@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 420 150" width="420" height="150" fill="none">
+  <defs>
+    <linearGradient id="yawGrad" x1="20" y1="20" x2="140" y2="140" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="50%" stop-color="#6366f1"/>
+      <stop offset="100%" stop-color="#a855f7"/>
+    </linearGradient>
+  </defs>
+  <!-- Graph / Yaw rotation icon -->
+  <g transform="translate(10, 5)">
+    <!-- Coordinate arcs -->
+    <path d="M 45 40 A 45 45 0 0 1 115 40" stroke="url(#yawGrad)" stroke-width="2.5" stroke-linecap="round" stroke-dasharray="4 5" opacity="0.6"/>
+    <path d="M 125 75 A 45 45 0 0 1 55 115" stroke="url(#yawGrad)" stroke-width="2.5" stroke-linecap="round" stroke-dasharray="4 5" opacity="0.6"/>
+    <!-- Edges -->
+    <line x1="40" y1="45" x2="80" y2="75" stroke="url(#yawGrad)" stroke-width="2.5" stroke-linecap="round"/>
+    <line x1="120" y1="45" x2="80" y2="75" stroke="url(#yawGrad)" stroke-width="2.5" stroke-linecap="round"/>
+    <line x1="80" y1="75" x2="80" y2="125" stroke="url(#yawGrad)" stroke-width="3" stroke-linecap="round"/>
+    <line x1="40" y1="45" x2="120" y2="45" stroke="#6366f1" stroke-width="1.5" stroke-dasharray="3 3" opacity="0.4"/>
+    <line x1="40" y1="45" x2="80" y2="125" stroke="#38bdf8" stroke-width="1.2" stroke-dasharray="2 4" opacity="0.4"/>
+    <line x1="120" y1="45" x2="80" y2="125" stroke="#a855f7" stroke-width="1.2" stroke-dasharray="2 4" opacity="0.4"/>
+    <!-- Peripheral nodes -->
+    <circle cx="40" cy="45" r="7" fill="#38bdf8"/>
+    <circle cx="40" cy="45" r="11" stroke="#38bdf8" stroke-width="1.5" opacity="0.4"/>
+    <circle cx="120" cy="45" r="7" fill="#a855f7"/>
+    <circle cx="120" cy="45" r="11" stroke="#a855f7" stroke-width="1.5" opacity="0.4"/>
+    <circle cx="80" cy="125" r="7" fill="#6366f1"/>
+    <circle cx="80" cy="125" r="11" stroke="#6366f1" stroke-width="1.5" opacity="0.4"/>
+    <!-- Central hub node -->
+    <circle cx="80" cy="75" r="10" fill="url(#yawGrad)"/>
+    <circle cx="80" cy="75" r="5" fill="#ffffff"/>
+  </g>
+  <!-- Wordmark styled for light and dark themes -->
+  <text x="160" y="86" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Helvetica, Arial, sans-serif" font-size="54" font-weight="800" letter-spacing="-1.5" fill="#38bdf8">y<tspan fill="#6366f1">a</tspan><tspan fill="#a855f7">w</tspan></text>
+  <text x="162" y="112" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Helvetica, Arial, sans-serif" font-size="13" font-weight="600" letter-spacing="1.5" fill="#94a3b8">LLM-WIKI GRAPH ENGINE</text>
+</svg>

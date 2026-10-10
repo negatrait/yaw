@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "skills": {
+    "cocoindex": {
+      "source": "cocoindex-io/cocoindex",
+      "sourceType": "github",
+      "skillPath": "skills/cocoindex/SKILL.md",
+      "computedHash": "ef9d4905c3c714eccdcebb45a18f71faf0cc5ad75718a7afb0c9e626808bf263"
+    },
+    "owl": {
+      "source": "sparkling/claude-config",
+      "sourceType": "github",
+      "skillPath": "skills/owl/SKILL.md",
+      "computedHash": "0e2bcb7d15ae4adf7f649ea9f2c78eb2bb406ffabc8f19ae1bb0c5de7573e365"
+    },
+    "shacl": {
+      "source": "sparkling/claude-config",
+      "sourceType": "github",
+      "skillPath": "skills/shacl/SKILL.md",
+      "computedHash": "a0f96b562ce11d541d52f89ba42f4221a24424641bbcff6ad3b95a3ad14b6c33"
+    },
+    "skos": {
+      "source": "sparkling/claude-config",
+      "sourceType": "github",
+      "skillPath": "skills/skos/SKILL.md",
+      "computedHash": "9303756bee63e8dbfb5ce3ec19320a27d96c45099a324efdf0c845ba0af4d4a1"
+    },
+    "spacy": {
+      "source": "g1joshi/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/ai-ml/spacy/SKILL.md",
+      "computedHash": "e2ba797ddefcce7cf6b23bccc88c9fa0b93b2a46ba27389ed0ad0acb0a7c3a1e"
+    },
+    "sparql": {
+      "source": "sparkling/claude-config",
+      "sourceType": "github",
+      "skillPath": "skills/sparql/SKILL.md",
+      "computedHash": "4898151b11922fd92baa111dcf3bea5061e70d25d2dfc09dc264db4d58b86995"
+    }
+  }
+}

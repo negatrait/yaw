@@ -1,0 +1,30 @@
+@prefix corp: <https://corp.example.com/ontology#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+
+corp:BuildingEnclosure a owl:Class ;
+    rdfs:label "Building Enclosure" .
+
+corp:Wall a owl:Class ;
+    rdfs:subClassOf corp:BuildingEnclosure ;
+    rdfs:label "Wall" .
+
+corp:ExteriorWall a owl:Class ;
+    rdfs:subClassOf corp:Wall ;
+    rdfs:label "Exterior Wall" ;
+    skos:prefLabel "exterior wall" ;
+    skos:altLabel "outer wall" .
+
+corp:Column a owl:Class ;
+    rdfs:label "Column" ;
+    skos:prefLabel "structural column" .
+
+corp:isAdjacentTo a owl:ObjectProperty ;
+    rdfs:label "is adjacent to" ;
+    skos:prefLabel "adjacent" ;
+    skos:altLabel "adjacent to" .
+
+corp:GhostHVACUnit a owl:Class ;
+    rdfs:label "Ghost HVAC Unit" ;
+    skos:prefLabel "ghost hvac unit" .

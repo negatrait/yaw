@@ -1,0 +1,174 @@
+@prefix yaw: <http://yaw.local/> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+@prefix concepts: <http://yaw.local/concepts/> .
+@prefix entities: <http://yaw.local/entities/> .
+@prefix claims: <http://yaw.local/claims/> .
+@prefix invariants: <http://yaw.local/invariants/> .
+@prefix decisions: <http://yaw.local/decisions/> .
+@prefix processes: <http://yaw.local/processes/> .
+@prefix sources: <http://yaw.local/sources/> .
+@prefix contexts: <http://yaw.local/contexts/> .
+@prefix predicates: <http://yaw.local/predicates/> .
+
+# ==============================================================================
+# Canonical Concept Scheme
+# ==============================================================================
+
+yaw:VaultScheme a skos:ConceptScheme ;
+    rdfs:label "YAW Vault Concept Scheme" ;
+    skos:prefLabel "YAW Vault Concept Scheme" ;
+    skos:hasTopConcept concepts:Root ,
+                       entities:Root ,
+                       claims:Root ,
+                       invariants:Root ,
+                       decisions:Root ,
+                       processes:Root ,
+                       sources:Root ,
+                       contexts:Root .
+
+# ==============================================================================
+# 8 Universal Node Root Classes
+# ==============================================================================
+
+concepts:Root a owl:Class ,
+                skos:Concept ;
+    rdfs:label "Concepts Root" ;
+    skos:prefLabel "Concepts Root" ;
+    rdfs:subClassOf owl:Thing ;
+    skos:topConceptOf yaw:VaultScheme ;
+    skos:inScheme yaw:VaultScheme .
+
+entities:Root a owl:Class ,
+                skos:Concept ;
+    rdfs:label "Entities Root" ;
+    skos:prefLabel "Entities Root" ;
+    rdfs:subClassOf owl:Thing ;
+    skos:topConceptOf yaw:VaultScheme ;
+    skos:inScheme yaw:VaultScheme .
+
+claims:Root a owl:Class ,
+              skos:Concept ;
+    rdfs:label "Claims Root" ;
+    skos:prefLabel "Claims Root" ;
+    rdfs:subClassOf owl:Thing ;
+    skos:topConceptOf yaw:VaultScheme ;
+    skos:inScheme yaw:VaultScheme .
+
+invariants:Root a owl:Class ,
+                  skos:Concept ;
+    rdfs:label "Invariants Root" ;
+    skos:prefLabel "Invariants Root" ;
+    rdfs:subClassOf owl:Thing ;
+    skos:topConceptOf yaw:VaultScheme ;
+    skos:inScheme yaw:VaultScheme .
+
+decisions:Root a owl:Class ,
+                 skos:Concept ;
+    rdfs:label "Decisions Root" ;
+    skos:prefLabel "Decisions Root" ;
+    rdfs:subClassOf owl:Thing ;
+    skos:topConceptOf yaw:VaultScheme ;
+    skos:inScheme yaw:VaultScheme .
+
+processes:Root a owl:Class ,
+                 skos:Concept ;
+    rdfs:label "Processes Root" ;
+    skos:prefLabel "Processes Root" ;
+    rdfs:subClassOf owl:Thing ;
+    skos:topConceptOf yaw:VaultScheme ;
+    skos:inScheme yaw:VaultScheme .
+
+sources:Root a owl:Class ,
+               skos:Concept ;
+    rdfs:label "Sources Root" ;
+    skos:prefLabel "Sources Root" ;
+    rdfs:subClassOf owl:Thing ;
+    skos:topConceptOf yaw:VaultScheme ;
+    skos:inScheme yaw:VaultScheme .
+
+contexts:Root a owl:Class ,
+                skos:Concept ;
+    rdfs:label "Contexts Root" ;
+    skos:prefLabel "Contexts Root" ;
+    rdfs:subClassOf owl:Thing ;
+    skos:topConceptOf yaw:VaultScheme ;
+    skos:inScheme yaw:VaultScheme .
+
+# ==============================================================================
+# Universal Predicate Property Root (Strictly owl:ObjectProperty, NOT owl:Class)
+# ==============================================================================
+
+predicates:Root a owl:ObjectProperty ;
+    rdfs:label "Predicates Root Property" ;
+    skos:prefLabel "Predicates Root Property" .
+
+# ==============================================================================
+# Canonical Seed Predicates
+# ==============================================================================
+
+predicates:subClassOf a owl:ObjectProperty ,
+                        owl:TransitiveProperty ;
+    rdfs:label "subClassOf" ;
+    skos:prefLabel "subClassOf" ;
+    rdfs:subPropertyOf rdfs:subClassOf ,
+                       predicates:Root .
+
+predicates:partOf a owl:ObjectProperty ,
+                    owl:TransitiveProperty ;
+    rdfs:label "partOf" ;
+    skos:prefLabel "partOf" ;
+    rdfs:subPropertyOf predicates:Root .
+
+predicates:instanceOf a owl:ObjectProperty ;
+    rdfs:label "instanceOf" ;
+    skos:prefLabel "instanceOf" ;
+    rdfs:subPropertyOf predicates:Root .
+
+predicates:broader a owl:ObjectProperty ,
+                     owl:TransitiveProperty ;
+    rdfs:label "broader" ;
+    skos:prefLabel "broader" ;
+    rdfs:subPropertyOf skos:broader ,
+                       predicates:Root .
+
+predicates:narrower a owl:ObjectProperty ,
+                      owl:TransitiveProperty ;
+    rdfs:label "narrower" ;
+    skos:prefLabel "narrower" ;
+    rdfs:subPropertyOf skos:narrower ,
+                       predicates:Root .
+
+predicates:supports a owl:ObjectProperty ;
+    rdfs:label "supports" ;
+    skos:prefLabel "supports" ;
+    rdfs:subPropertyOf predicates:Root ;
+    owl:propertyDisjointWith predicates:refutes , predicates:contradicts .
+
+predicates:refutes a owl:ObjectProperty ;
+    rdfs:label "refutes" ;
+    skos:prefLabel "refutes" ;
+    rdfs:subPropertyOf predicates:Root ;
+    owl:propertyDisjointWith predicates:supports .
+
+predicates:contradicts a owl:ObjectProperty , owl:SymmetricProperty ;
+    rdfs:label "contradicts" ;
+    skos:prefLabel "contradicts" ;
+    rdfs:subPropertyOf predicates:Root ;
+    owl:propertyDisjointWith predicates:supports .
+
+predicates:causes a owl:ObjectProperty ;
+    rdfs:label "causes" ;
+    skos:prefLabel "causes" ;
+    rdfs:subPropertyOf predicates:Root ;
+    owl:propertyDisjointWith predicates:prevents .
+
+predicates:prevents a owl:ObjectProperty ;
+    rdfs:label "prevents" ;
+    skos:prefLabel "prevents" ;
+    rdfs:subPropertyOf predicates:Root ;
+    owl:propertyDisjointWith predicates:causes .

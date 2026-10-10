@@ -1,0 +1,57 @@
+"""Storage domain: SQLite connection provider, pragmas, sqlite-vec, FTS5, and alias contracts."""
+
+from __future__ import annotations
+
+from yaw.storage.db import (
+    DatabaseError,
+    _clean_fts_query,
+    apply_pragmas,
+    clean_db,
+    delete_alias,
+    ensure_schema_tables,
+    ensure_schema_views,
+    get_active_aliases,
+    get_aliases_for_canonical,
+    get_canonical_id,
+    get_db,
+    insert_alias,
+    insert_leaf_node,
+    load_vec_extension,
+    log_canon_verdict,
+    search_fts,
+    serialize_embedding,
+    set_alias_status,
+    verify_schema_integrity,
+)
+from yaw.storage.rdf import (
+    bind_namespaces,
+    export_graph,
+    project_knowledge_graph,
+    to_rdflib_graph,
+)
+
+__all__ = [
+    "DatabaseError",
+    "_clean_fts_query",
+    "apply_pragmas",
+    "bind_namespaces",
+    "clean_db",
+    "delete_alias",
+    "ensure_schema_tables",
+    "ensure_schema_views",
+    "export_graph",
+    "get_active_aliases",
+    "get_aliases_for_canonical",
+    "get_canonical_id",
+    "get_db",
+    "insert_alias",
+    "insert_leaf_node",
+    "load_vec_extension",
+    "log_canon_verdict",
+    "project_knowledge_graph",
+    "search_fts",
+    "serialize_embedding",
+    "set_alias_status",
+    "to_rdflib_graph",
+    "verify_schema_integrity",
+]

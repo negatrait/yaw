@@ -1,0 +1,64 @@
+[project]
+name = "llm-wiki-mcp"
+version = "0.1.0"
+description = "Fast local Ollama vector search and dialectic reasoning engine for llm-wiki"
+requires-python = ">=3.14"
+dependencies = [
+    "cocoindex>=1.0.24",
+    "sqlite-vec>=0.1.9",
+    "pyyaml>=6.0.2",
+    "numpy>=2.2.0",
+    "fastmcp[openai]>=4.0.0",
+    "spacy>=3.8.16",
+    "spacy-llm>=0.7.4",
+    "scipy>=1.18.0",
+    "rdflib>=7.0.0",
+    "pyshacl>=0.25.0",
+    "en-core-web-lg",
+]
+
+[project.scripts]
+yaw = "yaw.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+en-core-web-lg = { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_lg-3.8.0/en_core_web_lg-3.8.0-py3-none-any.whl" }
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-cov>=6.0.0",
+    "pytest-testmon>=2.1.3",
+    "ruff>=0.16.10",
+    "ty>=0.0.84",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "--testmon"
+
+[tool.coverage.run]
+source = ["src"]
+omit = [
+    ".agents/*",
+    ".cache/*",
+    "tests/*",
+    "*/site-packages/*",
+    "*/__pycache__/*",
+]
+
+[tool.coverage.report]
+omit = [
+    ".agents/*",
+    ".cache/*",
+    "tests/*",
+    "*/site-packages/*",
+    "*/__pycache__/*",
+]
