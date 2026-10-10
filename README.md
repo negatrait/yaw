@@ -4,6 +4,10 @@
   <p><strong>FastMCP Cocoindex LLM-Wiki Indexer & Ontology GraphRAG Engine</strong></p>
 </div>
 
+# YAW IS WIP!
+
+Had to save to github to save the repository.
+
 yaw is an autonomous, local-first GraphRAG engine combining **Cocoindex**, **spaCy + spacy-llm**, **SQLite** (`fts5` + `sqlite-vec`), and **SciPy** (Personalized PageRank through the ontology layer) served via **FastMCP**.
 
 > [!NOTE]
