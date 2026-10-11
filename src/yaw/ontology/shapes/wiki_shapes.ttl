@@ -187,10 +187,13 @@ yaw:DialecticalIntegrityShape a sh:NodeShape ;
         sh:severity sh:Violation ;
         sh:select '''
             PREFIX predicates: <http://yaw.local/predicates/>
-            SELECT $this (<http://yaw.local/predicates/causes> AS ?path) (?target AS ?value)
+            SELECT $this ?path (?target AS ?value)
             WHERE {
                 $this predicates:causes ?target .
                 $this predicates:prevents ?target .
+                { BIND(<http://yaw.local/predicates/causes> AS ?path) }
+                UNION
+                { BIND(<http://yaw.local/predicates/prevents> AS ?path) }
             }
         ''' ;
     ] ;
@@ -200,16 +203,22 @@ yaw:DialecticalIntegrityShape a sh:NodeShape ;
         sh:severity sh:Violation ;
         sh:select '''
             PREFIX predicates: <http://yaw.local/predicates/>
-            SELECT $this (<http://yaw.local/predicates/supports> AS ?path) (?target AS ?value)
+            SELECT $this ?path (?target AS ?value)
             WHERE {
                 {
                     $this predicates:supports ?target .
                     $this predicates:contradicts ?target .
+                    { BIND(<http://yaw.local/predicates/supports> AS ?path) }
+                    UNION
+                    { BIND(<http://yaw.local/predicates/contradicts> AS ?path) }
                 }
                 UNION
                 {
                     $this predicates:supports ?target .
                     ?target predicates:contradicts $this .
+                    { BIND(<http://yaw.local/predicates/supports> AS ?path) }
+                    UNION
+                    { BIND(<http://yaw.local/predicates/contradicts> AS ?path) }
                 }
             }
         ''' ;
@@ -220,16 +229,22 @@ yaw:DialecticalIntegrityShape a sh:NodeShape ;
         sh:severity sh:Violation ;
         sh:select '''
             PREFIX predicates: <http://yaw.local/predicates/>
-            SELECT $this (<http://yaw.local/predicates/supports> AS ?path) (?target AS ?value)
+            SELECT $this ?path (?target AS ?value)
             WHERE {
                 {
                     $this predicates:supports ?target .
                     $this predicates:refutes ?target .
+                    { BIND(<http://yaw.local/predicates/supports> AS ?path) }
+                    UNION
+                    { BIND(<http://yaw.local/predicates/refutes> AS ?path) }
                 }
                 UNION
                 {
                     $this predicates:supports ?target .
                     ?target predicates:refutes $this .
+                    { BIND(<http://yaw.local/predicates/supports> AS ?path) }
+                    UNION
+                    { BIND(<http://yaw.local/predicates/refutes> AS ?path) }
                 }
             }
         ''' ;

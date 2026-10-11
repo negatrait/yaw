@@ -6,6 +6,7 @@ import logging
 import re
 import sqlite3
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,7 @@ __all__ = [
     "ensure_schema_tables",
     "ensure_schema_views",
     "export_graph",
+    "fetch_compiled_violations",
     "get_active_aliases",
     "get_aliases_for_canonical",
     "get_canonical_id",
@@ -40,6 +42,7 @@ __all__ = [
     "insert_leaf_node",
     "load_vec_extension",
     "log_canon_verdict",
+    "persist_compiled_violations",
     "search_fts",
     "serialize_embedding",
     "set_alias_status",
@@ -423,3 +426,102 @@ def search_fts(
 
 
 DatabaseError = sqlite3.DatabaseError
+
+
+def persist_compiled_violations(
+    conn: sqlite3.Connection,
+    violations: list[dict[str, Any]],
+) -> int:
+    """Transactionally persist SHACL validation violations into compiled_violations table.
+
+    Replaces active violations and returns count of inserted records.
+    """
+    ensure_schema_tables(conn)
+    with conn:
+        conn.execute("DELETE FROM compiled_violations")
+        for v in violations:
+            v_id = str(v.get("violation_id") or uuid.uuid4().hex)
+            focus_node = str(v.get("focus_node", ""))
+            shape_id = str(
+                v.get("shape_id") or v.get("constraint") or "yaw:GenericShape"
+            )
+            result_path = str(v.get("result_path") or v.get("path") or "")
+            raw_sev = str(v.get("severity", "Violation")).capitalize()
+            severity = (
+                raw_sev if raw_sev in ("Info", "Warning", "Violation") else "Violation"
+            )
+            message = str(v.get("message", "Integrity constraint violation"))
+            source_chunk_id = v.get("source_chunk_id")
+            if source_chunk_id is not None:
+                source_chunk_id = str(source_chunk_id)
+            conflicting_chunk_id = v.get("conflicting_chunk_id") or v.get("value")
+            if conflicting_chunk_id is not None:
+                conflicting_chunk_id = str(conflicting_chunk_id)
+            compiled_at = float(v.get("compiled_at") or time.time())
+
+            conn.execute(
+                """
+                INSERT INTO compiled_violations (
+                    violation_id, focus_node, shape_id, result_path, severity,
+                    message, source_chunk_id, conflicting_chunk_id, compiled_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    v_id,
+                    focus_node,
+                    shape_id,
+                    result_path,
+                    severity,
+                    message,
+                    source_chunk_id,
+                    conflicting_chunk_id,
+                    compiled_at,
+                ),
+            )
+    return len(violations)
+
+
+def fetch_compiled_violations(
+    conn: sqlite3.Connection,
+    focus_node: str | None = None,
+    query: str | None = None,
+) -> list[dict[str, Any]]:
+    """Retrieve pre-compiled SHACL violations from SQLite in O(1) time.
+
+    Supports optional focus_node exact filtering and query term matching
+    across focus_node and message columns.
+    """
+    clauses: list[str] = []
+    params: list[Any] = []
+
+    if focus_node and focus_node.strip():
+        clauses.append("focus_node = ?")
+        params.append(focus_node.strip())
+
+    if query and query.strip() and query.strip() != "*":
+        q = query.strip()
+        q_like = f"%{q}%"
+        clauses.append("(focus_node = ? OR focus_node LIKE ? OR message LIKE ?)")
+        params.extend([q, q_like, q_like])
+
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    sql = f"SELECT * FROM compiled_violations {where_sql} ORDER BY compiled_at DESC, violation_id ASC"
+
+    try:
+        cursor = conn.execute(sql, tuple(params))
+    except sqlite3.OperationalError:
+        ensure_schema_tables(conn)
+        cursor = conn.execute(sql, tuple(params))
+    cols = [d[0] for d in cursor.description]
+    rows = cursor.fetchall()
+
+    results: list[dict[str, Any]] = []
+    for r in rows:
+        row_dict = dict(zip(cols, r))
+        # Ensure backwards-compatible diagnostic keys matching ValidationReport expectations
+        row_dict["path"] = row_dict.get("result_path") or ""
+        row_dict["constraint"] = row_dict.get("shape_id") or ""
+        row_dict["value"] = row_dict.get("conflicting_chunk_id") or ""
+        results.append(row_dict)
+
+    return results

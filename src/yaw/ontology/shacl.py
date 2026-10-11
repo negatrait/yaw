@@ -193,6 +193,7 @@ def _extract_result_item(
     path = report_graph.value(result, SH.resultPath)
     severity = report_graph.value(result, SH.resultSeverity)
     component = report_graph.value(result, SH.sourceConstraintComponent)
+    source_shape = report_graph.value(result, SH.sourceShape)
     message = report_graph.value(result, SH.resultMessage)
     val = report_graph.value(result, SH.value)
 
@@ -204,14 +205,25 @@ def _extract_result_item(
         if component
         else "ConstraintComponent"
     )
+    shape_name = (
+        str(source_shape).rsplit("#", 1)[-1].rsplit("/", 1)[-1]
+        if source_shape
+        else comp_name
+    )
+
+    path_str = str(path) if path else ""
+    val_str = str(val) if val else ""
 
     return {
         "focus_node": str(focus_node) if focus_node else "",
-        "path": str(path) if path else "",
+        "path": path_str,
+        "result_path": path_str,
         "severity": sev_name,
         "constraint": comp_name,
+        "shape_id": shape_name,
         "message": str(message) if message else "Integrity constraint violation",
-        "value": str(val) if val else "",
+        "value": val_str,
+        "conflicting_chunk_id": val_str,
     }
 
 
@@ -398,7 +410,9 @@ def load_fast_shapes_graph(reload: bool = False) -> rdflib.Graph:
     @prefix skos: <http://www.w3.org/2004/02/skos/core#> .
     @prefix yaw: <http://yaw.local/> .
     @prefix concepts: <http://yaw.local/concepts/> .
+    @prefix predicates: <http://yaw.local/predicates/> .
     @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+    @prefix owl: <http://www.w3.org/2002/07/owl#> .
 
     yaw:ConceptShape a sh:NodeShape ;
         sh:targetSubjectsOf skos:definition ;
@@ -411,6 +425,93 @@ def load_fast_shapes_graph(reload: bool = False) -> rdflib.Graph:
     yaw:RelationShape a sh:NodeShape ;
         sh:targetSubjectsOf rdfs:subClassOf ;
         sh:nodeKind sh:IRI .
+
+    yaw:DialecticalIntegrityShape a sh:NodeShape ;
+        sh:targetClass owl:Thing ;
+        sh:targetSubjectsOf yaw:contestedMerge, yaw:aliasStatus, predicates:causes, predicates:prevents, predicates:supports, predicates:contradicts, predicates:refutes ;
+        sh:sparql [
+            a sh:SPARQLConstraint ;
+            sh:message "Dialectical contradiction: Node simultaneously causes and prevents target."@en ;
+            sh:severity sh:Violation ;
+            sh:select '''
+                PREFIX predicates: <http://yaw.local/predicates/>
+                SELECT $this ?path (?target AS ?value)
+                WHERE {
+                    $this predicates:causes ?target .
+                    $this predicates:prevents ?target .
+                    { BIND(<http://yaw.local/predicates/causes> AS ?path) }
+                    UNION
+                    { BIND(<http://yaw.local/predicates/prevents> AS ?path) }
+                }
+            ''' ;
+        ] ;
+        sh:sparql [
+            a sh:SPARQLConstraint ;
+            sh:message "Dialectical contradiction: Node simultaneously supports and contradicts target."@en ;
+            sh:severity sh:Violation ;
+            sh:select '''
+                PREFIX predicates: <http://yaw.local/predicates/>
+                SELECT $this ?path (?target AS ?value)
+                WHERE {
+                    {
+                        $this predicates:supports ?target .
+                        $this predicates:contradicts ?target .
+                        { BIND(<http://yaw.local/predicates/supports> AS ?path) }
+                        UNION
+                        { BIND(<http://yaw.local/predicates/contradicts> AS ?path) }
+                    }
+                    UNION
+                    {
+                        $this predicates:supports ?target .
+                        ?target predicates:contradicts $this .
+                        { BIND(<http://yaw.local/predicates/supports> AS ?path) }
+                        UNION
+                        { BIND(<http://yaw.local/predicates/contradicts> AS ?path) }
+                    }
+                }
+            ''' ;
+        ] ;
+        sh:sparql [
+            a sh:SPARQLConstraint ;
+            sh:message "Dialectical contradiction: Node simultaneously supports and refutes target."@en ;
+            sh:severity sh:Violation ;
+            sh:select '''
+                PREFIX predicates: <http://yaw.local/predicates/>
+                SELECT $this ?path (?target AS ?value)
+                WHERE {
+                    {
+                        $this predicates:supports ?target .
+                        $this predicates:refutes ?target .
+                        { BIND(<http://yaw.local/predicates/supports> AS ?path) }
+                        UNION
+                        { BIND(<http://yaw.local/predicates/refutes> AS ?path) }
+                    }
+                    UNION
+                    {
+                        $this predicates:supports ?target .
+                        ?target predicates:refutes $this .
+                        { BIND(<http://yaw.local/predicates/supports> AS ?path) }
+                        UNION
+                        { BIND(<http://yaw.local/predicates/refutes> AS ?path) }
+                    }
+                }
+            ''' ;
+        ] ;
+        sh:sparql [
+            a sh:SPARQLConstraint ;
+            sh:message "Contested alias merge detected."@en ;
+            sh:severity sh:Violation ;
+            sh:select '''
+                PREFIX yaw: <http://yaw.local/>
+                SELECT DISTINCT $this (yaw:aliasStatus AS ?path) (?canonical AS ?value)
+                WHERE {
+                    { $this yaw:aliasStatus "contested" .
+                      OPTIONAL { $this yaw:canonicalTarget ?canonical } }
+                    UNION
+                    { $this yaw:contestedMerge ?canonical }
+                }
+            ''' ;
+        ] .
     """
     fresh = rdflib.Graph().parse(data=fast_shapes, format="turtle")
     _CACHED_FAST_SHAPES_GRAPH = fresh
@@ -471,7 +572,7 @@ def validate_wiki_graph_fast(
             shacl_graph=shapes_graph,
             ont_graph=None,
             inference=None,
-            advanced=False,
+            advanced=True,
             inplace=True,
         )
     finally:

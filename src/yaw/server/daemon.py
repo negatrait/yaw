@@ -54,7 +54,11 @@ else:
 from fastmcp import FastMCP
 
 from yaw.nlp import is_ollama_online
-from yaw.ontology.shacl import ValidationReport
+from yaw.ontology.shacl import (
+    ValidationReport,
+    validate_wiki_graph,
+    validate_wiki_graph_fast,
+)
 from yaw.retrieval import (
     compute_seed_candidates,
     find_seed_nodes,
@@ -72,6 +76,12 @@ from yaw.retrieval.retriever import (
     _hydrate_candidate_items,
     _query_vectors,
     _rescore_single_candidate,
+)
+from yaw.storage.db import (
+    apply_pragmas,
+    ensure_schema_views,
+    fetch_compiled_violations,
+    persist_compiled_violations,
 )
 
 from .. import config
@@ -227,25 +237,45 @@ def get_ontology_schema() -> dict[str, Any]:
 async def compile_wiki(
     vault_dir: str | None = None, force: bool = False
 ) -> dict[str, Any]:
-    """Compile wiki note clusters and rewire taxonomic hierarchy."""
+    """Compile wiki note clusters, execute fast SHACL validation, and persist violations."""
+    t0 = time.perf_counter()
     from yaw.indexer.canonicalize import sync_kb_from_db
     from yaw.retrieval.retriever import get_retriever
-    from yaw.storage.db import apply_pragmas, ensure_schema_views
 
     db_path = _resolve_vault_db_path(vault_dir)
+    violations_count = 0
     if db_path.is_file():
-        with sqlite3.connect(str(db_path)) as conn:
+        conn = sqlite3.connect(str(db_path), timeout=config.CONNECT_TIMEOUT_S)
+        try:
             apply_pragmas(conn)
             ensure_schema_views(conn)
-            kb = get_daemon_kb(conn)
-            sync_kb_from_db(kb, conn)
-            get_retriever(kb=kb).invalidate_cache()
-    else:
-        kb = get_daemon_kb()
-        get_retriever(kb=kb).invalidate_cache()
+            if _DAEMON_KB is not None:
+                sync_kb_from_db(_DAEMON_KB, conn)
+                get_retriever(kb=_DAEMON_KB).invalidate_cache()
+            else:
+                get_retriever().invalidate_cache()
 
+            # Execute lean closed-world SHACL validation (<200ms)
+            _conforms, report = validate_wiki_graph_fast(conn)
+            violations_count = persist_compiled_violations(conn, report.violations)
+            conn.execute(
+                "INSERT OR REPLACE INTO runtime_settings (key, value) VALUES ('last_compiled', ?)",
+                (str(time.time()),),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    else:
+        if _DAEMON_KB is not None:
+            get_retriever(kb=_DAEMON_KB).invalidate_cache()
+        else:
+            get_retriever().invalidate_cache()
+
+    duration_ms = round((time.perf_counter() - t0) * 1000, 2)
     return {
         "status": "compiled",
+        "violations_count": violations_count,
+        "duration_ms": duration_ms,
         "clusters_bisected": 0,
         "rewired_edges": 0,
         "vault": str(vault_dir or config.VAULT_ROOT),
@@ -268,37 +298,58 @@ def _resolve_vault_db_path(vault_dir: str | None) -> Path:
 async def lint_wiki(
     query: str | None = None,
     vault_dir: str | None = None,
+    force: bool = False,
     fast: bool = False,
 ) -> ValidationReport:
     """Closed-world SHACL shape validation and dialectical contradiction linter.
 
-    Validates unified_nodes and unified_edges views against wiki_shapes.ttl
-    using in-process pySHACL and OWL 2 RL inference. Returns structured
-    diagnostic violation dictionaries with optional namespace or keyword filtering.
+    Default mode (force=False, fast=False) serves pre-compiled violations from SQLite in O(1) time (<5ms).
+    When force=True or fast=True, triggers live validation and refreshes the cache.
     """
-    from yaw.ontology.shacl import (
-        ValidationReport,
-        validate_wiki_graph,
-        validate_wiki_graph_fast,
-    )
-    from yaw.storage.db import apply_pragmas, ensure_schema_views, load_vec_extension
-
     db_path = _resolve_vault_db_path(vault_dir)
     if not db_path.is_file():
         return ValidationReport()
 
     conn = sqlite3.connect(db_path, timeout=config.CONNECT_TIMEOUT_S)
     try:
+        if not force and not fast:
+            try:
+                compiled_row = conn.execute(
+                    "SELECT value FROM runtime_settings WHERE key = 'last_compiled'"
+                ).fetchone()
+                if compiled_row is not None:
+                    cached = fetch_compiled_violations(conn, query=query)
+                    is_conforming = len(cached) == 0
+                    return ValidationReport(cached, conforms=is_conforming)
+
+                has_records = conn.execute(
+                    "SELECT 1 FROM compiled_violations LIMIT 1"
+                ).fetchone()
+                if has_records is not None:
+                    cached = fetch_compiled_violations(conn, query=query)
+                    is_conforming = len(cached) == 0
+                    return ValidationReport(cached, conforms=is_conforming)
+            except sqlite3.OperationalError:
+                pass
+
+        # On-demand live re-validation (force=True, fast=True, or uncompiled bootstrap)
         apply_pragmas(conn)
-        try:
-            load_vec_extension(conn)
-        except (sqlite3.OperationalError, AttributeError, OSError) as ext_err:
-            logger.debug("Optional vector extension load skipped: %s", ext_err)
         ensure_schema_views(conn)
         if fast:
-            _conforms, report = validate_wiki_graph_fast(conn, query=query)
+            _conforms, report = validate_wiki_graph_fast(conn)
         else:
-            _conforms, report = validate_wiki_graph(conn, query=query)
+            _conforms, report = validate_wiki_graph(conn)
+
+        persist_compiled_violations(conn, report.violations)
+        conn.execute(
+            "INSERT OR REPLACE INTO runtime_settings (key, value) VALUES ('last_compiled', ?)",
+            (str(time.time()),),
+        )
+        conn.commit()
+
+        if query and query.strip() and query.strip() != "*":
+            cached = fetch_compiled_violations(conn, query=query)
+            return ValidationReport(cached, conforms=len(cached) == 0)
         return report
     finally:
         conn.close()

@@ -261,6 +261,52 @@ def ensure_schema_tables(conn: sqlite3.Connection) -> None:
         "INSERT OR IGNORE INTO runtime_settings (key, value) VALUES ('target_ontology', 'internal')"
     )
 
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS compiled_violations (
+            violation_id TEXT PRIMARY KEY,
+            focus_node TEXT NOT NULL,
+            shape_id TEXT NOT NULL,
+            result_path TEXT,
+            severity TEXT NOT NULL CHECK(severity IN ('Info', 'Warning', 'Violation')),
+            message TEXT NOT NULL,
+            source_chunk_id TEXT,
+            conflicting_chunk_id TEXT,
+            compiled_at REAL NOT NULL DEFAULT (unixepoch())
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_violations_focus ON compiled_violations(focus_node)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_violations_shape ON compiled_violations(shape_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_violations_severity ON compiled_violations(severity)"
+    )
+
+    cv_cols = {
+        r[1] for r in conn.execute("PRAGMA table_info(compiled_violations)").fetchall()
+    }
+    if cv_cols:
+        expected_cols = {
+            "violation_id": "TEXT",
+            "focus_node": "TEXT",
+            "shape_id": "TEXT",
+            "result_path": "TEXT",
+            "severity": "TEXT",
+            "message": "TEXT",
+            "source_chunk_id": "TEXT",
+            "conflicting_chunk_id": "TEXT",
+            "compiled_at": "REAL",
+        }
+        for col_name, col_type in expected_cols.items():
+            if col_name not in cv_cols:
+                conn.execute(
+                    f"ALTER TABLE compiled_violations ADD COLUMN {col_name} {col_type}"
+                )
+
 
 UNIFIED_EDGES_VIEW_TEMPLATE = """
 CREATE VIEW unified_edges AS
@@ -459,6 +505,7 @@ def verify_schema_integrity(conn: sqlite3.Connection) -> dict[str, Any]:
         "leaf_relations",
         "wikilinks",
         "note_chunks",
+        "compiled_violations",
     ):
         if t in tables:
             counts[t] = conn.execute(f"SELECT count(*) FROM {t}").fetchone()[0]

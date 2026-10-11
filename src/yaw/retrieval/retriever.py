@@ -191,7 +191,7 @@ def _collect_table_nodes(conn: sqlite3.Connection) -> set[str]:
     """Collect non-null entity and node IDs from database tables."""
     nodes: set[str] = set()
     table_queries = (
-        "SELECT node_id FROM leaf_nodes",
+        "SELECT node_id FROM leaf_nodes WHERE source_leaf_id NOT LIKE 'dynamic_ontology:%'",
         "SELECT entity_uri FROM note_chunks",
         "SELECT node_id FROM compiled_nodes",
     )

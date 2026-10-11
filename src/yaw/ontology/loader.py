@@ -479,6 +479,101 @@ def _insert_prop_records(
     return props_ingested, aliases_materialized
 
 
+def _index_ontology_fts_and_vectors(
+    conn: sqlite3.Connection,
+    raw_classes: list[dict[str, Any]],
+    raw_props: list[dict[str, Any]],
+    detected_prefix: str,
+) -> None:
+    """Index dynamic ontology classes and properties into query_fts and compute vector embeddings."""
+    from yaw.nlp import embed_texts_sync, format_prompt, is_ollama_online
+    from yaw.storage.db import serialize_embedding
+
+    master_tables = {
+        r[0]
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+        ).fetchall()
+    }
+
+    if "query_fts" not in master_tables:
+        try:
+            conn.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS query_fts USING fts5("
+                "entity_uri UNINDEXED, rel_path UNINDEXED, heading, content, "
+                "content='', contentless_unindexed=1, contentless_delete=1"
+                ")"
+            )
+            master_tables.add("query_fts")
+        except sqlite3.OperationalError as op_err:
+            logger.debug("Could not create query_fts virtual table: %s", op_err)
+
+    if "query_fts" in master_tables:
+        for rc in raw_classes:
+            curie = str(rc["curie"])
+            label = str(rc.get("label", "")).strip()
+            definition = str(rc.get("definition", "")).strip()
+            content = f"{label}: {definition}" if definition else label
+            rel_path = f"dynamic_ontology:{detected_prefix}"
+            conn.execute(
+                "INSERT INTO query_fts(entity_uri, rel_path, heading, content) VALUES (?, ?, ?, ?)",
+                (curie, rel_path, label, content),
+            )
+
+        for rp in raw_props:
+            curie = str(rp["curie"])
+            label = str(rp.get("label", "")).strip()
+            definition = str(rp.get("definition", "")).strip()
+            content = f"{label}: {definition}" if definition else label
+            rel_path = f"dynamic_ontology:{detected_prefix}"
+            conn.execute(
+                "INSERT INTO query_fts(entity_uri, rel_path, heading, content) VALUES (?, ?, ?, ?)",
+                (curie, rel_path, label, content),
+            )
+
+    if "leaf_nodes" in master_tables and raw_classes:
+        prompts = [
+            format_prompt(
+                f"{str(rc.get('label', '')).strip()}: {str(rc.get('definition', '')).strip()}"
+                if str(rc.get("definition", "")).strip()
+                else str(rc.get("label", "")).strip(),
+                task="Classification",
+            )
+            for rc in raw_classes
+        ]
+
+        embs: list[np.ndarray] = []
+        if is_ollama_online(timeout_s=0.5):
+            try:
+                embs = embed_texts_sync(prompts)
+            except (OSError, TimeoutError, ValueError, RuntimeError) as err:
+                logger.warning(
+                    "Failed to compute embeddings for ontology classes: %s", err
+                )
+
+        for i, rc in enumerate(raw_classes):
+            curie = str(rc["curie"])
+            label = str(rc.get("label", "")).strip()
+            definition = str(rc.get("definition", "")).strip()
+            source_leaf_id = f"dynamic_ontology:{detected_prefix}"
+            emb_bytes = serialize_embedding(embs[i]) if i < len(embs) else None
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO leaf_nodes (
+                    node_id, source_leaf_id, name, namespace, definition, embedding
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    curie,
+                    source_leaf_id,
+                    label,
+                    detected_prefix,
+                    definition,
+                    emb_bytes,
+                ),
+            )
+
+
 def _persist_ontology_catalog(
     conn: sqlite3.Connection,
     detected_prefix: str,
@@ -520,6 +615,7 @@ def _persist_ontology_catalog(
         p_ingested, p_aliases = _insert_prop_records(
             conn, raw_props, detected_prefix, has_prop_def
         )
+        _index_ontology_fts_and_vectors(conn, raw_classes, raw_props, detected_prefix)
         conn.commit()
         return c_ingested, p_ingested, c_aliases + p_aliases
     except Exception:
