@@ -20,7 +20,7 @@ Rather than searching for disconnected prose fragments, the engine:
                                           │
                   ┌───────────────────────┴───────────────────────┐
                   ▼                                               ▼
-         FTS5 BM25 Lexical Search                        Embedding Cosine Projection
+         FTS5 BM25 Lexical Search                 Alias Priors + Query→Fact / Chunk KNN
                   │ (weight: 0.20)                                │ (weights: 0.60 concept, 0.20 chunk)
                   └───────────────────────┬───────────────────────┘
                                           ▼
@@ -56,6 +56,7 @@ The vertex set $V$ unifies:
    $$W_{\text{rev}} = 0.5 \times W_{\text{fwd}}$$
 4. **Document Sequential Flow:** Directed linear edges linking contiguous chunks within the same document to preserve reading order:
    $$\text{chunk}_i \xrightarrow{\text{sequence}} \text{chunk}_{i+1} \quad (W_{\text{seq}} = 0.8)$$
+5. **Soft Identity Links:** `close_matches` rows project as `rel_type = 'closeMatch'` in both directions (symmetric, non-transitive) with $W = \text{score}$ ([`docs/adr/ADR-012.md`](file:///home/harri/yaw/docs/adr/ADR-012.md) §3).
 
 ---
 
@@ -72,6 +73,7 @@ Uniform random-walk conductance causes catastrophic mass leakage when graphs con
 | **Document Sequence** | $\text{chunk}_i$ | $\text{chunk}_{i+1}$ | **0.8** | Preserves sequential narrative coherence across adjacent paragraphs. |
 | **Forward Wikilink** | Document / Concept | Target Concept | **1.0** | Direct intentional semantic association. |
 | **Reverse Wikilink** | Target Concept | Document | **0.5** | Attenuated back-propagation along human reference trails. |
+| **Soft Identity (`closeMatch`)** | Entity | Entity | **score** (both directions) | Symmetric, non-transitive candidate link; PPR resolves ambiguity topologically ([`ADR-012`](file:///home/harri/yaw/docs/adr/ADR-012.md)). |
 
 ### 3.2 In-Degree Hub Dampening
 To prevent high-degree vertices (e.g. ubiquitous concepts like `concepts:machine-learning`) from acting as probability sinks, each forward edge weight is penalized by the target node's in-degree:
@@ -96,20 +98,20 @@ Rather than uniform personalization ($\mathbf{p}_0 = \frac{1}{|V|} \mathbf{1}$),
 
 $$\mathbf{p}_0 = \beta_1 \cdot \mathbf{s}_{\text{concepts}} + \beta_2 \cdot \mathbf{s}_{\text{chunks\_vec}} + \beta_3 \cdot \mathbf{s}_{\text{chunks\_fts}}$$
 
-Where:
-- $\beta_1 = 0.60$: Concept canopy vector similarity bias (modulated by candidate priors).
+Where (initial values are uncalibrated priors, calibrated in Epic 8 on a calibration split only, [`docs/adr/ADR-012.md`](file:///home/harri/yaw/docs/adr/ADR-012.md)):
+- $\beta_1 = 0.60$: Concept canopy bias (alias priors + query-to-fact relevance).
 - $\beta_2 = 0.20$: Chunk vector similarity bias.
 - $\beta_3 = 0.20$: FTS5 BM25 lexical score bias.
 
-### 4.1 Concept Canopy Seeding with Calibrated Alias Priors ($\beta_1 = 0.60$)
-To prevent premature winner-take-all discretization of polysemous query terms ([`docs/adr/ADR-010.md`](file:///home/harri/yaw/docs/adr/ADR-010.md)), query mentions $a \in \text{mentions}(q)$ look up candidate entities $e \in \text{cands}(a)$ via compiled C/Cython `InMemoryLookupKB.get_alias_candidates(a)`.
-Each candidate provides a calibrated prior probability $P(e \mid a) \in (0, 1]$ satisfying $\sum_{e} P(e \mid a) = 1.0$.
+### 4.1 Concept Canopy Seeding with Alias Priors and Query-to-Fact Relevance ($\beta_1 = 0.60$)
+To prevent premature winner-take-all discretization of polysemous query terms ([`docs/adr/ADR-010.md`](file:///home/harri/yaw/docs/adr/ADR-010.md)), query mentions $a \in M(q)$ (extracted in space L) look up candidate entities $e \in \text{cands}(a)$ via compiled C/Cython `InMemoryLookupKB.get_alias_candidates(a)`.
+Each candidate provides a normalized candidate weight $P(e \mid a) \in (0, 1]$ satisfying $\sum_{e} P(e \mid a) = 1.0$, backed by `aliases` ($w = 1$ for the hard canonical) and `close_matches` ($w = \text{score}$) ([`docs/adr/ADR-012.md`](file:///home/harri/yaw/docs/adr/ADR-012.md) §3).
 
-When query embedding $\mathbf{q}$ is available:
-- Queries SQLite `leaf_nodes` using `vec_distance_cosine(embedding, ?)`.
-- Seed mass for entity $e$ is weighted by the joint product of candidate prior and query cosine similarity:
-  $$\mathbf{s}_{\text{concepts}}[e] \propto \sum_{a \in \text{mentions}(q)} P(e \mid a) \cdot \max(0.0, 1.0 - \text{distance}(q, e))$$
-- Top $N=50$ candidates inject normalized mass into $\mathbf{p}_0$.
+The concept seed combines an alias-prior channel and a query-to-fact channel ([`docs/adr/ADR-012.md`](file:///home/harri/yaw/docs/adr/ADR-012.md) §4):
+$$\mathbf{s}_{\text{concepts}} = \lambda \cdot \widehat{\mathbf{s}}_{\text{alias}} + (1 - \lambda) \cdot \widehat{\mathbf{r}}, \qquad \mathbf{s}_{\text{alias}}[e] = \sum_{a \in M(q)} P(e \mid a)$$
+- When query embedding $\mathbf{q}$ (space R) is available, $F_q$ is the top-`FACT_TOP_K` (default 5) facts from `fact_vec`, and $r(q, e)$ is the mean $\cos(\mathbf{q}, \mathbf{f})$ over the facts $f \in F_q$ whose subject or object is $e$ (0 if none).
+- $\widehat{\cdot}$ is L1 normalization; $\lambda = 0.5$ is an uncalibrated prior. The channels are additive, so an entity named in the question but absent from $F_q$ still seeds.
+- There is **no** query → `leaf_nodes` vector seeding.
 
 ### 4.2 Chunk Vector Seeding ($\beta_2 = 0.20$)
 - Queries SQLite `note_chunks` using `vec_distance_cosine(embedding, ?)`.
@@ -121,7 +123,7 @@ When query embedding $\mathbf{q}$ is available:
 
 ### 4.4 Graceful Offline Fallback
 If the embedding service is unreachable or times out ($\mathbf{q} = \mathbf{0}$):
-- $\mathbf{s}_{\text{concepts}}[e] \propto \sum_{a} P(e \mid a)$ (lexical alias prior distribution) and $\mathbf{s}_{\text{chunks\_vec}} = \mathbf{0}$.
+- $\mathbf{r} = \mathbf{0}$, so $\mathbf{s}_{\text{concepts}} = \widehat{\mathbf{s}}_{\text{alias}}$ (lexical alias prior distribution), and $\mathbf{s}_{\text{chunks\_vec}} = \mathbf{0}$.
 - If no concept aliases match, the seed vector simplifies continuously to normalized lexical hits: $\mathbf{p}_0 = \mathbf{s}_{\text{chunks\_fts}}$, ensuring search never fails even in fully offline environments.
 
 Finally, $\mathbf{p}_0$ is normalized to unit sum: $\sum_i p_{0, i} = 1.0$.

@@ -29,7 +29,7 @@ flowchart TD
         Chunks -->|title: doc \| text: chunk| Vec[sqlite-vec Chunks Vec]
         Chunks -->|BM25 indexing| FTS[query_fts FTS5]
         Chunks -->|Doc-integrity spaCy Pipeline| Leaf[Leaf Ontology Triples]
-        Leaf -->|EDC Self-Canonicalization| Aliases[aliases & canon_verdicts]
+        Leaf -->|EDC Self-Canonicalization| Aliases[aliases, close_matches & canon_verdicts]
     end
 
     subgraph Storage [Single SQLite Database SSOT: yaw.db]
@@ -60,10 +60,10 @@ CocoIndex continuously monitors `vault/raw/` for markdown file modifications and
 - **Line-Range Provenance:** Chunks carry 1-indexed line numbers (`line_start`, `line_end`) into the raw note for zero-copy on-demand disk hydration.
 
 ### 2. Ontological Convergence (Two-Tier Convergence Protocol)
-Prevents vocabulary fragmentation across an append-only corpus without runtime LLM calls ([`docs/adr/ADR-003.md`](file:///home/harri/yaw/docs/adr/ADR-003.md), [`docs/adr/ADR-010.md`](file:///home/harri/yaw/docs/adr/ADR-010.md)):
-- **Compiled C/Cython KnowledgeBase:** In-process `InMemoryLookupKB` synchronizes canonical entities and active alias candidate prior distributions $P(e \mid a) \in (0, 1]$ directly from SQLite (`leaf_nodes`, `aliases`).
-- **Tier 1 (Direct Match):** Exact slug match, active alias table lookup, or Cython KB candidate resolution. 0 vectors, 0 LLM calls.
-- **Tier 2 (Vector Near-Match):** In-process vector similarity > 0.80 using `en_core_web_lg` static 300d GloVe vectors. Auto-merges and records alias mapping. 0 LLM calls.
+Prevents vocabulary fragmentation across an append-only corpus without runtime LLM calls ([`docs/adr/ADR-003.md`](file:///home/harri/yaw/docs/adr/ADR-003.md), [`docs/adr/ADR-010.md`](file:///home/harri/yaw/docs/adr/ADR-010.md), [`docs/adr/ADR-012.md`](file:///home/harri/yaw/docs/adr/ADR-012.md)):
+- **Compiled C/Cython KnowledgeBase:** In-process `InMemoryLookupKB` (alias → candidate prior index, never a similarity source) synchronizes canonical entities and normalized candidate distributions $P(e \mid a) \in (0, 1]$ directly from SQLite (`aliases` for hard identity, `close_matches` for soft identity).
+- **Tier 1 (Direct Match):** Exact slug match, spaCy normalized key, alias table lookup, or Cython KB candidate resolution. 0 vectors, 0 LLM calls.
+- **Tier 2 (Blocked + Corroborated):** `entity_vec` KNN in space S (EmbeddingGemma `task: sentence similarity` prompt), cosine ≥ τ (0.80). Merges only if exactly one candidate passes deterministic linguistic corroboration (acronym, head-anchored containment, initial expansion); otherwise records soft `close_matches` links. Every pair is logged to `canon_verdicts`. Predicates never enter Tier 2. 0 LLM calls.
 - **Fallback:** New canonical induction under plural universal root (`concepts:{slug}`). Zero external LLM pairwise adjudication.
 - **Zero-Copy Projection:** Nodes and relations are unified via zero-copy SQLite views (`unified_edges`, `unified_nodes`).
 

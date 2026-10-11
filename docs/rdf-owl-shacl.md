@@ -695,7 +695,7 @@ gantt
 - **Verification Suite:** `tests/test_owl_ontology.py`
   - Asserts cyclic `subClassOf` insertions are flagged as DAG errors.
   - Asserts transitive inheritance query returns full ancestry path without external DL tableau reasoners.
-  - Asserts active aliases project to `owl:sameAs` and distinct verdicts project to `owl:differentFrom`.
+  - Asserts `aliases` rows project to `owl:sameAs`, `close_matches` rows project to `skos:closeMatch` (vault ↔ external ontology) / `yaw:closeMatch` (intra-vault) in both directions, and zero `owl:differentFrom` triples are emitted ([`docs/adr/ADR-012.md`](file:///home/harri/yaw/docs/adr/ADR-012.md) §5).
 
 #### Sprint 6C & Epic 7.6: SHACL Closed-World Linter & Contradiction Cache ([`docs/adr/ADR-011.md`](file:///home/harri/yaw/docs/adr/ADR-011.md))
 - **Module:** `src/yaw/ontology/shacl.py`, `src/yaw/server/daemon.py`, `src/yaw/storage/schema.py`
@@ -706,7 +706,7 @@ gantt
 - **Verification Suite:** `tests/test_compile_shacl_cache.py`, `tests/test_shacl_lint.py`
   - Asserts compile-time validation completes in $<200\text{ ms}$ and persists violations into `compiled_violations`.
   - Asserts `lint_wiki()` retrieves pre-compiled violations in $<5\text{ ms}$ without running pySHACL.
-  - Asserts detection of definitions exceeding 50 words, dialectical contradictions (`causes` vs `prevents`, `supports` vs `refutes`), and contested alias merges.
+  - Asserts detection of definitions exceeding 50 words, dialectical contradictions (`causes` vs `prevents`, `supports` vs `refutes`), and ambiguous identities ($\ge 2$ unlinked `close_matches` targets, reported as `sh:Warning`).
 
 #### Epic 8: Production FastMCP Server & GitHub v1.0 Launch
 - **Module:** `src/yaw/server/daemon.py`
