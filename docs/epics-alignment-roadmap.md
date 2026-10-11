@@ -36,7 +36,8 @@ All Epics are strict mathematical and operational derivatives of [`FOUNDATIONAL.
 | **Epic 6.3 (Sprint 6C)** | **Closed-World SHACL Wiki Lint & Validation** | Declarative `sh:NodeShape` & `sh:PropertyShape` validation via `pyshacl` in-process, orphan concept & contradiction detection in `lint_wiki`. | **COMPLETE** | [`FOUNDATIONAL.md §5.4`](file:///home/harri/yaw/FOUNDATIONAL.md), [`docs/rdf-owl-shacl.md`](file:///home/harri/yaw/docs/rdf-owl-shacl.md) | `tests/test_shacl_lint.py` (34/34 pass) |
 | **Epic 7 (Sprint 7A)** | **Pluggable RDF/OWL Ontology Substrate & Configurable Extraction** | Dynamic OWL/RDFS ingestion (`infer_ontologies`), dynamic catalog tables, dual extraction modes (`open_ie=true|false`), dynamic SHACL whitelist, Ollama offline warning callouts. | **COMPLETE** | [`docs/ADR.md`](file:///home/harri/yaw/docs/ADR.md), [`FOUNDATIONAL.md §5.4`](file:///home/harri/yaw/FOUNDATIONAL.md), [`docs/epic7-pluggable-ontology-integration-spec.md`](file:///home/harri/yaw/docs/epic7-pluggable-ontology-integration-spec.md) | `tests/test_pluggable_ontology.py` (11/11 pass, 429 total) |
 | **Epic 7.5** | **Architectural Convergence & Pre-Epic 8 Substrate Realignment** | Cython `InMemoryLookupKB` prior distribution $P(e \mid a)$, Bayesian evidence chunk scoring, clean `aliases.method` CHECK, zero-fallback enforcement. | **COMPLETE** | [`FOUNDATIONAL.md §3, §5.1-5.3`](file:///home/harri/yaw/FOUNDATIONAL.md), [`docs/adr/ADR-010.md`](file:///home/harri/yaw/docs/adr/ADR-010.md) | `tests/test_retriever.py`, `tests/test_canonicalization.py` (98/98 pass) |
-| **Epic 7.6 (Sprint 7F)** | **Compile-Time Closed-World SHACL & O(1) Contradiction Caching** | Wire `validate_wiki_graph_fast` into `compile_wiki()`, transactional `compiled_violations` SQLite table, O(1) `lint_wiki()` reads, ontology FTS5/vector indexing. | **SPECIFIED (TARGET v1.0)** | [`FOUNDATIONAL.md §4.3-4.4, §5.5`](file:///home/harri/yaw/FOUNDATIONAL.md), [`docs/adr/ADR-011.md`](file:///home/harri/yaw/docs/adr/ADR-011.md) | `tests/test_compile_shacl_cache.py` |
+| **Epic 7.6 (Sprint 7F)** | **Compile-Time Closed-World SHACL & O(1) Contradiction Caching** | Wire `validate_wiki_graph_fast` into `compile_wiki()`, transactional `compiled_violations` SQLite table, O(1) `lint_wiki()` reads, ontology FTS5 indexing (vector half superseded by ADR-012). | **COMPLETE** | [`FOUNDATIONAL.md §4.3-4.4, §5.5`](file:///home/harri/yaw/FOUNDATIONAL.md), [`docs/adr/ADR-011.md`](file:///home/harri/yaw/docs/adr/ADR-011.md) | `tests/test_compile_shacl_cache.py` (Commit `e64ed3c`) |
+| **Epic 7.7** | **Representation-Space Separation, Corroborated Identity & Query-to-Fact Seeding** | One vector space per store (`entity_vec` S, `fact_vec` R), Tier 1 normalized keys, blocked + corroborated Tier 2 with `close_matches`, storage-backed $P(e \mid a)$, query-to-fact PPR seeding. | **SPECIFIED (BLOCKS EPIC 8)** | [`docs/adr/ADR-012.md`](file:///home/harri/yaw/docs/adr/ADR-012.md), [`FOUNDATIONAL.md §3, §5.1-5.3`](file:///home/harri/yaw/FOUNDATIONAL.md) | `tests/test_representation_spaces.py` |
 | **Epic 8.1 (Sprint 8A)** | **Compilation Triggers, B-Tree Ward HAC & FastMCP Production Lifecycle** | Ingestion post-sync compilation hook, B-Tree Ward HAC cluster splitting, hypernym induction, full FastMCP production lifecycle (`compile_wiki`, `lint_wiki`, `query_wiki`, `ingest_raw`). | **SPECIFIED (TARGET v1.0)** | [`docs/adr/ADR-002.md`](file:///home/harri/yaw/docs/adr/ADR-002.md), [`docs/adr/ADR-011.md`](file:///home/harri/yaw/docs/adr/ADR-011.md), [`FOUNDATIONAL.md §4`](file:///home/harri/yaw/FOUNDATIONAL.md) | `tests/test_fastmcp_contract.py`, `tests/test_btree_hac.py` |
 | **Epic 8.2 (Sprint 8B)** | **2WikiMultiHopQA & MuSiQue Benchmark Evaluation Harness & Materialization** | Ingest official benchmark slices into `sample-llm-wiki/raw/benchmark/`, execute official eval scripts (Exact Match, Token F1, Recall@k, Supporting Fact F1), materialize `vault/wiki/`. | **SPECIFIED (TARGET v1.0)** | [`FOUNDATIONAL.md §1, §6`](file:///home/harri/yaw/FOUNDATIONAL.md), [`docs/karpathy-llm-wiki.md`](file:///home/harri/yaw/docs/karpathy-llm-wiki.md) | `eval/run_benchmark.py`, `tests/test_wiki_materializer.py` |
 | **Epic 8.3 (Sprint 8C)** | **Packaging, CI Matrix & GitHub v1.0 Release** | Multi-OS GitHub Actions CI, packaging, documentation audit, release tag `v1.0.0`. | **SPECIFIED (TARGET v1.0)** | [`README.md`](file:///home/harri/yaw/README.md), [`FOUNDATIONAL.md`](file:///home/harri/yaw/FOUNDATIONAL.md) | `tests/test_e2e_launch.py` |
@@ -50,7 +51,7 @@ All Epics are strict mathematical and operational derivatives of [`FOUNDATIONAL.
 | **Doc Integrity vs Preprocessing** | Stripping markdown code blocks (`946bd44`) broke byte provenance. | Treating spaCy doc as mutable text string instead of annotation substrate. | **Invariant E1:** `doc.text == chunk_text` byte-for-byte. `markdown_structure` annotates code regions into `doc.spans["code"]`; filtering happens strictly in taxonomy compiler. |
 | **Open IE Relation Extraction** | Default `spacy.REL.v1` prompt loops over `labels`. Empty list produces empty prompt. | Standard `rel.v1.jinja` requires label definitions for prompt generation. | **`OPEN_IE_REL_TEMPLATE`:** Custom Jinja template extracts freeform semantic predicates without fixed schemas. Lemmatized via native spaCy infix tokenizer ([`docs/adr/ADR-006.md`](file:///home/harri/yaw/docs/adr/ADR-006.md)). |
 | **Categorization vs Grounding** | Classifying chunks into `invariants` / `concepts` / `decisions`. | Rylean category mistake: chunks are evidence, not universals. | **Entity-Level Typing:** `spacy.TextCat.v3` is applied exclusively to entity definitions (`Doc._.description`), determining the Universal/Type across the 9 root namespaces ([`docs/adr/ADR-005.md`](file:///home/harri/yaw/docs/adr/ADR-005.md)). |
-| **Offline Seeding & Math Continuity** | Creating an ad-hoc "offline lexical fallback" branch in retrieval. | Viewing offline mode as an exception rather than zero vector continuity. | **Unified Vector Equation:** $\mathbf{p}_0 = \beta_1 \mathbf{s}_{\text{vec}} + \beta_2 \mathbf{s}_{\text{fts}}$. When $\mathbf{q} = \mathbf{0}$, $\mathbf{p}_0 = \mathbf{s}_{\text{fts}}$ continuously seeds PPR power iteration across graph topology. |
+| **Offline Seeding & Math Continuity** | Creating an ad-hoc "offline lexical fallback" branch in retrieval. | Viewing offline mode as an exception rather than zero vector continuity. | **Unified Vector Equation:** $\mathbf{p}_0 = \beta_1 \mathbf{s}_{\text{concepts}} + \beta_2 \mathbf{s}_{\text{chunks\_vec}} + \beta_3 \mathbf{s}_{\text{chunks\_fts}}$. When $\mathbf{q} = \mathbf{0}$, the vector channels vanish and the alias-prior and FTS5 channels continuously seed PPR ([`FOUNDATIONAL.md §5.3`](file:///home/harri/yaw/FOUNDATIONAL.md), [`ADR-012`](file:///home/harri/yaw/docs/adr/ADR-012.md)). |
 | **Candidate Chunk Selection** | Pre-filtering candidate chunks before PPR diffusion ran. | Confusing candidate seed generation with post-diffusion graph ranking. | **Post-Diffusion Selection:** Candidates are extracted from converged distribution $\mathbf{p}^*[c] > 0$, allowing unseeded chunks to surface via graph propagation. |
 | **Retrieval Output Architecture** | Disconnected global concept lists separated from chunk evidence. | Outputting macro concept canopy without linking to evidence. | **Bridging Subgraph Per Result:** Each result couples rank, citation, local ontological context (seed concepts $\cup$ chunk-grounded concepts), and evidence slice. $K=0$ provides explicit corpus growth recommendation. |
 
@@ -126,7 +127,7 @@ Prevent ontological fragmentation by implementing the core **Entity Disambiguati
 - **Reversible Alias Persistence:** Merges write strictly to `aliases` table. `unified_edges` and `unified_nodes` rewrite endpoints via `LEFT JOIN aliases ON ... COALESCE(a.canonical_id, x.id)`. Raw extraction tables (`leaf_nodes`, `leaf_relations`) remain immutable (preserving Invariant 1).
 - **Two-Tier Convergence Engine ([`src/yaw/indexer/canonicalize.py`](file:///home/harri/yaw/src/yaw/indexer/canonicalize.py)):**
   1. *Tier 1 (Direct Match)*: Exact slug match or registered active alias lookup in `aliases` or `InMemoryLookupKB`. Instant resolution with 0 vector or LLM calls.
-  2. *Tier 2 (Near Match)*: In-process vector similarity > `CANON_SIM_THRESHOLD` (0.80) using static GloVe 300d vectors (`en_core_web_lg`). Consolidates to existing canonical node.
+  2. *Tier 2 (Near Match)*: In-process vector similarity > `CANON_SIM_THRESHOLD` (0.80) using static GloVe 300d vectors (`en_core_web_lg`). Consolidates to existing canonical node. *(Superseded by [`ADR-012`](file:///home/harri/yaw/docs/adr/ADR-012.md): Tier 2 now blocks in space S and merges only on linguistic corroboration; Epic 7.7.)*
   3. *Induction (Novel Node)*: Novel entity registered with URI `concepts:{slug}` (`TierEnum.NEW_INDUCTION`, `is_new=True`).
 - **Compiled C/Cython Knowledge Base & Prior Distributions ([`docs/adr/ADR-010.md`](file:///home/harri/yaw/docs/adr/ADR-010.md)):** `InMemoryLookupKB` maintains an alias candidate distribution with prior probabilities $P(\text{entity} \mid \text{alias}) \in (0, 1]$ satisfying unit sum $\sum_e P(e \mid a) = 1.0$. Microsecond candidate evaluation executes natively in Cython, and `aliases.score` records calibrated prior probabilities without premature winner-take-all discretization.
 - **Namespace Inheritance:** Merged aliases strictly inherit the canonical node's root namespace (`concepts`, `entities`, `invariants`, `decisions`, `processes`, `claims`, `sources`, `contexts`, `predicates`).
@@ -175,7 +176,7 @@ Surgically remediate schema, configuration, and namespace discrepancies identifi
 4. **5-Column `unified_edges` Quad Projection:** Extend `unified_edges` view to project `(src_id, dst_id, rel_type, weight, source_chunk_id)` for seamless Sprint 6A named quad export.
 5. **Compiled Knowledge Persistence:** Architect `compiled_nodes` and `compiled_relations` tables in `db.py` and union into views, preserving Invariant 1 (extraction substrate purity) during ADR-002 saturated hub bisections.
 6. **Subsumption Conductance Asymmetry:** Implement 1.0 downward / 0.2 upward conductance in `retriever.py` for `subClassOf`/`partOf` with reciprocal reverse edge synthesis.
-7. **Contested Alias State Machine:** Implement automated transition to `status = 'contested'` when candidate confidence is low ($<0.80$) or when conflicting candidates emerge, flagging them for SHACL closed-world linting without live LLM calls.
+7. **Contested Alias State Machine:** Implement automated transition to `status = 'contested'` when candidate confidence is low ($<0.80$) or when conflicting candidates emerge, flagging them for SHACL closed-world linting without live LLM calls. *(Retired by [`ADR-012`](file:///home/harri/yaw/docs/adr/ADR-012.md): ambiguity is now ≥2 `close_matches` edges reported as an ambiguous-identity `sh:Warning`; Epic 7.7.)*
 
 #### 2. Verification
 - `uv run pytest tests/test_sprint5_1_alignment.py -v` (100% pass across all 7 tests).
@@ -277,7 +278,7 @@ Elevate YAW's graph substrate, taxonomic inference, and wiki validation into 100
   - OWL/SKOS taxonomy module (`src/yaw/ontology/owl.py`):
     - Aligns nodes with `skos:Concept`, canonical names with `skos:prefLabel`, and active aliases with `skos:altLabel`.
     - Maps ADR-002 B-tree hypernym splits to `rdfs:subClassOf` and `skos:broader`/`skos:narrower` axioms.
-    - Reversible alias mapping translating active `aliases` rows to `owl:sameAs` equivalence axioms via view joins, and distinct verdicts to `owl:differentFrom`.
+    - Reversible alias mapping translating active `aliases` rows to `owl:sameAs` equivalence axioms via view joins, and distinct verdicts to `owl:differentFrom`. *(The `owl:differentFrom` projection is retired by [`ADR-012`](file:///home/harri/yaw/docs/adr/ADR-012.md) §5: unsound under OWA and inconsistent with later merges via OWL 2 RL `eq-diff1`; Epic 7.7.)*
     - Transitive closure computation for taxonomic subsumption queries (`get_subclass_closure(node_id)`) via SQLite recursive CTEs and SciPy sparse matrix powers.
     - Subsumption tree DAG validator asserting zero cycle formation.
   - Asymmetric conductance weighting (1.0 downward / 0.2 upward) formalizing directed property inheritance for GraphRAG.
@@ -294,7 +295,7 @@ Elevate YAW's graph substrate, taxonomic inference, and wiki validation into 100
   - Declarative SHACL shape definitions (`src/yaw/ontology/shapes/wiki_shapes.ttl`):
     - `ConceptShape`: Requires non-empty `definition` ($\le 50$ words) and canonical URI syntax matching 9 universal root namespaces.
     - `RelationShape`: Validates subject/predicate/object domain and range constraints, detecting dangling pointers and invalid target nodes.
-    - `DialecticalIntegrityShape`: Flags contradictory claims (e.g. `A causes B` vs `A prevents B`) and `contested` alias merges (`aliases.status = 'contested'`).
+    - `DialecticalIntegrityShape`: Flags contradictory claims (e.g. `A causes B` vs `A prevents B`) and `contested` alias merges (`aliases.status = 'contested'`). *(Replaced by the ambiguous-identity `sh:Warning`, [`ADR-012`](file:///home/harri/yaw/docs/adr/ADR-012.md); Epic 7.7.)*
   - Integration into `lint_wiki`: Runs in-process `pyshacl` validation against the SQLite RDF projection with support for namespace/keyword filtering (`lint_wiki(query: str | None = None)`), yielding standard W3C `sh:ValidationReport` conformance status and structured violation items without external daemons.
 - **Test File:** `tests/test_shacl_lint.py`
   - Asserts detection of missing definitions, invalid namespaces, broken links, contested aliases, and dialectical contradictions.
@@ -324,7 +325,7 @@ Transform the hardcoded 9-namespace taxonomy into a pluggable RDF/OWL substrate 
    - Closed-world pySHACL validation enforces domain-specific shape constraints without modifying core engine logic.
 5. **Dynamic Knowledge Base Vocabulary & Alias Prior Synchronization ([`docs/adr/ADR-010.md`](file:///home/harri/yaw/docs/adr/ADR-010.md)):**
    - Imported RDF/OWL/SKOS ontologies dynamically synchronize terms, class labels, and `skos:altLabel` synonyms directly into `InMemoryLookupKB` via `sync_kb_from_db`.
-   - Each imported synonym registers a calibrated candidate prior probability $P(e \mid a)$, ensuring external domain ontologies immediately participate in probabilistic seed formulation and topological disambiguation during GraphRAG retrieval without manual prompt tuning.
+   - Each imported synonym registers a normalized candidate prior $P(e \mid a)$, ensuring external domain ontologies immediately participate in probabilistic seed formulation and topological disambiguation during GraphRAG retrieval without manual prompt tuning.
 
 ### 9.2 Test Authoring Plan (TDD & Grounded Invariants)
 - **Invariant 1 (Pluggable Ingestion Invariant):**
@@ -366,7 +367,7 @@ Harden the core ingestion, retrieval, storage, and server layers to eliminate ar
 ---
 
 ## 9.6. Epic 7.6: Compile-Time Closed-World SHACL Validation & O(1) Contradiction Caching
-**Status:** **SPECIFIED (PRE-EPIC 8 TARGET)**  
+**Status:** **COMPLETE** (Commit `e64ed3c`; ontology vector indexing superseded by Epic 7.7)  
 **Governing Document:** [`docs/adr/ADR-011.md`](file:///home/harri/yaw/docs/adr/ADR-011.md), [`FOUNDATIONAL.md §4.3, §4.4, §5.5`](file:///home/harri/yaw/FOUNDATIONAL.md), [`docs/rdf-owl-shacl.md`](file:///home/harri/yaw/docs/rdf-owl-shacl.md)  
 **Target Test Files:** `tests/test_compile_shacl_cache.py`, `tests/test_shacl_lint.py`
 
@@ -398,6 +399,55 @@ Decouple streaming chunk ingestion from heavy SHACL validation while eliminating
   - `test_lint_wiki_scoped_query_filtering`: Assert `lint_wiki(query="target_concept")` returns only violations where `focus_node` or message matches target.
   - `test_lint_wiki_force_revalidation_updates_cache`: Assert `lint_wiki(force=True)` triggers live validation and refreshes the cache.
   - `test_dynamic_ontology_ingestion_inserts_fts_and_vectors`: Assert `ingest_ontology` indexes classes into `query_fts` and `leaf_nodes.embedding`.
+
+> [!NOTE]
+> Pillar 4's vector half (ontology class embeddings in `leaf_nodes.embedding`, query-vector seeding of ontology nodes) is superseded by [`ADR-012`](file:///home/harri/yaw/docs/adr/ADR-012.md) §5 and re-implemented in Epic 7.7. The FTS5 half stands.
+
+---
+
+## 9.7. Epic 7.7: Representation-Space Separation, Corroborated Identity Resolution & Query-to-Fact Seeding
+**Status:** **SPECIFIED (BLOCKING PREREQUISITE OF EPIC 8)**  
+**Governing Document:** [`docs/adr/ADR-012.md`](file:///home/harri/yaw/docs/adr/ADR-012.md), [`FOUNDATIONAL.md §3, §5.1–§5.3, §5.5`](file:///home/harri/yaw/FOUNDATIONAL.md), [`docs/adr/ADR-003.md`](file:///home/harri/yaw/docs/adr/ADR-003.md), [`docs/adr/ADR-010.md`](file:///home/harri/yaw/docs/adr/ADR-010.md)  
+**Target Test Files:** `tests/test_representation_spaces.py` (new), `tests/test_canonicalization.py`, `tests/test_retriever.py`, `tests/test_pluggable_ontology.py`, `tests/test_compile_shacl_cache.py`, `tests/test_owl_ontology.py`, `tests/test_shacl_lint.py`
+
+### 9.7.1 Goal
+Every vector store holds exactly one representation space, entity identity is decided by evidence that measures identity rather than relatedness, and retrieval seeds the graph the way the multi-hop evidence says it should (query-to-fact). Epic 8 benchmark numbers are meaningless until this holds, so Epic 8 does not start before this Epic's quality gates pass.
+
+### 9.7.2 Architectural Pillars
+1. **Schema migration (`src/yaw/storage/schema.py`, `db.py`):**
+   - Drop `leaf_nodes.embedding` and `aliases.status`. Remove every `status = 'active'` filter from views and queries.
+   - Add `close_matches` (with `CHECK (src_id < dst_id)`), `entity_vec` (space S, `PARTITION KEY` namespace, `distance_metric=cosine`), `fact_vec` (space R).
+   - Idempotent migration in `ensure_schema_tables()`. Rows with `status = 'contested'` migrate to `close_matches` and are removed from `aliases`.
+   - `unified_edges` gains the symmetric `closeMatch` branch exactly as in [`FOUNDATIONAL.md §5.2`](file:///home/harri/yaw/FOUNDATIONAL.md).
+2. **Tier 1 normalized key (`src/yaw/indexer/canonicalize.py`):** NFKC + casefold, leading determiner and possessive clitic removed, `NOUN` lemmatized, `PROPN` verbatim, punctuation / hyphen / whitespace collapsed. Induced IDs are `{namespace}:{normalized-key}`. Existing slugs whose key changes receive a Tier 1 alias row so no existing reference breaks.
+3. **Tier 2 blocked + corroborated matching:** `entity_vec` KNN (`k = CANON_TOP_K`, cosine ≥ τ) restricted to the mention namespace plus active ontology partitions; merge only when exactly one candidate passes the linguistic corroboration predicate (acronym, head-anchored containment, initial expansion); otherwise write `close_matches`. Every evaluated pair is logged to `canon_verdicts`.
+4. **Predicates are space L only:** zero embedding calls for predicates. `_find_vec_nearest` is never reached for `kind = 'predicate'`.
+5. **Dead and duplicated code removal:** delete `_find_kb_nearest`, the spaCy-vector branch of `_get_or_compute_vector`, and the copy-pasted KB vector blocks. `InMemoryLookupKB` becomes an alias → candidate prior index whose priors are computed solely from `aliases` + `close_matches` (ADR-012 §3). Entity vector width is no longer a KB concern.
+6. **Embedding prompts (`src/yaw/nlp/embeddings.py`, SSOT):** one formatter per space. Space S uses `task: sentence similarity | query: {name}`; space R documents use `title: {title} | text: {text}` and queries `task: search result | query: {q}` ([EmbeddingGemma model card](https://ai.google.dev/gemma/docs/embeddinggemma/model_card)). The `Classification` prompt is removed from all entity paths.
+7. **Fact embedding in the pipeline (`src/yaw/indexer/pipeline.py`):** each `leaf_relations` row is rendered as `title: {note_title} | text: {subject_name} {surface_predicate} {object_name}` and embedded in the same batched `/api/embed` call as its chunks; written to `fact_vec`. Fact text is never stored (Invariant 2).
+8. **Retriever query-to-fact seeding (`src/yaw/retrieval/retriever.py`):** implement $\mathbf{s}_{\text{concepts}} = \lambda \widehat{\mathbf{s}}_{\text{alias}} + (1-\lambda)\widehat{\mathbf{r}}$ exactly as [`FOUNDATIONAL.md §5.3`](file:///home/harri/yaw/FOUNDATIONAL.md); delete `_score_leaf_nodes_vec` and all query → `leaf_nodes` vector seeding. Add `closeMatch` conductance ($W = \text{score}$, both directions).
+9. **Ontology loader (`src/yaw/ontology/loader.py`):** stop writing ontology classes to `leaf_nodes`; write one space-S vector per class to `entity_vec` (partition = prefix); make `query_fts` ontology rows idempotent on re-ingestion. A `close_matches` edge to an ontology class instantiates it as a ghost class in the PPR graph.
+10. **SHACL & OWL (`src/yaw/ontology/shapes/wiki_shapes.ttl`, `shacl.py`, `owl.py`):** replace the contested-merge check with the ambiguous-identity `sh:Warning`; project `close_matches` to `skos:closeMatch` (cross-scheme) / `yaw:closeMatch` (intra-vault, `owl:SymmetricProperty`); delete the `canon_verdicts` → `owl:differentFrom` projection (ADR-012 §5).
+11. **Fail-loud dimensions:** every vector write goes through `vec0`, so a wrong-width vector raises `sqlite3.OperationalError`; no `try/except` downgrades it to a log line.
+
+### 9.7.3 Test Authoring Plan (TDD, real SQLite + loopback Ollama, zero mocks of DB/FS)
+- **Space integrity:** inserting a 300-float vector into `entity_vec` or `fact_vec` raises `sqlite3.OperationalError`; `PRAGMA table_info(leaf_nodes)` has no `embedding` column; `aliases` has no `status` column.
+- **Identity precision:** "Barack Obama" vs existing "Michelle Obama" → no `aliases` row, one `close_matches` row, `canon_verdicts.verdict = 'distinct'`.
+- **Identity recall:** "A. Einstein" and "Einstein" each merge into existing "Albert Einstein" when it is the unique corroborated candidate; "NASA" merges into "National Aeronautics and Space Administration" (acronym).
+- **Ambiguity:** a mention with two corroborated candidates → zero merges, two `close_matches` rows, and `compile_wiki()` persists one ambiguous-identity `Warning` in `compiled_violations`.
+- **Tier 1:** "The transformers" and "Transformer" resolve to the same canonical with zero embedding calls (assert loopback request count).
+- **Predicates:** resolving 20 predicate surface forms issues zero `/api/embed` requests.
+- **Fact index:** after ingesting a note with *n* relations, `fact_vec` has exactly *n* rows keyed by `relation_id`, and chunk + fact embeddings arrive in one batched request per chunk group.
+- **Query-to-fact seeding:** a two-hop fixture (*A* —r1→ *B* —r2→ *C*, question names *A*, answer is *C*): *A* receives seed mass via $\mathbf{s}_{\text{alias}}$ even when no top-`FACT_TOP_K` fact contains *A*; the chunk holding r2 ranks in the top-k.
+- **Offline continuity:** with Ollama unreachable, $\mathbf{p}_0$ is a valid distribution built from alias + FTS5 channels only, and no exception escapes.
+- **Ontology:** ingesting the same TTL twice leaves `query_fts` row counts unchanged; `leaf_nodes` gains zero rows; a `close_matches` edge to an ontology class makes that class a node in the PPR matrix.
+- **W3C projection:** `to_rdflib_graph()` contains `yaw:closeMatch` in both directions for an intra-vault pair, `skos:closeMatch` for a vault ↔ ontology pair, and zero `owl:differentFrom` triples.
+
+### 9.7.4 Quality Gates
+- `uv run pytest --no-testmon`: 100% pass, 0 regressions.
+- `uv run ruff check src/ tests/`, `uv run ruff format --check src/ tests/`, `uv run ty check src/ tests/`: 0 diagnostics.
+- `git grep -n -e "leaf_nodes.embedding" -e "status = 'active'" -e "contested" -e "_find_kb_nearest" -e "differentFrom" -- src/` returns 0 matches.
+- Ontologist critic review: zero unaddressed findings against ADR-012 and FOUNDATIONAL.md.
 
 ---
 
@@ -443,12 +493,14 @@ Achieve production feature completeness (v1.0) and prepare the repository for pu
   - Re-running `compile_wiki()` cleanly overwrites existing `vault/wiki/` pages without content duplication.
   - Removing a concept from the index cleanly prunes its orphaned `.md` file from `vault/wiki/`.
 - **Invariant 4 (Dialectical Linter & Cached Violation Surfacing):**
-  - Seed an alias marked as `contested` and two contradictory relations (`A causes B` vs `A prevents B`).
+  - Seed one ambiguous identity (a node with two unlinked `close_matches` targets) and two contradictory relations (`A causes B` vs `A prevents B`).
   - Assert `compile_wiki()` detects both conflicts and records them in `compiled_violations`.
   - Assert `lint_wiki()` retrieves both in $<5\text{ ms}$ without live pySHACL re-execution.
-- **Invariant 5 (Benchmark Evaluation Rigor):**
-  - Execute evaluation harness over 2Wiki and MuSiQue benchmark slices.
-  - Assert retrieval attains published recall thresholds on multi-hop chains via PPR topological diffusion.
+- **Invariant 5 (Benchmark Evaluation Rigor & Calibration Protocol):**
+  - Execute evaluation harness over 2Wiki and MuSiQue benchmark slices using the official splits and official evaluation scripts.
+  - **Calibration on dev only:** the uncalibrated priors of [`ADR-012`](file:///home/harri/yaw/docs/adr/ADR-012.md) (λ, $\beta_{1..3}$, `FACT_TOP_K`, τ) and the PPR damping α are tuned exclusively on a calibration split. The chosen values and the search grid are committed to `eval/` before any held-out run.
+  - **Report on held-out data only:** headline numbers come from a single run on a held-out split with the committed configuration. Where official test labels are not public, the official dev set is partitioned once into disjoint calibration and held-out subsets by a committed seed, and the partition IDs are committed. No held-out result feeds back into configuration.
+  - **Ablations reported alongside:** query-to-fact channel off ($\lambda = 1$), `closeMatch` edges off, and alias-prior channel off ($\lambda = 0$), so each ADR-012 decision has a measured effect.
 - **Invariant 6 (FastMCP Streamable HTTP & SSE Transport End-to-End):**
   - Launch FastMCP daemon over loopback HTTP (`127.0.0.1:8765`) using SSE transport.
   - Connect remote FastMCP client over SSE `/sse` and message streaming `/messages/`.
