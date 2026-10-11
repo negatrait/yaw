@@ -26,7 +26,6 @@ from http.server import HTTPServer
 from pathlib import Path
 from typing import Any
 
-import anyio
 import numpy as np
 import psutil
 import pytest
@@ -69,7 +68,7 @@ def test_reciprocal_wikilink_back_edge_csr_conductance(tmp_path: Path):
     - Rows in row-stochastic matrix _P sum to 1.0 for all non-dangling nodes.
     """
     config.set_vault(tmp_path)
-    db_path = tmp_path / ".cache" / "vectors.db"
+    db_path = tmp_path / ".cache" / "yaw.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     with sqlite3.connect(db_path) as conn:
@@ -81,7 +80,7 @@ def test_reciprocal_wikilink_back_edge_csr_conductance(tmp_path: Path):
         )
         conn.execute(
             "CREATE TABLE note_chunks (chunk_id TEXT, entity_uri TEXT PRIMARY KEY, rel_path TEXT, ordinal INTEGER, "
-            "heading TEXT, heading_slug TEXT, byte_offset INTEGER, byte_length INTEGER, line_start INTEGER, line_end INTEGER, "
+            "heading TEXT, heading_slug TEXT, line_start INTEGER, line_end INTEGER, "
             "embedding BLOB)"
         )
 
@@ -146,7 +145,7 @@ def test_reciprocal_wikilink_hub_dampening_forward_edges(tmp_path: Path):
     - Reciprocal edges (Hub -> Source) have raw weight 0.5 and denominator 1.0, so weight is 0.5.
     """
     config.set_vault(tmp_path)
-    db_path = tmp_path / ".cache" / "vectors.db"
+    db_path = tmp_path / ".cache" / "yaw.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     with sqlite3.connect(db_path) as conn:
@@ -158,7 +157,7 @@ def test_reciprocal_wikilink_hub_dampening_forward_edges(tmp_path: Path):
         )
         conn.execute(
             "CREATE TABLE note_chunks (chunk_id TEXT, entity_uri TEXT PRIMARY KEY, rel_path TEXT, ordinal INTEGER, "
-            "heading TEXT, heading_slug TEXT, byte_offset INTEGER, byte_length INTEGER, line_start INTEGER, line_end INTEGER, "
+            "heading TEXT, heading_slug TEXT, line_start INTEGER, line_end INTEGER, "
             "embedding BLOB)"
         )
 
@@ -192,37 +191,36 @@ def test_reciprocal_wikilink_hub_dampening_forward_edges(tmp_path: Path):
 
 
 def test_hydrate_disk_slice_eof_and_bounded(tmp_path: Path):
-    """Verify hydrate_disk_slice reads to EOF when byte_length is None and supports bounded slicing."""
+    """Verify hydrate_disk_slice reads whole file when line args are None and supports bounded line slicing."""
     config.set_vault(tmp_path)
     test_file = tmp_path / "notes" / "mechanics.md"
     test_file.parent.mkdir(parents=True, exist_ok=True)
 
-    content = "Quantum mechanics: Δx · Δp ≥ ℏ/2, Schrödinger 🐱"
+    content = "Line 1: Quantum mechanics: Δx · Δp ≥ ℏ/2\nLine 2: Schrödinger 🐱\nLine 3: Dirac notation\n"
     test_file.write_text(content, encoding="utf-8")
-    raw_bytes = content.encode("utf-8")
 
-    # 1. byte_length is None -> read entire file to EOF
-    assert hydrate_disk_slice("notes/mechanics.md", 0, None) == content
-
-    # 2. byte_length is None with positive offset
-    offset = 19
-    expected_tail = raw_bytes[offset:].decode("utf-8")
-    assert hydrate_disk_slice("notes/mechanics.md", offset, None) == expected_tail
-
-    # 3. Default parameter behavior (byte_offset=0, byte_length=None)
+    # 1. line_start and line_end are None -> read entire file
+    assert hydrate_disk_slice("notes/mechanics.md", None, None) == content
     assert hydrate_disk_slice("notes/mechanics.md") == content
 
-    # 4. Bounded slice
-    slice_len = 17
-    expected_head = raw_bytes[:slice_len].decode("utf-8")
-    assert hydrate_disk_slice("notes/mechanics.md", 0, slice_len) == expected_head
+    # 2. Bounded slice line 1 to 1
+    assert (
+        hydrate_disk_slice("notes/mechanics.md", 1, 1)
+        == "Line 1: Quantum mechanics: Δx · Δp ≥ ℏ/2\n"
+    )
 
-    # 5. Non-existent file returns empty string
-    assert hydrate_disk_slice("notes/missing.md", 0, 100) == ""
+    # 3. Bounded slice lines 2 to 3
+    assert (
+        hydrate_disk_slice("notes/mechanics.md", 2, 3)
+        == "Line 2: Schrödinger 🐱\nLine 3: Dirac notation\n"
+    )
+
+    # 4. Non-existent file returns empty string
+    assert hydrate_disk_slice("notes/missing.md", 1, 10) == ""
     assert hydrate_disk_slice("notes/missing.md") == ""
 
-    # 6. Seek past EOF returns empty string
-    assert hydrate_disk_slice("notes/mechanics.md", len(raw_bytes) + 100) == ""
+    # 5. Seek past EOF returns empty string
+    assert hydrate_disk_slice("notes/mechanics.md", 100, 150) == ""
 
 
 def test_hydrate_disk_slice_security_confinement(tmp_path: Path):
@@ -264,16 +262,19 @@ def test_read_document_parity(tmp_path: Path):
     """Verify read_document maintains full parity with hydrate_disk_slice."""
     config.set_vault(tmp_path)
     doc_path = tmp_path / "doc.md"
-    doc_path.write_text("Authoritative document text for GraphRAG.", encoding="utf-8")
+    content = "Line 1: Authoritative document text for GraphRAG.\nLine 2: Second line of context.\n"
+    doc_path.write_text(content, encoding="utf-8")
 
-    # 1. Full read to EOF
-    assert read_document("doc.md") == "Authoritative document text for GraphRAG."
-    assert (
-        read_document("doc.md", 0, None) == "Authoritative document text for GraphRAG."
-    )
+    # 1. Full read
+    assert read_document("doc.md") == content
+    assert read_document("doc.md", None, None) == content
 
     # 2. Bounded slice
-    assert read_document("doc.md", 0, 13) == "Authoritative"
+    assert (
+        read_document("doc.md", 1, 1)
+        == "Line 1: Authoritative document text for GraphRAG.\n"
+    )
+    assert read_document("doc.md", 1, 2) == content
 
     # 3. Confinement check
     with pytest.raises(ValueError, match="outside VAULT_ROOT"):
@@ -365,9 +366,9 @@ def test_daemon_lifecycle_signal_interception(tmp_path: Path):
 def test_daemon_lifecycle_wal_checkpoint_truncate(tmp_path: Path):
     """Verify real WAL page accumulation, checkpoint truncation, and zero data loss."""
     config.set_vault(tmp_path)
-    db_path = tmp_path / ".cache" / "vectors.db"
+    db_path = tmp_path / ".cache" / "yaw.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    wal_path = tmp_path / ".cache" / "vectors.db-wal"
+    wal_path = tmp_path / ".cache" / "yaw.db-wal"
 
     # Create table in WAL mode and commit substantial batch to generate dirty WAL pages
     conn = sqlite3.connect(str(db_path))
@@ -421,7 +422,7 @@ def test_daemon_lifecycle_wal_checkpoint_truncate(tmp_path: Path):
 def test_daemon_lifecycle_shutdown_sla(tmp_path: Path):
     """Verify shutdown executes checkpoint, removes PID, and completes well within 5.0s SLA."""
     config.set_vault(tmp_path)
-    db_path = tmp_path / ".cache" / "vectors.db"
+    db_path = tmp_path / ".cache" / "yaw.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     pid_file = tmp_path / ".cache" / "yaw.pid"
 
@@ -464,22 +465,21 @@ async def test_in_memory_rescoring_zero_outbound_http_calls(
         "# Quantum Mechanics\nHeisenberg uncertainty relation defines conjugate limit."
     )
     note_file.write_text(note_text, encoding="utf-8")
-    b_text = note_text.encode("utf-8")
 
     # 2. Build real SQLite DB with vectors and FTS5
-    db_path = cache_dir / "vectors.db"
+    db_path = cache_dir / "yaw.db"
     vec_aligned = np.zeros(768, dtype=np.float32)
     vec_aligned[0] = 1.0  # dot product with [1.0, 0.0, ...] is 1.0
 
     with sqlite3.connect(db_path) as conn:
         conn.execute(
             "CREATE TABLE note_chunks (chunk_id TEXT, entity_uri TEXT PRIMARY KEY, rel_path TEXT, ordinal INTEGER, "
-            "heading TEXT, heading_slug TEXT, byte_offset INTEGER, byte_length INTEGER, line_start INTEGER, line_end INTEGER, "
+            "heading TEXT, heading_slug TEXT, line_start INTEGER, line_end INTEGER, "
             "embedding BLOB)"
         )
         conn.execute(
-            "INSERT INTO note_chunks VALUES ('c1', 'raw/quantum.md#chunk:0', 'raw/quantum.md', 0, 'Quantum Mechanics', 'quantum-mechanics', 0, ?, 1, 2, ?)",
-            (len(b_text), vec_aligned.tobytes()),
+            "INSERT INTO note_chunks VALUES ('c1', 'raw/quantum.md#chunk:0', 'raw/quantum.md', 0, 'Quantum Mechanics', 'quantum-mechanics', 1, 2, ?)",
+            (vec_aligned.tobytes(),),
         )
         conn.execute(
             "CREATE TABLE leaf_nodes (node_id TEXT, source_leaf_id TEXT, name TEXT, namespace TEXT, definition TEXT, embedding BLOB, PRIMARY KEY (node_id, source_leaf_id))"
@@ -515,8 +515,8 @@ async def test_in_memory_rescoring_zero_outbound_http_calls(
     assert seed["entity_uri"] == "raw/quantum.md#chunk:0"
     assert pytest.approx(seed["rerank_score"], abs=1e-4) == 1.0
     assert seed["text"] == note_text
-    assert seed["byte_offset"] == 0
-    assert seed["byte_length"] == len(b_text)
+    assert seed["line_start"] == 1
+    assert seed["line_end"] == 2
 
 
 @pytest.mark.anyio
@@ -535,19 +535,17 @@ async def test_in_memory_rescoring_missing_vector_fallback(
     note_file = raw_dir / "unembedded.md"
     content = "# Unembedded Note\nLexical text only without vector embedding."
     note_file.write_text(content, encoding="utf-8")
-    b_len = len(content.encode("utf-8"))
 
-    db_path = cache_dir / "vectors.db"
+    db_path = cache_dir / "yaw.db"
     with sqlite3.connect(db_path) as conn:
         conn.execute(
             "CREATE TABLE note_chunks (chunk_id TEXT, entity_uri TEXT PRIMARY KEY, rel_path TEXT, ordinal INTEGER, "
-            "heading TEXT, heading_slug TEXT, byte_offset INTEGER, byte_length INTEGER, line_start INTEGER, line_end INTEGER, "
+            "heading TEXT, heading_slug TEXT, line_start INTEGER, line_end INTEGER, "
             "embedding BLOB)"
         )
         # Store chunk with NULL embedding
         conn.execute(
-            "INSERT INTO note_chunks VALUES ('c1', 'raw/unembedded.md#chunk:0', 'raw/unembedded.md', 0, 'Unembedded', 'unembedded', 0, ?, 1, 2, NULL)",
-            (b_len,),
+            "INSERT INTO note_chunks VALUES ('c1', 'raw/unembedded.md#chunk:0', 'raw/unembedded.md', 0, 'Unembedded', 'unembedded', 1, 2, NULL)"
         )
         conn.execute(
             "CREATE TABLE leaf_nodes (node_id TEXT, source_leaf_id TEXT, name TEXT, namespace TEXT, definition TEXT, embedding BLOB, PRIMARY KEY (node_id, source_leaf_id))"
@@ -600,21 +598,20 @@ async def test_find_seed_structured_output_contract_and_disk_seek(tmp_path: Path
     note_path = raw_dir / "relativity.md"
     note_path.write_text(content, encoding="utf-8")
 
-    chunk1_text = "# Relativity\nMass-energy equivalence is expressed as $E = mc^2$ ⚡."
-    b_chunk1 = chunk1_text.encode("utf-8")
-    byte_offset = 0
-    byte_length = len(b_chunk1)
+    chunk1_text = "# Relativity\nMass-energy equivalence is expressed as $E = mc^2$ ⚡.\n"
+    line_start = 1
+    line_end = 2
 
-    db_path = cache_dir / "vectors.db"
+    db_path = cache_dir / "yaw.db"
     with sqlite3.connect(db_path) as conn:
         conn.execute(
             "CREATE TABLE note_chunks (chunk_id TEXT, entity_uri TEXT PRIMARY KEY, rel_path TEXT, ordinal INTEGER, "
-            "heading TEXT, heading_slug TEXT, byte_offset INTEGER, byte_length INTEGER, line_start INTEGER, line_end INTEGER, "
+            "heading TEXT, heading_slug TEXT, line_start INTEGER, line_end INTEGER, "
             "embedding BLOB)"
         )
         conn.execute(
-            "INSERT INTO note_chunks VALUES ('c1', 'raw/relativity.md#chunk:0', 'raw/relativity.md', 0, 'Relativity', 'relativity', ?, ?, 1, 2, NULL)",
-            (byte_offset, byte_length),
+            "INSERT INTO note_chunks VALUES ('c1', 'raw/relativity.md#chunk:0', 'raw/relativity.md', 0, 'Relativity', 'relativity', ?, ?, NULL)",
+            (line_start, line_end),
         )
         conn.execute(
             "CREATE TABLE leaf_nodes (node_id TEXT, source_leaf_id TEXT, name TEXT, namespace TEXT, definition TEXT, embedding BLOB, PRIMARY KEY (node_id, source_leaf_id))"
@@ -642,8 +639,8 @@ async def test_find_seed_structured_output_contract_and_disk_seek(tmp_path: Path
         "kind",
         "rel_path",
         "heading",
-        "byte_offset",
-        "byte_length",
+        "line_start",
+        "line_end",
         "hybrid_prob",
         "rerank_score",
         "text",
@@ -655,18 +652,15 @@ async def test_find_seed_structured_output_contract_and_disk_seek(tmp_path: Path
     assert isinstance(seed["kind"], str)
     assert isinstance(seed["rel_path"], str)
     assert isinstance(seed["heading"], str)
-    assert isinstance(seed["byte_offset"], int)
-    assert isinstance(seed["byte_length"], int)
+    assert isinstance(seed["line_start"], int)
+    assert isinstance(seed["line_end"], int)
     assert isinstance(seed["hybrid_prob"], float)
     assert isinstance(seed["rerank_score"], float)
     assert isinstance(seed["text"], str)
 
-    # 4. Zero-copy physical disk seek verification
-    async with await anyio.open_file(tmp_path / seed["rel_path"], "rb") as f:
-        await f.seek(seed["byte_offset"])
-        hydrated_bytes = await f.read(seed["byte_length"])
-    assert hydrated_bytes.decode("utf-8") == seed["text"]
-    assert hydrated_bytes.decode("utf-8") == chunk1_text
+    # 4. Zero-copy line hydration verification
+    hydrated = hydrate_disk_slice(seed["rel_path"], seed["line_start"], seed["line_end"])
+    assert hydrated.rstrip("\r\n") == seed["text"].rstrip("\r\n")
 
 
 def _get_free_port() -> int:
@@ -685,7 +679,7 @@ def test_cli_index_foreground(tmp_path: Path):
     Invariants:
     - Synchronous execution: subprocess blocks until indexing is fully complete.
     - Exit code 0 on valid vault directory.
-    - Real database: .cache/vectors.db exists on disk with populated tables.
+    - Real database: .cache/yaw.db exists on disk with populated tables.
     - Process hygiene: no detached or zombie background processes remain running.
     """
     vault_dir = tmp_path / "vault"
@@ -727,7 +721,7 @@ def test_cli_index_foreground(tmp_path: Path):
     )
 
     # Invariant 2: Physical SQLite database exists
-    db_path = vault_dir / ".cache" / "vectors.db"
+    db_path = vault_dir / ".cache" / "yaw.db"
     assert db_path.is_file(), f"Database {db_path} must exist after foreground indexing"
 
     # Invariant 3: Real data committed to tables
@@ -1044,26 +1038,33 @@ def test_cli_serve_signal_shutdown(tmp_path: Path):
             f"PID file {pid_file} was not created within 5.0s of daemon startup"
         )
         pid_content = pid_file.read_text(encoding="utf-8").strip()
-        assert int(pid_content) == proc.pid, (
-            f"PID file contains {pid_content}, expected child PID {proc.pid}"
-        )
+        child_pids = [
+            c.pid for c in psutil.Process(proc.pid).children(recursive=True)
+        ]
+        assert (
+            int(pid_content) == proc.pid or int(pid_content) in child_pids
+        ), f"PID file contains {pid_content}, expected child PID {proc.pid} or child of launcher {child_pids}"
 
-        # Invariant 2: Intercept SIGINT and terminate within 5.0s SLA
+        # Invariant 2: Intercept SIGINT/SIGTERM and terminate within 5.0s SLA
         t0 = time.monotonic()
-        proc.send_signal(signal.SIGINT)
+        if sys.platform == "win32":
+            assert stop_daemon(pid_file) == 0
+        else:
+            proc.send_signal(signal.SIGINT)
 
         try:
             proc.wait(timeout=5.0)
         except subprocess.TimeoutExpired:
             proc.kill()
-            pytest.fail("Daemon failed to shut down within 5.0s SLA after SIGINT")
+            pytest.fail("Daemon failed to shut down within 5.0s SLA after signal")
 
         duration = time.monotonic() - t0
         assert duration < 5.0, f"Shutdown took {duration:.2f}s, exceeding 5.0s SLA"
 
-        # Invariant 3: Exit code 0
-        assert proc.returncode == 0, (
-            f"Daemon exited with non-zero code {proc.returncode} on SIGINT"
+        # Invariant 3: Exit code 0 (or 1 on Windows TerminateProcess)
+        expected_codes = (0, 1) if sys.platform == "win32" else (0,)
+        assert proc.returncode in expected_codes, (
+            f"Daemon exited with unexpected code {proc.returncode}"
         )
 
         # Invariant 4: PID file cleanly removed
@@ -1154,7 +1155,7 @@ def test_inprocess_cli_handle_index(tmp_path: Path):
     args = parser.parse_args(["index", "--vault", str(vault), "--quiet"])
     ret = yaw.handle_index(args)
     assert ret == 0
-    assert (vault / ".cache" / "vectors.db").is_file()
+    assert (vault / ".cache" / "yaw.db").is_file()
 
     # Re-run with force
     args_force = parser.parse_args(
@@ -1164,7 +1165,11 @@ def test_inprocess_cli_handle_index(tmp_path: Path):
     assert ret_force == 0
 
     # Error path: invalid/inaccessible vault filesystem path
-    args_err = parser.parse_args(["index", "--vault", "/dev/null/not_a_dir", "--quiet"])
+    bad_file = tmp_path / "not_a_dir_file"
+    bad_file.write_text("file", encoding="utf-8")
+    args_err = parser.parse_args(
+        ["index", "--vault", str(bad_file / "sub_path"), "--quiet"]
+    )
     ret_err = yaw.handle_index(args_err)
     assert ret_err == 1
 
@@ -1217,7 +1222,7 @@ def test_inprocess_cli_handle_schema(
     empty_vault = tmp_path / "empty_schema_vault"
     empty_cache = empty_vault / ".cache"
     empty_cache.mkdir(parents=True)
-    with sqlite3.connect(empty_cache / "vectors.db") as conn:
+    with sqlite3.connect(empty_cache / "yaw.db") as conn:
         conn.execute("CREATE TABLE unrelated_metadata (id INTEGER PRIMARY KEY)")
     args_empty = parser.parse_args(["schema", "--vault", str(empty_vault)])
     ret_empty = yaw.handle_schema(args_empty)
@@ -1229,7 +1234,7 @@ def test_inprocess_cli_handle_schema(
     corrupt_vault = tmp_path / "corrupt_schema_vault"
     corrupt_cache = corrupt_vault / ".cache"
     corrupt_cache.mkdir(parents=True)
-    (corrupt_cache / "vectors.db").write_bytes(b"CORRUPTED INVALID SQLITE FILE HEADER")
+    (corrupt_cache / "yaw.db").write_bytes(b"CORRUPTED INVALID SQLITE FILE HEADER")
     args_corrupt = parser.parse_args(["schema", "--vault", str(corrupt_vault)])
     ret_corrupt = yaw.handle_schema(args_corrupt)
     assert ret_corrupt == 0
@@ -1354,7 +1359,7 @@ def test_inprocess_cli_handle_query(tmp_path: Path, capsys: pytest.CaptureFixtur
 
     # 2. Error path: corrupt database raises real sqlite3.DatabaseError in retrieve
     corrupt_vault = tmp_path / "corrupt_vault"
-    corrupt_db = corrupt_vault / ".cache" / "vectors.db"
+    corrupt_db = corrupt_vault / ".cache" / "yaw.db"
     corrupt_db.parent.mkdir(parents=True)
     corrupt_db.write_bytes(b"corrupted sqlite header garbage")
 
@@ -1515,7 +1520,8 @@ def test_daemon_hydrate_candidate_items_edge_cases(tmp_path: Path):
         item = items[0]
         assert item["kind"] == "taxonomy"
         assert item["entity_uri"] == "tax:test"
-        assert item["byte_offset"] == 0
+        assert item["line_start"] is None
+        assert item["line_end"] is None
         assert item["hybrid_prob"] == 0.88
         assert "TestNode" in item["heading"]
     finally:
@@ -1781,11 +1787,11 @@ async def test_compute_seed_candidates_offline_fallback_zero_http(tmp_path: Path
     orig_host = config.OLLAMA_HOST
     config.OLLAMA_HOST = "http://127.0.0.1:1"
     try:
-        db_path = tmp_path / ".cache" / "vectors.db"
+        db_path = tmp_path / ".cache" / "yaw.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(db_path) as conn:
             conn.execute(
-                "CREATE TABLE note_chunks (entity_uri TEXT PRIMARY KEY, heading TEXT, rel_path TEXT, byte_offset INTEGER, byte_length INTEGER, line_start INTEGER, line_end INTEGER, embedding BLOB)"
+                "CREATE TABLE note_chunks (chunk_id TEXT, entity_uri TEXT PRIMARY KEY, rel_path TEXT, ordinal INTEGER, heading TEXT, heading_slug TEXT, line_start INTEGER, line_end INTEGER, embedding BLOB)"
             )
             conn.execute(
                 "CREATE TABLE leaf_nodes (node_id TEXT, source_leaf_id TEXT, name TEXT, namespace TEXT, definition TEXT, embedding BLOB, PRIMARY KEY (node_id, source_leaf_id))"
@@ -1794,7 +1800,7 @@ async def test_compute_seed_candidates_offline_fallback_zero_http(tmp_path: Path
                 "CREATE VIRTUAL TABLE query_fts USING fts5(entity_uri UNINDEXED, heading, content, tokenize='porter unicode61')"
             )
             conn.execute(
-                "INSERT INTO note_chunks VALUES ('chunk:offline_1', 'Offline Header', 'raw/offline.md', 0, 20, 1, 2, NULL)"
+                "INSERT INTO note_chunks VALUES ('c1', 'chunk:offline_1', 'raw/offline.md', 0, 'Offline Header', 'offline-header', 1, 2, NULL)"
             )
             conn.execute(
                 "INSERT INTO query_fts VALUES ('chunk:offline_1', 'Offline Header', 'offline test document content')"
@@ -1819,7 +1825,7 @@ async def test_compute_seed_candidates_offline_fallback_zero_http(tmp_path: Path
 
 
 def test_sync_vault_idempotent_reindex_when_cocoindex_cache_missing(tmp_path: Path):
-    """Verify that sync_vault cleanly re-indexes an existing vectors.db without --force
+    """Verify that sync_vault cleanly re-indexes an existing yaw.db without --force
 
     even when .cache/cocoindex tracking directory was deleted/missing, preventing
     'sqlite3.OperationalError: table "note_meta" already exists'.
@@ -1837,7 +1843,7 @@ def test_sync_vault_idempotent_reindex_when_cocoindex_cache_missing(tmp_path: Pa
     # 1. Initial indexing run
     ret1 = sync_vault(vault_dir=tmp_path, force=False, verbose=False)
     assert ret1 == 0
-    db_file = tmp_path / ".cache" / "vectors.db"
+    db_file = tmp_path / ".cache" / "yaw.db"
     assert db_file.is_file()
 
     # 2. Simulate external cache deletion (e.g. git clean, docker cache wipe)
@@ -1925,7 +1931,7 @@ def _init_graphrag_test_db_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE TABLE note_chunks ("
         "chunk_id TEXT, entity_uri TEXT PRIMARY KEY, rel_path TEXT, ordinal INTEGER, "
-        "heading TEXT, heading_slug TEXT, byte_offset INTEGER, byte_length INTEGER, "
+        "heading TEXT, heading_slug TEXT, "
         "line_start INTEGER, line_end INTEGER, embedding BLOB"
         ")"
     )
@@ -1955,7 +1961,7 @@ def test_adversarial_cyclic_triangle_conductance_and_flow(tmp_path: Path):
     - Non-uniform seed p0=[1, 0, 0] favors forward flow: p*[B] > p*[C].
     """
     config.set_vault(tmp_path)
-    db_path = tmp_path / ".cache" / "vectors.db"
+    db_path = tmp_path / ".cache" / "yaw.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     with sqlite3.connect(db_path) as conn:
@@ -2038,7 +2044,7 @@ def test_adversarial_multi_hop_chain_conductance_and_reversibility(tmp_path: Pat
     - Information diffuses all the way backwards from terminus to root under PPR.
     """
     config.set_vault(tmp_path)
-    db_path = tmp_path / ".cache" / "vectors.db"
+    db_path = tmp_path / ".cache" / "yaw.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     n_nodes = 5
@@ -2117,7 +2123,7 @@ def test_adversarial_multiple_mutual_pairs_exact_1_5_conductance(tmp_path: Path)
     (A_i <-> B_i) for i in {0, 1, 2, 3, 4}.
     """
     config.set_vault(tmp_path)
-    db_path = tmp_path / ".cache" / "vectors.db"
+    db_path = tmp_path / ".cache" / "yaw.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     num_pairs = 6
@@ -2213,7 +2219,7 @@ def test_adversarial_forward_hub_dampening_vs_reciprocal_back_edges(tmp_path: Pa
     6. Reciprocal back-edge S0 -> X enters X (deg 1) -> adj[S0, X] = 0.5 / sqrt(1) = 0.5.
     """
     config.set_vault(tmp_path)
-    db_path = tmp_path / ".cache" / "vectors.db"
+    db_path = tmp_path / ".cache" / "yaw.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     with sqlite3.connect(db_path) as conn:
@@ -2297,7 +2303,7 @@ def test_adversarial_isolated_nodes_dangling_sinks_and_self_loops(tmp_path: Path
     - PPR power iteration teleports dangling mass properly, maintaining exact probability conservation.
     """
     config.set_vault(tmp_path)
-    db_path = tmp_path / ".cache" / "vectors.db"
+    db_path = tmp_path / ".cache" / "yaw.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     with sqlite3.connect(db_path) as conn:
@@ -2382,7 +2388,7 @@ def test_adversarial_asymmetric_edge_weights_and_directional_rules(tmp_path: Pat
        Resulting in asymmetric conductance: adj[U, V] = 1.7, adj[V, U] = 0.5.
     """
     config.set_vault(tmp_path)
-    db_path = tmp_path / ".cache" / "vectors.db"
+    db_path = tmp_path / ".cache" / "yaw.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     with sqlite3.connect(db_path) as conn:
@@ -2479,7 +2485,7 @@ def test_adversarial_asymmetric_edge_weights_and_directional_rules(tmp_path: Pat
 def test_adversarial_empty_graph_and_zero_nodes(tmp_path: Path):
     """Verify retriever handles empty or zero-edge databases without crashing."""
     config.set_vault(tmp_path)
-    db_path = tmp_path / ".cache" / "vectors.db"
+    db_path = tmp_path / ".cache" / "yaw.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     with sqlite3.connect(db_path) as conn:
@@ -2525,7 +2531,7 @@ def _lock_proc(
 def test_lifecycle_abrupt_sigterm_cleanup(tmp_path: Path) -> None:
     """Empirical verification: Abrupt SIGTERM to running daemon triggers clean exit 0, PID deletion, and WAL truncation."""
     pid_file = tmp_path / "yaw.pid"
-    db_path = tmp_path / "vectors.db"
+    db_path = tmp_path / "yaw.db"
     ready_file = tmp_path / "ready.txt"
 
     # Seed WAL database
@@ -2600,7 +2606,7 @@ with lifecycle:
 def test_lifecycle_abrupt_sigint_cleanup(tmp_path: Path) -> None:
     """Empirical verification: Abrupt SIGINT triggers clean exit 0 and PID unlinking."""
     pid_file = tmp_path / "yaw.pid"
-    db_path = tmp_path / "vectors.db"
+    db_path = tmp_path / "yaw.db"
     ready_file = tmp_path / "ready.txt"
 
     script = f"""
@@ -2636,7 +2642,7 @@ with DaemonLifecycle(pid_file=Path("{pid_file}"), db_path=Path("{db_path}")):
 def test_lifecycle_rapid_start_stop_cycles(tmp_path: Path) -> None:
     """Stress-test 50 rapid sequential start/stop cycles ensuring zero orphaned PID files or resource leaks."""
     pid_file = tmp_path / "yaw.pid"
-    db_path = tmp_path / "vectors.db"
+    db_path = tmp_path / "yaw.db"
 
     t0 = time.monotonic()
     for i in range(50):
@@ -2656,7 +2662,7 @@ def test_lifecycle_rapid_start_stop_cycles(tmp_path: Path) -> None:
 def test_lifecycle_dirty_wal_high_volume_checkpoint(tmp_path: Path) -> None:
     """Stress-test checkpoint truncation against 1000 rows / 50 commits (>4MB WAL)."""
     pid_file = tmp_path / "yaw.pid"
-    db_path = tmp_path / "vectors.db"
+    db_path = tmp_path / "yaw.db"
     wal_path = Path(str(db_path) + "-wal")
 
     conn = sqlite3.connect(str(db_path))
@@ -2699,7 +2705,7 @@ def test_lifecycle_dirty_wal_high_volume_checkpoint(tmp_path: Path) -> None:
 
 def test_lifecycle_simulated_exclusive_lock_timeout_graceful(tmp_path: Path) -> None:
     """Stress-test concurrent exclusive lock: verify checkpoint_wal handles lock timeout gracefully within 5s SLA."""
-    db_path = tmp_path / "vectors.db"
+    db_path = tmp_path / "yaw.db"
     pid_file = tmp_path / "yaw.pid"
 
     init_conn = sqlite3.connect(str(db_path))
@@ -2760,7 +2766,7 @@ def test_lifecycle_simulated_exclusive_lock_timeout_graceful(tmp_path: Path) -> 
 
 def test_lifecycle_simulated_active_reader_lock_nonblocking(tmp_path: Path) -> None:
     """Verify that an active reader holding a transaction does not hang checkpoint indefinitely."""
-    db_path = tmp_path / "vectors.db"
+    db_path = tmp_path / "yaw.db"
     pid_file = tmp_path / "yaw.pid"
 
     conn = sqlite3.connect(str(db_path))
@@ -2792,7 +2798,7 @@ def test_lifecycle_simulated_active_reader_lock_nonblocking(tmp_path: Path) -> N
 def test_lifecycle_corrupted_pid_file_overwritten_and_cleaned(tmp_path: Path) -> None:
     """Verify that pre-existing corrupted non-numeric PID file is overwritten and cleaned up."""
     pid_file = tmp_path / "yaw.pid"
-    db_path = tmp_path / "vectors.db"
+    db_path = tmp_path / "yaw.db"
 
     # Pre-populate corrupted PID file
     pid_file.write_text("CORRUPTED_NON_NUMERIC_GARBAGE\x00\n", encoding="utf-8")
@@ -2809,7 +2815,7 @@ def test_lifecycle_corrupted_pid_file_overwritten_and_cleaned(tmp_path: Path) ->
 def test_lifecycle_corrupted_db_file_graceful_handling(tmp_path: Path) -> None:
     """Verify that non-SQLite database file does not crash checkpoint_wal."""
     pid_file = tmp_path / "yaw.pid"
-    db_path = tmp_path / "vectors.db"
+    db_path = tmp_path / "yaw.db"
     db_path.write_bytes(b"NOT_A_VALID_SQLITE_HEADER")
 
     lc = DaemonLifecycle(pid_file=pid_file, db_path=db_path)
@@ -2822,7 +2828,7 @@ def test_lifecycle_corrupted_db_file_graceful_handling(tmp_path: Path) -> None:
 def test_lifecycle_context_manager_exception_cleanup(tmp_path: Path) -> None:
     """Verify PID file cleanup when exception is raised inside with block."""
     pid_file = tmp_path / "yaw.pid"
-    db_path = tmp_path / "vectors.db"
+    db_path = tmp_path / "yaw.db"
 
     lc = DaemonLifecycle(pid_file=pid_file, db_path=db_path)
     with pytest.raises(ValueError, match="Adversarial explosion"), lc:
@@ -2837,7 +2843,7 @@ def test_lifecycle_context_manager_exception_cleanup(tmp_path: Path) -> None:
 def test_lifecycle_sys_exit_code_cleanup(tmp_path: Path) -> None:
     """Verify PID file cleanup via atexit when subprocess calls sys.exit(1)."""
     pid_file = tmp_path / "yaw.pid"
-    db_path = tmp_path / "vectors.db"
+    db_path = tmp_path / "yaw.db"
 
     code = f"""
 import sys
@@ -2860,7 +2866,7 @@ def test_lifecycle_instance_reentry_cleanup(tmp_path: Path) -> None:
     truncates WAL, and cleans up PID file on each exit.
     """
     pid_file = tmp_path / "yaw.pid"
-    db_path = tmp_path / "vectors.db"
+    db_path = tmp_path / "yaw.db"
 
     # Initialize SQLite database in WAL mode
     with sqlite3.connect(str(db_path)) as conn:
@@ -2895,7 +2901,7 @@ def test_lifecycle_instance_reentry_cleanup(tmp_path: Path) -> None:
 def test_lifecycle_concurrent_pid_no_cross_unlink(tmp_path: Path) -> None:
     """Verify that an exiting daemon does not unlink a PID file that belongs to a different running process."""
     pid_file = tmp_path / "yaw.pid"
-    db_path = tmp_path / "vectors.db"
+    db_path = tmp_path / "yaw.db"
 
     lc = DaemonLifecycle(pid_file=pid_file, db_path=db_path)
     lc.start()
@@ -2916,7 +2922,7 @@ def test_lifecycle_concurrent_pid_no_cross_unlink(tmp_path: Path) -> None:
 def test_lifecycle_flock_concurrency_locking(tmp_path: Path) -> None:
     """Verify that DaemonLifecycle uses fcntl.flock to prevent concurrent daemons from sharing a PID file."""
     pid_file = tmp_path / "yaw.pid"
-    db_path = tmp_path / "vectors.db"
+    db_path = tmp_path / "yaw.db"
 
     lc1 = DaemonLifecycle(pid_file=pid_file, db_path=db_path)
     lc1.start()
@@ -2954,7 +2960,7 @@ def test_lifecycle_flock_concurrency_locking(tmp_path: Path) -> None:
 def test_lifecycle_flock_cross_process_mutual_exclusion(tmp_path: Path) -> None:
     """Verify cross-process mutual exclusion via fcntl.flock and PID protection."""
     pid_file = tmp_path / "yaw.pid"
-    db_path = tmp_path / "vectors.db"
+    db_path = tmp_path / "yaw.db"
     ready_file = tmp_path / "child_ready.txt"
 
     script = f"""
@@ -3008,14 +3014,14 @@ def _setup_m2_adversarial_vault_and_db(tmp_path: Path) -> tuple[Path, Path]:
     raw_dir.mkdir(parents=True, exist_ok=True)
     cache_dir = tmp_path / ".cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    db_path = cache_dir / "vectors.db"
+    db_path = cache_dir / "yaw.db"
 
     with sqlite3.connect(db_path) as conn:
         conn.execute(
             """
             CREATE TABLE note_chunks (
                 chunk_id TEXT, entity_uri TEXT PRIMARY KEY, rel_path TEXT, ordinal INTEGER,
-                heading TEXT, heading_slug TEXT, byte_offset INTEGER, byte_length INTEGER,
+                heading TEXT, heading_slug TEXT,
                 line_start INTEGER, line_end INTEGER, embedding BLOB
             )
             """
@@ -3078,10 +3084,9 @@ async def test_adversarial_zero_outbound_http_rescoring_diverse_queries(
         for idx, (filename, content) in enumerate(docs):
             p = raw_dir / filename
             p.write_text(content, encoding="utf-8")
-            b_text = content.encode("utf-8")
             uri = f"raw/{filename}#chunk:0"
             conn.execute(
-                "INSERT INTO note_chunks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO note_chunks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     f"c{idx}",
                     uri,
@@ -3089,8 +3094,6 @@ async def test_adversarial_zero_outbound_http_rescoring_diverse_queries(
                     0,
                     f"Heading {idx}",
                     f"heading-{idx}",
-                    0,
-                    len(b_text),
                     1,
                     2,
                     unit_vec.tobytes(),
@@ -3187,7 +3190,6 @@ async def test_adversarial_missing_and_malformed_vector_fallbacks(
     doc_text = "# Adversarial Tests\nTesting robustness of vector deserialization."
     doc_path = raw_dir / "adversarial.md"
     doc_path.write_text(doc_text, encoding="utf-8")
-    b_len = len(doc_text.encode("utf-8"))
 
     valid_vec = np.zeros(768, dtype=np.float32)
     valid_vec[0] = 1.0  # Aligned with q_vec
@@ -3209,7 +3211,7 @@ async def test_adversarial_missing_and_malformed_vector_fallbacks(
     with sqlite3.connect(db_path) as conn:
         for cid, uri, name, blob in test_candidates:
             conn.execute(
-                "INSERT INTO note_chunks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO note_chunks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     cid,
                     uri,
@@ -3217,8 +3219,6 @@ async def test_adversarial_missing_and_malformed_vector_fallbacks(
                     0,
                     f"Section {name}",
                     f"sec-{name}",
-                    0,
-                    b_len,
                     1,
                     2,
                     blob,
@@ -3311,8 +3311,8 @@ async def test_adversarial_missing_and_malformed_vector_fallbacks(
 
 
 @pytest.mark.anyio
-async def test_adversarial_physical_disk_byte_seeks_multibyte_utf8(tmp_path: Path):
-    """Stress-test byte_offset and byte_length seeking over complex multi-byte UTF-8 texts on physical ext4 disk."""
+async def test_adversarial_physical_disk_line_hydration_multibyte_utf8(tmp_path: Path):
+    """Stress-test 1-indexed line hydration seeking over complex multi-byte UTF-8 texts on physical disk."""
     raw_dir, db_path = _setup_m2_adversarial_vault_and_db(tmp_path)
 
     # Complex multi-byte text with 4-byte emojis, 3-byte CJK, 3-byte Devanagari, 2-byte Greek/Cyrillic
@@ -3341,32 +3341,32 @@ async def test_adversarial_physical_disk_byte_seeks_multibyte_utf8(tmp_path: Pat
     note_file = raw_dir / "multibyte_corpus.md"
     note_file.write_bytes(full_bytes)
 
-    # Calculate exact byte offsets on disk
-    current_offset = 0
+    # Calculate exact line ranges on disk
+    current_line = 1
     chunks_meta = []
     for idx, (section_text, heading) in enumerate(doc_sections):
-        sec_bytes = section_text.encode("utf-8")
-        sec_len = len(sec_bytes)
+        num_newlines = section_text.count("\n")
+        l_start = current_line
+        l_end = max(
+            l_start,
+            current_line + num_newlines - (1 if section_text.endswith("\n") else 0),
+        )
         chunks_meta.append(
             (
                 f"c{idx}",
                 f"raw/multibyte_corpus.md#chunk:{idx}",
                 heading,
-                current_offset,
-                sec_len,
+                l_start,
+                l_end,
                 section_text,
             )
         )
-        current_offset += sec_len
-
-    assert current_offset == len(full_bytes), (
-        "Calculated byte offsets must exactly sum to file length"
-    )
+        current_line += num_newlines
 
     with sqlite3.connect(db_path) as conn:
-        for cid, uri, heading, b_off, b_len, sec_text in chunks_meta:
+        for cid, uri, heading, l_start, l_end, sec_text in chunks_meta:
             conn.execute(
-                "INSERT INTO note_chunks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+                "INSERT INTO note_chunks VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)",
                 (
                     cid,
                     uri,
@@ -3374,10 +3374,8 @@ async def test_adversarial_physical_disk_byte_seeks_multibyte_utf8(tmp_path: Pat
                     0,
                     heading,
                     heading.lower(),
-                    b_off,
-                    b_len,
-                    1,
-                    5,
+                    l_start,
+                    l_end,
                 ),
             )
             conn.execute(
@@ -3412,45 +3410,32 @@ async def test_adversarial_physical_disk_byte_seeks_multibyte_utf8(tmp_path: Pat
             "kind",
             "rel_path",
             "heading",
-            "byte_offset",
-            "byte_length",
+            "line_start",
+            "line_end",
             "hybrid_prob",
             "rerank_score",
             "text",
         }
-        assert isinstance(seed["byte_offset"], int)
-        assert isinstance(seed["byte_length"], int)
-        assert seed["byte_offset"] >= 0
-        assert seed["byte_length"] > 0
+        assert isinstance(seed["line_start"], int)
+        assert isinstance(seed["line_end"], int)
+        assert seed["line_start"] >= 1
+        assert seed["line_end"] >= seed["line_start"]
 
-        # Physical disk binary seek
+        # Physical disk line hydration
         file_disk_path = tmp_path / seed["rel_path"]
         assert file_disk_path.is_file()
 
-        with file_disk_path.open("rb") as f:
-            f.seek(seed["byte_offset"])
-            read_bytes = f.read(seed["byte_length"])
-
-        assert len(read_bytes) == seed["byte_length"], (
-            "Physical disk byte length must match seed byte_length"
-        )
-        # Must decode cleanly without UnicodeDecodeError
-        decoded_text = read_bytes.decode("utf-8")
-        assert decoded_text == seed["text"], (
-            "Physical disk slice must match seed text verbatim"
-        )
-
         # Parity with read_document
         parity_text = read_document(
-            seed["rel_path"], seed["byte_offset"], seed["byte_length"]
+            seed["rel_path"], seed["line_start"], seed["line_end"]
         )
-        assert parity_text == seed["text"], "read_document must return exact seed text"
+        assert parity_text.rstrip("\r\n") == seed["text"].rstrip("\r\n")
 
     # 2. Verify taxonomy candidate contract
     for tax_seed in tax_results:
         assert tax_seed["kind"] == "taxonomy"
-        assert tax_seed["byte_offset"] == 0
-        assert tax_seed["byte_length"] == len(tax_seed["text"].encode("utf-8"))
+        assert tax_seed["line_start"] is None
+        assert tax_seed["line_end"] is None
         assert isinstance(tax_seed["text"], str)
 
 
@@ -3466,33 +3451,34 @@ def test_adversarial_read_document_boundary_conditions(tmp_path: Path):
     raw_dir.mkdir(parents=True, exist_ok=True)
 
     test_file = raw_dir / "boundary.md"
-    test_content = "Hello, world! 🌍 Unicode boundary check."
+    test_content = "Line 1: Hello, world! 🌍\nLine 2: Unicode boundary check.\nLine 3: Third line.\n"
     test_file.write_text(test_content, encoding="utf-8")
-    b_len = len(test_content.encode("utf-8"))
 
-    # 1. Read to EOF with byte_length=None
-    eof_slice = read_document("raw/boundary.md", byte_offset=7, byte_length=None)
-    expected_eof = test_content.encode("utf-8")[7:].decode("utf-8")
-    assert eof_slice == expected_eof
+    # 1. Read to EOF with line_start=None, line_end=None
+    eof_slice = read_document("raw/boundary.md", line_start=None, line_end=None)
+    assert eof_slice == test_content
 
-    # 2. Seek beyond file length: must return empty string, zero crash
-    beyond_slice = read_document(
-        "raw/boundary.md", byte_offset=b_len + 100, byte_length=50
-    )
+    # 2. Seek beyond file length lines: returns empty string
+    beyond_slice = read_document("raw/boundary.md", line_start=100, line_end=150)
     assert beyond_slice == ""
 
-    # 3. Read length exceeding remaining file bytes: reads cleanly to EOF without padding
-    overshoot_slice = read_document(
-        "raw/boundary.md", byte_offset=0, byte_length=b_len + 1000
-    )
+    # 3. Read exceeding line count: reads available lines without error
+    overshoot_slice = read_document("raw/boundary.md", line_start=1, line_end=1000)
     assert overshoot_slice == test_content
 
-    # 4. Security path traversal: must raise ValueError
-    with pytest.raises(ValueError, match="Path outside VAULT_ROOT"):
-        read_document("../../etc/passwd", byte_offset=0, byte_length=100)
+    # 4. Invalid line ranges (line_start < 1 or line_end < line_start) raise ValueError
+    with pytest.raises(ValueError, match="must be >= 1"):
+        read_document("raw/boundary.md", line_start=0, line_end=2)
 
-    # 5. Non-existent file: returns empty string
-    assert read_document("raw/non_existent.md", byte_offset=0, byte_length=10) == ""
+    with pytest.raises(ValueError, match="must be >= line_start"):
+        read_document("raw/boundary.md", line_start=3, line_end=1)
+
+    # 5. Security path traversal: must raise ValueError
+    with pytest.raises(ValueError, match="outside VAULT_ROOT"):
+        read_document("../../etc/passwd", line_start=1, line_end=10)
+
+    # 6. Non-existent file: returns empty string
+    assert read_document("raw/non_existent.md", line_start=1, line_end=10) == ""
 
 
 # ==============================================================================
@@ -3595,8 +3581,8 @@ def test_cli_index_synchronous_and_zero_zombies(tmp_path: Path):
     )
 
     # Invariant: SQLite database created and populated
-    db_file = vault_dir / ".cache" / "vectors.db"
-    assert db_file.exists(), "vectors.db was not created by yaw index"
+    db_file = vault_dir / ".cache" / "yaw.db"
+    assert db_file.exists(), "yaw.db was not created by yaw index"
 
     # Invariant: Check no lingering zombie/orphan subprocesses
     children_after = set(current_proc.children(recursive=True))
@@ -3759,7 +3745,7 @@ def test_cli_schema_corrupted_database_resilience(tmp_path: Path):
     corrupt_vault = tmp_path / "corrupt_vault"
     db_dir = corrupt_vault / ".cache"
     db_dir.mkdir(parents=True, exist_ok=True)
-    (db_dir / "vectors.db").write_text(
+    (db_dir / "yaw.db").write_text(
         "CORRUPTED NOT A SQLITE DATABASE", encoding="utf-8"
     )
 

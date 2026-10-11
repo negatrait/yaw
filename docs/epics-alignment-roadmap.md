@@ -194,7 +194,7 @@ Close the active feedback loop between SQLite and initial extraction. Guide the 
 - **Live Predicate Injection:** Query `unified_edges` for top active canonical predicates and combine with `config.BASE_PREDICATES` fallback, ensuring dynamic prompts reflect both grounded vault usage and standard W3C taxonomy.
 - **spaCy-LLM Integration:** Register `@registry.misc("yaw.CanonicalExamples.v1")` providing dynamic few-shot examples for `spacy.REL.v1` and `spacy.SpanCat.v3`. Adhere strictly to Epic 1 (pure declarative configuration, zero private `_model` or `_task` attribute access).
 - **Quad Projection Compatibility:** Ensure relations extracted via steered prompts project losslessly into `(subject, predicate, object, graph_uri)` quad tuples in `unified_edges` with source chunk provenance.
-- **Multi-Note Convergence Verification:** Ingest multi-note corpus (e.g. `sample-llm-wiki`) and audit `vectors.db` for zero duplicate concept nodes and zero uncontrolled predicate synonyms.
+- **Multi-Note Convergence Verification:** Ingest multi-note corpus (e.g. `sample-llm-wiki`) and audit `yaw.db` for zero duplicate concept nodes and zero uncontrolled predicate synonyms.
 
 #### 2. Test Authoring Plan (TDD & Grounded Invariants)
 - **Target Test File:** `tests/test_fewshot_steering.py`.

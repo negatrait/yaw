@@ -50,7 +50,7 @@ def test_concept_and_chunk_node_classification():
 def test_csr_matrix_directional_conductance_and_hub_dampening(tmp_path):
     """Verify CSR transition matrix construction, row-stochasticity, and directional conductance."""
     config.set_vault(tmp_path)
-    db_path = tmp_path / ".cache" / "vectors.db"
+    db_path = tmp_path / ".cache" / "yaw.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     with sqlite3.connect(db_path) as conn:
@@ -62,7 +62,7 @@ def test_csr_matrix_directional_conductance_and_hub_dampening(tmp_path):
         )
         conn.execute(
             "CREATE TABLE note_chunks (chunk_id TEXT, entity_uri TEXT PRIMARY KEY, rel_path TEXT, ordinal INTEGER, "
-            "heading TEXT, heading_slug TEXT, byte_offset INTEGER, byte_length INTEGER, line_start INTEGER, line_end INTEGER, "
+            "heading TEXT, heading_slug TEXT, line_start INTEGER, line_end INTEGER, "
             "embedding BLOB)"
         )
 
@@ -135,7 +135,7 @@ def test_power_iteration_convergence():
 async def test_dual_layer_retrieval_rendering(tmp_path):
     """Verify retrieve() returns formatted Ontological Context and Grounded Evidence with disk hydration."""
     config.set_vault(tmp_path)
-    db_path = tmp_path / ".cache" / "vectors.db"
+    db_path = tmp_path / ".cache" / "yaw.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     raw_dir = tmp_path / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -143,7 +143,6 @@ async def test_dual_layer_retrieval_rendering(tmp_path):
     note_path = raw_dir / "heisenberg.md"
     note_content = "# Heisenberg\nWerner Heisenberg discovered the uncertainty principle in quantum physics."
     note_path.write_text(note_content, encoding="utf-8")
-    b_content = note_content.encode("utf-8")
 
     dummy_vec = np.ones(768, dtype=np.float32)
     dummy_vec /= np.linalg.norm(dummy_vec)
@@ -160,7 +159,7 @@ async def test_dual_layer_retrieval_rendering(tmp_path):
         )
         conn.execute(
             "CREATE TABLE note_chunks (chunk_id TEXT, entity_uri TEXT PRIMARY KEY, rel_path TEXT, ordinal INTEGER, "
-            "heading TEXT, heading_slug TEXT, byte_offset INTEGER, byte_length INTEGER, line_start INTEGER, line_end INTEGER, "
+            "heading TEXT, heading_slug TEXT, line_start INTEGER, line_end INTEGER, "
             "embedding BLOB)"
         )
         conn.execute(
@@ -169,8 +168,8 @@ async def test_dual_layer_retrieval_rendering(tmp_path):
 
         chunk_uri = "raw/heisenberg.md#chunk:0"
         conn.execute(
-            "INSERT INTO note_chunks VALUES ('c0', ?, 'raw/heisenberg.md', 0, 'Heisenberg', 'heisenberg', 0, ?, 1, 2, ?)",
-            (chunk_uri, len(b_content), dummy_vec.tobytes()),
+            "INSERT INTO note_chunks VALUES ('c0', ?, 'raw/heisenberg.md', 0, 'Heisenberg', 'heisenberg', 1, 2, ?)",
+            (chunk_uri, dummy_vec.tobytes()),
         )
         conn.execute(
             "INSERT INTO leaf_nodes VALUES ('concepts:uncertainty-principle', 'raw/heisenberg.md', 'Uncertainty Principle', 'concepts', 'Fundamental limit of precision.', ?)",
@@ -271,11 +270,10 @@ async def test_dual_layer_retrieval_with_json_text_embeddings(tmp_path):
     note_path = raw_dir / "planck.md"
     note_content = "Max Planck originated quantum theory in 1900."
     note_path.write_text(note_content, encoding="utf-8")
-    b_content = note_content.encode("utf-8")
 
     config.set_vault(vault_dir)
 
-    db_path = cache_dir / "vectors.db"
+    db_path = cache_dir / "yaw.db"
     dummy_vec = np.ones(768, dtype=np.float32)
     norm = float(np.linalg.norm(dummy_vec))
     dummy_vec /= norm
@@ -284,7 +282,7 @@ async def test_dual_layer_retrieval_with_json_text_embeddings(tmp_path):
     with sqlite3.connect(db_path) as conn:
         conn.execute(
             "CREATE TABLE note_chunks (chunk_id TEXT, entity_uri TEXT PRIMARY KEY, rel_path TEXT, ordinal INTEGER, "
-            "heading TEXT, heading_slug TEXT, byte_offset INTEGER, byte_length INTEGER, line_start INTEGER, line_end INTEGER, "
+            "heading TEXT, heading_slug TEXT, line_start INTEGER, line_end INTEGER, "
             "embedding TEXT)"
         )
         conn.execute(
@@ -301,8 +299,8 @@ async def test_dual_layer_retrieval_with_json_text_embeddings(tmp_path):
 
         chunk_uri = "raw/planck.md#chunk:0"
         conn.execute(
-            "INSERT INTO note_chunks VALUES ('c0', ?, 'raw/planck.md', 0, 'Planck', 'planck', 0, ?, 1, 2, ?)",
-            (chunk_uri, len(b_content), json_vec_str),
+            "INSERT INTO note_chunks VALUES ('c0', ?, 'raw/planck.md', 0, 'Planck', 'planck', 1, 2, ?)",
+            (chunk_uri, json_vec_str),
         )
         conn.execute(
             "INSERT INTO leaf_nodes VALUES ('concepts:quantum-hypothesis', 'raw/planck.md', 'Quantum Hypothesis', 'concepts', 'Energy quanta.', ?)",
@@ -334,7 +332,7 @@ async def test_dual_layer_retrieval_with_json_text_embeddings(tmp_path):
 def test_retriever_reciprocal_wikilinks_coexistence_with_ontological_edges(tmp_path):
     """Verify reciprocal wikilinks coexist seamlessly with ontological concept/chunk edges."""
     config.set_vault(tmp_path)
-    db_path = tmp_path / ".cache" / "vectors.db"
+    db_path = tmp_path / ".cache" / "yaw.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     with sqlite3.connect(db_path) as conn:
@@ -346,7 +344,7 @@ def test_retriever_reciprocal_wikilinks_coexistence_with_ontological_edges(tmp_p
         )
         conn.execute(
             "CREATE TABLE note_chunks (chunk_id TEXT, entity_uri TEXT PRIMARY KEY, rel_path TEXT, ordinal INTEGER, "
-            "heading TEXT, heading_slug TEXT, byte_offset INTEGER, byte_length INTEGER, line_start INTEGER, line_end INTEGER, "
+            "heading TEXT, heading_slug TEXT, line_start INTEGER, line_end INTEGER, "
             "embedding BLOB)"
         )
 
@@ -397,7 +395,7 @@ def test_retriever_reciprocal_wikilinks_coexistence_with_ontological_edges(tmp_p
 async def test_retriever_offline_lexical_fallback(tmp_path):
     """Verify offline fallback correctly resolves chunks via entity_uri and hydrates lexical evidence."""
     config.set_vault(tmp_path)
-    db_path = tmp_path / ".cache" / "vectors.db"
+    db_path = tmp_path / ".cache" / "yaw.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     raw_dir = tmp_path / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -405,7 +403,6 @@ async def test_retriever_offline_lexical_fallback(tmp_path):
     note_path = raw_dir / "test.md"
     note_content = "# Test Document\nThis note contains search query content that should be retrieved offline."
     note_path.write_text(note_content, encoding="utf-8")
-    b_content = note_content.encode("utf-8")
 
     chunk_uri = "raw/test.md#chunk:0"
 
@@ -421,7 +418,7 @@ async def test_retriever_offline_lexical_fallback(tmp_path):
         )
         conn.execute(
             "CREATE TABLE note_chunks (chunk_id TEXT, entity_uri TEXT PRIMARY KEY, rel_path TEXT, ordinal INTEGER, "
-            "heading TEXT, heading_slug TEXT, byte_offset INTEGER, byte_length INTEGER, line_start INTEGER, line_end INTEGER, "
+            "heading TEXT, heading_slug TEXT, line_start INTEGER, line_end INTEGER, "
             "embedding BLOB)"
         )
         conn.execute(
@@ -429,8 +426,8 @@ async def test_retriever_offline_lexical_fallback(tmp_path):
         )
 
         conn.execute(
-            "INSERT INTO note_chunks VALUES ('c0', ?, 'raw/test.md', 0, 'Test Document', 'test-document', 0, ?, 1, 2, NULL)",
-            (chunk_uri, len(b_content)),
+            "INSERT INTO note_chunks VALUES ('c0', ?, 'raw/test.md', 0, 'Test Document', 'test-document', 1, 2, NULL)",
+            (chunk_uri,),
         )
         conn.execute(
             "INSERT INTO leaf_nodes VALUES ('concepts:test', 'raw/test.md', 'Test Concept', 'concepts', 'Concept for offline fallback test.', NULL)"
@@ -464,7 +461,7 @@ async def test_retriever_offline_lexical_fallback(tmp_path):
 async def test_retriever_concept_diffusion_reaches_unseeded_chunk(tmp_path):
     """Verify PPR diffuses probability mass from an FTS-seeded concept to an unseeded chunk via manifests_in."""
     config.set_vault(tmp_path)
-    db_path = tmp_path / ".cache" / "vectors.db"
+    db_path = tmp_path / ".cache" / "yaw.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     raw_dir = tmp_path / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -476,7 +473,6 @@ async def test_retriever_concept_diffusion_reaches_unseeded_chunk(tmp_path):
         "Chloroplasts capture photons from sunlight to convert carbon dioxide into glucose."
     )
     note_path.write_text(note_content, encoding="utf-8")
-    b_content = note_content.encode("utf-8")
 
     chunk_uri = "raw/chloroplast.md#chunk:0"
     concept_uri = "concepts:photosynthesis"
@@ -493,7 +489,7 @@ async def test_retriever_concept_diffusion_reaches_unseeded_chunk(tmp_path):
         )
         conn.execute(
             "CREATE TABLE note_chunks (chunk_id TEXT, entity_uri TEXT PRIMARY KEY, rel_path TEXT, ordinal INTEGER, "
-            "heading TEXT, heading_slug TEXT, byte_offset INTEGER, byte_length INTEGER, line_start INTEGER, line_end INTEGER, "
+            "heading TEXT, heading_slug TEXT, line_start INTEGER, line_end INTEGER, "
             "embedding BLOB)"
         )
         conn.execute(
@@ -501,8 +497,8 @@ async def test_retriever_concept_diffusion_reaches_unseeded_chunk(tmp_path):
         )
 
         conn.execute(
-            "INSERT INTO note_chunks VALUES ('c0', ?, 'raw/chloroplast.md', 0, 'Cellular Energy', 'cellular-energy', 0, ?, 1, 2, NULL)",
-            (chunk_uri, len(b_content)),
+            "INSERT INTO note_chunks VALUES ('c0', ?, 'raw/chloroplast.md', 0, 'Cellular Energy', 'cellular-energy', 1, 2, NULL)",
+            (chunk_uri,),
         )
         conn.execute(
             "INSERT INTO leaf_nodes VALUES (?, 'raw/chloroplast.md', 'Photosynthesis', 'concepts', 'Biological synthesis of organic compounds.', NULL)",
@@ -545,7 +541,7 @@ async def test_retriever_bridging_subgraph_filters_unlinked_distractor_concepts(
 ):
     """Verify bridging subgraph filters out unlinked distractor concepts even if high-degree."""
     config.set_vault(tmp_path)
-    db_path = tmp_path / ".cache" / "vectors.db"
+    db_path = tmp_path / ".cache" / "yaw.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     raw_dir = tmp_path / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -556,7 +552,6 @@ async def test_retriever_bridging_subgraph_filters_unlinked_distractor_concepts(
         "Albert Einstein formulated special relativity describing inertial reference frames."
     )
     note_path.write_text(note_content, encoding="utf-8")
-    b_content = note_content.encode("utf-8")
 
     chunk_uri = "raw/relativity.md#chunk:0"
     grounded_concept = "concepts:special-relativity"
@@ -574,7 +569,7 @@ async def test_retriever_bridging_subgraph_filters_unlinked_distractor_concepts(
         )
         conn.execute(
             "CREATE TABLE note_chunks (chunk_id TEXT, entity_uri TEXT PRIMARY KEY, rel_path TEXT, ordinal INTEGER, "
-            "heading TEXT, heading_slug TEXT, byte_offset INTEGER, byte_length INTEGER, line_start INTEGER, line_end INTEGER, "
+            "heading TEXT, heading_slug TEXT, line_start INTEGER, line_end INTEGER, "
             "embedding BLOB)"
         )
         conn.execute(
@@ -582,8 +577,8 @@ async def test_retriever_bridging_subgraph_filters_unlinked_distractor_concepts(
         )
 
         conn.execute(
-            "INSERT INTO note_chunks VALUES ('c0', ?, 'raw/relativity.md', 0, 'Special Relativity', 'special-relativity', 0, ?, 1, 2, NULL)",
-            (chunk_uri, len(b_content)),
+            "INSERT INTO note_chunks VALUES ('c0', ?, 'raw/relativity.md', 0, 'Special Relativity', 'special-relativity', 1, 2, NULL)",
+            (chunk_uri,),
         )
         conn.execute(
             "INSERT INTO leaf_nodes VALUES (?, 'raw/relativity.md', 'Special Relativity', 'concepts', 'Theory of space and time.', NULL)",
@@ -645,7 +640,7 @@ async def test_retriever_bridging_subgraph_filters_unlinked_distractor_concepts(
 async def test_retriever_zero_chunks_guidance_and_global_concepts(tmp_path):
     """Verify K=0 falls back to global top concepts and renders recommended source research guidance."""
     config.set_vault(tmp_path)
-    db_path = tmp_path / ".cache" / "vectors.db"
+    db_path = tmp_path / ".cache" / "yaw.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     concept_uri = "concepts:general-relativity"
@@ -662,7 +657,7 @@ async def test_retriever_zero_chunks_guidance_and_global_concepts(tmp_path):
         )
         conn.execute(
             "CREATE TABLE note_chunks (chunk_id TEXT, entity_uri TEXT PRIMARY KEY, rel_path TEXT, ordinal INTEGER, "
-            "heading TEXT, heading_slug TEXT, byte_offset INTEGER, byte_length INTEGER, line_start INTEGER, line_end INTEGER, "
+            "heading TEXT, heading_slug TEXT, line_start INTEGER, line_end INTEGER, "
             "embedding BLOB)"
         )
         conn.execute(
@@ -703,7 +698,7 @@ async def test_retriever_zero_chunks_guidance_and_global_concepts(tmp_path):
 def test_render_ontological_context_unified_views(tmp_path):
     """Verify _render_ontological_context reads from unified_edges and unified_nodes views."""
     config.set_vault(tmp_path)
-    db_path = tmp_path / ".cache" / "vectors.db"
+    db_path = tmp_path / ".cache" / "yaw.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     with sqlite3.connect(db_path) as conn:
@@ -718,7 +713,7 @@ def test_render_ontological_context_unified_views(tmp_path):
         )
         conn.execute(
             "CREATE TABLE note_chunks (chunk_id TEXT, entity_uri TEXT PRIMARY KEY, rel_path TEXT, ordinal INTEGER, "
-            "heading TEXT, heading_slug TEXT, byte_offset INTEGER, byte_length INTEGER, line_start INTEGER, line_end INTEGER, "
+            "heading TEXT, heading_slug TEXT, line_start INTEGER, line_end INTEGER, "
             "embedding BLOB)"
         )
         ensure_schema_views(conn)
@@ -757,7 +752,7 @@ def test_render_ontological_context_unified_views(tmp_path):
 async def test_retriever_cold_start_and_zero_matches(tmp_path):
     """Test GraphRAGRetriever against empty db, shouldn't crash."""
     config.set_vault(tmp_path)
-    db_path = tmp_path / ".cache" / "vectors.db"
+    db_path = tmp_path / ".cache" / "yaw.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     with sqlite3.connect(db_path) as conn:
@@ -853,7 +848,7 @@ def test_create_canonical_node_guards_predicates(tmp_path: Path) -> None:
 def test_taxonomic_subsumption_conductance_asymmetry_wp516(tmp_path: Path):
     """Verify WP 5.1.6: SubClassOf/PartOf upward abstraction is damped to 0.2 while downward is 1.0."""
     config.set_vault(tmp_path)
-    db_path = tmp_path / ".cache" / "vectors.db"
+    db_path = tmp_path / ".cache" / "yaw.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     with sqlite3.connect(db_path) as conn:
@@ -865,7 +860,7 @@ def test_taxonomic_subsumption_conductance_asymmetry_wp516(tmp_path: Path):
         )
         conn.execute(
             "CREATE TABLE note_chunks (chunk_id TEXT, entity_uri TEXT PRIMARY KEY, rel_path TEXT, ordinal INTEGER, "
-            "heading TEXT, heading_slug TEXT, byte_offset INTEGER, byte_length INTEGER, line_start INTEGER, line_end INTEGER, "
+            "heading TEXT, heading_slug TEXT, line_start INTEGER, line_end INTEGER, "
             "embedding BLOB)"
         )
         from yaw.storage.db import ensure_schema_tables

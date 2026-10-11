@@ -324,7 +324,7 @@ def query_live_predicates(db_path: str | Path, limit: int = 20) -> list[str]:
     if not path.is_file():
         return []
 
-    uri = f"file:{path}?mode=ro"
+    uri = f"file:{path.as_posix()}?mode=ro"
     try:
         with sqlite3.connect(uri, uri=True, timeout=5.0) as conn:
             cursor = conn.cursor()
@@ -431,7 +431,7 @@ def make_canonical_examples(
         task_type: Alias for task to support alternative configuration keys.
         max_examples: Maximum number of examples to include (capped by CANON_FEWSHOT_MAX).
         limit: Alias for max_examples.
-        db_path: Optional path to SQLite vectors.db for live vocabulary enrichment.
+        db_path: Optional path to SQLite yaw.db for live vocabulary enrichment.
         include_live: Whether to blend active database predicates with base canonical examples.
         active_predicates: Injected list of active predicates to prioritize.
 

@@ -78,8 +78,6 @@ def _setup_full_wal_db(conn: sqlite3.Connection) -> None:
             ordinal INT NOT NULL,
             heading TEXT,
             heading_slug TEXT,
-            byte_offset INT,
-            byte_length INT,
             line_start INT,
             line_end INT,
             embedding BLOB
@@ -92,14 +90,14 @@ def _setup_full_wal_db(conn: sqlite3.Connection) -> None:
 
 
 # ===========================================================================
-# 1. 10,000-Line Note Chunk Monotonicity & Exact Disk Byte Offsets
+# 1. 10,000-Line Note Chunk Monotonicity & Exact Disk Line Ranges
 # ===========================================================================
 
 
-def test_ten_thousand_line_note_chunk_monotonicity_and_exact_disk_byte_offsets(
+def test_ten_thousand_line_note_chunk_monotonicity_and_exact_disk_line_ranges(
     tmp_path: Path,
 ) -> None:
-    """10,000-line note generates strictly monotonic chunks matching exact disk byte slices."""
+    """10,000-line note generates strictly monotonic chunks matching exact disk line slices."""
     lines: list[str] = ["# Grand Unified Theory and Scientific Taxonomy\n"]
     # 100 sections, each with a heading + 99 paragraph lines = 10,001 physical lines
     for section_idx in range(100):
@@ -118,30 +116,26 @@ def test_ten_thousand_line_note_chunk_monotonicity_and_exact_disk_byte_offsets(
 
     large_file = tmp_path / "ten_thousand_line_note.md"
     large_file.write_text(large_text, encoding="utf-8")
-    raw_bytes = large_file.read_bytes()
 
     chunks = chunk_markdown(large_text)
     assert len(chunks) >= 20, f"Expected at least 20 chunks, got {len(chunks)}"
 
-    # Invariant: Chunk offsets must be strictly monotonic non-overlapping forward progression
+    # Invariant: Chunk line ranges must be strictly monotonic non-overlapping forward progression
     for i in range(len(chunks) - 1):
-        assert (
-            chunks[i + 1].byte_offset >= chunks[i].byte_offset + chunks[i].byte_length
-        ), (
-            f"Chunk {i + 1} overlap or regression: offset {chunks[i + 1].byte_offset} "
-            f"< end of chunk {i} ({chunks[i].byte_offset + chunks[i].byte_length})"
+        assert chunks[i + 1].line_start > chunks[i].line_end, (
+            f"Chunk {i + 1} overlap or regression: line_start {chunks[i + 1].line_start} "
+            f"<= line_end of chunk {i} ({chunks[i].line_end})"
         )
 
-    # Invariant: Physical disk verification via exact seek/slice comparison
+    # Invariant: Physical disk verification via exact line slicing
+    file_lines = large_text.splitlines(keepends=True)
     for idx, c in enumerate(chunks):
-        assert c.byte_offset >= 0
-        assert c.byte_length > 0, f"Chunk {idx} has non-positive byte length"
         assert c.line_start >= 1
         assert c.line_end >= c.line_start
-        disk_slice = raw_bytes[c.byte_offset : c.byte_offset + c.byte_length].decode(
-            "utf-8"
+        line_slice = "".join(file_lines[c.line_start - 1 : c.line_end])
+        assert line_slice.rstrip("\r\n") == c.text.rstrip("\r\n"), (
+            f"Disk line mismatch at chunk {idx}"
         )
-        assert disk_slice == c.text, f"Disk byte mismatch at chunk {idx}"
 
 
 # ===========================================================================
@@ -167,8 +161,8 @@ def test_malformed_unparseable_markdown_syntax_tolerance(tmp_path: Path) -> None
     assert len(chunks) > 0
 
     for c in chunks:
-        assert c.byte_offset >= 0
-        assert c.byte_length >= 0
+        assert c.line_start >= 1
+        assert c.line_end >= c.line_start
 
     valid_targets = get_valid_targets(tmp_path)
     edges = extract_wikilinks("raw/malformed.md", chunks, valid_targets)
@@ -259,7 +253,7 @@ def test_wal_mode_concurrent_high_volume_reads_during_active_write_transactions(
     tmp_path: Path,
 ) -> None:
     """WAL mode enables 400 concurrent read-only queries across 8 threads during active write transactions."""
-    db_path = tmp_path / "vectors.db"
+    db_path = tmp_path / "yaw.db"
     init_conn = sqlite3.connect(db_path)
     _setup_full_wal_db(init_conn)
 
@@ -371,7 +365,7 @@ def test_wal_mode_concurrent_high_volume_reads_during_active_write_transactions(
 
 def test_read_only_connection_strict_write_protection(tmp_path: Path) -> None:
     """mode=ro strictly prevents write mutations at SQLite engine level."""
-    db_path = tmp_path / "vectors.db"
+    db_path = tmp_path / "yaw.db"
     conn = sqlite3.connect(db_path)
     _setup_full_wal_db(conn)
     conn.close()

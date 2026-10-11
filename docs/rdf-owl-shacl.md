@@ -16,7 +16,7 @@ To satisfy both high-throughput local GraphRAG retrieval (sub-millisecond PPR di
 ```mermaid
 flowchart TD
     subgraph Storage ["Tier 1: Relational & RDF Quad Substrate"]
-        DB[("SQLite vectors.db")]
+        DB[("SQLite yaw.db")]
         UE["unified_edges View\n(s, p, o, g)"]
         UN["unified_nodes View\n(id, prefLabel, type)"]
         DB --> UE
@@ -130,7 +130,7 @@ YAW rejects external graph server processes. Semantic graph operations execute s
 sequenceDiagram
     autonumber
     participant CLI as FastMCP / CLI (lint_wiki)
-    participant DB as SQLite (vectors.db)
+    participant DB as SQLite (yaw.db)
     participant RDF as In-Process rdflib.Graph
     participant Engine as pyshacl.validate()
     participant OWL as src/yaw/ontology.ttl

@@ -20,9 +20,9 @@ CHUNK_URI_RE = re.compile(r"^.+#chunk:\d+$")
 
 
 def test_adversarial_existing_vault_db_purity():
-    """Verify that sample-llm-wiki/.cache/vectors.db exists and contains ZERO engine terms."""
+    """Verify that sample-llm-wiki/.cache/yaw.db exists and contains ZERO engine terms."""
     vault_path = Path("sample-llm-wiki").resolve()
-    db_path = vault_path / ".cache" / "vectors.db"
+    db_path = vault_path / ".cache" / "yaw.db"
     if not db_path.is_file():
         sync_vault(vault_dir=vault_path, force=False, verbose=False)
     assert db_path.is_file(), f"Database does not exist at {db_path}"
@@ -96,7 +96,7 @@ def test_adversarial_existing_vault_db_purity():
 async def test_adversarial_sample_vault_retrieval():
     """Adversarially verify that retrieval works on the real sample-llm-wiki vault indexed via sync_vault."""
     vault_path = Path("sample-llm-wiki").resolve()
-    db_path = vault_path / ".cache" / "vectors.db"
+    db_path = vault_path / ".cache" / "yaw.db"
     if not db_path.is_file():
         sync_vault(vault_dir=vault_path, force=False, verbose=False)
     old_root = config.VAULT_ROOT
@@ -338,7 +338,7 @@ async def test_adversarial_synthetic_multi_note_vault_indexing_and_retrieval(tmp
         # Sync vault
         sync_vault(vault_dir=tmp_path, force=True, verbose=False)
 
-        db_path = tmp_path / ".cache" / "vectors.db"
+        db_path = tmp_path / ".cache" / "yaw.db"
         assert db_path.is_file()
 
         with sqlite3.connect(db_path) as conn:
@@ -412,7 +412,7 @@ async def test_adversarial_corrupt_embeddings_resilience(tmp_path):
         )
 
         sync_vault(vault_dir=tmp_path, force=True, verbose=False)
-        db_path = tmp_path / ".cache" / "vectors.db"
+        db_path = tmp_path / ".cache" / "yaw.db"
         assert db_path.is_file()
 
         conn = get_db(load_vec=True)
@@ -424,10 +424,10 @@ async def test_adversarial_corrupt_embeddings_resilience(tmp_path):
             conn.execute(
                 """
                 INSERT OR REPLACE INTO note_chunks 
-                (chunk_id, entity_uri, rel_path, ordinal, heading, heading_slug, byte_offset, byte_length, line_start, line_end, embedding)
+                (chunk_id, entity_uri, rel_path, ordinal, heading, heading_slug, line_start, line_end, embedding)
                 VALUES 
-                ('cid:corrupt_json', 'raw/note.md#chunk:bad_json', 'raw/note.md', 10, 'Bad JSON', 'bad-json', 0, 10, 1, 2, '{not valid json'),
-                ('cid:corrupt_bytes', 'raw/note.md#chunk:bad_bytes', 'raw/note.md', 11, 'Bad Bytes', 'bad-bytes', 0, 10, 3, 4, ?)
+                ('cid:corrupt_json', 'raw/note.md#chunk:bad_json', 'raw/note.md', 10, 'Bad JSON', 'bad-json', 1, 2, '{not valid json'),
+                ('cid:corrupt_bytes', 'raw/note.md#chunk:bad_bytes', 'raw/note.md', 11, 'Bad Bytes', 'bad-bytes', 3, 4, ?)
                 """,
                 (b"odd_bytes_123",),
             )
@@ -491,7 +491,7 @@ async def test_adversarial_null_distance_handling(tmp_path):
         )
 
         sync_vault(vault_dir=tmp_path, force=True, verbose=False)
-        db_path = tmp_path / ".cache" / "vectors.db"
+        db_path = tmp_path / ".cache" / "yaw.db"
         assert db_path.is_file()
 
         zero_vec = np.zeros(768, dtype=np.float32)
@@ -506,10 +506,10 @@ async def test_adversarial_null_distance_handling(tmp_path):
             conn.execute(
                 """
                 INSERT OR REPLACE INTO note_chunks 
-                (chunk_id, entity_uri, rel_path, ordinal, heading, heading_slug, byte_offset, byte_length, line_start, line_end, embedding)
+                (chunk_id, entity_uri, rel_path, ordinal, heading, heading_slug, line_start, line_end, embedding)
                 VALUES 
-                ('cid:zero_chunk', 'raw/zero.md#chunk:zero', 'raw/zero.md', 20, 'Zero Chunk', 'zero-chunk', 0, 10, 1, 2, ?),
-                ('cid:valid_chunk', 'raw/zero.md#chunk:valid', 'raw/zero.md', 21, 'Valid Chunk', 'valid-chunk', 0, 10, 3, 4, ?)
+                ('cid:zero_chunk', 'raw/zero.md#chunk:zero', 'raw/zero.md', 20, 'Zero Chunk', 'zero-chunk', 1, 2, ?),
+                ('cid:valid_chunk', 'raw/zero.md#chunk:valid', 'raw/zero.md', 21, 'Valid Chunk', 'valid-chunk', 3, 4, ?)
                 """,
                 (zero_vec.tobytes(), valid_vec.tobytes()),
             )

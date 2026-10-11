@@ -61,12 +61,12 @@ Every line of code and test in YAW is governed by seven non-negotiable invariant
 - **Lossless Ingestion Invariant across 2x2 Extraction Matrix ([`docs/adr/ADR-009.md`](file:///home/harri/yaw/docs/adr/ADR-009.md)):** `leaf_nodes` and `leaf_relations` are append-only and strictly lossless. Toggling between internal/external ontologies or enabling/disabling `open_ie` is a pure read-time dynamic view filter (`unified_edges`). Switching extraction quadrants never purges raw triples, drops out-of-vocabulary relations, or wipes CocoIndex content-hash / EmbeddingGemma caches.
 
 ### Invariant 2: Zero-Prose Disk Pointers
-- SQLite tables store **byte pointers** (`byte_offset`, `byte_length`) into raw files rather than duplicating raw text payloads.
+- SQLite tables store **1-indexed line pointers** (`line_start`, `line_end`) into raw files rather than duplicating raw text payloads.
 - FTS5 operates in `contentless_delete=1` mode to prevent duplicate text storage while providing full-text search indexing.
-- Winning retrieval chunks seek directly to disk (`file.seek(offset)`, `file.read(length)`), guaranteeing zero text drift and zero byte redundancy.
+- Winning retrieval chunks hydrate directly on demand from disk via 1-indexed line slicing ([`hydrate_disk_slice()`](file:///home/harri/yaw/src/yaw/retrieval/retriever.py)), guaranteeing zero text drift and zero prose redundancy.
 
 ### Invariant 3: Single In-Process SQLite Database
-- Exactly **one** SQLite database (`.cache/vectors.db`) houses all state ([`docs/adr/ADR-004.md`](file:///home/harri/yaw/docs/adr/ADR-004.md)).
+- Exactly **one** SQLite database (`.cache/yaw.db`) houses all state ([`docs/adr/ADR-004.md`](file:///home/harri/yaw/docs/adr/ADR-004.md)).
 - There are no separate databases for chunks, vectors, and graphs.
 - Zero external graph servers or background daemons (Neo4j, Blazegraph, Virtuoso, Jena): SQLite relational tables and views act as the complete triple/quad store and vector store in-process ([`docs/rdf-owl-shacl.md`](file:///home/harri/yaw/docs/rdf-owl-shacl.md)). All RDF serialization (`rdflib`) and SHACL validation (`pyshacl`) execute in-process against this single database.
 - Concurrency and reliability are enforced by SQLite engine PRAGMAs:
@@ -152,7 +152,7 @@ To eliminate hallucinations, non-determinism, and memory bloat, YAW is bound to 
                                          ▼
   ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
   │ 2. STORAGE CONTRACTS & SQLITE QUAD SUBSTRATE (src/yaw/storage/db.py)                        │
-  │ • Single SQLite DB at sample-llm-wiki/.cache/vectors.db (WAL mode, busy_timeout=60000ms)    │
+  │ • Single SQLite DB at sample-llm-wiki/.cache/yaw.db (WAL mode, busy_timeout=60000ms)    │
   │ • Physical Extraction Tables: note_meta, note_chunks, wikilinks, leaf_nodes, leaf_relations│
   │ • Engine-Owned Tables: aliases, canon_verdicts, compiled_nodes, compiled_relations          │
   │ • Contentless FTS5: query_fts (contentless_delete=1) indexing headings and chunks           │
@@ -194,8 +194,7 @@ To eliminate hallucinations, non-determinism, and memory bloat, YAW is bound to 
 1. **Delta Tracking:** CocoIndex's Rust core filesystem watcher monitors `vault/raw/` recursively. File content hashes are maintained internally by CocoIndex; no manual document hash column is required in `note_meta`.
 2. **Deterministic Chunking:** Documents are split along semantic boundaries (default ~1000 characters with 150 overlap). Each chunk records:
    - `chunk_id`: sha256 digest of heading + content.
-   - `byte_offset` & `byte_length`: exact disk byte pointers.
-   - `line_start` & `line_end`: 1-based human-readable line ranges.
+   - `line_start` & `line_end`: 1-based human-readable line ranges for direct disk hydration.
 3. **Embedding:** Chunks are embedded using `embed-gemma-300m-FLM` formatted with the document title:
    `title: {doc_title} | text: {chunk_text}`.
 4. **Wikilink Extraction:** Regex parser extracts Obsidian `[[wikilinks]]`, mapping them to `wikilinks` records with source and target chunk pointers.
@@ -216,10 +215,10 @@ To eliminate hallucinations, non-determinism, and memory bloat, YAW is bound to 
    - **Zero LLM Adjudication:** 0 LLM calls during entity or predicate canonicalization; procedural pairwise adjudication and external Gemma embedding calls are completely eliminated.
 
 ### Component 2: Storage & Schema Contracts (`src/yaw/storage/db.py`)
-Single SQLite database at `sample-llm-wiki/.cache/vectors.db` governed by WAL pragmas:
+Single SQLite database at `sample-llm-wiki/.cache/yaw.db` governed by WAL pragmas:
 
 - **`note_meta`**: `(rel_path TEXT PRIMARY KEY, title TEXT, category TEXT, modified_at REAL)`.
-- **`note_chunks`**: `(entity_uri TEXT PRIMARY KEY, rel_path TEXT, heading TEXT, byte_offset INTEGER, byte_length INTEGER, line_start INTEGER, line_end INTEGER, ordinal INTEGER, chunk_id TEXT, embedding BLOB/JSON)`.
+- **`note_chunks`**: `(chunk_id TEXT PRIMARY KEY, entity_uri TEXT, rel_path TEXT, ordinal INTEGER, heading TEXT, heading_slug TEXT, line_start INTEGER, line_end INTEGER, embedding BLOB/JSON)`.
 - **`wikilinks`**: `(source_uri TEXT, target_uri TEXT, link_label TEXT, PRIMARY KEY(source_uri, target_uri))`.
 - **`leaf_nodes`**: `(node_id TEXT, source_leaf_id TEXT, name TEXT, namespace TEXT, definition TEXT, embedding BLOB/JSON, PRIMARY KEY(node_id, source_leaf_id))`.
 - **`leaf_relations`**: `(relation_id TEXT PRIMARY KEY, source_leaf_id TEXT, subject_id TEXT, predicate TEXT, object_id TEXT, weight REAL, predicate_id TEXT)`.
@@ -373,7 +372,7 @@ YAW implements the **Karpathy LLM-Wiki pattern** over FastMCP (Streamable HTTP `
 
 #### 2. Development & Diagnostic Probes (Internal / Debugging Only)
 - **`find_seed(query: str, top_k: int = 3) -> list[dict]`:** Inspects intermediate candidate generation prior to graph traversal.
-- **`read_document(path: str, byte_offset: int = 0, byte_length: int | None = None) -> str`:** Direct binary disk-seek reader for testing.
+- **`read_document(path: str, line_start: int | None = None, line_end: int | None = None) -> str`:** Direct line-based disk hydration reader for testing.
 - **`get_ontology_schema() -> dict`:** Low-level introspection tool returning database statistics, active taxonomy namespaces, and base predicates.
 
 ### Component 5: W3C Semantic Web Substrate (RDF, OWL, SKOS, SHACL)
@@ -476,7 +475,7 @@ yaw/
 │
 └── sample-llm-wiki/          # Canonical Reference Vault (Domain Knowledge Substrate)
     ├── raw/                  # User notes and external knowledge material (e.g. test-material/)
-    ├── .cache/               # Local SQLite database (vectors.db) and CocoIndex state
+    ├── .cache/               # Local SQLite database (yaw.db) and CocoIndex state
     └── wiki/                 # (Optional) Asynchronous materialized Markdown summaries
 ```
 

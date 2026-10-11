@@ -103,8 +103,6 @@ def _create_base_tables(conn: sqlite3.Connection) -> None:
             ordinal INT NOT NULL,
             heading TEXT,
             heading_slug TEXT,
-            byte_offset INT,
-            byte_length INT,
             line_start INT,
             line_end INT,
             embedding BLOB
@@ -126,10 +124,10 @@ def populated_db(tmp_path: Path) -> Generator[sqlite3.Connection]:
     # 1. Chunks
     conn.execute(
         """
-        INSERT INTO note_chunks (chunk_id, entity_uri, rel_path, ordinal, heading, heading_slug, byte_offset, byte_length, line_start, line_end)
+        INSERT INTO note_chunks (chunk_id, entity_uri, rel_path, ordinal, heading, heading_slug, line_start, line_end)
         VALUES
-        ('c0', 'raw/transformers.md#chunk:0', 'raw/transformers.md', 0, 'Self-Attention Mechanism', 'self-attention-mechanism', 0, 100, 1, 10),
-        ('c1', 'raw/transformers.md#chunk:1', 'raw/transformers.md', 1, 'Multi-Head Projection', 'multi-head-projection', 101, 200, 11, 20)
+        ('c0', 'raw/transformers.md#chunk:0', 'raw/transformers.md', 0, 'Self-Attention Mechanism', 'self-attention-mechanism', 1, 10),
+        ('c1', 'raw/transformers.md#chunk:1', 'raw/transformers.md', 1, 'Multi-Head Projection', 'multi-head-projection', 11, 20)
         """
     )
 

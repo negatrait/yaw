@@ -16,7 +16,7 @@ The early 2.0.0 prototype outlined preliminary invariants and table definitions 
 | Legacy Prototype Feature | Authoritative Production Architecture | Key Reference |
 | :--- | :--- | :--- |
 | 5 Invariants | **7 System Invariants** (added Invariant 6: Real Testing, Invariant 7: SSOT) | [`FOUNDATIONAL.md §2`](file:///home/harri/yaw/FOUNDATIONAL.md#2-the-seven-invariants-of-yaw) |
-| Multiple DB files (`vault_knowledge.db`) | **Single in-process database (`.cache/vectors.db`)** | [`FOUNDATIONAL.md §2 Invariant 3`](file:///home/harri/yaw/FOUNDATIONAL.md) |
+| Multiple DB files (`vault_knowledge.db`) | **Single in-process database (`.cache/yaw.db`)** | [`FOUNDATIONAL.md §2 Invariant 3`](file:///home/harri/yaw/FOUNDATIONAL.md) |
 | `raw_documents` and `raw_chunks` tables | **`note_meta` and `note_chunks` with byte pointers** | [`FOUNDATIONAL.md §5.2`](file:///home/harri/yaw/FOUNDATIONAL.md) |
 | Hardcoded `is_a` / `part_of` relations | **14 Canonical Base Predicates & W3C Semantic Alignment** | [`docs/adr/ADR-008.md`](file:///home/harri/yaw/docs/adr/ADR-008.md) |
 | Singular `concept:` namespace | **9 Plural Root Namespaces (`concepts:`, etc.)** | [`docs/adr/ADR-005.md`](file:///home/harri/yaw/docs/adr/ADR-005.md) |

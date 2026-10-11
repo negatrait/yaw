@@ -36,7 +36,7 @@ raw: dict = {}
 
 # Module-level attribute declarations for static analysis (ruff, ty)
 VAULT_ROOT: Path = Path.cwd()
-DB_PATH: Path = Path.cwd() / ".cache" / "vectors.db"
+DB_PATH: Path = Path.cwd() / ".cache" / "yaw.db"
 PID_FILE: Path = Path.cwd() / ".cache" / "yaw.pid"
 HTTP_HOST: str = "127.0.0.1"
 HTTP_PORT: int = 8765
@@ -137,7 +137,7 @@ def _populate_paths(
 
     dp = Path(
         os.environ.get(
-            "YAW_DB_PATH", raw.get("storage", {}).get("db_path", ".cache/vectors.db")
+            "YAW_DB_PATH", raw.get("storage", {}).get("db_path", ".cache/yaw.db")
         )
     )
     g["DB_PATH"] = (

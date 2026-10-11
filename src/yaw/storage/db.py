@@ -43,6 +43,7 @@ __all__ = [
     "search_fts",
     "serialize_embedding",
     "set_alias_status",
+    "vacuum_db",
     "verify_schema_integrity",
 ]
 
@@ -66,7 +67,46 @@ def clean_db(db_path: Path | None = None) -> None:
     """Safely unlink SQLite database and associated WAL/SHM journaling artifacts."""
     target = db_path or config.DB_PATH
     for p in (target, Path(f"{target}-wal"), Path(f"{target}-shm")):
-        p.unlink(missing_ok=True)
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
+    if target.is_file():
+        try:
+            with sqlite3.connect(
+                str(target), autocommit=True, timeout=config.CONNECT_TIMEOUT_S
+            ) as conn:
+                conn.execute("PRAGMA foreign_keys = OFF;")
+                views = [
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'view'"
+                    ).fetchall()
+                ]
+                for v in views:
+                    conn.execute(f"DROP VIEW IF EXISTS {v};")
+                tables = [
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+                    ).fetchall()
+                ]
+                for t in tables:
+                    conn.execute(f"DROP TABLE IF EXISTS {t};")
+                conn.execute("VACUUM;")
+        except (sqlite3.DatabaseError, OSError):
+            pass
+
+
+def vacuum_db(db_path: Path | str | None = None) -> None:
+    """Execute VACUUM on the database to reclaim free space and defragment."""
+    target = Path(db_path) if db_path else config.DB_PATH
+    if not target.is_file():
+        return
+    with sqlite3.connect(
+        str(target), autocommit=True, timeout=config.CONNECT_TIMEOUT_S
+    ) as conn:
+        conn.execute("VACUUM;")
 
 
 def insert_alias(

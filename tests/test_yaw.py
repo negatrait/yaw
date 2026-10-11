@@ -49,8 +49,10 @@ async def test_mcp_server_metadata_and_tools():
     rd_tool = await mcp.get_tool("read_document")
     assert rd_tool is not None
     assert "path" in rd_tool.parameters["properties"]
-    assert "byte_offset" in rd_tool.parameters["properties"]
-    assert "byte_length" in rd_tool.parameters["properties"]
+    assert "line_start" in rd_tool.parameters["properties"]
+    assert "line_end" in rd_tool.parameters["properties"]
+    assert "byte_offset" not in rd_tool.parameters["properties"]
+    assert "byte_length" not in rd_tool.parameters["properties"]
 
     os_tool = await mcp.get_tool("get_ontology_schema")
     assert os_tool is not None
@@ -70,8 +72,8 @@ async def test_find_seed_fastmcp_client_integration():
                 "kind": "chunk",
                 "rel_path": "raw/test-material/test-document.md",
                 "heading": "Testing Intent",
-                "byte_offset": 0,
-                "byte_length": 58,
+                "line_start": 1,
+                "line_end": 1,
                 "hybrid_prob": 0.85,
                 "rerank_score": 0.92,
                 "text": "Allways test the real source code, never do soft mocking.",
@@ -101,8 +103,8 @@ async def test_find_seed_fastmcp_client_integration():
                 "kind",
                 "rel_path",
                 "heading",
-                "byte_offset",
-                "byte_length",
+                "line_start",
+                "line_end",
                 "hybrid_prob",
                 "rerank_score",
                 "text",
@@ -114,10 +116,10 @@ async def test_find_seed_fastmcp_client_integration():
             assert seed["kind"] == "chunk"
             assert seed["rel_path"] == "raw/test-material/test-document.md"
             assert seed["heading"] == "Testing Intent"
-            assert isinstance(seed["byte_offset"], int)
-            assert seed["byte_offset"] == 0
-            assert isinstance(seed["byte_length"], int)
-            assert seed["byte_length"] == 58
+            assert isinstance(seed["line_start"], int)
+            assert seed["line_start"] == 1
+            assert isinstance(seed["line_end"], int)
+            assert seed["line_end"] == 1
             assert isinstance(seed["hybrid_prob"], float)
             assert seed["hybrid_prob"] == 0.85
             assert isinstance(seed["rerank_score"], float)
@@ -137,8 +139,8 @@ async def test_find_seed_fastmcp_client_integration():
                 "read_document",
                 {
                     "path": "raw/test-material/test-document.md",
-                    "byte_offset": 0,
-                    "byte_length": 15,
+                    "line_start": 1,
+                    "line_end": 1,
                 },
             )
             assert res_read.data is not None
@@ -179,7 +181,7 @@ async def test_find_seed_pipeline_math_and_summed_probability(tmp_path):
     )
     note2.write_text(note2_text, encoding="utf-8")
 
-    db_path = cache_dir / "vectors.db"
+    db_path = cache_dir / "yaw.db"
     with sqlite3.connect(db_path) as conn:
         conn.execute(
             "CREATE TABLE note_meta (rel_path TEXT PRIMARY KEY, title TEXT, category TEXT, modified_at REAL)"
@@ -193,21 +195,19 @@ async def test_find_seed_pipeline_math_and_summed_probability(tmp_path):
 
         conn.execute(
             "CREATE TABLE note_chunks (chunk_id TEXT, entity_uri TEXT PRIMARY KEY, rel_path TEXT, ordinal INTEGER, "
-            "heading TEXT, heading_slug TEXT, byte_offset INTEGER, byte_length INTEGER, line_start INTEGER, line_end INTEGER, "
+            "heading TEXT, heading_slug TEXT, line_start INTEGER, line_end INTEGER, "
             "embedding BLOB)"
         )
-        b1 = note1_text.encode("utf-8")
-        b2 = note2_text.encode("utf-8")
         dummy_vec1 = np.ones(768, dtype=np.float32).tobytes()
         dummy_vec2 = np.zeros(768, dtype=np.float32).tobytes()
 
         conn.execute(
-            "INSERT INTO note_chunks VALUES ('c1', 'raw/note1.md#chunk:0', 'raw/note1.md', 0, 'Physics', 'physics', 0, ?, 1, 2, ?)",
-            (len(b1), dummy_vec1),
+            "INSERT INTO note_chunks VALUES ('c1', 'raw/note1.md#chunk:0', 'raw/note1.md', 0, 'Physics', 'physics', 1, 2, ?)",
+            (dummy_vec1,),
         )
         conn.execute(
-            "INSERT INTO note_chunks VALUES ('c2', 'raw/note2.md#chunk:0', 'raw/note2.md', 0, 'Biology', 'biology', 0, ?, 1, 2, ?)",
-            (len(b2), dummy_vec2),
+            "INSERT INTO note_chunks VALUES ('c2', 'raw/note2.md#chunk:0', 'raw/note2.md', 0, 'Biology', 'biology', 1, 2, ?)",
+            (dummy_vec2,),
         )
 
         conn.execute(
@@ -234,16 +234,16 @@ async def test_find_seed_pipeline_math_and_summed_probability(tmp_path):
                 "entity_uri": "raw/note1.md#chunk:0",
                 "rel_path": "raw/note1.md",
                 "heading": "Physics",
-                "byte_offset": 0,
-                "byte_length": len(b1),
+                "line_start": 1,
+                "line_end": 2,
                 "sim": 0.90,
             },
             {
                 "entity_uri": "raw/note2.md#chunk:0",
                 "rel_path": "raw/note2.md",
                 "heading": "Biology",
-                "byte_offset": 0,
-                "byte_length": len(b2),
+                "line_start": 1,
+                "line_end": 2,
                 "sim": 0.10,
             },
         ]
@@ -273,20 +273,19 @@ async def test_unified_vector_and_taxonomy_candidate_retrieval(tmp_path):
     note_file = raw_dir / "quantum.md"
     note_text = "# Quantum Mechanics\nWerner Heisenberg developed matrix mechanics."
     note_file.write_text(note_text, encoding="utf-8")
-    b_text = note_text.encode("utf-8")
 
-    db_path = cache_dir / "vectors.db"
+    db_path = cache_dir / "yaw.db"
     dummy_vec = np.ones(768, dtype=np.float32).tobytes()
 
     with sqlite3.connect(db_path) as conn:
         conn.execute(
             "CREATE TABLE note_chunks (chunk_id TEXT, entity_uri TEXT PRIMARY KEY, rel_path TEXT, ordinal INTEGER, "
-            "heading TEXT, heading_slug TEXT, byte_offset INTEGER, byte_length INTEGER, line_start INTEGER, line_end INTEGER, "
+            "heading TEXT, heading_slug TEXT, line_start INTEGER, line_end INTEGER, "
             "embedding BLOB)"
         )
         conn.execute(
-            "INSERT INTO note_chunks VALUES ('c1', 'raw/quantum.md#chunk:0', 'raw/quantum.md', 0, 'Quantum', 'quantum', 0, ?, 1, 2, ?)",
-            (len(b_text), dummy_vec),
+            "INSERT INTO note_chunks VALUES ('c1', 'raw/quantum.md#chunk:0', 'raw/quantum.md', 0, 'Quantum', 'quantum', 1, 2, ?)",
+            (dummy_vec,),
         )
 
         conn.execute(
@@ -337,24 +336,24 @@ async def test_unified_vector_and_taxonomy_candidate_retrieval(tmp_path):
 
 
 def test_hydrate_disk_slice_edge_cases(tmp_path):
-    """Verify hydrate_disk_slice handles missing files, empty reads, and valid byte offsets."""
+    """Verify hydrate_disk_slice handles missing files, empty reads, and valid line slices."""
     old_root = config.VAULT_ROOT
     try:
         config.set_vault(tmp_path)
         # Missing file
-        assert hydrate_disk_slice("missing.md", 0, 100) == ""
+        assert hydrate_disk_slice("missing.md", 1, 100) == ""
 
         # Valid file
         test_file = tmp_path / "sample.md"
-        content = "Hello, zero-copy GraphRAG!"
+        content = "Line 1: Header\nLine 2: Hello, zero-copy GraphRAG!\nLine 3: Footer\n"
         test_file.write_text(content, encoding="utf-8")
 
         # Read slice
-        slice_text = hydrate_disk_slice("sample.md", 7, 9)
-        assert slice_text == "zero-copy"
+        slice_text = hydrate_disk_slice("sample.md", 2, 2)
+        assert slice_text == "Line 2: Hello, zero-copy GraphRAG!\n"
 
         # Out of bounds / seek beyond EOF
-        assert hydrate_disk_slice("sample.md", 1000, 10) == ""
+        assert hydrate_disk_slice("sample.md", 1000, 1010) == ""
     finally:
         config.set_vault(old_root)
 

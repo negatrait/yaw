@@ -17,7 +17,7 @@
 YAW is an autonomous, local-first GraphRAG engine combining **Cocoindex**, **spaCy + spacy-llm**, **SQLite** (`fts5` + `sqlite-vec`), and **SciPy** (Personalized PageRank through the ontology layer) served via **FastMCP**.
 
 ### The 4-Tier Semantic Stack
-1. **Tier 1: SQLite In-Process Quad Substrate (`.cache/vectors.db`)**
+1. **Tier 1: SQLite In-Process Quad Substrate (`.cache/yaw.db`)**
    - Single-stage continuous ingestion DAG storing byte offsets and contentless FTS5 indexes.
    - Dynamic views ([`unified_edges`](file:///home/harri/yaw/src/yaw/storage/db.py#L85-L168), [`unified_nodes`](file:///home/harri/yaw/src/yaw/storage/db.py#L170-L200)) mapping 5-column named quads `(src_id, dst_id, rel_type, weight, source_chunk_id)`.
    - Engine-owned [`aliases`](file:///home/harri/yaw/src/yaw/storage/db.py#L44-L60) table providing reversible canonicalization without mutating raw extractions.

@@ -31,15 +31,14 @@ def _build_test_sqlite_db(db_path: Path) -> sqlite3.Connection:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS note_chunks (
-            entity_uri TEXT PRIMARY KEY,
+            chunk_id TEXT PRIMARY KEY,
+            entity_uri TEXT,
             rel_path TEXT,
+            ordinal INT,
             heading TEXT,
-            byte_offset INT,
-            byte_length INT,
+            heading_slug TEXT,
             line_start INT,
             line_end INT,
-            ordinal INT,
-            chunk_id TEXT,
             embedding BLOB
         );
         """

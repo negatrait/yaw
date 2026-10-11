@@ -18,7 +18,7 @@ Your mission is to create a FastMCP Cocoindex LLM-Wiki indexer + Ontology GraphR
 The repository is Python 3, with `uv` package manager.
 - **FastMCP** for the MCP interface.
 	- **Scipy** for PPR GraphRAG ranking through the ontology layer
-- **Cocoindex** for Single-Stage continuous indexing, chunking, and embedding the `raw/` notes into SQLite (`vectors.db`).
+- **Cocoindex** for Single-Stage continuous indexing, chunking, and embedding the `raw/` notes into SQLite (`yaw.db`).
 	- **spacy-llm** with Pydantic for extracting leaf ontologies, named entities, and Open IE relations.
 - **Cocoindex & SQLite Views** for instant global interconnection (`unified_edges`, `unified_nodes`) and optional compiled wiki materialization (`vault/wiki/`).
 

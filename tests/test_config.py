@@ -126,7 +126,7 @@ def test_set_vault_and_port(tmp_path: Path) -> None:
     vault.mkdir()
     config.set_vault(vault)
     assert config.VAULT_ROOT == vault.resolve()
-    assert config.DB_PATH == (vault / ".cache" / "vectors.db").resolve()
+    assert config.DB_PATH == (vault / ".cache" / "yaw.db").resolve()
 
     config.set_port(9999)
     assert config.HTTP_PORT == 9999

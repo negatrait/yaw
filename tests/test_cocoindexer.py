@@ -17,16 +17,12 @@ def test_disk_first_chunking_offsets_and_lines():
     sample = "# Main Title\n\nParagraph 1.\n\n## Subheading\n\nLine 1\nLine 2\n"
     chunks = chunk_markdown(sample)
     assert len(chunks) >= 1
-    raw_bytes = sample.encode("utf-8")
+    lines = sample.splitlines(keepends=True)
     for c in chunks:
-        assert c.byte_offset >= 0
-        assert c.byte_length > 0
         assert c.line_start >= 1
         assert c.line_end >= c.line_start
-        slice_text = raw_bytes[c.byte_offset : c.byte_offset + c.byte_length].decode(
-            "utf-8"
-        )
-        assert slice_text == c.text
+        slice_text = "".join(lines[c.line_start - 1 : c.line_end])
+        assert slice_text.rstrip("\r\n") == c.text.rstrip("\r\n")
 
 
 def test_cocoindexer_invariants_disk_first_and_contentless_fts(tmp_path):
@@ -41,7 +37,7 @@ def test_cocoindexer_invariants_disk_first_and_contentless_fts(tmp_path):
 
         sync_vault(vault_dir=tmp_path, force=True)
 
-        db_path = tmp_path / ".cache" / "vectors.db"
+        db_path = tmp_path / ".cache" / "yaw.db"
         assert db_path.exists()
 
         with sqlite3.connect(db_path) as conn:
@@ -50,23 +46,23 @@ def test_cocoindexer_invariants_disk_first_and_contentless_fts(tmp_path):
                 r[1] for r in conn.execute("PRAGMA table_info(note_chunks)").fetchall()
             ]
             assert "content" not in cols, "note_chunks MUST NEVER store raw chunk text"
-            for req in ("byte_offset", "byte_length", "line_start", "line_end"):
+            assert "byte_offset" not in cols, "note_chunks MUST NOT store byte_offset"
+            assert "byte_length" not in cols, "note_chunks MUST NOT store byte_length"
+            for req in ("line_start", "line_end"):
                 assert req in cols, f"note_chunks missing {req}"
 
             rows = conn.execute(
-                "SELECT chunk_id, entity_uri, rel_path, byte_offset, byte_length, line_start, line_end FROM note_chunks"
+                "SELECT chunk_id, entity_uri, rel_path, line_start, line_end FROM note_chunks"
             ).fetchall()
             assert len(rows) > 0
             for r in rows:
-                assert r[3] >= 0
-                assert r[4] > 0
-                assert r[5] >= 1
-                assert r[6] >= r[5]
+                assert r[3] >= 1
+                assert r[4] >= r[3]
 
             # 2. Disk-first hydration verification
             for r in rows:
-                _uri, rel, b_off, b_len = r[1], r[2], r[3], r[4]
-                text = hydrate_disk_slice(rel, b_off, b_len)
+                _uri, rel, l_start, l_end = r[1], r[2], r[3], r[4]
+                text = hydrate_disk_slice(rel, l_start, l_end)
                 assert "Heisenberg" in text
 
             # 3. Invariant: contentless query_fts

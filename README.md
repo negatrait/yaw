@@ -15,7 +15,7 @@ yaw is an autonomous, local-first GraphRAG engine combining **Cocoindex**, **spa
 
 ## Architecture
 
-The system operates via single-stage continuous ingestion into a single SQLite database SSOT (`.cache/vectors.db`), providing instant global interconnection without multi-stage staging barriers:
+The system operates via single-stage continuous ingestion into a single SQLite database SSOT (`.cache/yaw.db`), providing instant global interconnection without multi-stage staging barriers:
 
 ```mermaid
 flowchart TD
@@ -32,7 +32,7 @@ flowchart TD
         Leaf -->|EDC Self-Canonicalization| Aliases[aliases & canon_verdicts]
     end
 
-    subgraph Storage [Single SQLite Database SSOT: vectors.db]
+    subgraph Storage [Single SQLite Database SSOT: yaw.db]
         Vec & FTS & Leaf & Aliases --> Views["Views: unified_edges & unified_nodes"]
     end
 
@@ -57,7 +57,7 @@ CocoIndex continuously monitors `vault/raw/` for markdown file modifications and
 - **LLM-Primary Entity Extraction:** `en_core_web_sm` is loaded with `exclude=['ner']`; `spacy.NER.v3` (Qwen) runs as the primary extractor on every chunk across 8 non-predicate categories (`entities`, `concepts`, `claims`, `invariants`, `decisions`, `processes`, `sources`, `contexts`).
 - **Markdown Structure:** Code spans are annotated in `doc.spans["code"]` and filtered exclusively in `leaf_taxonomy_compiler`.
 - **Open IE Relations:** `spacy.REL.v1` extracts unconstrained relations into `doc._.rel`; predicates are normalized via `Token.lemma_`.
-- **Span-Offset Provenance:** Entities carry disk byte offsets into the raw note: `chunk.byte_offset + len(chunk_text[:ent.start_char].encode("utf-8"))`.
+- **Line-Range Provenance:** Chunks carry 1-indexed line numbers (`line_start`, `line_end`) into the raw note for zero-copy on-demand disk hydration.
 
 ### 2. Ontological Convergence (EDC Self-Canonicalization)
 Prevents vocabulary fragmentation (synonyms, misspellings, spacing variants) across an append-only corpus:
@@ -157,7 +157,7 @@ uv run python yaw.py schema --vault /path/to/vault
 
 #### Developer Probes
 - `find_seed(query: str, top_k: int = 3) -> list[dict]`: Stage 1 seed generator returning top FTS BM25 and vector hits.
-- `read_document(path: str, byte_offset: int = 0, byte_length: int | None = None) -> str`: Zero-copy byte slice reader into `vault/raw/`.
+- `read_document(path: str, line_start: int | None = None, line_end: int | None = None) -> str`: Zero-copy line-based slice reader into `vault/raw/`.
 - `get_ontology_schema() -> dict`: Returns active namespaces, base predicates, and graph node/edge counts.
 
 ---
@@ -174,7 +174,7 @@ port = 8765
 [vault]
 raw_dir = "raw"
 wiki_dir = "wiki"
-db_path = ".cache/vectors.db"
+db_path = ".cache/yaw.db"
 
 [models]
 embedding_model = "embed-gemma-300m-FLM"

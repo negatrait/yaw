@@ -468,10 +468,10 @@ def test_invariant_e1_e2_store_chunk_concept_edges_provenance_and_no_fallback():
 
     chunks = [
         MarkdownChunk(
-            "c0", "H0", "h0", "Alpha text with no concept name.", 0, 0, 32, 1, 2
+            "c0", "H0", "h0", "Alpha text with no concept name.", 0, 1, 2
         ),
         MarkdownChunk(
-            "c1", "H1", "h1", "Beta text contains Encoder clearly.", 1, 33, 35, 3, 4
+            "c1", "H1", "h1", "Beta text contains Encoder clearly.", 1, 3, 4
         ),
         MarkdownChunk(
             "c2",
@@ -479,8 +479,6 @@ def test_invariant_e1_e2_store_chunk_concept_edges_provenance_and_no_fallback():
             "h2",
             "Gamma text with completely unrelated content.",
             2,
-            69,
-            45,
             5,
             6,
         ),

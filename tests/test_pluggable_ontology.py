@@ -115,22 +115,21 @@ ex:PunningViolation a owl:Class, skos:Concept ;
 @pytest.fixture
 def real_disk_db(tmp_path: Path) -> Generator[sqlite3.Connection]:
     """Unmocked real SQLite database on disk with WAL pragmas per Invariant 6."""
-    db_file = tmp_path / "vectors.db"
+    db_file = tmp_path / "yaw.db"
     conn = sqlite3.connect(str(db_file))
     apply_pragmas(conn)
 
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS note_chunks (
-            entity_uri TEXT PRIMARY KEY,
+            chunk_id TEXT PRIMARY KEY,
+            entity_uri TEXT,
             rel_path TEXT,
+            ordinal INT,
             heading TEXT,
-            byte_offset INT,
-            byte_length INT,
+            heading_slug TEXT,
             line_start INT,
             line_end INT,
-            ordinal INT,
-            chunk_id TEXT,
             embedding BLOB
         );
         """
@@ -554,7 +553,7 @@ async def test_mcp_daemon_extraction_and_ontology_tools(tmp_path: Path) -> None:
     """Verify FastMCP set_extraction_mode (<5ms) and load_ontology tools."""
     from yaw.server.daemon import load_ontology, set_extraction_mode
 
-    db_path = tmp_path / "vectors.db"
+    db_path = tmp_path / "yaw.db"
     conn = sqlite3.connect(str(db_path))
     apply_pragmas(conn)
     ensure_schema_views(conn)

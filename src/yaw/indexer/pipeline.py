@@ -96,8 +96,6 @@ class NoteChunkRow:
     ordinal: int
     heading: str
     heading_slug: str
-    byte_offset: int
-    byte_length: int
     line_start: int
     line_end: int
     embedding: list[float]
@@ -140,8 +138,6 @@ class MarkdownChunk(NamedTuple):
     heading_slug: str
     text: str
     ordinal: int
-    byte_offset: int
-    byte_length: int
     line_start: int
     line_end: int
 
@@ -176,14 +172,10 @@ def chunk_markdown(content: str) -> list[MarkdownChunk]:
             cur_h = h.group(1).strip()
         cid = hashlib.sha256(f"{cur_h}\n{c.text}".encode()).hexdigest()[:16]
 
-        if hasattr(c.start, "byte_offset"):
-            b_off = c.start.byte_offset
-            b_len = c.end.byte_offset - c.start.byte_offset
+        if hasattr(c.start, "line"):
             l_start = c.start.line
             l_end = c.end.line
         else:
-            b_off = len(content[: c.start].encode("utf-8"))
-            b_len = len(c.text.encode("utf-8"))
             l_start = content[: c.start].count("\n") + 1
             l_end = l_start + c.text.count("\n")
 
@@ -194,8 +186,6 @@ def chunk_markdown(content: str) -> list[MarkdownChunk]:
                 heading_slug=slugify(cur_h),
                 text=c.text,
                 ordinal=ord_idx,
-                byte_offset=b_off,
-                byte_length=b_len,
                 line_start=l_start,
                 line_end=l_end,
             )
@@ -630,8 +620,6 @@ async def _declare_chunk_embeddings(
                 ordinal=c.ordinal,
                 heading=c.heading,
                 heading_slug=c.heading_slug,
-                byte_offset=c.byte_offset,
-                byte_length=c.byte_length,
                 line_start=c.line_start,
                 line_end=c.line_end,
                 embedding=vec.tolist(),
@@ -874,14 +862,14 @@ def sync_vault(
                 close_err,
             )
 
-    # Invariant: vectors.db and cocoindex LMDB cache must be synchronized.
+    # Invariant: yaw.db and cocoindex LMDB cache must be synchronized.
     # If one exists without the other, or if force is requested, re-initialize cleanly.
     if force or (db_exists != has_coco_cache):
         clean_db(config.DB_PATH)
         if cache_path.exists():
             shutil.rmtree(cache_path, ignore_errors=True)
         if verbose:
-            sys.stderr.write("[clean-rebuild] Wiped vectors.db and cocoindex cache.\n")
+            sys.stderr.write("[clean-rebuild] Wiped yaw.db and cocoindex cache.\n")
 
     if _active_managed_conn is not None:
         config.DB_PATH.parent.mkdir(parents=True, exist_ok=True)

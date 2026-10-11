@@ -388,6 +388,23 @@ def ensure_schema_views(conn: sqlite3.Connection) -> None:
         weight_col = "lr.weight AS weight" if "weight" in lr_cols else "1.0 AS weight"
         conn.execute(UNIFIED_EDGES_VIEW_TEMPLATE.format(weight_col=weight_col))
 
+    if "note_chunks" in tables:
+        nc_cols = {
+            r[1] for r in conn.execute("PRAGMA table_info(note_chunks)").fetchall()
+        }
+        migrated_nc = False
+        if "byte_offset" in nc_cols:
+            conn.execute("ALTER TABLE note_chunks DROP COLUMN byte_offset;")
+            migrated_nc = True
+        if "byte_length" in nc_cols:
+            conn.execute("ALTER TABLE note_chunks DROP COLUMN byte_length;")
+            migrated_nc = True
+        if migrated_nc:
+            try:
+                conn.execute("VACUUM;")
+            except sqlite3.OperationalError:
+                pass
+
     if "note_chunks" in tables and "leaf_nodes" in tables:
         conn.execute("DROP VIEW IF EXISTS unified_nodes")
         conn.execute(UNIFIED_NODES_VIEW_SQL)

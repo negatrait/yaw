@@ -6,7 +6,7 @@ port = 8765         # FastMCP host port
 
 [storage]
 vault_root = "sample-llm-wiki"         # '/dir' for absolute, 'dir' for relative to yaw.py
-db_path = ".cache/vectors.db"   # path to sqlite db (relative to yaw.py)
+db_path = ".cache/yaw.db"   # path to sqlite db (relative to yaw.py)
 busy_timeout_s = 60.0           # SQLite busy timeout in seconds
 connect_timeout_s = 60.0        # SQLite connect timeout in seconds
 journal_mode = "WAL"            # SQLite journal mode

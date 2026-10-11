@@ -21,15 +21,23 @@ if sys.platform == "win32":
     LOCK_UN = 8
 
     def flock(fd: int, operation: int) -> None:
-        """Cross-platform flock emulation using msvcrt on Windows."""
+        """Cross-platform flock emulation using msvcrt on Windows.
+
+        Locks byte offset 1024 to provide mutual exclusion without blocking
+        readers from inspecting PID text at byte 0.
+        """
         try:
-            os.lseek(fd, 0, os.SEEK_SET)
-            if operation & LOCK_UN:
-                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-            elif operation & LOCK_NB:
-                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-            else:
-                msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+            cur_pos = os.lseek(fd, 0, os.SEEK_CUR)
+            os.lseek(fd, 1024, os.SEEK_SET)
+            try:
+                if operation & LOCK_UN:
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                elif operation & LOCK_NB:
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                else:
+                    msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+            finally:
+                os.lseek(fd, cur_pos, os.SEEK_SET)
         except OSError as err:
             raise BlockingIOError(err.errno, err.strerror) from err
 else:
@@ -180,15 +188,15 @@ async def compile_wiki(
 
 
 def _resolve_vault_db_path(vault_dir: str | None) -> Path:
-    """Resolve vectors.db path from optional vault directory or config default."""
+    """Resolve yaw.db path from optional vault directory or config default."""
     if not vault_dir:
         return config.DB_PATH
     v_path = Path(vault_dir)
     if v_path.is_file():
         return v_path
-    if (v_path / "vectors.db").is_file():
-        return v_path / "vectors.db"
-    return v_path / ".cache" / "vectors.db"
+    if (v_path / "yaw.db").is_file():
+        return v_path / "yaw.db"
+    return v_path / ".cache" / "yaw.db"
 
 
 @mcp.tool()

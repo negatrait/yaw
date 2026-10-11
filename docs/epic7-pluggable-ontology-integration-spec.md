@@ -18,7 +18,7 @@ This specification defines the complete end-to-end integration of **Pluggable RD
 In strict adherence to the Ontologist's governing tenets, this design enforces:
 
 1. **SQLite Quad Substrate (Kurt Cagle's Threshold):**  
-   Zero external graph databases (no Neo4j, Jena Fuseki, GraphDB, or Virtuoso). All triple/quad storage, transitive closures, and identity mappings execute in-process via SQLite (`.cache/vectors.db`).
+   Zero external graph databases (no Neo4j, Jena Fuseki, GraphDB, or Virtuoso). All triple/quad storage, transitive closures, and identity mappings execute in-process via SQLite (`.cache/yaw.db`).
 2. **Zero Cache-Wipe Invariant (Lossless Leaf Storage):**  
    Extraction into `leaf_nodes` and `leaf_relations` is **lossless and immutable**. Closed-world filtering (`open_ie=false`) and ontology alignments execute downstream in SQLite views (`unified_edges`, `unified_nodes`) at query time (< 5 ms toggle). Toggling ontologies or switching extraction modes **never triggers vault-wide re-indexing or Gemma embedding cache wipes**.
 3. **Antonym-Guarded Predicate Normalization:**  
@@ -1314,10 +1314,10 @@ dico:isAdjacentTo a owl:ObjectProperty, owl:SymmetricProperty ;
 @pytest.fixture
 def real_disk_db(tmp_path: Path) -> sqlite3.Connection:
     """Unmocked real SQLite database on disk with WAL pragmas per Invariant 6."""
-    db_file = tmp_path / "vectors.db"
+    db_file = tmp_path / "yaw.db"
     conn = sqlite3.connect(str(db_file))
     apply_pragmas(conn)
-    conn.execute("CREATE TABLE note_chunks (entity_uri TEXT PRIMARY KEY, rel_path TEXT, heading TEXT, byte_offset INT, byte_length INT, line_start INT, line_end INT, ordinal INT, chunk_id TEXT, embedding BLOB);")
+    conn.execute("CREATE TABLE note_chunks (chunk_id TEXT PRIMARY KEY, entity_uri TEXT, rel_path TEXT, ordinal INT, heading TEXT, heading_slug TEXT, line_start INT, line_end INT, embedding BLOB);")
     conn.execute("CREATE TABLE wikilinks (source_uri TEXT, target_uri TEXT, link_label TEXT, PRIMARY KEY(source_uri, target_uri));")
     conn.execute("CREATE TABLE leaf_nodes (node_id TEXT, source_leaf_id TEXT, name TEXT, namespace TEXT, definition TEXT, embedding BLOB, PRIMARY KEY(node_id, source_leaf_id));")
     conn.execute("CREATE TABLE leaf_relations (relation_id TEXT PRIMARY KEY, source_leaf_id TEXT, subject_id TEXT, predicate TEXT, object_id TEXT, weight REAL, predicate_id TEXT);")

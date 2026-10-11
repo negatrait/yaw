@@ -421,7 +421,7 @@ def test_cold_start_empty_db_fallback_to_canonical_predicates(
 ) -> None:
     """Tier 1 / F3.2: Cold start with 0 rows in unified_edges falls back cleanly to static canonical examples."""
     factory = _get_canonical_examples_factory()
-    db_path = tmp_path / "vectors.db"
+    db_path = tmp_path / "yaw.db"
     callable_examples = factory(task="rel", max_examples=5, db_path=str(db_path))
     examples = callable_examples()
     assert len(examples) > 0, (
@@ -438,7 +438,7 @@ def test_live_seeding_enriches_predicates_from_unified_edges(
 ) -> None:
     """Tier 1 / F3.3: Active relations from unified_edges are queried and injected into few-shot examples."""
     factory = _get_canonical_examples_factory()
-    db_path = tmp_path / "vectors.db"
+    db_path = tmp_path / "yaw.db"
     callable_examples = factory(task="rel", max_examples=5, db_path=str(db_path))
     examples = callable_examples()
     relations_used = {
@@ -470,7 +470,7 @@ def test_live_seeding_deduplicates_and_preserves_canonical_precedence(
     test_db.commit()
 
     factory = _get_canonical_examples_factory()
-    db_path = tmp_path / "vectors.db"
+    db_path = tmp_path / "yaw.db"
     callable_examples = factory(task="rel", max_examples=5, db_path=str(db_path))
     examples = callable_examples()
     assert len(examples) <= 5
@@ -651,8 +651,8 @@ def test_invariant_e1_doc_text_equals_chunk_text() -> None:
     assert doc.text == sample_text, "doc.text must equal raw input text"
 
 
-def test_chunk_byte_offset_exact_seek_verification(tmp_path: Path) -> None:
-    """Tier 1 / F5.3: Byte offset seek on physical disk reproduces exact chunk text."""
+def test_chunk_line_range_exact_hydration_verification(tmp_path: Path) -> None:
+    """Tier 1 / F5.3: 1-indexed line hydration on physical disk reproduces exact chunk text."""
     note_file = tmp_path / "physical_seek_note.md"
     content = (
         "# Section Alpha\n\n"
@@ -665,14 +665,14 @@ def test_chunk_byte_offset_exact_seek_verification(tmp_path: Path) -> None:
     chunks = chunk_markdown(content)
     assert len(chunks) >= 2
 
-    with open(note_file, "rb") as f:
-        for chunk in chunks:
-            f.seek(chunk.byte_offset)
-            raw_bytes = f.read(chunk.byte_length)
-            decoded = raw_bytes.decode("utf-8")
-            assert decoded == chunk.text, (
-                f"Physical byte seek failed on chunk {chunk.chunk_id}"
-            )
+    lines = content.splitlines(keepends=True)
+    for chunk in chunks:
+        assert chunk.line_start >= 1
+        assert chunk.line_end >= chunk.line_start
+        hydrated = "".join(lines[chunk.line_start - 1 : chunk.line_end])
+        assert hydrated.rstrip("\r\n") == chunk.text.rstrip("\r\n"), (
+            f"Line hydration failed on chunk {chunk.chunk_id}"
+        )
 
 
 def test_entity_character_spans_anchor_exact_substrings() -> None:
@@ -721,7 +721,7 @@ def test_canon_fewshot_max_cap_enforcement(
     assert canon_max <= 5, "CANON_FEWSHOT_MAX must be <= 5 to prevent context bloating"
 
     factory = _get_canonical_examples_factory()
-    db_path = tmp_path / "vectors.db"
+    db_path = tmp_path / "yaw.db"
     callable_examples = factory(
         task="rel", max_examples=canon_max, db_path=str(db_path)
     )
@@ -748,7 +748,7 @@ def test_out_of_vocabulary_noisy_predicates_filtering(
     test_db.commit()
 
     factory = _get_canonical_examples_factory()
-    db_path = tmp_path / "vectors.db"
+    db_path = tmp_path / "yaw.db"
     callable_examples = factory(task="rel", max_examples=5, db_path=str(db_path))
     examples = callable_examples()
     for ex in examples:
@@ -961,7 +961,7 @@ def test_cold_start_vault_feedback_loop(
 ) -> None:
     """Tier 4 / S2: Cold-start empty vault dynamically enriches Stage 1 extraction few-shot prompt with newly seeded active vocabulary."""
     factory = _get_canonical_examples_factory()
-    db_path = tmp_path / "vectors.db"
+    db_path = tmp_path / "yaw.db"
 
     callable_init = factory(task="rel", max_examples=5, db_path=str(db_path))
     examples_init = callable_init()

@@ -425,7 +425,7 @@ def get_cli_env() -> dict[str, str]:
     env = os.environ.copy()
     src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src"))
     if "PYTHONPATH" in env:
-        env["PYTHONPATH"] = f"{src_dir}:{env['PYTHONPATH']}"
+        env["PYTHONPATH"] = f"{src_dir}{os.pathsep}{env['PYTHONPATH']}"
     else:
         env["PYTHONPATH"] = src_dir
     env["FASTMCP_SHOW_SERVER_BANNER"] = "false"
@@ -442,7 +442,7 @@ def test_db(tmp_path: Path) -> Generator[sqlite3.Connection]:
         load_vec_extension,
     )
 
-    db_path = tmp_path / "vectors.db"
+    db_path = tmp_path / "yaw.db"
     conn = sqlite3.connect(db_path)
     apply_pragmas(conn)
     load_vec_extension(conn)
@@ -492,8 +492,6 @@ def test_db(tmp_path: Path) -> Generator[sqlite3.Connection]:
             ordinal INT NOT NULL,
             heading TEXT,
             heading_slug TEXT,
-            byte_offset INT,
-            byte_length INT,
             line_start INT,
             line_end INT,
             embedding BLOB

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import logging
 import sqlite3
@@ -31,9 +32,9 @@ _QUERY_EMB_EXCEPTIONS = (
 
 
 def hydrate_disk_slice(
-    path: str, byte_offset: int = 0, byte_length: int | None = None
+    path: str, line_start: int | None = None, line_end: int | None = None
 ) -> str:
-    """Read chunk text slice strictly on demand from disk via binary seek."""
+    """Read chunk text slice strictly on demand from disk via 1-indexed line numbers."""
     target = Path(path)
     if not target.is_absolute():
         target = config.VAULT_ROOT / target
@@ -45,20 +46,35 @@ def hydrate_disk_slice(
     if not resolved.is_file():
         return ""
 
+    if (line_start is None and line_end is not None) or (
+        line_start is not None and line_end is None
+    ):
+        raise ValueError(
+            "Both line_start and line_end must be provided or both must be None"
+        )
+
+    if line_start is not None and line_end is not None:
+        if line_start < 1 or line_end < 1:
+            raise ValueError(
+                f"line_start ({line_start}) and line_end ({line_end}) must be >= 1"
+            )
+        if line_end < line_start:
+            raise ValueError(
+                f"line_end ({line_end}) must be >= line_start ({line_start})"
+            )
+
     try:
-        with resolved.open("rb") as f:
-            f.seek(byte_offset)
-            if byte_length is None:
-                raw = f.read()
-            else:
-                raw = f.read(byte_length)
-            return raw.decode("utf-8", errors="replace")
+        with resolved.open("r", encoding="utf-8", errors="replace") as f:
+            if line_start is None or line_end is None:
+                return f.read()
+            lines = list(itertools.islice(f, line_start - 1, line_end))
+            return "".join(lines)
     except (OSError, UnicodeDecodeError) as err:
         logger.warning(
-            "Failed to hydrate disk slice %s [%d:%s]: %s",
+            "Failed to hydrate disk slice %s [%s:%s]: %s",
             path,
-            byte_offset,
-            str(byte_length),
+            str(line_start),
+            str(line_end),
             err,
         )
         return ""
@@ -457,7 +473,7 @@ class GraphRAGRetriever:
         try:
             chunk_vec_hits = conn.execute(
                 """
-                SELECT entity_uri, rel_path, heading, byte_offset, byte_length,
+                SELECT entity_uri, rel_path, heading,
                        line_start, line_end, embedding,
                        vec_distance_cosine(embedding, ?) AS distance
                 FROM note_chunks
@@ -468,7 +484,7 @@ class GraphRAGRetriever:
             ).fetchall()
 
             for r in chunk_vec_hits:
-                uri, r_path, hd, b_off, b_len, l_start, l_end, emb_raw, dist = r
+                uri, r_path, hd, l_start, l_end, emb_raw, dist = r
                 try:
                     emb = deserialize_embedding(emb_raw)
                 except (ValueError, TypeError, json.JSONDecodeError) as err:
@@ -487,8 +503,6 @@ class GraphRAGRetriever:
                         "entity_uri": uri,
                         "rel_path": r_path,
                         "heading": hd,
-                        "byte_offset": b_off,
-                        "byte_length": b_len,
                         "line_start": l_start,
                         "line_end": l_end,
                         "embedding": emb,
@@ -580,19 +594,17 @@ class GraphRAGRetriever:
                 if not _is_chunk(entity_uri):
                     continue
                 row = conn.execute(
-                    "SELECT rel_path, heading, byte_offset, byte_length, line_start, line_end, embedding FROM note_chunks WHERE entity_uri = ?",
+                    "SELECT rel_path, heading, line_start, line_end, embedding FROM note_chunks WHERE entity_uri = ?",
                     (entity_uri,),
                 ).fetchone()
                 if row:
-                    r_path, hd_db, b_off, b_len, l_start, l_end, emb_raw = row
+                    r_path, hd_db, l_start, l_end, emb_raw = row
                     emb = deserialize_embedding(emb_raw) if emb_raw else None
                     cand_chunk_rows.append(
                         {
                             "entity_uri": entity_uri,
                             "rel_path": r_path,
                             "heading": hd or hd_db,
-                            "byte_offset": b_off,
-                            "byte_length": b_len,
                             "line_start": l_start,
                             "line_end": l_end,
                             "embedding": emb,
@@ -623,7 +635,7 @@ class GraphRAGRetriever:
         placeholders = ",".join("?" for _ in cand_uris)
         chunk_db_rows = conn.execute(
             f"""
-            SELECT entity_uri, rel_path, ordinal, heading, byte_offset, byte_length,
+            SELECT entity_uri, rel_path, ordinal, heading,
                    line_start, line_end, embedding
             FROM note_chunks
             WHERE entity_uri IN ({placeholders})
@@ -633,7 +645,7 @@ class GraphRAGRetriever:
 
         chunk_meta_by_uri: dict[str, dict[str, Any]] = {}
         for row in chunk_db_rows:
-            uri, r_path, ord_val, hd, b_off, b_len, l_start, l_end, emb_raw = row
+            uri, r_path, ord_val, hd, l_start, l_end, emb_raw = row
             try:
                 emb = deserialize_embedding(emb_raw)
             except (ValueError, TypeError, json.JSONDecodeError) as err:
@@ -646,8 +658,6 @@ class GraphRAGRetriever:
                 "rel_path": r_path,
                 "ordinal": ord_val,
                 "heading": hd,
-                "byte_offset": b_off,
-                "byte_length": b_len,
                 "line_start": l_start,
                 "line_end": l_end,
                 "embedding": emb,
@@ -791,7 +801,7 @@ class GraphRAGRetriever:
 
         for chunk in winning_chunks:
             chunk["text"] = hydrate_disk_slice(
-                chunk["rel_path"], chunk["byte_offset"], chunk["byte_length"]
+                chunk["rel_path"], chunk.get("line_start"), chunk.get("line_end")
             )
         return winning_chunks
 
@@ -933,48 +943,35 @@ def _fetch_chunk_candidates(
     """Fetch nearest note_chunks candidates in a single pass."""
     results: list[dict[str, Any]] = []
     try:
-        try:
-            rows = conn.execute(
-                "SELECT entity_uri, rel_path, heading, byte_offset, byte_length, "
-                "line_start, line_end, embedding, "
-                "vec_distance_cosine(embedding, ?) AS distance "
-                "FROM note_chunks WHERE embedding IS NOT NULL ORDER BY distance LIMIT ?",
-                (q_bytes, top_n),
-            ).fetchall()
-            has_lines = True
-        except sqlite3.OperationalError:
-            rows = conn.execute(
-                "SELECT entity_uri, rel_path, heading, byte_offset, byte_length, "
-                "embedding, "
-                "vec_distance_cosine(embedding, ?) AS distance "
-                "FROM note_chunks WHERE embedding IS NOT NULL ORDER BY distance LIMIT ?",
-                (q_bytes, top_n),
-            ).fetchall()
-            has_lines = False
+        rows = conn.execute(
+            "SELECT entity_uri, rel_path, heading, "
+            "line_start, line_end, embedding, "
+            "vec_distance_cosine(embedding, ?) AS distance "
+            "FROM note_chunks WHERE embedding IS NOT NULL ORDER BY distance LIMIT ?",
+            (q_bytes, top_n),
+        ).fetchall()
 
         for r in rows:
-            dist_raw = r[8] if has_lines else r[6]
+            dist_raw = r[6]
             if dist_raw is None:
                 continue
             dist = float(dist_raw)
             rel_path = str(r[1])
-            b_off = int(r[3])
-            b_len = int(r[4])
-            emb_raw = r[7] if has_lines else r[5]
+            l_start = int(r[3]) if r[3] is not None else None
+            l_end = int(r[4]) if r[4] is not None else None
+            emb_raw = r[5]
             results.append(
                 {
                     "entity_uri": str(r[0]),
                     "kind": "chunk",
                     "rel_path": rel_path,
                     "heading": str(r[2] or ""),
-                    "byte_offset": b_off,
-                    "byte_length": b_len,
-                    "line_start": int(r[5]) if has_lines and r[5] is not None else 0,
-                    "line_end": int(r[6]) if has_lines and r[6] is not None else 0,
+                    "line_start": l_start,
+                    "line_end": l_end,
                     "embedding": deserialize_embedding(emb_raw),
                     "dist": dist,
                     "sim": round(max(0.0, 1.0 - dist), 4),
-                    "text": hydrate_disk_slice(rel_path, b_off, b_len),
+                    "text": hydrate_disk_slice(rel_path, l_start, l_end),
                 }
             )
     except sqlite3.DatabaseError as db_err:
@@ -1011,10 +1008,8 @@ def _fetch_leaf_candidates(
                     "kind": "taxonomy",
                     "rel_path": str(r[1]),
                     "heading": heading,
-                    "byte_offset": 0,
-                    "byte_length": len(text.encode("utf-8")),
-                    "line_start": 0,
-                    "line_end": 0,
+                    "line_start": None,
+                    "line_end": None,
                     "embedding": deserialize_embedding(r[5]),
                     "dist": dist,
                     "sim": round(max(0.0, 1.0 - dist), 4),
@@ -1067,14 +1062,20 @@ def _get_candidate_metadata(
         should_close = True
     try:
         placeholders = ",".join("?" for _ in normalized_uris)
-        chunks: dict[str, tuple[str, str, int, int]] = {}
+        chunks: dict[str, tuple[str, str, int | None, int | None]] = {}
         try:
             chunk_rows = conn.execute(
-                f"SELECT entity_uri, rel_path, heading, byte_offset, byte_length FROM note_chunks WHERE entity_uri IN ({placeholders})",
+                f"SELECT entity_uri, rel_path, heading, line_start, line_end FROM note_chunks WHERE entity_uri IN ({placeholders})",
                 normalized_uris,
             ).fetchall()
             chunks = {
-                r[0]: (r[1], r[2] or "", int(r[3]), int(r[4])) for r in chunk_rows
+                r[0]: (
+                    r[1],
+                    r[2] or "",
+                    int(r[3]) if r[3] is not None else None,
+                    int(r[4]) if r[4] is not None else None,
+                )
+                for r in chunk_rows
             }
         except sqlite3.OperationalError:
             pass
@@ -1151,21 +1152,21 @@ def _hydrate_candidate_items(
     sorted_candidates: list[str],
     hybrid_scores: dict[str, float],
 ) -> list[dict[str, Any]]:
-    """Hydrate candidate items with text slices and byte offsets from disk or taxonomy."""
+    """Hydrate candidate items with text slices from disk or taxonomy."""
     chunks_meta, tax_meta = _get_candidate_metadata(sorted_candidates)
     candidate_items: list[dict[str, Any]] = []
     for u in sorted_candidates:
         if u in chunks_meta:
-            rel_path, heading, b_off, b_len = chunks_meta[u]
-            text = hydrate_disk_slice(rel_path, b_off, b_len)
+            rel_path, heading, l_start, l_end = chunks_meta[u]
+            text = hydrate_disk_slice(rel_path, l_start, l_end)
             candidate_items.append(
                 {
                     "entity_uri": u,
                     "kind": "chunk",
                     "rel_path": rel_path,
                     "heading": heading,
-                    "byte_offset": int(b_off),
-                    "byte_length": int(b_len),
+                    "line_start": l_start,
+                    "line_end": l_end,
                     "hybrid_prob": float(hybrid_scores[u]),
                     "text": text,
                 }
@@ -1178,8 +1179,8 @@ def _hydrate_candidate_items(
                     "kind": "taxonomy",
                     "rel_path": rel_path,
                     "heading": heading,
-                    "byte_offset": 0,
-                    "byte_length": len(text.encode("utf-8")),
+                    "line_start": None,
+                    "line_end": None,
                     "hybrid_prob": float(hybrid_scores[u]),
                     "text": text,
                 }

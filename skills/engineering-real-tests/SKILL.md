@@ -69,7 +69,7 @@ from yaw.storage.db import ensure_schema_views
 
 
 def test_composite_primary_key_and_unified_views(tmp_path: Path):
-    db_path = tmp_path / "test_vectors.db"
+    db_path = tmp_path / "test_yaw.db"
     conn = sqlite3.connect(str(db_path))
     ensure_schema_views(conn)
     cursor = conn.cursor()
@@ -118,24 +118,24 @@ from pathlib import Path
 from yaw.indexer.pipeline import chunk_markdown
 
 
-def test_byte_offset_seek_exactness(tmp_path: Path):
+def test_line_hydration_exactness(tmp_path: Path):
     note_file = tmp_path / "unicode_note.md"
     # Content with multi-byte UTF-8 characters (emoji, mathematical symbols)
-    content = "# Title\n\nSection with mathematical symbols: $\\alpha \\le 0.85$ and emoji 🧠.\n\n## Subheading\nSecond chunk text."
+    content = "# Title\n\nSection with mathematical symbols: $\\alpha \\le 0.85$ and emoji 🧠.\n\n## Subheading\nSecond chunk text.\n"
     note_file.write_text(content, encoding="utf-8")
 
     chunks = chunk_markdown(content, "unicode_note.md")
     assert len(chunks) >= 2
 
-    # Physical verification: read exact bytes from disk using calculated offsets
-    with open(note_file, "rb") as f:
-        for chunk in chunks:
-            f.seek(chunk.byte_offset)
-            read_bytes = f.read(chunk.byte_length)
-            decoded_text = read_bytes.decode("utf-8")
-            assert decoded_text == chunk.content, (
-                f"Byte seek mismatch on chunk {chunk.chunk_index}"
-            )
+    # Physical verification: read exact lines from disk using calculated line ranges
+    lines = content.splitlines(keepends=True)
+    for chunk in chunks:
+        assert chunk.line_start >= 1
+        assert chunk.line_end >= chunk.line_start
+        hydrated = "".join(lines[chunk.line_start - 1 : chunk.line_end])
+        assert hydrated.rstrip("\r\n") == chunk.text.rstrip("\r\n"), (
+            f"Line hydration mismatch on chunk {chunk.chunk_id}"
+        )
 ```
 
 ### Recipe 3: Real Localhost Loopback HTTP Mock (No Monkeypatching)

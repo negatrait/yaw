@@ -24,22 +24,21 @@ from yaw.storage.db import apply_pragmas, ensure_schema_views
 @pytest.fixture
 def challenge_disk_db(tmp_path: Path) -> Generator[sqlite3.Connection]:
     """Unmocked real SQLite database on disk with WAL pragmas per Invariant 6."""
-    db_file = tmp_path / "vectors.db"
+    db_file = tmp_path / "yaw.db"
     conn = sqlite3.connect(str(db_file))
     apply_pragmas(conn)
 
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS note_chunks (
-            entity_uri TEXT PRIMARY KEY,
+            chunk_id TEXT PRIMARY KEY,
+            entity_uri TEXT,
             rel_path TEXT,
+            ordinal INT,
             heading TEXT,
-            byte_offset INT,
-            byte_length INT,
+            heading_slug TEXT,
             line_start INT,
             line_end INT,
-            ordinal INT,
-            chunk_id TEXT,
             embedding BLOB
         );
         """

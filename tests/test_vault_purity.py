@@ -62,7 +62,7 @@ def test_invariant_2_and_3_vault_rebuild_cleanliness_and_topology():
     vault_dir = Path("sample-llm-wiki").resolve()
     sync_vault(vault_dir=vault_dir, force=True, verbose=False)
 
-    db_path = vault_dir / ".cache" / "vectors.db"
+    db_path = vault_dir / ".cache" / "yaw.db"
     assert db_path.is_file(), f"Database not found at {db_path}"
 
     with sqlite3.connect(db_path) as conn:
@@ -198,7 +198,7 @@ async def test_invariant_5_sample_vault_dual_epistemic_retrieval():
     against real indexed data without tautological cushion mocks or exception masking.
     """
     vault_dir = Path("sample-llm-wiki").resolve()
-    db_path = vault_dir / ".cache" / "vectors.db"
+    db_path = vault_dir / ".cache" / "yaw.db"
     if not db_path.is_file():
         sync_vault(vault_dir=vault_dir, force=False, verbose=False)
 

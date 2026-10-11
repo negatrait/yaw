@@ -152,7 +152,7 @@ Candidate chunks with positive stationary mass ($\mathbf{p}^*[\text{chunk}] > 0$
 - When $\mathbf{q} = \mathbf{0}$: $\text{Score} = \mathbf{p}^*[\text{chunk}]$.
 
 ### 6.2 Zero-Copy Disk Slice Hydration
-The top-$k$ winning chunk IDs look up `(rel_path, byte_offset, byte_length)` in `note_chunks` and read the exact UTF-8 byte slice from disk via binary seek ([`hydrate_disk_slice()`](file:///home/harri/yaw/src/yaw/retrieval/retriever.py)), strictly honoring Invariant 2 (Zero-Prose Disk Pointers).
+The top-$k$ winning chunk IDs look up `(rel_path, line_start, line_end)` in `note_chunks` and read the exact line slice directly on demand from disk ([`hydrate_disk_slice()`](file:///home/harri/yaw/src/yaw/retrieval/retriever.py)), strictly honoring Invariant 2 (Zero-Prose Disk Pointers).
 
 ### 6.3 Bridging Subgraph Assembly
 The engine extracts active concept paths linking query seeds to retrieved chunks:
