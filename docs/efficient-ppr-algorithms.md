@@ -9,6 +9,14 @@ tags:
   - clippings
 ---
 
+> [!IMPORTANT]
+> **YAW Engine Architectural Context & Probabilistic Seed Vector Formulation ($\mathbf{p}_0$)**:  
+> In YAW's GraphRAG engine ([`FOUNDATIONAL.md §5.3`](file:///home/harri/yaw/FOUNDATIONAL.md), [`docs/power-pagerank.md`](file:///home/harri/yaw/docs/power-pagerank.md), [`docs/adr/ADR-010.md`](file:///home/harri/yaw/docs/adr/ADR-010.md)), Personalized PageRank (PPR) is computed query-time over an in-memory SciPy Compressed Sparse Row (CSR) matrix. Rather than restricting the preference vector to a degenerate single-node indicator $\boldsymbol{e}_s$, YAW operationalizes the **Generalized Preference Vector** (Section II-B) as a multi-modal, probabilistic personalization seed vector:
+> $$\mathbf{p}_0 = \beta_1 \cdot \mathbf{s}_{\text{concepts}} + \beta_2 \cdot \mathbf{s}_{\text{chunks\_vec}} + \beta_3 \cdot \mathbf{s}_{\text{chunks\_fts}}$$
+> Candidate concept canopy seeds $\mathbf{s}_{\text{concepts}}[e]$ incorporate continuous candidate prior distributions $P(e \mid a) \in (0, 1]$ maintained natively in spaCy's compiled C/Cython `InMemoryLookupKB`:
+> $$\mathbf{s}_{\text{concepts}}[e] \propto \sum_{a \in \text{mentions}(q)} P(e \mid a) \cdot \text{sim}(q, e), \quad \text{with } \sum_{e \in \text{cands}(a)} P(e \mid a) = 1.0$$
+> This prevents premature winner-take-all discretization of polysemous mentions, transforming the subsequent power iteration diffusion ($\mathbf{p}^{(t+1)} = \alpha \mathbf{P}^T \mathbf{p}^{(t)} + (1-\alpha)\mathbf{p}_0$) into a mechanism for **Topological Disambiguation** and enabling Bayesian evidence fusion for chunk ranking: $\text{Score}(c) = \left( \sum_{e \in c} P(e \mid a) \cdot \mathbf{p}^*[e] + \mathbf{p}^*[c] \right) \cdot \text{sim}(q, c)$.
+
 Mingji Yang    Hanzhi Wang    Zhewei Wei    Sibo Wang    Ji-Rong Wen
 
 ## Abstract
@@ -73,7 +81,7 @@ $$
 \displaystyle=\alpha\big(\mathbf{I}-(1-\alpha)\mathbf{P}\big)^{-1}\boldsymbol{e}_{s},
 $$
 
-which establishes the existence and uniqueness of $\boldsymbol{\pi}_{s}$. A more general definition of PPR allows the preference vector in Eqn. (1) to be an arbitrary probability distribution vector, rather than being limited to indicator vectors. As we will see from Thm. 1, these generalized PPR vectors are linear combinations of the PPR vectors in our definition.
+which establishes the existence and uniqueness of $\boldsymbol{\pi}_{s}$. A more general definition of PPR allows the preference vector in Eqn. (1) to be an arbitrary probability distribution vector, rather than being limited to indicator vectors. As we will see from Thm. 1, these generalized PPR vectors are linear combinations of the PPR vectors in our definition. *(In YAW, this generalized preference vector is operationalized as the multi-modal seed vector $\mathbf{p}_0 = \beta_1 \mathbf{s}_{\text{concepts}} + \beta_2 \mathbf{s}_{\text{chunks\_vec}} + \beta_3 \mathbf{s}_{\text{chunks\_fts}}$, where $\mathbf{s}_{\text{concepts}}[e]$ incorporates the alias candidate prior distribution $P(e \mid a) \in (0, 1]$ via `InMemoryLookupKB`; see [`docs/adr/ADR-010.md`](file:///home/harri/yaw/docs/adr/ADR-010.md) and [`docs/power-pagerank.md`](file:///home/harri/yaw/docs/power-pagerank.md)).*
 
 Random-Walk-Based Interpretations. Apart from the algebraic definition, there are two more comprehensible interpretations of PPR. Both of them are based on a critical concept called random walk, with two slightly different definitions.
 

@@ -7,7 +7,6 @@ via in-process pyshacl with OWL 2 RL inference and zero external graph daemons.
 from __future__ import annotations
 
 import sqlite3
-import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -522,13 +521,19 @@ def test_zero_external_daemon_processes(test_db: sqlite3.Connection) -> None:
     assert violations == []
 
     # Verify no neo4j, blazegraph, or external java daemons were spawned
-    pgrep_res = subprocess.run(
-        ["pgrep", "-f", "neo4j|blazegraph|fuseki"],
-        capture_output=True,
-        text=True,
-        check=False,
+    import psutil
+
+    external_daemons = [
+        p.info["name"]
+        for p in psutil.process_iter(["name"])
+        if any(
+            target in (p.info["name"] or "").lower()
+            for target in ("neo4j", "blazegraph", "fuseki")
+        )
+    ]
+    assert len(external_daemons) == 0, (
+        f"External graph daemon detected running: {external_daemons}"
     )
-    assert pgrep_res.returncode != 0, "External graph daemon detected running!"
 
 
 def test_empty_database_conforms(test_db: sqlite3.Connection) -> None:

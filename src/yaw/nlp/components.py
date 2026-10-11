@@ -670,7 +670,27 @@ def make_span_reconciler(nlp: Language, name: str):
         doc.ents = filter_spans(clean_spans)
         return doc
 
-    return _reconcile
+
+@Language.factory("kb_entity_disambiguator")
+def make_kb_entity_disambiguator(
+    nlp: Language, name: str, kb: Any | None = None
+) -> Any:
+    """Links doc.ents with InMemoryLookupKB candidates, populating token.ent_kb_id_."""
+
+    def _disambiguate(doc: Doc) -> Doc:
+        if kb is None:
+            return doc
+        for ent in doc.ents:
+            clean = ent.text.strip(" \t\n\r\"'.,:;!?(){}[]<>")
+            if kb.contains_alias(clean):
+                cands = kb.get_alias_candidates(clean)
+                if cands:
+                    cand_id = str(cands[0].entity_)
+                    for token in ent:
+                        token.ent_kb_id_ = cand_id
+        return doc
+
+    return _disambiguate
 
 
 def _extract_entity_nodes(
@@ -689,12 +709,16 @@ def _extract_entity_nodes(
             continue
         ns = map_namespace(ent)
         key = f"{ns}:{clean_name.casefold()}"
+        kb_id = getattr(ent, "kb_id_", None) or None
         if key not in node_map:
             node_map[key] = ExtractedNode(
                 name=clean_name,
                 namespace=ns,
                 definition=_entity_definition(ent, clean_name=clean_name),
+                canonical_id=kb_id,
             )
+        elif kb_id and node_map[key].canonical_id is None:
+            node_map[key] = node_map[key].model_copy(update={"canonical_id": kb_id})
         ent_nodes.append(node_map[key])
     return ent_nodes
 

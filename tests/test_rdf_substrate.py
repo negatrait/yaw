@@ -185,14 +185,14 @@ def populated_db(tmp_path: Path) -> Generator[sqlite3.Connection]:
         alias_id="concepts:self-attention",
         kind="entity",
         canonical_id="concepts:attention",
-        method="lexical",
+        method="exact",
     )
     insert_alias(
         conn,
         alias_id="uses",
         kind="predicate",
         canonical_id="predicates:utilizes",
-        method="lexical",
+        method="exact",
     )
 
     conn.commit()

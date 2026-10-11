@@ -289,16 +289,25 @@ def test_schema_integrity_and_pragmas(tmp_path: Path) -> None:
 
 
 def test_aliases_method_check_constraint(tmp_path: Path) -> None:
-    """WP 5.1.3: Verify aliases table accepts all valid MatchMethod values."""
+    """WP 5.1.3: Verify aliases table accepts all canonical MatchMethod values and rejects purged methods."""
     db_file = tmp_path / "test_aliases.db"
     conn = sqlite3.connect(str(db_file))
     try:
         ensure_schema_tables(conn)
-        valid_methods = ("exact", "alias", "lexical", "auto", "llm", "compile", "new")
+        valid_methods = ("exact", "alias", "auto", "new", "ontology")
         for m in valid_methods:
             insert_alias(conn, f"alias_{m}", "entity", "concepts:test", method=m)
         count = conn.execute("SELECT count(*) FROM aliases").fetchone()[0]
         assert count == len(valid_methods)
+
+        # Assert purged legacy methods fail immediately
+        import pytest
+
+        for m in ("lexical", "llm", "compile"):
+            with pytest.raises(ValueError, match="Invalid alias method"):
+                insert_alias(
+                    conn, f"alias_bad_{m}", "entity", "concepts:test", method=m
+                )
     finally:
         conn.close()
 
@@ -339,5 +348,74 @@ def test_compiled_tables_and_unified_views(tmp_path: Path) -> None:
             "SELECT src_id, dst_id, rel_type FROM unified_edges WHERE src_id = 'concepts:leaf'"
         ).fetchone()
         assert e_row == ("concepts:leaf", "concepts:meso", "subClassOf")
+    finally:
+        conn.close()
+
+
+def test_aliases_idempotent_migration_purges_obsolete_methods(
+    tmp_path: Path,
+) -> None:
+    """Verify ensure_schema_tables idempotently migrates legacy aliases table containing obsolete methods."""
+    db_file = tmp_path / "legacy_migration.db"
+    conn = sqlite3.connect(str(db_file))
+    try:
+        # Create legacy aliases table with obsolete methods allowed in CHECK constraint
+        conn.execute(
+            """
+            CREATE TABLE aliases (
+                alias_id TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK(kind IN ('entity', 'predicate')),
+                canonical_id TEXT NOT NULL,
+                method TEXT NOT NULL CHECK(method IN ('lexical', 'auto', 'llm', 'compile', 'exact', 'alias', 'new')),
+                score REAL NOT NULL DEFAULT 1.0 CHECK(score >= 0.0 AND score <= 1.0),
+                status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'contested')),
+                source_leaf_id TEXT,
+                resolved_at REAL DEFAULT (unixepoch()),
+                evidence TEXT,
+                PRIMARY KEY (alias_id, kind)
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO aliases (alias_id, kind, canonical_id, method, score) VALUES ('a_lex', 'entity', 'c1', 'lexical', 0.9)"
+        )
+        conn.execute(
+            "INSERT INTO aliases (alias_id, kind, canonical_id, method, score) VALUES ('a_llm', 'entity', 'c2', 'llm', 0.8)"
+        )
+        conn.execute(
+            "INSERT INTO aliases (alias_id, kind, canonical_id, method, score) VALUES ('a_comp', 'entity', 'c3', 'compile', 0.7)"
+        )
+        conn.execute(
+            "INSERT INTO aliases (alias_id, kind, canonical_id, method, score) VALUES ('a_exact', 'entity', 'c4', 'exact', 1.0)"
+        )
+        conn.commit()
+
+        # Run ensure_schema_tables migration
+        ensure_schema_tables(conn)
+
+        # Verify schema table SQL no longer contains obsolete methods
+        sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='aliases'"
+        ).fetchone()[0]
+        assert "'lexical'" not in sql
+        assert "'llm'" not in sql
+        assert "'compile'" not in sql
+        assert "'ontology'" in sql
+
+        # Verify rows were safely migrated without data loss
+        rows = dict(
+            conn.execute(
+                "SELECT alias_id, (method || ':' || printf('%.1f', score) || ':' || canonical_id) FROM aliases"
+            ).fetchall()
+        )
+        assert rows["a_lex"] == "exact:0.9:c1"
+        assert rows["a_llm"] == "auto:0.8:c2"
+        assert rows["a_comp"] == "auto:0.7:c3"
+        assert rows["a_exact"] == "exact:1.0:c4"
+
+        # Re-run migration: must be strictly idempotent
+        ensure_schema_tables(conn)
+        count = conn.execute("SELECT count(*) FROM aliases").fetchone()[0]
+        assert count == 4
     finally:
         conn.close()

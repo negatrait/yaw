@@ -59,11 +59,13 @@ CocoIndex continuously monitors `vault/raw/` for markdown file modifications and
 - **Open IE Relations:** `spacy.REL.v1` extracts unconstrained relations into `doc._.rel`; predicates are normalized via `Token.lemma_`.
 - **Line-Range Provenance:** Chunks carry 1-indexed line numbers (`line_start`, `line_end`) into the raw note for zero-copy on-demand disk hydration.
 
-### 2. Ontological Convergence (EDC Self-Canonicalization)
-Prevents vocabulary fragmentation (synonyms, misspellings, spacing variants) across an append-only corpus:
-- Lexical matching (`difflib`) and semantic retrieval over definition embeddings (`embed-gemma-300m-FLM`).
-- Hybrid banding: auto-merge at cosine $\ge 0.95$, LLM verification on grey band. Adjudications are logged to `canon_verdicts`, and mappings are stored in `aliases`.
-- Nodes are unified via zero-copy SQLite views (`unified_edges`, `unified_nodes`).
+### 2. Ontological Convergence (Two-Tier Convergence Protocol)
+Prevents vocabulary fragmentation across an append-only corpus without runtime LLM calls ([`docs/adr/ADR-003.md`](file:///home/harri/yaw/docs/adr/ADR-003.md), [`docs/adr/ADR-010.md`](file:///home/harri/yaw/docs/adr/ADR-010.md)):
+- **Compiled C/Cython KnowledgeBase:** In-process `InMemoryLookupKB` synchronizes canonical entities and active alias candidate prior distributions $P(e \mid a) \in (0, 1]$ directly from SQLite (`leaf_nodes`, `aliases`).
+- **Tier 1 (Direct Match):** Exact slug match, active alias table lookup, or Cython KB candidate resolution. 0 vectors, 0 LLM calls.
+- **Tier 2 (Vector Near-Match):** In-process vector similarity > 0.80 using `en_core_web_lg` static 300d GloVe vectors. Auto-merges and records alias mapping. 0 LLM calls.
+- **Fallback:** New canonical induction under plural universal root (`concepts:{slug}`). Zero external LLM pairwise adjudication.
+- **Zero-Copy Projection:** Nodes and relations are unified via zero-copy SQLite views (`unified_edges`, `unified_nodes`).
 
 ### 3. Associative Retrieval & Graph Diffusion
 Retrieval queries execute against SQLite and in-memory SciPy CSR matrices:
@@ -151,9 +153,9 @@ uv run python yaw.py schema --vault /path/to/vault
 
 #### Production Client Interface (Karpathy Contract)
 - `query_wiki(query: str, top_k: int = 3) -> str`: Full hybrid GraphRAG retrieval returning dual-layer payload (Ontological Context + Retrieved Ground-Truth Evidence).
-- `ingest_raw(file_path: str, content: str) -> str`: Writes markdown notes directly to `vault/raw/` and triggers incremental indexing.
-- `compile_wiki() -> str`: Runs ontological re-consolidation and materializes wiki pages.
-- `lint_wiki() -> str`: Detects contradictory claims landing on identical canonical nodes and flags contested aliases.
+- `ingest_raw(content: str, title: str | None = None, url: str | None = None) -> dict`: Ingests an external URL or raw text string into a timestamped, slugged Markdown note in `vault/raw/`.
+- `compile_wiki(force: bool = False) -> dict`: Triggers background consolidation, B-Tree HAC splitting, hypernym induction, fast closed-world SHACL (<200ms), and commits detected violations to SQLite `compiled_violations`.
+- `lint_wiki(query: str | None = None, force: bool = False) -> list[dict]`: Instantaneous O(1) query of pre-compiled contradictions and shape violations from SQLite (<5ms); live pySHACL validation override on `force=True`.
 
 #### Developer Probes
 - `find_seed(query: str, top_k: int = 3) -> list[dict]`: Stage 1 seed generator returning top FTS BM25 and vector hits.

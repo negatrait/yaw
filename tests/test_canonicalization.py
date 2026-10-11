@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import json
 import re
-from typing import cast
+from typing import Any, cast
 from urllib.request import Request, urlopen
 
 import numpy as np
+import pytest
 import spacy
 from thinc.types import Floats1d
 
@@ -73,7 +74,7 @@ def test_invariant_5a1_lexical_exact_alias_hit(test_db, mock_ollama_requests):
         alias_id="concept:shannon-entropy",
         kind="entity",
         canonical_id="concepts:entropy",
-        method="lexical",
+        method="exact",
         score=1.0,
         status="active",
     )
@@ -181,12 +182,12 @@ def test_invariant_5a1_lexical_predicate_fastpath(test_db, mock_ollama_requests)
         res_exact.canonical_id in config.BASE_PREDICATES
         or res_exact.canonical_id == "subClassOf"
     )
-    assert res_exact.tier in (TierEnum.TIER_1_EXACT, TierEnum.TIER_1_LEXICAL)
+    assert res_exact.tier == TierEnum.TIER_1_EXACT
 
     # Typo predicate matches lexical ratio >= 0.85 against 'subClassOf'
     res_typo = resolve(name="subclassof", kind="predicate", conn=test_db)
     assert "subclass" in res_typo.canonical_id.lower()
-    assert res_typo.tier in (TierEnum.TIER_1_EXACT, TierEnum.TIER_1_LEXICAL)
+    assert res_typo.tier == TierEnum.TIER_1_EXACT
 
     assert len(mock_ollama_requests) == initial_req_count
 
@@ -407,7 +408,7 @@ def test_invariant_5a4_non_destructive_view_rerouting_and_reversibility(test_db)
         alias_id="concepts:entrophy",
         kind="entity",
         canonical_id="concepts:entropy",
-        method="lexical",
+        method="exact",
         score=0.86,
         status="active",
     )
@@ -476,7 +477,7 @@ def test_invariant_5a4_predicate_view_rerouting_and_reversibility(test_db):
         alias_id="has_equivalence",
         kind="predicate",
         canonical_id="relates_to",
-        method="lexical",
+        method="exact",
         score=0.9,
         status="active",
     )
@@ -530,7 +531,7 @@ def test_invariant_5a5_namespace_inheritance(test_db):
         alias_id="entities:shannon-entropy",
         kind="entity",
         canonical_id="concepts:entropy",
-        method="lexical",
+        method="exact",
         score=0.92,
         status="active",
     )
@@ -797,7 +798,7 @@ def test_alias_status_contestability(test_db):
         alias_id="concepts:y_surface",
         kind="entity",
         canonical_id="concepts:y_canonical",
-        method="lexical",
+        method="exact",
         score=0.9,
         status="active",
     )
@@ -1140,3 +1141,299 @@ def test_wp517_candidate_resolution_threshold_mismatch_records_contested(test_db
     assert contested[0]["alias_id"] == "concepts:quantum-field-theory"
     assert contested[0]["canonical_id"] == "concepts:quantum-mechanics"
     assert contested[0]["status"] == "contested"
+
+
+# ==============================================================================
+# SPACYFUSED KNOWLEDGEBASE & ZOMBIE ELIMINATION SUITE
+# ==============================================================================
+
+
+def test_in_memory_kb_lifecycle_and_synchronization(test_db):
+    """Test create_in_memory_kb and sync_kb_from_db synchronizes entities, aliases, and priors."""
+    from yaw.indexer.canonicalize import create_in_memory_kb, sync_kb_from_db
+
+    nlp = spacy.blank("en")
+    kb = create_in_memory_kb(nlp, entity_vector_length=128)
+    assert kb.entity_vector_length == 128
+
+    # Seed leaf_nodes
+    v = np.ones(128, dtype=np.float32)
+    test_db.execute(
+        """
+        INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition, embedding)
+        VALUES ('concepts:shannon-entropy', 'doc1.md', 'Shannon Entropy', 'concepts', 'Information measure', ?)
+        """,
+        (v.tobytes(),),
+    )
+    # Seed aliases
+    test_db.execute(
+        """
+        INSERT INTO aliases (alias_id, kind, canonical_id, method, score, status)
+        VALUES ('entropy', 'entity', 'concepts:shannon-entropy', 'exact', 1.0, 'active')
+        """
+    )
+    test_db.commit()
+
+    sync_kb_from_db(kb, test_db)
+
+    # Entities synced
+    assert kb.contains_entity("concepts:shannon-entropy")
+    # Base predicates synced
+    for bp in config.BASE_PREDICATES:
+        assert kb.contains_entity(bp)
+        assert kb.contains_alias(bp)
+
+    # Aliases synced
+    assert kb.contains_alias("entropy")
+    cands = kb.get_alias_candidates("entropy")
+    assert len(cands) == 1
+    assert cands[0].entity_ == "concepts:shannon-entropy"
+    assert cands[0].prior_prob <= 1.0
+
+
+def test_bidirectional_kb_and_sqlite_registration(test_db):
+    """Novel induction and auto-merged aliases register in both SQLite and InMemoryLookupKB."""
+    from yaw.indexer.canonicalize import create_in_memory_kb
+
+    nlp = spacy.blank("en")
+    kb = create_in_memory_kb(nlp, entity_vector_length=64)
+
+    # 1. Novel induction
+    v_ind = np.ones(64, dtype=np.float32)
+    res_ind = resolve(
+        name="topological-quantum-field-theory",
+        kind="entity",
+        conn=test_db,
+        embedding=v_ind.tolist(),
+        kb=kb,
+    )
+    assert res_ind.tier == TierEnum.NEW_INDUCTION
+    assert res_ind.is_new is True
+
+    # Check registered in SQLite
+    row = test_db.execute(
+        "SELECT node_id FROM leaf_nodes WHERE node_id = ?", (res_ind.canonical_id,)
+    ).fetchone()
+    assert row is not None
+
+    # Check registered in InMemoryLookupKB
+    assert kb.contains_entity(res_ind.canonical_id)
+    assert kb.contains_alias("topological-quantum-field-theory")
+
+    # 2. Tier 2 near match auto-merge
+    v_cand = v_ind * 0.99
+    res_near = resolve(
+        name="tqft",
+        kind="entity",
+        conn=test_db,
+        embedding=v_cand.tolist(),
+        kb=kb,
+    )
+    assert res_near.tier == TierEnum.TIER_2_EMBEDDING
+    assert res_near.canonical_id == res_ind.canonical_id
+
+    # Check alias in SQLite
+    alias_row = test_db.execute(
+        "SELECT canonical_id FROM aliases WHERE alias_id = 'concepts:tqft'"
+    ).fetchone()
+    assert alias_row is not None
+    assert alias_row[0] == res_ind.canonical_id
+
+    # Check alias in InMemoryLookupKB
+    assert kb.contains_alias("concepts:tqft")
+    cand = kb.get_alias_candidates("concepts:tqft")[0]
+    assert cand.entity_ == res_ind.canonical_id
+
+
+def test_clean_enums_and_zombie_code_elimination():
+    """Verify strictly cleaned TierEnum and MatchMethod, and total eradication of CanonicalVerdict."""
+    import yaw.indexer
+    import yaw.indexer.canonicalize
+
+    # CanonicalVerdict eliminated
+    assert not hasattr(yaw.indexer, "CanonicalVerdict")
+    assert not hasattr(yaw.indexer.canonicalize, "CanonicalVerdict")
+
+    # TierEnum strictly contains 3 variants
+    expected_tiers = {"TIER_1_EXACT", "TIER_2_EMBEDDING", "NEW_INDUCTION"}
+    actual_tiers = {m.name for m in TierEnum}
+    assert actual_tiers == expected_tiers
+
+    # MatchMethod strictly contains 4 variants
+    expected_methods = {"EXACT", "ALIAS", "AUTO", "NEW"}
+    actual_methods = {m.name for m in MatchMethod}
+    assert actual_methods == expected_methods
+
+
+def test_ent_kb_id_propagation_to_extracted_node(test_db):
+    """Verify ent.kb_id_ from linked spans propagates directly into ExtractedNode and resolve()."""
+    from yaw.nlp.components import _extract_entity_nodes
+
+    nlp = spacy.blank("en")
+    ruler: Any = nlp.add_pipe("entity_ruler")
+    ruler.add_patterns([{"label": "CONCEPT", "pattern": "Topological Insulator"}])
+    doc = nlp("Topological Insulator is a condensed matter phase.")
+
+    for token in doc.ents[0]:
+        token.ent_kb_id_ = "concepts:topological-insulator"
+
+    node_map = {}
+    ent_nodes = _extract_entity_nodes(doc, node_map)
+    assert len(ent_nodes) == 1
+    node = ent_nodes[0]
+    assert node is not None
+    assert node.name == "Topological Insulator"
+    assert node.canonical_id == "concepts:topological-insulator"
+
+    # resolve with canonical_id hits Tier 1 instantly
+    res = resolve(
+        name=node.name,
+        conn=test_db,
+        canonical_id=node.canonical_id,
+    )
+    assert res.tier == TierEnum.TIER_1_EXACT
+    assert res.canonical_id == "concepts:topological-insulator"
+    assert res.method == MatchMethod.EXACT.value
+
+
+def test_defined_aliases_preserves_multi_candidate_distribution(test_db):
+    """Verify defined_aliases in aliases table are not overwritten by node_id pre-registration in sync_kb_from_db."""
+    from yaw.indexer.canonicalize import create_in_memory_kb, sync_kb_from_db
+
+    # Insert leaf node whose ID is also an alias in the aliases table
+    test_db.execute(
+        "INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition, embedding) VALUES ('concepts:transformer', 'doc1.md', 'Transformer Architecture', 'concepts', 'Dual apparatus', NULL)"
+    )
+    # Insert calibrated multi-candidate distribution for this alias ID
+    test_db.execute(
+        "INSERT INTO aliases (alias_id, kind, canonical_id, method, score, status) VALUES ('concepts:transformer', 'entity', 'concepts:transformer_ml', 'alias', 0.8, 'active')"
+    )
+    test_db.execute(
+        "INSERT INTO aliases (alias_id, kind, canonical_id, method, score, status) VALUES ('concepts:transformer', 'predicate', 'concepts:transformer_ee', 'alias', 0.2, 'active')"
+    )
+    test_db.commit()
+
+    kb = create_in_memory_kb()
+    sync_kb_from_db(kb, test_db)
+
+    cands = kb.get_alias_candidates("concepts:transformer")
+    cand_map = {c.entity_: c.prior_prob for c in cands}
+    assert "concepts:transformer_ml" in cand_map
+    assert "concepts:transformer_ee" in cand_map
+    assert pytest.approx(cand_map["concepts:transformer_ml"], abs=1e-3) == 0.8
+    assert pytest.approx(cand_map["concepts:transformer_ee"], abs=1e-3) == 0.2
+    assert sum(cand_map.values()) <= 1.0 + 1e-6
+
+
+def test_alias_conflicting_scores_takes_max_prior(test_db):
+    """Verify duplicate alias definitions with different scores resolve to the maximum confidence score."""
+    from yaw.indexer.canonicalize import create_in_memory_kb, sync_kb_from_db
+
+    test_db.execute(
+        "INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition, embedding) VALUES ('concepts:sensor', 'doc1.md', 'Sensor', 'concepts', 'Detector', NULL)"
+    )
+    # Duplicate alias mapping across entity and predicate with different scores
+    test_db.execute(
+        "INSERT INTO aliases (alias_id, kind, canonical_id, method, score, status) VALUES ('detector', 'entity', 'concepts:sensor', 'alias', 0.4, 'active')"
+    )
+    test_db.execute(
+        "INSERT INTO aliases (alias_id, kind, canonical_id, method, score, status) VALUES ('detector', 'predicate', 'concepts:sensor', 'alias', 0.9, 'active')"
+    )
+    test_db.commit()
+
+    kb = create_in_memory_kb()
+    sync_kb_from_db(kb, test_db)
+
+    cands = kb.get_alias_candidates("detector")
+    assert len(cands) == 1
+    assert cands[0].entity_ == "concepts:sensor"
+    assert pytest.approx(cands[0].prior_prob, abs=1e-3) == 1.0
+
+
+def test_in_memory_kb_proportional_append_allocation(test_db):
+    """Verify appending multiple new candidates to existing KB alias proportionally divides remaining budget."""
+    from yaw.indexer.canonicalize import create_in_memory_kb, sync_kb_from_db
+
+    kb = create_in_memory_kb()
+    kb.add_entity(
+        "concepts:existing_c", freq=1, entity_vector=np.zeros(300, dtype=np.float32)
+    )
+    # Pre-existing candidate takes 0.4 of probability budget
+    kb.add_alias("polysemous_term", ["concepts:existing_c"], [0.4])
+
+    test_db.execute(
+        "INSERT INTO aliases (alias_id, kind, canonical_id, method, score, status) VALUES ('polysemous_term', 'entity', 'concepts:new_c1', 'alias', 0.8, 'active')"
+    )
+    test_db.execute(
+        "INSERT INTO aliases (alias_id, kind, canonical_id, method, score, status) VALUES ('polysemous_term', 'predicate', 'concepts:new_c2', 'alias', 0.4, 'active')"
+    )
+    test_db.commit()
+
+    sync_kb_from_db(kb, test_db)
+
+    cands = kb.get_alias_candidates("polysemous_term")
+    cand_map = {c.entity_: c.prior_prob for c in cands}
+    assert "concepts:existing_c" in cand_map
+    assert "concepts:new_c1" in cand_map
+    assert "concepts:new_c2" in cand_map
+    assert sum(cand_map.values()) <= 1.0 + 1e-6
+    # Relative ratio between new candidates (0.8 vs 0.4 -> 2:1) is preserved within remaining 0.6 budget
+    assert cand_map["concepts:new_c1"] > cand_map["concepts:new_c2"]
+    assert pytest.approx(cand_map["concepts:new_c1"], abs=1e-2) == 0.4
+    assert pytest.approx(cand_map["concepts:new_c2"], abs=1e-2) == 0.2
+
+
+def test_in_memory_kb_case_insensitive_matching(test_db):
+    """Verify title-cased names in SQLite normalize and match query mentions in KB."""
+    from yaw.indexer.canonicalize import create_in_memory_kb, sync_kb_from_db
+    from yaw.retrieval.retriever import _extract_query_mentions
+
+    test_db.execute(
+        "INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition, embedding) VALUES ('concepts:albert-einstein', 'doc1.md', 'Albert Einstein', 'concepts', 'Physicist', NULL)"
+    )
+    test_db.commit()
+
+    kb = create_in_memory_kb()
+    sync_kb_from_db(kb, test_db)
+
+    mentions = _extract_query_mentions("Who was Albert Einstein?")
+    matched = [m for m in mentions if kb.contains_alias(m)]
+    assert "albert einstein" in matched
+    cands = kb.get_alias_candidates("albert einstein")
+    assert len(cands) == 1
+    assert cands[0].entity_ == "concepts:albert-einstein"
+    # Assert exact title casing is also directly preserved in KB
+    assert kb.contains_alias("Albert Einstein")
+    cands_exact = kb.get_alias_candidates("Albert Einstein")
+    assert len(cands_exact) == 1
+    assert cands_exact[0].entity_ == "concepts:albert-einstein"
+
+
+def test_in_memory_kb_dual_casing_exact_and_lowercase(test_db):
+    """Verify sync_kb_from_db dual-registers both exact-cased and lowercased aliases with full candidate prior distributions."""
+    from yaw.indexer.canonicalize import create_in_memory_kb, sync_kb_from_db
+
+    test_db.execute(
+        "INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition, embedding) VALUES ('concepts:tqft', 'doc1.md', 'Topological QFT', 'concepts', 'Quantum field theory', NULL)"
+    )
+    test_db.execute(
+        "INSERT INTO aliases (alias_id, kind, canonical_id, method, score, status) VALUES ('Topological Quantum Field Theory', 'entity', 'concepts:tqft', 'alias', 0.95, 'active')"
+    )
+    test_db.commit()
+
+    kb = create_in_memory_kb()
+    sync_kb_from_db(kb, test_db)
+
+    # Both exact casing and lowercase must be directly queryable in compiled Cython KB
+    assert kb.contains_alias("Topological Quantum Field Theory")
+    assert kb.contains_alias("topological quantum field theory")
+
+    exact_cands = kb.get_alias_candidates("Topological Quantum Field Theory")
+    lower_cands = kb.get_alias_candidates("topological quantum field theory")
+
+    assert len(exact_cands) == 1
+    assert len(lower_cands) == 1
+    assert exact_cands[0].entity_ == "concepts:tqft"
+    assert lower_cands[0].entity_ == "concepts:tqft"
+    assert pytest.approx(exact_cands[0].prior_prob, abs=1e-3) == 1.0
+    assert pytest.approx(lower_cands[0].prior_prob, abs=1e-3) == 1.0

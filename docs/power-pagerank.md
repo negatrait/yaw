@@ -92,49 +92,62 @@ For dangling nodes ($D_{uu} = 0$), the dangling state is tracked via a boolean m
 
 ## 4. Localized Seed Formulation ($\mathbf{p}_0$)
 
-Rather than uniform personalization ($\mathbf{p}_0 = \frac{1}{|V|} \mathbf{1}$), YAW concentrates teleportation mass on a localized seed vector reflecting multi-modal query match:
+Rather than uniform personalization ($\mathbf{p}_0 = \frac{1}{|V|} \mathbf{1}$), YAW concentrates teleportation mass on a localized seed vector reflecting multi-modal query match and candidate prior distributions:
 
 $$\mathbf{p}_0 = \beta_1 \cdot \mathbf{s}_{\text{concepts}} + \beta_2 \cdot \mathbf{s}_{\text{chunks\_vec}} + \beta_3 \cdot \mathbf{s}_{\text{chunks\_fts}}$$
 
 Where:
-- $\beta_1 = 0.60$: Concept canopy vector similarity bias.
+- $\beta_1 = 0.60$: Concept canopy vector similarity bias (modulated by candidate priors).
 - $\beta_2 = 0.20$: Chunk vector similarity bias.
 - $\beta_3 = 0.20$: FTS5 BM25 lexical score bias.
 
-### 4.1 Concept Canopy Seeding ($\beta_1 = 0.60$)
+### 4.1 Concept Canopy Seeding with Calibrated Alias Priors ($\beta_1 = 0.60$)
+To prevent premature winner-take-all discretization of polysemous query terms ([`docs/adr/ADR-010.md`](file:///home/harri/yaw/docs/adr/ADR-010.md)), query mentions $a \in \text{mentions}(q)$ look up candidate entities $e \in \text{cands}(a)$ via compiled C/Cython `InMemoryLookupKB.get_alias_candidates(a)`.
+Each candidate provides a calibrated prior probability $P(e \mid a) \in (0, 1]$ satisfying $\sum_{e} P(e \mid a) = 1.0$.
+
 When query embedding $\mathbf{q}$ is available:
 - Queries SQLite `leaf_nodes` using `vec_distance_cosine(embedding, ?)`.
-- Top $N=50$ candidates contribute mass proportional to cosine similarity: $\text{sim} = \max(0.0, 1.0 - \text{distance})$.
+- Seed mass for entity $e$ is weighted by the joint product of candidate prior and query cosine similarity:
+  $$\mathbf{s}_{\text{concepts}}[e] \propto \sum_{a \in \text{mentions}(q)} P(e \mid a) \cdot \max(0.0, 1.0 - \text{distance}(q, e))$$
+- Top $N=50$ candidates inject normalized mass into $\mathbf{p}_0$.
 
 ### 4.2 Chunk Vector Seeding ($\beta_2 = 0.20$)
 - Queries SQLite `note_chunks` using `vec_distance_cosine(embedding, ?)`.
-- Top $N=50$ chunks contribute mass proportional to vector similarity.
+- Top $N=50$ chunks contribute mass proportional to vector similarity $\text{sim}(q, c) = \max(0.0, 1.0 - \text{distance})$.
 
 ### 4.3 Lexical BM25 Seeding ($\beta_3 = 0.20$)
-- Queries SQLite `fts_chunks` via FTS5 BM25 ranking.
+- Queries SQLite `fts_chunks` via FTS5 BM25 ranking over spaCy-lemmatized non-stopword query terms.
 - Top $N=50$ lexical hits inject normalized rank scores into $\mathbf{p}_0$.
 
 ### 4.4 Graceful Offline Fallback
 If the embedding service is unreachable or times out ($\mathbf{q} = \mathbf{0}$):
-- $\mathbf{s}_{\text{concepts}} = \mathbf{0}$ and $\mathbf{s}_{\text{chunks\_vec}} = \mathbf{0}$.
-- The seed vector simplifies continuously to normalized lexical hits: $\mathbf{p}_0 = \mathbf{s}_{\text{chunks\_fts}}$, ensuring search never fails even in fully offline environments.
+- $\mathbf{s}_{\text{concepts}}[e] \propto \sum_{a} P(e \mid a)$ (lexical alias prior distribution) and $\mathbf{s}_{\text{chunks\_vec}} = \mathbf{0}$.
+- If no concept aliases match, the seed vector simplifies continuously to normalized lexical hits: $\mathbf{p}_0 = \mathbf{s}_{\text{chunks\_fts}}$, ensuring search never fails even in fully offline environments.
 
 Finally, $\mathbf{p}_0$ is normalized to unit sum: $\sum_i p_{0, i} = 1.0$.
 
 ---
 
-## 5. Power Iteration Diffusion
+## 5. Power Iteration Diffusion & Topological Disambiguation
 
 The stationary probability distribution $\mathbf{p}^*$ is computed via iterative matrix-vector multiplications in [`GraphRAGRetriever.power_iteration()`](file:///home/harri/yaw/src/yaw/retrieval/retriever.py):
 
-$$\mathbf{p}^{(t+1)} = \alpha \left( \mathbf{p}^{(t)} \mathbf{P} + m_{\text{dangling}} \mathbf{p}_0 \right) + (1 - \alpha) \mathbf{p}_0$$
+$$\mathbf{p}^{(t+1)} = \alpha \left( \mathbf{P}^T \mathbf{p}^{(t)} + m_{\text{dangling}} \mathbf{p}_0 \right) + (1 - \alpha) \mathbf{p}_0$$
 
 Where:
 - $\alpha = 0.85$: Standard PageRank damping factor (probability of continuing random walk).
 - $1 - \alpha = 0.15$: Teleportation probability returning to personalized seeds $\mathbf{p}_0$.
 - $m_{\text{dangling}} = \sum_{i \in \text{dangling}} p_i^{(t)}$: Redistributed probability mass from sink nodes.
+- $\mathbf{P}$ is the row-stochastic transition matrix of `unified_edges` with directional conductance ($1.0$ down, $0.2$ up) and hub dampening $\gamma = 0.5$.
 
-### 5.1 Convergence Invariant
+### 5.1 Topological Disambiguation of Polysemous Mentions
+When an ambiguous query mention (e.g. *"Transformer"*) splits seed mass across divergent candidate hypotheses ($P(e_{\text{ML}} \mid a) = 0.85$, $P(e_{\text{electric}} \mid a) = 0.15$):
+- Global graph diffusion propagates mass across adjacent structural paths (wikilinks, semantic triples, chunk co-occurrences).
+- Candidates that share topological connectivity with the query's other concept seeds experience constructive spectral resonance: probability mass recirculates and amplifies at the true semantic target.
+- Spurious candidates lacking topological reinforcement rapidly shed their mass into unconnected graph sinks.
+- This resolves polysemy as an **emergent topological property of the random walk**, eliminating expensive LLM pairwise adjudication calls.
+
+### 5.2 Convergence Invariant
 Iterations repeat until the $L_1$ norm of the residual falls below tolerance, or until max iterations:
 $$\|\mathbf{p}^{(t+1)} - \mathbf{p}^{(t)}\|_1 < \text{tol} \quad (\text{tol} = 10^{-6}, \; \text{max\_iter} = 30)$$
 
@@ -146,10 +159,12 @@ Because $\mathbf{P}$ is row-stochastic and $\alpha < 1.0$, the Banach Fixed Poin
 
 After power iteration converges to $\mathbf{p}^*$:
 
-### 6.1 Chunk Rescoring
-Candidate chunks with positive stationary mass ($\mathbf{p}^*[\text{chunk}] > 0$) are rescored:
-- When $\mathbf{q} \ne \mathbf{0}$: $\text{Score} = \mathbf{p}^*[\text{chunk}] \times \text{sim}(q, \text{chunk})$. Chunks below `RELEVANCE_THRESHOLD` (0.10) are filtered out.
-- When $\mathbf{q} = \mathbf{0}$: $\text{Score} = \mathbf{p}^*[\text{chunk}]$.
+### 6.1 Bayesian Evidence Chunk Rescoring
+Candidate chunks with positive stationary mass ($\mathbf{p}^*[\text{chunk}] > 0$) are rescored via Bayesian evidence fusion:
+- When $\mathbf{q} \ne \mathbf{0}$:
+  $$\text{Score}(c) = \left( \sum_{e \in \text{entities}(c)} P(e \mid a) \cdot \mathbf{p}^*[e] + \mathbf{p}^*[c] \right) \cdot \text{sim}(q, c)$$
+  Where $P(e \mid a)$ is the alias candidate prior, $\mathbf{p}^*[e]$ is the stationary mass of entity $e$ manifesting in chunk $c$, $\mathbf{p}^*[c]$ is the chunk's direct topological mass, and $\text{sim}(q, c) = \mathbf{q} \cdot \mathbf{c}$. Chunks below `RELEVANCE_THRESHOLD` (0.10) are filtered out.
+- When $\mathbf{q} = \mathbf{0}$: $\text{Score}(c) = \mathbf{p}^*[c]$.
 
 ### 6.2 Zero-Copy Disk Slice Hydration
 The top-$k$ winning chunk IDs look up `(rel_path, line_start, line_end)` in `note_chunks` and read the exact line slice directly on demand from disk ([`hydrate_disk_slice()`](file:///home/harri/yaw/src/yaw/retrieval/retriever.py)), strictly honoring Invariant 2 (Zero-Prose Disk Pointers).

@@ -933,3 +933,460 @@ async def test_daemon_mcp_tool_stubs_and_schema_wp518(tmp_path: Path):
         assert ing["file_path"] == "raw/test.md"
     finally:
         config.DB_PATH = orig_db
+
+
+def test_bayesian_evidence_chunk_scoring_fusion(tmp_path: Path):
+    """Verify ADR-010 Bayesian evidence fusion chunk rescoring: Score(c) = (sum P(e|a)*p*[e] + p*[c]) * sim(q,c)."""
+    from yaw.indexer.canonicalize import create_in_memory_kb
+    from yaw.retrieval.retriever import GraphRAGRetriever
+    from yaw.storage.db import (
+        apply_pragmas,
+        ensure_schema_tables,
+        ensure_schema_views,
+        serialize_embedding,
+    )
+
+    retriever = GraphRAGRetriever()
+    kb = create_in_memory_kb()
+    # Register entity and alias with prior probability 0.8
+    kb.add_entity(
+        entity="concepts:entropy", freq=1, entity_vector=np.zeros(300, dtype=np.float32)
+    )
+    kb.add_alias(
+        alias="shannon-entropy", entities=["concepts:entropy"], probabilities=[0.8]
+    )
+    retriever.kb = kb
+
+    # Set up node-to-index mapping for graph stationary distribution p*
+    retriever._node_to_idx = {
+        "concepts:entropy": 0,
+        "raw/note.md#chunk:0": 1,
+        "raw/note.md#chunk:1": 2,
+    }
+    p_star = np.array([0.50, 0.30, 0.10], dtype=np.float32)
+
+    db_path = tmp_path / "bayesian_test.db"
+    with sqlite3.connect(db_path) as conn:
+        apply_pragmas(conn)
+        conn.execute(
+            "CREATE TABLE leaf_nodes (node_id TEXT, source_leaf_id TEXT, name TEXT, namespace TEXT, definition TEXT, embedding BLOB, PRIMARY KEY (node_id, source_leaf_id))"
+        )
+        conn.execute(
+            "CREATE TABLE leaf_relations (subject_id TEXT, predicate TEXT, object_id TEXT, source_leaf_id TEXT, weight REAL)"
+        )
+        conn.execute(
+            "CREATE TABLE note_chunks (chunk_id TEXT, entity_uri TEXT PRIMARY KEY, rel_path TEXT, ordinal INTEGER, heading TEXT, heading_slug TEXT, line_start INTEGER, line_end INTEGER, embedding BLOB)"
+        )
+        conn.execute(
+            "CREATE TABLE wikilinks (source_uri TEXT, target_uri TEXT, target_note TEXT, weight REAL)"
+        )
+        ensure_schema_tables(conn)
+        ensure_schema_views(conn)
+
+        q_vec = np.zeros(300, dtype=np.float32)
+        q_vec[0] = 0.90
+        chunk_emb = np.zeros(300, dtype=np.float32)
+        chunk_emb[0] = 1.0
+        emb_blob = serialize_embedding(chunk_emb)
+
+        conn.execute(
+            "INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition, embedding) VALUES ('concepts:entropy', 'doc1.md', 'entropy', 'concepts', 'Information measure', NULL)"
+        )
+        # chunk:0 manifests concepts:entropy
+        conn.execute(
+            "INSERT INTO leaf_relations (subject_id, predicate, object_id, source_leaf_id, weight) VALUES ('concepts:entropy', 'manifests_in', 'raw/note.md#chunk:0', 'raw/note.md', 1.0)"
+        )
+        # chunk:0 has text mention "shannon-entropy" in heading
+        conn.execute(
+            "INSERT INTO note_chunks (chunk_id, entity_uri, rel_path, ordinal, heading, heading_slug, line_start, line_end, embedding) VALUES ('c0', 'raw/note.md#chunk:0', 'raw/note.md', 0, 'Shannon-Entropy Study', 'shannon-entropy-study', 1, 10, ?)",
+            (emb_blob,),
+        )
+        conn.execute(
+            "INSERT INTO note_chunks (chunk_id, entity_uri, rel_path, ordinal, heading, heading_slug, line_start, line_end, embedding) VALUES ('c1', 'raw/note.md#chunk:1', 'raw/note.md', 1, 'General Overview', 'general-overview', 11, 20, ?)",
+            (emb_blob,),
+        )
+        conn.commit()
+
+        top_chunk_pool = [
+            ("raw/note.md#chunk:0", 1, 0.30),
+            ("raw/note.md#chunk:1", 2, 0.10),
+        ]
+
+        # Score chunk candidates using Bayesian evidence fusion with query mentions
+        scored_candidates = retriever._score_chunk_candidates(
+            conn=conn,
+            top_chunk_pool=top_chunk_pool,
+            p_star=p_star,
+            q_vec=q_vec,
+            top_k=2,
+            query_mentions=["shannon-entropy", "entropy"],
+        )
+
+        scores = {c["entity_uri"]: c["final_score"] for c in scored_candidates}
+        assert "raw/note.md#chunk:0" in scores
+        assert "raw/note.md#chunk:1" in scores
+        # chunk:0 has concept entity: Prior(0.8) * p*[concepts:entropy](0.50) + p*[chunk:0](0.30) = 0.40 + 0.30 = 0.70
+        # Multiplied by vec_sim(0.90) = 0.63
+        # chunk:1 has no entities: p*[chunk:1](0.10) * vec_sim(0.90) = 0.09
+        assert scores["raw/note.md#chunk:0"] > scores["raw/note.md#chunk:1"]
+        assert (
+            pytest.approx(scores["raw/note.md#chunk:0"], rel=1e-2)
+            == (0.8 * 0.50 + 0.30) * 0.90
+        )
+        assert pytest.approx(scores["raw/note.md#chunk:1"], rel=1e-2) == 0.10 * 0.90
+
+
+@pytest.mark.anyio
+async def test_canopy_seeding_with_in_memory_kb_priors(tmp_path: Path):
+    """Verify canopy seeding blends candidate priors continuously without branch failure."""
+    import scipy.sparse as sp
+
+    from yaw.indexer.canonicalize import create_in_memory_kb
+    from yaw.retrieval.retriever import GraphRAGRetriever
+
+    retriever = GraphRAGRetriever()
+    kb = create_in_memory_kb()
+    kb.add_entity(
+        entity="concepts:gravity", freq=1, entity_vector=np.zeros(300, dtype=np.float32)
+    )
+    kb.add_alias(
+        alias="gravitation", entities=["concepts:gravity"], probabilities=[0.95]
+    )
+    retriever.kb = kb
+
+    retriever._node_to_idx = {"concepts:gravity": 0}
+    retriever._idx_to_node = ["concepts:gravity"]
+    retriever._P = sp.eye(1, format="csr")
+    try:
+        retriever._cached_db_mtime = config.DB_PATH.stat().st_mtime
+    except OSError:
+        retriever._cached_db_mtime = 0.0
+
+    db_path = tmp_path / "seeding_test.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "CREATE TABLE note_chunks (entity_uri TEXT, rel_path TEXT, heading TEXT, line_start INT, line_end INT, embedding BLOB)"
+        )
+        conn.execute(
+            "CREATE TABLE leaf_nodes (node_id TEXT, name TEXT, namespace TEXT, definition TEXT, embedding BLOB)"
+        )
+        conn.execute(
+            "CREATE TABLE aliases (alias_id TEXT, kind TEXT, canonical_id TEXT, method TEXT, score REAL, status TEXT)"
+        )
+        conn.execute(
+            "CREATE VIRTUAL TABLE query_fts USING fts5(entity_uri UNINDEXED, rel_path UNINDEXED, heading, content, content='', contentless_unindexed=1)"
+        )
+
+        # Query mentioning alias 'gravitation'
+        p0, _q_vec, _cand_rows = await retriever.compute_seed_vector(
+            query="gravitation and curvature",
+            conn=conn,
+            terms=["gravitation", "curvature"],
+        )
+
+        assert p0.shape == (1,)
+        # concepts:gravity must be seeded with non-zero probability mass derived from KB alias prior
+        assert p0[0] > 0.0
+        assert pytest.approx(p0.sum(), rel=1e-5) == 1.0
+
+
+@pytest.mark.anyio
+async def test_daemon_kb_wiring_and_retriever_synchronization(tmp_path: Path):
+    """Verify FastMCP daemon initializes persistent KB and syncs across lifecycle."""
+    from yaw.server.daemon import (
+        compile_wiki,
+        get_daemon_kb,
+        get_retriever,
+        reset_daemon_kb,
+    )
+
+    reset_daemon_kb()
+    kb1 = get_daemon_kb()
+    assert kb1 is not None
+
+    # Singleton persistence
+    kb2 = get_daemon_kb()
+    assert kb1 is kb2
+
+    # Retriever instance receives KB
+    retriever = get_retriever(kb=kb1)
+    assert retriever.kb is kb1
+
+    # compile_wiki refreshes cache and preserves KB
+    comp = await compile_wiki(vault_dir=str(tmp_path))
+    assert comp["status"] == "compiled"
+    reset_daemon_kb()
+
+
+@pytest.mark.anyio
+async def test_polysemous_topological_disambiguation_end_to_end(tmp_path: Path):
+    """Verify polysemous mentions disambiguate via graph diffusion without runtime LLM calls."""
+    config.set_vault(tmp_path)
+    db_path = tmp_path / ".cache" / "yaw.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+
+    # Note 1: Machine Learning Transformer
+    ml_path = raw_dir / "ml_transformer.md"
+    ml_content = (
+        "# Machine Learning Transformer\n"
+        "Self-attention mechanism powers neural network transformer architecture for language understanding."
+    )
+    ml_path.write_text(ml_content, encoding="utf-8")
+
+    # Note 2: Electrical Transformer
+    ee_path = raw_dir / "power_transformer.md"
+    ee_content = (
+        "# Power Transformer\n"
+        "Electrical transformers transfer energy between circuits through electromagnetic induction."
+    )
+    ee_path.write_text(ee_content, encoding="utf-8")
+
+    chunk_ml = "raw/ml_transformer.md:1-2#chunk:0"
+    chunk_ee = "raw/power_transformer.md:1-2#chunk:0"
+    concept_ml = "concepts:transformer-neural-network"
+    concept_ee = "concepts:electrical-transformer"
+    concept_attn = "concepts:attention-mechanism"
+
+    from yaw.storage.db import (
+        ensure_schema_tables,
+        ensure_schema_views,
+        insert_alias,
+    )
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "CREATE TABLE wikilinks (source_uri TEXT, target_uri TEXT, target_note TEXT, weight REAL)"
+        )
+        conn.execute(
+            "CREATE TABLE leaf_relations (subject_id TEXT, predicate TEXT, object_id TEXT, source_leaf_id TEXT, weight REAL)"
+        )
+        conn.execute(
+            "CREATE TABLE leaf_nodes (node_id TEXT, source_leaf_id TEXT, name TEXT, namespace TEXT, definition TEXT, embedding BLOB, PRIMARY KEY (node_id, source_leaf_id))"
+        )
+        conn.execute(
+            "CREATE TABLE note_chunks (chunk_id TEXT, entity_uri TEXT PRIMARY KEY, rel_path TEXT, ordinal INTEGER, "
+            "heading TEXT, heading_slug TEXT, line_start INTEGER, line_end INTEGER, "
+            "embedding BLOB)"
+        )
+        conn.execute(
+            "CREATE VIRTUAL TABLE query_fts USING fts5(entity_uri UNINDEXED, rel_path UNINDEXED, heading, content, content='', contentless_unindexed=1)"
+        )
+        ensure_schema_tables(conn)
+
+        # Insert chunks
+        conn.execute(
+            "INSERT INTO note_chunks VALUES ('c_ml', ?, 'raw/ml_transformer.md', 0, 'Machine Learning Transformer', 'ml-transformer', 1, 2, NULL)",
+            (chunk_ml,),
+        )
+        conn.execute(
+            "INSERT INTO note_chunks VALUES ('c_ee', ?, 'raw/power_transformer.md', 0, 'Power Transformer', 'power-transformer', 1, 2, NULL)",
+            (chunk_ee,),
+        )
+
+        # Insert leaf nodes
+        conn.execute(
+            "INSERT INTO leaf_nodes VALUES (?, 'raw/ml_transformer.md', 'Transformer NN', 'concepts', 'Attention-based deep learning architecture.', NULL)",
+            (concept_ml,),
+        )
+        conn.execute(
+            "INSERT INTO leaf_nodes VALUES (?, 'raw/power_transformer.md', 'Electrical Transformer', 'concepts', 'Passive electromagnetic induction device.', NULL)",
+            (concept_ee,),
+        )
+        conn.execute(
+            "INSERT INTO leaf_nodes VALUES (?, 'raw/ml_transformer.md', 'Attention Mechanism', 'concepts', 'Contextual token weight vector.', NULL)",
+            (concept_attn,),
+        )
+
+        # Aliases table: 'transformer' has calibrated candidate distribution (0.50 ML, 0.50 EE)
+        insert_alias(
+            conn,
+            "transformer",
+            concept_ml,
+            kind="entity",
+            method="ontology",
+            score=0.50,
+        )
+        insert_alias(
+            conn, "attention", concept_attn, kind="entity", method="ontology", score=1.0
+        )
+
+        # Relations: ML cluster connects concept_ml with concept_attn and chunk_ml
+        conn.execute(
+            "INSERT INTO leaf_relations VALUES (?, 'manifests_in', ?, 'raw/ml_transformer.md', 1.0)",
+            (concept_ml, chunk_ml),
+        )
+        conn.execute(
+            "INSERT INTO leaf_relations VALUES (?, 'manifests_in', ?, 'raw/ml_transformer.md', 1.0)",
+            (concept_attn, chunk_ml),
+        )
+        conn.execute(
+            "INSERT INTO leaf_relations VALUES (?, 'dependsOn', ?, 'raw/ml_transformer.md', 1.0)",
+            (concept_ml, concept_attn),
+        )
+
+        # EE cluster connects concept_ee with chunk_ee
+        conn.execute(
+            "INSERT INTO leaf_relations VALUES (?, 'manifests_in', ?, 'raw/power_transformer.md', 1.0)",
+            (concept_ee, chunk_ee),
+        )
+
+        # FTS5 indexing
+        conn.execute(
+            "INSERT INTO query_fts(entity_uri, rel_path, heading, content) VALUES (?, 'raw/ml_transformer.md', 'Machine Learning Transformer', 'Self-attention mechanism powers neural network transformer architecture.')",
+            (chunk_ml,),
+        )
+        conn.execute(
+            "INSERT INTO query_fts(entity_uri, rel_path, heading, content) VALUES (?, 'raw/power_transformer.md', 'Power Transformer', 'Electrical transformers transfer energy between circuits.')",
+            (chunk_ee,),
+        )
+        ensure_schema_views(conn)
+        conn.commit()
+
+        # Mount KB with polysemous candidate distribution
+        from yaw.indexer.canonicalize import create_in_memory_kb, sync_kb_from_db
+
+        kb = create_in_memory_kb()
+        for cid in (concept_ml, concept_ee, concept_attn):
+            kb.add_entity(
+                entity=cid, freq=1, entity_vector=np.zeros(300, dtype=np.float32)
+            )
+        kb.add_alias(
+            alias="transformer",
+            entities=[concept_ml, concept_ee],
+            probabilities=[0.50, 0.50],
+        )
+        sync_kb_from_db(kb, conn)
+
+    retriever = GraphRAGRetriever(kb=kb)
+
+    with patch("yaw.retrieval.retriever.is_ollama_online", return_value=False):
+        # Query combining polysemous 'transformer' with contextual cue 'attention'
+        result = await retriever.retrieve("transformer attention", top_k=1)
+
+    assert "# Result: [1]" in result
+    assert "## Ontological Context" in result
+    # Contextual resonance amplifies the ML transformer concept
+    assert "concepts:transformer-neural-network" in result
+    assert "## Evidence Chunk" in result
+    # ML chunk wins decisively over the electrical transformer chunk
+    assert "raw/ml_transformer.md:1-2#chunk:0" in result
+    assert "Self-attention mechanism" in result
+    evidence_section = result.split("## Evidence Chunk")[1]
+    assert "power_transformer.md" not in evidence_section
+
+
+def test_bayesian_evidence_chunk_scoring_large_candidate_pool_scaling(tmp_path: Path):
+    """Attack _score_chunk_candidates with K > 100 candidate chunks and skewed prior distributions."""
+    from yaw.indexer.canonicalize import create_in_memory_kb
+    from yaw.retrieval.retriever import GraphRAGRetriever
+    from yaw.storage.db import (
+        apply_pragmas,
+        ensure_schema_tables,
+        ensure_schema_views,
+    )
+
+    retriever = GraphRAGRetriever()
+    kb = create_in_memory_kb()
+    kb.add_entity(
+        entity="concepts:target-concept",
+        freq=1,
+        entity_vector=np.zeros(300, dtype=np.float32),
+    )
+    kb.add_alias(
+        alias="target-alias", entities=["concepts:target-concept"], probabilities=[0.85]
+    )
+    retriever.kb = kb
+
+    num_chunks = 120
+    node_to_idx = {"concepts:target-concept": 0}
+    for i in range(num_chunks):
+        node_to_idx[f"raw/note_{i}.md#chunk:0"] = i + 1
+
+    retriever._node_to_idx = node_to_idx
+    retriever._idx_to_node = sorted(node_to_idx.keys())
+
+    # Simulated stationary PPR distribution
+    p_star = np.zeros(num_chunks + 1, dtype=np.float32)
+    p_star[node_to_idx["concepts:target-concept"]] = 0.40
+    for i in range(num_chunks):
+        p_star[node_to_idx[f"raw/note_{i}.md#chunk:0"]] = 0.01 + (0.001 * i)
+
+    db_path = tmp_path / "large_pool_test.db"
+    with sqlite3.connect(db_path) as conn:
+        apply_pragmas(conn)
+        conn.execute(
+            "CREATE TABLE leaf_nodes (node_id TEXT, source_leaf_id TEXT, name TEXT, namespace TEXT, definition TEXT, embedding BLOB, PRIMARY KEY (node_id, source_leaf_id))"
+        )
+        conn.execute(
+            "CREATE TABLE leaf_relations (subject_id TEXT, predicate TEXT, object_id TEXT, source_leaf_id TEXT, weight REAL)"
+        )
+        conn.execute(
+            "CREATE TABLE note_chunks (chunk_id TEXT, entity_uri TEXT PRIMARY KEY, rel_path TEXT, ordinal INTEGER, heading TEXT, heading_slug TEXT, line_start INTEGER, line_end INTEGER, embedding BLOB)"
+        )
+        conn.execute(
+            "CREATE TABLE wikilinks (source_uri TEXT, target_uri TEXT, target_note TEXT, weight REAL)"
+        )
+        ensure_schema_tables(conn)
+        ensure_schema_views(conn)
+
+        conn.execute(
+            "INSERT INTO leaf_nodes VALUES ('concepts:target-concept', 'seed.md', 'target', 'concepts', 'Target concept definition', NULL)"
+        )
+
+        for i in range(num_chunks):
+            uri = f"raw/note_{i}.md#chunk:0"
+            conn.execute(
+                "INSERT INTO note_chunks VALUES (?, ?, ?, 0, 'Heading', 'heading', 1, 10, NULL)",
+                (f"c_{i}", uri, f"raw/note_{i}.md"),
+            )
+            # Chunks 100-119 manifest the target concept
+            if i >= 100:
+                conn.execute(
+                    "INSERT INTO leaf_relations (subject_id, predicate, object_id, source_leaf_id, weight) VALUES ('concepts:target-concept', 'manifests_in', ?, 'seed.md', 1.0)",
+                    (uri,),
+                )
+        conn.commit()
+
+        top_chunk_pool = [
+            (
+                f"raw/note_{i}.md#chunk:0",
+                node_to_idx[f"raw/note_{i}.md#chunk:0"],
+                float(p_star[node_to_idx[f"raw/note_{i}.md#chunk:0"]]),
+            )
+            for i in range(num_chunks)
+        ]
+
+        q_vec = np.zeros(300, dtype=np.float32)  # offline embedding
+
+        scored = retriever._score_chunk_candidates(
+            conn=conn,
+            top_chunk_pool=top_chunk_pool,
+            p_star=p_star,
+            q_vec=q_vec,
+            top_k=5,
+            query_mentions=["target-alias"],
+        )
+
+        assert len(scored) == 5
+        # Top scoring chunks must be from chunks 100-119 that manifest the target concept with compound Bayesian prior
+        top_uris = [c["entity_uri"] for c in scored]
+        assert all(int(u.split("_")[1].split(".")[0]) >= 100 for u in top_uris)
+        # Winning score equals prior(0.85) * p*[concept](0.40) + p*[chunk]
+        assert scored[0]["final_score"] > 0.85 * 0.40
+
+
+@pytest.mark.anyio
+async def test_zero_fallback_kb_initialization_error_early(tmp_path: Path):
+    """Verify retriever raises explicit RuntimeError early if KB cannot be initialized, enforcing zero fallbacks."""
+    from yaw.retrieval.retriever import GraphRAGRetriever
+
+    retriever = GraphRAGRetriever(kb=None)
+    fake_conn = sqlite3.connect(":memory:")
+    fake_conn.close()  # closed connection cannot be queried or synchronized
+
+    with pytest.raises(
+        RuntimeError, match="Mandatory InMemoryLookupKB could not be initialized"
+    ):
+        await retriever.compute_seed_vector("query", fake_conn)

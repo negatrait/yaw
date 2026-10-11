@@ -3,7 +3,7 @@
 ## Test Philosophy
 - Opaque-box and disk-grounded unmocked integration tests.
 - Real SQLite databases with WAL pragmas on temporary disk directories (`tmp_path`).
-- Tests cover the 2x2 matrix (Quadrants 1–4) and all 6 foundational invariants.
+- Tests cover the 2x2 matrix (Quadrants 1–4) and all 7 foundational invariants ([`FOUNDATIONAL.md §2`](FOUNDATIONAL.md)).
 - Zero mock cushions: tests validate real RDF parsing, real relational SQLite pre-closure, real pySHACL execution, real spaCy PhraseMatcher tokens, and real PageRank conductance.
 
 ## Feature Inventory & Test Mapping

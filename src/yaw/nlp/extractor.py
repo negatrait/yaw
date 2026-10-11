@@ -293,6 +293,7 @@ def build_leaf_pipeline(
     rel_labels: list[str] | None = None,
     rel_examples: Any | None = None,
     fewshot_examples: Any | None = None,
+    kb: Any | None = None,
     **kwargs: Any,
 ) -> Language:
     """Builds a single unified spaCy Language pipeline with markdown_structure,
@@ -332,6 +333,9 @@ def build_leaf_pipeline(
         rel_examples=rel_examples,
         fewshot_examples=fewshot_examples,
     )
+
+    if kb is not None:
+        nlp.add_pipe("kb_entity_disambiguator", config={"kb": kb})
 
     nlp.add_pipe("leaf_taxonomy_compiler", last=True)
     return nlp

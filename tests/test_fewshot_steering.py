@@ -586,7 +586,7 @@ def test_quad_active_alias_canonicalization_join(
         alias_id="surface:relativity-theory",
         canonical_id="concepts:general-relativity",
         kind="entity",
-        method="lexical",
+        method="exact",
         status="active",
     )
     insert_alias(
@@ -594,7 +594,7 @@ def test_quad_active_alias_canonicalization_join(
         alias_id="leads_to",
         canonical_id="causes",
         kind="predicate",
-        method="lexical",
+        method="exact",
         status="active",
     )
 
@@ -804,7 +804,6 @@ def test_fewshot_steering_with_two_tier_edc_convergence(
     res_entity = resolve(name="General Relativity", kind="entity", conn=test_db)
     assert res_entity.tier in (
         TierEnum.TIER_1_EXACT,
-        TierEnum.TIER_1_LEXICAL,
         TierEnum.TIER_2_EMBEDDING,
         TierEnum.NEW_INDUCTION,
     )
@@ -859,7 +858,7 @@ def test_dynamic_seeding_with_contested_alias_state_machine(
         alias_id="contested_term",
         canonical_id="concepts:disputed",
         kind="entity",
-        method="llm",
+        method="auto",
         status="contested",
     )
     test_db.execute(
@@ -912,7 +911,7 @@ def test_multinote_ingestion_canonical_convergence_and_zero_drift(
         alias_id="Einstein's Special Relativity",
         canonical_id=canon_id,
         kind="entity",
-        method="lexical",
+        method="exact",
         status="active",
     )
 

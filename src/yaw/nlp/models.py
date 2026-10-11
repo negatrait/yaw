@@ -116,6 +116,7 @@ class ExtractedNode(BaseModel):
     name: str = Field(min_length=1)
     namespace: str
     definition: str = Field(min_length=1)
+    canonical_id: str | None = None
 
     @field_validator("namespace")
     @classmethod

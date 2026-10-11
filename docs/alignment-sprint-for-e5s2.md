@@ -11,7 +11,7 @@
 - [`docs/rdf-owl-shacl.md`](file:///home/harri/yaw/docs/rdf-owl-shacl.md)  
 - [`docs/USER_STORIES.md`](file:///home/harri/yaw/docs/USER_STORIES.md)  
 **Target Release:** Epic 5.1 (Substrate Hardening & Quad Alignment) → Epic 5.2 (E5S2: Dynamic Few-Shot Steering)  
-**Active Test Harness:** [`tests/test_sprint5_1_alignment.py`](file:///home/harri/yaw/tests/test_sprint5_1_alignment.py)  
+**Active Test Harness:** `tests/test_storage.py`, `tests/test_canonicalization.py`  
 **Sprint Status:** **COMPLETE** (Delivered in Commit `481d5bd`, 226/226 tests green, Sentrux modularity 5234)  
 
 ---
@@ -46,7 +46,7 @@ flowchart LR
 | **C3** | **Contradiction** | [`src/yaw/indexer/canonicalize.py`](file:///home/harri/yaw/src/yaw/indexer/canonicalize.py) defaults to singular `namespace="concept"` (`_node_id`, `_parse_surface_identity`, `resolve`). | Un-prefixed nodes produce `concept:{slug}`, failing Sprint 6C SHACL URI regex validation (`concepts`). | Change all defaults in `canonicalize.py` to plural `"concepts"`, validating against `config.TAXONOMY_NAMESPACES`. |
 | **C4** | **Contradiction** | [`src/yaw/storage/db.py`](file:///home/harri/yaw/src/yaw/storage/db.py) enforces `CHECK(method IN ('lexical', 'auto', 'llm', 'compile'))`, while `MatchMethod` enum includes `exact`, `alias`, `new`. | Inserting `MatchMethod.EXACT` triggers SQLite `CHECK constraint failed: aliases.method`. | Reconcile SQLite CHECK constraint to include `'exact'`, `'alias'`, `'new'` matching `MatchMethod` enum values. |
 | **G1** | **Gap** | [`src/yaw/retrieval/retriever.py`](file:///home/harri/yaw/src/yaw/retrieval/retriever.py) only applies asymmetric conductance to `concept <-> chunk`; `subClassOf` is unhandled (1.0). | Violates [`docs/adr/ADR-002.md`](file:///home/harri/yaw/docs/adr/ADR-002.md) and Sprint 6B; PPR mass leaks up superclasses during GraphRAG retrieval. | Synthesize reciprocal inverse edge `hasSubClass` (weight 1.0) and damp upward `subClassOf` (weight 0.2). |
-| **G2** | **Gap** | `aliases.status = 'contested'` exists in schema, but [`src/yaw/indexer/canonicalize.py`](file:///home/harri/yaw/src/yaw/indexer/canonicalize.py) inserts only `status='active'`. | SHACL contested alias validation in Sprint 6C and Epic 7 is dead code without input data. | Add automated `contested` state transition when Tier 3 LLM adjudication confidence $< 0.80$ on high-cosine candidates. |
+| **G2** | **Gap** | `aliases.status = 'contested'` exists in schema, but [`src/yaw/indexer/canonicalize.py`](file:///home/harri/yaw/src/yaw/indexer/canonicalize.py) inserts only `status='active'`. | SHACL contested alias validation in Sprint 6C and Epic 7 is dead code without input data. | Add automated `contested` state transition when candidate prior confidence $< 0.80$ or conflicting targets emerge (remediated in Epic 7.5 / ADR-010 via Cython `InMemoryLookupKB` priors without LLM calls). |
 | **G3** | **Gap** | ADR-002 & Epic 7 split saturated hubs in `compile_wiki` and rewire `subClassOf`, but Invariant 1 forbids mutating `leaf_relations`. | Nowhere to persist compiled superclasses and rewired edges without violating Invariant 1. | Add `compiled_nodes` and `compiled_relations` tables in `db.py`; union them into `unified_nodes` and `unified_edges`. |
 | **G4** | **Gap** | [`src/yaw/server/daemon.py`](file:///home/harri/yaw/src/yaw/server/daemon.py) leaks obsolete predicates via `get_ontology_schema()`, and misses `compile_wiki`, `lint_wiki`, `ingest_raw`. | FastMCP clients receive invalid metadata and incomplete production tool contracts. | Update `daemon.py` schema reflection to reference updated `config.BASE_PREDICATES` and stub Epic 7 tool signatures. |
 
@@ -397,9 +397,9 @@ flowchart TD
 
 ---
 
-## 5. TDD Test Specification (`tests/test_sprint5_1_alignment.py`)
+## 5. TDD Test Specification (`tests/test_storage.py` & `tests/test_canonicalization.py`)
 
-Prior to authoring production code, create [`tests/test_sprint5_1_alignment.py`](file:///home/harri/yaw/tests/test_sprint5_1_alignment.py) with the following 7 explicit test functions:
+Prior to authoring production code, the 7 alignment test invariants were authored and integrated into `tests/test_storage.py` and `tests/test_canonicalization.py`:
 
 ```python
 """Tests for Sprint 5.1 Remediation & Alignment Invariants.
@@ -605,7 +605,7 @@ def test_wp517_automated_contested_alias_state_machine(tmp_path: Path):
 
 ## 6. Verification & Execution Sequence
 
-1. **Step 1:** Author [`tests/test_sprint5_1_alignment.py`](file:///home/harri/yaw/tests/test_sprint5_1_alignment.py) with all 7 test cases.
+1. **Step 1:** Author alignment test invariants (integrated into `tests/test_storage.py` and `tests/test_canonicalization.py`).
 2. **Step 2:** Dispatch Agent B to execute WP 5.1.1 ([`src/yaw/config.py`](file:///home/harri/yaw/src/yaw/config.py)) and WP 5.1.2 ([`src/yaw/indexer/canonicalize.py`](file:///home/harri/yaw/src/yaw/indexer/canonicalize.py)).
 3. **Step 3:** Dispatch Agent A to execute WP 5.1.3, WP 5.1.5, and WP 5.1.4 ([`src/yaw/storage/db.py`](file:///home/harri/yaw/src/yaw/storage/db.py)).
 4. **Step 4:** Dispatch Agent C to execute WP 5.1.6 ([`src/yaw/retrieval/retriever.py`](file:///home/harri/yaw/src/yaw/retrieval/retriever.py)) and WP 5.1.1b ([`src/yaw/server/daemon.py`](file:///home/harri/yaw/src/yaw/server/daemon.py)).

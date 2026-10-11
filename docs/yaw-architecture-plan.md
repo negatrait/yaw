@@ -25,10 +25,12 @@ YAW is an autonomous, local-first GraphRAG engine combining **Cocoindex**, **spa
    - 14 Canonical Base Predicates across 4 categories (Subsumption, Dialectical, Process, Grounding).
    - 9 Universal Root Namespaces ([`docs/adr/ADR-005.md`](file:///home/harri/yaw/docs/adr/ADR-005.md)).
    - B-Tree hypernym induction and cluster splitting ([`docs/adr/ADR-002.md`](file:///home/harri/yaw/docs/adr/ADR-002.md)).
-3. **Tier 3: SciPy Power Personalized PageRank ([`docs/power-pagerank.md`](file:///home/harri/yaw/docs/power-pagerank.md))**
+3. **Tier 3: SciPy Power Personalized PageRank ([`docs/power-pagerank.md`](file:///home/harri/yaw/docs/power-pagerank.md), [`docs/adr/ADR-010.md`](file:///home/harri/yaw/docs/adr/ADR-010.md))**
    - Sparse CSR matrix power iteration with hub dampening ($\gamma=0.5$).
+   - Candidate prior distributions $P(e \mid a)$ in seed personalization and topological disambiguation.
    - Taxonomic conductance asymmetry ($1.0$ downward broadcast, $0.2$ upward damping).
-   - In-memory bi-encoder vector rescoring.
-4. **Tier 4: SHACL Closed-World Validation ([`docs/rdf-owl-shacl.md`](file:///home/harri/yaw/docs/rdf-owl-shacl.md))**
-   - Declarative shape validation via in-process `pyshacl`.
-   - Detection of orphan nodes, schema violations, and contested alias states.
+   - In-memory Bayesian evidence fusion for chunk candidate rescoring.
+4. **Tier 4: SHACL Closed-World Validation & Contradiction Cache ([`docs/rdf-owl-shacl.md`](file:///home/harri/yaw/docs/rdf-owl-shacl.md), [`docs/adr/ADR-011.md`](file:///home/harri/yaw/docs/adr/ADR-011.md))**
+   - Lean compile-time validation (`validate_wiki_graph_fast` < 200 ms) via relational pre-closure without heavy DL tableaux reasoners.
+   - Transactional persistence into `compiled_violations` SQLite table.
+   - Instantaneous $\mathcal{O}(1)$ `lint_wiki()` reads (< 5 ms) surfacing dialectical contradictions (`causes` vs `prevents`, `supports` vs `refutes`) and contested alias merges.

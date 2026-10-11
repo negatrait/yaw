@@ -22,7 +22,7 @@ def ensure_schema_tables(conn: sqlite3.Connection) -> None:
             alias_id TEXT NOT NULL,
             kind TEXT NOT NULL CHECK(kind IN ('entity', 'predicate')),
             canonical_id TEXT NOT NULL,
-            method TEXT NOT NULL CHECK(method IN ('lexical', 'auto', 'llm', 'compile', 'exact', 'alias', 'new', 'ontology')),
+            method TEXT NOT NULL CHECK(method IN ('exact', 'alias', 'auto', 'new', 'ontology')),
             score REAL NOT NULL DEFAULT 1.0 CHECK(score >= 0.0 AND score <= 1.0),
             status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'contested')),
             source_leaf_id TEXT,
@@ -32,56 +32,82 @@ def ensure_schema_tables(conn: sqlite3.Connection) -> None:
         )
         """
     )
-    # Idempotent migration for existing aliases table lacking 'ontology' method
+    # Idempotent migration for existing aliases table if obsolete methods or missing ontology method are present
     cursor = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='aliases'"
     )
     row = cursor.fetchone()
-    if row and row[0] and "'ontology'" not in row[0]:
-        conn.execute("PRAGMA foreign_keys=OFF;")
-        conn.execute("DROP TABLE IF EXISTS aliases_new;")
-        conn.execute(
-            """
-            CREATE TABLE aliases_new (
-                alias_id TEXT NOT NULL,
-                kind TEXT NOT NULL CHECK(kind IN ('entity', 'predicate')),
-                canonical_id TEXT NOT NULL,
-                method TEXT NOT NULL CHECK(method IN ('lexical', 'auto', 'llm', 'compile', 'exact', 'alias', 'new', 'ontology')),
-                score REAL NOT NULL DEFAULT 1.0 CHECK(score >= 0.0 AND score <= 1.0),
-                status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'contested')),
-                source_leaf_id TEXT,
-                resolved_at REAL DEFAULT (unixepoch()),
-                evidence TEXT,
-                PRIMARY KEY (alias_id, kind)
-            )
-            """
+    if row and row[0]:
+        table_sql = row[0]
+        obsolete_present = any(
+            m in table_sql for m in ("'lexical'", "'llm'", "'compile'")
         )
-        cols = [r[1] for r in conn.execute("PRAGMA table_info(aliases)").fetchall()]
-        common_cols = [
-            c
-            for c in cols
-            if c
-            in (
-                "alias_id",
-                "kind",
-                "canonical_id",
-                "method",
-                "score",
-                "status",
-                "source_leaf_id",
-                "resolved_at",
-                "evidence",
+        missing_ontology = "'ontology'" not in table_sql
+        if obsolete_present or missing_ontology:
+            conn.execute("PRAGMA foreign_keys=OFF;")
+            conn.execute("DROP TABLE IF EXISTS aliases_new;")
+            conn.execute(
+                """
+                CREATE TABLE aliases_new (
+                    alias_id TEXT NOT NULL,
+                    kind TEXT NOT NULL CHECK(kind IN ('entity', 'predicate')),
+                    canonical_id TEXT NOT NULL,
+                    method TEXT NOT NULL CHECK(method IN ('exact', 'alias', 'auto', 'new', 'ontology')),
+                    score REAL NOT NULL DEFAULT 1.0 CHECK(score >= 0.0 AND score <= 1.0),
+                    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'contested')),
+                    source_leaf_id TEXT,
+                    resolved_at REAL DEFAULT (unixepoch()),
+                    evidence TEXT,
+                    PRIMARY KEY (alias_id, kind)
+                )
+                """
             )
-        ]
-        col_str = ", ".join(common_cols)
-        conn.execute(
-            f"INSERT INTO aliases_new ({col_str}) SELECT {col_str} FROM aliases"
-        )
-        conn.execute("DROP VIEW IF EXISTS unified_edges")
-        conn.execute("DROP VIEW IF EXISTS unified_nodes")
-        conn.execute("DROP TABLE aliases")
-        conn.execute("ALTER TABLE aliases_new RENAME TO aliases")
-        conn.execute("PRAGMA foreign_keys=ON;")
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(aliases)").fetchall()]
+            common_cols = [
+                c
+                for c in cols
+                if c
+                in (
+                    "alias_id",
+                    "kind",
+                    "canonical_id",
+                    "method",
+                    "score",
+                    "status",
+                    "source_leaf_id",
+                    "resolved_at",
+                    "evidence",
+                )
+            ]
+            select_exprs = []
+            for c in common_cols:
+                if c == "method":
+                    select_exprs.append(
+                        """
+                        CASE
+                            WHEN method IN ('exact', 'alias', 'auto', 'new', 'ontology') THEN method
+                            WHEN method = 'lexical' THEN 'exact'
+                            ELSE 'auto'
+                        END AS method
+                        """
+                    )
+                else:
+                    select_exprs.append(c)
+            select_clause = ", ".join(select_exprs)
+            col_str = ", ".join(common_cols)
+            conn.execute(
+                f"""
+                INSERT INTO aliases_new ({col_str})
+                SELECT {select_clause}
+                FROM aliases
+                """
+            )
+            conn.execute("DROP VIEW IF EXISTS unified_edges")
+            conn.execute("DROP VIEW IF EXISTS unified_nodes")
+            conn.execute("DROP TABLE aliases")
+            conn.execute("ALTER TABLE aliases_new RENAME TO aliases")
+            conn.execute("PRAGMA foreign_keys=ON;")
+            ensure_schema_views(conn)
 
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_aliases_canonical ON aliases(canonical_id)"

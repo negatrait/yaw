@@ -4,7 +4,7 @@
 **Location:** [`docs/epics-alignment-roadmap.md`](file:///home/harri/yaw/docs/epics-alignment-roadmap.md)  
 **Governing Documents:**  
 - [`FOUNDATIONAL.md`](file:///home/harri/yaw/FOUNDATIONAL.md) (The Single Source of Truth)
-- [`docs/ADR.md`](file:///home/harri/yaw/docs/ADR.md) ([`ADR-001`](file:///home/harri/yaw/docs/adr/ADR-001.md) through [`ADR-008`](file:///home/harri/yaw/docs/adr/ADR-008.md))
+- [`docs/ADR.md`](file:///home/harri/yaw/docs/ADR.md) ([`ADR-001`](file:///home/harri/yaw/docs/adr/ADR-001.md) through [`ADR-010`](file:///home/harri/yaw/docs/adr/ADR-010.md))
 - [`docs/rdf-owl-shacl.md`](file:///home/harri/yaw/docs/rdf-owl-shacl.md)
 - [`docs/alignment-sprint-for-e5s2.md`](file:///home/harri/yaw/docs/alignment-sprint-for-e5s2.md)
 - [`docs/USER_STORIES.md`](file:///home/harri/yaw/docs/USER_STORIES.md)
@@ -26,17 +26,19 @@ All Epics are strict mathematical and operational derivatives of [`FOUNDATIONAL.
 | **Epic 2** | **Vault Purity, Substrate Decoupling & Graph Topology** | Purge meta-docs from `raw/`, enforce composite primary keys in SQLite, bidirectional chunk-concept edges (`manifests_in`/`mentions`). | **COMPLETE** | [`FOUNDATIONAL.md §6`](file:///home/harri/yaw/FOUNDATIONAL.md#6-repository-architecture--directory-boundaries) | `tests/test_vault_purity.py` (Commit `001ecae`) |
 | **Epic 3** | **CLI, Production Daemon Lifecycle & In-Memory Rescoring** | Stdlib `argparse` subparsers (`index`, `serve`, `query`, `schema`, `shutdown`), lock cleanup, WAL truncation, reciprocal wikilink conductance. | **COMPLETE** | [`docs/power-pagerank.md`](file:///home/harri/yaw/docs/power-pagerank.md), [`FOUNDATIONAL.md §5.4`](file:///home/harri/yaw/FOUNDATIONAL.md) | `tests/test_cli_lifecycle.py` (Commits `8672f0d`, `67c33fa`) |
 | **Epic 4** | **Doc-Integrity Extraction & Bridging Subgraph Retrieval** | Invariant E1 (`doc.text == chunk_text`), native `spacy.SpanCat.v3` + `spacy.REL.v1`, post-diffusion chunk selection, token-dense Bridging Subgraph per result. | **COMPLETE** | [`docs/open-ie-authoritative-source.md`](file:///home/harri/yaw/docs/open-ie-authoritative-source.md), [`docs/how-to-handle-spacy-llm.md`](file:///home/harri/yaw/docs/how-to-handle-spacy-llm.md) | `tests/test_leaf_pipeline.py`, `tests/test_retriever.py` (Commits `4f46778`, `22d9fc0`) |
-| **Epic 5.0 (Sprint 5A)** | **Two-Tier EDC Convergence & Reversible Aliases** | `aliases` + `canon_verdicts` tables, Two-Tier convergence resolver (`resolve()`), single-pass Open IE ([`ADR-001`](file:///home/harri/yaw/docs/adr/ADR-001.md)), SQLite graph view joins. | **COMPLETE** | [`docs/ADR.md`](file:///home/harri/yaw/docs/ADR.md), [`FOUNDATIONAL.md §5.1-5.2`](file:///home/harri/yaw/FOUNDATIONAL.md) | `tests/test_canonicalization.py` |
+| **Epic 5.0 (Sprint 5A)** | **Two-Tier EDC Convergence & Reversible Aliases** | `aliases` + `canon_verdicts` tables, Two-Tier convergence resolver (`resolve()`), `InMemoryLookupKB` prior distribution $P(e \mid a)$, SQLite graph view joins. | **COMPLETE** | [`docs/ADR.md`](file:///home/harri/yaw/docs/ADR.md), [`FOUNDATIONAL.md §5.1-5.2`](file:///home/harri/yaw/FOUNDATIONAL.md), [`docs/adr/ADR-010.md`](file:///home/harri/yaw/docs/adr/ADR-010.md) | `tests/test_canonicalization.py` |
 | **Epic 5.0b (Sprint 5-Align)** | **Forensic Semantic Web Alignment & Quad Preparation** | Standardize 14 canonical predicates ([`ADR-008`](file:///home/harri/yaw/docs/adr/ADR-008.md)), 9 plural roots ([`ADR-005`](file:///home/harri/yaw/docs/adr/ADR-005.md)), quad view contracts. | **COMPLETE** | [`docs/adr/ADR-008.md`](file:///home/harri/yaw/docs/adr/ADR-008.md), [`docs/rdf-owl-shacl.md`](file:///home/harri/yaw/docs/rdf-owl-shacl.md) | Commit `dd25de9` |
 | **Epic 5.0c (Remediation Prior)** | **Native spaCy & spacy-llm Remediation Prior** | SSOT base `en_core_web_lg`, `spacy.BatchCache.v1`, purge regex heuristics, 2-tier convergence (0 LLM canonicalization calls), FTS5 stopword stripping, `yaw shutdown`. | **COMPLETE** | [`spacy/SKILL.md`](file:///home/harri/yaw/.agents/skills/spacy/SKILL.md), [`FOUNDATIONAL.md`](file:///home/harri/yaw/FOUNDATIONAL.md) | 208/208 tests pass (Commits `b70d8d4`, `bfdd064`, `67c33fa`) |
-| **Epic 5.1 (Sprint 5.1)** | **Substrate Hardening, Quad Views & 14-Predicate Alignment** | Reconcile `aliases.method` CHECK, purge `is_a`, enforce 14 ADR-008 predicates, plural `concepts:`, 5-col `unified_edges` quads, `compiled_relations` tables, subsumption conductance. | **COMPLETE** | [`docs/alignment-sprint-for-e5s2.md`](file:///home/harri/yaw/docs/alignment-sprint-for-e5s2.md), [`docs/adr/ADR-008.md`](file:///home/harri/yaw/docs/adr/ADR-008.md) | [`tests/test_sprint5_1_alignment.py`](file:///home/harri/yaw/tests/test_sprint5_1_alignment.py) (Commit `481d5bd`) |
+| **Epic 5.1 (Sprint 5.1)** | **Substrate Hardening, Quad Views & 14-Predicate Alignment** | Reconcile `aliases.method` CHECK, purge `is_a`, enforce 14 ADR-008 predicates, plural `concepts:`, 5-col `unified_edges` quads, `compiled_relations` tables, subsumption conductance. | **COMPLETE** | [`docs/alignment-sprint-for-e5s2.md`](file:///home/harri/yaw/docs/alignment-sprint-for-e5s2.md), [`docs/adr/ADR-008.md`](file:///home/harri/yaw/docs/adr/ADR-008.md) | `tests/test_storage.py`, `tests/test_canonicalization.py` (Commit `481d5bd`) |
 | **Epic 5.2 (Sprint 5B / E5S2)** | **Dynamic Few-Shot Steering & Live Vocabulary Injection** | `@registry.misc("yaw.CanonicalExamples.v1")`, ADR-008 predicate seeding, live canonical vocabulary steering, quad projection compatibility, multi-note audit. | **COMPLETE** | [`docs/adr/ADR-008.md`](file:///home/harri/yaw/docs/adr/ADR-008.md), [`docs/how-to-handle-spacy-llm.md`](file:///home/harri/yaw/docs/how-to-handle-spacy-llm.md), [`FOUNDATIONAL.md §5.1`](file:///home/harri/yaw/FOUNDATIONAL.md) | `tests/test_fewshot_steering.py` (35/35 pass, 261 total) |
 | **Epic 6.1 (Sprint 6A)** | **In-Process RDF Triple/Quad Substrate & Serialization** | 5-col SQLite quad view $\to$ `rdflib` graph extraction, CURIE prefixes, Turtle/N-Quads export, zero external graph server, code smell remediation. | **COMPLETE** | [`FOUNDATIONAL.md §1, §5.4`](file:///home/harri/yaw/FOUNDATIONAL.md), [`docs/rdf-owl-shacl.md`](file:///home/harri/yaw/docs/rdf-owl-shacl.md) | `tests/test_rdf_substrate.py` (Commit `462ad1e`) |
 | **Epic 6.2 (Sprint 6B)** | **OWL 2 RL & SKOS Taxonomic Subsumption Inference** | In-process OWL 2 RL inference rules, `owl:sameAs` transitive closure via `aliases`, `skos:broader`/`skos:narrower` concept schemes. | **COMPLETE** | [`docs/ADR.md`](file:///home/harri/yaw/docs/ADR.md), [`docs/rdf-owl-shacl.md`](file:///home/harri/yaw/docs/rdf-owl-shacl.md) | `tests/test_owl_ontology.py` (Commit `79ce19d`, 25/25 pass) |
 | **Epic 6.3 (Sprint 6C)** | **Closed-World SHACL Wiki Lint & Validation** | Declarative `sh:NodeShape` & `sh:PropertyShape` validation via `pyshacl` in-process, orphan concept & contradiction detection in `lint_wiki`. | **COMPLETE** | [`FOUNDATIONAL.md §5.4`](file:///home/harri/yaw/FOUNDATIONAL.md), [`docs/rdf-owl-shacl.md`](file:///home/harri/yaw/docs/rdf-owl-shacl.md) | `tests/test_shacl_lint.py` (34/34 pass) |
 | **Epic 7 (Sprint 7A)** | **Pluggable RDF/OWL Ontology Substrate & Configurable Extraction** | Dynamic OWL/RDFS ingestion (`infer_ontologies`), dynamic catalog tables, dual extraction modes (`open_ie=true|false`), dynamic SHACL whitelist, Ollama offline warning callouts. | **COMPLETE** | [`docs/ADR.md`](file:///home/harri/yaw/docs/ADR.md), [`FOUNDATIONAL.md §5.4`](file:///home/harri/yaw/FOUNDATIONAL.md), [`docs/epic7-pluggable-ontology-integration-spec.md`](file:///home/harri/yaw/docs/epic7-pluggable-ontology-integration-spec.md) | `tests/test_pluggable_ontology.py` (11/11 pass, 429 total) |
-| **Epic 8.1 (Sprint 8A)** | **FastMCP Production Tool Contract Implementation** | Full production FastMCP contract: `query_wiki`, `compile_wiki`, `lint_wiki`, `ingest_raw` with native `infer_ontologies` & `open_ie` parameters, error protocol and stdio/http transports. | **SPECIFIED (TARGET v1.0)** | [`docs/karpathy-llm-wiki.md`](file:///home/harri/yaw/docs/karpathy-llm-wiki.md), [`FOUNDATIONAL.md §5.4`](file:///home/harri/yaw/FOUNDATIONAL.md) | `tests/test_fastmcp_contract.py` |
-| **Epic 8.2 (Sprint 8B)** | **Markdown Wiki Materialization & Fenced Turtle Substrate** | Materialize `vault/wiki/{namespace}/{slug}.md` with frontmatter, `[[wikilinks]]`, and folded callout `> [!metadata]- RDF Turtle Substrate`. | **SPECIFIED (TARGET v1.0)** | [`FOUNDATIONAL.md §1, §6`](file:///home/harri/yaw/FOUNDATIONAL.md), [`docs/karpathy-llm-wiki.md`](file:///home/harri/yaw/docs/karpathy-llm-wiki.md) | `tests/test_wiki_materializer.py` |
+| **Epic 7.5** | **Architectural Convergence & Pre-Epic 8 Substrate Realignment** | Cython `InMemoryLookupKB` prior distribution $P(e \mid a)$, Bayesian evidence chunk scoring, clean `aliases.method` CHECK, zero-fallback enforcement. | **COMPLETE** | [`FOUNDATIONAL.md §3, §5.1-5.3`](file:///home/harri/yaw/FOUNDATIONAL.md), [`docs/adr/ADR-010.md`](file:///home/harri/yaw/docs/adr/ADR-010.md) | `tests/test_retriever.py`, `tests/test_canonicalization.py` (98/98 pass) |
+| **Epic 7.6 (Sprint 7F)** | **Compile-Time Closed-World SHACL & O(1) Contradiction Caching** | Wire `validate_wiki_graph_fast` into `compile_wiki()`, transactional `compiled_violations` SQLite table, O(1) `lint_wiki()` reads, ontology FTS5/vector indexing. | **SPECIFIED (TARGET v1.0)** | [`FOUNDATIONAL.md §4.3-4.4, §5.5`](file:///home/harri/yaw/FOUNDATIONAL.md), [`docs/adr/ADR-011.md`](file:///home/harri/yaw/docs/adr/ADR-011.md) | `tests/test_compile_shacl_cache.py` |
+| **Epic 8.1 (Sprint 8A)** | **Compilation Triggers, B-Tree Ward HAC & FastMCP Production Lifecycle** | Ingestion post-sync compilation hook, B-Tree Ward HAC cluster splitting, hypernym induction, full FastMCP production lifecycle (`compile_wiki`, `lint_wiki`, `query_wiki`, `ingest_raw`). | **SPECIFIED (TARGET v1.0)** | [`docs/adr/ADR-002.md`](file:///home/harri/yaw/docs/adr/ADR-002.md), [`docs/adr/ADR-011.md`](file:///home/harri/yaw/docs/adr/ADR-011.md), [`FOUNDATIONAL.md §4`](file:///home/harri/yaw/FOUNDATIONAL.md) | `tests/test_fastmcp_contract.py`, `tests/test_btree_hac.py` |
+| **Epic 8.2 (Sprint 8B)** | **2WikiMultiHopQA & MuSiQue Benchmark Evaluation Harness & Materialization** | Ingest official benchmark slices into `sample-llm-wiki/raw/benchmark/`, execute official eval scripts (Exact Match, Token F1, Recall@k, Supporting Fact F1), materialize `vault/wiki/`. | **SPECIFIED (TARGET v1.0)** | [`FOUNDATIONAL.md §1, §6`](file:///home/harri/yaw/FOUNDATIONAL.md), [`docs/karpathy-llm-wiki.md`](file:///home/harri/yaw/docs/karpathy-llm-wiki.md) | `eval/run_benchmark.py`, `tests/test_wiki_materializer.py` |
 | **Epic 8.3 (Sprint 8C)** | **Packaging, CI Matrix & GitHub v1.0 Release** | Multi-OS GitHub Actions CI, packaging, documentation audit, release tag `v1.0.0`. | **SPECIFIED (TARGET v1.0)** | [`README.md`](file:///home/harri/yaw/README.md), [`FOUNDATIONAL.md`](file:///home/harri/yaw/FOUNDATIONAL.md) | `tests/test_e2e_launch.py` |
 
 ---
@@ -126,6 +128,7 @@ Prevent ontological fragmentation by implementing the core **Entity Disambiguati
   1. *Tier 1 (Direct Match)*: Exact slug match or registered active alias lookup in `aliases` or `InMemoryLookupKB`. Instant resolution with 0 vector or LLM calls.
   2. *Tier 2 (Near Match)*: In-process vector similarity > `CANON_SIM_THRESHOLD` (0.80) using static GloVe 300d vectors (`en_core_web_lg`). Consolidates to existing canonical node.
   3. *Induction (Novel Node)*: Novel entity registered with URI `concepts:{slug}` (`TierEnum.NEW_INDUCTION`, `is_new=True`).
+- **Compiled C/Cython Knowledge Base & Prior Distributions ([`docs/adr/ADR-010.md`](file:///home/harri/yaw/docs/adr/ADR-010.md)):** `InMemoryLookupKB` maintains an alias candidate distribution with prior probabilities $P(\text{entity} \mid \text{alias}) \in (0, 1]$ satisfying unit sum $\sum_e P(e \mid a) = 1.0$. Microsecond candidate evaluation executes natively in Cython, and `aliases.score` records calibrated prior probabilities without premature winner-take-all discretization.
 - **Namespace Inheritance:** Merged aliases strictly inherit the canonical node's root namespace (`concepts`, `entities`, `invariants`, `decisions`, `processes`, `claims`, `sources`, `contexts`, `predicates`).
 - **Ingestion Hook:** `process_vault_raw` calls `resolve()` for nodes and predicates, writing canonical URIs to SQLite while recording aliases.
 
@@ -162,17 +165,17 @@ Remediated architectural drift by enforcing canonical spaCy and `spacy-llm` idio
 ### 7.4 Epic 5.1 (Sprint 5.1): Mid-Epic 5 Remediation & Pre-E5S2 Architectural Alignment
 **Status:** **COMPLETE** (Commit `481d5bd`, 226/226 tests green, Sentrux modularity 5234)  
 **Governing Document:** [`docs/alignment-sprint-for-e5s2.md`](file:///home/harri/yaw/docs/alignment-sprint-for-e5s2.md), [`docs/adr/ADR-008.md`](file:///home/harri/yaw/docs/adr/ADR-008.md), [`FOUNDATIONAL.md §1, §5.4`](file:///home/harri/yaw/FOUNDATIONAL.md)  
-**Target Test File:** [`tests/test_sprint5_1_alignment.py`](file:///home/harri/yaw/tests/test_sprint5_1_alignment.py)
+**Target Test Files:** `tests/test_storage.py`, `tests/test_canonicalization.py`
 
 #### 1. Goal & Architecture
 Surgically remediate schema, configuration, and namespace discrepancies identified during the cross-epic forensic audit before launching Sprint 5B:
 1. **Predicate SSOT Alignment:** Update `config.BASE_PREDICATES` to the authoritative 14 ADR-008 canonical predicates across 4 categories, explicitly purging `is_a`. Update `daemon.get_ontology_schema()` to reflect this SSOT.
 2. **Plural Root Namespace Alignment:** Change `canonicalize.py` defaults from singular `"concept"` to plural `"concepts"`, validating against `config.TAXONOMY_NAMESPACES` to guarantee W3C URI regex compliance.
-3. **SQLite Aliases Method CHECK Constraint:** Reconcile `db.py` `CHECK(method IN ('exact', 'alias', 'lexical', 'auto', 'llm', 'compile', 'new'))` with `MatchMethod` enum.
+3. **SQLite Aliases Method CHECK Constraint & Calibrated Priors:** Reconcile `db.py` `CHECK(method IN ('exact', 'alias', 'auto', 'new', 'ontology'))` with `MatchMethod` enum (with `'lexical'`, `'llm'`, and `'compile'` completely purged in Epic 7.5), while formalizing `aliases.score` as the calibrated candidate prior confidence / conditional probability $P(\text{canonical\_id} \mid \text{alias\_id})$ feeding into PPR seeding ([`docs/adr/ADR-010.md`](file:///home/harri/yaw/docs/adr/ADR-010.md)).
 4. **5-Column `unified_edges` Quad Projection:** Extend `unified_edges` view to project `(src_id, dst_id, rel_type, weight, source_chunk_id)` for seamless Sprint 6A named quad export.
 5. **Compiled Knowledge Persistence:** Architect `compiled_nodes` and `compiled_relations` tables in `db.py` and union into views, preserving Invariant 1 (extraction substrate purity) during ADR-002 saturated hub bisections.
 6. **Subsumption Conductance Asymmetry:** Implement 1.0 downward / 0.2 upward conductance in `retriever.py` for `subClassOf`/`partOf` with reciprocal reverse edge synthesis.
-7. **Contested Alias State Machine:** Implement automated transition to `status = 'contested'` when Tier 3 LLM adjudication encounters low confidence ($<0.80$).
+7. **Contested Alias State Machine:** Implement automated transition to `status = 'contested'` when candidate confidence is low ($<0.80$) or when conflicting candidates emerge, flagging them for SHACL closed-world linting without live LLM calls.
 
 #### 2. Verification
 - `uv run pytest tests/test_sprint5_1_alignment.py -v` (100% pass across all 7 tests).
@@ -319,6 +322,9 @@ Transform the hardcoded 9-namespace taxonomy into a pluggable RDF/OWL substrate 
 4. **Dynamic Closed-World SHACL Whitelisting:**
    - Dynamically synthesize or bind domain-specific SHACL shape graphs (`shapes_graph`) based on imported OWL classes and restrictions.
    - Closed-world pySHACL validation enforces domain-specific shape constraints without modifying core engine logic.
+5. **Dynamic Knowledge Base Vocabulary & Alias Prior Synchronization ([`docs/adr/ADR-010.md`](file:///home/harri/yaw/docs/adr/ADR-010.md)):**
+   - Imported RDF/OWL/SKOS ontologies dynamically synchronize terms, class labels, and `skos:altLabel` synonyms directly into `InMemoryLookupKB` via `sync_kb_from_db`.
+   - Each imported synonym registers a calibrated candidate prior probability $P(e \mid a)$, ensuring external domain ontologies immediately participate in probabilistic seed formulation and topological disambiguation during GraphRAG retrieval without manual prompt tuning.
 
 ### 9.2 Test Authoring Plan (TDD & Grounded Invariants)
 - **Invariant 1 (Pluggable Ingestion Invariant):**
@@ -332,64 +338,123 @@ Transform the hardcoded 9-namespace taxonomy into a pluggable RDF/OWL substrate 
 
 ---
 
+## 9.5. Epic 7.5: Architectural Convergence & Pre-Epic 8 Substrate Realignment
+**Status:** **IMPLEMENTED & VERIFIED**  
+**Governing Document:** `pre_epic8_realignment_plan.md`, [`FOUNDATIONAL.md §3, §4, §5`](file:///home/harri/yaw/FOUNDATIONAL.md), [`ADR-003`](file:///home/harri/yaw/docs/adr/ADR-003.md), [`ADR-010`](file:///home/harri/yaw/docs/adr/ADR-010.md)  
+**Target Test Files:** `tests/test_retriever.py`, `tests/test_pluggable_ontology.py`, `tests/test_canonicalization.py`, `tests/test_fewshot_steering.py`
+
+### 9.5.1 Goal & Architectural Pillars
+Harden the core ingestion, retrieval, storage, and server layers to eliminate architectural smells, align with ADR-010 candidate prior semantics, and enforce zero-fallback guarantees across the substrate ahead of Epic 8:
+1. **Bayesian Evidence Chunk Scoring & Canopy Seeding (R1, ADR-010):**
+   - Candidate prior probabilities $P(e \mid a)$ from `InMemoryLookupKB` are blended proportionally into seed vector $\mathbf{p}_0$ ($\sum_a P(e \mid a) \cdot \max(0.0, \text{sim}(q, e))$), simplifying continuously to $\sum_a P(e \mid a)$ when $\mathbf{q} = \mathbf{0}$ (Ollama offline).
+   - Compound Bayesian evidence chunk scoring:
+     $$\text{Score}(c) = \left( \sum_{e \in \text{entities}(c)} P(e \mid a) \cdot \mathbf{p}^*[e] + \mathbf{p}^*[c] \right) \cdot \text{sim}(q, c)$$
+   - Full query mention extraction spanning exact query, spaCy doc entities, noun chunks, tokens, and sliding n-grams.
+2. **Storage Schema & DB Constraint Purification (R2, Invariant 4):**
+   - Purged dead-code methods (`'lexical'`, `'llm'`, `'compile'`) from `aliases` table `CHECK` constraints. Canonical set strictly enforced: `('exact', 'alias', 'auto', 'new', 'ontology')`.
+   - Purged silent exception swallowers and legacy argument-order shims in `insert_alias` and `insert_leaf_node`, enforcing immediate `ValueError` and zero fallbacks.
+   - Idempotent migration in `ensure_schema_tables` rebuilding obsolete `aliases` tables non-destructively.
+   - Synchronized `FOUNDATIONAL.md` SQLite schema contracts.
+3. **Dynamic Ontology Loader KB Synchronization (R3, ADR-010):**
+   - Implemented `sync_dynamic_ontology_to_kb` registering dynamically ingested OWL/RDFS classes, properties, and synonym aliases with normalized candidate priors into `InMemoryLookupKB`.
+   - Connected dynamic sync directly to `ingest_ontology(..., kb=...)`.
+4. **Daemon KB Wiring & Cache Lifecycle (R4):**
+   - Implemented module-level `get_daemon_kb(conn)` and `reset_daemon_kb()`.
+   - Mounted `InMemoryLookupKB` into `GraphRAGRetriever`, `query_wiki`, and `find_seed`.
+   - Wired cache invalidation and re-synchronization into `compile_wiki` and `load_ontology`.
+
+---
+
+## 9.6. Epic 7.6: Compile-Time Closed-World SHACL Validation & O(1) Contradiction Caching
+**Status:** **SPECIFIED (PRE-EPIC 8 TARGET)**  
+**Governing Document:** [`docs/adr/ADR-011.md`](file:///home/harri/yaw/docs/adr/ADR-011.md), [`FOUNDATIONAL.md §4.3, §4.4, §5.5`](file:///home/harri/yaw/FOUNDATIONAL.md), [`docs/rdf-owl-shacl.md`](file:///home/harri/yaw/docs/rdf-owl-shacl.md)  
+**Target Test Files:** `tests/test_compile_shacl_cache.py`, `tests/test_shacl_lint.py`
+
+### 9.6.1 Goal & Architectural Pillars
+Decouple streaming chunk ingestion from heavy SHACL validation while eliminating the multi-second latency of on-demand `lint_wiki()` invocations:
+1. **Compile-Time Fast SHACL Execution (`compile_wiki`):**
+   - Wire `validate_wiki_graph_fast(conn)` into `compile_wiki()` in `src/yaw/server/daemon.py`.
+   - Executes lean closed-world validation in $<200\text{ ms}$ over SQLite relational pre-closure (`unified_edges`, `unified_nodes`) with `inference=None`.
+   - Surfaces dialectical contradictions (`causes` vs `prevents`, `supports` vs `refutes`, contested alias merges) and structural violations (`yaw:ConceptShape`, `yaw:RelationShape`).
+2. **Persistent `compiled_violations` SQLite Storage:**
+   - Add `compiled_violations` schema table and indexes (`idx_violations_focus`, `idx_violations_shape`, `idx_violations_severity`) to `src/yaw/storage/schema.py`.
+   - Add idempotent migration in `ensure_schema_tables`.
+   - Implement `persist_compiled_violations(conn, violations)` and `fetch_compiled_violations(conn, focus_node=None, query=None)`.
+   - Transactionally refresh compilation results during each `compile_wiki()` run.
+3. **$\mathcal{O}(1)$ Instantaneous `lint_wiki` Protocol:**
+   - Refactor `lint_wiki(query=None, vault_dir=None, force=False)` to query `compiled_violations` directly from SQLite by default.
+   - Returns structured violation records in $<5\text{ ms}$.
+   - Scoped query (`query="X"`) performs fast indexed SQLite `WHERE` filter.
+   - Live pySHACL is reserved exclusively for `force=True`.
+4. **Ontology Layer FTS & Vector Indexing:**
+   - In `src/yaw/ontology/loader.py` (`sync_dynamic_ontology_to_kb` / `ingest_ontology`), insert dynamic class names and definitions into `query_fts` (FTS5).
+   - Store class embeddings in `sqlite-vec` during dynamic ontology ingestion and compile-time hypernym induction.
+   - Ensures `compute_seed_candidates` retrieves ontology nodes as first-class seed candidates.
+
+### 9.6.2 Test Authoring Plan (TDD & Unmocked Invariants)
+- `tests/test_compile_shacl_cache.py`:
+  - `test_compile_wiki_runs_fast_shacl_and_persists_violations`: Seed contradictory relations (`A causes B` and `A prevents B`), call `compile_wiki()`, assert `compiled_violations` contains 2 records and execution completes in $<250\text{ ms}$.
+  - `test_lint_wiki_serves_from_sqlite_cache_in_sub_10ms`: Assert `lint_wiki()` queries the SQLite cache with zero `pyshacl.validate` calls when `force=False`.
+  - `test_lint_wiki_scoped_query_filtering`: Assert `lint_wiki(query="target_concept")` returns only violations where `focus_node` or message matches target.
+  - `test_lint_wiki_force_revalidation_updates_cache`: Assert `lint_wiki(force=True)` triggers live validation and refreshes the cache.
+  - `test_dynamic_ontology_ingestion_inserts_fts_and_vectors`: Assert `ingest_ontology` indexes classes into `query_fts` and `leaf_nodes.embedding`.
+
+---
+
 ## 10. Epic 8: Production FastMCP Server, Compiled Wiki Materialization & GitHub v1.0 Launch
 **Status:** **SPECIFIED (TARGET v1.0 LAUNCH)**  
-**Governing Document:** [`docs/karpathy-llm-wiki.md`](file:///home/harri/yaw/docs/karpathy-llm-wiki.md), [`FOUNDATIONAL.md §5.4, §6`](file:///home/harri/yaw/FOUNDATIONAL.md)  
-**Target Test Files:** `tests/test_wiki_materializer.py`, `tests/test_e2e_launch.py`, `tests/test_server_streaming.py`
+**Governing Document:** [`docs/karpathy-llm-wiki.md`](file:///home/harri/yaw/docs/karpathy-llm-wiki.md), [`FOUNDATIONAL.md §4, §5.4, §6`](file:///home/harri/yaw/FOUNDATIONAL.md), [`docs/adr/ADR-002.md`](file:///home/harri/yaw/docs/adr/ADR-002.md), [`docs/adr/ADR-011.md`](file:///home/harri/yaw/docs/adr/ADR-011.md)  
+**Target Test Files:** `tests/test_fastmcp_contract.py`, `tests/test_btree_hac.py`, `tests/test_wiki_materializer.py`, `eval/run_benchmark.py`, `tests/test_e2e_launch.py`
 
 ### 10.1 Goal & Architecture
-Achieve production feature completeness (v1.0) and prepare the repository for public GitHub launch. Deliver the full Karpathy LLM-Wiki contract over FastMCP with streaming HTTP/SSE access and non-blocking background continuous indexing:
-1. **Core 4 FastMCP Production Tools:**
-   - **`compile_wiki(force: bool = False) -> dict`**:
-     - Executes incremental re-consolidation over delta raw notes.
-     - Evaluates B-Tree node oversaturation: when degree $> K_{\max} = 10$, executes deterministic SciPy Ward's HAC bisection and induces hypernym superclass via `temperature=0.1` LLM, rewiring `subClassOf` edges with $1.0 / 0.2$ conductance asymmetry ([`ADR-002`](file:///home/harri/yaw/docs/adr/ADR-002.md)).
-     - Deterministically renders markdown pages directly from SQLite row data: YAML frontmatter from `unified_nodes` (`definition`), and page body from `unified_edges` (`[[wikilinks]]`); zero LLM authoring or synthesis.
-     - Strictly preserves Invariant 1: `vault/raw/` is never mutated; materialized wiki pages are cleanly segregated under `vault/wiki/`.
-   - **`lint_wiki(query: str | None = None) -> list[dict]`**:
-     - Surfaces dialectical contradictions, orphaned concepts, broken links, and contested canonical merges via closed-world SHACL evaluation.
-   - **`ingest_raw(content: str, title: str | None = None, url: str | None = None) -> dict`**:
-     - Writes immutable, timestamped markdown notes into `vault/raw/` with standardized YAML frontmatter.
-   - **`query_wiki(query: str, top_k: int = 3) -> str`**:
-     - Full dual-layer GraphRAG retrieval returning token-dense per-result Bridging Subgraphs and zero-copy disk hydrated evidence slices.
-2. **Remote FastMCP Daemon over Streaming HTTP/SSE:**
+Achieve production feature completeness (v1.0) and prepare the repository for public GitHub launch. Deliver the full Karpathy LLM-Wiki contract over FastMCP with streaming HTTP/SSE access, non-blocking background continuous indexing, and benchmark evaluation against published QA datasets:
+1. **Compilation Trigger & B-Tree Ward HAC Deepening (Epic 8.1 / Sprint 8A):**
+   - **Post-Sync Ingestion Hook:** CocoIndex file watcher / batch `sync_vault()` invokes debounced `compile_wiki(force=False)` upon ingestion settling.
+   - **B-Tree Hub Splitting:** When node degree $> K_{\max} = 10$, executes deterministic SciPy Ward's HAC bisection and induces hypernym superclass via `temperature=0.1` LLM, rewiring `subClassOf` edges with $1.0 / 0.2$ conductance asymmetry ([`ADR-002`](file:///home/harri/yaw/docs/adr/ADR-002.md)).
+   - **Compile-Time SHACL Validation:** Automatically invokes `validate_wiki_graph_fast` and persists dialectical contradictions into `compiled_violations` ([`ADR-011`](file:///home/harri/yaw/docs/adr/ADR-011.md)).
+2. **2WikiMultiHopQA & MuSiQue Benchmark Evaluation Harness (Epic 8.2 / Sprint 8B):**
+   - Ingest official multi-hop benchmark slices into `sample-llm-wiki/raw/benchmark/`.
+   - Evaluation harness in `eval/run_benchmark.py` running official published evaluation scripts:
+     - **Exact Match (EM)** and **Token F1** on final answer extraction.
+     - **Paragraph Recall@k** ($k \in \{2, 5, 10\}$) for retrieved evidence chunks.
+     - **Supporting Fact F1** and **Evidentiary Path F1** against ground-truth multi-hop reasoning graphs.
+     - **Strict Invariant:** Evaluated strictly against published benchmark metrics (zero handrolled metrics).
+   - Materialize deterministic read-only Markdown and Turtle pages into `vault/wiki/{namespace}/{slug}.md`.
+3. **Remote FastMCP Daemon over Streaming HTTP/SSE (Epic 8.1):**
    - Standard FastMCP server exposes Server-Sent Events (SSE) streaming transport (`/sse` endpoint) paired with streaming HTTP POST execution endpoints (`/messages/`).
    - Remote LLM agents interact exclusively via MCP protocol framing, making zero assumptions about local shell execution, subshell spawning, or CLI availability on the client host.
-3. **Non-Blocking Background CocoIndex Continuous Indexing:**
+4. **Non-Blocking Background Concurrency & Zero SQLite Busy Locks:**
    - Background file-watcher and ingestion threads operate concurrently with query serving.
    - SQLite concurrency architecture: WAL journal mode (`PRAGMA journal_mode = WAL`), non-blocking busy timeouts (`PRAGMA busy_timeout = 5000`), and connection pooling separating read-only query connections from dedicated write transactions.
    - Heavy ingestion bursts (chunking, embedding, EDC canonicalization) run asynchronously without causing `sqlite3.OperationalError: database is locked`, query latency spikes, or read stalls.
-4. **Production Packaging & CI Matrix:**
+5. **Production Packaging & CI Matrix (Epic 8.3 / Sprint 8C):**
    - GitHub Actions CI workflow covering Python 3.10, 3.11, 3.12, and 3.13.
    - Zero-warning `ty` typecheck and `ruff` lint.
    - Sentrux architectural score $\ge 7200$.
 
 ### 10.2 Test Authoring Plan (TDD & Grounded Invariants)
-- **Target Test Files:** `tests/test_wiki_materializer.py`, `tests/test_e2e_launch.py`, `tests/test_server_streaming.py`.
+- **Target Test Files:** `tests/test_fastmcp_contract.py`, `tests/test_btree_hac.py`, `tests/test_wiki_materializer.py`, `eval/run_benchmark.py`, `tests/test_e2e_launch.py`.
 - **Invariant 1 (Substrate Mutation Isolation):**
   - Materialization writes strictly to `vault/wiki/`.
   - Assert zero file creation, modification, or timestamp mutation inside `vault/raw/`.
 - **Invariant 2 (Valid Obsidian Frontmatter & Bidirectional Wikilinks):**
-  - Assert generated files under `vault/wiki/{namespace}/{slug}.md` contain valid YAML frontmatter:
-    ```yaml
-    ---
-    uri: "concepts:uncertainty-principle"
-    namespace: "concepts"
-    definition: "Fundamental limit of precision in quantum mechanics."
-    ---
-    ```
-  - Assert page body contains connected relations rendered as standard `[[wikilinks]]`.
+  - Assert generated files under `vault/wiki/{namespace}/{slug}.md` contain valid YAML frontmatter and connected relations rendered as standard `[[wikilinks]]`.
 - **Invariant 3 (Idempotent Compilation & Orphan Pruning):**
   - Re-running `compile_wiki()` cleanly overwrites existing `vault/wiki/` pages without content duplication.
   - Removing a concept from the index cleanly prunes its orphaned `.md` file from `vault/wiki/`.
-- **Invariant 4 (Dialectical Linter Surfacing):**
+- **Invariant 4 (Dialectical Linter & Cached Violation Surfacing):**
   - Seed an alias marked as `contested` and two contradictory relations (`A causes B` vs `A prevents B`).
-  - Assert `lint_wiki()` surfaces both conflicts in structured report.
-- **Invariant 5 (FastMCP Streamable HTTP & SSE Transport End-to-End):**
+  - Assert `compile_wiki()` detects both conflicts and records them in `compiled_violations`.
+  - Assert `lint_wiki()` retrieves both in $<5\text{ ms}$ without live pySHACL re-execution.
+- **Invariant 5 (Benchmark Evaluation Rigor):**
+  - Execute evaluation harness over 2Wiki and MuSiQue benchmark slices.
+  - Assert retrieval attains published recall thresholds on multi-hop chains via PPR topological diffusion.
+- **Invariant 6 (FastMCP Streamable HTTP & SSE Transport End-to-End):**
   - Launch FastMCP daemon over loopback HTTP (`127.0.0.1:8765`) using SSE transport.
   - Connect remote FastMCP client over SSE `/sse` and message streaming `/messages/`.
   - Execute end-to-end client session: `ingest_raw` $\to$ `compile_wiki` $\to$ `query_wiki` $\to$ `lint_wiki`.
   - Assert all 4 production operations succeed with zero protocol framing errors and zero local CLI invocations.
-- **Invariant 6 (Non-Blocking Concurrency & Zero SQLite Busy Locks):**
+- **Invariant 7 (Non-Blocking Concurrency & Zero SQLite Busy Locks):**
   - Run continuous high-throughput CocoIndex ingestion of 50 multi-chunk notes in background task.
   - Concurrently execute 30 parallel `query_wiki()` requests across multiple worker threads.
   - Assert 100% of queries succeed with zero `database is locked` operational errors and mean query latency $\le 50 \text{ ms}$.

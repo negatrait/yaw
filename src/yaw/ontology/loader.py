@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import rdflib
 from rdflib import OWL, RDF, RDFS, SKOS, URIRef
 
@@ -374,34 +375,39 @@ def _insert_class_records(
                 (rc["curie"], sec_parent),
             )
 
-        insert_alias(
-            conn,
-            alias_id=rc["curie"],
-            canonical_id=rc["curie"],
-            kind="entity",
-            method="ontology",
-            score=1.0,
-        )
-        insert_alias(
-            conn,
-            alias_id=rc["label"].lower().strip(),
-            canonical_id=rc["curie"],
-            kind="entity",
-            method="ontology",
-            score=1.0,
-        )
-        aliases_materialized += 2
+        label_clean = rc["label"].strip()
+        class_aliases = {
+            rc["curie"],
+            label_clean,
+            label_clean.lower(),
+            rc["suffix"],
+            rc["suffix"].lower(),
+        }
+        for a_form in class_aliases:
+            if a_form:
+                insert_alias(
+                    conn,
+                    alias_id=a_form,
+                    canonical_id=rc["curie"],
+                    kind="entity",
+                    method="ontology",
+                    score=1.0,
+                )
+                aliases_materialized += 1
 
         for alt in rc["alt_labels"]:
-            insert_alias(
-                conn,
-                alias_id=alt,
-                canonical_id=rc["curie"],
-                kind="entity",
-                method="ontology",
-                score=0.95,
-            )
-            aliases_materialized += 1
+            alt_clean = alt.strip()
+            for alt_form in {alt_clean, alt_clean.lower()}:
+                if alt_form:
+                    insert_alias(
+                        conn,
+                        alias_id=alt_form,
+                        canonical_id=rc["curie"],
+                        kind="entity",
+                        method="ontology",
+                        score=0.95,
+                    )
+                    aliases_materialized += 1
 
     return classes_ingested, aliases_materialized
 
@@ -450,23 +456,25 @@ def _insert_prop_records(
             )
         props_ingested += 1
 
-        insert_alias(
-            conn,
-            alias_id=rp["curie"],
-            canonical_id=rp["curie"],
-            kind="predicate",
-            method="ontology",
-            score=1.0,
-        )
-        insert_alias(
-            conn,
-            alias_id=rp["suffix"].lower(),
-            canonical_id=rp["curie"],
-            kind="predicate",
-            method="ontology",
-            score=1.0,
-        )
-        aliases_materialized += 2
+        prop_clean = rp["label"].strip()
+        prop_aliases = {
+            rp["curie"],
+            prop_clean,
+            prop_clean.lower(),
+            rp["suffix"],
+            rp["suffix"].lower(),
+        }
+        for a_form in prop_aliases:
+            if a_form:
+                insert_alias(
+                    conn,
+                    alias_id=a_form,
+                    canonical_id=rp["curie"],
+                    kind="predicate",
+                    method="ontology",
+                    score=1.0,
+                )
+                aliases_materialized += 1
 
     return props_ingested, aliases_materialized
 
@@ -519,11 +527,121 @@ def _persist_ontology_catalog(
         raise
 
 
+def sync_dynamic_ontology_to_kb(
+    kb: Any,
+    conn: sqlite3.Connection,
+    ontology_id: str,
+) -> None:
+    """Synchronize dynamically ingested classes and aliases with candidate priors into InMemoryLookupKB."""
+    from yaw.indexer.canonicalize import _register_alias_in_kb
+
+    # 1. Register canonical classes
+    class_rows = conn.execute(
+        """
+        SELECT curie, label, epistemic_type
+        FROM dynamic_classes
+        WHERE ontology_id = ?
+        """,
+        (ontology_id,),
+    ).fetchall()
+
+    for curie_val, label_val, _ep_type in class_rows:
+        curie = str(curie_val)
+        label = str(label_val).strip() if label_val else ""
+        if not kb.contains_entity(curie):
+            vec = np.zeros(kb.entity_vector_length, dtype=np.float32)
+            if label and label in kb.vocab and kb.vocab[label].has_vector:
+                arr = np.asarray(kb.vocab[label].vector, dtype=np.float32)
+                if len(arr) == kb.entity_vector_length:
+                    norm = float(np.linalg.norm(arr))
+                    vec = arr / norm if norm > 1e-12 else arr
+            kb.add_entity(entity=curie, freq=1, entity_vector=vec)
+
+        _register_alias_in_kb(kb, alias=curie, canonical_id=curie, score=1.0)
+
+    # 2. Register dynamic properties
+    prop_rows = conn.execute(
+        """
+        SELECT curie, label
+        FROM dynamic_properties
+        WHERE ontology_id = ?
+        """,
+        (ontology_id,),
+    ).fetchall()
+
+    for curie_val, _label_val in prop_rows:
+        curie = str(curie_val)
+        if not kb.contains_entity(curie):
+            vec = np.zeros(kb.entity_vector_length, dtype=np.float32)
+            kb.add_entity(entity=curie, freq=1, entity_vector=vec)
+        _register_alias_in_kb(kb, alias=curie, canonical_id=curie, score=1.0)
+
+    # 3. Synchronize active aliases for this ontology with grouped prior normalization
+    alias_rows = conn.execute(
+        """
+        SELECT a.alias_id, a.canonical_id, a.score
+        FROM aliases a
+        WHERE a.status = 'active'
+          AND (
+            a.canonical_id IN (SELECT curie FROM dynamic_classes WHERE ontology_id = ?)
+            OR a.canonical_id IN (SELECT curie FROM dynamic_properties WHERE ontology_id = ?)
+          )
+        """,
+        (ontology_id, ontology_id),
+    ).fetchall()
+
+    alias_groups: dict[str, dict[str, float]] = {}
+    for a_id, c_id, score in alias_rows:
+        if not a_id or not c_id:
+            continue
+        raw_alias = str(a_id).strip()
+        c_str = str(c_id).strip()
+        curr_score = float(score) if score is not None else 1.0
+        for a_key in {raw_alias, raw_alias.lower()}:
+            sub_map = alias_groups.setdefault(a_key, {})
+            sub_map[c_str] = max(sub_map.get(c_str, 0.0), curr_score)
+
+    for a_key, cand_map in alias_groups.items():
+        if kb.contains_alias(a_key):
+            existing_cands = kb.get_alias_candidates(a_key)
+            existing_ent_ids = [c.entity_ for c in existing_cands]
+            current_sum = sum(c.prior_prob for c in existing_cands)
+            rem = max(0.0, 1.0 - current_sum)
+            new_cands = [c for c in cand_map if c not in existing_ent_ids]
+            if new_cands and rem > 0.01:
+                raw_scores = [max(0.001, cand_map[c]) for c in new_cands]
+                tot_score = sum(raw_scores)
+                avail = rem
+                for i, c_str in enumerate(new_cands):
+                    if i == len(new_cands) - 1:
+                        allot = min(rem, max(0.001, rem))
+                    else:
+                        allot = min(rem, (cand_map[c_str] / tot_score) * avail)
+                        rem -= allot
+                    if allot > 0.001:
+                        kb.append_alias(
+                            alias=a_key,
+                            entity=c_str,
+                            prior_prob=allot,
+                        )
+        else:
+            cands = list(cand_map.keys())
+            raw_probs = [max(0.001, cand_map[c]) for c in cands]
+            prob_sum = sum(raw_probs)
+            probs = (
+                [p / prob_sum for p in raw_probs]
+                if prob_sum > 0
+                else [1.0 / len(cands)] * len(cands)
+            )
+            kb.add_alias(alias=a_key, entities=cands, probabilities=probs)
+
+
 def ingest_ontology(
     source: str | Path | rdflib.Graph,
     conn: sqlite3.Connection,
     ontology_id: str | None = None,
     is_default: bool = False,
+    kb: Any | None = None,
 ) -> dict[str, Any]:
     """Parse external RDF/OWL ontology into dynamic catalog tables and aliases.
 
@@ -532,6 +650,7 @@ def ingest_ontology(
         conn: Open SQLite connection with WAL pragmas applied.
         ontology_id: Prefix identifier (e.g. 'dico', 'prov'). Auto-detected if None.
         is_default: Whether this ontology serves as default fallback for Quad 3 & 4.
+        kb: Optional InMemoryLookupKB to synchronize with dynamic classes and aliases.
 
     Returns:
         Dictionary summarizing ingested classes, properties, and materialized aliases.
@@ -555,6 +674,12 @@ def ingest_ontology(
     reg = get_ontology_registry()
     reg.sync_from_db(conn)
 
+    from yaw.indexer.canonicalize import get_active_kb
+
+    target_kb = kb if kb is not None else get_active_kb()
+    if target_kb is not None:
+        sync_dynamic_ontology_to_kb(target_kb, conn, detected_prefix)
+
     return {
         "status": "success",
         "ontology_id": detected_prefix,
@@ -564,4 +689,4 @@ def ingest_ontology(
     }
 
 
-__all__ = ["ingest_ontology"]
+__all__ = ["ingest_ontology", "sync_dynamic_ontology_to_kb"]

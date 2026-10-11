@@ -13,17 +13,57 @@
 
 To navigate the system efficiently without cognitive thrashing or context decay, follow this progressive disclosure hierarchy:
 
+### 1. Core Architectural Canon, Governance & Master Roadmaps
 | System Layer | Document Link | Scope & Purpose |
 | :--- | :--- | :--- |
-| **System Overview & Invariants** | [`FOUNDATIONAL.md`](file:///home/harri/yaw/FOUNDATIONAL.md) (This Document) | Vision, 7 Invariants, Model Stack, Single-Stage DAG, SQLite Contracts, SciPy PPR Algorithms. |
-| **Active Execution Target** | [`docs/alignment-sprint-for-e5s2.md`](file:///home/harri/yaw/docs/alignment-sprint-for-e5s2.md) | Sprint 5.1 turnkey execution DAG, Prompt Cards for WP 5.1.1–5.1.7, TDD test specification. |
-| **Architectural Roadmap** | [`docs/epics-alignment-roadmap.md`](file:///home/harri/yaw/docs/epics-alignment-roadmap.md) | 7-Epic master plan (Epics 1–4 complete, Epic 5 active, Epics 6–7 specified), quality gates. |
-| **Architectural Decision Records** | [`docs/ADR.md`](file:///home/harri/yaw/docs/ADR.md) | Formal ADR ledger ([`ADR-001`](file:///home/harri/yaw/docs/adr/ADR-001.md) through [`ADR-009`](file:///home/harri/yaw/docs/adr/ADR-009.md)). |
-| **Semantic Web Integration** | [`docs/rdf-owl-shacl.md`](file:///home/harri/yaw/docs/rdf-owl-shacl.md) | W3C RDF quad mapping, OWL 2 RL inference, SKOS concept schemes, closed-world SHACL validation. |
-| **Acceptance Criteria (BDD)** | [`docs/USER_STORIES.md`](file:///home/harri/yaw/docs/USER_STORIES.md) | Formal Gherkin / BDD user stories for Epics 5, 6, and 7. |
-| **Core Algorithm Specs** | [`docs/power-pagerank.md`](file:///home/harri/yaw/docs/power-pagerank.md)<br>[`docs/efficient-ppr-algorithms.md`](file:///home/harri/yaw/docs/efficient-ppr-algorithms.md) | Mathematical formulation of sparse SciPy Personalized PageRank, hub dampening, and convergence proofs. |
-| **NLP & Extraction Contracts** | [`docs/how-to-handle-spacy-llm.md`](file:///home/harri/yaw/docs/how-to-handle-spacy-llm.md)<br>[`docs/open-ie-authoritative-source.md`](file:///home/harri/yaw/docs/open-ie-authoritative-source.md) | Official `spacy-llm` integration, Jinja2 template definitions, zero-monkeypatching registry contracts. |
-| **LLM-Wiki Specification** | [`docs/karpathy-llm-wiki.md`](file:///home/harri/yaw/docs/karpathy-llm-wiki.md) | Karpathy LLM-Wiki contract, FastMCP streaming interface, and wiki compiler specifications. |
+| **System Overview & Invariants** | [`FOUNDATIONAL.md`](file:///home/harri/yaw/FOUNDATIONAL.md) (This Document) | Root SSOT: Vision, 7 Invariants, Model Stack, Single-Stage DAG, SQLite Contracts, SciPy PPR Algorithms. |
+| **Architectural Decision Records** | [`docs/ADR.md`](file:///home/harri/yaw/docs/ADR.md) | Formal ADR ledger ([`ADR-001`](file:///home/harri/yaw/docs/adr/ADR-001.md) through [`ADR-011`](file:///home/harri/yaw/docs/adr/ADR-011.md)). |
+| **Engineering Implementation Roadmap** | [`docs/epics-alignment-roadmap.md`](file:///home/harri/yaw/docs/epics-alignment-roadmap.md) | Authoritative 8-Epic master plan (Epics 1–7.5 complete, Epics 7.6, 8.1–8.3 specified), quality gates. |
+| **Executable Acceptance Criteria** | [`docs/USER_STORIES.md`](file:///home/harri/yaw/docs/USER_STORIES.md) | Formal Gherkin / BDD user stories for Epics 5, 6, 7, and 8. |
+| **LLM-Wiki Foundational Pattern** | [`docs/karpathy-llm-wiki.md`](file:///home/harri/yaw/docs/karpathy-llm-wiki.md) | Andrej Karpathy's primary source defining the 3-layer persistent compounding PKM pattern. |
+| **Architecture Plan & Reference** | [`docs/yaw-architecture-plan.md`](file:///home/harri/yaw/docs/yaw-architecture-plan.md) | Consolidated 4-tier semantic stack reference and architectural synthesis. |
+
+### 2. Retrieval, Graph Diffusion & GraphRAG Algorithms
+| Algorithm Layer | Document Link | Scope & Purpose |
+| :--- | :--- | :--- |
+| **Power PageRank Query Engine** | [`docs/power-pagerank.md`](file:///home/harri/yaw/docs/power-pagerank.md) | Query-time SciPy CSR matrix PageRank diffusion, directional conductance, hub dampening, Bayesian evidence chunk rescoring. |
+| **Personalized PageRank Survey** | [`docs/efficient-ppr-algorithms.md`](file:///home/harri/yaw/docs/efficient-ppr-algorithms.md) | Comprehensive algorithmic survey; mathematical derivation of multi-modal candidate prior seed vectors ($\mathbf{p}_0$). |
+| **Geodesic Traversal & Linear Solvers** | [`docs/scipy-graphrag-extensions.md`](file:///home/harri/yaw/docs/scipy-graphrag-extensions.md) | Multi-hop geodesic path traces via `scipy.sparse.csgraph.shortest_path` and exact linear solvers (`spsolve`). |
+| **Hierarchical Deepening & Waveguides** | [`docs/ontological-roots.md`](file:///home/harri/yaw/docs/ontological-roots.md) | Mathematical justification for B-Tree Ward HAC hub splitting, hypernym induction, and spectral energy concentration. |
+| **Key Retrieval ADRs** | [`docs/adr/ADR-002.md`](file:///home/harri/yaw/docs/adr/ADR-002.md)<br>[`docs/adr/ADR-010.md`](file:///home/harri/yaw/docs/adr/ADR-010.md) | ADR-002 (B-Tree Hub Splitting); ADR-010 (Candidate Priors & Topological Disambiguation). |
+
+### 3. W3C Semantic Web, Ontologies & Closed-World SHACL
+| Semantic Subsystem | Document Link | Scope & Purpose |
+| :--- | :--- | :--- |
+| **RDF, OWL & SHACL Manual** | [`docs/rdf-owl-shacl.md`](file:///home/harri/yaw/docs/rdf-owl-shacl.md) | 4-tier semantic stack manual: RDF named quads, OWL 2 RL inference, SKOS concept schemes, pySHACL validation. |
+| **Pluggable Ontology Substrates** | [`docs/epic7-pluggable-ontology-integration-spec.md`](file:///home/harri/yaw/docs/epic7-pluggable-ontology-integration-spec.md) | Complete specification for pluggable external OWL/SKOS domain models, 2x2 extraction matrix, and antonym masks. |
+| **Key Semantic Web ADRs** | [`docs/adr/ADR-005.md`](file:///home/harri/yaw/docs/adr/ADR-005.md)<br>[`docs/adr/ADR-008.md`](file:///home/harri/yaw/docs/adr/ADR-008.md)<br>[`docs/adr/ADR-009.md`](file:///home/harri/yaw/docs/adr/ADR-009.md)<br>[`docs/adr/ADR-011.md`](file:///home/harri/yaw/docs/adr/ADR-011.md) | ADR-005 (9 Universal Roots); ADR-008 (W3C Alignment); ADR-009 (Pluggable Substrates); ADR-011 (Compile-Time SHACL & $\mathcal{O}(1)$ Contradiction Cache). |
+
+### 4. NLP Pipeline, Ingestion & Single-Stage Extraction
+| NLP / Ingestion Layer | Document Link | Scope & Purpose |
+| :--- | :--- | :--- |
+| **Open Information Extraction (Open IE)** | [`docs/open-ie-authoritative-source.md`](file:///home/harri/yaw/docs/open-ie-authoritative-source.md) | Academic research foundation establishing open-vocabulary relation extraction without schema blindness. |
+| **spaCy-LLM Integration Patterns** | [`docs/how-to-handle-spacy-llm.md`](file:///home/harri/yaw/docs/how-to-handle-spacy-llm.md) | Jinja2 prompt authoring, zero-monkeypatching registry contracts, and model/task pipelines. |
+| **Zero-Shot GLiNER Extraction** | [`docs/how-to-handle-spacy-gliner.md`](file:///home/harri/yaw/docs/how-to-handle-spacy-gliner.md) | Architectural alternative and evaluation for zero-shot bi-encoder entity span extraction. |
+| **spaCy-LLM Architecture & APIs** | [`docs/spacy-llm-api.md`](file:///home/harri/yaw/docs/spacy-llm-api.md)<br>[`docs/spacy-llm-docs.md`](file:///home/harri/yaw/docs/spacy-llm-docs.md) | Official architectural documentation and component API references for `spacy-llm`. |
+| **CocoIndex Incremental Engine** | [`docs/cocoindex.md`](file:///home/harri/yaw/docs/cocoindex.md) | CocoIndex declarative dataflow engine, Rust filesystem watcher, and incremental sync manual. |
+| **In-Process SQLite vs Neo4j** | [`docs/cocoindex-neo4j.md`](file:///home/harri/yaw/docs/cocoindex-neo4j.md) | Architectural evaluation establishing in-process SQLite and SciPy superiority over external graph daemons. |
+| **Key Ingestion ADRs** | [`docs/adr/ADR-001.md`](file:///home/harri/yaw/docs/adr/ADR-001.md)<br>[`docs/adr/ADR-003.md`](file:///home/harri/yaw/docs/adr/ADR-003.md)<br>[`docs/adr/ADR-004.md`](file:///home/harri/yaw/docs/adr/ADR-004.md)<br>[`docs/adr/ADR-006.md`](file:///home/harri/yaw/docs/adr/ADR-006.md) | ADR-001 (Single-Pass Triples); ADR-003 (Two-Tier Canonicalization); ADR-004 (Strict Embedding Boundary); ADR-006 (spaCy Token Lemmatization). |
+
+### 5. Testing Rigor, Verification & Test Infrastructure
+| Infrastructure Layer | Document Link | Scope & Purpose |
+| :--- | :--- | :--- |
+| **End-to-End Test Infrastructure** | [`TEST_INFRA.md`](file:///home/harri/yaw/TEST_INFRA.md) | Unmocked test philosophy, 2x2 matrix coverage, and 7 Invariant verification matrix. |
+| **Test Readiness & Verification Matrix** | [`TEST_READY.md`](file:///home/harri/yaw/TEST_READY.md) | Milestone readiness audits and verification pass/fail status across test suites. |
+| **Sprint 5.1 Remediation & Alignment** | [`docs/alignment-sprint-for-e5s2.md`](file:///home/harri/yaw/docs/alignment-sprint-for-e5s2.md) | Forensic audit, remediation actions, and TDD specifications for quad alignment. |
+| **Loopback Network Isolation ADR** | [`docs/adr/ADR-007.md`](file:///home/harri/yaw/docs/adr/ADR-007.md) | In-process loopback HTTP network isolation for fast, hermetic offline test suites. |
+
+### 6. Historical & Superseded Architecture Specifications
+| Document Link | Original Scope | Reason for Supercession |
+| :--- | :--- | :--- |
+| [`docs/llm-wiki-fts-vector-graph-playbook.md`](file:///home/harri/yaw/docs/llm-wiki-fts-vector-graph-playbook.md) | Prototype GraphRAG playbook | Formalized in [`FOUNDATIONAL.md §5.2`](file:///home/harri/yaw/FOUNDATIONAL.md) and [`docs/power-pagerank.md`](file:///home/harri/yaw/docs/power-pagerank.md). |
+| [`docs/llm-wiki-spec-v2.md`](file:///home/harri/yaw/docs/llm-wiki-spec-v2.md) | Architecture Spec v2.0 prototype | Superseded by 7 Invariants and Single-Stage Continuous Ingestion in `FOUNDATIONAL.md`. |
+| [`docs/llm-wiki-spec-addendum.md`](file:///home/harri/yaw/docs/llm-wiki-spec-addendum.md) | Medallion Two-Stage Architecture | Purged two-stage barrier (`Bronze -> Silver -> Gold`) in favor of Single-Stage Continuous Ingestion. |
 
 ---
 
@@ -79,17 +119,20 @@ Every line of code and test in YAW is governed by seven non-negotiable invariant
 ### Invariant 4: Machine Semantics Equal Human Wikilinks
 - Machine-extracted semantic relations are just as important as human-authored Obsidian wikilinks. We cannot trust humans to be expert ontology engineers.
 - In the retrieval matrix, human `[[wikilinks]]` and machine-extracted semantic triples (`subject -> predicate -> object`) are first-class peers with equal baseline weight ($1.0$), aligned to W3C standards ([`docs/adr/ADR-008.md`](file:///home/harri/yaw/docs/adr/ADR-008.md)).
+- **Probabilistic Alias Distributions & Anti-Winner-Take-All Grounding**: Human note text exhibits high lexical entropy and polysemy (e.g., surface mentions like *"Transformer"*, *"Mercury"*, or *"GraphRAG"*). Discretizing such mentions into a single canonical node at ingestion time via greedy "winner-take-all" heuristic collapses vital semantic uncertainty. Instead, YAW anchors lexical mentions to ontological nodes via a calibrated candidate probability distribution $P(\text{entity } e \mid \text{alias } a) \in (0, 1]$ maintained natively in spaCy's compiled C/Cython `InMemoryLookupKB` and backed by the SQLite `aliases` table. This preserves multiple epistemic interpretations simultaneously without premature hard clustering, deferring disambiguation to global graph topology at retrieval time.
 
 ### Invariant 5: Dual Epistemic Retrieval Contract
 - Retrieval must never return isolated chunk fragments without context, nor abstract theories without evidence.
 - Every retrieval query explains **both**:
   1. **The Ontological Context:** Active concept nodes, entity paths, and discovered semantic triples explaining *why* topics relate (the Bridging Subgraph).
   2. **The Grounded Evidence:** Direct hits to explicit raw chunks hydrated from disk with exact byte and line citations.
+- **Bayesian Epistemic Bridging & Topological Disambiguation**: The formal epistemic bridge connecting concrete textual evidence chunks to ontological universals is evaluated by fusing candidate alias priors $P(e \mid a)$ with spectral Personalized PageRank (PPR) random walk diffusion $\mathbf{p}^*[e]$ and chunk dense vector similarity $\text{sim}(q, c)$. Instead of ungrounded LLM inference, polysemous mentions are resolved topologically by propagating probability mass across the collective graph context, ensuring every retrieved assertion is mathematically grounded in disk evidence.
 
 ### Invariant 6: Real-Invariant Testing (Zero Tautological Cushion Mocks)
 - Tests must verify real invariants against real disk files, real SQLite instances, real `sqlite-vec` binary operations, and real SciPy sparse matrices.
 - Never mock internal subsystem interfaces or database connections. Tautological cushion mocks (mocking queries or matrix math) test only the mock definitions and conceal fatal structural bugs.
 - Boundary isolation mocking is strictly confined to external remote network services (the local Ollama HTTP server, mocked via a fast in-process loopback HTTP server in [`tests/conftest.py`](file:///home/harri/yaw/tests/conftest.py) per [`docs/adr/ADR-007.md`](file:///home/harri/yaw/docs/adr/ADR-007.md)).
+- Test architecture, 2x2 matrix coverage, and grounded invariant verification contracts are codified in [`TEST_INFRA.md`](file:///home/harri/yaw/TEST_INFRA.md) and tracked in [`TEST_READY.md`](file:///home/harri/yaw/TEST_READY.md).
 
 ### Invariant 7: Code Cleanliness, Strict Formatting & Single Source of Truth
 - Code must adhere to Ruff formatting standards (`uv run ruff format --check`) and clean static lint/type analysis via Ruff and Ty (`uv run ruff check`, `uv run ty check`) with zero unused imports, explicit typing, and zero circular dependencies.
@@ -106,17 +149,20 @@ To eliminate hallucinations, non-determinism, and memory bloat, YAW is bound to 
 | **Document Embedding** | `embed-gemma-300m-FLM` | `/api/embed` | `title: {doc_title} \| text: {content}` (or `title: none \| text: {content}`) — strictly long document chunk indexing (`note_chunks.embedding`) |
 | **Query Embedding** | `embed-gemma-300m-FLM` | `/api/embed` | `task: search result \| query: {query}` — retrieval queries (`s_chunks_vec`) |
 | **Bi-Encoder Reranker** | `embed-gemma-300m-FLM` | In-Memory Dot Product | Re-scores candidate chunk vectors against query vector; zero redundant re-embedding |
-| **Entity/Predicate Canonicalization** | `en_core_web_lg` static 300d vectors + `InMemoryLookupKB` | In-Process | Two-Tier Convergence Protocol (Tier 1 direct match, Tier 2 near match > 0.80, 0 LLM adjudication; [`docs/adr/ADR-003.md`](file:///home/harri/yaw/docs/adr/ADR-003.md)) |
+| **Entity/Predicate Canonicalization** | `en_core_web_lg` static 300d vectors + `InMemoryLookupKB` | In-Process Cython | Two-Tier Convergence Protocol with prior probabilities $P(e \mid a) \in (0, 1]$, zero external LLM pairwise adjudication ([`docs/adr/ADR-003.md`](file:///home/harri/yaw/docs/adr/ADR-003.md), [`docs/adr/ADR-010.md`](file:///home/harri/yaw/docs/adr/ADR-010.md)) |
 | **Open IE Triplet Extraction & Typing** | `Qwen3-4B-Instruct-2507-GGUF` | `/api/chat` via `spacy.Raw.v1` | Single-pass schema-free Open IE (`OPEN_IE_RAW_TRIPLES_TEMPLATE`; [`docs/adr/ADR-001.md`](file:///home/harri/yaw/docs/adr/ADR-001.md)) with `spacy.BatchCache.v1` disk caching |
 | **Node Definition Generation** | `Qwen3-4B-Instruct-2507-GGUF` | `/api/chat` | Off-the-shelf `spacy.Summarization.v1` (`field="description"`, `max_n_words=50` via `config.DEFINITION_MAX_WORDS`); `vault/wiki/` pages materialize deterministically from SQLite |
 
 ### Strict Embedding Boundary Contract
 - **Strict Embedding Boundary**: `embed-gemma-300m-FLM` is restricted **exclusively** to long document chunk indexing (`note_chunks.embedding`) and retrieval queries (`s_chunks_vec`). All post-indexing lexical operations, concept canonicalization, and (s,p,o) triplet treatments belong 100% to the spaCy pipeline (`en_core_web_lg` static 300d vectors, `InMemoryLookupKB`, token similarity). Zero external Gemma calls for entities or predicates.
+- **`InMemoryLookupKB` Entity Vector & Alias Prior Distribution Contract**:
+  - **Cython Candidate Evaluation**: `InMemoryLookupKB` manages entity vectors and alias candidate distributions in compiled C/Cython. Candidate lookup via `kb.get_alias_candidates(alias)` executes in microseconds without python overhead.
+  - **Calibrated Alias Prior Distribution ($P(e \mid a)$)**: Each alias $a$ maps to a normalized probability vector over candidate entities $e \in \text{cands}(a)$, satisfying $\sum_{e} P(e \mid a) = 1.0$ and $P(e \mid a) \in (0, 1]$. This prevents winner-take-all discretization and provides the quantitative prior for retrieval seeding and topological disambiguation ([`docs/adr/ADR-010.md`](file:///home/harri/yaw/docs/adr/ADR-010.md)).
+  - **Zero External LLM Pairwise Adjudication**: 0 LLM calls during entity or predicate canonicalization; procedural pairwise adjudication is completely eliminated.
 - **Two-Tier Convergence Protocol**:
-  - **Tier 1 (Direct Match)**: Exact slug or active alias lookup in `aliases` or `InMemoryLookupKB`.
-  - **Tier 2 (Near Match)**: In-process vector similarity > `CANON_SIM_THRESHOLD` (0.80) using `en_core_web_lg` static 300d GloVe vectors. Consolidate into the existing canonical node.
-  - **Fallback**: Novel canonical node creation.
-  - **Zero LLM Adjudication**: 0 LLM calls during entity or predicate canonicalization.
+  - **Tier 1 (Direct Match)**: Exact slug, active alias lookup in `aliases`, or candidate lookup in `InMemoryLookupKB`.
+  - **Tier 2 (Near Match)**: In-process vector similarity > `CANON_SIM_THRESHOLD` (0.80) using `en_core_web_lg` static 300d GloVe vectors. Consolidate into existing canonical node.
+  - **Fallback**: Novel canonical node creation (`TierEnum.NEW_INDUCTION`).
 - **Native Prompt-Response Disk Caching**: `spacy.BatchCache.v1` is declared and mounted as the native disk cache for all LLM calls (`path = ".cache/spacy_llm"`), ensuring automatic disk caching of prompt-response pairs without redundant network calls.
 
 ---
@@ -141,6 +187,8 @@ To eliminate hallucinations, non-determinism, and memory bloat, YAW is bound to 
   │ • Unified spacy-llm Pipeline (Qwen3-4B via yaw.Ollama.v1 with spacy.Raw.v1):                │
   │   - OPEN_IE_RAW_TRIPLES_TEMPLATE: Single-pass (s,p,o) schema-free extraction                │
   │   - Zero External Gemma Calls: 100% in-process spaCy for entities and predicates            │
+  │ • Compiled C/Cython InMemoryLookupKB: Alias candidate distribution with priors P(e|a)      │
+  │   - InMemoryLookupKB.add_alias(alias, entities, probabilities) synchronized from SQLite     │
   │ • In-Process Two-Tier Convergence Protocol:                                                 │
   │   - Tier 1: Direct match (exact slug / active alias in aliases or InMemoryLookupKB)        │
   │   - Tier 2: Near match (in-process static vector similarity > 0.80 via en_core_web_lg)     │
@@ -152,7 +200,7 @@ To eliminate hallucinations, non-determinism, and memory bloat, YAW is bound to 
                                          ▼
   ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
   │ 2. STORAGE CONTRACTS & SQLITE QUAD SUBSTRATE (src/yaw/storage/db.py)                        │
-  │ • Single SQLite DB at sample-llm-wiki/.cache/yaw.db (WAL mode, busy_timeout=60000ms)    │
+  │ • Single SQLite DB at sample-llm-wiki/.cache/yaw.db (WAL mode, busy_timeout=60000ms)       │
   │ • Physical Extraction Tables: note_meta, note_chunks, wikilinks, leaf_nodes, leaf_relations│
   │ • Engine-Owned Tables: aliases, canon_verdicts, compiled_nodes, compiled_relations          │
   │ • Contentless FTS5: query_fts (contentless_delete=1) indexing headings and chunks           │
@@ -165,13 +213,14 @@ To eliminate hallucinations, non-determinism, and memory bloat, YAW is bound to 
                                          ▼
   ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
   │ 3. GRAPHRAG RETRIEVAL & SCI-PY DIFFUSION ENGINE (src/yaw/retrieval/retriever.py)             │
-  │ • Seed Formulation: p0 = beta1*s_concepts + beta2*s_chunks_vec + beta3*s_chunks_fts        │
+  │ • Probabilistic Seed: p0 = beta1*s_concepts + beta2*s_chunks_vec + beta3*s_chunks_fts      │
+  │   - Concept Seeding: Incorporates candidate alias priors sum_a P(e|a)*sim(q, e)             │
   │ • Continuous Math: When embedding is offline (q=0), p0 simplifies to s_chunks_fts           │
   │ • SciPy Sparse CSR Matrix: In-memory row-stochastic transition matrix P                    │
   │ • Hub Dampening: In-degree power scaling (gamma = 0.5)                                      │
   │ • Conductance Asymmetry: 1.0 downward broadcast, 0.2 upward damping (ADR-002, Sprint 5.1)   │
-  │ • Power Iteration: p^(t+1) = alpha * p^(t) * P + (1 - alpha) * p0 (alpha = 0.85, 30 iters)  │
-  │ • Candidate Extraction: chunks where p*[chunk] > 0; in-memory bi-encoder reranking          │
+  │ • Topological Disambiguation: Random walk diffusion p^(t+1) = alpha*p^(t)*P + (1-alpha)*p0 │
+  │ • Bayesian Evidence Scoring: Score(c) = sum_{e in c} P(e|a) * p*[e] * sim(q, c)            │
   │ • Grounding: Zero-copy disk hydration via byte offsets (file.seek, file.read)               │
   │ • Payload: Dual-layer Bridging Subgraph (Ontological Context + Grounded Evidence)           │
   └──────────────────────────────────────┬──────────────────────────────────────────────────────┘
@@ -181,8 +230,8 @@ To eliminate hallucinations, non-determinism, and memory bloat, YAW is bound to 
   │ 4. FASTMCP PRODUCTION INTERFACE (src/yaw/server/daemon.py)                                   │
   │ • query_wiki: Full GraphRAG associative retrieval returning dual-layer Bridging Subgraph    │
   │ • ingest_raw: Immutable append-only note ingestion into vault/raw/                          │
-  │ • compile_wiki: B-Tree hub splitting, hypernym induction, wiki/ materialization (ADR-002)   │
-  │ • lint_wiki: Closed-world SHACL shape validation, contested alias & contradiction linter    │
+  │ • compile_wiki: B-Tree HAC splitting, hypernym induction, fast SHACL (<200ms), SQLite cache │
+  │ • lint_wiki: O(1) SQLite read of compiled contradictions, topic queries, live force re-lint  │
   └─────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -191,7 +240,7 @@ To eliminate hallucinations, non-determinism, and memory bloat, YAW is bound to 
 ## 5. Component Deep Dive & Business Logic
 
 ### Component 1: Single-Stage Ingestion & Leaf Ontology (`src/yaw/indexer/` & `src/yaw/nlp/`)
-1. **Delta Tracking:** CocoIndex's Rust core filesystem watcher monitors `vault/raw/` recursively. File content hashes are maintained internally by CocoIndex; no manual document hash column is required in `note_meta`.
+1. **Delta Tracking:** CocoIndex's Rust core filesystem watcher ([`docs/cocoindex.md`](file:///home/harri/yaw/docs/cocoindex.md)) monitors `vault/raw/` recursively. File content hashes are maintained internally by CocoIndex; no manual document hash column is required in `note_meta`.
 2. **Deterministic Chunking:** Documents are split along semantic boundaries (default ~1000 characters with 150 overlap). Each chunk records:
    - `chunk_id`: sha256 digest of heading + content.
    - `line_start` & `line_end`: 1-based human-readable line ranges for direct disk hydration.
@@ -199,7 +248,7 @@ To eliminate hallucinations, non-determinism, and memory bloat, YAW is bound to 
    `title: {doc_title} | text: {chunk_text}`.
 4. **Wikilink Extraction:** Regex parser extracts Obsidian `[[wikilinks]]`, mapping them to `wikilinks` records with source and target chunk pointers.
 5. **Open IE Extraction & Typing:**
-   - Single-pass Open IE ([`docs/adr/ADR-001.md`](file:///home/harri/yaw/docs/adr/ADR-001.md)) extracts relational triples `(subject, predicate, object)`.
+   - Single-pass Open IE ([`docs/adr/ADR-001.md`](file:///home/harri/yaw/docs/adr/ADR-001.md), [`docs/open-ie-authoritative-source.md`](file:///home/harri/yaw/docs/open-ie-authoritative-source.md), [`docs/how-to-handle-spacy-llm.md`](file:///home/harri/yaw/docs/how-to-handle-spacy-llm.md)) extracts relational triples `(subject, predicate, object)`.
    - Freeform predicates are decamelized and lemmatized via native spaCy `Token.lemma_` ([`docs/adr/ADR-006.md`](file:///home/harri/yaw/docs/adr/ADR-006.md)).
    - Predicates align with the **14 Canonical Base Predicates** ([`docs/adr/ADR-008.md`](file:///home/harri/yaw/docs/adr/ADR-008.md)):
      - *Subsumption & Mereology:* `subClassOf`, `partOf`, `instanceOf`
@@ -208,27 +257,34 @@ To eliminate hallucinations, non-determinism, and memory bloat, YAW is bound to 
      - *Provenance & Grounding:* `derivedFrom`, `cites`, `manifestsIn`
    - Entities are typed into **9 Universal Root Namespaces** ([`docs/adr/ADR-005.md`](file:///home/harri/yaw/docs/adr/ADR-005.md)):
      `entities`, `concepts`, `predicates`, `invariants`, `decisions`, `claims`, `processes`, `sources`, `contexts`.
-6. **Two-Tier Convergence Protocol ([`docs/adr/ADR-003.md`](file:///home/harri/yaw/docs/adr/ADR-003.md)):**
-   - **Tier 1 (Direct Match):** Exact slug or active alias lookup in `aliases` or `InMemoryLookupKB`. 0 vectors, 0 LLM calls.
-   - **Tier 2 (Near Match):** In-process vector similarity > `CANON_SIM_THRESHOLD` ($0.80$) using `en_core_web_lg` static 300d GloVe vectors. Consolidate into existing canonical node. 0 LLM calls.
-   - **Fallback:** Create new canonical node with immutable plural root namespace (`concepts:{slug}`).
+6. **In-Memory KB Synchronization & Candidate Prior Distribution ([`docs/adr/ADR-010.md`](file:///home/harri/yaw/docs/adr/ADR-010.md)):**
+   - The engine synchronizes an in-process, Cython-compiled `InMemoryLookupKB` from SQLite (`sync_kb_from_db(kb, conn)`):
+     - Loads canonical entities from `leaf_nodes` with unit vectors.
+     - Loads base predicates from `config.BASE_PREDICATES` and relations from `leaf_relations`.
+     - Groups active aliases from the `aliases` table by `alias_id` and registers candidate distributions via `InMemoryLookupKB.add_alias(alias, entities, probabilities)`.
+     - Prior probabilities are normalized per alias:
+       $$P(e_i \mid a) = \frac{\text{score}(a, e_i)}{\sum_{k} \text{score}(a, e_k)}, \quad \sum_{i} P(e_i \mid a) = 1.0$$
+7. **Two-Tier Convergence Protocol ([`docs/adr/ADR-003.md`](file:///home/harri/yaw/docs/adr/ADR-003.md)):**
+   - **Tier 1 (Direct Match):** Exact slug, active alias lookup in `aliases`, or candidate lookup in `InMemoryLookupKB.get_alias_candidates(alias)`. 0 vectors, 0 LLM calls.
+   - **Tier 2 (Near Match):** In-process vector similarity > `CANON_SIM_THRESHOLD` ($0.80$) using `en_core_web_lg` static 300d GloVe vectors. Consolidate into existing canonical node and record alias with cosine score. 0 LLM calls.
+   - **Fallback:** Create new canonical node with immutable plural root namespace (`concepts:{slug}`) via `TierEnum.NEW_INDUCTION`.
    - **Zero LLM Adjudication:** 0 LLM calls during entity or predicate canonicalization; procedural pairwise adjudication and external Gemma embedding calls are completely eliminated.
 
 ### Component 2: Storage & Schema Contracts (`src/yaw/storage/db.py`)
-Single SQLite database at `sample-llm-wiki/.cache/yaw.db` governed by WAL pragmas:
+Single SQLite database at `sample-llm-wiki/.cache/yaw.db` governed by WAL pragmas (reaffirming in-process relational speed over external graph daemons per [`docs/cocoindex-neo4j.md`](file:///home/harri/yaw/docs/cocoindex-neo4j.md)):
 
 - **`note_meta`**: `(rel_path TEXT PRIMARY KEY, title TEXT, category TEXT, modified_at REAL)`.
 - **`note_chunks`**: `(chunk_id TEXT PRIMARY KEY, entity_uri TEXT, rel_path TEXT, ordinal INTEGER, heading TEXT, heading_slug TEXT, line_start INTEGER, line_end INTEGER, embedding BLOB/JSON)`.
 - **`wikilinks`**: `(source_uri TEXT, target_uri TEXT, link_label TEXT, PRIMARY KEY(source_uri, target_uri))`.
 - **`leaf_nodes`**: `(node_id TEXT, source_leaf_id TEXT, name TEXT, namespace TEXT, definition TEXT, embedding BLOB/JSON, PRIMARY KEY(node_id, source_leaf_id))`.
 - **`leaf_relations`**: `(relation_id TEXT PRIMARY KEY, source_leaf_id TEXT, subject_id TEXT, predicate TEXT, object_id TEXT, weight REAL, predicate_id TEXT)`.
-- **`aliases`** ([`docs/adr/ADR-003.md`](file:///home/harri/yaw/docs/adr/ADR-003.md)):
+- **`aliases`** ([`docs/adr/ADR-003.md`](file:///home/harri/yaw/docs/adr/ADR-003.md), [`docs/adr/ADR-010.md`](file:///home/harri/yaw/docs/adr/ADR-010.md)):
   ```sql
   CREATE TABLE IF NOT EXISTS aliases (
       alias_id TEXT NOT NULL,
       kind TEXT NOT NULL CHECK(kind IN ('entity', 'predicate')),
       canonical_id TEXT NOT NULL,
-      method TEXT NOT NULL CHECK(method IN ('exact', 'alias', 'lexical', 'auto', 'llm', 'compile', 'new')),
+      method TEXT NOT NULL CHECK(method IN ('exact', 'alias', 'auto', 'new', 'ontology')),
       score REAL NOT NULL DEFAULT 1.0 CHECK(score >= 0.0 AND score <= 1.0),
       status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'contested')),
       source_leaf_id TEXT,
@@ -237,6 +293,7 @@ Single SQLite database at `sample-llm-wiki/.cache/yaw.db` governed by WAL pragma
       PRIMARY KEY (alias_id, kind)
   );
   ```
+  *Storage & Prior Semantics*: The `score` column stores the calibrated candidate prior confidence / conditional probability $P(\text{canonical\_id} \mid \text{alias\_id}) \in [0.0, 1.0]$. When multiple candidates map to the same surface alias, scores are grouped and normalized in `InMemoryLookupKB` to instantiate a discrete candidate distribution over canonical identities.
 - **`canon_verdicts`** (Audit & Self-Calibration):
   ```sql
   CREATE TABLE IF NOT EXISTS canon_verdicts (
@@ -321,8 +378,8 @@ Single SQLite database at `sample-llm-wiki/.cache/yaw.db` governed by WAL pragma
   SELECT curie AS node_id, label AS name, ontology_id AS namespace, label AS definition FROM dynamic_classes;
   ```
 
-### Component 3: GraphRAG PPR Retrieval Engine (`src/yaw/retrieval/`)
-1. **Sparse Adjacency Matrix:** Reads `unified_edges` and constructs an in-memory SciPy Compressed Sparse Row (`csr_matrix`) structure.
+### Component 3: GraphRAG PPR Retrieval Engine (`src/yaw/retrieval/retriever.py`, [`docs/power-pagerank.md`](file:///home/harri/yaw/docs/power-pagerank.md), [`docs/efficient-ppr-algorithms.md`](file:///home/harri/yaw/docs/efficient-ppr-algorithms.md), [`docs/scipy-graphrag-extensions.md`](file:///home/harri/yaw/docs/scipy-graphrag-extensions.md))
+1. **Sparse Adjacency Matrix:** Reads `unified_edges` and constructs an in-memory SciPy Compressed Sparse Row (`csr_matrix`) structure with bidirectional conductance and topological diffusion extensions ([`docs/scipy-graphrag-extensions.md`](file:///home/harri/yaw/docs/scipy-graphrag-extensions.md)).
 2. **Directional Conductance & Hub Dampening:**
    $$W_{uv} = \frac{W_{\text{direction}}(u, v)}{(\text{degree}(v))^\gamma}, \quad P_{uv} = \frac{W_{uv}}{\sum_k W_{uk}}$$
    - Downward broadcast (`CONCEPT` $\to$ `CHUNK`/`ENTITY`): $1.0$.
@@ -335,17 +392,26 @@ Single SQLite database at `sample-llm-wiki/.cache/yaw.db` governed by WAL pragma
    - Semantic relations and forward wikilinks: $1.0$ (equal baseline weight).
    - Reciprocal reverse wikilinks: $0.5$ (attenuated back-propagation).
    - Hub degree dampening exponent: $\gamma = 0.5$.
-3. **Seed Vector Formulation ($\mathbf{p}_0$):**
+3. **Probabilistic Seed Vector Formulation ($\mathbf{p}_0$):**
    $$\mathbf{p}_0 = \beta_1 \cdot \mathbf{s}_{\text{concepts}} + \beta_2 \cdot \mathbf{s}_{\text{chunks\_vec}} + \beta_3 \cdot \mathbf{s}_{\text{chunks\_fts}}$$
    Where $\beta_1 = 0.60$ (concept canopy bias), $\beta_2 = 0.20$, $\beta_3 = 0.20$.
+   - **Concept Canopy Seeding with Calibrated Alias Priors ([`docs/adr/ADR-010.md`](file:///home/harri/yaw/docs/adr/ADR-010.md)):**
+     For each query mention $a$ matching candidates in `InMemoryLookupKB`, candidate ontological entities $e$ receive seed mass weighted by the product of their prior probability $P(e \mid a)$ and dense vector similarity:
+     $$\mathbf{s}_{\text{concepts}}[e] \propto \sum_{a \in \text{mentions}(q)} P(e \mid a) \cdot \text{sim}(q, e)$$
    - When EmbeddingGemma is offline ($\mathbf{q} = \mathbf{0}$): $\mathbf{s}_{\text{concepts}} = \mathbf{0}$ and $\mathbf{s}_{\text{chunks\_vec}} = \mathbf{0}$, simplifying continuously to $\mathbf{p}_0 = \mathbf{s}_{\text{chunks\_fts}}$ (pure FTS5 seeding without artificial fallback branches).
-4. **Power Iteration Diffusion:**
-   $$\mathbf{p}^{(t+1)} = \alpha \mathbf{p}^{(t)} \mathbf{P} + (1 - \alpha) \mathbf{p}_0, \quad \alpha = 0.85 \quad (30 \text{ iterations})$$
-   Stationary distribution $\mathbf{p}^*$ accumulates mass across the graph topology (`manifests_in`, `mentions`, `wikilinks`, semantic predicates), including unseeded chunks connected to active concepts.
-5. **Candidate Chunk Selection & Bi-Encoder Similarity Rescoring:**
+   - The combined seed vector $\mathbf{p}_0$ is normalized to unit sum: $\sum_u \mathbf{p}_0[u] = 1.0$.
+
+4. **Topological Disambiguation via Power Iteration Diffusion:**
+   $$\mathbf{p}^{(t+1)} = \alpha \mathbf{P}^T \mathbf{p}^{(t)} + (1 - \alpha) \mathbf{p}_0, \quad \alpha = 0.85 \quad (30 \text{ iterations})$$
+   Where $\mathbf{P}$ is the row-stochastic transition matrix of `unified_edges` with directional conductance ($1.0$ down, $0.2$ up) and hub dampening $\gamma = 0.5$.
+   - **Topological Disambiguation**: By diffusing probability mass across the transposed transition matrix $\mathbf{P}^T$, polysemous candidates initially seeded via $P(e \mid a)$ are disambiguated by graph topology. Entities whose structural neighbors correlate with the query context accumulate stationary mass through coherent walk reinforcement, whereas spurious candidates bleed mass into unconnected sinks.
+
+5. **Bayesian Evidence Fusion for Candidate Chunk Selection & Rescoring:**
    - Candidate chunks are drawn directly from the converged distribution $\mathbf{p}^*$ for nodes where $\text{node} \in \text{chunks}$ and $\mathbf{p}^*[\text{chunk}] > 0$.
-   - When $\mathbf{q} \ne \mathbf{0}$: embeds query once using `embed_query()`, computes $\text{sim}(q, d) = \mathbf{q} \cdot \mathbf{d}$ against pre-indexed SQLite chunk embeddings, and ranks by $\text{Score} = \mathbf{p}^*[\text{chunk}] \times \text{sim}(q, d)$ with filter $\text{sim}(q, d) \ge \text{RELEVANCE\_THRESHOLD}$ ($0.10$).
-   - When $\mathbf{q} = \mathbf{0}$: ranks candidates directly by converged graph mass $\text{Score} = \mathbf{p}^*[\text{chunk}]$.
+   - When $\mathbf{q} \ne \mathbf{0}$: embeds query once using `embed_query()`, computes $\text{sim}(q, c) = \mathbf{q} \cdot \mathbf{c}$ against pre-indexed SQLite chunk embeddings, and ranks by Bayesian evidence fusion:
+     $$\text{Score}(c) = \left( \sum_{e \in c} P(e \mid a) \cdot \mathbf{p}^*[e] + \mathbf{p}^*[c] \right) \cdot \text{sim}(q, c)$$
+     with relevance cutoff $\text{sim}(q, c) \ge \text{RELEVANCE\_THRESHOLD}$ ($0.10$).
+   - When $\mathbf{q} = \mathbf{0}$: ranks candidates directly by converged graph mass $\text{Score}(c) = \mathbf{p}^*[c]$.
 6. **Zero-Copy Disk Slice Hydration:** Winning top-$k$ chunk IDs look up disk byte offsets in `note_chunks` and seek directly to raw text on disk.
 7. **Dual-Layer Output Presentation (The Bridging Subgraph):**
    - **Adaptive Semantic Scope**:
@@ -363,12 +429,17 @@ YAW implements the **Karpathy LLM-Wiki pattern** over FastMCP (Streamable HTTP `
 2. **`ingest_raw(content: str, title: str | None = None, url: str | None = None) -> dict` (Source Accumulation):**
    Ingests an external URL or raw text string into a timestamped, slugged Markdown note in `vault/raw/` with standardized YAML frontmatter (`title`, `source_url`, `ingested_at`). Strictly append-only (preserves Invariant 1: historical raw notes are immutable).
 3. **`compile_wiki(force: bool = False) -> dict` (Ontology Compilation Trigger & Hierarchical Deepening):**
-   Triggers asynchronous background indexing, ontology re-consolidation, and B-Tree hierarchical deepening ([`docs/adr/ADR-002.md`](file:///home/harri/yaw/docs/adr/ADR-002.md)).
+   Triggers asynchronous background indexing, ontology re-consolidation, B-Tree hierarchical deepening ([`docs/adr/ADR-002.md`](file:///home/harri/yaw/docs/adr/ADR-002.md)), and compile-time closed-world SHACL validation ([`docs/adr/ADR-011.md`](file:///home/harri/yaw/docs/adr/ADR-011.md)).
    - **Delta Ingestion:** By default (`force=False`), it only processes newly modified/added raw notes via CocoIndex content-hash deltas.
    - **B-Tree Cluster Splitting & Hypernym Inducing:** When any hub node accumulates out-degree $> K_{\max} = 10$, SciPy Ward's HAC partitions the subtree. LLM induces a hypernym superclass, rewiring `member --[subClassOf]--> hypernym` and `hypernym --[subClassOf]--> parent_hub` with asymmetric conductance ($1.0$ downward broadcast, $0.2$ upward damping).
-   - **Deterministic View Materialization:** Emits `vault/wiki/{namespace}/{slug}.md` pages directly from SQLite `unified_nodes` (frontmatter) and `unified_edges` (`[[wikilinks]]`) with zero LLM authoring.
-4. **`lint_wiki(query: str | None = None) -> str | list[dict]` (SHACL Graph & Conflict Linter):**
-   Surfaces contradictions, contested claims, dialectical disputes, and schema violations in the ontology layer via in-process `pyshacl` / `rdflib` against SQLite views ([`docs/rdf-owl-shacl.md`](file:///home/harri/yaw/docs/rdf-owl-shacl.md)).
+   - **Compile-Time Fast SHACL Validation (<200ms):** Executes lean closed-world validation (`validate_wiki_graph_fast(conn)`) over `unified_edges` and `unified_nodes`. Detects shape violations and dialectical contradictions (`causes` vs `prevents`, `supports` vs `refutes`, contested alias merges) and transactionally commits them to the `compiled_violations` SQLite table.
+   - **Deterministic View Materialization:** Emits read-only `vault/wiki/{namespace}/{slug}.md` pages directly from SQLite `unified_nodes` (frontmatter) and `unified_edges` (`[[wikilinks]]`) with zero LLM authoring.
+4. **`lint_wiki(query: str | None = None, force: bool = False) -> list[dict]` (SHACL Graph & Dialectical Conflict Linter):**
+   Surfaces dialectical contradictions, contested alias merges, and schema violations in the ontology layer ([`docs/adr/ADR-011.md`](file:///home/harri/yaw/docs/adr/ADR-011.md), [`docs/rdf-owl-shacl.md`](file:///home/harri/yaw/docs/rdf-owl-shacl.md)).
+   - **$\mathcal{O}(1)$ Cached Retrieval:** Reads pre-compiled violations directly from the `compiled_violations` SQLite table in $<5\text{ ms}$ by default (`force=False`).
+   - **Query Filtering:** When `query` is provided, executes an indexed SQLite filter (`WHERE focus_node = ? OR message LIKE ?`) returning violations localized to a specific concept or topic.
+   - **Epistemic Contradiction Steering:** Surfaced contradictions prompt the agent to accumulate additional authoritative sources (`ingest_raw`) or author a reconciliation note in `vault/raw/`.
+   - **Live Validation Override:** When `force=True`, bypasses SQLite cache and runs a live in-process pySHACL pass over the active graph, updating `compiled_violations`.
 
 #### 2. Development & Diagnostic Probes (Internal / Debugging Only)
 - **`find_seed(query: str, top_k: int = 3) -> list[dict]`:** Inspects intermediate candidate generation prior to graph traversal.
@@ -377,7 +448,7 @@ YAW implements the **Karpathy LLM-Wiki pattern** over FastMCP (Streamable HTTP `
 
 ### Component 5: W3C Semantic Web Substrate (RDF, OWL, SKOS, SHACL)
 
-YAW formalizes knowledge representation by anchoring in-process SQLite graph views to W3C Semantic Web standards ([`docs/adr/ADR-008.md`](file:///home/harri/yaw/docs/adr/ADR-008.md), [`docs/rdf-owl-shacl.md`](file:///home/harri/yaw/docs/rdf-owl-shacl.md)). To eliminate architectural confusion and prevent semantic collisions, each standard governs a strictly partitioned, non-overlapping concern:
+YAW formalizes knowledge representation by anchoring in-process SQLite graph views to W3C Semantic Web standards ([`docs/adr/ADR-008.md`](file:///home/harri/yaw/docs/adr/ADR-008.md), [`docs/rdf-owl-shacl.md`](file:///home/harri/yaw/docs/rdf-owl-shacl.md), [`docs/ontological-roots.md`](file:///home/harri/yaw/docs/ontological-roots.md), [`docs/epic7-pluggable-ontology-integration-spec.md`](file:///home/harri/yaw/docs/epic7-pluggable-ontology-integration-spec.md)). To eliminate architectural confusion and prevent semantic collisions, each standard governs a strictly partitioned, non-overlapping concern:
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
@@ -419,12 +490,33 @@ YAW formalizes knowledge representation by anchoring in-process SQLite graph vie
 
 #### 4. SHACL: Closed-World Data Integrity & Dialectical Linter
 - **Role:** Structural and semantic invariant enforcement, dialectical conflict detection, and data cleanliness validation.
-- **Execution Engine:** Evaluated in-process via `pyshacl` over the relational knowledge graph (`src/yaw/ontology/shacl.py`), surfaced through `@mcp.tool() async def lint_wiki()` in FastMCP.
+- **Execution & Storage Lifecycle ([`docs/adr/ADR-011.md`](file:///home/harri/yaw/docs/adr/ADR-011.md)):**
+  - **Ingestion Decoupling:** Continuous single-stage ingestion (`pipeline.py`) does *not* invoke SHACL, preserving sub-second streaming throughput per chunk.
+  - **Compile-Time Validation:** Executed in-process via `validate_wiki_graph_fast(conn)` during `compile_wiki()` in $<200\text{ ms}$ using SQLite relational pre-closure and `inference=None`.
+  - **Persistent SQLite Contradiction Cache:** Detected shape violations and dialectical contradictions are transactionally committed to `compiled_violations` in `yaw.db`:
+    ```sql
+    CREATE TABLE IF NOT EXISTS compiled_violations (
+        violation_id TEXT PRIMARY KEY,
+        focus_node TEXT NOT NULL,
+        shape_id TEXT NOT NULL,
+        result_path TEXT,
+        severity TEXT NOT NULL CHECK(severity IN ('Info', 'Warning', 'Violation')),
+        message TEXT NOT NULL,
+        source_chunk_id TEXT,
+        conflicting_chunk_id TEXT,
+        compiled_at REAL NOT NULL DEFAULT (unixepoch())
+    );
+    CREATE INDEX IF NOT EXISTS idx_violations_focus ON compiled_violations(focus_node);
+    CREATE INDEX IF NOT EXISTS idx_violations_shape ON compiled_violations(shape_id);
+    ```
+  - **$\mathcal{O}(1)$ Client Linting:** `@mcp.tool() async def lint_wiki()` queries `compiled_violations` in $\mathcal{O}(1)$ time ($< 5\text{ ms}$), returning all violations or filtering by topic (`query="<term>"`). Live pySHACL is reserved for `force=True`.
 - **Closed-World Assumption (CWA):** While OWL operates under Open-World Assumption (missing info is unknown), SHACL operates under Closed-World Assumption with Unique Name Assumption (UNA) at validation time: unfulfilled constraints are explicit actionable violations.
 - **Core Declarative Shapes (`src/yaw/ontology/shapes/wiki_shapes.ttl`):**
   - **`yaw:ConceptShape`:** Requires non-empty definitions conforming to word limits ($\le 50$ words via `config.DEFINITION_MAX_WORDS`) and canonical URI syntax across universal root namespaces.
   - **`yaw:RelationShape`:** Enforces referential integrity on subjects, predicates, and objects, detecting dangling edges and unregistered namespaces.
   - **`yaw:DialecticalIntegrityShape`:** Flags dialectical contradictions (`causes` vs `prevents`, `supports` vs `refutes`, `supports` vs `contradicts`, reciprocal conflicts) and contested alias merges (`aliases.status = 'contested'`).
+- **Ontology Layer FTS & Vector Indexing Invariant:**
+  Whenever dynamic ontologies are loaded (`ingest_ontology()`) or hypernyms are induced at compile time, their names and definitions **must be inserted into `query_fts` (FTS5)** and their embeddings stored in **`sqlite-vec`**. This ensures `compute_seed_candidates()` (FTS5 + vector) seeds random walks from ontology classes as well as raw note chunks. Materialized markdown pages in `vault/wiki/` are read-only views for human navigation, never re-indexed by CocoIndex (Invariant 1).
 
 ---
 
@@ -449,24 +541,34 @@ yaw/
 │
 ├── tests/                    # Grounded Test Suite (Mirroring src/yaw/ 1:1)
 │   ├── conftest.py           # Ephemeral mock Ollama HTTP server for fast offline testing
-│   ├── test_canonicalization.py # Invariant tests: Two-Tier Convergence resolver, aliases, view rerouting
+│   ├── test_canonicalization.py # Invariant tests: Two-Tier Cython KB resolver, aliases, view rerouting
+│   ├── test_cli_lifecycle.py # End-to-end CLI lifecycle & daemon management tests
 │   ├── test_cocoindexer.py   # Invariant tests: disk byte offsets, contentless FTS, views
 │   ├── test_embedding_gemma.py # EmbeddingGemma prompt formatting and bi-encoder reranking
+│   ├── test_fewshot_steering.py # Few-shot LLM steering & Open IE extraction tests
 │   ├── test_leaf_pipeline.py # spaCy + spacy.NER.v3, Doc integrity, Open IE, predicate normalization
+│   ├── test_pluggable_ontology.py # Dynamic ontology ingestion, class hierarchies, and KB sync
 │   ├── test_provenance.py    # Doc integrity, line ranges, byte hydration
-│   ├── test_retriever.py     # SciPy CSR matrix, directional conductance, PPR convergence
-│   ├── test_sprint5_1_alignment.py # Sprint 5.1 alignment invariant verification (WP 5.1.1–5.1.7)
+│   ├── test_rdf_substrate.py # RDF 1.1 / OWL 2 RL quad views and graph projections
+│   ├── test_retriever.py     # SciPy CSR matrix, directional conductance, PPR convergence, Bayesian scoring
+│   ├── test_shacl_lint.py    # Closed-world SHACL dialectical contradiction validation tests
+│   ├── test_storage.py       # Physical SQLite schema, pragmas, migrations, and unified views
 │   ├── test_vault_purity.py  # Vault purity tests asserting zero engine specs in raw/
 │   └── test_yaw.py           # FastMCP server integration and end-to-end tool execution
 │
 ├── docs/                     # Engine Specifications, Architectural Blueprints & Playbooks
 │   │                         # (SSOT for developer documentation; kept strictly outside the vault!)
-│   ├── ADR.md                # Architectural Decision Records ledger (ADR-001 through ADR-008)
-│   ├── adr/                  # Authoritative ADR files (ADR-001.md ... ADR-008.md)
+│   ├── ADR.md                # Architectural Decision Records ledger (ADR-001 through ADR-011)
+│   ├── adr/                  # Authoritative ADR files (ADR-001.md ... ADR-011.md)
 │   ├── alignment-sprint-for-e5s2.md # Sprint 5.1 turnkey execution DAG & prompt cards
-│   ├── epics-alignment-roadmap.md # Authoritative engineering implementation roadmap (7 Epics)
+│   ├── epics-alignment-roadmap.md # Authoritative engineering implementation roadmap (Epics 1 through 8)
+│   ├── ontological-roots.md  # 9 Universal root namespaces and ontology alignment
+│   ├── epic7-pluggable-ontology-integration-spec.md # Dynamic OWL/SKOS ontology ingestion specification
+│   ├── scipy-graphrag-extensions.md # SciPy sparse matrix GraphRAG diffusion extensions
+│   ├── cocoindex.md          # CocoIndex streaming ingestion & incremental processing
+│   ├── cocoindex-neo4j.md    # CocoIndex SQLite in-process relational speed benchmark comparison
 │   ├── rdf-owl-shacl.md      # Authoritative W3C Semantic Web integration manual
-│   ├── USER_STORIES.md       # BDD user stories across Epics 5, 6, 7
+│   ├── USER_STORIES.md       # BDD user stories across Epics 5, 6, 7, 8
 │   ├── how-to-handle-spacy-llm.md # Canonical spaCy-LLM model & task integration guide
 │   ├── open-ie-authoritative-source.md # Open IE extraction specifications
 │   ├── power-pagerank.md     # Personalized PageRank mathematical specification

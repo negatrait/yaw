@@ -28,12 +28,15 @@ import cocoindex as coco
 from cocoindex.connectors import localfs, sqlite
 from cocoindex.ops.text import RecursiveSplitter
 from cocoindex.resources.file import PatternFilePathMatcher
+from spacy.kb import InMemoryLookupKB
 
 from yaw.indexer.canonicalize import (
     _node_id,
+    create_in_memory_kb,
     normalize_token,
     resolve,
     slugify,
+    sync_kb_from_db,
 )
 from yaw.nlp import (
     ExtractedNode,
@@ -51,6 +54,7 @@ from yaw.nlp import (
     parse_raw_triples_json,
     query_live_predicates,
 )
+from yaw.nlp.components import get_base_spacy
 from yaw.storage import (
     apply_pragmas,
     clean_db,
@@ -62,6 +66,8 @@ from .. import config
 
 DB_KEY = coco.ContextKey[sqlite.ManagedConnection]("vault_db")
 _active_managed_conn: sqlite.ManagedConnection | None = None
+KB_KEY = coco.ContextKey[InMemoryLookupKB]("vault_kb")
+_active_managed_kb: InMemoryLookupKB | None = None
 
 _splitter = RecursiveSplitter()
 
@@ -353,8 +359,8 @@ def _insert_query_fts(
 
 @coco.lifespan
 async def vault_lifespan(builder: coco.EnvironmentBuilder):
-    """Lifecycle provider establishing SQLite connection with authoritative PRAGMAs."""
-    global _active_managed_conn
+    """Lifecycle provider establishing SQLite connection and synchronized InMemoryLookupKB."""
+    global _active_managed_conn, _active_managed_kb
     (config.VAULT_ROOT / ".cache" / "cocoindex").mkdir(parents=True, exist_ok=True)
     builder.settings.db_path = config.VAULT_ROOT / ".cache" / "cocoindex"
     config.DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -369,11 +375,20 @@ async def vault_lifespan(builder: coco.EnvironmentBuilder):
     conn = sqlite.connect(config.DB_PATH, load_vec=True)
     _active_managed_conn = conn
     builder.provide(DB_KEY, conn)
+
+    nlp = get_base_spacy()
+    kb = create_in_memory_kb(nlp)
+    with sqlite3.connect(config.DB_PATH) as raw_c:
+        sync_kb_from_db(kb, raw_c)
+    _active_managed_kb = kb
+    builder.provide(KB_KEY, kb)
+
     try:
         yield
     finally:
         conn.close()
         _active_managed_conn = None
+        _active_managed_kb = None
 
 
 def _register_raw_nodes(
@@ -461,6 +476,7 @@ async def _resolve_and_store_nodes(
     raw_nodes: dict[str, tuple[str, ExtractedNode]],
     nodes_target: sqlite.TableTarget[LeafNodeRow],
     conn: sqlite3.Connection | None,
+    kb: InMemoryLookupKB | None = None,
 ) -> None:
     """Step 4: Embed, resolve canonical entities, and persist LeafNodeRow."""
     if not raw_nodes:
@@ -479,6 +495,8 @@ async def _resolve_and_store_nodes(
                 embedding=node_vec,
                 source_leaf_id=source_leaf_id,
                 namespace=node.namespace,
+                kb=kb,
+                canonical_id=node.canonical_id,
             )
         except _CANON_EXCEPTIONS as res_err:
             logger.warning("Entity resolution failed for %s: %s", node.name, res_err)
@@ -500,6 +518,7 @@ def _resolve_and_store_relations(
     relations_target: sqlite.TableTarget[LeafRelationRow],
     conn: sqlite3.Connection | None,
     seen_rel_ids: set[str],
+    kb: InMemoryLookupKB | None = None,
 ) -> None:
     """Step 5: Resolve predicate universals and persist LeafRelationRow."""
     for source_leaf_id, triple in all_triples:
@@ -511,6 +530,8 @@ def _resolve_and_store_relations(
                 conn=conn,
                 source_leaf_id=source_leaf_id,
                 namespace="predicates",
+                kb=kb,
+                canonical_id=triple.predicate.canonical_id,
             )
         except _CANON_EXCEPTIONS as res_pred_err:
             logger.warning(
@@ -646,12 +667,13 @@ async def _persist_canonical_knowledge(
         )
         conn = None
 
+    kb = _active_managed_kb
     try:
-        await _resolve_and_store_nodes(raw_nodes, nodes_target, conn)
+        await _resolve_and_store_nodes(raw_nodes, nodes_target, conn, kb=kb)
         seen_rel_ids: set[str] = set()
         if all_triples:
             _resolve_and_store_relations(
-                all_triples, relations_target, conn, seen_rel_ids
+                all_triples, relations_target, conn, seen_rel_ids, kb=kb
             )
         _store_chunk_concept_edges(
             raw_nodes,

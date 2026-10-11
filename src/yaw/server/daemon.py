@@ -50,6 +50,7 @@ else:
     def flock(fd: int, operation: int) -> None:
         fcntl.flock(fd, operation)
 
+
 from fastmcp import FastMCP
 
 from yaw.nlp import is_ollama_online
@@ -83,10 +84,61 @@ mcp = FastMCP(
 )
 
 
+_DAEMON_KB: Any | None = None
+
+
+def get_daemon_kb(conn: sqlite3.Connection | None = None) -> Any:
+    """Acquire or lazily initialize the daemon's singleton InMemoryLookupKB."""
+    global _DAEMON_KB
+    if _DAEMON_KB is not None:
+        return _DAEMON_KB
+
+    from yaw.indexer.canonicalize import (
+        create_in_memory_kb,
+        get_active_kb,
+        set_active_kb,
+        sync_kb_from_db,
+    )
+    from yaw.storage.db import apply_pragmas
+
+    active = get_active_kb(conn)
+    if active is not None:
+        _DAEMON_KB = active
+        return _DAEMON_KB
+
+    if conn is not None:
+        kb = create_in_memory_kb()
+        sync_kb_from_db(kb, conn)
+        _DAEMON_KB = kb
+        set_active_kb(kb)
+        return _DAEMON_KB
+
+    if config.DB_PATH.is_file():
+        with sqlite3.connect(str(config.DB_PATH)) as db_conn:
+            apply_pragmas(db_conn)
+            kb = create_in_memory_kb()
+            sync_kb_from_db(kb, db_conn)
+            _DAEMON_KB = kb
+            set_active_kb(kb)
+            return _DAEMON_KB
+
+    kb = create_in_memory_kb()
+    _DAEMON_KB = kb
+    set_active_kb(kb)
+    return _DAEMON_KB
+
+
+def reset_daemon_kb() -> None:
+    """Reset daemon-level KB singleton (useful for test isolation)."""
+    global _DAEMON_KB
+    _DAEMON_KB = None
+
+
 @mcp.tool()
 async def query_wiki(query: str, top_k: int = 3) -> str:
     """Full dual-layer GraphRAG retrieval through the ontology layer."""
-    retriever = get_retriever()
+    kb = get_daemon_kb()
+    retriever = get_retriever(kb=kb)
     return await retriever.retrieve(query, top_k=top_k)
 
 
@@ -99,12 +151,9 @@ async def find_seed(
     Returns structured candidate dictionaries containing disk byte pointers and scores.
     When Ollama is offline, returns degraded status payload.
     """
-    if hasattr(compute_seed_candidates, "assert_called") or hasattr(
-        compute_seed_candidates, "mock"
-    ):
-        return await compute_seed_candidates(query, top_k=top_k)
-
-    candidates = await find_seed_nodes(query, top_k=top_k)
+    kb = get_daemon_kb()
+    get_retriever(kb=kb)
+    candidates = await compute_seed_candidates(query, top_k=top_k, kb=kb)
     if not is_ollama_online(timeout_s=0.5):
         return {
             "status": "degraded",
@@ -179,6 +228,22 @@ async def compile_wiki(
     vault_dir: str | None = None, force: bool = False
 ) -> dict[str, Any]:
     """Compile wiki note clusters and rewire taxonomic hierarchy."""
+    from yaw.indexer.canonicalize import sync_kb_from_db
+    from yaw.retrieval.retriever import get_retriever
+    from yaw.storage.db import apply_pragmas, ensure_schema_views
+
+    db_path = _resolve_vault_db_path(vault_dir)
+    if db_path.is_file():
+        with sqlite3.connect(str(db_path)) as conn:
+            apply_pragmas(conn)
+            ensure_schema_views(conn)
+            kb = get_daemon_kb(conn)
+            sync_kb_from_db(kb, conn)
+            get_retriever(kb=kb).invalidate_cache()
+    else:
+        kb = get_daemon_kb()
+        get_retriever(kb=kb).invalidate_cache()
+
     return {
         "status": "compiled",
         "clusters_bisected": 0,
@@ -255,13 +320,15 @@ async def load_ontology(
     with sqlite3.connect(str(db_path)) as conn:
         apply_pragmas(conn)
         ensure_schema_views(conn)
+        kb = get_daemon_kb(conn)
         res = ingest_ontology(
             source=source,
             conn=conn,
             ontology_id=ontology_id,
             is_default=is_default,
+            kb=kb,
         )
-    get_retriever().invalidate_cache()
+    get_retriever(kb=kb).invalidate_cache()
     return res
 
 
@@ -520,7 +587,7 @@ def _is_process_alive(pid: int) -> bool:
             reaped_pid, _ = os.waitpid(pid, wnohang)
             if reaped_pid != 0:
                 return False
-        except (ChildProcessError, OSError):
+        except ChildProcessError, OSError:
             pass
     try:
         os.kill(pid, 0)
@@ -556,13 +623,13 @@ def _force_kill_process(pid: int) -> None:
     sig = getattr(signal, "SIGKILL", signal.SIGTERM)
     try:
         os.kill(pid, sig)
-    except (ProcessLookupError, OSError):
+    except ProcessLookupError, OSError:
         pass
     wnohang = getattr(os, "WNOHANG", None)
     if wnohang is not None:
         try:
             os.waitpid(pid, wnohang)
-        except (ChildProcessError, OSError):
+        except ChildProcessError, OSError:
             pass
 
 
@@ -606,6 +673,7 @@ __all__ = [
     "find_seed",
     "find_seed_nodes",
     "flock",
+    "get_daemon_kb",
     "get_ontology_schema",
     "hydrate_disk_slice",
     "ingest_raw",
@@ -614,6 +682,7 @@ __all__ = [
     "mcp",
     "query_wiki",
     "read_document",
+    "reset_daemon_kb",
     "run_daemon",
     "set_extraction_mode",
     "stop_daemon",

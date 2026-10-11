@@ -467,12 +467,8 @@ def test_invariant_e1_e2_store_chunk_concept_edges_provenance_and_no_fallback():
     from yaw.indexer.pipeline import MarkdownChunk, _store_chunk_concept_edges
 
     chunks = [
-        MarkdownChunk(
-            "c0", "H0", "h0", "Alpha text with no concept name.", 0, 1, 2
-        ),
-        MarkdownChunk(
-            "c1", "H1", "h1", "Beta text contains Encoder clearly.", 1, 3, 4
-        ),
+        MarkdownChunk("c0", "H0", "h0", "Alpha text with no concept name.", 0, 1, 2),
+        MarkdownChunk("c1", "H1", "h1", "Beta text contains Encoder clearly.", 1, 3, 4),
         MarkdownChunk(
             "c2",
             "H2",

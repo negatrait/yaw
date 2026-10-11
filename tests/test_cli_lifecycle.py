@@ -598,7 +598,9 @@ async def test_find_seed_structured_output_contract_and_disk_seek(tmp_path: Path
     note_path = raw_dir / "relativity.md"
     note_path.write_text(content, encoding="utf-8")
 
-    chunk1_text = "# Relativity\nMass-energy equivalence is expressed as $E = mc^2$ ⚡.\n"
+    chunk1_text = (
+        "# Relativity\nMass-energy equivalence is expressed as $E = mc^2$ ⚡.\n"
+    )
     line_start = 1
     line_end = 2
 
@@ -659,7 +661,9 @@ async def test_find_seed_structured_output_contract_and_disk_seek(tmp_path: Path
     assert isinstance(seed["text"], str)
 
     # 4. Zero-copy line hydration verification
-    hydrated = hydrate_disk_slice(seed["rel_path"], seed["line_start"], seed["line_end"])
+    hydrated = hydrate_disk_slice(
+        seed["rel_path"], seed["line_start"], seed["line_end"]
+    )
     assert hydrated.rstrip("\r\n") == seed["text"].rstrip("\r\n")
 
 
@@ -1038,12 +1042,10 @@ def test_cli_serve_signal_shutdown(tmp_path: Path):
             f"PID file {pid_file} was not created within 5.0s of daemon startup"
         )
         pid_content = pid_file.read_text(encoding="utf-8").strip()
-        child_pids = [
-            c.pid for c in psutil.Process(proc.pid).children(recursive=True)
-        ]
-        assert (
-            int(pid_content) == proc.pid or int(pid_content) in child_pids
-        ), f"PID file contains {pid_content}, expected child PID {proc.pid} or child of launcher {child_pids}"
+        child_pids = [c.pid for c in psutil.Process(proc.pid).children(recursive=True)]
+        assert int(pid_content) == proc.pid or int(pid_content) in child_pids, (
+            f"PID file contains {pid_content}, expected child PID {proc.pid} or child of launcher {child_pids}"
+        )
 
         # Invariant 2: Intercept SIGINT/SIGTERM and terminate within 5.0s SLA
         t0 = time.monotonic()
@@ -3745,9 +3747,7 @@ def test_cli_schema_corrupted_database_resilience(tmp_path: Path):
     corrupt_vault = tmp_path / "corrupt_vault"
     db_dir = corrupt_vault / ".cache"
     db_dir.mkdir(parents=True, exist_ok=True)
-    (db_dir / "yaw.db").write_text(
-        "CORRUPTED NOT A SQLITE DATABASE", encoding="utf-8"
-    )
+    (db_dir / "yaw.db").write_text("CORRUPTED NOT A SQLITE DATABASE", encoding="utf-8")
 
     env = get_cli_env()
     res = subprocess.run(

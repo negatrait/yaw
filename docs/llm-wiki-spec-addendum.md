@@ -23,6 +23,6 @@ The initial 2.0.0 prototype proposed splitting ingestion into an artificial two-
 ### The Production Single-Stage Solution
 YAW replaced the Medallion CQRS pipeline with **Single-Stage Continuous Ingestion**:
 - Ingestion occurs in a single pass via CocoIndex and `spacy-llm`.
-- Entities and predicates are resolved on the fly via the 3-Tier EDC Resolver ([`docs/adr/ADR-003.md`](file:///home/harri/yaw/docs/adr/ADR-003.md)).
+- Entities and predicates are resolved on the fly via the Two-Tier EDC Resolver with Cython `InMemoryLookupKB` candidate priors ([`docs/adr/ADR-003.md`](file:///home/harri/yaw/docs/adr/ADR-003.md), [`docs/adr/ADR-010.md`](file:///home/harri/yaw/docs/adr/ADR-010.md)).
 - Dynamic SQLite views ([`unified_nodes`](file:///home/harri/yaw/src/yaw/storage/db.py#L170-L200), [`unified_edges`](file:///home/harri/yaw/src/yaw/storage/db.py#L85-L168)) immediately expose the interconnected graph as W3C-compliant named quads ([`docs/adr/ADR-008.md`](file:///home/harri/yaw/docs/adr/ADR-008.md)).
 - SciPy Personalized PageRank executes immediately over the unified views without batch delays.

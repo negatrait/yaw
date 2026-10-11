@@ -94,7 +94,7 @@ def clean_db(db_path: Path | None = None) -> None:
                 for t in tables:
                     conn.execute(f"DROP TABLE IF EXISTS {t};")
                 conn.execute("VACUUM;")
-        except (sqlite3.DatabaseError, OSError):
+        except sqlite3.DatabaseError, OSError:
             pass
 
 
@@ -122,7 +122,11 @@ def insert_alias(
     evidence: str | None = None,
     **kwargs: Any,
 ) -> None:
-    """Upsert alias mapping into aliases table."""
+    """Upsert alias mapping into aliases table.
+
+    Strictly enforces method in ('exact', 'alias', 'auto', 'new', 'ontology').
+    Zero fallback shims or silent swallowers.
+    """
     if canonical_id in ("entity", "predicate") and kind not in ("entity", "predicate"):
         actual_kind = canonical_id
         actual_canonical_id = kind
@@ -130,44 +134,40 @@ def insert_alias(
         actual_kind = kind
         actual_canonical_id = canonical_id or kwargs.get("canonical_id", alias_id)
 
-    valid_methods = (
-        "exact",
-        "alias",
-        "lexical",
-        "auto",
-        "llm",
-        "compile",
-        "new",
-        "ontology",
-    )
-    actual_method = method if method in valid_methods else "alias"
+    valid_methods = ("exact", "alias", "auto", "new", "ontology")
+    if method not in valid_methods:
+        raise ValueError(
+            f"Invalid alias method '{method}'; must be one of {valid_methods}"
+        )
+    if actual_kind not in ("entity", "predicate"):
+        raise ValueError(
+            f"Invalid kind '{actual_kind}'; must be 'entity' or 'predicate'"
+        )
+    if not alias_id or not actual_canonical_id:
+        raise ValueError("alias_id and canonical_id must be non-empty strings")
+    if status not in ("active", "contested"):
+        raise ValueError(f"Invalid status '{status}'; must be 'active' or 'contested'")
+
     ts = time.time() if resolved_at is None else resolved_at
 
-    try:
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO aliases (
-                alias_id, kind, canonical_id, method, score, status, source_leaf_id, resolved_at, evidence
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                alias_id,
-                actual_kind,
-                actual_canonical_id,
-                actual_method,
-                score,
-                status,
-                source_leaf_id,
-                ts,
-                evidence,
-            ),
-        )
-        try:
-            conn.commit()
-        except sqlite3.OperationalError, sqlite3.DatabaseError:
-            pass
-    except sqlite3.OperationalError, sqlite3.DatabaseError:
-        pass
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO aliases (
+            alias_id, kind, canonical_id, method, score, status, source_leaf_id, resolved_at, evidence
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            alias_id,
+            actual_kind,
+            actual_canonical_id,
+            method,
+            score,
+            status,
+            source_leaf_id,
+            ts,
+            evidence,
+        ),
+    )
 
 
 def get_canonical_id(
@@ -223,48 +223,30 @@ def insert_leaf_node(
     source_leaf_id: str = "raw/note.md",
 ) -> None:
     """Insert leaf node record into leaf_nodes table idempotently."""
+    if not node_id:
+        raise ValueError("node_id must be a non-empty string")
     emb_bytes = serialize_embedding(embedding) if embedding is not None else None
     eff_source = source_leaf_id or "system:canonical_induction"
     try:
-        try:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO leaf_nodes (
-                    node_id, name, namespace, definition, embedding, source_leaf_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    node_id,
-                    name,
-                    namespace,
-                    definition or "",
-                    emb_bytes,
-                    eff_source,
-                    time.time(),
-                ),
-            )
-        except sqlite3.OperationalError:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO leaf_nodes (
-                    node_id, source_leaf_id, name, namespace, definition, embedding
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    node_id,
-                    eff_source,
-                    name,
-                    namespace,
-                    definition or "",
-                    emb_bytes,
-                ),
-            )
-        try:
-            conn.commit()
-        except sqlite3.OperationalError, sqlite3.DatabaseError:
-            pass
-    except (sqlite3.OperationalError, sqlite3.DatabaseError) as err:
-        logger.debug("Failed inserting leaf node: %s", err)
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO leaf_nodes (
+                node_id, source_leaf_id, name, namespace, definition, embedding
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                node_id,
+                eff_source,
+                name,
+                namespace,
+                definition or "",
+                emb_bytes,
+            ),
+        )
+    except sqlite3.OperationalError as err:
+        if "no such table: leaf_nodes" in str(err).lower():
+            return
+        raise
 
 
 def get_active_aliases(

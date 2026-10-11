@@ -143,6 +143,7 @@ from rdflib import Namespace, URIRef
 
 from yaw.storage.rdf import ROOT_NAMESPACES, W3C_NAMESPACES, YAW_PREFIX
 
+
 @dataclass(frozen=True)
 class DynamicClassMeta:
     curie: str
@@ -154,6 +155,7 @@ class DynamicClassMeta:
     is_root: bool = False
     epistemic_type: str = "class"  # 'class' (OWL) or 'concept' (SKOS)
 
+
 @dataclass(frozen=True)
 class DynamicPropertyMeta:
     curie: str
@@ -164,9 +166,11 @@ class DynamicPropertyMeta:
     is_transitive: bool = False
     is_symmetric: bool = False
 
+
 @dataclass(frozen=True)
 class RegistrySnapshot:
     """Immutable state snapshot for thread-safe lock-free reads."""
+
     prefix_to_uri: dict[str, str]
     uri_to_prefix: dict[str, str]
     concept_prefixes: frozenset[str]
@@ -174,11 +178,13 @@ class RegistrySnapshot:
     properties: dict[str, DynamicPropertyMeta]
     class_depths: dict[str, int]
 
+
 class OntologyRegistry:
     """Singleton registry holding active ontology prefix maps and property characteristics.
-    
+
     Guarantees thread-safe lock-free reads via atomic immutable RegistrySnapshot swapping.
     """
+
     _instance: ClassVar[OntologyRegistry | None] = None
     _lock: ClassVar[threading.RLock] = threading.RLock()
 
@@ -239,7 +245,7 @@ class OntologyRegistry:
         snap = self._snapshot
         for base_uri, prefix in snap.uri_to_prefix.items():
             if uri_str.startswith(base_uri):
-                suffix = uri_str[len(base_uri):]
+                suffix = uri_str[len(base_uri) :]
                 return f"{prefix}:{suffix}"
         return uri_str
 
@@ -264,7 +270,9 @@ class OntologyRegistry:
         with self._write_lock:
             # Build new snapshot dictionaries
             new_prefix_to_uri = dict(self._snapshot.prefix_to_uri)
-            for row in conn.execute("SELECT ontology_id, uri_prefix FROM dynamic_ontologies").fetchall():
+            for row in conn.execute(
+                "SELECT ontology_id, uri_prefix FROM dynamic_ontologies"
+            ).fetchall():
                 ont_id, uri_prefix = str(row[0]), str(row[1])
                 new_prefix_to_uri[ont_id.lower()] = uri_prefix
             new_uri_to_prefix = {v: k for k, v in new_prefix_to_uri.items()}
@@ -275,8 +283,14 @@ class OntologyRegistry:
                 "SELECT curie, class_uri, ontology_id, label, parent_class_uri, depth, is_root, epistemic_type FROM dynamic_classes"
             ).fetchall():
                 curie, uri_str, ont_id, label, parent_uri, depth, is_root, ep_type = (
-                    str(row[0]), str(row[1]), str(row[2]), str(row[3]),
-                    str(row[4]) if row[4] else None, int(row[5]), bool(row[6]), str(row[7])
+                    str(row[0]),
+                    str(row[1]),
+                    str(row[2]),
+                    str(row[3]),
+                    str(row[4]) if row[4] else None,
+                    int(row[5]),
+                    bool(row[6]),
+                    str(row[7]),
                 )
                 meta = DynamicClassMeta(
                     curie=curie,
@@ -298,8 +312,13 @@ class OntologyRegistry:
                 "SELECT curie, property_uri, ontology_id, label, parent_property_uri, is_transitive, is_symmetric FROM dynamic_properties"
             ).fetchall():
                 curie, uri_str, ont_id, label, parent_uri, is_trans, is_symm = (
-                    str(row[0]), str(row[1]), str(row[2]), str(row[3]),
-                    str(row[4]) if row[4] else None, bool(row[5]), bool(row[6])
+                    str(row[0]),
+                    str(row[1]),
+                    str(row[2]),
+                    str(row[3]),
+                    str(row[4]) if row[4] else None,
+                    bool(row[5]),
+                    bool(row[6]),
                 )
                 prop_meta = DynamicPropertyMeta(
                     curie=curie,
@@ -323,7 +342,9 @@ class OntologyRegistry:
                 class_depths=new_depths,
             )
 
+
 _registry: OntologyRegistry | None = None
+
 
 def get_ontology_registry() -> OntologyRegistry:
     """Access the global OntologyRegistry singleton."""
@@ -357,6 +378,7 @@ from yaw.storage.db import insert_alias
 
 logger = logging.getLogger(__name__)
 
+
 def ingest_ontology(
     source: str | Path | rdflib.Graph,
     conn: sqlite3.Connection,
@@ -364,13 +386,13 @@ def ingest_ontology(
     is_default: bool = False,
 ) -> dict[str, Any]:
     """Parse external RDF/OWL ontology into dynamic catalog tables and aliases.
-    
+
     Args:
         source: File path, URL string, or pre-loaded rdflib.Graph.
         conn: Open SQLite connection with WAL pragmas applied.
         ontology_id: Prefix identifier (e.g. 'dico', 'prov'). Auto-detected if None.
         is_default: Whether this ontology serves as default fallback for Quad 3 & 4.
-        
+
     Returns:
         Dictionary summarizing ingested classes, properties, and materialized aliases.
     """
@@ -381,7 +403,9 @@ def ingest_ontology(
     else:
         source_path = Path(source)
         source_uri = str(source_path.resolve()) if source_path.exists() else str(source)
-        g.parse(source, format="turtle" if str(source).endswith((".ttl", ".owl")) else None)
+        g.parse(
+            source, format="turtle" if str(source).endswith((".ttl", ".owl")) else None
+        )
 
     # 1. Detect base URI and ontology prefix (OWL Ontology or SKOS ConceptScheme)
     detected_prefix = ontology_id
@@ -390,14 +414,18 @@ def ingest_ontology(
     for ont_subj in g.subjects(RDF.type, OWL.Ontology):
         base_uri = str(ont_subj).rstrip("#/") + "#"
         if not detected_prefix:
-            detected_prefix = str(ont_subj).rsplit("/", 1)[-1].rsplit("#", 1)[-1].lower()
+            detected_prefix = (
+                str(ont_subj).rsplit("/", 1)[-1].rsplit("#", 1)[-1].lower()
+            )
             break
 
     if not base_uri:
         for scheme_subj in g.subjects(RDF.type, SKOS.ConceptScheme):
             base_uri = str(scheme_subj).rstrip("#/") + "#"
             if not detected_prefix:
-                detected_prefix = str(scheme_subj).rsplit("/", 1)[-1].rsplit("#", 1)[-1].lower()
+                detected_prefix = (
+                    str(scheme_subj).rsplit("/", 1)[-1].rsplit("#", 1)[-1].lower()
+                )
                 break
 
     if not detected_prefix:
@@ -453,13 +481,13 @@ def ingest_ontology(
         # Hierarchy: OWL uses rdfs:subClassOf; SKOS uses skos:broader
         if epistemic_type == "class":
             parents = [
-                str(p) for p in g.objects(c_uri, RDFS.subClassOf) 
+                str(p)
+                for p in g.objects(c_uri, RDFS.subClassOf)
                 if isinstance(p, URIRef) and p != OWL.Thing
             ]
         else:
             parents = [
-                str(p) for p in g.objects(c_uri, SKOS.broader)
-                if isinstance(p, URIRef)
+                str(p) for p in g.objects(c_uri, SKOS.broader) if isinstance(p, URIRef)
             ]
         parent_uri = parents[0] if parents else None
         is_root = 1 if not parents else 0
@@ -468,7 +496,16 @@ def ingest_ontology(
             """INSERT OR REPLACE INTO dynamic_classes 
                (class_uri, curie, ontology_id, label, definition, parent_class_uri, is_root, epistemic_type)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (uri_str, curie, detected_prefix, pref_label, definition, parent_uri, is_root, epistemic_type),
+            (
+                uri_str,
+                curie,
+                detected_prefix,
+                pref_label,
+                definition,
+                parent_uri,
+                is_root,
+                epistemic_type,
+            ),
         )
         classes_ingested += 1
 
@@ -482,21 +519,47 @@ def ingest_ontology(
 
         # Materialize entity aliases directly into indexed aliases table
         # Variant A: CURIE (dico:Wall -> dico:Wall)
-        insert_alias(conn, alias_id=curie, canonical_id=curie, kind="entity", method="ontology", score=1.0)
+        insert_alias(
+            conn,
+            alias_id=curie,
+            canonical_id=curie,
+            kind="entity",
+            method="ontology",
+            score=1.0,
+        )
         aliases_materialized += 1
 
         # Variant B: Normalized surface label ("wall" -> dico:Wall)
         clean_label = pref_label.lower().strip()
-        insert_alias(conn, alias_id=clean_label, canonical_id=curie, kind="entity", method="ontology", score=1.0)
+        insert_alias(
+            conn,
+            alias_id=clean_label,
+            canonical_id=curie,
+            kind="entity",
+            method="ontology",
+            score=1.0,
+        )
         aliases_materialized += 1
 
         # Variant C: AltLabels
         for alt in g.objects(c_uri, SKOS.altLabel):
-            insert_alias(conn, alias_id=str(alt).lower().strip(), canonical_id=curie, kind="entity", method="ontology", score=0.95)
+            insert_alias(
+                conn,
+                alias_id=str(alt).lower().strip(),
+                canonical_id=curie,
+                kind="entity",
+                method="ontology",
+                score=0.95,
+            )
             aliases_materialized += 1
 
     # 4. Extract Object & Datatype Properties
-    prop_types = {OWL.ObjectProperty, OWL.DatatypeProperty, RDF.Property, OWL.TransitiveProperty}
+    prop_types = {
+        OWL.ObjectProperty,
+        OWL.DatatypeProperty,
+        RDF.Property,
+        OWL.TransitiveProperty,
+    }
     for p_uri in set(g.subjects(RDF.type, None)):
         types = set(g.objects(p_uri, RDF.type))
         if not (types & prop_types) or not isinstance(p_uri, URIRef):
@@ -512,7 +575,11 @@ def ingest_ontology(
         defs = [str(d) for d in g.objects(p_uri, RDFS.comment)]
         definition = defs[0] if defs else ""
 
-        parents = [str(p) for p in g.objects(p_uri, RDFS.subPropertyOf) if isinstance(p, URIRef)]
+        parents = [
+            str(p)
+            for p in g.objects(p_uri, RDFS.subPropertyOf)
+            if isinstance(p, URIRef)
+        ]
         parent_uri = parents[0] if parents else None
 
         is_trans = 1 if OWL.TransitiveProperty in types else 0
@@ -522,13 +589,36 @@ def ingest_ontology(
             """INSERT OR REPLACE INTO dynamic_properties 
                (property_uri, curie, ontology_id, label, definition, parent_property_uri, is_transitive, is_symmetric)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (uri_str, curie, detected_prefix, pref_label, definition, parent_uri, is_trans, is_sym),
+            (
+                uri_str,
+                curie,
+                detected_prefix,
+                pref_label,
+                definition,
+                parent_uri,
+                is_trans,
+                is_sym,
+            ),
         )
         props_ingested += 1
 
         # Materialize predicate aliases
-        insert_alias(conn, alias_id=curie, canonical_id=curie, kind="predicate", method="ontology", score=1.0)
-        insert_alias(conn, alias_id=suffix.lower(), canonical_id=curie, kind="predicate", method="ontology", score=1.0)
+        insert_alias(
+            conn,
+            alias_id=curie,
+            canonical_id=curie,
+            kind="predicate",
+            method="ontology",
+            score=1.0,
+        )
+        insert_alias(
+            conn,
+            alias_id=suffix.lower(),
+            canonical_id=curie,
+            kind="predicate",
+            method="ontology",
+            score=1.0,
+        )
         aliases_materialized += 2
 
     conn.commit()
@@ -570,62 +660,175 @@ logger = logging.getLogger(__name__)
 
 # Bipartite and symmetric exclusion masks (Blacklist Table)
 POLARITY_EXCLUSION_MASK: dict[str, frozenset[str]] = {
-    "causes": frozenset({
-        "prevent", "prevents", "prevented", "preventing", "prevention",
-        "inhibit", "inhibits", "inhibited", "inhibiting", "inhibition",
-        "block", "blocks", "blocked", "blocking",
-        "stop", "stops", "stopped", "stopping",
-        "thwart", "thwarts", "thwarted", "preclude", "precludes",
-    }),
-    "prevents": frozenset({
-        "cause", "causes", "caused", "causing",
-        "induce", "induces", "induced", "inducing",
-        "trigger", "triggers", "triggered", "triggering",
-        "produce", "produces", "produced", "producing",
-        "generate", "generates", "generated", "lead to", "results in",
-    }),
-    "supports": frozenset({
-        "refute", "refutes", "refuted", "refuting",
-        "contradict", "contradicts", "contradicted", "contradicting",
-        "oppose", "opposes", "opposed", "opposing",
-        "disprove", "disproves", "disproved", "disproving",
-        "rebut", "rebuts", "undermine", "undermines",
-    }),
-    "refutes": frozenset({
-        "support", "supports", "supported", "supporting",
-        "confirm", "confirms", "confirmed", "confirming",
-        "prove", "proves", "proved", "proving",
-        "corroborate", "corroborates", "substantiate", "uphold",
-    }),
-    "contradicts": frozenset({
-        "support", "supports", "supported", "supporting",
-        "agree", "agrees", "agreed", "align", "aligns", "aligned",
-        "match", "matches", "consistent with",
-    }),
-    "precedes": frozenset({
-        "follow", "follows", "followed", "following",
-        "succeed", "succeeds", "succeeded", "succeeding",
-    }),
+    "causes": frozenset(
+        {
+            "prevent",
+            "prevents",
+            "prevented",
+            "preventing",
+            "prevention",
+            "inhibit",
+            "inhibits",
+            "inhibited",
+            "inhibiting",
+            "inhibition",
+            "block",
+            "blocks",
+            "blocked",
+            "blocking",
+            "stop",
+            "stops",
+            "stopped",
+            "stopping",
+            "thwart",
+            "thwarts",
+            "thwarted",
+            "preclude",
+            "precludes",
+        }
+    ),
+    "prevents": frozenset(
+        {
+            "cause",
+            "causes",
+            "caused",
+            "causing",
+            "induce",
+            "induces",
+            "induced",
+            "inducing",
+            "trigger",
+            "triggers",
+            "triggered",
+            "triggering",
+            "produce",
+            "produces",
+            "produced",
+            "producing",
+            "generate",
+            "generates",
+            "generated",
+            "lead to",
+            "results in",
+        }
+    ),
+    "supports": frozenset(
+        {
+            "refute",
+            "refutes",
+            "refuted",
+            "refuting",
+            "contradict",
+            "contradicts",
+            "contradicted",
+            "contradicting",
+            "oppose",
+            "opposes",
+            "opposed",
+            "opposing",
+            "disprove",
+            "disproves",
+            "disproved",
+            "disproving",
+            "rebut",
+            "rebuts",
+            "undermine",
+            "undermines",
+        }
+    ),
+    "refutes": frozenset(
+        {
+            "support",
+            "supports",
+            "supported",
+            "supporting",
+            "confirm",
+            "confirms",
+            "confirmed",
+            "confirming",
+            "prove",
+            "proves",
+            "proved",
+            "proving",
+            "corroborate",
+            "corroborates",
+            "substantiate",
+            "uphold",
+        }
+    ),
+    "contradicts": frozenset(
+        {
+            "support",
+            "supports",
+            "supported",
+            "supporting",
+            "agree",
+            "agrees",
+            "agreed",
+            "align",
+            "aligns",
+            "aligned",
+            "match",
+            "matches",
+            "consistent with",
+        }
+    ),
+    "precedes": frozenset(
+        {
+            "follow",
+            "follows",
+            "followed",
+            "following",
+            "succeed",
+            "succeeds",
+            "succeeded",
+            "succeeding",
+        }
+    ),
 }
 
 # Pre-compiled high-precision synset dictionary
 SYNSET_DICTIONARY: dict[str, str] = {
     # Causal
-    "induces": "causes", "induce": "causes", "leads to": "causes", "lead to": "causes",
-    "triggers": "causes", "trigger": "causes", "results in": "causes", "sparks": "causes",
-    "brings about": "causes", "produces": "causes", "generates": "causes",
+    "induces": "causes",
+    "induce": "causes",
+    "leads to": "causes",
+    "lead to": "causes",
+    "triggers": "causes",
+    "trigger": "causes",
+    "results in": "causes",
+    "sparks": "causes",
+    "brings about": "causes",
+    "produces": "causes",
+    "generates": "causes",
     # Dialectical supports
-    "corroborates": "supports", "substantiates": "supports", "upholds": "supports",
-    "endorses": "supports", "backs": "supports", "confirms": "supports", "verifies": "supports",
+    "corroborates": "supports",
+    "substantiates": "supports",
+    "upholds": "supports",
+    "endorses": "supports",
+    "backs": "supports",
+    "confirms": "supports",
+    "verifies": "supports",
     # Dialectical refutes / contradicts
-    "disproves": "refutes", "debunks": "refutes", "rebuts": "refutes",
-    "invalidates": "refutes", "opposes": "contradicts", "negates": "contradicts",
+    "disproves": "refutes",
+    "debunks": "refutes",
+    "rebuts": "refutes",
+    "invalidates": "refutes",
+    "opposes": "contradicts",
+    "negates": "contradicts",
     # Mereology
-    "consists of": "partOf", "comprises": "partOf", "composed of": "partOf",
-    "constitutes": "partOf", "belongs to": "partOf", "element of": "partOf",
+    "consists of": "partOf",
+    "comprises": "partOf",
+    "composed of": "partOf",
+    "constitutes": "partOf",
+    "belongs to": "partOf",
+    "element of": "partOf",
     # Subsumption
-    "is a type of": "subClassOf", "is a kind of": "subClassOf", "categorized as": "subClassOf",
+    "is a type of": "subClassOf",
+    "is a kind of": "subClassOf",
+    "categorized as": "subClassOf",
 }
+
 
 def is_antonym_conflict(candidate: str, target_predicate: str) -> bool:
     """Check if candidate text violates polarity exclusion mask for target predicate."""
@@ -644,7 +847,9 @@ def is_antonym_conflict(candidate: str, target_predicate: str) -> bool:
                 return True
     return False
 
+
 _base_spacy_model: Language | None = None
+
 
 def get_base_spacy() -> Language:
     """Cached singleton loader for en_core_web_lg to avoid 500MB reload on every call."""
@@ -652,6 +857,7 @@ def get_base_spacy() -> Language:
     if _base_spacy_model is None:
         _base_spacy_model = spacy.load("en_core_web_lg", exclude=["ner"])
     return _base_spacy_model
+
 
 def normalize_predicate_antonym_guarded(
     predicate: str,
@@ -706,7 +912,12 @@ def normalize_predicate_antonym_guarded(
             if is_antonym_conflict(decamel, bp):
                 continue
 
-            bp_clean = re.sub(r"([a-z])([A-Z])", r"\1 \2", bp).replace("_", " ").lower().strip()
+            bp_clean = (
+                re.sub(r"([a-z])([A-Z])", r"\1 \2", bp)
+                .replace("_", " ")
+                .lower()
+                .strip()
+            )
             bp_doc = base_pipe(bp_clean)
             if bp_doc and bp_doc.has_vector and bp_doc.vector_norm > 0:
                 sim = float(target_doc.similarity(bp_doc))
@@ -717,7 +928,7 @@ def normalize_predicate_antonym_guarded(
         if best_sim >= threshold and best_bp is not None:
             return best_bp
 
-    # --- TIER 3: Compile-Time Property Closure Fallback ---
+    # --- Dynamic Property Lookup Fallback ---
     if ":" in rel:
         curie = reg.uri_to_curie(rel)
         if curie in snapshot.properties:
@@ -739,13 +950,15 @@ The extraction contract mandates that **out-of-vocabulary triples are never disc
 ```python
 # Modified segment in src/yaw/nlp/models.py
 
+
 def map_namespace(ent: Span) -> str:
     """Map spaCy entity span to active taxonomy namespace via OntologyRegistry."""
     from yaw.ontology.registry import get_ontology_registry
+
     reg = get_ontology_registry()
 
     lbl = normalize_label(ent.label_) if ent.label_ else ""
-    
+
     # 1. Check registry concept namespaces (O(1) check)
     if reg.is_concept_namespace(lbl) and lbl not in GENERIC_LABELS:
         return lbl
@@ -762,15 +975,18 @@ def map_namespace(ent: Span) -> str:
         return "entities"
     return "concepts"
 
+
 # Bottom-Up Mention Scoper for Quadrant 4 (Closed-Domain Candidate Scoping)
 from spacy.matcher import PhraseMatcher
 
+
 class DynamicConceptMentionScoper:
     """Bottom-up candidate scoping for closed-domain extraction (Quadrant 4).
-    
+
     Pre-matches text chunks against registered ontology labels via spaCy C-speed
     PhraseMatcher (Trie) to constrain candidate alignments without bloating LLM prompt prefixes.
     """
+
     def __init__(self, nlp: Language) -> None:
         self.nlp = nlp
         self.matcher = PhraseMatcher(nlp.vocab, attr="LOWER")
@@ -862,7 +1078,7 @@ INSERT OR IGNORE INTO runtime_settings (key, value) VALUES ('target_ontology', '
 -- When existing database has aliases table with CHECK constraint excluding 'ontology',
 -- execute atomic migration in ensure_schema_tables():
 -- 1. PRAGMA foreign_keys=OFF;
--- 2. CREATE TABLE aliases_new (... method IN ('lexical', 'auto', 'llm', 'compile', 'exact', 'alias', 'new', 'ontology'));
+-- 2. CREATE TABLE aliases_new (... method IN ('exact', 'alias', 'auto', 'new', 'ontology'));
 -- 3. INSERT INTO aliases_new SELECT * FROM aliases;
 -- 4. DROP TABLE aliases; ALTER TABLE aliases_new RENAME TO aliases;
 -- 5. Recreate idx_aliases_lookup; PRAGMA foreign_keys=ON;
@@ -1003,8 +1219,14 @@ from rdflib import RDF, RDFS, OWL, Namespace, URIRef
 import pyshacl
 
 from yaw.ontology.registry import get_ontology_registry
-from yaw.ontology.shacl import ValidationReport, load_shapes_graph, parse_validation_report, filter_violations
+from yaw.ontology.shacl import (
+    ValidationReport,
+    load_shapes_graph,
+    parse_validation_report,
+    filter_violations,
+)
 from yaw.storage.rdf import curie_to_uri, project_knowledge_graph
+
 
 def precompute_rdfs_closure(conn: sqlite3.Connection, g: rdflib.Graph) -> None:
     """Pre-compute transitive subClassOf, broader, and subPropertyOf closure via SQLite recursive CTEs."""
@@ -1049,11 +1271,12 @@ def precompute_rdfs_closure(conn: sqlite3.Connection, g: rdflib.Graph) -> None:
         elif kind == "prop":
             g.add((sub_uri, RDFS.subPropertyOf, parent_uri))
 
+
 def generate_dynamic_whitelist_shape() -> rdflib.Graph:
     """Synthesize dynamic SHACL namespace whitelist shape from active OntologyRegistry prefixes."""
     reg = get_ontology_registry()
     prefixes = reg.get_active_prefixes()
-    
+
     # Build regex matching all registered namespace URI prefixes
     escaped_patterns = [re.escape(uri) for uri in prefixes.values()]
     combined_regex = f"^({'|'.join(escaped_patterns)}|http://www\\.w3\\.org/)"
@@ -1083,6 +1306,7 @@ def generate_dynamic_whitelist_shape() -> rdflib.Graph:
     g.parse(data=shape_ttl, format="turtle")
     return g
 
+
 def validate_wiki_graph_fast(
     conn: sqlite3.Connection,
     query: str | None = None,
@@ -1091,7 +1315,9 @@ def validate_wiki_graph_fast(
     t0 = time.perf_counter()
 
     # 1. Project base graph from SQLite views
-    data_graph = project_knowledge_graph(conn=conn, include_skos=False, named_quads=False)
+    data_graph = project_knowledge_graph(
+        conn=conn, include_skos=False, named_quads=False
+    )
 
     # 2. Add relational pre-closure (SQLite recursive CTE)
     precompute_rdfs_closure(conn, data_graph)
@@ -1130,11 +1356,12 @@ To prevent 60% concept seed mass dilution into uninstantiated ontology classes, 
 ```python
 # Modified methods in src/yaw/retrieval/retriever.py
 
+
 def _get_active_subgraph_nodes(
     conn: sqlite3.Connection, raw_edge_rows: list[tuple[str, str, str, float]]
 ) -> set[str]:
     """Identify active classes (instantiated classes + direct ancestors to root).
-    
+
     Expands ancestors in Python memory over hydrated OntologyRegistry class hierarchy
     to prevent SQLite parameter limit overflows and redundant CTE execution.
     """
@@ -1166,6 +1393,7 @@ def _get_active_subgraph_nodes(
 
     return instantiated_nodes | ancestors
 
+
 def compute_upward_conductance(dst_curie: str) -> float:
     """Compute depth-scaled upward conductance with root damping: W_up = min(0.8, max(0.2, 0.2 + 0.1 * depth))."""
     reg = get_ontology_registry()
@@ -1194,11 +1422,25 @@ OPEN_IE: bool = True
 TARGET_ONTOLOGY: str = "internal"
 
 # Added to _populate_nlp(g, raw):
-raw_infer = _get("ontology", "infer_ontologies", raw.get("ontology", {}).get("infer_ontologies", []))
-g["INFER_ONTOLOGIES"] = tuple(str(x).strip() for x in raw_infer) if isinstance(raw_infer, (list, tuple)) else ()
+raw_infer = _get(
+    "ontology", "infer_ontologies", raw.get("ontology", {}).get("infer_ontologies", [])
+)
+g["INFER_ONTOLOGIES"] = (
+    tuple(str(x).strip() for x in raw_infer)
+    if isinstance(raw_infer, (list, tuple))
+    else ()
+)
 
-g["OPEN_IE"] = _get("ontology", "open_ie", raw.get("ontology", {}).get("open_ie", True), bool)
-g["TARGET_ONTOLOGY"] = str(_get("ontology", "target_ontology", raw.get("ontology", {}).get("target_ontology", "internal"))).lower()
+g["OPEN_IE"] = _get(
+    "ontology", "open_ie", raw.get("ontology", {}).get("open_ie", True), bool
+)
+g["TARGET_ONTOLOGY"] = str(
+    _get(
+        "ontology",
+        "target_ontology",
+        raw.get("ontology", {}).get("target_ontology", "internal"),
+    )
+).lower()
 ```
 
 ### 4.2 FastMCP Tool Parameter Exposure (`src/yaw/server/daemon.py`)
@@ -1219,12 +1461,14 @@ g["TARGET_ONTOLOGY"] = str(_get("ontology", "target_ontology", raw.get("ontology
        from yaw.ontology.loader import ingest_ontology
        from yaw.storage.db import apply_pragmas, ensure_schema_views
        from yaw.retrieval.retriever import get_retriever
-       
+
        db_path = _resolve_vault_db_path(vault_dir)
        with sqlite3.connect(str(db_path)) as conn:
            apply_pragmas(conn)
            ensure_schema_views(conn)
-           res = ingest_ontology(source=source, conn=conn, ontology_id=ontology_id, is_default=is_default)
+           res = ingest_ontology(
+               source=source, conn=conn, ontology_id=ontology_id, is_default=is_default
+           )
        get_retriever().invalidate_cache()
        return res
    ```
@@ -1239,12 +1483,18 @@ g["TARGET_ONTOLOGY"] = str(_get("ontology", "target_ontology", raw.get("ontology
        """Configure active extraction quadrant and closed-world view filters (< 5 ms toggle)."""
        from yaw.storage.db import apply_pragmas
        from yaw.retrieval.retriever import get_retriever
-       
+
        db_path = _resolve_vault_db_path(vault_dir)
        with sqlite3.connect(str(db_path)) as conn:
            apply_pragmas(conn)
-           conn.execute("INSERT OR REPLACE INTO runtime_settings (key, value) VALUES ('open_ie', ?)", ('1' if open_ie else '0',))
-           conn.execute("INSERT OR REPLACE INTO runtime_settings (key, value) VALUES ('target_ontology', ?)", (target_ontology.lower(),))
+           conn.execute(
+               "INSERT OR REPLACE INTO runtime_settings (key, value) VALUES ('open_ie', ?)",
+               ("1" if open_ie else "0",),
+           )
+           conn.execute(
+               "INSERT OR REPLACE INTO runtime_settings (key, value) VALUES ('target_ontology', ?)",
+               (target_ontology.lower(),),
+           )
            conn.commit()
        get_retriever().invalidate_cache()
        return {"status": "success", "open_ie": open_ie, "target_ontology": target_ontology}
@@ -1311,22 +1561,38 @@ dico:isAdjacentTo a owl:ObjectProperty, owl:SymmetricProperty ;
     rdfs:label "is adjacent to"@en .
 """
 
+
 @pytest.fixture
 def real_disk_db(tmp_path: Path) -> sqlite3.Connection:
     """Unmocked real SQLite database on disk with WAL pragmas per Invariant 6."""
     db_file = tmp_path / "yaw.db"
     conn = sqlite3.connect(str(db_file))
     apply_pragmas(conn)
-    conn.execute("CREATE TABLE note_chunks (chunk_id TEXT PRIMARY KEY, entity_uri TEXT, rel_path TEXT, ordinal INT, heading TEXT, heading_slug TEXT, line_start INT, line_end INT, embedding BLOB);")
-    conn.execute("CREATE TABLE wikilinks (source_uri TEXT, target_uri TEXT, link_label TEXT, PRIMARY KEY(source_uri, target_uri));")
-    conn.execute("CREATE TABLE leaf_nodes (node_id TEXT, source_leaf_id TEXT, name TEXT, namespace TEXT, definition TEXT, embedding BLOB, PRIMARY KEY(node_id, source_leaf_id));")
-    conn.execute("CREATE TABLE leaf_relations (relation_id TEXT PRIMARY KEY, source_leaf_id TEXT, subject_id TEXT, predicate TEXT, object_id TEXT, weight REAL, predicate_id TEXT);")
-    conn.execute("CREATE TABLE aliases (alias_id TEXT PRIMARY KEY, canonical_id TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('entity', 'predicate')), status TEXT NOT NULL DEFAULT 'active', method TEXT NOT NULL, score REAL NOT NULL DEFAULT 1.0, created_at REAL NOT NULL DEFAULT (unixepoch()));")
+    conn.execute(
+        "CREATE TABLE note_chunks (chunk_id TEXT PRIMARY KEY, entity_uri TEXT, rel_path TEXT, ordinal INT, heading TEXT, heading_slug TEXT, line_start INT, line_end INT, embedding BLOB);"
+    )
+    conn.execute(
+        "CREATE TABLE wikilinks (source_uri TEXT, target_uri TEXT, link_label TEXT, PRIMARY KEY(source_uri, target_uri));"
+    )
+    conn.execute(
+        "CREATE TABLE leaf_nodes (node_id TEXT, source_leaf_id TEXT, name TEXT, namespace TEXT, definition TEXT, embedding BLOB, PRIMARY KEY(node_id, source_leaf_id));"
+    )
+    conn.execute(
+        "CREATE TABLE leaf_relations (relation_id TEXT PRIMARY KEY, source_leaf_id TEXT, subject_id TEXT, predicate TEXT, object_id TEXT, weight REAL, predicate_id TEXT);"
+    )
+    conn.execute(
+        "CREATE TABLE aliases (alias_id TEXT PRIMARY KEY, canonical_id TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('entity', 'predicate')), status TEXT NOT NULL DEFAULT 'active', method TEXT NOT NULL, score REAL NOT NULL DEFAULT 1.0, created_at REAL NOT NULL DEFAULT (unixepoch()));"
+    )
     conn.execute("CREATE INDEX idx_aliases_lookup ON aliases(alias_id, kind, status);")
-    conn.execute("CREATE TABLE compiled_relations (relation_id TEXT PRIMARY KEY, subject_id TEXT NOT NULL, predicate TEXT NOT NULL, object_id TEXT NOT NULL, weight REAL NOT NULL DEFAULT 1.0);")
-    conn.execute("CREATE TABLE compiled_nodes (node_id TEXT PRIMARY KEY, name TEXT NOT NULL, namespace TEXT NOT NULL, definition TEXT NOT NULL);")
+    conn.execute(
+        "CREATE TABLE compiled_relations (relation_id TEXT PRIMARY KEY, subject_id TEXT NOT NULL, predicate TEXT NOT NULL, object_id TEXT NOT NULL, weight REAL NOT NULL DEFAULT 1.0);"
+    )
+    conn.execute(
+        "CREATE TABLE compiled_nodes (node_id TEXT PRIMARY KEY, name TEXT NOT NULL, namespace TEXT NOT NULL, definition TEXT NOT NULL);"
+    )
     ensure_schema_views(conn)
     return conn
+
 
 def test_antonym_polarity_exclusion():
     """Verify Polarity Exclusion Mask blocks causal and dialectical vector collapse."""
@@ -1339,6 +1605,7 @@ def test_antonym_polarity_exclusion():
     res_refutes = normalize_predicate_antonym_guarded("refutes")
     assert res_refutes != "supports"
     assert "refute" in res_refutes
+
 
 def test_external_ontology_ingestion_and_active_projection(real_disk_db):
     """Verify DiCo TTL ingestion, alias materialization, and ghost class pruning in PPR."""
@@ -1370,86 +1637,148 @@ def test_external_ontology_ingestion_and_active_projection(real_disk_db):
     # Ghost class must be strictly PRUNED
     assert "dico:GhostClass" not in retriever._node_to_idx
 
+
 def test_quadrant_1_hybrid_open_ie(real_disk_db):
     """Verify Q1 (internal, open_ie=true): Extracts leaf triples, permits open predicates."""
-    real_disk_db.execute("INSERT OR REPLACE INTO runtime_settings VALUES ('open_ie', '1'), ('target_ontology', 'internal')")
-    real_disk_db.execute("INSERT INTO leaf_relations VALUES ('rel_q1', 'raw/1.md#0', 'concepts:foo', 'disruptsMarket', 'entities:bar', 1.0, 'disruptsmarket')")
+    real_disk_db.execute(
+        "INSERT OR REPLACE INTO runtime_settings VALUES ('open_ie', '1'), ('target_ontology', 'internal')"
+    )
+    real_disk_db.execute(
+        "INSERT INTO leaf_relations VALUES ('rel_q1', 'raw/1.md#0', 'concepts:foo', 'disruptsMarket', 'entities:bar', 1.0, 'disruptsmarket')"
+    )
     real_disk_db.commit()
 
-    edges = real_disk_db.execute("SELECT src_id, dst_id, rel_type FROM unified_edges WHERE src_id='concepts:foo'").fetchall()
+    edges = real_disk_db.execute(
+        "SELECT src_id, dst_id, rel_type FROM unified_edges WHERE src_id='concepts:foo'"
+    ).fetchall()
     assert len(edges) == 1
     assert edges[0][2] == "disruptsMarket"
 
+
 def test_quadrant_2_strict_fixed(real_disk_db):
     """Verify Q2 (internal, open_ie=false): Filters out open-IE predicates in unified_edges (<5ms toggle)."""
-    real_disk_db.execute("INSERT INTO leaf_relations VALUES ('rel_open', 'raw/1.md#0', 'concepts:x', 'disruptsMarket', 'entities:y', 1.0, 'disruptsmarket')")
-    real_disk_db.execute("INSERT INTO leaf_relations VALUES ('rel_fixed', 'raw/1.md#0', 'concepts:x', 'causes', 'entities:y', 1.0, 'causes')")
+    real_disk_db.execute(
+        "INSERT INTO leaf_relations VALUES ('rel_open', 'raw/1.md#0', 'concepts:x', 'disruptsMarket', 'entities:y', 1.0, 'disruptsmarket')"
+    )
+    real_disk_db.execute(
+        "INSERT INTO leaf_relations VALUES ('rel_fixed', 'raw/1.md#0', 'concepts:x', 'causes', 'entities:y', 1.0, 'causes')"
+    )
     real_disk_db.commit()
 
     # Toggle open_ie to 0
-    real_disk_db.execute("INSERT OR REPLACE INTO runtime_settings VALUES ('open_ie', '0')")
+    real_disk_db.execute(
+        "INSERT OR REPLACE INTO runtime_settings VALUES ('open_ie', '0')"
+    )
     real_disk_db.commit()
 
-    edges = real_disk_db.execute("SELECT rel_type FROM unified_edges WHERE src_id='concepts:x'").fetchall()
+    edges = real_disk_db.execute(
+        "SELECT rel_type FROM unified_edges WHERE src_id='concepts:x'"
+    ).fetchall()
     rel_types = [e[0] for e in edges]
     assert "causes" in rel_types
     assert "disruptsMarket" not in rel_types
     # Invariant 2: leaf_relations retains raw triple
-    raw = real_disk_db.execute("SELECT COUNT(*) FROM leaf_relations WHERE predicate='disruptsMarket'").fetchone()[0]
+    raw = real_disk_db.execute(
+        "SELECT COUNT(*) FROM leaf_relations WHERE predicate='disruptsMarket'"
+    ).fetchone()[0]
     assert raw == 1
+
 
 def test_quadrant_3_external_open_ie(real_disk_db):
     """Verify Q3 (external, open_ie=true): External ontology classes active, open verbs permitted."""
     g = rdflib.Graph().parse(data=DICO_SAMPLE_TTL, format="turtle")
     ingest_ontology(source=g, conn=real_disk_db, ontology_id="dico")
-    real_disk_db.execute("INSERT OR REPLACE INTO runtime_settings VALUES ('open_ie', '1'), ('target_ontology', 'external')")
-    real_disk_db.execute("INSERT INTO leaf_relations VALUES ('rel_q3', 'raw/1.md#0', 'dico:Wall', 'degradesOverTime', 'concepts:entropy', 1.0, 'degradesovertime')")
+    real_disk_db.execute(
+        "INSERT OR REPLACE INTO runtime_settings VALUES ('open_ie', '1'), ('target_ontology', 'external')"
+    )
+    real_disk_db.execute(
+        "INSERT INTO leaf_relations VALUES ('rel_q3', 'raw/1.md#0', 'dico:Wall', 'degradesOverTime', 'concepts:entropy', 1.0, 'degradesovertime')"
+    )
     real_disk_db.commit()
 
-    edges = real_disk_db.execute("SELECT rel_type FROM unified_edges WHERE src_id='dico:Wall'").fetchall()
+    edges = real_disk_db.execute(
+        "SELECT rel_type FROM unified_edges WHERE src_id='dico:Wall'"
+    ).fetchall()
     assert any(e[0] == "degradesOverTime" for e in edges)
+
 
 def test_quadrant_4_external_closed(real_disk_db):
     """Verify Q4 (external, open_ie=false): Filters out non-canonical, non-ontology predicates in view."""
     g = rdflib.Graph().parse(data=DICO_SAMPLE_TTL, format="turtle")
     ingest_ontology(source=g, conn=real_disk_db, ontology_id="dico")
-    real_disk_db.execute("INSERT OR REPLACE INTO runtime_settings VALUES ('open_ie', '0'), ('target_ontology', 'external')")
-    real_disk_db.execute("INSERT INTO leaf_relations VALUES ('rel_q4a', 'raw/1.md#0', 'dico:ExteriorWall', 'isAdjacentTo', 'dico:Wall', 1.0, 'isadjacentto')")
-    real_disk_db.execute("INSERT INTO leaf_relations VALUES ('rel_q4b', 'raw/1.md#0', 'dico:ExteriorWall', 'randomVerb', 'dico:Wall', 1.0, 'randomverb')")
+    real_disk_db.execute(
+        "INSERT OR REPLACE INTO runtime_settings VALUES ('open_ie', '0'), ('target_ontology', 'external')"
+    )
+    real_disk_db.execute(
+        "INSERT INTO leaf_relations VALUES ('rel_q4a', 'raw/1.md#0', 'dico:ExteriorWall', 'isAdjacentTo', 'dico:Wall', 1.0, 'isadjacentto')"
+    )
+    real_disk_db.execute(
+        "INSERT INTO leaf_relations VALUES ('rel_q4b', 'raw/1.md#0', 'dico:ExteriorWall', 'randomVerb', 'dico:Wall', 1.0, 'randomverb')"
+    )
     real_disk_db.commit()
 
-    edges = real_disk_db.execute("SELECT rel_type FROM unified_edges WHERE src_id='dico:ExteriorWall'").fetchall()
+    edges = real_disk_db.execute(
+        "SELECT rel_type FROM unified_edges WHERE src_id='dico:ExteriorWall'"
+    ).fetchall()
     rel_types = [e[0] for e in edges]
     assert "dico:isAdjacentTo" in rel_types or "isAdjacentTo" in rel_types
     assert "randomVerb" not in rel_types
 
+
 def test_zero_cache_wipes(real_disk_db):
     """Verify Invariant 2: Mode switching modifies 0 chunk embeddings and 0 leaf_relations."""
-    real_disk_db.execute("INSERT INTO note_chunks VALUES ('raw/1.md#0', '1.md', 'Test', 0, 100, 1, 10, 0, 'c0', X'1234')")
-    real_disk_db.execute("INSERT INTO leaf_relations VALUES ('rel_z', 'raw/1.md#0', 'concepts:a', 'causes', 'concepts:b', 1.0, 'causes')")
+    real_disk_db.execute(
+        "INSERT INTO note_chunks VALUES ('raw/1.md#0', '1.md', 'Test', 0, 100, 1, 10, 0, 'c0', X'1234')"
+    )
+    real_disk_db.execute(
+        "INSERT INTO leaf_relations VALUES ('rel_z', 'raw/1.md#0', 'concepts:a', 'causes', 'concepts:b', 1.0, 'causes')"
+    )
     real_disk_db.commit()
 
-    emb_before = real_disk_db.execute("SELECT embedding FROM note_chunks WHERE entity_uri='raw/1.md#0'").fetchone()[0]
-    count_before = real_disk_db.execute("SELECT COUNT(*) FROM leaf_relations").fetchone()[0]
+    emb_before = real_disk_db.execute(
+        "SELECT embedding FROM note_chunks WHERE entity_uri='raw/1.md#0'"
+    ).fetchone()[0]
+    count_before = real_disk_db.execute(
+        "SELECT COUNT(*) FROM leaf_relations"
+    ).fetchone()[0]
 
     # Toggle settings
-    for mode in ['0', '1']:
-        real_disk_db.execute("INSERT OR REPLACE INTO runtime_settings VALUES ('open_ie', ?)", (mode,))
+    for mode in ["0", "1"]:
+        real_disk_db.execute(
+            "INSERT OR REPLACE INTO runtime_settings VALUES ('open_ie', ?)", (mode,)
+        )
         real_disk_db.commit()
 
-    emb_after = real_disk_db.execute("SELECT embedding FROM note_chunks WHERE entity_uri='raw/1.md#0'").fetchone()[0]
-    count_after = real_disk_db.execute("SELECT COUNT(*) FROM leaf_relations").fetchone()[0]
+    emb_after = real_disk_db.execute(
+        "SELECT embedding FROM note_chunks WHERE entity_uri='raw/1.md#0'"
+    ).fetchone()[0]
+    count_after = real_disk_db.execute(
+        "SELECT COUNT(*) FROM leaf_relations"
+    ).fetchone()[0]
 
     assert emb_before == emb_after, "Chunk embedding was modified during mode toggle!"
-    assert count_before == count_after, "leaf_relations rows were modified during mode toggle!"
+    assert count_before == count_after, (
+        "leaf_relations rows were modified during mode toggle!"
+    )
+
 
 def test_lean_pyshacl_execution_speed(real_disk_db):
     """Assert relational pre-closure + inference=None executes in < 200 ms with complete node fixtures."""
-    real_disk_db.execute("INSERT INTO leaf_nodes VALUES ('concepts:a', 'raw/1.md#0', 'Concept A', 'concepts', 'Def A', NULL)")
-    real_disk_db.execute("INSERT INTO leaf_nodes VALUES ('concepts:b', 'raw/1.md#0', 'Concept B', 'concepts', 'Def B', NULL)")
-    real_disk_db.execute("INSERT INTO leaf_nodes VALUES ('concepts:c', 'raw/1.md#0', 'Concept C', 'concepts', 'Def C', NULL)")
-    real_disk_db.execute("INSERT INTO leaf_relations VALUES ('rel1', 'raw/1.md#0', 'concepts:a', 'subClassOf', 'concepts:b', 1.0, 'subclassof')")
-    real_disk_db.execute("INSERT INTO leaf_relations VALUES ('rel2', 'raw/1.md#0', 'concepts:b', 'subClassOf', 'concepts:c', 1.0, 'subclassof')")
+    real_disk_db.execute(
+        "INSERT INTO leaf_nodes VALUES ('concepts:a', 'raw/1.md#0', 'Concept A', 'concepts', 'Def A', NULL)"
+    )
+    real_disk_db.execute(
+        "INSERT INTO leaf_nodes VALUES ('concepts:b', 'raw/1.md#0', 'Concept B', 'concepts', 'Def B', NULL)"
+    )
+    real_disk_db.execute(
+        "INSERT INTO leaf_nodes VALUES ('concepts:c', 'raw/1.md#0', 'Concept C', 'concepts', 'Def C', NULL)"
+    )
+    real_disk_db.execute(
+        "INSERT INTO leaf_relations VALUES ('rel1', 'raw/1.md#0', 'concepts:a', 'subClassOf', 'concepts:b', 1.0, 'subclassof')"
+    )
+    real_disk_db.execute(
+        "INSERT INTO leaf_relations VALUES ('rel2', 'raw/1.md#0', 'concepts:b', 'subClassOf', 'concepts:c', 1.0, 'subclassof')"
+    )
     real_disk_db.commit()
 
     t0 = time.perf_counter()
@@ -1457,7 +1786,9 @@ def test_lean_pyshacl_execution_speed(real_disk_db):
     elapsed_ms = (time.perf_counter() - t0) * 1000
 
     assert conforms is True
-    assert elapsed_ms < 200.0, f"SHACL validation exceeded 200ms threshold: {elapsed_ms:.1f}ms"
+    assert elapsed_ms < 200.0, (
+        f"SHACL validation exceeded 200ms threshold: {elapsed_ms:.1f}ms"
+    )
 ```
 
 ---

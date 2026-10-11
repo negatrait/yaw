@@ -79,10 +79,10 @@ And a reciprocal downward transition "Parent -> Child" must be synthesized with 
 
 #### Scenario 7: Automated Contested Alias Transition
 ```gherkin
-Given a candidate pair with vector cosine similarity between 0.80 and 0.95
-When Tier 3 LLM adjudication yields a low-confidence decision or dialectical ambiguity
+Given an alias candidate with conflicting canonical targets or dialectical ambiguity
+When candidate prior confidence is low (< 0.80) or flagged during validation
 Then a row must be inserted into "aliases" with "status = 'contested'"
-And the contested record must be queryable via "get_contested_aliases()" for SHACL validation
+And the contested record must be queryable via "get_contested_aliases()" and surfaced in compile-time SHACL validation
 ```
 
 ---
@@ -292,23 +292,21 @@ And power iteration must diffuse mass toward concrete leaf implementations witho
 
 ---
 
-## 5. Epic 6, Sprint 6C: SHACL Closed-World Wiki Linter (`lint_wiki` Tool)
+## 5. Epic 6 & Epic 7.6: SHACL Closed-World Wiki Linter & Contradiction Cache (`lint_wiki` Tool)
 
-### Feature: In-Process Closed-World SHACL Shape Validation & Wiki Linting
+### Feature: In-Process Closed-World SHACL Shape Validation & O(1) Contradiction Caching
 As a wiki author, knowledge graph maintainer, or automated CI quality gate  
-I want declarative closed-world SHACL shape validation over the knowledge graph via the "lint_wiki" tool using in-process "pyshacl"  
-So that invalid namespaces, missing definitions, broken wikilinks, and dialectical contradictions are surfaced with structured W3C "sh:ValidationReport" outputs with zero external graph daemons.
+I want compile-time closed-world SHACL shape validation over the knowledge graph via "compile_wiki" with instantaneous O(1) querying via "lint_wiki" ([`docs/adr/ADR-011.md`](file:///home/harri/yaw/docs/adr/ADR-011.md))  
+So that invalid namespaces, missing definitions, broken wikilinks, and dialectical contradictions are pre-compiled into SQLite and surfaced instantaneously with zero external graph daemons.
 
-#### Scenario 1: Validation of ConceptShape (Definitions and URIs via pyshacl)
+#### Scenario 1: Compile-Time Validation & Caching of ConceptShape Violations
 ```gherkin
 Given a node in "leaf_nodes" with "node_id = 'concepts:entropy'"
 And the node's definition is empty or exceeds the configured word limit (50 words)
-When the "lint_wiki()" MCP tool is executed
-Then the return payload must contain a W3C "sh:ValidationReport" produced by in-process "pyshacl"
-And the report must indicate "sh:conforms = false"
-And the violation must identify "sh:MinLengthConstraintComponent" or "sh:MaxLengthConstraintComponent"
-And the severity must be flagged as "sh:Violation"
-And validation must complete in-process without contacting external services
+When "compile_wiki()" executes in-process fast validation (< 200 ms)
+Then the detected violation must be transactionally committed to "compiled_violations" in "yaw.db"
+And subsequent execution of "lint_wiki()" must return the pre-compiled violation in under 5 ms without running pySHACL
+And the report must indicate "sh:conforms = false" with severity "Violation"
 ```
 
 #### Scenario 2: Validation of RelationShape (Domain and Range Constraints)
@@ -316,8 +314,8 @@ And validation must complete in-process without contacting external services
 Given an extracted relation in "leaf_relations":
   | subject_id        | predicate | object_id           |
   | concepts:gravity  | partOf    | non-existent:entity |
-When the "lint_wiki()" MCP tool is executed
-Then the report must flag an unresolved dangling object target
+When "compile_wiki()" runs or "lint_wiki(force=True)" is executed
+Then the validation record in "compiled_violations" must flag an unresolved dangling object target
 And the violation message must specify broken referential integrity for "non-existent:entity"
 ```
 
@@ -328,19 +326,18 @@ And two contradictory claims in "leaf_relations":
   | subject_id       | predicate | object_id       |
   | concepts:coffee  | prevents  | concepts:cancer |
   | concepts:coffee  | causes    | concepts:cancer |
-When the "lint_wiki()" MCP tool is executed
-Then the linter must detect both dialectical issues
-And report the contested alias merge under "contested_aliases"
-And report the contradictory predicate pair under "dialectical_contradictions"
+When "compile_wiki()" compiles the graph
+Then both dialectical issues must be recorded in "compiled_violations"
+And "lint_wiki()" must surface the contested alias merge and contradictory predicate pair in O(1) time
+And the surfaced contradictions must prompt the agent to accumulate resolving sources in "vault/raw/"
 ```
 
-#### Scenario 4: Filtered Lint Querying via FastMCP Interface with Zero Background Daemons
+#### Scenario 4: Instantaneous Filtered Lint Querying via FastMCP Interface
 ```gherkin
-Given a knowledge graph containing 50 total minor warnings across all 9 namespaces
+Given a knowledge graph with pre-compiled violations in "compiled_violations"
 When a client invokes "lint_wiki(query='concepts')" over FastMCP
-Then the returned list must be filtered exclusively to violations concerning the "concepts" namespace
-And validation must run entirely in-process against SQLite views with zero background graph daemons
-And execution latency must be under 200 milliseconds
+Then the returned list must be filtered via indexed SQLite query to violations concerning "concepts"
+And execution latency must be under 5 milliseconds without re-validating the RDF graph
 ```
 
 ---

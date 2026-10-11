@@ -6,6 +6,7 @@ import asyncio
 import itertools
 import json
 import logging
+import re
 import sqlite3
 import urllib.error
 from pathlib import Path
@@ -129,6 +130,53 @@ def _extract_fts_terms(query: str, nlp: Any | None = None) -> list[str]:
     return _clean_fts_query(query, strip_stopwords=True)
 
 
+def _extract_query_mentions(query: str, nlp: Any | None = None) -> list[str]:
+    """Extract candidate alias mention strings from query string using spaCy and n-grams."""
+    mentions: list[str] = []
+    seen: set[str] = set()
+
+    def add_mention(m: str) -> None:
+        cleaned = m.strip().lower()
+        if cleaned and len(cleaned) > 1 and cleaned not in seen:
+            seen.add(cleaned)
+            mentions.append(cleaned)
+
+    # 1. Full query string
+    add_mention(query)
+
+    # 2. spaCy entities, noun chunks, and non-stop words
+    if nlp is None:
+        try:
+            from yaw.nlp import get_spacy_pipeline
+
+            nlp = get_spacy_pipeline()
+        except (ImportError, RuntimeError, OSError) as err:
+            logger.debug("Could not initialize spaCy pipeline: %s", err)
+
+    if nlp is not None:
+        try:
+            doc = nlp(query)
+            for ent in doc.ents:
+                add_mention(ent.text)
+            if hasattr(doc, "noun_chunks"):
+                for chunk in doc.noun_chunks:
+                    add_mention(chunk.text)
+            for token in doc:
+                if not token.is_stop and not token.is_punct and not token.is_space:
+                    add_mention(token.text)
+                    add_mention(token.lemma_)
+        except (ValueError, TypeError, RuntimeError) as err:
+            logger.debug("spaCy query mention extraction error: %s", err)
+
+    # 3. Regex n-grams (1-gram, 2-gram, 3-gram)
+    words = re.findall(r"\w+", query.lower())
+    for n in (1, 2, 3):
+        for i in range(len(words) - n + 1):
+            add_mention(" ".join(words[i : i + n]))
+
+    return mentions
+
+
 def compute_upward_conductance(dst_curie: str) -> float:
     """Compute depth-scaled upward conductance with root damping: W_up = min(0.8, max(0.2, 0.2 + 0.1 * depth))."""
     from yaw.ontology.registry import get_ontology_registry
@@ -220,7 +268,8 @@ def _filter_active_edge_rows(
         raw_edge_rows = conn.execute(
             "SELECT src_id, dst_id, rel_type, weight, source_chunk_id FROM unified_edges"
         ).fetchall()
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as err:
+        logger.warning("Failed querying unified_edges: %s", err)
         return [], set()
 
     active_nodes = _get_active_subgraph_nodes(conn, raw_edge_rows)
@@ -288,14 +337,43 @@ class GraphRAGRetriever:
     """Personalized PageRank associative retrieval over unified SQLite knowledge graph."""
 
     _extract_fts_terms = staticmethod(_extract_fts_terms)
+    _extract_query_mentions = staticmethod(_extract_query_mentions)
 
-    def __init__(self) -> None:
+    def __init__(self, kb: Any | None = None) -> None:
+        self._kb: Any | None = kb
         self._P: sp.csr_matrix | None = None
         self._adj: sp.csr_matrix | None = None
         self._node_to_idx: dict[str, int] = {}
         self._idx_to_node: list[str] = []
         self._dangling_mask: np.ndarray | None = None
         self._cached_db_mtime: float = -1.0
+
+    @property
+    def kb(self) -> Any | None:
+        """Mounted InMemoryLookupKB instance."""
+        return self._kb
+
+    @kb.setter
+    def kb(self, value: Any) -> None:
+        self._kb = value
+
+    def _get_or_sync_kb(self, conn: sqlite3.Connection) -> Any:
+        """Ensure InMemoryLookupKB is mounted and synchronized, or raise RuntimeError."""
+        if self._kb is None:
+            try:
+                from yaw.indexer.canonicalize import (
+                    create_in_memory_kb,
+                    sync_kb_from_db,
+                )
+
+                kb = create_in_memory_kb()
+                sync_kb_from_db(kb, conn)
+                self._kb = kb
+            except Exception as err:
+                raise RuntimeError(
+                    f"Mandatory InMemoryLookupKB could not be initialized or synchronized: {err}"
+                ) from err
+        return self._kb
 
     @property
     def adj(self) -> sp.csr_matrix | None:
@@ -544,18 +622,22 @@ class GraphRAGRetriever:
         conn: sqlite3.Connection,
         terms: list[str] | None = None,
     ) -> tuple[np.ndarray, np.ndarray, list[dict[str, Any]]]:
-        """Formulate seed vector p0 combining concepts, vector chunks, and BM25 hits."""
+        """Formulate seed vector p0 combining concepts, vector chunks, and BM25 hits.
+
+        Concept canopy seeding evaluates candidate alias priors from InMemoryLookupKB:
+        s_concepts[e] ∝ sum_a P(e | a) * max(0.0, sim(q, e))
+        simplifying continuously to sum_a P(e | a) when q is offline (q = 0).
+        """
+        kb = self._get_or_sync_kb(conn)
         self._sync_graph(conn)
         n_nodes = len(self._idx_to_node)
         if n_nodes == 0:
             return np.zeros(0, dtype=np.float32), np.zeros(768, dtype=np.float32), []
 
-        p0 = np.zeros(n_nodes, dtype=np.float32)
-
         # 1. Query Embedding (with fast offline guard and bounded timeout)
         if not is_ollama_online(timeout_s=0.5):
             logger.warning(
-                "Ollama is offline; skipping query embedding and falling back to lexical search"
+                "Ollama is offline; applying continuous mathematical formulation (q = 0)"
             )
             q_vec = np.zeros(768, dtype=np.float32)
         else:
@@ -570,7 +652,63 @@ class GraphRAGRetriever:
                 )
                 q_vec = np.zeros(768, dtype=np.float32)
 
-        # 2. Lexical Hits via FTS5 BM25
+        is_dense_active = not np.all(q_vec == 0)
+
+        # 2. Concept Canopy Seeding via InMemoryLookupKB candidate priors
+        leaf_sims: dict[str, float] = {}
+        if is_dense_active:
+            q_bytes = q_vec.astype(np.float32).tobytes()
+            try:
+                leaf_hits = conn.execute(
+                    """
+                    SELECT node_id, vec_distance_cosine(embedding, ?) AS distance
+                    FROM leaf_nodes
+                    WHERE embedding IS NOT NULL
+                    ORDER BY distance ASC LIMIT ?
+                    """,
+                    (q_bytes, config.VEC_TOP_N),
+                ).fetchall()
+                for nid, dist in leaf_hits:
+                    if dist is not None:
+                        leaf_sims[str(nid)] = max(0.0, 1.0 - float(dist))
+            except sqlite3.DatabaseError as db_err:
+                logger.warning("Leaf nodes vector scoring query failed: %s", db_err)
+
+        s_concepts = np.zeros(n_nodes, dtype=np.float32)
+        query_mentions = self._extract_query_mentions(query)
+        for m in query_mentions:
+            if kb.contains_alias(m):
+                for cand in kb.get_alias_candidates(m):
+                    ent_id = cand.entity_
+                    prior = cand.prior_prob
+                    if ent_id in self._node_to_idx:
+                        idx = self._node_to_idx[ent_id]
+                        sim = leaf_sims.get(ent_id, 1.0) if is_dense_active else 1.0
+                        s_concepts[idx] += prior * max(0.0, sim)
+
+        # Complement with direct dense semantic leaf node hits
+        if is_dense_active:
+            for ent_id, sim in leaf_sims.items():
+                if ent_id in self._node_to_idx:
+                    idx = self._node_to_idx[ent_id]
+                    s_concepts[idx] += 0.5 * sim
+
+        s_concepts_sum = float(np.sum(s_concepts))
+        if s_concepts_sum > 1e-12:
+            s_concepts /= s_concepts_sum
+
+        # 3. Dense Vector Search on note_chunks
+        cand_chunk_rows: list[dict[str, Any]] = []
+        s_chunks_vec = np.zeros(n_nodes, dtype=np.float32)
+        if is_dense_active:
+            q_bytes = q_vec.astype(np.float32).tobytes()
+            self._score_chunks_vec(conn, q_bytes, s_chunks_vec, cand_chunk_rows)
+            s_chunks_vec_sum = float(np.sum(s_chunks_vec))
+            if s_chunks_vec_sum > 1e-12:
+                s_chunks_vec /= s_chunks_vec_sum
+
+        # 4. Lexical Hits via FTS5 BM25
+        s_chunks_fts = np.zeros(n_nodes, dtype=np.float32)
         fts_terms = terms if terms is not None else self._extract_fts_terms(query)
         try:
             fts_hits = search_fts(
@@ -578,16 +716,14 @@ class GraphRAGRetriever:
             )
         except sqlite3.OperationalError:
             fts_hits = []
-        for entity_uri, rank_score, _, _ in fts_hits:
-            if entity_uri in self._node_to_idx:
-                p0[self._node_to_idx[entity_uri]] += 0.20 * rank_score
 
-        # 3. Dense Vector Search on note_chunks and leaf_nodes
-        cand_chunk_rows: list[dict[str, Any]] = []
-        if not np.all(q_vec == 0):
-            q_bytes = q_vec.astype(np.float32).tobytes()
-            self._score_chunks_vec(conn, q_bytes, p0, cand_chunk_rows)
-            self._score_leaf_nodes_vec(conn, q_bytes, p0)
+        for entity_uri, rank_score, hd, _ in fts_hits:
+            if entity_uri in self._node_to_idx:
+                s_chunks_fts[self._node_to_idx[entity_uri]] += float(rank_score)
+
+        s_chunks_fts_sum = float(np.sum(s_chunks_fts))
+        if s_chunks_fts_sum > 1e-12:
+            s_chunks_fts /= s_chunks_fts_sum
 
         if not cand_chunk_rows and fts_hits:
             for entity_uri, rank_score, hd, _ in fts_hits:
@@ -612,7 +748,8 @@ class GraphRAGRetriever:
                         }
                     )
 
-        # Normalize p0
+        # 5. Formulate p0 = beta1 * s_concepts + beta2 * s_chunks_vec + beta3 * s_chunks_fts
+        p0 = 0.60 * s_concepts + 0.20 * s_chunks_vec + 0.20 * s_chunks_fts
         total_mass = float(np.sum(p0))
         if total_mass > 1e-12:
             p0 /= total_mass
@@ -623,79 +760,159 @@ class GraphRAGRetriever:
         self,
         conn: sqlite3.Connection,
         top_chunk_pool: list[tuple[str, int, float]],
+        p_star: np.ndarray,
         q_vec: np.ndarray,
         top_k: int,
+        query_mentions: list[str] | None = None,
     ) -> list[dict[str, Any]]:
-        """Score candidate chunks via dense similarity and PPR mass, returning top_k winners."""
+        """Score candidate chunks via Bayesian evidence fusion:
+        Score(c) = ( sum_{e in entities(c)} P(e|a) * p*[e] + p*[c] ) * sim(q, c)
+        """
         scored_candidates: list[dict[str, Any]] = []
         if not top_chunk_pool:
             return scored_candidates
 
         cand_uris = [c[0] for c in top_chunk_pool]
-        placeholders = ",".join("?" for _ in cand_uris)
-        chunk_db_rows = conn.execute(
-            f"""
-            SELECT entity_uri, rel_path, ordinal, heading,
-                   line_start, line_end, embedding
-            FROM note_chunks
-            WHERE entity_uri IN ({placeholders})
-            """,
-            cand_uris,
-        ).fetchall()
-
         chunk_meta_by_uri: dict[str, dict[str, Any]] = {}
-        for row in chunk_db_rows:
-            uri, r_path, ord_val, hd, l_start, l_end, emb_raw = row
+        for b_start in range(0, len(cand_uris), 500):
+            batch = cand_uris[b_start : b_start + 500]
+            b_placeholders = ",".join("?" for _ in batch)
+            chunk_db_rows = conn.execute(
+                f"""
+                SELECT entity_uri, rel_path, ordinal, heading,
+                       line_start, line_end, embedding
+                FROM note_chunks
+                WHERE entity_uri IN ({b_placeholders})
+                """,
+                batch,
+            ).fetchall()
+            for row in chunk_db_rows:
+                uri, r_path, ord_val, hd, l_start, l_end, emb_raw = row
+                try:
+                    emb = deserialize_embedding(emb_raw)
+                except (ValueError, TypeError, json.JSONDecodeError) as err:
+                    logger.warning(
+                        "Failed to deserialize embedding for chunk %s: %s", uri, err
+                    )
+                    emb = None
+                chunk_meta_by_uri[uri] = {
+                    "entity_uri": uri,
+                    "rel_path": r_path,
+                    "ordinal": ord_val,
+                    "heading": hd,
+                    "line_start": l_start,
+                    "line_end": l_end,
+                    "embedding": emb,
+                }
+
+        # Query entities connected to candidate chunks via manifests_in or mentions
+        chunk_entities: dict[str, set[str]] = {uri: set() for uri in cand_uris}
+        for b_start in range(0, len(cand_uris), 500):
+            batch = cand_uris[b_start : b_start + 500]
+            b_placeholders = ",".join("?" for _ in batch)
             try:
-                emb = deserialize_embedding(emb_raw)
-            except (ValueError, TypeError, json.JSONDecodeError) as err:
+                edge_rows = conn.execute(
+                    f"""
+                    SELECT dst_id AS chunk_uri, src_id AS entity_id
+                    FROM unified_edges
+                    WHERE dst_id IN ({b_placeholders}) AND rel_type = 'manifests_in'
+                    UNION
+                    SELECT src_id AS chunk_uri, dst_id AS entity_id
+                    FROM unified_edges
+                    WHERE src_id IN ({b_placeholders}) AND rel_type = 'mentions'
+                    """,
+                    batch + batch,
+                ).fetchall()
+                for c_uri, e_id in edge_rows:
+                    if c_uri in chunk_entities and e_id:
+                        chunk_entities[c_uri].add(str(e_id))
+            except sqlite3.OperationalError as err:
                 logger.warning(
-                    "Failed to deserialize embedding for chunk %s: %s", uri, err
+                    "Failed querying chunk entities from unified_edges: %s", err
                 )
-                emb = None
-            chunk_meta_by_uri[uri] = {
-                "entity_uri": uri,
-                "rel_path": r_path,
-                "ordinal": ord_val,
-                "heading": hd,
-                "line_start": l_start,
-                "line_end": l_end,
-                "embedding": emb,
-            }
+
+        # Candidate alias priors from kb
+        kb = self._get_or_sync_kb(conn)
+        entity_priors: dict[str, float] = {}
+        if query_mentions:
+            for m in query_mentions:
+                variants = [m]
+                if m.lower() != m:
+                    variants.append(m.lower())
+                for var in variants:
+                    if kb.contains_alias(var):
+                        for cand in kb.get_alias_candidates(var):
+                            entity_priors[cand.entity_] = max(
+                                entity_priors.get(cand.entity_, 0.0),
+                                cand.prior_prob,
+                            )
+
+        # Candidate priors from aliases table for entities not matched in query mentions
+        all_connected_entities = {e for ents in chunk_entities.values() for e in ents}
+        missing_entities = [e for e in all_connected_entities if e not in entity_priors]
+        if missing_entities:
+            try:
+                for b_start in range(0, len(missing_entities), 500):
+                    batch = missing_entities[b_start : b_start + 500]
+                    m_placeholders = ",".join("?" for _ in batch)
+                    a_rows = conn.execute(
+                        f"""
+                        SELECT canonical_id, MAX(score)
+                        FROM aliases
+                        WHERE canonical_id IN ({m_placeholders}) AND status = 'active'
+                        GROUP BY canonical_id
+                        """,
+                        batch,
+                    ).fetchall()
+                    for c_id, score in a_rows:
+                        if c_id and score is not None:
+                            entity_priors[str(c_id)] = float(score)
+            except sqlite3.OperationalError as err:
+                logger.warning(
+                    "Failed querying missing entity priors from aliases: %s", err
+                )
 
         is_dense_active = not np.all(q_vec == 0)
-        candidate_pool: list[tuple[dict[str, Any], float, float]] = []
+        candidate_pool: list[tuple[dict[str, Any], float, float, float]] = []
         for uri, _idx, ppr_mass in top_chunk_pool:
             chunk_meta = chunk_meta_by_uri.get(uri)
             if not chunk_meta:
                 continue
+
+            entity_mass = 0.0
+            for ent_id in chunk_entities.get(uri, set()):
+                if ent_id in self._node_to_idx:
+                    prior = entity_priors.get(ent_id, 1.0)
+                    entity_mass += prior * float(p_star[self._node_to_idx[ent_id]])
 
             emb = chunk_meta["embedding"]
             if emb is not None and is_dense_active:
                 sim = float(np.dot(emb, q_vec))
             else:
                 sim = 1.0
-            candidate_pool.append((chunk_meta, ppr_mass, sim))
+            candidate_pool.append((chunk_meta, ppr_mass, entity_mass, sim))
 
         any_met_threshold = is_dense_active and any(
-            sim >= RELEVANCE_THRESHOLD for _, _, sim in candidate_pool
+            sim >= RELEVANCE_THRESHOLD for _, _, _, sim in candidate_pool
         )
 
-        for chunk_meta, ppr_mass, sim in candidate_pool:
+        for chunk_meta, ppr_mass, entity_mass, sim in candidate_pool:
+            compound_mass = entity_mass + ppr_mass
             if is_dense_active:
                 if any_met_threshold:
                     if sim < RELEVANCE_THRESHOLD:
                         continue
-                    final_score = round(ppr_mass * sim, 6)
+                    final_score = round(compound_mass * sim, 6)
                 else:
-                    final_score = round(ppr_mass * max(0.001, sim), 6)
+                    final_score = round(compound_mass * max(0.001, sim), 6)
             else:
-                final_score = round(ppr_mass * sim, 6)
+                final_score = round(compound_mass * sim, 6)
 
             scored_candidates.append(
                 {
                     **chunk_meta,
                     "ppr_score": ppr_mass,
+                    "entity_score": entity_mass,
                     "sim_score": sim,
                     "final_score": final_score,
                 }
@@ -784,6 +1001,7 @@ class GraphRAGRetriever:
         p_star: np.ndarray,
         q_vec: np.ndarray,
         top_k: int,
+        query_mentions: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Filter chunk candidates from PPR distribution, score, and hydrate winning text slices."""
         chunk_candidates: list[tuple[str, int, float]] = []
@@ -796,7 +1014,12 @@ class GraphRAGRetriever:
         top_chunk_pool = chunk_candidates[:pool_size]
 
         winning_chunks = self._score_chunk_candidates(
-            conn, top_chunk_pool, q_vec, top_k
+            conn,
+            top_chunk_pool,
+            p_star=p_star,
+            q_vec=q_vec,
+            top_k=top_k,
+            query_mentions=query_mentions,
         )
 
         for chunk in winning_chunks:
@@ -892,7 +1115,10 @@ class GraphRAGRetriever:
                 )
 
             p_star = self.power_iteration(p0, alpha=0.85, max_iter=30)
-            winning_chunks = self._fuse_candidate_scores(conn, p_star, q_vec, top_k)
+            query_mentions = self._extract_query_mentions(query)
+            winning_chunks = self._fuse_candidate_scores(
+                conn, p_star, q_vec, top_k, query_mentions=query_mentions
+            )
 
             concept_indices = [
                 i for i, n in enumerate(self._idx_to_node) if _is_concept(n)
@@ -932,7 +1158,7 @@ class GraphRAGRetriever:
 
     async def find_seed_nodes(self, query: str, top_k: int = 3) -> list[dict[str, Any]]:
         """Compute top seed nodes using in-memory hybrid search (renamed from find_seed)."""
-        return await compute_seed_candidates(query, top_k=top_k)
+        return await compute_seed_candidates(query, top_k=top_k, kb=self._kb)
 
 
 def _fetch_chunk_candidates(
@@ -1249,6 +1475,7 @@ async def compute_seed_candidates(
     top_k: int = 3,
     query_vec: np.ndarray | None = None,
     query_vectors_fn: Any | None = None,
+    kb: Any | None = None,
     **kwargs: Any,
 ) -> list[dict[str, Any]]:
     """Compute seed candidates via summed probability (FTS + vector) and in-memory bi-encoder rescoring."""
@@ -1264,16 +1491,7 @@ async def compute_seed_candidates(
     if query_vectors_fn is not None:
         dense_candidates = query_vectors_fn(q_vec, top_n=config.VEC_TOP_N)
     elif q_vec is not None:
-        if hasattr(_query_vectors, "assert_called") or hasattr(_query_vectors, "mock"):
-            dense_candidates = _query_vectors(q_vec, top_n=config.VEC_TOP_N)
-        else:
-            conn = get_db(load_vec=True)
-            try:
-                dense_candidates = _fetch_candidates_single_pass(
-                    conn, q_vec.astype(np.float32).tobytes(), config.VEC_TOP_N
-                )
-            finally:
-                conn.close()
+        dense_candidates = _query_vectors(q_vec, top_n=config.VEC_TOP_N)
 
     vec_scores = {r["entity_uri"]: max(0.0, float(r["sim"])) for r in dense_candidates}
     fts_sum = sum(fts_scores.values())
@@ -1336,22 +1554,27 @@ async def compute_seed_candidates(
     return candidate_items[:top_k]
 
 
-async def find_seed_nodes(query: str, top_k: int = 3) -> list[dict[str, Any]]:
+async def find_seed_nodes(
+    query: str, top_k: int = 3, kb: Any | None = None
+) -> list[dict[str, Any]]:
     """Find top associative seed nodes using summed probability (FTS + vector) and in-memory rescoring.
 
     Returns structured candidate dictionaries containing disk byte pointers and scores.
     """
-    return await compute_seed_candidates(query, top_k=top_k)
+    retriever = get_retriever(kb=kb)
+    return await retriever.find_seed_nodes(query, top_k=top_k)
 
 
 _RETRIEVER_INSTANCE: GraphRAGRetriever | None = None
 
 
-def get_retriever() -> GraphRAGRetriever:
+def get_retriever(kb: Any | None = None) -> GraphRAGRetriever:
     """Singleton getter for GraphRAGRetriever."""
     global _RETRIEVER_INSTANCE
     if _RETRIEVER_INSTANCE is None:
-        _RETRIEVER_INSTANCE = GraphRAGRetriever()
+        _RETRIEVER_INSTANCE = GraphRAGRetriever(kb=kb)
+    elif kb is not None:
+        _RETRIEVER_INSTANCE.kb = kb
     return _RETRIEVER_INSTANCE
 
 

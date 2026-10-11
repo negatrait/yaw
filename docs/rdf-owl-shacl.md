@@ -38,13 +38,14 @@ flowchart TD
         UE --> CSR --> PPR --> BR
     end
 
-    subgraph Validation ["Tier 4: Closed-World Constraint Validation"]
+    subgraph Validation ["Tier 4: Closed-World Constraint Validation & Cache"]
         SHACL["vault/shapes.ttl\n(shacl_graph)"]
-        PYSHACL["pyshacl.validate()\n(inference='owlrl')"]
-        REPORT["sh:ValidationReport\n(lint_wiki tool)"]
-        UE & UN -.-> PYSHACL
-        ONT -.-> PYSHACL
-        SHACL --> PYSHACL --> REPORT
+        FAST_SHACL["validate_wiki_graph_fast()\n(<200ms at compile_wiki)"]
+        CACHE[("compiled_violations\nSQLite Cache")]
+        REPORT["lint_wiki tool\n(O(1) <5ms reads)"]
+        UE & UN -.-> FAST_SHACL
+        ONT -.-> FAST_SHACL
+        SHACL --> FAST_SHACL --> CACHE --> REPORT
     end
 ```
 
@@ -54,8 +55,8 @@ flowchart TD
 | :--- | :--- | :--- | :--- |
 | **Tier 1** | **RDF Triple/Quad Substrate** | SQLite `unified_edges` & `unified_nodes` views | Zero-copy projection of relational nodes, edges, aliases, and source chunks into W3C `(s, p, o, g)` quads. |
 | **Tier 2** | **OWL 2 RL & SKOS Axiomatic Schema** | `src/yaw/ontology.ttl` (`ont_graph`) | Static W3C taxonomy defining the 9 universal root classes, SKOS concept scheme, and OWL property characteristics. |
-| **Tier 3** | **GraphRAG Diffusion & Ranking** | SciPy Power-Iteration PPR (`src/yaw/retrieval/`) | Ultra-fast numerical personalized PageRank over CSR matrices with asymmetric conductance ($1.0$ down, $0.2$ up). |
-| **Tier 4** | **Closed-World Constraint Validation** | `pyshacl.validate()` (`src/yaw/ontology/shacl.py`) | In-process structural integrity verification, dialectical contradiction checks, and diagnostic report generation. |
+| **Tier 3** | **GraphRAG Diffusion & Ranking** | SciPy Power-Iteration PPR (`src/yaw/retrieval/`) | Ultra-fast numerical personalized PageRank over CSR matrices with asymmetric conductance ($1.0$ down, $0.2$ up) and candidate priors $P(e \mid a)$. |
+| **Tier 4** | **Closed-World Constraint Validation & Cache** | `validate_wiki_graph_fast()` & `compiled_violations` (`src/yaw/ontology/shacl.py`, [`docs/adr/ADR-011.md`](file:///home/harri/yaw/docs/adr/ADR-011.md)) | Compile-time validation (< 200 ms) committed to SQLite; instantaneous $\mathcal{O}(1)$ dialectical contradiction and shape linting. |
 
 ---
 
@@ -122,29 +123,37 @@ conforms, report_graph, report_text = pyshacl.validate(
 
 ---
 
-## 3. pySHACL Runtime Architecture & Integration Pattern
+## 3. pySHACL Runtime Architecture & Integration Pattern ([`docs/adr/ADR-011.md`](file:///home/harri/yaw/docs/adr/ADR-011.md))
 
 YAW rejects external graph server processes. Semantic graph operations execute strictly **in-process** via Python bindings (`rdflib` and `pyshacl`), ensuring deterministic unit testing, rapid startup, and zero deployment overhead.
+
+To maintain sub-second ingestion throughput and eliminate multi-second linting delays, SHACL validation is decoupled across the system lifecycle:
+1. **Streaming Ingestion (`pipeline.py`):** Bypasses SHACL validation entirely.
+2. **Compile-Time Validation (`compile_wiki`):** Executes `validate_wiki_graph_fast(conn)` in $<200\text{ ms}$ over relational pre-closure (`inference=None`) and transactionally commits detected contradictions and shape violations to `compiled_violations` in SQLite.
+3. **Client Query Linting (`lint_wiki`):** Queries `compiled_violations` in $\mathcal{O}(1)$ time ($<5\text{ ms}$). Live pySHACL is reserved exclusively for `force=True`.
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant CLI as FastMCP / CLI (lint_wiki)
+    participant Client as FastMCP Client (Agent)
+    participant Daemon as FastMCP Daemon (daemon.py)
+    participant Compiler as compile_wiki() Lifecycle
     participant DB as SQLite (yaw.db)
-    participant RDF as In-Process rdflib.Graph
-    participant Engine as pyshacl.validate()
-    participant OWL as src/yaw/ontology.ttl
-    participant SHACL as vault/shapes.ttl
+    participant FastEngine as validate_wiki_graph_fast()
+    participant Shapes as wiki_shapes.ttl
 
-    CLI->>DB: Query unified_edges & unified_nodes
-    DB-->>RDF: Stream (s, p, o, g) quads into ConjunctiveGraph
-    CLI->>OWL: Parse static ontology (cached in-memory)
-    CLI->>SHACL: Parse user & system shapes
-    CLI->>Engine: validate(data_graph, shacl_graph, ont_graph, inference='owlrl')
-    Note over Engine: Phase 1: owlrl expands transitivity & class subsumption
-    Note over Engine: Phase 2: Closed-world constraint evaluation
-    Engine-->>CLI: Return (conforms: bool, report_graph, report_text)
-    CLI->>CLI: Format sh:ValidationReport into actionable agent diagnostics
+    Note over Compiler,DB: Compile-Time Execution (< 200 ms)
+    Compiler->>DB: Query relational pre-closure (unified_edges, unified_nodes)
+    Compiler->>Shapes: Load declarative shapes & dialectical constraints
+    Compiler->>FastEngine: validate(data_graph, shapes, inference=None)
+    FastEngine-->>Compiler: Return structured violations (< 200 ms)
+    Compiler->>DB: Transactionally persist into compiled_violations
+
+    Note over Client,Daemon: Client Query Execution (< 5 ms, O(1))
+    Client->>Daemon: lint_wiki(query="target", force=False)
+    Daemon->>DB: SELECT * FROM compiled_violations WHERE focus_node = ?
+    DB-->>Daemon: Return cached violation records
+    Daemon-->>Client: Return actionable dialectical diagnostics (< 5 ms)
 ```
 
 ### Ingestion Flow: SQLite to In-Memory ConjunctiveGraph
@@ -688,27 +697,27 @@ gantt
   - Asserts transitive inheritance query returns full ancestry path without external DL tableau reasoners.
   - Asserts active aliases project to `owl:sameAs` and distinct verdicts project to `owl:differentFrom`.
 
-#### Sprint 6C: SHACL Closed-World Linter (`lint_wiki` Tool)
-- **Module:** `src/yaw/ontology/shacl.py` & shapes in `src/yaw/ontology/shapes/wiki_shapes.ttl`
+#### Sprint 6C & Epic 7.6: SHACL Closed-World Linter & Contradiction Cache ([`docs/adr/ADR-011.md`](file:///home/harri/yaw/docs/adr/ADR-011.md))
+- **Module:** `src/yaw/ontology/shacl.py`, `src/yaw/server/daemon.py`, `src/yaw/storage/schema.py`
 - **Scope & Deliverables:**
-  - `validate_wiki_graph(conn: sqlite3.Connection, query: str | None = None) -> tuple[bool, list[dict]]`: Invokes `pyshacl.validate(data_graph, shacl_graph, ont_graph, inference='owlrl')`.
-  - Implements `ConceptDefinitionShape`, `DialecticalIntegrityShape`, and `RelationIntegrityShape`.
-  - Diagnostic formatting: Transforms W3C `sh:ValidationReport` into structured JSON dictionaries containing `focus_node`, `severity`, `constraint`, and `message`.
-- **Verification Suite:** `tests/test_shacl_lint.py`
-  - Asserts detection of definitions exceeding 50 words.
-  - Asserts detection of concurrent `supports` and `contradicts` edges between identical nodes.
-  - Asserts detection of orphaned relation edges and invalid namespace prefixes.
+  - `validate_wiki_graph_fast(conn: sqlite3.Connection) -> tuple[bool, list[dict]]`: Fast in-process lean validation (<200 ms) over relational pre-closure (`unified_edges`, `unified_nodes`) with `inference=None`.
+  - Transactional persistence into `compiled_violations` SQLite table (`violation_id`, `focus_node`, `shape_id`, `result_path`, `severity`, `message`, `source_chunk_id`, `conflicting_chunk_id`, `compiled_at`).
+  - Production `lint_wiki(query: str | None = None, force: bool = False) -> list[dict]`: Instantaneous $\mathcal{O}(1)$ query from SQLite cache (<5 ms); live pySHACL re-validation override on `force=True`.
+- **Verification Suite:** `tests/test_compile_shacl_cache.py`, `tests/test_shacl_lint.py`
+  - Asserts compile-time validation completes in $<200\text{ ms}$ and persists violations into `compiled_violations`.
+  - Asserts `lint_wiki()` retrieves pre-compiled violations in $<5\text{ ms}$ without running pySHACL.
+  - Asserts detection of definitions exceeding 50 words, dialectical contradictions (`causes` vs `prevents`, `supports` vs `refutes`), and contested alias merges.
 
-#### Epic 7: Production FastMCP Server & GitHub v1.0 Launch
-- **Module:** `src/yaw/server/mcp.py` / `src/yaw/server/server.py`
+#### Epic 8: Production FastMCP Server & GitHub v1.0 Launch
+- **Module:** `src/yaw/server/daemon.py`
 - **Scope & Deliverables:**
-  - Expose production `lint_wiki(query: str | None = None) -> list[dict]` over FastMCP.
+  - Expose production `query_wiki`, `ingest_raw`, `compile_wiki`, `lint_wiki` over FastMCP stdio and HTTP/SSE.
   - Implement Karpathy LLM-Wiki materialization (`compile_wiki(force: bool = False)`):
     - Materializes Markdown pages strictly to `vault/wiki/` (Invariant 1: `vault/raw/` is untouched).
     - Frontmatter generated from `unified_nodes` (`definition`), body generated from `unified_edges` (`[[wikilinks]]`).
     - B-tree node oversaturation bisection when degree $> K_{\max} = 10$ using SciPy Ward's HAC.
   - Background CocoIndex continuous indexing under SQLite WAL journal mode.
-- **Verification Suite:** `tests/test_wiki_materializer.py`, `tests/test_e2e_launch.py`
+- **Verification Suite:** `tests/test_wiki_materializer.py`, `tests/test_fastmcp_contract.py`, `tests/test_e2e_launch.py`
   - End-to-end FastMCP tool invocation over HTTP/SSE.
   - Complete vault compilation and linting verification.
 

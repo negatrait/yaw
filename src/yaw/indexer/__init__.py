@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from yaw.indexer.canonicalize import (
     AliasStatus,
-    CanonicalVerdict,
     MatchMethod,
     Resolution,
     ResolutionResult,
     SurfaceIdentity,
     TierEnum,
+    create_in_memory_kb,
     resolve,
+    sync_kb_from_db,
 )
 from yaw.indexer.pipeline import (
     LeafNodeRow,
@@ -31,7 +32,6 @@ from yaw.indexer.pipeline import (
 
 __all__ = [
     "AliasStatus",
-    "CanonicalVerdict",
     "LeafNodeRow",
     "LeafRelationRow",
     "MarkdownChunk",
@@ -47,9 +47,11 @@ __all__ = [
     "chunk_markdown",
     "classify_freeform_llm",
     "clean_edge_target",
+    "create_in_memory_kb",
     "extract_title",
     "extract_wikilinks",
     "process_vault_raw",
     "resolve",
+    "sync_kb_from_db",
     "sync_vault",
 ]

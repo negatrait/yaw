@@ -482,7 +482,7 @@ def test_invariant_7_non_punning_rejection(real_disk_db: sqlite3.Connection) -> 
 def test_zero_cache_wipes(real_disk_db: sqlite3.Connection) -> None:
     """Verify Invariant 2: Mode switching modifies 0 chunk embeddings and 0 leaf_relations."""
     real_disk_db.execute(
-        "INSERT INTO note_chunks VALUES ('raw/1.md#0', '1.md', 'Test', 0, 100, 1, 10, 0, 'c0', X'1234')"
+        "INSERT INTO note_chunks (chunk_id, entity_uri, rel_path, ordinal, heading, heading_slug, line_start, line_end, embedding) VALUES ('c0', 'raw/1.md#0', '1.md', 0, 'Test', 'test', 1, 10, X'1234')"
     )
     real_disk_db.execute(
         "INSERT INTO leaf_relations VALUES ('rel_z', 'raw/1.md#0', 'concepts:a', 'causes', 'concepts:b', 1.0, 'causes')"
@@ -577,3 +577,46 @@ async def test_mcp_daemon_extraction_and_ontology_tools(tmp_path: Path) -> None:
     assert ont_res["status"] == "success"
     assert ont_res["classes_ingested"] == 4
     assert ont_res["properties_ingested"] == 1
+
+
+def test_dynamic_ontology_kb_synchronization(tmp_path: Path) -> None:
+    """Verify ADR-010 / R3: Dynamic ontology loader synchronizes classes, properties, and altLabels into InMemoryLookupKB."""
+    from yaw.indexer.canonicalize import create_in_memory_kb
+    from yaw.ontology.loader import ingest_ontology
+    from yaw.storage.db import apply_pragmas, ensure_schema_views
+
+    db_path = tmp_path / "sync_kb_test.db"
+    conn = sqlite3.connect(str(db_path))
+    apply_pragmas(conn)
+    ensure_schema_views(conn)
+
+    kb = create_in_memory_kb()
+
+    # Ingest DICO ontology passing kb
+    res = ingest_ontology(source=DICO_SAMPLE_TTL, conn=conn, ontology_id="dico", kb=kb)
+    assert res["status"] == "success"
+
+    # Dynamic classes registered in KB
+    assert kb.contains_entity("dico:BuildingElement")
+    assert kb.contains_entity("dico:Wall")
+    assert kb.contains_entity("dico:ExteriorWall")
+
+    # Dynamic properties registered in KB
+    assert kb.contains_entity("dico:isAdjacentTo")
+
+    # Synonyms / labels registered as aliases (both exact casing and lowercase)
+    assert kb.contains_alias("wall")
+    assert kb.contains_alias("Wall")
+    assert kb.contains_alias("dico:Wall")
+    assert kb.contains_alias("ExteriorWall")
+    assert kb.contains_alias("exteriorwall")
+
+    cands = kb.get_alias_candidates("wall")
+    assert len(cands) >= 1
+    assert any(c.entity_ == "dico:Wall" for c in cands)
+
+    cands_exact = kb.get_alias_candidates("Wall")
+    assert len(cands_exact) >= 1
+    assert any(c.entity_ == "dico:Wall" for c in cands_exact)
+
+    conn.close()
