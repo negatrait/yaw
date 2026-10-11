@@ -10,7 +10,6 @@ Adheres strictly to .agents/skills/engineering-real-tests/SKILL.md:
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import importlib.util
 import json
 import logging
@@ -32,6 +31,8 @@ import numpy as np
 import psutil
 import pytest
 import scipy.sparse as sp
+
+from yaw.server.daemon import LOCK_EX, LOCK_NB, LOCK_UN, flock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 YAW_SCRIPT = str(REPO_ROOT / "yaw.py")
@@ -1304,7 +1305,7 @@ def test_inprocess_cli_handle_serve(tmp_path: Path):
     pid_file = tmp_path / ".cache" / "yaw.pid"
     pid_file.parent.mkdir(parents=True, exist_ok=True)
     held_fd = os.open(pid_file, os.O_RDWR | os.O_CREAT, 0o644)
-    fcntl.flock(held_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    flock(held_fd, LOCK_EX | LOCK_NB)
     try:
         args_serve_stdio = parser.parse_args(
             ["serve", "--stdio", "--vault", str(tmp_path)]
@@ -1327,7 +1328,7 @@ def test_inprocess_cli_handle_serve(tmp_path: Path):
         with pytest.raises(RuntimeError, match="Another yaw daemon is already running"):
             yaw.handle_serve(args_serve_http)
     finally:
-        fcntl.flock(held_fd, fcntl.LOCK_UN)
+        flock(held_fd, LOCK_UN)
         os.close(held_fd)
 
 
@@ -1409,12 +1410,12 @@ def test_inprocess_cli_main(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     pid_file = vault / ".cache" / "yaw.pid"
     pid_file.parent.mkdir(parents=True, exist_ok=True)
     held_fd = os.open(pid_file, os.O_RDWR | os.O_CREAT, 0o644)
-    fcntl.flock(held_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    flock(held_fd, LOCK_EX | LOCK_NB)
     try:
         with pytest.raises(RuntimeError, match="Another yaw daemon is already running"):
             yaw.main(["serve", "--vault", str(vault)])
     finally:
-        fcntl.flock(held_fd, fcntl.LOCK_UN)
+        flock(held_fd, LOCK_UN)
         os.close(held_fd)
 
     proc_serve = subprocess.Popen(

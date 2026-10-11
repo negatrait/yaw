@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import atexit
-import fcntl
 import logging
 import os
 import signal
@@ -13,6 +12,35 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Self
+
+if sys.platform == "win32":
+    import msvcrt
+
+    LOCK_EX = 1
+    LOCK_NB = 2
+    LOCK_UN = 8
+
+    def flock(fd: int, operation: int) -> None:
+        """Cross-platform flock emulation using msvcrt on Windows."""
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            if operation & LOCK_UN:
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            elif operation & LOCK_NB:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            else:
+                msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+        except OSError as err:
+            raise BlockingIOError(err.errno, err.strerror) from err
+else:
+    import fcntl
+
+    LOCK_EX = fcntl.LOCK_EX
+    LOCK_NB = fcntl.LOCK_NB
+    LOCK_UN = fcntl.LOCK_UN
+
+    def flock(fd: int, operation: int) -> None:
+        fcntl.flock(fd, operation)
 
 from fastmcp import FastMCP
 
@@ -309,7 +337,7 @@ class DaemonLifecycle:
         self.pid_file.parent.mkdir(parents=True, exist_ok=True)
         if self._pid_fd is not None:
             try:
-                fcntl.flock(self._pid_fd, fcntl.LOCK_UN)
+                flock(self._pid_fd, LOCK_UN)
             except OSError:
                 pass
             try:
@@ -320,7 +348,7 @@ class DaemonLifecycle:
 
         fd = os.open(self.pid_file, os.O_RDWR | os.O_CREAT, 0o644)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            flock(fd, LOCK_EX | LOCK_NB)
         except (BlockingIOError, OSError) as err:
             os.close(fd)
             raise RuntimeError("Another yaw daemon is already running") from err
@@ -372,7 +400,7 @@ class DaemonLifecycle:
         """Remove PID file if present and owned by current process."""
         if self._pid_fd is not None:
             try:
-                fcntl.flock(self._pid_fd, fcntl.LOCK_UN)
+                flock(self._pid_fd, LOCK_UN)
             except OSError:
                 pass
             try:
@@ -478,12 +506,14 @@ def _read_pid(pid_path: Path) -> int | None:
 
 def _is_process_alive(pid: int) -> bool:
     """Check if process is alive, reaping zombies if child of current process."""
-    try:
-        reaped_pid, _ = os.waitpid(pid, os.WNOHANG)
-        if reaped_pid != 0:
-            return False
-    except ChildProcessError, OSError:
-        pass
+    wnohang = getattr(os, "WNOHANG", None)
+    if wnohang is not None:
+        try:
+            reaped_pid, _ = os.waitpid(pid, wnohang)
+            if reaped_pid != 0:
+                return False
+        except (ChildProcessError, OSError):
+            pass
     try:
         os.kill(pid, 0)
         return True
@@ -514,15 +544,18 @@ def _send_term_signal(pid: int) -> bool:
 
 
 def _force_kill_process(pid: int) -> None:
-    """Forcefully terminate process with SIGKILL and attempt zombie reap."""
+    """Forcefully terminate process with SIGKILL (or platform equivalent) and attempt zombie reap."""
+    sig = getattr(signal, "SIGKILL", signal.SIGTERM)
     try:
-        os.kill(pid, signal.SIGKILL)
-    except ProcessLookupError, OSError:
+        os.kill(pid, sig)
+    except (ProcessLookupError, OSError):
         pass
-    try:
-        os.waitpid(pid, os.WNOHANG)
-    except ChildProcessError, OSError:
-        pass
+    wnohang = getattr(os, "WNOHANG", None)
+    if wnohang is not None:
+        try:
+            os.waitpid(pid, wnohang)
+        except (ChildProcessError, OSError):
+            pass
 
 
 def stop_daemon(pid_file: Path | None = None, timeout_s: float = 5.0) -> int:
@@ -550,6 +583,9 @@ def stop_daemon(pid_file: Path | None = None, timeout_s: float = 5.0) -> int:
 
 
 __all__ = [
+    "LOCK_EX",
+    "LOCK_NB",
+    "LOCK_UN",
     "DaemonLifecycle",
     "_fetch_table_vectors",
     "_get_candidate_metadata",
@@ -561,6 +597,7 @@ __all__ = [
     "compile_wiki",
     "find_seed",
     "find_seed_nodes",
+    "flock",
     "get_ontology_schema",
     "hydrate_disk_slice",
     "ingest_raw",
