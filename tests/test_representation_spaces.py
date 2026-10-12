@@ -108,3 +108,27 @@ def test_space_s_and_r_prompt_formatters_and_entity_grounding():
     doc_no_sent = spacy.blank("en")("Albert Einstein")
     span_no_sent = doc_no_sent[0:2]
     assert _entity_definition(span_no_sent) == ""
+
+
+@pytest.mark.anyio
+async def test_embed_query_empty_vectors_raises_runtime_error(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    import yaw.nlp.embeddings as emb
+
+    monkeypatch.setattr(emb, "embed_texts", AsyncMock(return_value=[]))
+    with pytest.raises(
+        RuntimeError, match="Embedding service returned empty vector list"
+    ):
+        await emb.embed_query("test query")
+
+
+def test_config_and_retriever_fact_constants_ssot():
+    import yaw.config as cfg
+    from yaw.retrieval import retriever
+
+    assert "FACT_SEED_LAMBDA" in cfg.__all__
+    assert "FACT_TOP_K" in cfg.__all__
+    assert sorted(cfg.__all__) == cfg.__all__
+    assert retriever.FACT_TOP_K == cfg.FACT_TOP_K
+    assert retriever.FACT_SEED_LAMBDA == cfg.FACT_SEED_LAMBDA

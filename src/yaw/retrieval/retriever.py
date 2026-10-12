@@ -29,8 +29,8 @@ from .. import config
 logger = logging.getLogger(__name__)
 
 RELEVANCE_THRESHOLD: float = config.RELEVANCE_THRESHOLD
-FACT_TOP_K: int = getattr(config, "FACT_TOP_K", 5)
-FACT_SEED_LAMBDA: float = getattr(config, "FACT_SEED_LAMBDA", 0.5)
+FACT_TOP_K: int = config.FACT_TOP_K
+FACT_SEED_LAMBDA: float = config.FACT_SEED_LAMBDA
 _QUERY_EMB_EXCEPTIONS = (
     TimeoutError,
     urllib.error.URLError,

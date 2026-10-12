@@ -356,6 +356,8 @@ __all__ = [
     "EMBEDDING_MODEL",
     "EXCLUDED_PATTERNS",
     "EXTRACTION_CONTEXT_TOKENS",
+    "FACT_SEED_LAMBDA",
+    "FACT_TOP_K",
     "FTS_TOP_N",
     "HOST",
     "HOST_PROVIDER",

@@ -124,6 +124,8 @@ async def embed_query(
     """Embed a search query in Space R query space."""
     formatted = format_space_r_query(query)
     vecs = await embed_texts([formatted], host=host, model=model, timeout_s=timeout_s)
+    if not vecs:
+        raise RuntimeError("Embedding service returned empty vector list")
     return vecs[0]
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 
 import numpy as np
@@ -1390,3 +1391,285 @@ async def test_zero_fallback_kb_initialization_error_early(tmp_path: Path):
         RuntimeError, match="Mandatory InMemoryLookupKB could not be initialized"
     ):
         await retriever.compute_seed_vector("query", fake_conn)
+
+
+def test_symmetric_close_match_conductance_in_retriever_graph(tmp_path: Path):
+    """Verify symmetric closeMatch edge conductance W = score in both directions without hub dampening distortion."""
+    from yaw.storage import insert_close_match
+
+    config.set_vault(tmp_path)
+    db_path = tmp_path / ".cache" / "yaw.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "CREATE TABLE wikilinks (source_uri TEXT, target_uri TEXT, target_note TEXT, weight REAL)"
+        )
+        conn.execute(
+            "CREATE TABLE leaf_relations (subject_id TEXT, predicate TEXT, object_id TEXT, source_leaf_id TEXT, weight REAL)"
+        )
+        conn.execute(
+            "CREATE TABLE note_chunks (chunk_id TEXT, entity_uri TEXT PRIMARY KEY, rel_path TEXT, ordinal INTEGER, "
+            "heading TEXT, heading_slug TEXT, line_start INTEGER, line_end INTEGER, embedding BLOB)"
+        )
+        conn.execute(
+            "CREATE TABLE leaf_nodes (node_id TEXT, source_leaf_id TEXT, name TEXT, namespace TEXT, definition TEXT, PRIMARY KEY (node_id, source_leaf_id))"
+        )
+        ensure_schema_views(conn)
+
+        # Active note chunk and concept grounding
+        conn.execute(
+            "INSERT INTO leaf_nodes VALUES ('concepts:quantum_computing', 'raw/quantum.md', 'Quantum Computing', 'concepts', 'Computation using quantum mechanics.')"
+        )
+        conn.execute(
+            "INSERT INTO leaf_nodes VALUES ('concepts:quantum_information', 'raw/quantum.md', 'Quantum Information', 'concepts', 'Information of the state of a quantum system.')"
+        )
+        conn.execute(
+            "INSERT INTO leaf_nodes VALUES ('concepts:qubits', 'raw/quantum.md', 'Qubits', 'concepts', 'Quantum bits.')"
+        )
+        conn.execute(
+            "INSERT INTO note_chunks VALUES ('c0', 'raw/quantum.md#chunk:0', 'raw/quantum.md', 0, 'Quantum', 'quantum', 1, 5, NULL)"
+        )
+        conn.execute(
+            "INSERT INTO leaf_relations (subject_id, predicate, object_id, source_leaf_id, weight) "
+            "VALUES ('concepts:quantum_computing', 'manifests_in', 'raw/quantum.md#chunk:0', 'raw/quantum.md', 1.0)"
+        )
+        conn.execute(
+            "INSERT INTO leaf_relations (subject_id, predicate, object_id, source_leaf_id, weight) "
+            "VALUES ('concepts:qubits', 'partOf', 'concepts:quantum_information', 'raw/quantum.md', 1.0)"
+        )
+
+        # Soft link: close_matches with score 0.88
+        insert_close_match(
+            conn,
+            "concepts:quantum_computing",
+            "concepts:quantum_information",
+            score=0.88,
+        )
+        conn.commit()
+
+        retriever = GraphRAGRetriever()
+        retriever._sync_graph(conn)
+
+        assert retriever.adj is not None
+        adj = retriever.adj.toarray()
+        idx_qc = retriever._node_to_idx["concepts:quantum_computing"]
+        idx_qi = retriever._node_to_idx["concepts:quantum_information"]
+
+        # Symmetric closeMatch conductance: W = score (0.88) in both directions
+        assert pytest.approx(adj[idx_qc, idx_qi], rel=1e-5) == 0.88
+        assert pytest.approx(adj[idx_qi, idx_qc], rel=1e-5) == 0.88
+
+
+@pytest.mark.anyio
+async def test_query_to_fact_seeding_bayesian_fusion(tmp_path: Path):
+    """Verify Bayesian concept seed vector combines InMemoryLookupKB candidate priors and Space R fact relevance:
+    s_concepts = lambda * s_alias_hat + (1 - lambda) * r_hat.
+    """
+    from yaw.indexer.canonicalize import create_in_memory_kb
+    from yaw.storage import get_db, insert_fact_vec, serialize_embedding
+
+    config.set_vault(tmp_path)
+    db_path = tmp_path / ".cache" / "yaw.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with get_db(load_vec=True) as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS wikilinks (source_uri TEXT, target_uri TEXT, target_note TEXT, weight REAL)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS leaf_relations (relation_id TEXT PRIMARY KEY, source_leaf_id TEXT, subject_id TEXT, predicate TEXT, predicate_id TEXT, object_id TEXT, weight REAL)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS note_chunks (chunk_id TEXT, entity_uri TEXT PRIMARY KEY, rel_path TEXT, ordinal INTEGER, "
+            "heading TEXT, heading_slug TEXT, line_start INTEGER, line_end INTEGER, embedding BLOB)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS leaf_nodes (node_id TEXT, source_leaf_id TEXT, name TEXT, namespace TEXT, definition TEXT, PRIMARY KEY (node_id, source_leaf_id))"
+        )
+        ensure_schema_views(conn)
+
+        conn.execute(
+            "INSERT INTO leaf_nodes VALUES ('concepts:albert_einstein', 'raw/relativity.md', 'Einstein', 'concepts', 'Physicist.')"
+        )
+        conn.execute(
+            "INSERT INTO leaf_nodes VALUES ('concepts:marie_curie', 'raw/radioactivity.md', 'Curie', 'concepts', 'Chemist.')"
+        )
+        conn.execute(
+            "INSERT INTO leaf_nodes VALUES ('concepts:relativity', 'raw/relativity.md', 'Relativity', 'concepts', 'Physical theory.')"
+        )
+        conn.execute(
+            "INSERT INTO note_chunks VALUES ('c0', 'raw/relativity.md#chunk:0', 'raw/relativity.md', 0, 'Relativity', 'relativity', 1, 5, NULL)"
+        )
+        conn.execute(
+            "INSERT INTO leaf_nodes VALUES ('concepts:radioactivity', 'raw/radioactivity.md', 'Radioactivity', 'concepts', 'Decay.')"
+        )
+        conn.execute(
+            "INSERT INTO leaf_relations (relation_id, source_leaf_id, subject_id, predicate, predicate_id, object_id, weight) "
+            "VALUES ('rel:einstein_relativity', 'raw/relativity.md', 'concepts:albert_einstein', 'developed', 'predicates:developed', 'concepts:relativity', 1.0)"
+        )
+        conn.execute(
+            "INSERT INTO leaf_relations (relation_id, source_leaf_id, subject_id, predicate, predicate_id, object_id, weight) "
+            "VALUES ('rel:curie_radioactivity', 'raw/radioactivity.md', 'concepts:marie_curie', 'discovered', 'predicates:discovered', 'concepts:radioactivity', 1.0)"
+        )
+
+        fact_vec = np.zeros(768, dtype=np.float32)
+        fact_vec[0] = 1.0
+        fact_bytes = serialize_embedding(fact_vec)
+        assert fact_bytes is not None
+        insert_fact_vec(conn, "rel:einstein_relativity", fact_bytes)
+        conn.commit()
+
+        from yaw.indexer.canonicalize import _register_alias_in_kb, create_in_memory_kb
+
+        kb = create_in_memory_kb()
+        _register_alias_in_kb(kb, "albert", "concepts:albert_einstein", score=0.9)
+        _register_alias_in_kb(kb, "curie", "concepts:marie_curie", score=1.0)
+
+        retriever = GraphRAGRetriever(kb=kb)
+
+        q_vec = np.zeros(768, dtype=np.float32)
+        q_vec[0] = 1.0
+
+        with patch(
+            "yaw.nlp.embeddings.embed_query", new_callable=AsyncMock
+        ) as mock_embed:
+            mock_embed.return_value = q_vec
+
+            p0, _, _ = await retriever.compute_seed_vector("albert and curie", conn)
+
+            idx_einstein = retriever._node_to_idx["concepts:albert_einstein"]
+            idx_curie = retriever._node_to_idx["concepts:marie_curie"]
+            idx_relativity = retriever._node_to_idx["concepts:relativity"]
+
+            assert p0[idx_einstein] > 0.0
+            assert p0[idx_curie] > 0.0
+            assert p0[idx_relativity] > 0.0
+            assert pytest.approx(p0.sum(), rel=1e-4) == 1.0
+
+
+@pytest.mark.anyio
+async def test_query_to_fact_seeding_offline_continuous_degradation(tmp_path: Path):
+    """Verify continuous mathematical degradation to pure alias prior seeding when q = 0 (offline)."""
+    from yaw.indexer.canonicalize import create_in_memory_kb
+    from yaw.storage import get_db
+
+    config.set_vault(tmp_path)
+    db_path = tmp_path / ".cache" / "yaw.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with get_db(load_vec=True) as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS wikilinks (source_uri TEXT, target_uri TEXT, target_note TEXT, weight REAL)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS leaf_relations (relation_id TEXT PRIMARY KEY, source_leaf_id TEXT, subject_id TEXT, predicate TEXT, predicate_id TEXT, object_id TEXT, weight REAL)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS note_chunks (chunk_id TEXT, entity_uri TEXT PRIMARY KEY, rel_path TEXT, ordinal INTEGER, "
+            "heading TEXT, heading_slug TEXT, line_start INTEGER, line_end INTEGER, embedding BLOB)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS leaf_nodes (node_id TEXT, source_leaf_id TEXT, name TEXT, namespace TEXT, definition TEXT, PRIMARY KEY (node_id, source_leaf_id))"
+        )
+        ensure_schema_views(conn)
+        conn.execute(
+            "INSERT INTO leaf_nodes VALUES ('concepts:offline_concept', 'raw/test.md', 'Offline Concept', 'concepts', 'Concept description.')"
+        )
+        conn.execute(
+            "INSERT INTO note_chunks VALUES ('c0', 'raw/test.md#chunk:0', 'raw/test.md', 0, 'Test', 'test', 1, 5, NULL)"
+        )
+        conn.execute(
+            "INSERT INTO leaf_relations (relation_id, source_leaf_id, subject_id, predicate, predicate_id, object_id, weight) "
+            "VALUES ('rel:offline_rel', 'raw/test.md', 'concepts:offline_concept', 'manifests_in', 'predicates:manifests_in', 'raw/test.md#chunk:0', 1.0)"
+        )
+        conn.commit()
+
+        from yaw.indexer.canonicalize import _register_alias_in_kb
+
+        kb = create_in_memory_kb()
+        _register_alias_in_kb(kb, "offline", "concepts:offline_concept", score=1.0)
+
+        retriever = GraphRAGRetriever(kb=kb)
+
+        with patch("yaw.retrieval.retriever.is_ollama_online", return_value=False):
+            p0, q_vec, _ = await retriever.compute_seed_vector("offline", conn)
+
+            assert np.all(q_vec == 0)
+            idx_concept = retriever._node_to_idx["concepts:offline_concept"]
+            assert p0[idx_concept] > 0.0
+            assert pytest.approx(p0.sum(), rel=1e-4) == 1.0
+
+
+def test_leaf_nodes_embedding_completely_purged():
+    """Verify zero dependencies on leaf_nodes.embedding: no _score_leaf_nodes_vec, no vector queries on leaf_nodes."""
+    retriever = GraphRAGRetriever()
+    assert not hasattr(retriever, "_score_leaf_nodes_vec"), (
+        "_score_leaf_nodes_vec must be completely purged"
+    )
+    assert not hasattr(retriever, "_fetch_leaf_candidates"), (
+        "_fetch_leaf_candidates must be completely purged"
+    )
+
+
+@pytest.mark.anyio
+async def test_pipeline_fact_embedding_in_space_r(tmp_path: Path):
+    """Verify pipeline renders deterministic Space R prompts and embeds facts into fact_vec table."""
+    from yaw.indexer.pipeline import _embed_relation_facts, _resolve_and_store_relations
+    from yaw.nlp import ExtractedNode, ExtractedTriple
+    from yaw.storage import get_db
+
+    config.set_vault(tmp_path)
+    db_path = tmp_path / ".cache" / "yaw.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with get_db(load_vec=True) as conn:
+        ensure_schema_views(conn)
+
+        triple = ExtractedTriple(
+            subject=ExtractedNode(name="Heisenberg", namespace="entities"),
+            predicate=ExtractedNode(name="formulated", namespace="predicates"),
+            object=ExtractedNode(name="Matrix Mechanics", namespace="concepts"),
+        )
+        all_triples = [("raw/quantum.md", triple)]
+
+        fake_vec = np.zeros(768, dtype=np.float32)
+        fake_vec[42] = 1.0
+
+        with patch(
+            "yaw.indexer.pipeline.embed_texts", new_callable=AsyncMock
+        ) as mock_embed:
+            mock_embed.return_value = [fake_vec]
+
+            fact_embeddings = await _embed_relation_facts(all_triples)
+            assert len(fact_embeddings) == 1
+            rel_id = next(iter(fact_embeddings))
+
+            mock_embed.assert_called_once()
+            call_prompts = mock_embed.call_args[0][0]
+            assert (
+                call_prompts[0]
+                == "title: none | text: Heisenberg formulated Matrix Mechanics"
+            )
+
+            class DummyTarget:
+                def declare_row(self, row):
+                    pass
+
+            seen_rel_ids: set[str] = set()
+            _resolve_and_store_relations(
+                all_triples=all_triples,
+                relations_target=cast(Any, DummyTarget()),
+                conn=conn,
+                seen_rel_ids=seen_rel_ids,
+                fact_embeddings=fact_embeddings,
+            )
+            conn.commit()
+
+            row = conn.execute(
+                "SELECT relation_id, length(embedding) FROM fact_vec WHERE relation_id = ?",
+                (rel_id,),
+            ).fetchone()
+            assert row is not None
+            assert row[0] == rel_id
+            assert row[1] == 768 * 4
