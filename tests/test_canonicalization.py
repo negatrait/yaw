@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from typing import Any, cast
 from urllib.request import Request, urlopen
 
@@ -23,11 +24,17 @@ from thinc.types import Floats1d
 
 from yaw import config
 from yaw.indexer import (
-    AliasStatus,
     MatchMethod,
     ResolutionResult,
     TierEnum,
     resolve,
+)
+from yaw.indexer.canonicalize import (
+    _normalize_entity_key,
+    check_linguistic_corroboration,
+    is_acronym,
+    is_head_anchored_containment,
+    is_initial_expansion,
 )
 from yaw.nlp import (
     HYPERNYM_INFERENCE_TEMPLATE,
@@ -39,7 +46,6 @@ from yaw.nlp.extractor import get_base_spacy
 from yaw.storage import (
     delete_alias,
     insert_alias,
-    set_alias_status,
 )
 
 
@@ -87,7 +93,6 @@ def test_invariant_5a1_lexical_exact_alias_hit(test_db, mock_ollama_requests):
     assert isinstance(res, ResolutionResult)
     assert res.canonical_id == "concepts:entropy"
     assert res.method == MatchMethod.ALIAS.value
-    assert res.status == AliasStatus.ACTIVE.value
     assert res.tier == TierEnum.TIER_1_EXACT
     assert res.score == 1.0
     assert res.is_new is False
@@ -124,19 +129,23 @@ def test_invariant_5a1_lexical_exact_node_hit(test_db, mock_ollama_requests):
 
 
 def test_invariant_5a2_near_match_vector_consolidation(test_db, mock_ollama_requests):
-    """Near match with vector similarity > CANON_SIM_THRESHOLD (0.80) consolidates via Tier 2."""
+    """Near match with vector similarity > CANON_SIM_THRESHOLD (0.80) without linguistic corroboration records soft link."""
     v_canon, v_cand = _make_orthogonal_vectors(dim=768, target_cosine=0.88)
     test_db.execute(
         """
-        INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition, embedding)
-        VALUES ('concepts:entropy', 'note_entropy.md', 'entropy', 'concepts', 'Thermodynamic entropy', ?)
-        """,
+        INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition)
+        VALUES ('concepts:entropy', 'note_entropy.md', 'entropy', 'concepts', 'Thermodynamic entropy')
+        """
+    )
+    test_db.execute(
+        "INSERT INTO entity_vec (entity_id, partition_key, embedding) VALUES ('concepts:entropy', 'concepts', ?)",
         (v_canon.astype(np.float32).tobytes(),),
     )
     test_db.commit()
 
     initial_req_count = len(mock_ollama_requests)
 
+    # "entrophy" vs "entropy" lacks linguistic corroboration -> soft link in close_matches, new induction
     res = resolve(
         name="entrophy",
         kind="entity",
@@ -144,21 +153,86 @@ def test_invariant_5a2_near_match_vector_consolidation(test_db, mock_ollama_requ
         embedding=v_cand.tolist(),
     )
 
-    assert res.canonical_id == "concepts:entropy"
+    assert res.canonical_id == "concepts:entrophy"
+    assert res.method == MatchMethod.NEW.value
+    assert res.tier == TierEnum.NEW_INDUCTION
+    assert res.is_new is True
+
+    # Soft link inserted in close_matches
+    close_row = test_db.execute(
+        "SELECT src_id, dst_id, score FROM close_matches WHERE (src_id = 'concepts:entropy' AND dst_id = 'concepts:entrophy') OR (src_id = 'concepts:entrophy' AND dst_id = 'concepts:entropy')"
+    ).fetchone()
+    assert close_row is not None
+    assert close_row[2] >= config.CANON_SIM_THRESHOLD
+
+    # No alias created pointing to concepts:entropy
+    alias_row = test_db.execute(
+        "SELECT canonical_id FROM aliases WHERE alias_id = 'concepts:entrophy'"
+    ).fetchone()
+    assert alias_row is None
+
+    # Decision logged in canon_verdicts
+    verdict_row = test_db.execute(
+        "SELECT candidate_id, verdict, lexical FROM canon_verdicts WHERE surface_id = 'concepts:entrophy'"
+    ).fetchone()
+    assert verdict_row is not None
+    assert verdict_row[0] == "concepts:entropy"
+    assert verdict_row[1] == "distinct"
+    assert verdict_row[2] == 0.0
+
+    # Zero LLM requests
+    assert len(mock_ollama_requests) == initial_req_count
+
+
+def test_invariant_5a2_near_match_vector_consolidation_corroborated(
+    test_db, mock_ollama_requests
+):
+    """Near match with vector similarity >= 0.80 AND head-anchored containment consolidates via Tier 2."""
+    v_canon, v_cand = _make_orthogonal_vectors(dim=768, target_cosine=0.88)
+    test_db.execute(
+        """
+        INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition)
+        VALUES ('concepts:albert-einstein', 'note_phys.md', 'Albert Einstein', 'concepts', 'Theoretical physicist')
+        """
+    )
+    test_db.execute(
+        "INSERT INTO entity_vec (entity_id, partition_key, embedding) VALUES ('concepts:albert-einstein', 'concepts', ?)",
+        (v_canon.astype(np.float32).tobytes(),),
+    )
+    test_db.commit()
+
+    initial_req_count = len(mock_ollama_requests)
+
+    # "Einstein" is head-anchored containment of "Albert Einstein" -> corroborated -> hard merge
+    res = resolve(
+        name="Einstein",
+        kind="entity",
+        conn=test_db,
+        embedding=v_cand.tolist(),
+    )
+
+    assert res.canonical_id == "concepts:albert-einstein"
     assert res.method == MatchMethod.AUTO.value
-    assert res.status == AliasStatus.ACTIVE.value
     assert res.tier == TierEnum.TIER_2_EMBEDDING
     assert res.score >= config.CANON_SIM_THRESHOLD
     assert res.is_new is False
 
-    # Row inserted in aliases table with auto method
+    # Alias record stored in aliases
     alias_row = test_db.execute(
-        "SELECT canonical_id, method, status FROM aliases WHERE alias_id = 'concepts:entrophy' AND kind = 'entity'"
+        "SELECT canonical_id, method FROM aliases WHERE alias_id = 'concepts:einstein' AND kind = 'entity'"
     ).fetchone()
     assert alias_row is not None
-    assert alias_row[0] == "concepts:entropy"
+    assert alias_row[0] == "concepts:albert-einstein"
     assert alias_row[1] == "auto"
-    assert alias_row[2] == "active"
+
+    # Match logged in canon_verdicts
+    verdict_row = test_db.execute(
+        "SELECT candidate_id, verdict, lexical FROM canon_verdicts WHERE surface_id = 'concepts:einstein'"
+    ).fetchone()
+    assert verdict_row is not None
+    assert verdict_row[0] == "concepts:albert-einstein"
+    assert verdict_row[1] == "match"
+    assert verdict_row[2] == 1.0
 
     # Zero LLM requests
     assert len(mock_ollama_requests) == initial_req_count
@@ -198,23 +272,25 @@ def test_invariant_5a1_lexical_predicate_fastpath(test_db, mock_ollama_requests)
 
 
 def test_invariant_5a2_semantic_vector_canopy_auto_merge(test_db, mock_ollama_requests):
-    """Cosine similarity >= CANON_SIM_HIGH (0.95) auto-merges with method='auto' and zero LLM calls."""
+    """Cosine similarity >= CANON_SIM_HIGH (0.95) without linguistic corroboration records soft link."""
     v_canon, v_cand = _make_orthogonal_vectors(dim=768, target_cosine=0.97)
 
     # Seed canonical node with high-dimensional embedding
     test_db.execute(
         """
-        INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition, embedding)
-        VALUES ('concepts:space-time-curvature', 'note_relativity.md', 'space-time-curvature', 'concepts',
-                'Curvature of four-dimensional space-time under general relativity', ?)
-        """,
+        INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition)
+        VALUES ('concepts:space-time-curvature', 'note_relativity.md', 'space-time-curvature', 'concepts', 'Curvature of four-dimensional space-time under general relativity')
+        """
+    )
+    test_db.execute(
+        "INSERT INTO entity_vec (entity_id, partition_key, embedding) VALUES ('concepts:space-time-curvature', 'concepts', ?)",
         (v_canon.astype(np.float32).tobytes(),),
     )
     test_db.commit()
 
     initial_req_count = len(mock_ollama_requests)
 
-    # 'space-time-warp' has lexical similarity < 0.85 with 'space-time-curvature', but cosine 0.97 >= 0.95
+    # 'space-time-warp' has cosine 0.97 >= 0.95 with 'space-time-curvature' but lacks linguistic corroboration
     res = resolve(
         name="space-time-warp",
         kind="entity",
@@ -223,27 +299,92 @@ def test_invariant_5a2_semantic_vector_canopy_auto_merge(test_db, mock_ollama_re
         embedding=v_cand.tolist(),
     )
 
-    assert res.canonical_id == "concepts:space-time-curvature"
+    assert res.canonical_id == "concepts:space-time-warp"
+    assert res.method == MatchMethod.NEW.value
+    assert res.tier == TierEnum.NEW_INDUCTION
+    assert res.is_new is True
+
+    # Soft link in close_matches
+    close_row = test_db.execute(
+        "SELECT src_id, dst_id, score FROM close_matches WHERE src_id = 'concepts:space-time-curvature' AND dst_id = 'concepts:space-time-warp'"
+    ).fetchone()
+    assert close_row is not None
+    assert close_row[2] >= config.CANON_SIM_HIGH
+
+    # No alias created
+    assert (
+        test_db.execute(
+            "SELECT canonical_id FROM aliases WHERE alias_id = 'concepts:space-time-warp'"
+        ).fetchone()
+        is None
+    )
+
+    # Verdict logged as distinct
+    v_row = test_db.execute(
+        "SELECT candidate_id, verdict, lexical FROM canon_verdicts WHERE surface_id = 'concepts:space-time-warp'"
+    ).fetchone()
+    assert v_row is not None
+    assert v_row[0] == "concepts:space-time-curvature"
+    assert v_row[1] == "distinct"
+    assert v_row[2] == 0.0
+
+    # Zero LLM chat requests triggered
+    assert len(mock_ollama_requests) == initial_req_count
+
+
+def test_invariant_5a2_semantic_vector_canopy_auto_merge_corroborated(
+    test_db, mock_ollama_requests
+):
+    """Cosine similarity >= CANON_SIM_HIGH (0.95) with acronym corroboration auto-merges with method='auto'."""
+    v_canon, v_cand = _make_orthogonal_vectors(dim=768, target_cosine=0.97)
+
+    test_db.execute(
+        """
+        INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition)
+        VALUES ('concepts:national-aeronautics-and-space-administration', 'note_space.md', 'National Aeronautics and Space Administration', 'concepts', 'US space agency')
+        """
+    )
+    test_db.execute(
+        "INSERT INTO entity_vec (entity_id, partition_key, embedding) VALUES ('concepts:national-aeronautics-and-space-administration', 'concepts', ?)",
+        (v_canon.astype(np.float32).tobytes(),),
+    )
+    test_db.commit()
+
+    initial_req_count = len(mock_ollama_requests)
+
+    # "NASA" is acronym of "National Aeronautics and Space Administration"
+    res = resolve(
+        name="NASA",
+        kind="entity",
+        definition_ctx="US space agency acronym",
+        conn=test_db,
+        embedding=v_cand.tolist(),
+    )
+
+    assert res.canonical_id == "concepts:national-aeronautics-and-space-administration"
     assert res.method == MatchMethod.AUTO.value
-    assert res.status == AliasStatus.ACTIVE.value
     assert res.tier == TierEnum.TIER_2_EMBEDDING
     assert res.score >= config.CANON_SIM_HIGH
     assert res.is_new is False
 
-    # Alias record stored with method='auto'
+    # Alias recorded with auto method
     alias_row = test_db.execute(
-        "SELECT canonical_id, method, status FROM aliases WHERE alias_id = 'concepts:space-time-warp'"
+        "SELECT canonical_id, method FROM aliases WHERE alias_id = 'concepts:nasa'"
     ).fetchone()
     assert alias_row is not None
-    assert alias_row[0] == "concepts:space-time-curvature"
+    assert alias_row[0] == "concepts:national-aeronautics-and-space-administration"
     assert alias_row[1] == "auto"
 
-    # Zero LLM chat requests triggered
+    # Match logged in canon_verdicts
+    v_row = test_db.execute(
+        "SELECT candidate_id, verdict, lexical FROM canon_verdicts WHERE surface_id = 'concepts:nasa'"
+    ).fetchone()
+    assert v_row is not None
+    assert v_row[0] == "concepts:national-aeronautics-and-space-administration"
+    assert v_row[1] == "match"
+    assert v_row[2] == 1.0
+
     assert len(mock_ollama_requests) == initial_req_count
-    chat_requests = [
-        r for r in mock_ollama_requests if "messages" in r or "prompt" in r
-    ]
-    assert len(chat_requests) == 0
 
 
 # ==============================================================================
@@ -254,22 +395,24 @@ def test_invariant_5a2_semantic_vector_canopy_auto_merge(test_db, mock_ollama_re
 def test_invariant_5a2_vector_similarity_above_threshold_auto_merges_without_llm(
     test_db, mock_ollama_requests
 ):
-    """Cosine similarity > CANON_SIM_THRESHOLD (0.80) consolidates via Tier 2 near match with zero LLM calls."""
+    """Cosine similarity > CANON_SIM_THRESHOLD (0.80) without linguistic corroboration records soft link in close_matches."""
     v_canon, v_cand = _make_orthogonal_vectors(dim=768, target_cosine=0.88)
 
     test_db.execute(
         """
-        INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition, embedding)
-        VALUES ('concepts:information-theory', 'note_info.md', 'information-theory', 'concepts',
-                'Mathematical treatment of communication and information storage', ?)
-        """,
+        INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition)
+        VALUES ('concepts:information-theory', 'note_info.md', 'information-theory', 'concepts', 'Mathematical treatment of communication and information storage')
+        """
+    )
+    test_db.execute(
+        "INSERT INTO entity_vec (entity_id, partition_key, embedding) VALUES ('concepts:information-theory', 'concepts', ?)",
         (v_canon.astype(np.float32).tobytes(),),
     )
     test_db.commit()
 
     initial_req_count = len(mock_ollama_requests)
 
-    # Surface name 'communication-theory' has cosine ~ 0.88 >= 0.80 threshold
+    # Surface name 'communication-theory' has cosine ~ 0.88 >= 0.80 threshold but lacks linguistic corroboration
     res = resolve(
         name="communication-theory",
         kind="entity",
@@ -278,22 +421,82 @@ def test_invariant_5a2_vector_similarity_above_threshold_auto_merges_without_llm
         embedding=v_cand.tolist(),
     )
 
-    assert res.canonical_id == "concepts:information-theory"
+    assert res.canonical_id == "concepts:communication-theory"
+    assert res.method == MatchMethod.NEW.value
+    assert res.tier == TierEnum.NEW_INDUCTION
+    assert res.is_new is True
+
+    # Soft link in close_matches
+    close_row = test_db.execute(
+        "SELECT src_id, dst_id, score FROM close_matches WHERE (src_id = 'concepts:communication-theory' AND dst_id = 'concepts:information-theory') OR (src_id = 'concepts:information-theory' AND dst_id = 'concepts:communication-theory')"
+    ).fetchone()
+    assert close_row is not None
+    assert close_row[2] >= config.CANON_SIM_THRESHOLD
+
+    # No alias created
+    assert (
+        test_db.execute(
+            "SELECT canonical_id FROM aliases WHERE alias_id = 'concepts:communication-theory'"
+        ).fetchone()
+        is None
+    )
+
+    # Distinct verdict logged in canon_verdicts
+    v_row = test_db.execute(
+        "SELECT candidate_id, verdict, lexical FROM canon_verdicts WHERE surface_id = 'concepts:communication-theory'"
+    ).fetchone()
+    assert v_row is not None
+    assert v_row[0] == "concepts:information-theory"
+    assert v_row[1] == "distinct"
+    assert v_row[2] == 0.0
+
+    # Zero LLM chat requests triggered
+    assert len(mock_ollama_requests) == initial_req_count
+
+
+def test_invariant_5a2_vector_similarity_above_threshold_auto_merges_without_llm_corroborated(
+    test_db, mock_ollama_requests
+):
+    """Cosine similarity > 0.80 with initial expansion corroboration auto-merges with method='auto'."""
+    v_canon, v_cand = _make_orthogonal_vectors(dim=768, target_cosine=0.88)
+
+    test_db.execute(
+        """
+        INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition)
+        VALUES ('concepts:albert-einstein', 'note_phys.md', 'Albert Einstein', 'concepts', 'Theoretical physicist')
+        """
+    )
+    test_db.execute(
+        "INSERT INTO entity_vec (entity_id, partition_key, embedding) VALUES ('concepts:albert-einstein', 'concepts', ?)",
+        (v_canon.astype(np.float32).tobytes(),),
+    )
+    test_db.commit()
+
+    initial_req_count = len(mock_ollama_requests)
+
+    # "A. Einstein" is initial expansion of "Albert Einstein"
+    res = resolve(
+        name="A. Einstein",
+        kind="entity",
+        definition_ctx="Theoretical physicist",
+        conn=test_db,
+        embedding=v_cand.tolist(),
+    )
+
+    assert res.canonical_id == "concepts:albert-einstein"
     assert res.method == MatchMethod.AUTO.value
     assert res.tier == TierEnum.TIER_2_EMBEDDING
-    assert res.status == AliasStatus.ACTIVE.value
     assert res.score >= config.CANON_SIM_THRESHOLD
     assert res.is_new is False
 
-    # Verify alias created with method='auto'
+    # Alias created with method='auto'
     alias_row = test_db.execute(
-        "SELECT canonical_id, method FROM aliases WHERE alias_id = 'concepts:communication-theory'"
+        "SELECT canonical_id, method FROM aliases WHERE alias_id = 'concepts:a-einstein'"
     ).fetchone()
     assert alias_row is not None
-    assert alias_row[0] == "concepts:information-theory"
+    assert alias_row[0] == "concepts:albert-einstein"
     assert alias_row[1] == "auto"
 
-    # Zero LLM chat requests triggered
     assert len(mock_ollama_requests) == initial_req_count
 
 
@@ -305,10 +508,12 @@ def test_fallback_vector_similarity_below_threshold_creates_new_node(
 
     test_db.execute(
         """
-        INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition, embedding)
-        VALUES ('concepts:thermodynamics', 'note_thermo.md', 'thermodynamics', 'concepts',
-                'Branch of physics dealing with heat and temperature', ?)
-        """,
+        INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition)
+        VALUES ('concepts:thermodynamics', 'note_thermo.md', 'thermodynamics', 'concepts', 'Branch of physics dealing with heat and temperature')
+        """
+    )
+    test_db.execute(
+        "INSERT INTO entity_vec (entity_id, partition_key, embedding) VALUES ('concepts:thermodynamics', 'concepts', ?)",
         (v_canon.astype(np.float32).tobytes(),),
     )
     test_db.commit()
@@ -326,12 +531,12 @@ def test_fallback_vector_similarity_below_threshold_creates_new_node(
     assert res.is_new is True
     assert res.method == MatchMethod.NEW.value
     assert res.tier == TierEnum.NEW_INDUCTION
-    assert res.canonical_id == "concepts:cryogenics"
+    assert res.canonical_id == "concepts:cryogenic"
     assert res.score == 1.0
 
     # No alias created pointing to thermodynamics
     alias_row = test_db.execute(
-        "SELECT canonical_id FROM aliases WHERE alias_id = 'concepts:cryogenics'"
+        "SELECT canonical_id FROM aliases WHERE alias_id = 'concepts:cryogenic'"
     ).fetchone()
     assert alias_row is None
 
@@ -345,18 +550,21 @@ def test_two_tier_convergence_bypasses_llm_completely(test_db, mock_ollama_reque
 
     test_db.execute(
         """
-        INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition, embedding)
-        VALUES ('concepts:deep-reinforcement-learning', 'note_rl.md', 'deep-reinforcement-learning', 'concepts',
-                'Combination of artificial neural networks and reinforcement learning', ?)
-        """,
+        INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition)
+        VALUES ('concepts:deep-reinforcement-learning', 'note_rl.md', 'deep reinforcement learning', 'concepts', 'Combination of artificial neural networks and reinforcement learning')
+        """
+    )
+    test_db.execute(
+        "INSERT INTO entity_vec (entity_id, partition_key, embedding) VALUES ('concepts:deep-reinforcement-learning', 'concepts', ?)",
         (v_canon.astype(np.float32).tobytes(),),
     )
     test_db.commit()
 
     initial_req_count = len(mock_ollama_requests)
 
+    # "DRL" is acronym of "deep reinforcement learning" (acronym corroboration)
     res = resolve(
-        name="deep-rl",
+        name="DRL",
         kind="entity",
         definition_ctx="Reinforcement learning with deep function approximators",
         conn=test_db,
@@ -785,57 +993,6 @@ def test_mock_ollama_handler_open_ie_and_hypernym():
         assert "definition" in hyp_dict
 
 
-def test_alias_status_contestability(test_db):
-    """Updating alias status to 'contested' excludes it from view rewrites; restoring to 'active' re-enables it."""
-    test_db.execute(
-        """
-        INSERT INTO leaf_relations (relation_id, source_leaf_id, subject_id, predicate, object_id)
-        VALUES ('rel_404', 'note_a.md', 'concepts:x', 'relates_to', 'concepts:y_surface')
-        """
-    )
-    insert_alias(
-        conn=test_db,
-        alias_id="concepts:y_surface",
-        kind="entity",
-        canonical_id="concepts:y_canonical",
-        method="exact",
-        score=0.9,
-        status="active",
-    )
-    test_db.commit()
-
-    # Active alias rewrites edge
-    edge_active = test_db.execute(
-        "SELECT dst_id FROM unified_edges WHERE src_id = 'concepts:x'"
-    ).fetchone()
-    assert edge_active[0] == "concepts:y_canonical"
-
-    # Contest alias
-    updated = set_alias_status(
-        test_db, alias_id="concepts:y_surface", kind="entity", status="contested"
-    )
-    assert updated is True
-    test_db.commit()
-
-    # Contested alias is excluded by view WHERE a.status = 'active'
-    edge_contested = test_db.execute(
-        "SELECT dst_id FROM unified_edges WHERE src_id = 'concepts:x'"
-    ).fetchone()
-    assert edge_contested[0] == "concepts:y_surface"
-
-    # Re-activate alias
-    updated_act = set_alias_status(
-        test_db, alias_id="concepts:y_surface", kind="entity", status="active"
-    )
-    assert updated_act is True
-    test_db.commit()
-
-    edge_reactivated = test_db.execute(
-        "SELECT dst_id FROM unified_edges WHERE src_id = 'concepts:x'"
-    ).fetchone()
-    assert edge_reactivated[0] == "concepts:y_canonical"
-
-
 def test_fallback_novel_node_creation(test_db):
     """Completely novel surface forms with zero lexical or vector hits fallback to new canonical URI."""
     res = resolve(
@@ -919,10 +1076,12 @@ def test_unmocked_two_tier_convergence_real_sqlite_and_alias_persistence(test_db
 
     conn.execute(
         """
-        INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition, embedding)
-        VALUES ('concepts:quantum-entanglement', 'note_qm.md', 'quantum-entanglement', 'concepts',
-                'Phenomenon where quantum particles share states', ?)
-        """,
+        INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition)
+        VALUES ('concepts:quantum-entanglement', 'note_qm.md', 'quantum-entanglement', 'concepts', 'Phenomenon where quantum particles share states')
+        """
+    )
+    conn.execute(
+        "INSERT INTO entity_vec (entity_id, partition_key, embedding) VALUES ('concepts:quantum-entanglement', 'concepts', ?)",
         (v_canon.astype(np.float32).tobytes(),),
     )
     conn.commit()
@@ -939,9 +1098,9 @@ def test_unmocked_two_tier_convergence_real_sqlite_and_alias_persistence(test_db
     assert res_tier1.score == 1.0
     assert res_tier1.is_new is False
 
-    # Step B: Tier 2 - Near match with vector similarity > 0.80
+    # Step B: Tier 2 - Near match with vector similarity > 0.80 and head-anchored containment
     res_tier2 = resolve(
-        name="spooky-action-at-a-distance",
+        name="entanglement",
         kind="entity",
         namespace="concepts",
         conn=conn,
@@ -956,21 +1115,20 @@ def test_unmocked_two_tier_convergence_real_sqlite_and_alias_persistence(test_db
     # Verify alias row genuinely persisted into real SQLite aliases table
     alias_row = conn.execute(
         """
-        SELECT alias_id, canonical_id, method, score, status
+        SELECT alias_id, canonical_id, method, score
         FROM aliases
-        WHERE alias_id = 'concepts:spooky-action-at-a-distance'
+        WHERE alias_id = 'concepts:entanglement'
         """
     ).fetchone()
     assert alias_row is not None
-    assert alias_row[0] == "concepts:spooky-action-at-a-distance"
+    assert alias_row[0] == "concepts:entanglement"
     assert alias_row[1] == "concepts:quantum-entanglement"
     assert alias_row[2] == "auto"
     assert alias_row[3] >= 0.80
-    assert alias_row[4] == "active"
 
     # Step C: Subsequent resolution of the alias hits Tier 1 immediately!
     res_subsequent = resolve(
-        name="spooky-action-at-a-distance",
+        name="entanglement",
         kind="entity",
         namespace="concepts",
         conn=conn,
@@ -981,6 +1139,23 @@ def test_unmocked_two_tier_convergence_real_sqlite_and_alias_persistence(test_db
     assert res_subsequent.score == 1.0
     assert res_subsequent.is_new is False
 
+    # Step C2: Uncorroborated candidate creates soft link in close_matches
+    res_uncorr = resolve(
+        name="spooky-action-at-a-distance",
+        kind="entity",
+        namespace="concepts",
+        conn=conn,
+        embedding=v_near.tolist(),
+    )
+    assert res_uncorr.tier == TierEnum.NEW_INDUCTION
+    assert res_uncorr.canonical_id == "concepts:spooky-action-at-a-distance"
+    assert res_uncorr.is_new is True
+
+    close_row = conn.execute(
+        "SELECT src_id, dst_id FROM close_matches WHERE src_id = 'concepts:quantum-entanglement' AND dst_id = 'concepts:spooky-action-at-a-distance'"
+    ).fetchone()
+    assert close_row is not None
+
     # Step D: Fallback - Dissimilar novel concept (< 0.80) creates new canonical node
     res_novel = resolve(
         name="classical-mechanics",
@@ -990,55 +1165,70 @@ def test_unmocked_two_tier_convergence_real_sqlite_and_alias_persistence(test_db
         embedding=v_far.tolist(),
     )
     assert res_novel.tier == TierEnum.NEW_INDUCTION
-    assert res_novel.canonical_id == "concepts:classical-mechanics"
+    assert res_novel.canonical_id == "concepts:classical-mechanic"
     assert res_novel.method == MatchMethod.NEW.value
     assert res_novel.is_new is True
 
     # No alias created for novel concept
     novel_alias = conn.execute(
-        "SELECT canonical_id FROM aliases WHERE alias_id = 'concepts:classical-mechanics'"
+        "SELECT canonical_id FROM aliases WHERE alias_id = 'concepts:classical-mechanic'"
     ).fetchone()
     assert novel_alias is None
 
 
 def test_unmocked_two_tier_convergence_with_spacy_vectors(test_db):
-    """Real SQLite and in-process spaCy vector similarity without synthetic mocks."""
+    from yaw.indexer.canonicalize import create_in_memory_kb, sync_kb_from_db
+
     conn = test_db
 
-    nlp = get_base_spacy()
-    nlp.vocab.reset_vectors(width=300)
-    v_base = np.ones(300, dtype=np.float32)
-    nlp.vocab.set_vector("relativity", cast(Floats1d, v_base))
-    nlp.vocab.set_vector("general-relativity", cast(Floats1d, v_base))
+    try:
+        nlp = get_base_spacy()
+        nlp.vocab.reset_vectors(width=300)
+        import numpy as np
 
-    conn.execute(
-        """
-        INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition, embedding)
-        VALUES ('concepts:relativity', 'note_physics.md', 'relativity', 'concepts', 'Einstein theory of spacetime', NULL)
-        """
-    )
-    conn.commit()
+        v_base_300 = np.ones(300, dtype=np.float32)
+        nlp.vocab.set_vector("relativity", cast(Floats1d, v_base_300))
+        nlp.vocab.set_vector("general-relativity", cast(Floats1d, v_base_300))
 
-    res = resolve(
-        name="general-relativity",
-        kind="entity",
-        namespace="concepts",
-        conn=conn,
-        nlp=nlp,
-    )
-    assert res.tier == TierEnum.TIER_2_EMBEDDING
-    assert res.canonical_id == "concepts:relativity"
-    assert res.method == MatchMethod.AUTO.value
-    assert res.score >= config.CANON_SIM_THRESHOLD
-    assert res.is_new is False
+        # Seed 768d unit vector in entity_vec (Space S)
+        v_canon, v_cand = _make_orthogonal_vectors(dim=768, target_cosine=0.90)
+        conn.execute(
+            """
+            INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition)
+                VALUES ('concepts:relativity', 'note_physics.md', 'relativity', 'concepts', 'Einstein theory of spacetime')
+            """
+        )
+        conn.execute(
+            "INSERT INTO entity_vec (entity_id, partition_key, embedding) VALUES ('concepts:relativity', 'concepts', ?)",
+            (v_canon.astype(np.float32).tobytes(),),
+        )
+        conn.commit()
 
-    alias_row = conn.execute(
-        "SELECT canonical_id, method, status FROM aliases WHERE alias_id = 'concepts:general-relativity'"
-    ).fetchone()
-    assert alias_row is not None
-    assert alias_row[0] == "concepts:relativity"
-    assert alias_row[1] == "auto"
-    assert alias_row[2] == "active"
+        kb = create_in_memory_kb(nlp, entity_vector_length=300)
+        sync_kb_from_db(kb, conn)
+        res = resolve(
+            name="general-relativity",
+            kind="entity",
+            namespace="concepts",
+            conn=conn,
+            embedding=v_cand.tolist(),
+            nlp=nlp,
+            kb=kb,
+        )
+        assert res.tier == TierEnum.TIER_2_EMBEDDING
+        assert res.canonical_id == "concepts:relativity"
+        assert res.method == MatchMethod.AUTO.value
+        assert res.score >= config.CANON_SIM_THRESHOLD
+        assert res.is_new is False
+
+        alias_row = conn.execute(
+            "SELECT canonical_id, method FROM aliases WHERE alias_id = 'concepts:general-relativity'"
+        ).fetchone()
+        assert alias_row is not None
+        assert alias_row[0] == "concepts:relativity"
+        assert alias_row[1] == "auto"
+    finally:
+        get_base_spacy.cache_clear()
 
 
 def test_create_canonical_node_vector_dimensions_and_predicate_guard(test_db):
@@ -1046,21 +1236,21 @@ def test_create_canonical_node_vector_dimensions_and_predicate_guard(test_db):
     from yaw.indexer.canonicalize import _create_canonical_node
 
     # 300d vector list
-    vec_300 = [0.1] * 300
+    vec_768 = [0.1] * 768
     _create_canonical_node(
         conn=test_db,
         surface_id="concepts:dim300",
         name="dim300",
         namespace="concepts",
         source_leaf_id="doc.md#0",
-        embedding=vec_300,
+        embedding=vec_768,
     )
     row = test_db.execute(
-        "SELECT embedding FROM leaf_nodes WHERE node_id = 'concepts:dim300'"
+        "SELECT embedding FROM entity_vec WHERE entity_id = 'concepts:dim300'"
     ).fetchone()
     assert row is not None
     assert row[0] is not None
-    assert len(row[0]) == 300 * 4
+    assert len(row[0]) == 768 * 4
 
     # 768d numpy vector with fallback provenance
     vec_768 = np.ones(768, dtype=np.float32)
@@ -1073,7 +1263,7 @@ def test_create_canonical_node_vector_dimensions_and_predicate_guard(test_db):
         embedding=vec_768,
     )
     row768 = test_db.execute(
-        "SELECT source_leaf_id, embedding FROM leaf_nodes WHERE node_id = 'concepts:dim768'"
+        "SELECT n.source_leaf_id, v.embedding FROM leaf_nodes n LEFT JOIN entity_vec v ON n.node_id = v.entity_id WHERE n.node_id = 'concepts:dim768'"
     ).fetchone()
     assert row768 is not None
     assert row768[0] == "system:canonical_induction"
@@ -1110,16 +1300,17 @@ def test_create_canonical_node_vector_dimensions_and_predicate_guard(test_db):
 
 def test_wp517_candidate_resolution_threshold_mismatch_records_contested(test_db):
     """WP 5.1.7: Candidate with high cosine (0.82) failing higher threshold (0.90) records contested alias."""
-    from yaw.indexer.canonicalize import get_contested_aliases
 
     v_canon, v_cand = _make_orthogonal_vectors(dim=768, target_cosine=0.82)
 
     test_db.execute(
         """
-        INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition, embedding)
-        VALUES ('concepts:quantum-mechanics', 'note_qm.md', 'quantum-mechanics', 'concepts',
-                'Fundamental physics of atomic scales', ?)
-        """,
+        INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition)
+        VALUES ('concepts:quantum-mechanics', 'note_qm.md', 'quantum-mechanics', 'concepts', 'Fundamental physics of atomic scales')
+        """
+    )
+    test_db.execute(
+        "INSERT INTO entity_vec (entity_id, partition_key, embedding) VALUES ('concepts:quantum-mechanics', 'concepts', ?)",
         (v_canon.astype(np.float32).tobytes(),),
     )
     test_db.commit()
@@ -1136,11 +1327,15 @@ def test_wp517_candidate_resolution_threshold_mismatch_records_contested(test_db
     assert res.is_new is True
     assert res.canonical_id == "concepts:quantum-field-theory"
 
-    contested = get_contested_aliases(test_db)
-    assert len(contested) == 1
-    assert contested[0]["alias_id"] == "concepts:quantum-field-theory"
-    assert contested[0]["canonical_id"] == "concepts:quantum-mechanics"
-    assert contested[0]["status"] == "contested"
+    close_matches = test_db.execute(
+        "SELECT src_id, dst_id FROM close_matches"
+    ).fetchall()
+    assert len(close_matches) >= 1
+    src, dst = close_matches[0]
+    expected = tuple(
+        sorted(["concepts:quantum-field-theory", "concepts:quantum-mechanics"])
+    )
+    assert tuple(sorted([src, dst])) == expected
 
 
 # ==============================================================================
@@ -1153,23 +1348,26 @@ def test_in_memory_kb_lifecycle_and_synchronization(test_db):
     from yaw.indexer.canonicalize import create_in_memory_kb, sync_kb_from_db
 
     nlp = spacy.blank("en")
-    kb = create_in_memory_kb(nlp, entity_vector_length=128)
-    assert kb.entity_vector_length == 128
+    kb = create_in_memory_kb(nlp, entity_vector_length=768)
+    assert kb.entity_vector_length == 768
 
     # Seed leaf_nodes
-    v = np.ones(128, dtype=np.float32)
+    v = np.ones(768, dtype=np.float32)
     test_db.execute(
         """
-        INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition, embedding)
-        VALUES ('concepts:shannon-entropy', 'doc1.md', 'Shannon Entropy', 'concepts', 'Information measure', ?)
-        """,
+        INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition)
+        VALUES ('concepts:shannon-entropy', 'doc1.md', 'Shannon Entropy', 'concepts', 'Information measure')
+        """
+    )
+    test_db.execute(
+        "INSERT INTO entity_vec (entity_id, partition_key, embedding) VALUES ('concepts:shannon-entropy', 'concepts', ?)",
         (v.tobytes(),),
     )
     # Seed aliases
     test_db.execute(
         """
-        INSERT INTO aliases (alias_id, kind, canonical_id, method, score, status)
-        VALUES ('entropy', 'entity', 'concepts:shannon-entropy', 'exact', 1.0, 'active')
+        INSERT INTO aliases (alias_id, kind, canonical_id, method, score)
+        VALUES ('entropy', 'entity', 'concepts:shannon-entropy', 'exact', 1.0)
         """
     )
     test_db.commit()
@@ -1196,10 +1394,10 @@ def test_bidirectional_kb_and_sqlite_registration(test_db):
     from yaw.indexer.canonicalize import create_in_memory_kb
 
     nlp = spacy.blank("en")
-    kb = create_in_memory_kb(nlp, entity_vector_length=64)
+    kb = create_in_memory_kb(nlp, entity_vector_length=768)
 
     # 1. Novel induction
-    v_ind = np.ones(64, dtype=np.float32)
+    v_ind = np.ones(768, dtype=np.float32)
     res_ind = resolve(
         name="topological-quantum-field-theory",
         kind="entity",
@@ -1223,7 +1421,7 @@ def test_bidirectional_kb_and_sqlite_registration(test_db):
     # 2. Tier 2 near match auto-merge
     v_cand = v_ind * 0.99
     res_near = resolve(
-        name="tqft",
+        name="TQFT",
         kind="entity",
         conn=test_db,
         embedding=v_cand.tolist(),
@@ -1302,14 +1500,14 @@ def test_defined_aliases_preserves_multi_candidate_distribution(test_db):
 
     # Insert leaf node whose ID is also an alias in the aliases table
     test_db.execute(
-        "INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition, embedding) VALUES ('concepts:transformer', 'doc1.md', 'Transformer Architecture', 'concepts', 'Dual apparatus', NULL)"
+        "INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition) VALUES ('concepts:transformer', 'doc1.md', 'Transformer Architecture', 'concepts', 'Dual apparatus')"
     )
     # Insert calibrated multi-candidate distribution for this alias ID
     test_db.execute(
-        "INSERT INTO aliases (alias_id, kind, canonical_id, method, score, status) VALUES ('concepts:transformer', 'entity', 'concepts:transformer_ml', 'alias', 0.8, 'active')"
+        "INSERT INTO aliases (alias_id, kind, canonical_id, method, score) VALUES ('concepts:transformer', 'entity', 'concepts:transformer_ml', 'alias', 0.8)"
     )
     test_db.execute(
-        "INSERT INTO aliases (alias_id, kind, canonical_id, method, score, status) VALUES ('concepts:transformer', 'predicate', 'concepts:transformer_ee', 'alias', 0.2, 'active')"
+        "INSERT INTO aliases (alias_id, kind, canonical_id, method, score) VALUES ('concepts:transformer', 'predicate', 'concepts:transformer_ee', 'alias', 0.2)"
     )
     test_db.commit()
 
@@ -1330,14 +1528,14 @@ def test_alias_conflicting_scores_takes_max_prior(test_db):
     from yaw.indexer.canonicalize import create_in_memory_kb, sync_kb_from_db
 
     test_db.execute(
-        "INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition, embedding) VALUES ('concepts:sensor', 'doc1.md', 'Sensor', 'concepts', 'Detector', NULL)"
+        "INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition) VALUES ('concepts:sensor', 'doc1.md', 'Sensor', 'concepts', 'Detector')"
     )
     # Duplicate alias mapping across entity and predicate with different scores
     test_db.execute(
-        "INSERT INTO aliases (alias_id, kind, canonical_id, method, score, status) VALUES ('detector', 'entity', 'concepts:sensor', 'alias', 0.4, 'active')"
+        "INSERT INTO aliases (alias_id, kind, canonical_id, method, score) VALUES ('detector', 'entity', 'concepts:sensor', 'alias', 0.4)"
     )
     test_db.execute(
-        "INSERT INTO aliases (alias_id, kind, canonical_id, method, score, status) VALUES ('detector', 'predicate', 'concepts:sensor', 'alias', 0.9, 'active')"
+        "INSERT INTO aliases (alias_id, kind, canonical_id, method, score) VALUES ('detector', 'predicate', 'concepts:sensor', 'alias', 0.9)"
     )
     test_db.commit()
 
@@ -1362,10 +1560,10 @@ def test_in_memory_kb_proportional_append_allocation(test_db):
     kb.add_alias("polysemous_term", ["concepts:existing_c"], [0.4])
 
     test_db.execute(
-        "INSERT INTO aliases (alias_id, kind, canonical_id, method, score, status) VALUES ('polysemous_term', 'entity', 'concepts:new_c1', 'alias', 0.8, 'active')"
+        "INSERT INTO aliases (alias_id, kind, canonical_id, method, score) VALUES ('polysemous_term', 'entity', 'concepts:new_c1', 'alias', 0.8)"
     )
     test_db.execute(
-        "INSERT INTO aliases (alias_id, kind, canonical_id, method, score, status) VALUES ('polysemous_term', 'predicate', 'concepts:new_c2', 'alias', 0.4, 'active')"
+        "INSERT INTO aliases (alias_id, kind, canonical_id, method, score) VALUES ('polysemous_term', 'predicate', 'concepts:new_c2', 'alias', 0.4)"
     )
     test_db.commit()
 
@@ -1389,7 +1587,7 @@ def test_in_memory_kb_case_insensitive_matching(test_db):
     from yaw.retrieval.retriever import _extract_query_mentions
 
     test_db.execute(
-        "INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition, embedding) VALUES ('concepts:albert-einstein', 'doc1.md', 'Albert Einstein', 'concepts', 'Physicist', NULL)"
+        "INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition) VALUES ('concepts:albert-einstein', 'doc1.md', 'Albert Einstein', 'concepts', 'Physicist')"
     )
     test_db.commit()
 
@@ -1414,10 +1612,10 @@ def test_in_memory_kb_dual_casing_exact_and_lowercase(test_db):
     from yaw.indexer.canonicalize import create_in_memory_kb, sync_kb_from_db
 
     test_db.execute(
-        "INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition, embedding) VALUES ('concepts:tqft', 'doc1.md', 'Topological QFT', 'concepts', 'Quantum field theory', NULL)"
+        "INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition) VALUES ('concepts:tqft', 'doc1.md', 'Topological QFT', 'concepts', 'Quantum field theory')"
     )
     test_db.execute(
-        "INSERT INTO aliases (alias_id, kind, canonical_id, method, score, status) VALUES ('Topological Quantum Field Theory', 'entity', 'concepts:tqft', 'alias', 0.95, 'active')"
+        "INSERT INTO aliases (alias_id, kind, canonical_id, method, score) VALUES ('Topological Quantum Field Theory', 'entity', 'concepts:tqft', 'alias', 0.95)"
     )
     test_db.commit()
 
@@ -1437,3 +1635,390 @@ def test_in_memory_kb_dual_casing_exact_and_lowercase(test_db):
     assert lower_cands[0].entity_ == "concepts:tqft"
     assert pytest.approx(exact_cands[0].prior_prob, abs=1e-3) == 1.0
     assert pytest.approx(lower_cands[0].prior_prob, abs=1e-3) == 1.0
+
+
+# ==============================================================================
+# EPIC 7.7 M2: DEDICATED TWO-TIER EDC PROTOCOL UNIT & EDGE-CASE TESTS
+# ==============================================================================
+
+
+def test_tier1_normalization_determiners_stripping():
+    """Tier 1 strips leading English determiners (^the\\s+, ^a\\s+, ^an\\s+)."""
+    assert _normalize_entity_key("The Quantum Computer") == "quantum-computer"
+    assert _normalize_entity_key("the theory of relativity") == "theory-of-relativity"
+    assert _normalize_entity_key("A Black Hole") == "black-hole"
+    assert _normalize_entity_key("an electron") == "electron"
+
+
+def test_tier1_normalization_possessive_clitics():
+    """Tier 1 strips possessive clitics ('s\\b, ’s\\b)."""
+    assert _normalize_entity_key("Schrödinger's Cat") == "schrodinger-cat"
+    assert _normalize_entity_key("Euler’s formula") == "euler-formula"
+    assert _normalize_entity_key("Newton's Laws") == "newton-law"
+
+
+def test_tier1_normalization_noun_lemmatization_vs_propn_verbatim():
+    """Tier 1 lemmatizes NOUN tokens to singular base lemma while preserving PROPN tokens verbatim."""
+    # NOUNs are lemmatized
+    assert _normalize_entity_key("cryogenics") == "cryogenic"
+    assert _normalize_entity_key("entanglements") == "entanglement"
+    assert _normalize_entity_key("quantum computers") == "quantum-computer"
+
+    # PROPNs are preserved verbatim (lowercased)
+    assert _normalize_entity_key("Albert Einstein") == "albert-einstein"
+    assert _normalize_entity_key("Isaac Newton") == "isaac-newton"
+
+
+def test_tier1_normalization_nfkc_ligatures():
+    """Tier 1 applies NFKC unicode normalization to decompose ligatures and compatibility characters."""
+    assert _normalize_entity_key("ﬁle") == "file"
+    assert _normalize_entity_key("ﬂow") == "flow"
+    assert _normalize_entity_key("ﬃ") == "ffi"
+
+
+def test_tier2_linguistic_corroboration_acronym():
+    """L(a, e) is_acronym correctly detects acronyms matching token initials."""
+    nlp = get_base_spacy()
+    doc_drl = nlp("DRL")
+    doc_full = nlp("Deep Reinforcement Learning")
+    assert is_acronym(doc_drl, doc_full) is True
+    assert is_acronym(doc_full, doc_drl) is True
+
+    # With stop word filtering
+    doc_tqft = nlp("TQFT")
+    doc_tqft_full = nlp("Topological Quantum Field Theory")
+    assert is_acronym(doc_tqft, doc_tqft_full) is True
+
+    # Negative cases
+    doc_single = nlp("A")
+    assert is_acronym(doc_single, nlp("Albert")) is False
+    doc_mismatch = nlp("XYZ")
+    assert is_acronym(doc_mismatch, doc_full) is False
+
+
+def test_tier2_linguistic_corroboration_head_anchored_containment():
+    """L(a, e) is_head_anchored_containment requires both contiguous subsequence and shared syntactic head."""
+    nlp = get_base_spacy()
+
+    # Success: "entanglement" is contiguous subsequence of "quantum entanglement", both have root "entanglement"
+    doc_sub = nlp("entanglement")
+    doc_full = nlp("quantum entanglement")
+    assert is_head_anchored_containment(doc_sub, doc_full) is True
+    assert is_head_anchored_containment(doc_full, doc_sub) is True
+
+    # Success: lemma matching ("classical mechanic" vs "classical mechanics")
+    assert (
+        is_head_anchored_containment(
+            nlp("classical mechanic"), nlp("classical mechanics")
+        )
+        is True
+    )
+
+    # Failure: "Albert" vs "Albert Einstein" — syntactic head of "Albert" is "Albert", head of "Albert Einstein" is "Einstein"
+    assert is_head_anchored_containment(nlp("Albert"), nlp("Albert Einstein")) is False
+
+    # Failure: non-contiguous subsequence ("quantum theory" vs "quantum field theory")
+    assert (
+        is_head_anchored_containment(nlp("quantum theory"), nlp("quantum field theory"))
+        is False
+    )
+
+
+def test_tier2_linguistic_corroboration_initial_expansion():
+    """L(a, e) is_initial_expansion requires token-aligned match where initials match full tokens."""
+    nlp = get_base_spacy()
+
+    # Success: A. Einstein <-> Albert Einstein
+    assert is_initial_expansion(nlp("A. Einstein"), nlp("Albert Einstein")) is True
+    assert is_initial_expansion(nlp("Albert Einstein"), nlp("A. Einstein")) is True
+
+    # Success: J. J. Thomson <-> Joseph John Thomson
+    assert (
+        is_initial_expansion(nlp("J. J. Thomson"), nlp("Joseph John Thomson")) is True
+    )
+
+    # Failure: Initial mismatch
+    assert is_initial_expansion(nlp("B. Einstein"), nlp("Albert Einstein")) is False
+
+    # Failure: Token count mismatch
+    assert is_initial_expansion(nlp("Einstein"), nlp("Albert Einstein")) is False
+
+
+def test_tier2_check_linguistic_corroboration_wrapper():
+    """check_linguistic_corroboration dispatches across acronym, containment, and initials."""
+    assert check_linguistic_corroboration("DRL", "Deep Reinforcement Learning") is True
+    assert (
+        check_linguistic_corroboration("entanglement", "quantum entanglement") is True
+    )
+    assert check_linguistic_corroboration("A. Einstein", "Albert Einstein") is True
+    assert check_linguistic_corroboration("Albert", "Albert Einstein") is False
+    assert (
+        check_linguistic_corroboration("Quantum Physics", "Information Theory") is False
+    )
+
+
+def test_tier2_ambiguity_multiple_corroborated_candidates_induces_novel_node(test_db):
+    """When >= 2 candidates pass both cosine >= 0.80 and linguistic corroboration, EDC enters ambiguity branch:
+    soft links in close_matches, distinct verdicts in canon_verdicts, and novel canonical node induction.
+    """
+    v1, v2 = _make_orthogonal_vectors(dim=768, target_cosine=0.92)
+    # Generate v_mention close to both v1 and v2 (cosine ~0.85+)
+    v_mention = (v1 + v2) / np.linalg.norm(v1 + v2)
+
+    # Seed two canonical nodes in leaf_nodes and entity_vec:
+    # 1. "quantum entanglement"
+    # 2. "bipartite entanglement"
+    test_db.execute(
+        """
+        INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition)
+        VALUES ('concepts:quantum-entanglement', 'note_q.md', 'quantum entanglement', 'concepts', 'Quantum entanglement of states')
+        """
+    )
+    test_db.execute(
+        "INSERT INTO entity_vec (entity_id, partition_key, embedding) VALUES ('concepts:quantum-entanglement', 'concepts', ?)",
+        (v1.astype(np.float32).tobytes(),),
+    )
+
+    test_db.execute(
+        """
+        INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition)
+        VALUES ('concepts:bipartite-entanglement', 'note_b.md', 'bipartite entanglement', 'concepts', 'Entanglement between two subsystems')
+        """
+    )
+    test_db.execute(
+        "INSERT INTO entity_vec (entity_id, partition_key, embedding) VALUES ('concepts:bipartite-entanglement', 'concepts', ?)",
+        (v2.astype(np.float32).tobytes(),),
+    )
+    test_db.commit()
+
+    # Mention "entanglement": head-anchored containment matches BOTH "quantum entanglement" and "bipartite entanglement"!
+    res = resolve(
+        name="entanglement",
+        kind="entity",
+        definition_ctx="Quantum state correlation phenomenon",
+        conn=test_db,
+        embedding=v_mention.tolist(),
+    )
+
+    # Must NOT merge into aliases
+    assert res.canonical_id == "concepts:entanglement"
+    assert res.method == MatchMethod.NEW.value
+    assert res.tier == TierEnum.NEW_INDUCTION
+    assert res.is_new is True
+
+    # No alias record created
+    alias_row = test_db.execute(
+        "SELECT canonical_id FROM aliases WHERE alias_id = 'concepts:entanglement' OR alias_id = 'entanglement'"
+    ).fetchone()
+    assert alias_row is None
+
+    # Both candidates must be recorded in close_matches with CHECK(src_id < dst_id) satisfied
+    cm_rows = test_db.execute(
+        """
+        SELECT src_id, dst_id, score, evidence
+        FROM close_matches
+        WHERE src_id = 'concepts:entanglement' OR dst_id = 'concepts:entanglement'
+        ORDER BY score DESC
+        """
+    ).fetchall()
+    assert len(cm_rows) == 2
+    for s_id, d_id, score, ev in cm_rows:
+        assert s_id < d_id
+        assert score >= 0.80
+        assert "Ambiguous identity (multiple corroborated candidates)" in ev
+
+    # Decisions logged to canon_verdicts as 'distinct' for both candidates
+    verdicts = test_db.execute(
+        """
+        SELECT candidate_id, cosine, lexical, verdict, rationale
+        FROM canon_verdicts
+        WHERE surface_id = 'concepts:entanglement'
+        ORDER BY candidate_id ASC
+        """
+    ).fetchall()
+    assert len(verdicts) == 2
+    for cand_id, cosine, lexical, verdict, rationale in verdicts:
+        assert cand_id in (
+            "concepts:bipartite-entanglement",
+            "concepts:quantum-entanglement",
+        )
+        assert cosine >= 0.80
+        assert lexical == 1.0  # Corroborated!
+        assert verdict == "distinct"
+        assert "Ambiguous identity" in rationale
+
+
+def test_canon_verdicts_audit_logging_schema_and_fields(test_db):
+    """canon_verdicts table logs decision audit records with all required columns and valid values."""
+    v_canon, v_cand = _make_orthogonal_vectors(dim=768, target_cosine=0.96)
+
+    test_db.execute(
+        """
+        INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition)
+        VALUES ('concepts:deep-reinforcement-learning', 'ai.md', 'Deep Reinforcement Learning', 'concepts', 'RL with deep networks')
+        """
+    )
+    test_db.execute(
+        "INSERT INTO entity_vec (entity_id, partition_key, embedding) VALUES ('concepts:deep-reinforcement-learning', 'concepts', ?)",
+        (v_canon.astype(np.float32).tobytes(),),
+    )
+    test_db.commit()
+
+    start_time = time.time()
+    res = resolve(
+        name="DRL",
+        kind="entity",
+        definition_ctx="Deep RL",
+        conn=test_db,
+        embedding=v_cand.tolist(),
+    )
+    end_time = time.time()
+
+    assert res.canonical_id == "concepts:deep-reinforcement-learning"
+    assert res.method == MatchMethod.AUTO.value
+    assert res.tier == TierEnum.TIER_2_EMBEDDING
+
+    row = test_db.execute(
+        """
+        SELECT surface_id, kind, candidate_id, cosine, lexical, verdict, phase, decided_at, rationale
+        FROM canon_verdicts
+        WHERE surface_id = 'concepts:drl'
+        LIMIT 1
+        """
+    ).fetchone()
+
+    assert row is not None
+    (
+        surface_id,
+        kind,
+        candidate_id,
+        cosine,
+        lexical,
+        verdict,
+        phase,
+        decided_at,
+        rationale,
+    ) = row
+    assert surface_id == "concepts:drl"
+    assert kind == "entity"
+    assert candidate_id == "concepts:deep-reinforcement-learning"
+    assert 0.95 <= cosine <= 1.0
+    assert lexical == 1.0
+    assert verdict == "match"
+    assert phase == "ingest"
+    assert start_time - 1.0 <= decided_at <= end_time + 1.0
+    assert "Corroborated Tier 2 match" in rationale
+
+
+def test_predicate_space_l_guard_never_enters_tier2(test_db):
+    """Predicates are strictly guarded in Space L and never query entity_vec or enter Tier 2."""
+    v_dummy = np.random.default_rng(42).standard_normal(768).astype(np.float32)
+    v_dummy /= np.linalg.norm(v_dummy)
+
+    # Seed entity_vec and leaf_nodes with a predicate
+    test_db.execute(
+        """
+        INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition)
+        VALUES ('predicates:causes', 'logic.md', 'causes', 'predicates', 'Causal relation')
+        """
+    )
+    test_db.execute(
+        "INSERT INTO entity_vec (entity_id, partition_key, embedding) VALUES ('predicates:causes', 'predicates', ?)",
+        (v_dummy.tobytes(),),
+    )
+    test_db.commit()
+
+    # 1. Resolving standard base predicate synset with embedding
+    res1 = resolve(
+        name="triggers",
+        kind="predicate",
+        conn=test_db,
+        embedding=v_dummy.tolist(),
+    )
+    # Must resolve via synset/antonym guard in Space L (Tier 1)
+    assert res1.tier == TierEnum.TIER_1_EXACT
+    assert res1.canonical_id == "causes"
+
+    # 2. Resolving novel predicate with embedding
+    res2 = resolve(
+        name="substantially impacts upon",
+        kind="predicate",
+        conn=test_db,
+        embedding=v_dummy.tolist(),
+    )
+    # Must resolve via novel induction (Tier new_induction), never Tier 2
+    assert res2.tier == TierEnum.NEW_INDUCTION
+    assert res2.is_new is True
+    assert res2.canonical_id.startswith("predicates:")
+
+    # Verify zero audit verdicts logged for predicates
+    pred_verdicts = test_db.execute(
+        "SELECT COUNT(*) FROM canon_verdicts WHERE kind = 'predicate'"
+    ).fetchone()[0]
+    assert pred_verdicts == 0
+
+    # Verify zero close_matches created for predicates
+    pred_cm = test_db.execute(
+        "SELECT COUNT(*) FROM close_matches WHERE src_id LIKE 'predicates:%' OR dst_id LIKE 'predicates:%'"
+    ).fetchone()[0]
+    assert pred_cm == 0
+
+
+def test_regression_tier1_kind_guarding_prevents_cross_kind_hijacking(test_db):
+    """Regression test for DEFECT-M2-01: Entity never resolves to bare predicate, predicate never resolves to entity KB entry."""
+    from yaw.indexer.canonicalize import _register_alias_in_kb, create_in_memory_kb
+
+    # 1. Mention 'causes' as entity must resolve to concepts: namespace, never bare predicate 'causes'
+    res_ent = resolve(name="causes", kind="entity", conn=test_db)
+    assert res_ent.canonical_id != "causes"
+    assert res_ent.canonical_id.startswith("concepts:")
+
+    # 2. Mention 'Quantum Computer' as predicate when KB has entity must resolve to predicates:, never concepts:
+    kb = create_in_memory_kb()
+    _register_alias_in_kb(kb, "Quantum Computer", "concepts:quantum-computer", 1.0)
+    res_pred = resolve(name="Quantum Computer", kind="predicate", conn=test_db, kb=kb)
+    assert res_pred.canonical_id.startswith("predicates:")
+    assert res_pred.canonical_id == "predicates:quantum-computer"
+    assert not res_pred.canonical_id.startswith("concepts:")
+
+
+def test_regression_tier2_namespace_prefixed_mention_corroborates_and_automerges(
+    test_db,
+):
+    """Regression test for DEFECT-M2-02: Mention with namespace prefix (e.g. concepts:DRL) corroborates against candidate."""
+    v1, v2 = _make_orthogonal_vectors(dim=768, target_cosine=0.90)
+
+    test_db.execute(
+        """
+        INSERT INTO leaf_nodes (node_id, source_leaf_id, name, namespace, definition)
+        VALUES ('concepts:deep-reinforcement-learning', 'rl.md', 'Deep Reinforcement Learning', 'concepts', 'DRL methods')
+        """
+    )
+    test_db.execute(
+        "INSERT INTO entity_vec (entity_id, partition_key, embedding) VALUES ('concepts:deep-reinforcement-learning', 'concepts', ?)",
+        (v1.astype(np.float32).tobytes(),),
+    )
+    test_db.commit()
+
+    # Mention passed with namespace prefix 'concepts:DRL'
+    res = resolve(
+        name="concepts:DRL",
+        kind="entity",
+        conn=test_db,
+        embedding=v2.tolist(),
+        definition_ctx="Deep reinforcement learning",
+    )
+
+    # Must successfully corroborate and auto-merge into concepts:deep-reinforcement-learning
+    assert res.canonical_id == "concepts:deep-reinforcement-learning"
+    assert res.method == MatchMethod.AUTO.value
+    assert res.tier == TierEnum.TIER_2_EMBEDDING
+    assert res.is_new is False
+
+
+def test_regression_acronym_case_validation():
+    """Regression test for DEFECT-M2-03: Lowercase words are rejected as acronyms."""
+    nlp = get_base_spacy()
+    assert is_acronym(nlp("DRL"), nlp("Deep Reinforcement Learning")) is True
+    assert is_acronym(nlp("drl"), nlp("Deep Reinforcement Learning")) is False
+    assert is_acronym(nlp("cat"), nlp("Central Action Team")) is False

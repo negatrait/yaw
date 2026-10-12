@@ -24,7 +24,6 @@ def ensure_schema_tables(conn: sqlite3.Connection) -> None:
             canonical_id TEXT NOT NULL,
             method TEXT NOT NULL CHECK(method IN ('exact', 'alias', 'auto', 'new', 'ontology')),
             score REAL NOT NULL DEFAULT 1.0 CHECK(score >= 0.0 AND score <= 1.0),
-            status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'contested')),
             source_leaf_id TEXT,
             resolved_at REAL DEFAULT (unixepoch()),
             evidence TEXT,
@@ -32,7 +31,51 @@ def ensure_schema_tables(conn: sqlite3.Connection) -> None:
         )
         """
     )
-    # Idempotent migration for existing aliases table if obsolete methods or missing ontology method are present
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS close_matches (
+            src_id TEXT NOT NULL,
+            dst_id TEXT NOT NULL,
+            score REAL NOT NULL,
+            resolved_at REAL DEFAULT (unixepoch()),
+            evidence TEXT,
+            PRIMARY KEY (src_id, dst_id),
+            CHECK (src_id < dst_id)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_close_matches_src ON close_matches(src_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_close_matches_dst ON close_matches(dst_id)"
+    )
+
+    try:
+        conn.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS entity_vec USING vec0(
+                entity_id TEXT PRIMARY KEY,
+                partition_key TEXT,
+                embedding FLOAT[768] distance_metric=cosine
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS fact_vec USING vec0(
+                relation_id TEXT PRIMARY KEY,
+                embedding FLOAT[768] distance_metric=cosine
+            )
+            """
+        )
+    except sqlite3.OperationalError as e:
+        if "no such module: vec0" not in str(e):
+            raise
+
+    # Idempotent migration for existing aliases table if obsolete methods or missing ontology method are present, or status column exists
     cursor = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='aliases'"
     )
@@ -43,8 +86,26 @@ def ensure_schema_tables(conn: sqlite3.Connection) -> None:
             m in table_sql for m in ("'lexical'", "'llm'", "'compile'")
         )
         missing_ontology = "'ontology'" not in table_sql
-        if obsolete_present or missing_ontology:
+        has_status = "status" in table_sql
+        if obsolete_present or missing_ontology or has_status:
             conn.execute("PRAGMA foreign_keys=OFF;")
+
+            # Migrate contested aliases to close_matches
+            if has_status:
+                try:
+                    conn.execute("""
+                        INSERT OR IGNORE INTO close_matches (src_id, dst_id, score, evidence)
+                        SELECT 
+                            CASE WHEN alias_id < canonical_id THEN alias_id ELSE canonical_id END,
+                            CASE WHEN alias_id < canonical_id THEN canonical_id ELSE alias_id END,
+                            score,
+                            evidence
+                        FROM aliases
+                        WHERE status = 'contested'
+                    """)
+                except sqlite3.OperationalError:
+                    pass
+
             conn.execute("DROP TABLE IF EXISTS aliases_new;")
             conn.execute(
                 """
@@ -54,7 +115,6 @@ def ensure_schema_tables(conn: sqlite3.Connection) -> None:
                     canonical_id TEXT NOT NULL,
                     method TEXT NOT NULL CHECK(method IN ('exact', 'alias', 'auto', 'new', 'ontology')),
                     score REAL NOT NULL DEFAULT 1.0 CHECK(score >= 0.0 AND score <= 1.0),
-                    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'contested')),
                     source_leaf_id TEXT,
                     resolved_at REAL DEFAULT (unixepoch()),
                     evidence TEXT,
@@ -73,7 +133,6 @@ def ensure_schema_tables(conn: sqlite3.Connection) -> None:
                     "canonical_id",
                     "method",
                     "score",
-                    "status",
                     "source_leaf_id",
                     "resolved_at",
                     "evidence",
@@ -95,11 +154,14 @@ def ensure_schema_tables(conn: sqlite3.Connection) -> None:
                     select_exprs.append(c)
             select_clause = ", ".join(select_exprs)
             col_str = ", ".join(common_cols)
+
+            where_clause = "WHERE status = 'active'" if has_status else ""
             conn.execute(
                 f"""
                 INSERT INTO aliases_new ({col_str})
                 SELECT {select_clause}
                 FROM aliases
+                {where_clause}
                 """
             )
             conn.execute("DROP VIEW IF EXISTS unified_edges")
@@ -113,7 +175,7 @@ def ensure_schema_tables(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_aliases_canonical ON aliases(canonical_id)"
     )
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_aliases_lookup ON aliases(alias_id, kind, status)"
+        "CREATE INDEX IF NOT EXISTS idx_aliases_lookup ON aliases(alias_id, kind)"
     )
     conn.execute(
         """
@@ -320,11 +382,9 @@ FROM wikilinks w
 LEFT JOIN aliases a_src
     ON a_src.alias_id = w.source_uri
     AND a_src.kind = 'entity'
-    AND a_src.status = 'active'
 LEFT JOIN aliases a_dst
     ON a_dst.alias_id = w.target_uri
     AND a_dst.kind = 'entity'
-    AND a_dst.status = 'active'
 UNION ALL
 SELECT
     COALESCE(a_sub.canonical_id, lr.subject_id) AS src_id,
@@ -336,17 +396,14 @@ FROM leaf_relations lr
 LEFT JOIN aliases a_sub
     ON a_sub.alias_id = lr.subject_id
     AND a_sub.kind = 'entity'
-    AND a_sub.status = 'active'
 LEFT JOIN aliases a_obj
     ON a_obj.alias_id = lr.object_id
     AND a_obj.kind = 'entity'
-    AND a_obj.status = 'active'
 LEFT JOIN aliases a_pred
     ON (a_pred.alias_id = lr.predicate_id
         OR a_pred.alias_id = lr.predicate 
         OR a_pred.alias_id = replace(lower(lr.predicate), ' ', '-'))
     AND a_pred.kind = 'predicate'
-    AND a_pred.status = 'active'
 WHERE (
     (SELECT COALESCE(value, '1') FROM runtime_settings WHERE key = 'open_ie') = '1'
     OR a_pred.canonical_id IS NOT NULL
@@ -369,16 +426,13 @@ FROM compiled_relations cr
 LEFT JOIN aliases a_sub
     ON a_sub.alias_id = cr.subject_id
     AND a_sub.kind = 'entity'
-    AND a_sub.status = 'active'
 LEFT JOIN aliases a_obj
     ON a_obj.alias_id = cr.object_id
     AND a_obj.kind = 'entity'
-    AND a_obj.status = 'active'
 LEFT JOIN aliases a_pred
     ON (a_pred.alias_id = cr.predicate 
         OR a_pred.alias_id = replace(lower(cr.predicate), ' ', '-'))
     AND a_pred.kind = 'predicate'
-    AND a_pred.status = 'active'
 UNION ALL
 SELECT
     dc.curie AS src_id,
@@ -399,6 +453,22 @@ SELECT
 FROM dynamic_properties dp
 LEFT JOIN dynamic_properties p ON p.property_uri = dp.parent_property_uri OR p.curie = dp.parent_property_uri
 WHERE dp.parent_property_uri IS NOT NULL
+UNION ALL
+SELECT
+    src_id,
+    dst_id,
+    'closeMatch' AS rel_type,
+    score AS weight,
+    'close_matches' AS source_chunk_id
+FROM close_matches
+UNION ALL
+SELECT
+    dst_id AS src_id,
+    src_id AS dst_id,
+    'closeMatch' AS rel_type,
+    score AS weight,
+    'close_matches' AS source_chunk_id
+FROM close_matches
 """
 
 UNIFIED_NODES_VIEW_SQL = """
@@ -423,7 +493,6 @@ FROM leaf_nodes ln
 LEFT JOIN aliases a
     ON a.alias_id = ln.node_id
     AND a.kind = 'entity'
-    AND a.status = 'active'
 UNION
 SELECT
     node_id,

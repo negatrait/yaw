@@ -15,7 +15,7 @@ from typing import Any
 
 import pyshacl
 import rdflib
-from rdflib import RDF, RDFS, SH, SKOS, Literal, Namespace, URIRef
+from rdflib import RDF, RDFS, SH, SKOS, Namespace, URIRef
 
 from yaw.ontology.owl import get_ontology_graph
 from yaw.ontology.registry import get_ontology_registry
@@ -67,8 +67,18 @@ class ValidationReport(list[dict[str, Any]]):
 
     @property
     def contested_aliases(self) -> int:
-        """Count of contested alias merge violations."""
+        """Count of contested alias merge violations (retained for backward compatibility)."""
         return sum(1 for v in self if "contested" in v.get("message", "").lower())
+
+    @property
+    def ambiguous_identities(self) -> int:
+        """Count of ambiguous identity warnings."""
+        return sum(
+            1
+            for v in self
+            if "ambiguous identity" in v.get("message", "").lower()
+            or "unlinked close match" in v.get("message", "").lower()
+        )
 
     @property
     def dialectical_contradictions(self) -> int:
@@ -146,31 +156,6 @@ def load_shapes_graph(reload: bool = False) -> rdflib.Graph:
     return clone
 
 
-def _project_contested_aliases(conn: sqlite3.Connection, g: rdflib.Graph) -> None:
-    """Project SQLite contested aliases into the data graph for SHACL inspection."""
-    tables = {
-        r[0]
-        for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
-        ).fetchall()
-    }
-    if "aliases" not in tables:
-        return
-
-    cursor = conn.execute(
-        """
-        SELECT alias_id, canonical_id FROM aliases
-        WHERE status = 'contested' AND alias_id IS NOT NULL AND canonical_id IS NOT NULL
-        """
-    )
-    for alias_id, canonical_id in cursor.fetchall():
-        alias_uri = curie_to_uri(str(alias_id))
-        canonical_uri = curie_to_uri(str(canonical_id))
-        g.add((alias_uri, YAW_NS.aliasStatus, Literal("contested")))
-        g.add((alias_uri, YAW_NS.canonicalTarget, canonical_uri))
-        g.add((alias_uri, YAW_NS.contestedMerge, canonical_uri))
-
-
 def build_validation_data_graph(conn: sqlite3.Connection) -> rdflib.Graph:
     """Stream SQLite unified_nodes and unified_edges into an rdflib validation Graph."""
     if conn is None:
@@ -181,7 +166,6 @@ def build_validation_data_graph(conn: sqlite3.Connection) -> rdflib.Graph:
         if "Missing required unified views" in str(op_err):
             return rdflib.Graph()
         raise
-    _project_contested_aliases(conn, g)
     return g
 
 
@@ -428,7 +412,7 @@ def load_fast_shapes_graph(reload: bool = False) -> rdflib.Graph:
 
     yaw:DialecticalIntegrityShape a sh:NodeShape ;
         sh:targetClass owl:Thing ;
-        sh:targetSubjectsOf yaw:contestedMerge, yaw:aliasStatus, predicates:causes, predicates:prevents, predicates:supports, predicates:contradicts, predicates:refutes ;
+        sh:targetSubjectsOf predicates:causes, predicates:prevents, predicates:supports, predicates:contradicts, predicates:refutes ;
         sh:sparql [
             a sh:SPARQLConstraint ;
             sh:message "Dialectical contradiction: Node simultaneously causes and prevents target."@en ;
@@ -496,19 +480,50 @@ def load_fast_shapes_graph(reload: bool = False) -> rdflib.Graph:
                     }
                 }
             ''' ;
-        ] ;
+        ] .
+
+    yaw:AmbiguousIdentityShape a sh:NodeShape ;
+        sh:targetClass owl:Thing ;
+        sh:targetSubjectsOf yaw:closeMatch, skos:closeMatch ;
+        sh:severity sh:Warning ;
         sh:sparql [
             a sh:SPARQLConstraint ;
-            sh:message "Contested alias merge detected."@en ;
-            sh:severity sh:Violation ;
+            sh:message "Ambiguous identity detected: node has multiple unlinked close matches."@en ;
+            sh:severity sh:Warning ;
             sh:select '''
                 PREFIX yaw: <http://yaw.local/>
-                SELECT DISTINCT $this (yaw:aliasStatus AS ?path) (?canonical AS ?value)
+                PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+                SELECT DISTINCT $this ?path (?target1 AS ?value)
                 WHERE {
-                    { $this yaw:aliasStatus "contested" .
-                      OPTIONAL { $this yaw:canonicalTarget ?canonical } }
+                    {
+                        $this yaw:closeMatch ?target1 .
+                        BIND(yaw:closeMatch AS ?path)
+                    }
                     UNION
-                    { $this yaw:contestedMerge ?canonical }
+                    {
+                        $this skos:closeMatch ?target1 .
+                        BIND(skos:closeMatch AS ?path)
+                    }
+                    {
+                        $this yaw:closeMatch ?target2 .
+                    }
+                    UNION
+                    {
+                        $this skos:closeMatch ?target2 .
+                    }
+                    FILTER (?target1 != ?target2)
+                    FILTER NOT EXISTS {
+                        ?target1 yaw:closeMatch ?target2 .
+                    }
+                    FILTER NOT EXISTS {
+                        ?target1 skos:closeMatch ?target2 .
+                    }
+                    FILTER NOT EXISTS {
+                        ?target2 yaw:closeMatch ?target1 .
+                    }
+                    FILTER NOT EXISTS {
+                        ?target2 skos:closeMatch ?target1 .
+                    }
                 }
             ''' ;
         ] .

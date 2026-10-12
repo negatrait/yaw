@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from yaw.indexer.canonicalize import (
-    AliasStatus,
     MatchMethod,
     Resolution,
     ResolutionResult,
@@ -31,7 +30,6 @@ from yaw.indexer.pipeline import (
 )
 
 __all__ = [
-    "AliasStatus",
     "LeafNodeRow",
     "LeafRelationRow",
     "MarkdownChunk",

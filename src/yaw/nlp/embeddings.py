@@ -31,6 +31,9 @@ __all__ = [
     "format_document",
     "format_prompt",
     "format_proposition",
+    "format_space_r_doc",
+    "format_space_r_query",
+    "format_space_s",
     "is_valid_entity_text",
     "rerank_candidates",
 ]
@@ -40,6 +43,30 @@ def format_document(text: str, title: str | None = None) -> str:
     """Format document text with EmbeddingGemma document prompt."""
     t = (title or "").strip()
     return f"title: {t} | text: {text}" if t else f"title: none | text: {text}"
+
+
+def format_space_s(name: str, definition: str = "") -> str:
+    """Format entity mention for symmetric similarity (Space S)."""
+    d = (definition or "").strip()
+    n = (name or "").strip()
+    return (
+        f"task: sentence similarity | query: {n}: {d}"
+        if d
+        else f"task: sentence similarity | query: {n}"
+    )
+
+
+def format_space_r_doc(text: str, title: str | None = None) -> str:
+    """Format document or fact text for asymmetric retrieval (Space R)."""
+    return format_document(text, title)
+
+
+def format_space_r_query(query: str) -> str:
+    """Format search query for asymmetric retrieval (Space R)."""
+    prefix = "task: search result | query: "
+    if query.startswith(prefix):
+        return query
+    return f"{prefix}{query}"
 
 
 def format_prompt(text: str, task: str = "Retrieval-query") -> str:
@@ -94,8 +121,8 @@ async def embed_query(
     model: str | None = None,
     timeout_s: float | None = None,
 ) -> NDArray[np.float32]:
-    """Embed a search query using prompt Retrieval-query."""
-    formatted = format_prompt(query, "Retrieval-query")
+    """Embed a search query in Space R query space."""
+    formatted = format_space_r_query(query)
     vecs = await embed_texts([formatted], host=host, model=model, timeout_s=timeout_s)
     return vecs[0]
 

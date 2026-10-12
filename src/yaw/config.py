@@ -106,6 +106,8 @@ CANON_TOP_K: int = 5
 CANON_LLM_CONFIDENCE: float = 0.80
 LLM_DEFINE_TEMPERATURE: float = 0.1
 DEFINITION_MAX_WORDS: int = 50
+FACT_TOP_K: int = 5
+FACT_SEED_LAMBDA: float = 0.5
 
 
 def _get(sec: str, key: str, default, cast=None):
@@ -288,6 +290,8 @@ def _populate(
         raw.get("reranker", {}).get("relevance_threshold", 0.10),
         float,
     )
+    g["FACT_TOP_K"] = _get("retrieval", "fact_top_k", 5, int)
+    g["FACT_SEED_LAMBDA"] = _get("retrieval", "fact_seed_lambda", 0.5, float)
 
 
 def get_spacy_model_name(preferred: str | None = None) -> str:

@@ -47,7 +47,7 @@ yaw:ConceptShape a sh:NodeShape ;
         sh:select '''
             SELECT $this (?this AS ?value)
             WHERE {
-                FILTER (isIRI($this) && !STRSTARTS(STR($this), "http://www.w3.org/") && $this != <http://yaw.local/VaultScheme>)
+                FILTER (isIRI($this) && !STRSTARTS(STR($this), "http://www.w3.org/") && $this != <http://yaw.local/VaultScheme> && $this != <http://yaw.local/closeMatch>)
                 FILTER (!REGEX(STR($this), "^http://yaw\\\\.local/((sources|contexts)/.+|(concepts|entities|predicates|claims|invariants|decisions|processes)/[A-Za-z0-9_.:-]+)$"))
             }
         ''' ;
@@ -73,10 +73,10 @@ yaw:RelationShape a sh:NodeShape ;
             SELECT DISTINCT ?this
             WHERE {
                 ?this ?p ?o .
-                FILTER (!STRSTARTS(STR(?this), "http://www.w3.org/"))
+                FILTER (!STRSTARTS(STR(?this), "http://www.w3.org/") && ?this != <http://yaw.local/closeMatch>)
                 FILTER (?p != rdf:type && ?p != rdfs:label && ?p != skos:prefLabel &&
                         ?p != skos:definition && ?p != skos:inScheme && ?p != yaw:aliasStatus &&
-                        ?p != yaw:contestedMerge && ?p != yaw:canonicalTarget &&
+                        ?p != yaw:contestedMerge && ?p != yaw:canonicalTarget && ?p != rdfs:subPropertyOf &&
                         !STRSTARTS(STR(?p), "http://www.w3.org/2002/07/owl#"))
             }
         ''' ;
@@ -93,12 +93,12 @@ yaw:RelationShape a sh:NodeShape ;
             SELECT $this (?p AS ?path) (?o AS ?value)
             WHERE {
                 $this ?p ?o .
-                FILTER (!STRSTARTS(STR($this), "http://www.w3.org/"))
+                FILTER (!STRSTARTS(STR($this), "http://www.w3.org/") && $this != <http://yaw.local/closeMatch>)
                 FILTER (?p != rdf:type && ?p != rdfs:label && ?p != skos:prefLabel &&
                         ?p != skos:definition && ?p != skos:inScheme && ?p != yaw:aliasStatus &&
-                        ?p != yaw:contestedMerge && ?p != yaw:canonicalTarget &&
+                        ?p != yaw:contestedMerge && ?p != yaw:canonicalTarget && ?p != rdfs:subPropertyOf &&
                         !STRSTARTS(STR(?p), "http://www.w3.org/2002/07/owl#"))
-                FILTER (isIRI(?o) && !STRSTARTS(STR(?o), "http://www.w3.org/"))
+                FILTER (isIRI(?o) && !STRSTARTS(STR(?o), "http://www.w3.org/") && ?o != <http://yaw.local/closeMatch>)
                 FILTER NOT EXISTS { ?o rdf:type ?anyType }
             }
         ''' ;
@@ -115,12 +115,12 @@ yaw:RelationShape a sh:NodeShape ;
             SELECT $this (?p AS ?path) (?o AS ?value)
             WHERE {
                 $this ?p ?o .
-                FILTER (!STRSTARTS(STR($this), "http://www.w3.org/"))
+                FILTER (!STRSTARTS(STR($this), "http://www.w3.org/") && $this != <http://yaw.local/closeMatch>)
                 FILTER (?p != rdf:type && ?p != rdfs:label && ?p != skos:prefLabel &&
                         ?p != skos:definition && ?p != skos:inScheme && ?p != yaw:aliasStatus &&
-                        ?p != yaw:contestedMerge && ?p != yaw:canonicalTarget &&
+                        ?p != yaw:contestedMerge && ?p != yaw:canonicalTarget && ?p != rdfs:subPropertyOf &&
                         !STRSTARTS(STR(?p), "http://www.w3.org/2002/07/owl#"))
-                FILTER (isIRI(?o) && !STRSTARTS(STR(?o), "http://www.w3.org/"))
+                FILTER (isIRI(?o) && !STRSTARTS(STR(?o), "http://www.w3.org/") && ?o != <http://yaw.local/closeMatch>)
                 FILTER (!REGEX(STR(?o), "^http://yaw\\\\.local/(concepts|entities|predicates|claims|invariants|decisions|processes|sources|contexts)/"))
             }
         ''' ;
@@ -137,10 +137,10 @@ yaw:RelationShape a sh:NodeShape ;
             SELECT $this (?p AS ?path) ($this AS ?value)
             WHERE {
                 $this ?p ?o .
-                FILTER (!STRSTARTS(STR($this), "http://www.w3.org/"))
+                FILTER (!STRSTARTS(STR($this), "http://www.w3.org/") && $this != <http://yaw.local/closeMatch>)
                 FILTER (?p != rdf:type && ?p != rdfs:label && ?p != skos:prefLabel &&
                         ?p != skos:definition && ?p != skos:inScheme && ?p != yaw:aliasStatus &&
-                        ?p != yaw:contestedMerge && ?p != yaw:canonicalTarget &&
+                        ?p != yaw:contestedMerge && ?p != yaw:canonicalTarget && ?p != rdfs:subPropertyOf &&
                         !STRSTARTS(STR(?p), "http://www.w3.org/2002/07/owl#"))
                 FILTER (isIRI($this))
                 FILTER (!REGEX(STR($this), "^http://yaw\\\\.local/(concepts|entities|predicates|claims|invariants|decisions|processes|sources|contexts)/"))
@@ -159,10 +159,11 @@ yaw:RelationShape a sh:NodeShape ;
             SELECT $this (?p AS ?path) (?p AS ?value)
             WHERE {
                 $this ?p ?o .
-                FILTER (!STRSTARTS(STR($this), "http://www.w3.org/"))
+                FILTER (!STRSTARTS(STR($this), "http://www.w3.org/") && $this != <http://yaw.local/closeMatch>)
                 FILTER (?p != rdf:type && ?p != rdfs:label && ?p != skos:prefLabel &&
                         ?p != skos:definition && ?p != skos:inScheme && ?p != yaw:aliasStatus &&
-                        ?p != yaw:contestedMerge && ?p != yaw:canonicalTarget &&
+                        ?p != yaw:contestedMerge && ?p != yaw:canonicalTarget && ?p != yaw:closeMatch &&
+                        ?p != rdfs:subPropertyOf &&
                         !STRSTARTS(STR(?p), "http://www.w3.org/2002/07/owl#"))
                 FILTER (isIRI(?p))
                 FILTER (!REGEX(STR(?p), "^(http://yaw\\\\.local/(predicates|concepts|entities|claims|invariants|decisions|processes|sources|contexts)/|http://www\\\\.w3\\\\.org/)"))
@@ -180,7 +181,7 @@ shapes:RelationShape a sh:NodeShape ;
 
 yaw:DialecticalIntegrityShape a sh:NodeShape ;
     sh:targetClass owl:Thing ;
-    sh:targetSubjectsOf yaw:contestedMerge, yaw:aliasStatus, predicates:causes, predicates:prevents, predicates:supports, predicates:contradicts, predicates:refutes ;
+    sh:targetSubjectsOf predicates:causes, predicates:prevents, predicates:supports, predicates:contradicts, predicates:refutes ;
     sh:sparql [
         a sh:SPARQLConstraint ;
         sh:message "Dialectical contradiction: Node simultaneously causes and prevents target."@en ;
@@ -248,22 +249,61 @@ yaw:DialecticalIntegrityShape a sh:NodeShape ;
                 }
             }
         ''' ;
-    ] ;
-    sh:sparql [
-        a sh:SPARQLConstraint ;
-        sh:message "Contested alias merge detected."@en ;
-        sh:severity sh:Violation ;
-        sh:select '''
-            PREFIX yaw: <http://yaw.local/>
-            SELECT DISTINCT $this (yaw:aliasStatus AS ?path) (?canonical AS ?value)
-            WHERE {
-                { $this yaw:aliasStatus "contested" .
-                  OPTIONAL { $this yaw:canonicalTarget ?canonical } }
-                UNION
-                { $this yaw:contestedMerge ?canonical }
-            }
-        ''' ;
     ] .
 
 shapes:DialecticalIntegrityShape a sh:NodeShape ;
     owl:equivalentClass yaw:DialecticalIntegrityShape .
+
+# ----------------------------------------------------------------------
+# 4. AmbiguousIdentityShape (yaw:AmbiguousIdentityShape & shapes:AmbiguousIdentityShape)
+# >= 2 unlinked close matches warning
+# ----------------------------------------------------------------------
+
+yaw:AmbiguousIdentityShape a sh:NodeShape ;
+    sh:targetClass owl:Thing ;
+    sh:targetSubjectsOf yaw:closeMatch, skos:closeMatch ;
+    sh:severity sh:Warning ;
+    sh:sparql [
+        a sh:SPARQLConstraint ;
+        sh:message "Ambiguous identity detected: node has multiple unlinked close matches."@en ;
+        sh:severity sh:Warning ;
+        sh:select '''
+            PREFIX yaw: <http://yaw.local/>
+            PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+            SELECT DISTINCT $this ?path (?target1 AS ?value)
+            WHERE {
+                {
+                    $this yaw:closeMatch ?target1 .
+                    BIND(yaw:closeMatch AS ?path)
+                }
+                UNION
+                {
+                    $this skos:closeMatch ?target1 .
+                    BIND(skos:closeMatch AS ?path)
+                }
+                {
+                    $this yaw:closeMatch ?target2 .
+                }
+                UNION
+                {
+                    $this skos:closeMatch ?target2 .
+                }
+                FILTER (?target1 != ?target2)
+                FILTER NOT EXISTS {
+                    ?target1 yaw:closeMatch ?target2 .
+                }
+                FILTER NOT EXISTS {
+                    ?target1 skos:closeMatch ?target2 .
+                }
+                FILTER NOT EXISTS {
+                    ?target2 yaw:closeMatch ?target1 .
+                }
+                FILTER NOT EXISTS {
+                    ?target2 skos:closeMatch ?target1 .
+                }
+            }
+        ''' ;
+    ] .
+
+shapes:AmbiguousIdentityShape a sh:NodeShape ;
+    owl:equivalentClass yaw:AmbiguousIdentityShape .

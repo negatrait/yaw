@@ -429,6 +429,10 @@ Every vector store holds exactly one representation space, entity identity is de
 9. **Ontology loader (`src/yaw/ontology/loader.py`):** stop writing ontology classes to `leaf_nodes`; write one space-S vector per class to `entity_vec` (partition = prefix); make `query_fts` ontology rows idempotent on re-ingestion. A `close_matches` edge to an ontology class instantiates it as a ghost class in the PPR graph.
 10. **SHACL & OWL (`src/yaw/ontology/shapes/wiki_shapes.ttl`, `shacl.py`, `owl.py`):** replace the contested-merge check with the ambiguous-identity `sh:Warning`; project `close_matches` to `skos:closeMatch` (cross-scheme) / `yaw:closeMatch` (intra-vault, `owl:SymmetricProperty`); delete the `canon_verdicts` → `owl:differentFrom` projection (ADR-012 §5).
 11. **Fail-loud dimensions:** every vector write goes through `vec0`, so a wrong-width vector raises `sqlite3.OperationalError`; no `try/except` downgrades it to a log line.
+12. **Entity Definition & Grounding Invariant (`src/yaw/nlp/components.py`, `pipeline.py`):**
+    - Purge legacy `_entity_definition` placeholder (`f"{name} ({ent.label_})"`). Raw note entity mentions use their enclosing sentential context (`ent.sent.text.strip()`) for definition grounding.
+    - When no definition or sentential context exists, definition defaults to `""`, cleanly emitting `task: sentence similarity | query: {name}` in Space S without tautological repetitions or dangling colons.
+    - Saturated hubs and compile-time wiki synthesis can selectively route ambiguous entities to `spacy-llm` intensional definition induction ("what is X") if sentential context is too coarse.
 
 ### 9.7.3 Test Authoring Plan (TDD, real SQLite + loopback Ollama, zero mocks of DB/FS)
 - **Space integrity:** inserting a 300-float vector into `entity_vec` or `fact_vec` raises `sqlite3.OperationalError`; `PRAGMA table_info(leaf_nodes)` has no `embedding` column; `aliases` has no `status` column.

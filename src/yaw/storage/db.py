@@ -34,18 +34,20 @@ __all__ = [
     "ensure_schema_views",
     "export_graph",
     "fetch_compiled_violations",
-    "get_active_aliases",
+    "get_aliases",
     "get_aliases_for_canonical",
     "get_canonical_id",
     "get_db",
     "insert_alias",
+    "insert_close_match",
+    "insert_entity_vec",
+    "insert_fact_vec",
     "insert_leaf_node",
     "load_vec_extension",
     "log_canon_verdict",
     "persist_compiled_violations",
     "search_fts",
     "serialize_embedding",
-    "set_alias_status",
     "vacuum_db",
     "verify_schema_integrity",
 ]
@@ -119,7 +121,6 @@ def insert_alias(
     kind: str = "entity",
     method: str = "alias",
     score: float = 1.0,
-    status: str = "active",
     source_leaf_id: str | None = None,
     resolved_at: float | None = None,
     evidence: str | None = None,
@@ -148,16 +149,14 @@ def insert_alias(
         )
     if not alias_id or not actual_canonical_id:
         raise ValueError("alias_id and canonical_id must be non-empty strings")
-    if status not in ("active", "contested"):
-        raise ValueError(f"Invalid status '{status}'; must be 'active' or 'contested'")
 
     ts = time.time() if resolved_at is None else resolved_at
 
     conn.execute(
         """
         INSERT OR REPLACE INTO aliases (
-            alias_id, kind, canonical_id, method, score, status, source_leaf_id, resolved_at, evidence
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            alias_id, kind, canonical_id, method, score, source_leaf_id, resolved_at, evidence
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             alias_id,
@@ -165,11 +164,67 @@ def insert_alias(
             actual_canonical_id,
             method,
             score,
-            status,
             source_leaf_id,
             ts,
             evidence,
         ),
+    )
+
+
+def insert_close_match(
+    conn: sqlite3.Connection,
+    src_id: str,
+    dst_id: str,
+    score: float,
+    evidence: str | None = None,
+) -> None:
+    """Insert a soft identity close match link. Swaps src/dst to satisfy CHECK(src_id < dst_id)."""
+    if src_id > dst_id:
+        src_id, dst_id = dst_id, src_id
+    elif src_id == dst_id:
+        return
+
+    conn.execute(
+        """
+        INSERT INTO close_matches (src_id, dst_id, score, evidence)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(src_id, dst_id) DO UPDATE SET
+            score = excluded.score,
+            evidence = excluded.evidence,
+            resolved_at = unixepoch()
+        """,
+        (src_id, dst_id, score, evidence),
+    )
+
+
+def insert_entity_vec(
+    conn: sqlite3.Connection,
+    entity_id: str,
+    partition_key: str,
+    embedding: bytes,
+) -> None:
+    """Insert or replace an entity vector in Space S."""
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO entity_vec (entity_id, partition_key, embedding)
+        VALUES (?, ?, ?)
+        """,
+        (entity_id, partition_key, embedding),
+    )
+
+
+def insert_fact_vec(
+    conn: sqlite3.Connection,
+    relation_id: str,
+    embedding: bytes,
+) -> None:
+    """Insert or replace a fact vector in Space R."""
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO fact_vec (relation_id, embedding)
+        VALUES (?, ?)
+        """,
+        (relation_id, embedding),
     )
 
 
@@ -179,10 +234,10 @@ def get_canonical_id(
     kind: str = "entity",
     fallback_to_alias: bool = True,
 ) -> str | None:
-    """Lookup active canonical ID for alias_id, or return alias_id (or None) if none."""
+    """Lookup canonical ID for alias_id, or return alias_id (or None) if none."""
     try:
         row = conn.execute(
-            "SELECT canonical_id FROM aliases WHERE alias_id = ? AND kind = ? AND status = 'active'",
+            "SELECT canonical_id FROM aliases WHERE alias_id = ? AND kind = ?",
             (alias_id, kind),
         ).fetchone()
         if row and row[0]:
@@ -222,20 +277,18 @@ def insert_leaf_node(
     name: str,
     namespace: str,
     definition: str | None = None,
-    embedding: list[float] | np.ndarray | None = None,
     source_leaf_id: str = "raw/note.md",
 ) -> None:
     """Insert leaf node record into leaf_nodes table idempotently."""
     if not node_id:
         raise ValueError("node_id must be a non-empty string")
-    emb_bytes = serialize_embedding(embedding) if embedding is not None else None
     eff_source = source_leaf_id or "system:canonical_induction"
     try:
         conn.execute(
             """
             INSERT OR IGNORE INTO leaf_nodes (
-                node_id, source_leaf_id, name, namespace, definition, embedding
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                node_id, source_leaf_id, name, namespace, definition
+            ) VALUES (?, ?, ?, ?, ?)
             """,
             (
                 node_id,
@@ -243,7 +296,6 @@ def insert_leaf_node(
                 name,
                 namespace,
                 definition or "",
-                emb_bytes,
             ),
         )
     except sqlite3.OperationalError as err:
@@ -252,16 +304,16 @@ def insert_leaf_node(
         raise
 
 
-def get_active_aliases(
+def get_aliases(
     conn: sqlite3.Connection,
     kind: str | None = None,
 ) -> dict[str, str]:
-    """Retrieve all active alias -> canonical mappings as a lookup dictionary."""
+    """Retrieve all alias -> canonical mappings as a lookup dictionary."""
     try:
-        query = "SELECT alias_id, canonical_id FROM aliases WHERE status = 'active'"
+        query = "SELECT alias_id, canonical_id FROM aliases"
         params: tuple[Any, ...] = ()
         if kind:
-            query += " AND kind = ?"
+            query += " WHERE kind = ?"
             params = (kind,)
         rows = conn.execute(query, params).fetchall()
         return {str(r[0]): str(r[1]) for r in rows}
@@ -273,7 +325,6 @@ def get_aliases_for_canonical(
     conn: sqlite3.Connection,
     canonical_id: str,
     kind: str | None = None,
-    include_contested: bool = False,
 ) -> list[str]:
     """Retrieve all alias identifiers mapped to a canonical entity/predicate."""
     try:
@@ -282,8 +333,6 @@ def get_aliases_for_canonical(
         if kind:
             clauses.append("kind = ?")
             params.append(kind)
-        if not include_contested:
-            clauses.append("status = 'active'")
         query = f"SELECT alias_id FROM aliases WHERE {' AND '.join(clauses)}"
         rows = conn.execute(query, tuple(params)).fetchall()
         return [str(r[0]) for r in rows]
@@ -335,25 +384,6 @@ def delete_alias(
         cur = conn.execute(
             "DELETE FROM aliases WHERE alias_id = ? AND kind = ?",
             (alias_id, kind),
-        )
-        return cur.rowcount > 0
-    except sqlite3.OperationalError:
-        return False
-
-
-def set_alias_status(
-    conn: sqlite3.Connection,
-    alias_id: str,
-    kind: str,
-    status: str,
-) -> bool:
-    """Update alias status ('active' or 'contested')."""
-    if status not in ("active", "contested"):
-        raise ValueError(f"Invalid status '{status}'. Must be 'active' or 'contested'.")
-    try:
-        cur = conn.execute(
-            "UPDATE aliases SET status = ? WHERE alias_id = ? AND kind = ?",
-            (status, alias_id, kind),
         )
         return cur.rowcount > 0
     except sqlite3.OperationalError:

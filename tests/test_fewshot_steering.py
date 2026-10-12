@@ -35,6 +35,7 @@ from yaw.nlp import (
 )
 from yaw.storage import (
     insert_alias,
+    insert_close_match,
 )
 
 # ---------------------------------------------------------------------------
@@ -852,14 +853,12 @@ def test_steered_relations_unified_edges_named_quad_projection_multi_source(
 def test_dynamic_seeding_with_contested_alias_state_machine(
     test_db: sqlite3.Connection, tmp_path: Path
 ) -> None:
-    """Tier 3 / P3: Contested aliases are excluded from canonical re-routing and dynamic live seeding."""
-    insert_alias(
+    """Tier 3 / P3: Soft collisions use close_matches and are excluded from canonical re-routing."""
+    insert_close_match(
         conn=test_db,
-        alias_id="contested_term",
-        canonical_id="concepts:disputed",
-        kind="entity",
-        method="auto",
-        status="contested",
+        src_id="concepts:disputed",
+        dst_id="contested_term",
+        score=0.85,
     )
     test_db.execute(
         """

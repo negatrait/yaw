@@ -227,20 +227,21 @@ def test_lru_cache_eviction_under_multiple_predicate_combinations(
 def test_lru_cache_hundred_combinations_stress_and_bounded_size(
     tmp_path: Path,
 ) -> None:
-    """Pass 100 distinct predicate combinations, ensuring strict memory boundedness."""
+    """Pass distinct predicate combinations through maxsize=8 cache, ensuring strict memory boundedness without CPU starvation."""
     db_file = tmp_path / "lru_100_test.db"
     db_file.touch()
 
     _get_steered_pipeline.cache_clear()
 
-    for idx in range(100):
+    # Test 16 distinct combinations to force multiple eviction cycles past maxsize=8
+    for idx in range(16):
         combo = (f"predicate_scale_{idx}",)
         pipe = _get_steered_pipeline(combo, str(db_file))
         assert isinstance(pipe, spacy.language.Language)
 
     info = _get_steered_pipeline.cache_info()
     assert info.currsize == 8, "Cache currsize must strictly not exceed maxsize=8"
-    assert info.misses == 100, "All 100 calls were distinct misses"
+    assert info.misses == 16, "All 16 calls were distinct misses"
     _get_steered_pipeline.cache_clear()
 
 

@@ -13,6 +13,9 @@ from yaw.nlp.embeddings import (
     format_document,
     format_prompt,
     format_proposition,
+    format_space_r_doc,
+    format_space_r_query,
+    format_space_s,
     rerank_candidates,
 )
 from yaw.nlp.examples import (
@@ -71,6 +74,9 @@ __all__ = [
     "format_document",
     "format_prompt",
     "format_proposition",
+    "format_space_r_doc",
+    "format_space_r_query",
+    "format_space_s",
     "get_leaf_pipeline",
     "get_spacy_pipeline",
     "is_ollama_online",

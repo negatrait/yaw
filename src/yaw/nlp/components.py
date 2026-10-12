@@ -615,13 +615,23 @@ class DynamicConceptMentionScoper:
 
 
 def _entity_definition(ent: Span, clean_name: str | None = None) -> str:
-    """Format definition using native spaCy entity label."""
-    name = (
-        clean_name
-        if clean_name is not None
-        else ent.text.strip(" \t\n\r\"'.,:;!?(){}[]<>")
-    )
-    return f"{name} ({ent.label_})"
+    """Format definition using enclosing sentential context.
+
+    Raw note entity mentions use their enclosing sentential context
+    (ent.sent.text.strip()) for definition grounding. If an entity mention has
+    no available sentential context or definition, defaults to '' so format_space_s
+    cleanly emits 'task: sentence similarity | query: {name}' without tautological
+    repetitions or dangling colons.
+    """
+    try:
+        sent = ent.sent
+        if sent is not None:
+            text = sent.text.strip()
+            if text:
+                return text
+    except ValueError, AttributeError:
+        pass
+    return ""
 
 
 def _filter_code_spans(spans: Iterable[Span], code_spans: list[Span]) -> list[Span]:

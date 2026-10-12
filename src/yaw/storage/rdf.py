@@ -191,7 +191,25 @@ def _project_nodes(
             g.add((node_uri, SKOS.definition, Literal(str(raw_def).strip())))
 
 
-def _resolve_edge_predicate(rel: str, rel_norm: str) -> tuple[URIRef, URIRef | None]:
+def _is_cross_scheme_endpoint(endpoint: str | None) -> bool:
+    """Return True if endpoint CURIE or URI belongs to an external ontology scheme."""
+    if not endpoint or not endpoint.strip():
+        return False
+    raw = endpoint.strip()
+    if raw.startswith(("http://", "https://", "urn:")):
+        return not raw.startswith(YAW_PREFIX)
+    if ":" in raw:
+        prefix = raw.split(":", 1)[0].strip()
+        return prefix not in ("yaw", *ROOT_NAMESPACES.keys())
+    return False
+
+
+def _resolve_edge_predicate(
+    rel: str,
+    rel_norm: str,
+    src_id: str | None = None,
+    dst_id: str | None = None,
+) -> tuple[URIRef, URIRef | None]:
     """Resolve predicate URI and optional reciprocal predicate URI."""
     if rel_norm == "subClassOf":
         return RDFS.subClassOf, None
@@ -199,6 +217,10 @@ def _resolve_edge_predicate(rel: str, rel_norm: str) -> tuple[URIRef, URIRef | N
         return SKOS.broader, SKOS.narrower
     if rel_norm == "narrower":
         return SKOS.narrower, SKOS.broader
+    if rel_norm == "closeMatch":
+        if _is_cross_scheme_endpoint(src_id) or _is_cross_scheme_endpoint(dst_id):
+            return SKOS.closeMatch, None
+        return URIRef(f"{YAW_PREFIX}closeMatch"), None
     if ":" in rel:
         return curie_to_uri(rel), None
     rel_clean = re.sub(r"\s+", "-", rel)
@@ -217,8 +239,10 @@ def _project_edges(
     is_conjunctive = named_quads and isinstance(g, ConjunctiveGraph)
 
     for raw_src, raw_rel, raw_dst, _weight, raw_chunk in edge_rows:
-        s_uri = curie_to_uri(str(raw_src))
-        o_uri = curie_to_uri(str(raw_dst))
+        src_str = str(raw_src)
+        dst_str = str(raw_dst)
+        s_uri = curie_to_uri(src_str)
+        o_uri = curie_to_uri(dst_str)
 
         rel = str(raw_rel).strip()
         rel_norm = rel.split(":", 1)[1] if ":" in rel else rel
@@ -229,7 +253,9 @@ def _project_edges(
             if ctx_uri is not None:
                 ctx_graph = g.get_context(ctx_uri)
 
-        pred_uri, reciprocal_pred = _resolve_edge_predicate(rel, rel_norm)
+        pred_uri, reciprocal_pred = _resolve_edge_predicate(
+            rel, rel_norm, src_id=src_str, dst_id=dst_str
+        )
         ctx_graph.add((s_uri, pred_uri, o_uri))
         if reciprocal_pred is not None:
             ctx_graph.add((o_uri, reciprocal_pred, s_uri))

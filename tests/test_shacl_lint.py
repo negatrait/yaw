@@ -25,7 +25,7 @@ from yaw.server.daemon import lint_wiki
 from yaw.storage.db import (
     ensure_schema_tables,
     ensure_schema_views,
-    insert_alias,
+    insert_close_match,
     insert_leaf_node,
 )
 
@@ -348,21 +348,34 @@ def test_detect_dialectical_contradiction_supports_contradicts(
 
 
 def test_detect_contested_alias_merge(test_db: sqlite3.Connection) -> None:
-    """Verify that an alias with status='contested' is flagged in validation."""
+    """Verify that multiple unlinked close matches trigger an ambiguous identity warning."""
     ensure_schema_tables(test_db)
     _seed_clean_node(
         test_db,
-        node_id="entities:canonical-target",
-        name="Canonical Target",
+        node_id="entities:disputed-surface",
+        name="Disputed Surface",
         namespace="entities",
-        definition="Canonical entity target.",
+        definition="Disputed entity surface.",
     )
-    insert_alias(
-        conn=test_db,
-        alias_id="entities:disputed-surface",
-        canonical_id="entities:canonical-target",
-        kind="entity",
-        status="contested",
+    _seed_clean_node(
+        test_db,
+        node_id="entities:canonical-target-1",
+        name="Canonical Target 1",
+        namespace="entities",
+        definition="Canonical entity target 1.",
+    )
+    _seed_clean_node(
+        test_db,
+        node_id="entities:canonical-target-2",
+        name="Canonical Target 2",
+        namespace="entities",
+        definition="Canonical entity target 2.",
+    )
+    insert_close_match(
+        test_db, "entities:disputed-surface", "entities:canonical-target-1", 0.85
+    )
+    insert_close_match(
+        test_db, "entities:disputed-surface", "entities:canonical-target-2", 0.82
     )
     ensure_schema_views(test_db)
 
@@ -374,7 +387,8 @@ def test_detect_contested_alias_merge(test_db: sqlite3.Connection) -> None:
         if "disputed-surface" in v["focus_node"] or "disputed-surface" in v["value"]
     ]
     assert len(matched) >= 1
-    assert any("contested" in v["message"].lower() for v in matched)
+    assert any("ambiguous identity" in v["message"].lower() for v in matched)
+    assert any(v["severity"] == "Warning" for v in matched)
 
 
 def test_validation_report_diagnostic_dictionary_keys(
@@ -405,7 +419,7 @@ def test_validation_report_diagnostic_dictionary_keys(
 
 def test_query_filtering_by_namespace(test_db: sqlite3.Connection) -> None:
     """Verify that query filtering by namespace isolates relevant violations."""
-    # Add a concept violation and an entity contested violation
+    # Add a concept violation and an entity ambiguous identity warning
     _seed_clean_node(
         test_db,
         node_id="concepts:verbose-query",
@@ -415,18 +429,27 @@ def test_query_filtering_by_namespace(test_db: sqlite3.Connection) -> None:
     )
     _seed_clean_node(
         test_db,
-        node_id="entities:canon-ent",
-        name="Canon Entity",
+        node_id="entities:canon-ent-1",
+        name="Canon Entity 1",
         namespace="entities",
-        definition="Valid definition for canonical entity.",
+        definition="Valid definition for canonical entity 1.",
     )
-    insert_alias(
-        conn=test_db,
-        alias_id="entities:contested-ent",
-        canonical_id="entities:canon-ent",
-        kind="entity",
-        status="contested",
+    _seed_clean_node(
+        test_db,
+        node_id="entities:canon-ent-2",
+        name="Canon Entity 2",
+        namespace="entities",
+        definition="Valid definition for canonical entity 2.",
     )
+    _seed_clean_node(
+        test_db,
+        node_id="entities:ambig-ent",
+        name="Ambig Entity",
+        namespace="entities",
+        definition="Valid definition for ambiguous entity.",
+    )
+    insert_close_match(test_db, "entities:ambig-ent", "entities:canon-ent-1", 0.85)
+    insert_close_match(test_db, "entities:ambig-ent", "entities:canon-ent-2", 0.82)
     ensure_schema_views(test_db)
 
     _c_all, all_v = validate_wiki_graph(test_db)
@@ -438,7 +461,7 @@ def test_query_filtering_by_namespace(test_db: sqlite3.Connection) -> None:
     assert all(
         "concepts" in v["focus_node"] or "concepts" in v["path"] for v in concept_v
     )
-    assert not any("contested-ent" in v["focus_node"] for v in concept_v)
+    assert not any("ambig-ent" in v["focus_node"] for v in concept_v)
 
     # Filter strictly for entities
     _c_entities, entity_v = validate_wiki_graph(test_db, query="entities")
@@ -697,14 +720,13 @@ def test_multiple_dialectical_conflicts_simultaneous(
     _seed_relation(test_db, "r_sup", "claims:c2", "supports", "claims:c3")
     _seed_relation(test_db, "r_con", "claims:c2", "contradicts", "claims:c3")
 
-    # Contested alias
-    insert_alias(
-        conn=test_db,
-        alias_id="entities:disputed1",
-        canonical_id="entities:canon1",
-        kind="entity",
-        status="contested",
+    # Ambiguous identity close matches
+    _seed_clean_node(test_db, "entities:canon2", "Canon 2", "entities", "Canon 2 def.")
+    _seed_clean_node(
+        test_db, "entities:disputed1", "Disputed 1", "entities", "Disputed 1 def."
     )
+    insert_close_match(test_db, "entities:disputed1", "entities:canon1", 0.85)
+    insert_close_match(test_db, "entities:disputed1", "entities:canon2", 0.82)
     ensure_schema_views(test_db)
 
     conforms, violations = validate_wiki_graph(test_db)
@@ -715,13 +737,17 @@ def test_multiple_dialectical_conflicts_simultaneous(
     has_supports_contradicts = any(
         "supports" in v["message"].lower() for v in violations
     )
-    has_contested = any("contested" in v["message"].lower() for v in violations)
+    has_ambiguous = any(
+        "ambiguous identity" in v["message"].lower()
+        or "close matches" in v["message"].lower()
+        for v in violations
+    )
 
     assert has_causes_prevents, f"Missing causes/prevents violation: {violations}"
     assert has_supports_contradicts, (
         f"Missing supports/contradicts violation: {violations}"
     )
-    assert has_contested, f"Missing contested alias violation: {violations}"
+    assert has_ambiguous, f"Missing ambiguous identity warning: {violations}"
 
 
 def test_canonical_uri_with_colon_in_slug_conforms(test_db: sqlite3.Connection) -> None:

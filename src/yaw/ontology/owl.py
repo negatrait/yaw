@@ -28,7 +28,6 @@ __all__ = [
     "build_skos_concept_scheme",
     "compute_transitive_closure_csr",
     "get_broader_closure",
-    "get_different_from_triples",
     "get_ontology_graph",
     "get_same_as_triples",
     "get_subclass_closure",
@@ -206,14 +205,12 @@ def compute_transitive_closure_csr(
 
 
 def get_same_as_triples(conn: sqlite3.Connection) -> list[tuple[str, str, str]]:
-    """Generate bidirectional owl:sameAs triples for active aliases.
+    """Generate bidirectional owl:sameAs triples for aliases.
 
-    Inactive or contested aliases are excluded.
+    All rows in aliases represent hard merges.
     Returns list of (subject_curie, 'owl:sameAs', object_curie) triples.
     """
-    cursor = conn.execute(
-        "SELECT alias_id, canonical_id FROM aliases WHERE status = 'active'"
-    )
+    cursor = conn.execute("SELECT alias_id, canonical_id FROM aliases")
     rows = cursor.fetchall()
     triples: list[tuple[str, str, str]] = []
     seen: set[tuple[str, str, str]] = set()
@@ -231,41 +228,12 @@ def get_same_as_triples(conn: sqlite3.Connection) -> list[tuple[str, str, str]]:
     return triples
 
 
-def get_different_from_triples(
-    conn: sqlite3.Connection,
-) -> list[tuple[str, str, str]]:
-    """Generate bidirectional owl:differentFrom triples for distinct canon verdicts.
-
-    Non-distinct (match) verdicts are excluded.
-    Returns list of (subject_curie, 'owl:differentFrom', object_curie) triples.
-    """
-    cursor = conn.execute(
-        "SELECT surface_id, candidate_id FROM canon_verdicts WHERE verdict = 'distinct'"
-    )
-    rows = cursor.fetchall()
-    triples: list[tuple[str, str, str]] = []
-    seen: set[tuple[str, str, str]] = set()
-
-    for surface_id, candidate_id in rows:
-        t1 = (str(surface_id), "owl:differentFrom", str(candidate_id))
-        t2 = (str(candidate_id), "owl:differentFrom", str(surface_id))
-        if t1 not in seen:
-            seen.add(t1)
-            triples.append(t1)
-        if t2 not in seen:
-            seen.add(t2)
-            triples.append(t2)
-
-    return triples
-
-
 def _project_skos_aliases(g: rdflib.Graph, conn: sqlite3.Connection) -> None:
     alias_rows = conn.execute(
         """
         SELECT a.alias_id, a.canonical_id, n.name
         FROM aliases a
         LEFT JOIN unified_nodes n ON a.alias_id = n.node_id
-        WHERE a.status = 'active'
         """
     ).fetchall()
     for alias_id, canonical_id, node_name in alias_rows:

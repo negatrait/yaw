@@ -67,7 +67,6 @@ try:
     build_skos_concept_scheme = _owl.build_skos_concept_scheme
     compute_transitive_closure_csr = _owl.compute_transitive_closure_csr
     get_broader_closure = _owl.get_broader_closure
-    get_different_from_triples = _owl.get_different_from_triples
     get_ontology_graph = _owl.get_ontology_graph
     get_same_as_triples = _owl.get_same_as_triples
     get_subclass_closure = _owl.get_subclass_closure
@@ -88,7 +87,6 @@ except ImportError, ModuleNotFoundError:
     build_skos_concept_scheme = _stub  # type: ignore[assignment]
     compute_transitive_closure_csr = _stub  # type: ignore[assignment]
     get_broader_closure = _stub  # type: ignore[assignment]
-    get_different_from_triples = _stub  # type: ignore[assignment]
     get_ontology_graph = _stub  # type: ignore[assignment]
     get_same_as_triples = _stub  # type: ignore[assignment]
     get_subclass_closure = _stub  # type: ignore[assignment]
@@ -163,17 +161,16 @@ def _insert_alias(
     conn: sqlite3.Connection,
     alias_id: str,
     canonical_id: str,
-    status: str = "active",
     kind: str = "entity",
     method: str = "alias",
 ) -> None:
     """Insert an alias record into real SQLite database."""
     conn.execute(
         """
-        INSERT INTO aliases (alias_id, kind, canonical_id, method, score, status)
-        VALUES (?, ?, ?, ?, 1.0, ?)
+        INSERT INTO aliases (alias_id, kind, canonical_id, method, score)
+        VALUES (?, ?, ?, ?, 1.0)
         """,
-        (alias_id, kind, canonical_id, method, status),
+        (alias_id, kind, canonical_id, method),
     )
 
 
@@ -360,20 +357,20 @@ def test_build_skos_concept_scheme_aliases_alt_label(
         test_db,
         alias_id="concepts:attention-model",
         canonical_id="concepts:transformer",
-        status="active",
     )
     _insert_alias(
         test_db,
         alias_id="concepts:xformer",
         canonical_id="concepts:transformer",
-        status="active",
     )
-    # Contested alias
-    _insert_alias(
+    # Close match soft link (not a hard alias merge)
+    from yaw.storage.db import insert_close_match
+
+    insert_close_match(
         test_db,
-        alias_id="concepts:recurrent-net",
-        canonical_id="concepts:transformer",
-        status="contested",
+        src_id="concepts:recurrent-net",
+        dst_id="concepts:transformer",
+        score=0.82,
     )
     test_db.commit()
 
@@ -390,9 +387,9 @@ def test_build_skos_concept_scheme_aliases_alt_label(
         f"Active alias xformer missing in altLabels: {alt_labels}"
     )
 
-    # Contested alias must NOT appear
+    # Soft close match must NOT appear as skos:altLabel
     assert not any("recurrent-net" in lbl for lbl in alt_labels), (
-        "Contested alias recurrent-net must not be emitted as skos:altLabel"
+        "Close match recurrent-net must not be emitted as skos:altLabel"
     )
 
 
@@ -706,11 +703,9 @@ def test_zero_dl_reasoners_invariant() -> None:
 
 
 def test_get_same_as_triples_active_aliases(test_db: sqlite3.Connection) -> None:
-    """Verify active aliases project into bidirectional owl:sameAs triples."""
-    _insert_alias(
-        test_db, "entities:albert", "entities:albert-einstein", status="active"
-    )
-    _insert_alias(test_db, "entities:marie", "entities:marie-curie", status="active")
+    """Verify aliases project into bidirectional owl:sameAs triples."""
+    _insert_alias(test_db, "entities:albert", "entities:albert-einstein")
+    _insert_alias(test_db, "entities:marie", "entities:marie-curie")
     test_db.commit()
 
     triples = get_same_as_triples(test_db)
@@ -738,44 +733,42 @@ def test_get_same_as_triples_active_aliases(test_db: sqlite3.Connection) -> None
 def test_get_same_as_triples_excludes_contested_and_reversibility(
     test_db: sqlite3.Connection,
 ) -> None:
-    """Verify contested aliases are excluded and status mutation immediately revokes equivalence."""
-    _insert_alias(test_db, "entities:isaac", "entities:isaac-newton", status="active")
-    _insert_alias(
-        test_db, "entities:leibniz", "entities:isaac-newton", status="contested"
-    )
+    """Verify close matches are excluded from sameAs and alias deletion immediately revokes equivalence."""
+    from yaw.storage.db import delete_alias, insert_close_match
+
+    _insert_alias(test_db, "entities:isaac", "entities:isaac-newton")
+    insert_close_match(test_db, "entities:leibniz", "entities:isaac-newton", 0.82)
     test_db.commit()
 
     triples = get_same_as_triples(test_db)
     pairs = {(s, o) for s, p, o in triples}
 
-    # Leibniz must NOT be equated to Newton
+    # Leibniz must NOT be equated to Newton via owl:sameAs
     assert not any("leibniz" in s or "leibniz" in o for s, o in pairs), (
-        "Contested alias 'leibniz' must not generate owl:sameAs triples"
+        "Close match 'leibniz' must not generate owl:sameAs triples"
     )
 
-    # Reversibility test: revoke active status on isaac
-    test_db.execute(
-        "UPDATE aliases SET status = 'contested' WHERE alias_id = 'entities:isaac'"
-    )
+    # Reversibility test: delete alias on isaac
+    delete_alias(test_db, "entities:isaac", "entity")
     test_db.commit()
 
     triples_revoked = get_same_as_triples(test_db)
     assert len(triples_revoked) == 0, (
-        "Revoking active status must instantly remove all owl:sameAs triples"
+        "Deleting alias must instantly remove all owl:sameAs triples"
     )
 
 
-def test_get_different_from_triples_distinct_verdicts(
+def test_canon_verdicts_do_not_project_different_from_triples(
     test_db: sqlite3.Connection,
 ) -> None:
-    """Verify explicit 'distinct' canon verdicts project into bidirectional owl:differentFrom triples."""
+    """Verify ADR-012 §5: distinct canon verdicts do NOT project into owl:differentFrom triples under OWA."""
     _insert_canon_verdict(
         test_db, "entities:heisenberg", "entities:bohr", verdict="distinct"
     )
     _insert_canon_verdict(
         test_db, "entities:dirac", "entities:fermi", verdict="distinct"
     )
-    # Non-distinct verdicts must be excluded
+    # Non-distinct verdicts
     _insert_canon_verdict(
         test_db, "entities:feynman", "entities:richard-feynman", verdict="match"
     )
@@ -784,41 +777,17 @@ def test_get_different_from_triples_distinct_verdicts(
     )
     test_db.commit()
 
-    triples = get_different_from_triples(test_db)
-    assert isinstance(triples, list)
-    assert len(triples) == 4, (
-        f"Expected 4 bidirectional triples for 2 distinct verdicts, got {len(triples)}"
-    )
+    # Verify get_different_from_triples is deleted from yaw.ontology
+    import yaw.ontology as ont
 
-    pairs = {(s, o) for s, p, o in triples if "differentFrom" in p}
-    assert ("entities:heisenberg", "entities:bohr") in pairs or (
-        f"{YAW_PREFIX}entities/heisenberg",
-        f"{YAW_PREFIX}entities/bohr",
-    ) in pairs
-    assert ("entities:bohr", "entities:heisenberg") in pairs or (
-        f"{YAW_PREFIX}entities/bohr",
-        f"{YAW_PREFIX}entities/heisenberg",
-    ) in pairs
+    assert not hasattr(ont, "get_different_from_triples")
 
-    # Match / pending must not generate differentFrom
-    assert not any("feynman" in s or "feynman" in o for s, o in pairs)
-    assert not any("schroedinger" in s or "schroedinger" in o for s, o in pairs)
+    # Verify project_knowledge_graph emits zero owl:differentFrom triples
+    from yaw.storage.rdf import project_knowledge_graph
 
-
-def test_get_different_from_triples_empty_and_duplicate_deduplication(
-    test_db: sqlite3.Connection,
-) -> None:
-    """Verify get_different_from_triples handles empty tables and duplicate entries cleanly."""
-    assert get_different_from_triples(test_db) == []
-
-    # Insert duplicate distinct verdicts between same pair
-    _insert_canon_verdict(test_db, "entities:a", "entities:b", verdict="distinct")
-    _insert_canon_verdict(test_db, "entities:a", "entities:b", verdict="distinct")
-    test_db.commit()
-
-    triples = get_different_from_triples(test_db)
-    # Deduplication must yield exactly 2 bidirectional triples
-    assert len(triples) == 2
+    g = project_knowledge_graph(test_db)
+    diff_triples = list(g.triples((None, OWL.differentFrom, None)))
+    assert len(diff_triples) == 0
 
 
 # ==============================================================================

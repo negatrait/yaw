@@ -9,13 +9,19 @@ import logging
 import re
 import sqlite3
 import urllib.error
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import scipy.sparse as sp
 
-from yaw.nlp import deserialize_embedding, embed_query, is_ollama_online
+from yaw.nlp import (
+    deserialize_embedding,
+    embed_query,
+    format_space_r_query,
+    is_ollama_online,
+)
 from yaw.storage import _clean_fts_query, get_db, search_fts
 
 from .. import config
@@ -23,6 +29,8 @@ from .. import config
 logger = logging.getLogger(__name__)
 
 RELEVANCE_THRESHOLD: float = config.RELEVANCE_THRESHOLD
+FACT_TOP_K: int = getattr(config, "FACT_TOP_K", 5)
+FACT_SEED_LAMBDA: float = getattr(config, "FACT_SEED_LAMBDA", 0.5)
 _QUERY_EMB_EXCEPTIONS = (
     TimeoutError,
     urllib.error.URLError,
@@ -443,7 +451,14 @@ class GraphRAGRetriever:
 
             # Directional Conductance Rules
             r = rel_type.split(":", 1)[1] if ":" in rel_type else rel_type
-            if r in ("subClassOf", "broader", "partOf"):
+            if r in ("closeMatch", "skos:closeMatch", "yaw:closeMatch"):
+                # Symmetric closeMatch conductance: assign edge weight W = score directly without hub dampening
+                w_uv = float(raw_w if raw_w is not None else 1.0)
+                adj_rows.append(u)
+                adj_cols.append(v)
+                adj_weights.append(w_uv)
+                continue
+            elif r in ("subClassOf", "broader", "partOf"):
                 dir_w = compute_upward_conductance(
                     dst
                 )  # Depth-scaled upward conductance
@@ -590,32 +605,6 @@ class GraphRAGRetriever:
         except sqlite3.DatabaseError as db_err:
             logger.warning("Chunk vector scoring query failed: %s", db_err)
 
-    def _score_leaf_nodes_vec(
-        self, conn: sqlite3.Connection, q_bytes: bytes, p0: np.ndarray
-    ) -> None:
-        try:
-            leaf_hits = conn.execute(
-                """
-                SELECT node_id, name, namespace, definition,
-                       vec_distance_cosine(embedding, ?) AS distance
-                FROM leaf_nodes
-                WHERE embedding IS NOT NULL
-                ORDER BY distance ASC LIMIT ?
-                """,
-                (q_bytes, config.VEC_TOP_N),
-            ).fetchall()
-
-            seen_nodes: set[str] = set()
-            for node_id, _name, _ns, _definition, dist in leaf_hits:
-                if node_id in seen_nodes or dist is None:
-                    continue
-                seen_nodes.add(node_id)
-                sim = max(0.0, 1.0 - float(dist))
-                if node_id in self._node_to_idx:
-                    p0[self._node_to_idx[node_id]] += 0.60 * sim
-        except sqlite3.DatabaseError as db_err:
-            logger.warning("Leaf nodes vector scoring query failed: %s", db_err)
-
     async def compute_seed_vector(
         self,
         query: str,
@@ -624,9 +613,10 @@ class GraphRAGRetriever:
     ) -> tuple[np.ndarray, np.ndarray, list[dict[str, Any]]]:
         """Formulate seed vector p0 combining concepts, vector chunks, and BM25 hits.
 
-        Concept canopy seeding evaluates candidate alias priors from InMemoryLookupKB:
-        s_concepts[e] ∝ sum_a P(e | a) * max(0.0, sim(q, e))
-        simplifying continuously to sum_a P(e | a) when q is offline (q = 0).
+        Bayesian concept seed vector fuses candidate alias priors and Space R fact relevance:
+        s_concepts = lambda * s_alias_hat + (1 - lambda) * r_hat
+        where r(q, e) = mean_{f in F_q, e in {subj, obj}} cos(q, f).
+        Simplifying continuously to s_alias_hat when q is offline (q = 0).
         """
         kb = self._get_or_sync_kb(conn)
         self._sync_graph(conn)
@@ -634,7 +624,7 @@ class GraphRAGRetriever:
         if n_nodes == 0:
             return np.zeros(0, dtype=np.float32), np.zeros(768, dtype=np.float32), []
 
-        # 1. Query Embedding (with fast offline guard and bounded timeout)
+        # 1. Query Embedding in Space R (with fast offline guard and bounded timeout)
         if not is_ollama_online(timeout_s=0.5):
             logger.warning(
                 "Ollama is offline; applying continuous mathematical formulation (q = 0)"
@@ -642,8 +632,9 @@ class GraphRAGRetriever:
             q_vec = np.zeros(768, dtype=np.float32)
         else:
             try:
+                space_r_query = format_space_r_query(query)
                 q_vec = await asyncio.wait_for(
-                    embed_query(query, timeout_s=config.CONNECT_TIMEOUT_S),
+                    embed_query(space_r_query, timeout_s=config.CONNECT_TIMEOUT_S),
                     timeout=2.0,
                 )
             except _QUERY_EMB_EXCEPTIONS as emb_err:
@@ -654,44 +645,101 @@ class GraphRAGRetriever:
 
         is_dense_active = not np.all(q_vec == 0)
 
-        # 2. Concept Canopy Seeding via InMemoryLookupKB candidate priors
-        leaf_sims: dict[str, float] = {}
+        # 2. Fact Seeding (Space R) & Concept Canopy Seeding via InMemoryLookupKB candidate priors
+        r_vec = np.zeros(n_nodes, dtype=np.float32)
         if is_dense_active:
             q_bytes = q_vec.astype(np.float32).tobytes()
+            fact_hits: list[tuple[str, float]] = []
             try:
-                leaf_hits = conn.execute(
+                raw_hits = conn.execute(
                     """
-                    SELECT node_id, vec_distance_cosine(embedding, ?) AS distance
-                    FROM leaf_nodes
-                    WHERE embedding IS NOT NULL
-                    ORDER BY distance ASC LIMIT ?
+                    SELECT relation_id, distance
+                    FROM fact_vec
+                    WHERE embedding MATCH ? AND k = ?
                     """,
-                    (q_bytes, config.VEC_TOP_N),
+                    (q_bytes, FACT_TOP_K),
                 ).fetchall()
-                for nid, dist in leaf_hits:
-                    if dist is not None:
-                        leaf_sims[str(nid)] = max(0.0, 1.0 - float(dist))
-            except sqlite3.DatabaseError as db_err:
-                logger.warning("Leaf nodes vector scoring query failed: %s", db_err)
+                fact_hits = [
+                    (str(r[0]), float(r[1]))
+                    for r in raw_hits
+                    if r[0] and r[1] is not None
+                ]
+            except sqlite3.OperationalError:
+                try:
+                    raw_hits = conn.execute(
+                        """
+                        SELECT relation_id, vec_distance_cosine(embedding, ?) AS distance
+                        FROM fact_vec
+                        ORDER BY distance ASC LIMIT ?
+                        """,
+                        (q_bytes, FACT_TOP_K),
+                    ).fetchall()
+                    fact_hits = [
+                        (str(r[0]), float(r[1]))
+                        for r in raw_hits
+                        if r[0] and r[1] is not None
+                    ]
+                except sqlite3.OperationalError as db_err:
+                    logger.debug(
+                        "fact_vec KNN search failed or table not present: %s", db_err
+                    )
+                    fact_hits = []
 
-        s_concepts = np.zeros(n_nodes, dtype=np.float32)
+            if fact_hits:
+                rel_ids = [rid for rid, _ in fact_hits]
+                rel_sim_map = {rid: max(0.0, 1.0 - dist) for rid, dist in fact_hits}
+                placeholders = ",".join("?" for _ in rel_ids)
+                try:
+                    fact_rows = conn.execute(
+                        f"SELECT relation_id, subject_id, object_id FROM leaf_relations WHERE relation_id IN ({placeholders})",
+                        rel_ids,
+                    ).fetchall()
+                    endpoint_sims: dict[str, list[float]] = defaultdict(list)
+                    for r_id, subj, obj in fact_rows:
+                        sim = rel_sim_map.get(str(r_id), 0.0)
+                        if subj:
+                            endpoint_sims[str(subj)].append(sim)
+                        if obj and obj != subj:
+                            endpoint_sims[str(obj)].append(sim)
+
+                    for ent_id, sims in endpoint_sims.items():
+                        if ent_id in self._node_to_idx and sims:
+                            idx = self._node_to_idx[ent_id]
+                            r_vec[idx] = float(np.mean(sims))
+                except sqlite3.OperationalError as rel_err:
+                    logger.debug("leaf_relations query for facts failed: %s", rel_err)
+
+        # Alias candidate priors s_alias[e] = sum_{a in M(q)} P(e | a)
+        s_alias = np.zeros(n_nodes, dtype=np.float32)
         query_mentions = self._extract_query_mentions(query)
         for m in query_mentions:
             if kb.contains_alias(m):
                 for cand in kb.get_alias_candidates(m):
                     ent_id = cand.entity_
-                    prior = cand.prior_prob
+                    prior = float(cand.prior_prob)
                     if ent_id in self._node_to_idx:
                         idx = self._node_to_idx[ent_id]
-                        sim = leaf_sims.get(ent_id, 1.0) if is_dense_active else 1.0
-                        s_concepts[idx] += prior * max(0.0, sim)
+                        s_alias[idx] += prior
 
-        # Complement with direct dense semantic leaf node hits
-        if is_dense_active:
-            for ent_id, sim in leaf_sims.items():
-                if ent_id in self._node_to_idx:
-                    idx = self._node_to_idx[ent_id]
-                    s_concepts[idx] += 0.5 * sim
+        # L1-normalize s_alias and r_vec
+        s_alias_sum = float(np.sum(s_alias))
+        r_vec_sum = float(np.sum(r_vec))
+
+        s_alias_hat = (
+            (s_alias / s_alias_sum) if s_alias_sum > 1e-12 else np.zeros_like(s_alias)
+        )
+        r_hat = (r_vec / r_vec_sum) if r_vec_sum > 1e-12 else np.zeros_like(r_vec)
+
+        # Bayesian concept seed vector: s_concepts = lambda * s_alias_hat + (1 - lambda) * r_hat
+        lambda_val = float(FACT_SEED_LAMBDA)
+        if s_alias_sum > 1e-12 and r_vec_sum > 1e-12:
+            s_concepts = lambda_val * s_alias_hat + (1.0 - lambda_val) * r_hat
+        elif s_alias_sum > 1e-12:
+            s_concepts = s_alias_hat
+        elif r_vec_sum > 1e-12:
+            s_concepts = r_hat
+        else:
+            s_concepts = np.zeros(n_nodes, dtype=np.float32)
 
         s_concepts_sum = float(np.sum(s_concepts))
         if s_concepts_sum > 1e-12:
@@ -859,7 +907,7 @@ class GraphRAGRetriever:
                         f"""
                         SELECT canonical_id, MAX(score)
                         FROM aliases
-                        WHERE canonical_id IN ({m_placeholders}) AND status = 'active'
+                        WHERE canonical_id IN ({m_placeholders})
                         GROUP BY canonical_id
                         """,
                         batch,
@@ -1205,57 +1253,13 @@ def _fetch_chunk_candidates(
     return results
 
 
-def _fetch_leaf_candidates(
-    conn: sqlite3.Connection,
-    q_bytes: bytes,
-    top_n: int,
-) -> list[dict[str, Any]]:
-    """Fetch nearest leaf_nodes candidates in a single pass."""
-    results: list[dict[str, Any]] = []
-    try:
-        rows = conn.execute(
-            "SELECT node_id, source_leaf_id, name, namespace, definition, embedding, "
-            "vec_distance_cosine(embedding, ?) AS distance "
-            "FROM leaf_nodes WHERE embedding IS NOT NULL ORDER BY distance LIMIT ?",
-            (q_bytes, top_n),
-        ).fetchall()
-        for r in rows:
-            if r[6] is None:
-                continue
-            dist = float(r[6])
-            name = str(r[2])
-            namespace = str(r[3])
-            definition = str(r[4]) if r[4] is not None else ""
-            heading = f"{name} ({namespace})"
-            text = f"{heading}: {definition}"
-            results.append(
-                {
-                    "entity_uri": str(r[0]),
-                    "kind": "taxonomy",
-                    "rel_path": str(r[1]),
-                    "heading": heading,
-                    "line_start": None,
-                    "line_end": None,
-                    "embedding": deserialize_embedding(r[5]),
-                    "dist": dist,
-                    "sim": round(max(0.0, 1.0 - dist), 4),
-                    "text": text,
-                }
-            )
-    except sqlite3.DatabaseError as db_err:
-        logger.warning("Leaf node single-pass query failed: %s", db_err)
-    return results
-
-
 def _fetch_candidates_single_pass(
     conn: sqlite3.Connection,
     q_bytes: bytes,
     top_n: int = config.VEC_TOP_N,
 ) -> list[dict[str, Any]]:
-    """Retrieve chunk distance, metadata, and embeddings in a single SQLite query per table."""
-    results = _fetch_chunk_candidates(conn, q_bytes, top_n) + _fetch_leaf_candidates(
-        conn, q_bytes, top_n
-    )
+    """Retrieve chunk distance, metadata, and embeddings in a single SQLite query."""
+    results = _fetch_chunk_candidates(conn, q_bytes, top_n)
     results.sort(key=lambda x: x["dist"])
     return results[:top_n]
 
@@ -1368,7 +1372,6 @@ def _get_candidate_vectors(uris: list[str]) -> dict[str, np.ndarray]:
     vecs: dict[str, np.ndarray] = {}
     try:
         _fetch_table_vectors(conn, "note_chunks", "entity_uri", uris, vecs)
-        _fetch_table_vectors(conn, "leaf_nodes", "node_id", uris, vecs)
         return vecs
     finally:
         conn.close()

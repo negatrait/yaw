@@ -486,8 +486,9 @@ def _index_ontology_fts_and_vectors(
     detected_prefix: str,
 ) -> None:
     """Index dynamic ontology classes and properties into query_fts and compute vector embeddings."""
-    from yaw.nlp import embed_texts_sync, format_prompt, is_ollama_online
-    from yaw.storage.db import serialize_embedding
+    from yaw.nlp import embed_texts_sync, is_ollama_online
+    from yaw.nlp.embeddings import format_space_s
+    from yaw.storage.db import insert_entity_vec, serialize_embedding
 
     master_tables = {
         r[0]
@@ -509,12 +510,17 @@ def _index_ontology_fts_and_vectors(
             logger.debug("Could not create query_fts virtual table: %s", op_err)
 
     if "query_fts" in master_tables:
+        rel_path = f"dynamic_ontology:{detected_prefix}"
+        try:
+            conn.execute("DELETE FROM query_fts WHERE rel_path = ?", (rel_path,))
+        except sqlite3.OperationalError as op_err:
+            logger.debug("Could not delete existing query_fts entries: %s", op_err)
+
         for rc in raw_classes:
             curie = str(rc["curie"])
             label = str(rc.get("label", "")).strip()
             definition = str(rc.get("definition", "")).strip()
             content = f"{label}: {definition}" if definition else label
-            rel_path = f"dynamic_ontology:{detected_prefix}"
             conn.execute(
                 "INSERT INTO query_fts(entity_uri, rel_path, heading, content) VALUES (?, ?, ?, ?)",
                 (curie, rel_path, label, content),
@@ -525,19 +531,16 @@ def _index_ontology_fts_and_vectors(
             label = str(rp.get("label", "")).strip()
             definition = str(rp.get("definition", "")).strip()
             content = f"{label}: {definition}" if definition else label
-            rel_path = f"dynamic_ontology:{detected_prefix}"
             conn.execute(
                 "INSERT INTO query_fts(entity_uri, rel_path, heading, content) VALUES (?, ?, ?, ?)",
                 (curie, rel_path, label, content),
             )
 
-    if "leaf_nodes" in master_tables and raw_classes:
+    if raw_classes:
         prompts = [
-            format_prompt(
-                f"{str(rc.get('label', '')).strip()}: {str(rc.get('definition', '')).strip()}"
-                if str(rc.get("definition", "")).strip()
-                else str(rc.get("label", "")).strip(),
-                task="Classification",
+            format_space_s(
+                str(rc.get("label", "")).strip(),
+                str(rc.get("definition", "")).strip(),
             )
             for rc in raw_classes
         ]
@@ -552,26 +555,16 @@ def _index_ontology_fts_and_vectors(
                 )
 
         for i, rc in enumerate(raw_classes):
-            curie = str(rc["curie"])
-            label = str(rc.get("label", "")).strip()
-            definition = str(rc.get("definition", "")).strip()
-            source_leaf_id = f"dynamic_ontology:{detected_prefix}"
-            emb_bytes = serialize_embedding(embs[i]) if i < len(embs) else None
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO leaf_nodes (
-                    node_id, source_leaf_id, name, namespace, definition, embedding
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    curie,
-                    source_leaf_id,
-                    label,
-                    detected_prefix,
-                    definition,
-                    emb_bytes,
-                ),
-            )
+            if i < len(embs) and embs[i] is not None:
+                curie = str(rc["curie"])
+                emb_bytes = serialize_embedding(embs[i])
+                if emb_bytes is not None:
+                    try:
+                        insert_entity_vec(conn, curie, detected_prefix, emb_bytes)
+                    except sqlite3.OperationalError as err:
+                        logger.warning(
+                            "Could not insert entity vector for %s: %s", curie, err
+                        )
 
 
 def _persist_ontology_catalog(
@@ -677,11 +670,8 @@ def sync_dynamic_ontology_to_kb(
         """
         SELECT a.alias_id, a.canonical_id, a.score
         FROM aliases a
-        WHERE a.status = 'active'
-          AND (
-            a.canonical_id IN (SELECT curie FROM dynamic_classes WHERE ontology_id = ?)
-            OR a.canonical_id IN (SELECT curie FROM dynamic_properties WHERE ontology_id = ?)
-          )
+        WHERE a.canonical_id IN (SELECT curie FROM dynamic_classes WHERE ontology_id = ?)
+           OR a.canonical_id IN (SELECT curie FROM dynamic_properties WHERE ontology_id = ?)
         """,
         (ontology_id, ontology_id),
     ).fetchall()

@@ -47,7 +47,8 @@ from yaw.nlp import (
     embed_texts,
     extract_leaf_taxonomy,
     format_document,
-    format_prompt,
+    format_space_r_doc,
+    format_space_s,
     get_leaf_pipeline,
     is_ollama_online,
     parse_extracted_triples,
@@ -60,6 +61,9 @@ from yaw.storage import (
     clean_db,
     ensure_schema_views,
     get_db,
+    insert_entity_vec,
+    insert_fact_vec,
+    serialize_embedding,
 )
 
 from .. import config
@@ -124,7 +128,6 @@ class LeafNodeRow:
     name: str
     namespace: str
     definition: str
-    embedding: list[float]
 
 
 @dataclass
@@ -478,12 +481,14 @@ async def _resolve_and_store_nodes(
     conn: sqlite3.Connection | None,
     kb: InMemoryLookupKB | None = None,
 ) -> None:
-    """Step 4: Embed, resolve canonical entities, and persist LeafNodeRow."""
+    """Step 4: Embed in Space S, resolve canonical entities, and persist LeafNodeRow."""
     if not raw_nodes:
         return
-    node_texts = [f"{node.name}: {node.definition}" for _, node in raw_nodes.values()]
-    formatted = [format_prompt(t, task="Classification") for t in node_texts]
+    formatted = [
+        format_space_s(node.name, node.definition) for _, node in raw_nodes.values()
+    ]
     node_vecs = await embed_texts(formatted)
+
     for (node_id, (source_leaf_id, node)), vec in zip(raw_nodes.items(), node_vecs):
         node_vec = vec.tolist()
         try:
@@ -498,6 +503,11 @@ async def _resolve_and_store_nodes(
                 kb=kb,
                 canonical_id=node.canonical_id,
             )
+
+            if conn is not None:
+                vec_bytes = serialize_embedding(node_vec)
+                if vec_bytes:
+                    insert_entity_vec(conn, node_id, node.namespace, vec_bytes)
         except _CANON_EXCEPTIONS as res_err:
             logger.warning("Entity resolution failed for %s: %s", node.name, res_err)
 
@@ -508,7 +518,6 @@ async def _resolve_and_store_nodes(
                 name=node.name,
                 namespace=node.namespace,
                 definition=node.definition,
-                embedding=node_vec,
             )
         )
 
@@ -519,8 +528,9 @@ def _resolve_and_store_relations(
     conn: sqlite3.Connection | None,
     seen_rel_ids: set[str],
     kb: InMemoryLookupKB | None = None,
+    fact_embeddings: dict[str, list[float]] | None = None,
 ) -> None:
-    """Step 5: Resolve predicate universals and persist LeafRelationRow."""
+    """Step 5: Resolve predicate universals, persist LeafRelationRow, and index fact vectors in Space R."""
     for source_leaf_id, triple in all_triples:
         try:
             resolve(
@@ -562,6 +572,12 @@ def _resolve_and_store_relations(
                     weight=1.0,
                 )
             )
+            if conn is not None and fact_embeddings:
+                fact_vec = fact_embeddings.get(rel_id)
+                if fact_vec:
+                    emb_bytes = serialize_embedding(fact_vec)
+                    if emb_bytes:
+                        insert_fact_vec(conn, rel_id, emb_bytes)
 
 
 def _store_chunk_concept_edges(
@@ -648,6 +664,41 @@ async def _declare_chunk_embeddings(
         )
 
 
+async def _embed_relation_facts(
+    all_triples: list[tuple[str, ExtractedTriple]],
+) -> dict[str, list[float]]:
+    """Render deterministic relation strings in Space R and embed them in batches."""
+    if not all_triples:
+        return {}
+    unique_facts: dict[str, str] = {}
+    for source_leaf_id, triple in all_triples:
+        rel_id = _relation_id(
+            source_leaf_id,
+            triple.subject.name,
+            triple.predicate.name,
+            triple.object.name,
+        )
+        if rel_id not in unique_facts:
+            fact_str = (
+                f"{triple.subject.name} {triple.predicate.name} {triple.object.name}"
+            )
+            unique_facts[rel_id] = fact_str
+
+    if not unique_facts:
+        return {}
+
+    fact_rel_ids = list(unique_facts.keys())
+    fact_prompts = [
+        format_space_r_doc(title="", text=unique_facts[rid]) for rid in fact_rel_ids
+    ]
+    try:
+        fact_vecs = await embed_texts(fact_prompts)
+        return {rid: vec.tolist() for rid, vec in zip(fact_rel_ids, fact_vecs)}
+    except (urllib.error.URLError, TimeoutError, OSError, RuntimeError) as emb_err:
+        logger.warning("Failed to embed relation facts: %s", emb_err)
+        return {}
+
+
 async def _persist_canonical_knowledge(
     raw_nodes: dict[str, tuple[str, ExtractedNode]],
     all_triples: list[tuple[str, ExtractedTriple]],
@@ -672,8 +723,16 @@ async def _persist_canonical_knowledge(
         await _resolve_and_store_nodes(raw_nodes, nodes_target, conn, kb=kb)
         seen_rel_ids: set[str] = set()
         if all_triples:
+            fact_embeddings: dict[str, list[float]] = {}
+            if conn is not None:
+                fact_embeddings = await _embed_relation_facts(all_triples)
             _resolve_and_store_relations(
-                all_triples, relations_target, conn, seen_rel_ids, kb=kb
+                all_triples,
+                relations_target,
+                conn,
+                seen_rel_ids,
+                kb=kb,
+                fact_embeddings=fact_embeddings,
             )
         _store_chunk_concept_edges(
             raw_nodes,

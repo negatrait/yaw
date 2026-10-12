@@ -115,7 +115,7 @@ class ExtractedNode(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str = Field(min_length=1)
     namespace: str
-    definition: str = Field(min_length=1)
+    definition: str = Field(default="", description="Sentential or lexical definition")
     canonical_id: str | None = None
 
     @field_validator("namespace")

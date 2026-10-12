@@ -350,13 +350,19 @@ def test_dynamic_ontology_ingestion_inserts_fts_and_vectors(
     ).fetchall()
     assert len(fts_rows) >= 2
 
-    # Verify leaf_nodes contains stored vector embeddings
+    # Verify leaf_nodes contains 0 rows for dynamic ontology (Invariant 1: note extractions only)
     leaf_rows = test_db.execute(
-        "SELECT node_id, name, embedding FROM leaf_nodes WHERE node_id LIKE 'bio:%'"
+        "SELECT node_id FROM leaf_nodes WHERE node_id LIKE 'bio:%'"
     ).fetchall()
-    assert len(leaf_rows) >= 2
-    for row in leaf_rows:
+    assert len(leaf_rows) == 0
+
+    # Verify entity_vec contains stored vector embeddings in Space S
+    vec_rows = test_db.execute(
+        "SELECT entity_id, partition_key, embedding FROM entity_vec WHERE partition_key = 'bio'"
+    ).fetchall()
+    assert len(vec_rows) >= 2
+    for row in vec_rows:
         assert row[2] is not None, (
-            f"Node {row[0]} is missing vector embedding BLOB in leaf_nodes"
+            f"Entity {row[0]} is missing vector embedding in entity_vec"
         )
         assert len(row[2]) > 0

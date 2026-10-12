@@ -172,3 +172,7 @@ predicates:prevents a owl:ObjectProperty ;
     skos:prefLabel "prevents" ;
     rdfs:subPropertyOf predicates:Root ;
     owl:propertyDisjointWith predicates:causes .
+
+yaw:closeMatch a owl:ObjectProperty , owl:SymmetricProperty ;
+    rdfs:label "closeMatch" ;
+    skos:prefLabel "closeMatch" .
