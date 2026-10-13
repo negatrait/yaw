@@ -9,13 +9,7 @@ tags:
   - clippings
 ---
 
-> [!IMPORTANT]
-> **YAW Engine Architectural Context & Probabilistic Seed Vector Formulation ($\mathbf{p}_0$)**:  
-> In YAW's GraphRAG engine ([`FOUNDATIONAL.md §5.3`](file:///home/harri/yaw/FOUNDATIONAL.md), [`docs/power-pagerank.md`](file:///home/harri/yaw/docs/power-pagerank.md), [`docs/adr/ADR-010.md`](file:///home/harri/yaw/docs/adr/ADR-010.md)), Personalized PageRank (PPR) is computed query-time over an in-memory SciPy Compressed Sparse Row (CSR) matrix. Rather than restricting the preference vector to a degenerate single-node indicator $\boldsymbol{e}_s$, YAW operationalizes the **Generalized Preference Vector** (Section II-B) as a multi-modal, probabilistic personalization seed vector:
-> $$\mathbf{p}_0 = \beta_1 \cdot \mathbf{s}_{\text{concepts}} + \beta_2 \cdot \mathbf{s}_{\text{chunks\_vec}} + \beta_3 \cdot \mathbf{s}_{\text{chunks\_fts}}$$
-> $$\mathbf{s}_{\text{concepts}} = \lambda \widehat{\mathbf{s}}_{\text{alias}} + (1 - \lambda) \widehat{\mathbf{r}}, \quad \text{where } \mathbf{s}_{\text{alias}}[e] = \sum_{a \in M(q)} P(e \mid a)$$
-> This query-to-fact seeding incorporates continuous candidate prior distributions $P(e \mid a) \in (0, 1]$ maintained natively in spaCy's compiled C/Cython `InMemoryLookupKB` and query-to-fact relevance $r(q, e)$ from `fact_vec`.
-> This prevents premature winner-take-all discretization of polysemous mentions, transforming the subsequent power iteration diffusion ($\mathbf{p}^{(t+1)} = \alpha \mathbf{P}^T \mathbf{p}^{(t)} + (1-\alpha)\mathbf{p}_0$) into a mechanism for **Topological Disambiguation** and enabling Bayesian evidence fusion for chunk ranking: $\text{Score}(c) = \left( \sum_{e \in c} P(e \mid a) \cdot \mathbf{p}^*[e] + \mathbf{p}^*[c] \right) \cdot \text{sim}(q, c)$.
+> **Research reference:** The survey below is upstream material, not YAW's executable specification. Use the [PPR guide](power-pagerank.md) and [FOUNDATIONAL](../FOUNDATIONAL.md) for the current contract. Normalized graph relevance does not establish factual truth or hard identity.
 
 Mingji Yang    Hanzhi Wang    Zhewei Wei    Sibo Wang    Ji-Rong Wen
 
@@ -66,7 +60,7 @@ We first give the algebraic definition of PPR. We denote the PPR vector w.r.t. a
 $$
 \displaystyle\boldsymbol{\pi}_{s}
 $$
- 
+
 $$
 \displaystyle=(1-\alpha)\mathbf{P}\boldsymbol{\pi}_{s}+\alpha\cdot\boldsymbol{e}_{s},
 $$
@@ -76,12 +70,12 @@ where $\alpha\in(0,1)$ is a predefined parameter called the teleportation probab
 $$
 \displaystyle\boldsymbol{\pi}_{s}
 $$
- 
+
 $$
 \displaystyle=\alpha\big(\mathbf{I}-(1-\alpha)\mathbf{P}\big)^{-1}\boldsymbol{e}_{s},
 $$
 
-which establishes the existence and uniqueness of $\boldsymbol{\pi}_{s}$. A more general definition of PPR allows the preference vector in Eqn. (1) to be an arbitrary probability distribution vector, rather than being limited to indicator vectors. As we will see from Thm. 1, these generalized PPR vectors are linear combinations of the PPR vectors in our definition. *(In YAW, this generalized preference vector is operationalized as the multi-modal seed vector $\mathbf{p}_0 = \beta_1 \mathbf{s}_{\text{concepts}} + \beta_2 \mathbf{s}_{\text{chunks\_vec}} + \beta_3 \mathbf{s}_{\text{chunks\_fts}}$, where $\mathbf{s}_{\text{concepts}}[e]$ incorporates the alias candidate prior distribution $P(e \mid a) \in (0, 1]$ via `InMemoryLookupKB`; see [`docs/adr/ADR-010.md`](file:///home/harri/yaw/docs/adr/ADR-010.md) and [`docs/power-pagerank.md`](file:///home/harri/yaw/docs/power-pagerank.md)).*
+which establishes the existence and uniqueness of $\boldsymbol{\pi}_{s}$. A more general definition of PPR allows the preference vector in Eqn. (1) to be an arbitrary probability distribution vector, rather than being limited to indicator vectors. As we will see from Thm. 1, these generalized PPR vectors are linear combinations of the PPR vectors in our definition. *(In YAW, this generalized preference vector is operationalized as the multi-modal seed vector $\mathbf{p}_0 = \beta_1 \mathbf{s}_{\text{concepts}} + \beta_2 \mathbf{s}_{\text{chunks\_vec}} + \beta_3 \mathbf{s}_{\text{chunks\_fts}}$, where $\mathbf{s}_{\text{concepts}}[e]$ incorporates the alias candidate prior distribution $P(e \mid a) \in (0, 1]$ via `InMemoryLookupKB`; see [`docs/adr/ADR-010.md`](adr/ADR-010.md) and [`docs/power-pagerank.md`](power-pagerank.md)).*
 
 Random-Walk-Based Interpretations. Apart from the algebraic definition, there are two more comprehensible interpretations of PPR. Both of them are based on a critical concept called random walk, with two slightly different definitions.
 
@@ -96,7 +90,7 @@ PageRank. We denote the PageRank vector as $\boldsymbol{\pi}$, which assigns a c
 $$
 \displaystyle\boldsymbol{\pi}
 $$
- 
+
 $$
 \displaystyle=(1-\alpha)\mathbf{P}\boldsymbol{\pi}+\alpha\cdot\frac{1}{n}\boldsymbol{1}.
 $$
@@ -125,7 +119,7 @@ Error Measures. For two $n$ -dimensional vectors $\boldsymbol{\hat{x}}$ and $\bo
 - $\ell_{1}$ -error: $\lVert\boldsymbol{\hat{x}}-\boldsymbol{x}\rVert_{1}=\sum_{v\in V}\big\lvert\boldsymbol{\hat{x}}(v)-\boldsymbol{x}(v)\big\rvert.$
 - $\ell_{2}$ -error: $\lVert\boldsymbol{\hat{x}}-\boldsymbol{x}\rVert_{2}=\sqrt{\sum_{v\in V}\big(\boldsymbol{\hat{x}}(v)-\boldsymbol{x}(v)\big)^{2}}.$
 - absolute error (a.k.a. additive error or $\ell_{\infty}$ -error for vectors): $\lVert\boldsymbol{\hat{x}}-\boldsymbol{x}\rVert_{\infty}=\max_{v\in V}\big\lvert\boldsymbol{\hat{x}}(v)-\boldsymbol{x}(v)\big\rvert$, or $|\hat{x}-x|$.
-- relative error with threshold $\mu$:  
+- relative error with threshold $\mu$:\
 	$\max_{v\in V:\boldsymbol{x}(v)\geq\mu}\frac{|\boldsymbol{\hat{x}}(v)-\boldsymbol{x}(v)|}{\boldsymbol{x}(v)}$, or $\frac{\lvert\hat{x}-x\rvert}{x}\cdot\mathds{1}\{x\geq\mu\}$.
 
 These definitions are straightforward, except for relative error: given the inherent difficulty of achieving the same relative error for smaller values, many relevant algorithms offer relative error bounds only for values above a threshold $\mu$. Also, note that these error measures are not directly applicable for the top- $k$ PPR query; we will discuss the approximation guarantees separately for the top- $k$ PPR query.
@@ -196,21 +190,21 @@ Some other algebraic properties of PPR are listed below, wherein $\lVert\boldsym
 $$
 \displaystyle\lVert\boldsymbol{\pi}_{s}\rVert_{1}=1
 $$
- 
+
 $$
 \displaystyle,\ \left\lVert\boldsymbol{\pi}^{-1}_{t}\right\rVert_{1}=n\boldsymbol{\pi}(t).
 $$
 $$
 \displaystyle\boldsymbol{\pi}_{s}=\mathbf{\Pi}\boldsymbol{e}_{s}
 $$
- 
+
 $$
 \displaystyle,\ \boldsymbol{\pi}^{-1}_{t}=\mathbf{\Pi}^{\top}\boldsymbol{e}_{t}.
 $$
 $$
 \displaystyle\lVert\mathbf{\Pi}\boldsymbol{x}\rVert_{1}=\lVert\boldsymbol{x}\rVert_{1}
 $$
- 
+
 $$
 \displaystyle,\ \mathbf{\Pi}^{\top}\boldsymbol{1}=\boldsymbol{1}.
 $$
@@ -228,14 +222,14 @@ The following theorem provides a method to decompose a node’s PPR vector or in
 $$
 \displaystyle\boldsymbol{\pi}_{v}
 $$
- 
+
 $$
 \displaystyle=\frac{1-\alpha}{d_{\mathrm{out}}(v)}\sum_{u\in\mathcal{N}_{\mathrm{out}}(v)}\boldsymbol{\pi}_{u}+\alpha\boldsymbol{e}_{v},
 $$
 $$
 \displaystyle\boldsymbol{\pi}^{-1}_{v}
 $$
- 
+
 $$
 \displaystyle=(1-\alpha)\sum_{u\in\mathcal{N}_{\mathrm{in}}(v)}\frac{\boldsymbol{\pi}^{-1}_{u}}{d_{\mathrm{out}}(u)}+\alpha\boldsymbol{e}_{v}.
 $$
@@ -277,14 +271,14 @@ Cumulative Power Iteration. We additionally introduce a variant of PI since it c
 $$
 \displaystyle\boldsymbol{r}^{(L)}
 $$
- 
+
 $$
 \displaystyle=(1-\alpha)^{L}\mathbf{P}^{L}\boldsymbol{e}_{s},
 $$
 $$
 \displaystyle\boldsymbol{\hat{\pi}}_{s}^{(L)}
 $$
- 
+
 $$
 \displaystyle=\alpha\sum_{\ell=0}^{L-1}\boldsymbol{r}^{(\ell)}=\alpha\sum_{\ell=0}^{L-1}(1-\alpha)^{\ell}\mathbf{P}^{\ell}\boldsymbol{e}_{s}.
 $$
@@ -294,28 +288,28 @@ We can compute $\boldsymbol{r}^{(L)}$ and $\boldsymbol{\hat{\pi}}_{s}^{(L)}$ ite
 $$
 \displaystyle\boldsymbol{r}^{(0)}
 $$
- 
+
 $$
 \displaystyle=\boldsymbol{e}_{s},
 $$
 $$
 \displaystyle\quad\boldsymbol{r}^{(L+1)}
 $$
- 
+
 $$
 \displaystyle=(1-\alpha)\mathbf{P}\boldsymbol{r}^{(L)},
 $$
 $$
 \displaystyle\boldsymbol{\hat{\pi}}_{s}^{(0)}
 $$
- 
+
 $$
 \displaystyle=\boldsymbol{0},
 $$
 $$
 \displaystyle\quad\boldsymbol{\hat{\pi}}_{s}^{(L+1)}
 $$
- 
+
 $$
 \displaystyle=\boldsymbol{\hat{\pi}}_{s}^{(L)}+\alpha\boldsymbol{r}^{(L)}.
 $$
@@ -327,11 +321,11 @@ Again, we choose a parameter $T$, compute $\boldsymbol{\hat{\pi}}_{s}^{(0)}$ thr
 $$
 \displaystyle\left\lVert\boldsymbol{\hat{\pi}}_{s}^{(T)}-\boldsymbol{\pi}_{s}\right\rVert_{1}=\left\lVert\alpha\sum_{\ell=T}^{\infty}(1-\alpha)^{\ell}\mathbf{P}^{\ell}\boldsymbol{e}_{s}\right\rVert_{1}
 $$
- 
+
 $$
 \displaystyle=
 $$
- 
+
 $$
 \displaystyle\alpha\sum_{\ell=T}^{\infty}(1-\alpha)^{\ell}\left\lVert\mathbf{P}^{\ell}\boldsymbol{e}_{s}\right\rVert_{1}=\alpha\sum_{\ell=T}^{\infty}(1-\alpha)^{\ell}=(1-\alpha)^{T}.
 $$
@@ -403,11 +397,11 @@ However, since $\mathbf{P}^{\top}$ is no longer column-stochastic as $\mathbf{P}
 $$
 \displaystyle\left\lVert\boldsymbol{\hat{\pi}}_{t}^{(-T)}-\boldsymbol{\pi}^{-1}_{t}\right\rVert_{\infty}\leq\left\lVert\alpha\sum_{\ell=T}^{\infty}(1-\alpha)^{\ell}\left(\mathbf{P}^{\top}\right)^{\ell}\boldsymbol{1}\right\lVert_{\infty}
 $$
- 
+
 $$
 \displaystyle=
 $$
- 
+
 $$
 \displaystyle\left\lVert\alpha\sum_{\ell=T}^{\infty}(1-\alpha)^{\ell}\boldsymbol{1}\right\rVert_{\infty}=(1-\alpha)^{T}.
 $$
@@ -465,11 +459,11 @@ Error Bound. As Line 2 implies, after termination, the residue vector satisfies 
 $$
 \displaystyle\left\lVert\boldsymbol{\hat{\pi}}^{(\mathrm{b})}_{t}-\boldsymbol{\pi}^{-1}_{t}\right\rVert_{\infty}=\left\lVert\mathbf{\Pi}^{\top}\boldsymbol{r}^{(\mathrm{b})}_{t}\right\rVert_{\infty}
 $$
- 
+
 $$
 \displaystyle\leq
 $$
- 
+
 $$
 \displaystyle\left\lVert\mathbf{\Pi}^{\top}\cdot r_{\mathrm{max}}^{(\mathrm{b})}\cdot\boldsymbol{1}\right\rVert_{\infty}=r_{\mathrm{max}}^{(\mathrm{b})}\cdot\lVert\boldsymbol{1}\rVert_{\infty}=r_{\mathrm{max}}^{(\mathrm{b})}.
 $$
@@ -494,7 +488,7 @@ $$
 $$
 \displaystyle\Leftrightarrow
 $$
- 
+
 $$
 \displaystyle\frac{\boldsymbol{\pi}_{s}(v)}{d(v)}-r_{\mathrm{max}}^{(\mathrm{f})}\leq\frac{\boldsymbol{\hat{\pi}}^{(\mathrm{f})}_{s}(v)}{d(v)}\leq\frac{\boldsymbol{\pi}_{s}(v)}{d(v)},\quad\forall v\in V.
 $$

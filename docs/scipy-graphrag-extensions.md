@@ -1,3 +1,14 @@
+# SciPy GraphRAG research extensions
+
+**Status:** Research alternatives; not selected runtime requirements. The [PPR guide](power-pagerank.md) owns the current retrieval algorithm.
+
+Shortest paths can describe graph connectivity but do not prove that a chain of arbitrary predicates is a valid logical inference. Linear-system solvers need their own sparsity, conditioning and workload evaluation before replacing the selected power iteration. Preserve provenance and distinguish navigation from entailment.
+
+The original research note follows as historical material; its unmeasured guarantees and architectural prescriptions are not current requirements.
+
+<details>
+<summary>Historical research note</summary>
+
 ---
 title: "SciPy GraphRAG Extensions: Shortest Paths and Linear System PPR Solvers"
 source: "internal://llm-wiki/architecture/scipy-graphrag-extensions"
@@ -141,3 +152,5 @@ def ppr_direct_solve(
 ### Architectural Recommendation
 1. **Online Query Diffusion**: Retain **iterative power method** (`M.dot(p)`) for `search_graph_activation` in `graph.py`. It runs in $<0.2\text{ ms}$, conserves total probability at every step without fill-in memory, and requires zero cache re-factorization when SQLite notes are updated live.
 2. **Offline Precomputation & Inversion**: Use `spla.splu` only when precomputing the full all-pairs inverse resolvent matrix $(I - \alpha M)^{-1}$ for static graph snapshots, where repeated queries can be computed as a single sparse-dense product without re-solving.
+
+</details>

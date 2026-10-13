@@ -1,11 +1,13 @@
+> **Reference material:** This document supplies background, not an alternative YAW implementation. [FOUNDATIONAL](../FOUNDATIONAL.md), [Epic 7.8](epic7.8-open-ie-ontology-alignment.md) and the focused guides define the selected path and current gates.
+
 # Architectural Evaluation: Neo4j vs In-Process SQLite + SciPy (SUPERSEDED)
 
 > [!WARNING]
-> **SUPERSEDED SPECIFICATION:** This document explores an external Neo4j / property graph database integration. It is superseded by Invariant 3 in [`FOUNDATIONAL.md`](file:///home/harri/yaw/FOUNDATIONAL.md) and [`docs/adr/ADR-008.md`](file:///home/harri/yaw/docs/adr/ADR-008.md). YAW strictly uses a single in-process SQLite database with SciPy sparse matrix PageRank and in-process W3C RDF/SHACL validation.
+> **SUPERSEDED SPECIFICATION:** This document explores an external Neo4j / property graph database integration. It is superseded by Invariant 3 in [`FOUNDATIONAL.md`](../FOUNDATIONAL.md) and [`docs/adr/ADR-008.md`](adr/ADR-008.md). YAW strictly uses a single in-process SQLite database with SciPy sparse matrix PageRank and in-process W3C RDF/SHACL validation.
 
-**Status:** Architectural Decision Record / Superseded Evaluation  
-**Governing Canon:** [`FOUNDATIONAL.md §2 Invariant 3`](file:///home/harri/yaw/FOUNDATIONAL.md), [`docs/adr/ADR-008.md`](file:///home/harri/yaw/docs/adr/ADR-008.md)  
-**Authoritative Implementation:** In-process SQLite quad substrate in [`src/yaw/storage/db.py`](file:///home/harri/yaw/src/yaw/storage/db.py) and SciPy PPR in [`src/yaw/retrieval/retriever.py`](file:///home/harri/yaw/src/yaw/retrieval/retriever.py).
+**Status:** Architectural Decision Record / Superseded Evaluation\
+**Governing Canon:** [`FOUNDATIONAL.md §2 Invariant 3`](../FOUNDATIONAL.md), [`docs/adr/ADR-008.md`](adr/ADR-008.md)\
+**Authoritative Implementation:** In-process SQLite quad substrate in [`src/yaw/storage/db.py`](../src/yaw/storage/db.py) and SciPy PPR in [`src/yaw/retrieval/retriever.py`](../src/yaw/retrieval/retriever.py).
 
 ---
 

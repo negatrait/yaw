@@ -9,8 +9,10 @@ tags:
   - "clippings"
 ---
 
+> **Reference material:** This document supplies background, not an alternative YAW implementation. [FOUNDATIONAL](../FOUNDATIONAL.md), [Epic 7.8](epic7.8-open-ie-ontology-alignment.md) and the focused guides define the selected path and current gates.
+
 > [!NOTE]
-> **EXTERNAL REFERENCE / CLIPPING:** This document is an external documentation archive from spacy.io. For YAW's authoritative, production-grade spaCy-LLM integration contracts, model registry, and Jinja2 Open IE templates, refer to [`docs/how-to-handle-spacy-llm.md`](file:///home/harri/yaw/docs/how-to-handle-spacy-llm.md) and [`docs/open-ie-authoritative-source.md`](file:///home/harri/yaw/docs/open-ie-authoritative-source.md).
+> **EXTERNAL REFERENCE / CLIPPING:** This document is an external documentation archive from spacy.io. For YAW's authoritative, production-grade spaCy-LLM integration contracts, model registry, and Jinja2 Open IE templates, refer to [`docs/how-to-handle-spacy-llm.md`](how-to-handle-spacy-llm.md) and [`docs/open-ie-authoritative-source.md`](open-ie-authoritative-source.md).
 
 [The spacy-llm package](https://github.com/explosion/spacy-llm) integrates Large Language Models (LLMs) into spaCy pipelines, featuring a modular system for **fast prototyping** and **prompting**, and turning unstructured responses into **robust outputs** for various NLP tasks, **no training data** required.
 

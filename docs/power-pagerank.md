@@ -1,195 +1,79 @@
-# Query-Time Power Personalized PageRank (PPR) Engine
+# Query-time Personalized PageRank
 
-**Status:** Authoritative Specification & Codebase Reality  
-**Governing Canon:** [`FOUNDATIONAL.md §5.3`](file:///home/harri/yaw/FOUNDATIONAL.md), [`docs/scipy-graphrag-extensions.md`](file:///home/harri/yaw/docs/scipy-graphrag-extensions.md)  
-**Implementation:** [`src/yaw/retrieval/retriever.py`](file:///home/harri/yaw/src/yaw/retrieval/retriever.py)
+**Status:** Target retrieval specification; runtime conformance pending [Epic 7.8](epic7.8-open-ie-ontology-alignment.md).\
+**Contract:** [FOUNDATIONAL](../FOUNDATIONAL.md), [ADR-012 as amended](adr/ADR-012.md), [ADR-014](adr/ADR-014.md).\
+**Executable owner:** `src/yaw/retrieval/retriever.py`; one structured `GraphRAGRetriever.retrieve` result serves MCP, CLI and evaluation. Numerical settings live only in `src/yaw/config.py` / `config.toml`.
 
----
+## Graph and conductance
 
-## 1. Overview & Architectural Role
+Build a consistent versioned snapshot from active node/edge projections, including source occurrences, admitted domain resources and provenance-labelled associations. Do not use database-file modification time alone as a complete semantic cache key, particularly with WAL; track committed data/resource/projection generations.
 
-YAW rejects dense vector-only retrieval and uniform graph traversal in favor of **dual-layer Personalized PageRank (PPR)** computed query-time over an in-memory SciPy Compressed Sparse Row (CSR) matrix.
+Domain-specific property traits and membership come from semantic resources. Generic traversal policy can assign different upward/downward, sequential, wikilink and candidate-link weights. Configuration owns numerical weights. Never infer a property's semantics solely by stripping its prefix and comparing its local name.
 
-Rather than searching for disconnected prose fragments, the engine:
-1. Projects queries onto localized **seed concepts and chunk canopies** ($\mathbf{p}_0$).
-2. Diffuses probability mass across the unified knowledge graph topology (`unified_edges`).
-3. Discovers high-conductance **Bridging Subgraphs** connecting abstract ontological concepts to concrete source evidence slices.
+Reverse navigation edges and candidate associations are retrieval structures; exporting them as logical assertions requires independent semantic justification. Human wikilinks and source-grounded semantic edges have equal baseline importance before explicit traversal policy.
 
-```
-                      Query: "How does relativity affect GPS clocks?"
-                                          │
-                  ┌───────────────────────┴───────────────────────┐
-                  ▼                                               ▼
-         FTS5 BM25 Lexical Search                 Alias Priors + Query→Fact / Chunk KNN
-                  │ (weight: 0.20)                                │ (weights: 0.60 concept, 0.20 chunk)
-                  └───────────────────────┬───────────────────────┘
-                                          ▼
-                             Localized Seed Vector (p0)
-                                          │
-                                          ▼
-                      SciPy CSR Power Iteration Diffusion (α = 0.85)
-                         Over `unified_edges` + Sequence Flow
-                                          │
-                                          ▼
-                         Converged Distribution (p*)
-                                          │
-                                          ▼
-                          Bridging Subgraph Extraction
-                        & Zero-Copy Disk Slice Hydration
-```
+The selected upward policy is `w_up(u,v) = max(w_floor, 1 / (1 + log2(1 + depth(v))))`, initially `w_floor=0.2`. Depth is the shortest root-to-node distance in the current admitted organizational/taxonomic traversal hierarchy, roots at zero. Compute depth on the directed acyclic condensation of hierarchy components; each component without incoming parent edges is a root, and members of a cycle share its component depth with an explicit cycle diagnostic. An isolated node has depth zero. Non-hierarchy edges do not use this policy. Downward hierarchy conductance is 1 before the common resource/candidate weights. This is a selected ranking heuristic, not an optimality or truth claim.
 
----
+One `compute_upward_conductance` implementation uses that policy. Do not also store flat/linear upward multipliers on leaf edges or apply a second degree penalty. Offline evaluation can measure alternatives; the production graph has no algorithm-selection or recovery branch.
 
-## 2. Graph Construction & Sparse Matrix Representation
+For nonnegative adjacency A, let D(u) = sum_v A(u,v) and P(u,v) = A(u,v)/D(u) for non-dangling rows. Dangling rows remain zero and their mass is redistributed to personalization during iteration.
 
-The graph transition matrix is built dynamically in [`GraphRAGRetriever._sync_graph()`](file:///home/harri/yaw/src/yaw/retrieval/retriever.py) by reading the SQLite dynamic view `unified_edges`, synchronized with database modification timestamps (`db_mtime`).
+## Seed channels
 
-### 2.1 Vertex Space ($V$)
-The vertex set $V$ unifies:
-- **Ontological Universal Nodes:** Nodes belonging to the 9 root namespaces (`concepts`, `claims`, `invariants`, `decisions`, `processes`, `sources`, `contexts`, `entities`, `predicates`).
-- **Document Chunk Pointers:** Zero-prose URIs formatted as `{rel_path}#chunk:{ordinal}`.
+Use three channel families:
 
-### 2.2 Edge Topologies ($E$)
-1. **Semantic Relations:** Triples extracted from `leaf_relations` resolved through `aliases` (e.g., `A --[rel_type]--> B`).
-2. **Explicit Wikilinks:** Document-to-concept and document-to-document hyperlinks from `wikilinks` (e.g., `A --[wikilink]--> B`).
-3. **Reciprocal Reverse Wikilinks:** Synthesized reverse edges ($B \to A$) with attenuated conductance:
-   $$W_{\text{rev}} = 0.5 \times W_{\text{fwd}}$$
-4. **Document Sequential Flow:** Directed linear edges linking contiguous chunks within the same document to preserve reading order:
-   $$\text{chunk}_i \xrightarrow{\text{sequence}} \text{chunk}_{i+1} \quad (W_{\text{seq}} = 0.8)$$
-5. **Soft Identity Links:** `close_matches` rows project as `rel_type = 'closeMatch'` in both directions (symmetric, non-transitive) with $W = \text{score}$ ([`docs/adr/ADR-012.md`](file:///home/harri/yaw/docs/adr/ADR-012.md) §3).
+1. Alias candidates from the linguistic/KB index, combined with query-to-fact relevance.
+2. Query-to-chunk relevance in space R.
+3. Lexical FTS relevance.
 
----
+For query mentions M(q), define alias mass:
 
-## 3. Asymmetric Conductance & In-Degree Hub Dampening
+$$s_{alias}(e) = \sum_{a \in M(q)} w(e \mid a)$$
 
-Uniform random-walk conductance causes catastrophic mass leakage when graphs contain high-degree hubs. YAW implements directional asymmetric conductance and degree penalization.
+Here w is normalized nonnegative candidate evidence within a mention's candidate set. It is not a calibrated probability of identity. Label equality alone must not collapse the candidate set.
 
-### 3.1 Directional Conductance Rules
+Let F_q be the selected active, qualified facts retrieved in space R. For a node e, let r(q,e) be the mean nonnegative cosine relevance of facts in F_q that refer to e, or zero if none. Facts are rendered with their qualifications and semantic roles; embeddings must not erase the difference between positive and negated statements.
 
-| Edge Type | Source ($u$) | Target ($v$) | Conductance Weight ($W_{\text{dir}}$) | Rationale |
-| :--- | :--- | :--- | :--- | :--- |
-| **Downward Broadcast** | Concept / Taxonomy | Chunk / Entity | **1.0** | Low-friction diffusion from abstract query intent to concrete evidence. |
-| **Upward Abstraction** | Chunk / Entity | Concept / Taxonomy | **0.2** | High-friction damping; prevents evidence nodes from leaking mass back to generic abstract hubs. |
-| **Document Sequence** | $\text{chunk}_i$ | $\text{chunk}_{i+1}$ | **0.8** | Preserves sequential narrative coherence across adjacent paragraphs. |
-| **Forward Wikilink** | Document / Concept | Target Concept | **1.0** | Direct intentional semantic association. |
-| **Reverse Wikilink** | Target Concept | Document | **0.5** | Attenuated back-propagation along human reference trails. |
-| **Soft Identity (`closeMatch`)** | Entity | Entity | **score** (both directions) | Symmetric, non-transitive candidate link; PPR resolves ambiguity topologically ([`ADR-012`](file:///home/harri/yaw/docs/adr/ADR-012.md)). |
+Combine L1-normalized nonempty alias and fact channels:
 
-### 3.2 In-Degree Hub Dampening
-To prevent high-degree vertices (e.g. ubiquitous concepts like `concepts:machine-learning`) from acting as probability sinks, each forward edge weight is penalized by the target node's in-degree:
+$$s_{concepts} = \lambda \widehat{s}_{alias} + (1-\lambda)\widehat{r}$$
 
-$$W_{uv} = \frac{W_{\text{dir}}(u, v)}{(\max(1, \text{in\_degree}(v)))^\gamma}, \quad \text{where } \gamma = 0.5$$
+If either channel has legitimately empty data, renormalize the remaining nonempty weights. A failed channel is an error, not empty data. At the outer level:
 
-### 3.3 Row-Stochastic Normalization
-The sparse adjacency matrix $\mathbf{A} \in \mathbb{R}^{|V| \times |V|}$ is constructed in Compressed Sparse Row (CSR) format:
+$$p_0 = \beta_1 \widehat{s}_{concepts} + \beta_2 \widehat{s}_{chunks,vec} + \beta_3 \widehat{s}_{chunks,fts}$$
 
-$$D_{uu} = \sum_{v \in V} A_{uv}$$
+Again, normalize active weights and the resulting mass. Clip negative cosine contributions to zero for probability-mass construction. The single FTS formatter in the retriever orders eligible unique occurrences by SQLite BM25 ascending, then occurrence ID; assign **`1 / rank` with one-based rank**, then L1-normalize. Three hits therefore contribute weights `6/11, 3/11, 2/11` before outer mixing. SQLite assigns better matches lower BM25 values; do not insert raw signed scores into p_0. [SQLite FTS5 BM25](https://sqlite.org/fts5.html#the_bm25_function).
 
-For non-dangling nodes ($D_{uu} > 0$):
-$$P_{uv} = \frac{A_{uv}}{D_{uu}}$$
+Reject nonfinite/negative channel weights, all-zero configured outer weights, and nonpositive convergence/iteration limits at configuration validation. After omitting legitimately empty channels, if no positive configured weight remains, return complete/no evidence; do not turn on a disabled channel or invent uniform seeds. A disabled channel has weight zero and is not an outage recovery branch.
 
-For dangling nodes ($D_{uu} = 0$), the dangling state is tracked via a boolean mask $\mathbf{d}_{\text{mask}}$, and its probability mass is teleported back to the personalization vector during iteration.
+Space-S identity candidate vectors never serve as space-R query vectors. Retain additive alias seeding so a query-mentioned node can contribute even if absent from the selected fact set. The configured embedding model/index is required; unavailability or incompatible dimensions produces a typed query error. If every successfully computed channel is empty, return an explicit no-evidence result instead of inventing seed mass over unrelated nodes. There is no lexical-only outage mode.
 
----
+## Power iteration
 
-## 4. Localized Seed Formulation ($\mathbf{p}_0$)
+For continuation probability 0 < alpha < 1:
 
-Rather than uniform personalization ($\mathbf{p}_0 = \frac{1}{|V|} \mathbf{1}$), YAW concentrates teleportation mass on a localized seed vector reflecting multi-modal query match and candidate prior distributions:
+$$p^{(t+1)} = \alpha(P^T p^{(t)} + m_{dangling}p_0) + (1-\alpha)p_0$$
 
-$$\mathbf{p}_0 = \beta_1 \cdot \mathbf{s}_{\text{concepts}} + \beta_2 \cdot \mathbf{s}_{\text{chunks\_vec}} + \beta_3 \cdot \mathbf{s}_{\text{chunks\_fts}}$$
+where m_dangling is the current probability mass in dangling rows. Start from p_0, preserve nonnegative finite mass, and stop at the configured L1 residual tolerance. Reaching the iteration limit without convergence is an explicit query failure, not a reason to select another solver/scorer. Do not advertise an unverified fixed iteration count or universal latency.
 
-Where (initial values are uncalibrated priors, calibrated in Epic 8 on a calibration split only, [`docs/adr/ADR-012.md`](file:///home/harri/yaw/docs/adr/ADR-012.md)):
-- $\beta_1 = 0.60$: Concept canopy bias (alias priors + query-to-fact relevance).
-- $\beta_2 = 0.20$: Chunk vector similarity bias.
-- $\beta_3 = 0.20$: FTS5 BM25 lexical score bias.
+The result ranks graph relevance. It can help resolve an ambiguous query in context but does not prove identity, factual truth or logical entailment and must not write permanent merges.
 
-### 4.1 Concept Canopy Seeding with Alias Priors and Query-to-Fact Relevance ($\beta_1 = 0.60$)
-To prevent premature winner-take-all discretization of polysemous query terms ([`docs/adr/ADR-010.md`](file:///home/harri/yaw/docs/adr/ADR-010.md)), query mentions $a \in M(q)$ (extracted in space L) look up candidate entities $e \in \text{cands}(a)$ via compiled C/Cython `InMemoryLookupKB.get_alias_candidates(a)`.
-Each candidate provides a normalized candidate weight $P(e \mid a) \in (0, 1]$ satisfying $\sum_{e} P(e \mid a) = 1.0$, backed by `aliases` ($w = 1$ for the hard canonical) and `close_matches` ($w = \text{score}$) ([`docs/adr/ADR-012.md`](file:///home/harri/yaw/docs/adr/ADR-012.md) §3).
+## Chunk ranking and evidence
 
-The concept seed combines an alias-prior channel and a query-to-fact channel ([`docs/adr/ADR-012.md`](file:///home/harri/yaw/docs/adr/ADR-012.md) §4):
-$$\mathbf{s}_{\text{concepts}} = \lambda \cdot \widehat{\mathbf{s}}_{\text{alias}} + (1 - \lambda) \cdot \widehat{\mathbf{r}}, \qquad \mathbf{s}_{\text{alias}}[e] = \sum_{a \in M(q)} P(e \mid a)$$
-- When query embedding $\mathbf{q}$ (space R) is available, $F_q$ is the top-`FACT_TOP_K` (default 5) facts from `fact_vec`, and $r(q, e)$ is the mean $\cos(\mathbf{q}, \mathbf{f})$ over the facts $f \in F_q$ whose subject or object is $e$ (0 if none).
-- $\widehat{\cdot}$ is L1 normalization; $\lambda = 0.5$ is an uncalibrated prior. The channels are additive, so an entity named in the question but absent from $F_q$ still seeds.
-- There is **no** query → `leaf_nodes` vector seeding.
+Build the candidate pool as the union of eligible vector hits, FTS hits and PPR-supported chunks, deduplicated by source occurrence ID. Do not discard dense/lexical candidates merely because they were absent from the top graph list. Apply this single versioned score to every candidate:
 
-### 4.2 Chunk Vector Seeding ($\beta_2 = 0.20$)
-- Queries SQLite `note_chunks` using `vec_distance_cosine(embedding, ?)`.
-- Top $N=50$ chunks contribute mass proportional to vector similarity $\text{sim}(q, c) = \max(0.0, 1.0 - \text{distance})$.
+$$Score(c) = (p^*(c) + \sum_{e \in E_c} w_c(e)p^*(e))\,rel(q,c)$$
 
-### 4.3 Lexical BM25 Seeding ($\beta_3 = 0.20$)
-- Queries SQLite `fts_chunks` via FTS5 BM25 ranking over spaCy-lemmatized non-stopword query terms.
-- Top $N=50$ lexical hits inject normalized rank scores into $\mathbf{p}_0$.
+E_c contains distinct nodes supported by occurrences in c. To avoid an undefined alias a or accidental duplicate counting, w_c(e) is the maximum normalized candidate weight for e over the chunk's mention occurrences; the aggregation is part of the scorer version. rel(q,c) is max(0, cosine(q,c)) for the required compatible retrieval vectors. Missing required embeddings fail; there is no alternate formula. Sort descending by score, then stable occurrence ID for ties. Treat this score as a ranking heuristic and evaluate it, not as a Bayesian posterior.
 
-### 4.4 Graceful Offline Fallback
-If the embedding service is unreachable or times out ($\mathbf{q} = \mathbf{0}$):
-- $\mathbf{r} = \mathbf{0}$, so $\mathbf{s}_{\text{concepts}} = \widehat{\mathbf{s}}_{\text{alias}}$ (lexical alias prior distribution), and $\mathbf{s}_{\text{chunks\_vec}} = \mathbf{0}$.
-- If no concept aliases match, the seed vector simplifies continuously to normalized lexical hits: $\mathbf{p}_0 = \mathbf{s}_{\text{chunks\_fts}}$, ensuring search never fails even in fully offline environments.
+Select evidence-bearing chunks, construct typed/provenanced connecting paths, then hydrate exact occurrences only after source-revision verification. For selected claims, include their current material conflict/supersession counterparts as explicit related evidence. Keep the ranked passage list separate from those relationship expansions so Recall@k retains a clear meaning. If the context budget prevents including both sides, return the omitted IDs and a truncation/coverage indicator; never present the selected side as uncontested.
 
-Finally, $\mathbf{p}_0$ is normalized to unit sum: $\sum_i p_{0, i} = 1.0$.
+Return structured passage/source/occurrence IDs, ranks/scores, evidence spans, qualified claims, typed paths, stored synthesis, source/compiled generations and completeness. Render Markdown only after this result is built. [The compiler guide](knowledge-compilation.md#6-publication-freshness-and-retraction) owns pending/failed scope handling. Stale source evidence cannot be silently replaced; an abstract path alone is not a grounded answer.
 
----
+## Validation and performance
 
-## 5. Power Iteration Diffusion & Topological Disambiguation
+Test mass conservation, dangling rows, disconnected graphs, legitimately empty channels, explicit embedding/convergence failure, representation separation, unfamiliar property behavior, union candidate retention, counterevidence and source revision changes. Use actual sparse matrices. Fault injection must show that no alternate scorer or solver was invoked.
 
-The stationary probability distribution $\mathbf{p}^*$ is computed via iterative matrix-vector multiplications in [`GraphRAGRetriever.power_iteration()`](file:///home/harri/yaw/src/yaw/retrieval/retriever.py):
+Report graph size, nonzero edges, iterations, memory, hardware and latency distributions. Per-iteration sparse traversal costs depend on edges and vertices; serializing k findings/results depends on k. Numerical parameters are read from configuration and calibrated only on the designated split. Report query-to-fact/candidate-link/alias-channel ablations on held-out data.
 
-$$\mathbf{p}^{(t+1)} = \alpha \left( \mathbf{P}^T \mathbf{p}^{(t)} + m_{\text{dangling}} \mathbf{p}_0 \right) + (1 - \alpha) \mathbf{p}_0$$
-
-Where:
-- $\alpha = 0.85$: Standard PageRank damping factor (probability of continuing random walk).
-- $1 - \alpha = 0.15$: Teleportation probability returning to personalized seeds $\mathbf{p}_0$.
-- $m_{\text{dangling}} = \sum_{i \in \text{dangling}} p_i^{(t)}$: Redistributed probability mass from sink nodes.
-- $\mathbf{P}$ is the row-stochastic transition matrix of `unified_edges` with directional conductance ($1.0$ down, $0.2$ up) and hub dampening $\gamma = 0.5$.
-
-### 5.1 Topological Disambiguation of Polysemous Mentions
-When an ambiguous query mention (e.g. *"Transformer"*) splits seed mass across divergent candidate hypotheses ($P(e_{\text{ML}} \mid a) = 0.85$, $P(e_{\text{electric}} \mid a) = 0.15$):
-- Global graph diffusion propagates mass across adjacent structural paths (wikilinks, semantic triples, chunk co-occurrences).
-- Candidates that share topological connectivity with the query's other concept seeds experience constructive spectral resonance: probability mass recirculates and amplifies at the true semantic target.
-- Spurious candidates lacking topological reinforcement rapidly shed their mass into unconnected graph sinks.
-- This resolves polysemy as an **emergent topological property of the random walk**, eliminating expensive LLM pairwise adjudication calls.
-
-### 5.2 Convergence Invariant
-Iterations repeat until the $L_1$ norm of the residual falls below tolerance, or until max iterations:
-$$\|\mathbf{p}^{(t+1)} - \mathbf{p}^{(t)}\|_1 < \text{tol} \quad (\text{tol} = 10^{-6}, \; \text{max\_iter} = 30)$$
-
-Because $\mathbf{P}$ is row-stochastic and $\alpha < 1.0$, the Banach Fixed Point Theorem guarantees geometric convergence at rate $\mathcal{O}(\alpha^t)$. In practice, convergence is reached in $12–18$ iterations ($< 2 \text{ ms}$).
-
----
-
-## 6. Candidate Rescoring & Bridging Subgraph Extraction
-
-After power iteration converges to $\mathbf{p}^*$:
-
-### 6.1 Bayesian Evidence Chunk Rescoring
-Candidate chunks with positive stationary mass ($\mathbf{p}^*[\text{chunk}] > 0$) are rescored via Bayesian evidence fusion:
-- When $\mathbf{q} \ne \mathbf{0}$:
-  $$\text{Score}(c) = \left( \sum_{e \in \text{entities}(c)} P(e \mid a) \cdot \mathbf{p}^*[e] + \mathbf{p}^*[c] \right) \cdot \text{sim}(q, c)$$
-  Where $P(e \mid a)$ is the alias candidate prior, $\mathbf{p}^*[e]$ is the stationary mass of entity $e$ manifesting in chunk $c$, $\mathbf{p}^*[c]$ is the chunk's direct topological mass, and $\text{sim}(q, c) = \mathbf{q} \cdot \mathbf{c}$. Chunks below `RELEVANCE_THRESHOLD` (0.10) are filtered out.
-- When $\mathbf{q} = \mathbf{0}$: $\text{Score}(c) = \mathbf{p}^*[c]$.
-
-### 6.2 Zero-Copy Disk Slice Hydration
-The top-$k$ winning chunk IDs look up `(rel_path, line_start, line_end)` in `note_chunks` and read the exact line slice directly on demand from disk ([`hydrate_disk_slice()`](file:///home/harri/yaw/src/yaw/retrieval/retriever.py)), strictly honoring Invariant 2 (Zero-Prose Disk Pointers).
-
-### 6.3 Bridging Subgraph Assembly
-The engine extracts active concept paths linking query seeds to retrieved chunks:
-```markdown
-### Concept Graph Context
-- concepts:general-relativity --[manifests_in]--> raw/physics/spacetime.md#chunk:2
-- concepts:gravitational-redshift --[subClassOf]--> concepts:general-relativity
-
-### Retrieved Source Evidence
-> [raw/physics/spacetime.md:42-58]
-> Gravitational time dilation causes atomic clocks at higher altitudes...
-```
-
----
-
-## 7. Performance & Complexity Characteristics
-
-| Metric | Measured Value | Theoretical Complexity |
-| :--- | :--- | :--- |
-| **Matrix Assembly Latency** | $< 5 \text{ ms}$ for 10,000 edges | $\mathcal{O}(\|E\|)$ |
-| **Power Iteration Latency** | $< 2 \text{ ms}$ for 30 iterations | $\mathcal{O}(\text{iter} \times \|E\|)$ |
-| **Memory Footprint** | $\approx 2.4 \text{ MB}$ for 50,000 edges | SciPy CSR format: $8\|E\| + 4\|V\|$ bytes |
-| **Dynamic Graph Sync** | Checked via SQLite `st_mtime` | Instantaneous cache re-use if DB unmutated |
+[HippoRAG 2](https://arxiv.org/html/2502.14802v2) motivates evaluating fact-based seeding; its measured gain is not a YAW performance guarantee. [Research extensions](scipy-graphrag-extensions.md) and [the PPR survey](efficient-ppr-algorithms.md) are references, not competing runtime contracts.

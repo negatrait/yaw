@@ -2,16 +2,16 @@ Your mission is to create a FastMCP Cocoindex LLM-Wiki indexer + Ontology GraphR
 
 ## Your Process
 
-**You are about to crash into one of your usual pitfalls again.** If you want to be helpful and avoid this, **consult the table below before proceeding:**
+Before editing, apply these rules to the selected work item:
 
-| Principle: | Which of your usual pitfalls it adresses? | The actionable steps to avoid failure. |
+| Principle: | Failure to prevent | The actionable steps to avoid failure. |
 | :--- | :--- | :--- |
 | **Think Before Coding** | Wrong assumptions, hidden confusion, missing tradeoffs | State assumptions, surface tradeoffs, push back when warranted. |
 | **Simplicity First** | Overcomplication, bloated abstractions | Minimum code that solves the problem. Nothing speculative. |
 | **Surgical Changes** | Orthogonal edits, touching code you shouldn't | Touch only what you must. Clean up only your own mess. |
 | **Goal-Driven Execution** | Leverage through-tests first, verifiable success criteria | Define success criteria. Loop until verified.|
-| **Never Guess, Allways Cite** | Making up claims and criteria, copping out of background research | Research and cite sources before you make decisions. |
-| **Allways SSOT** | Hardcoding and handrolling several near-similar solutions | Import from a single source of truth, never re-export or copy-paste. |
+| **Never Guess, Always Cite** | Making up claims and criteria, copping out of background research | Research and cite sources before you make decisions. |
+| **Always SSOT** | Hardcoding and handrolling several near-similar solutions | Import from a single source of truth, never re-export or copy-paste. |
 
 ## Context
 
@@ -22,20 +22,19 @@ The repository is Python 3, with `uv` package manager.
 	- **spacy-llm** with Pydantic for extracting leaf ontologies, named entities, and Open IE relations.
 - **SQLite Views & Engine** for instant global interconnection (`unified_edges`, `unified_nodes`) and optional compiled wiki materialization (`vault/wiki/`).
 
+### Repository boundary
+Before writing, verify that the working directory and Git remote match the repository explicitly named by the user. An attached workspace or a remembered checkout path does not override that location.
+
 ### Progressive Disclosure: Architecture & Implementation Plans
 Before authoring code or proposing architectural changes, consult these authoritative documents based on your task scope:
-- **Core System Specification:** Read [`FOUNDATIONAL.md`](file:///home/harri/yaw/FOUNDATIONAL.md) **first** for the 7 system invariants, single-stage ingestion flow, SQLite schema contracts, and retrieval algorithms.
-- **Implementation & Roadmap Epics:** Consult [`docs/epics-alignment-roadmap.md`](file:///home/harri/yaw/docs/epics-alignment-roadmap.md) when executing or verifying any of the 5 engineering Epics, reviewing TDD test authoring plans, or resolving cross-cutting smells (`ARCH-SSOT-001`, `ARCH-PERF-002`).
-- **spaCy-LLM Integration Patterns:** Consult [`docs/how-to-handle-spacy-llm.md`](file:///home/harri/yaw/docs/how-to-handle-spacy-llm.md) whenever touching [`src/yaw/nlp/`](file:///home/harri/yaw/src/yaw/nlp/), configuring models/tasks, or implementing Jinja2 Open IE relation extraction without private attribute monkeypatching.
+- **Core System Specification:** Read [FOUNDATIONAL.md](FOUNDATIONAL.md) **first** for invariants and cross-component contracts.
+- **Current execution contract:** Read [Epic 7.8](docs/epic7.8-open-ie-ontology-alignment.md#coding-agent-execution-contract) for the resume protocol, module ownership and ordered delivery packets. Select one unfinished packet step and its observable acceptance result before editing. [ADR-014](docs/adr/ADR-014.md) selects one production path with zero fallbacks.
+- **Roadmap and entry gates:** Read [the roadmap](docs/epics-alignment-roadmap.md) before Epic 8 work. Every 7.8 runtime gate must pass before any 8.x implementation begins; documentation completion is not runtime completion.
+- **Component guides:** Read [spaCy integration](docs/how-to-handle-spacy-llm.md) for NLP work and [continuous compilation](docs/knowledge-compilation.md) for orchestration/publication. Follow their links to the semantic, hierarchy and retrieval owners as needed. Historical ADR bodies and research clippings are not alternative implementation instructions.
+- **Evidence:** [USER_STORIES](docs/USER_STORIES.md) owns E78 acceptance cases; [TEST_INFRA](TEST_INFRA.md) owns execution categories; [TEST_READY](TEST_READY.md) records actual results. Do not invent a pass, restore an obsolete path or use another checkout's results when the current runtime is incomplete.
 
 ## Tools
 
 Ad-hoc commands often waste turns. Consult this list to find out repeating, succesful commands:
-- `uv run <command>`: Runs the python command in the correct venv.
-
-<!-- lean-ctx -->
-## lean-ctx
-
-lean-ctx is active — the MCP tools replace native equivalents.
-Full rules: LEAN-CTX.md (open on demand — do not auto-load).
-<!-- /lean-ctx -->
+- [TEST_INFRA](TEST_INFRA.md#entry-commands) owns environment, focused-test, full-regression and actual-model commands. Use locked dependencies and explicit test targets; a selected/empty pytest run is not a full gate.
+- `python tools/check_docs.py` and `git diff --check` verify documentation edits. The checker uses only the standard library and does not import or certify YAW.

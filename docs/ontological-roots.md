@@ -1,50 +1,33 @@
-# Ontological Roots: Hierarchical Deepening & The Waveguide Effect
+# Corpus organization and supported hierarchy
 
-> [!NOTE]
-> **RESEARCH & MATHEMATICAL SPECIFICATION:** This document details the mathematical rationale behind B-Tree hypernym induction and hierarchical deepening. In production, this architecture is codified in [`docs/adr/ADR-002.md`](file:///home/harri/yaw/docs/adr/ADR-002.md) (B-Tree Hypernym Induction for Saturated Hubs), [`docs/adr/ADR-005.md`](file:///home/harri/yaw/docs/adr/ADR-005.md) (9 Universal Root Namespaces), and [`FOUNDATIONAL.md §5.4`](file:///home/harri/yaw/FOUNDATIONAL.md).
+**Status:** Selected compiler stage; implement and verify in [Epic 7.8](epic7.8-open-ie-ontology-alignment.md).\
+**Authority:** [FOUNDATIONAL](../FOUNDATIONAL.md), [ADR-014](adr/ADR-014.md).\
+**Orchestrator:** [Continuous compilation](knowledge-compilation.md). This guide owns grouping; the [PPR guide](power-pagerank.md) owns traversal weights.
 
-**Governing Canon:**  
-- [`docs/adr/ADR-002.md`](file:///home/harri/yaw/docs/adr/ADR-002.md)  
-- [`docs/adr/ADR-005.md`](file:///home/harri/yaw/docs/adr/ADR-005.md)  
-- [`FOUNDATIONAL.md §5.1, §5.4`](file:///home/harri/yaw/FOUNDATIONAL.md)  
+## Selected algorithm
 
----
+Implement this procedure inside `src/yaw/indexer/compiler.py`; do not add a second clustering service or runtime algorithm selector.
 
-## 1. Why Roots Must "Dig Deeper" (The PPR GraphRAG Math)
+1. Collect active entity/concept description records with source support and compatible space-S vectors. Exclude properties, literals, already generated group labels and unsupported descriptions. Empty input is a legitimate empty organization result; a missing/invalid required vector is an explicit stage error.
+2. Sort records by stable ID and L2-normalize their vectors. With zero records return empty organization; with one record retain it as a supported root without calling `linkage`. When the supported root count is already at or below `target_roots`, retain those roots and continue page synthesis without inventing a merge. Otherwise run SciPy hierarchical `linkage` with **`method="ward"`** on those Euclidean observations. Pin the SciPy version and record input/order/configuration identity. Reject zero/nonfinite vectors rather than manufacture values. The resulting dendrogram is a candidate organization, not an ontology.
+3. Walk the linkage rows in their returned bottom-up order, using the sorted input IDs and pinned SciPy version to resolve the candidate sequence. Count only accepted merges toward the root target. A rejected candidate and ancestors requiring it are ineligible; do not generate a second clustering to rescue the target. The shared synthesis task receives the members and supporting claims and proposes an umbrella label, definition and evidence-linked membership. Validate its structured references and semantic kinds. Record accepted organizational proposals or explicit rejection/insufficient-support diagnostics; acceptance here does not admit a logical axiom.
+4. An internal group can be retained only when its required child groups/members remain supported. Rejected groups do not force a broader merge. Stop merging when the selected root target is met or no supported candidate remains. Enforce the configured positive depth/member/work budgets; distinguish an unmet root target from truncated/incomplete processing.
+5. Persist organization and its full membership/input fingerprint as derived records. Source edits or membership changes invalidate the group and dependent synthesis. Exact compatible generated proposals are memoized; deterministic clustering is recomputed from the current manifest.
 
-When a knowledge base expands from 10 notes to 1,000, its ontology cannot remain a flat 1-tier canopy (`Root -> Leaf`). If it does, root domains become massive super-hubs, and Personalized PageRank (PPR) graph diffusion degrades.
+The starting `target_roots` is **9**, expressing the owner's fewer-than-ten preference. Fewer source topics may yield fewer groups; unrelated topics may require more. Report actual roots, rejected candidates and `target_met` instead of inventing common semantics to satisfy the count. This target differs from the built-in nine-folder organization profile.
 
-Suppose a wiki grows to 500 notes, and 120 different concepts attach directly to `concept:resilience`.
-In the PPR transition matrix across the ontology layer, outgoing probability is distributed across neighbors:
-$$P_{uv} = \frac{W_{uv}}{\sum_k W_{uk}}$$
+SciPy Ward requires Euclidean geometry and uses quadratic memory; it does not promise balanced branches, stable partitions after edits or improved retrieval. These are library constraints and evaluation questions, not reasons to introduce a hidden alternative. [SciPy linkage](https://docs.scipy.org/doc/scipy/reference/generated/scipy.cluster.hierarchy.linkage.html).
 
-If `concept:resilience` has 120 outgoing edges, each child concept receives less than **$0.008$ of the probability mass** ($1/120$). Energy injected by a vague query is pulverized into micro-droplets. No individual chunk accumulates enough mass to beat background noise.
+## Semantic and retrieval boundaries
 
-### The Solution: Hierarchical Deepening (The Waveguide Effect)
-As the wiki expands, intermediate **Meso-Concepts** must emerge to act as directed conduits (waveguides) [Edge et al., 2024, arXiv:2404.16130]:
+Persist generated grouping as the built-in profile's **organizational membership** relation, with generated status, member evidence and model/input versions. Define that relation once in the engine RDF resources and project it generically. Do not emit `rdfs:subClassOf`, `rdf:type` or `skos:broader` merely because Ward placed records together.
 
-```txt
-Flat Structure (Energy Diffusion):
-Root (Resilience) ──► 120 leaves (each gets ~0.8% energy)
+Imported/source-supported class or thesaurus hierarchies retain their own meaning and are admitted through the semantic compiler. Individuals, classes and concepts cannot be interchanged; a label collision is not identity. YAW's class/concept non-punning policy remains.
 
-Hierarchical Deepening (Waveguide Focus):
-Root (Resilience)
-  ├── Meso 1 (Ecological Resilience)  ──► 30 leaves (~8.3% per leaf)
-  ├── Meso 2 (Cybernetic Resilience)  ──► 40 leaves (~6.2% per leaf)
-  └── Meso 3 (Psychological Resilience) ──► 50 leaves (~5.0% per leaf)
-```
+The production retrieval graph includes supported organizational links with their status. Whether they improve results is measured through an **offline evaluation ablation**; there is no automatic hierarchy-on/off recovery path. Failures remain visible. Proposed hierarchy and inferred facts must be distinguishable in returned paths.
 
-The intermediate meso-concepts concentrate random walk energy into specific topical subgraphs, increasing signal-to-noise ratio by up to $10\times$.
+## Acceptance and cost evidence
 
----
+E78-09 and E78-15 test zero/one/already-within-target inputs, a real accepted merge, fixed-input reuse, stable ordering, rejected group preservation, an unmet root target, evidence removal, input membership invalidation and no automatic class axioms. The live-model pilot measures label/member support and false conceptual bridges. Record node count, vector dimensions, clustering memory/time and synthesis calls.
 
-## 2. Deterministic B-Tree Splitting vs Stochastic Clustering
-
-Traditional GraphRAG systems run stochastic community detection algorithms (e.g. Louvain, Leiden) or LLM-driven batch clustering. In an incremental, local-first wiki, this causes **Ontological Churn (Thrashing)**: adding a single note can arbitrarily repartition the entire graph, rewriting dozens of concept boundaries.
-
-YAW solves this by treating the ontology like a **B-Tree** ([`docs/adr/ADR-002.md`](file:///home/harri/yaw/docs/adr/ADR-002.md)):
-1. **Saturation Threshold ($K_{\max} = 10$):** When any node's out-degree exceeds $10$, it is considered saturated.
-2. **Deterministic Ward's HAC:** SciPy Agglomerative Hierarchical Clustering (`method='ward'`) partitions the saturated node's children into two balanced sub-clusters based on vector embedding distance.
-3. **Hypernym Induction:** An LLM call (`temperature=0.1`) generates a concise 1–3 word hypernym and 1-sentence definition for the split cluster.
-4. **Substrate Immutability:** Saturated hub splits persist in `compiled_nodes` and `compiled_relations` tables without mutating raw `leaf_nodes` or `leaf_relations`, strictly preserving Invariant 1.
-5. **Taxonomic Conductance Asymmetry:** Edges are rewired with $1.0$ downward conductance (parent $\to$ child) and $0.2$ upward conductance (child $\to$ parent), preventing mass leakage into superclasses.
+This capability must work before Epics 8.x. Epic 8.2 evaluates its benefit; it does not implement the missing compiler. The historical B-tree/degree-10 bisection and automatic hypernym-subclass recipe in [ADR-002](adr/ADR-002.md) is superseded.

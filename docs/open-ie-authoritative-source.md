@@ -1,95 +1,32 @@
-# Authoritative Source & Foundation: Open Information Extraction (Open IE) vs. Closed Ontology
+# Open IE: research foundation and YAW interpretation
 
-**Document Status:** Authoritative Research Benchmark & Architectural SSOT  
-**Location:** `docs/open-ie-authoritative-source.md`
+**Status:** Evidence reference, reconciled 2026-10-12.\
+**Normative contract:** [FOUNDATIONAL](../FOUNDATIONAL.md). Research findings motivate decisions; they do not replace the application contract or prove its implementation.
 
----
+## Open discovery and structured output
 
-## 1. The Authoritative Definition of Open IE
+Open IE extracts relations without an exhaustive predefined domain relation inventory. A structured response containing mentions, arguments, qualifiers and provenance is compatible with that goal. Ontology alignment can follow extraction within one incremental pipeline.
 
-Open Information Extraction (Open IE) was introduced by Banko et al. (IJCAI 2007) and systematically surveyed by Niklaus et al. (COLING 2018), Liu et al. (ACL/EMNLP 2024), and Zhang & Soh (EDC, arXiv:2404.03868, 2024).
+YAW uses this distinction to keep unknown relations and uncertain interpretations rather than discarding them. NER, labels and ontologies may supply candidates; they must not define the entire universe of discoverable arguments.
 
-### Formal Definition
-An Open IE system is a function from an unstructured natural language text $d$ to a set of relational tuples:
-$$\langle \text{arg}_1; \text{rel}; \text{arg}_2 \rangle \quad \text{or} \quad \langle \text{arg}_1; \text{rel}; \text{arg}_2; \dots; \text{arg}_n \rangle$$
-where:
-1. **$\text{rel}$ is an unconstrained relational phrase** (verbal, prepositional, or adjectival) denoting the semantic relationship expressed in the text.
-2. **$\text{arg}_1, \text{arg}_2, \dots$ are unconstrained argument phrases** (typically noun phrases or propositions) representing the entities, claims, or conditions participating in the relation.
-3. **No Target Schema:** Neither $\text{rel}$ nor $\text{arg}_i$ are drawn from a predefined set of categories, labels, or relations.
+## Primary sources and limits
 
-### The Seminal Literature (Citations & Quotes)
+| Source | Relevant evidence | YAW interpretation and boundary |
+| --- | --- | --- |
+| [Banko et al., IJCAI 2007, Open Information Extraction from the Web](https://www.eng.utah.edu/~cs6961/papers/banko-ijca07.pdf) | Relation-independent extraction at scale | Supports open relation discovery. Previous purported verbatim quotations in this document have been removed in favor of this paraphrase. |
+| [Niklaus et al., COLING 2018, A Survey on Open Information Extraction](https://aclanthology.org/C18-1326/) | Reviews Open IE methods and their evolution | Historical cautions about NER are not a universal prohibition on modern linguistic components. Test whether a component restricts recall in YAW. |
+| [Liu et al., arXiv:2208.08690v7](https://arxiv.org/abs/2208.08690v7) | Survey spanning rule-based approaches through LLMs | The verified record is a preprint revised 23 October 2024; do not attribute it to ACL/EMNLP 2024 without a verified publication record. |
+| [Zhang and Soh, EDC, EMNLP 2024](https://aclanthology.org/2024.emnlp-main.548/) | Extraction, schema definition and canonicalization as distinct responsibilities | Supports separating evidence and alignment. It does not validate YAW's old deterministic identity heuristics or require separate batch ingestion stages. |
+| [Gashteovski et al., MinIE, EMNLP 2017](https://aclanthology.org/D17-1278/) | Compact extractions with polarity, modality, attribution and quantity annotations | Motivates qualified assertions rather than flattening every statement into an unconditional triple. |
+| [OpenFact, TACL 2023](https://aclanthology.org/2023.tacl-1.40/) | Factuality-enhanced open extraction | Supports explicitly evaluating factuality distinctions, without implying that extraction establishes world truth. |
+| [Mrkšić et al., NAACL 2016](https://aclanthology.org/N16-1018/) | Counter-fitting distinguishes lexical constraints from distributional proximity | Related vectors do not justify predicate equivalence or an antonym-safe universal normalizer. |
+| [HippoRAG 2](https://arxiv.org/html/2502.14802v2) | Query-to-fact retrieval experiments and ablations | Motivates YAW's fact channel. The reported Recall@5 improvement belongs to its benchmark/model setup, not a guaranteed YAW gain. |
+| [BenchIE, ACL 2022](https://aclanthology.org/2022.acl-long.307/) and [BenchIE-FL, Findings ACL 2024](https://aclanthology.org/2024.findings-acl.496/) | Fact-based evaluation and reannotation | Motivate extraction evaluation alongside retrieval QA; acceptable alternative surface realizations and downstream suitability matter. |
 
-1. **Banko et al. (IJCAI 2007) — *Open Information Extraction from the Web*:**
-   > *"Traditional Information Extraction (IE) has focused on satisfying narrow, pre-specified requests over small, homogeneous corpora... Open IE is a novel extraction paradigm that is **relation-independent and schema-free**. It extracts all relations and entity arguments without human input or predefined categories, making a single data-driven pass over the corpus."*
-   > *(Banko, Cafarella, Soderland, Broadhead, & Etzioni, 2007)*
+## Evaluation consequences
 
-2. **Niklaus et al. (COLING 2018) — *A Survey on Open Information Extraction*:**
-   > *"Traditional approaches to IE focus on answering narrow, well-defined requests over a **predefined set of target relations**... In order to reduce the manual effort required by IE approaches, Banko et al. (2007) introduced a new extraction paradigm: Open IE. Unlike traditional IE methods, Open IE is not limited to a small set of target relations known in advance, but rather extracts all types of relations found in a text... **Furthermore, Named Entity Recognition (NER) is unsuitable to target the variety and complexity of entity types on the Web.** As Open IE systems are intended for domain-independent usage, such tools should be avoided in favor of shallow parsing methods."*
+Use independently labelled examples covering unfamiliar predicates, direction, negation/modality, attribution, literals, nested/repeated mentions and polysemy. Model-produced or heuristic-produced verdicts are predictions, not gold calibration labels.
 
-3. **Liu et al. (EMNLP 2024 / arXiv:2208.08690) — *A Survey on Open Information Extraction from Rule-based Model to Large Language Model*:**
-   > *"Unlike standard IE, which relies on **predefined categories** to identify relationships and entities, OpenIE operates **without such constraints**, enabling the extraction of diverse and unforeseen relations. This flexibility makes OpenIE especially valuable for dynamic and unstructured data."*
+Keep calibration and held-out data disjoint. Report false identity merges and grounding errors separately from extraction F1 and retrieval Recall@k. Record model/configuration/resource versions and costs. Loopback fixtures verify orchestration only.
 
-4. **Zhang & Soh (arXiv:2404.03868, 2024) — *Extract, Define, Canonicalize: An LLM-based Framework for Knowledge Graph Construction (EDC)*:**
-   > *"Standard (closed) information extraction requires the output triplets to follow a pre-defined schema, e.g. a list of relation or entity types to be extracted from. In contrast, open information extraction (OIE) does not have such a requirement... In Phase 1 (Extract), we leverage models for open information extraction to identify and extract relational triplets $([\text{Subject}, \text{Relation}, \text{Object}])$ from input texts, **independent of any specific schema**."*
-
----
-
-## 2. The Core Conflict: Closed IE vs. Emergent Open IE
-
-| Dimension | Traditional / Closed IE | Open IE (Open Information Extraction) |
-| :--- | :--- | :--- |
-| **Relation Set ($R$)** | Predefined closed set: $R = \{r_1, \dots, r_k\}$ (e.g. `is_a`, `partOf`, `employed_at`). | **Open-vocabulary:** Any textual predicate appearing in the sentence (e.g. `"is composed of"`, `"depends on"`, `"violates"`). |
-| **Entity Set / Labels ($E$)** | Predefined category taxonomy: $E = \{e_1, \dots, e_m\}$ (e.g. `PER`, `ORG`, or `concepts`, `invariants`). | **Open-vocabulary / Schema-free:** Extracted directly as noun phrases or propositions from the text without predefined labels. |
-| **Domain Dependence** | Narrow, domain-specific, requires per-class training data or schemas. | Domain-independent, universal. |
-| **Failure Mode** | Blindness: ignores all valid knowledge that does not fit into the predefined schema. | Polysemy & fragmentation: surface drift (synonyms, phrasing variants). |
-
----
-
-## 3. Resolving the YAW Paradox: How Does Open IE Reconcile with an Upper Ontology?
-
-### The Pitfall
-If the leaf extraction component is provided with a fixed list of 8 categories:
-```python
-# ANTI-OPEN-IE: This converts leaf extraction into Closed IE!
-labels = [
-    "entities",
-    "concepts",
-    "claims",
-    "invariants",
-    "decisions",
-    "processes",
-    "sources",
-    "contexts",
-]
-```
-**This is NOT Open IE.** It forces an artificial closed taxonomy onto the text during extraction, causing:
-1. **Extraction Distortion:** The model forces arbitrary text spans into arbitrary ontological buckets (e.g., mislabeling code or sentences as `invariants` or `decisions`).
-2. **Span Blindness:** Legitimate domain relationships that do not fit the 8 labels are discarded.
-3. **Ontological Collusion:** It conflates the **Type Layer** (upper ontology) with the **Instance Extraction Layer** (Open IE).
-
-### The Correct Three-Stage Architecture (EDC Pattern)
-
-To achieve true Emergent Open IE while maintaining a structured Knowledge Graph, YAW separates extraction from typing:
-
-```mermaid
-flowchart TD
-    subgraph Stage1["1. Open Leaf Extraction (Schema-Free Open IE)"]
-        Text["Raw Text Chunk"] --> OIE["Open IE Extractor (spacy.SpanCat.v3 + spacy.REL.v1)"]
-        OIE --> Triples["Raw Relational Triples: (Subject, Predicate, Object)<br/>No predefined entity labels<br/>No predefined relation labels"]
-    end
-
-    subgraph Stage2["2. Ontological Typing & Grounding (Type Layer)"]
-        Triples --> Typing["Ontology Classifier / Structural Role Typing"]
-        Typing --> TypedNodes["Nodes categorized into Ontological Universals:<br/>• concepts, claims, invariants, decisions, processes, entities<br/>• Predicates categorized under 'predicates' namespace"]
-    end
-
-    subgraph Stage3["3. Ontological Convergence (EDC Canonicalization)"]
-        TypedNodes --> EDC["EntityLinker & EDC Self-Canonicalization"]
-        EDC --> CanonicalGraph["Canonical SQLite Graph:<br/>• Merged Synonyms: 'consists of' == 'is composed of'<br/>• Unified URIs: {namespace}:{slug}"]
-    end
-```
-
-### Architectural Rules for YAW:
-1. **Leaf Extraction is Schema-Free:** The leaf extraction stage extracts open entities and open relational triples `(subject, predicate, object)` directly from chunk text without forcing tokens into predefined category buckets.
-2. **The 9 Universals Govern the Type Layer, Not the Extraction Layer:** The 9 ontological categories (`entities`, `concepts`, `claims`, `invariants`, `decisions`, `processes`, `sources`, `contexts`, `predicates`) are assigned to nodes post-extraction (e.g. based on syntactic role, sentence modality, or `TextCat` classification of the entity definition).
-3. **Canonicalization Prevents Fragmentation:** Because Open IE produces diverse surface expressions, the Ontological Convergence Protocol (EDC Phase 3) unifies synonymous entities and predicates into canonical graph nodes.
+The [review](reviews/open-ie-ontology-review-2026-10-12.md) connects these sources to defects at its pinned baseline. [Epic 7.8](epic7.8-open-ie-ontology-alignment.md) tracks correction; the [spaCy guide](how-to-handle-spacy-llm.md) describes the selected implementation pattern.

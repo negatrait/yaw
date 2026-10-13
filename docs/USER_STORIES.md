@@ -1,402 +1,127 @@
-# YAW BDD User Stories & Behavioral Specifications
+# YAW acceptance scenarios
 
-**Document Status:** Living Behavioral Specification  
-**Format:** BDD Gherkin (Given-When-Then)  
-**Governing Canon:** [`FOUNDATIONAL.md`](file:///home/harri/yaw/FOUNDATIONAL.md), [`docs/epics-alignment-roadmap.md`](file:///home/harri/yaw/docs/epics-alignment-roadmap.md)
+**Status:** Reconciled target scenarios; execution results belong in [TEST_READY](../TEST_READY.md).\
+**Contract:** [FOUNDATIONAL](../FOUNDATIONAL.md), [ADR-014](adr/ADR-014.md).\
+**Delivery:** [Epic 7.8](epic7.8-open-ie-ontology-alignment.md). Scenario IDs below are acceptance obligations, not claims that tests already exist.
 
----
+The [test-target map](../TEST_INFRA.md#test-target-map) assigns these obligations to existing/planned test modules. Each implemented test identifies its E78 case; every required clause and control needs evidence. One passing example or an existing filename does not close a whole scenario.
 
-## Overview
+## Open extraction and declarative semantics
 
-This document specifies the authoritative Acceptance Criteria and Behavioral Driven Development (BDD) scenarios for upcoming YAW milestones:
-1. **Sprint 5.1:** Mid-Epic 5 Remediation & Pre-E5S2 Architectural Alignment Sprint
-2. **Sprint 5B (E5S2):** Dynamic Few-Shot Steering & Pipeline Feedback Loop
-3. **Epic 6, Sprint 6A:** RDF Serialization & Quad Store Integration
-4. **Epic 6, Sprint 6B:** OWL Ontology Semantics & Axiom Inference
-5. **Epic 6, Sprint 6C:** SHACL Closed-World Wiki Linter (`lint_wiki` tool)
-6. **Epic 7:** Production FastMCP Server & Streaming HTTP Access
+### E78-01 — Unfamiliar property without code changes
 
----
+Given a note expressing a relation absent from the selected ontology, ingestion retains its original predicate, arguments, qualifiers and evidence and exposes it in the open view.
 
-## 1. Sprint 5.1: Mid-Epic 5 Remediation & Pre-E5S2 Architectural Alignment Sprint
+When a resource declaring the applicable property, lexical frame, inverse relationship and relevant SHACL shape is loaded, generic consumers align/project/validate/retrieve it without edits to Python predicate tables or SQL whitelists. Removing or changing the resource refreshes interpretation while preserving the original assertion.
 
-### Feature: Mid-Epic 5 Substrate Remediation & Architectural Alignment
-As a YAW platform engineer  
-I want the SQLite relational views, predicate configuration SSOT, namespace defaults, and GraphRAG conductance models to be 100% aligned with ADR-008 and Epics 6–7  
-So that Sprint 5B prompt steering operates on verified canonical vocabularies and downstream RDF/OWL/SHACL components receive valid quad schemas.
+### E78-02 — View scope and empty profiles
 
-#### Scenario 1: Authoritative Predicate SSOT & Obsolete Synonym Purge
-```gherkin
-Given the configuration module "src/yaw/config.py"
-When "config.BASE_PREDICATES" is inspected
-Then it must contain exactly the 14 canonical predicates defined in ADR-008
-And the uncontrolled synonym "is_a" must NOT be present
-And FastMCP endpoint "get_ontology_schema()" must return the identical 14 canonical predicates
-```
+Given the same source revision and extraction configuration, switching among built-in/external and open/scoped views preserves raw extraction. A scoped view derives property membership from selected resources and accepted alignments. An empty optional inventory does not restore a hidden base vocabulary. Namespace-local-name collisions do not equate distinct properties.
 
-#### Scenario 2: Plural Root Namespace Defaulting in EDC Resolver
-```gherkin
-Given a candidate entity string "quantum-tunneling" without an explicit namespace prefix
-When "canonicalize.resolve('quantum-tunneling')" is invoked
-Then the resolved identifier must default to "concepts:quantum-tunneling"
-And the singular prefix "concept:" must NEVER be generated
-And the prefix must match an entry in "config.TAXONOMY_NAMESPACES"
-```
+Resource updates may require rebuilding dependent projections; tests do not assert a universal constant-time update.
 
-#### Scenario 3: SQLite Aliases Method CHECK Constraint Compatibility
-```gherkin
-Given an initialized SQLite database with aliases schema
-When an alias record is inserted with method "exact" or "alias" from "MatchMethod"
-Then the database insertion must succeed
-And no "sqlite3.IntegrityError: CHECK constraint failed: aliases.method" must be raised
-```
+### E78-03 — Predicate direction and qualification
 
-#### Scenario 4: 5-Column unified_edges Quad Projection
-```gherkin
-Given an active SQLite database with indexed "wikilinks" and "leaf_relations"
-When the "unified_edges" view is queried
-Then it must return 5 columns: "src_id", "dst_id", "rel_type", "weight", "source_chunk_id"
-And "source_chunk_id" must contain non-empty chunk or source URI provenance
-And "retriever.py" must successfully construct its adjacency matrix without column unpacking errors
-```
+Given “A consists of B” and “A is part of B”, declared lexical frames produce the correct orientation or an explicit unresolved alignment. Neither original assertion is rewritten.
 
-#### Scenario 5: Compiled Knowledge Substrate Isolation
-```gherkin
-Given a saturated hub split executed during "compile_wiki"
-When an induced hypernym node and rewired "subClassOf" edge are persisted
-Then they must be written to "compiled_nodes" and "compiled_relations" tables
-And the raw tables "leaf_nodes" and "leaf_relations" must remain unmodified
-And the views "unified_nodes" and "unified_edges" must seamlessly reflect the compiled knowledge
-```
+Given positive, negated, modal, attributed and conditional versions of a claim, stored assertions, fact rendering and retrieved context retain those differences. The engine does not project a modal/negative claim as an unconditional positive fact. Subject/object/predicate definitions distinguish source-supported text, generated explanations and unknown values; lack of a definition cannot cause fabricated prose or loss of the claim.
 
-#### Scenario 6: Taxonomic Subsumption Conductance Asymmetry
-```gherkin
-Given an edge "(Child, subClassOf, Parent)" in "unified_edges"
-When "GraphRAGRetriever._build_matrix()" builds the sparse transition matrix
-Then the upward transition probability "Child -> Parent" must be damped with conductance 0.2
-And a reciprocal downward transition "Parent -> Child" must be synthesized with conductance 1.0
-```
+## Grounding and interpretation
 
-#### Scenario 7: Automated Contested Alias Transition
-```gherkin
-Given an alias candidate with conflicting canonical targets or dialectical ambiguity
-When candidate prior confidence is low (< 0.80) or flagged during validation
-Then a row must be inserted into "aliases" with "status = 'contested'"
-And the contested record must be queryable via "get_contested_aliases()" and surfaced in compile-time SHACL validation
-```
+### E78-04 — Occurrences and verified evidence
 
----
+Given repeated identical strings, overlapping/nested mentions, Unicode, CRLF/LF and identical sections in different files, each source occurrence remains distinct and its spans reproduce the cited source text.
 
-## 2. Sprint 5B: Dynamic Few-Shot Steering & Pipeline Feedback Loop
+When the source changes after indexing, hydration reports stale evidence and schedules refresh. It does not cite the changed slice as verified indexed content. Source revision metadata does not require duplicating whole chunk prose in SQLite.
 
-### Feature: Dynamic Few-Shot Ontology Extraction Steering
-As a continuous ingestion indexer  
-I want to steer the spaCy-LLM extraction pipeline using dynamic canonical vocabulary and few-shot examples drawn live from SQLite and ADR-008 seed predicates  
-So that extracted entities and predicates converge to established canonical terms before string resolution, preventing graph fragmentation and outputting quad-ready triples.
+### E78-05 — Identity and semantic kinds
 
-#### Scenario 1: Declarative Registration of Dynamic Example Provider
-```gherkin
-Given a running YAW instance with populated canonical concepts in SQLite "leaf_nodes"
-When the spaCy-LLM pipeline is constructed via "build_leaf_pipeline()"
-Then the factory "@registry.misc('yaw.CanonicalExamples.v1')" must be resolved from spaCy's global registry
-And calling the factory must return a Callable producing dynamic few-shot extraction examples
-And the pipeline must build without private "_model" or "_task" monkeypatching
-```
+Given homonyms, ambiguous acronyms and “cell” versus “cancer cell”, lexical similarity or a single retrieved candidate is insufficient for a hard merge. Record candidates and accepted identities separately with evidence and scope.
 
-#### Scenario 2: Dynamic Injection of Established Canonical Vocabulary
-```gherkin
-Given an indexed vault containing high-conductance canonical concept "concepts:quantum-entanglement"
-And an active alias "entangled particles" pointing to "concepts:quantum-entanglement"
-When a new raw document containing the sentence "Entangled particles demonstrate nonlocal state collapse." is ingested
-Then the dynamic few-shot steering injector must include "quantum-entanglement" in the prompt's candidate vocabulary
-And the extracted Subject entity must be emitted directly as "quantum-entanglement"
-And zero novel duplicate concept nodes must be created in "leaf_nodes"
-```
+Given individual/class/concept/property/literal endpoints, RDF projection uses the appropriate relationship and preserves datatype/language where supported. Namespace alone does not select SKOS mapping. Removing an accepted binding refreshes dependent projections. A non-merge does not generate differentFrom.
 
-#### Scenario 3: Multi-Note Synonym Convergence Across Extraction Sessions
-```gherkin
-Given two distinct raw notes ingested sequentially:
-  | note_path                 | content                                                     |
-  | raw/physics/relativity.md | "Albert Einstein formulated the theory of special relativity." |
-  | raw/physics/spacetime.md  | "Einsteinian relativity predicts gravitational time dilation." |
-When the ingestion pipeline finishes processing both notes
-Then the unified view "unified_nodes" must contain exactly one canonical node for the concept
-And the "aliases" table must record an active alias mapping "einsteinian relativity" to the canonical slug
-And the knowledge graph must contain zero disconnected synonym duplicates
-```
+### E78-06 — Complete extraction outcome
 
-#### Scenario 4: Bounded Latency and Memory Cap on Injected Examples
-```gherkin
-Given a mature vault containing over 10,000 indexed canonical concepts
-When dynamic few-shot examples are assembled for chunk extraction
-Then the injector must select at most "CANON_FEWSHOT_MAX" (default 5) top-conductance examples
-And total injected prompt token overhead must not exceed 250 tokens
-And candidate selection latency must execute in under 10 milliseconds
-```
+A standalone mention remains recorded even without a binary relation. Nested mentions are retained independently.
 
-#### Scenario 5: Canonical Predicate Steering via ADR-008 Seed Taxonomy
-```gherkin
-Given a raw markdown note containing relations across subsumptive, dialectical, and causal statements
-When the spaCy-LLM extraction pipeline processes the text with "@registry.misc('yaw.CanonicalExamples.v1')"
-Then few-shot prompt injection must prioritize canonical predicates from "config.BASE_PREDICATES"
-And extracted relation types must align to ADR-008 canonical categories:
-  | Category           | Canonical Predicate |
-  | Subsumption        | "subClassOf"        |
-  | Dialectical        | "supports"          |
-  | Dialectical        | "contradicts"       |
-  | Dependency/Process | "causes"            |
-  | Provenance         | "derivedFrom"       |
-And unconstrained synonyms such as "is_a", "kind_of", or "proves" must not be emitted when canonical alternatives apply
-```
+Valid no-extractions, schema failure, unmatched evidence, network failure and partial/unsupported interpretation have distinct outcomes. A valid outer envelope with two records, one with invalid grounding, preserves only the independently valid record and reports partial; zero survivors after rejection is still partial, not successful empty. A malformed outer envelope fails without trying another parser. Local references within the bounded source context require supported antecedents and coordinates. Ambiguous pronouns, arbitrary cross-document coreference and unsupported n-ary interpretation are not silently converted into confident binary claims.
 
-#### Scenario 6: Lossless RDF Quad Projection of Steered Extractions
-```gherkin
-Given extracted relations produced by the steered spaCy-LLM pipeline for note "raw/notes/relativity.md"
-When the extracted triples are inserted into SQLite and queried via "unified_edges"
-Then each row must project valid W3C quad fields:
-  | Field        | Quad Role      | Expected Format                                      |
-  | src_id       | subject        | "yaw:<namespace>:<slug>"                             |
-  | rel_type     | predicate      | "yaw:predicates:<canonical_predicate>"               |
-  | dst_id       | object         | "yaw:<namespace>:<slug>"                             |
-  | source_chunk | graph_uri      | "yaw:sources/notes/relativity.md#chunk:<chunk_id>"   |
-And the projected quad must be directly serializable into standard N-Quads without schema mapping errors
-```
+## Incremental correctness
 
----
+### E78-07 — Ordered, configuration-aware caches
 
-## 3. Epic 6, Sprint 6A: RDF Serialization & Quad Store Integration
+Reversing “Alice supports Bob” to “Bob supports Alice” cannot return the old Doc/annotations. Changing rendered examples, task/schema, model digest or generation settings invalidates incompatible extraction entries. Restart preserves valid entries and rejects mismatches. Different task/component caches do not collide.
 
-### Feature: In-Process W3C RDF Triple and Quad Substrate (Zero External Graph Daemons)
-As an external semantic consumer, knowledge engineer, or graph database  
-I want to query and export YAW's unified SQLite graph as standard W3C RDF triples and named quads  
-So that the knowledge graph is interoperable with standard SPARQL engines, RDF quad stores, and semantic web tooling without losing byte-level provenance or requiring external graph daemons.
+### E78-08 — Supported inference and scoped validation
 
-#### Scenario 1: Lossless Turtle Export from SQLite Unified Views via In-Process rdflib
-```gherkin
-Given an indexed SQLite database with populated "unified_nodes" and "unified_edges"
-When the export function "export_graph(format='turtle')" is executed
-Then the output string must be a syntactically valid W3C Turtle document
-And standard namespace prefixes must be bound:
-  | Prefix | URI                                  |
-  | yaw    | https://yaw.local/ontology/          |
-  | rdfs   | http://www.w3.org/2000/01/rdf-schema#|
-  | owl    | http://www.w3.org/2002/07/owl#       |
-  | sh     | http://www.w3.org/ns/shacl#          |
-  | skos   | http://www.w3.org/2004/02/skos/core# |
-And parsing the Turtle string into an "rdflib.Graph" must yield the exact triple count from "unified_edges"
-And the operation must run strictly in-process with zero external graph daemons or background network calls
-```
+Declared subclass/subproperty/type, inverse/symmetric/transitive, admitted identity and disjointness capabilities have real positive/negative examples through the selected pySHACL sequence. Cycles terminate; unsupported constructs are inactive with diagnostics, and incomplete closure cannot publish a complete scope.
 
-#### Scenario 2: Canonical CURIE URI Minting
-```gherkin
-Given an edge in "unified_edges" with:
-  | Column   | Value                          |
-  | src_id   | concepts:quantum-entanglement  |
-  | dst_id   | invariants:bell-inequality     |
-  | rel_type | violates                       |
-When the edge is projected into an RDF triple
-Then the subject URI must resolve to "https://yaw.local/ontology/concepts/quantum-entanglement"
-And the predicate URI must resolve to "https://yaw.local/ontology/predicates/violates"
-And the object URI must resolve to "https://yaw.local/ontology/invariants/bell-inequality"
-```
+Opposing attributed/time-scoped claims are evaluated under a declared comparison policy. Structural conformance is not labelled factual truth. Shape/resource/data changes mark cached findings stale and refresh the correct scope.
 
-#### Scenario 3: Named Quad Serialization with Document Provenance Context
-```gherkin
-Given a relation extracted from raw note "raw/science/epr_paper.md" at chunk ordinal 3
-When the export function "export_graph(format='nquads')" is executed
-Then each triple must include the named graph URI identifying its chunk origin:
-  """
-  <https://yaw.local/ontology/concepts/epr-paradox>
-  <https://yaw.local/ontology/predicates/challenges>
-  <https://yaw.local/ontology/concepts/quantum-mechanics>
-  <https://yaw.local/sources/raw/science/epr_paper.md#chunk:3> .
-  """
-And loading the quads into an "rdflib.ConjunctiveGraph" must preserve chunk graph partitioning
-```
+### E78-09 — Derived hierarchy
 
-#### Scenario 4: Multi-Format Serialization Round-Trip without External Daemons
-```gherkin
-Given a canonical YAW knowledge graph in SQLite
-When serialized successively into "turtle", "json-ld", and "nt" formats via in-process "rdflib"
-Then each serialized representation must deserialize into an isomorphic RDF graph
-And isomorphic graph comparison must confirm zero lost edges, properties, or blank-node skolemization bugs
-And no external triple store or graph database service must be spawned or queried
-```
+A generated group label has support, generation metadata and organizational status. It is not automatically a class-subsumption axiom. Original source records remain unchanged. Re-running unchanged inputs reuses compatible generation. Zero/one/already-within-target inputs retain their supported roots without a linkage/merge call; a larger supported fixture proves an accepted merge. A target of nine umbrella groups does not force unrelated meanings together; an unmet target and rejected candidates are reported. Changed members invalidate both grouping and dependent summaries.
 
----
+### E78-10 — Migration
 
-## 4. Epic 6, Sprint 6B: OWL Ontology Semantics & Axiom Inference
+Legacy rows with overwritten source predicates are marked for re-extraction from available authoritative notes. Old heuristic aliases are reviewed/rebuilt under the new evidence policy. Migration preserves audit/reference mappings, is transactional/idempotent, and reports unavailable source evidence.
 
-### Feature: Pragmatic OWL 2 RL & SKOS Ontology Formalization (Zero DL Tableaux Reasoners)
-As an automated reasoning engine and retrieval graph traverser  
-I want taxonomic relationships, hypernym inductions, and alias mappings formalized as OWL 2 RL / RDFS and SKOS axioms  
-So that subsumption hierarchies and node equivalences are mathematically well-founded with acyclic directed conductance without heavy DL tableaux solver bottlenecks.
+## Retrieval, interface and portability
 
-#### Scenario 1: Active Alias Projection to `owl:sameAs` Axioms and `skos:altLabel`
-```gherkin
-Given an active record in SQLite "aliases":
-  | alias_id             | kind   | canonical_id            | status |
-  | entities:a-einstein  | entity | concepts:albert-einstein| active |
-When the OWL/SKOS ontology projection is generated
-Then an equivalence axiom must be declared:
-  """
-  yaw:entities:a-einstein owl:sameAs yaw:concepts:albert-einstein .
-  """
-And the canonical node must record the alias as "skos:altLabel"
-And querying either identifier must navigate to identical incoming and outgoing relation closures
-And resolution must execute via SQLite view joins without invoking external DL reasoners
-```
+### E78-11 — Retrieval invariants
 
-#### Scenario 2: Formalizing B-Tree Saturated Hub Splits as `rdfs:subClassOf` and `skos:broader`
-```gherkin
-Given a hub node "concepts:machine-learning" exceeding out-degree K_max (10)
-When the B-tree hypernym induction protocol splits the cluster into sub-cluster "concepts:supervised-learning"
-Then ontological subsumption axioms must be emitted:
-  """
-  yaw:concepts:supervised-learning rdfs:subClassOf yaw:concepts:machine-learning .
-  yaw:concepts:supervised-learning skos:broader yaw:concepts:machine-learning .
-  """
-And member concepts must be subsumed under the new hypernym:
-  """
-  yaw:concepts:linear-regression rdfs:subClassOf yaw:concepts:supervised-learning .
-  yaw:concepts:linear-regression skos:broader yaw:concepts:supervised-learning .
-  """
-```
+Real sparse matrices preserve finite nonnegative normalized mass, including dangling nodes and disconnected components. Empty channels are omitted/renormalized; all-empty input returns no evidence. A query-mentioned node can contribute through aliases even when absent from top facts. Wrong vector spaces/dimensions fail explicitly.
 
-#### Scenario 3: Taxonomic Subsumption Transitive Closure via In-Process SQL Recursive CTE / SciPy
-```gherkin
-Given the subsumption hierarchy:
-  | SubClass            | SuperClass                 |
-  | concepts:transformer| concepts:attention-models  |
-  | concepts:attention-models | concepts:deep-learning |
-  | concepts:deep-learning   | concepts:machine-learning |
-When a taxonomic closure query is evaluated for "concepts:transformer"
-Then the inferred ancestor set must include:
-  | Ancestor                   |
-  | concepts:attention-models  |
-  | concepts:deep-learning     |
-  | concepts:machine-learning  |
-And the closure must be computed using an in-process SQLite recursive CTE or SciPy sparse matrix powers
-And the subsumption graph must be verified as a strict Directed Acyclic Graph (DAG) with zero cycles
-And no external tableaux reasoner (Pellet, HermiT) shall be loaded
-```
+Returned paths distinguish candidates, organization and entailment; source evidence is revision-verified. The union of eligible dense/lexical/graph passage candidates survives to the one scorer. Embedding/index failure, wrong dimensions and non-convergent PPR return explicit errors; no offline scorer or alternate solver runs. Verify the shared logarithmic conductance policy, root/cycle handling and stable tie order. FTS normalization has an independent three-hit expected vector (`6/11, 3/11, 2/11`), and an all-empty/zero-active-weight case does not enable a disabled channel.
 
-#### Scenario 4: Asymmetric Conductance Enforcement in Spectral Diffusion
-```gherkin
-Given a taxonomic edge "yaw:concepts:cnn rdfs:subClassOf yaw:concepts:deep-learning"
-When the transition conductance matrix for GraphRAG is constructed
-Then the downward transition conductance from "deep-learning" to "cnn" must equal 1.0
-And the upward transition conductance from "cnn" to "deep-learning" must be dampened to 0.2
-And power iteration must diffuse mass toward concrete leaf implementations without runaway topic drift
-```
+### E78-12 — FastMCP and wiki lifecycle
 
----
+A real client exercises ingest, compile, query and lint through the same application and structured results. Queries coexist with incremental indexing under a declared workload. Compilation/materialization never modifies existing raw notes or overwrites source assertions. Generated wiki pages render persisted source-supported blocks; rendering an unchanged stored generation makes zero model calls. Lint reads completed findings and reports pending/failed scopes; it cannot run a live alternate validator.
 
-## 5. Epic 6 & Epic 7.6: SHACL Closed-World Wiki Linter & Contradiction Cache (`lint_wiki` Tool)
+### E78-13 — Platform behavior
 
-### Feature: In-Process Closed-World SHACL Shape Validation & O(1) Contradiction Caching
-As a wiki author, knowledge graph maintainer, or automated CI quality gate  
-I want compile-time closed-world SHACL shape validation over the knowledge graph via "compile_wiki" with instantaneous O(1) querying via "lint_wiki" ([`docs/adr/ADR-011.md`](file:///home/harri/yaw/docs/adr/ADR-011.md))  
-So that invalid namespaces, missing definitions, broken wikilinks, and dialectical contradictions are pre-compiled into SQLite and surfaced instantaneously with zero external graph daemons.
+Windows and Unix use identical semantic resources/configuration. Tests exercise native path handling, locks, safe non-terminating process-status probes, startup and shutdown. Do not execute a known unsafe Windows liveness probe as a test shortcut.
 
-#### Scenario 1: Compile-Time Validation & Caching of ConceptShape Violations
-```gherkin
-Given a node in "leaf_nodes" with "node_id = 'concepts:entropy'"
-And the node's definition is empty or exceeds the configured word limit (50 words)
-When "compile_wiki()" executes in-process fast validation (< 200 ms)
-Then the detected violation must be transactionally committed to "compiled_violations" in "yaw.db"
-And subsequent execution of "lint_wiki()" must return the pre-compiled violation in under 5 ms without running pySHACL
-And the report must indicate "sh:conforms = false" with severity "Violation"
-```
+### E78-14 — Independent evaluation
 
-#### Scenario 2: Validation of RelationShape (Domain and Range Constraints)
-```gherkin
-Given an extracted relation in "leaf_relations":
-  | subject_id        | predicate | object_id           |
-  | concepts:gravity  | partOf    | non-existent:entity |
-When "compile_wiki()" runs or "lint_wiki(force=True)" is executed
-Then the validation record in "compiled_violations" must flag an unresolved dangling object target
-And the violation message must specify broken referential integrity for "non-existent:entity"
-```
+Before closing 7.8, run the actual configured model on independent extraction/comparison/synthesis labels covering E78-01–06 and E78-16/19/20. Report missed evidence and incorrect output, false merges, direction/qualification/grounding errors, unsupported generated statements, comparison errors and cost separately. Expected outputs must include positive cases, so returning only empty/unknown results cannot satisfy the pilot. Every labelled sentinel case has a declared expected outcome before the run; unmet required outcomes keep the gate open.
 
-#### Scenario 3: Detection of Dialectical Contradictions and Contested Merges
-```gherkin
-Given an alias in SQLite "aliases" with "status = 'contested'"
-And two contradictory claims in "leaf_relations":
-  | subject_id       | predicate | object_id       |
-  | concepts:coffee  | prevents  | concepts:cancer |
-  | concepts:coffee  | causes    | concepts:cancer |
-When "compile_wiki()" compiles the graph
-Then both dialectical issues must be recorded in "compiled_violations"
-And "lint_wiki()" must surface the contested alias merge and contradictory predicate pair in O(1) time
-And the surfaced contradictions must prompt the agent to accumulate resolving sources in "vault/raw/"
-```
+Epic 8.2 extends this into disjoint calibration/held-out retrieval comparisons under the [roadmap protocol](epics-alignment-roadmap.md#epic-82--held-out-quality-and-cost-evaluation). Record complete model/resource/configuration versions. Loopback fixture success is not a model-accuracy result.
 
-#### Scenario 4: Instantaneous Filtered Lint Querying via FastMCP Interface
-```gherkin
-Given a knowledge graph with pre-compiled violations in "compiled_violations"
-When a client invokes "lint_wiki(query='concepts')" over FastMCP
-Then the returned list must be filtered via indexed SQLite query to violations concerning "concepts"
-And execution latency must be under 5 milliseconds without re-validating the RDF graph
-```
+## Complete compiler and zero-fallback gates
 
----
+### E78-15 — Automatic cross-document lifecycle
 
-## 6. Epic 7: Production FastMCP Server & Streaming HTTP Access
+Given two documents supporting a shared topic and an unrelated third document, ingestion through the one CocoIndex application automatically extracts, compares, enriches, validates, organizes and stores supported wiki blocks. No manual compile/lint sequence is needed. An unfamiliar property works through resource changes without Python domain edits.
 
-### Feature: Production FastMCP Server & Streaming HTTP Transport
-As an AI pair-programmer, autonomous agent, or remote LLM client  
-I want to interact with YAW exclusively through a high-performance FastMCP server over streaming HTTP/SSE with non-blocking continuous indexing  
-So that I can ingest raw research, compile wiki materializations, query GraphRAG bridging subgraphs, and lint wiki integrity remotely without local subshell commands or SQLite lock contention.
+Edit one document, remove its support, then delete it. Dependent comparisons, derivations, groups, summaries, findings, FTS/vector rows and exported pages update correctly; independently supported knowledge survives. Unrelated extraction is reused. Restart after interrupted publication and reorder input discovery: the active manifest and derived semantic state converge. A newer desired manifest arriving before commit prevents the old job from becoming current. `force=True` re-evaluates the same scope without deleting database/cache state or invalidating compatible generation arbitrarily. Tests compare stored/versioned outputs rather than assuming uncached LLM generations are byte-identical.
 
-#### Scenario 1: Complete 4-Tool Production Lifecycle Session
-```gherkin
-Given a running FastMCP server instance
-When a client executes the following 4-step sequence via MCP tool calls:
-  1. "ingest_raw(content='# Quantum Computing\nQubits leverage superposition.', title='Quantum Intro')"
-  2. "compile_wiki(force=False)"
-  3. "query_wiki(query='How do qubits work?', top_k=3)"
-  4. "lint_wiki()"
-Then all 4 tool calls must return successful JSON/Markdown payloads
-And step 1 must write an unmutated markdown file into "vault/raw/"
-And step 2 must materialize valid YAML-frontmatter wiki pages under "vault/wiki/"
-And step 3 must return a token-dense Bridging Subgraph citing the new raw note
-And step 4 must return an empty violation list (valid wiki)
-```
+### E78-16 — Contradiction, revision and scope
 
-#### Scenario 2: Remote Streaming HTTP/SSE Transport Without CLI Assumptions
-```gherkin
-Given a YAW server started with "yaw serve --host 127.0.0.1 --port 8765 --transport sse"
-When a remote client connects to "http://127.0.0.1:8765/sse"
-Then the server must establish an open Server-Sent Events (SSE) streaming session
-And tool execution requests sent via HTTP POST to "http://127.0.0.1:8765/messages/" must stream responses back over SSE
-And the client must require zero local terminal access, shell execution, or CLI binary dependencies on the client host
-```
+Use three independent source notes: April predicts June completion; May explicitly records the authorized replacement date of July; a supplier still expects June. Preserve all claims, attribution, validity/document times and evidence. Record supported supersession for the decision and the supplier's differing position; do not turn newest-document order into a truth rule.
 
-#### Scenario 3: Non-Blocking Background Continuous Indexing Under Concurrent Query Load
-```gherkin
-Given the FastMCP server is actively processing background CocoIndex ingestion for 100 new markdown notes
-When a concurrent client issues 20 simultaneous "query_wiki(query='...')" requests over HTTP/SSE
-Then every "query_wiki" request must complete in under 50 milliseconds
-And zero requests may fail with "sqlite3.OperationalError: database is locked"
-And SQLite WAL mode and busy timeouts must ensure zero query stalls or writer starvation
-```
+Add controls with different entities, years, units and conditions, and a later note that merely repeats an opinion. These must not be labelled the same formal contradiction or authorized supersession. Unresolved identity/scope remains unknown. A retrieval answer about the deadline includes material competing evidence or explicit omitted IDs/coverage, rather than presenting one side as settled.
 
-#### Scenario 4: Substrate Mutation Isolation During Wiki Materialization (Invariant 1)
-```gherkin
-Given a vault containing files in "vault/raw/"
-When "compile_wiki(force=True)" executes
-Then files must be written strictly to "vault/wiki/{namespace}/{slug}.md"
-And directory "vault/raw/" must experience zero file additions, modifications, or timestamp changes
-And existing custom frontmatter in "vault/raw/" files must remain 100% byte-identical
-```
+### E78-17 — No alternate implementation after failure
 
-#### Scenario 5: Dual-Layer GraphRAG Retrieval Contract (Invariant 2 & Invariant 5)
-```gherkin
-Given an indexed knowledge base containing concepts connected to raw evidence
-When "query_wiki(query='Explain CRISPR Cas9 gene editing', top_k=3)" is invoked
-Then the returned Markdown response must contain:
-  1. "### Concept Graph Context": local bridging subgraph with active seed concepts and taxonomic links
-  2. "### Retrieved Source Evidence": exact disk slices hydrated from raw files via byte seeks
-And the SQLite database must not store duplicated prose strings (zero-prose disk pointers)
-```
+Inject a missing model, failed embedding service, malformed response, invalid span, wrong vector dimension, corrupt cache, incomplete closure and publication failure at their real boundaries. Verify explicit failure/partial states as defined by the compiler contract, with no success-shaped empty result or stale completed generation. Changed cache inputs are a separate control: they recompute through the same component rather than reuse incompatible output.
+
+Record invoked task/component IDs. Assert that no REL, LLM NER/EntityLinker, alternate parser/model, direct secondary client, post-sync compiler, live-lint validator, lexical-only retriever or alternate PPR solver executes. A compatible cache hit and valid empty response remain distinguishable controls. An explicit retry uses the same selected implementation.
+
+### E78-18 — AF enrichment, provenance and retraction
+
+Supply an admitted resource rule that derives an expected fact and a shape that checks its consequence. Also require an AF consequence to feed a later entailment round. Prove the single fixed-point sequence terminates and validation consumes the completed result.
+
+No-rule and invalid/unsupported-rule controls cannot silently derive that fact. Removed premises invalidate the scope; another surviving support can derive it again. Derived triples cite the actual complete input scope and rule-set version, never a guessed individual rule or minimal proof. Limit exhaustion produces no complete-generation marker. A valid non-conforming SHACL report instead completes validation with findings; both conflicting source accounts remain queryable.
+
+### E78-19 — English and occasional other languages
+
+Run original-text, non-English and mixed-language cases through the same extraction path, including language-tagged aliases/literals and at least one cross-language reference with explicit identity evidence. Verify Unicode coordinates and qualifications. English linguistic annotations cannot reject unfamiliar-language claims or silently translate their evidence.
+
+Independent labels must expose unsupported or mistaken language interpretation. Model availability failures do not select another language/model pipeline. Record per-language coverage and errors; passing a few examples is not universal multilingual support.
+
+### E78-20 — Stored synthesis, publication and consumer agreement
+
+Generated page blocks reference current source claims/derivations and distinguish inferred, contested and uncertain material. Invalid evidence IDs fail structural admission; independently labelled model checks detect unsupported paraphrases that structural validation alone cannot find. New conflicting group membership invalidates the old summary even when prior claims remain unchanged.
+
+MCP, CLI, evaluation and Markdown consume the same structured records/generations. During pending compilation, fresh evidence and explicitly completed scopes remain identifiable; stale dependencies are excluded. A failed required scope returns its error, never a substitute current result. An omitted source scope includes the active corpus; a narrowed explicit source-ID scope is resolved before candidate retrieval and excludes unrelated failures. Top-k selection cannot hide a failure in the promised scope. Aggregate status follows failed, partial, pending, complete precedence; findings from a completed non-conforming SHACL report do not cause failed status. Rendering twice from the same generation is identical and makes zero model calls. Generated wiki pages never enter the raw source corpus.

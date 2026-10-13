@@ -1,3 +1,5 @@
+> **Upstream reference:** This is a CocoIndex documentation clipping. YAW's current pipeline and single-database contract are defined in [FOUNDATIONAL](../FOUNDATIONAL.md); dependency/runtime compatibility is verified under [Epic 7.8](epic7.8-open-ie-ontology-alignment.md).
+
 <p align="center">
   <a href="https://github.com/cocoindex-io/cocoindex" title="CocoIndex on GitHub">
     <picture>

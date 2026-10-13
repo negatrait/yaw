@@ -1,36 +1,20 @@
-# YAW Architecture Plan (Reference)
+# YAW architecture reference
 
-**Document Version:** 2.0.0 (Consolidated Architecture Reference)  
-**Governing SSOT:** [`FOUNDATIONAL.md`](file:///home/harri/yaw/FOUNDATIONAL.md)  
-**Active Roadmap:** [`docs/epics-alignment-roadmap.md`](file:///home/harri/yaw/docs/epics-alignment-roadmap.md)  
-**Target:** `yaw` Core Engine (`src/yaw/`)  
+**Status:** Navigation and component responsibility guide; [FOUNDATIONAL](../FOUNDATIONAL.md) is the contract owner.\
+**Active refactoring:** [Epic 7.8](epic7.8-open-ie-ontology-alignment.md), selected by [ADR-014](adr/ADR-014.md). Coding agents start with its [execution contract](epic7.8-open-ie-ontology-alignment.md#coding-agent-execution-contract).
 
----
+YAW continuously turns notes into source-grounded knowledge and retrieves their connections and evidence. Open discovery, ontology-driven interpretation and revisable identities are central. Imported vocabularies enrich knowledge without exhausting what may be discovered.
 
-> [!IMPORTANT]
-> [`FOUNDATIONAL.md`](file:///home/harri/yaw/FOUNDATIONAL.md) is the primary authoritative Single Source of Truth (SSOT) for all product requirements, invariants, database contracts, and algorithms. [`docs/epics-alignment-roadmap.md`](file:///home/harri/yaw/docs/epics-alignment-roadmap.md) is the authoritative implementation roadmap. This document provides an aligned architectural synthesis and must remain strictly consistent with both.
+| Component | Responsibility | Detailed guide |
+| --- | --- | --- |
+| CocoIndex | One application for source processing and shared corpus compilation | [Continuous compilation](knowledge-compilation.md) |
+| spaCy / spacy-llm | Linguistic analysis and validated mention/assertion extraction | [spaCy integration](how-to-handle-spacy-llm.md) |
+| Semantic resources and registry | Domain meaning, lexical alignment, kinds, supported inference and shapes | [Semantic substrate](rdf-owl-shacl.md), [loading](epic7-pluggable-ontology-integration-spec.md) |
+| SQLite | Original assertions, versioned interpretations and derived views, FTS and typed vectors | [Storage contract](../FOUNDATIONAL.md#component-2-storage--schema-contracts) |
+| SciPy | Candidate/fact/chunk relevance and graph traversal | [PPR](power-pagerank.md), [derived hierarchy](ontological-roots.md) |
+| FastMCP | Ingest, compile, query and lint interfaces | [FOUNDATIONAL interface](../FOUNDATIONAL.md#component-4-fastmcp-protocol-interface) |
+| Wiki materializer | Optional deterministic rendering of stored authored blocks; zero generation at export | [Compiler output](knowledge-compilation.md#5-organization-and-authored-knowledge) |
 
----
+A change to semantic resources refreshes dependent interpretation; it does not overwrite the source extraction. Runtime registry indexes are compiled projections. Ranking weights are algorithm parameters; domain relationships are resource data. Windows/Unix adapters affect execution mechanics, not semantics.
 
-## 1. Architectural Summary & System Boundaries
-
-YAW is an autonomous, local-first GraphRAG engine combining **Cocoindex**, **spaCy + spacy-llm**, **SQLite** (`fts5` + `sqlite-vec`), and **SciPy** (Personalized PageRank through the ontology layer) served via **FastMCP**.
-
-### The 4-Tier Semantic Stack
-1. **Tier 1: SQLite In-Process Quad Substrate (`.cache/yaw.db`)**
-   - Single-stage continuous ingestion DAG storing byte offsets and contentless FTS5 indexes.
-   - Dynamic views ([`unified_edges`](file:///home/harri/yaw/src/yaw/storage/db.py#L85-L168), [`unified_nodes`](file:///home/harri/yaw/src/yaw/storage/db.py#L170-L200)) mapping 5-column named quads `(src_id, dst_id, rel_type, weight, source_chunk_id)`.
-   - Engine-owned [`aliases`](file:///home/harri/yaw/src/yaw/storage/db.py#L44-L60) table providing reversible canonicalization without mutating raw extractions.
-2. **Tier 2: OWL 2 RL Axiomatic Invariants ([`docs/adr/ADR-008.md`](file:///home/harri/yaw/docs/adr/ADR-008.md))**
-   - 14 Canonical Base Predicates across 4 categories (Subsumption, Dialectical, Process, Grounding).
-   - 9 Universal Root Namespaces ([`docs/adr/ADR-005.md`](file:///home/harri/yaw/docs/adr/ADR-005.md)).
-   - B-Tree hypernym induction and cluster splitting ([`docs/adr/ADR-002.md`](file:///home/harri/yaw/docs/adr/ADR-002.md)).
-3. **Tier 3: SciPy Power Personalized PageRank ([`docs/power-pagerank.md`](file:///home/harri/yaw/docs/power-pagerank.md), [`docs/adr/ADR-010.md`](file:///home/harri/yaw/docs/adr/ADR-010.md))**
-   - Sparse CSR matrix power iteration with hub dampening ($\gamma=0.5$).
-   - Candidate prior distributions $P(e \mid a)$ in seed personalization and topological disambiguation.
-   - Taxonomic conductance asymmetry ($1.0$ downward broadcast, $0.2$ upward damping).
-   - In-memory Bayesian evidence fusion for chunk candidate rescoring.
-4. **Tier 4: SHACL Closed-World Validation & Contradiction Cache ([`docs/rdf-owl-shacl.md`](file:///home/harri/yaw/docs/rdf-owl-shacl.md), [`docs/adr/ADR-011.md`](file:///home/harri/yaw/docs/adr/ADR-011.md))**
-   - Lean compile-time validation (`validate_wiki_graph_fast` < 200 ms) via relational pre-closure without heavy DL tableaux reasoners.
-   - Transactional persistence into `compiled_violations` SQLite table.
-   - Instantaneous $\mathcal{O}(1)$ `lint_wiki()` reads (< 5 ms) surfacing dialectical contradictions (`causes` vs `prevents`, `supports` vs `refutes`) and ambiguous identity warnings ([`docs/adr/ADR-012.md`](file:///home/harri/yaw/docs/adr/ADR-012.md)).
+[The roadmap](epics-alignment-roadmap.md) requires all 7.8 gates before 8.x. [The ADR ledger](ADR.md) records amendments. [Readiness](../TEST_READY.md) records verified behavior. Errors never select another extractor, compiler or retriever. This navigation guide does not duplicate execution checklists, schemas or algorithms.

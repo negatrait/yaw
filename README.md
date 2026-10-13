@@ -1,191 +1,59 @@
-<div align="center">
-  <img src="https://raw.githubusercontent.com/yawn-hub/assets/main/yaw-logo.png" alt="yaw logo" width="180" />
-  <h1>yaw</h1>
-  <p><strong>FastMCP Cocoindex LLM-Wiki Indexer & Ontology GraphRAG Engine</strong></p>
-</div>
+# YAW — Yet Another Wiki
 
-# YAW IS WIP!
+YAW is a local knowledge compiler and ontology GraphRAG engine for **100–500 Markdown documents**, mainly English with occasional other languages. It is intended to retain source claims, disagreements and revisions, compile supported cross-document knowledge, and retrieve that knowledge with verified evidence.
 
-Had to save to github to save the repository.
+**Current state:** documentation selects the implementation; production migration and runtime verification remain open in [Epic 7.8](docs/epic7.8-open-ie-ontology-alignment.md). See [TEST_READY](TEST_READY.md). No Epic 8 implementation starts until every 7.8 gate passes.
 
-yaw is an autonomous, local-first GraphRAG engine combining **Cocoindex**, **spaCy + spacy-llm**, **SQLite** (`fts5` + `sqlite-vec`), and **SciPy** (Personalized PageRank through the ontology layer) served via **FastMCP**.
+## Start here when implementing
 
-> [!NOTE]
-> For the complete, authoritative system specification and invariant contracts, see [`FOUNDATIONAL.md`](FOUNDATIONAL.md). For implementation phases, see [`docs/epics-alignment-roadmap.md`](docs/epics-alignment-roadmap.md).
+1. Read [AGENTS](AGENTS.md), then [FOUNDATIONAL](FOUNDATIONAL.md).
+2. Follow the [coding-agent execution contract](docs/epic7.8-open-ie-ontology-alignment.md#coding-agent-execution-contract), then take the first unfinished step in its [delivery packet](docs/epic7.8-open-ie-ontology-alignment.md#delivery-packets).
+3. Read only the relevant [compiler](docs/knowledge-compilation.md), [spaCy](docs/how-to-handle-spacy-llm.md), [semantics](docs/rdf-owl-shacl.md), [organization](docs/ontological-roots.md) or [retrieval](docs/power-pagerank.md) guide.
+4. Use the [test-target map and commands](TEST_INFRA.md#test-target-map) to prove the applicable E78 cases; record actual results and the next step in TEST_READY.
 
-## Architecture
+For documentation-only changes, run `python tools/check_docs.py` and `git diff --check`; no YAW environment or model is required for the documentation checker.
 
-The system operates via single-stage continuous ingestion into a single SQLite database SSOT (`.cache/yaw.db`), providing instant global interconnection without multi-stage staging barriers:
+[ADR-014](docs/adr/ADR-014.md) resolves earlier alternatives. Historical ADR bodies and research clippings are background, not competing implementation plans. [The roadmap](docs/epics-alignment-roadmap.md) defines 8.1 hardening, 8.2 evaluation and 8.3 release.
 
-```mermaid
-flowchart TD
-    subgraph Vault [Markdown Vault]
-        Raw["vault/raw/ (Immutable Source)"]
-        Wiki["vault/wiki/ (Optional Compiled dist/)"]
-    end
+## Selected architecture
 
-    subgraph Ingestion [Single-Stage Continuous Ingestion]
-        Raw -->|Chunk & Delta Watch via CocoIndex| Chunks[Deterministic Chunks]
-        Chunks -->|title: doc \| text: chunk| Vec[sqlite-vec Chunks Vec]
-        Chunks -->|BM25 indexing| FTS[query_fts FTS5]
-        Chunks -->|Doc-integrity spaCy Pipeline| Leaf[Leaf Ontology Triples]
-        Leaf -->|EDC Self-Canonicalization| Aliases[aliases, close_matches & canon_verdicts]
-    end
+`raw source revisions → spaCy/Raw qualified claims → shared CocoIndex corpus compiler → SQLite → query / cached lint / Markdown`
 
-    subgraph Storage [Single SQLite Database SSOT: yaw.db]
-        Vec & FTS & Leaf & Aliases --> Views["Views: unified_edges & unified_nodes"]
-    end
+- **spaCy/spacy-llm + Ollama:** linguistic assistance and typed extraction, with separately scheduled claim comparison and synthesis through the same adapter.
+- **CocoIndex:** one application for source and cross-document dependencies; no post-sync fallback compiler.
+- **RDF/OWL/SKOS/SHACL + pySHACL:** resource-defined semantics, scoped inference, admitted rules and validation.
+- **SQLite:** source pointers/claims, revisable interpretations, dependencies, generated wiki blocks, findings, FTS and typed vectors.
+- **SciPy:** the single candidate/fact/chunk/lexical PPR retrieval algorithm.
+- **FastMCP:** shared ingestion, compilation, query and lint handlers.
+- **Markdown:** optional deterministic rendering of stored authored blocks; no export-time model calls or re-ingestion of generated pages.
 
-    subgraph Retrieval [Zero-Allocation GraphRAG Retrieval]
-        Query[User Query] --> Seed[BM25 + Dense Vector Seed Vector]
-        Seed --> PPR[SciPy CSR PageRank Diffusion]
-        Views --> PPR
-        PPR --> Rerank[In-Memory Dot-Product Bi-Encoder Rerank]
-        Rerank --> Payload[Ranked Evidence + Ontological Context]
-    end
+Unknown relations remain available. `open_ie` selects an output vocabulary view, never another extractor. Source assertions remain separate from interpreted identities and generated knowledge. Required-component failures are explicit errors; no alternate model, parser, compiler or retriever takes over.
 
-    subgraph Materializer [Optional Asynchronous Materializer]
-        Views -.->|Decoupled Markdown Pass| Wiki
-    end
+## Runtime preparation
+
+The initial target is Python **3.14**, uv and the configured local Ollama models. Model names/settings have one owner in `config.toml` / `src/yaw/config.py`; implementations pin resolved digests and locked dependencies. Broader version support and performance are measured release claims.
+
+This repository includes `pyproject.toml`, `uv.lock` and the source entry points. Verify its locked environment and configured models in 7.8.3 before treating setup commands or CLI operation as proven. Documentation reconciliation does not certify an application runtime.
+
+Keep platform environments separate when sharing a checkout:
+
+```powershell
+$env:UV_PROJECT_ENVIRONMENT = ".cache/venv-windows"
+uv sync --locked
 ```
 
-## How It Works
-
-### 1. Single-Stage Ingestion & Leaf Ontology Extraction
-CocoIndex continuously monitors `vault/raw/` for markdown file modifications and computes deterministic chunk boundaries.
-- **Doc Integrity (Annotate, Never Mutate):** The text passed to spaCy equals source chunk text byte-for-byte (`doc.text == chunk_text`).
-- **LLM-Primary Entity Extraction:** `en_core_web_sm` is loaded with `exclude=['ner']`; `spacy.NER.v3` (Qwen) runs as the primary extractor on every chunk across 8 non-predicate categories (`entities`, `concepts`, `claims`, `invariants`, `decisions`, `processes`, `sources`, `contexts`).
-- **Markdown Structure:** Code spans are annotated in `doc.spans["code"]` and filtered exclusively in `leaf_taxonomy_compiler`.
-- **Open IE Relations:** `spacy.REL.v1` extracts unconstrained relations into `doc._.rel`; predicates are normalized via `Token.lemma_`.
-- **Line-Range Provenance:** Chunks carry 1-indexed line numbers (`line_start`, `line_end`) into the raw note for zero-copy on-demand disk hydration.
-
-### 2. Ontological Convergence (Two-Tier Convergence Protocol)
-Prevents vocabulary fragmentation across an append-only corpus without runtime LLM calls ([`docs/adr/ADR-003.md`](file:///home/harri/yaw/docs/adr/ADR-003.md), [`docs/adr/ADR-010.md`](file:///home/harri/yaw/docs/adr/ADR-010.md), [`docs/adr/ADR-012.md`](file:///home/harri/yaw/docs/adr/ADR-012.md)):
-- **Compiled C/Cython KnowledgeBase:** In-process `InMemoryLookupKB` (alias → candidate prior index, never a similarity source) synchronizes canonical entities and normalized candidate distributions $P(e \mid a) \in (0, 1]$ directly from SQLite (`aliases` for hard identity, `close_matches` for soft identity).
-- **Tier 1 (Direct Match):** Exact slug match, spaCy normalized key, alias table lookup, or Cython KB candidate resolution. 0 vectors, 0 LLM calls.
-- **Tier 2 (Blocked + Corroborated):** `entity_vec` KNN in space S (EmbeddingGemma `task: sentence similarity` prompt), cosine ≥ τ (0.80). Merges only if exactly one candidate passes deterministic linguistic corroboration (acronym, head-anchored containment, initial expansion); otherwise records soft `close_matches` links. Every pair is logged to `canon_verdicts`. Predicates never enter Tier 2. 0 LLM calls.
-- **Fallback:** New canonical induction under plural universal root (`concepts:{slug}`). Zero external LLM pairwise adjudication.
-- **Zero-Copy Projection:** Nodes and relations are unified via zero-copy SQLite views (`unified_edges`, `unified_nodes`).
-
-### 3. Associative Retrieval & Graph Diffusion
-Retrieval queries execute against SQLite and in-memory SciPy CSR matrices:
-- **Dual-Channel Seeding:** Merges top BM25 lexical hits (`query_fts`) and top dense vector hits (`chunks_vec`).
-- **PageRank Diffusion:** Runs 30 fixed power iterations over `unified_edges` with directional conductance, reciprocal back-edges ($0.5$), and analytical hub dampening ($\gamma = 0.5$).
-- **In-Memory Dot Product Reranking:** Stored 768-dim chunk embeddings are retrieved directly from SQLite and rescored against query vectors via in-memory dot product ($S(c) = 0.5 \cdot \text{PPR}(c) + 0.5 \cdot \cos(q, c)$). Zero HTTP calls for chunk embeddings are made during retrieval.
-
----
-
-## Quickstart
-
-### Prerequisites
-- Python 3.11+
-- `uv` package manager
-- Running Ollama instance with `embed-gemma-300m-FLM` and `Qwen3-4B-Instruct-2507-GGUF`
-
-### 1. Ingest a Vault
-```bash
-uv run python yaw.py index --vault /path/to/vault
-```
-To force a full re-indexing of all chunks:
-```bash
-uv run python yaw.py index --vault /path/to/vault --force
+```sh
+export UV_PROJECT_ENVIRONMENT=.cache/venv-unix
+uv sync --locked
 ```
 
-### 2. Start the FastMCP Server
-Run the background daemon over Streamable HTTP:
-```bash
-uv run python yaw.py serve --vault /path/to/vault --port 8765
-```
-Or start over stdio transport:
-```bash
-uv run python yaw.py serve --vault /path/to/vault --transport stdio
-```
+## Interface contract
 
-### 3. Query via CLI
-```bash
-uv run python yaw.py query "how does embedding gemma reranking work?" --vault /path/to/vault --top-k 3
-```
+| Interface | Responsibility |
+| --- | --- |
+| `ingest_raw` | Append supplied source material and schedule the one application; report actual job state |
+| `compile_wiki` | Refresh the same application's derived inputs and report generation/state |
+| `query_wiki` | Return structured ranked passages, current context, counterevidence and coverage |
+| `lint_wiki` | Read scoped versioned findings; refresh through `compile_wiki` |
 
-### 4. Inspect Schema & Index Health
-```bash
-uv run python yaw.py schema --vault /path/to/vault
-```
-
----
-
-## MCP Client Configuration
-
-### Streamable HTTP (Recommended)
-```json
-{
-  "mcpServers": {
-    "yaw": {
-      "url": "http://127.0.0.1:8765/mcp"
-    }
-  }
-}
-```
-
-### Stdio Transport
-```json
-{
-  "mcpServers": {
-    "yaw": {
-      "command": "uv",
-      "args": [
-        "run",
-        "--directory",
-        "/path/to/yaw",
-        "python",
-        "yaw.py",
-        "serve",
-        "--vault",
-        "/path/to/vault",
-        "--transport",
-        "stdio"
-      ]
-    }
-  }
-}
-```
-
-### Exposed FastMCP Tools
-
-#### Production Client Interface (Karpathy Contract)
-- `query_wiki(query: str, top_k: int = 3) -> str`: Full hybrid GraphRAG retrieval returning dual-layer payload (Ontological Context + Retrieved Ground-Truth Evidence).
-- `ingest_raw(content: str, title: str | None = None, url: str | None = None) -> dict`: Ingests an external URL or raw text string into a timestamped, slugged Markdown note in `vault/raw/`.
-- `compile_wiki(force: bool = False) -> dict`: Triggers background consolidation, B-Tree HAC splitting, hypernym induction, fast closed-world SHACL (<200ms), and commits detected violations to SQLite `compiled_violations`.
-- `lint_wiki(query: str | None = None, force: bool = False) -> list[dict]`: Instantaneous O(1) query of pre-compiled contradictions and shape violations from SQLite (<5ms); live pySHACL validation override on `force=True`.
-
-#### Developer Probes
-- `find_seed(query: str, top_k: int = 3) -> list[dict]`: Stage 1 seed generator returning top FTS BM25 and vector hits.
-- `read_document(path: str, line_start: int | None = None, line_end: int | None = None) -> str`: Zero-copy line-based slice reader into `vault/raw/`.
-- `get_ontology_schema() -> dict`: Returns active namespaces, base predicates, and graph node/edge counts.
-
----
-
-## Configuration
-
-Settings are managed in `config.toml` (or environment variables prefixed with `YAW_`):
-
-```toml
-[mcp]
-host = "127.0.0.1"
-port = 8765
-
-[vault]
-raw_dir = "raw"
-wiki_dir = "wiki"
-db_path = ".cache/yaw.db"
-
-[models]
-embedding_model = "embed-gemma-300m-FLM"
-chat_model = "Qwen3-4B-Instruct-2507-GGUF"
-ollama_host = "http://127.0.0.1:11434"
-
-[retrieval]
-alpha = 0.85
-top_k = 3
-relevance_threshold = 0.10
-hub_dampening_gamma = 0.5
-```
+Streamable HTTP uses the configured `/mcp` endpoint; stdio uses the same handlers. Neither transport selects another engine. Source/generation state and typed errors remain visible. Exact launcher/package verification belongs to 7.8 and the subsequent production gates.

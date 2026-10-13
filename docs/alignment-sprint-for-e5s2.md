@@ -1,18 +1,27 @@
+# Historical Epic 5.1 alignment sprint
+
+**Status:** Historical implementation plan, superseded for current work by [Epic 7.8](epic7.8-open-ie-ontology-alignment.md), [FOUNDATIONAL](../FOUNDATIONAL.md) and [ADR-013](adr/ADR-013.md).
+
+The old fourteen-predicate alignment, contested-alias state machine, test recipes and agent dispatch instructions below must not be used as the current plan. They are retained to explain the migration baseline.
+
+<details>
+<summary>Historical sprint plan and test recipes</summary>
+
 # Epic 5.1 (Sprint 5.1): Mid-Epic 5 Substrate Hardening & Quad Alignment
 
-**Document Status:** Authoritative Sprint Implementation Plan & Teamwork Dispatch Plan  
-**Location:** [`docs/alignment-sprint-for-e5s2.md`](file:///home/harri/yaw/docs/alignment-sprint-for-e5s2.md)  
-**Governing Documents:**  
-- [`FOUNDATIONAL.md §0, §1, §5.1, §5.2, §5.4`](file:///home/harri/yaw/FOUNDATIONAL.md)  
-- [`docs/adr/ADR-008.md`](file:///home/harri/yaw/docs/adr/ADR-008.md)  
-- [`docs/adr/ADR-005.md`](file:///home/harri/yaw/docs/adr/ADR-005.md)  
-- [`docs/adr/ADR-002.md`](file:///home/harri/yaw/docs/adr/ADR-002.md)  
-- [`docs/epics-alignment-roadmap.md`](file:///home/harri/yaw/docs/epics-alignment-roadmap.md)  
-- [`docs/rdf-owl-shacl.md`](file:///home/harri/yaw/docs/rdf-owl-shacl.md)  
-- [`docs/USER_STORIES.md`](file:///home/harri/yaw/docs/USER_STORIES.md)  
-**Target Release:** Epic 5.1 (Substrate Hardening & Quad Alignment) → Epic 5.2 (E5S2: Dynamic Few-Shot Steering)  
-**Active Test Harness:** `tests/test_storage.py`, `tests/test_canonicalization.py`  
-**Sprint Status:** **COMPLETE** (Delivered in Commit `481d5bd`, 226/226 tests green, Sentrux modularity 5234)  
+**Document Status:** Authoritative Sprint Implementation Plan & Teamwork Dispatch Plan\
+**Location:** [`docs/alignment-sprint-for-e5s2.md`](alignment-sprint-for-e5s2.md)\
+**Governing Documents:**\
+- [`FOUNDATIONAL.md §0, §1, §5.1, §5.2, §5.4`](../FOUNDATIONAL.md)\
+- [`docs/adr/ADR-008.md`](adr/ADR-008.md)\
+- [`docs/adr/ADR-005.md`](adr/ADR-005.md)\
+- [`docs/adr/ADR-002.md`](adr/ADR-002.md)\
+- [`docs/epics-alignment-roadmap.md`](epics-alignment-roadmap.md)\
+- [`docs/rdf-owl-shacl.md`](rdf-owl-shacl.md)\
+- [`docs/USER_STORIES.md`](USER_STORIES.md)\
+**Target Release:** Epic 5.1 (Substrate Hardening & Quad Alignment) → Epic 5.2 (E5S2: Dynamic Few-Shot Steering)\
+**Active Test Harness:** `tests/test_storage.py`, `tests/test_canonicalization.py`\
+**Sprint Status:** **COMPLETE** (Delivered in Commit `481d5bd`, 226/226 tests green, Sentrux modularity 5234)\
 
 ---
 
@@ -41,14 +50,14 @@ flowchart LR
 
 | ID | Category | Discrepancy Found | Impact if Unresolved | Sprint 5.1 Remediation Action |
 | :--- | :--- | :--- | :--- | :--- |
-| **C1** | **Contradiction** | `unified_edges` view in [`src/yaw/storage/db.py`](file:///home/harri/yaw/src/yaw/storage/db.py) projects only 4 columns `(src_id, dst_id, rel_type, weight)`. Missing `source_chunk_id`. | Breaks Sprint 6A RDF named quad projection `(s, p, o, g)` ([`docs/adr/ADR-008.md`](file:///home/harri/yaw/docs/adr/ADR-008.md)). | Extend `unified_edges` to project 5 columns: `src_id`, `dst_id`, `rel_type`, `weight`, `source_chunk_id`. |
-| **C2** | **Contradiction** | [`src/yaw/config.py`](file:///home/harri/yaw/src/yaw/config.py) defines `BASE_PREDICATES = ("is_a", "partOf", "subClassOf")`. `is_a` persists; 11 ADR-008 predicates missing. | Sprint 5B injects obsolete synonyms (`is_a`) into LLM prompts instead of canonical vocabulary. | Update `config.BASE_PREDICATES` to the authoritative 14 ADR-008 canonical predicates across 4 categories. |
-| **C3** | **Contradiction** | [`src/yaw/indexer/canonicalize.py`](file:///home/harri/yaw/src/yaw/indexer/canonicalize.py) defaults to singular `namespace="concept"` (`_node_id`, `_parse_surface_identity`, `resolve`). | Un-prefixed nodes produce `concept:{slug}`, failing Sprint 6C SHACL URI regex validation (`concepts`). | Change all defaults in `canonicalize.py` to plural `"concepts"`, validating against `config.TAXONOMY_NAMESPACES`. |
-| **C4** | **Contradiction** | [`src/yaw/storage/db.py`](file:///home/harri/yaw/src/yaw/storage/db.py) enforces `CHECK(method IN ('lexical', 'auto', 'llm', 'compile'))`, while `MatchMethod` enum includes `exact`, `alias`, `new`. | Inserting `MatchMethod.EXACT` triggers SQLite `CHECK constraint failed: aliases.method`. | Reconcile SQLite CHECK constraint to include `'exact'`, `'alias'`, `'new'` matching `MatchMethod` enum values. |
-| **G1** | **Gap** | [`src/yaw/retrieval/retriever.py`](file:///home/harri/yaw/src/yaw/retrieval/retriever.py) only applies asymmetric conductance to `concept <-> chunk`; `subClassOf` is unhandled (1.0). | Violates [`docs/adr/ADR-002.md`](file:///home/harri/yaw/docs/adr/ADR-002.md) and Sprint 6B; PPR mass leaks up superclasses during GraphRAG retrieval. | Synthesize reciprocal inverse edge `hasSubClass` (weight 1.0) and damp upward `subClassOf` (weight 0.2). |
-| **G2** | **Gap** | `aliases.status = 'contested'` exists in schema, but [`src/yaw/indexer/canonicalize.py`](file:///home/harri/yaw/src/yaw/indexer/canonicalize.py) inserts only `status='active'`. | SHACL contested alias validation in Sprint 6C and Epic 7 is dead code without input data. | Add automated `contested` state transition when candidate prior confidence $< 0.80$ or conflicting targets emerge (remediated in Epic 7.5 / ADR-010 via Cython `InMemoryLookupKB` priors without LLM calls). |
+| **C1** | **Contradiction** | `unified_edges` view in [`src/yaw/storage/db.py`](../src/yaw/storage/db.py) projects only 4 columns `(src_id, dst_id, rel_type, weight)`. Missing `source_chunk_id`. | Breaks Sprint 6A RDF named quad projection `(s, p, o, g)` ([`docs/adr/ADR-008.md`](adr/ADR-008.md)). | Extend `unified_edges` to project 5 columns: `src_id`, `dst_id`, `rel_type`, `weight`, `source_chunk_id`. |
+| **C2** | **Contradiction** | [`src/yaw/config.py`](../src/yaw/config.py) defines `BASE_PREDICATES = ("is_a", "partOf", "subClassOf")`. `is_a` persists; 11 ADR-008 predicates missing. | Sprint 5B injects obsolete synonyms (`is_a`) into LLM prompts instead of canonical vocabulary. | Update `config.BASE_PREDICATES` to the authoritative 14 ADR-008 canonical predicates across 4 categories. |
+| **C3** | **Contradiction** | [`src/yaw/indexer/canonicalize.py`](../src/yaw/indexer/canonicalize.py) defaults to singular `namespace="concept"` (`_node_id`, `_parse_surface_identity`, `resolve`). | Un-prefixed nodes produce `concept:{slug}`, failing Sprint 6C SHACL URI regex validation (`concepts`). | Change all defaults in `canonicalize.py` to plural `"concepts"`, validating against `config.TAXONOMY_NAMESPACES`. |
+| **C4** | **Contradiction** | [`src/yaw/storage/db.py`](../src/yaw/storage/db.py) enforces `CHECK(method IN ('lexical', 'auto', 'llm', 'compile'))`, while `MatchMethod` enum includes `exact`, `alias`, `new`. | Inserting `MatchMethod.EXACT` triggers SQLite `CHECK constraint failed: aliases.method`. | Reconcile SQLite CHECK constraint to include `'exact'`, `'alias'`, `'new'` matching `MatchMethod` enum values. |
+| **G1** | **Gap** | [`src/yaw/retrieval/retriever.py`](../src/yaw/retrieval/retriever.py) only applies asymmetric conductance to `concept <-> chunk`; `subClassOf` is unhandled (1.0). | Violates [`docs/adr/ADR-002.md`](adr/ADR-002.md) and Sprint 6B; PPR mass leaks up superclasses during GraphRAG retrieval. | Synthesize reciprocal inverse edge `hasSubClass` (weight 1.0) and damp upward `subClassOf` (weight 0.2). |
+| **G2** | **Gap** | `aliases.status = 'contested'` exists in schema, but [`src/yaw/indexer/canonicalize.py`](../src/yaw/indexer/canonicalize.py) inserts only `status='active'`. | SHACL contested alias validation in Sprint 6C and Epic 7 is dead code without input data. | Add automated `contested` state transition when candidate prior confidence $< 0.80$ or conflicting targets emerge (remediated in Epic 7.5 / ADR-010 via Cython `InMemoryLookupKB` priors without LLM calls). |
 | **G3** | **Gap** | ADR-002 & Epic 7 split saturated hubs in `compile_wiki` and rewire `subClassOf`, but Invariant 1 forbids mutating `leaf_relations`. | Nowhere to persist compiled superclasses and rewired edges without violating Invariant 1. | Add `compiled_nodes` and `compiled_relations` tables in `db.py`; union them into `unified_nodes` and `unified_edges`. |
-| **G4** | **Gap** | [`src/yaw/server/daemon.py`](file:///home/harri/yaw/src/yaw/server/daemon.py) leaks obsolete predicates via `get_ontology_schema()`, and misses `compile_wiki`, `lint_wiki`, `ingest_raw`. | FastMCP clients receive invalid metadata and incomplete production tool contracts. | Update `daemon.py` schema reflection to reference updated `config.BASE_PREDICATES` and stub Epic 7 tool signatures. |
+| **G4** | **Gap** | [`src/yaw/server/daemon.py`](../src/yaw/server/daemon.py) leaks obsolete predicates via `get_ontology_schema()`, and misses `compile_wiki`, `lint_wiki`, `ingest_raw`. | FastMCP clients receive invalid metadata and incomplete production tool contracts. | Update `daemon.py` schema reflection to reference updated `config.BASE_PREDICATES` and stub Epic 7 tool signatures. |
 
 ---
 
@@ -98,9 +107,9 @@ flowchart TD
 ```
 
 ### Dispatch Concurrency & Assignment Matrix
-- **Agent A (Storage Engineer):** Owns [`src/yaw/storage/db.py`](file:///home/harri/yaw/src/yaw/storage/db.py). Executes WP 5.1.3, WP 5.1.5, WP 5.1.4.
-- **Agent B (NLP & Resolver Engineer):** Owns [`src/yaw/config.py`](file:///home/harri/yaw/src/yaw/config.py) and [`src/yaw/indexer/canonicalize.py`](file:///home/harri/yaw/src/yaw/indexer/canonicalize.py). Executes WP 5.1.1 (predicates), WP 5.1.2, WP 5.1.7.
-- **Agent C (Graph & Server Engineer):** Owns [`src/yaw/retrieval/retriever.py`](file:///home/harri/yaw/src/yaw/retrieval/retriever.py) and [`src/yaw/server/daemon.py`](file:///home/harri/yaw/src/yaw/server/daemon.py). Executes WP 5.1.6 and WP 5.1.1b.
+- **Agent A (Storage Engineer):** Owns [`src/yaw/storage/db.py`](../src/yaw/storage/db.py). Executes WP 5.1.3, WP 5.1.5, WP 5.1.4.
+- **Agent B (NLP & Resolver Engineer):** Owns [`src/yaw/config.py`](../src/yaw/config.py) and [`src/yaw/indexer/canonicalize.py`](../src/yaw/indexer/canonicalize.py). Executes WP 5.1.1 (predicates), WP 5.1.2, WP 5.1.7.
+- **Agent C (Graph & Server Engineer):** Owns [`src/yaw/retrieval/retriever.py`](../src/yaw/retrieval/retriever.py) and [`src/yaw/server/daemon.py`](../src/yaw/server/daemon.py). Executes WP 5.1.6 and WP 5.1.1b.
 
 ---
 
@@ -109,9 +118,9 @@ flowchart TD
 ### Prompt Card 1: WP 5.1.1 — Authoritative Predicate SSOT Alignment
 - **Agent Assignment:** Agent B (NLP & Resolver Engineer)
 - **Target Files:**
-  - [`src/yaw/config.py`](file:///home/harri/yaw/src/yaw/config.py#L65-L80)
-  - [`src/yaw/server/daemon.py`](file:///home/harri/yaw/src/yaw/server/daemon.py#L375-L445)
-- **Problem Statement:** `config.py` defines `BASE_PREDICATES = ("is_a", "partOf", "subClassOf")`. `is_a` is an unconstrained synonym that [`docs/adr/ADR-008.md`](file:///home/harri/yaw/docs/adr/ADR-008.md) explicitly purges. The 11 standard predicates across dialectical, process, and grounding axes are absent.
+  - [`src/yaw/config.py`](../src/yaw/config.py)
+  - [`src/yaw/server/daemon.py`](../src/yaw/server/daemon.py)
+- **Problem Statement:** `config.py` defines `BASE_PREDICATES = ("is_a", "partOf", "subClassOf")`. `is_a` is an unconstrained synonym that [`docs/adr/ADR-008.md`](adr/ADR-008.md) explicitly purges. The 11 standard predicates across dialectical, process, and grounding axes are absent.
 - **Lines to Modify:**
   - `src/yaw/config.py`: Line 65 and Line 180.
   - `src/yaw/server/daemon.py`: Lines 375–445 (`get_ontology_schema()`) and register tool stubs (`compile_wiki`, `lint_wiki`, `ingest_raw`).
@@ -119,7 +128,7 @@ flowchart TD
   ```python
   # BEFORE (src/yaw/config.py:65)
   BASE_PREDICATES: tuple[str, ...] = ("is_a", "partOf", "subClassOf")
-  
+
   # AFTER (src/yaw/config.py:65)
   BASE_PREDICATES: tuple[str, ...] = (
       # Subsumption & Mereology
@@ -157,8 +166,8 @@ flowchart TD
 
 ### Prompt Card 2: WP 5.1.2 — Plural Root Namespace Alignment in EDC Resolver
 - **Agent Assignment:** Agent B (NLP & Resolver Engineer)
-- **Target File:** [`src/yaw/indexer/canonicalize.py`](file:///home/harri/yaw/src/yaw/indexer/canonicalize.py#L155-L175)
-- **Problem Statement:** Functions `_node_id`, `_parse_surface_identity`, and `resolve` default parameter `namespace: str = "concept"` (singular). This causes un-prefixed nodes to produce `concept:{slug}`, violating the 9 plural root namespaces defined in [`docs/adr/ADR-005.md`](file:///home/harri/yaw/docs/adr/ADR-005.md) and failing Sprint 6C SHACL validation.
+- **Target File:** [`src/yaw/indexer/canonicalize.py`](../src/yaw/indexer/canonicalize.py)
+- **Problem Statement:** Functions `_node_id`, `_parse_surface_identity`, and `resolve` default parameter `namespace: str = "concept"` (singular). This causes un-prefixed nodes to produce `concept:{slug}`, violating the 9 plural root namespaces defined in [`docs/adr/ADR-005.md`](adr/ADR-005.md) and failing Sprint 6C SHACL validation.
 - **Lines to Modify:**
   - `src/yaw/indexer/canonicalize.py`: Line 155 (`_node_id`), Line 470 (`_parse_surface_identity`), Line 749 (`resolve`).
 - **Concrete Before/After Snippet:**
@@ -199,7 +208,7 @@ flowchart TD
 
 ### Prompt Card 3: WP 5.1.3 — SQLite `aliases.method` CHECK Constraint Reconciliation
 - **Agent Assignment:** Agent A (Storage Engineer)
-- **Target File:** [`src/yaw/storage/db.py`](file:///home/harri/yaw/src/yaw/storage/db.py#L44-L60)
+- **Target File:** [`src/yaw/storage/db.py`](../src/yaw/storage/db.py)
 - **Problem Statement:** Table `aliases` has constraint `CHECK(method IN ('lexical', 'auto', 'llm', 'compile'))`. When `canonicalize._resolve_tier1_exact()` inserts an alias, it uses `method="exact"` or `MatchMethod.EXACT`, which causes a SQLite CHECK constraint failure.
 - **Lines to Modify:** `src/yaw/storage/db.py`: Line 48 in `ensure_schema_tables()`.
 - **Concrete Before/After Snippet:**
@@ -225,9 +234,9 @@ flowchart TD
 ### Prompt Card 4: WP 5.1.4 — `unified_edges` Quad Projection Schema Extension
 - **Agent Assignment:** Agent A (Storage Engineer)
 - **Target Files:**
-  - [`src/yaw/storage/db.py`](file:///home/harri/yaw/src/yaw/storage/db.py#L85-L168)
-  - [`src/yaw/retrieval/retriever.py`](file:///home/harri/yaw/src/yaw/retrieval/retriever.py#L105-L125)
-- **Problem Statement:** `unified_edges` view only outputs 4 columns `(src_id, dst_id, rel_type, weight)`. W3C named quads in [`docs/adr/ADR-008.md`](file:///home/harri/yaw/docs/adr/ADR-008.md) and Sprint 6A require a 5th column `source_chunk_id` representing the graph context / provenance quad.
+  - [`src/yaw/storage/db.py`](../src/yaw/storage/db.py)
+  - [`src/yaw/retrieval/retriever.py`](../src/yaw/retrieval/retriever.py)
+- **Problem Statement:** `unified_edges` view only outputs 4 columns `(src_id, dst_id, rel_type, weight)`. W3C named quads in [`docs/adr/ADR-008.md`](adr/ADR-008.md) and Sprint 6A require a 5th column `source_chunk_id` representing the graph context / provenance quad.
 - **Lines to Modify:**
   - `src/yaw/storage/db.py`: `UNIFIED_EDGES_VIEW_TEMPLATE` lines 85–168.
   - `src/yaw/retrieval/retriever.py`: Line 110 (edge query unpacking).
@@ -281,8 +290,8 @@ flowchart TD
 
 ### Prompt Card 5: WP 5.1.5 — Compiled Knowledge Persistence Tables
 - **Agent Assignment:** Agent A (Storage Engineer)
-- **Target File:** [`src/yaw/storage/db.py`](file:///home/harri/yaw/src/yaw/storage/db.py#L70-L100, #L170-L240)
-- **Problem Statement:** Saturated hub bisection ([`docs/adr/ADR-002.md`](file:///home/harri/yaw/docs/adr/ADR-002.md)) creates hypernym superclasses and rewired `subClassOf` edges. Mutating `leaf_nodes` or `leaf_relations` violates Invariant 1 (extraction substrate immutability).
+- **Target File:** [`src/yaw/storage/db.py`](../src/yaw/storage/db.py)
+- **Problem Statement:** Saturated hub bisection ([`docs/adr/ADR-002.md`](adr/ADR-002.md)) creates hypernym superclasses and rewired `subClassOf` edges. Mutating `leaf_nodes` or `leaf_relations` violates Invariant 1 (extraction substrate immutability).
 - **Lines to Modify:**
   - `src/yaw/storage/db.py`: `ensure_schema_tables()` (add DDL for `compiled_nodes`, `compiled_relations`).
   - `src/yaw/storage/db.py`: `ensure_schema_views()` (add `UNION ALL` legs to `unified_nodes` and `unified_edges`).
@@ -339,7 +348,7 @@ flowchart TD
 
 ### Prompt Card 6: WP 5.1.6 — Taxonomic Subsumption Conductance Asymmetry
 - **Agent Assignment:** Agent C (Graph & Server Engineer)
-- **Target File:** [`src/yaw/retrieval/retriever.py`](file:///home/harri/yaw/src/yaw/retrieval/retriever.py#L145-L215)
+- **Target File:** [`src/yaw/retrieval/retriever.py`](../src/yaw/retrieval/retriever.py)
 - **Problem Statement:** `retriever.py` does not apply the $1.0 / 0.2$ conductance asymmetry to `subClassOf` and `partOf` relations, and does not synthesize reciprocal downward edges for hierarchical inheritance, causing energy loss during GraphRAG queries.
 - **Lines to Modify:** `src/yaw/retrieval/retriever.py`: In `_build_matrix()`.
 - **Concrete Before/After Snippet:**
@@ -367,7 +376,7 @@ flowchart TD
 
 ### Prompt Card 7: WP 5.1.7 — Automated Contested Alias State Machine
 - **Agent Assignment:** Agent B (NLP & Resolver Engineer)
-- **Target File:** [`src/yaw/indexer/canonicalize.py`](file:///home/harri/yaw/src/yaw/indexer/canonicalize.py#L420-L465)
+- **Target File:** [`src/yaw/indexer/canonicalize.py`](../src/yaw/indexer/canonicalize.py)
 - **Problem Statement:** `aliases.status = 'contested'` exists in the SQLite schema, but is never populated automatically during indexing.
 - **Lines to Modify:** `src/yaw/indexer/canonicalize.py`: Tier 3 resolution logic + add `get_contested_aliases(conn: sqlite3.Connection) -> list[dict]`.
 - **Concrete Before/After Snippet:**
@@ -606,12 +615,14 @@ def test_wp517_automated_contested_alias_state_machine(tmp_path: Path):
 ## 6. Verification & Execution Sequence
 
 1. **Step 1:** Author alignment test invariants (integrated into `tests/test_storage.py` and `tests/test_canonicalization.py`).
-2. **Step 2:** Dispatch Agent B to execute WP 5.1.1 ([`src/yaw/config.py`](file:///home/harri/yaw/src/yaw/config.py)) and WP 5.1.2 ([`src/yaw/indexer/canonicalize.py`](file:///home/harri/yaw/src/yaw/indexer/canonicalize.py)).
-3. **Step 3:** Dispatch Agent A to execute WP 5.1.3, WP 5.1.5, and WP 5.1.4 ([`src/yaw/storage/db.py`](file:///home/harri/yaw/src/yaw/storage/db.py)).
-4. **Step 4:** Dispatch Agent C to execute WP 5.1.6 ([`src/yaw/retrieval/retriever.py`](file:///home/harri/yaw/src/yaw/retrieval/retriever.py)) and WP 5.1.1b ([`src/yaw/server/daemon.py`](file:///home/harri/yaw/src/yaw/server/daemon.py)).
-5. **Step 5:** Dispatch Agent B to execute WP 5.1.7 ([`src/yaw/indexer/canonicalize.py`](file:///home/harri/yaw/src/yaw/indexer/canonicalize.py)).
+2. **Step 2:** Dispatch Agent B to execute WP 5.1.1 ([`src/yaw/config.py`](../src/yaw/config.py)) and WP 5.1.2 ([`src/yaw/indexer/canonicalize.py`](../src/yaw/indexer/canonicalize.py)).
+3. **Step 3:** Dispatch Agent A to execute WP 5.1.3, WP 5.1.5, and WP 5.1.4 ([`src/yaw/storage/db.py`](../src/yaw/storage/db.py)).
+4. **Step 4:** Dispatch Agent C to execute WP 5.1.6 ([`src/yaw/retrieval/retriever.py`](../src/yaw/retrieval/retriever.py)) and WP 5.1.1b ([`src/yaw/server/daemon.py`](../src/yaw/server/daemon.py)).
+5. **Step 5:** Dispatch Agent B to execute WP 5.1.7 ([`src/yaw/indexer/canonicalize.py`](../src/yaw/indexer/canonicalize.py)).
 6. **Step 6:** Run full validation suite:
    - `uv run pytest tests/test_sprint5_1_alignment.py -v` (100% pass across all 7 tests).
    - `uv run pytest tests/test_canonicalization.py tests/test_retriever.py tests/test_provenance.py -v` (0 regressions).
    - `uv run ruff check` (0 errors).
 7. **Step 7:** Commit and mark Sprint 5.1 complete, enabling turnkey kickoff of Sprint 5B (E5S2).
+
+</details>

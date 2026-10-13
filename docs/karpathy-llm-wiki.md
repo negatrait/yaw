@@ -15,6 +15,8 @@ tags:
 research_rationale: "Ingested as the canonical primary source defining the 3-layer persistent compounding knowledge base pattern."
 ---
 
+> **Reference material:** This document supplies background, not an alternative YAW implementation. [FOUNDATIONAL](../FOUNDATIONAL.md), [Epic 7.8](epic7.8-open-ie-ontology-alignment.md) and the focused guides define the selected path and current gates.
+
 ## LLM Wiki
 
 A pattern for building personal knowledge bases using LLMs. ^176c3c
