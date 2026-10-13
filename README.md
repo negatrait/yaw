@@ -1,59 +1,46 @@
-# YAW — Yet Another Wiki
+# YAW: HippoRAG 2 evaluation
 
-YAW is a local knowledge compiler and ontology GraphRAG engine for **100–500 Markdown documents**, mainly English with occasional other languages. It is intended to retain source claims, disagreements and revisions, compile supported cross-document knowledge, and retrieve that knowledge with verified evidence.
+YAW is a minimal workspace for evaluating upstream HippoRAG 2 against a small, messy corpus. The previous YAW application and architecture have been retired. Read [FOUNDATIONAL.md](FOUNDATIONAL.md) for scope and the next evaluation steps.
 
-**Current state:** documentation selects the implementation; production migration and runtime verification remain open in [Epic 7.8](docs/epic7.8-open-ie-ontology-alignment.md). See [TEST_READY](TEST_READY.md). No Epic 8 implementation starts until every 7.8 gate passes.
+## Install
 
-## Start here when implementing
-
-1. Read [AGENTS](AGENTS.md), then [FOUNDATIONAL](FOUNDATIONAL.md).
-2. Follow the [coding-agent execution contract](docs/epic7.8-open-ie-ontology-alignment.md#coding-agent-execution-contract), then take the first unfinished step in its [delivery packet](docs/epic7.8-open-ie-ontology-alignment.md#delivery-packets).
-3. Read only the relevant [compiler](docs/knowledge-compilation.md), [spaCy](docs/how-to-handle-spacy-llm.md), [semantics](docs/rdf-owl-shacl.md), [organization](docs/ontological-roots.md) or [retrieval](docs/power-pagerank.md) guide.
-4. Use the [test-target map and commands](TEST_INFRA.md#test-target-map) to prove the applicable E78 cases; record actual results and the next step in TEST_READY.
-
-For documentation-only changes, run `python tools/check_docs.py` and `git diff --check`; no YAW environment or model is required for the documentation checker.
-
-[ADR-014](docs/adr/ADR-014.md) resolves earlier alternatives. Historical ADR bodies and research clippings are background, not competing implementation plans. [The roadmap](docs/epics-alignment-roadmap.md) defines 8.1 hardening, 8.2 evaluation and 8.3 release.
-
-## Selected architecture
-
-`raw source revisions → spaCy/Raw qualified claims → shared CocoIndex corpus compiler → SQLite → query / cached lint / Markdown`
-
-- **spaCy/spacy-llm + Ollama:** linguistic assistance and typed extraction, with separately scheduled claim comparison and synthesis through the same adapter.
-- **CocoIndex:** one application for source and cross-document dependencies; no post-sync fallback compiler.
-- **RDF/OWL/SKOS/SHACL + pySHACL:** resource-defined semantics, scoped inference, admitted rules and validation.
-- **SQLite:** source pointers/claims, revisable interpretations, dependencies, generated wiki blocks, findings, FTS and typed vectors.
-- **SciPy:** the single candidate/fact/chunk/lexical PPR retrieval algorithm.
-- **FastMCP:** shared ingestion, compilation, query and lint handlers.
-- **Markdown:** optional deterministic rendering of stored authored blocks; no export-time model calls or re-ingestion of generated pages.
-
-Unknown relations remain available. `open_ie` selects an output vocabulary view, never another extractor. Source assertions remain separate from interpreted identities and generated knowledge. Required-component failures are explicit errors; no alternate model, parser, compiler or retriever takes over.
-
-## Runtime preparation
-
-The initial target is Python **3.14**, uv and the configured local Ollama models. Model names/settings have one owner in `config.toml` / `src/yaw/config.py`; implementations pin resolved digests and locked dependencies. Broader version support and performance are measured release claims.
-
-This repository includes `pyproject.toml`, `uv.lock` and the source entry points. Verify its locked environment and configured models in 7.8.3 before treating setup commands or CLI operation as proven. Documentation reconciliation does not certify an application runtime.
-
-Keep platform environments separate when sharing a checkout:
+Use Python 3.12 and uv:
 
 ```powershell
-$env:UV_PROJECT_ENVIRONMENT = ".cache/venv-windows"
 uv sync --locked
+uv run --locked python -c "from hipporag import HippoRAG; print('HippoRAG import OK')"
 ```
 
-```sh
-export UV_PROJECT_ENVIRONMENT=.cache/venv-unix
-uv sync --locked
+HippoRAG is the only direct dependency. It is pinned to upstream commit `d5c8329422e0a0b834a15874545cb6a74b4f9b26`, which declares version `2.0.0a5`. This is a source installation, not a published a5 wheel. Public PyPI offered a4 when checked on 2026-10-13. Git is required for installation.
+
+Python 3.14.7 was tested during setup: dependency resolution fails because upstream requires `torch==2.5.1`, which has no CPython 3.14 wheel. Python 3.12 avoids overriding upstream dependencies. Revisit this constraint when upstream changes its pins.
+
+## Verified setup (2026-10-13)
+
+The locked environment installed successfully in this repository on Windows with CPython 3.12.14. Importing HippoRAG succeeded and package metadata reported 2.0.0a5. The eight retained source documents were verified unchanged by SHA-256. No model inference, corpus indexing or retrieval-quality evaluation was performed during this reset.
+
+## First model evaluation
+
+Start Lemonade at `http://localhost:13305/api/v1`. Confirm the model IDs below with its `/models` endpoint. Run this Python example after installation; it creates an index in `outputs/smoke`:
+
+```python
+from hipporag import HippoRAG
+
+with HippoRAG(
+    save_dir="outputs/smoke",
+    llm_model_name="Qwen3-4B-Instruct-2507-GGUF",
+    llm_base_url="http://localhost:13305/api/v1",
+    embedding_model_name="embed-gemma-300m-FLM",
+    embedding_provider="openai",
+    embedding_base_url="http://localhost:13305/api/v1",
+) as hipporag:
+    hipporag.index(docs=["George Rankin is a politician."])
+    results = hipporag.rag_qa(queries=["What is George Rankin's occupation?"])
+    print(results)
 ```
 
-## Interface contract
+Configure credentials through the upstream API's environment-variable options if the server requires them. Model listing alone does not establish extraction, embedding or QA compatibility. The example is an evaluation starting point, not evidence of a successful model run.
 
-| Interface | Responsibility |
-| --- | --- |
-| `ingest_raw` | Append supplied source material and schedule the one application; report actual job state |
-| `compile_wiki` | Refresh the same application's derived inputs and report generation/state |
-| `query_wiki` | Return structured ranked passages, current context, counterevidence and coverage |
-| `lint_wiki` | Read scoped versioned findings; refresh through `compile_wiki` |
+Existing source notes remain in `sample-llm-wiki/raw/`. They are not automatically indexed. Start with a few manually selected passages before deciding how to prepare the full corpus.
 
-Streamable HTTP uses the configured `/mcp` endpoint; stdio uses the same handlers. Neither transport selects another engine. Source/generation state and typed errors remain visible. Exact launcher/package verification belongs to 7.8 and the subsequent production gates.
+Upstream: [HippoRAG](https://github.com/OSU-NLP-Group/HippoRAG/tree/d5c8329422e0a0b834a15874545cb6a74b4f9b26).
