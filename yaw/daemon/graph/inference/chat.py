@@ -144,6 +144,36 @@ def _normalize_qa_response(response: str, *, allow_missing_delimiter: bool = Fal
     return normalized
 
 
+def _repair_truncated_openie_json(response: str, *, is_triples: bool) -> str:
+    try:
+        json.loads(response)
+        return response
+    except ValueError:
+        pass
+    depth, in_str, esc, last_end = 0, False, False, -1
+    for i, ch in enumerate(response):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+                if not is_triples and depth == 2:
+                    last_end = i + 1
+        elif ch == '"':
+            in_str = True
+        elif ch in "{[":
+            depth += 1
+        elif ch in "}]":
+            if is_triples and depth == 3 and ch == "]":
+                last_end = i + 1
+            depth -= 1
+    if last_end == -1:
+        return '{"triples": []}' if is_triples else '{"named_entities": []}'
+    return response[:last_end] + "]}"
+
+
 def chat_identity(model):
     checkpoint, recipe = CHAT_MODELS[model]
     policy = RECIPE_POLICY_TAG[recipe]
@@ -218,16 +248,20 @@ class LocalChat(CacheOpenAI):
         try:
             result = super().infer(messages, **kwargs)
             text = result[0]
+            meta = result[1]
+            finish_reason = meta.get("finish_reason")
             if recipe == "ryzenai-llm" and isinstance(text, str) and r"\_" in text:
                 # Mistral v0.3 occasionally escapes underscores as \_ inside JSON keys.
                 text = text.replace(r"\_", "_")
+            if raw_system in OPENIE_JSON_SCHEMAS and finish_reason == "length" and isinstance(text, str):
+                text = _repair_truncated_openie_json(text, is_triples=(raw_system == ner_conditioned_re_system))
             if raw_system == rag_qa_system and isinstance(text, str):
                 text = _normalize_qa_response(text, allow_missing_delimiter=(recipe != "llamacpp"))
             if text is not result[0]:
                 result = (text, *result[1:])
-            meta = result[1]
-            if meta.get("finish_reason") != "stop":
-                raise ValueError(f"Chat response did not finish normally: {meta.get('finish_reason')}")
+            allowed_finish = ("stop", "length") if raw_system in OPENIE_JSON_SCHEMAS else ("stop",)
+            if finish_reason not in allowed_finish:
+                raise ValueError(f"Chat response did not finish normally: {finish_reason}")
         except Exception as error:
             self.errors.append(f"{type(error).__name__}: {error}")
             raise

@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from yaw.logger import FIFOLineRotatingHandler, configure_logging
+from yaw.core.logger import FIFOLineRotatingHandler, configure_logging
 
 
 class LoggerTests(unittest.TestCase):

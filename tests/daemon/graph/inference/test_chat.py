@@ -10,8 +10,8 @@ from hipporag.prompts import PromptTemplateManager
 from hipporag.prompts.filter_default_prompt import best_dspy_prompt
 from hipporag.utils.config_utils import BaseConfig
 from hipporag.utils.llm_utils import PROMPT_JSON_TEMPLATE
-from yaw.chat import RERANK_GBNF_GRAMMAR, LocalChat, chat_identity
-from yaw.models import CHAT_MODELS
+from yaw.daemon.graph.inference.chat import RERANK_GBNF_GRAMMAR, LocalChat, chat_identity
+from yaw.daemon.graph.inference.models import CHAT_MODELS
 
 
 class ChatTests(unittest.TestCase):
@@ -35,7 +35,7 @@ class ChatTests(unittest.TestCase):
                         self.assertNotIn("extra_body", params)
 
     def test_ryzenai_folds_leading_system_message_and_unescapes_markdown_underscores(self):
-        from yaw.chat import QA_TURN_REMINDER, TIGHTENED_QA_SYSTEM
+        from yaw.daemon.graph.inference.chat import QA_TURN_REMINDER, TIGHTENED_QA_SYSTEM
 
         with TemporaryDirectory(ignore_cleanup_errors=True) as directory, closing(
             LocalChat.from_experiment_config(BaseConfig(
@@ -81,7 +81,7 @@ class ChatTests(unittest.TestCase):
             self.assertEqual(chat.errors, [])
 
     def test_llamacpp_applies_openie_json_schemas_and_dspy_rerank_gbnf_grammar(self):
-        from yaw.chat import QA_GBNF_GRAMMAR, TIGHTENED_QA_SYSTEM
+        from yaw.daemon.graph.inference.chat import QA_GBNF_GRAMMAR, TIGHTENED_QA_SYSTEM
 
         with TemporaryDirectory(ignore_cleanup_errors=True) as directory, closing(
             LocalChat.from_experiment_config(BaseConfig(
@@ -132,7 +132,7 @@ class ChatTests(unittest.TestCase):
             self.assertEqual(qa_kwargs["extra_body"], {"grammar": QA_GBNF_GRAMMAR})
 
     def test_qa_delimiter_normalization(self):
-        from yaw.chat import _normalize_qa_response
+        from yaw.daemon.graph.inference.chat import _normalize_qa_response
 
         # QA delimiter normalization handles Markdown bolding, internal 'Answer:' mentions, and missing 'Answer:'
         normalized = _normalize_qa_response("The doc says Answer: maybe X.\n**Answer:** The glass slipper fit Cinderella.")
@@ -147,7 +147,7 @@ class ChatTests(unittest.TestCase):
             _normalize_qa_response("   ", allow_missing_delimiter=True)
 
     def test_dynamic_rerank_grammar_handles_all_candidate_counts_and_corpus_updates(self):
-        from yaw.chat import _build_rerank_grammar
+        from yaw.daemon.graph.inference.chat import _build_rerank_grammar
 
         def make_messages(fact_json_str):
             user_content = (
@@ -241,6 +241,22 @@ class ChatTests(unittest.TestCase):
         expected = ("answer", {"finish_reason": "stop", "prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}, False)
         with patch.object(CacheOpenAI, "infer", return_value=expected):
             self.assertEqual(chat.infer([]), expected)
+        self.assertEqual(len(chat.calls), 1)
+
+    def test_openie_allows_length_truncation_for_json_repair(self):
+        from hipporag.prompts.templates.triple_extraction import ner_conditioned_re_system
+        chat = object.__new__(LocalChat)
+        chat.llm_name = "Qwen3-4B-Instruct-2507-GGUF"
+        chat.calls = []
+        chat.errors = []
+        chat.global_config = BaseConfig()
+        openie_msgs = [{"role": "system", "content": ner_conditioned_re_system}, {"role": "user", "content": "text"}]
+        raw = '{"triples": [["A", "B", "C"], ["D", "rambling with, commas, inside'
+        meta = {"finish_reason": "length", "prompt_tokens": 100, "completion_tokens": 4096, "total_tokens": 4196}
+        with patch.object(CacheOpenAI, "infer", return_value=(raw, meta, False)):
+            res = chat.infer(openie_msgs)
+            self.assertEqual(res, ('{"triples": [["A", "B", "C"]]}', meta, False))
+        self.assertEqual(len(chat.errors), 0)
         self.assertEqual(len(chat.calls), 1)
 
     def test_chat_identity_distinguishes_all_registered_models_and_policies(self):

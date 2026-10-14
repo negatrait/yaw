@@ -1,0 +1,180 @@
+"""AST-enforced architecture containment and zero-cross-domain import boundary tests."""
+
+import ast
+from pathlib import Path
+import unittest
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+YAW_DIR = PROJECT_ROOT / "yaw"
+
+
+def parse_module_imports(file_path: Path) -> list[tuple[int, str]]:
+    """Parse all import statements in a python file and return (lineno, imported_module)."""
+    source = file_path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(file_path))
+    imports: list[tuple[int, str]] = []
+
+    # Calculate package name for relative imports
+    rel_path = file_path.relative_to(PROJECT_ROOT)
+    parts = list(rel_path.with_suffix("").parts)
+    # If the file is __init__.py, its package is parts[:-1], otherwise parts[:-1]
+    current_pkg_parts = parts[:-1] if file_path.name == "__init__.py" else parts[:-1]
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imports.append((node.lineno, alias.name))
+        elif isinstance(node, ast.ImportFrom):
+            if node.level > 0:
+                # Relative import: resolve against current_pkg_parts
+                # level=1 means from . import X (current package)
+                # level=2 means from .. import X (parent package)
+                drop = node.level - 1
+                if drop > len(current_pkg_parts):
+                    base_parts = []
+                else:
+                    base_parts = current_pkg_parts[: len(current_pkg_parts) - drop]
+                mod = ".".join(base_parts)
+                if node.module:
+                    full_mod = f"{mod}.{node.module}" if mod else node.module
+                else:
+                    full_mod = mod
+                imports.append((node.lineno, full_mod))
+            elif node.module:
+                imports.append((node.lineno, node.module))
+
+    return imports
+
+
+def get_canonical_package(module_path: Path) -> str:
+    """Return the dotted canonical package name for a given file inside yaw/."""
+    rel = module_path.relative_to(PROJECT_ROOT)
+    parts = list(rel.parts)
+    if parts[-1] == "__init__.py":
+        return ".".join(parts[:-1])
+    return ".".join(parts[:-1])
+
+
+def is_allowed_internal_import(importer_pkg: str, imported_mod: str) -> bool:
+    """Validate containment law: package P imports only P.* (descendants) or yaw.core.*."""
+    if not imported_mod.startswith("yaw.") and imported_mod != "yaw":
+        # External library or stdlib
+        return True
+
+    # Rule: yaw.core.* is globally accessible to all yaw modules
+    if imported_mod == "yaw.core" or imported_mod.startswith("yaw.core."):
+        return True
+
+    # Rule: yaw/core/* cannot import any other yaw package
+    if importer_pkg == "yaw.core" or importer_pkg.startswith("yaw.core."):
+        return False
+
+    # Rule: Top-level __main__.py can import daemon.cli
+    if importer_pkg == "yaw" and (imported_mod == "yaw.daemon.cli" or imported_mod.startswith("yaw.daemon.cli.")):
+        return True
+
+    # Rule: daemon.runtime is the daemon orchestrator and can import direct children (ingestion, graph)
+    if importer_pkg == "yaw.daemon":
+        # runtime.py or cli.py or mcp_server.py
+        if imported_mod.startswith("yaw.daemon."):
+            return True
+
+    # Rule: graph.engine is the graph orchestrator and can import direct children (storage, inference, ppr)
+    if importer_pkg == "yaw.daemon.graph":
+        if imported_mod.startswith("yaw.daemon.graph."):
+            return True
+
+    # General Rule: package P imports only P.* (itself or its descendants)
+    if imported_mod == importer_pkg or imported_mod.startswith(f"{importer_pkg}."):
+        return True
+
+    return False
+
+
+class ArchitectureTests(unittest.TestCase):
+    def test_all_init_files_are_strictly_empty(self):
+        """Rule 1: Every __init__.py in yaw/ is empty (0 bytes or whitespace/comments only)."""
+        init_files = list(YAW_DIR.rglob("__init__.py"))
+        self.assertGreater(len(init_files), 0, "No __init__.py files found in yaw/")
+
+        for init_file in init_files:
+            content = init_file.read_text(encoding="utf-8").strip()
+            # Must not contain any non-comment executable code
+            lines = [line.strip() for line in content.splitlines() if line.strip() and not line.strip().startswith("#")]
+            self.assertEqual(
+                lines,
+                [],
+                f"Non-empty __init__.py with executable statements found at: {init_file.relative_to(PROJECT_ROOT)}",
+            )
+
+    def test_domain_containment_and_zero_cross_domain_imports(self):
+        """Rule 2 & 3: Package P imports only P.* and yaw.core.* (zero horizontal cross-domain edges)."""
+        py_files = [p for p in YAW_DIR.rglob("*.py") if p.name != "__init__.py"]
+        self.assertGreater(len(py_files), 0, "No .py files found in yaw/")
+
+        violations = []
+        for py_file in py_files:
+            importer_pkg = get_canonical_package(py_file)
+            imports = parse_module_imports(py_file)
+
+            for lineno, imported_mod in imports:
+                if imported_mod.startswith("yaw.") or imported_mod == "yaw":
+                    if not is_allowed_internal_import(importer_pkg, imported_mod):
+                        violations.append(
+                            f"{py_file.relative_to(PROJECT_ROOT)}:{lineno}: "
+                            f"package '{importer_pkg}' forbidden to import '{imported_mod}'"
+                        )
+
+        self.assertEqual(
+            violations,
+            [],
+            "Architecture containment violations detected:\n" + "\n".join(violations),
+        )
+
+    def test_core_imports_stdlib_only(self):
+        """Rule: yaw/core/* must strictly import standard library only (zero third-party, zero daemon)."""
+        core_files = list((YAW_DIR / "core").glob("*.py"))
+        self.assertGreater(len(core_files), 0)
+
+        # Common known stdlib top-level modules
+        stdlib_whitelist = {
+            "ast", "collections", "contextlib", "dataclasses", "datetime", "functools",
+            "hashlib", "itertools", "json", "logging", "math", "os", "pathlib", "queue",
+            "re", "shutil", "stat", "string", "sys", "tempfile", "threading", "time",
+            "types", "typing", "unittest", "urllib", "uuid", "weakref", "enum", "abc",
+        }
+
+        violations = []
+        for py_file in core_files:
+            imports = parse_module_imports(py_file)
+            for lineno, mod in imports:
+                top_pkg = mod.split(".")[0]
+                if top_pkg == "yaw":
+                    # Only yaw.core is permitted inside yaw.core
+                    if not (mod == "yaw.core" or mod.startswith("yaw.core.")):
+                        violations.append(f"{py_file.relative_to(PROJECT_ROOT)}:{lineno}: imports non-core '{mod}'")
+                elif top_pkg not in stdlib_whitelist:
+                    violations.append(f"{py_file.relative_to(PROJECT_ROOT)}:{lineno}: imports non-stdlib '{mod}'")
+
+        self.assertEqual(
+            violations,
+            [],
+            "yaw/core non-stdlib imports detected:\n" + "\n".join(violations),
+        )
+
+    def test_synthetic_boundary_violation_detection(self):
+        """Verify the test architecture checker properly rejects synthetic cross-domain and parent imports."""
+        # storage importing inference (horizontal sibling edge) -> must be rejected
+        self.assertFalse(is_allowed_internal_import("yaw.daemon.graph.storage", "yaw.daemon.graph.inference.models"))
+        # inference importing storage (horizontal sibling edge) -> must be rejected
+        self.assertFalse(is_allowed_internal_import("yaw.daemon.graph.inference", "yaw.daemon.graph.storage.db"))
+        # ingestion importing graph (horizontal sibling edge) -> must be rejected
+        self.assertFalse(is_allowed_internal_import("yaw.daemon.ingestion", "yaw.daemon.graph.engine"))
+        # inference importing daemon runtime (child importing parent) -> must be rejected
+        self.assertFalse(is_allowed_internal_import("yaw.daemon.graph.inference", "yaw.daemon.runtime"))
+        # core importing daemon (core importing non-core) -> must be rejected
+        self.assertFalse(is_allowed_internal_import("yaw.core", "yaw.daemon.graph.inference"))
+        # inference importing core -> allowed
+        self.assertTrue(is_allowed_internal_import("yaw.daemon.graph.inference", "yaw.core.types"))
+        # inference importing internal sibling -> allowed
+        self.assertTrue(is_allowed_internal_import("yaw.daemon.graph.inference", "yaw.daemon.graph.inference.models"))

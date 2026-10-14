@@ -1,38 +1,52 @@
-# Foundation: HippoRAG 2 evaluation and local service
+# FOUNDATIONAL
 
-Decision baseline: 2026-10-13. YAW uses upstream HippoRAG 2 as its indexing, graph retrieval and QA engine. The earlier YAW application, ontology compiler, CocoIndex/spaCy stack and Epic 7/8 plans remain retired. Git history is reference material, not an active implementation contract.
+Baseline: 2026-10-14. YAW is a native HippoRAG 2 graph & storage engine (`yaw/daemon/graph/{engine.py,ppr.py,storage/*}`) backed by one SQLite file (`yaw.db`), CocoIndex (`cocoindex>=1.0.0`) ingestion, sparse PPR with 1-indexed line hydration, and FastMCP over Streamable HTTP. Pinned upstream `hipporag` (`2.0.0a5`) is kept only in [`benchmark.py`](benchmark.py) as the reference baseline and evaluator. No `rdflib`, OWL, `pySHACL`, `spaCy`, Parquet, or Pickle in runtime.
 
-## Current evidence and planned work
+## 6 Core Rules (Max Perf, Min Bloat)
 
-The installed baseline is Python 3.12.14 with HippoRAG 2.0.0a5 pinned to `d5c8329422e0a0b834a15874545cb6a74b4f9b26`. NumPy is also declared for the adapter. [benchmark.py](benchmark.py) (which replaces the retired `live_smoke.py` fixture script) passes repeatability and upstream multi-hop retrieval/QA benchmark checks (`sample`, `2wikimultihopqa`, `musique`) with EmbeddingGemma through llama.cpp. The former FLM embedding path failed and is retired from this evaluation. See the dated [evaluation record](docs/evaluation.md); this benchmark pass is not acceptance of a daemon or source-deletion lifecycle.
+1. **`yaw.db` SSOT + 1-Indexed Line Hydration:**
+   - Zero file sprawl; zero chunk text stored in `yaw.db`.
+   - `chunks(chunk_id, rel_posix_path, start_line, end_line, title, content_hash)` stores 1-indexed line spans.
+   - Graph lives in `edges(src_id, dst_id, edge_kind, weight)` + `edge_sources(src_id, dst_id, edge_kind, chunk_id)`.
+   - Run sparse PPR (`scipy.sparse.csr_matrix` power iteration or Forward Push) in `<3 ms`. Hydrate disk lines **only** for the final top-$k$ chunks; verify `content_hash` on read (`stale_on_disk=True` on mismatch).
+2. **`sqlite-vec` + Contentless `FTS5` Seeding:**
+   - Vectors live in `chunk_vec`, `entity_vec`, `fact_vec` (`sqlite-vec` / `float32` BLOBs). Use bounded SQL top-$k$ queries, never duplicate full-corpus NumPy matrices in RAM.
+   - Lexical BM25 seeding uses contentless `FTS5` (`content=''`, `1 / rank` L1-normalized) + exact entity/alias lookup.
+3. **Zero Unproven Bloat:**
+   - Every added piece of graph/ranking logic must prove measurable `Recall@k` or `F1` lift on [`benchmark.py`](benchmark.py).
+4. **CocoIndex Daemon + External Inference:**
+   - `cocoindex>=1.0.0` watches `corpus.root`, chunks files on line boundaries, and feeds coalesced `(added_chunks, deleted_chunk_ids)` deltas into a single serialized `yaw.db` worker thread.
+   - Stage 1 OpenIE caches per-request LLM outputs in `yaw.db` (`llm_cache`) for instant crash resume; Stage 2 graph/vector commit runs in one SQLite transaction.
+   - Enforce single-owner lock via `filelock.FileLock("yaw.db.lock")` + bound port (never PID-alive checks).
+   - Treat inference (`http://localhost:13305/api/v1` or configured URL) as an external persistent server; never load/unload models from the daemon.
+5. **FastMCP Adapter:**
+   - Mount `fastmcp` Streamable HTTP (`127.0.0.1:13306/mcp` + `/healthz` + `/readyz`) onto the single daemon runtime.
+6. **Lean Native Graph Engine + Owned DSPy/GEPA Prompts:**
+   - Own the NER, Triple Extraction, Recognition Memory (`DSPyFilter`), and QA prompts directly in `yaw/daemon/graph/inference/prompts.py` for direct DSPy/GEPA optimization on local 4B/7B models. Keep implementations direct and self-contained; no code-golfing, no artificial LOC quotas, and no multi-store synchronization sprawl.
 
-The next work is planned in exactly two epics:
+## Domain Containment Tree (Zero Cross-Domain / Sibling Edges)
 
-1. [Epic 1: HippoRAG 2 daemon mode](docs/epic-1-hipporag-daemon.md): establish correct embeddings first, then add source reconciliation, one persistent runtime, native Windows lifecycle controls and explicit repair after interrupted writes.
-2. [Epic 2: FastMCP v4 over Streamable HTTP](docs/epic-2-fastmcp-http.md): expose the same runtime through one local HTTP endpoint. Its implementation follows the Epic 1 acceptance gates.
+Every package owns its children; **horizontal imports between sibling domains are forbidden (`0` cross-domain edges)**. A module in package `X` may only import its own children `X.*` or `yaw.core.*`:
 
-These epics are not completed features; only the embedding/chat adapters and benchmark harness are implemented. The daemon commands and MCP endpoint described in them are target interfaces.
+```text
+yaw/
+  core/                    types.py, config.py, logger.py          (imports: stdlib only)
+  daemon/                  runtime.py, cli.py, mcp_server.py       (imports: daemon.*, core)
+    ingestion/             corpus.py                               (imports: core, cocoindex)
+    graph/                 engine.py, ppr.py                       (imports: graph.*, core, scipy)
+      storage/             db.py, hydration.py                     (imports: core, sqlite3, sqlite_vec)
+      inference/           models.py, prompts.py, embedding.py, chat.py (imports: core, openai)
+  __main__.py                                                      (imports: daemon.cli)
+```
 
-## Fixed integration decisions
+## Validated 3-Slot Local Model Stack (`http://localhost:13305/api/v1`)
 
-- One process, one state owner, one HippoRAG instance and one serialized operation queue. File reconciliation is the sole writer of corpus membership. MCP uses this runtime rather than starting another upstream server.
-- Lemonade remains the local OpenAI-compatible inference server at `http://localhost:13305/api/v1`. In the default 3-slot development configuration (`max_models = 3`), `embeddinggemma-300m-GGUF` (checkpoint `ggml-org/embeddinggemma-300M-GGUF:embeddinggemma-300M-Q8_0.gguf`, mean pooling, `--batch-size 2048 --ubatch-size 2048`, default `distinct-titled` task mode) and the extraction/reranking chat model `Qwen3-4B-Instruct-2507-GGUF` (checkpoint `unsloth/Qwen3-4B-Instruct-2507-GGUF:Qwen3-4B-Instruct-2507-Q4_K_M.gguf`, `--parallel 1` without `-dio`, tightened OpenIE NER and triple JSON Schemas + dynamic candidate-literal `DSPyFilter` GBNF) run on discrete GPU CUDA (`llamacpp`), while the QA reading model `Mistral-7B-Instruct-v0.3-Hybrid` (`amd/Mistral-7B-Instruct-v0.3-onnx-ryzenai-1.7-hybrid`) runs on the Ryzen AI Hybrid NPU/iGPU (`ryzenai-llm`). The FLM 1.0.6 embedding path is excluded because it forces query formatting and failed repeatability; this does not exclude FLM chat. The daemon must pass the explicit embedding provider, split `extraction_llm`/`qa_llm` instances, and truthful model/adapter identity.
-- The upstream Parquet backend remains selected for both epics. Milvus is optional and is not a remedy for incorrect embeddings or source lifecycle behavior. A future adoption requires measured benefit in the pinned integration.
-- Extraction chat, QA chat, and embeddings are independently selected through the same upstream API (`HippoRAG(embedding_model=..., extraction_llm=..., qa_llm=..., index_identity=...)`). The selected embedding profiles are the standard and QAT EmbeddingGemma 300M weights (supporting `search`, `qa`, `fact`, `distinct`, `titled`, and `distinct-titled` task modes) plus Qwen3-Embedding-0.6B. Registered chat profiles include `Qwen3-4B-Instruct-2507-GGUF`, `Mistral-7B-Instruct-v0.3-Hybrid`, step-up FLM models (`gemma4-it-12b-FLM`, `qwen3.5-9b-FLM`), and secondary `llamacpp` candidates (`Phi-4-mini-instruct-GGUF`, `Llama-3.2-3B-Instruct-GGUF`). Exact checkpoints, compatibility evidence and the real HippoRAG benchmark gate are in [model evaluation](docs/model-evaluation.md). EmbeddingGemma-2/multimodal support is deferred. Explicitly selecting a validated model profile is configuration, not a fallback; no model is silently substituted. Each extraction-chat/embedding combination must pass fresh gold-document/answer evaluation and index-compatibility checks before daemon/MCP acceptance.
-- Correct EmbeddingGemma behavior is implemented through its public injection point with a small adapter; no global monkeypatch, copied retrieval implementation or fork. Existing experimental vectors are rebuilt when prompt/adapter identity changes.
-- FastMCP 4.1.0 is the selected v4 target. Use Streamable HTTP on `127.0.0.1:13306/mcp` with a shared application lifespan. HTTP transport does not imply answer-token streaming.
-- Python stays on 3.12 while the upstream `torch==2.5.1` pin prevents installation on 3.14.7. Add direct dependencies when the integration actually imports them: filelock in E1 and FastMCP in E2. Pin/lock and verify them at implementation time; do not install optional database stacks preemptively.
+- **Embeddings (CUDA `llamacpp`):** `embeddinggemma-300m-GGUF` (`Q8_0`, mean pooling, `--batch-size 2048 --ubatch-size 2048`, `distinct-titled` / `retrieval-prompts-v3`).
+- **Extraction & Rerank (CUDA `llamacpp`):** `Qwen3-4B-Instruct-2507-GGUF` (`Q4_K_M`, `--parallel 1 --cache-ram 0`, no `-dio`, `temp=0.2`, `freq_penalty=0.5`, `gbnf-v3:require-stop`).
+- **QA Reader (Ryzen AI Hybrid NPU/iGPU `ryzenai-llm`):** `Mistral-7B-Instruct-v0.3-Hybrid` (`temp=0.2`, `fold-system:prompt-v4:require-stop`).
 
-## Corpus and correctness boundary
+## Execution & Hard Gates
 
-The intended corpus has 100–500 documents, mainly English with occasional other languages. Start with UTF-8 `.md` and `.txt` files under one configured root. The first daemon uses deterministic bounded passages and a source manifest. Document conversion is a separate future decision. No processing-time SLA exists; measure model calls, scan cost, vector counts, memory and latency.
-
-Preserve exact passage text and every source owner. Relevance scores are not truth confidence. Contradictions remain evidence to retrieve and report; the wrapper does not decide canonical truth. RDF/OWL/SKOS/SHACL remain deferred until retrieval evidence establishes a concrete need.
-
-No YAW-selected model/backend fallback is permitted. The selected HippoRAG version still has internal retrieval branches; observe and report them rather than claiming their removal. Dirty or inconsistent state is surfaced and explicitly rebuilt. A health response, package import or generated answer is insufficient evidence of correct indexing, ranking, source deletion or persistence.
-
-## Document ownership and execution
-
-FOUNDATIONAL owns scope and shared decisions. `docs/model-evaluation.md` owns selected model contracts and the benchmark comparison protocol; report differences without an automatic degradation cutoff. Each epic owns its contracts, delivery order and acceptance tests. `docs/evaluation.md` owns measured outcomes and unresolved failures. README owns commands available now and clearly labels future ones.
-
-Continue D1-01 with multilingual/chunk-boundary validation; its adapter and nine-document smoke checks now pass. Complete the first unfinished packet, run its targeted checks and record commands/results before advancing. Retain explicit failures and use live model evidence for quality claims. Reconcile these documents if an accepted decision changes; do not resurrect retired architecture to fill an ambiguity.
+1. **[Epic 1 (`E1-S1..E1-S6`)](docs/epic-1-hipporag-daemon.md):** Build strictly bottom-up along the containment tree: `E1-S1` (`core` + AST import lock) $\to$ `E1-S2` (`inference` HippoRAG prompt/parser port) $\to$ `E1-S3` (`storage` `yaw.db` + line hydration) $\to$ `E1-S4` (`graph` sparse PPR + engine, **Tier 1 parity gate**) $\to$ `E1-S5` (`ingestion` CocoIndex delta pipeline) $\to$ `E1-S6` (`daemon` runtime/CLI + **Tier 2 full-corpus parity or beat gate**).
+2. **[Epic 2 (`E2-S1..E2-S2`)](docs/epic-2-fastmcp-http.md):** Starts after `E1-S6`; mounts `yaw/daemon/mcp_server.py` onto `yaw/daemon/runtime.py` (`0` direct `graph`/`storage`/`inference` imports).
+3. Logs use 500-line FIFO rotation (`yaw/core/logger.py`). Record all measured runs in [`docs/evaluation.md`](docs/evaluation.md).

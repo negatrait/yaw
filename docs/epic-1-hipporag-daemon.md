@@ -1,131 +1,149 @@
-# Epic 1: HippoRAG 2 daemon mode
+# Epic 1: Native `yaw.db` Engine & CocoIndex Daemon
 
-Status: D1-01 adapter and nine-document regression implemented; multilingual/chunk-boundary validation and daemon implementation remain. Owner contract: [FOUNDATIONAL](../FOUNDATIONAL.md). Evidence: [evaluation record](evaluation.md). Next epic: [FastMCP v4](epic-2-fastmcp-http.md).
+Owner: [FOUNDATIONAL](../FOUNDATIONAL.md) | Results: [evaluation](evaluation.md) | Next: [Epic 2](epic-2-fastmcp-http.md)
 
-## Outcome and boundary
+## Hard Gates
 
-A native Windows background process keeps one HippoRAG instance alive and reconciles a configured source folder into one persistent index. Operators can start, inspect, synchronize and stop it. New text, edits, renames and deletions have defined behavior. An interrupted update never becomes a silently trusted index.
+- **Zero Cross-Domain Edges (`E1-S1`):** Lock the containment tree and AST boundary test (`tests/core/test_architecture.py`) **before** writing engine code. Sibling packages never import each other (`0` horizontal edges).
+- **Lean Architecture (No Code-Golfing, No LOC Quotas):** Eliminate dead abstractions and multi-file synchronization sprawl (retire the 7-file Parquet/Pickle/JSON store and multi-provider wrappers). Write direct, readable, strongly-typed code without line-count obsession or code-golfing.
+- **Dev Gate (`E1-S4`):** Native `yaw.daemon.graph` engine matches or beats upstream `hipporag` on **Tier 1** (`sample`, `2wikimultihopqa`, `musique` 10-query slices) on the 3-model local setup.
+- **Epic Gate (`E1-S6`):** Native `yaw.daemon.graph` engine matches or beats upstream `hipporag` baseline on our exact 3-model local setup on **Tier 2** full-corpus benchmarks (`Recall@2`, `Recall@5`, `QA EM`, `QA F1`), with published paper figures recorded in [evaluation](evaluation.md) as reference.
 
-This is the first epic after the MVP reset; its number does not continue the retired Epic 7/8 series. Use the pinned upstream package. Scope is local UTF-8 Markdown/text input, Lemonade, the upstream Parquet stores and lifecycle glue. PDF/Office conversion, operating-system service installation, restart-at-login, remote hosting, Milvus, ontology compilation and custom retrieval are outside these two epics.
+---
 
-## Prerequisite: fix and prove embeddings (D1-01)
+## 1. Containment Tree & Import Law
 
-The initial `live_smoke.py` exposed query-role and FLM serving defects. The corrected adapter/smoke run now passes items 1–5 below, using an explicit EmbeddingGemma llama.cpp backend change. These remain regression requirements. The 1024-byte English/multilingual chunk-boundary checks below remain unfinished; the daemon is not implemented.
-
-1. Replace process-wide assignments to `OpenAIEmbeddingModel.encode/batch_encode` with one small injected embedding adapter. Set the actual model ID `user.embeddinggemma-300m-GGUF` and explicit provider `openai`. Keep upstream SDK/batching/normalization and preserve ordering, float encoding, response validation, usage reporting and zero-vector handling. The shared adapter owns encode because upstream newline flattening would alter Qwen instructions. Do not substitute a made-up model name to select a provider.
-2. Set `query_instruction_mode = "shared"`: query-to-fact and query-to-passage both use `task: search result | query: ...`; passage, entity and fact inputs use `title: none | text: ...`. Prefix exactly once. The pinned HippoRAG omits instruction arguments for a provider declaring `ignored`, which is why the former monkeypatch misclassified queries. Use an explicit `index_identity` containing adapter/prompt/normalization versions; close the injected client explicitly when its owner shuts down.
-3. Probe the real endpoint with identical inputs alone, in a batch, and after reordered batches. Record input strings, model/backend versions, dimensions, row indices, finite/nonzero vectors and pairwise cosine. Acceptance: the same input has cosine >= 0.999 across those contexts on five repeated probes. This is a proposed regression threshold, not a model vendor guarantee. The corrected llama.cpp path passes; FLM 1.0.6 failed directly as well as through Lemonade. Diagnose the selected serving backend if it fails; do not hide it by silently switching model, single-item requests or vector backend.
-4. Rebuild into a fresh disposable index after changing prompts or adapter identity. Log the indexing stages, extracted triples, retrieval branch/seeds and the actual passages supplied to QA. The politician fact must rank first; both birthplace passages must be within QA's five-passage evidence window. Record the three fixture answers and useful recall@1/@2/@5; retrieving all nine documents is not a discriminating recall test.
-5. Correct the Cinderella reference answer before evaluating the corrected run: the supplied evidence links the matching slipper to reunion with the prince. Keep retrieval and answer-quality scores separate, and report a correct paraphrase separately from exact-match scoring. Do not tune the expected answer to an observed prediction.
-
-Use the checkpoint and mean-pooling CUDA setup in README. The switch preserves EmbeddingGemma 300M while explicitly replacing its faulty FLM serving path; model selection is explicit and no runtime fallback is added.
-
-Failure of this gate blocks claims that the daemon has a usable model baseline. Lifecycle unit work can be prepared, but D1 cannot close on installation/import evidence alone. Google documents the two prompt forms and a 2K input context for EmbeddingGemma; Lemonade's advertised 8192 setting does not establish a larger effective embedding window. [Model card](https://ai.google.dev/gemma/docs/embeddinggemma/model_card#prompt-instructions)
-
-## Model compatibility gate (2026-10-14 clarification)
-
-Preserve the heterogeneous device split across Lemonade's 3-slot pool (`max_models = 3`): `embeddinggemma-300m-GGUF` and `Qwen3-4B-Instruct-2507-GGUF` (`extraction_llm`) on discrete GPU CUDA (`llamacpp`), and `Mistral-7B-Instruct-v0.3-Hybrid` (`qa_llm`) on Ryzen AI Hybrid NPU/iGPU (`ryzenai-llm`), with `gemma4-it-12b-FLM` and `qwen3.5-9b-FLM` retained as step-up NPU chat profiles. FLM's diagnosed embedding defects do not imply a ban on FLM chat.
-
-Before admitting further models, extend the existing adapter/configuration with explicitly selected, validated model profiles, not parallel pipelines or error-triggered provider switches:
-
-- Keep extraction chat, QA chat, and embedding model IDs and endpoints independently configured. Chat uses the upstream OpenAI-compatible client with the explicit recipe-specific policy in `yaw/chat.py` (`gbnf-grammar:require-stop` on `llamacpp`, `fold-system:require-stop` on `ryzenai-llm`, `think-off:require-stop` on `flm`); exercise extraction, recognition/reranking and QA with each selected chat combination. Unsupported request parameters or malformed responses must surface as failures rather than silent parameter/model substitution.
-- Each embedding profile specifies exact checkpoint/revision, query/document formatting (including EmbeddingGemma's `search`, `qa`, `fact`, and `distinct` task modes), whether the server adds formatting, expected dimensions, normalization, pooling and supported context limit. Do not apply EmbeddingGemma's prefixes or 768-dimensional check to Qwen by assumption. Keep inherited SDK/batching and tested row-order/usage validation in one adapter implementation.
-- Test single/batched/reordered/repeated inputs and active document/query roles for every profile. Run `live_smoke.py --mode eval` on a fresh index for each approved chat/embedding combination, retaining gold documents, gold answers, per-question and aggregate recall/EM/F1 (both graph retrieval and DPR baseline) plus actual QA evidence and non-empty `graph_seeds`. An import, device health response or successful HTTP request cannot close this gate.
-- Include model weights/revision and prompt/dimension/pooling/normalization policy in index identity, along with the `extraction_llm` policy identity. Changing extraction chat or embedding profile must reject incompatible persisted state and require an explicit rebuild. The smoke command always creates fresh state.
-
-Exact profiles and a shared adapter are now implemented for the two selected Gemma quantizations and Qwen3-Embedding-0.6B, with independent `extraction_llm` and `qa_llm` selection. Read [model evaluation](model-evaluation.md) for evidence boundaries and the real-benchmark implementation packet. EmbeddingGemma-2/multimodal support remains deferred. Report model differences without an automatic degradation cutoff. Treat compatibility and benchmark evidence as required before closing the development epics; retain the English/multilingual chunk-boundary checks.
-
-## Runtime and commands
-
-Target interface, to be implemented; these commands do not exist yet:
-
-```powershell
-uv run --locked python -m yaw run --config yaw.toml
-uv run --locked python -m yaw start --config yaw.toml
-uv run --locked python -m yaw status --config yaw.toml
-uv run --locked python -m yaw sync --config yaw.toml
-uv run --locked python -m yaw stop --config yaw.toml
-uv run --locked python -m yaw rebuild --config yaw.toml
+```text
+yaw/
+  core/                    types.py, config.py, logger.py          (imports: stdlib only)
+  daemon/                  runtime.py, cli.py, mcp_server.py       (imports: daemon.*, core)
+    ingestion/             corpus.py                               (imports: core, cocoindex)
+    graph/                 engine.py, ppr.py                       (imports: graph.*, core, scipy)
+      storage/             db.py, hydration.py                     (imports: core, sqlite3, sqlite_vec)
+      inference/           models.py, prompts.py, embedding.py, chat.py (imports: core, openai)
+  __main__.py                                                      (imports: daemon.cli)
 ```
 
-- `run` is the foreground entry point. `start` launches exactly that entry point with the environment's interpreter, hidden window and redirected logs; it never runs a second implementation. Wait up to 30 seconds for the control endpoint to acknowledge the matching instance ID. Report `starting` if model initialization is still underway, not `ready`.
-- One canonical state directory has one lifetime `filelock.FileLock`. A second owner exits before constructing HippoRAG. A stale lock-file pathname alone is not a running process. Do not use `os.kill(pid, 0)`, Unix `fcntl`, PID-only termination, or port-killing shortcuts on Windows.
-- Use a local Windows named pipe via standard-library `multiprocessing.connection` for control. Derive the pipe name from the canonical state path. Use a per-run random auth key and instance ID stored under that user's state directory. Exchange bounded JSON using `send_bytes/recv_bytes`, never pickle `send/recv`. The controls are status, sync and stop; no RAG RPC is built here.
-- `status` reads a live control response and cached state, without waiting for an LLM or touching HippoRAG on another thread. A failed control connection is reported as unresponsive/stopped based on the owner lock, never as healthy from a PID file. A stale response from an earlier instance is rejected.
-- `sync` coalesces an immediate full scan and returns the scan ID. It does not directly mutate HippoRAG from the CLI process. `stop` stops admission and scanning, rejects queued work with SHUTTING_DOWN, then waits for the active operation and closes resources. After a 120-second client wait, report that shutdown is still pending; do not force-kill. Ctrl+C in foreground uses the same shutdown path.
-- `rebuild` requires the daemon to be stopped and the same owner lock. It builds a fresh local index from the currently readable source corpus and publishes it only after successful completion. It is explicit repair, not automatic recovery or an alternate retrieval path.
+- **Containment Law (`tests/core/test_architecture.py`):**
+  1. Every `__init__.py` is empty (no parent side-effects when importing child modules).
+  2. A module in package `P` imports **only** `P.*` (its own descendants) and `yaw.core.*`.
+  3. **Zero horizontal edges:** `ingestion` $\not\leftrightarrow$ `graph`, and `storage` $\not\leftrightarrow$ `inference` $\not\leftrightarrow$ `ppr`. Only a parent orchestrator (`daemon/runtime.py` or `graph/engine.py`) bridges its direct children.
 
-Use one `Runtime` async context manager for initialization, polling, state and shutdown. Construct, call and close HippoRAG on one worker thread. Index, delete, prepare-for-retrieval, retrieve, QA and graph-stat collection are serialized through a bounded FIFO queue of 32 waiting operations. Cache status separately. Coalesce scan requests to one pending scan. A busy queue returns an explicit error; do not create extra HippoRAG instances for concurrent clients.
+---
 
-After Epic 2, the FastMCP server lifespan enters this same context manager. The daemon controls and runtime remain the same; the foreground host gains the HTTP adapter. Do not expose a second independent upstream MCP process against this state directory.
+## 2. Sprint-by-Sprint Implementation Plan (One Node at a Time, Zero Spaghetti)
 
-## Configuration and identity
+Execute strictly in order `E1-S1` $\to$ `E1-S6`. Never start Sprint $k+1$ until Sprint $k$'s exit gate passes.
 
-Create one `yaw.toml` example with these settings; relative paths resolve against its location. Validate unknown keys and unsupported values instead of ignoring them.
+---
 
-| Setting | Initial value / rule |
-| --- | --- |
-| `corpus.root` | `sample-llm-wiki/raw`; one existing directory |
-| `corpus.poll_seconds` | 5; positive integer |
-| `corpus.chunk_bytes` | 1024; fixed for this initial baseline |
-| `index.state_dir` | `outputs/daemon`; outside the corpus root |
-| `models.base_url` | `http://localhost:13305/api/v1` for chat and embeddings |
-| `models.extraction_chat` | `Qwen3-4B-Instruct-2507-GGUF`; GPU CUDA `llamacpp` |
-| `models.qa_chat` | `Mistral-7B-Instruct-v0.3-Hybrid`; Ryzen AI Hybrid NPU/iGPU (`models.chat` may set both when single-model mode is desired) |
-| `models.embedding` | `user.embeddinggemma-300m-GGUF` (with optional `models.embedding_task_mode = "search"`) |
-| `models.api_key_env` | Optional environment-variable name, never a literal secret |
-| storage | Explicit upstream `vector_store_type="parquet"`; no configurable backend selector |
+### Sprint 1 (`E1-S1`): `yaw/core/` & Containment Tree Lock
+- **Files:** `yaw/core/{types.py, logger.py}`, empty `__init__.py` tree (`yaw/{core,daemon/{ingestion,graph/{storage,inference}}}/__init__.py`), `tests/core/test_architecture.py`.
+- **Allowed imports:** `stdlib` only (`dataclasses`, `logging`, `pathlib`, `typing`, `collections`).
+- **Copy/Adapt From:**
+  - Move current [`yaw/logger.py`](../yaw/logger.py) (`FIFOLineRotatingHandler(max_lines=500)`) $\to$ `yaw/core/logger.py`.
+  - Move current [`yaw/{models,embedding,chat}.py`](../yaw/) $\to$ `yaw/daemon/graph/inference/` (after running Tier 2 baseline completes) and update imports in `benchmark.py` & `tests/`.
+  - Adapt data structures from `git show d1bc65e:src/yaw/indexer/pipeline.py` (`MarkdownChunk`) and `hipporag/utils/misc_utils.py` (`Chunk`, `QuerySolution`, `NerRawOutput`, `TripleRawOutput`) into 6 frozen `@dataclass(slots=True, frozen=True)` types in `yaw/core/types.py`:
+    - `ChunkPointer(chunk_id, rel_posix_path, start_line, end_line, title, content_hash)`
+    - `HydratedPassage(pointer, text, score, stale_on_disk=False)`
+    - `OpenIERecord(chunk_id, entities: tuple[str, ...], triples: tuple[tuple[str, str, str], ...])`
+    - `RetrievalResult(question, passages: tuple[HydratedPassage, ...], answer: str | None = None)`
+    - `SyncDelta(added_chunks: tuple[ tuple[ChunkPointer, str], ...], deleted_chunk_ids: tuple[str, ...])`
+- **Drop (Anti-Spaghetti):** Drop `d1bc65e:src/yaw/utils.py`, global mutable singletons, and upstream's mutable `QuerySolution.to_dict()` / numpy array fields.
+- **Exit Gate (`D1-A1`):** `uv run --locked python -m unittest discover -s tests -v` passes with `tests/core/test_architecture.py` verifying `0` cross-domain imports and empty `__init__.py`s across all `yaw/**/*.py`.
 
-Pin the HippoRAG commit and Python 3.12 baseline. NumPy is already a direct dependency of the experiment. Declare `filelock` directly when importing it in the daemon; it already exists transitively. All other E1 orchestration uses the standard library. Do not install upstream's MCP or Milvus extras in E1.
+---
 
-Persist a configuration fingerprint including canonical source root, HippoRAG revision, model IDs/endpoints, adapter/prompt/normalization identity and chunker version. Refuse to open an incompatible existing index. A changed fingerprint requires the explicit rebuild command. A successful HTTP response is not proof that the model served the requested weights; record the server-reported model/backend version during validation.
+### Sprint 2 (`E1-S2`): `yaw/daemon/graph/inference/prompts.py` — Owned DSPy/GEPA Prompts & Parsers
+- **Files:** `yaw/daemon/graph/inference/prompts.py`, `tests/daemon/graph/inference/test_prompts.py`.
+- **Allowed imports:** `yaw.core.*`, `json`, `re`, `ast`, `difflib`. (No dynamic loaders, no provider wrappers).
+- **Copy/Adapt From (Upstream `hipporag`):**
+  - **Prompts:** Copy exact prompt strings & one-shot demos from `.venv/Lib/site-packages/hipporag/prompts/templates/{ner.py, triple_extraction.py, rag_qa_musique.py}` and `prompts/filter_default_prompt.py` (`best_dspy_prompt`) into plain module constants (`NER_MESSAGES`, `TRIPLE_MESSAGES`, `FACT_FILTER_MESSAGES`, `RAG_QA_MESSAGES`).
+  - **Stateless Parsers:**
+    - From `hipporag/information_extraction/openie_openai.py:32-72`: port `_extract_ner_from_response`, `_extract_json_list_field`, and `filter_invalid_triples` (preserving exact `[s, p, o]` length-3 string coercion).
+    - From `hipporag/rerank.py:35-120`: port `DSPyFilter.parse_filter` and `difflib.get_close_matches(..., n=1, cutoff=0.0)` candidate fact matcher as a pure function `filter_reranked_facts(candidate_facts, llm_response) -> list[int]`.
+    - From `hipporag/utils/misc_utils.py:42-65`: port `compute_mdhash_id(content, prefix)` and `text_processing(text)` (lowercase alphanumeric + whitespace normalization).
+- **Drop (Anti-Spaghetti):** Drop `hipporag/prompts/prompt_template_manager.py` (dynamic `importlib` file scanning, `string.Template` AST introspection, role-mapping classes) and `d1bc65e:src/yaw/nlp/*` (spaCy, GLiNER, Ollama wrappers).
+- **Exit Gate (`D1-A2`):** `tests/daemon/graph/inference/test_prompts.py` proves 100% byte-for-byte rendered message parity and parser output parity against upstream `PromptTemplateManager`, `OpenIE`, and `DSPyFilter`.
 
-## Folder reconciliation and source ownership
+---
 
-1. Poll the full tree on startup and every configured interval. For 100–500 files this avoids adding a watcher dependency. Accept `.md` and `.txt`, case-insensitively; ignore hidden directories and report unsupported extensions in status counts. Do not traverse symlinks/junctions or paths that escape the configured root. Do not write source files.
-2. Read UTF-8 with optional BOM and normalize CRLF/CR to LF. Hash content rather than trusting modification time. Require the same path/content hash on two consecutive scans before admitting additions/edits; require absence on two complete scans for deletions. A missing root, failed directory enumeration or unreadable supported file invalidates the scan: retain the previous committed index, report the error and admit no deletions from that scan.
-3. Split deterministically into contiguous passages of at most 1024 UTF-8 bytes. Prefer the last newline within the limit; otherwise split at a Unicode character boundary. No overlap, summarization, lowercasing, title injection or silent truncation. Record offsets in the normalized source and original byte hash. Skip whitespace-only spans but report empty sources. D1-01 must verify boundary-size English and multilingual inputs against the actual embedding and chat limits before this chunking policy passes; bytes are a conservative sizing policy, not a claimed token count.
-4. Maintain a single committed source manifest: relative path, original file hash, normalized text hash, and ordered passage entries containing exact text, SHA-256, start/end offsets. Derive the set of source owners of each exact passage from it. Reject case-colliding relative paths on this Windows baseline. Renames are removal/addition of source ownership, so unchanged text need not be embedded again.
-5. Diff the unique exact texts of the previous and next manifests. Call `index(new_texts)` for texts with no previous owner and `delete(orphaned_texts)` only when no next owner remains. Shared text is indexed once, and remains searchable when only one of its source files disappears. Update the manifest for an ownership-only change without re-extracting text. Do not rely on HippoRAG's single `source_id` slot to represent duplicate owners.
-6. A query's citations are reconstructed by matching each returned exact passage against the committed manifest. Return every owning relative path/hash/offset span. Unknown text is a consistency error. Passages and scores stay in upstream order; the wrapper does not rerank or infer canonical facts.
+### Sprint 3 (`E1-S3`): `yaw/daemon/graph/storage/{db.py, hydration.py}` — Single `yaw.db` & Line Hydration
+- **Files:** `yaw/daemon/graph/storage/{db.py, hydration.py}`, `tests/daemon/graph/storage/{test_db.py, test_hydration.py}`.
+- **Allowed imports:** `yaw.core.*`, `sqlite3`, `sqlite_vec`, `numpy`, `hashlib`, `itertools`, `pathlib`.
+- **Copy/Adapt From:**
+  - **SQLite WAL & `sqlite-vec` setup (`db.py`):** Adapt `apply_pragmas` (`WAL`, `busy_timeout=5000`, `synchronous=NORMAL`, `foreign_keys=ON`) and `load_vec_extension` (`sqlite_vec.load(conn)`) from `git show d1bc65e:src/yaw/storage/db.py:55-68`.
+  - **Single Fixed Schema (`db.py` — Zero Migrations):**
+    ```sql
+    CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    CREATE TABLE llm_cache (cache_key TEXT PRIMARY KEY, response TEXT NOT NULL, meta_json TEXT NOT NULL);
+    CREATE TABLE chunks (chunk_id TEXT PRIMARY KEY, rel_posix_path TEXT NOT NULL, start_line INT NOT NULL, end_line INT NOT NULL, title TEXT NOT NULL, content_hash TEXT NOT NULL);
+    CREATE TABLE openie_chunks (chunk_id TEXT PRIMARY KEY, entities_json TEXT NOT NULL, triples_json TEXT NOT NULL);
+    CREATE TABLE entities (entity_id TEXT PRIMARY KEY, text TEXT NOT NULL);
+    CREATE TABLE facts (fact_id TEXT PRIMARY KEY, subj_id TEXT NOT NULL, pred TEXT NOT NULL, obj_id TEXT NOT NULL, text TEXT NOT NULL);
+    CREATE TABLE edges (src_id TEXT NOT NULL, dst_id TEXT NOT NULL, kind TEXT NOT NULL, weight REAL NOT NULL, PRIMARY KEY (src_id, dst_id, kind));
+    CREATE TABLE edge_sources (src_id TEXT NOT NULL, dst_id TEXT NOT NULL, kind TEXT NOT NULL, chunk_id TEXT NOT NULL, PRIMARY KEY (src_id, dst_id, kind, chunk_id));
+    CREATE VIRTUAL TABLE chunk_fts USING fts5(chunk_id UNINDEXED, title, body, content='', contentless_delete=1);
+    -- + sqlite-vec float32 tables: chunk_vec(chunk_id, embedding), entity_vec(entity_id, embedding), fact_vec(fact_id, embedding)
+    ```
+  - **1-Indexed Line Hydration (`hydration.py`):** Adapt `hydrate_disk_slice` from `git show d1bc65e:src/yaw/retrieval/retriever.py:30-75` (`itertools.islice(f, start_line - 1, end_line)` + `resolved.is_relative_to(corpus_root)` path guard), adding SHA-256 `content_hash` verification (`stale_on_disk = (sha256(text) != pointer.content_hash)`).
+- **Drop (Anti-Spaghetti):** Drop all 7 upstream files (`EmbeddingStore` Parquet rewrite loops, `openie_results_*.json`, `chunk_metadata.json`, `graph.pickle`) AND drop `d1bc65e:src/yaw/storage/{rdf.py, schema.py}` (`unified_edges` SQL views, `compiled_violations`, `aliases`, `canon_verdicts`).
+- **Exit Gate (`D1-A3`):** Unmocked `test_db.py` & `test_hydration.py` pass top-$k$ `sqlite-vec` KNN, contentless `FTS5` BM25 (`1 / rank` L1-normalized), atomic `chunk_id` deletion cascading through `edge_sources` $\to$ `edges`/`entities`/`facts`, and `stale_on_disk` detection.
 
-## Commit, failure and restart contract
+---
 
-HippoRAG writes multiple files during a mutation. Atomic graph-file replacement is not an atomic transaction across graph, vectors, OpenIE and source manifest.
+### Sprint 4 (`E1-S4`): `yaw/daemon/graph/{ppr.py, engine.py}` — Sparse PPR & Tier 1 Parity
+- **Files:** `yaw/daemon/graph/{ppr.py, engine.py}`, `tests/daemon/graph/{test_ppr.py, test_engine.py}`.
+- **Allowed imports:** `ppr.py` imports `yaw.core.*`, `numpy`, `scipy.sparse` only; `engine.py` imports `yaw.daemon.graph.{storage,inference,ppr}` and `yaw.core.*`. (Zero external graph frameworks).
+- **Copy/Adapt From:**
+  - **Sparse CSR Power Iteration (`ppr.py`):** Adapt `power_iteration` from `git show d1bc65e:src/yaw/retrieval/retriever.py:280-315`:
+    - Build symmetric row-stochastic CSR matrix $P = D^{-1} A$ from `edges(src_id, dst_id, weight)` plus `min_max_normalize` (`hipporag/utils/misc_utils.py:132`).
+    - Run $p^{(t+1)} = (1 - \alpha) (P^T p^{(t)} + m_{\text{dangling}} p_0) + \alpha p_0$ with HippoRAG damping $\alpha = 0.5$ (`damping=0.5`), converging in $<3\text{ ms}$ on CSR matrices.
+  - **HippoRAG 2 Graph Construction (`engine.py`):** Port directly from `hipporag/HippoRAG.py`:
+    - `add_fact_edges` (`HippoRAG.py:1303-1340`): entity $\leftrightarrow$ entity co-occurrence counts across triples.
+    - `add_passage_edges` (`HippoRAG.py:1342-1372`): chunk $\leftrightarrow$ entity mention edges (`weight = 1.0`).
+    - `add_synonymy_edges` (`HippoRAG.py:1435-1510`): entity $\leftrightarrow$ entity KNN via `entity_vec` where cosine similarity $\ge 0.8$.
+  - **HippoRAG 2 Retrieval & Multi-Step QA (`engine.py`):** Port directly from `hipporag/HippoRAG.py`:
+    - Fact linking & Recognition Memory (`HippoRAG.py:2125-2175`): query `fact_vec` top-$k$ (`linking_top_k=5`) $\to$ filter via `inference/prompts.py:filter_reranked_facts`.
+    - PPR Seeding (`HippoRAG.py:2008-2120`): entity weight $w(e) = \text{mean\_fact\_score}(e) / \max(1, \text{doc\_freq}(e))$; passage weight $w(c) = 0.05 \cdot (\widehat{s}_{\text{vec}}(c) + \widehat{s}_{\text{fts}}(c))$ $\to$ `ppr.run_ppr` $\to$ rank chunk nodes $\to$ hydrate **only** top-$k$ chunks via `storage/hydration.py` (killing the `HippoRAG.py:2098` full-corpus `get_row` loop).
+    - QA reader (`HippoRAG.py:804-860, 1117-1165`): format top-$k$ hydrated passages with `Wikipedia Title: {title}\n{text}` and run `inference/chat.py`.
+- **Drop (Anti-Spaghetti):** Drop `python-igraph` (`self.graph`, vertex deletion index-shifting bugs, `graph.pickle`) and drop `d1bc65e`'s `compute_upward_conductance`, `in_degrees**0.5` hub dampening, and `InMemoryLookupKB`.
+- **Exit Gate (`D1-A4` — Tier 1 Dev Parity Gate):** `uv run --locked python benchmark.py --engine yaw --dataset {sample,2wikimultihopqa,musique} --max-queries 10` matches or beats upstream `hipporag` on `Recall@2`, `Recall@5`, `QA EM`, and `QA F1`.
 
-Before calling an index/delete mutation or publishing an ownership change, durably write a dirty marker containing the intended scan ID. Execute no query during the reconciliation; admitted queries wait in the bounded queue and recheck index state when they start. Apply additions, then removals, then prepare retrieval objects when nonempty; publish the next source manifest using a flushed temporary file and atomic replacement. Clear the dirty marker only after all steps succeed. An unchanged scan calls neither index nor delete. A query queued before a failed mutation must receive NEEDS_REBUILD rather than running against the damaged state.
+---
 
-Any exception after marking dirty puts the runtime into `needs_rebuild`: reject queries and mutations, retain the last error, keep status/stop responsive. A dirty marker on restart has the same meaning. Do not replay a half-applied batch or silently query a partially updated store. Failed reads before mutation leave the last committed index usable with `sync_error` and its last successful scan time visible.
+### Sprint 5 (`E1-S5`): `yaw/daemon/ingestion/corpus.py` — CocoIndex Incremental Line-Pointer Pipeline
+- **Files:** `yaw/daemon/ingestion/corpus.py`, `tests/daemon/ingestion/test_corpus.py`.
+- **Allowed imports:** `yaw.core.*`, `cocoindex`, `hashlib`, `pathlib`. (Zero imports from `graph/`).
+- **Copy/Adapt From:**
+  - Adapt `chunk_markdown` from `git show d1bc65e:src/yaw/indexer/pipeline.py:122-167`:
+    - Walk `corpus.root` using `cocoindex>=1.0.0` (`localfs.walk_`, `PatternFilePathMatcher` for `*.md`, `*.txt`, `RecursiveSplitter`).
+    - Compute 1-indexed inclusive `start_line = content[:c.start].count("\n") + 1`, `end_line = start_line + c.text.count("\n")`, and `content_hash = sha256(c.text)`.
+    - Diff against committed `chunk_id` set to return a single coalesced `SyncDelta(added_chunks, deleted_chunk_ids)`.
+- **Drop (Anti-Spaghetti):** Never call LLMs, spaCy, or SQLite writers inside the CocoIndex flow (`d1bc65e:pipeline.py` had 14 functions calling Ollama/spaCy inside CocoIndex). `corpus.py` is a pure file-to-`SyncDelta` producer.
+- **Exit Gate (`D1-A5`):** Unmocked `tests/daemon/ingestion/test_corpus.py` (adapted from `d1bc65e:tests/test_cocoindexer.py`) passes file add, edit, rename, delete, and memoized zero-op re-scans.
 
-Rebuild uses a fresh generation directory under the same state root. On success, atomically replace a small `current.json` pointer; the manifest and HippoRAG files belong to that generation. A failed rebuild leaves the prior pointer untouched and reports failure. Never import legacy `yaw.db` or experiment outputs. Local index generations are disposable derived state, not external project backups.
+---
 
-Status fields: instance ID, lifecycle (`starting`, `running`, `stopping`, `failed`), index state (`empty`, `ready`, `updating`, `sync_error`, `needs_rebuild`), configuration fingerprint, current/last scan IDs, last successful scan timestamp, file/passage/entity/fact counts, queue depth, active operation, last error and log path. `empty` is healthy with zero sources; retrieval returns an empty collection and QA returns `EMPTY_INDEX` without a model call. Log operation IDs and phase timings; redact credentials and avoid routine logging of full document text.
+### Sprint 6 (`E1-S6`): `yaw/daemon/{runtime.py, cli.py}` & Tier 2 Full-Corpus Parity Gate
+- **Files:** `yaw/core/config.py`, `yaw/daemon/{runtime.py, cli.py}`, `yaw/__main__.py`, `yaw.toml`, `tests/daemon/test_runtime.py`.
+- **Allowed imports:** `runtime.py` & `cli.py` import `yaw.daemon.{ingestion,graph}`, `yaw.core.*`, `filelock`, `tomllib`, `argparse`, `queue`, `threading`.
+- **Copy/Adapt From:**
+  - Adapt `DaemonLifecycle` and graceful signal handling from `git show d1bc65e:src/yaw/server/daemon.py:260-340` (using `filelock.FileLock("yaw.db.lock")` instead of raw `msvcrt`/PID-alive checks).
+  - Adapt `argparse` subcommands from `git show d1bc65e:src/yaw/cli.py:42-180` into `python -m yaw {run|start|status|sync|stop|rebuild} --config yaw.toml`.
+  - Wire single-owner 32-slot bounded FIFO worker thread in `runtime.py`: drains `ingestion.corpus.poll()` $\to$ `graph.engine.apply_delta(delta)` and serves `retrieve`/`rag_qa` requests, with non-blocking cached `status()`/`stats()`.
+- **Exit Gate (`D1-A6` — Epic 1 Acceptance Gate):**
+  1. `tests/daemon/test_runtime.py` passes lock contention, 32-slot `BUSY` overflow, Stage 1 crash-resume, and inference outage recovery.
+  2. Native `yaw.daemon.graph` engine matches or beats our upstream `hipporag` 3-model baseline on **Tier 2** full-corpus benchmarks in [evaluation](evaluation.md).
 
-## Delivery packets and verification
+---
 
-Select the first unfinished packet; record its command, result and outstanding failure in [evaluation](evaluation.md) before moving on. All boxes start unchecked.
+## 3. Checklist Summary
 
-| Packet | Owned files (future) | Observable exit condition |
-| --- | --- | --- |
-| D1-01 (partial) | `yaw/embedding.py`, `yaw/chat.py`, `benchmark.py`, `tests/test_embedding.py`, `tests/test_chat.py`, `tests/test_benchmark.py` | Adapter, stable probes, and Tier 0/1 upstream benchmark evaluation pass; remaining: English/multilingual 1024-byte boundary validation against embedding and chat limits |
-| D1-02 | `yaw/config.py`, `yaw/runtime.py` | One validated config and one worker-owned instance; bounded queue and explicit cleanup including injected client |
-| D1-03 | `yaw/corpus.py` | Stable scans, deterministic passages, exact text manifest and duplicate-owner reconciliation |
-| D1-04 | `yaw/daemon.py`, `yaw/__main__.py`, `yaw.toml` | Foreground/background lifecycle and control protocol operate on native Windows |
-| D1-05 | Same modules, `tests/test_daemon.py`, `tests/test_corpus.py` | Dirty-state detection and explicit rebuild; failure-injection checks pass |
-| D1-06 | README, evaluation record | Real Lemonade acceptance and restart evidence recorded; all limitations stated |
-
-Use standard-library `unittest` for deterministic lifecycle/source-ownership tests; use controlled fakes for injected write failures, never as evidence of real model quality. Place embedding contract tests in `tests/test_embedding.py` and benchmark slicing/evaluation tests in `tests/test_benchmark.py`. Execute the real run separately against Lemonade with disposable source/index fixtures.
-
-- [ ] **D1-A1:** Start twice against one state root: second start cannot load or mutate the index. Stop/restart releases clients and owner lock. Killing a disposable test child leaves no false-live PID behavior.
-- [ ] **D1-A2:** Stable new file is indexed; unchanged scan/restart causes zero embedding or extraction requests. Changed file removes unique old evidence before queries resume. Rename and deleting one of two identical sources retain the correct remaining citation.
-- [ ] **D1-A3:** Delete a source sharing an entity/triple with another: surviving evidence remains; deleted source contributes no stale citation. Deleting the last file yields the defined empty-index behavior.
-- [ ] **D1-A4:** Missing root, invalid UTF-8, unreadable file, reparse-point escape and file changing mid-read produce explicit outcomes and no inferred mass deletion.
-- [ ] **D1-A5:** Inject failure after embedding persistence, after OpenIE persistence, after deletion, and before manifest publication. Each affected run/restart requires explicit rebuild. Rebuild failure never publishes the new generation.
-- [ ] **D1-A6:** A slow index operation cannot overlap retrieval or shutdown cleanup; status remains responsive within two seconds in the local test. Saturating 32 waiting slots produces a busy error without extra workers. Cancelling a queued request removes it; cancelling a running awaiter never allows the next operation to overlap its thread.
-- [ ] **D1-A7:** Real nine-document evaluation, multilingual/boundary-size passages and a real add/edit/delete/restart sequence pass with model/version/latency evidence. Do not certify relevance from answer text alone.
-
-Epic 2 depends on D1-01 through D1-06 and all D1 acceptance checks. Required failures stay visible as blockers; adding a different database is not the repair for an embedding or source-ownership defect.
-
-## Source references
-
-The attached DeepWiki analysis describes an older revision. Our pinned source includes an optional MCP service and explicit state validation; do not copy the attachment's unconditional crash-recovery or MCP-absence claims. See upstream [HippoRAG implementation](https://github.com/OSU-NLP-Group/HippoRAG/blob/d5c8329422e0a0b834a15874545cb6a74b4f9b26/src/hipporag/HippoRAG.py), [MCP service](https://github.com/OSU-NLP-Group/HippoRAG/blob/d5c8329422e0a0b834a15874545cb6a74b4f9b26/src/hipporag/mcp_server.py) and [OpenAI embedding adapter](https://github.com/OSU-NLP-Group/HippoRAG/blob/d5c8329422e0a0b834a15874545cb6a74b4f9b26/src/hipporag/embedding_model/OpenAI.py). These sources inform the integration boundary; YAW's lifecycle and reconciliation contracts above are project decisions.
+- [x] **D1-A0 (`D1-01`):** Embedding repeatability (`cosine >= 0.999`), $T=0.2$ floors, GBNF, 500-line FIFO logger, paper datasets downloaded.
+- [x] **D1-A1 (`E1-S1`):** `yaw/core/` + containment tree locked; `test_architecture.py` enforces `0` horizontal/cross-domain imports.
+- [ ] **D1-A2 (`E1-S2`):** `inference/prompts.py` ports HippoRAG 2 NER, Triple, Recognition Memory, and QA prompts/parsers with 1:1 unit parity.
+- [ ] **D1-A3 (`E1-S3`):** `storage/{db,hydration}.py` implements single-schema `yaw.db` (`sqlite-vec`, contentless `FTS5`, provenance edges) and 1-indexed `itertools.islice` line hydration.
+- [ ] **D1-A4 (`E1-S4`):** `graph/{ppr,engine}.py` + `storage/*` achieves **Tier 1 benchmark parity** vs. upstream `hipporag` on the 3-model local setup.
+- [ ] **D1-A5 (`E1-S5`):** `ingestion/corpus.py` (`cocoindex>=1.0.0`) emits pure coalesced line-pointer `SyncDelta`s across add/edit/rename/delete.
+- [ ] **D1-A6 (`E1-S6`):** `daemon/{runtime,cli}.py` passes lifecycle/lock/recovery tests AND native engine matches or beats upstream `hipporag` 3-model baseline on **Tier 2** full corpus.

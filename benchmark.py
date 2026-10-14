@@ -26,16 +26,16 @@ from hipporag.evaluation.retrieval_eval import RetrievalRecall
 from hipporag.prompts.linking import get_query_instruction
 from hipporag.utils.config_utils import BaseConfig
 
-from yaw.chat import LocalChat, chat_identity
-from yaw.logger import configure_logging
-from yaw.embedding import (
+from yaw.core.logger import configure_logging
+from yaw.daemon.graph.inference.chat import LocalChat, chat_identity
+from yaw.daemon.graph.inference.embedding import (
     GEMMA_TASK_MODES,
     MODEL,
     PROFILES,
     RetrievalEmbedding,
     resolve_embedding_profile,
 )
-from yaw.models import (
+from yaw.daemon.graph.inference.models import (
     BASE_URL,
     CHAT_MODELS,
     DEFAULT_CHAT,

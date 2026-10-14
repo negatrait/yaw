@@ -5,9 +5,9 @@ import unittest
 from unittest.mock import Mock
 
 from hipporag.utils.config_utils import BaseConfig
-from yaw.embedding import GEMMA_TASK_MODES, MODEL, PROFILES, RetrievalEmbedding, resolve_embedding_profile
+from yaw.daemon.graph.inference.embedding import GEMMA_TASK_MODES, MODEL, PROFILES, RetrievalEmbedding, resolve_embedding_profile
 from hipporag.prompts.linking import get_query_instruction
-from yaw.models import CHAT_MODELS, chat_evidence, check_registry
+from yaw.daemon.graph.inference.models import CHAT_MODELS, chat_evidence, check_registry
 from unittest.mock import patch
 
 
@@ -23,10 +23,10 @@ class ProfileTests(unittest.TestCase):
             "backend_health": "ready",
             "launch_command": ["llama-server.exe", "--parallel", "1", "--cache-ram", "0"],
         }
-        with patch("yaw.models.get_json", return_value={"all_models_loaded": [base_entry]}):
+        with patch("yaw.daemon.graph.inference.models.get_json", return_value={"all_models_loaded": [base_entry]}):
             self.assertEqual(chat_evidence(name)["id"], name)
         with patch(
-            "yaw.models.get_json",
+            "yaw.daemon.graph.inference.models.get_json",
             return_value={
                 "all_models_loaded": [
                     {**base_entry, "launch_command": ["llama-server.exe", "-dio", "--cache-ram", "0"]}
@@ -36,7 +36,7 @@ class ProfileTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "-dio"):
                 chat_evidence(name)
         with patch(
-            "yaw.models.get_json",
+            "yaw.daemon.graph.inference.models.get_json",
             return_value={"all_models_loaded": [{**base_entry, "launch_command": ["llama-server.exe", "--parallel", "1"]}]},
         ):
             with self.assertRaisesRegex(ValueError, "--cache-ram 0"):
@@ -53,16 +53,16 @@ class ProfileTests(unittest.TestCase):
             "backend_health": "ready",
             "recipe_options": {"ctx_size": 32786},
         }
-        with patch("yaw.models.get_json", return_value={"all_models_loaded": [valid_entry]}):
+        with patch("yaw.daemon.graph.inference.models.get_json", return_value={"all_models_loaded": [valid_entry]}):
             self.assertEqual(chat_evidence(name)["id"], name)
         with patch(
-            "yaw.models.get_json",
+            "yaw.daemon.graph.inference.models.get_json",
             return_value={"all_models_loaded": [{**valid_entry, "device": "cpu"}]},
         ):
             with self.assertRaisesRegex(ValueError, "expected device npu"):
                 chat_evidence(name)
         with patch(
-            "yaw.models.get_json",
+            "yaw.daemon.graph.inference.models.get_json",
             return_value={"all_models_loaded": [{**valid_entry, "recipe_options": {"ctx_size": 4096}}]},
         ):
             with self.assertRaisesRegex(ValueError, "ctx_size >="):

@@ -9,7 +9,7 @@ from hipporag.embedding_model.OpenAI import OpenAIEmbeddingModel
 from hipporag.prompts.linking import get_query_instruction
 from hipporag.utils.config_utils import BaseConfig
 
-from yaw.embedding import (
+from yaw.daemon.graph.inference.embedding import (
     DOCUMENT_PREFIX,
     FACT_CHECK_PREFIX,
     MODEL,
