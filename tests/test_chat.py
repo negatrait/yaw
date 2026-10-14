@@ -35,6 +35,8 @@ class ChatTests(unittest.TestCase):
                         self.assertNotIn("extra_body", params)
 
     def test_ryzenai_folds_leading_system_message_and_unescapes_markdown_underscores(self):
+        from yaw.chat import QA_TURN_REMINDER, TIGHTENED_QA_SYSTEM
+
         with TemporaryDirectory(ignore_cleanup_errors=True) as directory, closing(
             LocalChat.from_experiment_config(BaseConfig(
                 save_dir=directory, llm_name="Mistral-7B-Instruct-v0.3-Hybrid",
@@ -57,8 +59,25 @@ class ChatTests(unittest.TestCase):
             self.assertEqual([m["role"] for m in sent_messages], ["user", "assistant", "user"])
             self.assertTrue(sent_messages[0]["content"].startswith(raw_messages[0]["content"].strip()))
             self.assertIn(raw_messages[1]["content"], sent_messages[0]["content"])
-            self.assertEqual(chat.summary()["calls"], 1)
-            self.assertEqual(chat.summary()["total_tokens"], 15)
+            self.assertNotIn(QA_TURN_REMINDER, sent_messages[-1]["content"])
+
+            chat.openai_client.chat.completions.create.return_value = SimpleNamespace(
+                id="resp-2", model="mistral",
+                choices=[SimpleNamespace(message=SimpleNamespace(content="Reasoning.\nAnswer: George."), finish_reason="stop")],
+                usage=SimpleNamespace(prompt_tokens=20, completion_tokens=5, total_tokens=25),
+            )
+            qa_messages = ptm.render(
+                name="rag_qa_musique",
+                prompt_user="Wikipedia Title: George Rankin\nGeorge Rankin is a politician.\n\nQuestion: Who is George?\nThought: ",
+            )
+            chat.infer(qa_messages)
+            sent_qa = chat.openai_client.chat.completions.create.call_args.kwargs["messages"]
+            self.assertEqual([m["role"] for m in sent_qa], ["user", "assistant", "user"])
+            self.assertTrue(sent_qa[0]["content"].startswith(TIGHTENED_QA_SYSTEM))
+            self.assertIn(f"\n{QA_TURN_REMINDER}\nQuestion: Who is George?\nThought: ", sent_qa[-1]["content"])
+
+            self.assertEqual(chat.summary()["calls"], 2)
+            self.assertEqual(chat.summary()["total_tokens"], 40)
             self.assertEqual(chat.errors, [])
 
     def test_llamacpp_applies_openie_json_schemas_and_dspy_rerank_gbnf_grammar(self):
@@ -87,20 +106,16 @@ class ChatTests(unittest.TestCase):
             self.assertEqual(ner_schema["properties"]["named_entities"]["items"], {"type": "string", "minLength": 1})
             self.assertEqual(PROMPT_JSON_TEMPLATE["ner"]["properties"]["named_entities"]["items"], {"type": "string"})
 
-            # Triple extraction with valid named_entities uses dynamic entity-anchored GBNF grammar
             chat.infer(ptm.render(name="triple_extraction", passage="George Rankin is a politician.", named_entity_json='{"named_entities": ["George"]}'))
             triple_kwargs = chat.openai_client.chat.completions.create.call_args.kwargs
-            self.assertNotIn("response_format", triple_kwargs)
-            self.assertIn('triple ::= "[" entity ", " string ", " string "]" | "[" string ", " string ", " entity "]"', triple_kwargs["extra_body"]["grammar"])
-            self.assertIn('entity ::= "\\\"George\\\""', triple_kwargs["extra_body"]["grammar"])
-
-            # Triple extraction with malformed named_entity_json falls back to tightened JSON schema
-            chat.infer(ptm.render(name="triple_extraction", passage="George Rankin is a politician.", named_entity_json="not-json"))
-            fallback_kwargs = chat.openai_client.chat.completions.create.call_args.kwargs
-            triple_schema = fallback_kwargs["response_format"]["json_schema"]["schema"]
+            triple_schema = triple_kwargs["response_format"]["json_schema"]["schema"]
             self.assertEqual(
                 triple_schema["properties"]["triples"]["items"]["items"],
                 {"type": "string", "minLength": 1},
+            )
+            self.assertEqual(
+                PROMPT_JSON_TEMPLATE["triples"]["properties"]["triples"]["items"]["items"],
+                {"type": "string"},
             )
 
             chat.infer([
@@ -116,38 +131,20 @@ class ChatTests(unittest.TestCase):
             self.assertNotIn("response_format", qa_kwargs)
             self.assertEqual(qa_kwargs["extra_body"], {"grammar": QA_GBNF_GRAMMAR})
 
-    def test_dynamic_triple_grammar_and_qa_delimiter_normalization(self):
-        import json
-        from yaw.chat import _build_triple_grammar, _normalize_qa_response
+    def test_qa_delimiter_normalization(self):
+        from yaw.chat import _normalize_qa_response
 
-        ptm = PromptTemplateManager()
-        # 1. Missing or malformed named_entities -> None (fallback to JSON schema)
-        self.assertIsNone(_build_triple_grammar([]))
-        self.assertIsNone(_build_triple_grammar(ptm.render(name="triple_extraction", passage="P", named_entity_json="bad")))
-        self.assertIsNone(_build_triple_grammar(ptm.render(name="triple_extraction", passage="P", named_entity_json='{"named_entities": "not-list"}')))
-
-        # 2. Empty named_entities (M = 0) -> forces {"triples": []}
-        grammar_empty = _build_triple_grammar(ptm.render(name="triple_extraction", passage="P", named_entity_json='{"named_entities": []}'))
-        self.assertIn('"{\\"triples\\": []}"', grammar_empty)
-        self.assertNotIn("entity ::=", grammar_empty)
-
-        # 3. M >= 1 with duplicates and special characters -> deduplicates and anchors subject or object
-        grammar_entities = _build_triple_grammar(ptm.render(
-            name="triple_extraction",
-            passage="P",
-            named_entity_json=json.dumps({"named_entities": ["Cinderella", "slipper", "Cinderella", 'quote "x"', "münchen"]}),
-        ))
-        self.assertIn('triple ::= "[" entity ", " string ", " string "]" | "[" string ", " string ", " entity "]"', grammar_entities)
-        self.assertEqual(grammar_entities.count('Cinderella'), 1)
-        self.assertIn("münchen", grammar_entities)
-
-        # 4. QA delimiter normalization handles Markdown bolding, internal 'Answer:' mentions, and missing 'Answer:'
+        # QA delimiter normalization handles Markdown bolding, internal 'Answer:' mentions, and missing 'Answer:'
         normalized = _normalize_qa_response("The doc says Answer: maybe X.\n**Answer:** The glass slipper fit Cinderella.")
         self.assertEqual(normalized.split("Answer:")[1].strip(), "The glass slipper fit Cinderella.")
         self.assertEqual(normalized.count("Answer:"), 1)
 
         with self.assertRaisesRegex(ValueError, "omitted required 'Answer:'"):
             _normalize_qa_response("Just a thought without the final marker.")
+        fallback = _normalize_qa_response("Step 1. Therefore, the answer is X.", allow_missing_delimiter=True)
+        self.assertEqual(fallback.split("Answer:")[1].strip(), "Therefore, the answer is X.")
+        with self.assertRaisesRegex(ValueError, "omitted required 'Answer:' content"):
+            _normalize_qa_response("   ", allow_missing_delimiter=True)
 
     def test_dynamic_rerank_grammar_handles_all_candidate_counts_and_corpus_updates(self):
         from yaw.chat import _build_rerank_grammar

@@ -7,10 +7,39 @@ from unittest.mock import Mock
 from hipporag.utils.config_utils import BaseConfig
 from yaw.embedding import GEMMA_TASK_MODES, MODEL, PROFILES, RetrievalEmbedding, resolve_embedding_profile
 from hipporag.prompts.linking import get_query_instruction
-from yaw.models import CHAT_MODELS, check_registry
+from yaw.models import CHAT_MODELS, chat_evidence, check_registry
+from unittest.mock import patch
 
 
 class ProfileTests(unittest.TestCase):
+    def test_llamacpp_chat_evidence_requires_cache_ram_zero_and_no_dio(self):
+        name = "Qwen3-4B-Instruct-2507-GGUF"
+        ckpt, recipe = CHAT_MODELS[name]
+        base_entry = {
+            "id": name,
+            "checkpoint": ckpt,
+            "recipe": recipe,
+            "backend_health": "ready",
+            "launch_command": ["llama-server.exe", "--parallel", "1", "--cache-ram", "0"],
+        }
+        with patch("yaw.models.get_json", return_value={"all_models_loaded": [base_entry]}):
+            self.assertEqual(chat_evidence(name)["id"], name)
+        with patch(
+            "yaw.models.get_json",
+            return_value={
+                "all_models_loaded": [
+                    {**base_entry, "launch_command": ["llama-server.exe", "-dio", "--cache-ram", "0"]}
+                ]
+            },
+        ):
+            with self.assertRaisesRegex(ValueError, "-dio"):
+                chat_evidence(name)
+        with patch(
+            "yaw.models.get_json",
+            return_value={"all_models_loaded": [{**base_entry, "launch_command": ["llama-server.exe", "--parallel", "1"]}]},
+        ):
+            with self.assertRaisesRegex(ValueError, "--cache-ram 0"):
+                chat_evidence(name)
     def test_each_profile_preserves_its_request_format_and_dimensions(self):
         for profile in PROFILES.values():
             with self.subTest(model=profile.model):

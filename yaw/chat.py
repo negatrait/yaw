@@ -16,7 +16,7 @@ from .models import CHAT_MODELS
 
 RECIPE_POLICY_TAG = {
     "flm": "think-off:prompt-v3:require-stop",
-    "ryzenai-llm": "fold-system:prompt-v3:require-stop",
+    "ryzenai-llm": "fold-system:prompt-v4:require-stop",
     "llamacpp": "gbnf-v3:require-stop",
 }
 
@@ -24,6 +24,10 @@ TIGHTENED_QA_SYSTEM = (
     f"{rag_qa_system} "
     "For 'Who', 'What', 'When', or 'Where' questions, state only the exact entity or fact. "
     "For 'How' or 'Why' questions, state both the key condition/means and the resulting outcome from the passages."
+)
+QA_TURN_REMINDER = (
+    "Based on the passages above, reason step by step and conclude on a new line "
+    "with 'Answer: ' followed only by the concise final answer."
 )
 SYSTEM_PROMPT_TIGHTENINGS = {
     rag_qa_system: TIGHTENED_QA_SYSTEM,
@@ -74,44 +78,6 @@ def _gbnf_literal(text: str) -> str:
     return f'"{escaped}"'
 
 
-def _build_triple_grammar(messages) -> str | None:
-    if not messages or messages[-1].get("role") != "user":
-        return None
-    content = messages[-1].get("content", "")
-    marker = "\n```\n\n"
-    if marker not in content:
-        return None
-    raw_json = content.rsplit(marker, 1)[1].strip()
-    try:
-        payload = json.loads(raw_json)
-        if not isinstance(payload, dict):
-            return None
-        entities = payload["named_entities"]
-        if not isinstance(entities, list) or not all(isinstance(x, str) for x in entities):
-            return None
-        unique_entities = []
-        for item in entities:
-            if item:
-                serialized = json.dumps(item, ensure_ascii=False)
-                if serialized not in unique_entities:
-                    unique_entities.append(serialized)
-    except (KeyError, TypeError, ValueError):
-        return None
-
-    if not unique_entities:
-        return 'root ::= "{\\"triples\\": []}"\n'
-
-    entity_rule = " | ".join(_gbnf_literal(e) for e in unique_entities)
-    return (
-        'root ::= "{\\"triples\\": [" triple-list "]}"\n'
-        'triple-list ::= (triple (", " triple)*)?\n'
-        'triple ::= "[" entity ", " string ", " string "]" | "[" string ", " string ", " entity "]"\n'
-        f"entity ::= {entity_rule}\n"
-        'string ::= "\\"" char+ "\\""\n'
-        'char ::= [^"\\\\\\x7F\\x00-\\x1F] | "\\\\" (["\\\\bfnrt] | "u" [0-9a-fA-F]{4})\n'
-    )
-
-
 def _build_rerank_grammar(messages, max_facts: int = 4) -> str:
     if not messages or messages[-1].get("role") != "user":
         return RERANK_GBNF_GRAMMAR
@@ -160,11 +126,16 @@ def _build_rerank_grammar(messages, max_facts: int = 4) -> str:
     )
 
 
-def _normalize_qa_response(response: str) -> str:
+def _normalize_qa_response(response: str, *, allow_missing_delimiter: bool = False) -> str:
     normalized = re.sub(r"\*{1,2}Answer\*{0,2}:\*{0,2}", "Answer:", response)
     normalized = re.sub(r"\bAnswer\s+:", "Answer:", normalized)
     if "Answer:" not in normalized:
-        raise ValueError("QA response omitted required 'Answer:' delimiter.")
+        if not allow_missing_delimiter:
+            raise ValueError("QA response omitted required 'Answer:' delimiter.")
+        if not normalized.strip():
+            raise ValueError("QA response omitted required 'Answer:' content.")
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", normalized.strip()) if s.strip()]
+        return f"{normalized.rstrip()}\nAnswer: {sentences[-1]}"
     parts = normalized.split("Answer:")
     if not parts[-1].strip():
         raise ValueError("QA response omitted required 'Answer:' content.")
@@ -213,14 +184,17 @@ class LocalChat(CacheOpenAI):
                 {"role": "user", "content": messages[0]["content"].strip() + "\n\n" + messages[1]["content"]},
                 *messages[2:],
             ]
+            if (raw_system == rag_qa_system and len(messages) >= 2
+                    and messages[-1].get("role") == "user"):
+                user_text = messages[-1].get("content", "")
+                if QA_TURN_REMINDER not in user_text and "\nQuestion: " in user_text:
+                    head, tail = user_text.rsplit("\nQuestion: ", 1)
+                    messages = [
+                        *messages[:-1],
+                        {"role": "user", "content": f"{head}\n{QA_TURN_REMINDER}\nQuestion: {tail}"},
+                    ]
         elif recipe == "llamacpp" and raw_system is not None:
-            if raw_system == ner_conditioned_re_system:
-                triple_grammar = _build_triple_grammar(messages)
-                if triple_grammar is not None and "extra_body" not in kwargs and "response_format" not in kwargs:
-                    kwargs = {**kwargs, "extra_body": {"grammar": triple_grammar}}
-                elif "response_format" not in kwargs:
-                    kwargs = {**kwargs, "response_format": OPENIE_JSON_SCHEMAS[ner_conditioned_re_system]}
-            elif raw_system in OPENIE_JSON_SCHEMAS and "response_format" not in kwargs:
+            if raw_system in OPENIE_JSON_SCHEMAS and "response_format" not in kwargs:
                 kwargs = {**kwargs, "response_format": OPENIE_JSON_SCHEMAS[raw_system]}
             elif raw_system == DSPY_FILTER_SYSTEM and "extra_body" not in kwargs:
                 kwargs = {**kwargs, "extra_body": {"grammar": _build_rerank_grammar(messages)}}
@@ -233,7 +207,7 @@ class LocalChat(CacheOpenAI):
                 # Mistral v0.3 occasionally escapes underscores as \_ inside JSON keys.
                 text = text.replace(r"\_", "_")
             if raw_system == rag_qa_system and isinstance(text, str):
-                text = _normalize_qa_response(text)
+                text = _normalize_qa_response(text, allow_missing_delimiter=(recipe != "llamacpp"))
             if text is not result[0]:
                 result = (text, *result[1:])
             meta = result[1]

@@ -3,6 +3,7 @@
 from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
+import re
 
 import numpy as np
 from hipporag.embedding_model.OpenAI import OpenAIEmbeddingModel
@@ -11,6 +12,7 @@ from hipporag.prompts.linking import get_query_instruction
 FACT_INSTRUCTION = get_query_instruction("query_to_fact")
 PASSAGE_INSTRUCTION = get_query_instruction("query_to_passage")
 QUERY_INSTRUCTIONS = {FACT_INSTRUCTION, PASSAGE_INSTRUCTION}
+TITLE_LINE_RE = re.compile(r"^(?:#{1,6}\s+|(?:wikipedia\s+)?title:\s*)(.+)$", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -38,7 +40,7 @@ class EmbeddingProfile:
             payload.pop("fact_query_prefix", None)
         if not self.parse_document_title:
             payload.pop("parse_document_title", None)
-        contract = {"adapter": "retrieval-prompts-v2", "normalization": "l2", **payload}
+        contract = {"adapter": "retrieval-prompts-v3", "normalization": "l2", **payload}
         return "yaw-embedding-v2:" + hashlib.sha256(
             json.dumps(contract, sort_keys=True).encode("utf-8")
         ).hexdigest()
@@ -57,9 +59,10 @@ class EmbeddingProfile:
             raise ValueError("Pass raw text, not an already prefixed embedding input.")
         if not query:
             if self.parse_document_title and "\n" in text:
-                title, body = text.split("\n", 1)
-                if title.strip() and body.strip():
-                    return f"title: {title.strip()} | text: {body.strip()}"
+                first_line, body = text.split("\n", 1)
+                match = TITLE_LINE_RE.match(first_line.strip())
+                if match and match.group(1).strip() and body.strip():
+                    return f"title: {match.group(1).strip()} | text: {body.strip()}"
             return self.document_prefix + text
         if instruction == FACT_INSTRUCTION and self.fact_query_prefix:
             return self.fact_query_prefix + text

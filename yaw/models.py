@@ -97,4 +97,12 @@ def chat_evidence(model_name, base_url=BASE_URL):
     if (model.get("checkpoint") != checkpoint or model.get("recipe") != recipe
             or model.get("backend_health") != "ready"):
         raise ValueError(f"Loaded chat backend for {model_name} differs from its declared profile.")
+    if recipe == "llamacpp":
+        command = model.get("launch_command", [])
+        if "-dio" in command or "--direct-io" in command:
+            raise ValueError(f"{model_name} must not use -dio/--direct-io on Windows CUDA.")
+        if "--cache-ram" not in command or command[command.index("--cache-ram") + 1] != "0":
+            raise ValueError(
+                f"{model_name} requires explicit --cache-ram 0 in Lemonade to prevent host RAM prompt-cache growth."
+            )
     return model

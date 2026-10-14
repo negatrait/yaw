@@ -107,14 +107,14 @@ Select the first unfinished packet; record its command, result and outstanding f
 
 | Packet | Owned files (future) | Observable exit condition |
 | --- | --- | --- |
-| D1-01 (partial) | `yaw/embedding.py`, `live_smoke.py`, `tests/test_embedding.py`, `tests/test_live_smoke.py` | Adapter, stable probes and clean nine-document evaluation pass; remaining: English/multilingual 1024-byte boundary validation against embedding and chat limits |
+| D1-01 (partial) | `yaw/embedding.py`, `yaw/chat.py`, `benchmark.py`, `tests/test_embedding.py`, `tests/test_chat.py`, `tests/test_benchmark.py` | Adapter, stable probes, and Tier 0/1 upstream benchmark evaluation pass; remaining: English/multilingual 1024-byte boundary validation against embedding and chat limits |
 | D1-02 | `yaw/config.py`, `yaw/runtime.py` | One validated config and one worker-owned instance; bounded queue and explicit cleanup including injected client |
 | D1-03 | `yaw/corpus.py` | Stable scans, deterministic passages, exact text manifest and duplicate-owner reconciliation |
 | D1-04 | `yaw/daemon.py`, `yaw/__main__.py`, `yaw.toml` | Foreground/background lifecycle and control protocol operate on native Windows |
 | D1-05 | Same modules, `tests/test_daemon.py`, `tests/test_corpus.py` | Dirty-state detection and explicit rebuild; failure-injection checks pass |
 | D1-06 | README, evaluation record | Real Lemonade acceptance and restart evidence recorded; all limitations stated |
 
-Use standard-library `unittest` for deterministic lifecycle/source-ownership tests; use controlled fakes for injected write failures, never as evidence of real model quality. Place embedding contract tests in `tests/test_embedding.py`. Execute the real run separately against Lemonade with disposable source/index fixtures.
+Use standard-library `unittest` for deterministic lifecycle/source-ownership tests; use controlled fakes for injected write failures, never as evidence of real model quality. Place embedding contract tests in `tests/test_embedding.py` and benchmark slicing/evaluation tests in `tests/test_benchmark.py`. Execute the real run separately against Lemonade with disposable source/index fixtures.
 
 - [ ] **D1-A1:** Start twice against one state root: second start cannot load or mutate the index. Stop/restart releases clients and owner lock. Killing a disposable test child leaves no false-live PID behavior.
 - [ ] **D1-A2:** Stable new file is indexed; unchanged scan/restart causes zero embedding or extraction requests. Changed file removes unique old evidence before queries resume. Rename and deleting one of two identical sources retain the correct remaining citation.

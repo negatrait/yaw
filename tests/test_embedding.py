@@ -110,22 +110,37 @@ class EmbeddingTests(unittest.TestCase):
             3,
         )
 
-        # Multi-line titled passage -> title: {first_line} | text: {body}
-        self.assertEqual(
-            titled_profile.format("Montebello\nMontebello is a part of Rockland County.", query=False),
-            "title: Montebello | text: Montebello is a part of Rockland County.",
-        )
-        # Single-line passage, fact tuple string, and entity string -> title: none | text: {text}
-        for single_line in (
+        # Explicit Title: or Markdown #..###### heading on line 1 -> title: {heading} | text: {body}
+        for raw_doc, expected in (
+            (
+                "Title: Montebello\nMontebello is a part of Rockland County.",
+                "title: Montebello | text: Montebello is a part of Rockland County.",
+            ),
+            (
+                "Wikipedia Title: Montebello\nMontebello is a part of Rockland County.",
+                "title: Montebello | text: Montebello is a part of Rockland County.",
+            ),
+            (
+                "## Section 2.1: Montebello\nMontebello is a part of Rockland County.",
+                "title: Section 2.1: Montebello | text: Montebello is a part of Rockland County.",
+            ),
+        ):
+            self.assertEqual(titled_profile.format(raw_doc, query=False), expected)
+
+        # Untitled multi-line passages, single-line passages, fact tuples, and entities -> title: none | text: {text}
+        for untitled_input in (
+            "Montebello\nMontebello is a part of Rockland County.",
+            "First paragraph of an enterprise policy.\nSecond paragraph with details.",
             "George Rankin is a politician.",
             "('george rankin', 'is', 'a politician')",
             "george rankin",
             "\nBody with empty title line",
-            "Title with empty body\n   ",
+            "## Heading with empty body\n   ",
+            "Title:   \nBody with blank title value",
         ):
             self.assertEqual(
-                titled_profile.format(single_line, query=False),
-                DOCUMENT_PREFIX + single_line,
+                titled_profile.format(untitled_input, query=False),
+                DOCUMENT_PREFIX + untitled_input,
             )
         # Reject already-prefixed titled document input
         with self.assertRaises(ValueError):
