@@ -1,28 +1,38 @@
-# Foundation: evaluate HippoRAG 2
+# Foundation: HippoRAG 2 evaluation and local service
 
-Decision: 2026-10-13. YAW starts again as a HippoRAG 2 evaluation workspace. This document replaces all previous YAW foundations, epics, ADRs and implementation plans. Old specifications in Git history are historical material, not active instructions.
+Decision baseline: 2026-10-13. YAW uses upstream HippoRAG 2 as its indexing, graph retrieval and QA engine. The earlier YAW application, ontology compiler, CocoIndex/spaCy stack and Epic 7/8 plans remain retired. Git history is reference material, not an active implementation contract.
 
-## Current boundary
+## Current evidence and planned work
 
-Use the pinned upstream HippoRAG package through its public Python API. HippoRAG owns extraction, indexing, retrieval and answer generation. The project has one direct dependency and no custom application, service or retrieval implementation. The exact source revision and transitive dependencies are recorded in `pyproject.toml` and `uv.lock`.
+The installed baseline is Python 3.12.14 with HippoRAG 2.0.0a5 pinned to `d5c8329422e0a0b834a15874545cb6a74b4f9b26`. NumPy is also declared for the adapter. The corrected [live_smoke.py](live_smoke.py) passes repeatability and nine-document retrieval/QA checks with EmbeddingGemma through llama.cpp. The former FLM path failed and is retired from this evaluation. See the dated [evaluation record](docs/evaluation.md); this fixture pass is not acceptance of a daemon or corpus-wide quality.
 
-The intended corpus is 100–500 documents, mainly English with occasional other languages. Content may contain disagreements, revisions and ambiguous entities. Processing-time requirements are not yet defined; measure actual latency before setting a target.
+The next work is planned in exactly two epics:
 
-RDF, OWL, SKOS and SHACL remain possible future tools for evidence and knowledge management. No semantic layer is required or approved for implementation at this stage. The former CocoIndex, spaCy, ontology compiler, MCP service and Epic 8 plans are retired. Do not port them as part of this evaluation.
+1. [Epic 1: HippoRAG 2 daemon mode](docs/epic-1-hipporag-daemon.md): establish correct embeddings first, then add source reconciliation, one persistent runtime, native Windows lifecycle controls and explicit repair after interrupted writes.
+2. [Epic 2: FastMCP v4 over Streamable HTTP](docs/epic-2-fastmcp-http.md): expose the same runtime through one local HTTP endpoint. Its implementation follows the Epic 1 acceptance gates.
 
-## Execute in this order
+These epics are not completed features; only the embedding adapter and smoke regression are implemented. The daemon commands and MCP endpoint described in them are target interfaces. The smoke repair installed an EmbeddingGemma GGUF checkpoint in Lemonade, not a daemon or new Python runtime packages.
 
-1. Install the locked environment and verify `from hipporag import HippoRAG`. Record interpreter, package revision and any installation failures. An import pass establishes installation only.
-2. Run the README example against Lemonade. Record actual model IDs, extraction and embedding success, retrieved evidence, answer and elapsed time. Stop and report errors; do not silently select another model or backend.
-3. Select a few existing source notes. Prepare explicit text passages for `index(docs=...)` and retain their source paths in the evaluation record. Do not assume HippoRAG handles arbitrary file formats or automatically splits a document into suitable passages.
-4. Write expected evidence and answers before running queries. Include a direct fact, a question requiring two passages, contradictory sources, a revised claim, an absent answer and a non-English sample. Inspect retrieved passages separately from the generated answer. Do not score contradictions as resolved simply because one answer sounds plausible.
-5. Exercise repeated indexing, addition, replacement and deletion using the pinned API. Check the resulting retrieval evidence, including shared facts and duplicate text. Do not equate adding a new version with removing the old version. Record restart/persistence behavior and actual failures.
-6. Expand toward the intended corpus only after the small evaluation works. Record quality, runtime, memory and passage-preparation limits. Propose the smallest change justified by the observed failures.
+## Fixed integration decisions
 
-Use one evaluation record when results exist, including commands, versions, selected inputs, expected evidence, actual outputs and unresolved failures. Do not create speculative delivery epics or describe unrun checks as passing. The reset itself does not establish model quality or readiness for the full corpus.
+- One process, one state owner, one HippoRAG instance and one serialized operation queue. File reconciliation is the sole writer of corpus membership. MCP uses this runtime rather than starting another upstream server.
+- Lemonade remains the local OpenAI-compatible inference server at `http://localhost:13305/api/v1`. In the default 3-slot development configuration (`max_models = 3`), `embeddinggemma-300m-GGUF` (checkpoint `ggml-org/embeddinggemma-300M-GGUF:embeddinggemma-300M-Q8_0.gguf`, mean pooling) and the extraction/reranking chat model `Qwen3-4B-Instruct-2507-GGUF` (checkpoint `unsloth/Qwen3-4B-Instruct-2507-GGUF:Qwen3-4B-Instruct-2507-Q4_K_M.gguf`, tightened OpenIE NER JSON Schema + dynamic entity-anchored triple GBNF + dynamic candidate-literal `DSPyFilter` GBNF) run on discrete GPU CUDA (`llamacpp`), while the QA reading model `Mistral-7B-Instruct-v0.3-Hybrid` (`amd/Mistral-7B-Instruct-v0.3-onnx-ryzenai-1.7-hybrid`) runs on the Ryzen AI Hybrid NPU/iGPU (`ryzenai-llm`). The FLM 1.0.6 embedding path is excluded because it forces query formatting and failed repeatability; this does not exclude FLM chat. The daemon must pass the explicit embedding provider, split `extraction_llm`/`qa_llm` instances, and truthful model/adapter identity.
+- The upstream Parquet backend remains selected for both epics. Milvus is optional and is not a remedy for incorrect embeddings or source lifecycle behavior. A future adoption requires measured benefit in the pinned integration.
+- Extraction chat, QA chat, and embeddings are independently selected through the same upstream API (`HippoRAG(embedding_model=..., extraction_llm=..., qa_llm=..., index_identity=...)`). The selected embedding profiles are the standard and QAT EmbeddingGemma 300M weights (supporting `search`, `qa`, `fact`, `distinct`, `titled`, and `distinct-titled` task modes) plus Qwen3-Embedding-0.6B. Registered chat profiles include `Qwen3-4B-Instruct-2507-GGUF`, `Mistral-7B-Instruct-v0.3-Hybrid`, step-up FLM models (`gemma4-it-12b-FLM`, `qwen3.5-9b-FLM`), and secondary `llamacpp` candidates (`Phi-4-mini-instruct-GGUF`, `Llama-3.2-3B-Instruct-GGUF`). Exact checkpoints, compatibility evidence and the real HippoRAG benchmark gate are in [model evaluation](docs/model-evaluation.md). EmbeddingGemma-2/multimodal support is deferred. Explicitly selecting a validated model profile is configuration, not a fallback; no model is silently substituted. Each extraction-chat/embedding combination must pass fresh gold-document/answer evaluation and index-compatibility checks before daemon/MCP acceptance.
+- Correct EmbeddingGemma behavior is implemented through its public injection point with a small adapter; no global monkeypatch, copied retrieval implementation or fork. Existing experimental vectors are rebuilt when prompt/adapter identity changes.
+- FastMCP 4.1.0 is the selected v4 target. Use Streamable HTTP on `127.0.0.1:13306/mcp` with a shared application lifespan. HTTP transport does not imply answer-token streaming.
+- Python stays on 3.12 while the upstream `torch==2.5.1` pin prevents installation on 3.14.7. Add direct dependencies when the integration actually imports them: filelock in E1 and FastMCP in E2. Pin/lock and verify them at implementation time; do not install optional database stacks preemptively.
 
-## Decisions deferred until evidence exists
+## Corpus and correctness boundary
 
-Whether to add document conversion, provenance mappings, semantic validation or an upstream contribution depends on the evaluation. Prefer the public API before subclassing; consider a fork only for a demonstrated requirement that the pinned API cannot support. No fork, copied internals, alternate implementation or compatibility overrides are part of this baseline.
+The intended corpus has 100–500 documents, mainly English with occasional other languages. Start with UTF-8 `.md` and `.txt` files under one configured root. The first daemon uses deterministic bounded passages and a source manifest. Document conversion is a separate future decision. No processing-time SLA exists; measure model calls, scan cost, vector counts, memory and latency.
 
-The earlier zero-fallback requirement is not a claim about upstream behavior. HippoRAG has internal retrieval branches and error handling; record their effects during evaluation. YAW adds no fallback path. Source attribution, contradiction handling and deletion correctness must be demonstrated rather than inferred from a graph-based design.
+Preserve exact passage text and every source owner. Relevance scores are not truth confidence. Contradictions remain evidence to retrieve and report; the wrapper does not decide canonical truth. RDF/OWL/SKOS/SHACL remain deferred until retrieval evidence establishes a concrete need.
+
+No YAW-selected model/backend fallback is permitted. The selected HippoRAG version still has internal retrieval branches; observe and report them rather than claiming their removal. Dirty or inconsistent state is surfaced and explicitly rebuilt. A health response, package import or generated answer is insufficient evidence of correct indexing, ranking, source deletion or persistence.
+
+## Document ownership and execution
+
+FOUNDATIONAL owns scope and shared decisions. `docs/model-evaluation.md` owns selected model contracts and the benchmark comparison protocol; report differences without an automatic degradation cutoff. Each epic owns its contracts, delivery order and acceptance tests. `docs/evaluation.md` owns measured outcomes and unresolved failures. README owns commands available now and clearly labels future ones.
+
+Continue D1-01 with multilingual/chunk-boundary validation; its adapter and nine-document smoke checks now pass. Complete the first unfinished packet, run its targeted checks and record commands/results before advancing. Retain explicit failures and use live model evidence for quality claims. Reconcile these documents if an accepted decision changes; do not resurrect retired architecture to fill an ambiguity.

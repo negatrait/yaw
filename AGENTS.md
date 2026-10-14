@@ -1,12 +1,12 @@
 # Instructions for coding agents
 
-Read [FOUNDATIONAL.md](FOUNDATIONAL.md) first. The current task is evaluating upstream HippoRAG 2, not rebuilding the retired YAW architecture.
+Read [FOUNDATIONAL.md](FOUNDATIONAL.md) first. YAW is a small HippoRAG integration; the retired YAW architecture is not active scope.
 
-- Verify the repository path and Git remote before editing. The user-designated checkout is authoritative.
-- Follow the ordered evaluation steps in FOUNDATIONAL. State which step is being executed and its observable result.
-- Keep HippoRAG as the only direct dependency. Use the pinned public API; do not add a framework, fork, wrapper hierarchy or semantic engine without a demonstrated need and a new scope decision.
-- Use `uv sync --locked` and `uv run --locked`. Preserve the pinned source revision unless intentionally upgrading and validating it.
-- Keep source notes and user data intact. Put generated indexes in ignored `outputs/`.
-- Report installation checks separately from actual model evaluations. Preserve errors and retrieved evidence; do not invent results or silently switch models/backends.
-- Update README and FOUNDATIONAL when an accepted decision changes the baseline. Historical Git versions of removed epics and ADRs are not active requirements.
-- Run checks appropriate to the change and `git diff --check`. Do not create tests that merely restate configuration or documentation.
+- Verify the user-designated checkout and its Git remote before writing. Current repository: `C:\Users\Harri.Ahokas\Documents\yaw`.
+- Execute [Epic 1](docs/epic-1-hipporag-daemon.md) before [Epic 2](docs/epic-2-fastmcp-http.md). Select the first unfinished packet and its observable exit condition. D1-01 has a passing adapter/smoke regression; its remaining work includes multilingual/chunk-boundary validation. Apply Epic 1's model-compatibility gate before admitting additional chat/embedding combinations or closing the development epics.
+- Keep the pinned HippoRAG public API as the engine. Use the existing small injected embedding adapter; no global monkeypatch or copied upstream retrieval/service implementation.
+- Implement one runtime and corpus writer. MCP is an adapter to it. Follow the source-ownership, serialization and dirty-state contracts; do not introduce alternate model/backend paths.
+- Preserve source files and user experiments. Put generated indexes under ignored outputs or disposable temporary directories. Never treat a partial directory scan as evidence of source deletion.
+- Use `uv sync --locked` and `uv run --locked`. Add only the dependencies assigned to the current epic, updating the lock deliberately. Milvus and the upstream MCP extra are not part of this plan.
+- Record actual checks and failures in [evaluation](docs/evaluation.md). Distinguish package resolution, installation, real inference, retrieval correctness and daemon/transport acceptance. A fake provider validates orchestration only.
+- Keep README's available commands separate from epic target commands. Update scope documents when accepted decisions change. Run focused verification and `git diff --check` before reporting completion.
