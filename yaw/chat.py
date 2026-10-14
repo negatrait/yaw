@@ -176,14 +176,20 @@ class LocalChat(CacheOpenAI):
                 {"role": "system", "content": SYSTEM_PROMPT_TIGHTENINGS[raw_system]},
                 *messages[1:],
             ]
-        if (recipe == "ryzenai-llm" and len(messages) >= 2
-                and messages[0].get("role") == "system" and messages[1].get("role") == "user"):
-            # Ryzen AI's Mistral template injects system into the final [INST] turn after
-            # few-shot turns; folding it into the first user turn preserves one-shot formatting.
-            messages = [
-                {"role": "user", "content": messages[0]["content"].strip() + "\n\n" + messages[1]["content"]},
-                *messages[2:],
-            ]
+        profile = CHAT_MODELS.get(self.llm_name)
+        if recipe == "ryzenai-llm":
+            if profile is not None and getattr(profile, "qa_temperature", 0.0) > 0:
+                current_temp = kwargs.get("temperature", getattr(self.global_config, "temperature", 0.0))
+                if current_temp < profile.qa_temperature:
+                    kwargs = {**kwargs, "temperature": profile.qa_temperature}
+            if (len(messages) >= 2
+                    and messages[0].get("role") == "system" and messages[1].get("role") == "user"):
+                # Ryzen AI's Mistral template injects system into the final [INST] turn after
+                # few-shot turns; folding it into the first user turn preserves one-shot formatting.
+                messages = [
+                    {"role": "user", "content": messages[0]["content"].strip() + "\n\n" + messages[1]["content"]},
+                    *messages[2:],
+                ]
             if (raw_system == rag_qa_system and len(messages) >= 2
                     and messages[-1].get("role") == "user"):
                 user_text = messages[-1].get("content", "")
@@ -196,6 +202,15 @@ class LocalChat(CacheOpenAI):
         elif recipe == "llamacpp" and raw_system is not None:
             if raw_system in OPENIE_JSON_SCHEMAS and "response_format" not in kwargs:
                 kwargs = {**kwargs, "response_format": OPENIE_JSON_SCHEMAS[raw_system]}
+                profile = CHAT_MODELS.get(self.llm_name)
+                ext_temp = getattr(profile, "extraction_temperature", 0.2)
+                current_temp = kwargs.get("temperature", getattr(self.global_config, "temperature", 0.0))
+                if current_temp < ext_temp:
+                    kwargs = {**kwargs, "temperature": ext_temp}
+                if raw_system == ner_conditioned_re_system:
+                    freq_pen = getattr(profile, "frequency_penalty", 0.5)
+                    if freq_pen > 0 and "frequency_penalty" not in kwargs:
+                        kwargs = {**kwargs, "frequency_penalty": freq_pen}
             elif raw_system == DSPY_FILTER_SYSTEM and "extra_body" not in kwargs:
                 kwargs = {**kwargs, "extra_body": {"grammar": _build_rerank_grammar(messages)}}
             elif raw_system == rag_qa_system and "extra_body" not in kwargs:

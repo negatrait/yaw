@@ -19,6 +19,7 @@ class ProfileTests(unittest.TestCase):
             "id": name,
             "checkpoint": ckpt,
             "recipe": recipe,
+            "device": "gpu",
             "backend_health": "ready",
             "launch_command": ["llama-server.exe", "--parallel", "1", "--cache-ram", "0"],
         }
@@ -39,6 +40,32 @@ class ProfileTests(unittest.TestCase):
             return_value={"all_models_loaded": [{**base_entry, "launch_command": ["llama-server.exe", "--parallel", "1"]}]},
         ):
             with self.assertRaisesRegex(ValueError, "--cache-ram 0"):
+                chat_evidence(name)
+
+    def test_ryzenai_chat_evidence_validates_npu_device_and_context(self):
+        name = "Mistral-7B-Instruct-v0.3-Hybrid"
+        profile = CHAT_MODELS[name]
+        valid_entry = {
+            "id": name,
+            "checkpoint": profile.checkpoint,
+            "recipe": profile.recipe,
+            "device": "npu",
+            "backend_health": "ready",
+            "recipe_options": {"ctx_size": 32786},
+        }
+        with patch("yaw.models.get_json", return_value={"all_models_loaded": [valid_entry]}):
+            self.assertEqual(chat_evidence(name)["id"], name)
+        with patch(
+            "yaw.models.get_json",
+            return_value={"all_models_loaded": [{**valid_entry, "device": "cpu"}]},
+        ):
+            with self.assertRaisesRegex(ValueError, "expected device npu"):
+                chat_evidence(name)
+        with patch(
+            "yaw.models.get_json",
+            return_value={"all_models_loaded": [{**valid_entry, "recipe_options": {"ctx_size": 4096}}]},
+        ):
+            with self.assertRaisesRegex(ValueError, "ctx_size >="):
                 chat_evidence(name)
     def test_each_profile_preserves_its_request_format_and_dimensions(self):
         for profile in PROFILES.values():

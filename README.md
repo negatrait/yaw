@@ -64,13 +64,13 @@ Existing source notes remain in `sample-llm-wiki/raw/`; they are not automatical
 
 ## Measured versus planned
 
-On the 2026-10-14 Tier 0 and Tier 1 upstream benchmark runs with the default split (`embeddinggemma-300m-GGUF` `distinct-titled` `retrieval-prompts-v3` + `Qwen3-4B-Instruct-2507-GGUF` `gbnf-v3:require-stop` + `Mistral-7B-Instruct-v0.3-Hybrid` `fold-system:prompt-v4:require-stop`):
+On the 2026-10-14 Tier 0 and Tier 1 upstream benchmark runs with the default split (`embeddinggemma-300m-GGUF` `distinct-titled` `retrieval-prompts-v3` + `Qwen3-4B-Instruct-2507-GGUF` `gbnf-v3:require-stop` + `Mistral-7B-Instruct-v0.3-Hybrid` `fold-system:prompt-v4:require-stop`, `temperature = 0.2`):
 - **Tier 0 (`sample`, 1 query, 3 passages, `run-sample-hgj5zm7g`):** HippoRAG 2 Recall@1/@2/@5 = **1.0 / 1.0 / 1.0** (30 phrase nodes, 29 triples).
-- **Tier 1 (`2wikimultihopqa`, 10 queries, 96 passages, `run-2wikimultihopqa-7uayugy8` & `run-2wikimultihopqa-g9xs0sug`):** HippoRAG 2 Recall@1/@2/@5 = **0.425 / 0.800 / 1.000** vs. Standard DPR **0.425 / 0.725 / 0.850** (**`+7.5%` Recall@2**, **`+15.0%` Recall@5**; 866 phrase nodes, 905 triples, 8/10 queries with graph seeds); HippoRAG 2 QA EM/F1 = **0.300 / 0.5278** vs. Standard DPR **0.400 / 0.4500** (**`+7.78%` F1**).
-- **Tier 1 (`hotpotqa`, 10 queries, 94 passages, `run-hotpotqa-o_m7kg6f`, `--mode retrieval`):** HippoRAG 2 Recall@1/@2/@5 = **0.500 / 0.850 / 1.000** vs. Standard DPR **0.450 / 0.700 / 0.950** (**`+5.0%` Recall@1**, **`+15.0%` Recall@2**, **`+5.0%` Recall@5**; 1,206 phrase nodes, 1,286 triples, 10/10 queries with graph seeds).
-- **Tier 1 (`musique`, 10 queries, 197 passages, `run-musique-ctw7b5zv`, `--mode retrieval`):** HippoRAG 2 Recall@1/@2/@5 = **0.1833 / 0.3167 / 0.5417** vs. Standard DPR **0.2083 / 0.2833 / 0.5167** (**`+3.34%` Recall@2**, **`+2.5%` Recall@5**; 2,268 phrase nodes, 2,346 triples, 7/10 queries with graph seeds).
+- **Tier 1 (`2wikimultihopqa`, 10 queries, 96 passages, `run-2wikimultihopqa-fbmnosfw`):** HippoRAG 2 Recall@1/@2/@5 = **0.425 / 0.800 / 1.000** vs. Standard DPR **0.425 / 0.725 / 0.850** (**`+7.5%` Recall@2**, **`+15.0%` Recall@5**; 866 phrase nodes, 905 triples, 8/10 queries with graph seeds); HippoRAG 2 QA EM/F1 = **0.300 / 0.5278** vs. Standard DPR **0.400 / 0.4500** (**`+7.78%` F1**).
+- **Tier 1 (`hotpotqa`, 10 queries, 94 passages, `run-hotpotqa-zbp9k8e0`):** HippoRAG 2 Recall@1/@2/@5 = **0.500 / 0.850 / 1.000** vs. Standard DPR **0.450 / 0.700 / 0.950** (**`+5.0%` Recall@1**, **`+15.0%` Recall@2**, **`+5.0%` Recall@5**; 1,206 phrase nodes, 1,286 triples, 10/10 queries with graph seeds); HippoRAG 2 QA EM/F1 = **0.300 / 0.5483** vs. Standard DPR **0.300 / 0.4524** (**`+9.59%` F1**).
+- **Tier 1 (`musique`, 10 queries, 197 passages, `run-musique-_5f_uroh`):** HippoRAG 2 Recall@1/@2/@5 = **0.1833 / 0.3167 / 0.5417** vs. Standard DPR **0.2083 / 0.2833 / 0.5167** (**`+3.34%` Recall@2**, **`+2.5%` Recall@5**; 2,268 phrase nodes, 2,346 triples, 7/10 queries with graph seeds); HippoRAG 2 QA EM/F1 = **0.200 / 0.3000** vs. Standard DPR **0.300 / 0.4000**.
 
-Thirty-one offline regression tests pass (`uv run --locked python -m unittest discover -s tests -v`). See [evaluation](docs/evaluation.md) for commands, versions, answer-score limitations and preserved failure diagnostics.
+Thirty-two offline regression tests pass (`uv run --locked python -m unittest discover -s tests -v`). See [evaluation](docs/evaluation.md) for commands, versions, answer-score limitations and preserved failure diagnostics.
 
 Epic 1 has its embedding and chat adapters plus Tier 0/1 benchmark harness implemented; multilingual/chunk-boundary validation and daemon work remain. Epic 2 is planned. No daemon commands or MCP endpoint are implemented yet.
 
