@@ -735,9 +735,16 @@ def index_documents_in_batches(
     pre_openie = getattr(hipporag, "pre_openie", None)
     use_staged_openie = callable(pre_openie) and not hasattr(pre_openie, "assert_called")
     num_batches = 0
+    total_docs = len(pending)
+    total_batches = (total_docs + batch_size - 1) // batch_size
     for start in range(0, len(pending), batch_size):
         batch = pending[start : start + batch_size]
         if use_staged_openie:
+            print(
+                f"[Indexing OpenIE] Batch {num_batches + 1}/{total_batches} "
+                f"({min(start + len(batch), total_docs)}/{total_docs} docs)",
+                flush=True,
+            )
             try:
                 pre_openie(batch)
             except RuntimeError as exc:
@@ -750,6 +757,7 @@ def index_documents_in_batches(
         num_batches += 1
 
     if use_staged_openie:
+        print(f"[Indexing Graph] Building embeddings and knowledge graph for {total_docs} docs...", flush=True)
         hipporag.index(docs=pending)
         _release_indexing_memory(hipporag)
     return num_batches

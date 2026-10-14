@@ -3,6 +3,8 @@
 __pycache__/
 *.py[cod]
 outputs/
+datasets/
+data/
 .env
 .env.*
 !.env.example
