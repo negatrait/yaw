@@ -27,6 +27,7 @@ from hipporag.prompts.linking import get_query_instruction
 from hipporag.utils.config_utils import BaseConfig
 
 from yaw.chat import LocalChat, chat_identity
+from yaw.logger import configure_logging
 from yaw.embedding import (
     GEMMA_TASK_MODES,
     MODEL,
@@ -562,10 +563,7 @@ def main(
     else:
         index_dir = root / "indexes" / f"{dataset}_d{num_docs}_{slice_hash}_{id_hash}"
 
-    logging.basicConfig(
-        level=logging.INFO,
-        handlers=[logging.StreamHandler(), logging.FileHandler(run_dir / "run.log", encoding="utf-8")],
-    )
+    configure_logging(log_file=run_dir / "run.log", max_lines=500)
     report = {
         "status": "running",
         "dataset": dataset,
