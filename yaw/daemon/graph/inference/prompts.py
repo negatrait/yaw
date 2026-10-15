@@ -782,6 +782,49 @@ def _gbnf_escape_literal(text: str) -> str:
     return f'"{escaped}"'
 
 
+def build_dspy_ner_grammar(max_entities: int | None = None) -> str:
+    """Build pure-JSON GBNF grammar for ExtractEntities, optionally capping entity count for sizecoding."""
+    if max_entities is None or max_entities <= 0:
+        return DSPY_NER_GBNF_GRAMMAR
+    seq = "string"
+    for _ in range(max_entities - 1):
+        seq = f'string (", " {seq})?'
+    return (
+        'root ::= "{\\"named_entities\\": [" entity-list "]}"\n'
+        f"entity-list ::= ({seq})?\n"
+        'string ::= "\\"" char+ "\\""\n'
+        'char ::= [^"\\\\\\x7F\\x00-\\x1F] | "\\\\" (["\\\\bfnrt] | "u" [0-9a-fA-F]{4})\n'
+    )
+
+
+def build_dspy_triples_grammar(max_triples: int | None = None) -> str:
+    """Build pure-JSON GBNF grammar for ExtractTriples, optionally capping triple count for sizecoding."""
+    if max_triples is None or max_triples <= 0:
+        return DSPY_TRIPLES_GBNF_GRAMMAR
+    seq = "triple"
+    for _ in range(max_triples - 1):
+        seq = f'triple (", " {seq})?'
+    return (
+        'root ::= "{\\"triples\\": [" triple-list "]}"\n'
+        f"triple-list ::= ({seq})?\n"
+        'triple ::= "[" string ", " string ", " string "]"\n'
+        'string ::= "\\"" char+ "\\""\n'
+        'char ::= [^"\\\\\\x7F\\x00-\\x1F] | "\\\\" (["\\\\bfnrt] | "u" [0-9a-fA-F]{4})\n'
+    )
+
+
+def build_dspy_qa_cot_grammar(max_reasoning_chars: int | None = None) -> str:
+    """Build pure-JSON GBNF grammar for AnswerQuestion CoT, optionally capping reasoning length."""
+    if max_reasoning_chars is None or max_reasoning_chars <= 0:
+        return DSPY_QA_COT_GBNF_GRAMMAR
+    return (
+        'root ::= "{\\"reasoning\\": " reasoning-str ", \\"answer\\": " string "}"\n'
+        f'reasoning-str ::= "\\"" char{{1,{int(max_reasoning_chars)}}} "\\""\n'
+        'string ::= "\\"" char+ "\\""\n'
+        'char ::= [^"\\\\\\x7F\\x00-\\x1F] | "\\\\" (["\\\\bfnrt] | "u" [0-9a-fA-F]{4})\n'
+    )
+
+
 def build_dspy_rerank_grammar(
     candidate_facts: Sequence[Union[Tuple[str, str, str], List[str]]],
     max_facts: int = 4,
@@ -814,6 +857,85 @@ def build_dspy_rerank_grammar(
     )
 
 
+def compute_sizecoding_pareto_score(
+    recall_at_5: float,
+    *,
+    tokens: int,
+    elapsed_seconds: float,
+    min_baseline_recall: float = 0.0,
+    target_token_seconds: float = 100.0,
+    pred_name: str | None = None,
+    missed_items: Sequence[str] = (),
+) -> dspy.Prediction:
+    """Compute a sizecoding Pareto metric (`recall@5 / (tokens * time)`) for `dspy.GEPA`.
+
+    - Hard Tier 1 baseline gate: if `recall_at_5 < min_baseline_recall`, the candidate is
+      clamped below `0.05` with zero `pareto_raw`/`efficiency` objective scores so no
+      token-saving mutation can ever drop below the locked Tier 1 baseline.
+    - Above the floor: computes `pareto_raw = recall_at_5 / (tokens * elapsed_seconds)`,
+      maps it to a bounded `[0.10, 1.0]` score for `dspy.Evaluate`, attaches
+      `objective_scores` (`recall_at_5`, `pareto_raw`, `efficiency`) for GEPA's multi-objective
+      Pareto frontier (`gepa_kwargs={"frontier_type": "hybrid"}`), and emits targeted textual
+      feedback so the reflection LM compresses instructions, triples, and reasoning tokens.
+    """
+    clamped_recall = max(0.0, min(1.0, float(recall_at_5)))
+    safe_tokens = max(int(tokens), 1)
+    safe_seconds = max(float(elapsed_seconds), 1e-3)
+    token_seconds = safe_tokens * safe_seconds
+    pareto_raw = clamped_recall / token_seconds
+    target_budget = max(float(target_token_seconds), 1e-3)
+    efficiency = target_budget / (target_budget + token_seconds)
+    stage_prefix = f"[{pred_name}] " if pred_name else ""
+
+    if clamped_recall < min_baseline_recall:
+        floor_ratio = clamped_recall / max(float(min_baseline_recall), 1e-6)
+        gated_score = 0.05 * max(0.0, min(0.99, floor_ratio))
+        missed_str = f" Missed gold items: {list(missed_items)}." if missed_items else ""
+        feedback = (
+            f"{stage_prefix}BASELINE GATE VIOLATION: Recall@5={clamped_recall:.4f} dropped below "
+            f"locked Tier 1 baseline ({min_baseline_recall:.4f}). Cost={safe_tokens} tokens * "
+            f"{safe_seconds:.3f}s ({token_seconds:.2f} tok*s).{missed_str} "
+            "Restore missing entity/triple/fact coverage first before compressing output tokens."
+        )
+        return dspy.Prediction(
+            score=gated_score,
+            feedback=feedback,
+            pareto_raw=0.0,
+            recall_at_5=clamped_recall,
+            tokens=safe_tokens,
+            elapsed_seconds=safe_seconds,
+            objective_scores={
+                "recall_at_5": clamped_recall,
+                "pareto_raw": 0.0,
+                "efficiency": 0.0,
+            },
+        )
+
+    score = 0.10 + 0.90 * clamped_recall * efficiency
+    missed_str = f" Missed gold items: {list(missed_items)}." if missed_items else ""
+    feedback = (
+        f"{stage_prefix}PASS Tier 1 floor ({clamped_recall:.4f} >= {min_baseline_recall:.4f}). "
+        f"Sizecoding Pareto={pareto_raw:.6f} (Recall@5={clamped_recall:.4f} / "
+        f"[{safe_tokens} tokens * {safe_seconds:.3f}s = {token_seconds:.2f} tok*s], "
+        f"efficiency={efficiency:.4f}).{missed_str} "
+        "To increase Pareto score, preserve 100% of gold retrieval bridges while pruning "
+        "redundant triples, verbose entity aliases, and filler reasoning tokens."
+    )
+    return dspy.Prediction(
+        score=score,
+        feedback=feedback,
+        pareto_raw=pareto_raw,
+        recall_at_5=clamped_recall,
+        tokens=safe_tokens,
+        elapsed_seconds=safe_seconds,
+        objective_scores={
+            "recall_at_5": clamped_recall,
+            "pareto_raw": pareto_raw,
+            "efficiency": efficiency,
+        },
+    )
+
+
 class HippoRAGProgram(dspy.Module):
     """Unified DSPy Module for HippoRAG 2 OpenIE, Recognition Memory, and Multi-Hop QA.
 
@@ -836,6 +958,10 @@ class HippoRAGProgram(dspy.Module):
         qa_mode: Literal["cot", "rlm"] = "cot",
         include_demos: bool = True,
         enable_gbnf: bool = False,
+        gbnf_max_entities: int | None = None,
+        gbnf_max_triples: int | None = None,
+        gbnf_max_facts: int = 4,
+        gbnf_max_reasoning_chars: int | None = None,
         adapter: dspy.Adapter | None = None,
         rlm_max_iters: int = 10,
         rlm_max_llm_calls: int = 20,
@@ -850,6 +976,10 @@ class HippoRAGProgram(dspy.Module):
             raise ValueError(f"Unsupported qa_mode: {qa_mode!r}. Expected 'cot' or 'rlm'.")
         self.qa_mode: Literal["cot", "rlm"] = qa_mode
         self.enable_gbnf: bool = enable_gbnf
+        self.gbnf_max_entities: int | None = gbnf_max_entities
+        self.gbnf_max_triples: int | None = gbnf_max_triples
+        self.gbnf_max_facts: int = gbnf_max_facts
+        self.gbnf_max_reasoning_chars: int | None = gbnf_max_reasoning_chars
         self.json_adapter: dspy.Adapter = adapter or dspy.JSONAdapter()
 
         self.ner = dspy.Predict(ExtractEntities)
@@ -896,7 +1026,8 @@ class HippoRAGProgram(dspy.Module):
         gbnf = self.enable_gbnf if use_gbnf is None else use_gbnf
         call_kwargs: dict[str, Any] = {}
         if gbnf:
-            call_kwargs["config"] = {"extra_body": {"grammar": DSPY_NER_GBNF_GRAMMAR}}
+            grammar = build_dspy_ner_grammar(self.gbnf_max_entities)
+            call_kwargs["config"] = {"extra_body": {"grammar": grammar}}
         with self._dspy_ctx(lm, use_json_adapter=True):
             pred = self.ner(passage=passage, **call_kwargs)
         raw_entities = getattr(pred, "named_entities", [])
@@ -926,7 +1057,8 @@ class HippoRAGProgram(dspy.Module):
         gbnf = self.enable_gbnf if use_gbnf is None else use_gbnf
         call_kwargs: dict[str, Any] = {}
         if gbnf:
-            call_kwargs["config"] = {"extra_body": {"grammar": DSPY_TRIPLES_GBNF_GRAMMAR}}
+            grammar = build_dspy_triples_grammar(self.gbnf_max_triples)
+            call_kwargs["config"] = {"extra_body": {"grammar": grammar}}
         with self._dspy_ctx(lm, use_json_adapter=True):
             pred = self.triples(
                 passage=passage,
@@ -963,19 +1095,20 @@ class HippoRAGProgram(dspy.Module):
         question: str,
         candidate_facts: Sequence[Union[Tuple[str, str, str], List[str]]],
         *,
-        max_facts: int | None = 4,
+        max_facts: int | None = None,
         lm: dspy.LM | None = None,
         use_gbnf: bool | None = None,
     ) -> List[int]:
         """Filter candidate facts with DSPy recognition memory and return matched indices."""
         if not candidate_facts:
             return []
+        effective_max_facts = self.gbnf_max_facts if max_facts is None else max_facts
         fact_before_filter = json.dumps({"fact": [list(f) for f in candidate_facts]})
         gbnf = self.enable_gbnf if use_gbnf is None else use_gbnf
         call_kwargs: dict[str, Any] = {}
         if gbnf:
             grammar = build_dspy_rerank_grammar(
-                candidate_facts, max_facts=max_facts if max_facts is not None else 4
+                candidate_facts, max_facts=effective_max_facts
             )
             call_kwargs["config"] = {"extra_body": {"grammar": grammar}}
         with self._dspy_ctx(lm, use_json_adapter=True):
@@ -987,7 +1120,7 @@ class HippoRAGProgram(dspy.Module):
         raw_after = getattr(pred, "fact", getattr(pred, "fact_after_filter", None))
         generated = _coerce_generated_facts(raw_after)
         return match_facts_to_candidate_indices(
-            candidate_facts, generated, max_facts=max_facts
+            candidate_facts, generated, max_facts=effective_max_facts
         )
 
     def answer_question(
@@ -997,16 +1130,18 @@ class HippoRAGProgram(dspy.Module):
         *,
         mode: Literal["cot", "rlm"] | None = None,
         lm: dspy.LM | None = None,
-        use_gbnf: bool = False,
+        use_gbnf: bool | None = None,
     ) -> dspy.Prediction:
         """Answer a question over retrieved context using either ChainOfThought or RLM."""
         active_mode = mode or self.qa_mode
         if active_mode not in ("cot", "rlm"):
             raise ValueError(f"Unsupported QA mode: {active_mode!r}")
         qa_module = self.qa_rlm if active_mode == "rlm" else self.qa_cot
+        gbnf = self.enable_gbnf if use_gbnf is None else use_gbnf
         call_kwargs: dict[str, Any] = {}
-        if use_gbnf and active_mode == "cot":
-            call_kwargs["config"] = {"extra_body": {"grammar": DSPY_QA_COT_GBNF_GRAMMAR}}
+        if gbnf and active_mode == "cot":
+            grammar = build_dspy_qa_cot_grammar(self.gbnf_max_reasoning_chars)
+            call_kwargs["config"] = {"extra_body": {"grammar": grammar}}
         # Use JSONAdapter for single-turn CoT, and default ChatAdapter for RLM code blocks
         with self._dspy_ctx(lm, use_json_adapter=(active_mode == "cot")):
             return qa_module(context=context, question=question, **call_kwargs)
@@ -1017,6 +1152,9 @@ class HippoRAGProgram(dspy.Module):
         question: str,
         *,
         mode: Literal["cot", "rlm"] | None = None,
+        use_gbnf: bool | None = None,
     ) -> dspy.Prediction:
         """Default DSPy forward pass executes multi-hop QA (CoT or RLM) for GEPA evaluation."""
-        return self.answer_question(context=context, question=question, mode=mode)
+        return self.answer_question(
+            context=context, question=question, mode=mode, use_gbnf=use_gbnf
+        )

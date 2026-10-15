@@ -493,6 +493,92 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             {"grammar": DSPY_QA_COT_GBNF_GRAMMAR},
         )
 
+    def test_sizecoding_gbnf_caps_and_gepa_pareto_metric(self):
+        """Verify sizecoding GBNF caps on forward() and compute_sizecoding_pareto_score for dspy.GEPA."""
+        import dspy
+        from dspy.teleprompt.gepa.gepa_utils import _extract_score_and_objective_scores
+        from dspy.utils import DummyLM
+        from yaw.daemon.graph.inference.prompts import (
+            HippoRAGProgram,
+            build_dspy_ner_grammar,
+            build_dspy_qa_cot_grammar,
+            build_dspy_triples_grammar,
+            compute_sizecoding_pareto_score,
+        )
+
+        program = HippoRAGProgram(
+            enable_gbnf=True,
+            gbnf_max_entities=3,
+            gbnf_max_triples=2,
+            gbnf_max_facts=2,
+            gbnf_max_reasoning_chars=180,
+        )
+        lm = DummyLM(
+            [
+                {"named_entities": ["Alan Turing", "London"]},
+                {"triples": [["Alan Turing", "born in", "London"]]},
+                {"reasoning": "Born in London.", "answer": "London"},
+            ],
+            adapter=dspy.JSONAdapter(),
+        )
+        program.extract_openie("c-1", "Alan Turing was born in London.", lm=lm)
+        self.assertEqual(
+            lm.history[0]["kwargs"].get("extra_body"),
+            {"grammar": build_dspy_ner_grammar(3)},
+        )
+        self.assertEqual(
+            lm.history[1]["kwargs"].get("extra_body"),
+            {"grammar": build_dspy_triples_grammar(2)},
+        )
+
+        # Calling program(...) (GEPA's forward pass) automatically attaches the capped CoT GBNF grammar
+        with dspy.context(lm=lm):
+            pred = program(context="Alan Turing was born in London.", question="Where?")
+        self.assertEqual(pred.answer, "London")
+        self.assertIn("char{1,180}", build_dspy_qa_cot_grammar(180))
+        self.assertEqual(
+            lm.history[2]["kwargs"].get("extra_body"),
+            {"grammar": build_dspy_qa_cot_grammar(180)},
+        )
+
+        # 1. Below Tier 1 baseline floor -> hard gate violation, clamped < 0.05
+        violated = compute_sizecoding_pareto_score(
+            0.60,
+            tokens=20,
+            elapsed_seconds=0.1,
+            min_baseline_recall=0.75,
+            pred_name="triples",
+            missed_items=["doc-2"],
+        )
+        self.assertLess(violated.score, 0.05)
+        self.assertEqual(violated.pareto_raw, 0.0)
+        self.assertIn("BASELINE GATE VIOLATION", violated.feedback)
+
+        # 2. Above Tier 1 baseline floor -> rewards higher recall / (tokens * time)
+        bloated = compute_sizecoding_pareto_score(
+            0.80,
+            tokens=400,
+            elapsed_seconds=1.5,
+            min_baseline_recall=0.75,
+            target_token_seconds=100.0,
+        )
+        sizecoded = compute_sizecoding_pareto_score(
+            0.80,
+            tokens=80,
+            elapsed_seconds=0.4,
+            min_baseline_recall=0.75,
+            target_token_seconds=100.0,
+        )
+        self.assertGreater(sizecoded.score, bloated.score)
+        self.assertGreater(sizecoded.pareto_raw, bloated.pareto_raw)
+        self.assertGreater(bloated.score, violated.score)
+
+        # Verify dspy.GEPA's internal DspyAdapter extracts both scalar score and multi-objective dict
+        scalar_score, obj_scores = _extract_score_and_objective_scores(sizecoded)
+        self.assertAlmostEqual(scalar_score, sizecoded.score)
+        self.assertEqual(set(obj_scores.keys()), {"recall_at_5", "pareto_raw", "efficiency"})
+        self.assertAlmostEqual(obj_scores["recall_at_5"], 0.80)
+
 
 if __name__ == "__main__":
     unittest.main()
