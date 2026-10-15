@@ -275,6 +275,8 @@ def cache_response(func):
 class CacheOpenAI:
     """Self-contained OpenAI-compatible chat client with SQLite caching (zero hipporag imports)."""
 
+    __module__ = "yaw.chat"
+
     @classmethod
     def from_experiment_config(cls, global_config) -> "CacheOpenAI":
         cache_dir = os.path.join(global_config.save_dir, "llm_cache")
@@ -398,6 +400,8 @@ class CacheOpenAI:
 
 class LocalChat(CacheOpenAI):
     """Local chat adapter for pinned upstream HippoRAG baseline experiments."""
+
+    __module__ = "yaw.chat"
 
     @classmethod
     def from_experiment_config(cls, global_config, model_name=None):

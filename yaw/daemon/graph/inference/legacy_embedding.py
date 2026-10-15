@@ -24,6 +24,8 @@ class RetrievalEmbedding:
     Preserves full interface compatibility for the pinned upstream `hipporag` baseline in `benchmark.py`.
     """
 
+    __module__ = "yaw.embedding"
+
     query_instruction_mode = "shared"
 
     def __init__(self, global_config, profile=None):
