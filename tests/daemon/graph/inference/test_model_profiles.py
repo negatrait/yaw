@@ -5,7 +5,8 @@ import unittest
 from unittest.mock import Mock
 
 from hipporag.utils.config_utils import BaseConfig
-from yaw.daemon.graph.inference.embedding import GEMMA_TASK_MODES, MODEL, PROFILES, RetrievalEmbedding, resolve_embedding_profile
+from yaw.daemon.graph.inference.embedding import GEMMA_TASK_MODES, MODEL, PROFILES, resolve_embedding_profile
+from yaw.daemon.graph.inference.legacy_embedding import RetrievalEmbedding
 from hipporag.prompts.linking import get_query_instruction
 from yaw.daemon.graph.inference.models import CHAT_MODELS, chat_evidence, check_registry
 from unittest.mock import patch

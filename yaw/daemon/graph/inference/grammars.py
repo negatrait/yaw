@@ -36,7 +36,7 @@ char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
 """
 
 
-def _gbnf_escape_literal(text: str) -> str:
+def gbnf_escape_literal(text: str) -> str:
     escaped = (
         text.replace("\\", "\\\\")
         .replace('"', '\\"')
@@ -114,7 +114,7 @@ def build_dspy_rerank_grammar(
     seq = "triple"
     for _ in range(limit - 1):
         seq = f'triple (", " {seq})?'
-    triple_rule = " | ".join(_gbnf_escape_literal(c) for c in candidates)
+    triple_rule = " | ".join(gbnf_escape_literal(c) for c in candidates)
     return (
         'root ::= "{\\"fact\\": [" fact-list "]}"\n'
         f"fact-list ::= ({seq})?\n"
@@ -221,3 +221,18 @@ def lm_supports_gbnf(lm: dspy.LM | None = None) -> bool:
     if "mistral" in model_name or "ryzenai" in model_name or "flm" in model_name:
         return False
     return True
+
+
+__all__ = [
+    "DSPY_NER_GBNF_GRAMMAR",
+    "DSPY_TRIPLES_GBNF_GRAMMAR",
+    "DSPY_RERANK_GBNF_GRAMMAR",
+    "DSPY_QA_COT_GBNF_GRAMMAR",
+    "gbnf_escape_literal",
+    "build_dspy_ner_grammar",
+    "build_dspy_triples_grammar",
+    "build_dspy_qa_cot_grammar",
+    "build_dspy_rerank_grammar",
+    "compute_sizecoding_pareto_score",
+    "lm_supports_gbnf",
+]

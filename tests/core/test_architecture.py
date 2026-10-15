@@ -142,6 +142,10 @@ class ArchitectureTests(unittest.TestCase):
             _ = getattr(inference, "_build_default_ner_demos")
         with self.assertRaises(AttributeError):
             _ = getattr(inference, "_extract_json_list_field")
+        with self.assertRaises(AttributeError):
+            _ = getattr(inference, "_PositionalSafeRLM")
+        with self.assertRaises(AttributeError):
+            _ = getattr(inference, "_LLMConfig")
 
     def test_domain_containment_and_zero_cross_domain_imports(self):
         """Rule 2 & 3: Package P imports only P.* and yaw.core.* (zero horizontal cross-domain edges)."""

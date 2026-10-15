@@ -5,50 +5,12 @@ from typing import Any
 import dspy
 
 from .grammars import lm_supports_gbnf
-from .legacy_chat import (
-    DSPY_FILTER_SYSTEM,
-    OPENIE_JSON_SCHEMAS,
-    QA_GBNF_GRAMMAR,
-    QA_TURN_REMINDER,
-    RECIPE_POLICY_TAG,
-    RERANK_GBNF_GRAMMAR,
-    SYSTEM_PROMPT_TIGHTENINGS,
-    TIGHTENED_QA_SYSTEM,
-    CacheOpenAI,
-    LocalChat,
-    _LLMConfig,
-    _build_rerank_grammar,
-    _normalize_generation_token_params,
-    _normalize_qa_response,
-    _repair_truncated_openie_json,
-    cache_response,
-    chat_identity,
-)
 from .models import BASE_URL, CHAT_MODELS, DEFAULT_EXTRACTION_CHAT, DEFAULT_QA_CHAT
 
 __all__ = [
-    # Native DSPy
     "create_dspy_lm",
     "create_dspy_rlm_pair",
     "lm_supports_gbnf",
-    # Legacy Baseline Adapters
-    "CacheOpenAI",
-    "LocalChat",
-    "chat_identity",
-    "cache_response",
-    "RECIPE_POLICY_TAG",
-    "TIGHTENED_QA_SYSTEM",
-    "QA_TURN_REMINDER",
-    "SYSTEM_PROMPT_TIGHTENINGS",
-    "OPENIE_JSON_SCHEMAS",
-    "DSPY_FILTER_SYSTEM",
-    "RERANK_GBNF_GRAMMAR",
-    "QA_GBNF_GRAMMAR",
-    "_LLMConfig",
-    "_normalize_generation_token_params",
-    "_build_rerank_grammar",
-    "_normalize_qa_response",
-    "_repair_truncated_openie_json",
 ]
 
 

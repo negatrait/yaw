@@ -241,19 +241,4 @@ __all__ = [
     "resolve_embedding_profile",
     "create_dspy_embedder",
     "DSPyEmbeddingAdapter",
-    "RetrievalEmbedding",
 ]
-
-
-def __getattr__(name: str):
-    if name in ("RetrievalEmbedding", "_EmbeddingConfig"):
-        from .legacy_embedding import RetrievalEmbedding, _EmbeddingConfig
-
-        mapping = {
-            "RetrievalEmbedding": RetrievalEmbedding,
-            "_EmbeddingConfig": _EmbeddingConfig,
-        }
-        val = mapping[name]
-        globals()[name] = val
-        return val
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

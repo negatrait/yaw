@@ -13,7 +13,7 @@ from typing import Any
 from filelock import FileLock
 from openai import DefaultHttpxClient, OpenAI
 
-from .grammars import _gbnf_escape_literal as _gbnf_literal
+from .grammars import gbnf_escape_literal
 from .models import BASE_URL, CHAT_MODELS
 from .templates import (
     PROMPT_JSON_TEMPLATE,
@@ -76,7 +76,7 @@ char ::= [^\r\n\x00-\x1F]
 """
 
 
-def _build_rerank_grammar(messages, max_facts: int = 4) -> str:
+def build_rerank_grammar(messages, max_facts: int = 4) -> str:
     if not messages or messages[-1].get("role") != "user":
         return RERANK_GBNF_GRAMMAR
     content = messages[-1].get("content", "")
@@ -115,7 +115,7 @@ def _build_rerank_grammar(messages, max_facts: int = 4) -> str:
     seq = "triple"
     for _ in range(limit - 1):
         seq = f'triple (", " {seq})?'
-    triple_rule = " | ".join(_gbnf_literal(c) for c in candidates)
+    triple_rule = " | ".join(gbnf_escape_literal(c) for c in candidates)
     return (
         'root ::= "[[ ## fact_after_filter ## ]]\\n" fact-obj "\\n\\n[[ ## completed ## ]]"\n'
         'fact-obj ::= "{\\"fact\\": [" fact-list "]}"\n'
@@ -124,7 +124,7 @@ def _build_rerank_grammar(messages, max_facts: int = 4) -> str:
     )
 
 
-def _normalize_qa_response(response: str, *, allow_missing_delimiter: bool = False) -> str:
+def normalize_qa_response(response: str, *, allow_missing_delimiter: bool = False) -> str:
     normalized = re.sub(r"\*{1,2}Answer\*{0,2}:\*{0,2}", "Answer:", response)
     normalized = re.sub(r"\bAnswer\s+:", "Answer:", normalized)
     if "Answer:" not in normalized:
@@ -142,7 +142,7 @@ def _normalize_qa_response(response: str, *, allow_missing_delimiter: bool = Fal
     return normalized
 
 
-def _repair_truncated_openie_json(response: str, *, is_triples: bool) -> str:
+def repair_truncated_openie_json(response: str, *, is_triples: bool) -> str:
     try:
         json.loads(response)
         return response
@@ -185,7 +185,7 @@ class _LLMConfig:
     generate_params: dict[str, Any] = field(default_factory=dict)
 
 
-def _normalize_generation_token_params(
+def normalize_generation_token_params(
     base_params: dict[str, Any],
     call_kwargs: dict[str, Any],
     target_token_key: str,
@@ -221,7 +221,7 @@ def cache_response(func):
             if hasattr(self, "llm_config") and self.llm_config is not None
             else {}
         )
-        key_data = _normalize_generation_token_params(gen_params, kwargs, "_max_tokens")
+        key_data = normalize_generation_token_params(gen_params, kwargs, "_max_tokens")
         key_data["messages"] = messages
         key_data["_cache_schema"] = 3
         key_data["_provider_class"] = f"{self.__class__.__module__}.{self.__class__.__qualname__}"
@@ -342,7 +342,7 @@ class CacheOpenAI:
 
     @cache_response
     def infer(self, messages: list[dict[str, Any]], **kwargs: Any) -> tuple[str, dict[str, Any], bool]:
-        params = _normalize_generation_token_params(
+        params = normalize_generation_token_params(
             self.llm_config.generate_params, kwargs, "max_tokens"
         )
         params["messages"] = messages
@@ -460,7 +460,7 @@ class LocalChat(CacheOpenAI):
                     if freq_pen > 0 and "frequency_penalty" not in kwargs:
                         kwargs = {**kwargs, "frequency_penalty": freq_pen}
             elif raw_system == DSPY_FILTER_SYSTEM and "extra_body" not in kwargs:
-                kwargs = {**kwargs, "extra_body": {"grammar": _build_rerank_grammar(messages)}}
+                kwargs = {**kwargs, "extra_body": {"grammar": build_rerank_grammar(messages)}}
             elif raw_system == rag_qa_system and "extra_body" not in kwargs:
                 kwargs = {**kwargs, "extra_body": {"grammar": QA_GBNF_GRAMMAR}}
         try:
@@ -472,9 +472,9 @@ class LocalChat(CacheOpenAI):
                 # Mistral v0.3 occasionally escapes underscores as \_ inside JSON keys.
                 text = text.replace(r"\_", "_")
             if raw_system in OPENIE_JSON_SCHEMAS and finish_reason == "length" and isinstance(text, str):
-                text = _repair_truncated_openie_json(text, is_triples=(raw_system == ner_conditioned_re_system))
+                text = repair_truncated_openie_json(text, is_triples=(raw_system == ner_conditioned_re_system))
             if raw_system == rag_qa_system and isinstance(text, str):
-                text = _normalize_qa_response(text, allow_missing_delimiter=(recipe != "llamacpp"))
+                text = normalize_qa_response(text, allow_missing_delimiter=(recipe != "llamacpp"))
             if text is not result[0]:
                 result = (text, *result[1:])
             allowed_finish = ("stop", "length") if raw_system in OPENIE_JSON_SCHEMAS else ("stop",)
@@ -503,3 +503,23 @@ class LocalChat(CacheOpenAI):
             "total_tokens": sum(c["total_tokens"] for c in self.calls),
             "errors": list(self.errors),
         }
+
+
+__all__ = [
+    "CacheOpenAI",
+    "DSPY_FILTER_SYSTEM",
+    "LocalChat",
+    "OPENIE_JSON_SCHEMAS",
+    "QA_GBNF_GRAMMAR",
+    "QA_TURN_REMINDER",
+    "RECIPE_POLICY_TAG",
+    "RERANK_GBNF_GRAMMAR",
+    "SYSTEM_PROMPT_TIGHTENINGS",
+    "TIGHTENED_QA_SYSTEM",
+    "build_rerank_grammar",
+    "cache_response",
+    "chat_identity",
+    "normalize_generation_token_params",
+    "normalize_qa_response",
+    "repair_truncated_openie_json",
+]

@@ -16,7 +16,17 @@ from hipporag.utils.misc_utils import (
     text_processing as upstream_text_processing,
 )
 
-from yaw.daemon.graph.inference.prompts import (
+from yaw.daemon.graph.inference.parsers import (
+    compute_mdhash_id,
+    extract_named_entities,
+    extract_triples,
+    filter_invalid_triples,
+    filter_reranked_facts,
+    parse_filter_facts,
+    repair_truncated_json,
+    text_processing,
+)
+from yaw.daemon.graph.inference.templates import (
     FACT_FILTER_INPUT_TEMPLATE,
     FACT_FILTER_OUTPUT_TEMPLATE,
     NER_ONE_SHOT_OUTPUT,
@@ -29,18 +39,10 @@ from yaw.daemon.graph.inference.prompts import (
     TRIPLE_ONE_SHOT_INPUT,
     TRIPLE_ONE_SHOT_OUTPUT,
     TRIPLE_SYSTEM,
-    compute_mdhash_id,
-    extract_named_entities,
-    extract_triples,
-    filter_invalid_triples,
-    filter_reranked_facts,
-    parse_filter_facts,
     render_fact_filter_messages,
     render_ner_messages,
     render_rag_qa_messages,
     render_triple_messages,
-    repair_truncated_json,
-    text_processing,
 )
 
 
@@ -317,7 +319,7 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         """Verify HippoRAGProgram executes OpenIE, fact filtering, and CoT QA via dspy.JSONAdapter (pure JSON output)."""
         import dspy
         from dspy.utils import DummyLM
-        from yaw.daemon.graph.inference.prompts import HippoRAGProgram
+        from yaw.daemon.graph.inference.program import HippoRAGProgram
 
         program = HippoRAGProgram(qa_mode="cot")
         lm = DummyLM(
@@ -384,7 +386,7 @@ class PromptsAndParsersParityTests(unittest.TestCase):
     def test_hipporag_program_rlm_qa_executes_in_local_interpreter(self):
         """Verify HippoRAGProgram RLM mode executes real Python code inside dspy.LocalInterpreter."""
         from dspy.utils import DummyLM
-        from yaw.daemon.graph.inference.prompts import HippoRAGProgram
+        from yaw.daemon.graph.inference.program import HippoRAGProgram
 
         program = HippoRAGProgram(qa_mode="rlm", rlm_max_iters=4, rlm_max_llm_calls=5)
         lm = DummyLM([
@@ -412,7 +414,7 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         from pathlib import Path
         from tempfile import TemporaryDirectory
         import dspy
-        from yaw.daemon.graph.inference.prompts import HippoRAGProgram
+        from yaw.daemon.graph.inference.program import HippoRAGProgram
 
         with TemporaryDirectory() as tmp_dir:
             state_path = Path(tmp_dir) / "gepa_compiled.json"
@@ -441,13 +443,13 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         """Verify HippoRAGProgram forwards pure-JSON static and dynamic GBNF grammars via extra_body."""
         import dspy
         from dspy.utils import DummyLM
-        from yaw.daemon.graph.inference.prompts import (
+        from yaw.daemon.graph.inference.grammars import (
             DSPY_NER_GBNF_GRAMMAR,
             DSPY_QA_COT_GBNF_GRAMMAR,
             DSPY_TRIPLES_GBNF_GRAMMAR,
-            HippoRAGProgram,
             build_dspy_rerank_grammar,
         )
+        from yaw.daemon.graph.inference.program import HippoRAGProgram
 
         program = HippoRAGProgram(enable_gbnf=True)
         lm = DummyLM(
@@ -498,13 +500,13 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         import dspy
         from dspy.teleprompt.gepa.gepa_utils import _extract_score_and_objective_scores
         from dspy.utils import DummyLM
-        from yaw.daemon.graph.inference.prompts import (
-            HippoRAGProgram,
+        from yaw.daemon.graph.inference.grammars import (
             build_dspy_ner_grammar,
             build_dspy_qa_cot_grammar,
             build_dspy_triples_grammar,
             compute_sizecoding_pareto_score,
         )
+        from yaw.daemon.graph.inference.program import HippoRAGProgram
 
         program = HippoRAGProgram(
             enable_gbnf=True,
@@ -583,14 +585,14 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         """Verify execution_mode='rlm' runs Mistral NPU orchestrator (zero GBNF) + Qwen GPU worker (pure-JSON GBNF) on every stage."""
         import dspy
         from dspy.utils import DummyLM
-        from yaw.daemon.graph.inference.prompts import (
+        from yaw.daemon.graph.inference.grammars import (
             DSPY_NER_GBNF_GRAMMAR,
             DSPY_QA_COT_GBNF_GRAMMAR,
             DSPY_TRIPLES_GBNF_GRAMMAR,
-            HippoRAGProgram,
             build_dspy_rerank_grammar,
             lm_supports_gbnf,
         )
+        from yaw.daemon.graph.inference.program import HippoRAGProgram
 
         # Mistral orchestrator on Ryzen AI NPU/OGA (ChatAdapter, NO GBNF allowed)
         mistral_lm = DummyLM([
@@ -697,7 +699,7 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         """Verify _PositionalSafeRLM handles real Mistral NPU outputs: positional tool args, dict-wrapped SUBMIT, JSON-string triples, and leading ']\\n'."""
         import dspy
         from dspy.utils import DummyLM
-        from yaw.daemon.graph.inference.prompts import HippoRAGProgram
+        from yaw.daemon.graph.inference.program import HippoRAGProgram
 
         # Real-silicon failure patterns observed on Mistral-7B-Instruct-v0.3-Hybrid (ryzenai-llm):
         # 1. Positional tool calls: qwen_extract_entities(passage) instead of keyword args
@@ -808,7 +810,7 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             )
 
         from yaw.daemon.graph.inference.chat import create_dspy_lm, create_dspy_rlm_pair
-        from yaw.daemon.graph.inference.prompts import HippoRAGProgram
+        from yaw.daemon.graph.inference.program import HippoRAGProgram
 
         passage = (
             "Radio City is India's first private FM radio station and was started on "
@@ -889,21 +891,21 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             build_dspy_ner_grammar as GrammarBuildNer,
             compute_sizecoding_pareto_score as GrammarPareto,
         )
-        from yaw.daemon.graph.inference.prompts import (
-            HippoRAGProgram as PromptsHippoRAGProgram,
-            build_dspy_ner_grammar as PromptsBuildNer,
-        )
         from yaw.daemon.graph.inference import (
             HippoRAGProgram as FacadeHippoRAGProgram,
             build_dspy_ner_grammar as FacadeBuildNer,
             compute_sizecoding_pareto_score as FacadePareto,
         )
+        import yaw.daemon.graph.inference.prompts as prompts_module
 
-        self.assertIs(ProgramHippoRAGProgram, PromptsHippoRAGProgram)
         self.assertIs(ProgramHippoRAGProgram, FacadeHippoRAGProgram)
-        self.assertIs(GrammarBuildNer, PromptsBuildNer)
         self.assertIs(GrammarBuildNer, FacadeBuildNer)
         self.assertIs(GrammarPareto, FacadePareto)
+
+        # Comfort cushions off: prompts.py does NOT re-export program or grammars
+        self.assertFalse(hasattr(prompts_module, "HippoRAGProgram"))
+        self.assertFalse(hasattr(prompts_module, "build_dspy_ner_grammar"))
+        self.assertFalse(hasattr(prompts_module, "compute_sizecoding_pareto_score"))
 
 
 if __name__ == "__main__":

@@ -261,12 +261,12 @@ def filter_reranked_facts(
     )
 
 
-def _strip_mistral_bracket_prefix(text: str) -> str:
-    """Strip leading `]\\n` artifact occasionally emitted by Mistral v0.3 after DSPy `[[ ## field ## ]]` headers."""
+def strip_mistral_bracket_prefix(text: str) -> str:
+    """Strip leading `]\n` artifact occasionally emitted by Mistral v0.3 after DSPy `[[ ## field ## ]]` headers."""
     return re.sub(r"^\s*\]\s*\n+", "", text).strip()
 
 
-def _coerce_generated_facts(raw_output: Any) -> list[list[str]]:
+def coerce_generated_facts(raw_output: Any) -> list[list[str]]:
     """Extract 3-element string lists from a FactList, dict, JSON string, or list."""
     if hasattr(raw_output, "fact"):
         candidates = getattr(raw_output, "fact")
@@ -297,6 +297,6 @@ __all__ = [
     "parse_filter_facts",
     "match_facts_to_candidate_indices",
     "filter_reranked_facts",
-    "_strip_mistral_bracket_prefix",
-    "_coerce_generated_facts",
+    "strip_mistral_bracket_prefix",
+    "coerce_generated_facts",
 ]

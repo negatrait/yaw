@@ -1,57 +1,16 @@
 """Native DSPy signatures and few-shot demonstration sets for HippoRAG 2."""
 
 import json
-from typing import Any
 
 import dspy
 from pydantic import BaseModel, Field
 
-from .parsers import (
-    _coerce_generated_facts,
-    _strip_mistral_bracket_prefix,
-    compute_mdhash_id,
-    extract_named_entities,
-    extract_triples,
-    filter_invalid_triples,
-    filter_reranked_facts,
-    match_facts_to_candidate_indices,
-    parse_filter_facts,
-    repair_truncated_json,
-    text_processing,
-)
 from .templates import (
-    FACT_FILTER_BASE_MESSAGES,
-    FACT_FILTER_INPUT_TEMPLATE,
-    FACT_FILTER_OUTPUT_TEMPLATE,
-    FACT_FILTER_SYSTEM,
     NER_ONE_SHOT_OUTPUT,
     NER_ONE_SHOT_PARAGRAPH,
-    NER_SYSTEM,
-    PROMPT_JSON_TEMPLATE,
     RAG_QA_DOCS,
-    RAG_QA_ONE_SHOT_INPUT,
-    RAG_QA_ONE_SHOT_OUTPUT,
-    RAG_QA_SYSTEM,
-    TRIPLE_FRAME,
-    TRIPLE_ONE_SHOT_INPUT,
     TRIPLE_ONE_SHOT_OUTPUT,
-    TRIPLE_SYSTEM,
     best_dspy_prompt,
-    ner_conditioned_re_frame,
-    ner_conditioned_re_input,
-    ner_conditioned_re_output,
-    ner_conditioned_re_system,
-    ner_system,
-    one_shot_ner_output,
-    one_shot_ner_paragraph,
-    one_shot_rag_qa_docs,
-    one_shot_rag_qa_input,
-    one_shot_rag_qa_output,
-    rag_qa_system,
-    render_fact_filter_messages,
-    render_ner_messages,
-    render_rag_qa_messages,
-    render_triple_messages,
 )
 
 # ---------------------------------------------------------------------------
@@ -165,43 +124,14 @@ FACT_FILTER_DEMOS: list[dspy.Example] = _build_default_fact_filter_demos()
 QA_DEMOS: list[dspy.Example] = _build_default_qa_demos()
 
 
-# Re-exports from .grammars for backwards compatibility
-from .grammars import (
-    DSPY_NER_GBNF_GRAMMAR,
-    DSPY_QA_COT_GBNF_GRAMMAR,
-    DSPY_RERANK_GBNF_GRAMMAR,
-    DSPY_TRIPLES_GBNF_GRAMMAR,
-    _gbnf_escape_literal,
-    build_dspy_ner_grammar,
-    build_dspy_qa_cot_grammar,
-    build_dspy_rerank_grammar,
-    build_dspy_triples_grammar,
-    compute_sizecoding_pareto_score,
-    lm_supports_gbnf,
-)
-
-
-def __getattr__(name: str) -> Any:
-    if name in (
-        "HippoRAGProgram",
-        "_PositionalSafeRLM",
-        "_STAGE_RLM_DELEGATION_RULES",
-        "_build_rlm_action_demos",
-    ):
-        from .program import (
-            HippoRAGProgram,
-            _PositionalSafeRLM,
-            _STAGE_RLM_DELEGATION_RULES,
-            _build_rlm_action_demos,
-        )
-
-        mapping = {
-            "HippoRAGProgram": HippoRAGProgram,
-            "_PositionalSafeRLM": _PositionalSafeRLM,
-            "_STAGE_RLM_DELEGATION_RULES": _STAGE_RLM_DELEGATION_RULES,
-            "_build_rlm_action_demos": _build_rlm_action_demos,
-        }
-        val = mapping[name]
-        globals()[name] = val
-        return val
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+__all__ = [
+    "AnswerQuestion",
+    "ExtractEntities",
+    "ExtractTriples",
+    "FACT_FILTER_DEMOS",
+    "FactList",
+    "FilterFacts",
+    "NER_DEMOS",
+    "QA_DEMOS",
+    "TRIPLE_DEMOS",
+]

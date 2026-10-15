@@ -9,7 +9,12 @@ from hipporag.prompts import PromptTemplateManager
 from hipporag.prompts.filter_default_prompt import best_dspy_prompt
 from hipporag.utils.config_utils import BaseConfig
 from hipporag.utils.llm_utils import PROMPT_JSON_TEMPLATE
-from yaw.daemon.graph.inference.chat import CacheOpenAI, RERANK_GBNF_GRAMMAR, LocalChat, chat_identity
+from yaw.daemon.graph.inference.legacy_chat import (
+    CacheOpenAI,
+    LocalChat,
+    RERANK_GBNF_GRAMMAR,
+    chat_identity,
+)
 from yaw.daemon.graph.inference.models import CHAT_MODELS
 
 
@@ -34,7 +39,7 @@ class ChatTests(unittest.TestCase):
                         self.assertNotIn("extra_body", params)
 
     def test_ryzenai_folds_leading_system_message_and_unescapes_markdown_underscores(self):
-        from yaw.daemon.graph.inference.chat import QA_TURN_REMINDER, TIGHTENED_QA_SYSTEM
+        from yaw.daemon.graph.inference.legacy_chat import QA_TURN_REMINDER, TIGHTENED_QA_SYSTEM
 
         with TemporaryDirectory(ignore_cleanup_errors=True) as directory, closing(
             LocalChat.from_experiment_config(BaseConfig(
@@ -80,7 +85,7 @@ class ChatTests(unittest.TestCase):
             self.assertEqual(chat.errors, [])
 
     def test_llamacpp_applies_openie_json_schemas_and_dspy_rerank_gbnf_grammar(self):
-        from yaw.daemon.graph.inference.chat import QA_GBNF_GRAMMAR, TIGHTENED_QA_SYSTEM
+        from yaw.daemon.graph.inference.legacy_chat import QA_GBNF_GRAMMAR, TIGHTENED_QA_SYSTEM
 
         with TemporaryDirectory(ignore_cleanup_errors=True) as directory, closing(
             LocalChat.from_experiment_config(BaseConfig(
@@ -131,22 +136,22 @@ class ChatTests(unittest.TestCase):
             self.assertEqual(qa_kwargs["extra_body"], {"grammar": QA_GBNF_GRAMMAR})
 
     def test_qa_delimiter_normalization(self):
-        from yaw.daemon.graph.inference.chat import _normalize_qa_response
+        from yaw.daemon.graph.inference.legacy_chat import normalize_qa_response
 
         # QA delimiter normalization handles Markdown bolding, internal 'Answer:' mentions, and missing 'Answer:'
-        normalized = _normalize_qa_response("The doc says Answer: maybe X.\n**Answer:** The glass slipper fit Cinderella.")
+        normalized = normalize_qa_response("The doc says Answer: maybe X.\n**Answer:** The glass slipper fit Cinderella.")
         self.assertEqual(normalized.split("Answer:")[1].strip(), "The glass slipper fit Cinderella.")
         self.assertEqual(normalized.count("Answer:"), 1)
 
         with self.assertRaisesRegex(ValueError, "omitted required 'Answer:'"):
-            _normalize_qa_response("Just a thought without the final marker.")
-        fallback = _normalize_qa_response("Step 1. Therefore, the answer is X.", allow_missing_delimiter=True)
+            normalize_qa_response("Just a thought without the final marker.")
+        fallback = normalize_qa_response("Step 1. Therefore, the answer is X.", allow_missing_delimiter=True)
         self.assertEqual(fallback.split("Answer:")[1].strip(), "Therefore, the answer is X.")
         with self.assertRaisesRegex(ValueError, "omitted required 'Answer:' content"):
-            _normalize_qa_response("   ", allow_missing_delimiter=True)
+            normalize_qa_response("   ", allow_missing_delimiter=True)
 
     def test_dynamic_rerank_grammar_handles_all_candidate_counts_and_corpus_updates(self):
-        from yaw.daemon.graph.inference.chat import _build_rerank_grammar
+        from yaw.daemon.graph.inference.legacy_chat import build_rerank_grammar
 
         def make_messages(fact_json_str):
             user_content = (
@@ -160,18 +165,18 @@ class ChatTests(unittest.TestCase):
             ]
 
         # 1. Missing or malformed fact_before_filter -> static fallback
-        self.assertEqual(_build_rerank_grammar([]), RERANK_GBNF_GRAMMAR)
-        self.assertEqual(_build_rerank_grammar(make_messages("not-json")), RERANK_GBNF_GRAMMAR)
-        self.assertEqual(_build_rerank_grammar(make_messages('{"fact": "bad"}')), RERANK_GBNF_GRAMMAR)
-        self.assertEqual(_build_rerank_grammar(make_messages('{"fact": [["only", "two"]]}')), RERANK_GBNF_GRAMMAR)
+        self.assertEqual(build_rerank_grammar([]), RERANK_GBNF_GRAMMAR)
+        self.assertEqual(build_rerank_grammar(make_messages("not-json")), RERANK_GBNF_GRAMMAR)
+        self.assertEqual(build_rerank_grammar(make_messages('{"fact": "bad"}')), RERANK_GBNF_GRAMMAR)
+        self.assertEqual(build_rerank_grammar(make_messages('{"fact": [["only", "two"]]}')), RERANK_GBNF_GRAMMAR)
 
         # 2. N = 0 (empty candidate list) -> forces {"fact": []} without empty triple ::= rule
-        grammar_zero = _build_rerank_grammar(make_messages('{"fact": []}'))
+        grammar_zero = build_rerank_grammar(make_messages('{"fact": []}'))
         self.assertIn('"{\\"fact\\": []}"', grammar_zero)
         self.assertNotIn("triple ::=", grammar_zero)
 
         # 3. 1 <= N < 4 (N = 2) -> caps selections at 2 and includes both candidates
-        grammar_two = _build_rerank_grammar(make_messages(
+        grammar_two = build_rerank_grammar(make_messages(
             '{"fact": [["george rankin", "is", "politician"], ["cinderella", "attended", "royal ball"]]}'
         ))
         self.assertIn('fact-list ::= (triple (", " triple)?)?', grammar_two)
@@ -183,7 +188,7 @@ class ChatTests(unittest.TestCase):
             [f"s{i}", f"p{i}", f"o{i}"] for i in range(6)
         ] + [["s0", "p0", "o0"]]
         import json
-        grammar_six = _build_rerank_grammar(make_messages(json.dumps({"fact": six_facts})))
+        grammar_six = build_rerank_grammar(make_messages(json.dumps({"fact": six_facts})))
         self.assertIn(
             'fact-list ::= (triple (", " triple (", " triple (", " triple)?)?)?)?',
             grammar_six,
@@ -193,7 +198,7 @@ class ChatTests(unittest.TestCase):
             self.assertIn(f'"[\\"s{i}\\", \\"p{i}\\", \\"o{i}\\"]"', grammar_six)
 
         # 5. Special characters (quotes, backslashes, unicode) are safely escaped
-        grammar_special = _build_rerank_grammar(make_messages(
+        grammar_special = build_rerank_grammar(make_messages(
             json.dumps({"fact": [['cinderella "glass"', r"path\to", "münchen"]]})
         ))
         self.assertIn("münchen", grammar_special)
@@ -265,8 +270,11 @@ class ChatTests(unittest.TestCase):
         self.assertTrue(all("chat-v1" in chat_identity(name) for name in CHAT_MODELS))
 
     def test_create_dspy_lm_configures_lemonade_and_ollama_models(self):
-        from yaw.daemon.graph.inference.chat import create_dspy_lm, create_dspy_rlm_pair
-        from yaw.daemon.graph.inference.prompts import lm_supports_gbnf
+        from yaw.daemon.graph.inference.chat import (
+            create_dspy_lm,
+            create_dspy_rlm_pair,
+            lm_supports_gbnf,
+        )
 
         # Qwen3-4B extraction on Lemonade (8192-16384 ctx window, llamacpp GPU -> GBNF supported)
         qwen_lm = create_dspy_lm("Qwen3-4B-Instruct-2507-GGUF", role="extraction")
@@ -324,6 +332,10 @@ class ChatTests(unittest.TestCase):
         self.assertIs(FacadeCacheOpenAI, CacheOpenAI)
         self.assertIs(direct_chat_identity, chat_identity)
         self.assertIs(facade_chat_identity, chat_identity)
+
+        import yaw.daemon.graph.inference.chat as chat_module
+        self.assertFalse(hasattr(chat_module, "LocalChat"))
+        self.assertFalse(hasattr(chat_module, "CacheOpenAI"))
 
 
 if __name__ == "__main__":

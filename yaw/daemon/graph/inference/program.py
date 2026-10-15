@@ -19,12 +19,12 @@ from .grammars import (
     lm_supports_gbnf,
 )
 from .parsers import (
-    _coerce_generated_facts,
-    _strip_mistral_bracket_prefix,
+    coerce_generated_facts,
     extract_named_entities,
     extract_triples,
     filter_invalid_triples,
     match_facts_to_candidate_indices,
+    strip_mistral_bracket_prefix,
 )
 from .prompts import (
     FACT_FILTER_DEMOS,
@@ -198,9 +198,9 @@ class _PositionalSafeRLM(dspy.RLM):
                     elif isinstance(val, (list, tuple)):
                         val = [list(t) for t in filter_invalid_triples(val)]
                 elif name == "fact":
-                    val = _coerce_generated_facts(val)
+                    val = coerce_generated_facts(val)
                 elif annotation is str and isinstance(val, str):
-                    val = _strip_mistral_bracket_prefix(val)
+                    val = strip_mistral_bracket_prefix(val)
                 raw_output[name] = val
         return super()._process_final_output(result, output_field_names)
 
@@ -216,7 +216,7 @@ class _PositionalSafeRLM(dspy.RLM):
             annotation = getattr(field, "annotation", str)
             val = getattr(pred, name, None)
             if annotation is str and isinstance(val, str):
-                setattr(pred, name, _strip_mistral_bracket_prefix(val))
+                setattr(pred, name, strip_mistral_bracket_prefix(val))
         return pred
 
 
@@ -400,7 +400,7 @@ class HippoRAGProgram(dspy.Module):
         ) -> list[list[str]]:
             """Filter candidate [s, p, o] facts using the dynamic candidate-literal GBNF Qwen GPU model."""
             raw_source = candidate_facts if candidate_facts is not None else fact_before_filter
-            parsed_candidates = _coerce_generated_facts(raw_source)
+            parsed_candidates = coerce_generated_facts(raw_source)
             if not parsed_candidates:
                 return []
             worker_lm = self._resolve_worker_lm()
@@ -428,8 +428,8 @@ class HippoRAGProgram(dspy.Module):
                 use_gbnf=self.enable_gbnf,
             )
             return {
-                "reasoning": _strip_mistral_bracket_prefix(str(getattr(pred, "reasoning", ""))),
-                "answer": _strip_mistral_bracket_prefix(str(getattr(pred, "answer", ""))),
+                "reasoning": strip_mistral_bracket_prefix(str(getattr(pred, "reasoning", ""))),
+                "answer": strip_mistral_bracket_prefix(str(getattr(pred, "answer", ""))),
             }
 
         return [
@@ -585,7 +585,7 @@ class HippoRAGProgram(dspy.Module):
                     **call_kwargs,
                 )
         raw_after = getattr(pred, "fact", getattr(pred, "fact_after_filter", None))
-        generated = _coerce_generated_facts(raw_after)
+        generated = coerce_generated_facts(raw_after)
         return match_facts_to_candidate_indices(
             candidate_facts, generated, max_facts=effective_max_facts
         )
@@ -627,3 +627,8 @@ class HippoRAGProgram(dspy.Module):
         return self.answer_question(
             context=context, question=question, mode=mode, use_gbnf=use_gbnf
         )
+
+
+__all__ = [
+    "HippoRAGProgram",
+]

@@ -15,9 +15,9 @@ from yaw.daemon.graph.inference.embedding import (
     MODEL,
     QA_QUERY_PREFIX,
     QUERY_PREFIX,
-    RetrievalEmbedding,
     resolve_embedding_profile,
 )
+from yaw.daemon.graph.inference.legacy_embedding import RetrievalEmbedding
 
 
 class EmbeddingTests(unittest.TestCase):
@@ -246,6 +246,9 @@ class EmbeddingTests(unittest.TestCase):
 
         self.assertIs(DirectRetrievalEmbedding, RetrievalEmbedding)
         self.assertIs(FacadeRetrievalEmbedding, RetrievalEmbedding)
+
+        import yaw.daemon.graph.inference.embedding as embedding_module
+        self.assertFalse(hasattr(embedding_module, "RetrievalEmbedding"))
 
 
 if __name__ == "__main__":

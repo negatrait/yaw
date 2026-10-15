@@ -158,3 +158,8 @@ class RetrievalEmbedding:
 
     def close(self) -> None:
         self.client.close()
+
+
+__all__ = [
+    "RetrievalEmbedding",
+]
