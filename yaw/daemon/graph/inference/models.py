@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 import hashlib
 import json
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 
 @dataclass(frozen=True)
@@ -147,7 +147,26 @@ def preflight(profile, chat_model=None, qa_model=None, base_url=BASE_URL):
 
 def embedding_evidence(profile, base_url=BASE_URL):
     health = get_json(base_url, "/health")
-    model = select_model(health.get("all_models_loaded", []), profile.model)
+    loaded_models = health.get("all_models_loaded", [])
+    if not any(
+        canonical(m.get("id", m.get("model_name", ""))) == canonical(profile.model)
+        for m in loaded_models
+    ):
+        # Warm / auto-load the configured embedding model into residency if Lemonade evicted it.
+        probe_req = Request(
+            base_url.rstrip("/") + "/embeddings",
+            data=json.dumps({"model": profile.model, "input": "probe"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urlopen(probe_req, timeout=30):
+                pass
+        except Exception:
+            pass
+        health = get_json(base_url, "/health")
+        loaded_models = health.get("all_models_loaded", [])
+
+    model = select_model(loaded_models, profile.model)
     if (model.get("checkpoint") != profile.checkpoint or model.get("recipe") != "llamacpp"
             or model.get("backend_health") != "ready"):
         raise ValueError("Loaded embedding backend differs from the selected profile.")
