@@ -21,10 +21,11 @@ Baseline: 2026-10-14. YAW is a native HippoRAG 2 graph & storage engine (`yaw/da
    - Treat inference (`http://localhost:13305/api/v1` or configured URL) as an external persistent server; never load/unload models from the daemon.
 5. **FastMCP Adapter:**
    - Mount `fastmcp` Streamable HTTP (`127.0.0.1:13306/mcp` + `/healthz` + `/readyz`) onto the single daemon runtime.
-6. **Native DSPy Inference (`dspy.LM` + `dspy.Embedder` + `dspy.RLM` + `dspy.GEPA`):**
+6. **Native DSPy Inference, GBNF Grammars & Anti-Lock-In `MIPROv2`/`GEPA` Evolution (`dspy.LM` + `dspy.Embedder` + `dspy.RLM` + `dspy.MIPROv2`/`dspy.GEPA`):**
    - Drive all inference through `dspy` (`yaw/daemon/graph/inference/`): `dspy.LM` (`chat.py`) and `dspy.Embedder` (`embedding.py`) against Lemonade (`openai/...`) or Ollama (`ollama_chat/...`, `ollama/...`) with zero `hipporag` runtime imports.
-   - Express NER (`ExtractEntities`), Triple Extraction (`ExtractTriples`), Recognition Memory (`FilterFacts`), and Multi-Hop QA (`AnswerQuestion`) as typed `dspy.Signature`s and `dspy.Module`s in `prompts.py`.
-   - Use single-turn `dspy.Predict` for short per-chunk indexing/reranking and support `dspy.ChainOfThought` or **`dspy.RLM`** (Recursive Language Model with `sub_lm` delegation and on-demand line-hydration tools) for multi-hop QA and long contexts on constrained local models (`Qwen3-4B` at `8192–16384` ctx + `Mistral-7B`), compiled via `dspy.GEPA` (`.save()` / `.load()`).
+   - Express NER (`ExtractEntities`), Triple Extraction (`ExtractTriples`), Recognition Memory (`FilterFacts`), and Multi-Hop QA (`AnswerQuestion`) as typed `dspy.Signature`s and `dspy.Module`s in `prompts.py`, forwarding Lemonade/`llama.cpp` GBNF context-free grammars (`DSPY_NER_GBNF_GRAMMAR`, `DSPY_TRIPLES_GBNF_GRAMMAR`, and dynamic candidate-literal `build_dspy_rerank_grammar`) via `dspy.Predict(..., config={"extra_body": {"grammar": ...}})`.
+   - Use single-turn `dspy.Predict` for short per-chunk indexing/reranking and support `dspy.ChainOfThought` or **`dspy.RLM`** (`dspy.LocalInterpreter`, `sub_lm` delegation, and on-demand line-hydration tools) for multi-hop QA and long contexts on constrained local models (`Qwen3-4B` at `8192–16384` ctx + `Mistral-7B` at `32786` ctx).
+   - **Zero-Lock-In Prompt Evolution Policy:** Never evolve or fine-tune prompts on the full Tier 2 benchmark corpora. Evolve one universal `compiled_program.json` via `dspy.MIPROv2` + `dspy.GEPA` strictly on **Tier 1 small slices** (`--max-queries 10`) and/or **external out-of-distribution RAG datasets** (`onyx-dot-app/EnterpriseRAG-Bench`, `microsoft/graphrag-benchmarking-datasets`), then evaluate that frozen program zero-shot across the unseen Tier 2 full-corpus holdouts (`musique`, `2wikimultihopqa`, `hotpotqa`).
 
 ## Domain Containment Tree (Zero Cross-Domain / Sibling Edges)
 

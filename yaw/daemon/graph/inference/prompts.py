@@ -739,16 +739,97 @@ def match_facts_to_candidate_indices(
     return result_indices
 
 
+# ---------------------------------------------------------------------------
+# 8. Context-Free Grammars (GBNF) for DSPy ChatAdapter on Lemonade / llama.cpp
+# ---------------------------------------------------------------------------
+
+DSPY_NER_GBNF_GRAMMAR = r"""root ::= "[[ ## named_entities ## ]]\n" entity-list "\n\n[[ ## completed ## ]]"
+entity-list ::= "[]" | "[" string (", " string)* "]"
+string ::= "\"" char+ "\""
+char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
+"""
+
+DSPY_TRIPLES_GBNF_GRAMMAR = r"""root ::= "[[ ## triples ## ]]\n" triple-list "\n\n[[ ## completed ## ]]"
+triple-list ::= "[]" | "[" triple (", " triple)* "]"
+triple ::= "[" string ", " string ", " string "]"
+string ::= "\"" char+ "\""
+char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
+"""
+
+DSPY_RERANK_GBNF_GRAMMAR = r"""root ::= "[[ ## fact_after_filter ## ]]\n" fact-obj "\n\n[[ ## completed ## ]]"
+fact-obj ::= "{\"fact\": [" fact-list "]}"
+fact-list ::= (triple (", " triple)*)?
+triple ::= "[" string ", " string ", " string "]"
+string ::= "\"" char+ "\""
+char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
+"""
+
+DSPY_QA_COT_GBNF_GRAMMAR = r"""root ::= "[[ ## reasoning ## ]]\n" text "\n\n[[ ## answer ## ]]\n" line "\n\n[[ ## completed ## ]]"
+text ::= line ("\n" line)*
+line ::= char+
+char ::= [^\r\n\x00-\x1F]
+"""
+
+
+def _gbnf_escape_literal(text: str) -> str:
+    escaped = (
+        text.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+    )
+    return f'"{escaped}"'
+
+
+def build_dspy_rerank_grammar(
+    candidate_facts: Sequence[Union[Tuple[str, str, str], List[str]]],
+    max_facts: int = 4,
+) -> str:
+    """Build dynamic candidate-literal GBNF grammar for DSPy FilterFacts (ChatAdapter)."""
+    candidates: list[str] = []
+    for item in candidate_facts:
+        if (
+            not isinstance(item, (list, tuple))
+            or len(item) != 3
+            or not all(isinstance(x, str) for x in item)
+        ):
+            return DSPY_RERANK_GBNF_GRAMMAR
+        serialized = json.dumps(list(item), ensure_ascii=False)
+        if serialized not in candidates:
+            candidates.append(serialized)
+
+    if not candidates:
+        return (
+            'root ::= "[[ ## fact_after_filter ## ]]\\n" '
+            '"{\\"fact\\": []}" '
+            '"\\n\\n[[ ## completed ## ]]"\n'
+        )
+
+    limit = min(max_facts, len(candidates))
+    seq = "triple"
+    for _ in range(limit - 1):
+        seq = f'triple (", " {seq})?'
+    triple_rule = " | ".join(_gbnf_escape_literal(c) for c in candidates)
+    return (
+        'root ::= "[[ ## fact_after_filter ## ]]\\n" fact-obj "\\n\\n[[ ## completed ## ]]"\n'
+        'fact-obj ::= "{\\"fact\\": [" fact-list "]}"\n'
+        f"fact-list ::= ({seq})?\n"
+        f"triple ::= {triple_rule}\n"
+    )
+
+
 class HippoRAGProgram(dspy.Module):
     """Unified DSPy Module for HippoRAG 2 OpenIE, Recognition Memory, and Multi-Hop QA.
 
     - OpenIE (`ner`, `triples`) and Recognition Memory (`fact_filter`) use `dspy.Predict`
-      for fast 1-call structured execution per stage.
+      for fast 1-call structured execution per stage, with optional `llama.cpp` GBNF
+      context-free grammar enforcement (`enable_gbnf=True`) via `config={"extra_body": {"grammar": ...}}`.
     - QA supports both `dspy.ChainOfThought(AnswerQuestion)` (`qa_mode="cot"`) and
       `dspy.RLM(AnswerQuestion)` (`qa_mode="rlm"`) using `dspy.LocalInterpreter` by default
       so large evidence contexts can be explored iteratively in Python without blowing the
       8192-16384 context window of Qwen3-4B or crowding Mistral-7B Hybrid's attention.
-    - Compatible with `dspy.GEPA` optimization and `.save()` / `.load()` state persistence.
+    - Compatible with `dspy.MIPROv2` and `dspy.GEPA` optimization and `.save()` / `.load()`.
     """
 
     def __init__(
@@ -756,6 +837,7 @@ class HippoRAGProgram(dspy.Module):
         *,
         qa_mode: Literal["cot", "rlm"] = "cot",
         include_demos: bool = True,
+        enable_gbnf: bool = False,
         rlm_max_iters: int = 10,
         rlm_max_llm_calls: int = 20,
         rlm_max_output_chars: int = 10000,
@@ -768,6 +850,7 @@ class HippoRAGProgram(dspy.Module):
         if qa_mode not in ("cot", "rlm"):
             raise ValueError(f"Unsupported qa_mode: {qa_mode!r}. Expected 'cot' or 'rlm'.")
         self.qa_mode: Literal["cot", "rlm"] = qa_mode
+        self.enable_gbnf: bool = enable_gbnf
 
         self.ner = dspy.Predict(ExtractEntities)
         self.triples = dspy.Predict(ExtractTriples)
@@ -795,12 +878,20 @@ class HippoRAGProgram(dspy.Module):
                 self.load(str(path))
 
     def extract_entities(
-        self, passage: str, *, lm: dspy.LM | None = None
+        self,
+        passage: str,
+        *,
+        lm: dspy.LM | None = None,
+        use_gbnf: bool | None = None,
     ) -> Tuple[str, ...]:
         """Run DSPy NER extraction and return deduplicated non-empty entity strings."""
+        gbnf = self.enable_gbnf if use_gbnf is None else use_gbnf
+        call_kwargs: dict[str, Any] = {}
+        if gbnf:
+            call_kwargs["config"] = {"extra_body": {"grammar": DSPY_NER_GBNF_GRAMMAR}}
         ctx = dspy.context(lm=lm) if lm is not None else dspy.context()
         with ctx:
-            pred = self.ner(passage=passage)
+            pred = self.ner(passage=passage, **call_kwargs)
         raw_entities = getattr(pred, "named_entities", [])
         if isinstance(raw_entities, str):
             return extract_named_entities(raw_entities)
@@ -822,11 +913,20 @@ class HippoRAGProgram(dspy.Module):
         named_entities: Sequence[str],
         *,
         lm: dspy.LM | None = None,
+        use_gbnf: bool | None = None,
     ) -> Tuple[Tuple[str, str, str], ...]:
         """Run DSPy entity-conditioned triple extraction and return deduplicated 3-tuples."""
+        gbnf = self.enable_gbnf if use_gbnf is None else use_gbnf
+        call_kwargs: dict[str, Any] = {}
+        if gbnf:
+            call_kwargs["config"] = {"extra_body": {"grammar": DSPY_TRIPLES_GBNF_GRAMMAR}}
         ctx = dspy.context(lm=lm) if lm is not None else dspy.context()
         with ctx:
-            pred = self.triples(passage=passage, named_entities=list(named_entities))
+            pred = self.triples(
+                passage=passage,
+                named_entities=list(named_entities),
+                **call_kwargs,
+            )
         raw_triples = getattr(pred, "triples", [])
         if isinstance(raw_triples, str):
             return extract_triples(raw_triples)
@@ -841,10 +941,11 @@ class HippoRAGProgram(dspy.Module):
         passage: str,
         *,
         lm: dspy.LM | None = None,
+        use_gbnf: bool | None = None,
     ) -> OpenIERecord:
         """Execute two-stage OpenIE (NER -> Triples) for a passage chunk."""
-        entities = self.extract_entities(passage, lm=lm)
-        triples = self.extract_triples(passage, entities, lm=lm)
+        entities = self.extract_entities(passage, lm=lm, use_gbnf=use_gbnf)
+        triples = self.extract_triples(passage, entities, lm=lm, use_gbnf=use_gbnf)
         return OpenIERecord(
             chunk_id=chunk_id,
             entities=entities,
@@ -858,16 +959,25 @@ class HippoRAGProgram(dspy.Module):
         *,
         max_facts: int | None = 4,
         lm: dspy.LM | None = None,
+        use_gbnf: bool | None = None,
     ) -> List[int]:
         """Filter candidate facts with DSPy recognition memory and return matched indices."""
         if not candidate_facts:
             return []
         fact_before_filter = json.dumps({"fact": [list(f) for f in candidate_facts]})
+        gbnf = self.enable_gbnf if use_gbnf is None else use_gbnf
+        call_kwargs: dict[str, Any] = {}
+        if gbnf:
+            grammar = build_dspy_rerank_grammar(
+                candidate_facts, max_facts=max_facts if max_facts is not None else 4
+            )
+            call_kwargs["config"] = {"extra_body": {"grammar": grammar}}
         ctx = dspy.context(lm=lm) if lm is not None else dspy.context()
         with ctx:
             pred = self.fact_filter(
                 question=question,
                 fact_before_filter=fact_before_filter,
+                **call_kwargs,
             )
         raw_after = getattr(pred, "fact_after_filter", None)
         generated = _coerce_generated_facts(raw_after)
@@ -882,15 +992,19 @@ class HippoRAGProgram(dspy.Module):
         *,
         mode: Literal["cot", "rlm"] | None = None,
         lm: dspy.LM | None = None,
+        use_gbnf: bool = False,
     ) -> dspy.Prediction:
         """Answer a question over retrieved context using either ChainOfThought or RLM."""
         active_mode = mode or self.qa_mode
         if active_mode not in ("cot", "rlm"):
             raise ValueError(f"Unsupported QA mode: {active_mode!r}")
         qa_module = self.qa_rlm if active_mode == "rlm" else self.qa_cot
+        call_kwargs: dict[str, Any] = {}
+        if use_gbnf and active_mode == "cot":
+            call_kwargs["config"] = {"extra_body": {"grammar": DSPY_QA_COT_GBNF_GRAMMAR}}
         ctx = dspy.context(lm=lm) if lm is not None else dspy.context()
         with ctx:
-            return qa_module(context=context, question=question)
+            return qa_module(context=context, question=question, **call_kwargs)
 
     def forward(
         self,

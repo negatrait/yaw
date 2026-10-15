@@ -121,6 +121,9 @@ Execute strictly in order `E1-S1` $\to$ `E1-S6`. Never start Sprint $k+1$ until 
     - Fact linking & Recognition Memory (`HippoRAG.py:2125-2175`): query `fact_vec` top-$k$ (`linking_top_k=5`) $\to$ filter via `HippoRAGProgram.filter_facts`.
     - PPR Seeding (`HippoRAG.py:2008-2120`): entity weight $w(e) = \text{mean\_fact\_score}(e) / \max(1, \text{doc\_freq}(e))$; passage weight $w(c) = 0.05 \cdot (\widehat{s}_{\text{vec}}(c) + \widehat{s}_{\text{fts}}(c))$ $\to$ `ppr.run_ppr` $\to$ rank chunk nodes $\to$ hydrate **only** top-$k$ chunks via `storage/hydration.py`.
     - QA reader: run `HippoRAGProgram.answer_question` (selectable `ChainOfThought` or `RLM` with `sub_lm` and hydration tool).
+  - **End-to-End DSPy Trace Hook (`engine.py`) & Disjoint Benchmark Split (`benchmark.py`):**
+    - Wire `engine.retrieve_and_answer(question)` through `HippoRAGProgram` so a single `dspy.Module.forward(question)` trace captures `FilterFacts` $\to$ `<3 ms` CSR PPR + line hydration $\to$ `AnswerQuestion` (`CoT` or `RLM`).
+    - Add `--engine {hipporag, yaw}`, `--query-offset <M>`, `--evolve {none, miprov2, gepa, hybrid}`, `--train-queries <K>`, and `--compiled-program <path>` to `benchmark.py` to support strict disjoint learning (`[0:K]`) vs. holdout (`[K:N]`) evaluation.
 - **Drop (Anti-Spaghetti):** Drop `python-igraph` (`self.graph`, vertex deletion index-shifting bugs, `graph.pickle`) and drop `d1bc65e`'s `compute_upward_conductance`, `in_degrees**0.5` hub dampening, and `InMemoryLookupKB`.
 - **Exit Gate (`D1-A4` — Tier 1 Dev Parity Gate):** `uv run --locked python benchmark.py --engine yaw --dataset {sample,2wikimultihopqa,musique} --max-queries 10` matches or beats upstream `hipporag` on `Recall@2`, `Recall@5`, `QA EM`, and `QA F1`.
 
@@ -139,17 +142,21 @@ Execute strictly in order `E1-S1` $\to$ `E1-S6`. Never start Sprint $k+1$ until 
 
 ---
 
-### Sprint 6 (`E1-S6`): `yaw/daemon/{runtime.py, cli.py}`, `dspy.GEPA` / `dspy.RLM` Tuning & Tier 2 Full-Corpus Parity Gate
+### Sprint 6 (`E1-S6`): `yaw/daemon/{runtime.py, cli.py}`, Two-Phase `MIPROv2` + `GEPA` Evolution & Tier 2 Holdout Gate
 - **Files:** `yaw/core/config.py`, `yaw/daemon/{runtime.py, cli.py}`, `yaw/__main__.py`, `yaw.toml`, `tests/daemon/test_runtime.py`.
 - **Allowed imports:** `runtime.py` & `cli.py` import `yaw.daemon.{ingestion,graph}`, `yaw.core.*`, `filelock`, `tomllib`, `argparse`, `queue`, `threading`.
 - **Copy/Adapt From:**
   - Adapt `DaemonLifecycle` and graceful signal handling from `git show d1bc65e:src/yaw/server/daemon.py:260-340` (using `filelock.FileLock("yaw.db.lock")` instead of raw `msvcrt`/PID-alive checks).
-  - Adapt `argparse` subcommands from `git show d1bc65e:src/yaw/cli.py:42-180` into `python -m yaw {run|start|status|sync|stop|rebuild} --config yaw.toml`.
-  - Wire single-owner 32-slot bounded FIFO worker thread in `runtime.py`: drains `ingestion.corpus.poll()` $\to$ `graph.engine.apply_delta(delta)` and serves `retrieve`/`rag_qa` requests, with non-blocking cached `status()`/`stats()`.
-  - Compile `HippoRAGProgram` with `dspy.GEPA` (and evaluate `dspy.RLM` vs `dspy.ChainOfThought` reader with `Qwen3-4B` at `8192–16384` ctx + `Mistral-7B`) to maximize `Recall@k` and `QA F1`.
+  - Adapt `argparse` subcommands from `git show d1bc65e:src/yaw/cli.py:42-180` into `python -m yaw {run|start|status|sync|stop|rebuild|optimize} --config yaw.toml`.
+  - Wire single-owner 32-slot bounded FIFO worker thread in `runtime.py`: drains `ingestion.corpus.poll()` $\to$ `graph.engine.apply_delta(delta)` and serves `retrieve`/`rag_qa` requests, with non-blocking cached `status()`/`stats()`, loading `compiled_program_path` from `yaw.toml` when present.
+  - **Zero-Lock-In `MIPROv2` + `GEPA` Evolution (`engine.evolve_prompts` & `python -m yaw optimize` / `benchmark.py --evolve`):**
+    1. **Anti-Overfitting Rule:** Never run prompt evolution on full Tier 2 benchmark corpora (`musique`, `2wikimultihopqa`, `hotpotqa` full sets) to prevent benchmark lock-in.
+    2. **Evolve on Tier 1 Calibration Slices or External OOD Corpora:** Run `dspy.MIPROv2` + `dspy.GEPA` (`enable_gbnf=True` for `llama.cpp` GBNF grammar enforcement via `config={"extra_body": {"grammar": ...}}`) strictly on the small **Tier 1 benchmark sets** (`--max-queries 10`) and/or **external out-of-distribution corpora** (`onyx-dot-app/EnterpriseRAG-Bench`, `microsoft/graphrag-benchmarking-datasets`) to produce one universal, generalizable `compiled_program.json`.
+    3. **Run Unseen Holdout Benchmarks Zero-Shot:** Evaluate `--engine yaw --compiled-program compiled_program.json --query-offset 10` on the remaining unseen Tier 2 holdout queries (`10..N`).
+    4. **Target Consumer-Hardware Victory:** Beat our un-evolved `hipporag` baseline and target the HippoRAG 2 paper (`Llama-3.3-70B` + `NV-Embed-v2`) benchmarks on consumer hardware (`Qwen3-4B` + `Mistral-7B` + `embeddinggemma-300m`).
 - **Exit Gate (`D1-A6` — Epic 1 Acceptance Gate):**
   1. `tests/daemon/test_runtime.py` passes lock contention, 32-slot `BUSY` overflow, Stage 1 crash-resume, and inference outage recovery.
-  2. Native `yaw.daemon.graph` engine matches or beats our upstream `hipporag` 3-model baseline on **Tier 2** full-corpus benchmarks in [evaluation](evaluation.md).
+  2. Native `yaw.daemon.graph` engine + universal `MIPROv2`/`GEPA`-evolved `HippoRAGProgram` (trained only on Tier 1 slices / external OOD corpora) matches or beats our upstream `hipporag` 3-model baseline on **Tier 2** disjoint holdout benchmarks in [evaluation](evaluation.md).
 
 ---
 
@@ -157,8 +164,8 @@ Execute strictly in order `E1-S1` $\to$ `E1-S6`. Never start Sprint $k+1$ until 
 
 - [x] **D1-A0 (`D1-01`):** Embedding repeatability (`cosine >= 0.999`), $T=0.2$ floors, GBNF, 500-line FIFO logger, paper datasets downloaded.
 - [x] **D1-A1 (`E1-S1`):** `yaw/core/` + containment tree locked; `test_architecture.py` enforces `0` horizontal/cross-domain imports.
-- [x] **D1-A2 (`E1-S2`):** `inference/` refactored onto native `dspy` (`dspy.LM`, `dspy.Embedder`, `dspy.Signature`s, `dspy.Predict`/`ChainOfThought`/`RLM`, `.save()`/`.load()`) with `0` `hipporag` imports in `yaw/`.
+- [x] **D1-A2 (`E1-S2`):** `inference/` refactored onto native `dspy` (`dspy.LM`, `dspy.Embedder`, `dspy.Signature`s, `dspy.Predict`/`ChainOfThought`/`RLM`, GBNF grammar forwarding, `.save()`/`.load()`) with `0` `hipporag` imports in `yaw/`.
 - [ ] **D1-A3 (`E1-S3`):** `storage/{db,hydration}.py` implements single-schema `yaw.db` (`sqlite-vec`, contentless `FTS5`, provenance edges) and 1-indexed `itertools.islice` line hydration.
-- [ ] **D1-A4 (`E1-S4`):** `graph/{ppr,engine}.py` + `storage/*` achieves **Tier 1 benchmark parity** vs. upstream `hipporag` on the 3-model local setup.
+- [ ] **D1-A4 (`E1-S4`):** `graph/{ppr,engine}.py` + `storage/*` + `--query-offset`/`--evolve` hooks achieve **Tier 1 benchmark parity** vs. upstream `hipporag` on the 3-model local setup.
 - [ ] **D1-A5 (`E1-S5`):** `ingestion/corpus.py` (`cocoindex>=1.0.0`) emits pure coalesced line-pointer `SyncDelta`s across add/edit/rename/delete.
-- [ ] **D1-A6 (`E1-S6`):** `daemon/{runtime,cli}.py` passes lifecycle/lock/recovery tests AND native engine + `dspy.GEPA`/`dspy.RLM` matches or beats upstream `hipporag` 3-model baseline on **Tier 2** full corpus.
+- [ ] **D1-A6 (`E1-S6`):** `daemon/{runtime,cli}.py` (`optimize` subcommand) passes lifecycle/lock/recovery tests AND native engine + universal `MIPROv2`/`GEPA`/`RLM` program (trained only on Tier 1 / OOD corpora) beats baseline on **Tier 2** disjoint holdout benchmarks.

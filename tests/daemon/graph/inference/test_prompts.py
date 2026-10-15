@@ -433,6 +433,54 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             self.assertEqual(len(prog2.ner.demos), 1)
             self.assertEqual(prog2.ner.demos[0]["named_entities"], ["GEPA"])
 
+    def test_hipporag_program_gbnf_grammar_forwarding(self):
+        """Verify HippoRAGProgram forwards static and dynamic candidate-literal GBNF grammars via extra_body."""
+        from dspy.utils import DummyLM
+        from yaw.daemon.graph.inference.prompts import (
+            DSPY_NER_GBNF_GRAMMAR,
+            DSPY_QA_COT_GBNF_GRAMMAR,
+            DSPY_TRIPLES_GBNF_GRAMMAR,
+            HippoRAGProgram,
+            build_dspy_rerank_grammar,
+        )
+
+        program = HippoRAGProgram(enable_gbnf=True)
+        lm = DummyLM([
+            {"named_entities": ["Alan Turing", "London"]},
+            {"triples": [["Alan Turing", "born in", "London"]]},
+            {"fact_after_filter": {"fact": [["alan turing", "born in", "london"]]}},
+            {"reasoning": "Born in London.", "answer": "London"},
+        ])
+
+        program.extract_openie("c-1", "Alan Turing was born in London.", lm=lm)
+        self.assertEqual(
+            lm.history[0]["kwargs"].get("extra_body"),
+            {"grammar": DSPY_NER_GBNF_GRAMMAR},
+        )
+        self.assertEqual(
+            lm.history[1]["kwargs"].get("extra_body"),
+            {"grammar": DSPY_TRIPLES_GBNF_GRAMMAR},
+        )
+
+        candidates = [
+            ("alan turing", "born in", "london"),
+            ("cinderella", "attended", "royal ball"),
+        ]
+        selected = program.filter_facts("Where was Alan Turing born?", candidates, lm=lm)
+        self.assertEqual(selected, [0])
+        expected_rerank_grammar = build_dspy_rerank_grammar(candidates, max_facts=4)
+        self.assertIn('"[\\"alan turing\\", \\"born in\\", \\"london\\"]"', expected_rerank_grammar)
+        self.assertEqual(
+            lm.history[2]["kwargs"].get("extra_body"),
+            {"grammar": expected_rerank_grammar},
+        )
+
+        program.answer_question("Alan Turing was born in London.", "Where?", mode="cot", lm=lm, use_gbnf=True)
+        self.assertEqual(
+            lm.history[3]["kwargs"].get("extra_body"),
+            {"grammar": DSPY_QA_COT_GBNF_GRAMMAR},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
