@@ -532,20 +532,23 @@ def parse_filter_facts(response: str) -> List[List[str]]:
                 for item in val["fact"]:
                     if isinstance(item, (list, tuple)) and len(item) == 3:
                         parsed.append([str(x) for x in item])
+            elif isinstance(val, list):
+                for item in val:
+                    if isinstance(item, (list, tuple)) and len(item) == 3:
+                        parsed.append([str(x) for x in item])
         except Exception:
             pass
 
     return parsed
 
 
-def filter_reranked_facts(
+def match_facts_to_candidate_indices(
     candidate_facts: Sequence[Union[Tuple[str, str, str], List[str]]],
-    response: str,
-    max_facts: Union[int, None] = None,
+    generated_facts: Sequence[Sequence[str]],
+    max_facts: Union[int, None] = 4,
 ) -> List[int]:
-    """Map generated facts back to original candidate fact indices via difflib."""
-    generated_facts = parse_filter_facts(response)
-    if not generated_facts:
+    """Map generated [s, p, o] facts back to original candidate_facts indices via difflib."""
+    if not generated_facts or not candidate_facts:
         return []
 
     candidate_str_list = [
@@ -557,7 +560,7 @@ def filter_reranked_facts(
 
     result_indices: List[int] = []
     for generated_fact in generated_facts:
-        gen_str = str(list(generated_fact) if isinstance(generated_fact, tuple) else generated_fact)
+        gen_str = str(list(generated_fact))
         matches = difflib.get_close_matches(
             gen_str, candidate_str_list, n=1, cutoff=0.0
         )
@@ -567,12 +570,26 @@ def filter_reranked_facts(
                 idx = candidate_list_of_lists.index(ast.literal_eval(closest_matched_fact))
                 if idx not in result_indices:
                     result_indices.append(idx)
-            except Exception:
+            except (ValueError, SyntaxError):
                 pass
 
     if max_facts is not None:
         return result_indices[:max_facts]
     return result_indices
+
+
+def filter_reranked_facts(
+    candidate_facts: Sequence[Union[Tuple[str, str, str], List[str]]],
+    response: str,
+    max_facts: Union[int, None] = None,
+) -> List[int]:
+    """Map generated facts back to original candidate fact indices via difflib."""
+    generated_facts = parse_filter_facts(response)
+    if not generated_facts:
+        return []
+    return match_facts_to_candidate_indices(
+        candidate_facts, generated_facts, max_facts=max_facts
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -705,42 +722,6 @@ def _coerce_generated_facts(raw_output: Any) -> list[list[str]]:
             if isinstance(item, (list, tuple)) and len(item) == 3:
                 valid.append([str(x) for x in item])
     return valid
-
-
-def match_facts_to_candidate_indices(
-    candidate_facts: Sequence[Union[Tuple[str, str, str], List[str]]],
-    generated_facts: Sequence[Sequence[str]],
-    max_facts: Union[int, None] = 4,
-) -> List[int]:
-    """Map generated [s, p, o] facts back to original candidate_facts indices via difflib."""
-    if not generated_facts or not candidate_facts:
-        return []
-
-    candidate_str_list = [
-        str(list(f) if isinstance(f, tuple) else f) for f in candidate_facts
-    ]
-    candidate_list_of_lists = [
-        list(f) if isinstance(f, tuple) else f for f in candidate_facts
-    ]
-
-    result_indices: List[int] = []
-    for generated_fact in generated_facts:
-        gen_str = str(list(generated_fact))
-        matches = difflib.get_close_matches(
-            gen_str, candidate_str_list, n=1, cutoff=0.0
-        )
-        if matches:
-            closest_matched_fact = matches[0]
-            try:
-                idx = candidate_list_of_lists.index(ast.literal_eval(closest_matched_fact))
-                if idx not in result_indices:
-                    result_indices.append(idx)
-            except (ValueError, SyntaxError):
-                pass
-
-    if max_facts is not None:
-        return result_indices[:max_facts]
-    return result_indices
 
 
 # ---------------------------------------------------------------------------
@@ -1328,37 +1309,7 @@ class HippoRAGProgram(dspy.Module):
         ) -> list[list[str]]:
             """Filter candidate [s, p, o] facts using the dynamic candidate-literal GBNF Qwen GPU model."""
             raw_source = candidate_facts if candidate_facts is not None else fact_before_filter
-            parsed_candidates: list[list[str]] = []
-            if isinstance(raw_source, str):
-                try:
-                    loaded = json.loads(raw_source)
-                    if isinstance(loaded, dict) and "fact" in loaded and isinstance(loaded["fact"], list):
-                        parsed_candidates = [
-                            [str(x) for x in item]
-                            for item in loaded["fact"]
-                            if isinstance(item, (list, tuple)) and len(item) == 3
-                        ]
-                    elif isinstance(loaded, list):
-                        parsed_candidates = [
-                            [str(x) for x in item]
-                            for item in loaded
-                            if isinstance(item, (list, tuple)) and len(item) == 3
-                        ]
-                except Exception:
-                    parsed_candidates = parse_filter_facts(raw_source)
-            elif isinstance(raw_source, dict) and "fact" in raw_source and isinstance(raw_source["fact"], list):
-                parsed_candidates = [
-                    [str(x) for x in item]
-                    for item in raw_source["fact"]
-                    if isinstance(item, (list, tuple)) and len(item) == 3
-                ]
-            elif isinstance(raw_source, (list, tuple)):
-                parsed_candidates = [
-                    [str(x) for x in item]
-                    for item in raw_source
-                    if isinstance(item, (list, tuple)) and len(item) == 3
-                ]
-
+            parsed_candidates = _coerce_generated_facts(raw_source)
             if not parsed_candidates:
                 return []
             worker_lm = self._resolve_worker_lm()

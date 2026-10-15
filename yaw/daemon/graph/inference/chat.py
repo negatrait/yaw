@@ -17,6 +17,7 @@ from openai import DefaultHttpxClient, OpenAI
 from .models import BASE_URL, CHAT_MODELS, DEFAULT_EXTRACTION_CHAT, DEFAULT_QA_CHAT
 from .prompts import (
     PROMPT_JSON_TEMPLATE,
+    _gbnf_escape_literal as _gbnf_literal,
     best_dspy_prompt,
     ner_conditioned_re_system,
     ner_system,
@@ -75,17 +76,6 @@ thought ::= char+
 answer ::= char+
 char ::= [^\r\n\x00-\x1F]
 """
-
-
-def _gbnf_literal(text: str) -> str:
-    escaped = (
-        text.replace("\\", "\\\\")
-        .replace('"', '\\"')
-        .replace("\n", "\\n")
-        .replace("\r", "\\r")
-        .replace("\t", "\\t")
-    )
-    return f'"{escaped}"'
 
 
 def _build_rerank_grammar(messages, max_facts: int = 4) -> str:
