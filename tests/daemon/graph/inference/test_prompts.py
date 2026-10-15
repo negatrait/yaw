@@ -693,6 +693,195 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             {"grammar": DSPY_QA_COT_GBNF_GRAMMAR},
         )
 
+    def test_rlm_positional_tool_calls_and_mistral_submit_quirks(self):
+        """Verify _PositionalSafeRLM handles real Mistral NPU outputs: positional tool args, dict-wrapped SUBMIT, JSON-string triples, and leading ']\\n'."""
+        import dspy
+        from dspy.utils import DummyLM
+        from yaw.daemon.graph.inference.prompts import HippoRAGProgram
+
+        # Real-silicon failure patterns observed on Mistral-7B-Instruct-v0.3-Hybrid (ryzenai-llm):
+        # 1. Positional tool calls: qwen_extract_entities(passage) instead of keyword args
+        # 2. JSON-serialized triples passed to SUBMIT(triples=json.dumps(...))
+        # 3. Raw fact_before_filter JSON string passed positionally + dict-wrapped SUBMIT({"fact": kept})
+        # 4. Single-key dict SUBMIT({"when": ...}) with leading "]\n" ChatAdapter bracket artifact
+        mistral_lm = DummyLM([
+            {
+                "reasoning": "]\nExtract entities positionally.",
+                "code": (
+                    "ents = qwen_extract_entities(passage)\n"
+                    "SUBMIT({'named_entities': ents})"
+                ),
+            },
+            {
+                "reasoning": "]\nExtract triples positionally and JSON-dump.",
+                "code": (
+                    "import json\n"
+                    "trips = qwen_extract_triples(passage, named_entities)\n"
+                    "SUBMIT(triples=json.dumps(trips))"
+                ),
+            },
+            {
+                "reasoning": "]\nFilter facts passing fact_before_filter positionally and dict-wrapping SUBMIT.",
+                "code": (
+                    "kept = qwen_filter_facts(question, fact_before_filter)\n"
+                    "SUBMIT({'fact': kept})"
+                ),
+            },
+            {
+                "reasoning": "]\nAnswer question positionally and submit dict.",
+                "code": (
+                    "res = qwen_answer_cot(context, question)\n"
+                    "SUBMIT({'when': ']\\n' + res['answer']})"
+                ),
+            },
+        ])
+        mistral_lm._yaw_recipe = "ryzenai-llm"
+        mistral_lm._yaw_supports_gbnf = False
+
+        qwen_lm = DummyLM(
+            [
+                {"named_entities": ["Radio City", "Bangalore", "Abraham Thomas"]},
+                {"triples": [["Radio City", "started in", "Bangalore"]]},
+                {"fact": [["Radio City", "started in", "Bangalore"]]},
+                {"reasoning": "]\nStarted on 3 July 2001.", "answer": "]\n3 July 2001"},
+            ],
+            adapter=dspy.JSONAdapter(),
+        )
+        qwen_lm._yaw_recipe = "llamacpp"
+        qwen_lm._yaw_supports_gbnf = True
+
+        program = HippoRAGProgram(
+            execution_mode="rlm",
+            enable_gbnf=True,
+            orchestrator_lm=mistral_lm,
+            rlm_sub_lm=qwen_lm,
+            rlm_max_iters=2,
+        )
+
+        record = program.extract_openie(
+            "c-pos",
+            "Radio City was started on 3 July 2001 in Bangalore by Abraham Thomas.",
+        )
+        self.assertEqual(record.entities, ("Radio City", "Bangalore", "Abraham Thomas"))
+        self.assertEqual(record.triples, (("Radio City", "started in", "Bangalore"),))
+
+        kept = program.filter_facts(
+            "Where was Radio City started?",
+            [("Radio City", "started in", "Bangalore"), ("Apple", "founded by", "Steve Jobs")],
+        )
+        self.assertEqual(kept, [0])
+
+        qa_pred = program(
+            "Radio City was started on 3 July 2001 in Bangalore by Abraham Thomas.",
+            "When was Radio City started?",
+        )
+        self.assertEqual(qa_pred.answer, "3 July 2001")
+        # Every stage must succeed on iteration 1 without falling back to self.extract
+        self.assertEqual(len(mistral_lm.history), 4)
+        self.assertEqual(len(qwen_lm.history), 4)
+
+    @staticmethod
+    def _probe_live_lemonade_models() -> set[str]:
+        import urllib.request
+
+        try:
+            with urllib.request.urlopen("http://localhost:13305/api/v1/health", timeout=2.0) as resp:
+                if resp.status != 200:
+                    return set()
+                payload = json.loads(resp.read().decode("utf-8"))
+                loaded = payload.get("all_models_loaded", [])
+                return {
+                    str(item.get("model_name"))
+                    for item in loaded
+                    if isinstance(item, dict) and item.get("model_name")
+                }
+        except Exception:
+            return set()
+
+    def test_live_silicon_direct_qwen_gbnf_and_heterogeneous_mistral_qwen_rlm(self):
+        """Run un-mocked end-to-end HippoRAGProgram against live Lemonade Server (Qwen GPU GBNF + Mistral NPU RLM)."""
+        loaded_models = self._probe_live_lemonade_models()
+        required = {"Qwen3-4B-Instruct-2507-GGUF", "Mistral-7B-Instruct-v0.3-Hybrid"}
+        if not required.issubset(loaded_models):
+            self.skipTest(
+                f"Live Lemonade Server models {sorted(required)} not loaded (found {sorted(loaded_models)})"
+            )
+
+        from yaw.daemon.graph.inference.chat import create_dspy_lm, create_dspy_rlm_pair
+        from yaw.daemon.graph.inference.prompts import HippoRAGProgram
+
+        passage = (
+            "Radio City is India's first private FM radio station and was started on "
+            "3 July 2001 in Bangalore by Abraham Thomas."
+        )
+        candidates = [
+            ("Radio City", "started in", "Bangalore"),
+            ("Apple", "founded by", "Steve Jobs"),
+        ]
+
+        # 1. Live Direct Mode on Qwen3-4B-Instruct-2507-GGUF (llama.cpp GPU + pure-JSON GBNF)
+        qwen_direct_lm = create_dspy_lm(
+            "Qwen3-4B-Instruct-2507-GGUF",
+            base_url="http://localhost:13305/api/v1",
+            role="extraction",
+            max_tokens=512,
+            cache=True,
+        )
+        direct_prog = HippoRAGProgram(
+            execution_mode="direct",
+            enable_gbnf=True,
+        )
+        direct_record = direct_prog.extract_openie("c-live-direct", passage, lm=qwen_direct_lm)
+        self.assertIn("Radio City", direct_record.entities)
+        self.assertIn("Bangalore", direct_record.entities)
+        self.assertTrue(len(direct_record.triples) >= 1)
+
+        direct_kept = direct_prog.filter_facts(
+            "Where was Radio City started?", candidates, lm=qwen_direct_lm
+        )
+        self.assertEqual(direct_kept, [0])
+
+        direct_qa = direct_prog.answer_question(
+            passage, "When was Radio City started?", lm=qwen_direct_lm
+        )
+        self.assertIn("2001", direct_qa.answer)
+        self.assertEqual(len(qwen_direct_lm.history), 4)
+        for call_entry in qwen_direct_lm.history:
+            self.assertIn("grammar", (call_entry["kwargs"].get("extra_body") or {}))
+
+        # 2. Live RLM Mode: Mistral-7B-Instruct-v0.3-Hybrid (Ryzen AI NPU) Orchestrator +
+        #    Qwen3-4B-Instruct-2507-GGUF (llama.cpp GPU + pure-JSON GBNF) Worker
+        orch_lm, sub_lm = create_dspy_rlm_pair(
+            base_url="http://localhost:13305/api/v1",
+            cache=True,
+        )
+        rlm_prog = HippoRAGProgram(
+            execution_mode="rlm",
+            enable_gbnf=True,
+            orchestrator_lm=orch_lm,
+            rlm_sub_lm=sub_lm,
+            rlm_max_iters=3,
+        )
+        rlm_record = rlm_prog.extract_openie("c-live-rlm", passage)
+        self.assertIn("Radio City", rlm_record.entities)
+        self.assertIn("Bangalore", rlm_record.entities)
+        self.assertTrue(len(rlm_record.triples) >= 1)
+
+        rlm_kept = rlm_prog.filter_facts("Where was Radio City started?", candidates)
+        self.assertEqual(rlm_kept, [0])
+
+        rlm_qa = rlm_prog.answer_question(passage, "When was Radio City started?")
+        self.assertIn("2001", rlm_qa.answer)
+        self.assertFalse(rlm_qa.answer.startswith("]"))
+
+        # Verify 1-iteration RLM completion across all 4 stages (4 Mistral NPU calls, 4 Qwen GPU GBNF calls)
+        self.assertEqual(len(orch_lm.history), 4)
+        for orch_entry in orch_lm.history:
+            self.assertIsNone(orch_entry["kwargs"].get("extra_body"))
+        self.assertEqual(len(sub_lm.history), 4)
+        for sub_entry in sub_lm.history:
+            self.assertIn("grammar", (sub_entry["kwargs"].get("extra_body") or {}))
+
 
 if __name__ == "__main__":
     unittest.main()

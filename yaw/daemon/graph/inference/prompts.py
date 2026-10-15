@@ -2,7 +2,9 @@
 
 import ast
 import difflib
+import functools
 import hashlib
+import inspect
 import json
 from pathlib import Path
 import re
@@ -958,6 +960,194 @@ def lm_supports_gbnf(lm: dspy.LM | None = None) -> bool:
     return True
 
 
+_STAGE_RLM_DELEGATION_RULES: dict[str, str] = {
+    "ner": (
+        "CRITICAL RLM SANDBOX RULE:\n"
+        "Do NOT import `nltk` or `spacy`. Delegate directly to `qwen_extract_entities` and call `SUBMIT` in iteration 1:\n"
+        "```python\n"
+        "entities = qwen_extract_entities(passage=passage)\n"
+        "SUBMIT(named_entities=entities)\n"
+        "```"
+    ),
+    "triples": (
+        "CRITICAL RLM SANDBOX RULE:\n"
+        "Do NOT call `qwen_extract_entities` or loop per entity. Pass `passage` and `named_entities` directly to "
+        "`qwen_extract_triples` once and call `SUBMIT` in iteration 1:\n"
+        "```python\n"
+        "triples = qwen_extract_triples(passage=passage, named_entities=named_entities)\n"
+        "SUBMIT(triples=triples)\n"
+        "```"
+    ),
+    "fact_filter": (
+        "CRITICAL RLM SANDBOX RULE:\n"
+        "Do NOT filter facts manually in Python. Delegate directly to `qwen_filter_facts` and call `SUBMIT` in iteration 1:\n"
+        "```python\n"
+        "kept = qwen_filter_facts(question=question, fact_before_filter=fact_before_filter)\n"
+        "SUBMIT(fact=kept)\n"
+        "```"
+    ),
+    "qa": (
+        "CRITICAL RLM SANDBOX RULE:\n"
+        "Delegate directly to `qwen_answer_cot` and call `SUBMIT` with `res['answer']` in iteration 1:\n"
+        "```python\n"
+        "res = qwen_answer_cot(context=context, question=question)\n"
+        "SUBMIT(answer=res[\"answer\"])\n"
+        "```"
+    ),
+}
+
+
+def _strip_mistral_bracket_prefix(text: str) -> str:
+    """Strip leading `]\\n` artifact occasionally emitted by Mistral v0.3 after DSPy `[[ ## field ## ]]` headers."""
+    return re.sub(r"^\s*\]\s*\n+", "", text).strip()
+
+
+def _build_rlm_action_demos() -> dict[str, list[dspy.Example]]:
+    from dspy.primitives.repl_types import REPLHistory
+
+    empty_history = REPLHistory()
+    return {
+        "ner": [
+            dspy.Example(
+                variables_info="Variable: `passage` (type: str): Source passage text",
+                repl_history=empty_history,
+                iteration="1/3",
+                reasoning="Delegate named entity extraction to the GBNF-constrained Qwen GPU worker and submit.",
+                code="```python\nentities = qwen_extract_entities(passage=passage)\nSUBMIT(named_entities=entities)\n```",
+            ).with_inputs("variables_info", "repl_history", "iteration")
+        ],
+        "triples": [
+            dspy.Example(
+                variables_info=(
+                    "Variable: `passage` (type: str): Source passage text\n"
+                    "Variable: `named_entities` (type: list): Named entity list extracted from the passage"
+                ),
+                repl_history=empty_history,
+                iteration="1/3",
+                reasoning="Delegate RDF triple extraction to the GBNF-constrained Qwen GPU worker in a single call and submit.",
+                code="```python\ntriples = qwen_extract_triples(passage=passage, named_entities=named_entities)\nSUBMIT(triples=triples)\n```",
+            ).with_inputs("variables_info", "repl_history", "iteration")
+        ],
+        "fact_filter": [
+            dspy.Example(
+                variables_info=(
+                    "Variable: `question` (type: str): Query for retrieval\n"
+                    "Variable: `fact_before_filter` (type: str): Candidate facts to be filtered"
+                ),
+                repl_history=empty_history,
+                iteration="1/3",
+                reasoning="Delegate candidate fact filtering to the GBNF-constrained Qwen GPU worker and submit the selected facts.",
+                code="```python\nkept = qwen_filter_facts(question=question, fact_before_filter=fact_before_filter)\nSUBMIT(fact=kept)\n```",
+            ).with_inputs("variables_info", "repl_history", "iteration")
+        ],
+        "qa": [
+            dspy.Example(
+                variables_info=(
+                    "Variable: `context` (type: str): Retrieved evidence passages\n"
+                    "Variable: `question` (type: str): Question to answer"
+                ),
+                repl_history=empty_history,
+                iteration="1/3",
+                reasoning="Delegate Chain-of-Thought reading comprehension to the GBNF-constrained Qwen GPU worker and submit its answer.",
+                code='```python\nres = qwen_answer_cot(context=context, question=question)\nSUBMIT(answer=res["answer"])\n```',
+            ).with_inputs("variables_info", "repl_history", "iteration")
+        ],
+    }
+
+
+class _PositionalSafeRLM(dspy.RLM):
+    """RLM subclass that binds positional tool arguments, enforces 1-step Qwen delegation, and normalizes SUBMIT payloads."""
+
+    def __init__(self, *args: Any, stage_rule: str = "", **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        if stage_rule:
+            updated_instructions = self._action_signature.instructions + "\n\n" + stage_rule
+            self._action_signature = self._action_signature.with_instructions(updated_instructions)
+            self.generate_action.signature = self._action_signature
+
+    def _make_interpreter_tool(self, tool: dspy.Tool) -> Callable[..., Any]:
+        sig = inspect.signature(tool.func)
+        if inspect.iscoroutinefunction(tool.func) or inspect.iscoroutinefunction(
+            getattr(tool.func, "__call__", None)
+        ):
+            async def invoke(*args: Any, **kwargs: Any) -> Any:
+                bound = sig.bind(*args, **kwargs)
+                bound.apply_defaults()
+                return await tool.acall(**bound.arguments)
+        else:
+            def invoke(*args: Any, **kwargs: Any) -> Any:
+                bound = sig.bind(*args, **kwargs)
+                bound.apply_defaults()
+                return tool(**bound.arguments)
+
+        functools.update_wrapper(invoke, tool.func)
+        invoke.__signature__ = sig
+        return invoke
+
+    def _process_final_output(
+        self,
+        result: Any,
+        output_field_names: list[str],
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        raw_output = getattr(result, "output", None)
+        if isinstance(raw_output, dict):
+            if len(output_field_names) == 1 and output_field_names[0] not in raw_output and len(raw_output) == 1:
+                raw_output[output_field_names[0]] = next(iter(raw_output.values()))
+            for name in output_field_names:
+                if name not in raw_output:
+                    continue
+                val = raw_output[name]
+                field = self.signature.output_fields[name]
+                annotation = getattr(field, "annotation", str)
+                if isinstance(val, dict):
+                    if name in val:
+                        val = val[name]
+                    elif len(val) == 1:
+                        val = next(iter(val.values()))
+                if name == "named_entities" and isinstance(val, str):
+                    try:
+                        loaded = json.loads(val)
+                    except Exception:
+                        loaded = None
+                    if isinstance(loaded, list):
+                        val = [str(x) for x in loaded if isinstance(x, str)]
+                    else:
+                        val = list(extract_named_entities(val))
+                elif name == "triples":
+                    if isinstance(val, str):
+                        try:
+                            loaded = json.loads(val)
+                        except Exception:
+                            loaded = None
+                        if isinstance(loaded, list):
+                            val = [list(t) for t in filter_invalid_triples(loaded)]
+                        else:
+                            val = [list(t) for t in extract_triples(val)]
+                    elif isinstance(val, (list, tuple)):
+                        val = [list(t) for t in filter_invalid_triples(val)]
+                elif name == "fact":
+                    val = _coerce_generated_facts(val)
+                elif annotation is str and isinstance(val, str):
+                    val = _strip_mistral_bracket_prefix(val)
+                raw_output[name] = val
+        return super()._process_final_output(result, output_field_names)
+
+    def _extract_fallback(
+        self,
+        variables: list[Any],
+        history: Any,
+        output_field_names: list[str],
+    ) -> dspy.Prediction:
+        pred = super()._extract_fallback(variables, history, output_field_names)
+        for name in output_field_names:
+            field = self.signature.output_fields[name]
+            annotation = getattr(field, "annotation", str)
+            val = getattr(pred, name, None)
+            if annotation is str and isinstance(val, str):
+                setattr(pred, name, _strip_mistral_bracket_prefix(val))
+        return pred
+
+
 class HippoRAGProgram(dspy.Module):
     """Unified DSPy Module for HippoRAG 2 OpenIE, Recognition Memory, and Multi-Hop QA.
 
@@ -1023,47 +1213,61 @@ class HippoRAGProgram(dspy.Module):
         self.fact_filter = dspy.Predict(FilterFacts)
         self.qa_cot = dspy.ChainOfThought(AnswerQuestion)
 
-        qwen_worker_tools = self._build_qwen_worker_tools()
-        combined_tools = list(qwen_worker_tools)
-        if rlm_tools:
-            existing_names = {getattr(t, "__name__", "") for t in combined_tools}
-            for user_tool in rlm_tools:
-                if getattr(user_tool, "__name__", "") not in existing_names:
-                    combined_tools.append(user_tool)
+        (
+            qwen_ner_tool,
+            qwen_triples_tool,
+            qwen_filter_tool,
+            qwen_qa_tool,
+        ) = self._build_qwen_worker_tools()
 
-        self.ner_rlm = dspy.RLM(
+        def _stage_tools(primary: Callable[..., Any]) -> list[Callable[..., Any]]:
+            tools = [primary]
+            if rlm_tools:
+                existing = {getattr(primary, "__name__", "")}
+                for user_tool in rlm_tools:
+                    name = getattr(user_tool, "__name__", "")
+                    if name not in existing:
+                        existing.add(name)
+                        tools.append(user_tool)
+            return tools
+
+        self.ner_rlm = _PositionalSafeRLM(
             ExtractEntities,
+            stage_rule=_STAGE_RLM_DELEGATION_RULES["ner"],
             max_iters=rlm_max_iters,
             max_llm_calls=rlm_max_llm_calls,
             max_output_chars=rlm_max_output_chars,
-            tools=combined_tools,
+            tools=_stage_tools(qwen_ner_tool),
             sub_lm=rlm_sub_lm,
             interpreter_factory=rlm_interpreter_factory,
         )
-        self.triples_rlm = dspy.RLM(
+        self.triples_rlm = _PositionalSafeRLM(
             ExtractTriples,
+            stage_rule=_STAGE_RLM_DELEGATION_RULES["triples"],
             max_iters=rlm_max_iters,
             max_llm_calls=rlm_max_llm_calls,
             max_output_chars=rlm_max_output_chars,
-            tools=combined_tools,
+            tools=_stage_tools(qwen_triples_tool),
             sub_lm=rlm_sub_lm,
             interpreter_factory=rlm_interpreter_factory,
         )
-        self.fact_filter_rlm = dspy.RLM(
+        self.fact_filter_rlm = _PositionalSafeRLM(
             FilterFacts,
+            stage_rule=_STAGE_RLM_DELEGATION_RULES["fact_filter"],
             max_iters=rlm_max_iters,
             max_llm_calls=rlm_max_llm_calls,
             max_output_chars=rlm_max_output_chars,
-            tools=combined_tools,
+            tools=_stage_tools(qwen_filter_tool),
             sub_lm=rlm_sub_lm,
             interpreter_factory=rlm_interpreter_factory,
         )
-        self.qa_rlm = dspy.RLM(
+        self.qa_rlm = _PositionalSafeRLM(
             AnswerQuestion,
+            stage_rule=_STAGE_RLM_DELEGATION_RULES["qa"],
             max_iters=rlm_max_iters,
             max_llm_calls=rlm_max_llm_calls,
             max_output_chars=rlm_max_output_chars,
-            tools=combined_tools,
+            tools=_stage_tools(qwen_qa_tool),
             sub_lm=rlm_sub_lm,
             interpreter_factory=rlm_interpreter_factory,
         )
@@ -1073,6 +1277,11 @@ class HippoRAGProgram(dspy.Module):
             self.triples.demos = list(TRIPLE_DEMOS)
             self.fact_filter.demos = list(FACT_FILTER_DEMOS)
             self.qa_cot.demos = list(QA_DEMOS)
+            rlm_demos = _build_rlm_action_demos()
+            self.ner_rlm.generate_action.demos = list(rlm_demos["ner"])
+            self.triples_rlm.generate_action.demos = list(rlm_demos["triples"])
+            self.fact_filter_rlm.generate_action.demos = list(rlm_demos["fact_filter"])
+            self.qa_rlm.generate_action.demos = list(rlm_demos["qa"])
 
         if compiled_path is not None:
             path = Path(compiled_path)
@@ -1113,18 +1322,58 @@ class HippoRAGProgram(dspy.Module):
             return [list(t) for t in triples]
 
         def qwen_filter_facts(
-            question: str, candidate_facts: list[list[str]]
+            question: str,
+            fact_before_filter: Any = None,
+            candidate_facts: list[list[str]] | None = None,
         ) -> list[list[str]]:
             """Filter candidate [s, p, o] facts using the dynamic candidate-literal GBNF Qwen GPU model."""
+            raw_source = candidate_facts if candidate_facts is not None else fact_before_filter
+            parsed_candidates: list[list[str]] = []
+            if isinstance(raw_source, str):
+                try:
+                    loaded = json.loads(raw_source)
+                    if isinstance(loaded, dict) and "fact" in loaded and isinstance(loaded["fact"], list):
+                        parsed_candidates = [
+                            [str(x) for x in item]
+                            for item in loaded["fact"]
+                            if isinstance(item, (list, tuple)) and len(item) == 3
+                        ]
+                    elif isinstance(loaded, list):
+                        parsed_candidates = [
+                            [str(x) for x in item]
+                            for item in loaded
+                            if isinstance(item, (list, tuple)) and len(item) == 3
+                        ]
+                except Exception:
+                    parsed_candidates = parse_filter_facts(raw_source)
+            elif isinstance(raw_source, dict) and "fact" in raw_source and isinstance(raw_source["fact"], list):
+                parsed_candidates = [
+                    [str(x) for x in item]
+                    for item in raw_source["fact"]
+                    if isinstance(item, (list, tuple)) and len(item) == 3
+                ]
+            elif isinstance(raw_source, (list, tuple)):
+                parsed_candidates = [
+                    [str(x) for x in item]
+                    for item in raw_source
+                    if isinstance(item, (list, tuple)) and len(item) == 3
+                ]
+
+            if not parsed_candidates:
+                return []
             worker_lm = self._resolve_worker_lm()
             indices = self.filter_facts(
                 question,
-                candidate_facts,
+                parsed_candidates,
                 mode="direct",
                 lm=worker_lm,
                 use_gbnf=self.enable_gbnf,
             )
-            return [list(candidate_facts[i]) for i in indices if 0 <= i < len(candidate_facts)]
+            return [
+                list(parsed_candidates[i])
+                for i in indices
+                if 0 <= i < len(parsed_candidates)
+            ]
 
         def qwen_answer_cot(context: str, question: str) -> dict[str, str]:
             """Run GBNF-constrained Chain-of-Thought QA on the Qwen GPU model and return {reasoning, answer}."""
@@ -1137,8 +1386,8 @@ class HippoRAGProgram(dspy.Module):
                 use_gbnf=self.enable_gbnf,
             )
             return {
-                "reasoning": str(getattr(pred, "reasoning", "")),
-                "answer": str(getattr(pred, "answer", "")),
+                "reasoning": _strip_mistral_bracket_prefix(str(getattr(pred, "reasoning", ""))),
+                "answer": _strip_mistral_bracket_prefix(str(getattr(pred, "answer", ""))),
             }
 
         return [
