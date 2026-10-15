@@ -91,25 +91,53 @@ def is_allowed_internal_import(importer_pkg: str, imported_mod: str) -> bool:
     return False
 
 
+def is_leaf_package(package_dir: Path) -> bool:
+    """Return True if package_dir contains no subdirectories with an __init__.py file."""
+    for child in package_dir.iterdir():
+        if child.is_dir() and (child / "__init__.py").exists():
+            return False
+    return True
+
+
 class ArchitectureTests(unittest.TestCase):
     def test_all_init_files_are_strictly_empty(self):
-        """Rule 1: Every __init__.py in yaw/ is empty (0 bytes or whitespace/comments only)."""
+        """Rule 1: Intermediate package __init__.py files in yaw/ are strictly empty (0 bytes or comments only).
+
+        Leaf packages (e.g. yaw/core, yaw/daemon/graph/inference) may define public API facades
+        and re-exports, while intermediate parent packages (yaw/, yaw/daemon/, yaw/daemon/graph/)
+        must remain strictly empty to prevent parent-level side-effects or horizontal coupling.
+        """
         init_files = list(YAW_DIR.rglob("__init__.py"))
         self.assertGreater(len(init_files), 0, "No __init__.py files found in yaw/")
 
-        for init_file in init_files:
+        intermediate_inits = [f for f in init_files if not is_leaf_package(f.parent)]
+        self.assertGreater(len(intermediate_inits), 0, "No intermediate packages found in yaw/")
+
+        for init_file in intermediate_inits:
             content = init_file.read_text(encoding="utf-8").strip()
             # Must not contain any non-comment executable code
             lines = [line.strip() for line in content.splitlines() if line.strip() and not line.strip().startswith("#")]
             self.assertEqual(
                 lines,
                 [],
-                f"Non-empty __init__.py with executable statements found at: {init_file.relative_to(PROJECT_ROOT)}",
+                f"Non-empty intermediate __init__.py with executable statements found at: {init_file.relative_to(PROJECT_ROOT)}",
             )
+
+    def test_leaf_package_facades_allow_contract_import_without_knowing_file(self):
+        """Rule 1b: Leaf packages export their public API contract for caller convenience and leaf mutation."""
+        from yaw.core import ChunkPointer, HydratedPassage, OpenIERecord, RetrievalResult, SyncDelta
+        self.assertTrue(issubclass(ChunkPointer, object))
+
+        import yaw.daemon.graph.inference as inference
+        self.assertTrue(hasattr(inference, "create_dspy_lm"))
+        self.assertTrue(hasattr(inference, "HippoRAGProgram"))
+        self.assertTrue(hasattr(inference, "RetrievalEmbedding"))
+        self.assertTrue(hasattr(inference, "LocalChat"))
+        self.assertTrue(hasattr(inference, "compute_sizecoding_pareto_score"))
 
     def test_domain_containment_and_zero_cross_domain_imports(self):
         """Rule 2 & 3: Package P imports only P.* and yaw.core.* (zero horizontal cross-domain edges)."""
-        py_files = [p for p in YAW_DIR.rglob("*.py") if p.name != "__init__.py"]
+        py_files = list(YAW_DIR.rglob("*.py"))
         self.assertGreater(len(py_files), 0, "No .py files found in yaw/")
 
         violations = []

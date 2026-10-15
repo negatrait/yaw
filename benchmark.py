@@ -27,12 +27,12 @@ from hipporag.prompts.linking import get_query_instruction
 from hipporag.utils.config_utils import BaseConfig
 
 from yaw.core.logger import configure_logging
-from yaw.daemon.graph.inference.chat import LocalChat, chat_identity
+from yaw.daemon.graph.inference.legacy_chat import LocalChat, chat_identity
+from yaw.daemon.graph.inference.legacy_embedding import RetrievalEmbedding
 from yaw.daemon.graph.inference.embedding import (
     GEMMA_TASK_MODES,
     MODEL,
     PROFILES,
-    RetrievalEmbedding,
     resolve_embedding_profile,
 )
 from yaw.daemon.graph.inference.models import (

@@ -98,6 +98,7 @@ DEFAULT_EXTRACTION_CHAT = "Qwen3-4B-Instruct-2507-GGUF"
 DEFAULT_QA_CHAT = "Mistral-7B-Instruct-v0.3-Hybrid"
 DEFAULT_CHAT = DEFAULT_QA_CHAT
 BASE_URL = "http://localhost:13305/api/v1"
+DEFAULT_BASE_URL = BASE_URL
 
 
 def get_json(base_url, route):

@@ -882,6 +882,29 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         for sub_entry in sub_lm.history:
             self.assertIn("grammar", (sub_entry["kwargs"].get("extra_body") or {}))
 
+    def test_leaf_modularization_and_inference_facade_integrity(self):
+        """Verify program, grammars, and prompts are cleanly modularized and accessible via facade."""
+        from yaw.daemon.graph.inference.program import HippoRAGProgram as ProgramHippoRAGProgram
+        from yaw.daemon.graph.inference.grammars import (
+            build_dspy_ner_grammar as GrammarBuildNer,
+            compute_sizecoding_pareto_score as GrammarPareto,
+        )
+        from yaw.daemon.graph.inference.prompts import (
+            HippoRAGProgram as PromptsHippoRAGProgram,
+            build_dspy_ner_grammar as PromptsBuildNer,
+        )
+        from yaw.daemon.graph.inference import (
+            HippoRAGProgram as FacadeHippoRAGProgram,
+            build_dspy_ner_grammar as FacadeBuildNer,
+            compute_sizecoding_pareto_score as FacadePareto,
+        )
+
+        self.assertIs(ProgramHippoRAGProgram, PromptsHippoRAGProgram)
+        self.assertIs(ProgramHippoRAGProgram, FacadeHippoRAGProgram)
+        self.assertIs(GrammarBuildNer, PromptsBuildNer)
+        self.assertIs(GrammarBuildNer, FacadeBuildNer)
+        self.assertIs(GrammarPareto, FacadePareto)
+
 
 if __name__ == "__main__":
     unittest.main()

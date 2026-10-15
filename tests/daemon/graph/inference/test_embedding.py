@@ -239,6 +239,14 @@ class EmbeddingTests(unittest.TestCase):
         self.assertEqual(recorded_inputs[-1], [QA_QUERY_PREFIX + "Where is Montebello?"])
         self.assertEqual(passage_q_vecs.shape, (1, 768))
 
+    def test_legacy_embedding_and_inference_facade_exports(self):
+        """Verify RetrievalEmbedding is detangled to legacy_embedding and accessible via inference facade."""
+        from yaw.daemon.graph.inference.legacy_embedding import RetrievalEmbedding as DirectRetrievalEmbedding
+        from yaw.daemon.graph.inference import RetrievalEmbedding as FacadeRetrievalEmbedding
+
+        self.assertIs(DirectRetrievalEmbedding, RetrievalEmbedding)
+        self.assertIs(FacadeRetrievalEmbedding, RetrievalEmbedding)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -305,6 +305,26 @@ class ChatTests(unittest.TestCase):
         self.assertEqual(ollama_lm.model, "ollama_chat/qwen3:4b")
         self.assertEqual(ollama_lm.kwargs.get("api_base"), "http://localhost:11434")
 
+    def test_legacy_chat_and_inference_facade_exports(self):
+        """Verify legacy_chat adapters are detangled and accessible via legacy module and inference facade."""
+        from yaw.daemon.graph.inference.legacy_chat import (
+            CacheOpenAI as DirectCacheOpenAI,
+            LocalChat as DirectLocalChat,
+            chat_identity as direct_chat_identity,
+        )
+        from yaw.daemon.graph.inference import (
+            CacheOpenAI as FacadeCacheOpenAI,
+            LocalChat as FacadeLocalChat,
+            chat_identity as facade_chat_identity,
+        )
+
+        self.assertIs(DirectLocalChat, LocalChat)
+        self.assertIs(FacadeLocalChat, LocalChat)
+        self.assertIs(DirectCacheOpenAI, CacheOpenAI)
+        self.assertIs(FacadeCacheOpenAI, CacheOpenAI)
+        self.assertIs(direct_chat_identity, chat_identity)
+        self.assertIs(facade_chat_identity, chat_identity)
+
 
 if __name__ == "__main__":
     unittest.main()
