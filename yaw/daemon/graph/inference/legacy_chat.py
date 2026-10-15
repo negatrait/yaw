@@ -15,7 +15,7 @@ from openai import DefaultHttpxClient, OpenAI
 
 from .grammars import _gbnf_escape_literal as _gbnf_literal
 from .models import BASE_URL, CHAT_MODELS
-from .prompts import (
+from .templates import (
     PROMPT_JSON_TEMPLATE,
     best_dspy_prompt,
     ner_conditioned_re_system,

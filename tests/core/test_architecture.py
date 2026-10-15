@@ -135,6 +135,14 @@ class ArchitectureTests(unittest.TestCase):
         self.assertTrue(hasattr(inference, "LocalChat"))
         self.assertTrue(hasattr(inference, "compute_sizecoding_pareto_score"))
 
+        # Verify facade is strictly constricted: internal helpers cannot leak through
+        with self.assertRaises(AttributeError):
+            _ = getattr(inference, "_strip_mistral_bracket_prefix")
+        with self.assertRaises(AttributeError):
+            _ = getattr(inference, "_build_default_ner_demos")
+        with self.assertRaises(AttributeError):
+            _ = getattr(inference, "_extract_json_list_field")
+
     def test_domain_containment_and_zero_cross_domain_imports(self):
         """Rule 2 & 3: Package P imports only P.* and yaw.core.* (zero horizontal cross-domain edges)."""
         py_files = list(YAW_DIR.rglob("*.py"))
