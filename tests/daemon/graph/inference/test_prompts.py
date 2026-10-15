@@ -275,3 +275,164 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         repaired_ner = repair_truncated_json(truncated_ner, is_triples=False)
         data_ner = json.loads(repaired_ner)
         self.assertEqual(data_ner["named_entities"], ["Alan Turing", "London"])
+
+    def test_dspy_signatures_and_default_demos(self):
+        """Verify all 4 dspy.Signatures and seeded dspy.Example demos."""
+        import dspy
+        from yaw.daemon.graph.inference.prompts import (
+            AnswerQuestion,
+            ExtractEntities,
+            ExtractTriples,
+            FACT_FILTER_DEMOS,
+            FactList,
+            FilterFacts,
+            NER_DEMOS,
+            QA_DEMOS,
+            TRIPLE_DEMOS,
+        )
+
+        self.assertTrue(issubclass(ExtractEntities, dspy.Signature))
+        self.assertTrue(issubclass(ExtractTriples, dspy.Signature))
+        self.assertTrue(issubclass(FilterFacts, dspy.Signature))
+        self.assertTrue(issubclass(AnswerQuestion, dspy.Signature))
+
+        self.assertEqual(list(ExtractEntities.input_fields.keys()), ["passage"])
+        self.assertEqual(list(ExtractEntities.output_fields.keys()), ["named_entities"])
+        self.assertEqual(list(ExtractTriples.input_fields.keys()), ["passage", "named_entities"])
+        self.assertEqual(list(ExtractTriples.output_fields.keys()), ["triples"])
+        self.assertEqual(list(FilterFacts.input_fields.keys()), ["question", "fact_before_filter"])
+        self.assertEqual(list(FilterFacts.output_fields.keys()), ["fact_after_filter"])
+        self.assertEqual(list(AnswerQuestion.input_fields.keys()), ["context", "question"])
+        self.assertEqual(list(AnswerQuestion.output_fields.keys()), ["answer"])
+
+        self.assertEqual(len(NER_DEMOS), 1)
+        self.assertEqual(len(TRIPLE_DEMOS), 1)
+        self.assertEqual(len(FACT_FILTER_DEMOS), 10)
+        self.assertIsInstance(FACT_FILTER_DEMOS[0].fact_after_filter, FactList)
+        self.assertEqual(len(QA_DEMOS), 1)
+
+    def test_hipporag_program_openie_fact_filter_and_cot_qa(self):
+        """Verify HippoRAGProgram executes OpenIE, fact filtering, and CoT QA via dspy.Predict and dspy.ChainOfThought."""
+        from dspy.utils import DummyLM
+        from yaw.daemon.graph.inference.prompts import HippoRAGProgram
+
+        program = HippoRAGProgram(qa_mode="cot")
+        lm = DummyLM([
+            {"named_entities": ["Alan Turing", "London", "Alan Turing"]},
+            {
+                "triples": [
+                    ["Alan Turing", "born in", "London"],
+                    ["London", "capital of", "United Kingdom"],
+                    ["invalid", "only_two"],
+                    ["Alan Turing", "born in", "London"],
+                ]
+            },
+            {
+                "fact_after_filter": {
+                    "fact": [
+                        ["imperial river", "is located in", "florida"],
+                        ["amaradia", "flows through", "ro ia de amaradia"],
+                    ]
+                }
+            },
+            {
+                "reasoning": "Neville Stanton works at the University of Southampton, founded in 1862.",
+                "answer": "1862",
+            },
+        ])
+
+        record = program.extract_openie(
+            "chunk-1",
+            "Alan Turing was born in London, the capital of the United Kingdom.",
+            lm=lm,
+        )
+        self.assertEqual(record.chunk_id, "chunk-1")
+        self.assertEqual(record.entities, ("Alan Turing", "London"))
+        self.assertEqual(
+            record.triples,
+            (
+                ("Alan Turing", "born in", "London"),
+                ("London", "capital of", "United Kingdom"),
+            ),
+        )
+
+        candidates = [
+            ("imperial river", "is located in", "florida"),
+            ("imperial river", "is a river in", "united states"),
+            ("amaradia", "flows through", "ro ia de amaradia"),
+        ]
+        selected_indices = program.filter_facts(
+            "Where are Imperial River and Amaradia located?",
+            candidates,
+            lm=lm,
+        )
+        self.assertEqual(selected_indices, [0, 2])
+
+        qa_pred = program.answer_question(
+            "University of Southampton was founded in 1862.",
+            "When was it founded?",
+            mode="cot",
+            lm=lm,
+        )
+        self.assertEqual(qa_pred.answer, "1862")
+        self.assertIn("1862", qa_pred.reasoning)
+
+    def test_hipporag_program_rlm_qa_executes_in_local_interpreter(self):
+        """Verify HippoRAGProgram RLM mode executes real Python code inside dspy.LocalInterpreter."""
+        from dspy.utils import DummyLM
+        from yaw.daemon.graph.inference.prompts import HippoRAGProgram
+
+        program = HippoRAGProgram(qa_mode="rlm", rlm_max_iters=4, rlm_max_llm_calls=5)
+        lm = DummyLM([
+            {
+                "reasoning": "Search the context in Python for the founding year and submit.",
+                "code": (
+                    "import re\n"
+                    "m = re.search(r'founded in (\\d{4})', context)\n"
+                    "SUBMIT(answer=m.group(1) if m else 'unknown')"
+                ),
+            }
+        ])
+
+        rlm_pred = program.answer_question(
+            "The University of Southampton was founded in 1862 and received its Royal Charter in 1952.",
+            "When was the University of Southampton founded?",
+            mode="rlm",
+            lm=lm,
+        )
+        self.assertEqual(rlm_pred.answer, "1862")
+        self.assertEqual(len(rlm_pred.trajectory), 1)
+
+    def test_hipporag_program_save_and_load_gepa_state(self):
+        """Verify HippoRAGProgram saves and reloads mutated GEPA instructions and demos cleanly."""
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        import dspy
+        from yaw.daemon.graph.inference.prompts import HippoRAGProgram
+
+        with TemporaryDirectory() as tmp_dir:
+            state_path = Path(tmp_dir) / "gepa_compiled.json"
+            prog1 = HippoRAGProgram()
+            prog1.ner.signature = prog1.ner.signature.with_instructions(
+                "GEPA optimized NER instruction."
+            )
+            prog1.ner.demos = [
+                dspy.Example(
+                    passage="Custom GEPA demo passage.",
+                    named_entities=["GEPA"],
+                ).with_inputs("passage")
+            ]
+            prog1.save(str(state_path))
+            self.assertTrue(state_path.exists())
+
+            prog2 = HippoRAGProgram(compiled_path=state_path)
+            self.assertEqual(
+                prog2.ner.signature.instructions,
+                "GEPA optimized NER instruction.",
+            )
+            self.assertEqual(len(prog2.ner.demos), 1)
+            self.assertEqual(prog2.ner.demos[0]["named_entities"], ["GEPA"])
+
+
+if __name__ == "__main__":
+    unittest.main()

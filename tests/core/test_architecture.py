@@ -178,3 +178,24 @@ class ArchitectureTests(unittest.TestCase):
         self.assertTrue(is_allowed_internal_import("yaw.daemon.graph.inference", "yaw.core.types"))
         # inference importing internal sibling -> allowed
         self.assertTrue(is_allowed_internal_import("yaw.daemon.graph.inference", "yaw.daemon.graph.inference.models"))
+
+    def test_zero_hipporag_imports_in_yaw(self):
+        """Rule 4: Zero hipporag runtime imports inside yaw/ (upstream hipporag is strictly confined to benchmark.py and tests/)."""
+        py_files = list(YAW_DIR.rglob("*.py"))
+        self.assertGreater(len(py_files), 0)
+
+        violations = []
+        for py_file in py_files:
+            imports = parse_module_imports(py_file)
+            for lineno, mod in imports:
+                top_pkg = mod.split(".")[0]
+                if top_pkg == "hipporag":
+                    violations.append(
+                        f"{py_file.relative_to(PROJECT_ROOT)}:{lineno}: forbidden upstream import '{mod}'"
+                    )
+
+        self.assertEqual(
+            violations,
+            [],
+            "Forbidden hipporag imports detected inside yaw/:\n" + "\n".join(violations),
+        )

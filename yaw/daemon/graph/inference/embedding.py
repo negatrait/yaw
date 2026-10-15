@@ -1,18 +1,21 @@
-"""One OpenAI embedding adapter with explicit model-specific retrieval contracts."""
+"""Native DSPy and OpenAI/Ollama embedding adapter with explicit model-specific retrieval contracts."""
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 import hashlib
 import json
+import os
 import re
+from typing import Any, Callable
 
+import dspy
 import numpy as np
-from hipporag.embedding_model.OpenAI import OpenAIEmbeddingModel
-from hipporag.prompts.linking import get_query_instruction
+from openai import DefaultHttpxClient, OpenAI
 
-FACT_INSTRUCTION = get_query_instruction("query_to_fact")
-PASSAGE_INSTRUCTION = get_query_instruction("query_to_passage")
+FACT_INSTRUCTION = "Given a question, retrieve relevant triplet facts that matches this question."
+PASSAGE_INSTRUCTION = "Given a question, retrieve relevant documents that best answer the question."
 QUERY_INSTRUCTIONS = {FACT_INSTRUCTION, PASSAGE_INSTRUCTION}
 TITLE_LINE_RE = re.compile(r"^(?:#{1,6}\s+|(?:wikipedia\s+)?title:\s*)(.+)$", re.IGNORECASE)
+DEFAULT_BASE_URL = "http://localhost:13305/api/v1"
 
 
 @dataclass(frozen=True)
@@ -121,34 +124,229 @@ def resolve_embedding_profile(model=MODEL, task_mode="search"):
     raise ValueError(f"Unsupported embedding task mode: {task_mode!r}")
 
 
-class RetrievalEmbedding(OpenAIEmbeddingModel):
-    """Keep upstream SDK, batching, usage aggregation and normalization.
+def create_dspy_embedder(
+    model_or_profile: EmbeddingProfile | str | Callable = MODEL,
+    *,
+    base_url: str = DEFAULT_BASE_URL,
+    api_key: str = "lemonade",
+    provider: str = "openai",
+    batch_size: int = 32,
+    caching: bool = False,
+    **kwargs: Any,
+) -> dspy.Embedder:
+    """Create a native dspy.Embedder for Lemonade (openai/...) or Ollama (ollama/...)."""
+    if callable(model_or_profile):
+        return dspy.Embedder(model_or_profile, batch_size=batch_size, caching=caching, **kwargs)
 
-    encode is intentionally local: upstream encode flattens newlines, corrupting
-    Qwen's task separator. Its ordering/usage guarantees are retained and tested.
-    No global patch, auto-detection, fallback model or dimension truncation.
+    model_name = (
+        model_or_profile.model
+        if isinstance(model_or_profile, EmbeddingProfile)
+        else str(model_or_profile)
+    )
+    if provider == "ollama" or model_name.startswith("ollama/"):
+        litellm_model = model_name if model_name.startswith("ollama/") else f"ollama/{model_name}"
+        return dspy.Embedder(
+            litellm_model,
+            batch_size=batch_size,
+            caching=caching,
+            api_base=base_url,
+            **kwargs,
+        )
+
+    litellm_model = model_name if "/" in model_name else f"openai/{model_name}"
+    return dspy.Embedder(
+        litellm_model,
+        batch_size=batch_size,
+        caching=caching,
+        api_base=base_url,
+        api_key=api_key,
+        encoding_format="float",
+        **kwargs,
+    )
+
+
+class DSPyEmbeddingAdapter:
+    """Profile-aware retrieval embedding adapter wrapping a native dspy.Embedder."""
+
+    def __init__(
+        self,
+        profile: EmbeddingProfile | None = None,
+        embedder: dspy.Embedder | None = None,
+        *,
+        task_mode: str = "distinct-titled",
+        base_url: str = DEFAULT_BASE_URL,
+        api_key: str = "lemonade",
+        provider: str = "openai",
+        batch_size: int = 32,
+        caching: bool = False,
+    ) -> None:
+        self.profile = profile or resolve_embedding_profile(MODEL, task_mode)
+        self.embedder = embedder or create_dspy_embedder(
+            self.profile,
+            base_url=base_url,
+            api_key=api_key,
+            provider=provider,
+            batch_size=batch_size,
+            caching=caching,
+        )
+
+    def batch_encode(
+        self,
+        texts: list[str] | str,
+        *,
+        instruction: str | None = None,
+        norm: bool = True,
+        batch_size: int | None = None,
+    ) -> np.ndarray:
+        if instruction not in (None, "") and instruction not in QUERY_INSTRUCTIONS:
+            raise ValueError(f"Unsupported retrieval instruction: {instruction!r}")
+        if isinstance(texts, str):
+            texts = [texts]
+        if not texts:
+            raise ValueError("Embedding input cannot be empty.")
+        prepared = [
+            self.profile.format(t, query=bool(instruction), instruction=instruction)
+            for t in texts
+        ]
+        call_kwargs: dict[str, Any] = {}
+        if batch_size is not None:
+            if not isinstance(batch_size, int) or batch_size < 1:
+                raise ValueError("batch_size must be a positive integer.")
+            call_kwargs["batch_size"] = batch_size
+        raw = self.embedder(prepared, **call_kwargs)
+        vectors = np.asarray(raw, dtype=np.float32)
+        if vectors.ndim == 1:
+            vectors = vectors.reshape(1, -1)
+        if (
+            vectors.shape != (len(prepared), self.profile.dimensions)
+            or not np.isfinite(vectors).all()
+            or np.any(np.linalg.norm(vectors, axis=1) == 0)
+        ):
+            raise ValueError(
+                f"Expected finite, nonzero {self.profile.dimensions}-dimensional vectors."
+            )
+        if not norm:
+            return vectors
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+        return vectors / norms
+
+
+@dataclass
+class _EmbeddingConfig:
+    embedding_model_name: str
+    norm: bool = True
+    encode_params: dict[str, Any] = field(default_factory=lambda: {"batch_size": 32})
+
+
+class RetrievalEmbedding:
+    """Self-contained OpenAI-compatible embedding client with task prefixes and strict validation.
+
+    Zero runtime dependency on upstream `hipporag`, while preserving full interface
+    compatibility for both `yaw` and `benchmark.py`.
     """
 
     query_instruction_mode = "shared"
 
     def __init__(self, global_config, profile=None):
+        self.global_config = global_config
         self.profile = profile or PROFILES[global_config.embedding_model_name]
         if global_config.embedding_model_name != self.profile.model:
             raise ValueError("Embedding config model must match the selected profile.")
+        self.embedding_model_name = self.profile.model
+        self.request_model_name = self.embedding_model_name
         self.query_instruction_mode = self.profile.query_instruction_mode
-        super().__init__(global_config)
+        self.last_usage = None
+        self._instruction_warning_emitted = False
+
+        batch_size = getattr(global_config, "embedding_batch_size", 32)
+        norm_default = getattr(global_config, "embedding_return_as_normalized", True)
+        self.embedding_config = _EmbeddingConfig(
+            embedding_model_name=self.embedding_model_name,
+            norm=norm_default,
+            encode_params={"batch_size": batch_size},
+        )
+
+        timeout = getattr(global_config, "embedding_request_timeout", 120.0)
+        max_retries = getattr(global_config, "max_retry_attempts", 0)
+        base_url = getattr(global_config, "embedding_base_url", None) or DEFAULT_BASE_URL
+        api_key_env = getattr(global_config, "embedding_api_key_env", None)
+        api_key = (os.environ.get(api_key_env) if api_key_env else None) or "lemonade"
+
+        http_client = DefaultHttpxClient(timeout=timeout)
+        try:
+            self.client = OpenAI(
+                api_key=api_key,
+                base_url=base_url,
+                http_client=http_client,
+                max_retries=max_retries,
+            )
+        except Exception:
+            http_client.close()
+            raise
+
+    def _normalize_embeddings(self, embeddings: np.ndarray, normalize: bool | None = None) -> np.ndarray:
+        embeddings = np.asarray(embeddings, dtype=np.float32)
+        if normalize is None:
+            normalize = self.embedding_config.norm
+        if not isinstance(normalize, bool):
+            raise TypeError("Embedding normalization must be a boolean.")
+        if not normalize:
+            return embeddings
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        if np.any(norms == 0):
+            raise ValueError("Cannot normalize a zero embedding vector.")
+        return embeddings / norms
+
+    def get_query_doc_scores(self, query_vec: np.ndarray, doc_vecs: np.ndarray) -> np.ndarray:
+        return np.dot(query_vec, doc_vecs.T)
 
     def batch_encode(self, texts, **kwargs):
+        unsupported = set(kwargs) - {"batch_size", "instruction", "norm"}
+        if unsupported:
+            raise TypeError(f"Unsupported OpenAI embedding options: {', '.join(sorted(unsupported))}.")
         instruction = kwargs.pop("instruction", None)
         if instruction not in (None, "") and instruction not in QUERY_INSTRUCTIONS:
             raise ValueError(f"Unsupported retrieval instruction: {instruction!r}")
         if isinstance(texts, str):
             texts = [texts]
+        if not texts:
+            raise ValueError("OpenAI embedding input cannot be empty.")
         prepared = [
             self.profile.format(t, query=bool(instruction), instruction=instruction)
             for t in texts
         ]
-        return super().batch_encode(prepared, **kwargs)
+        batch_size = kwargs.get("batch_size", self.embedding_config.encode_params["batch_size"])
+        if not isinstance(batch_size, int) or batch_size < 1:
+            raise ValueError("OpenAI embedding batch_size must be a positive integer.")
+
+        if len(prepared) <= batch_size:
+            results = self.encode(prepared)
+        else:
+            results = []
+            usage_totals = {"prompt_tokens": 0, "total_tokens": 0}
+            try:
+                for i in range(0, len(prepared), batch_size):
+                    batch = prepared[i : i + batch_size]
+                    results.append(self.encode(batch))
+                    usage_totals["prompt_tokens"] += self.last_usage["prompt_tokens"]
+                    usage_totals["total_tokens"] += self.last_usage["total_tokens"]
+                    self.last_usage = {**usage_totals, "complete": False}
+            except Exception:
+                failed_usage = self.last_usage or {}
+                for token_key in ("prompt_tokens", "total_tokens"):
+                    token_count = failed_usage.get(token_key)
+                    if isinstance(token_count, int):
+                        usage_totals[token_key] += token_count
+                self.last_usage = {**usage_totals, "complete": False}
+                if failed_usage.get("usage_unknown") or not any(
+                    key in failed_usage for key in ("prompt_tokens", "total_tokens")
+                ):
+                    self.last_usage["usage_unknown"] = True
+                raise
+            results = np.concatenate(results)
+            self.last_usage = usage_totals
+
+        return self._normalize_embeddings(results, normalize=kwargs.get("norm"))
 
     def encode(self, texts):
         """Send prepared inputs unchanged; reject malformed/partial responses."""
@@ -178,3 +376,6 @@ class RetrievalEmbedding(OpenAIEmbeddingModel):
             self.last_usage["complete"] = False
             raise
         return vectors
+
+    def close(self) -> None:
+        self.client.close()

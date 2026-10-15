@@ -5,12 +5,11 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
 
-from hipporag.llm.openai_gpt import CacheOpenAI
 from hipporag.prompts import PromptTemplateManager
 from hipporag.prompts.filter_default_prompt import best_dspy_prompt
 from hipporag.utils.config_utils import BaseConfig
 from hipporag.utils.llm_utils import PROMPT_JSON_TEMPLATE
-from yaw.daemon.graph.inference.chat import RERANK_GBNF_GRAMMAR, LocalChat, chat_identity
+from yaw.daemon.graph.inference.chat import CacheOpenAI, RERANK_GBNF_GRAMMAR, LocalChat, chat_identity
 from yaw.daemon.graph.inference.models import CHAT_MODELS
 
 
@@ -265,8 +264,36 @@ class ChatTests(unittest.TestCase):
         self.assertEqual(len({chat_identity(name) for name in CHAT_MODELS}), len(CHAT_MODELS))
         self.assertTrue(all("chat-v1" in chat_identity(name) for name in CHAT_MODELS))
 
+    def test_create_dspy_lm_configures_lemonade_and_ollama_models(self):
+        from yaw.daemon.graph.inference.chat import create_dspy_lm
+
+        # Qwen3-4B extraction on Lemonade (8192-16384 ctx window)
+        qwen_lm = create_dspy_lm("Qwen3-4B-Instruct-2507-GGUF", role="extraction")
+        self.assertEqual(qwen_lm.model, "openai/Qwen3-4B-Instruct-2507-GGUF")
+        self.assertAlmostEqual(qwen_lm.kwargs["temperature"], 0.2)
+        self.assertEqual(qwen_lm.kwargs["max_tokens"], 4096)
+        self.assertAlmostEqual(qwen_lm.kwargs["frequency_penalty"], 0.5)
+
+        # Mistral-7B QA/RLM on Lemonade (32786 ctx window)
+        mistral_lm = create_dspy_lm("Mistral-7B-Instruct-v0.3-Hybrid", role="qa")
+        self.assertEqual(mistral_lm.model, "openai/Mistral-7B-Instruct-v0.3-Hybrid")
+        self.assertAlmostEqual(mistral_lm.kwargs["temperature"], 0.2)
+        self.assertEqual(mistral_lm.kwargs["max_tokens"], 2048)
+
+        # Gemma4 FLM recipe sets think=False
+        flm_lm = create_dspy_lm("gemma4-it-12b-FLM", role="qa")
+        self.assertEqual(flm_lm.kwargs.get("extra_body"), {"think": False})
+
+        # Ollama provider configures ollama_chat/...
+        ollama_lm = create_dspy_lm(
+            "qwen3:4b",
+            base_url="http://localhost:11434",
+            provider="ollama",
+            role="extraction",
+        )
+        self.assertEqual(ollama_lm.model, "ollama_chat/qwen3:4b")
+        self.assertEqual(ollama_lm.kwargs.get("api_base"), "http://localhost:11434")
+
 
 if __name__ == "__main__":
     unittest.main()
-
-

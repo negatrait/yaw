@@ -1,11 +1,17 @@
-"""Owned DSPy/GEPA-optimizable prompts and stateless parsers for HippoRAG 2."""
+"""Owned DSPy/GEPA-optimizable prompts, dspy.Signatures, RLM/CoT modules, and stateless parsers for HippoRAG 2."""
 
 import ast
 import difflib
 import hashlib
 import json
+from pathlib import Path
 import re
-from typing import Any, Dict, List, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Literal, Sequence, Tuple, Union
+
+import dspy
+from pydantic import BaseModel, Field
+
+from yaw.core.types import OpenIERecord
 
 # ---------------------------------------------------------------------------
 # 1. Named Entity Recognition (NER) Prompts
@@ -568,63 +574,330 @@ def filter_reranked_facts(
 
 
 # ---------------------------------------------------------------------------
-# 5. Structured Output JSON Schemas
+# 7. Native DSPy Signatures, Few-Shot Demos, and HippoRAGProgram (Predict, CoT, RLM)
 # ---------------------------------------------------------------------------
 
-PROMPT_JSON_TEMPLATE: Dict[str, Dict[str, Any]] = {
-    "ner": {
-        "type": "object",
-        "properties": {
-            "named_entities": {
-                "type": "array",
-                "items": {"type": "string"},
-                "minItems": 0,
-            }
-        },
-        "required": ["named_entities"],
-    },
-    "triples": {
-        "type": "object",
-        "properties": {
-            "triples": {
-                "type": "array",
-                "items": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "minItems": 3,
-                    "maxItems": 3,
-                },
-                "minItems": 0,
-            }
-        },
-        "required": ["triples"],
-    },
-    "fact": {
-        "type": "object",
-        "properties": {
-            "fact": {
-                "type": "array",
-                "items": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "minItems": 3,
-                    "maxItems": 3,
-                },
-                "minItems": 0,
-            }
-        },
-        "required": ["fact"],
-    },
-    "qa_cot": {
-        "type": "object",
-        "properties": {
-            "Thought": {"type": "string", "minLength": 1, "maxLength": 2000},
-            "Answer": {"type": "string", "minLength": 1, "maxLength": 200},
-        },
-        "required": ["Thought", "Answer"],
-    },
-    "json": {
-        "type": "object",
-    },
-}
 
+class FactList(BaseModel):
+    """Typed Pydantic container for recognition-memory filtered facts."""
+
+    fact: list[list[str]] = Field(
+        default_factory=list,
+        description="A list of facts, each fact is a list of 3 strings: [subject, predicate, object]",
+    )
+
+
+class ExtractEntities(dspy.Signature):
+    """Your task is to extract named entities from the given paragraph.
+    Respond with a JSON list of entities."""
+
+    passage: str = dspy.InputField(desc="Source passage text")
+    named_entities: list[str] = dspy.OutputField(
+        desc="Deduplicated list of extracted named entities"
+    )
+
+
+class ExtractTriples(dspy.Signature):
+    """Your task is to construct an RDF (Resource Description Framework) graph from the given passages and named entity lists.
+    Respond with a JSON list of triples, with each triple representing a relationship in the RDF graph.
+    Pay attention to the following requirements:
+    - Each triple should contain at least one, but preferably two, of the named entities in the list for each passage.
+    - Clearly resolve pronouns to their specific names to maintain clarity."""
+
+    passage: str = dspy.InputField(desc="Source passage text")
+    named_entities: list[str] = dspy.InputField(
+        desc="Named entity list extracted from the passage"
+    )
+    triples: list[list[str]] = dspy.OutputField(
+        desc="List of [subject, predicate, object] relation triples"
+    )
+
+
+class FilterFacts(dspy.Signature):
+    """You are a critical component of a high-stakes question-answering system used by top researchers and decision-makers worldwide. Your task is to filter facts based on their relevance to a given query, ensuring that the most crucial information is presented to these stakeholders. The query requires careful analysis and possibly multi-hop reasoning to connect different pieces of information. You must select up to 4 relevant facts from the provided candidate list that have a strong connection to the query, aiding in reasoning and providing an accurate answer. The output should be in JSON format, e.g., {"fact": [["s1", "p1", "o1"], ["s2", "p2", "o2"]]}, and if no facts are relevant, return an empty list, {"fact": []}. The accuracy of your response is paramount, as it will directly impact the decisions made by these high-level stakeholders. You must only use facts from the candidate list and not generate new facts. The future of critical decision-making relies on your ability to accurately filter and present relevant information."""
+
+    question: str = dspy.InputField(desc="Query for retrieval")
+    fact_before_filter: str = dspy.InputField(desc="Candidate facts to be filtered")
+    fact_after_filter: FactList = dspy.OutputField(desc="Filtered facts in JSON format")
+
+
+class AnswerQuestion(dspy.Signature):
+    """As an advanced reading comprehension assistant, your task is to analyze text passages and corresponding questions meticulously. Break down the reasoning process methodically, illustrating how you arrive at conclusions, and present a concise, definitive final answer devoid of additional elaborations. For 'Who', 'What', 'When', or 'Where' questions, state only the exact entity or fact. For 'How' or 'Why' questions, state both the key condition/means and the resulting outcome from the passages."""
+
+    context: str = dspy.InputField(desc="Retrieved evidence passages")
+    question: str = dspy.InputField(desc="Question to answer")
+    answer: str = dspy.OutputField(desc="Concise, definitive final answer")
+
+
+def _build_default_ner_demos() -> list[dspy.Example]:
+    entities = json.loads(NER_ONE_SHOT_OUTPUT)["named_entities"]
+    return [
+        dspy.Example(
+            passage=NER_ONE_SHOT_PARAGRAPH,
+            named_entities=entities,
+        ).with_inputs("passage")
+    ]
+
+
+def _build_default_triple_demos() -> list[dspy.Example]:
+    entities = json.loads(NER_ONE_SHOT_OUTPUT)["named_entities"]
+    triples = json.loads(TRIPLE_ONE_SHOT_OUTPUT)["triples"]
+    return [
+        dspy.Example(
+            passage=NER_ONE_SHOT_PARAGRAPH,
+            named_entities=entities,
+            triples=triples,
+        ).with_inputs("passage", "named_entities")
+    ]
+
+
+def _build_default_fact_filter_demos() -> list[dspy.Example]:
+    demos: list[dspy.Example] = []
+    for raw_demo in best_dspy_prompt["prog"]["demos"]:
+        parsed_after = json.loads(raw_demo["fact_after_filter"])
+        demos.append(
+            dspy.Example(
+                question=raw_demo["question"],
+                fact_before_filter=raw_demo["fact_before_filter"],
+                fact_after_filter=FactList(fact=parsed_after["fact"]),
+            ).with_inputs("question", "fact_before_filter")
+        )
+    return demos
+
+
+def _build_default_qa_demos() -> list[dspy.Example]:
+    return [
+        dspy.Example(
+            context=RAG_QA_DOCS,
+            question="When was Neville A. Stanton's employer founded?",
+            reasoning="The employer of Neville A. Stanton is University of Southampton. The University of Southampton was founded in 1862.",
+            answer="1862.",
+        ).with_inputs("context", "question")
+    ]
+
+
+NER_DEMOS: list[dspy.Example] = _build_default_ner_demos()
+TRIPLE_DEMOS: list[dspy.Example] = _build_default_triple_demos()
+FACT_FILTER_DEMOS: list[dspy.Example] = _build_default_fact_filter_demos()
+QA_DEMOS: list[dspy.Example] = _build_default_qa_demos()
+
+
+def _coerce_generated_facts(raw_output: Any) -> list[list[str]]:
+    """Extract 3-element string lists from a FactList, dict, JSON string, or list."""
+    if isinstance(raw_output, FactList):
+        candidates = raw_output.fact
+    elif isinstance(raw_output, dict) and "fact" in raw_output:
+        candidates = raw_output["fact"]
+    elif isinstance(raw_output, list):
+        candidates = raw_output
+    elif isinstance(raw_output, str):
+        return parse_filter_facts(raw_output)
+    else:
+        return []
+
+    valid: list[list[str]] = []
+    if isinstance(candidates, list):
+        for item in candidates:
+            if isinstance(item, (list, tuple)) and len(item) == 3:
+                valid.append([str(x) for x in item])
+    return valid
+
+
+def match_facts_to_candidate_indices(
+    candidate_facts: Sequence[Union[Tuple[str, str, str], List[str]]],
+    generated_facts: Sequence[Sequence[str]],
+    max_facts: Union[int, None] = 4,
+) -> List[int]:
+    """Map generated [s, p, o] facts back to original candidate_facts indices via difflib."""
+    if not generated_facts or not candidate_facts:
+        return []
+
+    candidate_str_list = [
+        str(list(f) if isinstance(f, tuple) else f) for f in candidate_facts
+    ]
+    candidate_list_of_lists = [
+        list(f) if isinstance(f, tuple) else f for f in candidate_facts
+    ]
+
+    result_indices: List[int] = []
+    for generated_fact in generated_facts:
+        gen_str = str(list(generated_fact))
+        matches = difflib.get_close_matches(
+            gen_str, candidate_str_list, n=1, cutoff=0.0
+        )
+        if matches:
+            closest_matched_fact = matches[0]
+            try:
+                idx = candidate_list_of_lists.index(ast.literal_eval(closest_matched_fact))
+                if idx not in result_indices:
+                    result_indices.append(idx)
+            except (ValueError, SyntaxError):
+                pass
+
+    if max_facts is not None:
+        return result_indices[:max_facts]
+    return result_indices
+
+
+class HippoRAGProgram(dspy.Module):
+    """Unified DSPy Module for HippoRAG 2 OpenIE, Recognition Memory, and Multi-Hop QA.
+
+    - OpenIE (`ner`, `triples`) and Recognition Memory (`fact_filter`) use `dspy.Predict`
+      for fast 1-call structured execution per stage.
+    - QA supports both `dspy.ChainOfThought(AnswerQuestion)` (`qa_mode="cot"`) and
+      `dspy.RLM(AnswerQuestion)` (`qa_mode="rlm"`) using `dspy.LocalInterpreter` by default
+      so large evidence contexts can be explored iteratively in Python without blowing the
+      8192-16384 context window of Qwen3-4B or crowding Mistral-7B Hybrid's attention.
+    - Compatible with `dspy.GEPA` optimization and `.save()` / `.load()` state persistence.
+    """
+
+    def __init__(
+        self,
+        *,
+        qa_mode: Literal["cot", "rlm"] = "cot",
+        include_demos: bool = True,
+        rlm_max_iters: int = 10,
+        rlm_max_llm_calls: int = 20,
+        rlm_max_output_chars: int = 10000,
+        rlm_sub_lm: dspy.LM | None = None,
+        rlm_tools: list[Callable[..., Any]] | None = None,
+        rlm_interpreter_factory: Callable[[], Any] = dspy.LocalInterpreter,
+        compiled_path: str | Path | None = None,
+    ) -> None:
+        super().__init__()
+        if qa_mode not in ("cot", "rlm"):
+            raise ValueError(f"Unsupported qa_mode: {qa_mode!r}. Expected 'cot' or 'rlm'.")
+        self.qa_mode: Literal["cot", "rlm"] = qa_mode
+
+        self.ner = dspy.Predict(ExtractEntities)
+        self.triples = dspy.Predict(ExtractTriples)
+        self.fact_filter = dspy.Predict(FilterFacts)
+        self.qa_cot = dspy.ChainOfThought(AnswerQuestion)
+        self.qa_rlm = dspy.RLM(
+            AnswerQuestion,
+            max_iters=rlm_max_iters,
+            max_llm_calls=rlm_max_llm_calls,
+            max_output_chars=rlm_max_output_chars,
+            tools=rlm_tools,
+            sub_lm=rlm_sub_lm,
+            interpreter_factory=rlm_interpreter_factory,
+        )
+
+        if include_demos:
+            self.ner.demos = list(NER_DEMOS)
+            self.triples.demos = list(TRIPLE_DEMOS)
+            self.fact_filter.demos = list(FACT_FILTER_DEMOS)
+            self.qa_cot.demos = list(QA_DEMOS)
+
+        if compiled_path is not None:
+            path = Path(compiled_path)
+            if path.exists():
+                self.load(str(path))
+
+    def extract_entities(
+        self, passage: str, *, lm: dspy.LM | None = None
+    ) -> Tuple[str, ...]:
+        """Run DSPy NER extraction and return deduplicated non-empty entity strings."""
+        ctx = dspy.context(lm=lm) if lm is not None else dspy.context()
+        with ctx:
+            pred = self.ner(passage=passage)
+        raw_entities = getattr(pred, "named_entities", [])
+        if isinstance(raw_entities, str):
+            return extract_named_entities(raw_entities)
+        if not isinstance(raw_entities, (list, tuple)):
+            return ()
+        unique: list[str] = []
+        seen: set[str] = set()
+        for item in raw_entities:
+            if isinstance(item, str):
+                clean = item.strip()
+                if clean and clean not in seen:
+                    seen.add(clean)
+                    unique.append(clean)
+        return tuple(unique)
+
+    def extract_triples(
+        self,
+        passage: str,
+        named_entities: Sequence[str],
+        *,
+        lm: dspy.LM | None = None,
+    ) -> Tuple[Tuple[str, str, str], ...]:
+        """Run DSPy entity-conditioned triple extraction and return deduplicated 3-tuples."""
+        ctx = dspy.context(lm=lm) if lm is not None else dspy.context()
+        with ctx:
+            pred = self.triples(passage=passage, named_entities=list(named_entities))
+        raw_triples = getattr(pred, "triples", [])
+        if isinstance(raw_triples, str):
+            return extract_triples(raw_triples)
+        if not isinstance(raw_triples, (list, tuple)):
+            return ()
+        filtered = filter_invalid_triples(raw_triples)
+        return tuple((t[0], t[1], t[2]) for t in filtered)
+
+    def extract_openie(
+        self,
+        chunk_id: str,
+        passage: str,
+        *,
+        lm: dspy.LM | None = None,
+    ) -> OpenIERecord:
+        """Execute two-stage OpenIE (NER -> Triples) for a passage chunk."""
+        entities = self.extract_entities(passage, lm=lm)
+        triples = self.extract_triples(passage, entities, lm=lm)
+        return OpenIERecord(
+            chunk_id=chunk_id,
+            entities=entities,
+            triples=triples,
+        )
+
+    def filter_facts(
+        self,
+        question: str,
+        candidate_facts: Sequence[Union[Tuple[str, str, str], List[str]]],
+        *,
+        max_facts: int | None = 4,
+        lm: dspy.LM | None = None,
+    ) -> List[int]:
+        """Filter candidate facts with DSPy recognition memory and return matched indices."""
+        if not candidate_facts:
+            return []
+        fact_before_filter = json.dumps({"fact": [list(f) for f in candidate_facts]})
+        ctx = dspy.context(lm=lm) if lm is not None else dspy.context()
+        with ctx:
+            pred = self.fact_filter(
+                question=question,
+                fact_before_filter=fact_before_filter,
+            )
+        raw_after = getattr(pred, "fact_after_filter", None)
+        generated = _coerce_generated_facts(raw_after)
+        return match_facts_to_candidate_indices(
+            candidate_facts, generated, max_facts=max_facts
+        )
+
+    def answer_question(
+        self,
+        context: str,
+        question: str,
+        *,
+        mode: Literal["cot", "rlm"] | None = None,
+        lm: dspy.LM | None = None,
+    ) -> dspy.Prediction:
+        """Answer a question over retrieved context using either ChainOfThought or RLM."""
+        active_mode = mode or self.qa_mode
+        if active_mode not in ("cot", "rlm"):
+            raise ValueError(f"Unsupported QA mode: {active_mode!r}")
+        qa_module = self.qa_rlm if active_mode == "rlm" else self.qa_cot
+        ctx = dspy.context(lm=lm) if lm is not None else dspy.context()
+        with ctx:
+            return qa_module(context=context, question=question)
+
+    def forward(
+        self,
+        context: str,
+        question: str,
+        *,
+        mode: Literal["cot", "rlm"] | None = None,
+    ) -> dspy.Prediction:
+        """Default DSPy forward pass executes multi-hop QA (CoT or RLM) for GEPA evaluation."""
+        return self.answer_question(context=context, question=question, mode=mode)

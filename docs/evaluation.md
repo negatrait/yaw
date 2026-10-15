@@ -217,3 +217,15 @@ Retired `live_smoke.py` and `tests/test_live_smoke.py` in favor of `benchmark.py
 
 Offline test suite: `uv run --locked python -m unittest discover -s tests -v` — **32 tests passed**.
 
+## Epic 1 Sprint 1 (`D1-A1`) & Sprint 2 (`D1-A2`): Domain Containment Tree, Native DSPy (`dspy.LM`, `dspy.Embedder`, `dspy.RLM`, `dspy.GEPA`), and Zero `hipporag` Runtime Imports (2026-10-15)
+
+1. **Sprint 1 (`E1-S1`, `D1-A1`):**
+   - Established the permanent domain-oriented containment tree (`yaw/{core,daemon/{ingestion,graph/{storage,inference}}}/`) with frozen, zero-dependency contracts (`ChunkPointer`, `HydratedPassage`, `OpenIERecord`, `RetrievalResult`, `SyncDelta`) in `yaw/core/types.py` and the 500-line FIFO logger in `yaw/core/logger.py`.
+   - Enforced zero horizontal/cross-domain imports, empty `__init__.py` files, stdlib-only `yaw/core/*`, and zero `hipporag` runtime imports inside `yaw/**` via AST inspection in `tests/core/test_architecture.py`.
+2. **Sprint 2 (`E1-S2`, `D1-A2`):**
+   - Added `dspy>=3.0.0` (`dspy==3.4.1`, `gepa==0.1.4`) to `pyproject.toml` and synced `uv.lock`.
+   - Eliminated all `hipporag` runtime imports from `yaw/daemon/graph/inference/{models.py, embedding.py, chat.py, prompts.py}` while keeping `RetrievalEmbedding` and `LocalChat` 100% compatible with `benchmark.py`.
+   - Added `create_dspy_embedder` and `DSPyEmbeddingAdapter` (`yaw/daemon/graph/inference/embedding.py`) wrapping `dspy.Embedder` for Lemonade (`openai/...`, `encoding_format="float"`) and Ollama (`ollama/...`) with `distinct-titled` formatting and L2 normalization.
+   - Added `create_dspy_lm` (`yaw/daemon/graph/inference/chat.py`) wrapping `dspy.LM` for Lemonade (`openai/...`) and Ollama (`ollama_chat/...`), configured for our 3-slot stack (`Qwen3-4B-Instruct-2507-GGUF` on CUDA `llamacpp` with `8192–16384` context window, `temp=0.2`, `freq_penalty=0.5`, and `Mistral-7B-Instruct-v0.3-Hybrid` on Ryzen AI `ryzenai-llm` with `32786` context window).
+   - Implemented the 4 typed `dspy.Signature`s (`ExtractEntities`, `ExtractTriples`, `FilterFacts` with `FactList`, `AnswerQuestion`), seeded `dspy.Example` demos (`NER_DEMOS`, `TRIPLE_DEMOS`, `FACT_FILTER_DEMOS`, `QA_DEMOS`), and `HippoRAGProgram(dspy.Module)` (`yaw/daemon/graph/inference/prompts.py`) supporting `dspy.Predict`, `dspy.ChainOfThought`, `dspy.RLM(..., interpreter_factory=dspy.LocalInterpreter, sub_lm=...)`, and `.save()` / `.load()` for `dspy.GEPA`-compiled state.
+   - Verification: `uv run --locked python -m unittest discover -s tests -v` — **67 tests passed** in 4.69s (including real `dspy.RLM` Python execution in `dspy.LocalInterpreter` and AST verification of `0` `hipporag` imports in `yaw/`).

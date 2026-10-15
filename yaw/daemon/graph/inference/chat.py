@@ -1,13 +1,20 @@
-"""Explicit local chat policy, using HippoRAG's client and cache."""
+"""Native DSPy LM and explicit local chat policy with SQLite response caching."""
 
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
+import functools
+import hashlib
 import json
+import os
 import re
+import sqlite3
+from typing import Any
 
-from hipporag.llm.openai_gpt import CacheOpenAI
+import dspy
+from filelock import FileLock
+from openai import DefaultHttpxClient, OpenAI
 
-from .models import CHAT_MODELS
+from .models import BASE_URL, CHAT_MODELS, DEFAULT_EXTRACTION_CHAT
 from .prompts import (
     PROMPT_JSON_TEMPLATE,
     best_dspy_prompt,
@@ -183,6 +190,302 @@ def chat_identity(model):
     return f"chat-v1:{model}:{checkpoint}:{recipe}:{policy}"
 
 
+def create_dspy_lm(
+    model_name: str = DEFAULT_EXTRACTION_CHAT,
+    *,
+    base_url: str = BASE_URL,
+    api_key: str = "lemonade",
+    provider: str = "openai",
+    role: str = "extraction",
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+    cache: bool = True,
+    num_retries: int = 0,
+    **kwargs: Any,
+) -> dspy.LM:
+    """Create a native dspy.LM configured for Lemonade (openai/...) or Ollama (ollama_chat/...).
+
+    Applies recipe-aware and role-aware defaults for our 3-slot hardware stack:
+    - Qwen3-4B-Instruct-2507-GGUF (llamacpp, 8192-16384 ctx): temp=0.2, freq_penalty=0.5 for extraction.
+    - Mistral-7B-Instruct-v0.3-Hybrid (ryzenai-llm, 32786 ctx): temp=0.05 for QA / RLM.
+    - gemma4-it-12b-FLM (flm): extra_body={"think": False}.
+    """
+    clean_name = model_name
+    for prefix in ("openai/", "ollama_chat/", "ollama/"):
+        if clean_name.startswith(prefix):
+            clean_name = clean_name[len(prefix) :]
+            break
+
+    profile = CHAT_MODELS.get(clean_name)
+    recipe = profile.recipe if profile is not None else None
+
+    if temperature is None:
+        if role == "extraction" and profile is not None:
+            temperature = profile.extraction_temperature
+        elif role in ("qa", "rlm") and profile is not None and profile.qa_temperature > 0:
+            temperature = profile.qa_temperature
+        else:
+            temperature = 0.0
+
+    if max_tokens is None:
+        # Qwen3-4B runs with an 8192-16384 context window; Mistral-7B Hybrid runs with 32786.
+        max_tokens = 4096 if role == "extraction" else 2048
+
+    lm_kwargs: dict[str, Any] = dict(kwargs)
+    if role == "extraction" and profile is not None and profile.frequency_penalty > 0:
+        lm_kwargs.setdefault("frequency_penalty", profile.frequency_penalty)
+    if recipe == "flm":
+        lm_kwargs.setdefault("extra_body", {"think": False})
+
+    if provider == "ollama" or model_name.startswith(("ollama_chat/", "ollama/")):
+        litellm_model = (
+            model_name
+            if model_name.startswith(("ollama_chat/", "ollama/"))
+            else f"ollama_chat/{clean_name}"
+        )
+        return dspy.LM(
+            model=litellm_model,
+            model_type="chat",
+            temperature=temperature,
+            max_tokens=max_tokens,
+            cache=cache,
+            num_retries=num_retries,
+            api_base=base_url,
+            **lm_kwargs,
+        )
+
+    litellm_model = model_name if "/" in model_name else f"openai/{clean_name}"
+    return dspy.LM(
+        model=litellm_model,
+        model_type="chat",
+        temperature=temperature,
+        max_tokens=max_tokens,
+        cache=cache,
+        num_retries=num_retries,
+        api_base=base_url,
+        api_key=api_key,
+        **lm_kwargs,
+    )
+
+
+@dataclass
+class _LLMConfig:
+    llm_name: str
+    llm_base_url: str | None = None
+    generate_params: dict[str, Any] = field(default_factory=dict)
+
+
+def _normalize_generation_token_params(
+    base_params: dict[str, Any],
+    call_kwargs: dict[str, Any],
+    target_token_key: str,
+) -> dict[str, Any]:
+    params = deepcopy(base_params)
+    params.update(call_kwargs)
+    token_val = None
+    for key in ("max_new_tokens", "max_tokens", "max_completion_tokens"):
+        if key in params:
+            val = params.pop(key)
+            if val is not None:
+                token_val = val
+    if token_val is not None:
+        params[target_token_key] = token_val
+    return params
+
+
+def cache_response(func):
+    """SQLite-backed deterministic response cache using FileLock for concurrent safety."""
+
+    @functools.wraps(func)
+    def wrapper(self, *args, **kwargs):
+        global_config = getattr(self, "global_config", None)
+        if args:
+            messages = args[0]
+        else:
+            messages = kwargs.get("messages")
+        if messages is None:
+            raise ValueError("Missing required 'messages' parameter for caching.")
+
+        gen_params = (
+            getattr(self, "llm_config", None).generate_params
+            if hasattr(self, "llm_config") and self.llm_config is not None
+            else {}
+        )
+        key_data = _normalize_generation_token_params(gen_params, kwargs, "_max_tokens")
+        key_data["messages"] = messages
+        key_data["_cache_schema"] = 3
+        key_data["_provider_class"] = f"{self.__class__.__module__}.{self.__class__.__qualname__}"
+        key_data["_endpoint"] = getattr(global_config, "azure_endpoint", None) or getattr(
+            global_config, "llm_base_url", None
+        )
+        key_data["_azure_api_version"] = getattr(global_config, "azure_api_version", None)
+        key_data["_azure_chat_deployment"] = getattr(global_config, "azure_chat_deployment", None)
+        if key_data.get("store") is True:
+            message, metadata = func(self, *args, **kwargs)
+            return message, metadata, False
+
+        key_str = json.dumps(key_data, sort_keys=True, default=str)
+        key_hash = hashlib.sha256(key_str.encode("utf-8")).hexdigest()
+
+        database_lock_file = self.cache_file_name + ".lock"
+        key_lock_file = f"{self.cache_file_name}.{key_hash[:2]}.lock"
+        with FileLock(key_lock_file):
+            with FileLock(database_lock_file):
+                with sqlite3.connect(self.cache_file_name) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS cache (
+                            key TEXT PRIMARY KEY,
+                            message TEXT,
+                            metadata TEXT
+                        )
+                        """
+                    )
+                    cursor.execute("SELECT message, metadata FROM cache WHERE key = ?", (key_hash,))
+                    row = cursor.fetchone()
+            if row is not None:
+                message, metadata_str = row
+                return message, json.loads(metadata_str), True
+
+            message, metadata = func(self, *args, **kwargs)
+
+            with FileLock(database_lock_file):
+                with sqlite3.connect(self.cache_file_name) as conn:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO cache (key, message, metadata) VALUES (?, ?, ?)",
+                        (key_hash, message, json.dumps(metadata)),
+                    )
+
+        return message, metadata, False
+
+    return wrapper
+
+
+class CacheOpenAI:
+    """Self-contained OpenAI-compatible chat client with SQLite caching (zero hipporag imports)."""
+
+    @classmethod
+    def from_experiment_config(cls, global_config) -> "CacheOpenAI":
+        cache_dir = os.path.join(global_config.save_dir, "llm_cache")
+        return cls(
+            cache_dir=cache_dir,
+            global_config=global_config,
+            max_retries=getattr(global_config, "max_retry_attempts", 0),
+        )
+
+    def __init__(
+        self,
+        cache_dir: str,
+        global_config: Any,
+        cache_filename: str | None = None,
+        high_throughput: bool = True,
+        **kwargs: Any,
+    ) -> None:
+        self.cache_dir = cache_dir
+        self.global_config = global_config
+        self.llm_name = global_config.llm_name
+        self.llm_base_url = getattr(global_config, "llm_base_url", None) or BASE_URL
+
+        os.makedirs(self.cache_dir, exist_ok=True)
+        if cache_filename is None:
+            cache_filename = f"{self.llm_name.replace('/', '_')}_cache.sqlite"
+        self.cache_file_name = os.path.join(self.cache_dir, cache_filename)
+
+        self.max_retries = kwargs.get("max_retries", 2)
+        self.request_model_name = self.llm_name
+        self._init_llm_config()
+
+        api_key_env = getattr(global_config, "llm_api_key_env", None)
+        api_key = (os.environ.get(api_key_env) if api_key_env else None) or "lemonade"
+        client = DefaultHttpxClient(timeout=5 * 60) if high_throughput else None
+        try:
+            self.openai_client = OpenAI(
+                api_key=api_key,
+                base_url=self.llm_base_url,
+                http_client=client,
+                max_retries=self.max_retries,
+            )
+        except Exception:
+            if client is not None:
+                client.close()
+            raise
+
+    def _init_llm_config(self) -> None:
+        generate_params: dict[str, Any] = {
+            "model": self.request_model_name,
+        }
+        max_new_tokens = getattr(self.global_config, "max_new_tokens", None)
+        if max_new_tokens is not None:
+            generate_params["max_completion_tokens"] = max_new_tokens
+        seed = getattr(self.global_config, "seed", None)
+        if seed is not None:
+            generate_params["seed"] = seed
+        temperature = getattr(self.global_config, "temperature", None)
+        if temperature is not None:
+            generate_params["temperature"] = temperature
+        self.llm_config = _LLMConfig(
+            llm_name=self.global_config.llm_name,
+            llm_base_url=self.global_config.llm_base_url,
+            generate_params=generate_params,
+        )
+
+    @cache_response
+    def infer(self, messages: list[dict[str, Any]], **kwargs: Any) -> tuple[str, dict[str, Any], bool]:
+        params = _normalize_generation_token_params(
+            self.llm_config.generate_params, kwargs, "max_tokens"
+        )
+        params["messages"] = messages
+
+        response = self.openai_client.chat.completions.create(**params)
+        if len(response.choices) != 1:
+            raise ValueError(
+                f"Expected exactly one OpenAI choice, received {len(response.choices)}."
+            )
+        choice = response.choices[0]
+        response_message = choice.message.content
+        if not isinstance(response_message, str) or not response_message:
+            refusal = getattr(choice.message, "refusal", None)
+            detail = f" Refusal: {refusal}" if refusal else ""
+            raise ValueError(f"OpenAI response did not contain non-empty text.{detail}")
+        usage = response.usage
+        if usage is None:
+            raise ValueError(
+                "OpenAI response omitted usage; cannot account for this request safely."
+            )
+        total_tokens = getattr(usage, "total_tokens", None)
+        metadata: dict[str, Any] = {
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+            "total_tokens": (
+                total_tokens
+                if total_tokens is not None
+                else usage.prompt_tokens + usage.completion_tokens
+            ),
+            "finish_reason": choice.finish_reason,
+        }
+        for key, value in (
+            ("response_id", getattr(response, "id", None)),
+            ("model", getattr(response, "model", None)),
+            ("request_id", getattr(response, "_request_id", None)),
+        ):
+            if value is not None:
+                metadata[key] = value
+        prompt_details = getattr(usage, "prompt_tokens_details", None)
+        completion_details = getattr(usage, "completion_tokens_details", None)
+        cached_tokens = getattr(prompt_details, "cached_tokens", None)
+        reasoning_tokens = getattr(completion_details, "reasoning_tokens", None)
+        if cached_tokens is not None:
+            metadata["cached_tokens"] = cached_tokens
+        if reasoning_tokens is not None:
+            metadata["reasoning_tokens"] = reasoning_tokens
+
+        return response_message, metadata
+
+    def close(self) -> None:
+        self.openai_client.close()
+
+
 class LocalChat(CacheOpenAI):
     @classmethod
     def from_experiment_config(cls, global_config, model_name=None):
@@ -288,6 +591,3 @@ class LocalChat(CacheOpenAI):
             "total_tokens": sum(c["total_tokens"] for c in self.calls),
             "errors": list(self.errors),
         }
-
-
-

@@ -21,8 +21,10 @@ Baseline: 2026-10-14. YAW is a native HippoRAG 2 graph & storage engine (`yaw/da
    - Treat inference (`http://localhost:13305/api/v1` or configured URL) as an external persistent server; never load/unload models from the daemon.
 5. **FastMCP Adapter:**
    - Mount `fastmcp` Streamable HTTP (`127.0.0.1:13306/mcp` + `/healthz` + `/readyz`) onto the single daemon runtime.
-6. **Lean Native Graph Engine + Owned DSPy/GEPA Prompts:**
-   - Own the NER, Triple Extraction, Recognition Memory (`DSPyFilter`), and QA prompts directly in `yaw/daemon/graph/inference/prompts.py` for direct DSPy/GEPA optimization on local 4B/7B models. Keep implementations direct and self-contained; no code-golfing, no artificial LOC quotas, and no multi-store synchronization sprawl.
+6. **Native DSPy Inference (`dspy.LM` + `dspy.Embedder` + `dspy.RLM` + `dspy.GEPA`):**
+   - Drive all inference through `dspy` (`yaw/daemon/graph/inference/`): `dspy.LM` (`chat.py`) and `dspy.Embedder` (`embedding.py`) against Lemonade (`openai/...`) or Ollama (`ollama_chat/...`, `ollama/...`) with zero `hipporag` runtime imports.
+   - Express NER (`ExtractEntities`), Triple Extraction (`ExtractTriples`), Recognition Memory (`FilterFacts`), and Multi-Hop QA (`AnswerQuestion`) as typed `dspy.Signature`s and `dspy.Module`s in `prompts.py`.
+   - Use single-turn `dspy.Predict` for short per-chunk indexing/reranking and support `dspy.ChainOfThought` or **`dspy.RLM`** (Recursive Language Model with `sub_lm` delegation and on-demand line-hydration tools) for multi-hop QA and long contexts on constrained local models (`Qwen3-4B` at `8192–16384` ctx + `Mistral-7B`), compiled via `dspy.GEPA` (`.save()` / `.load()`).
 
 ## Domain Containment Tree (Zero Cross-Domain / Sibling Edges)
 
@@ -35,18 +37,18 @@ yaw/
     ingestion/             corpus.py                               (imports: core, cocoindex)
     graph/                 engine.py, ppr.py                       (imports: graph.*, core, scipy)
       storage/             db.py, hydration.py                     (imports: core, sqlite3, sqlite_vec)
-      inference/           models.py, prompts.py, embedding.py, chat.py (imports: core, openai)
+      inference/           models.py, prompts.py, embedding.py, chat.py (imports: core, dspy)
   __main__.py                                                      (imports: daemon.cli)
 ```
 
 ## Validated 3-Slot Local Model Stack (`http://localhost:13305/api/v1`)
 
-- **Embeddings (CUDA `llamacpp`):** `embeddinggemma-300m-GGUF` (`Q8_0`, mean pooling, `--batch-size 2048 --ubatch-size 2048`, `distinct-titled` / `retrieval-prompts-v3`).
-- **Extraction & Rerank (CUDA `llamacpp`):** `Qwen3-4B-Instruct-2507-GGUF` (`Q4_K_M`, `--parallel 1 --cache-ram 0`, no `-dio`, `temp=0.2`, `freq_penalty=0.5`, `gbnf-v3:require-stop`).
-- **QA Reader (Ryzen AI Hybrid NPU/iGPU `ryzenai-llm`):** `Mistral-7B-Instruct-v0.3-Hybrid` (`temp=0.2`, `fold-system:prompt-v4:require-stop`).
+- **Embeddings (`dspy.Embedder` on CUDA `llamacpp`):** `embeddinggemma-300m-GGUF` (`Q8_0`, mean pooling, `--batch-size 2048 --ubatch-size 2048`, `encoding_format="float"`, `distinct-titled` / `retrieval-prompts-v3`).
+- **Extraction, Rerank & RLM Code/Sub-LM (`dspy.LM` on CUDA `llamacpp`):** `Qwen3-4B-Instruct-2507-GGUF` (`Q4_K_M`, `8192–16384` ctx, `--parallel 1 --cache-ram 0`, no `-dio`, `temp=0.2`, `freq_penalty=0.5`).
+- **QA Reader (`dspy.LM` on Ryzen AI Hybrid NPU/iGPU `ryzenai-llm`):** `Mistral-7B-Instruct-v0.3-Hybrid` (`32786` ctx, `temp=0.2`, system-prompt folded into first user turn for RyzenAI Jinja).
 
 ## Execution & Hard Gates
 
-1. **[Epic 1 (`E1-S1..E1-S6`)](docs/epic-1-hipporag-daemon.md):** Build strictly bottom-up along the containment tree: `E1-S1` (`core` + AST import lock) $\to$ `E1-S2` (`inference` HippoRAG prompt/parser port) $\to$ `E1-S3` (`storage` `yaw.db` + line hydration) $\to$ `E1-S4` (`graph` sparse PPR + engine, **Tier 1 parity gate**) $\to$ `E1-S5` (`ingestion` CocoIndex delta pipeline) $\to$ `E1-S6` (`daemon` runtime/CLI + **Tier 2 full-corpus parity or beat gate**).
+1. **[Epic 1 (`E1-S1..E1-S6`)](docs/epic-1-hipporag-daemon.md):** Build strictly bottom-up along the containment tree: `E1-S1` (`core` + AST import lock) $\to$ `E1-S2` (`inference` native `dspy.LM`, `dspy.Embedder`, `dspy.Signature`s, `dspy.RLM` & `dspy.GEPA` loader) $\to$ `E1-S3` (`storage` `yaw.db` + line hydration) $\to$ `E1-S4` (`graph` sparse PPR + engine, **Tier 1 parity gate**) $\to$ `E1-S5` (`ingestion` CocoIndex delta pipeline) $\to$ `E1-S6` (`daemon` runtime/CLI + `dspy.GEPA` / `dspy.RLM` optimization + **Tier 2 full-corpus parity or beat gate**).
 2. **[Epic 2 (`E2-S1..E2-S2`)](docs/epic-2-fastmcp-http.md):** Starts after `E1-S6`; mounts `yaw/daemon/mcp_server.py` onto `yaw/daemon/runtime.py` (`0` direct `graph`/`storage`/`inference` imports).
 3. Logs use 500-line FIFO rotation (`yaw/core/logger.py`). Record all measured runs in [`docs/evaluation.md`](docs/evaluation.md).

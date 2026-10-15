@@ -180,7 +180,65 @@ class EmbeddingTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.embedding.batch_encode(["text"])
 
+    def test_dspy_embedder_and_adapter_preserve_prefixes_and_l2_normalization(self):
+        from yaw.daemon.graph.inference.embedding import (
+            DSPyEmbeddingAdapter,
+            FACT_INSTRUCTION,
+            PASSAGE_INSTRUCTION,
+            create_dspy_embedder,
+        )
+
+        # Verify Lemonade (openai/...) and Ollama (ollama/...) dspy.Embedder initialization
+        lemonade_emb = create_dspy_embedder(MODEL, base_url="http://localhost:13305/api/v1", provider="openai")
+        self.assertEqual(lemonade_emb.model, f"openai/{MODEL}")
+        self.assertEqual(lemonade_emb.default_kwargs.get("encoding_format"), "float")
+        self.assertEqual(lemonade_emb.default_kwargs.get("api_base"), "http://localhost:13305/api/v1")
+
+        ollama_emb = create_dspy_embedder("nomic-embed-text", base_url="http://localhost:11434", provider="ollama")
+        self.assertEqual(ollama_emb.model, "ollama/nomic-embed-text")
+        self.assertEqual(ollama_emb.default_kwargs.get("api_base"), "http://localhost:11434")
+
+        # Real callable dspy.Embedder through DSPyEmbeddingAdapter (no mocks)
+        recorded_inputs: list[list[str]] = []
+
+        def fake_embed_fn(texts: list[str]) -> np.ndarray:
+            recorded_inputs.append(list(texts))
+            rows = []
+            for idx, _ in enumerate(texts):
+                vec = np.zeros(768, dtype=np.float32)
+                vec[0] = float(idx + 2)
+                vec[1] = float(idx + 3)
+                rows.append(vec)
+            return np.stack(rows)
+
+        custom_dspy_embedder = create_dspy_embedder(fake_embed_fn, batch_size=2, caching=False)
+        adapter = DSPyEmbeddingAdapter(
+            profile=resolve_embedding_profile(MODEL, "distinct-titled"),
+            embedder=custom_dspy_embedder,
+        )
+
+        doc_vecs = adapter.batch_encode(
+            ["Title: Montebello\nMontebello is a village.", "Single line fact."],
+            norm=True,
+        )
+        self.assertEqual(
+            recorded_inputs[-1],
+            [
+                "title: Montebello | text: Montebello is a village.",
+                "title: none | text: Single line fact.",
+            ],
+        )
+        self.assertEqual(doc_vecs.shape, (2, 768))
+        np.testing.assert_allclose(np.linalg.norm(doc_vecs, axis=1), 1.0, atol=1e-6)
+
+        fact_q_vecs = adapter.batch_encode("Where is Montebello?", instruction=FACT_INSTRUCTION, norm=True)
+        self.assertEqual(recorded_inputs[-1], [FACT_CHECK_PREFIX + "Where is Montebello?"])
+        self.assertEqual(fact_q_vecs.shape, (1, 768))
+
+        passage_q_vecs = adapter.batch_encode("Where is Montebello?", instruction=PASSAGE_INSTRUCTION, norm=True)
+        self.assertEqual(recorded_inputs[-1], [QA_QUERY_PREFIX + "Where is Montebello?"])
+        self.assertEqual(passage_q_vecs.shape, (1, 768))
+
 
 if __name__ == "__main__":
     unittest.main()
-
