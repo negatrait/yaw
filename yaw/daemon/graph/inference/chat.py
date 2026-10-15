@@ -6,13 +6,16 @@ import json
 import re
 
 from hipporag.llm.openai_gpt import CacheOpenAI
-from hipporag.prompts.filter_default_prompt import best_dspy_prompt
-from hipporag.prompts.templates.ner import ner_system
-from hipporag.prompts.templates.rag_qa_musique import rag_qa_system
-from hipporag.prompts.templates.triple_extraction import ner_conditioned_re_system
-from hipporag.utils.llm_utils import PROMPT_JSON_TEMPLATE
 
 from .models import CHAT_MODELS
+from .prompts import (
+    PROMPT_JSON_TEMPLATE,
+    best_dspy_prompt,
+    ner_conditioned_re_system,
+    ner_system,
+    rag_qa_system,
+)
+
 
 RECIPE_POLICY_TAG = {
     "flm": "think-off:prompt-v3:require-stop",

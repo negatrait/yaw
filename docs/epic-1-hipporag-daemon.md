@@ -142,7 +142,7 @@ Execute strictly in order `E1-S1` $\to$ `E1-S6`. Never start Sprint $k+1$ until 
 
 - [x] **D1-A0 (`D1-01`):** Embedding repeatability (`cosine >= 0.999`), $T=0.2$ floors, GBNF, 500-line FIFO logger, paper datasets downloaded.
 - [x] **D1-A1 (`E1-S1`):** `yaw/core/` + containment tree locked; `test_architecture.py` enforces `0` horizontal/cross-domain imports.
-- [ ] **D1-A2 (`E1-S2`):** `inference/prompts.py` ports HippoRAG 2 NER, Triple, Recognition Memory, and QA prompts/parsers with 1:1 unit parity.
+- [x] **D1-A2 (`E1-S2`):** `inference/prompts.py` ports HippoRAG 2 NER, Triple, Recognition Memory, and QA prompts/parsers with 1:1 unit parity.
 - [ ] **D1-A3 (`E1-S3`):** `storage/{db,hydration}.py` implements single-schema `yaw.db` (`sqlite-vec`, contentless `FTS5`, provenance edges) and 1-indexed `itertools.islice` line hydration.
 - [ ] **D1-A4 (`E1-S4`):** `graph/{ppr,engine}.py` + `storage/*` achieves **Tier 1 benchmark parity** vs. upstream `hipporag` on the 3-model local setup.
 - [ ] **D1-A5 (`E1-S5`):** `ingestion/corpus.py` (`cocoindex>=1.0.0`) emits pure coalesced line-pointer `SyncDelta`s across add/edit/rename/delete.
