@@ -301,45 +301,49 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         self.assertEqual(list(ExtractTriples.input_fields.keys()), ["passage", "named_entities"])
         self.assertEqual(list(ExtractTriples.output_fields.keys()), ["triples"])
         self.assertEqual(list(FilterFacts.input_fields.keys()), ["question", "fact_before_filter"])
-        self.assertEqual(list(FilterFacts.output_fields.keys()), ["fact_after_filter"])
+        self.assertEqual(list(FilterFacts.output_fields.keys()), ["fact"])
         self.assertEqual(list(AnswerQuestion.input_fields.keys()), ["context", "question"])
         self.assertEqual(list(AnswerQuestion.output_fields.keys()), ["answer"])
 
         self.assertEqual(len(NER_DEMOS), 1)
         self.assertEqual(len(TRIPLE_DEMOS), 1)
         self.assertEqual(len(FACT_FILTER_DEMOS), 10)
-        self.assertIsInstance(FACT_FILTER_DEMOS[0].fact_after_filter, FactList)
+        self.assertIsInstance(FACT_FILTER_DEMOS[0].fact_before_filter, str)
+        self.assertIsInstance(FACT_FILTER_DEMOS[0].fact, list)
+        self.assertIsInstance(FactList(fact=FACT_FILTER_DEMOS[0].fact), FactList)
         self.assertEqual(len(QA_DEMOS), 1)
 
     def test_hipporag_program_openie_fact_filter_and_cot_qa(self):
-        """Verify HippoRAGProgram executes OpenIE, fact filtering, and CoT QA via dspy.Predict and dspy.ChainOfThought."""
+        """Verify HippoRAGProgram executes OpenIE, fact filtering, and CoT QA via dspy.JSONAdapter (pure JSON output)."""
+        import dspy
         from dspy.utils import DummyLM
         from yaw.daemon.graph.inference.prompts import HippoRAGProgram
 
         program = HippoRAGProgram(qa_mode="cot")
-        lm = DummyLM([
-            {"named_entities": ["Alan Turing", "London", "Alan Turing"]},
-            {
-                "triples": [
-                    ["Alan Turing", "born in", "London"],
-                    ["London", "capital of", "United Kingdom"],
-                    ["invalid", "only_two"],
-                    ["Alan Turing", "born in", "London"],
-                ]
-            },
-            {
-                "fact_after_filter": {
+        lm = DummyLM(
+            [
+                {"named_entities": ["Alan Turing", "London", "Alan Turing"]},
+                {
+                    "triples": [
+                        ["Alan Turing", "born in", "London"],
+                        ["London", "capital of", "United Kingdom"],
+                        ["invalid", "only_two"],
+                        ["Alan Turing", "born in", "London"],
+                    ]
+                },
+                {
                     "fact": [
                         ["imperial river", "is located in", "florida"],
                         ["amaradia", "flows through", "ro ia de amaradia"],
                     ]
-                }
-            },
-            {
-                "reasoning": "Neville Stanton works at the University of Southampton, founded in 1862.",
-                "answer": "1862",
-            },
-        ])
+                },
+                {
+                    "reasoning": "Neville Stanton works at the University of Southampton, founded in 1862.",
+                    "answer": "1862",
+                },
+            ],
+            adapter=dspy.JSONAdapter(),
+        )
 
         record = program.extract_openie(
             "chunk-1",
@@ -434,7 +438,8 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             self.assertEqual(prog2.ner.demos[0]["named_entities"], ["GEPA"])
 
     def test_hipporag_program_gbnf_grammar_forwarding(self):
-        """Verify HippoRAGProgram forwards static and dynamic candidate-literal GBNF grammars via extra_body."""
+        """Verify HippoRAGProgram forwards pure-JSON static and dynamic GBNF grammars via extra_body."""
+        import dspy
         from dspy.utils import DummyLM
         from yaw.daemon.graph.inference.prompts import (
             DSPY_NER_GBNF_GRAMMAR,
@@ -445,14 +450,20 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         )
 
         program = HippoRAGProgram(enable_gbnf=True)
-        lm = DummyLM([
-            {"named_entities": ["Alan Turing", "London"]},
-            {"triples": [["Alan Turing", "born in", "London"]]},
-            {"fact_after_filter": {"fact": [["alan turing", "born in", "london"]]}},
-            {"reasoning": "Born in London.", "answer": "London"},
-        ])
+        lm = DummyLM(
+            [
+                {"named_entities": ["Alan Turing", "London"]},
+                {"triples": [["Alan Turing", "born in", "London"]]},
+                {"fact": [["alan turing", "born in", "london"]]},
+                {"reasoning": "Born in London.", "answer": "London"},
+            ],
+            adapter=dspy.JSONAdapter(),
+        )
 
         program.extract_openie("c-1", "Alan Turing was born in London.", lm=lm)
+        self.assertNotIn("[[ ##", DSPY_NER_GBNF_GRAMMAR)
+        self.assertNotIn("[[ ##", DSPY_TRIPLES_GBNF_GRAMMAR)
+        self.assertNotIn("[[ ##", DSPY_QA_COT_GBNF_GRAMMAR)
         self.assertEqual(
             lm.history[0]["kwargs"].get("extra_body"),
             {"grammar": DSPY_NER_GBNF_GRAMMAR},
@@ -469,6 +480,7 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         selected = program.filter_facts("Where was Alan Turing born?", candidates, lm=lm)
         self.assertEqual(selected, [0])
         expected_rerank_grammar = build_dspy_rerank_grammar(candidates, max_facts=4)
+        self.assertNotIn("[[ ##", expected_rerank_grammar)
         self.assertIn('"[\\"alan turing\\", \\"born in\\", \\"london\\"]"', expected_rerank_grammar)
         self.assertEqual(
             lm.history[2]["kwargs"].get("extra_body"),

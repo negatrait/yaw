@@ -618,7 +618,9 @@ class FilterFacts(dspy.Signature):
 
     question: str = dspy.InputField(desc="Query for retrieval")
     fact_before_filter: str = dspy.InputField(desc="Candidate facts to be filtered")
-    fact_after_filter: FactList = dspy.OutputField(desc="Filtered facts in JSON format")
+    fact: list[list[str]] = dspy.OutputField(
+        desc="Selected relevant [subject, predicate, object] facts from the candidate list"
+    )
 
 
 class AnswerQuestion(dspy.Signature):
@@ -659,7 +661,7 @@ def _build_default_fact_filter_demos() -> list[dspy.Example]:
             dspy.Example(
                 question=raw_demo["question"],
                 fact_before_filter=raw_demo["fact_before_filter"],
-                fact_after_filter=FactList(fact=parsed_after["fact"]),
+                fact=parsed_after["fact"],
             ).with_inputs("question", "fact_before_filter")
         )
     return demos
@@ -740,34 +742,32 @@ def match_facts_to_candidate_indices(
 
 
 # ---------------------------------------------------------------------------
-# 8. Context-Free Grammars (GBNF) for DSPy ChatAdapter on Lemonade / llama.cpp
+# 8. Pure-JSON Context-Free Grammars (GBNF) for dspy.JSONAdapter on llama.cpp
 # ---------------------------------------------------------------------------
 
-DSPY_NER_GBNF_GRAMMAR = r"""root ::= "[[ ## named_entities ## ]]\n" entity-list "\n\n[[ ## completed ## ]]"
+DSPY_NER_GBNF_GRAMMAR = r"""root ::= "{\"named_entities\": " entity-list "}"
 entity-list ::= "[]" | "[" string (", " string)* "]"
 string ::= "\"" char+ "\""
 char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
 """
 
-DSPY_TRIPLES_GBNF_GRAMMAR = r"""root ::= "[[ ## triples ## ]]\n" triple-list "\n\n[[ ## completed ## ]]"
+DSPY_TRIPLES_GBNF_GRAMMAR = r"""root ::= "{\"triples\": " triple-list "}"
 triple-list ::= "[]" | "[" triple (", " triple)* "]"
 triple ::= "[" string ", " string ", " string "]"
 string ::= "\"" char+ "\""
 char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
 """
 
-DSPY_RERANK_GBNF_GRAMMAR = r"""root ::= "[[ ## fact_after_filter ## ]]\n" fact-obj "\n\n[[ ## completed ## ]]"
-fact-obj ::= "{\"fact\": [" fact-list "]}"
+DSPY_RERANK_GBNF_GRAMMAR = r"""root ::= "{\"fact\": [" fact-list "]}"
 fact-list ::= (triple (", " triple)*)?
 triple ::= "[" string ", " string ", " string "]"
 string ::= "\"" char+ "\""
 char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
 """
 
-DSPY_QA_COT_GBNF_GRAMMAR = r"""root ::= "[[ ## reasoning ## ]]\n" text "\n\n[[ ## answer ## ]]\n" line "\n\n[[ ## completed ## ]]"
-text ::= line ("\n" line)*
-line ::= char+
-char ::= [^\r\n\x00-\x1F]
+DSPY_QA_COT_GBNF_GRAMMAR = r"""root ::= "{\"reasoning\": " string ", \"answer\": " string "}"
+string ::= "\"" char+ "\""
+char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
 """
 
 
@@ -786,7 +786,7 @@ def build_dspy_rerank_grammar(
     candidate_facts: Sequence[Union[Tuple[str, str, str], List[str]]],
     max_facts: int = 4,
 ) -> str:
-    """Build dynamic candidate-literal GBNF grammar for DSPy FilterFacts (ChatAdapter)."""
+    """Build dynamic candidate-literal pure-JSON GBNF grammar for DSPy FilterFacts (JSONAdapter)."""
     candidates: list[str] = []
     for item in candidate_facts:
         if (
@@ -800,11 +800,7 @@ def build_dspy_rerank_grammar(
             candidates.append(serialized)
 
     if not candidates:
-        return (
-            'root ::= "[[ ## fact_after_filter ## ]]\\n" '
-            '"{\\"fact\\": []}" '
-            '"\\n\\n[[ ## completed ## ]]"\n'
-        )
+        return 'root ::= "{\\"fact\\": []}"\n'
 
     limit = min(max_facts, len(candidates))
     seq = "triple"
@@ -812,8 +808,7 @@ def build_dspy_rerank_grammar(
         seq = f'triple (", " {seq})?'
     triple_rule = " | ".join(_gbnf_escape_literal(c) for c in candidates)
     return (
-        'root ::= "[[ ## fact_after_filter ## ]]\\n" fact-obj "\\n\\n[[ ## completed ## ]]"\n'
-        'fact-obj ::= "{\\"fact\\": [" fact-list "]}"\n'
+        'root ::= "{\\"fact\\": [" fact-list "]}"\n'
         f"fact-list ::= ({seq})?\n"
         f"triple ::= {triple_rule}\n"
     )
@@ -822,8 +817,11 @@ def build_dspy_rerank_grammar(
 class HippoRAGProgram(dspy.Module):
     """Unified DSPy Module for HippoRAG 2 OpenIE, Recognition Memory, and Multi-Hop QA.
 
+    - Uses `dspy.JSONAdapter()` by default so all single-turn outputs are pure JSON
+      (`{"named_entities": [...]}`, `{"triples": [...]}`, `{"fact": [...]}`, `{"reasoning": "...", "answer": "..."}`)
+      with zero verbose `[[ ## ... ## ]]` output headers.
     - OpenIE (`ner`, `triples`) and Recognition Memory (`fact_filter`) use `dspy.Predict`
-      for fast 1-call structured execution per stage, with optional `llama.cpp` GBNF
+      for fast 1-call structured execution per stage, with optional `llama.cpp` pure-JSON GBNF
       context-free grammar enforcement (`enable_gbnf=True`) via `config={"extra_body": {"grammar": ...}}`.
     - QA supports both `dspy.ChainOfThought(AnswerQuestion)` (`qa_mode="cot"`) and
       `dspy.RLM(AnswerQuestion)` (`qa_mode="rlm"`) using `dspy.LocalInterpreter` by default
@@ -838,6 +836,7 @@ class HippoRAGProgram(dspy.Module):
         qa_mode: Literal["cot", "rlm"] = "cot",
         include_demos: bool = True,
         enable_gbnf: bool = False,
+        adapter: dspy.Adapter | None = None,
         rlm_max_iters: int = 10,
         rlm_max_llm_calls: int = 20,
         rlm_max_output_chars: int = 10000,
@@ -851,6 +850,7 @@ class HippoRAGProgram(dspy.Module):
             raise ValueError(f"Unsupported qa_mode: {qa_mode!r}. Expected 'cot' or 'rlm'.")
         self.qa_mode: Literal["cot", "rlm"] = qa_mode
         self.enable_gbnf: bool = enable_gbnf
+        self.json_adapter: dspy.Adapter = adapter or dspy.JSONAdapter()
 
         self.ner = dspy.Predict(ExtractEntities)
         self.triples = dspy.Predict(ExtractTriples)
@@ -877,6 +877,14 @@ class HippoRAGProgram(dspy.Module):
             if path.exists():
                 self.load(str(path))
 
+    def _dspy_ctx(self, lm: dspy.LM | None, *, use_json_adapter: bool = True):
+        ctx_kwargs: dict[str, Any] = {}
+        if lm is not None:
+            ctx_kwargs["lm"] = lm
+        if use_json_adapter:
+            ctx_kwargs["adapter"] = self.json_adapter
+        return dspy.context(**ctx_kwargs)
+
     def extract_entities(
         self,
         passage: str,
@@ -889,8 +897,7 @@ class HippoRAGProgram(dspy.Module):
         call_kwargs: dict[str, Any] = {}
         if gbnf:
             call_kwargs["config"] = {"extra_body": {"grammar": DSPY_NER_GBNF_GRAMMAR}}
-        ctx = dspy.context(lm=lm) if lm is not None else dspy.context()
-        with ctx:
+        with self._dspy_ctx(lm, use_json_adapter=True):
             pred = self.ner(passage=passage, **call_kwargs)
         raw_entities = getattr(pred, "named_entities", [])
         if isinstance(raw_entities, str):
@@ -920,8 +927,7 @@ class HippoRAGProgram(dspy.Module):
         call_kwargs: dict[str, Any] = {}
         if gbnf:
             call_kwargs["config"] = {"extra_body": {"grammar": DSPY_TRIPLES_GBNF_GRAMMAR}}
-        ctx = dspy.context(lm=lm) if lm is not None else dspy.context()
-        with ctx:
+        with self._dspy_ctx(lm, use_json_adapter=True):
             pred = self.triples(
                 passage=passage,
                 named_entities=list(named_entities),
@@ -972,14 +978,13 @@ class HippoRAGProgram(dspy.Module):
                 candidate_facts, max_facts=max_facts if max_facts is not None else 4
             )
             call_kwargs["config"] = {"extra_body": {"grammar": grammar}}
-        ctx = dspy.context(lm=lm) if lm is not None else dspy.context()
-        with ctx:
+        with self._dspy_ctx(lm, use_json_adapter=True):
             pred = self.fact_filter(
                 question=question,
                 fact_before_filter=fact_before_filter,
                 **call_kwargs,
             )
-        raw_after = getattr(pred, "fact_after_filter", None)
+        raw_after = getattr(pred, "fact", getattr(pred, "fact_after_filter", None))
         generated = _coerce_generated_facts(raw_after)
         return match_facts_to_candidate_indices(
             candidate_facts, generated, max_facts=max_facts
@@ -1002,8 +1007,8 @@ class HippoRAGProgram(dspy.Module):
         call_kwargs: dict[str, Any] = {}
         if use_gbnf and active_mode == "cot":
             call_kwargs["config"] = {"extra_body": {"grammar": DSPY_QA_COT_GBNF_GRAMMAR}}
-        ctx = dspy.context(lm=lm) if lm is not None else dspy.context()
-        with ctx:
+        # Use JSONAdapter for single-turn CoT, and default ChatAdapter for RLM code blocks
+        with self._dspy_ctx(lm, use_json_adapter=(active_mode == "cot")):
             return qa_module(context=context, question=question, **call_kwargs)
 
     def forward(
