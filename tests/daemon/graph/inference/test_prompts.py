@@ -579,6 +579,120 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         self.assertEqual(set(obj_scores.keys()), {"recall_at_5", "pareto_raw", "efficiency"})
         self.assertAlmostEqual(obj_scores["recall_at_5"], 0.80)
 
+    def test_heterogeneous_mistral_orchestrator_and_qwen_gbnf_rlm_across_all_stages(self):
+        """Verify execution_mode='rlm' runs Mistral NPU orchestrator (zero GBNF) + Qwen GPU worker (pure-JSON GBNF) on every stage."""
+        import dspy
+        from dspy.utils import DummyLM
+        from yaw.daemon.graph.inference.prompts import (
+            DSPY_NER_GBNF_GRAMMAR,
+            DSPY_QA_COT_GBNF_GRAMMAR,
+            DSPY_TRIPLES_GBNF_GRAMMAR,
+            HippoRAGProgram,
+            build_dspy_rerank_grammar,
+            lm_supports_gbnf,
+        )
+
+        # Mistral orchestrator on Ryzen AI NPU/OGA (ChatAdapter, NO GBNF allowed)
+        mistral_lm = DummyLM([
+            {
+                "reasoning": "Delegate entity extraction to GBNF-constrained Qwen GPU worker.",
+                "code": (
+                    "ents = qwen_extract_entities(passage=passage)\n"
+                    "SUBMIT(named_entities=ents)"
+                ),
+            },
+            {
+                "reasoning": "Delegate triple extraction to GBNF-constrained Qwen GPU worker.",
+                "code": (
+                    "trips = qwen_extract_triples(passage=passage, named_entities=named_entities)\n"
+                    "SUBMIT(triples=trips)"
+                ),
+            },
+            {
+                "reasoning": "Parse candidates and delegate fact filtering to GBNF-constrained Qwen GPU worker.",
+                "code": (
+                    "import json\n"
+                    "cands = json.loads(fact_before_filter)['fact']\n"
+                    "kept = qwen_filter_facts(question=question, candidate_facts=cands)\n"
+                    "SUBMIT(fact=kept)"
+                ),
+            },
+            {
+                "reasoning": "Delegate multi-hop CoT reasoning to GBNF-constrained Qwen GPU worker.",
+                "code": (
+                    "res = qwen_answer_cot(context=context, question=question)\n"
+                    "SUBMIT(answer=res['answer'])"
+                ),
+            },
+        ])
+        mistral_lm._yaw_recipe = "ryzenai-llm"
+        mistral_lm._yaw_supports_gbnf = False
+        self.assertFalse(lm_supports_gbnf(mistral_lm))
+
+        # Qwen worker on llama.cpp Vulkan GPU (JSONAdapter, pure-JSON GBNF enabled)
+        qwen_lm = DummyLM(
+            [
+                {"named_entities": ["Alan Turing", "London"]},
+                {"triples": [["Alan Turing", "born in", "London"]]},
+                {"fact": [["alan turing", "born in", "london"]]},
+                {"reasoning": "Alan Turing was born in London.", "answer": "London"},
+            ],
+            adapter=dspy.JSONAdapter(),
+        )
+        qwen_lm._yaw_recipe = "llamacpp"
+        qwen_lm._yaw_supports_gbnf = True
+        self.assertTrue(lm_supports_gbnf(qwen_lm))
+
+        program = HippoRAGProgram(
+            execution_mode="rlm",
+            enable_gbnf=True,
+            orchestrator_lm=mistral_lm,
+            rlm_sub_lm=qwen_lm,
+            rlm_max_iters=3,
+            rlm_max_llm_calls=8,
+        )
+
+        # 1 & 2: OpenIE (NER + Triples) via Mistral RLM -> Qwen GBNF worker
+        record = program.extract_openie("c-1", "Alan Turing was born in London.")
+        self.assertEqual(record.entities, ("Alan Turing", "London"))
+        self.assertEqual(record.triples, (("Alan Turing", "born in", "London"),))
+
+        # 3: Fact filter via Mistral RLM -> Qwen GBNF worker
+        candidates = [
+            ("alan turing", "born in", "london"),
+            ("cinderella", "attended", "royal ball"),
+        ]
+        selected = program.filter_facts("Where was Alan Turing born?", candidates)
+        self.assertEqual(selected, [0])
+
+        # 4: Multi-hop QA via Mistral RLM -> Qwen GBNF worker
+        qa_pred = program("Alan Turing was born in London.", "Where was Alan Turing born?")
+        self.assertEqual(qa_pred.answer, "London")
+
+        # Verify Mistral NPU orchestrator received 4 RLM calls and ZERO GBNF grammars
+        self.assertEqual(len(mistral_lm.history), 4)
+        for entry in mistral_lm.history:
+            self.assertIsNone(entry["kwargs"].get("extra_body"))
+
+        # Verify Qwen GPU worker received 4 inner calls, ALL with pure-JSON GBNF grammars
+        self.assertEqual(len(qwen_lm.history), 4)
+        self.assertEqual(
+            qwen_lm.history[0]["kwargs"].get("extra_body"),
+            {"grammar": DSPY_NER_GBNF_GRAMMAR},
+        )
+        self.assertEqual(
+            qwen_lm.history[1]["kwargs"].get("extra_body"),
+            {"grammar": DSPY_TRIPLES_GBNF_GRAMMAR},
+        )
+        self.assertEqual(
+            qwen_lm.history[2]["kwargs"].get("extra_body"),
+            {"grammar": build_dspy_rerank_grammar(candidates, max_facts=4)},
+        )
+        self.assertEqual(
+            qwen_lm.history[3]["kwargs"].get("extra_body"),
+            {"grammar": DSPY_QA_COT_GBNF_GRAMMAR},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -14,7 +14,7 @@ import dspy
 from filelock import FileLock
 from openai import DefaultHttpxClient, OpenAI
 
-from .models import BASE_URL, CHAT_MODELS, DEFAULT_EXTRACTION_CHAT
+from .models import BASE_URL, CHAT_MODELS, DEFAULT_EXTRACTION_CHAT, DEFAULT_QA_CHAT
 from .prompts import (
     PROMPT_JSON_TEMPLATE,
     best_dspy_prompt,
@@ -206,8 +206,8 @@ def create_dspy_lm(
     """Create a native dspy.LM configured for Lemonade (openai/...) or Ollama (ollama_chat/...).
 
     Applies recipe-aware and role-aware defaults for our 3-slot hardware stack:
-    - Qwen3-4B-Instruct-2507-GGUF (llamacpp, 8192-16384 ctx): temp=0.2, freq_penalty=0.5 for extraction.
-    - Mistral-7B-Instruct-v0.3-Hybrid (ryzenai-llm, 32786 ctx): temp=0.05 for QA / RLM.
+    - Qwen3-4B-Instruct-2507-GGUF (llamacpp on Vulkan GPU, 8192-16384 ctx): supports GBNF, temp=0.2, freq_penalty=0.5.
+    - Mistral-7B-Instruct-v0.3-Hybrid (ryzenai-llm on NPU/OGA, 32786 ctx): NO GBNF, orchestrator for RLM.
     - gemma4-it-12b-FLM (flm): extra_body={"think": False}.
     """
     clean_name = model_name
@@ -243,7 +243,7 @@ def create_dspy_lm(
             if model_name.startswith(("ollama_chat/", "ollama/"))
             else f"ollama_chat/{clean_name}"
         )
-        return dspy.LM(
+        lm = dspy.LM(
             model=litellm_model,
             model_type="chat",
             temperature=temperature,
@@ -253,19 +253,61 @@ def create_dspy_lm(
             api_base=base_url,
             **lm_kwargs,
         )
+    else:
+        litellm_model = model_name if "/" in model_name else f"openai/{clean_name}"
+        lm = dspy.LM(
+            model=litellm_model,
+            model_type="chat",
+            temperature=temperature,
+            max_tokens=max_tokens,
+            cache=cache,
+            num_retries=num_retries,
+            api_base=base_url,
+            api_key=api_key,
+            **lm_kwargs,
+        )
 
-    litellm_model = model_name if "/" in model_name else f"openai/{clean_name}"
-    return dspy.LM(
-        model=litellm_model,
-        model_type="chat",
-        temperature=temperature,
-        max_tokens=max_tokens,
+    lm._yaw_recipe = recipe
+    lm._yaw_supports_gbnf = recipe == "llamacpp"
+    return lm
+
+
+def create_dspy_rlm_pair(
+    orchestrator_model: str = DEFAULT_QA_CHAT,
+    sub_model: str = DEFAULT_EXTRACTION_CHAT,
+    *,
+    base_url: str = BASE_URL,
+    api_key: str = "lemonade",
+    provider: str = "openai",
+    cache: bool = True,
+    num_retries: int = 0,
+) -> tuple[dspy.LM, dspy.LM]:
+    """Create the heterogeneous (Mistral NPU Orchestrator, Qwen GPU GBNF Worker) LM pair.
+
+    - `orchestrator_lm` (`Mistral-7B-Instruct-v0.3-Hybrid` on Ryzen AI NPU/OGA): runs outer `dspy.RLM`
+      Python REPL orchestration without GBNF (`_yaw_supports_gbnf=False`).
+    - `sub_lm` (`Qwen3-4B-Instruct-2507-GGUF` on `llama.cpp` Vulkan GPU): runs inner `llm_query` and
+      GBNF-constrained `qwen_*` extraction/reranking/CoT worker calls (`_yaw_supports_gbnf=True`).
+    """
+    orchestrator_lm = create_dspy_lm(
+        orchestrator_model,
+        base_url=base_url,
+        api_key=api_key,
+        provider=provider,
+        role="rlm",
         cache=cache,
         num_retries=num_retries,
-        api_base=base_url,
-        api_key=api_key,
-        **lm_kwargs,
     )
+    sub_lm = create_dspy_lm(
+        sub_model,
+        base_url=base_url,
+        api_key=api_key,
+        provider=provider,
+        role="extraction",
+        cache=cache,
+        num_retries=num_retries,
+    )
+    return orchestrator_lm, sub_lm
 
 
 @dataclass

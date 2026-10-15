@@ -265,24 +265,35 @@ class ChatTests(unittest.TestCase):
         self.assertTrue(all("chat-v1" in chat_identity(name) for name in CHAT_MODELS))
 
     def test_create_dspy_lm_configures_lemonade_and_ollama_models(self):
-        from yaw.daemon.graph.inference.chat import create_dspy_lm
+        from yaw.daemon.graph.inference.chat import create_dspy_lm, create_dspy_rlm_pair
+        from yaw.daemon.graph.inference.prompts import lm_supports_gbnf
 
-        # Qwen3-4B extraction on Lemonade (8192-16384 ctx window)
+        # Qwen3-4B extraction on Lemonade (8192-16384 ctx window, llamacpp GPU -> GBNF supported)
         qwen_lm = create_dspy_lm("Qwen3-4B-Instruct-2507-GGUF", role="extraction")
         self.assertEqual(qwen_lm.model, "openai/Qwen3-4B-Instruct-2507-GGUF")
         self.assertAlmostEqual(qwen_lm.kwargs["temperature"], 0.2)
         self.assertEqual(qwen_lm.kwargs["max_tokens"], 4096)
         self.assertAlmostEqual(qwen_lm.kwargs["frequency_penalty"], 0.5)
+        self.assertTrue(lm_supports_gbnf(qwen_lm))
 
-        # Mistral-7B QA/RLM on Lemonade (32786 ctx window)
+        # Mistral-7B QA/RLM on Lemonade (32786 ctx window, ryzenai-llm NPU -> GBNF NOT supported)
         mistral_lm = create_dspy_lm("Mistral-7B-Instruct-v0.3-Hybrid", role="qa")
         self.assertEqual(mistral_lm.model, "openai/Mistral-7B-Instruct-v0.3-Hybrid")
         self.assertAlmostEqual(mistral_lm.kwargs["temperature"], 0.2)
         self.assertEqual(mistral_lm.kwargs["max_tokens"], 2048)
+        self.assertFalse(lm_supports_gbnf(mistral_lm))
 
-        # Gemma4 FLM recipe sets think=False
+        # Heterogeneous RLM pair: (Mistral NPU orchestrator without GBNF, Qwen GPU worker with GBNF)
+        orch_lm, sub_lm = create_dspy_rlm_pair()
+        self.assertEqual(orch_lm.model, "openai/Mistral-7B-Instruct-v0.3-Hybrid")
+        self.assertEqual(sub_lm.model, "openai/Qwen3-4B-Instruct-2507-GGUF")
+        self.assertFalse(lm_supports_gbnf(orch_lm))
+        self.assertTrue(lm_supports_gbnf(sub_lm))
+
+        # Gemma4 FLM recipe sets think=False and disables GBNF
         flm_lm = create_dspy_lm("gemma4-it-12b-FLM", role="qa")
         self.assertEqual(flm_lm.kwargs.get("extra_body"), {"think": False})
+        self.assertFalse(lm_supports_gbnf(flm_lm))
 
         # Ollama provider configures ollama_chat/...
         ollama_lm = create_dspy_lm(

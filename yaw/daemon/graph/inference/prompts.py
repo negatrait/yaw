@@ -936,26 +936,49 @@ def compute_sizecoding_pareto_score(
     )
 
 
+def lm_supports_gbnf(lm: dspy.LM | None = None) -> bool:
+    """Return True if `lm` runs on a `llama.cpp` backend that supports GBNF grammars.
+
+    Ryzen AI NPU/OGA (`ryzenai-llm`, e.g. `Mistral-7B-Instruct-v0.3-Hybrid`) and FLM
+    do NOT support GBNF (`extra_body={"grammar": ...}`). Only `llamacpp` GPU models
+    (e.g. `Qwen3-4B-Instruct-2507-GGUF`) support GBNF constrained decoding.
+    """
+    target_lm = lm if lm is not None else getattr(dspy.settings, "lm", None)
+    if target_lm is None:
+        return True
+    explicit = getattr(target_lm, "_yaw_supports_gbnf", None)
+    if isinstance(explicit, bool):
+        return explicit
+    recipe = getattr(target_lm, "_yaw_recipe", None)
+    if recipe in ("ryzenai-llm", "flm"):
+        return False
+    model_name = str(getattr(target_lm, "model", "")).lower()
+    if "mistral" in model_name or "ryzenai" in model_name or "flm" in model_name:
+        return False
+    return True
+
+
 class HippoRAGProgram(dspy.Module):
     """Unified DSPy Module for HippoRAG 2 OpenIE, Recognition Memory, and Multi-Hop QA.
 
-    - Uses `dspy.JSONAdapter()` by default so all single-turn outputs are pure JSON
-      (`{"named_entities": [...]}`, `{"triples": [...]}`, `{"fact": [...]}`, `{"reasoning": "...", "answer": "..."}`)
-      with zero verbose `[[ ## ... ## ]]` output headers.
-    - OpenIE (`ner`, `triples`) and Recognition Memory (`fact_filter`) use `dspy.Predict`
-      for fast 1-call structured execution per stage, with optional `llama.cpp` pure-JSON GBNF
-      context-free grammar enforcement (`enable_gbnf=True`) via `config={"extra_body": {"grammar": ...}}`.
-    - QA supports both `dspy.ChainOfThought(AnswerQuestion)` (`qa_mode="cot"`) and
-      `dspy.RLM(AnswerQuestion)` (`qa_mode="rlm"`) using `dspy.LocalInterpreter` by default
-      so large evidence contexts can be explored iteratively in Python without blowing the
-      8192-16384 context window of Qwen3-4B or crowding Mistral-7B Hybrid's attention.
-    - Compatible with `dspy.MIPROv2` and `dspy.GEPA` optimization and `.save()` / `.load()`.
+    Supports two execution styles across **all** stages (`ner`, `triples`, `fact_filter`, `qa`):
+    1. **Heterogeneous Mistral Orchestrator + Qwen RLM Worker (`execution_mode="rlm"`):**
+       - Outer `dspy.RLM` runs on `orchestrator_lm` (`Mistral-7B-Instruct-v0.3-Hybrid` on
+         Ryzen AI NPU/OGA, `ChatAdapter`, **never** GBNF) inside `dspy.LocalInterpreter`.
+       - Inner `llm_query` and built-in `qwen_*` sandbox tools (`qwen_extract_entities`,
+         `qwen_extract_triples`, `qwen_filter_facts`, `qwen_answer_cot`) execute on `rlm_sub_lm`
+         (`Qwen3-4B-Instruct-2507-GGUF` on `llama.cpp` Vulkan GPU) using `dspy.JSONAdapter()`
+         and **pure-JSON GBNF grammars** (`extra_body={"grammar": ...}`).
+    2. **Direct Single-Call (`execution_mode="direct"`):**
+       - Runs `dspy.Predict` / `dspy.ChainOfThought` directly with `dspy.JSONAdapter()` and
+         attaches GBNF grammars only when `lm_supports_gbnf(lm)` is `True`.
     """
 
     def __init__(
         self,
         *,
-        qa_mode: Literal["cot", "rlm"] = "cot",
+        execution_mode: Literal["direct", "rlm"] = "direct",
+        qa_mode: Literal["cot", "rlm"] | None = None,
         include_demos: bool = True,
         enable_gbnf: bool = False,
         gbnf_max_entities: int | None = None,
@@ -963,6 +986,7 @@ class HippoRAGProgram(dspy.Module):
         gbnf_max_facts: int = 4,
         gbnf_max_reasoning_chars: int | None = None,
         adapter: dspy.Adapter | None = None,
+        orchestrator_lm: dspy.LM | None = None,
         rlm_max_iters: int = 10,
         rlm_max_llm_calls: int = 20,
         rlm_max_output_chars: int = 10000,
@@ -972,26 +996,74 @@ class HippoRAGProgram(dspy.Module):
         compiled_path: str | Path | None = None,
     ) -> None:
         super().__init__()
-        if qa_mode not in ("cot", "rlm"):
-            raise ValueError(f"Unsupported qa_mode: {qa_mode!r}. Expected 'cot' or 'rlm'.")
-        self.qa_mode: Literal["cot", "rlm"] = qa_mode
+        if execution_mode not in ("direct", "rlm"):
+            raise ValueError(
+                f"Unsupported execution_mode: {execution_mode!r}. Expected 'direct' or 'rlm'."
+            )
+        resolved_qa_mode: Literal["cot", "rlm"] = (
+            qa_mode if qa_mode is not None else ("rlm" if execution_mode == "rlm" else "cot")
+        )
+        if resolved_qa_mode not in ("cot", "rlm"):
+            raise ValueError(
+                f"Unsupported qa_mode: {resolved_qa_mode!r}. Expected 'cot' or 'rlm'."
+            )
+        self.execution_mode: Literal["direct", "rlm"] = execution_mode
+        self.qa_mode: Literal["cot", "rlm"] = resolved_qa_mode
         self.enable_gbnf: bool = enable_gbnf
         self.gbnf_max_entities: int | None = gbnf_max_entities
         self.gbnf_max_triples: int | None = gbnf_max_triples
         self.gbnf_max_facts: int = gbnf_max_facts
         self.gbnf_max_reasoning_chars: int | None = gbnf_max_reasoning_chars
         self.json_adapter: dspy.Adapter = adapter or dspy.JSONAdapter()
+        self.orchestrator_lm: dspy.LM | None = orchestrator_lm
+        self.rlm_sub_lm: dspy.LM | None = rlm_sub_lm
 
         self.ner = dspy.Predict(ExtractEntities)
         self.triples = dspy.Predict(ExtractTriples)
         self.fact_filter = dspy.Predict(FilterFacts)
         self.qa_cot = dspy.ChainOfThought(AnswerQuestion)
+
+        qwen_worker_tools = self._build_qwen_worker_tools()
+        combined_tools = list(qwen_worker_tools)
+        if rlm_tools:
+            existing_names = {getattr(t, "__name__", "") for t in combined_tools}
+            for user_tool in rlm_tools:
+                if getattr(user_tool, "__name__", "") not in existing_names:
+                    combined_tools.append(user_tool)
+
+        self.ner_rlm = dspy.RLM(
+            ExtractEntities,
+            max_iters=rlm_max_iters,
+            max_llm_calls=rlm_max_llm_calls,
+            max_output_chars=rlm_max_output_chars,
+            tools=combined_tools,
+            sub_lm=rlm_sub_lm,
+            interpreter_factory=rlm_interpreter_factory,
+        )
+        self.triples_rlm = dspy.RLM(
+            ExtractTriples,
+            max_iters=rlm_max_iters,
+            max_llm_calls=rlm_max_llm_calls,
+            max_output_chars=rlm_max_output_chars,
+            tools=combined_tools,
+            sub_lm=rlm_sub_lm,
+            interpreter_factory=rlm_interpreter_factory,
+        )
+        self.fact_filter_rlm = dspy.RLM(
+            FilterFacts,
+            max_iters=rlm_max_iters,
+            max_llm_calls=rlm_max_llm_calls,
+            max_output_chars=rlm_max_output_chars,
+            tools=combined_tools,
+            sub_lm=rlm_sub_lm,
+            interpreter_factory=rlm_interpreter_factory,
+        )
         self.qa_rlm = dspy.RLM(
             AnswerQuestion,
             max_iters=rlm_max_iters,
             max_llm_calls=rlm_max_llm_calls,
             max_output_chars=rlm_max_output_chars,
-            tools=rlm_tools,
+            tools=combined_tools,
             sub_lm=rlm_sub_lm,
             interpreter_factory=rlm_interpreter_factory,
         )
@@ -1007,6 +1079,75 @@ class HippoRAGProgram(dspy.Module):
             if path.exists():
                 self.load(str(path))
 
+    def _resolve_worker_lm(self, fallback_lm: dspy.LM | None = None) -> dspy.LM | None:
+        return self.rlm_sub_lm if self.rlm_sub_lm is not None else fallback_lm
+
+    def _resolve_orchestrator_lm(self, fallback_lm: dspy.LM | None = None) -> dspy.LM | None:
+        return fallback_lm if fallback_lm is not None else self.orchestrator_lm
+
+    def _build_qwen_worker_tools(self) -> list[Callable[..., Any]]:
+        """Build GBNF-constrained Qwen (`llama.cpp` GPU) worker tools exposed inside Mistral's RLM REPL."""
+
+        def qwen_extract_entities(passage: str) -> list[str]:
+            """Extract deduplicated named entities from a passage using the GBNF-constrained Qwen GPU model."""
+            worker_lm = self._resolve_worker_lm()
+            return list(
+                self.extract_entities(
+                    passage,
+                    mode="direct",
+                    lm=worker_lm,
+                    use_gbnf=self.enable_gbnf,
+                )
+            )
+
+        def qwen_extract_triples(passage: str, named_entities: list[str]) -> list[list[str]]:
+            """Extract [subject, predicate, object] triples using the GBNF-constrained Qwen GPU model."""
+            worker_lm = self._resolve_worker_lm()
+            triples = self.extract_triples(
+                passage,
+                named_entities,
+                mode="direct",
+                lm=worker_lm,
+                use_gbnf=self.enable_gbnf,
+            )
+            return [list(t) for t in triples]
+
+        def qwen_filter_facts(
+            question: str, candidate_facts: list[list[str]]
+        ) -> list[list[str]]:
+            """Filter candidate [s, p, o] facts using the dynamic candidate-literal GBNF Qwen GPU model."""
+            worker_lm = self._resolve_worker_lm()
+            indices = self.filter_facts(
+                question,
+                candidate_facts,
+                mode="direct",
+                lm=worker_lm,
+                use_gbnf=self.enable_gbnf,
+            )
+            return [list(candidate_facts[i]) for i in indices if 0 <= i < len(candidate_facts)]
+
+        def qwen_answer_cot(context: str, question: str) -> dict[str, str]:
+            """Run GBNF-constrained Chain-of-Thought QA on the Qwen GPU model and return {reasoning, answer}."""
+            worker_lm = self._resolve_worker_lm()
+            pred = self.answer_question(
+                context,
+                question,
+                mode="cot",
+                lm=worker_lm,
+                use_gbnf=self.enable_gbnf,
+            )
+            return {
+                "reasoning": str(getattr(pred, "reasoning", "")),
+                "answer": str(getattr(pred, "answer", "")),
+            }
+
+        return [
+            qwen_extract_entities,
+            qwen_extract_triples,
+            qwen_filter_facts,
+            qwen_answer_cot,
+        ]
+
     def _dspy_ctx(self, lm: dspy.LM | None, *, use_json_adapter: bool = True):
         ctx_kwargs: dict[str, Any] = {}
         if lm is not None:
@@ -1015,21 +1156,32 @@ class HippoRAGProgram(dspy.Module):
             ctx_kwargs["adapter"] = self.json_adapter
         return dspy.context(**ctx_kwargs)
 
+    def _should_use_gbnf(self, use_gbnf: bool | None, lm: dspy.LM | None) -> bool:
+        requested = self.enable_gbnf if use_gbnf is None else use_gbnf
+        return bool(requested and lm_supports_gbnf(lm))
+
     def extract_entities(
         self,
         passage: str,
         *,
+        mode: Literal["direct", "rlm"] | None = None,
         lm: dspy.LM | None = None,
         use_gbnf: bool | None = None,
     ) -> Tuple[str, ...]:
-        """Run DSPy NER extraction and return deduplicated non-empty entity strings."""
-        gbnf = self.enable_gbnf if use_gbnf is None else use_gbnf
-        call_kwargs: dict[str, Any] = {}
-        if gbnf:
-            grammar = build_dspy_ner_grammar(self.gbnf_max_entities)
-            call_kwargs["config"] = {"extra_body": {"grammar": grammar}}
-        with self._dspy_ctx(lm, use_json_adapter=True):
-            pred = self.ner(passage=passage, **call_kwargs)
+        """Run DSPy NER extraction (direct on Qwen w/ GBNF, or Mistral RLM orchestrating Qwen)."""
+        active_mode = mode or self.execution_mode
+        if active_mode == "rlm":
+            orch_lm = self._resolve_orchestrator_lm(lm)
+            with self._dspy_ctx(orch_lm, use_json_adapter=False):
+                pred = self.ner_rlm(passage=passage)
+        else:
+            call_kwargs: dict[str, Any] = {}
+            if self._should_use_gbnf(use_gbnf, lm):
+                grammar = build_dspy_ner_grammar(self.gbnf_max_entities)
+                call_kwargs["config"] = {"extra_body": {"grammar": grammar}}
+            with self._dspy_ctx(lm, use_json_adapter=True):
+                pred = self.ner(passage=passage, **call_kwargs)
+
         raw_entities = getattr(pred, "named_entities", [])
         if isinstance(raw_entities, str):
             return extract_named_entities(raw_entities)
@@ -1050,21 +1202,31 @@ class HippoRAGProgram(dspy.Module):
         passage: str,
         named_entities: Sequence[str],
         *,
+        mode: Literal["direct", "rlm"] | None = None,
         lm: dspy.LM | None = None,
         use_gbnf: bool | None = None,
     ) -> Tuple[Tuple[str, str, str], ...]:
-        """Run DSPy entity-conditioned triple extraction and return deduplicated 3-tuples."""
-        gbnf = self.enable_gbnf if use_gbnf is None else use_gbnf
-        call_kwargs: dict[str, Any] = {}
-        if gbnf:
-            grammar = build_dspy_triples_grammar(self.gbnf_max_triples)
-            call_kwargs["config"] = {"extra_body": {"grammar": grammar}}
-        with self._dspy_ctx(lm, use_json_adapter=True):
-            pred = self.triples(
-                passage=passage,
-                named_entities=list(named_entities),
-                **call_kwargs,
-            )
+        """Run DSPy triple extraction (direct on Qwen w/ GBNF, or Mistral RLM orchestrating Qwen)."""
+        active_mode = mode or self.execution_mode
+        if active_mode == "rlm":
+            orch_lm = self._resolve_orchestrator_lm(lm)
+            with self._dspy_ctx(orch_lm, use_json_adapter=False):
+                pred = self.triples_rlm(
+                    passage=passage,
+                    named_entities=list(named_entities),
+                )
+        else:
+            call_kwargs: dict[str, Any] = {}
+            if self._should_use_gbnf(use_gbnf, lm):
+                grammar = build_dspy_triples_grammar(self.gbnf_max_triples)
+                call_kwargs["config"] = {"extra_body": {"grammar": grammar}}
+            with self._dspy_ctx(lm, use_json_adapter=True):
+                pred = self.triples(
+                    passage=passage,
+                    named_entities=list(named_entities),
+                    **call_kwargs,
+                )
+
         raw_triples = getattr(pred, "triples", [])
         if isinstance(raw_triples, str):
             return extract_triples(raw_triples)
@@ -1078,12 +1240,17 @@ class HippoRAGProgram(dspy.Module):
         chunk_id: str,
         passage: str,
         *,
+        mode: Literal["direct", "rlm"] | None = None,
         lm: dspy.LM | None = None,
         use_gbnf: bool | None = None,
     ) -> OpenIERecord:
         """Execute two-stage OpenIE (NER -> Triples) for a passage chunk."""
-        entities = self.extract_entities(passage, lm=lm, use_gbnf=use_gbnf)
-        triples = self.extract_triples(passage, entities, lm=lm, use_gbnf=use_gbnf)
+        entities = self.extract_entities(
+            passage, mode=mode, lm=lm, use_gbnf=use_gbnf
+        )
+        triples = self.extract_triples(
+            passage, entities, mode=mode, lm=lm, use_gbnf=use_gbnf
+        )
         return OpenIERecord(
             chunk_id=chunk_id,
             entities=entities,
@@ -1095,28 +1262,37 @@ class HippoRAGProgram(dspy.Module):
         question: str,
         candidate_facts: Sequence[Union[Tuple[str, str, str], List[str]]],
         *,
+        mode: Literal["direct", "rlm"] | None = None,
         max_facts: int | None = None,
         lm: dspy.LM | None = None,
         use_gbnf: bool | None = None,
     ) -> List[int]:
-        """Filter candidate facts with DSPy recognition memory and return matched indices."""
+        """Filter candidate facts (direct on Qwen w/ GBNF, or Mistral RLM orchestrating Qwen)."""
         if not candidate_facts:
             return []
         effective_max_facts = self.gbnf_max_facts if max_facts is None else max_facts
         fact_before_filter = json.dumps({"fact": [list(f) for f in candidate_facts]})
-        gbnf = self.enable_gbnf if use_gbnf is None else use_gbnf
-        call_kwargs: dict[str, Any] = {}
-        if gbnf:
-            grammar = build_dspy_rerank_grammar(
-                candidate_facts, max_facts=effective_max_facts
-            )
-            call_kwargs["config"] = {"extra_body": {"grammar": grammar}}
-        with self._dspy_ctx(lm, use_json_adapter=True):
-            pred = self.fact_filter(
-                question=question,
-                fact_before_filter=fact_before_filter,
-                **call_kwargs,
-            )
+        active_mode = mode or self.execution_mode
+        if active_mode == "rlm":
+            orch_lm = self._resolve_orchestrator_lm(lm)
+            with self._dspy_ctx(orch_lm, use_json_adapter=False):
+                pred = self.fact_filter_rlm(
+                    question=question,
+                    fact_before_filter=fact_before_filter,
+                )
+        else:
+            call_kwargs: dict[str, Any] = {}
+            if self._should_use_gbnf(use_gbnf, lm):
+                grammar = build_dspy_rerank_grammar(
+                    candidate_facts, max_facts=effective_max_facts
+                )
+                call_kwargs["config"] = {"extra_body": {"grammar": grammar}}
+            with self._dspy_ctx(lm, use_json_adapter=True):
+                pred = self.fact_filter(
+                    question=question,
+                    fact_before_filter=fact_before_filter,
+                    **call_kwargs,
+                )
         raw_after = getattr(pred, "fact", getattr(pred, "fact_after_filter", None))
         generated = _coerce_generated_facts(raw_after)
         return match_facts_to_candidate_indices(
@@ -1136,15 +1312,17 @@ class HippoRAGProgram(dspy.Module):
         active_mode = mode or self.qa_mode
         if active_mode not in ("cot", "rlm"):
             raise ValueError(f"Unsupported QA mode: {active_mode!r}")
-        qa_module = self.qa_rlm if active_mode == "rlm" else self.qa_cot
-        gbnf = self.enable_gbnf if use_gbnf is None else use_gbnf
+        if active_mode == "rlm":
+            orch_lm = self._resolve_orchestrator_lm(lm)
+            with self._dspy_ctx(orch_lm, use_json_adapter=False):
+                return self.qa_rlm(context=context, question=question)
+
         call_kwargs: dict[str, Any] = {}
-        if gbnf and active_mode == "cot":
+        if self._should_use_gbnf(use_gbnf, lm):
             grammar = build_dspy_qa_cot_grammar(self.gbnf_max_reasoning_chars)
             call_kwargs["config"] = {"extra_body": {"grammar": grammar}}
-        # Use JSONAdapter for single-turn CoT, and default ChatAdapter for RLM code blocks
-        with self._dspy_ctx(lm, use_json_adapter=(active_mode == "cot")):
-            return qa_module(context=context, question=question, **call_kwargs)
+        with self._dspy_ctx(lm, use_json_adapter=True):
+            return self.qa_cot(context=context, question=question, **call_kwargs)
 
     def forward(
         self,

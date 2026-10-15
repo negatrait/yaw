@@ -62,23 +62,23 @@ Execute strictly in order `E1-S1` $\to$ `E1-S6`. Never start Sprint $k+1$ until 
   - **`embedding.py` (`dspy.Embedder`):**
     - Wrap `dspy.Embedder(model="openai/...", api_base=..., api_key=..., batch_size=..., caching=True, encoding_format="float")` for Lemonade (`embeddinggemma-300m-GGUF`) or `ollama/...` for Ollama.
     - Apply `distinct-titled` passage prefix (`title: {title} | text: {body}`) and query prefix (`task: search result | query: {query}`) + L2 normalization (`np.float32`).
-  - **`chat.py` (`dspy.LM`):**
-    - Drive `dspy.LM` against Lemonade (`openai/...`) or Ollama (`ollama_chat/...`) with built-in caching (`dspy.configure_cache`):
-      - **Extraction, Rerank & RLM Code/Sub-LM (`Qwen3-4B-Instruct-2507-GGUF`):** CUDA `llamacpp`, `8192–16384` context window, `temp=0.2`, `freq_penalty=0.5`, `stop=["\n\n\n"]`.
-      - **QA Reader (`Mistral-7B-Instruct-v0.3-Hybrid`):** Ryzen AI NPU/iGPU `ryzenai-llm`, `32786` context window, `temp=0.2`, system-prompt folded into first user turn for RyzenAI Jinja compatibility.
-  - **`prompts.py` (`dspy.Signature`s, `dspy.Predict` / `dspy.ChainOfThought` / `dspy.RLM`, `dspy.GEPA`):**
-    - Define 4 typed `dspy.Signature`s seeded with HippoRAG 2 instructions and `dspy.Example` demos:
+  - **`chat.py` (`dspy.LM` & `create_dspy_rlm_pair`):**
+    - Drive `dspy.LM` against Lemonade (`openai/...`) or Ollama (`ollama_chat/...`) with recipe-aware GBNF capability flags (`_yaw_supports_gbnf`):
+      - **GBNF Worker & Direct Extraction/Rerank (`Qwen3-4B-Instruct-2507-GGUF`):** Vulkan GPU `llamacpp`, `8192–16384` context window, `_yaw_supports_gbnf=True`, `temp=0.2`, `freq_penalty=0.5`.
+      - **RLM Orchestrator & QA Reader (`Mistral-7B-Instruct-v0.3-Hybrid`):** Ryzen AI NPU/OGA `ryzenai-llm`, `32786` context window, `_yaw_supports_gbnf=False` (GBNF is not supported on Ryzen AI NPU/OGA).
+      - `create_dspy_rlm_pair()` constructs `(orchestrator_lm, sub_lm)` pairing `Mistral-7B` (NPU orchestrator) with `Qwen3-4B` (GPU GBNF worker).
+  - **`prompts.py` (`dspy.Signature`s, `dspy.JSONAdapter`, Heterogeneous `dspy.RLM` + GBNF, `compute_sizecoding_pareto_score`):**
+    - Define 4 typed `dspy.Signature`s seeded with HippoRAG 2 instructions and `dspy.Example` demos, formatted via **`dspy.JSONAdapter()`** (pure JSON, zero `[[ ## ... ## ]]` output headers):
       1. `ExtractEntities(dspy.Signature)`: `passage: str -> named_entities: list[str]`
       2. `ExtractTriples(dspy.Signature)`: `passage: str, named_entities: list[str] -> triples: list[list[str]]`
-      3. `FilterFacts(dspy.Signature)`: `question: str, fact_before_filter: FactList -> fact_after_filter: FactList` (with `difflib.get_close_matches(..., n=1, cutoff=0.0)` index resolver `filter_reranked_facts`)
+      3. `FilterFacts(dspy.Signature)`: `question: str, fact_before_filter: str -> fact: list[list[str]]` (with `difflib.get_close_matches(..., n=1, cutoff=0.0)` index resolver)
       4. `AnswerQuestion(dspy.Signature)`: `context: str, question: str -> answer: str`
-    - Provide composable `HippoRAGProgram(dspy.Module)`:
-      - Uses single-turn `dspy.Predict` (with `ChatAdapter` + `JSONAdapter` fallback) for fast per-chunk `ExtractEntities`, `ExtractTriples`, and `FilterFacts`.
-      - Supports both `dspy.ChainOfThought(AnswerQuestion)` and **`dspy.RLM(AnswerQuestion, sub_lm=extraction_lm, max_iters=..., max_llm_calls=..., tools=..., interpreter_factory=dspy.LocalInterpreter)`** for multi-hop QA and long contexts—leveraging `Qwen3-4B`'s `8192–16384` context window on CUDA for REPL code/sub-queries so retrieved contexts stay in Python variable space without context rot.
-      - Supports `.save(path)` / `.load(path)` for `dspy.GEPA`-compiled state.
+    - Provide composable `HippoRAGProgram(dspy.Module)` supporting both `execution_mode="direct"` and **`execution_mode="rlm"` across all 4 stages**:
+      - In `execution_mode="rlm"`, `ner_rlm`, `triples_rlm`, `fact_filter_rlm`, and `qa_rlm` run `Mistral-7B` on Ryzen AI NPU as the outer `dspy.RLM` orchestrator inside `dspy.LocalInterpreter` (zero GBNF), delegating inner `qwen_extract_entities`, `qwen_extract_triples`, `qwen_filter_facts`, `qwen_answer_cot`, and `llm_query` calls to `Qwen3-4B` on `llama.cpp` GPU with pure-JSON GBNF grammars (`build_dspy_ner_grammar`, `build_dspy_triples_grammar`, `build_dspy_rerank_grammar`, `build_dspy_qa_cot_grammar`).
+      - Provides `compute_sizecoding_pareto_score` ($\text{pareto} = \text{Recall@5} / (\text{tokens} \times \text{time})$ with hard Tier 1 baseline floor and multi-objective `objective_scores` for `dspy.GEPA`) and `.save(path)` / `.load(path)`.
     - Keep stateless helpers `compute_mdhash_id(content, prefix)`, `text_processing(text)`, `filter_invalid_triples(triples)`, and `filter_reranked_facts(candidate_facts, matched_facts)`.
 - **Drop (Anti-Spaghetti):** Drop `hipporag.llm.openai_gpt.CacheOpenAI`, `hipporag.embedding_model.base.BaseEmbeddingModel`, `hipporag/prompts/prompt_template_manager.py`, and `d1bc65e:src/yaw/nlp/*`.
-- **Exit Gate (`D1-A2`):** `tests/daemon/graph/inference/` passes unmocked tests for `dspy.Embedder`, `dspy.LM`, all 4 `dspy.Signature` modules (`Predict`, `ChainOfThought`, `RLM` with `LocalInterpreter`), `.save()`/`.load()` state round-tripping, and `test_architecture.py` enforces `0` `hipporag` imports inside `yaw/`.
+- **Exit Gate (`D1-A2`):** `tests/daemon/graph/inference/` passes unmocked tests for `dspy.Embedder`, `dspy.LM`, `create_dspy_rlm_pair`, all 4 `dspy.Signature` modules in both direct (`JSONAdapter` + GBNF) and heterogeneous `execution_mode="rlm"` (`Mistral` NPU orchestrator + `Qwen` GPU GBNF worker inside `LocalInterpreter`), `compute_sizecoding_pareto_score`, `.save()`/`.load()` state round-tripping, and `test_architecture.py` enforces `0` `hipporag` imports inside `yaw/`.
 
 ---
 
