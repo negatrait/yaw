@@ -44,7 +44,11 @@ def create_dspy_lm(
     recipe = profile.recipe if profile is not None else None
 
     if temperature is None:
-        if role == "extraction" and profile is not None:
+        if role == "reflection":
+            temperature = profile.reflection_temperature if profile is not None else 0.8
+        elif role == "reflection_worker":
+            temperature = profile.reflection_worker_temperature if profile is not None else 0.7
+        elif role == "extraction" and profile is not None:
             temperature = profile.extraction_temperature
         elif role in ("qa", "rlm") and profile is not None and profile.qa_temperature > 0:
             temperature = profile.qa_temperature
@@ -53,11 +57,15 @@ def create_dspy_lm(
 
     if max_tokens is None:
         # Qwen3-4B runs with an 8192-16384 context window; Mistral-7B Hybrid runs with 32786.
-        max_tokens = 4096 if role == "extraction" else 2048
+        max_tokens = 4096 if role in ("extraction", "reflection") else 2048
 
     lm_kwargs: dict[str, Any] = dict(kwargs)
     if role == "extraction" and profile is not None and profile.frequency_penalty > 0:
         lm_kwargs.setdefault("frequency_penalty", profile.frequency_penalty)
+    elif role == "reflection_worker":
+        freq = profile.reflection_frequency_penalty if profile is not None else 0.3
+        if freq > 0:
+            lm_kwargs.setdefault("frequency_penalty", freq)
     if recipe == "flm":
         lm_kwargs.setdefault("extra_body", {"think": False})
 
@@ -103,6 +111,7 @@ def create_dspy_rlm_pair(
     base_url: str = BASE_URL,
     api_key: str = "lemonade",
     provider: str = "openai",
+    reflection: bool = False,
     cache: bool = True,
     num_retries: int = 0,
 ) -> tuple[dspy.LM, dspy.LM]:
@@ -111,14 +120,16 @@ def create_dspy_rlm_pair(
     - `orchestrator_lm` (`Mistral-7B-Instruct-v0.3-Hybrid` on Ryzen AI NPU/OGA): runs outer `dspy.RLM`
       Python REPL orchestration without GBNF (`_yaw_supports_gbnf=False`).
     - `sub_lm` (`Qwen3-4B-Instruct-2507-GGUF` on `llama.cpp` Vulkan GPU): runs inner `llm_query` and
-      GBNF-constrained `qwen_*` extraction/reranking/CoT worker calls (`_yaw_supports_gbnf=True`).
+      GBNF-constrained `qwen_*` worker calls (`_yaw_supports_gbnf=True`).
+    - When `reflection=True`, configures `orchestrator_lm` with `role="reflection"` (`temp=0.8`, `max_tokens=4096`)
+      and `sub_lm` with `role="reflection_worker"` (`temp=0.7`, `max_tokens=2048`, `freq_penalty=0.3`).
     """
     orchestrator_lm = create_dspy_lm(
         orchestrator_model,
         base_url=base_url,
         api_key=api_key,
         provider=provider,
-        role="rlm",
+        role="reflection" if reflection else "rlm",
         cache=cache,
         num_retries=num_retries,
     )
@@ -127,7 +138,7 @@ def create_dspy_rlm_pair(
         base_url=base_url,
         api_key=api_key,
         provider=provider,
-        role="extraction",
+        role="reflection_worker" if reflection else "extraction",
         cache=cache,
         num_retries=num_retries,
     )

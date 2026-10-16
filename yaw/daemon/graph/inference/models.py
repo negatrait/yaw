@@ -14,7 +14,10 @@ class ChatProfile:
     default_temperature: float = 0.2
     extraction_temperature: float = 0.2
     qa_temperature: float = 0.2
+    reflection_temperature: float = 0.8
+    reflection_worker_temperature: float = 0.7
     frequency_penalty: float = 0.0
+    reflection_frequency_penalty: float = 0.3
     expected_device: str | None = None
     expected_context: int | None = None
 

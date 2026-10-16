@@ -581,7 +581,7 @@ def run_yaw_benchmark(
     if execution_mode == "rlm":
         orch_lm, worker_lm = create_dspy_rlm_pair(
             orchestrator_model=qa_model,
-            worker_model=extraction_model,
+            sub_model=extraction_model,
             base_url=BASE_URL,
         )
         program = HippoRAGProgram(
@@ -594,8 +594,16 @@ def run_yaw_benchmark(
         )
         dspy.settings.configure(lm=orch_lm)
     else:
-        extraction_lm = create_dspy_lm(model_name=extraction_model, base_url=BASE_URL)
-        qa_lm = create_dspy_lm(model_name=qa_model, base_url=BASE_URL) if qa_model != extraction_model else extraction_lm
+        extraction_lm = create_dspy_lm(
+            model_name=extraction_model,
+            base_url=BASE_URL,
+            role="extraction",
+        )
+        qa_lm = (
+            create_dspy_lm(model_name=qa_model, base_url=BASE_URL, role="qa")
+            if qa_model != extraction_model
+            else extraction_lm
+        )
         program = HippoRAGProgram(
             execution_mode="direct",
             qa_mode=cast(Any, qa_mode),
@@ -661,7 +669,37 @@ def run_yaw_benchmark(
                 ).with_inputs("question")
                 for idx, s in enumerate(train_samples)
             ]
-            yaw_engine.evolve_prompts(trainset, mode=cast(Any, evolve), save_path=compiled_program)
+            valset: list[Any] | None = None
+            train_q_set = {s["question"] for s in train_samples}
+            disjoint_val = [
+                (q, gold_answers[idx], gold_docs[idx])
+                for idx, q in enumerate(queries)
+                if q not in train_q_set
+            ]
+            if disjoint_val:
+                valset = [
+                    dspy.Example(
+                        question=q,
+                        gold_answers=ga,
+                        gold_docs=gd,
+                    ).with_inputs("question")
+                    for q, ga, gd in disjoint_val
+                ]
+            ref_lm, ref_worker_lm = create_dspy_rlm_pair(
+                orchestrator_model=DEFAULT_QA_CHAT,
+                sub_model=extraction_model,
+                base_url=BASE_URL,
+                reflection=True,
+            )
+            yaw_engine.evolve_prompts(
+                trainset,
+                valset=valset,
+                mode=cast(Any, evolve),
+                save_path=compiled_program,
+                reflection_lm=ref_lm,
+                reflection_worker_lm=ref_worker_lm,
+                max_metric_calls=max(16, (len(trainset) + len(valset or ())) * 2 + 6),
+            )
 
         eval_start = perf_counter()
         records: list[dict[str, Any]] = []
@@ -881,7 +919,8 @@ def main(
     eval_offset = query_offset
     if train_queries > 0 and evolve != "none":
         train_samples = samples[0:train_queries]
-        eval_offset = max(query_offset, train_queries)
+        if max_queries is not None and train_queries >= max_queries:
+            eval_offset = max(query_offset, train_queries)
 
     docs, queries, gold_docs, gold_answers = build_benchmark_slice(
         dataset, samples, corpus, max_queries=max_queries, query_offset=eval_offset, full_corpus=full_corpus,

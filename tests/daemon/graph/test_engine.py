@@ -335,8 +335,17 @@ def test_engine_evolve_prompts_miprov2_and_gepa_metric_contracts(
     gepa_scores: list[Any] = []
 
     class FakeMIPROv2:
-        def __init__(self, metric: Any, auto: str = "light") -> None:
+        def __init__(
+            self,
+            metric: Any,
+            prompt_model: Any = None,
+            task_model: Any = None,
+            auto: str = "light",
+            **kwargs: Any,
+        ) -> None:
             self.metric = metric
+            self.prompt_model = prompt_model
+            self.task_model = task_model
 
         def compile(self, student: Any, trainset: list[Any], valset: Any = None) -> Any:
             pred = student(question=trainset[0].question)
@@ -349,13 +358,28 @@ def test_engine_evolve_prompts_miprov2_and_gepa_metric_contracts(
 
     class FakeGEPA:
         def __init__(
-            self, metric: Any, reflection_lm: Any = None, auto: str = "light"
+            self,
+            metric: Any,
+            reflection_lm: Any = None,
+            instruction_proposer: Any = None,
+            auto: str = "light",
+            track_stats: bool = False,
+            track_best_outputs: bool = False,
+            log_dir: str | None = None,
+            **kwargs: Any,
         ) -> None:
             self.metric = metric
             self.reflection_lm = reflection_lm
+            self.instruction_proposer = instruction_proposer
             self.auto = auto
+            self.track_stats = track_stats
+            self.track_best_outputs = track_best_outputs
 
         def compile(self, student: Any, trainset: list[Any], valset: Any = None) -> Any:
+            assert self.instruction_proposer is not None
+            assert callable(self.instruction_proposer)
+            assert self.track_stats is True
+            assert self.track_best_outputs is True
             pred = student(question=trainset[0].question)
             res = self.metric(trainset[0], pred)
             gepa_scores.append(res)

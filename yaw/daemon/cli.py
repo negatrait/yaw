@@ -92,18 +92,51 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_opt.add_argument(
         "--dataset",
-        type=str,
+        "--datasets",
+        dest="dataset",
+        nargs="*",
         default=None,
-        help="Optional path to JSON list of {question, gold_answers, gold_docs} training examples",
+        help=(
+            "One or more Tier 1 dataset names (sample, 2wikimultihopqa, musique, hotpotqa) "
+            "or path to a JSON list of training examples (defaults to yaw.toml [optimization].datasets)"
+        ),
     )
     p_opt.add_argument(
         "--mode",
+        "--evolve",
+        dest="mode",
         choices=["miprov2", "gepa", "hybrid"],
-        default="hybrid",
-        help="Prompt optimization mode (default: hybrid)",
+        default=None,
+        help="Prompt optimization mode (defaults to yaw.toml [optimization].mode)",
+    )
+    p_opt.add_argument(
+        "--max-queries",
+        type=int,
+        default=None,
+        help="Maximum queries to load from dataset slice (defaults to yaw.toml [optimization].max_queries, max 50 on Tier 2 corpora)",
+    )
+    p_opt.add_argument(
+        "--train-queries",
+        type=int,
+        default=None,
+        help="Number of queries for training [0:K], leaving [K:max_queries] for validation (defaults to yaw.toml [optimization].train_queries)",
+    )
+    p_opt.add_argument(
+        "--query-offset",
+        type=int,
+        default=None,
+        help="Starting query offset in the dataset (defaults to yaw.toml [optimization].query_offset)",
+    )
+    p_opt.add_argument(
+        "--max-metric-calls",
+        type=int,
+        default=None,
+        help="Optional explicit GEPA evaluation budget (defaults to yaw.toml [optimization].max_metric_calls)",
     )
     p_opt.add_argument(
         "--output",
+        "--compiled-program",
+        dest="output",
         type=str,
         default=None,
         help="Override output path for compiled_program.json",
@@ -162,25 +195,197 @@ def inspect_status(config: YawConfig) -> dict[str, Any]:
     }
 
 
-def _load_training_examples(dataset_path: str | None) -> list[dspy.Example]:
-    if dataset_path is not None:
-        raw_items = json.loads(Path(dataset_path).read_text(encoding="utf-8"))
-        return [
+_TIER2_CORPORA = frozenset({"2wikimultihopqa", "musique", "hotpotqa"})
+_KNOWN_DATASETS = frozenset({"sample", "2wikimultihopqa", "musique", "hotpotqa"})
+
+
+def _extract_item_gold_answers(item: dict[str, Any]) -> list[str]:
+    if "gold_answers" in item:
+        raw = item["gold_answers"]
+    elif "answer" in item or "gold_ans" in item:
+        raw = item.get("answer", item.get("gold_ans"))
+    elif "reference" in item:
+        raw = item["reference"]
+    else:
+        raw = []
+    ans = [raw] if isinstance(raw, str) else [str(a) for a in (raw or ())]
+    ans.extend(str(a) for a in item.get("answer_aliases", ()))
+    return list(dict.fromkeys(ans))
+
+
+def _extract_item_docs_and_gold(
+    item: dict[str, Any],
+    dataset_name: str = "",
+) -> tuple[list[str], list[str]]:
+    if "gold_docs" in item and "paragraphs" not in item and "context" not in item and "contexts" not in item:
+        g_docs = [str(d) for d in item.get("gold_docs", ())]
+        return g_docs, g_docs
+
+    separator = "" if dataset_name.startswith("hotpotqa") else " "
+    all_docs: list[str] = []
+    gold_docs: list[str] = []
+
+    if "supporting_facts" in item and "context" in item:
+        gold_titles = { sf[0] for sf in item["supporting_facts"] }
+        for title, sents in item["context"]:
+            passage = f"{title}\n{separator.join(sents)}"
+            all_docs.append(passage)
+            if title in gold_titles:
+                gold_docs.append(passage)
+    elif "contexts" in item:
+        for ctx in item["contexts"]:
+            passage = f"{ctx['title']}\n{ctx['text']}"
+            all_docs.append(passage)
+            if ctx.get("is_supporting", True):
+                gold_docs.append(passage)
+    elif "paragraphs" in item:
+        for p in item["paragraphs"]:
+            text = p["text"] if "text" in p else p.get("paragraph_text", "")
+            passage = f"{p['title']}\n{text}"
+            all_docs.append(passage)
+            if p.get("is_supporting", True):
+                gold_docs.append(passage)
+
+    return list(dict.fromkeys(all_docs)), list(dict.fromkeys(gold_docs))
+
+
+def _load_single_dataset_examples(
+    dataset_name: str,
+    *,
+    workspace_root: Path | None = None,
+    max_queries: int = 10,
+    query_offset: int = 0,
+) -> tuple[list[dspy.Example], list[str]]:
+    ds_clean = dataset_name.strip()
+    ds_lower = Path(ds_clean).stem.lower()
+    if (ds_clean in _TIER2_CORPORA or ds_lower in _TIER2_CORPORA) and max_queries > 50:
+        raise YawRuntimeError(
+            "INVALID_INPUT",
+            f"Anti-overfitting policy forbids prompt evolution on >50 queries of Tier 2 dataset '{ds_clean}' (got max_queries={max_queries}).",
+        )
+
+    candidate_path = Path(ds_clean)
+    if not candidate_path.exists() and ds_clean in _KNOWN_DATASETS:
+        roots = [Path.cwd()]
+        if workspace_root is not None:
+            roots.insert(0, workspace_root)
+        for root in roots:
+            cached = root / "outputs" / "datasets" / f"{ds_clean}.json"
+            if cached.exists():
+                candidate_path = cached
+                break
+
+    if not candidate_path.exists():
+        raise YawRuntimeError("INVALID_INPUT", f"Training dataset not found: {ds_clean}")
+
+    raw_items = json.loads(candidate_path.read_text(encoding="utf-8"))
+    start = max(0, int(query_offset))
+    sliced = list(raw_items)[start : start + max_queries]
+    examples: list[dspy.Example] = []
+    corpus_docs: list[str] = []
+    for item in sliced:
+        item_docs, gold_docs = _extract_item_docs_and_gold(item, ds_lower)
+        corpus_docs.extend(item_docs)
+        examples.append(
             dspy.Example(
                 question=str(item["question"]),
-                gold_answers=list(item.get("gold_answers", item.get("answer", []))),
-                gold_docs=list(item.get("gold_docs", [])),
+                gold_answers=_extract_item_gold_answers(item),
+                gold_docs=gold_docs,
             ).with_inputs("question")
-            for item in raw_items
-        ]
+        )
+    return examples, list(dict.fromkeys(corpus_docs))
 
-    return [
-        dspy.Example(
-            question="When was the University of Southampton founded?",
-            gold_answers=["1862"],
-            gold_docs=[],
-        ).with_inputs("question")
-    ]
+
+def _load_dataset_splits(
+    dataset_args: Sequence[str] | str | None,
+    *,
+    workspace_root: Path | None = None,
+    max_queries: int = 20,
+    train_queries: int = 7,
+    query_offset: int = 0,
+) -> tuple[list[dspy.Example], list[dspy.Example] | None, list[str]]:
+    if max_queries < 1:
+        raise YawRuntimeError("INVALID_INPUT", "max_queries must be >= 1.")
+
+    if not dataset_args:
+        return (
+            [
+                dspy.Example(
+                    question="When was the University of Southampton founded?",
+                    gold_answers=["1862"],
+                    gold_docs=[],
+                ).with_inputs("question")
+            ],
+            None,
+            [],
+        )
+
+    if isinstance(dataset_args, str):
+        ds_list = [p.strip() for p in dataset_args.split(",") if p.strip()]
+    else:
+        ds_list = []
+        for item in dataset_args:
+            for sub in str(item).split(","):
+                if sub.strip():
+                    ds_list.append(sub.strip())
+
+    train_per_ds: list[list[dspy.Example]] = []
+    val_per_ds: list[list[dspy.Example]] = []
+    all_corpus_docs: list[str] = []
+
+    for ds_name in ds_list:
+        d_examples, d_docs = _load_single_dataset_examples(
+            ds_name,
+            workspace_root=workspace_root,
+            max_queries=max_queries,
+            query_offset=query_offset,
+        )
+        all_corpus_docs.extend(d_docs)
+        if 0 < train_queries < len(d_examples):
+            train_per_ds.append(d_examples[:train_queries])
+            val_per_ds.append(d_examples[train_queries:])
+        else:
+            train_per_ds.append(d_examples)
+            val_per_ds.append([])
+
+    # Interleave training examples across datasets for balanced mini-batches
+    trainset: list[dspy.Example] = []
+    max_t = max((len(t) for t in train_per_ds), default=0)
+    for i in range(max_t):
+        for t in train_per_ds:
+            if i < len(t):
+                trainset.append(t[i])
+
+    # Interleave validation examples across datasets
+    valset_list: list[dspy.Example] = []
+    max_v = max((len(v) for v in val_per_ds), default=0)
+    for i in range(max_v):
+        for v in val_per_ds:
+            if i < len(v):
+                valset_list.append(v[i])
+
+    valset = valset_list if valset_list else None
+    return trainset, valset, list(dict.fromkeys(all_corpus_docs))
+
+
+def _load_training_examples(
+    dataset_arg: Sequence[str] | str | None,
+    *,
+    workspace_root: Path | None = None,
+    max_queries: int = 10,
+    query_offset: int = 0,
+) -> tuple[list[dspy.Example], list[str]]:
+    trainset, valset, corpus_docs = _load_dataset_splits(
+        dataset_arg,
+        workspace_root=workspace_root,
+        max_queries=max_queries,
+        train_queries=max_queries,
+        query_offset=query_offset,
+    )
+    all_examples = list(trainset)
+    if valset:
+        all_examples.extend(valset)
+    return all_examples, corpus_docs
 
 
 def handle_run(
@@ -358,8 +563,49 @@ def handle_optimize(
     embedder: DSPyEmbeddingAdapter | None = None,
 ) -> int:
     """Compile DSPy prompts via MIPROv2/GEPA and save compiled_program.json."""
-    trainset = _load_training_examples(getattr(args, "dataset", None))
-    mode = getattr(args, "mode", "hybrid")
+    raw_dataset = getattr(args, "dataset", None)
+    if raw_dataset is not None:
+        if isinstance(raw_dataset, str):
+            dataset_args = [p.strip() for p in raw_dataset.split(",") if p.strip()]
+        elif isinstance(raw_dataset, (list, tuple)):
+            dataset_args = []
+            for item in raw_dataset:
+                for sub in str(item).split(","):
+                    if sub.strip():
+                        dataset_args.append(sub.strip())
+        else:
+            dataset_args = [str(raw_dataset)]
+    else:
+        dataset_args = list(config.optimize_datasets)
+
+    raw_max_q = getattr(args, "max_queries", None)
+    max_queries = int(raw_max_q if raw_max_q is not None else config.optimize_max_queries)
+
+    raw_offset = getattr(args, "query_offset", None)
+    query_offset = int(raw_offset if raw_offset is not None else config.optimize_query_offset)
+
+    raw_train_q = getattr(args, "train_queries", None)
+    train_queries = int(
+        raw_train_q if raw_train_q is not None else config.optimize_train_queries
+    )
+
+    raw_budget = getattr(args, "max_metric_calls", None)
+    max_metric_calls = (
+        int(raw_budget)
+        if raw_budget is not None
+        else config.optimize_max_metric_calls
+    )
+
+    trainset, valset, corpus_docs = _load_dataset_splits(
+        dataset_args,
+        workspace_root=config.workspace_root,
+        max_queries=max_queries,
+        train_queries=train_queries,
+        query_offset=query_offset,
+    )
+
+    raw_mode = getattr(args, "mode", None)
+    mode = raw_mode if raw_mode is not None else config.optimize_mode
     out_override = getattr(args, "output", None)
 
     runtime = YawRuntime(config, program=program, embedder=embedder, auto_poll=False)
@@ -367,13 +613,28 @@ def handle_optimize(
     try:
         saved_path = runtime.optimize(
             trainset=trainset,
+            valset=valset,
             mode=mode,
             save_path=out_override,
+            max_metric_calls=max_metric_calls,
+            corpus_docs=corpus_docs,
         )
-        payload = {
+        proposer_telemetry = saved_path.parent / f"{saved_path.stem}_proposer_telemetry.json"
+        gepa_telemetry_dir = saved_path.parent / f"{saved_path.stem}_telemetry"
+        payload: dict[str, Any] = {
             "optimized": True,
             "mode": mode,
+            "dataset": dataset_args[0] if len(dataset_args) == 1 else dataset_args,
+            "datasets": dataset_args,
+            "train_queries": len(trainset),
+            "val_queries": len(valset) if valset is not None else 0,
             "compiled_program_path": str(saved_path),
+            "proposer_telemetry_path": (
+                str(proposer_telemetry) if proposer_telemetry.exists() else None
+            ),
+            "gepa_telemetry_dir": (
+                str(gepa_telemetry_dir) if gepa_telemetry_dir.exists() else None
+            ),
             "stats": runtime.stats().to_dict(),
         }
         sys.stdout.write(json.dumps(payload, indent=2) + "\n")
@@ -419,8 +680,14 @@ def main(
         return 1
 
 
+def cli_entrypoint() -> None:
+    """Console script entrypoint for `yaw`."""
+    raise SystemExit(main())
+
+
 __all__ = [
     "build_parser",
+    "cli_entrypoint",
     "handle_optimize",
     "handle_rebuild",
     "handle_run",

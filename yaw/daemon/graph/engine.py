@@ -4,7 +4,6 @@ import json
 import re
 import sqlite3
 import threading
-import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Literal
@@ -18,6 +17,7 @@ from yaw.daemon.graph.inference import (
     PASSAGE_INSTRUCTION,
     DSPyEmbeddingAdapter,
     HippoRAGProgram,
+    RLMInstructionProposer,
     compute_mdhash_id,
     compute_qa_em_f1,
     compute_sizecoding_pareto_score,
@@ -184,19 +184,28 @@ class YawGraphEngine:
             results.extend(self.embedder.encode(batch, instruction=instruction))
         return results
 
+    @staticmethod
+    def _format_hydrated_passage(p: ChunkPointer, text: str) -> str:
+        if not p.title:
+            return text
+        if text.startswith(f"{p.title}\n") or text == p.title:
+            return f"Wikipedia Title: {text}"
+        return f"Wikipedia Title: {p.title}\n{text}"
+
     def _program_retrieval_hook(
         self,
         question: str,
+        program: HippoRAGProgram | None = None,
     ) -> tuple[str, tuple[str, ...], tuple[float, ...]]:
         """Internal retrieval hook wired into HippoRAGProgram for end-to-end DSPy trace compilation."""
-        hits = self.retrieve(question, top_k=max(20, self.retrieval_top_k))
+        hits = self.retrieve(question, top_k=max(20, self.retrieval_top_k), program=program)
         if not hits:
             return "", (), ()
         passages = tuple(p.chunk_id for p, _, _ in hits)
         scores = tuple(s for _, s, _ in hits)
         qa_hits = hits[: self.retrieval_top_k]
         formatted_context = "\n\n".join(
-            f"Wikipedia Title: {p.title}\n{text}" if p.title else text
+            self._format_hydrated_passage(p, text)
             for p, _, text in qa_hits
         )
         return formatted_context, passages, scores
@@ -420,8 +429,10 @@ class YawGraphEngine:
         top_k: int = 10,
         *,
         allow_intent_path: bool = True,
+        program: HippoRAGProgram | None = None,
     ) -> tuple[list[tuple[ChunkPointer, float, str]], list[tuple[str, str, str]]]:
         """Retrieve top-k chunks and return both hydrated hits and kept recognition-memory facts."""
+        active_program = program if program is not None else self.program
         with self._lock:
             graph = self._ensure_csr_graph()
             if len(graph.chunk_indices) == 0 or top_k <= 0:
@@ -491,16 +502,17 @@ class YawGraphEngine:
                     for fid, _, _ in top_candidates
                 ]
 
-                filter_indices = self.program.filter_facts(query, candidate_triples)
+                filter_indices = active_program.filter_facts(query, candidate_triples)
                 for idx in filter_indices:
                     if 0 <= idx < len(top_candidates):
                         kept_facts_with_scores.append((candidate_triples[idx], float(candidate_scores[idx])))
 
             if not kept_facts_with_scores and allow_intent_path:
                 return self.retrieve_with_seeds(
-                    self.program.extract_query_intent(query),
+                    active_program.extract_query_intent(query),
                     top_k=top_k,
                     allow_intent_path=False,
+                    program=active_program,
                 )
 
             # 2. Hybrid Dense + Lexical Passage Seeding
@@ -596,9 +608,11 @@ class YawGraphEngine:
         self,
         query: str,
         top_k: int = 10,
+        *,
+        program: HippoRAGProgram | None = None,
     ) -> list[tuple[ChunkPointer, float, str]]:
         """Retrieve top-k chunks for query using hybrid PPR + 1-indexed line hydration."""
-        hits, _ = self.retrieve_with_seeds(query, top_k=top_k)
+        hits, _ = self.retrieve_with_seeds(query, top_k=top_k, program=program)
         return hits
 
     def retrieve_dpr(
@@ -639,7 +653,7 @@ class YawGraphEngine:
             retrieved_cids = [p.chunk_id for p, _, _ in hits]
             retrieved_scores = [s for _, s, _ in hits]
             formatted_context = "\n\n".join(
-                f"Wikipedia Title: {p.title}\n{text}" if p.title else text
+                self._format_hydrated_passage(p, text)
                 for p, _, text in hits
             )
 
@@ -675,18 +689,14 @@ class YawGraphEngine:
         mode: Literal["miprov2", "gepa", "hybrid"] = "hybrid",
         save_path: Path | str | None = None,
         reflection_lm: Any = None,
+        reflection_worker_lm: Any = None,
+        max_metric_calls: int | None = None,
     ) -> HippoRAGProgram:
         """Evolve DSPy prompts via MIPROv2, GEPA, or two-phase hybrid with composite Sizecoding feedback."""
         if not trainset:
             return self.program
 
-        last_tick = [time.perf_counter()]
-
         def _evaluate_prediction(gold: Any, pred: Any, pred_name: Any = None) -> dspy.Prediction:
-            now = time.perf_counter()
-            elapsed = max(1e-3, now - last_tick[0])
-            last_tick[0] = now
-
             gold_answers_raw = getattr(gold, "gold_answers", getattr(gold, "answer", []))
             if isinstance(gold_answers_raw, str):
                 gold_answers = [gold_answers_raw]
@@ -694,7 +704,6 @@ class YawGraphEngine:
                 gold_answers = [str(a) for a in (gold_answers_raw or ())]
 
             pred_answer = str(getattr(pred, "answer", "")).strip()
-            reasoning = str(getattr(pred, "reasoning", "")).strip()
             context_str = str(getattr(pred, "context", ""))
 
             gold_docs_raw = getattr(gold, "gold_docs", None)
@@ -725,12 +734,28 @@ class YawGraphEngine:
             if gold_answers:
                 em_score, f1_score = compute_qa_em_f1(pred_answer, gold_answers)
                 if em_score < 1.0:
-                    missed.extend(gold_answers)
+                    missed.append(f"Predicted={pred_answer!r} != Expected={gold_answers!r}")
                 if not gold_docs_raw:
                     for k in (1, 2, 5, 10, 20):
                         recalls_by_k[k] = em_score
 
-            est_tokens = max(1, (len(pred_answer) + len(reasoning) + len(context_str) // 8) // 4)
+            usage_tokens = 0
+            if hasattr(pred, "get_lm_usage") and callable(pred.get_lm_usage):
+                usage_map = pred.get_lm_usage() or {}
+                if isinstance(usage_map, dict):
+                    for model_usage in usage_map.values():
+                        if isinstance(model_usage, dict):
+                            usage_tokens += int(
+                                model_usage.get("completion_tokens")
+                                or model_usage.get("output_tokens")
+                                or model_usage.get("total_tokens")
+                                or 0
+                            )
+            if usage_tokens <= 0:
+                raise RuntimeError(
+                    "Missing LM token usage on prediction (`pred.get_lm_usage()` returned 0 tokens). "
+                    "Ensure `track_usage=True` is active and task LMs report non-zero token usage."
+                )
             return compute_sizecoding_pareto_score(
                 recalls_by_k[5],
                 recall_at_1=recalls_by_k[1],
@@ -739,8 +764,7 @@ class YawGraphEngine:
                 recall_at_20=recalls_by_k[20],
                 em=em_score,
                 f1=f1_score,
-                tokens=est_tokens,
-                elapsed_seconds=elapsed,
+                tokens=usage_tokens,
                 pred_name=str(pred_name) if pred_name else None,
                 missed_items=missed,
             )
@@ -758,28 +782,92 @@ class YawGraphEngine:
             return _evaluate_prediction(gold, pred, pred_name=pred_name)
 
         compiled = self.program
+        resolved_ref_lm = (
+            reflection_lm
+            or self.program.orchestrator_lm
+            or self.program.rlm_sub_lm
+            or getattr(dspy.settings, "lm", None)
+        )
+        resolved_worker_lm = (
+            reflection_worker_lm
+            or self.program.rlm_sub_lm
+            or self.program.orchestrator_lm
+            or resolved_ref_lm
+        )
+        proposer = RLMInstructionProposer(
+            orchestrator_lm=resolved_ref_lm,
+            worker_lm=resolved_worker_lm,
+            enable_gbnf=True,
+        )
 
-        if mode in ("miprov2", "hybrid") and hasattr(dspy, "MIPROv2"):
-            optimizer = dspy.MIPROv2(metric=_mipro_metric, auto="light")
-            compiled = optimizer.compile(
-                compiled,
-                trainset=list(trainset),
-                valset=list(valset) if valset else None,
+        # Disable DSPy disk cache on task LMs during prompt evolution so DSPy's
+        # `if not result.cache_hit:` in `dspy/clients/execution.py` never drops token usage
+        # on repeated predictor calls across GEPA rounds.
+        task_lms = [
+            lm
+            for lm in (
+                self.program.orchestrator_lm,
+                self.program.rlm_sub_lm,
+                getattr(dspy.settings, "lm", None),
             )
+            if lm is not None and hasattr(lm, "cache")
+        ]
+        saved_cache_flags = [(lm, bool(getattr(lm, "cache", False))) for lm in task_lms]
+        for lm, _ in saved_cache_flags:
+            setattr(lm, "cache", False)
 
-        if mode in ("gepa", "hybrid") and hasattr(dspy, "GEPA"):
-            resolved_ref_lm = (
-                reflection_lm
-                or self.program.orchestrator_lm
-                or self.program.rlm_sub_lm
-                or getattr(dspy.settings, "lm", None)
-            )
-            gepa = dspy.GEPA(metric=_gepa_metric, reflection_lm=resolved_ref_lm, auto="light")
-            compiled = gepa.compile(
-                compiled,
-                trainset=list(trainset),
-                valset=list(valset) if valset else None,
-            )
+        try:
+            if mode in ("miprov2", "hybrid") and hasattr(dspy, "MIPROv2"):
+                optimizer = dspy.MIPROv2(
+                    metric=_mipro_metric,
+                    prompt_model=resolved_ref_lm,
+                    task_model=resolved_worker_lm,
+                    auto="light",
+                )
+                with dspy.context(track_usage=True):
+                    compiled = optimizer.compile(
+                        compiled,
+                        trainset=list(trainset),
+                        valset=list(valset) if valset else None,
+                    )
+
+            if mode in ("gepa", "hybrid") and hasattr(dspy, "GEPA"):
+                gepa_log_dir = (
+                    str(Path(save_path).parent / f"{Path(save_path).stem}_telemetry")
+                    if save_path is not None
+                    else None
+                )
+                budget_kwargs: dict[str, Any] = (
+                    {"max_metric_calls": max_metric_calls}
+                    if max_metric_calls is not None
+                    else {"auto": "light"}
+                )
+                gepa = dspy.GEPA(
+                    metric=_gepa_metric,
+                    reflection_lm=resolved_ref_lm,
+                    instruction_proposer=proposer,
+                    reflection_minibatch_size=3,
+                    candidate_selection_strategy="pareto",
+                    skip_perfect_score=True,
+                    use_merge=True,
+                    component_selector="all",
+                    track_stats=True,
+                    track_best_outputs=True,
+                    warn_on_score_mismatch=False,
+                    log_dir=gepa_log_dir,
+                    seed=0,
+                    gepa_kwargs={"use_cloudpickle": True},
+                    **budget_kwargs,
+                )
+                with dspy.context(track_usage=True):
+                    compiled = gepa.compile(
+                        compiled,
+                        trainset=list(trainset),
+                        valset=list(valset) if valset else None,
+                    )
+        finally:
+            for lm, orig_flag in saved_cache_flags:
+                setattr(lm, "cache", orig_flag)
 
         self.program = compiled
         self.program.set_retrieval_hook(self._program_retrieval_hook)
@@ -788,7 +876,13 @@ class YawGraphEngine:
         if save_path is not None:
             p = Path(save_path)
             p.parent.mkdir(parents=True, exist_ok=True)
-            self.program.save(str(p))
+            self.program.save(str(p), save_program=False)
+            if proposer.telemetry:
+                telemetry_path = p.parent / f"{p.stem}_proposer_telemetry.json"
+                telemetry_path.write_text(
+                    json.dumps(proposer.telemetry, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
 
         return self.program
 

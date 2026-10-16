@@ -8,7 +8,7 @@ import json
 import threading
 import time
 from collections.abc import Sequence
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +48,11 @@ class DeterministicTestLM(dspy.LM):
         if self.fail_online:
             raise ConnectionError("Inference server at http://localhost:13305/api/v1 is unreachable")
         req_str = str(prompt or messages or kwargs)
+        if dspy.settings.usage_tracker is not None:
+            dspy.settings.usage_tracker.add_usage(
+                self.model,
+                {"prompt_tokens": 32, "completion_tokens": 16, "total_tokens": 48},
+            )
         if "FilterFacts" in req_str or "fact_before_filter" in req_str:
             if "Turing" in req_str:
                 return ['{"fact": [["Alan Turing", "worked at", "Bletchley Park"]]}']
@@ -392,7 +397,7 @@ def test_inference_outage_degradation_and_recovery(tmp_path: Path) -> None:
 
 
 def test_optimize_and_reload_compiled_program_with_composite_fitness(tmp_path: Path) -> None:
-    """D1-A4: Verify composite fitness formula (Recall@1..20 * EM * F1) / (tokens * time) and full-surface persistence."""
+    """D1-A4: Verify composite fitness formula (Recall@1..20 * EM * F1) / tokens and full-surface persistence."""
     # 1. Verify exact composite fitness calculation in compute_sizecoding_pareto_score
     pred_metric = compute_sizecoding_pareto_score(
         0.8,
@@ -403,10 +408,9 @@ def test_optimize_and_reload_compiled_program_with_composite_fitness(tmp_path: P
         em=1.0,
         f1=0.9,
         tokens=50,
-        elapsed_seconds=0.2,
     )
     expected_quality = 0.5 * 0.6 * 0.8 * 1.0 * 1.0 * 1.0 * 0.9
-    expected_pareto_raw = expected_quality / (50 * 0.2)
+    expected_pareto_raw = expected_quality / 50
     assert pytest.approx(pred_metric.quality_numerator) == expected_quality
     assert pytest.approx(pred_metric.pareto_raw) == expected_pareto_raw
     assert "em" in pred_metric.objective_scores
@@ -434,13 +438,31 @@ def test_optimize_and_reload_compiled_program_with_composite_fitness(tmp_path: P
     prog.ner.signature = prog.ner.signature.with_instructions("Optimized NER surface instruction.")
 
     class StubGEPA:
-        def __init__(self, metric: Any, reflection_lm: Any = None, auto: str = "light") -> None:
+        def __init__(
+            self,
+            metric: Any,
+            reflection_lm: Any = None,
+            instruction_proposer: Any = None,
+            auto: str = "light",
+            track_stats: bool = False,
+            track_best_outputs: bool = False,
+            log_dir: str | None = None,
+            **kwargs: Any,
+        ) -> None:
             self.metric = metric
             self.reflection_lm = reflection_lm
+            self.instruction_proposer = instruction_proposer
             self.auto = auto
+            self.track_stats = track_stats
+            self.track_best_outputs = track_best_outputs
+            self.log_dir = log_dir
 
         def compile(self, student: Any, trainset: list[Any], valset: Any = None) -> Any:
             assert self.reflection_lm is not None
+            assert self.instruction_proposer is not None
+            assert callable(self.instruction_proposer)
+            assert self.track_stats is True
+            assert self.track_best_outputs is True
             pred = student(question=trainset[0].question)
             score_pred = self.metric(trainset[0], pred, pred_name="qa")
             assert score_pred.score > 0.0
@@ -548,3 +570,210 @@ def test_cli_subcommands_sync_status_rebuild_and_stop(tmp_path: Path) -> None:
     assert stop_out["stopped"] is True
     run_thread.join(timeout=5.0)
     assert not run_thread.is_alive()
+
+
+def test_cli_optimize_ergonomics_and_anti_overfitting_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify `python -m yaw optimize` CLI ergonomics: benchmark slice parsing, train/val split, telemetry paths, and Tier 2 anti-overfitting guard."""
+    _, toml_path = _make_test_config(tmp_path)
+    prog, emb, _, _ = _make_program_and_embedder()
+
+    # Write a 6-query benchmark-format dataset JSON (with paragraphs + is_supporting)
+    bench_dataset_path = tmp_path / "tier1_slice.json"
+    bench_samples = [
+        {
+            "id": f"q-{i}",
+            "question": f"Where did Scientist {i} work?",
+            "answer": [f"Institute {i}"],
+            "paragraphs": [
+                {
+                    "title": f"Scientist {i}",
+                    "text": f"Scientist {i} worked at Institute {i}.",
+                    "is_supporting": True,
+                },
+                {
+                    "title": f"Distractor {i}",
+                    "text": f"Distractor {i} is unrelated.",
+                    "is_supporting": False,
+                },
+            ],
+        }
+        for i in range(6)
+    ]
+    bench_dataset_path.write_text(json.dumps(bench_samples), encoding="utf-8")
+
+    captured_gepa: dict[str, Any] = {}
+
+    class CaptureGEPA:
+        def __init__(self, metric: Any, **kwargs: Any) -> None:
+            captured_gepa["metric"] = metric
+            captured_gepa.update(kwargs)
+
+        def compile(self, student: Any, trainset: list[Any], valset: Any = None) -> Any:
+            captured_gepa["trainset_len"] = len(trainset)
+            captured_gepa["valset_len"] = len(valset) if valset is not None else 0
+            proposer = captured_gepa.get("instruction_proposer")
+            if proposer is not None and hasattr(proposer, "telemetry"):
+                proposer.telemetry.append(
+                    {
+                        "component_name": "qa_cot.predict",
+                        "previous_instruction": "old",
+                        "new_instruction": "new",
+                        "num_feedback_examples": len(trainset),
+                    }
+                )
+            return student
+
+    monkeypatch.setattr(dspy, "GEPA", CaptureGEPA, raising=False)
+
+    out_compiled = tmp_path / "custom_compiled.json"
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = main(
+            [
+                "optimize",
+                "--config",
+                str(toml_path),
+                "--dataset",
+                str(bench_dataset_path),
+                "--mode",
+                "gepa",
+                "--max-queries",
+                "6",
+                "--train-queries",
+                "4",
+                "--max-metric-calls",
+                "12",
+                "--output",
+                str(out_compiled),
+            ],
+            program=prog,
+            embedder=emb,
+        )
+    assert rc == 0
+    opt_out = json.loads(buf.getvalue())
+    assert opt_out["optimized"] is True
+    assert opt_out["mode"] == "gepa"
+    assert opt_out["train_queries"] == 4
+    assert opt_out["val_queries"] == 2
+    assert Path(opt_out["compiled_program_path"]).exists()
+    assert Path(opt_out["proposer_telemetry_path"]).exists()
+    assert opt_out["stats"]["chunks"] >= 6
+    assert captured_gepa["trainset_len"] == 4
+    assert captured_gepa["valset_len"] == 2
+    assert captured_gepa["max_metric_calls"] == 12
+
+    # Anti-Overfitting Rule: Reject full Tier 2 benchmark optimization (--max-queries > 50)
+    err_buf = io.StringIO()
+    with redirect_stderr(err_buf):
+        rc_overfit = main(
+            [
+                "optimize",
+                "--config",
+                str(toml_path),
+                "--dataset",
+                "2wikimultihopqa",
+                "--max-queries",
+                "100",
+            ],
+            program=prog,
+            embedder=emb,
+        )
+    assert rc_overfit == 1
+    err_payload = json.loads(err_buf.getvalue())
+    assert err_payload["error"] == "INVALID_INPUT"
+
+
+def test_cli_optimize_multi_dataset_interleaved_splits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify multi-dataset optimization: array of datasets, interleaved train/val splits, and budget allocation."""
+    _, toml_path = _make_test_config(tmp_path)
+    prog, emb, _, _ = _make_program_and_embedder()
+
+    # Create 3 synthetic datasets (each with 10 questions)
+    ds_paths: list[Path] = []
+    for d_name in ["alpha", "beta", "gamma"]:
+        ds_file = tmp_path / f"ds_{d_name}.json"
+        samples = [
+            {
+                "id": f"{d_name}-{i}",
+                "question": f"Question {d_name} {i}?",
+                "answer": [f"Answer {d_name} {i}"],
+                "paragraphs": [
+                    {
+                        "title": f"Doc {d_name} {i}",
+                        "text": f"Content for {d_name} {i}.",
+                        "is_supporting": True,
+                    }
+                ],
+            }
+            for i in range(10)
+        ]
+        ds_file.write_text(json.dumps(samples), encoding="utf-8")
+        ds_paths.append(ds_file)
+
+    captured_gepa: dict[str, Any] = {}
+
+    class CaptureGEPA:
+        def __init__(self, metric: Any, **kwargs: Any) -> None:
+            captured_gepa["metric"] = metric
+            captured_gepa.update(kwargs)
+
+        def compile(self, student: Any, trainset: list[Any], valset: Any = None) -> Any:
+            captured_gepa["trainset"] = trainset
+            captured_gepa["valset"] = valset
+            return student
+
+    monkeypatch.setattr(dspy, "GEPA", CaptureGEPA, raising=False)
+
+    out_compiled = tmp_path / "multi_compiled.json"
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = main(
+            [
+                "optimize",
+                "--config",
+                str(toml_path),
+                "--datasets",
+                str(ds_paths[0]),
+                str(ds_paths[1]),
+                str(ds_paths[2]),
+                "--mode",
+                "gepa",
+                "--max-queries",
+                "10",
+                "--train-queries",
+                "7",
+                "--max-metric-calls",
+                "20",
+                "--output",
+                str(out_compiled),
+            ],
+            program=prog,
+            embedder=emb,
+        )
+    assert rc == 0
+    opt_out = json.loads(buf.getvalue())
+    assert opt_out["optimized"] is True
+    # 3 datasets * 7 train queries = 21 training queries (satisfies DSPy 20 minimum!)
+    assert opt_out["train_queries"] == 21
+    # 3 datasets * 3 val queries = 9 validation queries
+    assert opt_out["val_queries"] == 9
+    assert len(opt_out["datasets"]) == 3
+
+    trainset = captured_gepa["trainset"]
+    assert len(trainset) == 21
+    # Verify interleaving: first 3 examples come from alpha, beta, gamma respectively
+    assert "alpha" in trainset[0].question
+    assert "beta" in trainset[1].question
+    assert "gamma" in trainset[2].question
+
+    valset = captured_gepa["valset"]
+    assert len(valset) == 9
+    assert "alpha" in valset[0].question
+    assert "beta" in valset[1].question
+    assert "gamma" in valset[2].question

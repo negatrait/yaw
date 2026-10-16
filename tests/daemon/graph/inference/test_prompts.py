@@ -545,7 +545,6 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         violated = compute_sizecoding_pareto_score(
             0.60,
             tokens=20,
-            elapsed_seconds=0.1,
             min_baseline_recall=0.75,
             pred_name="triples",
             missed_items=["doc-2"],
@@ -554,24 +553,23 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         self.assertEqual(violated.pareto_raw, 0.0)
         self.assertIn("BASELINE GATE VIOLATION", violated.feedback)
 
-        # 2. Above Tier 1 baseline floor -> rewards higher recall / (tokens * time)
+        # 2. Above Tier 1 baseline floor -> rewards higher recall / tokens
         bloated = compute_sizecoding_pareto_score(
             0.80,
             tokens=400,
-            elapsed_seconds=1.5,
             min_baseline_recall=0.75,
-            target_token_seconds=100.0,
+            target_tokens=100.0,
         )
         sizecoded = compute_sizecoding_pareto_score(
             0.80,
             tokens=80,
-            elapsed_seconds=0.4,
             min_baseline_recall=0.75,
-            target_token_seconds=100.0,
+            target_tokens=100.0,
         )
         self.assertGreater(sizecoded.score, bloated.score)
         self.assertGreater(sizecoded.pareto_raw, bloated.pareto_raw)
         self.assertGreater(bloated.score, violated.score)
+        self.assertAlmostEqual(sizecoded.pareto_raw, 0.80 / 80)
 
         # Verify dspy.GEPA's internal DspyAdapter extracts both scalar score and multi-objective dict
         scalar_score, obj_scores = _extract_score_and_objective_scores(sizecoded)
@@ -912,6 +910,207 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         self.assertFalse(hasattr(prompts_module, "HippoRAGProgram"))
         self.assertFalse(hasattr(prompts_module, "build_dspy_ner_grammar"))
         self.assertFalse(hasattr(prompts_module, "compute_sizecoding_pareto_score"))
+
+    def test_instruction_proposal_gbnf_grammar_and_reflection_lm_contract(self):
+        """TDD Contract: instruction proposal GBNF grammar and reflection RLM temperatures."""
+        from yaw.daemon.graph.inference import (
+            DSPY_INSTRUCTION_PROPOSAL_GBNF_GRAMMAR,
+            build_dspy_instruction_proposal_grammar,
+            create_dspy_lm,
+            create_dspy_rlm_pair,
+        )
+
+        # 1. Happy path across bounded character limits
+        for max_chars in (64, 512, 1500, 3000):
+            grammar = build_dspy_instruction_proposal_grammar(max_chars=max_chars)
+            self.assertIn('root ::= "{\\"new_instruction\\": " instruction-str "}"', grammar)
+            self.assertIn(f"char{{1,{max_chars}}}", grammar)
+            self.assertNotIn("named_entities", grammar)
+            self.assertNotIn("triples", grammar)
+            self.assertNotIn("answer", grammar)
+
+        # 2. Boundary envelope: None or non-positive max_chars returns unbounded grammar
+        for unbounded in (None, 0, -10):
+            self.assertEqual(
+                build_dspy_instruction_proposal_grammar(max_chars=unbounded),
+                DSPY_INSTRUCTION_PROPOSAL_GBNF_GRAMMAR,
+            )
+
+        # 3. Reflection LM temperature & GBNF capability flags
+        mistral_ref = create_dspy_lm("Mistral-7B-Instruct-v0.3-Hybrid", role="reflection")
+        qwen_ref = create_dspy_lm("Qwen3-4B-Instruct-2507-GGUF", role="reflection_worker")
+        self.assertEqual(mistral_ref.kwargs["temperature"], 0.8)
+        self.assertEqual(mistral_ref.kwargs["max_tokens"], 4096)
+        self.assertFalse(getattr(mistral_ref, "_yaw_supports_gbnf", True))
+
+        self.assertEqual(qwen_ref.kwargs["temperature"], 0.7)
+        self.assertEqual(qwen_ref.kwargs["max_tokens"], 2048)
+        self.assertEqual(qwen_ref.kwargs["frequency_penalty"], 0.3)
+        self.assertTrue(getattr(qwen_ref, "_yaw_supports_gbnf", False))
+
+        orch_ref, worker_ref = create_dspy_rlm_pair(reflection=True)
+        self.assertEqual(orch_ref.kwargs["temperature"], 0.8)
+        self.assertEqual(worker_ref.kwargs["temperature"], 0.7)
+        self.assertFalse(getattr(orch_ref, "_yaw_supports_gbnf", True))
+        self.assertTrue(getattr(worker_ref, "_yaw_supports_gbnf", False))
+
+    def test_rlm_instruction_proposer_contract_and_boundary_envelope(self):
+        """TDD Contract: RLMInstructionProposer executes Mistral RLM + Qwen GBNF instruction synthesis."""
+        import dspy
+        from dspy.utils.dummies import DummyLM
+
+        from yaw.daemon.graph.inference import (
+            RLMInstructionProposer,
+            build_dspy_instruction_proposal_grammar,
+        )
+
+        # Negative boundary envelope: invalid max_instruction_chars raises ValueError
+        with self.assertRaises(ValueError):
+            RLMInstructionProposer(max_instruction_chars=0)
+
+        mistral_lm = DummyLM([
+            {
+                "reasoning": "Diagnose missed bridge entities in examples_with_feedback and delegate to Qwen.",
+                "code": (
+                    "critique = 'Preserve multi-hop bridge entities while pruning redundant aliases.'\n"
+                    "improved = qwen_propose_instruction(component_name, current_instruction, examples_with_feedback, critique)\n"
+                    "SUBMIT(new_instruction=improved)"
+                ),
+            }
+        ])
+        setattr(mistral_lm, "_yaw_recipe", "ryzenai-llm")
+        setattr(mistral_lm, "_yaw_supports_gbnf", False)
+
+        qwen_lm = DummyLM(
+            [{"new_instruction": "Extract all bridge named entities concisely without redundant titles."}],
+            adapter=dspy.JSONAdapter(),
+        )
+        setattr(qwen_lm, "_yaw_recipe", "llamacpp")
+        setattr(qwen_lm, "_yaw_supports_gbnf", True)
+
+        proposer = RLMInstructionProposer(
+            orchestrator_lm=mistral_lm,
+            worker_lm=qwen_lm,
+            enable_gbnf=True,
+            max_instruction_chars=900,
+        )
+
+        candidate = {
+            "ner": "Extract named entities from the passage.",
+            "qa_cot": "Answer the question concisely.",
+        }
+        reflective_dataset = {
+            "ner": [
+                {
+                    "Inputs": {"passage": "A" * 1200},
+                    "Generated Outputs": {"named_entities": ["Radio City"]},
+                    "Feedback": "Missed gold items: ['Bangalore', 'Abraham Thomas'].",
+                }
+            ]
+        }
+
+        # Boundary: empty or missing component updates make zero LM calls
+        self.assertEqual(proposer(candidate, reflective_dataset, []), {})
+        self.assertEqual(proposer(candidate, reflective_dataset, ["missing_comp"]), {})
+        self.assertEqual(len(mistral_lm.history), 0)
+        self.assertEqual(len(qwen_lm.history), 0)
+
+        # Happy path: updates 'ner' via Mistral RLM + Qwen GBNF worker
+        updated = proposer(candidate, reflective_dataset, ["ner"])
+        self.assertEqual(
+            updated,
+            {"ner": "Extract all bridge named entities concisely without redundant titles."},
+        )
+        self.assertEqual(len(mistral_lm.history), 1)
+        self.assertEqual(len(qwen_lm.history), 1)
+
+        # Verify Mistral got instruction proposal prompt (not SPO/QA tools) and zero GBNF
+        mistral_call = mistral_lm.history[0]
+        self.assertIsNone(mistral_call["kwargs"].get("extra_body"))
+        self.assertEqual(mistral_call["kwargs"].get("temperature"), 0.8)
+        mistral_prompt_text = str(mistral_call.get("messages") or mistral_call.get("prompt"))
+        self.assertIn("qwen_propose_instruction", mistral_prompt_text)
+        self.assertIn("new_instruction", mistral_prompt_text)
+        self.assertNotIn("qwen_extract_triples", mistral_prompt_text)
+
+        # Verify Qwen got pure-JSON instruction proposal GBNF grammar and temp=0.7
+        qwen_call = qwen_lm.history[0]
+        self.assertEqual(qwen_call["kwargs"].get("temperature"), 0.7)
+        expected_grammar = build_dspy_instruction_proposal_grammar(900)
+        self.assertEqual((qwen_call["kwargs"].get("extra_body") or {}).get("grammar"), expected_grammar)
+
+        # Verify telemetry was recorded on the proposer
+        self.assertEqual(len(proposer.telemetry), 1)
+        self.assertEqual(proposer.telemetry[0]["component_name"], "ner")
+        self.assertEqual(
+            proposer.telemetry[0]["new_instruction"],
+            "Extract all bridge named entities concisely without redundant titles.",
+        )
+
+    def test_live_silicon_rlm_instruction_proposer(self):
+        """Run un-mocked RLMInstructionProposer against live Lemonade Server (Mistral NPU + Qwen GPU GBNF)."""
+        loaded_models = self._probe_live_lemonade_models()
+        required = {"Qwen3-4B-Instruct-2507-GGUF", "Mistral-7B-Instruct-v0.3-Hybrid"}
+        if not required.issubset(loaded_models):
+            self.skipTest(
+                f"Live Lemonade Server models {sorted(required)} not loaded (found {sorted(loaded_models)})"
+            )
+
+        from yaw.daemon.graph.inference import (
+            RLMInstructionProposer,
+            build_dspy_instruction_proposal_grammar,
+            create_dspy_rlm_pair,
+        )
+
+        orch_lm, worker_lm = create_dspy_rlm_pair(
+            base_url="http://localhost:13305/api/v1",
+            reflection=True,
+            cache=False,
+        )
+        proposer = RLMInstructionProposer(
+            orchestrator_lm=orch_lm,
+            worker_lm=worker_lm,
+            enable_gbnf=True,
+            max_instruction_chars=800,
+            rlm_max_iters=3,
+        )
+        candidate = {
+            "qa_cot": "Read the retrieved Wikipedia passages and answer the multi-hop question."
+        }
+        reflective_dataset = {
+            "qa_cot": [
+                {
+                    "Inputs": {
+                        "context": "Wikipedia Title: Erik Hort\nErik Hort was born in Montebello, New York.\n\nWikipedia Title: Montebello, New York\nMontebello is an incorporated village in the town of Ramapo, Rockland County, New York.",
+                        "question": "What county is Erik Hort's birthplace a part of?",
+                    },
+                    "Generated Outputs": {
+                        "reasoning": "Erik Hort was born in Montebello, which is in Rockland County, New York.",
+                        "answer": "Erik Hort's birthplace is part of Rockland County in New York.",
+                    },
+                    "Feedback": "[qa_cot] PASS Tier 1 floor (1.0000 >= 0.0000). EM=0.0000, F1=0.3636. Missed gold items: ['Rockland County']. Output only the exact short entity name in `answer` without full sentence repetition.",
+                }
+            ]
+        }
+
+        updated = proposer(candidate, reflective_dataset, ["qa_cot"])
+        self.assertIn("qa_cot", updated)
+        new_inst = updated["qa_cot"].strip()
+        self.assertGreater(len(new_inst), 15)
+        self.assertLessEqual(len(new_inst), 800)
+        self.assertFalse(new_inst.startswith("]"))
+
+        self.assertEqual(len(orch_lm.history), 1)
+        self.assertIsNone(orch_lm.history[0]["kwargs"].get("extra_body"))
+        self.assertEqual(orch_lm.history[0]["kwargs"].get("temperature"), 0.8)
+
+        self.assertEqual(len(worker_lm.history), 1)
+        self.assertEqual(worker_lm.history[0]["kwargs"].get("temperature"), 0.7)
+        self.assertEqual(
+            (worker_lm.history[0]["kwargs"].get("extra_body") or {}).get("grammar"),
+            build_dspy_instruction_proposal_grammar(800),
+        )
+        self.assertEqual(len(proposer.telemetry), 1)
 
 
 if __name__ == "__main__":

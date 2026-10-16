@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "yaw"
 version = "0.1.0"
@@ -14,6 +18,9 @@ dependencies = [
     "sqlite-vec>=0.1.6",
 ]
 
+[project.scripts]
+yaw = "yaw.daemon.cli:cli_entrypoint"
+
 [dependency-groups]
 dev = [
     "pytest>=9.0.3",
@@ -22,7 +29,10 @@ dev = [
 ]
 
 [tool.uv]
-package = false
+package = true
+
+[tool.setuptools.packages.find]
+include = ["yaw*"]
 
 [tool.ruff]
 line-length = 100

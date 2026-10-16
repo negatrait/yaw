@@ -80,6 +80,50 @@ class ExtractQueryIntent(dspy.Signature):
     )
 
 
+class ProposeInstructionSignature(dspy.Signature):
+    """I provided an assistant with instructions to perform a task for me. You are given those instructions, along with examples of different task inputs provided to the assistant, the assistant's response for each of them, and some feedback on how the assistant's response could be better.
+
+    Your task is to write a new instruction for the assistant.
+
+    Read the inputs carefully and identify the input format and infer detailed task description about the task I wish to solve with the assistant.
+
+    Read all the assistant responses and the corresponding feedback. Identify all niche and domain specific factual information about the task and include it in the instruction, as a lot of it may not be available to the assistant in the future. The assistant may have utilized a generalizable strategy to solve the task, if so, include that in the instruction as well.
+    Respond with a JSON object in the format: {"new_instruction": "..."}"""
+
+    component_name: str = dspy.InputField(
+        desc="Name of the predictor component being optimized"
+    )
+    current_instruction: str = dspy.InputField(
+        desc="The instructions provided to the assistant"
+    )
+    examples_with_feedback: str = dspy.InputField(
+        desc="Task inputs provided to the assistant, the assistant's response for each, and feedback on how the response could be better"
+    )
+    orchestrator_critique: str = dspy.InputField(
+        desc="Failure diagnosis and strategy guidance from the reflection orchestrator"
+    )
+    new_instruction: str = dspy.OutputField(
+        desc="The new instruction for the assistant"
+    )
+
+
+class ReflectiveInstructionTask(dspy.Signature):
+    """Analyze the current instruction, task examples, and evaluation feedback to identify failure patterns and generalizable strategies, then synthesize an improved instruction for the assistant."""
+
+    component_name: str = dspy.InputField(
+        desc="Name of the predictor component being optimized"
+    )
+    current_instruction: str = dspy.InputField(
+        desc="The instructions provided to the assistant"
+    )
+    examples_with_feedback: str = dspy.InputField(
+        desc="Task inputs provided to the assistant, the assistant's response for each, and feedback on how the response could be better"
+    )
+    new_instruction: str = dspy.OutputField(
+        desc="The new instruction for the assistant"
+    )
+
+
 def _build_default_ner_demos() -> list[dspy.Example]:
     entities = json.loads(NER_ONE_SHOT_OUTPUT)["named_entities"]
     return [
@@ -142,6 +186,8 @@ __all__ = [
     "FactList",
     "FilterFacts",
     "NER_DEMOS",
+    "ProposeInstructionSignature",
     "QA_DEMOS",
+    "ReflectiveInstructionTask",
     "TRIPLE_DEMOS",
 ]

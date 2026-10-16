@@ -35,6 +35,11 @@ string ::= "\"" char+ "\""
 char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
 """
 
+DSPY_INSTRUCTION_PROPOSAL_GBNF_GRAMMAR = r"""root ::= "{\"new_instruction\": " string "}"
+string ::= "\"" char+ "\""
+char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
+"""
+
 
 def gbnf_escape_literal(text: str) -> str:
     escaped = (
@@ -90,6 +95,17 @@ def build_dspy_qa_cot_grammar(max_reasoning_chars: int | None = None) -> str:
     )
 
 
+def build_dspy_instruction_proposal_grammar(max_chars: int | None = 1500) -> str:
+    """Build pure-JSON GBNF grammar for GEPA/MIPROv2 instruction synthesis on Qwen (`llama.cpp` GPU)."""
+    if max_chars is None or max_chars <= 0:
+        return DSPY_INSTRUCTION_PROPOSAL_GBNF_GRAMMAR
+    return (
+        'root ::= "{\\"new_instruction\\": " instruction-str "}"\n'
+        f'instruction-str ::= "\\"" char{{1,{int(max_chars)}}} "\\""\n'
+        'char ::= [^"\\\\\\x7F\\x00-\\x1F] | "\\\\" (["\\\\bfnrt] | "u" [0-9a-fA-F]{4})\n'
+    )
+
+
 def build_dspy_rerank_grammar(
     candidate_facts: Sequence[tuple[str, str, str] | list[str]],
     max_facts: int = 4,
@@ -130,7 +146,6 @@ def compute_sizecoding_pareto_score(
     recall_at_5: float,
     *,
     tokens: int,
-    elapsed_seconds: float,
     recall_at_1: float | None = None,
     recall_at_2: float | None = None,
     recall_at_10: float | None = None,
@@ -138,25 +153,23 @@ def compute_sizecoding_pareto_score(
     em: float | None = None,
     f1: float | None = None,
     min_baseline_recall: float = 0.0,
-    target_token_seconds: float = 100.0,
+    target_tokens: float = 100.0,
     pred_name: str | None = None,
     missed_items: Sequence[str] = (),
 ) -> dspy.Prediction:
     """Compute a sizecoding Pareto metric for `dspy.GEPA`.
 
-    - Supports both single-rank (`recall_at_5 / (tokens * time)`) and full composite fitness:
-      - Retrieval/indexing stages: `(Recall@1 * Recall@2 * Recall@5 * Recall@10 * Recall@20) / (tokens * time)`
-      - End-to-End QA stages: `(Recall@1 * Recall@2 * Recall@5 * Recall@10 * Recall@20 * EM * F1) / (tokens * time)`
+    - Supports both single-rank (`recall_at_5 / tokens`) and full composite fitness:
+      - Retrieval/indexing stages: `(Recall@1 * Recall@2 * Recall@5 * Recall@10 * Recall@20) / tokens`
+      - End-to-End QA stages: `(Recall@1 * Recall@2 * Recall@5 * Recall@10 * Recall@20 * EM * F1) / tokens`
     - Hard Tier 1 baseline gate: if `recall_at_5 < min_baseline_recall`, the candidate is
       clamped below `0.05` with zero `pareto_raw`/`efficiency` objective scores so no
       token-saving mutation can ever drop below the locked Tier 1 baseline.
     """
     clamped_recall = _clamp_unit(recall_at_5)
     safe_tokens = max(int(tokens), 1)
-    safe_seconds = max(float(elapsed_seconds), 1e-3)
-    token_seconds = safe_tokens * safe_seconds
-    target_budget = max(float(target_token_seconds), 1e-3)
-    efficiency = target_budget / (target_budget + token_seconds)
+    target_budget = max(float(target_tokens), 1.0)
+    efficiency = target_budget / (target_budget + safe_tokens)
     stage_prefix = f"[{pred_name}] " if pred_name else ""
 
     has_multi_rank = any(
@@ -182,7 +195,7 @@ def compute_sizecoding_pareto_score(
         c_f1 = None
         quality_numerator = clamped_recall
 
-    pareto_raw = quality_numerator / token_seconds
+    pareto_raw = quality_numerator / safe_tokens
 
     if clamped_recall < min_baseline_recall:
         floor_ratio = clamped_recall / max(float(min_baseline_recall), 1e-6)
@@ -190,8 +203,7 @@ def compute_sizecoding_pareto_score(
         missed_str = f" Missed gold items: {list(missed_items)}." if missed_items else ""
         feedback = (
             f"{stage_prefix}BASELINE GATE VIOLATION: Recall@5={clamped_recall:.4f} dropped below "
-            f"locked Tier 1 baseline ({min_baseline_recall:.4f}). Cost={safe_tokens} tokens * "
-            f"{safe_seconds:.3f}s ({token_seconds:.2f} tok*s).{missed_str} "
+            f"locked Tier 1 baseline ({min_baseline_recall:.4f}). Cost={safe_tokens} tokens.{missed_str} "
             "Restore missing entity/triple/fact coverage first before compressing output tokens."
         )
         obj_violated: dict[str, float] = {
@@ -225,7 +237,6 @@ def compute_sizecoding_pareto_score(
             em=c_em,
             f1=c_f1,
             tokens=safe_tokens,
-            elapsed_seconds=safe_seconds,
             objective_scores=obj_violated,
         )
 
@@ -236,7 +247,7 @@ def compute_sizecoding_pareto_score(
         f"{stage_prefix}PASS Tier 1 floor ({clamped_recall:.4f} >= {min_baseline_recall:.4f}). "
         f"Sizecoding Pareto={pareto_raw:.6f} (Quality={quality_numerator:.4f}, "
         f"Recall@1/2/5/10/20={r1:.2f}/{r2:.2f}/{r5:.2f}/{r10:.2f}/{r20:.2f}{qa_str} / "
-        f"[{safe_tokens} tokens * {safe_seconds:.3f}s = {token_seconds:.2f} tok*s], "
+        f"[{safe_tokens} tokens], "
         f"efficiency={efficiency:.4f}).{missed_str} "
         "To increase Pareto score, preserve 100% of gold retrieval bridges while pruning "
         "redundant triples, verbose entity aliases, and filler reasoning tokens."
@@ -273,7 +284,6 @@ def compute_sizecoding_pareto_score(
         em=c_em,
         f1=c_f1,
         tokens=safe_tokens,
-        elapsed_seconds=safe_seconds,
         objective_scores=obj_scores,
     )
 
@@ -303,10 +313,12 @@ __all__ = [
     "DSPY_TRIPLES_GBNF_GRAMMAR",
     "DSPY_RERANK_GBNF_GRAMMAR",
     "DSPY_QA_COT_GBNF_GRAMMAR",
+    "DSPY_INSTRUCTION_PROPOSAL_GBNF_GRAMMAR",
     "gbnf_escape_literal",
     "build_dspy_ner_grammar",
     "build_dspy_triples_grammar",
     "build_dspy_qa_cot_grammar",
+    "build_dspy_instruction_proposal_grammar",
     "build_dspy_rerank_grammar",
     "compute_sizecoding_pareto_score",
     "lm_supports_gbnf",

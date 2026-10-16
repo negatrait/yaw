@@ -32,6 +32,7 @@ from yaw.daemon.graph.engine import YawGraphEngine
 from yaw.daemon.graph.inference import (
     DSPyEmbeddingAdapter,
     HippoRAGProgram,
+    create_dspy_rlm_pair,
 )
 from yaw.daemon.ingestion import CorpusIngestor
 
@@ -697,20 +698,45 @@ class YawRuntime:
         mode: Literal["miprov2", "gepa", "hybrid"] = "hybrid",
         save_path: Path | str | None = None,
         reflection_lm: Any = None,
+        reflection_worker_lm: Any = None,
+        max_metric_calls: int | None = None,
+        corpus_docs: Sequence[str] | None = None,
         progress_callback: Callable[[str], None] | None = None,
     ) -> Path:
         """Compile DSPy prompts and surface bounds on the worker thread and save artifact."""
-        target_path = Path(save_path or self.config.compiled_program_path or "compiled_program.json").resolve()
+        target_path = Path(
+            save_path or self.config.compiled_program_path or "compiled_program.json"
+        ).resolve()
 
         def _run_optimize() -> Path:
             if self.engine is None:
                 raise YawRuntimeError("NOT_READY", "Graph engine is not initialized.")
+            if corpus_docs:
+                self.engine.index(corpus_docs)
+                new_stats = self.engine.get_stats(self.config.config_fingerprint())
+                with self._state_lock:
+                    self._stats = new_stats
+
+            eff_ref_lm = reflection_lm
+            eff_worker_lm = reflection_worker_lm
+            if eff_ref_lm is None and self._custom_program is None:
+                eff_ref_lm, eff_worker_lm = create_dspy_rlm_pair(
+                    orchestrator_model=self.config.qa_model,
+                    sub_model=self.config.extraction_model,
+                    base_url=self.config.base_url,
+                    api_key=self.config.api_key,
+                    provider=self.config.provider,
+                    reflection=True,
+                )
+
             self.engine.evolve_prompts(
                 trainset=trainset,
                 valset=valset,
                 mode=mode,
                 save_path=target_path,
-                reflection_lm=reflection_lm,
+                reflection_lm=eff_ref_lm,
+                reflection_worker_lm=eff_worker_lm,
+                max_metric_calls=max_metric_calls,
             )
             return target_path
 

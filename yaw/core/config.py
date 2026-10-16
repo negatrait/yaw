@@ -76,6 +76,15 @@ class YawConfig:
     http_port: int = 13306
     http_path: str = "/mcp"
 
+    # Prompt optimization settings ([optimization] in yaw.toml)
+    optimize_dataset: str | tuple[str, ...] | None = None
+    optimize_datasets: tuple[str, ...] = ("2wikimultihopqa",)
+    optimize_mode: Literal["miprov2", "gepa", "hybrid"] = "gepa"
+    optimize_max_queries: int = 20
+    optimize_train_queries: int = 7
+    optimize_query_offset: int = 0
+    optimize_max_metric_calls: int | None = 20
+
     def __post_init__(self) -> None:
         ws = Path(self.workspace_root).resolve()
         object.__setattr__(self, "workspace_root", ws)
@@ -95,6 +104,27 @@ class YawConfig:
             )
         if self.qa_mode not in ("cot", "rlm"):
             raise YawRuntimeError("INVALID_INPUT", f"Unsupported qa_mode: {self.qa_mode!r}")
+        if self.optimize_mode not in ("miprov2", "gepa", "hybrid"):
+            raise YawRuntimeError(
+                "INVALID_INPUT", f"Unsupported optimize_mode: {self.optimize_mode!r}"
+            )
+        raw_ds = (
+            self.optimize_datasets
+            if self.optimize_datasets != ("2wikimultihopqa",)
+            else (self.optimize_dataset or self.optimize_datasets)
+        )
+        if isinstance(raw_ds, str):
+            ds_tuple = tuple(p.strip() for p in raw_ds.split(",") if p.strip())
+        elif isinstance(raw_ds, (list, tuple)):
+            ds_tuple = tuple(str(p).strip() for p in raw_ds if str(p).strip())
+        else:
+            ds_tuple = ("2wikimultihopqa",)
+        object.__setattr__(self, "optimize_datasets", ds_tuple or ("2wikimultihopqa",))
+        object.__setattr__(
+            self,
+            "optimize_dataset",
+            ds_tuple[0] if len(ds_tuple) == 1 else ds_tuple,
+        )
 
     def config_fingerprint(self) -> str:
         """Compute deterministic SHA-256 fingerprint of index-affecting settings."""
@@ -115,6 +145,18 @@ class YawConfig:
         }
         raw = json.dumps(payload, sort_keys=True).encode("utf-8")
         return "yaw-cfg-v1:" + hashlib.sha256(raw).hexdigest()[:16]
+
+
+_OPTIMIZATION_KEY_ALIASES: dict[str, str] = {
+    "dataset": "optimize_datasets",
+    "datasets": "optimize_datasets",
+    "mode": "optimize_mode",
+    "evolve": "optimize_mode",
+    "max_queries": "optimize_max_queries",
+    "train_queries": "optimize_train_queries",
+    "query_offset": "optimize_query_offset",
+    "max_metric_calls": "optimize_max_metric_calls",
+}
 
 
 def load_config(
@@ -144,12 +186,25 @@ def load_config(
 
     valid_fields = {f.name for f in fields(YawConfig)}
     kwargs: dict[str, Any] = {}
-    for sec_name in ("paths", "ingestion", "inference", "graph", "runtime"):
+    for sec_name in ("paths", "ingestion", "inference", "graph", "runtime", "optimization"):
         section = data.get(sec_name)
         if isinstance(section, dict):
             for k, v in section.items():
-                if k in valid_fields:
-                    kwargs[k] = tuple(v) if isinstance(v, list) else v
+                mapped_k = (
+                    _OPTIMIZATION_KEY_ALIASES.get(k, k)
+                    if sec_name == "optimization"
+                    else k
+                )
+                if mapped_k in valid_fields:
+                    if mapped_k == "optimize_datasets":
+                        if isinstance(v, str):
+                            kwargs[mapped_k] = tuple(p.strip() for p in v.split(",") if p.strip())
+                        elif isinstance(v, (list, tuple)):
+                            kwargs[mapped_k] = tuple(str(p).strip() for p in v if str(p).strip())
+                        else:
+                            kwargs[mapped_k] = (str(v),)
+                    else:
+                        kwargs[mapped_k] = tuple(v) if isinstance(v, list) else v
 
     ws_raw = kwargs.pop("workspace_root", None)
     kwargs["workspace_root"] = (
