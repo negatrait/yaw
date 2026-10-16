@@ -5,6 +5,7 @@ import contextlib
 import json
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -164,11 +165,13 @@ def inspect_status(config: YawConfig) -> dict[str, Any]:
     running = is_daemon_locked(config)
     chunks = entities = facts = edges = openie = 0
     if config.db_path and Path(config.db_path).exists():
-        conn = open_yaw_db(config.db_path)
-        try:
-            chunks, entities, facts, edges, openie = get_graph_counts(conn)
-        finally:
-            conn.close()
+        with contextlib.suppress(sqlite3.Error):
+            db_uri = f"file:{Path(config.db_path).resolve().as_posix()}?mode=ro"
+            conn = sqlite3.connect(db_uri, uri=True, timeout=1.0)
+            try:
+                chunks, entities, facts, edges, openie = get_graph_counts(conn)
+            finally:
+                conn.close()
 
     if running and config.status_path and Path(config.status_path).exists():
         with contextlib.suppress(OSError, json.JSONDecodeError):
