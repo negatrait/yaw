@@ -223,12 +223,16 @@ class YawRuntime:
     def _persist_status_file(self, snapshot: dict[str, Any]) -> None:
         if self.config.status_path is None:
             return
-        with contextlib.suppress(OSError):
-            status_path = Path(self.config.status_path)
-            status_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = status_path.with_suffix(".json.tmp")
-            tmp_path.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
-            tmp_path.replace(status_path)
+        status_path = Path(self.config.status_path)
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = status_path.with_suffix(f".json.{os.getpid()}.tmp")
+        for _ in range(5):
+            try:
+                tmp_path.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+                tmp_path.replace(status_path)
+                break
+            except OSError:
+                time.sleep(0.01)
 
     def start(self, *, sync_on_start: bool = True) -> None:
         """Acquire exclusive yaw.db.lock, open CocoIndex + YawGraphEngine, and start worker thread."""
@@ -486,7 +490,12 @@ class YawRuntime:
             finally:
                 self._queue.task_done()
 
-    def _apply_delta(self, delta: SyncDelta) -> None:
+    def _apply_delta(
+        self,
+        delta: SyncDelta,
+        *,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> None:
         assert self.engine is not None
         if not delta.deleted_chunk_ids and not delta.added_chunks:
             return
@@ -494,24 +503,28 @@ class YawRuntime:
         if delta.deleted_chunk_ids:
             self.engine.delete_chunks(delta.deleted_chunk_ids)
         if delta.added_chunks:
-            self.engine.index_chunks(delta.added_chunks)
+            self.engine.index_chunks(delta.added_chunks, progress_callback=progress_callback)
         self.engine.set_meta(_PENDING_DELTA_META_KEY, None)
 
     def _execute_sync_worker(self) -> SyncDelta:
         if self.ingestor is None or self.engine is None:
             raise YawRuntimeError("NOT_READY", "Engine or ingestor is not initialized.")
 
+        def _sync_progress(msg: str) -> None:
+            self._update_state(active_op=msg, sync_state="syncing")
+
         # 1. Replay any uncommitted pending delta before polling CocoIndex
         raw_pending = self.engine.get_meta(_PENDING_DELTA_META_KEY)
         if raw_pending:
             pending_delta = _deserialize_sync_delta(raw_pending)
-            self._apply_delta(pending_delta)
+            self._apply_delta(pending_delta, progress_callback=_sync_progress)
         else:
             pending_delta = None
 
         # 2. Poll CocoIndex for subsequent corpus changes and apply
+        _sync_progress("polling CocoIndex for corpus changes")
         polled_delta = self.ingestor.poll()
-        self._apply_delta(polled_delta)
+        self._apply_delta(polled_delta, progress_callback=_sync_progress)
 
         new_stats = self.engine.get_stats(self.config.config_fingerprint())
         with self._state_lock:
@@ -711,8 +724,15 @@ class YawRuntime:
         def _run_optimize() -> Path:
             if self.engine is None:
                 raise YawRuntimeError("NOT_READY", "Graph engine is not initialized.")
+
+            def _progress(msg: str) -> None:
+                self._update_state(active_op=msg)
+                if progress_callback is not None:
+                    progress_callback(msg)
+
             if corpus_docs:
-                self.engine.index(corpus_docs)
+                _progress(f"indexing: preparing {len(corpus_docs)} corpus passages")
+                self.engine.index(corpus_docs, progress_callback=_progress)
                 new_stats = self.engine.get_stats(self.config.config_fingerprint())
                 with self._state_lock:
                     self._stats = new_stats
@@ -720,6 +740,7 @@ class YawRuntime:
             eff_ref_lm = reflection_lm
             eff_worker_lm = reflection_worker_lm
             if eff_ref_lm is None and self._custom_program is None:
+                _progress("optimizing: configuring reflection LM pair")
                 eff_ref_lm, eff_worker_lm = create_dspy_rlm_pair(
                     orchestrator_model=self.config.qa_model,
                     sub_model=self.config.extraction_model,
@@ -729,6 +750,7 @@ class YawRuntime:
                     reflection=True,
                 )
 
+            _progress(f"optimizing: starting {mode} evolution")
             self.engine.evolve_prompts(
                 trainset=trainset,
                 valset=valset,
@@ -737,6 +759,7 @@ class YawRuntime:
                 reflection_lm=eff_ref_lm,
                 reflection_worker_lm=eff_worker_lm,
                 max_metric_calls=max_metric_calls,
+                progress_callback=_progress,
             )
             return target_path
 

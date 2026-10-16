@@ -81,6 +81,7 @@ class IndexStats:
     facts: int = 0
     edges: int = 0
     config_fingerprint: str = ""
+    openie_checkpoints: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

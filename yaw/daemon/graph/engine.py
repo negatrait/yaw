@@ -4,7 +4,7 @@ import json
 import re
 import sqlite3
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, Literal
 
@@ -141,13 +141,14 @@ class YawGraphEngine:
     def get_stats(self, config_fingerprint: str = "") -> IndexStats:
         """Return current graph index row counts and configuration fingerprint."""
         with self._lock:
-            chunks, entities, facts, edges = get_graph_counts(self.conn)
+            chunks, entities, facts, edges, openie = get_graph_counts(self.conn)
             return IndexStats(
                 chunks=chunks,
                 entities=entities,
                 facts=facts,
                 edges=edges,
                 config_fingerprint=config_fingerprint,
+                openie_checkpoints=openie,
             )
 
     def get_meta(self, key: str) -> str | None:
@@ -210,7 +211,12 @@ class YawGraphEngine:
         )
         return formatted_context, passages, scores
 
-    def index(self, docs: Sequence[str]) -> int:
+    def index(
+        self,
+        docs: Sequence[str],
+        *,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> int:
         """Raw document string ingestion adapter for CLI benchmarks and quick experimentation."""
         if not docs:
             return 0
@@ -282,9 +288,14 @@ class YawGraphEngine:
                         )
                         chunks_to_index.append((ptr, doc))
 
-            return self.index_chunks(chunks_to_index)
+            return self.index_chunks(chunks_to_index, progress_callback=progress_callback)
 
-    def index_chunks(self, chunks: Sequence[tuple[ChunkPointer, str]]) -> int:
+    def index_chunks(
+        self,
+        chunks: Sequence[tuple[ChunkPointer, str]],
+        *,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> int:
         """Incremental chunk indexing into yaw.db, sqlite-vec, and sparse CSR graph."""
         if not chunks:
             return 0
@@ -297,6 +308,8 @@ class YawGraphEngine:
             existing_chunk_vecs = get_existing_ids(self.conn, "chunk_vec", chunk_ids)
             missing_chunks = [(p, t) for p, t in chunks if p.chunk_id not in existing_chunk_vecs]
             if missing_chunks:
+                if progress_callback is not None:
+                    progress_callback(f"indexing: embedding {len(missing_chunks)} chunk vectors")
                 texts_to_embed = [t for _, t in missing_chunks]
                 vecs = self._encode_in_batches(texts_to_embed, instruction="")
                 upsert_chunk_vectors(
@@ -307,10 +320,13 @@ class YawGraphEngine:
             # 2. Crash-resilient OpenIE extraction (persisted per-chunk immediately)
             cached_openie = get_openie_checkpoints(self.conn, chunk_ids)
             all_records: list[Any] = []
-            for ptr, text in chunks:
+            total_chunks = len(chunks)
+            for idx, (ptr, text) in enumerate(chunks, 1):
                 if ptr.chunk_id in cached_openie:
                     all_records.append(cached_openie[ptr.chunk_id])
                 else:
+                    if progress_callback is not None:
+                        progress_callback(f"indexing: OpenIE extraction ({idx}/{total_chunks})")
                     rec = self.program.extract_openie(ptr.chunk_id, text)
                     save_openie_checkpoints(self.conn, [rec])
                     all_records.append(rec)
@@ -344,6 +360,8 @@ class YawGraphEngine:
                 (eid, name) for eid, name in entity_nodes if eid not in existing_entity_vecs
             ]
             if missing_entities:
+                if progress_callback is not None:
+                    progress_callback(f"indexing: embedding {len(missing_entities)} entity vectors")
                 e_texts = [name for _, name in missing_entities]
                 e_vecs = self._encode_in_batches(e_texts, instruction="")
                 upsert_entity_vectors(
@@ -360,6 +378,8 @@ class YawGraphEngine:
                 if fid not in existing_fact_vecs
             ]
             if missing_facts:
+                if progress_callback is not None:
+                    progress_callback(f"indexing: embedding {len(missing_facts)} fact vectors")
                 fact_texts: list[str] = []
                 for _, _s_id, pred, _o_id, raw_json in missing_facts:
                     items = json.loads(raw_json)
@@ -371,6 +391,8 @@ class YawGraphEngine:
                 )
 
             # 5. Build passage, fact, and synonymy edges
+            if progress_callback is not None:
+                progress_callback("indexing: constructing CSR graph edges")
             edges_with_sources: list[tuple[str, str, str, float, str]] = []
 
             for cid, eids in chunk_to_entities.items():
@@ -691,12 +713,20 @@ class YawGraphEngine:
         reflection_lm: Any = None,
         reflection_worker_lm: Any = None,
         max_metric_calls: int | None = None,
+        progress_callback: Callable[[str], None] | None = None,
     ) -> HippoRAGProgram:
         """Evolve DSPy prompts via MIPROv2, GEPA, or two-phase hybrid with composite Sizecoding feedback."""
         if not trainset:
             return self.program
 
+        eval_count = 0
+
         def _evaluate_prediction(gold: Any, pred: Any, pred_name: Any = None) -> dspy.Prediction:
+            nonlocal eval_count
+            eval_count += 1
+            if progress_callback is not None:
+                budget_str = f"/{max_metric_calls}" if max_metric_calls else ""
+                progress_callback(f"optimizing ({mode}): evaluating candidate ({eval_count}{budget_str})")
             gold_answers_raw = getattr(gold, "gold_answers", getattr(gold, "answer", []))
             if isinstance(gold_answers_raw, str):
                 gold_answers = [gold_answers_raw]

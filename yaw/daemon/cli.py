@@ -162,25 +162,32 @@ def is_daemon_locked(config: YawConfig) -> bool:
 def inspect_status(config: YawConfig) -> dict[str, Any]:
     """Read live daemon status if running, or offline yaw.db statistics if stopped."""
     running = is_daemon_locked(config)
+    chunks = entities = facts = edges = openie = 0
+    if config.db_path and Path(config.db_path).exists():
+        conn = open_yaw_db(config.db_path)
+        try:
+            chunks, entities, facts, edges, openie = get_graph_counts(conn)
+        finally:
+            conn.close()
+
     if running and config.status_path and Path(config.status_path).exists():
         with contextlib.suppress(OSError, json.JSONDecodeError):
             data = json.loads(Path(config.status_path).read_text(encoding="utf-8"))
             if isinstance(data, dict) and "status" in data and "stats" in data:
+                data["stats"]["openie_checkpoints"] = max(
+                    openie, data["stats"].get("openie_checkpoints", 0)
+                )
+                if not data["status"].get("active_op") and openie > data["stats"].get("chunks", 0):
+                    data["status"]["active_op"] = f"indexing: {openie} openie passages processed"
+                    data["status"]["sync_state"] = "syncing"
                 return data
-
-    chunks = entities = facts = edges = 0
-    if config.db_path and Path(config.db_path).exists():
-        conn = open_yaw_db(config.db_path)
-        try:
-            chunks, entities, facts, edges = get_graph_counts(conn)
-        finally:
-            conn.close()
 
     status = DaemonStatus(
         lifecycle="ready" if running else "stopped",
         provider_ready=running,
-        sync_state="idle",
+        sync_state="syncing" if (running and openie > chunks) else "idle",
         queue_depth=0,
+        active_op=f"indexing: {openie} openie passages processed" if (running and openie > chunks) else None,
     )
     stats = IndexStats(
         chunks=chunks,
@@ -188,6 +195,7 @@ def inspect_status(config: YawConfig) -> dict[str, Any]:
         facts=facts,
         edges=edges,
         config_fingerprint=config.config_fingerprint(),
+        openie_checkpoints=openie,
     )
     return {
         "status": status.to_dict(),

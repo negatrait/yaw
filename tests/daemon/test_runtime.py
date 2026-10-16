@@ -777,3 +777,40 @@ def test_cli_optimize_multi_dataset_interleaved_splits(
     assert "alpha" in valset[0].question
     assert "beta" in valset[1].question
     assert "gamma" in valset[2].question
+
+
+def test_cli_status_reports_active_indexing_progress(tmp_path: Path) -> None:
+    """Verify yaw status inspects openie checkpoints and surfaces active indexing progress."""
+    from yaw.core import OpenIERecord
+    from yaw.daemon.cli import inspect_status
+    from yaw.daemon.graph.storage import open_yaw_db, save_openie_checkpoints
+
+    cfg, _ = _make_test_config(tmp_path)
+    assert cfg.db_path is not None
+    conn = open_yaw_db(cfg.db_path)
+    try:
+        # Seed 3 dummy openie records
+        records = [
+            OpenIERecord(chunk_id=f"chunk-{i}", entities=("E",), triples=(("A", "r", "B"),))
+            for i in range(3)
+        ]
+        save_openie_checkpoints(conn, records)
+    finally:
+        conn.close()
+
+    # Offline inspect
+    offline_status = inspect_status(cfg)
+    assert offline_status["stats"]["openie_checkpoints"] == 3
+    assert offline_status["status"]["lifecycle"] == "stopped"
+
+    # With daemon locked, inspect_status recognizes indexing in progress
+    prog, emb, _, _ = _make_program_and_embedder()
+    rt = YawRuntime(cfg, program=prog, embedder=emb)
+    rt.start(sync_on_start=False)
+    try:
+        live_status = inspect_status(cfg)
+        assert live_status["stats"]["openie_checkpoints"] == 3
+        assert "indexing" in live_status["status"]["active_op"]
+        assert live_status["status"]["sync_state"] == "syncing"
+    finally:
+        rt.stop()

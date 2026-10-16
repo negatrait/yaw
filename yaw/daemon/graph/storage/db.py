@@ -751,20 +751,21 @@ def get_max_end_line(
     return int(row[0]) if row is not None else 0
 
 
-def get_graph_counts(conn: sqlite3.Connection) -> tuple[int, int, int, int]:
-    """Return (chunks_count, entities_count, facts_count, edges_count) in a single query."""
+def get_graph_counts(conn: sqlite3.Connection) -> tuple[int, int, int, int, int]:
+    """Return (chunks_count, entities_count, facts_count, edges_count, openie_count) in a single query."""
     row = conn.execute(
         """
         SELECT
             (SELECT COUNT(*) FROM chunks),
             (SELECT COUNT(*) FROM entities),
             (SELECT COUNT(*) FROM facts),
-            (SELECT COUNT(*) FROM edges)
+            (SELECT COUNT(*) FROM edges),
+            (SELECT COUNT(*) FROM openie_chunks)
         """
     ).fetchone()
     if row is None:
-        return (0, 0, 0, 0)
-    return (int(row[0]), int(row[1]), int(row[2]), int(row[3]))
+        return (0, 0, 0, 0, 0)
+    return (int(row[0]), int(row[1]), int(row[2]), int(row[3]), int(row[4]))
 
 
 def get_meta(conn: sqlite3.Connection, key: str) -> str | None:
