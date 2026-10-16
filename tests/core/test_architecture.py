@@ -1,8 +1,8 @@
 """AST-enforced architecture containment and zero-cross-domain import boundary tests."""
 
 import ast
-from pathlib import Path
 import unittest
+from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 YAW_DIR = PROJECT_ROOT / "yaw"
@@ -35,10 +35,7 @@ def parse_module_imports(file_path: Path) -> list[tuple[int, str]]:
                 else:
                     base_parts = current_pkg_parts[: len(current_pkg_parts) - drop]
                 mod = ".".join(base_parts)
-                if node.module:
-                    full_mod = f"{mod}.{node.module}" if mod else node.module
-                else:
-                    full_mod = mod
+                full_mod = (f"{mod}.{node.module}" if mod else node.module) if node.module else mod
                 imports.append((node.lineno, full_mod))
             elif node.module:
                 imports.append((node.lineno, node.module))
@@ -74,21 +71,16 @@ def is_allowed_internal_import(importer_pkg: str, imported_mod: str) -> bool:
         return True
 
     # Rule: daemon.runtime is the daemon orchestrator and can import direct children (ingestion, graph)
-    if importer_pkg == "yaw.daemon":
+    if importer_pkg == "yaw.daemon" and imported_mod.startswith("yaw.daemon."):
         # runtime.py or cli.py or mcp_server.py
-        if imported_mod.startswith("yaw.daemon."):
-            return True
-
-    # Rule: graph.engine is the graph orchestrator and can import direct children (storage, inference, ppr)
-    if importer_pkg == "yaw.daemon.graph":
-        if imported_mod.startswith("yaw.daemon.graph."):
-            return True
-
-    # General Rule: package P imports only P.* (itself or its descendants)
-    if imported_mod == importer_pkg or imported_mod.startswith(f"{importer_pkg}."):
         return True
 
-    return False
+    # Rule: graph.engine is the graph orchestrator and can import direct children (storage, inference, ppr)
+    if importer_pkg == "yaw.daemon.graph" and imported_mod.startswith("yaw.daemon.graph."):
+        return True
+
+    # General Rule: package P imports only P.* (itself or its descendants)
+    return bool(imported_mod == importer_pkg or imported_mod.startswith(f"{importer_pkg}."))
 
 
 def is_leaf_package(package_dir: Path) -> bool:
@@ -125,8 +117,20 @@ class ArchitectureTests(unittest.TestCase):
 
     def test_leaf_package_facades_allow_contract_import_without_knowing_file(self):
         """Rule 1b: Leaf packages export their public API contract for caller convenience and leaf mutation."""
-        from yaw.core import ChunkPointer, HydratedPassage, OpenIERecord, RetrievalResult, SyncDelta
+        from yaw.core import (
+            ChunkPointer,
+            DaemonStatus,
+            IndexStats,
+            YawConfig,
+            YawRuntimeError,
+            load_config,
+        )
         self.assertTrue(issubclass(ChunkPointer, object))
+        self.assertTrue(issubclass(YawConfig, object))
+        self.assertTrue(issubclass(IndexStats, object))
+        self.assertTrue(issubclass(DaemonStatus, object))
+        self.assertTrue(issubclass(YawRuntimeError, RuntimeError))
+        self.assertTrue(callable(load_config))
 
         import yaw.daemon.graph.inference as inference
         self.assertTrue(hasattr(inference, "create_dspy_lm"))
@@ -134,6 +138,32 @@ class ArchitectureTests(unittest.TestCase):
         self.assertTrue(hasattr(inference, "RetrievalEmbedding"))
         self.assertTrue(hasattr(inference, "LocalChat"))
         self.assertTrue(hasattr(inference, "compute_sizecoding_pareto_score"))
+
+        # Verify storage public facade
+        import yaw.daemon.graph.storage as storage
+        self.assertTrue(hasattr(storage, "open_yaw_db"))
+        self.assertTrue(hasattr(storage, "search_chunks_fts"))
+        self.assertTrue(hasattr(storage, "search_chunk_vectors_knn"))
+        self.assertTrue(hasattr(storage, "hydrate_chunk_pointer"))
+        self.assertTrue(hasattr(storage, "make_chunk_hydrator"))
+        self.assertTrue(hasattr(storage, "get_graph_counts"))
+        self.assertTrue(hasattr(storage, "get_meta"))
+        self.assertTrue(hasattr(storage, "set_meta"))
+
+        with self.assertRaises(AttributeError):
+            _ = storage._CREATE_SCHEMA_SQL
+
+        # Verify ingestion public facade
+        import yaw.daemon.ingestion as ingestion
+        self.assertTrue(hasattr(ingestion, "CorpusIngestor"))
+        self.assertTrue(hasattr(ingestion, "chunk_markdown_text"))
+        self.assertTrue(hasattr(ingestion, "sync_corpus_once"))
+        self.assertTrue(hasattr(ingestion, "extract_chunk_title"))
+
+        with self.assertRaises(AttributeError):
+            _ = getattr(ingestion, "_CHUNK_HANDLER")
+        with self.assertRaises(AttributeError):
+            _ = getattr(ingestion, "_ChunkSpec")
 
         # Verify facade is strictly constricted: internal helpers cannot leak through
         with self.assertRaises(AttributeError):
@@ -158,12 +188,13 @@ class ArchitectureTests(unittest.TestCase):
             imports = parse_module_imports(py_file)
 
             for lineno, imported_mod in imports:
-                if imported_mod.startswith("yaw.") or imported_mod == "yaw":
-                    if not is_allowed_internal_import(importer_pkg, imported_mod):
-                        violations.append(
-                            f"{py_file.relative_to(PROJECT_ROOT)}:{lineno}: "
-                            f"package '{importer_pkg}' forbidden to import '{imported_mod}'"
-                        )
+                if (imported_mod.startswith("yaw.") or imported_mod == "yaw") and not is_allowed_internal_import(
+                    importer_pkg, imported_mod
+                ):
+                    violations.append(
+                        f"{py_file.relative_to(PROJECT_ROOT)}:{lineno}: "
+                        f"package '{importer_pkg}' forbidden to import '{imported_mod}'"
+                    )
 
         self.assertEqual(
             violations,
@@ -181,7 +212,7 @@ class ArchitectureTests(unittest.TestCase):
             "ast", "collections", "contextlib", "dataclasses", "datetime", "functools",
             "hashlib", "itertools", "json", "logging", "math", "os", "pathlib", "queue",
             "re", "shutil", "stat", "string", "sys", "tempfile", "threading", "time",
-            "types", "typing", "unittest", "urllib", "uuid", "weakref", "enum", "abc",
+            "tomllib", "types", "typing", "unittest", "urllib", "uuid", "weakref", "enum", "abc",
         }
 
         violations = []
@@ -238,4 +269,45 @@ class ArchitectureTests(unittest.TestCase):
             violations,
             [],
             "Forbidden hipporag imports detected inside yaw/:\n" + "\n".join(violations),
+        )
+
+    def test_zero_cross_module_private_imports_and_exports(self):
+        """Rule 5: Zero protected (_) or private (__) symbols in public facades or cross-module imports."""
+        # 1. Check leaf package facades
+        init_files = list(YAW_DIR.rglob("__init__.py"))
+        for init_file in init_files:
+            source = init_file.read_text(encoding="utf-8")
+            tree = ast.parse(source, filename=str(init_file))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name) and target.id == "_PUBLIC_API" and isinstance(node.value, ast.Dict):
+                            for key in node.value.keys:
+                                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                                    self.assertFalse(
+                                        key.value.startswith("_"),
+                                        f"Public facade {init_file.relative_to(PROJECT_ROOT)} exports protected/private symbol '{key.value}'",
+                                    )
+
+        # 2. Check all yaw/**/*.py files for cross-module private imports
+        py_files = list(YAW_DIR.rglob("*.py"))
+        violations: list[str] = []
+        for py_file in py_files:
+            source = py_file.read_text(encoding="utf-8")
+            tree = ast.parse(source, filename=str(py_file))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom):
+                    is_internal = node.level > 0 or (bool(node.module) and (node.module.startswith("yaw.") or node.module == "yaw"))
+                    if is_internal:
+                        for alias in node.names:
+                            if alias.name.startswith("_"):
+                                violations.append(
+                                    f"{py_file.relative_to(PROJECT_ROOT)}:{node.lineno}: "
+                                    f"cross-module import of protected/private symbol '{alias.name}' is forbidden"
+                                )
+
+        self.assertEqual(
+            violations,
+            [],
+            "Protected/private cross-module imports detected:\n" + "\n".join(violations),
         )

@@ -1,6 +1,28 @@
-"""Frozen, zero-dependency data contracts for YAW."""
+"""Frozen, zero-dependency data contracts and pure coordinate/ID helpers for YAW."""
 
-from dataclasses import dataclass
+import hashlib
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Literal
+
+ErrorCode = Literal[
+    "INVALID_INPUT",
+    "NOT_READY",
+    "EMPTY_INDEX",
+    "BUSY",
+    "MODEL_ERROR",
+    "CONSISTENCY_ERROR",
+    "SHUTTING_DOWN",
+]
+
+
+class YawRuntimeError(RuntimeError):
+    """Structured runtime error carrying a canonical ErrorCode for CLI and MCP transport."""
+
+    def __init__(self, code: ErrorCode, message: str) -> None:
+        super().__init__(f"[{code}] {message}")
+        self.code: ErrorCode = code
+        self.message: str = message
 
 
 @dataclass(slots=True, frozen=True)
@@ -11,8 +33,7 @@ class ChunkPointer:
     rel_posix_path: str
     start_line: int
     end_line: int
-    title: str
-    content_hash: str
+    title: str = ""
 
 
 @dataclass(slots=True, frozen=True)
@@ -49,3 +70,74 @@ class SyncDelta:
 
     added_chunks: tuple[tuple[ChunkPointer, str], ...] = ()
     deleted_chunk_ids: tuple[str, ...] = ()
+
+
+@dataclass(slots=True, frozen=True)
+class IndexStats:
+    """Cached non-blocking graph index statistics and configuration fingerprint."""
+
+    chunks: int = 0
+    entities: int = 0
+    facts: int = 0
+    edges: int = 0
+    config_fingerprint: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True, frozen=True)
+class DaemonStatus:
+    """Cached non-blocking daemon lifecycle, provider health, and worker queue snapshot."""
+
+    lifecycle: str = "stopped"
+    provider_ready: bool = False
+    sync_state: str = "idle"
+    queue_depth: int = 0
+    active_op: str | None = None
+    last_error: str | None = None
+    last_sync_at: float | None = None
+    pid: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def compute_mdhash_id(content: str, prefix: str = "") -> str:
+    """Compute the MD5 hash of the given content string and optionally prepend a prefix."""
+    return prefix + hashlib.md5(content.encode("utf-8")).hexdigest()
+
+
+def compute_chunk_id(rel_posix_path: str, start_line: int, end_line: int, text: str) -> str:
+    """Compute deterministic canonical chunk ID from relative path, line span, and slice text."""
+    payload = f"{rel_posix_path}:{start_line}:{end_line}:{text}"
+    return compute_mdhash_id(payload, prefix="chunk-")
+
+
+def inclusive_end_line(start_line: int, end_line: int, end_column: int) -> int:
+    """Convert half-open coordinate (end_line, end_column) to 1-indexed inclusive end line."""
+    if end_column == 1 and end_line > start_line:
+        return end_line - 1
+    return end_line
+
+
+def resolve_corpus_path(corpus_root: Path, rel_posix_path: str) -> Path:
+    """Resolve a relative POSIX path against a corpus root, rejecting path traversals."""
+    root_resolved = corpus_root.resolve()
+    target_path = (root_resolved / rel_posix_path).resolve()
+    if not target_path.is_relative_to(root_resolved):
+        raise ValueError(
+            f"Path traversal detected: {rel_posix_path!r} resolves outside corpus root {corpus_root}"
+        )
+    return target_path
+
+
+def to_rel_posix_path(corpus_root: Path, file_path: Path | str) -> str:
+    """Convert an absolute or relative file path to a relative POSIX path under corpus_root."""
+    root_resolved = corpus_root.resolve()
+    target_path = Path(file_path).resolve()
+    if not target_path.is_relative_to(root_resolved):
+        raise ValueError(
+            f"File path {file_path!r} resolves outside corpus root {corpus_root}"
+        )
+    return target_path.relative_to(root_resolved).as_posix()

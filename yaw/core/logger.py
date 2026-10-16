@@ -1,51 +1,67 @@
 """FIFO log rotation and noise-suppression configuration for YAW."""
 
-from collections import deque
+import contextlib
 import logging
 import os
+from collections import deque
 from pathlib import Path
 
 
 class FIFOLineRotatingHandler(logging.Handler):
     """A logging handler that maintains at most `max_lines` in a FIFO ring buffer on disk."""
 
-    def __init__(self, filename: str | Path, max_lines: int = 500, encoding: str = "utf-8"):
+    def __init__(
+        self,
+        filename: str | Path,
+        max_lines: int = 500,
+        encoding: str = "utf-8",
+        flush_interval: int = 50,
+    ) -> None:
         super().__init__()
         self.filename = Path(filename)
         self.max_lines = max(1, max_lines)
         self.encoding = encoding
+        self.flush_interval = max(1, flush_interval)
         self._buffer: deque[str] = deque(maxlen=self.max_lines)
+        self._unflushed: int = 0
+        with contextlib.suppress(OSError):
+            self.filename.parent.mkdir(parents=True, exist_ok=True)
         self._load_existing()
 
     def _load_existing(self) -> None:
         if self.filename.exists():
-            try:
+            with contextlib.suppress(OSError):
                 lines = self.filename.read_text(encoding=self.encoding).splitlines()
                 self._buffer.extend(lines[-self.max_lines :])
-            except Exception:
-                pass
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
             msg = self.format(record)
             for line in msg.splitlines():
                 self._buffer.append(line)
-            self.flush()
+            self._unflushed += 1
+            if self._unflushed >= self.flush_interval or record.levelno >= logging.ERROR:
+                self.flush()
         except Exception:
             self.handleError(record)
 
     def flush(self) -> None:
+        if self._unflushed == 0 and self.filename.exists():
+            return
+        if not self._buffer and not self.filename.exists():
+            return
         try:
-            self.filename.parent.mkdir(parents=True, exist_ok=True)
             tmp_path = self.filename.with_suffix(self.filename.suffix + ".tmp")
             content = "\n".join(self._buffer) + ("\n" if self._buffer else "")
             tmp_path.write_text(content, encoding=self.encoding)
             tmp_path.replace(self.filename)
-        except Exception:
+            self._unflushed = 0
+        except OSError:
             pass
 
     def close(self) -> None:
-        self.flush()
+        if self._unflushed > 0:
+            self.flush()
         super().close()
 
 

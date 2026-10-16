@@ -8,8 +8,14 @@ Use Python 3.12 and uv:
 
 ```powershell
 uv sync --locked
-uv run --locked python -c "from hipporag import HippoRAG; print('HippoRAG import OK')"
-uv run --locked python -m unittest discover -s tests -v
+uv run --locked pytest -v
+uv run --locked python -m yaw status --config yaw.toml
+uv run --locked python -m yaw sync --config yaw.toml
+uv run --locked python -m yaw run --config yaw.toml
+uv run --locked python -m yaw start --config yaw.toml
+uv run --locked python -m yaw stop --config yaw.toml
+uv run --locked python -m yaw rebuild --config yaw.toml
+uv run --locked python -m yaw optimize --config yaw.toml --mode hybrid
 uv run --locked python benchmark.py --dataset sample --mode all
 uv run --locked python benchmark.py --dataset 2wikimultihopqa --max-queries 10
 uv run --locked python benchmark.py --dataset hotpotqa --max-queries 10 --mode retrieval

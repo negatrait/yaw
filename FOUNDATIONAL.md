@@ -27,9 +27,9 @@ Baseline: 2026-10-14. YAW is a native HippoRAG 2 graph & storage engine (`yaw/da
    - **Heterogeneous Mistral Orchestrator + Qwen GBNF Worker (`execution_mode="rlm"` across all stages):** GBNF (`extra_body={"grammar": ...}`) is supported **only** on `llama.cpp` (`Qwen3-4B-Instruct-2507-GGUF` on Vulkan GPU) and **never** on Ryzen AI NPU/OGA (`Mistral-7B-Instruct-v0.3-Hybrid`, enforced by `lm_supports_gbnf`). In `execution_mode="rlm"`, **every** stage (`ner_rlm`, `triples_rlm`, `fact_filter_rlm`, `qa_rlm`) runs `Mistral-7B` on Ryzen AI NPU as the outer `dspy.RLM` Python REPL orchestrator (zero GBNF), delegating inner `llm_query` and built-in `qwen_*` worker tools (`qwen_extract_entities`, `qwen_extract_triples`, `qwen_filter_facts`, `qwen_answer_cot`) to `Qwen3-4B` on `llama.cpp` GPU with pure-JSON GBNF grammars (`build_dspy_ner_grammar`, `build_dspy_triples_grammar`, `build_dspy_rerank_grammar`, `build_dspy_qa_cot_grammar`).
    - **Zero-Lock-In Sizecoding Pareto Evolution Policy:** Never evolve or fine-tune prompts on the full Tier 2 benchmark corpora. Evolve one universal `compiled_program.json` via `dspy.MIPROv2` + `dspy.GEPA` using `compute_sizecoding_pareto_score` ($\text{pareto} = \text{Recall@5} / (\text{tokens} \times \text{time})$ with a hard minimum floor locked at the Tier 1 baseline) strictly on **Tier 1 small slices** (`--max-queries 10`) and/or **external out-of-distribution RAG datasets** (`onyx-dot-app/EnterpriseRAG-Bench`, `microsoft/graphrag-benchmarking-datasets`), then evaluate that frozen program zero-shot across the unseen Tier 2 full-corpus holdouts (`musique`, `2wikimultihopqa`, `hotpotqa`).
 
-## Domain Containment Tree (Zero Cross-Domain / Sibling Edges)
+## Domain Containment Tree & Architectural Law (Zero Cross-Domain / Sibling Edges)
 
-Every package owns its children; **horizontal imports between sibling domains are forbidden (`0` cross-domain edges)**. A module in package `X` may only import its own children `X.*` or `yaw.core.*`:
+Every package owns its children; **horizontal imports between sibling domains are forbidden (`0` cross-domain edges)**. A module in package `X` may only import its own descendants `X.*` or `yaw.core.*`:
 
 ```text
 yaw/
@@ -41,6 +41,13 @@ yaw/
       inference/           models.py, prompts.py, embedding.py, chat.py (imports: core, dspy)
   __main__.py                                                      (imports: daemon.cli)
 ```
+
+### Architectural Containment Law (`tests/core/test_architecture.py`):
+1. **Empty Intermediate Packages:** Intermediate parent package initializers (`yaw/`, `yaw/daemon/`, `yaw/daemon/graph/`) contain zero executable statements and trigger zero parent-package import side-effects.
+2. **Constricted Leaf Facades:** Leaf domain packages (`yaw.core`, `yaw.daemon.graph.inference`, `yaw.daemon.graph.storage`, `yaw.daemon.ingestion`) provide constricted public API facades (`_PUBLIC_API` + lazy `__getattr__` + `__dir__`) allowing leaf mutation into single-responsibility modules while keeping a stable public API contract.
+3. **Strict Domain Containment:** A module in package `P` imports only `P.*` and `yaw.core.*`. Horizontal sibling imports (`storage` $\leftrightarrow$ `inference`, `ingestion` $\leftrightarrow$ `graph`) are strictly forbidden. Only top-level orchestrators (`runtime.py`, `mcp_server.py`, `cli.py`, `benchmark.py`) wire sibling leaf domains together.
+4. **Zero Protected (`_`) or Private (`__`) Cross-Module Imports or Facade Exports:** Any symbol starting with a leading underscore is strictly module-internal. No `name.startswith("_")` may ever appear in a leaf `_PUBLIC_API` facade, in cross-module imports (`from .mod import _helper`), or in cross-module attribute accesses.
+5. **Zero `hipporag` Runtime Imports Inside `yaw/`:** Pinned `hipporag` is imported only in `benchmark.py` and offline test suites as the reference baseline.
 
 ## Validated 3-Slot Local Model Stack (`http://localhost:13305/api/v1`)
 

@@ -15,11 +15,11 @@ Usage:
 
 import argparse
 import json
-from pathlib import Path
 import sys
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 HF_BASE_URL = "https://huggingface.co/datasets/osunlp/HippoRAG_2/resolve/main"
 GITHUB_PINNED_COMMIT = "d5c8329422e0a0b834a15874545cb6a74b4f9b26"

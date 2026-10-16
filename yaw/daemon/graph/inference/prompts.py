@@ -29,7 +29,7 @@ class FactList(BaseModel):
 
 class ExtractEntities(dspy.Signature):
     """Your task is to extract named entities from the given paragraph.
-    Respond with a JSON list of entities."""
+    Respond with a JSON object in the format: {"named_entities": ["entity1", "entity2", ...]}"""
 
     passage: str = dspy.InputField(desc="Source passage text")
     named_entities: list[str] = dspy.OutputField(
@@ -39,7 +39,7 @@ class ExtractEntities(dspy.Signature):
 
 class ExtractTriples(dspy.Signature):
     """Your task is to construct an RDF (Resource Description Framework) graph from the given passages and named entity lists.
-    Respond with a JSON list of triples, with each triple representing a relationship in the RDF graph.
+    Respond with a JSON object in the format: {"triples": [["subject", "predicate", "object"], ...]}
     Pay attention to the following requirements:
     - Each triple should contain at least one, but preferably two, of the named entities in the list for each passage.
     - Clearly resolve pronouns to their specific names to maintain clarity."""
@@ -69,6 +69,15 @@ class AnswerQuestion(dspy.Signature):
     context: str = dspy.InputField(desc="Retrieved evidence passages")
     question: str = dspy.InputField(desc="Question to answer")
     answer: str = dspy.OutputField(desc="Concise, definitive final answer")
+
+
+class ExtractQueryIntent(dspy.Signature):
+    """Rewrite a question as a concise declarative statement or target relation phrase for fact retrieval."""
+
+    question: str = dspy.InputField(desc="User question")
+    query_intent: str = dspy.OutputField(
+        desc="Concise declarative statement of the sought fact"
+    )
 
 
 def _build_default_ner_demos() -> list[dspy.Example]:
@@ -127,6 +136,7 @@ QA_DEMOS: list[dspy.Example] = _build_default_qa_demos()
 __all__ = [
     "AnswerQuestion",
     "ExtractEntities",
+    "ExtractQueryIntent",
     "ExtractTriples",
     "FACT_FILTER_DEMOS",
     "FactList",

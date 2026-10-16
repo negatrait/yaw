@@ -1,7 +1,8 @@
 """Upstream HippoRAG 2 prompt strings, few-shot frames, and chat message formatters."""
 
 import json
-from typing import Any, Dict, List, Sequence, Tuple, Union
+from collections.abc import Sequence
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # 1. Named Entity Recognition (NER) Prompts
@@ -27,7 +28,7 @@ NER_ONE_SHOT_PARAGRAPH = one_shot_ner_paragraph
 NER_ONE_SHOT_OUTPUT = one_shot_ner_output
 
 
-def render_ner_messages(passage: str) -> List[Dict[str, str]]:
+def render_ner_messages(passage: str) -> list[dict[str, str]]:
     """Render 4-message chat history for NER extraction."""
     return [
         {"role": "system", "content": NER_SYSTEM},
@@ -86,8 +87,8 @@ TRIPLE_ONE_SHOT_OUTPUT = ner_conditioned_re_output
 
 
 def render_triple_messages(
-    passage: str, named_entities: Union[List[str], Tuple[str, ...], Sequence[str]]
-) -> List[Dict[str, str]]:
+    passage: str, named_entities: list[str] | tuple[str, ...] | Sequence[str]
+) -> list[dict[str, str]]:
     """Render 4-message chat history for triple extraction."""
     named_entity_json = json.dumps({"named_entities": list(named_entities)})
     user_content = TRIPLE_FRAME.format(
@@ -137,7 +138,7 @@ RAG_QA_ONE_SHOT_INPUT = one_shot_rag_qa_input
 RAG_QA_ONE_SHOT_OUTPUT = one_shot_rag_qa_output
 
 
-def render_rag_qa_messages(prompt_user: str) -> List[Dict[str, str]]:
+def render_rag_qa_messages(prompt_user: str) -> list[dict[str, str]]:
     """Render 4-message chat history for RAG QA."""
     return [
         {"role": "system", "content": RAG_QA_SYSTEM},
@@ -151,7 +152,7 @@ def render_rag_qa_messages(prompt_user: str) -> List[Dict[str, str]]:
 # 4. Recognition Memory / Fact Rerank (DSPyFilter) Prompts
 # ---------------------------------------------------------------------------
 
-best_dspy_prompt: Dict[str, Any] = {
+best_dspy_prompt: dict[str, Any] = {
     "prog": {
         "lm": None,
         "traces": [],
@@ -232,7 +233,7 @@ FACT_FILTER_INPUT_TEMPLATE = """[[ ## question ## ]]\n{question}\n\n[[ ## fact_b
 FACT_FILTER_OUTPUT_TEMPLATE = """[[ ## fact_after_filter ## ]]\n{fact_after_filter}\n\n[[ ## completed ## ]]"""
 
 
-def _build_fact_filter_base_messages() -> List[Dict[str, str]]:
+def _build_fact_filter_base_messages() -> list[dict[str, str]]:
     messages = [{"role": "system", "content": FACT_FILTER_SYSTEM}]
     for demo in best_dspy_prompt["prog"]["demos"]:
         messages.append({
@@ -256,8 +257,8 @@ FACT_FILTER_BASE_MESSAGES = _build_fact_filter_base_messages()
 
 def render_fact_filter_messages(
     question: str,
-    candidate_facts: Union[Sequence[Tuple[str, str, str]], Sequence[List[str]]],
-) -> List[Dict[str, str]]:
+    candidate_facts: Sequence[tuple[str, str, str]] | Sequence[list[str]],
+) -> list[dict[str, str]]:
     """Render full chat messages for DSPy recognition memory fact reranking."""
     fact_before_filter = json.dumps({"fact": [list(f) for f in candidate_facts]})
     user_content = FACT_FILTER_INPUT_TEMPLATE.format(
@@ -273,7 +274,7 @@ def render_fact_filter_messages(
 # 5. Fixed JSON Schemas for Local LLM Constrained Decoding
 # ---------------------------------------------------------------------------
 
-PROMPT_JSON_TEMPLATE: Dict[str, Any] = {
+PROMPT_JSON_TEMPLATE: dict[str, Any] = {
     "ner": {
         "type": "object",
         "properties": {

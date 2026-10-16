@@ -1,0 +1,550 @@
+"""Unmocked integration tests for YawRuntime, FileLock, 32-slot queue, crash-resume, CLI, and optimization."""
+
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import threading
+import time
+from collections.abc import Sequence
+from contextlib import redirect_stdout
+from pathlib import Path
+from typing import Any
+
+import dspy
+import numpy as np
+import pytest
+
+from yaw.core import (
+    OpenIERecord,
+    YawConfig,
+    YawRuntimeError,
+    load_config,
+)
+from yaw.daemon.cli import inspect_status, main
+from yaw.daemon.graph.inference import (
+    HippoRAGProgram,
+    compute_sizecoding_pareto_score,
+    resolve_embedding_profile,
+)
+from yaw.daemon.graph.storage import get_meta, get_openie_checkpoints, open_yaw_db
+from yaw.daemon.runtime import YawRuntime
+
+
+class DeterministicTestLM(dspy.LM):
+    """Deterministic in-process dspy.LM for offline daemon runtime tests."""
+
+    def __init__(self) -> None:
+        super().__init__(model="openai/test-runtime-lm")
+        self.fail_online: bool = False
+
+    def __call__(
+        self,
+        prompt: str | None = None,
+        messages: list[dict[str, Any]] | None = None,
+        **kwargs: Any,
+    ) -> list[str]:
+        if self.fail_online:
+            raise ConnectionError("Inference server at http://localhost:13305/api/v1 is unreachable")
+        req_str = str(prompt or messages or kwargs)
+        if "FilterFacts" in req_str or "fact_before_filter" in req_str:
+            if "Turing" in req_str:
+                return ['{"fact": [["Alan Turing", "worked at", "Bletchley Park"]]}']
+            if "Lovelace" in req_str:
+                return ['{"fact": [["Ada Lovelace", "programmed", "Analytical Engine"]]}']
+            return ['{"fact": [["University of Southampton", "founded in", "1862"]]}']
+        if "ExtractTriples" in req_str or '"triples"' in req_str or "`triples`" in req_str:
+            if "Turing" in req_str:
+                return ['{"triples": [["Alan Turing", "worked at", "Bletchley Park"]]}']
+            if "Lovelace" in req_str:
+                return ['{"triples": [["Ada Lovelace", "programmed", "Analytical Engine"]]}']
+            return ['{"triples": [["University of Southampton", "founded in", "1862"]]}']
+        if "ExtractEntities" in req_str or "named_entities" in req_str:
+            if "Turing" in req_str:
+                return ['{"named_entities": ["Alan Turing", "Bletchley Park"]}']
+            if "Lovelace" in req_str:
+                return ['{"named_entities": ["Ada Lovelace", "Analytical Engine"]}']
+            return ['{"named_entities": ["University of Southampton", "1862"]}']
+        if "ExtractQueryIntent" in req_str or "query_intent" in req_str:
+            return ['{"query_intent": "Alan Turing worked at Bletchley Park"}']
+        return ['{"reasoning": "Derived from retrieved passages.", "answer": "Bletchley Park"}']
+
+
+class DeterministicTestEmbedder:
+    """Deterministic L2-normalized 16-D embedder with EmbeddingProfile prefix support."""
+
+    def __init__(self, dim: int = 16) -> None:
+        self.dim = dim
+        self.profile = resolve_embedding_profile("embeddinggemma-300m-GGUF", "distinct-titled")
+        self.fail_online: bool = False
+
+    def update_prefixes(
+        self,
+        *,
+        query_prefix: str | None = None,
+        fact_query_prefix: str | None = None,
+        document_prefix: str | None = None,
+    ) -> None:
+        from dataclasses import replace
+
+        updates: dict[str, Any] = {}
+        if query_prefix is not None:
+            updates["query_prefix"] = query_prefix
+        if fact_query_prefix is not None:
+            updates["fact_query_prefix"] = fact_query_prefix
+        if document_prefix is not None:
+            updates["document_prefix"] = document_prefix
+        if updates:
+            self.profile = replace(self.profile, **updates)
+
+    def encode(self, texts: Sequence[str], instruction: str = "") -> list[np.ndarray]:
+        if self.fail_online:
+            raise ConnectionError("Embedding server unreachable")
+        vecs: list[np.ndarray] = []
+        for t in texts:
+            tl = t.lower()
+            v = np.zeros(self.dim, dtype=np.float32)
+            if "turing" in tl or "bletchley" in tl:
+                v[0] = 1.0
+            elif "lovelace" in tl or "analytical" in tl:
+                v[1] = 1.0
+            elif "southampton" in tl or "1862" in tl:
+                v[2] = 1.0
+            else:
+                digest = hashlib.md5(tl.encode("utf-8")).digest()
+                for i in range(self.dim):
+                    v[i] = float(digest[i % len(digest)]) / 255.0 + 0.01
+            norm = float(np.linalg.norm(v))
+            vecs.append(v / norm if norm > 0 else v)
+        return vecs
+
+
+def _make_test_config(tmp_path: Path, *, queue_maxsize: int = 32) -> tuple[YawConfig, Path]:
+    toml_path = tmp_path / "yaw.toml"
+    toml_content = f"""
+[paths]
+corpus_root = "corpus"
+db_path = ".yaw/yaw.db"
+lock_path = ".yaw/yaw.db.lock"
+state_dir = ".yaw/coco_state"
+log_path = ".yaw/yaw.log"
+status_path = ".yaw/status.json"
+compiled_program_path = ".yaw/compiled_program.json"
+
+[ingestion]
+included_patterns = ["*.md", "*.txt"]
+excluded_patterns = [".*", "*/.*", "__pycache__/*"]
+chunk_size = 1200
+chunk_overlap = 100
+min_chunk_size = 20
+poll_interval_seconds = 0.2
+
+[inference]
+base_url = "http://localhost:13305/api/v1"
+execution_mode = "direct"
+qa_mode = "cot"
+enable_gbnf = false
+
+[graph]
+linking_top_k = 4
+retrieval_top_k = 3
+embed_batch_size = 16
+
+[runtime]
+queue_maxsize = {queue_maxsize}
+http_port = 13306
+"""
+    toml_path.write_text(toml_content.strip() + "\n", encoding="utf-8")
+    cfg = load_config(toml_path)
+    assert cfg.corpus_root is not None
+    cfg.corpus_root.mkdir(parents=True, exist_ok=True)
+    return cfg, toml_path
+
+
+def _make_program_and_embedder() -> tuple[HippoRAGProgram, Any, DeterministicTestLM, DeterministicTestEmbedder]:
+    lm = DeterministicTestLM()
+    dspy.settings.configure(lm=lm)
+    prog = HippoRAGProgram(
+        execution_mode="direct",
+        qa_mode="cot",
+        enable_gbnf=False,
+        orchestrator_lm=lm,
+        rlm_sub_lm=lm,
+    )
+    emb = DeterministicTestEmbedder(dim=16)
+    return prog, emb, lm, emb
+
+
+def test_load_config_and_fingerprint(tmp_path: Path) -> None:
+    """Verify stdlib tomllib loader, relative path resolution, and deterministic config fingerprinting."""
+    repo_cfg = load_config(Path(__file__).resolve().parents[2] / "yaw.toml")
+    assert repo_cfg.queue_maxsize == 32
+    assert repo_cfg.embedding_model == "embeddinggemma-300m-GGUF"
+    assert repo_cfg.extraction_model == "Qwen3-4B-Instruct-2507-GGUF"
+    assert repo_cfg.qa_model == "Mistral-7B-Instruct-v0.3-Hybrid"
+    assert repo_cfg.config_fingerprint().startswith("yaw-cfg-v1:")
+
+    cfg1, toml_path = _make_test_config(tmp_path)
+    cfg2 = load_config(toml_path)
+    assert cfg1.config_fingerprint() == cfg2.config_fingerprint()
+    assert cfg1.corpus_root == (tmp_path / "corpus").resolve()
+    assert cfg1.db_path == (tmp_path / ".yaw" / "yaw.db").resolve()
+
+    with pytest.raises(YawRuntimeError) as exc_info:
+        load_config(tmp_path / "nonexistent.toml")
+    assert exc_info.value.code == "INVALID_INPUT"
+
+
+def test_second_runtime_fails_fast_on_lock(tmp_path: Path) -> None:
+    """D1-A5: A second YawRuntime targeting the same yaw.db.lock fails fast with BUSY."""
+    cfg, _ = _make_test_config(tmp_path)
+    prog1, emb1, _, _ = _make_program_and_embedder()
+    prog2, emb2, _, _ = _make_program_and_embedder()
+
+    rt1 = YawRuntime(cfg, program=prog1, embedder=emb1)
+    rt2 = YawRuntime(cfg, program=prog2, embedder=emb2)
+
+    rt1.start(sync_on_start=False)
+    try:
+        assert rt1.status().lifecycle == "ready"
+        with pytest.raises(YawRuntimeError) as exc_info:
+            rt2.start(sync_on_start=False)
+        assert exc_info.value.code == "BUSY"
+    finally:
+        rt1.stop()
+
+    # Once rt1 stops and releases yaw.db.lock, rt2 can start cleanly
+    rt2.start(sync_on_start=False)
+    try:
+        assert rt2.status().lifecycle == "ready"
+    finally:
+        rt2.stop()
+
+
+def test_bounded_32_slot_queue_overflow_and_non_blocking_status(tmp_path: Path) -> None:
+    """D1-A5 & E2-A3: 32-slot bounded queue overflows with BUSY on the 33rd queued item while status() stays <50ms."""
+    cfg, _ = _make_test_config(tmp_path, queue_maxsize=32)
+    prog, emb, _, _ = _make_program_and_embedder()
+    rt = YawRuntime(cfg, program=prog, embedder=emb)
+    rt.start(sync_on_start=False)
+
+    gate = threading.Event()
+    worker_entered = threading.Event()
+    progress_stages: list[str] = []
+
+    def _blocking_task() -> str:
+        worker_entered.set()
+        gate.wait(timeout=5.0)
+        return "done"
+
+    try:
+        # 1. Occupy the worker thread with a slow operation
+        first_fut = rt.submit("slow_op", _blocking_task, progress_callback=progress_stages.append)
+        assert worker_entered.wait(timeout=2.0)
+
+        # 2. Fill all 32 slots in the bounded FIFO queue
+        queued_futures = [rt.submit("noop", lambda: "ok") for _ in range(32)]
+        assert len(queued_futures) == 32
+
+        # 3. 33rd submission while queue is full must immediately raise BUSY
+        with pytest.raises(YawRuntimeError) as exc_info:
+            rt.submit("overflow", lambda: "overflow")
+        assert exc_info.value.code == "BUSY"
+
+        # 4. Non-blocking cached status() and stats() must return in <50ms while worker is blocked
+        t0 = time.perf_counter()
+        status = rt.status()
+        stats = rt.stats()
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        assert elapsed_ms < 50.0
+        assert status.queue_depth == 32
+        assert status.active_op == "slow_op"
+        assert stats.config_fingerprint == cfg.config_fingerprint()
+
+        # 5. Release worker and verify all queued tasks complete
+        gate.set()
+        assert first_fut.result(timeout=5.0) == "done"
+        for f in queued_futures:
+            assert f.result(timeout=5.0) == "ok"
+        assert progress_stages == ["queued", "started", "ready"]
+    finally:
+        gate.set()
+        rt.stop()
+
+
+def test_stage1_crash_resume_does_not_reextract_completed_chunks(tmp_path: Path) -> None:
+    """D1-A3 & D1-A5: Crash mid-OpenIE persists completed chunks and pending_sync_delta; restart resumes without re-extracting."""
+    cfg, _ = _make_test_config(tmp_path)
+    assert cfg.corpus_root is not None
+    assert cfg.db_path is not None
+
+    (cfg.corpus_root / "01_turing.md").write_text(
+        "# Alan Turing\nAlan Turing worked at Bletchley Park during World War II.\n",
+        encoding="utf-8",
+    )
+    (cfg.corpus_root / "02_lovelace.md").write_text(
+        "# Ada Lovelace\nAda Lovelace programmed the Analytical Engine in London.\n",
+        encoding="utf-8",
+    )
+
+    prog1, emb1, _, _ = _make_program_and_embedder()
+    extracted_counts: dict[str, int] = {}
+    orig_extract1 = prog1.extract_openie
+    should_crash_on_second = [True]
+
+    def _InstrumentedExtract(chunk_id: str, passage: str, **kw: Any) -> OpenIERecord:
+        extracted_counts[chunk_id] = extracted_counts.get(chunk_id, 0) + 1
+        if should_crash_on_second[0] and len(extracted_counts) == 2:
+            raise RuntimeError("Simulated mid-batch Stage 1 OpenIE crash on chunk 2")
+        return orig_extract1(chunk_id, passage, **kw)
+
+    setattr(prog1, "extract_openie", _InstrumentedExtract)
+
+    rt1 = YawRuntime(cfg, program=prog1, embedder=emb1)
+    rt1.start(sync_on_start=False)
+    try:
+        with pytest.raises(YawRuntimeError) as exc_info:
+            rt1.sync_now()
+        assert exc_info.value.code == "MODEL_ERROR"
+        assert len(extracted_counts) == 2
+    finally:
+        rt1.stop()
+
+    # Verify chunk 1 was checkpointed to openie_chunks and pending_sync_delta was saved in yaw.db meta
+    first_chunk_id = next(iter(extracted_counts.keys()))
+    conn = open_yaw_db(cfg.db_path)
+    try:
+        saved_openie = get_openie_checkpoints(conn, list(extracted_counts.keys()))
+        assert first_chunk_id in saved_openie
+        assert get_meta(conn, "pending_sync_delta") is not None
+    finally:
+        conn.close()
+
+    # Restart a new YawRuntime with the crash cleared: chunk 1 must NOT be re-extracted!
+    should_crash_on_second[0] = False
+    prog2, emb2, _, _ = _make_program_and_embedder()
+    orig_extract2 = prog2.extract_openie
+
+    def _InstrumentedExtract2(chunk_id: str, passage: str, **kw: Any) -> OpenIERecord:
+        extracted_counts[chunk_id] = extracted_counts.get(chunk_id, 0) + 1
+        return orig_extract2(chunk_id, passage, **kw)
+
+    setattr(prog2, "extract_openie", _InstrumentedExtract2)
+
+    rt2 = YawRuntime(cfg, program=prog2, embedder=emb2)
+    rt2.start(sync_on_start=True)
+    try:
+        # Chunk 1 was extracted once in run 1 and 0 times in run 2 (count == 1)
+        assert extracted_counts[first_chunk_id] == 1
+        assert rt2.stats().chunks == 2
+        assert rt2.engine is not None
+        assert rt2.engine.get_meta("pending_sync_delta") is None
+
+        hits = rt2.retrieve("Where did Alan Turing work?", top_k=2)
+        assert len(hits) == 2
+        assert any("Bletchley Park" in h.text for h in hits)
+    finally:
+        rt2.stop()
+
+
+def test_inference_outage_degradation_and_recovery(tmp_path: Path) -> None:
+    """D1-A5: Inference outage sets provider_ready=False and lifecycle='degraded' without crashing; recovery restores ready."""
+    cfg, _ = _make_test_config(tmp_path)
+    assert cfg.corpus_root is not None
+    (cfg.corpus_root / "turing.md").write_text(
+        "# Alan Turing\nAlan Turing worked at Bletchley Park.\n",
+        encoding="utf-8",
+    )
+
+    prog, emb, lm, raw_emb = _make_program_and_embedder()
+    rt = YawRuntime(cfg, program=prog, embedder=emb)
+    rt.start(sync_on_start=True)
+    try:
+        assert rt.status().lifecycle == "ready"
+        assert rt.status().provider_ready is True
+
+        # Trigger inference outage on LM
+        lm.fail_online = True
+        with pytest.raises(YawRuntimeError) as exc_info:
+            rt.rag_qa("Where did Alan Turing work?")
+        assert exc_info.value.code == "MODEL_ERROR"
+
+        degraded_status = rt.status()
+        assert degraded_status.lifecycle == "degraded"
+        assert degraded_status.provider_ready is False
+        assert degraded_status.last_error is not None
+        assert "unreachable" in degraded_status.last_error
+
+        # Restore inference server: daemon recovers automatically on next request
+        lm.fail_online = False
+        raw_emb.fail_online = False
+        qa_res = rt.rag_qa("Where did Alan Turing work?")
+        assert qa_res["answer"] == "Bletchley Park"
+        assert len(qa_res["evidence"]) >= 1
+
+        recovered_status = rt.status()
+        assert recovered_status.lifecycle == "ready"
+        assert recovered_status.provider_ready is True
+        assert recovered_status.last_error is None
+    finally:
+        rt.stop()
+
+
+def test_optimize_and_reload_compiled_program_with_composite_fitness(tmp_path: Path) -> None:
+    """D1-A4: Verify composite fitness formula (Recall@1..20 * EM * F1) / (tokens * time) and full-surface persistence."""
+    # 1. Verify exact composite fitness calculation in compute_sizecoding_pareto_score
+    pred_metric = compute_sizecoding_pareto_score(
+        0.8,
+        recall_at_1=0.5,
+        recall_at_2=0.6,
+        recall_at_10=1.0,
+        recall_at_20=1.0,
+        em=1.0,
+        f1=0.9,
+        tokens=50,
+        elapsed_seconds=0.2,
+    )
+    expected_quality = 0.5 * 0.6 * 0.8 * 1.0 * 1.0 * 1.0 * 0.9
+    expected_pareto_raw = expected_quality / (50 * 0.2)
+    assert pytest.approx(pred_metric.quality_numerator) == expected_quality
+    assert pytest.approx(pred_metric.pareto_raw) == expected_pareto_raw
+    assert "em" in pred_metric.objective_scores
+    assert "f1" in pred_metric.objective_scores
+    assert "recall_at_1" in pred_metric.objective_scores
+    assert "recall_at_20" in pred_metric.objective_scores
+
+    # 2. Verify full-surface optimization and persistence via YawRuntime.optimize()
+    cfg, _ = _make_test_config(tmp_path)
+    assert cfg.corpus_root is not None
+    (cfg.corpus_root / "turing.md").write_text(
+        "# Alan Turing\nAlan Turing worked at Bletchley Park.\n",
+        encoding="utf-8",
+    )
+
+    prog, emb, _, _ = _make_program_and_embedder()
+    # Mutate full optimizable surface: instructions, EmbeddingGemma prefixes, and GBNF bounds
+    prog.embedding_query_prefix = "task: custom optimized query | query: "
+    prog.embedding_fact_prefix = "task: custom optimized fact | query: "
+    prog.embedding_document_prefix = "title: custom | text: "
+    prog.gbnf_max_entities = 6
+    prog.gbnf_max_triples = 5
+    prog.gbnf_max_facts = 3
+    prog.gbnf_max_reasoning_chars = 160
+    prog.ner.signature = prog.ner.signature.with_instructions("Optimized NER surface instruction.")
+
+    class StubGEPA:
+        def __init__(self, metric: Any, reflection_lm: Any = None, auto: str = "light") -> None:
+            self.metric = metric
+            self.reflection_lm = reflection_lm
+            self.auto = auto
+
+        def compile(self, student: Any, trainset: list[Any], valset: Any = None) -> Any:
+            assert self.reflection_lm is not None
+            pred = student(question=trainset[0].question)
+            score_pred = self.metric(trainset[0], pred, pred_name="qa")
+            assert score_pred.score > 0.0
+            return student
+
+    orig_gepa = getattr(dspy, "GEPA", None)
+    setattr(dspy, "GEPA", StubGEPA)
+    try:
+        rt1 = YawRuntime(cfg, program=prog, embedder=emb)
+        rt1.start(sync_on_start=True)
+        try:
+            trainset = [
+                dspy.Example(
+                    question="Where did Alan Turing work?",
+                    gold_answers=["Bletchley Park"],
+                    gold_docs=["Alan Turing worked at Bletchley Park."],
+                ).with_inputs("question")
+            ]
+            saved_path = rt1.optimize(trainset, mode="gepa")
+            assert saved_path.exists()
+        finally:
+            rt1.stop()
+    finally:
+        if orig_gepa is not None:
+            setattr(dspy, "GEPA", orig_gepa)
+
+    # 3. Start a brand-new YawRuntime and verify compiled_program.json restores all 5 surfaces
+    fresh_prog, fresh_emb, _, _ = _make_program_and_embedder()
+    rt2 = YawRuntime(cfg, program=fresh_prog, embedder=fresh_emb)
+    rt2.start(sync_on_start=False)
+    try:
+        assert rt2.engine is not None
+        loaded_p = rt2.engine.program
+        assert loaded_p.ner.signature.instructions == "Optimized NER surface instruction."
+        assert loaded_p.gbnf_max_entities == 6
+        assert loaded_p.gbnf_max_triples == 5
+        assert loaded_p.gbnf_max_facts == 3
+        assert loaded_p.gbnf_max_reasoning_chars == 160
+        assert rt2.engine.embedder.profile.query_prefix == "task: custom optimized query | query: "
+        assert rt2.engine.embedder.profile.fact_query_prefix == "task: custom optimized fact | query: "
+        assert rt2.engine.embedder.profile.document_prefix == "title: custom | text: "
+    finally:
+        rt2.stop()
+
+
+def test_cli_subcommands_sync_status_rebuild_and_stop(tmp_path: Path) -> None:
+    """Verify CLI subcommands sync, status, rebuild, and stop with --config yaw.toml."""
+    cfg, toml_path = _make_test_config(tmp_path)
+    assert cfg.corpus_root is not None
+    (cfg.corpus_root / "note.md").write_text(
+        "# University of Southampton\nThe University of Southampton was founded in 1862.\n",
+        encoding="utf-8",
+    )
+
+    prog, emb, _, _ = _make_program_and_embedder()
+
+    # 1. CLI sync
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = main(["sync", "--config", str(toml_path)], program=prog, embedder=emb)
+    assert rc == 0
+    sync_out = json.loads(buf.getvalue())
+    assert sync_out["added_chunks"] == 1
+    assert sync_out["stats"]["chunks"] == 1
+
+    # 2. CLI status (offline inspection of yaw.db)
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = main(["status", "--config", str(toml_path)])
+    assert rc == 0
+    status_out = json.loads(buf.getvalue())
+    assert status_out["status"]["lifecycle"] == "stopped"
+    assert status_out["stats"]["chunks"] == 1
+
+    # 3. CLI rebuild
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = main(["rebuild", "--config", str(toml_path)], program=prog, embedder=emb)
+    assert rc == 0
+    rebuild_out = json.loads(buf.getvalue())
+    assert rebuild_out["rebuilt"] is True
+    assert rebuild_out["stats"]["chunks"] == 1
+
+    # 4. Foreground daemon run + CLI stop from another thread
+    run_thread = threading.Thread(
+        target=lambda: main(["run", "--config", str(toml_path)], program=prog, embedder=emb),
+        daemon=True,
+    )
+    run_thread.start()
+
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        live = inspect_status(cfg)
+        if live["status"]["lifecycle"] == "ready":
+            break
+        time.sleep(0.05)
+
+    assert inspect_status(cfg)["status"]["lifecycle"] == "ready"
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc_stop = main(["stop", "--config", str(toml_path)])
+    assert rc_stop == 0
+    stop_out = json.loads(buf.getvalue())
+    assert stop_out["stopped"] is True
+    run_thread.join(timeout=5.0)
+    assert not run_thread.is_alive()

@@ -1,7 +1,9 @@
-"""Unit tests for yaw.core.types frozen dataclasses."""
+"""Unit tests for yaw.core.types frozen dataclasses and pure coordinate/ID helpers."""
 
-from dataclasses import FrozenInstanceError
+import tempfile
 import unittest
+from dataclasses import FrozenInstanceError
+from pathlib import Path
 
 from yaw.core.types import (
     ChunkPointer,
@@ -9,6 +11,11 @@ from yaw.core.types import (
     OpenIERecord,
     RetrievalResult,
     SyncDelta,
+    compute_chunk_id,
+    compute_mdhash_id,
+    inclusive_end_line,
+    resolve_corpus_path,
+    to_rel_posix_path,
 )
 
 
@@ -20,14 +27,12 @@ class TypesTests(unittest.TestCase):
             start_line=1,
             end_line=25,
             title="Sample Title",
-            content_hash="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         )
         self.assertEqual(pointer.chunk_id, "chunk-1")
         self.assertEqual(pointer.rel_posix_path, "docs/sample.md")
         self.assertEqual(pointer.start_line, 1)
         self.assertEqual(pointer.end_line, 25)
         self.assertEqual(pointer.title, "Sample Title")
-        self.assertEqual(pointer.content_hash, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
 
         # Frozen contract
         with self.assertRaises((FrozenInstanceError, AttributeError)):
@@ -43,14 +48,13 @@ class TypesTests(unittest.TestCase):
             start_line=1,
             end_line=25,
             title="Sample Title",
-            content_hash="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         )
         self.assertEqual(pointer, pointer2)
         self.assertEqual(hash(pointer), hash(pointer2))
         self.assertEqual(len({pointer, pointer2}), 1)
 
     def test_hydrated_passage_invariants(self):
-        pointer = ChunkPointer("c1", "p.md", 1, 10, "Title", "hash1")
+        pointer = ChunkPointer("c1", "p.md", 1, 10, "Title")
         passage = HydratedPassage(pointer=pointer, text="Hello world", score=0.95)
         self.assertEqual(passage.pointer, pointer)
         self.assertEqual(passage.text, "Hello world")
@@ -79,7 +83,7 @@ class TypesTests(unittest.TestCase):
         self.assertFalse(hasattr(record, "__dict__"))
 
     def test_retrieval_result_invariants(self):
-        pointer = ChunkPointer("c1", "p.md", 1, 10, "Title", "hash1")
+        pointer = ChunkPointer("c1", "p.md", 1, 10, "Title")
         passage = HydratedPassage(pointer=pointer, text="Hello world", score=0.95)
         result = RetrievalResult(question="What is this?", passages=(passage,))
         self.assertEqual(result.question, "What is this?")
@@ -100,7 +104,7 @@ class TypesTests(unittest.TestCase):
         self.assertEqual(delta_empty.added_chunks, ())
         self.assertEqual(delta_empty.deleted_chunk_ids, ())
 
-        pointer = ChunkPointer("c1", "p.md", 1, 10, "Title", "hash1")
+        pointer = ChunkPointer("c1", "p.md", 1, 10, "Title")
         delta = SyncDelta(
             added_chunks=((pointer, "Full chunk body text"),),
             deleted_chunk_ids=("c0",),
@@ -113,3 +117,44 @@ class TypesTests(unittest.TestCase):
         with self.assertRaises((FrozenInstanceError, AttributeError)):
             delta.deleted_chunk_ids = ()  # type: ignore
         self.assertFalse(hasattr(delta, "__dict__"))
+
+    def test_compute_mdhash_id_and_chunk_id(self):
+        content = "test text"
+        raw_hash = compute_mdhash_id(content)
+        self.assertEqual(len(raw_hash), 32)
+        prefixed = compute_mdhash_id(content, prefix="entity-")
+        self.assertTrue(prefixed.startswith("entity-"))
+        self.assertEqual(prefixed, f"entity-{raw_hash}")
+
+        chunk_id = compute_chunk_id("doc.md", 1, 10, content)
+        self.assertTrue(chunk_id.startswith("chunk-"))
+        self.assertEqual(len(chunk_id), 38)  # len("chunk-") + 32 hex
+
+    def test_inclusive_end_line(self):
+        # When end_column == 1 and end_line > start_line, slice ended at trailing newline
+        self.assertEqual(inclusive_end_line(start_line=1, end_line=5, end_column=1), 4)
+        # When end_line == start_line, never decrement below start_line
+        self.assertEqual(inclusive_end_line(start_line=1, end_line=1, end_column=1), 1)
+        # When end_column > 1, slice ended midway on end_line
+        self.assertEqual(inclusive_end_line(start_line=1, end_line=5, end_column=15), 5)
+
+    def test_resolve_corpus_path_and_to_rel_posix_path(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir).resolve()
+            sub = root / "nested" / "doc.md"
+            sub.parent.mkdir(parents=True)
+            sub.write_text("content", encoding="utf-8")
+
+            # Valid resolution
+            resolved = resolve_corpus_path(root, "nested/doc.md")
+            self.assertEqual(resolved, sub)
+
+            # Valid relative posix path conversion
+            rel = to_rel_posix_path(root, sub)
+            self.assertEqual(rel, "nested/doc.md")
+
+            # Traversal attempt rejection
+            with self.assertRaises(ValueError):
+                resolve_corpus_path(root, "../outside.txt")
+            with self.assertRaises(ValueError):
+                to_rel_posix_path(root, root.parent / "outside.txt")

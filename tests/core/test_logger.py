@@ -1,8 +1,8 @@
 import logging
 import os
-from pathlib import Path
 import tempfile
 import unittest
+from pathlib import Path
 
 from yaw.core.logger import FIFOLineRotatingHandler, configure_logging
 
@@ -54,6 +54,32 @@ class LoggerTests(unittest.TestCase):
                 self.assertEqual(logging.getLogger(name).level, logging.WARNING)
             self.assertEqual(len(handlers), 2)
             self.assertIsInstance(handlers[1], FIFOLineRotatingHandler)
+
+    def test_fifo_handler_buffers_writes_until_flush_interval_or_error(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            log_path = Path(tmp_dir) / "buffered.log"
+            handler = FIFOLineRotatingHandler(log_path, max_lines=50, flush_interval=5)
+            logger = logging.getLogger("test_buffered_fifo")
+            logger.setLevel(logging.INFO)
+            logger.addHandler(handler)
+
+            # 3 INFO messages (< flush_interval=5) remain buffered in memory without disk write
+            for i in range(3):
+                logger.info("Buffered %d", i)
+            self.assertFalse(log_path.exists())
+
+            # 2 more INFO messages reach flush_interval=5 and trigger a single disk flush
+            logger.info("Buffered 3")
+            logger.info("Buffered 4")
+            self.assertTrue(log_path.exists())
+            self.assertEqual(len(log_path.read_text(encoding="utf-8").splitlines()), 5)
+
+            # ERROR message flushes immediately even before flush_interval
+            logger.error("Immediate error")
+            self.assertEqual(len(log_path.read_text(encoding="utf-8").splitlines()), 6)
+
+            logger.removeHandler(handler)
+            handler.close()
 
 
 if __name__ == "__main__":

@@ -1,11 +1,11 @@
 """Executable specifications for HippoRAG benchmark slicing, evaluation, and integrity gates."""
 
-from pathlib import Path
-import tempfile
-from types import SimpleNamespace
-import unittest
-from unittest.mock import Mock
 import json
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 from benchmark import (
     PAPER_BASELINES,
@@ -239,7 +239,7 @@ class EvaluationAndIntegrityTests(unittest.TestCase):
                 self.entity_embeddings = [1, 2, 3]
                 self.passage_embeddings = [4, 5, 6]
                 self.fact_embeddings = [7, 8, 9]
-                self.query_to_embedding = {"triple": {"q": 1}, "passage": {"q": 2}}
+                self.query_to_embedding: dict[str, dict[str, object]] = {"triple": {"q": 1}, "passage": {"q": 2}}
                 self.ready_to_retrieve = True
 
             def retrieve(self, queries, num_to_retrieve=None):

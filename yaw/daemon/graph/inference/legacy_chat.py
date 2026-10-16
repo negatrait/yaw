@@ -1,13 +1,13 @@
 """Legacy local chat and CacheOpenAI adapters for pinned upstream HippoRAG baseline."""
 
-from copy import deepcopy
-from dataclasses import dataclass, field, replace
 import functools
 import hashlib
 import json
 import os
 import re
 import sqlite3
+from copy import deepcopy
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from filelock import FileLock
@@ -209,18 +209,12 @@ def cache_response(func):
     @functools.wraps(func)
     def wrapper(self, *args, **kwargs):
         global_config = getattr(self, "global_config", None)
-        if args:
-            messages = args[0]
-        else:
-            messages = kwargs.get("messages")
+        messages = args[0] if args else kwargs.get("messages")
         if messages is None:
             raise ValueError("Missing required 'messages' parameter for caching.")
 
-        gen_params = (
-            getattr(self, "llm_config", None).generate_params
-            if hasattr(self, "llm_config") and self.llm_config is not None
-            else {}
-        )
+        llm_conf = getattr(self, "llm_config", None)
+        gen_params = getattr(llm_conf, "generate_params", {}) if llm_conf is not None else {}
         key_data = normalize_generation_token_params(gen_params, kwargs, "_max_tokens")
         key_data["messages"] = messages
         key_data["_cache_schema"] = 3
@@ -240,32 +234,30 @@ def cache_response(func):
         database_lock_file = self.cache_file_name + ".lock"
         key_lock_file = f"{self.cache_file_name}.{key_hash[:2]}.lock"
         with FileLock(key_lock_file):
-            with FileLock(database_lock_file):
-                with sqlite3.connect(self.cache_file_name) as conn:
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        """
-                        CREATE TABLE IF NOT EXISTS cache (
-                            key TEXT PRIMARY KEY,
-                            message TEXT,
-                            metadata TEXT
-                        )
-                        """
+            with FileLock(database_lock_file), sqlite3.connect(self.cache_file_name) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS cache (
+                        key TEXT PRIMARY KEY,
+                        message TEXT,
+                        metadata TEXT
                     )
-                    cursor.execute("SELECT message, metadata FROM cache WHERE key = ?", (key_hash,))
-                    row = cursor.fetchone()
+                    """
+                )
+                cursor.execute("SELECT message, metadata FROM cache WHERE key = ?", (key_hash,))
+                row = cursor.fetchone()
             if row is not None:
                 message, metadata_str = row
                 return message, json.loads(metadata_str), True
 
             message, metadata = func(self, *args, **kwargs)
 
-            with FileLock(database_lock_file):
-                with sqlite3.connect(self.cache_file_name) as conn:
-                    conn.execute(
-                        "INSERT OR REPLACE INTO cache (key, message, metadata) VALUES (?, ?, ?)",
-                        (key_hash, message, json.dumps(metadata)),
-                    )
+            with FileLock(database_lock_file), sqlite3.connect(self.cache_file_name) as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO cache (key, message, metadata) VALUES (?, ?, ?)",
+                    (key_hash, message, json.dumps(metadata)),
+                )
 
         return message, metadata, False
 
@@ -343,7 +335,7 @@ class CacheOpenAI:
         )
 
     @cache_response
-    def infer(self, messages: list[dict[str, Any]], **kwargs: Any) -> tuple[str, dict[str, Any], bool]:
+    def infer(self, messages: list[dict[str, Any]], **kwargs: Any) -> tuple[str, dict[str, Any]]:
         params = normalize_generation_token_params(
             self.llm_config.generate_params, kwargs, "max_tokens"
         )

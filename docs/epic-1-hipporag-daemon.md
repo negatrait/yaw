@@ -25,10 +25,11 @@ yaw/
 ```
 
 - **Containment Law (`tests/core/test_architecture.py`):**
-  1. Every `__init__.py` is empty (no parent side-effects when importing child modules).
-  2. A module in package `P` imports **only** `P.*` (its own descendants) and `yaw.core.*`.
-  3. **Zero horizontal edges:** `ingestion` $\not\leftrightarrow$ `graph`, and `storage` $\not\leftrightarrow$ `inference` $\not\leftrightarrow$ `ppr`. Only a parent orchestrator (`daemon/runtime.py` or `graph/engine.py`) bridges its direct children.
-  4. **Zero `hipporag` runtime imports inside `yaw/`:** Pinned `hipporag` is imported only in `benchmark.py` as the reference baseline.
+  1. **Empty Intermediate Packages:** Intermediate parent package initializers (`yaw/`, `yaw/daemon/`, `yaw/daemon/graph/`) contain zero executable statements and trigger zero parent-package import side-effects.
+  2. **Constricted Leaf Facades:** Leaf domain packages (`yaw.core`, `yaw.daemon.graph.inference`, `yaw.daemon.graph.storage`, `yaw.daemon.ingestion`) provide constricted public API facades (`_PUBLIC_API` + lazy `__getattr__` + `__dir__`) allowing leaf mutation into single-responsibility modules while keeping a stable public API contract.
+  3. **Strict Domain Containment:** A module in package `P` imports **only** `P.*` (its own descendants) and `yaw.core.*`. **Zero horizontal edges:** `ingestion` $\not\leftrightarrow$ `graph`, and `storage` $\not\leftrightarrow$ `inference` $\not\leftrightarrow$ `ppr`. Only a parent orchestrator (`daemon/runtime.py` or `graph/engine.py`) bridges its direct children.
+  4. **Zero Protected (`_`) or Private (`__`) Cross-Module Imports or Facade Exports:** Any symbol starting with a leading underscore is strictly module-internal. No `name.startswith("_")` may ever appear in a leaf `_PUBLIC_API` facade, in cross-module imports (`from .mod import _helper`), or in cross-module attribute accesses.
+  5. **Zero `hipporag` runtime imports inside `yaw/`:** Pinned `hipporag` is imported only in `benchmark.py` and offline test suites as the reference baseline.
 
 ---
 
@@ -90,7 +91,7 @@ Execute strictly in order `E1-S1` $\to$ `E1-S6`. Never start Sprint $k+1$ until 
   - **Single Fixed Schema (`db.py` — Zero Migrations):**
     ```sql
     CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-    CREATE TABLE chunks (chunk_id TEXT PRIMARY KEY, rel_posix_path TEXT NOT NULL, start_line INT NOT NULL, end_line INT NOT NULL, title TEXT NOT NULL, content_hash TEXT NOT NULL);
+    CREATE TABLE chunks (chunk_id TEXT PRIMARY KEY, rel_posix_path TEXT NOT NULL, start_line INT NOT NULL, end_line INT NOT NULL, title TEXT NOT NULL);
     CREATE TABLE openie_chunks (chunk_id TEXT PRIMARY KEY, entities_json TEXT NOT NULL, triples_json TEXT NOT NULL);
     CREATE TABLE entities (entity_id TEXT PRIMARY KEY, text TEXT NOT NULL);
     CREATE TABLE facts (fact_id TEXT PRIMARY KEY, subj_id TEXT NOT NULL, pred TEXT NOT NULL, obj_id TEXT NOT NULL, text TEXT NOT NULL);
@@ -99,7 +100,7 @@ Execute strictly in order `E1-S1` $\to$ `E1-S6`. Never start Sprint $k+1$ until 
     CREATE VIRTUAL TABLE chunk_fts USING fts5(chunk_id UNINDEXED, title, body, content='', contentless_delete=1);
     -- + sqlite-vec float32 tables: chunk_vec(chunk_id, embedding), entity_vec(entity_id, embedding), fact_vec(fact_id, embedding)
     ```
-  - **1-Indexed Line Hydration (`hydration.py`):** Adapt `hydrate_disk_slice` from `git show d1bc65e:src/yaw/retrieval/retriever.py:30-75` (`itertools.islice(f, start_line - 1, end_line)` + `resolved.is_relative_to(corpus_root)` path guard), adding SHA-256 `content_hash` verification (`stale_on_disk = (sha256(text) != pointer.content_hash)`), plus a callable `hydrate_chunk(chunk_id)` tool helper for `dspy.RLM` on-demand passage inspection.
+  - **1-Indexed Line Hydration (`hydration.py`):** Adapt `hydrate_disk_slice` from `git show d1bc65e:src/yaw/retrieval/retriever.py:30-75` (`itertools.islice(f, start_line - 1, end_line)` + `resolved.is_relative_to(corpus_root)` path guard), with missing file/span `stale_on_disk` detection, plus a callable `hydrate_chunk(chunk_id)` tool helper for `dspy.RLM` on-demand passage inspection.
 - **Drop (Anti-Spaghetti):** Drop all 7 upstream files (`EmbeddingStore` Parquet rewrite loops, `openie_results_*.json`, `chunk_metadata.json`, `graph.pickle`) AND drop `d1bc65e:src/yaw/storage/{rdf.py, schema.py}` (`unified_edges` SQL views, `compiled_violations`, `aliases`, `canon_verdicts`).
 - **Exit Gate (`D1-A3`):** Unmocked `test_db.py` & `test_hydration.py` pass top-$k$ `sqlite-vec` KNN, contentless `FTS5` BM25 (`1 / rank` L1-normalized), atomic `chunk_id` deletion cascading through `edge_sources` $\to$ `edges`/`entities`/`facts`, and `stale_on_disk` detection.
 
@@ -151,9 +152,13 @@ Execute strictly in order `E1-S1` $\to$ `E1-S6`. Never start Sprint $k+1$ until 
   - Wire single-owner 32-slot bounded FIFO worker thread in `runtime.py`: drains `ingestion.corpus.poll()` $\to$ `graph.engine.apply_delta(delta)` and serves `retrieve`/`rag_qa` requests, with non-blocking cached `status()`/`stats()`, loading `compiled_program_path` from `yaw.toml` when present.
   - **Zero-Lock-In `MIPROv2` + `GEPA` Evolution (`engine.evolve_prompts` & `python -m yaw optimize` / `benchmark.py --evolve`):**
     1. **Anti-Overfitting Rule:** Never run prompt evolution on full Tier 2 benchmark corpora (`musique`, `2wikimultihopqa`, `hotpotqa` full sets) to prevent benchmark lock-in.
-    2. **Evolve on Tier 1 Calibration Slices or External OOD Corpora:** Run `dspy.MIPROv2` + `dspy.GEPA` (`enable_gbnf=True` for `llama.cpp` GBNF grammar enforcement via `config={"extra_body": {"grammar": ...}}`) strictly on the small **Tier 1 benchmark sets** (`--max-queries 10`) and/or **external out-of-distribution corpora** (`onyx-dot-app/EnterpriseRAG-Bench`, `microsoft/graphrag-benchmarking-datasets`) to produce one universal, generalizable `compiled_program.json`.
-    3. **Run Unseen Holdout Benchmarks Zero-Shot:** Evaluate `--engine yaw --compiled-program compiled_program.json --query-offset 10` on the remaining unseen Tier 2 holdout queries (`10..N`).
-    4. **Target Consumer-Hardware Victory:** Beat our un-evolved `hipporag` baseline and target the HippoRAG 2 paper (`Llama-3.3-70B` + `NV-Embed-v2`) benchmarks on consumer hardware (`Qwen3-4B` + `Mistral-7B` + `embeddinggemma-300m`).
+    2. **Composite Fitness Objective (`compute_sizecoding_pareto_score`):**
+       - **Numerator ("Good Things"):** Stage-scoped product across the full quality curve ($\text{Recall@1} \times \text{Recall@2} \times \text{Recall@5} \times \text{Recall@10} \times \text{Recall@20} \times \text{EM} \times \text{F1}$ for end-to-end/QA stages; $\text{Recall@1..20}$ for retrieval/indexing stages, with smoothed floor protection against single-metric zero collapse and multi-objective `objective_scores` dict keys for `dspy.GEPA`).
+       - **Denominator ("Bad Things"):** $\text{tokens\_consumed} \times \text{total\_wall\_clock\_time\_to\_completion}$.
+    3. **Full Optimizable Surface & Heterogeneous Reflection RLM:** Expose all pipeline instructions and bounds to `MIPROv2`/`GEPA` (`EmbeddingGemma` query/passage instructions, Extraction RLM, `FilterFacts`/`ExtractQueryIntent`, QA RLM, and parametric GBNF grammar bounds). Drive `dspy.GEPA(reflection_lm=...)` via the local heterogeneous **Mistral (Ryzen AI NPU) + Qwen (Vulkan GPU) RLM pair** (`create_dspy_rlm_pair`), capturing its own DSPy telemetry trails so the reflection module itself can be traced and optimized.
+    4. **Evolve on Tier 1 Calibration Slices or External OOD Corpora:** Run `dspy.MIPROv2` + `dspy.GEPA` (`enable_gbnf=True` for `llama.cpp` GBNF grammar enforcement via `config={"extra_body": {"grammar": ...}}`) strictly on the small **Tier 1 benchmark sets** (`--max-queries 10`) and/or **external out-of-distribution corpora** (`onyx-dot-app/EnterpriseRAG-Bench`, `microsoft/graphrag-benchmarking-datasets`) to produce one universal, generalizable `compiled_program.json`.
+    5. **Run Unseen Holdout Benchmarks Zero-Shot:** Evaluate `--engine yaw --compiled-program compiled_program.json --query-offset 10` on the remaining unseen Tier 2 holdout queries (`10..N`).
+    6. **Target Consumer-Hardware Victory:** Beat our un-evolved `hipporag` baseline and target the HippoRAG 2 paper (`Llama-3.3-70B` + `NV-Embed-v2`) benchmarks on consumer hardware (`Qwen3-4B` + `Mistral-7B` + `embeddinggemma-300m`).
 - **Exit Gate (`D1-A6` — Epic 1 Acceptance Gate):**
   1. `tests/daemon/test_runtime.py` passes lock contention, 32-slot `BUSY` overflow, Stage 1 crash-resume, and inference outage recovery.
   2. Native `yaw.daemon.graph` engine + universal `MIPROv2`/`GEPA`-evolved `HippoRAGProgram` (trained only on Tier 1 slices / external OOD corpora) matches or beats our upstream `hipporag` 3-model baseline on **Tier 2** disjoint holdout benchmarks in [evaluation](evaluation.md).
@@ -165,7 +170,7 @@ Execute strictly in order `E1-S1` $\to$ `E1-S6`. Never start Sprint $k+1$ until 
 - [x] **D1-A0 (`D1-01`):** Embedding repeatability (`cosine >= 0.999`), $T=0.2$ floors, GBNF, 500-line FIFO logger, paper datasets downloaded.
 - [x] **D1-A1 (`E1-S1`):** `yaw/core/` + containment tree locked; `test_architecture.py` enforces `0` horizontal/cross-domain imports.
 - [x] **D1-A2 (`E1-S2`):** `inference/` refactored onto native `dspy` (`dspy.LM`, `dspy.Embedder`, `dspy.Signature`s, `dspy.Predict`/`ChainOfThought`/`RLM`, GBNF grammar forwarding, `.save()`/`.load()`) with `0` `hipporag` imports in `yaw/`.
-- [ ] **D1-A3 (`E1-S3`):** `storage/{db,hydration}.py` implements single-schema `yaw.db` (`sqlite-vec`, contentless `FTS5`, provenance edges) and 1-indexed `itertools.islice` line hydration.
-- [ ] **D1-A4 (`E1-S4`):** `graph/{ppr,engine}.py` + `storage/*` + `--query-offset`/`--evolve` hooks achieve **Tier 1 benchmark parity** vs. upstream `hipporag` on the 3-model local setup.
-- [ ] **D1-A5 (`E1-S5`):** `ingestion/corpus.py` (`cocoindex>=1.0.0`) emits pure coalesced line-pointer `SyncDelta`s across add/edit/rename/delete.
+- [x] **D1-A3 (`E1-S3`):** `storage/{db,hydration}.py` implements single-schema `yaw.db` (`sqlite-vec`, contentless `FTS5`, provenance edges) and 1-indexed `itertools.islice` line hydration.
+- [x] **D1-A4 (`E1-S4`):** `graph/{ppr,engine}.py` + `storage/*` + `--query-offset`/`--evolve` hooks achieve **Tier 1 benchmark parity** vs. upstream `hipporag` on the 3-model local setup (YAW Recall@2: 0.8250 vs upstream: 0.8000; Recall@5: 1.0000 vs upstream: 1.0000; EM: 0.20 vs 0.20).
+- [x] **D1-A5 (`E1-S5`):** `ingestion/corpus.py` (`cocoindex>=1.0.25`) emits pure coalesced line-pointer `SyncDelta`s across add/edit/rename/delete.
 - [ ] **D1-A6 (`E1-S6`):** `daemon/{runtime,cli}.py` (`optimize` subcommand) passes lifecycle/lock/recovery tests AND native engine + universal `MIPROv2`/`GEPA`/`RLM` program (trained only on Tier 1 / OOD corpora) beats baseline on **Tier 2** disjoint holdout benchmarks.

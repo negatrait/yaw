@@ -1,13 +1,15 @@
 import importlib.util
 import json
-from pathlib import Path
 import tempfile
 import unittest
+from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT_PATH = PROJECT_ROOT / "scripts" / "download-datasets.py"
 
 spec = importlib.util.spec_from_file_location("download_datasets", SCRIPT_PATH)
+if spec is None or spec.loader is None:
+    raise RuntimeError(f"Could not load module from {SCRIPT_PATH}")
 download_datasets = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(download_datasets)
 
@@ -28,7 +30,7 @@ class DownloadDatasetsTests(unittest.TestCase):
         self.assertEqual(set(download_datasets.DATASET_REGISTRY.keys()), expected_benchmarks)
 
     def test_aliases_map_to_canonical_keys(self):
-        for alias, canonical in download_datasets.ALIASES.items():
+        for _alias, canonical in download_datasets.ALIASES.items():
             self.assertIn(canonical, download_datasets.DATASET_REGISTRY)
 
     def test_verify_dataset_detects_missing_and_valid_files(self):

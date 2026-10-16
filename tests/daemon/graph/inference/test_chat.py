@@ -1,18 +1,20 @@
 """Verify recipe-specific chat policies, split extraction/QA instances, and strict completion accounting."""
+import unittest
 from contextlib import closing
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-import unittest
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 from hipporag.prompts import PromptTemplateManager
 from hipporag.prompts.filter_default_prompt import best_dspy_prompt
 from hipporag.utils.config_utils import BaseConfig
 from hipporag.utils.llm_utils import PROMPT_JSON_TEMPLATE
+
 from yaw.daemon.graph.inference.legacy_chat import (
+    RERANK_GBNF_GRAMMAR,
     CacheOpenAI,
     LocalChat,
-    RERANK_GBNF_GRAMMAR,
     chat_identity,
 )
 from yaw.daemon.graph.inference.models import CHAT_MODELS
@@ -55,7 +57,7 @@ class ChatTests(unittest.TestCase):
                 usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5, total_tokens=15),
             )
             ptm = PromptTemplateManager()
-            raw_messages = ptm.render(name="ner", passage="George Rankin is a politician.")
+            raw_messages: Any = ptm.render(name="ner", passage="George Rankin is a politician.")
             text, meta, hit = chat.infer(raw_messages, max_new_tokens=128)
             self.assertFalse(hit)
             self.assertEqual(text, '{"named_entities": ["George"]}')
@@ -107,8 +109,9 @@ class ChatTests(unittest.TestCase):
             chat.infer(ptm.render(name="ner", passage="George Rankin is a politician."))
             ner_kwargs = chat.openai_client.chat.completions.create.call_args.kwargs
             ner_schema = ner_kwargs["response_format"]["json_schema"]["schema"]
+            prompt_json: Any = PROMPT_JSON_TEMPLATE
             self.assertEqual(ner_schema["properties"]["named_entities"]["items"], {"type": "string", "minLength": 1})
-            self.assertEqual(PROMPT_JSON_TEMPLATE["ner"]["properties"]["named_entities"]["items"], {"type": "string"})
+            self.assertEqual(prompt_json["ner"]["properties"]["named_entities"]["items"], {"type": "string"})
 
             chat.infer(ptm.render(name="triple_extraction", passage="George Rankin is a politician.", named_entity_json='{"named_entities": ["George"]}'))
             triple_kwargs = chat.openai_client.chat.completions.create.call_args.kwargs
@@ -118,7 +121,7 @@ class ChatTests(unittest.TestCase):
                 {"type": "string", "minLength": 1},
             )
             self.assertEqual(
-                PROMPT_JSON_TEMPLATE["triples"]["properties"]["triples"]["items"]["items"],
+                prompt_json["triples"]["properties"]["triples"]["items"]["items"],
                 {"type": "string"},
             )
 
@@ -238,9 +241,11 @@ class ChatTests(unittest.TestCase):
         chat.calls = []
         chat.errors = []
         for finish in ("length", "tool_calls", None):
-            with patch.object(CacheOpenAI, "infer", return_value=("partial", {"finish_reason": finish}, False)):
-                with self.assertRaisesRegex(ValueError, "did not finish normally"):
-                    chat.infer([])
+            with (
+                patch.object(CacheOpenAI, "infer", return_value=("partial", {"finish_reason": finish}, False)),
+                self.assertRaisesRegex(ValueError, "did not finish normally"),
+            ):
+                chat.infer([])
         self.assertEqual(len(chat.errors), 3)
         expected = ("answer", {"finish_reason": "stop", "prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}, False)
         with patch.object(CacheOpenAI, "infer", return_value=expected):
@@ -315,15 +320,23 @@ class ChatTests(unittest.TestCase):
 
     def test_legacy_chat_and_inference_facade_exports(self):
         """Verify legacy_chat adapters are detangled and accessible via legacy module and inference facade."""
-        from yaw.daemon.graph.inference.legacy_chat import (
-            CacheOpenAI as DirectCacheOpenAI,
-            LocalChat as DirectLocalChat,
-            chat_identity as direct_chat_identity,
-        )
         from yaw.daemon.graph.inference import (
             CacheOpenAI as FacadeCacheOpenAI,
+        )
+        from yaw.daemon.graph.inference import (
             LocalChat as FacadeLocalChat,
+        )
+        from yaw.daemon.graph.inference import (
             chat_identity as facade_chat_identity,
+        )
+        from yaw.daemon.graph.inference.legacy_chat import (
+            CacheOpenAI as DirectCacheOpenAI,
+        )
+        from yaw.daemon.graph.inference.legacy_chat import (
+            LocalChat as DirectLocalChat,
+        )
+        from yaw.daemon.graph.inference.legacy_chat import (
+            chat_identity as direct_chat_identity,
         )
 
         self.assertIs(DirectLocalChat, LocalChat)

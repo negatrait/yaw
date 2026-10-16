@@ -1,15 +1,20 @@
 """Model-profile and serving identity contracts, without local model calls."""
+import unittest
 from dataclasses import replace
 from types import SimpleNamespace
-import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
-from hipporag.utils.config_utils import BaseConfig
-from yaw.daemon.graph.inference.embedding import GEMMA_TASK_MODES, MODEL, PROFILES, resolve_embedding_profile
-from yaw.daemon.graph.inference.legacy_embedding import RetrievalEmbedding
 from hipporag.prompts.linking import get_query_instruction
+from hipporag.utils.config_utils import BaseConfig
+
+from yaw.daemon.graph.inference.embedding import (
+    GEMMA_TASK_MODES,
+    MODEL,
+    PROFILES,
+    resolve_embedding_profile,
+)
+from yaw.daemon.graph.inference.legacy_embedding import RetrievalEmbedding
 from yaw.daemon.graph.inference.models import CHAT_MODELS, chat_evidence, check_registry
-from unittest.mock import patch
 
 
 class ProfileTests(unittest.TestCase):
@@ -26,22 +31,26 @@ class ProfileTests(unittest.TestCase):
         }
         with patch("yaw.daemon.graph.inference.models.get_json", return_value={"all_models_loaded": [base_entry]}):
             self.assertEqual(chat_evidence(name)["id"], name)
-        with patch(
-            "yaw.daemon.graph.inference.models.get_json",
-            return_value={
-                "all_models_loaded": [
-                    {**base_entry, "launch_command": ["llama-server.exe", "-dio", "--cache-ram", "0"]}
-                ]
-            },
+        with (
+            patch(
+                "yaw.daemon.graph.inference.models.get_json",
+                return_value={
+                    "all_models_loaded": [
+                        {**base_entry, "launch_command": ["llama-server.exe", "-dio", "--cache-ram", "0"]}
+                    ]
+                },
+            ),
+            self.assertRaisesRegex(ValueError, "-dio"),
         ):
-            with self.assertRaisesRegex(ValueError, "-dio"):
-                chat_evidence(name)
-        with patch(
-            "yaw.daemon.graph.inference.models.get_json",
-            return_value={"all_models_loaded": [{**base_entry, "launch_command": ["llama-server.exe", "--parallel", "1"]}]},
+            chat_evidence(name)
+        with (
+            patch(
+                "yaw.daemon.graph.inference.models.get_json",
+                return_value={"all_models_loaded": [{**base_entry, "launch_command": ["llama-server.exe", "--parallel", "1"]}]},
+            ),
+            self.assertRaisesRegex(ValueError, "--cache-ram 0"),
         ):
-            with self.assertRaisesRegex(ValueError, "--cache-ram 0"):
-                chat_evidence(name)
+            chat_evidence(name)
 
     def test_ryzenai_chat_evidence_validates_npu_device_and_context(self):
         name = "Mistral-7B-Instruct-v0.3-Hybrid"
@@ -59,15 +68,16 @@ class ProfileTests(unittest.TestCase):
         with patch(
             "yaw.daemon.graph.inference.models.get_json",
             return_value={"all_models_loaded": [{**valid_entry, "device": "cpu"}]},
+        ), self.assertRaisesRegex(ValueError, "expected device npu"):
+            chat_evidence(name)
+        with (
+            patch(
+                "yaw.daemon.graph.inference.models.get_json",
+                return_value={"all_models_loaded": [{**valid_entry, "recipe_options": {"ctx_size": 4096}}]},
+            ),
+            self.assertRaisesRegex(ValueError, "ctx_size >="),
         ):
-            with self.assertRaisesRegex(ValueError, "expected device npu"):
-                chat_evidence(name)
-        with patch(
-            "yaw.daemon.graph.inference.models.get_json",
-            return_value={"all_models_loaded": [{**valid_entry, "recipe_options": {"ctx_size": 4096}}]},
-        ):
-            with self.assertRaisesRegex(ValueError, "ctx_size >="):
-                chat_evidence(name)
+            chat_evidence(name)
     def test_each_profile_preserves_its_request_format_and_dimensions(self):
         for profile in PROFILES.values():
             with self.subTest(model=profile.model):

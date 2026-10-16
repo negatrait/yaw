@@ -1,0 +1,45 @@
+# YAW Native HippoRAG 2 Daemon Configuration
+
+[paths]
+corpus_root = "corpus"
+db_path = ".yaw/yaw.db"
+lock_path = ".yaw/yaw.db.lock"
+state_dir = ".yaw/coco_state"
+log_path = ".yaw/yaw.log"
+status_path = ".yaw/status.json"
+compiled_program_path = ".yaw/compiled_program.json"
+
+[ingestion]
+included_patterns = ["*.md", "*.txt"]
+excluded_patterns = [".*", "*/.*", "__pycache__/*"]
+chunk_size = 1200
+chunk_overlap = 100
+min_chunk_size = 50
+poll_interval_seconds = 5.0
+
+[inference]
+base_url = "http://localhost:13305/api/v1"
+api_key = "lemonade"
+provider = "openai"
+embedding_model = "embeddinggemma-300m-GGUF"
+embedding_task_mode = "distinct-titled"
+extraction_model = "Qwen3-4B-Instruct-2507-GGUF"
+qa_model = "Mistral-7B-Instruct-v0.3-Hybrid"
+execution_mode = "direct"
+qa_mode = "cot"
+enable_gbnf = true
+gbnf_max_facts = 4
+
+[graph]
+linking_top_k = 8
+retrieval_top_k = 5
+damping = 0.5
+synonymy_threshold = 0.8
+synonymy_top_k = 100
+embed_batch_size = 64
+
+[runtime]
+queue_maxsize = 32
+http_host = "127.0.0.1"
+http_port = 13306
+http_path = "/mcp"

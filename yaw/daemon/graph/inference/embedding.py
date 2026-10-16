@@ -1,14 +1,16 @@
 """Native DSPy and OpenAI/Ollama embedding adapter with explicit model-specific retrieval contracts."""
 
-from dataclasses import asdict, dataclass, field, replace
 import hashlib
 import json
-import os
 import re
-from typing import Any, Callable
+from collections.abc import Callable, Sequence
+from dataclasses import asdict, dataclass, replace
+from typing import Any
 
 import dspy
 import numpy as np
+
+from yaw.core.config import YawConfig
 
 FACT_INSTRUCTION = "Given a question, retrieve relevant triplet facts that matches this question."
 PASSAGE_INSTRUCTION = "Given a question, retrieve relevant documents that best answer the question."
@@ -142,9 +144,10 @@ def create_dspy_embedder(
         if isinstance(model_or_profile, EmbeddingProfile)
         else str(model_or_profile)
     )
+    embedder_cls: Any = dspy.Embedder
     if provider == "ollama" or model_name.startswith("ollama/"):
         litellm_model = model_name if model_name.startswith("ollama/") else f"ollama/{model_name}"
-        return dspy.Embedder(
+        return embedder_cls(
             litellm_model,
             batch_size=batch_size,
             caching=caching,
@@ -153,7 +156,7 @@ def create_dspy_embedder(
         )
 
     litellm_model = model_name if "/" in model_name else f"openai/{model_name}"
-    return dspy.Embedder(
+    return embedder_cls(
         litellm_model,
         batch_size=batch_size,
         caching=caching,
@@ -187,6 +190,18 @@ class DSPyEmbeddingAdapter:
             provider=provider,
             batch_size=batch_size,
             caching=caching,
+        )
+
+    @classmethod
+    def from_config(cls, config: YawConfig) -> "DSPyEmbeddingAdapter":
+        """Construct a profile-aware DSPyEmbeddingAdapter from a YawConfig."""
+        profile = resolve_embedding_profile(config.embedding_model, config.embedding_task_mode)
+        return cls(
+            profile=profile,
+            base_url=config.base_url,
+            api_key=config.api_key,
+            provider=config.provider,
+            batch_size=config.embed_batch_size,
         )
 
     def batch_encode(
@@ -228,6 +243,37 @@ class DSPyEmbeddingAdapter:
             return vectors
         norms = np.linalg.norm(vectors, axis=1, keepdims=True)
         return vectors / norms
+
+    def encode(
+        self,
+        texts: list[str] | str | Sequence[str],
+        *,
+        instruction: str | None = None,
+        norm: bool = True,
+        batch_size: int | None = None,
+    ) -> np.ndarray:
+        """Alias for batch_encode matching sentence-transformers and DSPy embedder interfaces."""
+        if not isinstance(texts, (str, list)):
+            texts = list(texts)
+        return self.batch_encode(texts, instruction=instruction, norm=norm, batch_size=batch_size)
+
+    def update_prefixes(
+        self,
+        *,
+        query_prefix: str | None = None,
+        fact_query_prefix: str | None = None,
+        document_prefix: str | None = None,
+    ) -> None:
+        """Apply optimized EmbeddingGemma task prefixes to the active EmbeddingProfile."""
+        updates: dict[str, Any] = {}
+        if query_prefix is not None:
+            updates["query_prefix"] = query_prefix
+        if fact_query_prefix is not None:
+            updates["fact_query_prefix"] = fact_query_prefix
+        if document_prefix is not None:
+            updates["document_prefix"] = document_prefix
+        if updates:
+            self.profile = replace(self.profile, **updates)
 
 
 __all__ = [

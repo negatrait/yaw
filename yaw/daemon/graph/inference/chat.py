@@ -91,8 +91,8 @@ def create_dspy_lm(
             **lm_kwargs,
         )
 
-    lm._yaw_recipe = recipe
-    lm._yaw_supports_gbnf = recipe == "llamacpp"
+    setattr(lm, "_yaw_recipe", recipe)
+    setattr(lm, "_yaw_supports_gbnf", recipe == "llamacpp")
     return lm
 
 

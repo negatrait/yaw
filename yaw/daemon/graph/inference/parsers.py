@@ -2,18 +2,16 @@
 
 import ast
 import difflib
-import hashlib
 import json
 import re
-from typing import Any, List, Sequence, Tuple, Union
+from collections import Counter
+from collections.abc import Sequence
+from typing import Any
+
+from yaw.core import compute_mdhash_id
 
 
-def compute_mdhash_id(content: str, prefix: str = "") -> str:
-    """Compute the MD5 hash of the given content string and optionally prepend a prefix."""
-    return prefix + hashlib.md5(content.encode("utf-8")).hexdigest()
-
-
-def text_processing(text: Union[str, List[Any]]) -> Union[str, List[Any]]:
+def text_processing(text: str | list[Any]) -> str | list[Any]:
     """Entity and alias normalization: lowercase, alphanumeric and whitespace only."""
     if isinstance(text, list):
         return [text_processing(t) for t in text]
@@ -25,10 +23,10 @@ def text_processing(text: Union[str, List[Any]]) -> Union[str, List[Any]]:
     return " ".join(normalized.split())
 
 
-def filter_invalid_triples(triples: Sequence[Any]) -> List[List[str]]:
+def filter_invalid_triples(triples: Sequence[Any]) -> list[list[str]]:
     """Filter out invalid and duplicate triples, preserving original order."""
-    unique_triples: set[Tuple[str, str, str]] = set()
-    valid_triples: List[List[str]] = []
+    unique_triples: set[tuple[str, str, str]] = set()
+    valid_triples: list[list[str]] = []
 
     for triple in triples:
         if not isinstance(triple, (list, tuple)) or len(triple) != 3:
@@ -75,7 +73,7 @@ def repair_truncated_json(response: str, *, is_triples: bool = False) -> str:
     return response[:last_end] + "]}"
 
 
-def _extract_json_list_field(response: str, field_name: str) -> List[Any]:
+def _extract_json_list_field(response: str, field_name: str) -> list[Any]:
     """Scan a response string for the first JSON object containing `field_name` as a list."""
     decoder = json.JSONDecoder()
     for start_index, character in enumerate(response):
@@ -94,7 +92,7 @@ def _extract_json_list_field(response: str, field_name: str) -> List[Any]:
     raise ValueError(f"OpenIE response does not contain a valid JSON object with {field_name!r}.")
 
 
-def _parse_bare_json_string_list(response: str) -> Union[List[str], None]:
+def _parse_bare_json_string_list(response: str) -> list[str] | None:
     """Return the response as a list of strings if it is exactly one JSON array of strings, else None."""
     text = response.strip()
     if text.startswith("```") and text.endswith("```"):
@@ -111,7 +109,7 @@ def _parse_bare_json_string_list(response: str) -> Union[List[str], None]:
     return payload
 
 
-def extract_named_entities(response: str) -> Tuple[str, ...]:
+def extract_named_entities(response: str) -> tuple[str, ...]:
     """Extract and deduplicate unique named entities from LLM response."""
     try:
         raw_list = _extract_json_list_field(response, "named_entities")
@@ -130,7 +128,7 @@ def extract_named_entities(response: str) -> Tuple[str, ...]:
                 else:
                     return ()
 
-    unique: List[str] = []
+    unique: list[str] = []
     seen: set[str] = set()
     for item in raw_list:
         if isinstance(item, str):
@@ -141,7 +139,7 @@ def extract_named_entities(response: str) -> Tuple[str, ...]:
     return tuple(unique)
 
 
-def extract_triples(response: str) -> Tuple[Tuple[str, str, str], ...]:
+def extract_triples(response: str) -> tuple[tuple[str, str, str], ...]:
     """Extract, validate, and deduplicate relation triples from LLM response."""
     try:
         raw_list = _extract_json_list_field(response, "triples")
@@ -156,9 +154,9 @@ def extract_triples(response: str) -> Tuple[Tuple[str, str, str], ...]:
     return tuple((t[0], t[1], t[2]) for t in filtered)
 
 
-def parse_filter_facts(response: str) -> List[List[str]]:
+def parse_filter_facts(response: str) -> list[list[str]]:
     """Parse candidate facts from DSPy recognition memory response."""
-    sections: List[Tuple[Union[str, None], List[str]]] = [(None, [])]
+    sections: list[tuple[str | None, list[str]]] = [(None, [])]
     field_header_pattern = re.compile(r"\[\[ ## (\w+) ## \]\]")
     for line in response.splitlines():
         match = field_header_pattern.match(line.strip())
@@ -167,7 +165,7 @@ def parse_filter_facts(response: str) -> List[List[str]]:
         else:
             sections[-1][1].append(line)
 
-    parsed: List[List[str]] = []
+    parsed: list[list[str]] = []
     found_section = False
     for k, lines in sections:
         if k == "fact_after_filter":
@@ -212,10 +210,10 @@ def parse_filter_facts(response: str) -> List[List[str]]:
 
 
 def match_facts_to_candidate_indices(
-    candidate_facts: Sequence[Union[Tuple[str, str, str], List[str]]],
+    candidate_facts: Sequence[tuple[str, str, str] | list[str]],
     generated_facts: Sequence[Sequence[str]],
-    max_facts: Union[int, None] = 4,
-) -> List[int]:
+    max_facts: int | None = 4,
+) -> list[int]:
     """Map generated [s, p, o] facts back to original candidate_facts indices via difflib."""
     if not generated_facts or not candidate_facts:
         return []
@@ -227,7 +225,7 @@ def match_facts_to_candidate_indices(
         list(f) if isinstance(f, tuple) else f for f in candidate_facts
     ]
 
-    result_indices: List[int] = []
+    result_indices: list[int] = []
     for generated_fact in generated_facts:
         gen_str = str(list(generated_fact))
         matches = difflib.get_close_matches(
@@ -248,10 +246,10 @@ def match_facts_to_candidate_indices(
 
 
 def filter_reranked_facts(
-    candidate_facts: Sequence[Union[Tuple[str, str, str], List[str]]],
+    candidate_facts: Sequence[tuple[str, str, str] | list[str]],
     response: str,
-    max_facts: Union[int, None] = None,
-) -> List[int]:
+    max_facts: int | None = None,
+) -> list[int]:
     """Map generated facts back to original candidate fact indices via difflib."""
     generated_facts = parse_filter_facts(response)
     if not generated_facts:
@@ -269,7 +267,7 @@ def strip_mistral_bracket_prefix(text: str) -> str:
 def coerce_generated_facts(raw_output: Any) -> list[list[str]]:
     """Extract 3-element string lists from a FactList, dict, JSON string, or list."""
     if hasattr(raw_output, "fact"):
-        candidates = getattr(raw_output, "fact")
+        candidates = raw_output.fact
     elif isinstance(raw_output, dict) and "fact" in raw_output:
         candidates = raw_output["fact"]
     elif isinstance(raw_output, list):
@@ -287,8 +285,74 @@ def coerce_generated_facts(raw_output: Any) -> list[list[str]]:
     return valid
 
 
+def extract_entity_nodes(
+    triples: Sequence[tuple[str, str, str] | Sequence[str]],
+) -> list[tuple[str, str]]:
+    """Extract unique (entity_id, normalized_name) from triple subjects and objects."""
+    seen: set[str] = set()
+    result: list[tuple[str, str]] = []
+    for t in triples:
+        if len(t) < 3:
+            continue
+        subj = text_processing(str(t[0]))
+        obj = text_processing(str(t[2]))
+        if isinstance(subj, str) and subj and subj not in seen:
+            seen.add(subj)
+            result.append((compute_mdhash_id(subj, prefix="entity-"), subj))
+        if isinstance(obj, str) and obj and obj not in seen:
+            seen.add(obj)
+            result.append((compute_mdhash_id(obj, prefix="entity-"), obj))
+    return result
+
+
+def flatten_facts(
+    triples: Sequence[tuple[str, str, str] | Sequence[str]],
+) -> list[tuple[str, str, str, str, str]]:
+    """Convert triples to normalized (fact_id, subj_id, pred, obj_id, raw_triple_json)."""
+    seen: set[str] = set()
+    result: list[tuple[str, str, str, str, str]] = []
+    for t in triples:
+        if len(t) < 3:
+            continue
+        subj = str(text_processing(str(t[0])))
+        pred = str(text_processing(str(t[1])))
+        obj = str(text_processing(str(t[2])))
+        if not subj or not obj or subj == obj:
+            continue
+        subj_id = compute_mdhash_id(subj, prefix="entity-")
+        obj_id = compute_mdhash_id(obj, prefix="entity-")
+        triple_tuple = (subj, pred, obj)
+        fact_id = compute_mdhash_id(str(triple_tuple), prefix="fact-")
+        if fact_id not in seen:
+            seen.add(fact_id)
+            result.append((fact_id, subj_id, pred, obj_id, json.dumps(list(triple_tuple))))
+    return result
+
+
+def compute_qa_em_f1(pred_str: str, gold_answers: Sequence[str]) -> tuple[float, float]:
+    """Compute exact match (EM) and token-level F1 score against gold answers."""
+    norm_p = str(text_processing(pred_str))
+    p_tokens = norm_p.split()
+    p_counts = Counter(p_tokens)
+    best_em = 0.0
+    best_f1 = 0.0
+    for gold in gold_answers:
+        norm_g = str(text_processing(gold))
+        if norm_p == norm_g or (norm_p and norm_g and norm_g in norm_p):
+            best_em = 1.0
+        g_tokens = norm_g.split()
+        if not p_tokens and not g_tokens:
+            best_f1 = 1.0
+            continue
+        common = sum((p_counts & Counter(g_tokens)).values())
+        if common > 0:
+            best_f1 = max(best_f1, (2.0 * common) / (len(p_tokens) + len(g_tokens)))
+    return best_em, max(best_f1, best_em)
+
+
 __all__ = [
     "compute_mdhash_id",
+    "compute_qa_em_f1",
     "text_processing",
     "filter_invalid_triples",
     "repair_truncated_json",
@@ -299,4 +363,6 @@ __all__ = [
     "filter_reranked_facts",
     "strip_mistral_bracket_prefix",
     "coerce_generated_facts",
+    "extract_entity_nodes",
+    "flatten_facts",
 ]

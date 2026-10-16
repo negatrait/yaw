@@ -1,7 +1,7 @@
 """Legacy RetrievalEmbedding adapter for pinned upstream HippoRAG baseline."""
 
-from dataclasses import dataclass, field
 import os
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -109,8 +109,9 @@ class RetrievalEmbedding:
                 for i in range(0, len(prepared), batch_size):
                     batch = prepared[i : i + batch_size]
                     results.append(self.encode(batch))
-                    usage_totals["prompt_tokens"] += self.last_usage["prompt_tokens"]
-                    usage_totals["total_tokens"] += self.last_usage["total_tokens"]
+                    if self.last_usage is not None:
+                        usage_totals["prompt_tokens"] += self.last_usage.get("prompt_tokens", 0)
+                        usage_totals["total_tokens"] += self.last_usage.get("total_tokens", 0)
                     self.last_usage = {**usage_totals, "complete": False}
             except Exception:
                 failed_usage = self.last_usage or {}
