@@ -171,6 +171,10 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
     """Initialize all 11 unified schema tables and indices in yaw.db and auto-backfill fact_fts if needed."""
     with conn:
         conn.executescript(_CREATE_SCHEMA_SQL)
+        # Auto-migrate legacy content_hash column if present from early development
+        chunk_cols = {row[1] for row in conn.execute("PRAGMA table_info(chunks)").fetchall()}
+        if "content_hash" in chunk_cols:
+            conn.execute("ALTER TABLE chunks DROP COLUMN content_hash")
         # Auto-backfill fact_fts if facts exist but fact_fts is empty
         fact_count = int(conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0])
         if fact_count > 0:
