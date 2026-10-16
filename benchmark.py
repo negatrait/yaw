@@ -53,7 +53,7 @@ UPSTREAM_DATASET_BASE_URL = (
 )
 DATASETS = ("sample", "musique", "2wikimultihopqa", "hotpotqa")
 QA_TOP_K = 5
-RETRIEVAL_TOP_K = 5
+RETRIEVAL_TOP_K = 10
 LINKING_TOP_K = 8
 FACT_CANDIDATE_POOL_K = 50
 FACT_FTS_POOL_K = 50
@@ -731,7 +731,7 @@ def run_yaw_benchmark(
                 t_qa0 = perf_counter()
                 context = "\n\n".join(
                     f"Wikipedia Title: {text}"
-                    for _, _, text in hits
+                    for _, _, text in hits[:QA_TOP_K]
                 )
                 pred = yaw_engine.program.answer_question(context=context, question=query)
                 qa_elapsed = perf_counter() - t_qa0
@@ -742,9 +742,11 @@ def run_yaw_benchmark(
         recalls_1: list[float] = []
         recalls_2: list[float] = []
         recalls_5: list[float] = []
+        recalls_10: list[float] = []
         dpr_recalls_1: list[float] = []
         dpr_recalls_2: list[float] = []
         dpr_recalls_5: list[float] = []
+        dpr_recalls_10: list[float] = []
         for q_idx in range(len(queries)):
             exp_docs = {d.strip() for d in gold_docs[q_idx]}
             denom = max(1, len(exp_docs))
@@ -753,9 +755,11 @@ def run_yaw_benchmark(
             recalls_1.append(round(len(set(ret_pass[:1]) & exp_docs) / denom, 4))
             recalls_2.append(round(len(set(ret_pass[:2]) & exp_docs) / denom, 4))
             recalls_5.append(round(len(set(ret_pass[:5]) & exp_docs) / denom, 4))
+            recalls_10.append(round(len(set(ret_pass[:10]) & exp_docs) / denom, 4))
             dpr_recalls_1.append(round(len(set(dpr_pass[:1]) & exp_docs) / denom, 4))
             dpr_recalls_2.append(round(len(set(dpr_pass[:2]) & exp_docs) / denom, 4))
             dpr_recalls_5.append(round(len(set(dpr_pass[:5]) & exp_docs) / denom, 4))
+            dpr_recalls_10.append(round(len(set(dpr_pass[:10]) & exp_docs) / denom, 4))
 
         qa_metrics = None
         em_list: list[float] = []
@@ -786,11 +790,13 @@ def run_yaw_benchmark(
                     "@1": recalls_1[q_idx],
                     "@2": recalls_2[q_idx],
                     "@5": recalls_5[q_idx],
+                    "@10": recalls_10[q_idx],
                 },
                 "dpr_recall": {
                     "@1": dpr_recalls_1[q_idx],
                     "@2": dpr_recalls_2[q_idx],
                     "@5": dpr_recalls_5[q_idx],
+                    "@10": dpr_recalls_10[q_idx],
                 },
                 "retrieved_chunk_ids": retrieved_ids_list[q_idx],
                 "exact_match": em_list[q_idx] if include_qa else None,
@@ -811,11 +817,13 @@ def run_yaw_benchmark(
             "Recall@1": round(float(np.mean(recalls_1)), 4) if recalls_1 else 0.0,
             "Recall@2": round(float(np.mean(recalls_2)), 4) if recalls_2 else 0.0,
             "Recall@5": round(float(np.mean(recalls_5)), 4) if recalls_5 else 0.0,
+            "Recall@10": round(float(np.mean(recalls_10)), 4) if recalls_10 else 0.0,
         }
         dpr_ret = {
             "Recall@1": round(float(np.mean(dpr_recalls_1)), 4) if dpr_recalls_1 else 0.0,
             "Recall@2": round(float(np.mean(dpr_recalls_2)), 4) if dpr_recalls_2 else 0.0,
             "Recall@5": round(float(np.mean(dpr_recalls_5)), 4) if dpr_recalls_5 else 0.0,
+            "Recall@10": round(float(np.mean(dpr_recalls_10)), 4) if dpr_recalls_10 else 0.0,
         }
         metrics = {
             "hipporag": {
@@ -830,6 +838,7 @@ def run_yaw_benchmark(
                 "Recall@1": round(hipporag_ret["Recall@1"] - dpr_ret["Recall@1"], 4),
                 "Recall@2": round(hipporag_ret["Recall@2"] - dpr_ret["Recall@2"], 4),
                 "Recall@5": round(hipporag_ret["Recall@5"] - dpr_ret["Recall@5"], 4),
+                "Recall@10": round(hipporag_ret["Recall@10"] - dpr_ret["Recall@10"], 4),
             },
             "recognition_memory": {
                 "queries_with_graph_seeds": seeds_active,
