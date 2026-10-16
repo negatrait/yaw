@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import threading
 import time
 from collections.abc import Sequence
@@ -519,28 +520,28 @@ def test_cli_subcommands_sync_status_rebuild_and_stop(tmp_path: Path) -> None:
 
     prog, emb, _, _ = _make_program_and_embedder()
 
-    # 1. CLI sync
+    # 1. CLI graph build (standalone incremental sync)
     buf = io.StringIO()
     with redirect_stdout(buf):
-        rc = main(["sync", "--config", str(toml_path)], program=prog, embedder=emb)
+        rc = main(["graph", "build", "--config", str(toml_path)], program=prog, embedder=emb)
     assert rc == 0
     sync_out = json.loads(buf.getvalue())
     assert sync_out["added_chunks"] == 1
     assert sync_out["stats"]["chunks"] == 1
 
-    # 2. CLI status (offline inspection of yaw.db)
+    # 2. CLI daemon status (offline inspection of yaw.db)
     buf = io.StringIO()
     with redirect_stdout(buf):
-        rc = main(["status", "--config", str(toml_path)])
+        rc = main(["daemon", "status", "--config", str(toml_path)])
     assert rc == 0
     status_out = json.loads(buf.getvalue())
     assert status_out["status"]["lifecycle"] == "stopped"
     assert status_out["stats"]["chunks"] == 1
 
-    # 3. CLI rebuild
+    # 3. CLI graph rebuild
     buf = io.StringIO()
     with redirect_stdout(buf):
-        rc = main(["rebuild", "--config", str(toml_path)], program=prog, embedder=emb)
+        rc = main(["graph", "rebuild", "--config", str(toml_path)], program=prog, embedder=emb)
     assert rc == 0
     rebuild_out = json.loads(buf.getvalue())
     assert rebuild_out["rebuilt"] is True
@@ -548,7 +549,9 @@ def test_cli_subcommands_sync_status_rebuild_and_stop(tmp_path: Path) -> None:
 
     # 4. Foreground daemon run + CLI stop from another thread
     run_thread = threading.Thread(
-        target=lambda: main(["run", "--config", str(toml_path)], program=prog, embedder=emb),
+        target=lambda: main(
+            ["daemon", "run", "--config", str(toml_path)], program=prog, embedder=emb
+        ),
         daemon=True,
     )
     run_thread.start()
@@ -564,7 +567,7 @@ def test_cli_subcommands_sync_status_rebuild_and_stop(tmp_path: Path) -> None:
 
     buf = io.StringIO()
     with redirect_stdout(buf):
-        rc_stop = main(["stop", "--config", str(toml_path)])
+        rc_stop = main(["daemon", "stop", "--config", str(toml_path)])
     assert rc_stop == 0
     stop_out = json.loads(buf.getvalue())
     assert stop_out["stopped"] is True
@@ -576,7 +579,7 @@ def test_cli_optimize_ergonomics_and_anti_overfitting_gate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify `python -m yaw optimize` CLI ergonomics: benchmark slice parsing, train/val split, telemetry paths, and Tier 2 anti-overfitting guard."""
+    """Verify `yaw dspy optimize` CLI ergonomics: benchmark slice parsing, train/val split, telemetry paths, and Tier 2 anti-overfitting guard."""
     _, toml_path = _make_test_config(tmp_path)
     prog, emb, _, _ = _make_program_and_embedder()
 
@@ -633,6 +636,7 @@ def test_cli_optimize_ergonomics_and_anti_overfitting_gate(
     with redirect_stdout(buf):
         rc = main(
             [
+                "dspy",
                 "optimize",
                 "--config",
                 str(toml_path),
@@ -644,8 +648,8 @@ def test_cli_optimize_ergonomics_and_anti_overfitting_gate(
                 "6",
                 "--train-queries",
                 "4",
-                "--max-metric-calls",
-                "12",
+                "--auto",
+                "light",
                 "--output",
                 str(out_compiled),
             ],
@@ -656,6 +660,7 @@ def test_cli_optimize_ergonomics_and_anti_overfitting_gate(
     opt_out = json.loads(buf.getvalue())
     assert opt_out["optimized"] is True
     assert opt_out["mode"] == "gepa"
+    assert opt_out["auto"] == "light"
     assert opt_out["train_queries"] == 4
     assert opt_out["val_queries"] == 2
     assert Path(opt_out["compiled_program_path"]).exists()
@@ -663,13 +668,14 @@ def test_cli_optimize_ergonomics_and_anti_overfitting_gate(
     assert opt_out["stats"]["chunks"] >= 6
     assert captured_gepa["trainset_len"] == 4
     assert captured_gepa["valset_len"] == 2
-    assert captured_gepa["max_metric_calls"] == 12
+    assert captured_gepa["auto"] == "light"
 
     # Anti-Overfitting Rule: Reject full Tier 2 benchmark optimization (--max-queries > 50)
     err_buf = io.StringIO()
     with redirect_stderr(err_buf):
         rc_overfit = main(
             [
+                "dspy",
                 "optimize",
                 "--config",
                 str(toml_path),
@@ -735,10 +741,11 @@ def test_cli_optimize_multi_dataset_interleaved_splits(
     with redirect_stdout(buf):
         rc = main(
             [
+                "dspy",
                 "optimize",
                 "--config",
                 str(toml_path),
-                "--datasets",
+                "--dataset",
                 str(ds_paths[0]),
                 str(ds_paths[1]),
                 str(ds_paths[2]),
@@ -748,8 +755,8 @@ def test_cli_optimize_multi_dataset_interleaved_splits(
                 "10",
                 "--train-queries",
                 "7",
-                "--max-metric-calls",
-                "20",
+                "--auto",
+                "light",
                 "--output",
                 str(out_compiled),
             ],
@@ -759,6 +766,7 @@ def test_cli_optimize_multi_dataset_interleaved_splits(
     assert rc == 0
     opt_out = json.loads(buf.getvalue())
     assert opt_out["optimized"] is True
+    assert opt_out["auto"] == "light"
     # 3 datasets * 7 train queries = 21 training queries (satisfies DSPy 20 minimum!)
     assert opt_out["train_queries"] == 21
     # 3 datasets * 3 val queries = 9 validation queries
@@ -814,3 +822,171 @@ def test_cli_status_reports_active_indexing_progress(tmp_path: Path) -> None:
         assert live_status["status"]["sync_state"] == "syncing"
     finally:
         rt.stop()
+
+
+def test_cli_config_get_and_set(tmp_path: Path) -> None:
+    """Verify `yaw config get` and `yaw config set` read/write yaw.toml safely with validation."""
+    _, toml_path = _make_test_config(tmp_path)
+
+    # 1. Get specific key
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = main(["config", "get", "optimization.auto", "--config", str(toml_path)])
+    assert rc == 0
+    val_out = json.loads(buf.getvalue())
+    assert val_out["optimization.auto"] == "light"
+
+    # 2. Set valid key
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = main(["config", "set", "optimization.auto", "medium", "--config", str(toml_path)])
+    assert rc == 0
+    set_out = json.loads(buf.getvalue())
+    assert set_out["updated"] is True
+    assert set_out["key"] == "optimization.auto"
+    assert set_out["value"] == "medium"
+
+    # Verify get reflects updated value
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = main(["config", "get", "optimization.auto", "--config", str(toml_path)])
+    assert rc == 0
+    assert json.loads(buf.getvalue())["optimization.auto"] == "medium"
+
+    # 3. Setting invalid value fails with INVALID_INPUT and preserves yaw.toml integrity
+    err_buf = io.StringIO()
+    with redirect_stderr(err_buf):
+        rc_err = main(["config", "set", "optimization.auto", "super_heavy", "--config", str(toml_path)])
+    assert rc_err == 1
+    err_payload = json.loads(err_buf.getvalue())
+    assert err_payload["error"] == "INVALID_INPUT"
+
+    # File still has 'medium'
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = main(["config", "get", "optimization.auto", "--config", str(toml_path)])
+    assert rc == 0
+    assert json.loads(buf.getvalue())["optimization.auto"] == "medium"
+
+
+def test_cli_dspy_load_program_hot_reload_live_and_staged(tmp_path: Path) -> None:
+    """Verify `yaw dspy load-program <file>` stages offline and hot-reloads live daemon in-memory."""
+    cfg, toml_path = _make_test_config(tmp_path)
+    prog, emb, _, _ = _make_program_and_embedder()
+
+    # Create dummy candidate program JSON using prog.save()
+    cand1 = tmp_path / "cand1.json"
+    prog.embedding_query_prefix = "task: cand1 query | query: "
+    prog.save(str(cand1), save_program=False)
+
+    # 1. Offline promotion (daemon stopped)
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = main(["dspy", "load-program", str(cand1), "--config", str(toml_path)])
+    assert rc == 0
+    load_out = json.loads(buf.getvalue())
+    assert load_out["reloaded"] is False
+    assert load_out["staged"] is True
+    assert cfg.compiled_program_path is not None
+    assert Path(cfg.compiled_program_path).exists()
+
+    # 2. Boot daemon: verifies it loads staged program
+    rt = YawRuntime(cfg, program=HippoRAGProgram.from_config(cfg), embedder=emb)
+    rt.start(sync_on_start=False)
+    try:
+        assert rt.engine is not None
+        assert rt.engine.embedder.profile.query_prefix == "task: cand1 query | query: "
+
+        # Create cand2 with different instruction/prefix
+        cand2 = tmp_path / "cand2.json"
+        prog.embedding_query_prefix = "task: cand2 hot reloaded | query: "
+        prog.save(str(cand2), save_program=False)
+
+        # 3. Live hot-reload via CLI while daemon is running
+        buf2 = io.StringIO()
+        with redirect_stdout(buf2):
+            rc2 = main(["dspy", "load-program", str(cand2), "--config", str(toml_path)])
+        assert rc2 == 0
+        load_out2 = json.loads(buf2.getvalue())
+        assert load_out2["reloaded"] is True
+        assert load_out2["pid"] == os.getpid()
+
+        # Verify engine reloaded in-memory without restarting
+        assert rt.engine.embedder.profile.query_prefix == "task: cand2 hot reloaded | query: "
+    finally:
+        rt.stop()
+
+
+def test_cli_dspy_optimize_sandbox_isolation_and_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify `yaw dspy optimize` runs in an isolated sandbox concurrently with production daemon."""
+    from yaw.daemon.cli import is_daemon_locked
+
+    cfg, toml_path = _make_test_config(tmp_path)
+    prog, emb, _, _ = _make_program_and_embedder()
+
+    # Start persistent production daemon holding yaw.db.lock
+    prod_rt = YawRuntime(cfg, program=prog, embedder=emb)
+    prod_rt.start(sync_on_start=False)
+    try:
+        assert is_daemon_locked(cfg) is True
+
+        # Write small synthetic dataset
+        bench_ds = tmp_path / "bench.json"
+        bench_ds.write_text(
+            json.dumps([
+                {
+                    "id": "q1",
+                    "question": "Question 1?",
+                    "answer": ["Answer 1"],
+                    "paragraphs": [{"title": "Doc 1", "text": "Content 1.", "is_supporting": True}],
+                }
+            ]),
+            encoding="utf-8",
+        )
+
+        class FastGEPA:
+            def __init__(self, metric: Any, **kwargs: Any) -> None:
+                pass
+            def compile(self, student: Any, trainset: list[Any], valset: Any = None) -> Any:
+                return student
+
+        monkeypatch.setattr(dspy, "GEPA", FastGEPA, raising=False)
+
+        # Run optimization concurrently while production daemon holds yaw.db.lock
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = main(
+                [
+                    "dspy",
+                    "optimize",
+                    "--config",
+                    str(toml_path),
+                    "--dataset",
+                    str(bench_ds),
+                    "--max-queries",
+                    "1",
+                    "--train-queries",
+                    "1",
+                    "--auto",
+                    "light",
+                ],
+                program=prog,
+                embedder=emb,
+            )
+        assert rc == 0
+        opt_out = json.loads(buf.getvalue())
+        assert opt_out["optimized"] is True
+        assert "yaw_optimize_" in opt_out["sandbox_db_path"]
+        assert Path(opt_out["compiled_program_path"]).exists()
+
+        # Production database was NOT touched or overwritten
+        assert cfg.db_path is not None
+        assert Path(cfg.db_path).exists()
+        # Production compiled_program.json was NOT overwritten by random optimization run
+        assert cfg.compiled_program_path is not None
+        assert not Path(cfg.compiled_program_path).exists()
+    finally:
+        prod_rt.stop()

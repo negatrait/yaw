@@ -21,6 +21,11 @@ class DeterministicMockLM(dspy.LM):
         super().__init__(model="mock-lm")
 
     def __call__(self, prompt: str | None = None, messages: list[dict[str, Any]] | None = None, **kwargs: Any) -> list[str]:
+        if getattr(dspy.settings, "usage_tracker", None) is not None:
+            dspy.settings.usage_tracker.add_usage(
+                self.model,
+                {"prompt_tokens": 32, "completion_tokens": 16, "total_tokens": 48},
+            )
         req_str = str(prompt or messages or kwargs)
         # Triples stage
         if "ExtractTriples" in req_str or "triples" in req_str:

@@ -1,14 +1,23 @@
-"""Canonical CLI entrypoint for the YAW persistent HippoRAG 2 daemon."""
+"""Canonical CLI entrypoint for the YAW persistent HippoRAG 2 daemon.
+
+Grammar:
+  yaw daemon {start|stop|status|run} [--config <path>]
+  yaw graph {build|rebuild} [--config <path>]
+  yaw dspy {optimize|load-program} [--flags]
+  yaw config {get|set} [--flags]
+"""
 
 import argparse
 import contextlib
 import json
 import os
+import shutil
 import signal
 import sqlite3
 import subprocess
 import sys
 import time
+import uuid
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -21,15 +30,17 @@ from yaw.core import (
     IndexStats,
     YawConfig,
     YawRuntimeError,
+    get_config_value,
     load_config,
+    set_config_value,
 )
 from yaw.daemon.graph.inference import DSPyEmbeddingAdapter, HippoRAGProgram
-from yaw.daemon.graph.storage import get_graph_counts, open_yaw_db
+from yaw.daemon.graph.storage import get_graph_counts
 from yaw.daemon.runtime import YawRuntime
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Build argument parser for `python -m yaw {run|start|status|sync|stop|rebuild|optimize} --config yaw.toml`."""
+    """Build hierarchical argument parser for `yaw <domain> <action> --<flags>`."""
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(
         "--config",
@@ -53,94 +64,147 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to yaw.toml configuration file (default: ./yaw.toml)",
     )
 
-    subparsers = parser.add_subparsers(dest="command", help="Subcommand to execute")
+    domain_subparsers = parser.add_subparsers(dest="domain", help="Domain to operate on")
 
-    subparsers.add_parser(
-        "run",
-        parents=[common],
-        help="Run the persistent YAW daemon in the foreground",
+    # -------------------------------------------------------------------------
+    # 1. yaw daemon {start|stop|status|run}
+    # -------------------------------------------------------------------------
+    p_daemon = domain_subparsers.add_parser("daemon", help="Daemon lifecycle commands")
+    daemon_subs = p_daemon.add_subparsers(dest="action", help="Daemon action")
+
+    daemon_subs.add_parser(
+        "start", parents=[common], help="Start persistent daemon in background"
     )
-    subparsers.add_parser(
-        "start",
-        parents=[common],
-        help="Start the persistent YAW daemon in the background",
-    )
-    subparsers.add_parser(
+
+    daemon_subs.add_parser("stop", parents=[common], help="Gracefully stop a running daemon")
+    daemon_subs.add_parser(
         "status",
         parents=[common],
-        help="Inspect daemon status and graph index statistics as JSON",
+        help="Inspect daemon status, graph index statistics, and active optimizations as JSON",
     )
-    subparsers.add_parser(
-        "sync",
+    daemon_subs.add_parser(
+        "run",
         parents=[common],
-        help="Run an incremental CocoIndex corpus sync and update yaw.db",
-    )
-    subparsers.add_parser(
-        "stop",
-        parents=[common],
-        help="Gracefully stop a running YAW daemon",
-    )
-    subparsers.add_parser(
-        "rebuild",
-        parents=[common],
-        help="Rebuild yaw.db and CocoIndex state from scratch",
+        help="Run persistent daemon in the foreground until stopped",
     )
 
-    p_opt = subparsers.add_parser(
+    # -------------------------------------------------------------------------
+    # 2. yaw graph {build|rebuild}
+    # -------------------------------------------------------------------------
+    p_graph = domain_subparsers.add_parser(
+        "graph", help="Standalone graph and corpus index commands"
+    )
+    graph_subs = p_graph.add_subparsers(dest="action", help="Graph action")
+
+    graph_subs.add_parser(
+        "build",
+        parents=[common],
+        help="Run standalone incremental CocoIndex corpus sync and update yaw.db",
+    )
+    graph_subs.add_parser(
+        "rebuild",
+        parents=[common],
+        help="Wipe yaw.db and CocoIndex state and perform a full rebuild from scratch",
+    )
+
+    # -------------------------------------------------------------------------
+    # 3. yaw dspy {optimize|load-program}
+    # -------------------------------------------------------------------------
+    p_dspy = domain_subparsers.add_parser(
+        "dspy", help="DSPy prompt optimization and program management"
+    )
+    dspy_subs = p_dspy.add_subparsers(dest="action", help="DSPy action")
+
+    p_opt = dspy_subs.add_parser(
         "optimize",
         parents=[common],
-        help="Compile and evolve DSPy prompts (MIPROv2 / GEPA) and save compiled_program.json",
+        help="Compile and evolve DSPy prompts in an isolated sandbox and save candidate JSON",
+    )
+    p_opt.add_argument(
+        "--auto",
+        dest="auto",
+        choices=["light", "medium", "heavy"],
+        default=None,
+        help="GEPA/MIPROv2 evaluation budget mode (defaults to yaw.toml [optimization].auto, then 'light')",
+    )
+    p_opt.add_argument(
+        "--mode",
+        dest="mode",
+        choices=["miprov2", "gepa", "hybrid"],
+        default=None,
+        help="Prompt optimization mode (defaults to yaw.toml [optimization].mode, then 'gepa')",
     )
     p_opt.add_argument(
         "--dataset",
-        "--datasets",
         dest="dataset",
         nargs="*",
         default=None,
         help=(
             "One or more Tier 1 dataset names (sample, 2wikimultihopqa, musique, hotpotqa) "
-            "or path to a JSON list of training examples (defaults to yaw.toml [optimization].datasets)"
+            "or path to JSON training file (defaults to yaw.toml [optimization].datasets)"
         ),
-    )
-    p_opt.add_argument(
-        "--mode",
-        "--evolve",
-        dest="mode",
-        choices=["miprov2", "gepa", "hybrid"],
-        default=None,
-        help="Prompt optimization mode (defaults to yaw.toml [optimization].mode)",
     )
     p_opt.add_argument(
         "--max-queries",
         type=int,
         default=None,
-        help="Maximum queries to load from dataset slice (defaults to yaw.toml [optimization].max_queries, max 50 on Tier 2 corpora)",
+        help="Maximum queries to load (defaults to yaw.toml [optimization].max_queries, max 50 on Tier 2 corpora)",
     )
     p_opt.add_argument(
         "--train-queries",
         type=int,
         default=None,
-        help="Number of queries for training [0:K], leaving [K:max_queries] for validation (defaults to yaw.toml [optimization].train_queries)",
+        help="Number of queries for training [0:K] (defaults to yaw.toml [optimization].train_queries)",
     )
     p_opt.add_argument(
         "--query-offset",
         type=int,
         default=None,
-        help="Starting query offset in the dataset (defaults to yaw.toml [optimization].query_offset)",
-    )
-    p_opt.add_argument(
-        "--max-metric-calls",
-        type=int,
-        default=None,
-        help="Optional explicit GEPA evaluation budget (defaults to yaw.toml [optimization].max_metric_calls)",
+        help="Starting query offset in dataset (defaults to yaw.toml [optimization].query_offset)",
     )
     p_opt.add_argument(
         "--output",
-        "--compiled-program",
         dest="output",
         type=str,
         default=None,
-        help="Override output path for compiled_program.json",
+        help="Override output path for candidate compiled_program JSON",
+    )
+
+    p_load = dspy_subs.add_parser(
+        "load-program",
+        parents=[common],
+        help="Promote a compiled DSPy program JSON into production and hot-reload in-memory",
+    )
+    p_load.add_argument(
+        "file",
+        type=str,
+        help="Path to compiled DSPy program JSON file to promote and load",
+    )
+
+    # -------------------------------------------------------------------------
+    # 4. yaw config {get|set}
+    # -------------------------------------------------------------------------
+    p_cfg = domain_subparsers.add_parser("config", help="Configuration management")
+    cfg_subs = p_cfg.add_subparsers(dest="action", help="Config action")
+
+    p_get = cfg_subs.add_parser("get", parents=[common], help="Read configuration value(s)")
+    p_get.add_argument(
+        "key",
+        nargs="?",
+        default=None,
+        help="Configuration key to read (e.g. 'optimization.auto' or 'qa_model'). Omit to dump all.",
+    )
+
+    p_set = cfg_subs.add_parser("set", parents=[common], help="Update a configuration value")
+    p_set.add_argument(
+        "key",
+        type=str,
+        help="Configuration key to update (e.g. 'optimization.auto' or 'qa_model')",
+    )
+    p_set.add_argument(
+        "value",
+        type=str,
+        help="New value for configuration key (int, float, bool, JSON array, or string)",
     )
 
     return parser
@@ -160,8 +224,61 @@ def is_daemon_locked(config: YawConfig) -> bool:
         return False
 
 
+def _inspect_active_optimization(config: YawConfig) -> dict[str, Any] | None:
+    """Detect if any sandbox yaw_optimize_*.db.lock is currently locked and read its live progress."""
+    if not config.lock_path:
+        return None
+    base_dir = config.lock_path.parent
+    if not base_dir.exists():
+        return None
+
+    for lock_file in base_dir.glob("yaw_optimize_*.db.lock"):
+        fl = filelock.FileLock(str(lock_file), timeout=0)
+        is_held = False
+        try:
+            fl.acquire(timeout=0)
+            fl.release()
+        except filelock.Timeout:
+            is_held = True
+
+        if is_held:
+            raw_name = lock_file.name
+            # Format: yaw_optimize_<datestamp>.db.lock
+            stem = raw_name.removesuffix(".lock").removesuffix(".db")
+            ds = stem.removeprefix("yaw_optimize_")
+            status_file = base_dir / f"status_optimize_{ds}.json"
+            opt_db = base_dir / f"yaw_optimize_{ds}.db"
+
+            openie = 0
+            if opt_db.exists():
+                with contextlib.suppress(sqlite3.Error):
+                    db_uri = f"file:{opt_db.resolve().as_posix()}?mode=ro"
+                    conn = sqlite3.connect(db_uri, uri=True, timeout=1.0)
+                    try:
+                        _, _, _, _, openie = get_graph_counts(conn)
+                    finally:
+                        conn.close()
+
+            snap: dict[str, Any] = {}
+            if status_file.exists():
+                with contextlib.suppress(Exception):
+                    snap = json.loads(status_file.read_text(encoding="utf-8"))
+
+            return {
+                "active": True,
+                "datestamp": ds,
+                "sandbox_db": str(opt_db),
+                "openie_checkpoints": max(
+                    openie, snap.get("stats", {}).get("openie_checkpoints", 0)
+                ),
+                "active_op": snap.get("status", {}).get("active_op", "optimizing"),
+                "status": snap.get("status", {}),
+            }
+    return None
+
+
 def inspect_status(config: YawConfig) -> dict[str, Any]:
-    """Read live daemon status if running, or offline yaw.db statistics if stopped."""
+    """Read live daemon status if running, offline yaw.db stats if stopped, and active optimization progress."""
     running = is_daemon_locked(config)
     chunks = entities = facts = edges = openie = 0
     if config.db_path and Path(config.db_path).exists():
@@ -173,6 +290,8 @@ def inspect_status(config: YawConfig) -> dict[str, Any]:
             finally:
                 conn.close()
 
+    opt_info = _inspect_active_optimization(config)
+
     if running and config.status_path and Path(config.status_path).exists():
         with contextlib.suppress(OSError, json.JSONDecodeError):
             data = json.loads(Path(config.status_path).read_text(encoding="utf-8"))
@@ -183,14 +302,24 @@ def inspect_status(config: YawConfig) -> dict[str, Any]:
                 if not data["status"].get("active_op") and openie > data["stats"].get("chunks", 0):
                     data["status"]["active_op"] = f"indexing: {openie} openie passages processed"
                     data["status"]["sync_state"] = "syncing"
+                if opt_info:
+                    data["active_optimization"] = opt_info
                 return data
+
+    active_op = None
+    sync_state = "idle"
+    if running and openie > chunks:
+        active_op = f"indexing: {openie} openie passages processed"
+        sync_state = "syncing"
+    elif opt_info:
+        active_op = f"optimization active in sandbox: {opt_info['active_op']}"
 
     status = DaemonStatus(
         lifecycle="ready" if running else "stopped",
         provider_ready=running,
-        sync_state="syncing" if (running and openie > chunks) else "idle",
+        sync_state=sync_state,
         queue_depth=0,
-        active_op=f"indexing: {openie} openie passages processed" if (running and openie > chunks) else None,
+        active_op=active_op,
     )
     stats = IndexStats(
         chunks=chunks,
@@ -200,10 +329,13 @@ def inspect_status(config: YawConfig) -> dict[str, Any]:
         config_fingerprint=config.config_fingerprint(),
         openie_checkpoints=openie,
     )
-    return {
+    payload = {
         "status": status.to_dict(),
         "stats": stats.to_dict(),
     }
+    if opt_info:
+        payload["active_optimization"] = opt_info
+    return payload
 
 
 _TIER2_CORPORA = frozenset({"2wikimultihopqa", "musique", "hotpotqa"})
@@ -228,7 +360,12 @@ def _extract_item_docs_and_gold(
     item: dict[str, Any],
     dataset_name: str = "",
 ) -> tuple[list[str], list[str]]:
-    if "gold_docs" in item and "paragraphs" not in item and "context" not in item and "contexts" not in item:
+    if (
+        "gold_docs" in item
+        and "paragraphs" not in item
+        and "context" not in item
+        and "contexts" not in item
+    ):
         g_docs = [str(d) for d in item.get("gold_docs", ())]
         return g_docs, g_docs
 
@@ -237,7 +374,7 @@ def _extract_item_docs_and_gold(
     gold_docs: list[str] = []
 
     if "supporting_facts" in item and "context" in item:
-        gold_titles = { sf[0] for sf in item["supporting_facts"] }
+        gold_titles = {sf[0] for sf in item["supporting_facts"]}
         for title, sents in item["context"]:
             passage = f"{title}\n{separator.join(sents)}"
             all_docs.append(passage)
@@ -359,7 +496,6 @@ def _load_dataset_splits(
             train_per_ds.append(d_examples)
             val_per_ds.append([])
 
-    # Interleave training examples across datasets for balanced mini-batches
     trainset: list[dspy.Example] = []
     max_t = max((len(t) for t in train_per_ds), default=0)
     for i in range(max_t):
@@ -367,7 +503,6 @@ def _load_dataset_splits(
             if i < len(t):
                 trainset.append(t[i])
 
-    # Interleave validation examples across datasets
     valset_list: list[dspy.Example] = []
     max_v = max((len(v) for v in val_per_ds), default=0)
     for i in range(max_v):
@@ -379,27 +514,7 @@ def _load_dataset_splits(
     return trainset, valset, list(dict.fromkeys(all_corpus_docs))
 
 
-def _load_training_examples(
-    dataset_arg: Sequence[str] | str | None,
-    *,
-    workspace_root: Path | None = None,
-    max_queries: int = 10,
-    query_offset: int = 0,
-) -> tuple[list[dspy.Example], list[str]]:
-    trainset, valset, corpus_docs = _load_dataset_splits(
-        dataset_arg,
-        workspace_root=workspace_root,
-        max_queries=max_queries,
-        train_queries=max_queries,
-        query_offset=query_offset,
-    )
-    all_examples = list(trainset)
-    if valset:
-        all_examples.extend(valset)
-    return all_examples, corpus_docs
-
-
-def handle_run(
+def handle_daemon_run(
     config: YawConfig,
     *,
     program: HippoRAGProgram | None = None,
@@ -439,7 +554,7 @@ def handle_run(
     return 0
 
 
-def handle_start(config: YawConfig, config_path: Path | None) -> int:
+def handle_daemon_start(config: YawConfig, config_path: Path | None) -> int:
     """Spawn detached background daemon and wait for lock/status readiness."""
     if is_daemon_locked(config):
         payload = inspect_status(config)
@@ -447,7 +562,7 @@ def handle_start(config: YawConfig, config_path: Path | None) -> int:
         sys.stdout.write(json.dumps(payload, indent=2) + "\n")
         return 0
 
-    cmd = [sys.executable, "-m", "yaw", "run"]
+    cmd = [sys.executable, "-m", "yaw", "daemon", "run"]
     if config_path is not None:
         cmd.extend(["--config", str(config_path)])
 
@@ -478,7 +593,7 @@ def handle_start(config: YawConfig, config_path: Path | None) -> int:
     raise YawRuntimeError("NOT_READY", "Background daemon failed to acquire lock before timeout.")
 
 
-def handle_stop(config: YawConfig) -> int:
+def handle_daemon_stop(config: YawConfig) -> int:
     """Signal a running daemon to stop and wait for yaw.db.lock release."""
     if not is_daemon_locked(config):
         sys.stdout.write(json.dumps({"stopped": True, "was_running": False}, indent=2) + "\n")
@@ -523,13 +638,13 @@ def handle_stop(config: YawConfig) -> int:
     return 0 if stopped else 1
 
 
-def handle_sync(
+def handle_graph_build(
     config: YawConfig,
     *,
     program: HippoRAGProgram | None = None,
     embedder: DSPyEmbeddingAdapter | None = None,
 ) -> int:
-    """Execute a synchronous incremental CocoIndex sync."""
+    """Execute a standalone incremental CocoIndex corpus sync and graph index update."""
     runtime = YawRuntime(config, program=program, embedder=embedder, auto_poll=False)
     runtime.start(sync_on_start=False)
     try:
@@ -545,7 +660,7 @@ def handle_sync(
         runtime.stop()
 
 
-def handle_rebuild(
+def handle_graph_rebuild(
     config: YawConfig,
     *,
     program: HippoRAGProgram | None = None,
@@ -566,14 +681,14 @@ def handle_rebuild(
         runtime.stop()
 
 
-def handle_optimize(
+def handle_dspy_optimize(
     config: YawConfig,
     args: argparse.Namespace,
     *,
     program: HippoRAGProgram | None = None,
     embedder: DSPyEmbeddingAdapter | None = None,
 ) -> int:
-    """Compile DSPy prompts via MIPROv2/GEPA and save compiled_program.json."""
+    """Compile DSPy prompts in an isolated sandbox and save candidate JSON."""
     raw_dataset = getattr(args, "dataset", None)
     if raw_dataset is not None:
         if isinstance(raw_dataset, str):
@@ -586,26 +701,31 @@ def handle_optimize(
                         dataset_args.append(sub.strip())
         else:
             dataset_args = [str(raw_dataset)]
-    else:
+    elif config.optimize_datasets:
         dataset_args = list(config.optimize_datasets)
+    else:
+        dataset_args = ["2wikimultihopqa"]
 
     raw_max_q = getattr(args, "max_queries", None)
-    max_queries = int(raw_max_q if raw_max_q is not None else config.optimize_max_queries)
+    max_queries = int(raw_max_q if raw_max_q is not None else (config.optimize_max_queries or 20))
 
     raw_offset = getattr(args, "query_offset", None)
-    query_offset = int(raw_offset if raw_offset is not None else config.optimize_query_offset)
+    query_offset = int(
+        raw_offset if raw_offset is not None else (config.optimize_query_offset or 0)
+    )
 
     raw_train_q = getattr(args, "train_queries", None)
     train_queries = int(
-        raw_train_q if raw_train_q is not None else config.optimize_train_queries
+        raw_train_q if raw_train_q is not None else (config.optimize_train_queries or 7)
     )
 
-    raw_budget = getattr(args, "max_metric_calls", None)
-    max_metric_calls = (
-        int(raw_budget)
-        if raw_budget is not None
-        else config.optimize_max_metric_calls
-    )
+    raw_auto = getattr(args, "auto", None)
+    auto = raw_auto or config.optimize_auto or "light"
+
+    raw_mode = getattr(args, "mode", None)
+    mode = raw_mode or config.optimize_mode or "gepa"
+
+    out_override = getattr(args, "output", None)
 
     trainset, valset, corpus_docs = _load_dataset_splits(
         dataset_args,
@@ -615,19 +735,18 @@ def handle_optimize(
         query_offset=query_offset,
     )
 
-    raw_mode = getattr(args, "mode", None)
-    mode = raw_mode if raw_mode is not None else config.optimize_mode
-    out_override = getattr(args, "output", None)
+    # Resolution order for sandbox: always isolate prompt compilation
+    opt_config = config.for_optimization()
 
-    runtime = YawRuntime(config, program=program, embedder=embedder, auto_poll=False)
-    runtime.start(sync_on_start=True)
+    runtime = YawRuntime(opt_config, program=program, embedder=embedder, auto_poll=False)
+    runtime.start(sync_on_start=False)
     try:
         saved_path = runtime.optimize(
             trainset=trainset,
             valset=valset,
             mode=mode,
-            save_path=out_override,
-            max_metric_calls=max_metric_calls,
+            save_path=out_override or opt_config.compiled_program_path,
+            auto=auto,
             corpus_docs=corpus_docs,
         )
         proposer_telemetry = saved_path.parent / f"{saved_path.stem}_proposer_telemetry.json"
@@ -635,11 +754,13 @@ def handle_optimize(
         payload: dict[str, Any] = {
             "optimized": True,
             "mode": mode,
+            "auto": auto,
             "dataset": dataset_args[0] if len(dataset_args) == 1 else dataset_args,
             "datasets": dataset_args,
             "train_queries": len(trainset),
             "val_queries": len(valset) if valset is not None else 0,
             "compiled_program_path": str(saved_path),
+            "sandbox_db_path": str(opt_config.db_path),
             "proposer_telemetry_path": (
                 str(proposer_telemetry) if proposer_telemetry.exists() else None
             ),
@@ -654,6 +775,142 @@ def handle_optimize(
         runtime.stop()
 
 
+def handle_dspy_load_program(
+    config: YawConfig,
+    source_file: str | Path,
+) -> int:
+    """Validate program file, promote to config.compiled_program_path, and hot-reload in-memory."""
+    src = Path(source_file).resolve()
+    if not src.exists() or not src.is_file():
+        raise YawRuntimeError("INVALID_INPUT", f"Compiled program file not found: {src}")
+
+    try:
+        content = json.loads(src.read_text(encoding="utf-8"))
+        if not isinstance(content, dict):
+            raise ValueError("Root JSON must be a dictionary object")
+    except Exception as exc:
+        raise YawRuntimeError(
+            "INVALID_INPUT", f"Invalid compiled program JSON in {src}: {exc}"
+        ) from exc
+
+    target_path = (
+        Path(config.compiled_program_path).resolve()
+        if config.compiled_program_path
+        else (config.workspace_root / ".yaw" / "compiled_program.json").resolve()
+    )
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    if src != target_path:
+        tmp_target = target_path.with_suffix(f".tmp.{os.getpid()}")
+        shutil.copy2(src, tmp_target)
+        tmp_target.replace(target_path)
+
+    if is_daemon_locked(config):
+        assert config.lock_path is not None
+        with YawRuntime._active_lock:
+            local_rt = YawRuntime._active_instances.get(config.lock_path.resolve())
+
+        if local_rt is not None:
+            res = local_rt.reload_program(target_path)
+            res["source_path"] = str(src)
+            sys.stdout.write(json.dumps(res, indent=2) + "\n")
+            return 0
+
+        yaw_dir = config.workspace_root / ".yaw"
+        yaw_dir.mkdir(parents=True, exist_ok=True)
+        signal_file = yaw_dir / "reload.signal"
+        result_file = yaw_dir / "reload.result"
+        with contextlib.suppress(OSError):
+            result_file.unlink(missing_ok=True)
+
+        req_id = str(uuid.uuid4())
+        payload = {
+            "program_path": str(target_path),
+            "source_path": str(src),
+            "req_id": req_id,
+        }
+        signal_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if result_file.exists():
+                try:
+                    res = json.loads(result_file.read_text(encoding="utf-8"))
+                    if res.get("req_id") == req_id:
+                        sys.stdout.write(json.dumps(res, indent=2) + "\n")
+                        return 0 if res.get("reloaded", True) else 1
+                except Exception:
+                    pass
+            time.sleep(0.05)
+
+        sys.stdout.write(
+            json.dumps(
+                {
+                    "reloaded": False,
+                    "staged": True,
+                    "program_path": str(target_path),
+                    "source_path": str(src),
+                    "message": "Signal written; daemon did not acknowledge before timeout. Program staged for next startup.",
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+        return 0
+
+    sys.stdout.write(
+        json.dumps(
+            {
+                "reloaded": False,
+                "staged": True,
+                "compiled_program_path": str(target_path),
+                "source_path": str(src),
+                "message": "Daemon is not running. Program promoted to compiled_program_path and will load on next daemon start.",
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    return 0
+
+
+def handle_config_get(
+    config: YawConfig,
+    key: str | None = None,
+    config_path: Path | None = None,
+) -> int:
+    """Read a specific key or dump entire configuration as JSON."""
+    val = get_config_value(
+        path=config_path,
+        key=key,
+        workspace_override=config.workspace_root,
+    )
+    payload = {key: val} if key is not None else val
+    sys.stdout.write(json.dumps(payload, indent=2) + "\n")
+    return 0
+
+
+def handle_config_set(
+    config: YawConfig,
+    key: str,
+    value_raw: str,
+    config_path: Path | None = None,
+) -> int:
+    """Safely update a configuration setting in yaw.toml and verify validity."""
+    resolved_key, parsed_val = set_config_value(
+        key=key,
+        raw_value=value_raw,
+        path=config_path,
+        workspace_override=config.workspace_root,
+    )
+    payload = {
+        "updated": True,
+        "key": resolved_key,
+        "value": parsed_val,
+    }
+    sys.stdout.write(json.dumps(payload, indent=2) + "\n")
+    return 0
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -663,28 +920,53 @@ def main(
     """Main CLI dispatcher returning POSIX exit code."""
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
-    if not args.command:
+
+    domain = getattr(args, "domain", None)
+    action = getattr(args, "action", None)
+    if not domain or not action:
         parser.print_help(sys.stderr)
         return 2
 
     cfg_path = Path(args.config).resolve() if getattr(args, "config", None) else None
     try:
         config = load_config(cfg_path)
-        if args.command == "status":
-            sys.stdout.write(json.dumps(inspect_status(config), indent=2) + "\n")
-            return 0
-        if args.command == "run":
-            return handle_run(config, program=program, embedder=embedder)
-        if args.command == "start":
-            return handle_start(config, cfg_path)
-        if args.command == "stop":
-            return handle_stop(config)
-        if args.command == "sync":
-            return handle_sync(config, program=program, embedder=embedder)
-        if args.command == "rebuild":
-            return handle_rebuild(config, program=program, embedder=embedder)
-        if args.command == "optimize":
-            return handle_optimize(config, args, program=program, embedder=embedder)
+
+        # 1. yaw daemon {start|stop|status|run}
+        if domain == "daemon":
+            if action == "status":
+                sys.stdout.write(json.dumps(inspect_status(config), indent=2) + "\n")
+                return 0
+            if action == "run":
+                return handle_daemon_run(config, program=program, embedder=embedder)
+            if action == "start":
+                return handle_daemon_start(config, cfg_path)
+            if action == "stop":
+                return handle_daemon_stop(config)
+
+        # 2. yaw graph {build|rebuild}
+        if domain == "graph":
+            if action == "build":
+                return handle_graph_build(config, program=program, embedder=embedder)
+            if action == "rebuild":
+                return handle_graph_rebuild(config, program=program, embedder=embedder)
+
+        # 3. yaw dspy {optimize|load-program}
+        if domain == "dspy":
+            if action == "optimize":
+                return handle_dspy_optimize(config, args, program=program, embedder=embedder)
+            if action == "load-program":
+                return handle_dspy_load_program(config, args.file)
+
+        # 4. yaw config {get|set}
+        if domain == "config":
+            if action == "get":
+                return handle_config_get(config, key=args.key, config_path=cfg_path)
+            if action == "set":
+                return handle_config_set(
+                    config, key=args.key, value_raw=args.value, config_path=cfg_path
+                )
+
+        parser.print_help(sys.stderr)
         return 2
     except YawRuntimeError as err:
         sys.stderr.write(json.dumps({"error": err.code, "message": err.message}) + "\n")
@@ -699,12 +981,15 @@ def cli_entrypoint() -> None:
 __all__ = [
     "build_parser",
     "cli_entrypoint",
-    "handle_optimize",
-    "handle_rebuild",
-    "handle_run",
-    "handle_start",
-    "handle_stop",
-    "handle_sync",
+    "handle_config_get",
+    "handle_config_set",
+    "handle_daemon_run",
+    "handle_daemon_start",
+    "handle_daemon_stop",
+    "handle_dspy_load_program",
+    "handle_dspy_optimize",
+    "handle_graph_build",
+    "handle_graph_rebuild",
     "inspect_status",
     "is_daemon_locked",
     "main",

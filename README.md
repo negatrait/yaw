@@ -9,13 +9,16 @@ Use Python 3.12 and uv:
 ```powershell
 uv sync --locked
 uv run --locked pytest -v
-uv run --locked python -m yaw status --config yaw.toml
-uv run --locked python -m yaw sync --config yaw.toml
-uv run --locked python -m yaw run --config yaw.toml
-uv run --locked python -m yaw start --config yaw.toml
-uv run --locked python -m yaw stop --config yaw.toml
-uv run --locked python -m yaw rebuild --config yaw.toml
-uv run --locked python -m yaw optimize --config yaw.toml --mode hybrid
+uv run --locked python -m yaw daemon status --config yaw.toml
+uv run --locked python -m yaw daemon run --config yaw.toml
+uv run --locked python -m yaw daemon start --config yaw.toml
+uv run --locked python -m yaw daemon stop --config yaw.toml
+uv run --locked python -m yaw graph build --config yaw.toml
+uv run --locked python -m yaw graph rebuild --config yaw.toml
+uv run --locked python -m yaw dspy optimize --config yaw.toml --mode gepa --auto light
+uv run --locked python -m yaw dspy load-program .yaw/compiled_program_optimize_<datestamp>.json
+uv run --locked python -m yaw config get optimization.auto
+uv run --locked python -m yaw config set optimization.auto light
 uv run --locked python benchmark.py --dataset sample --mode all
 uv run --locked python benchmark.py --dataset 2wikimultihopqa --max-queries 10
 uv run --locked python benchmark.py --dataset hotpotqa --max-queries 10 --mode retrieval

@@ -698,7 +698,7 @@ def run_yaw_benchmark(
                 save_path=compiled_program,
                 reflection_lm=ref_lm,
                 reflection_worker_lm=ref_worker_lm,
-                max_metric_calls=max(16, (len(trainset) + len(valset or ())) * 2 + 6),
+                auto="light",
             )
 
         eval_start = perf_counter()

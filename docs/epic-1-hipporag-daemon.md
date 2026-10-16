@@ -148,9 +148,9 @@ Execute strictly in order `E1-S1` $\to$ `E1-S6`. Never start Sprint $k+1$ until 
 - **Allowed imports:** `runtime.py` & `cli.py` import `yaw.daemon.{ingestion,graph}`, `yaw.core.*`, `filelock`, `tomllib`, `argparse`, `queue`, `threading`.
 - **Copy/Adapt From:**
   - Adapt `DaemonLifecycle` and graceful signal handling from `git show d1bc65e:src/yaw/server/daemon.py:260-340` (using `filelock.FileLock("yaw.db.lock")` instead of raw `msvcrt`/PID-alive checks).
-  - Adapt `argparse` subcommands from `git show d1bc65e:src/yaw/cli.py:42-180` into `python -m yaw {run|start|status|sync|stop|rebuild|optimize} --config yaw.toml`.
+  - Adapt CLI commands into hierarchical grammar `python -m yaw <domain> <action> [--flags]` (`yaw daemon {start|stop|status|run}`, `yaw graph {build|rebuild}`, `yaw dspy {optimize|load-program}`, `yaw config {get|set}`).
   - Wire single-owner 32-slot bounded FIFO worker thread in `runtime.py`: drains `ingestion.corpus.poll()` $\to$ `graph.engine.apply_delta(delta)` and serves `retrieve`/`rag_qa` requests, with non-blocking cached `status()`/`stats()`, loading `compiled_program_path` from `yaw.toml` when present.
-  - **Zero-Lock-In `MIPROv2` + `GEPA` Evolution (`engine.evolve_prompts` & `python -m yaw optimize` / `benchmark.py --evolve`):**
+  - **Zero-Lock-In `MIPROv2` + `GEPA` Evolution (`engine.evolve_prompts` & `python -m yaw dspy optimize` / `benchmark.py --evolve`):**
     1. **Anti-Overfitting Rule:** Never run prompt evolution on full Tier 2 benchmark corpora (`musique`, `2wikimultihopqa`, `hotpotqa` full sets) to prevent benchmark lock-in.
     2. **Composite Fitness Objective (`compute_sizecoding_pareto_score`):**
        - **Numerator ("Good Things"):** Stage-scoped product across the full quality curve ($\text{Recall@1} \times \text{Recall@2} \times \text{Recall@5} \times \text{Recall@10} \times \text{Recall@20} \times \text{EM} \times \text{F1}$ for end-to-end/QA stages; $\text{Recall@1..20}$ for retrieval/indexing stages, with smoothed floor protection against single-metric zero collapse and multi-objective `objective_scores` dict keys for `dspy.GEPA`).
@@ -173,4 +173,4 @@ Execute strictly in order `E1-S1` $\to$ `E1-S6`. Never start Sprint $k+1$ until 
 - [x] **D1-A3 (`E1-S3`):** `storage/{db,hydration}.py` implements single-schema `yaw.db` (`sqlite-vec`, contentless `FTS5`, provenance edges) and 1-indexed `itertools.islice` line hydration.
 - [x] **D1-A4 (`E1-S4`):** `graph/{ppr,engine}.py` + `storage/*` + `--query-offset`/`--evolve` hooks achieve **Tier 1 benchmark parity** vs. upstream `hipporag` on the 3-model local setup (YAW Recall@2: 0.8250 vs upstream: 0.8000; Recall@5: 1.0000 vs upstream: 1.0000; EM: 0.20 vs 0.20).
 - [x] **D1-A5 (`E1-S5`):** `ingestion/corpus.py` (`cocoindex>=1.0.25`) emits pure coalesced line-pointer `SyncDelta`s across add/edit/rename/delete.
-- [ ] **D1-A6 (`E1-S6`):** `daemon/{runtime,cli}.py` (`optimize` subcommand) passes lifecycle/lock/recovery tests AND native engine + universal `MIPROv2`/`GEPA`/`RLM` program (trained only on Tier 1 / OOD corpora) beats baseline on **Tier 2** disjoint holdout benchmarks.
+- [ ] **D1-A6 (`E1-S6`):** `daemon/{runtime,cli}.py` (`yaw <domain> <action>` CLI & isolated sandbox `dspy optimize` / `load-program`) passes lifecycle/lock/recovery tests AND native engine + universal `MIPROv2`/`GEPA`/`RLM` program (trained only on Tier 1 / OOD corpora) beats baseline on **Tier 2** disjoint holdout benchmarks.

@@ -1,6 +1,6 @@
 """Core package: Frozen data contracts, configuration, pure coordinate/ID helpers, and logging utilities."""
 
-from .config import YawConfig, load_config
+from .config import YawConfig, get_config_value, load_config, set_config_value
 from .logger import FIFOLineRotatingHandler, configure_logging
 from .types import (
     ChunkPointer,
@@ -34,8 +34,10 @@ __all__ = [
     "compute_chunk_id",
     "compute_mdhash_id",
     "configure_logging",
+    "get_config_value",
     "inclusive_end_line",
     "load_config",
     "resolve_corpus_path",
+    "set_config_value",
     "to_rel_posix_path",
 ]

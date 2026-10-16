@@ -712,7 +712,7 @@ class YawGraphEngine:
         save_path: Path | str | None = None,
         reflection_lm: Any = None,
         reflection_worker_lm: Any = None,
-        max_metric_calls: int | None = None,
+        auto: Literal["light", "medium", "heavy"] = "light",
         progress_callback: Callable[[str], None] | None = None,
     ) -> HippoRAGProgram:
         """Evolve DSPy prompts via MIPROv2, GEPA, or two-phase hybrid with composite Sizecoding feedback."""
@@ -725,8 +725,7 @@ class YawGraphEngine:
             nonlocal eval_count
             eval_count += 1
             if progress_callback is not None:
-                budget_str = f"/{max_metric_calls}" if max_metric_calls else ""
-                progress_callback(f"optimizing ({mode}): evaluating candidate ({eval_count}{budget_str})")
+                progress_callback(f"optimizing ({mode}, auto={auto}): evaluating candidate ({eval_count})")
             gold_answers_raw = getattr(gold, "gold_answers", getattr(gold, "answer", []))
             if isinstance(gold_answers_raw, str):
                 gold_answers = [gold_answers_raw]
@@ -852,7 +851,7 @@ class YawGraphEngine:
                     metric=_mipro_metric,
                     prompt_model=resolved_ref_lm,
                     task_model=resolved_worker_lm,
-                    auto="light",
+                    auto=auto,
                 )
                 with dspy.context(track_usage=True):
                     compiled = optimizer.compile(
@@ -867,13 +866,9 @@ class YawGraphEngine:
                     if save_path is not None
                     else None
                 )
-                budget_kwargs: dict[str, Any] = (
-                    {"max_metric_calls": max_metric_calls}
-                    if max_metric_calls is not None
-                    else {"auto": "light"}
-                )
                 gepa = dspy.GEPA(
                     metric=_gepa_metric,
+                    auto=auto,
                     reflection_lm=resolved_ref_lm,
                     instruction_proposer=proposer,
                     reflection_minibatch_size=3,
@@ -887,7 +882,6 @@ class YawGraphEngine:
                     log_dir=gepa_log_dir,
                     seed=0,
                     gepa_kwargs={"use_cloudpickle": True},
-                    **budget_kwargs,
                 )
                 with dspy.context(track_usage=True):
                     compiled = gepa.compile(

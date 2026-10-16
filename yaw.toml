@@ -50,4 +50,4 @@ mode = "gepa"
 max_queries = 20
 train_queries = 7
 query_offset = 0
-max_metric_calls = 20
+auto = "light"

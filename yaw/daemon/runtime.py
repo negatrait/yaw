@@ -418,10 +418,47 @@ class YawRuntime:
         return fut
 
     def _poll_loop(self) -> None:
-        interval = max(0.05, float(self.config.poll_interval_seconds))
-        while not self._stop_event.wait(interval):
-            with contextlib.suppress(YawRuntimeError):
-                self.request_sync()
+        poll_interval = max(0.05, float(self.config.poll_interval_seconds))
+        last_sync_check = time.monotonic()
+        assert self.config.workspace_root is not None
+        yaw_dir = (self.config.workspace_root / ".yaw").resolve()
+        signal_file = yaw_dir / "reload.signal"
+        result_file = yaw_dir / "reload.result"
+
+        while not self._stop_event.is_set():
+            if signal_file.exists():
+                with contextlib.suppress(Exception):
+                    raw = signal_file.read_text(encoding="utf-8")
+                    data = json.loads(raw) if raw.strip() else {}
+                    prog_path = data.get("program_path")
+                    req_id = data.get("req_id")
+                    if prog_path:
+                        try:
+                            res = self.reload_program(prog_path)
+                            res["req_id"] = req_id
+                            result_file.write_text(json.dumps(res, indent=2), encoding="utf-8")
+                        except Exception as exc:
+                            err_payload = {
+                                "reloaded": False,
+                                "req_id": req_id,
+                                "error": str(exc),
+                                "pid": os.getpid(),
+                            }
+                            result_file.write_text(
+                                json.dumps(err_payload, indent=2), encoding="utf-8"
+                            )
+                        finally:
+                            with contextlib.suppress(OSError):
+                                signal_file.unlink(missing_ok=True)
+
+            now = time.monotonic()
+            if now - last_sync_check >= poll_interval:
+                last_sync_check = now
+                with contextlib.suppress(YawRuntimeError):
+                    self.request_sync()
+
+            if self._stop_event.wait(0.2):
+                break
 
     def _worker_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -712,7 +749,7 @@ class YawRuntime:
         save_path: Path | str | None = None,
         reflection_lm: Any = None,
         reflection_worker_lm: Any = None,
-        max_metric_calls: int | None = None,
+        auto: Literal["light", "medium", "heavy"] | None = None,
         corpus_docs: Sequence[str] | None = None,
         progress_callback: Callable[[str], None] | None = None,
     ) -> Path:
@@ -720,6 +757,7 @@ class YawRuntime:
         target_path = Path(
             save_path or self.config.compiled_program_path or "compiled_program.json"
         ).resolve()
+        resolved_auto = auto or self.config.optimize_auto or "light"
 
         def _run_optimize() -> Path:
             if self.engine is None:
@@ -750,7 +788,7 @@ class YawRuntime:
                     reflection=True,
                 )
 
-            _progress(f"optimizing: starting {mode} evolution")
+            _progress(f"optimizing: starting {mode} (auto={resolved_auto}) evolution")
             self.engine.evolve_prompts(
                 trainset=trainset,
                 valset=valset,
@@ -758,12 +796,34 @@ class YawRuntime:
                 save_path=target_path,
                 reflection_lm=eff_ref_lm,
                 reflection_worker_lm=eff_worker_lm,
-                max_metric_calls=max_metric_calls,
+                auto=resolved_auto,
                 progress_callback=_progress,
             )
             return target_path
 
         return self.submit("optimize", _run_optimize, progress_callback=progress_callback).result()
+
+    def reload_program(self, program_path: Path | str) -> dict[str, Any]:
+        """Hot-reload a compiled DSPy program into the running engine in-memory."""
+        p = Path(program_path).resolve()
+        if not p.exists() or not p.is_file():
+            raise YawRuntimeError("INVALID_INPUT", f"Compiled program file not found: {p}")
+
+        def _run_reload() -> dict[str, Any]:
+            if self.engine is None:
+                raise YawRuntimeError("NOT_READY", "Graph engine is not initialized.")
+            self.engine.program.load(str(p))
+            self.engine.program.set_retrieval_hook(self.engine._program_retrieval_hook)
+            self.engine._apply_program_embedding_prefixes()
+            self._update_state()
+            return {
+                "reloaded": True,
+                "program_path": str(p),
+                "pid": os.getpid(),
+                "timestamp": time.time(),
+            }
+
+        return self.submit("reload_program", _run_reload).result()
 
 
 __all__ = [
