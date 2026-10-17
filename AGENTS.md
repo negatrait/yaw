@@ -1,12 +1,12 @@
 # Instructions for coding agents
 
-Read [FOUNDATIONAL.md](FOUNDATIONAL.md) first. The current task is evaluating upstream HippoRAG 2, not rebuilding the retired YAW architecture.
+Read [FOUNDATIONAL.md](FOUNDATIONAL.md) first. YAW is a native HippoRAG 2 graph & storage engine backed by a single SQLite database (`yaw.db`), CocoIndex (`cocoindex>=1.0.0`) ingestion, and FastMCP over HTTP. Heavy ontology stacks (`rdflib`, OWL 2 RL, `pySHACL`, `spaCy`) remain retired unless proven by benchmark lift.
 
-- Verify the repository path and Git remote before editing. The user-designated checkout is authoritative.
-- Follow the ordered evaluation steps in FOUNDATIONAL. State which step is being executed and its observable result.
-- Keep HippoRAG as the only direct dependency. Use the pinned public API; do not add a framework, fork, wrapper hierarchy or semantic engine without a demonstrated need and a new scope decision.
-- Use `uv sync --locked` and `uv run --locked`. Preserve the pinned source revision unless intentionally upgrading and validating it.
-- Keep source notes and user data intact. Put generated indexes in ignored `outputs/`.
-- Report installation checks separately from actual model evaluations. Preserve errors and retrieved evidence; do not invent results or silently switch models/backends.
-- Update README and FOUNDATIONAL when an accepted decision changes the baseline. Historical Git versions of removed epics and ADRs are not active requirements.
-- Run checks appropriate to the change and `git diff --check`. Do not create tests that merely restate configuration or documentation.
+- Verify the user-designated checkout and its Git remote before writing. Current repository: `C:\Users\Harri.Ahokas\Documents\yaw`.
+- Execute [Epic 1](docs/epic-1-hipporag-daemon.md) before [Epic 2](docs/epic-2-fastmcp-http.md). Select the first unfinished packet and its observable exit condition. Epic 1 must achieve **Tier 1 benchmark parity** against upstream `hipporag` during development, and **Tier 2 full-corpus benchmark parity (or beat!)** as the Epic 1 acceptance gate.
+- Build the native HippoRAG 2 engine in the locked domain containment tree (`yaw/{core,daemon/{ingestion,graph/{storage,inference}}}/`) on top of a single `yaw.db` (`sqlite-vec` + contentless `FTS5` + sparse CSR/Forward-Push PPR + 1-indexed line hydration) and native DSPy inference (`dspy.LM`, `dspy.Embedder`, `dspy.Signature`s, `dspy.RLM`, `dspy.GEPA`) with zero `hipporag` runtime imports inside `yaw/`. Enforce zero horizontal/cross-domain imports (`test_architecture.py`: a package `P` only imports `P.*` and `yaw.core.*`) so files are never migrated or refactored again. Keep pinned upstream `hipporag` in `benchmark.py` as the reference baseline; retire upstream's 7-file Parquet/Pickle/JSON storage from the daemon.
+- Implement one runtime (`yaw/daemon/runtime.py`) and one `yaw.db` writer fed by CocoIndex (`cocoindex>=1.0.0`) coalesced `SyncDelta`s (`yaw/daemon/ingestion/corpus.py`). FastMCP (`yaw/daemon/mcp_server.py`) is a thin transport adapter to that runtime. Treat the inference server (`http://localhost:13305/api/v1` or configured URL) as an external persistent service.
+- Preserve source files and user experiments. Put generated indexes under ignored outputs or disposable temporary directories, and rotate logs with `yaw/core/logger.py` (500-line FIFO). Never treat a partial directory scan as evidence of source deletion.
+- Use `uv sync --locked` and `uv run --locked`. Add only the dependencies assigned to the current epic (`dspy`, `sqlite-vec`, `scipy`, `cocoindex`, `filelock` in Epic 1; `fastmcp` in Epic 2), updating the lock deliberately.
+- Record actual checks and failures in [evaluation](docs/evaluation.md). Distinguish package resolution, installation, real inference, retrieval correctness and daemon/transport acceptance. A fake provider validates orchestration only.
+- Keep README's available commands separate from epic target commands. Update scope documents when accepted decisions change. Run focused verification and `git diff --check` before reporting completion.

@@ -2,7 +2,12 @@
 .cache/
 __pycache__/
 *.py[cod]
+*.egg-info/
+.yaw/
+corpus/
 outputs/
+datasets/
+data/
 .env
 .env.*
 !.env.example

@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "yaw"
 version = "0.1.0"
@@ -5,8 +9,39 @@ description = "HippoRAG 2 evaluation workspace"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "cocoindex>=1.0.25",
+    "dspy>=3.0.0",
+    "filelock>=3.18.0",
     "hipporag @ git+https://github.com/OSU-NLP-Group/HippoRAG.git@d5c8329422e0a0b834a15874545cb6a74b4f9b26",
+    "numpy>=2.5.4",
+    "scipy>=1.15.0",
+    "sqlite-vec>=0.1.6",
+]
+
+[project.scripts]
+yaw = "yaw.daemon.cli:cli_entrypoint"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "ruff>=0.11.0",
+    "ty>=0.0.1a0",
 ]
 
 [tool.uv]
-package = false
+package = true
+
+[tool.setuptools.packages.find]
+include = ["yaw*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501", "B010", "B009"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
