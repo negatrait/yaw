@@ -40,6 +40,11 @@ string ::= "\"" char+ "\""
 char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
 """
 
+DSPY_QUERY_INTENT_GBNF_GRAMMAR = r"""root ::= "{\"query_intent\": " string "}"
+string ::= "\"" char+ "\""
+char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
+"""
+
 
 def gbnf_escape_literal(text: str) -> str:
     escaped = (
@@ -106,6 +111,11 @@ def build_dspy_instruction_proposal_grammar(max_chars: int | None = 1500) -> str
     )
 
 
+def build_dspy_query_intent_grammar() -> str:
+    """Build pure-JSON GBNF grammar for ExtractQueryIntent (`{"query_intent": "..."}`)."""
+    return DSPY_QUERY_INTENT_GBNF_GRAMMAR
+
+
 def build_dspy_rerank_grammar(
     candidate_facts: Sequence[tuple[str, str, str] | list[str]],
     max_facts: int = 4,
@@ -138,8 +148,15 @@ def build_dspy_rerank_grammar(
     )
 
 
+_METRIC_FLOOR = 0.05
+
+
 def _clamp_unit(val: float) -> float:
     return max(0.0, min(1.0, float(val)))
+
+
+def _smooth_floor(val: float) -> float:
+    return max(_METRIC_FLOOR, _clamp_unit(val))
 
 
 def compute_sizecoding_pareto_score(
@@ -162,6 +179,7 @@ def compute_sizecoding_pareto_score(
     - Supports both single-rank (`recall_at_5 / tokens`) and full composite fitness:
       - Retrieval/indexing stages: `(Recall@1 * Recall@2 * Recall@5 * Recall@10 * Recall@20) / tokens`
       - End-to-End QA stages: `(Recall@1 * Recall@2 * Recall@5 * Recall@10 * Recall@20 * EM * F1) / tokens`
+      with smoothed floor protection (`0.05`) against single-metric zero collapse.
     - Hard Tier 1 baseline gate: if `recall_at_5 < min_baseline_recall`, the candidate is
       clamped below `0.05` with zero `pareto_raw`/`efficiency` objective scores so no
       token-saving mutation can ever drop below the locked Tier 1 baseline.
@@ -181,19 +199,30 @@ def compute_sizecoding_pareto_score(
         r5 = clamped_recall
         r10 = _clamp_unit(recall_at_10 if recall_at_10 is not None else clamped_recall)
         r20 = _clamp_unit(recall_at_20 if recall_at_20 is not None else clamped_recall)
-        quality_numerator = r1 * r2 * r5 * r10 * r20
+        quality_numerator = (
+            _smooth_floor(r1)
+            * _smooth_floor(r2)
+            * _smooth_floor(r5)
+            * _smooth_floor(r10)
+            * _smooth_floor(r20)
+        )
+        recall_curve = (r1 + r2 + r5 + r10 + r20) / 5.0
         if em is not None or f1 is not None:
             c_em = _clamp_unit(em if em is not None else 1.0)
             c_f1 = _clamp_unit(f1 if f1 is not None else 1.0)
-            quality_numerator = quality_numerator * c_em * c_f1
+            quality_numerator = quality_numerator * _smooth_floor(c_em) * _smooth_floor(c_f1)
+            qa_curve = 0.5 * (c_em + c_f1)
+            composite_quality = 0.50 * quality_numerator + 0.25 * recall_curve + 0.25 * qa_curve
         else:
             c_em = None
             c_f1 = None
+            composite_quality = 0.50 * quality_numerator + 0.50 * recall_curve
     else:
         r1 = r2 = r5 = r10 = r20 = clamped_recall
         c_em = None
         c_f1 = None
         quality_numerator = clamped_recall
+        composite_quality = quality_numerator
 
     pareto_raw = quality_numerator / safe_tokens
 
@@ -240,7 +269,7 @@ def compute_sizecoding_pareto_score(
             objective_scores=obj_violated,
         )
 
-    score = 0.10 + 0.90 * quality_numerator * efficiency
+    score = 0.10 + 0.90 * composite_quality * efficiency
     missed_str = f" Missed gold items: {list(missed_items)}." if missed_items else ""
     qa_str = f", EM={c_em:.4f}, F1={c_f1:.4f}" if (c_em is not None and c_f1 is not None) else ""
     feedback = (
@@ -248,9 +277,7 @@ def compute_sizecoding_pareto_score(
         f"Sizecoding Pareto={pareto_raw:.6f} (Quality={quality_numerator:.4f}, "
         f"Recall@1/2/5/10/20={r1:.2f}/{r2:.2f}/{r5:.2f}/{r10:.2f}/{r20:.2f}{qa_str} / "
         f"[{safe_tokens} tokens], "
-        f"efficiency={efficiency:.4f}).{missed_str} "
-        "To increase Pareto score, preserve 100% of gold retrieval bridges while pruning "
-        "redundant triples, verbose entity aliases, and filler reasoning tokens."
+        f"efficiency={efficiency:.4f}).{missed_str}"
     )
     obj_scores: dict[str, float] = {
         "recall_at_5": clamped_recall,
@@ -314,11 +341,13 @@ __all__ = [
     "DSPY_RERANK_GBNF_GRAMMAR",
     "DSPY_QA_COT_GBNF_GRAMMAR",
     "DSPY_INSTRUCTION_PROPOSAL_GBNF_GRAMMAR",
+    "DSPY_QUERY_INTENT_GBNF_GRAMMAR",
     "gbnf_escape_literal",
     "build_dspy_ner_grammar",
     "build_dspy_triples_grammar",
     "build_dspy_qa_cot_grammar",
     "build_dspy_instruction_proposal_grammar",
+    "build_dspy_query_intent_grammar",
     "build_dspy_rerank_grammar",
     "compute_sizecoding_pareto_score",
     "lm_supports_gbnf",

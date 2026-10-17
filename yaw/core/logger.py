@@ -76,8 +76,20 @@ def configure_logging(
     if disable_tqdm:
         os.environ.setdefault("TQDM_DISABLE", "1")
 
+    os.environ.setdefault("LITELLM_LOG", "WARNING")
+    os.environ.setdefault("LITELLM_SUPPRESS_DEBUG_INFO", "True")
+
     if quiet_third_party:
-        for name in ("httpx", "httpcore", "openai", "urllib3"):
+        for name in (
+            "httpx",
+            "httpcore",
+            "openai",
+            "urllib3",
+            "litellm",
+            "LiteLLM",
+            "LiteLLM Router",
+            "LiteLLM Proxy",
+        ):
             logging.getLogger(name).setLevel(logging.WARNING)
 
     handlers: list[logging.Handler] = [logging.StreamHandler()]

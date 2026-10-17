@@ -47,7 +47,7 @@ http_path = "/mcp"
 [optimization]
 datasets = ["2wikimultihopqa", "hotpotqa", "musique"]
 mode = "gepa"
-max_queries = 20
+max_queries = 10
 train_queries = 7
 query_offset = 0
 auto = "light"

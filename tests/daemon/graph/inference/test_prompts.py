@@ -577,6 +577,47 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         self.assertEqual(set(obj_scores.keys()), {"recall_at_5", "pareto_raw", "efficiency"})
         self.assertAlmostEqual(obj_scores["recall_at_5"], 0.80)
 
+        # 3. Smoothed multi-rank gradient: when EM=0.0 or Recall@1=0.0, improving Recall@2/@5/@10
+        # or F1 MUST strictly increase scalar score (never collapse to flat 0.10).
+        em_zero_low_recall = compute_sizecoding_pareto_score(
+            0.50,
+            recall_at_1=0.0,
+            recall_at_2=0.50,
+            recall_at_10=0.50,
+            recall_at_20=1.0,
+            em=0.0,
+            f1=0.40,
+            tokens=100,
+        )
+        em_zero_high_recall = compute_sizecoding_pareto_score(
+            1.0,
+            recall_at_1=0.50,
+            recall_at_2=1.0,
+            recall_at_10=1.0,
+            recall_at_20=1.0,
+            em=0.0,
+            f1=0.40,
+            tokens=100,
+        )
+        self.assertGreater(em_zero_low_recall.quality_numerator, 0.0)
+        self.assertGreater(em_zero_low_recall.score, 0.10)
+        self.assertGreater(em_zero_high_recall.score, em_zero_low_recall.score)
+        self.assertNotIn("preserve 100% of gold retrieval bridges", em_zero_high_recall.feedback)
+
+        # Active predictor surface filtering for GEPA auto_budget
+        direct_prog = HippoRAGProgram(execution_mode="direct", qa_mode="cot")
+        direct_names = [name for name, _ in direct_prog.named_predictors()]
+        self.assertEqual(
+            direct_names,
+            ["ner", "triples", "fact_filter", "query_intent", "qa_cot.predict"],
+        )
+        direct_prog.set_retrieval_hook(lambda q: ("ctx", ("c1",), (1.0,)))
+        hooked_names = [name for name, _ in direct_prog.named_predictors()]
+        self.assertEqual(
+            hooked_names,
+            ["fact_filter", "query_intent", "qa_cot.predict"],
+        )
+
     def test_heterogeneous_mistral_orchestrator_and_qwen_gbnf_rlm_across_all_stages(self):
         """Verify execution_mode='rlm' runs Mistral NPU orchestrator (zero GBNF) + Qwen GPU worker (pure-JSON GBNF) on every stage."""
         import dspy
@@ -944,7 +985,7 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         self.assertFalse(getattr(mistral_ref, "_yaw_supports_gbnf", True))
 
         self.assertEqual(qwen_ref.kwargs["temperature"], 0.7)
-        self.assertEqual(qwen_ref.kwargs["max_tokens"], 2048)
+        self.assertEqual(qwen_ref.kwargs["max_tokens"], 4096)
         self.assertEqual(qwen_ref.kwargs["frequency_penalty"], 0.3)
         self.assertTrue(getattr(qwen_ref, "_yaw_supports_gbnf", False))
 
@@ -955,13 +996,13 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         self.assertTrue(getattr(worker_ref, "_yaw_supports_gbnf", False))
 
     def test_rlm_instruction_proposer_contract_and_boundary_envelope(self):
-        """TDD Contract: RLMInstructionProposer executes Mistral RLM + Qwen GBNF instruction synthesis."""
+        """TDD Contract: RLMInstructionProposer executes Outer Mistral RLM -> Inner Qwen RLM -> Qwen GBNF synthesis."""
         import dspy
         from dspy.utils.dummies import DummyLM
 
         from yaw.daemon.graph.inference import (
+            DSPY_INSTRUCTION_PROPOSAL_GBNF_GRAMMAR,
             RLMInstructionProposer,
-            build_dspy_instruction_proposal_grammar,
         )
 
         # Negative boundary envelope: invalid max_instruction_chars raises ValueError
@@ -970,10 +1011,9 @@ class PromptsAndParsersParityTests(unittest.TestCase):
 
         mistral_lm = DummyLM([
             {
-                "reasoning": "Diagnose missed bridge entities in examples_with_feedback and delegate to Qwen.",
+                "reasoning": "Inspect examples_with_feedback in Python and delegate to Qwen inner RLM.",
                 "code": (
-                    "critique = 'Preserve multi-hop bridge entities while pruning redundant aliases.'\n"
-                    "improved = qwen_propose_instruction(component_name, current_instruction, examples_with_feedback, critique)\n"
+                    "improved = qwen_propose_instruction(current_instruction, examples_with_feedback)\n"
                     "SUBMIT(new_instruction=improved)"
                 ),
             }
@@ -982,8 +1022,19 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         setattr(mistral_lm, "_yaw_supports_gbnf", False)
 
         qwen_lm = DummyLM(
-            [{"new_instruction": "Extract all bridge named entities concisely without redundant titles."}],
-            adapter=dspy.JSONAdapter(),
+            [
+                {
+                    "reasoning": "Distill examples_with_feedback in Python and call GBNF synthesize_instruction.",
+                    "code": (
+                        "digest = [{'Inputs': {'passage': ex['Inputs']['passage'][:200]}, "
+                        "'Generated Outputs': ex['Generated Outputs'], 'Feedback': ex['Feedback']} "
+                        "for ex in examples_with_feedback]\n"
+                        "res = synthesize_instruction(current_instruction, digest)\n"
+                        "SUBMIT(new_instruction=res)"
+                    ),
+                },
+                {"new_instruction": "Extract all bridge named entities concisely without redundant titles."},
+            ]
         )
         setattr(qwen_lm, "_yaw_recipe", "llamacpp")
         setattr(qwen_lm, "_yaw_supports_gbnf", True)
@@ -994,6 +1045,7 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             enable_gbnf=True,
             max_instruction_chars=900,
         )
+        self.assertFalse(isinstance(proposer, dspy.Module))
 
         candidate = {
             "ner": "Extract named entities from the passage.",
@@ -1015,14 +1067,15 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         self.assertEqual(len(mistral_lm.history), 0)
         self.assertEqual(len(qwen_lm.history), 0)
 
-        # Happy path: updates 'ner' via Mistral RLM + Qwen GBNF worker
-        updated = proposer(candidate, reflective_dataset, ["ner"])
+        # Happy path: updates 'ner' via Outer Mistral RLM -> Inner Qwen RLM -> Qwen GBNF synthesis
+        with dspy.context(track_usage=True):
+            updated = proposer(candidate, reflective_dataset, ["ner"])
         self.assertEqual(
             updated,
             {"ner": "Extract all bridge named entities concisely without redundant titles."},
         )
         self.assertEqual(len(mistral_lm.history), 1)
-        self.assertEqual(len(qwen_lm.history), 1)
+        self.assertEqual(len(qwen_lm.history), 2)
 
         # Verify Mistral got instruction proposal prompt (not SPO/QA tools) and zero GBNF
         mistral_call = mistral_lm.history[0]
@@ -1033,11 +1086,15 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         self.assertIn("new_instruction", mistral_prompt_text)
         self.assertNotIn("qwen_extract_triples", mistral_prompt_text)
 
-        # Verify Qwen got pure-JSON instruction proposal GBNF grammar and temp=0.7
-        qwen_call = qwen_lm.history[0]
-        self.assertEqual(qwen_call["kwargs"].get("temperature"), 0.7)
-        expected_grammar = build_dspy_instruction_proposal_grammar(900)
-        self.assertEqual((qwen_call["kwargs"].get("extra_body") or {}).get("grammar"), expected_grammar)
+        # Verify Qwen Call 1 was Inner RLM (no GBNF) and Call 2 was GBNF ProposeInstruction synthesis
+        qwen_rlm_call = qwen_lm.history[0]
+        self.assertIsNone(qwen_rlm_call["kwargs"].get("extra_body"))
+        qwen_synth_call = qwen_lm.history[1]
+        self.assertEqual(qwen_synth_call["kwargs"].get("temperature"), 0.7)
+        self.assertEqual(
+            (qwen_synth_call["kwargs"].get("extra_body") or {}).get("grammar"),
+            DSPY_INSTRUCTION_PROPOSAL_GBNF_GRAMMAR,
+        )
 
         # Verify telemetry was recorded on the proposer
         self.assertEqual(len(proposer.telemetry), 1)
@@ -1048,7 +1105,7 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         )
 
     def test_live_silicon_rlm_instruction_proposer(self):
-        """Run un-mocked RLMInstructionProposer against live Lemonade Server (Mistral NPU + Qwen GPU GBNF)."""
+        """Run un-mocked RLMInstructionProposer (RLM -> RLM cascade) against live Lemonade Server."""
         loaded_models = self._probe_live_lemonade_models()
         required = {"Qwen3-4B-Instruct-2507-GGUF", "Mistral-7B-Instruct-v0.3-Hybrid"}
         if not required.issubset(loaded_models):
@@ -1057,8 +1114,8 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             )
 
         from yaw.daemon.graph.inference import (
+            DSPY_INSTRUCTION_PROPOSAL_GBNF_GRAMMAR,
             RLMInstructionProposer,
-            build_dspy_instruction_proposal_grammar,
             create_dspy_rlm_pair,
         )
 
@@ -1088,7 +1145,7 @@ class PromptsAndParsersParityTests(unittest.TestCase):
                         "reasoning": "Erik Hort was born in Montebello, which is in Rockland County, New York.",
                         "answer": "Erik Hort's birthplace is part of Rockland County in New York.",
                     },
-                    "Feedback": "[qa_cot] PASS Tier 1 floor (1.0000 >= 0.0000). EM=0.0000, F1=0.3636. Missed gold items: ['Rockland County']. Output only the exact short entity name in `answer` without full sentence repetition.",
+                    "Feedback": "[qa_cot] PASS Tier 1 floor (1.0000 >= 0.0000). EM=0.0000, F1=0.3636. Missed gold items: ['Rockland County'].",
                 }
             ]
         }
@@ -1100,17 +1157,63 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         self.assertLessEqual(len(new_inst), 800)
         self.assertFalse(new_inst.startswith("]"))
 
-        self.assertEqual(len(orch_lm.history), 1)
+        self.assertGreaterEqual(len(orch_lm.history), 1)
         self.assertIsNone(orch_lm.history[0]["kwargs"].get("extra_body"))
         self.assertEqual(orch_lm.history[0]["kwargs"].get("temperature"), 0.8)
 
-        self.assertEqual(len(worker_lm.history), 1)
-        self.assertEqual(worker_lm.history[0]["kwargs"].get("temperature"), 0.7)
+        # Inner RLM on Qwen + GBNF ProposeInstruction synthesis
+        self.assertGreaterEqual(len(worker_lm.history), 2)
+        gbnf_calls = [
+            c for c in worker_lm.history if (c["kwargs"].get("extra_body") or {}).get("grammar")
+        ]
+        self.assertGreaterEqual(len(gbnf_calls), 1)
         self.assertEqual(
-            (worker_lm.history[0]["kwargs"].get("extra_body") or {}).get("grammar"),
-            build_dspy_instruction_proposal_grammar(800),
+            (gbnf_calls[0]["kwargs"].get("extra_body") or {}).get("grammar"),
+            DSPY_INSTRUCTION_PROPOSAL_GBNF_GRAMMAR,
         )
         self.assertEqual(len(proposer.telemetry), 1)
+
+    def test_extract_query_intent_gbnf_and_sampling_contract(self):
+        """TDD Contract: extract_query_intent enforces DSPY_QUERY_INTENT_GBNF_GRAMMAR on llamacpp with temp=0.4 and freq_penalty=0.2."""
+        from dspy.utils.dummies import DummyLM
+
+        from yaw.daemon.graph.inference import (
+            DSPY_QUERY_INTENT_GBNF_GRAMMAR,
+            HippoRAGProgram,
+            build_dspy_query_intent_grammar,
+        )
+
+        self.assertEqual(build_dspy_query_intent_grammar(), DSPY_QUERY_INTENT_GBNF_GRAMMAR)
+        self.assertIn("query_intent", DSPY_QUERY_INTENT_GBNF_GRAMMAR)
+
+        qwen_lm = DummyLM([{"query_intent": "Erik Hort birthplace village town county"}])
+        setattr(qwen_lm, "_yaw_recipe", "llamacpp")
+        setattr(qwen_lm, "_yaw_supports_gbnf", True)
+
+        prog = HippoRAGProgram(
+            execution_mode="direct",
+            qa_mode="cot",
+            enable_gbnf=True,
+            rlm_sub_lm=qwen_lm,
+        )
+        intent = prog.extract_query_intent("What county is Erik Hort's birthplace a part of?")
+        self.assertEqual(intent, "Erik Hort birthplace village town county")
+        self.assertEqual(len(qwen_lm.history), 1)
+        call_kwargs = qwen_lm.history[0]["kwargs"]
+        self.assertAlmostEqual(call_kwargs.get("temperature"), 0.4)
+        self.assertAlmostEqual(call_kwargs.get("frequency_penalty"), 0.2)
+        self.assertEqual(
+            (call_kwargs.get("extra_body") or {}).get("grammar"),
+            DSPY_QUERY_INTENT_GBNF_GRAMMAR,
+        )
+
+        # Boundary: non-GBNF LM (e.g. ryzenai-llm) omits extra_body.grammar
+        npu_lm = DummyLM([{"query_intent": "Erik Hort birthplace county"}])
+        setattr(npu_lm, "_yaw_recipe", "ryzenai-llm")
+        setattr(npu_lm, "_yaw_supports_gbnf", False)
+        intent_npu = prog.extract_query_intent("What county is Erik Hort's birthplace a part of?", lm=npu_lm)
+        self.assertEqual(intent_npu, "Erik Hort birthplace county")
+        self.assertIsNone(npu_lm.history[0]["kwargs"].get("extra_body"))
 
 
 if __name__ == "__main__":

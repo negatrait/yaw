@@ -44,11 +44,13 @@ _PUBLIC_API: dict[str, str] = {
     "build_dspy_rerank_grammar": ".grammars",
     "build_dspy_qa_cot_grammar": ".grammars",
     "build_dspy_instruction_proposal_grammar": ".grammars",
+    "build_dspy_query_intent_grammar": ".grammars",
     "DSPY_NER_GBNF_GRAMMAR": ".grammars",
     "DSPY_TRIPLES_GBNF_GRAMMAR": ".grammars",
     "DSPY_RERANK_GBNF_GRAMMAR": ".grammars",
     "DSPY_QA_COT_GBNF_GRAMMAR": ".grammars",
     "DSPY_INSTRUCTION_PROPOSAL_GBNF_GRAMMAR": ".grammars",
+    "DSPY_QUERY_INTENT_GBNF_GRAMMAR": ".grammars",
     # Pinned Upstream Baseline Adapters
     "LocalChat": ".legacy_chat",
     "CacheOpenAI": ".legacy_chat",

@@ -379,12 +379,17 @@ def test_engine_evolve_prompts_miprov2_and_gepa_metric_contracts(
             self.auto = auto
             self.track_stats = track_stats
             self.track_best_outputs = track_best_outputs
+            self.kwargs = kwargs
 
         def compile(self, student: Any, trainset: list[Any], valset: Any = None) -> Any:
             assert self.instruction_proposer is not None
             assert callable(self.instruction_proposer)
             assert self.track_stats is True
             assert self.track_best_outputs is True
+            assert self.kwargs.get("component_selector") == "round_robin"
+            gepa_kw = self.kwargs.get("gepa_kwargs") or {}
+            assert gepa_kw.get("frontier_type") == "hybrid"
+            assert gepa_kw.get("use_cloudpickle") is True
             pred = student(question=trainset[0].question)
             res = self.metric(trainset[0], pred)
             gepa_scores.append(res)

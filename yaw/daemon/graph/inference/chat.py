@@ -1,11 +1,13 @@
-"""Native DSPy LM and heterogeneous RLM model pair factories for local inference."""
-
+import logging
 from typing import Any
 
 import dspy
 
 from .grammars import lm_supports_gbnf
 from .models import BASE_URL, CHAT_MODELS, DEFAULT_EXTRACTION_CHAT, DEFAULT_QA_CHAT
+
+for _logger_name in ("LiteLLM", "LiteLLM Router", "LiteLLM Proxy", "litellm", "httpx"):
+    logging.getLogger(_logger_name).setLevel(logging.WARNING)
 
 __all__ = [
     "create_dspy_lm",
@@ -56,8 +58,8 @@ def create_dspy_lm(
             temperature = 0.0
 
     if max_tokens is None:
-        # Qwen3-4B runs with an 8192-16384 context window; Mistral-7B Hybrid runs with 32786.
-        max_tokens = 4096 if role in ("extraction", "reflection") else 2048
+        # Per-completion output token cap (total context window is 16384 on Qwen and 32786 on Mistral in Lemonade).
+        max_tokens = 4096
 
     lm_kwargs: dict[str, Any] = dict(kwargs)
     if role == "extraction" and profile is not None and profile.frequency_penalty > 0:

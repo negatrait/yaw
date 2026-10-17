@@ -1,10 +1,9 @@
 """Unit tests for YawConfig contract, TOML loading, optimization sandbox derivation, and get/set."""
 
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
-
-from typing import Any, cast
 
 from yaw.core import YawConfig, YawRuntimeError, get_config_value, set_config_value
 

@@ -281,7 +281,7 @@ class ChatTests(unittest.TestCase):
             lm_supports_gbnf,
         )
 
-        # Qwen3-4B extraction on Lemonade (8192-16384 ctx window, llamacpp GPU -> GBNF supported)
+        # Qwen3-4B extraction on Lemonade (16384 ctx window, llamacpp GPU -> GBNF supported)
         qwen_lm = create_dspy_lm("Qwen3-4B-Instruct-2507-GGUF", role="extraction")
         self.assertEqual(qwen_lm.model, "openai/Qwen3-4B-Instruct-2507-GGUF")
         self.assertAlmostEqual(qwen_lm.kwargs["temperature"], 0.2)
@@ -293,7 +293,7 @@ class ChatTests(unittest.TestCase):
         mistral_lm = create_dspy_lm("Mistral-7B-Instruct-v0.3-Hybrid", role="qa")
         self.assertEqual(mistral_lm.model, "openai/Mistral-7B-Instruct-v0.3-Hybrid")
         self.assertAlmostEqual(mistral_lm.kwargs["temperature"], 0.2)
-        self.assertEqual(mistral_lm.kwargs["max_tokens"], 2048)
+        self.assertEqual(mistral_lm.kwargs["max_tokens"], 4096)
         self.assertFalse(lm_supports_gbnf(mistral_lm))
 
         # Heterogeneous RLM pair: (Mistral NPU orchestrator without GBNF, Qwen GPU worker with GBNF)

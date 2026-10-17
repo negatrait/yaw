@@ -1,6 +1,7 @@
 """Native DSPy signatures and few-shot demonstration sets for HippoRAG 2."""
 
 import json
+from typing import Any
 
 import dspy
 from pydantic import BaseModel, Field
@@ -87,40 +88,48 @@ class ProposeInstructionSignature(dspy.Signature):
 
     Read the inputs carefully and identify the input format and infer detailed task description about the task I wish to solve with the assistant.
 
-    Read all the assistant responses and the corresponding feedback. Identify all niche and domain specific factual information about the task and include it in the instruction, as a lot of it may not be available to the assistant in the future. The assistant may have utilized a generalizable strategy to solve the task, if so, include that in the instruction as well.
-    Respond with a JSON object in the format: {"new_instruction": "..."}"""
+    Read all the assistant responses and the corresponding feedback. Identify all niche and domain specific factual information about the task and include it in the instruction, as a lot of it may not be available to the assistant in the future. The assistant may have utilized a generalizable strategy to solve the task, if so, include that in the instruction as well."""
 
-    component_name: str = dspy.InputField(
-        desc="Name of the predictor component being optimized"
-    )
     current_instruction: str = dspy.InputField(
-        desc="The instructions provided to the assistant"
+        desc="The instructions I provided to the assistant."
     )
-    examples_with_feedback: str = dspy.InputField(
-        desc="Task inputs provided to the assistant, the assistant's response for each, and feedback on how the response could be better"
-    )
-    orchestrator_critique: str = dspy.InputField(
-        desc="Failure diagnosis and strategy guidance from the reflection orchestrator"
+    examples_with_feedback: list[dict[str, Any]] = dspy.InputField(
+        desc="Task inputs provided to the assistant, the assistant's response for each, and feedback on how the response could be better."
     )
     new_instruction: str = dspy.OutputField(
-        desc="The new instruction for the assistant"
+        desc="The new instruction for the assistant."
+    )
+
+
+class CompressInstructionSignature(dspy.Signature):
+    """Shorten the instruction to fit within the stated limit. Preserve every
+    strategy, rule, and constraint; cut redundancy and verbosity. Do not add
+    new content. Output only the shortened instruction."""
+
+    instruction: str = dspy.InputField()
+    length_limit: str = dspy.InputField()
+    new_instruction: str = dspy.OutputField(
+        desc="The shortened instruction for the assistant."
     )
 
 
 class ReflectiveInstructionTask(dspy.Signature):
-    """Analyze the current instruction, task examples, and evaluation feedback to identify failure patterns and generalizable strategies, then synthesize an improved instruction for the assistant."""
+    """I provided an assistant with instructions to perform a task for me. You are given those instructions, along with examples of different task inputs provided to the assistant, the assistant's response for each of them, and some feedback on how the assistant's response could be better.
 
-    component_name: str = dspy.InputField(
-        desc="Name of the predictor component being optimized"
-    )
+    Your task is to write a new instruction for the assistant.
+
+    Read the inputs carefully and identify the input format and infer detailed task description about the task I wish to solve with the assistant.
+
+    Read all the assistant responses and the corresponding feedback. Identify all niche and domain specific factual information about the task and include it in the instruction, as a lot of it may not be available to the assistant in the future. The assistant may have utilized a generalizable strategy to solve the task, if so, include that in the instruction as well."""
+
     current_instruction: str = dspy.InputField(
-        desc="The instructions provided to the assistant"
+        desc="The instructions I provided to the assistant."
     )
-    examples_with_feedback: str = dspy.InputField(
-        desc="Task inputs provided to the assistant, the assistant's response for each, and feedback on how the response could be better"
+    examples_with_feedback: list[dict[str, Any]] = dspy.InputField(
+        desc="Task inputs provided to the assistant, the assistant's response for each, and feedback on how the response could be better."
     )
     new_instruction: str = dspy.OutputField(
-        desc="The new instruction for the assistant"
+        desc="The new instruction for the assistant."
     )
 
 
@@ -179,6 +188,7 @@ QA_DEMOS: list[dspy.Example] = _build_default_qa_demos()
 
 __all__ = [
     "AnswerQuestion",
+    "CompressInstructionSignature",
     "ExtractEntities",
     "ExtractQueryIntent",
     "ExtractTriples",

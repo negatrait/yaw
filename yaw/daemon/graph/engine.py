@@ -467,9 +467,23 @@ class YawGraphEngine:
                 self.conn, query_fact_vec, top_k=self.fact_candidate_pool_k
             )
 
-            # Step 2: Retrieve top-k lexical FTS hits from fact_fts
+            # Step 2: Retrieve top-k lexical FTS hits from fact_fts (plus query_intent expansion)
             fts_hits = search_facts_fts(
                 self.conn, query, top_k=self.fact_fts_pool_k
+            )
+            intent_query = (
+                active_program.extract_query_intent(query)
+                if allow_intent_path
+                else query
+            )
+            intent_fts_hits = (
+                search_facts_fts(self.conn, intent_query, top_k=self.fact_fts_pool_k)
+                if (
+                    allow_intent_path
+                    and intent_query
+                    and intent_query.strip().lower() != query.strip().lower()
+                )
+                else []
             )
 
             # Step 3: RRF merge -> max (fact_candidate_pool_k + fact_fts_pool_k) candidate list length
@@ -478,6 +492,10 @@ class YawGraphEngine:
                 rrf_scores[fid] = rrf_scores.get(fid, 0.0) + (1.0 / (self.fact_rrf_k + rank))
             for rank, (fid, _) in enumerate(fts_hits, start=1):
                 rrf_scores[fid] = rrf_scores.get(fid, 0.0) + self.fact_fts_weight * (
+                    1.0 / (self.fact_rrf_k + rank)
+                )
+            for rank, (fid, _) in enumerate(intent_fts_hits, start=1):
+                rrf_scores[fid] = rrf_scores.get(fid, 0.0) + 0.5 * self.fact_fts_weight * (
                     1.0 / (self.fact_rrf_k + rank)
                 )
 
@@ -531,7 +549,7 @@ class YawGraphEngine:
 
             if not kept_facts_with_scores and allow_intent_path:
                 return self.retrieve_with_seeds(
-                    active_program.extract_query_intent(query),
+                    intent_query,
                     top_k=top_k,
                     allow_intent_path=False,
                     program=active_program,
@@ -755,7 +773,9 @@ class YawGraphEngine:
                         ):
                             hits_k += 1
                         elif k == 5:
-                            missed.append(gd_cid)
+                            first_line = gd_str.splitlines()[0].strip() if gd_str else ""
+                            snippet = first_line[:120] if first_line else gd_cid
+                            missed.append(f"Missed passage: {snippet!r}")
                     recalls_by_k[k] = hits_k / total_gold
 
             em_score: float | None = None
@@ -875,13 +895,13 @@ class YawGraphEngine:
                     candidate_selection_strategy="pareto",
                     skip_perfect_score=True,
                     use_merge=True,
-                    component_selector="all",
+                    component_selector="round_robin",
                     track_stats=True,
                     track_best_outputs=True,
                     warn_on_score_mismatch=False,
                     log_dir=gepa_log_dir,
                     seed=0,
-                    gepa_kwargs={"use_cloudpickle": True},
+                    gepa_kwargs={"use_cloudpickle": True, "frontier_type": "hybrid"},
                 )
                 with dspy.context(track_usage=True):
                     compiled = gepa.compile(
