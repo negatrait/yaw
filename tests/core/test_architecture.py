@@ -91,6 +91,87 @@ def is_leaf_package(package_dir: Path) -> bool:
     return True
 
 
+def build_internal_import_graph() -> dict[str, set[str]]:
+    """Build the directed module-level import graph for all Python modules in yaw/."""
+    module_map: dict[str, Path] = {}
+    for p in YAW_DIR.rglob("*.py"):
+        rel = p.relative_to(PROJECT_ROOT).with_suffix("")
+        parts = list(rel.parts)
+        mod_name = ".".join(parts[:-1]) if parts[-1] == "__init__" else ".".join(parts)
+        module_map[mod_name] = p
+
+    graph: dict[str, set[str]] = {m: set() for m in module_map}
+
+    for mod, file_path in module_map.items():
+        rel = file_path.relative_to(PROJECT_ROOT).with_suffix("")
+        parts = list(rel.parts)
+        pkg_parts = parts[:-1]
+        tree = ast.parse(file_path.read_text(encoding="utf-8"), filename=str(file_path))
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    name = alias.name
+                    if name.startswith("yaw.") or name == "yaw":
+                        cand = name
+                        while cand and cand not in module_map:
+                            cand = cand.rsplit(".", 1)[0] if "." in cand else None
+                        if cand and cand != mod:
+                            graph[mod].add(cand)
+            elif isinstance(node, ast.ImportFrom):
+                if node.level > 0:
+                    drop = node.level - 1
+                    base = pkg_parts[: len(pkg_parts) - drop] if drop <= len(pkg_parts) else []
+                    m_str = ".".join(base)
+                    full = f"{m_str}.{node.module}" if node.module else m_str
+                    cand = full
+                    while cand and cand not in module_map:
+                        cand = cand.rsplit(".", 1)[0] if "." in cand else None
+                    if cand and cand != mod:
+                        graph[mod].add(cand)
+                    for alias in node.names:
+                        alias_full = f"{full}.{alias.name}" if full else alias.name
+                        if alias_full in module_map and alias_full != mod:
+                            graph[mod].add(alias_full)
+                elif node.module:
+                    if node.module.startswith("yaw.") or node.module == "yaw":
+                        cand = node.module
+                        while cand and cand not in module_map:
+                            cand = cand.rsplit(".", 1)[0] if "." in cand else None
+                        if cand and cand != mod:
+                            graph[mod].add(cand)
+                        for alias in node.names:
+                            alias_full = f"{node.module}.{alias.name}"
+                            if alias_full in module_map and alias_full != mod:
+                                graph[mod].add(alias_full)
+
+    return graph
+
+
+def find_import_cycles(graph: dict[str, set[str]]) -> list[list[str]]:
+    """Detect cycles in a directed graph using DFS back-edge detection. Returns all detected cycle paths."""
+    visited: dict[str, int] = {}  # 0: unvisited, 1: visiting (recursion stack), 2: visited
+    cycles: list[list[str]] = []
+
+    def dfs(node: str, path: list[str]) -> None:
+        visited[node] = 1
+        path.append(node)
+        for neighbor in sorted(graph.get(node, set())):
+            if visited.get(neighbor, 0) == 1:
+                idx = path.index(neighbor)
+                cycles.append(path[idx:] + [neighbor])
+            elif visited.get(neighbor, 0) == 0:
+                dfs(neighbor, path)
+        path.pop()
+        visited[node] = 2
+
+    for node in sorted(graph):
+        if visited.get(node, 0) == 0:
+            dfs(node, [])
+
+    return cycles
+
+
 class ArchitectureTests(unittest.TestCase):
     def test_all_init_files_are_strictly_empty(self):
         """Rule 1: Intermediate package __init__.py files in yaw/ are strictly empty (0 bytes or comments only).
@@ -311,3 +392,34 @@ class ArchitectureTests(unittest.TestCase):
             [],
             "Protected/private cross-module imports detected:\n" + "\n".join(violations),
         )
+
+    def test_zero_circular_dependencies_across_all_yaw_modules(self):
+        """Rule 6: The global module import graph must form a strict DAG with zero circular dependencies."""
+        graph = build_internal_import_graph()
+        self.assertGreater(len(graph), 0, "No yaw modules detected for cycle analysis.")
+
+        cycles = find_import_cycles(graph)
+        cycle_strs = [" -> ".join(c) for c in cycles]
+        self.assertEqual(
+            cycle_strs,
+            [],
+            f"Detected {len(cycles)} circular import cycle(s) in yaw:\n" + "\n".join(cycle_strs),
+        )
+
+    def test_synthetic_cycle_detection(self):
+        """Verify the cycle finder algorithm reliably identifies cycles when introduced."""
+        synthetic_dag = {
+            "a": {"b", "c"},
+            "b": {"c"},
+            "c": set(),
+        }
+        self.assertEqual(find_import_cycles(synthetic_dag), [])
+
+        synthetic_cyclic = {
+            "a": {"b"},
+            "b": {"c"},
+            "c": {"a"},
+        }
+        cycles = find_import_cycles(synthetic_cyclic)
+        self.assertEqual(len(cycles), 1)
+        self.assertEqual(cycles[0], ["a", "b", "c", "a"])
