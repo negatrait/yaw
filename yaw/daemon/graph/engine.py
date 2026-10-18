@@ -1545,6 +1545,58 @@ class YawGraphEngine:
             results.append(item)
         return results
 
+    class _ActiveTraceComponentSelector:
+        """GEPA component selector that dynamically prioritizes predictors with active execution traces."""
+
+        def __init__(self, program: HippoRAGProgram) -> None:
+            self.program = program
+            self.cursor = 0
+
+        def __call__(
+            self,
+            state: Any,
+            trajectories: list[Any],
+            subsample_scores: list[float],
+            candidate_idx: int,
+            candidate: dict[str, str],
+        ) -> list[str]:
+            active_sigs = set()
+            for data in trajectories or []:
+                for t in data.get("trace", ()):
+                    sig = getattr(t[0], "signature", None)
+                    if sig is not None:
+                        active_sigs.add(sig)
+
+            active_names: list[str] = []
+            name_to_pred = dict(self.program.named_predictors())
+            for name in getattr(state, "list_of_named_predictors", list(candidate.keys())):
+                pred = name_to_pred.get(name)
+                pred_sig = getattr(pred, "signature", None)
+                if pred_sig is not None:
+                    for a_sig in active_sigs:
+                        is_eq = (
+                            pred_sig.equals(a_sig)
+                            if hasattr(pred_sig, "equals")
+                            else pred_sig == a_sig
+                        )
+                        if is_eq:
+                            active_names.append(name)
+                            break
+
+            if not active_names:
+                pid = getattr(
+                    state, "named_predictor_id_to_update_next_for_program_candidate", [0]
+                )[candidate_idx]
+                num_preds = len(state.list_of_named_predictors)
+                state.named_predictor_id_to_update_next_for_program_candidate[candidate_idx] = (
+                    pid + 1
+                ) % num_preds
+                return [state.list_of_named_predictors[pid]]
+
+            selected = active_names[self.cursor % len(active_names)]
+            self.cursor += 1
+            return [selected]
+
     def evolve_prompts(
         self,
         trainset: Sequence[Any],
@@ -1554,7 +1606,9 @@ class YawGraphEngine:
         save_path: Path | str | None = None,
         reflection_lm: Any = None,
         reflection_worker_lm: Any = None,
-        auto: Literal["light", "medium", "heavy"] = "light",
+        auto: Literal["light", "medium", "heavy"] | None = "light",
+        num_candidates: int | None = None,
+        num_trials: int | None = None,
         progress_callback: Callable[[str], None] | None = None,
     ) -> HippoRAGProgram:
         """Evolve DSPy prompts via MIPROv2, GEPA, or two-phase hybrid with composite Sizecoding feedback."""
@@ -1615,7 +1669,9 @@ class YawGraphEngine:
             usage_tokens = 0
             if hasattr(pred, "get_lm_usage") and callable(pred.get_lm_usage):
                 usage_map = pred.get_lm_usage() or {}
-                if isinstance(usage_map, dict):
+                if isinstance(usage_map, (int, float)):
+                    usage_tokens = int(usage_map)
+                elif isinstance(usage_map, dict):
                     for model_usage in usage_map.values():
                         if isinstance(model_usage, dict):
                             usage_tokens += int(
@@ -1624,6 +1680,14 @@ class YawGraphEngine:
                                 or model_usage.get("total_tokens")
                                 or 0
                             )
+                        elif isinstance(model_usage, (int, float)):
+                            usage_tokens += int(model_usage)
+            if usage_tokens <= 0 and hasattr(self.program, "telemetry") and self.program.telemetry:
+                usage_tokens = sum(
+                    int(entry.get("tokens_used", 0))
+                    for entry in self.program.telemetry[-20:]
+                    if isinstance(entry, dict)
+                )
             if usage_tokens <= 0:
                 raise RuntimeError(
                     "Missing LM token usage on prediction (`pred.get_lm_usage()` returned 0 tokens). "
@@ -1711,17 +1775,32 @@ class YawGraphEngine:
 
         try:
             if mode in ("miprov2", "hybrid") and hasattr(dspy, "MIPROv2"):
-                optimizer = dspy.MIPROv2(
-                    metric=_mipro_metric,
-                    prompt_model=resolved_ref_lm,
-                    task_model=resolved_worker_lm,
-                    auto=auto,
-                )
+                auto_val = auto if auto not in ("none", None, "") else None
+                optimizer_kwargs: dict[str, Any] = {
+                    "metric": _mipro_metric,
+                    "prompt_model": resolved_ref_lm,
+                    "task_model": resolved_worker_lm,
+                    "num_threads": 1,
+                }
+                compile_kwargs: dict[str, Any] = {
+                    "trainset": list(trainset),
+                    "valset": list(valset) if valset else None,
+                }
+                if num_trials is not None or num_candidates is not None:
+                    optimizer_kwargs["auto"] = None
+                    optimizer_kwargs["num_candidates"] = num_candidates or 1
+                    compile_kwargs["num_trials"] = num_trials or 1
+                    compile_kwargs["minibatch"] = False
+                else:
+                    optimizer_kwargs["auto"] = auto_val or "light"
+                    if valset and len(valset) < 35:
+                        compile_kwargs["minibatch"] = False
+
+                optimizer = dspy.MIPROv2(**optimizer_kwargs)
                 with dspy.context(track_usage=True):
                     compiled = optimizer.compile(
                         compiled,
-                        trainset=list(trainset),
-                        valset=list(valset) if valset else None,
+                        **compile_kwargs,
                     )
 
             if mode in ("gepa", "hybrid") and hasattr(dspy, "GEPA"):
@@ -1730,23 +1809,30 @@ class YawGraphEngine:
                     if save_path is not None
                     else None
                 )
-                gepa = dspy.GEPA(
-                    metric=_gepa_metric,
-                    auto=auto,
-                    reflection_lm=resolved_ref_lm,
-                    instruction_proposer=proposer,
-                    reflection_minibatch_size=3,
-                    candidate_selection_strategy="pareto",
-                    skip_perfect_score=True,
-                    use_merge=True,
-                    component_selector="round_robin",
-                    track_stats=True,
-                    track_best_outputs=True,
-                    warn_on_score_mismatch=False,
-                    log_dir=gepa_log_dir,
-                    seed=0,
-                    gepa_kwargs={"use_cloudpickle": True, "frontier_type": "hybrid"},
-                )
+                gepa_kwargs: dict[str, Any] = {
+                    "metric": _gepa_metric,
+                    "reflection_lm": resolved_ref_lm,
+                    "instruction_proposer": proposer,
+                    "reflection_minibatch_size": 3,
+                    "candidate_selection_strategy": "pareto",
+                    "skip_perfect_score": True,
+                    "use_merge": True,
+                    "component_selector": self._ActiveTraceComponentSelector(compiled),
+                    "num_threads": 1,
+                    "track_stats": True,
+                    "track_best_outputs": True,
+                    "warn_on_score_mismatch": False,
+                    "log_dir": gepa_log_dir,
+                    "seed": 0,
+                    "gepa_kwargs": {"use_cloudpickle": True, "frontier_type": "hybrid"},
+                }
+                if num_trials is not None:
+                    gepa_kwargs["max_metric_calls"] = num_trials
+                    gepa_kwargs["auto"] = None
+                else:
+                    gepa_kwargs["auto"] = auto if auto in ("light", "medium", "heavy") else "light"
+
+                gepa = dspy.GEPA(**gepa_kwargs)
                 with dspy.context(track_usage=True):
                     compiled = gepa.compile(
                         compiled,

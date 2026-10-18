@@ -123,33 +123,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # -------------------------------------------------------------------------
-    # 3. yaw dspy {optimize|load-program}
+    # 3. yaw dspy {optimize|load-program} + top-level aliases {optimize|load-program}
     # -------------------------------------------------------------------------
-    p_dspy = domain_subparsers.add_parser(
-        "dspy", help="DSPy prompt optimization and program management"
-    )
-    dspy_subs = p_dspy.add_subparsers(dest="action", help="DSPy action")
-
-    p_opt = dspy_subs.add_parser(
-        "optimize",
-        parents=[common],
-        help="Compile and evolve DSPy prompts in an isolated sandbox and save candidate JSON",
-    )
-    p_opt.add_argument(
+    p_opt_common = argparse.ArgumentParser(add_help=False)
+    p_opt_common.add_argument(
         "--auto",
         dest="auto",
         choices=["light", "medium", "heavy"],
         default=None,
         help="GEPA/MIPROv2 evaluation budget mode (defaults to yaw.toml [optimization].auto, then 'light')",
     )
-    p_opt.add_argument(
+    p_opt_common.add_argument(
         "--mode",
         dest="mode",
         choices=["miprov2", "gepa", "hybrid"],
         default=None,
         help="Prompt optimization mode (defaults to yaw.toml [optimization].mode, then 'gepa')",
     )
-    p_opt.add_argument(
+    p_opt_common.add_argument(
         "--dataset",
         dest="dataset",
         nargs="*",
@@ -159,41 +150,78 @@ def build_parser() -> argparse.ArgumentParser:
             "or path to JSON training file (defaults to yaw.toml [optimization].datasets)"
         ),
     )
-    p_opt.add_argument(
+    p_opt_common.add_argument(
         "--max-queries",
         type=int,
         default=None,
         help="Maximum queries to load (defaults to yaw.toml [optimization].max_queries, max 50 on Tier 2 corpora)",
     )
-    p_opt.add_argument(
+    p_opt_common.add_argument(
         "--train-queries",
         type=int,
         default=None,
         help="Number of queries for training [0:K] (defaults to yaw.toml [optimization].train_queries)",
     )
-    p_opt.add_argument(
+    p_opt_common.add_argument(
         "--query-offset",
         type=int,
         default=None,
         help="Starting query offset in dataset (defaults to yaw.toml [optimization].query_offset)",
     )
-    p_opt.add_argument(
+    p_opt_common.add_argument(
         "--output",
         dest="output",
         type=str,
         default=None,
         help="Override output path for candidate compiled_program JSON",
     )
-
-    p_load = dspy_subs.add_parser(
-        "load-program",
-        parents=[common],
-        help="Promote a compiled DSPy program JSON into production and hot-reload in-memory",
+    p_opt_common.add_argument(
+        "--num-trials",
+        type=int,
+        default=None,
+        help="Explicit number of optimization trials (sets auto to None for fast smoke tests)",
     )
-    p_load.add_argument(
+    p_opt_common.add_argument(
+        "--num-candidates",
+        type=int,
+        default=None,
+        help="Explicit number of instruction/fewshot candidates per predictor",
+    )
+
+    p_dspy = domain_subparsers.add_parser(
+        "dspy", help="DSPy prompt optimization and program management"
+    )
+    dspy_subs = p_dspy.add_subparsers(dest="action", help="DSPy action")
+
+    dspy_subs.add_parser(
+        "optimize",
+        parents=[common, p_opt_common],
+        help="Compile and evolve DSPy prompts in an isolated sandbox and save candidate JSON",
+    )
+
+    domain_subparsers.add_parser(
+        "optimize",
+        parents=[common, p_opt_common],
+        help="Alias for `yaw dspy optimize`: compile and evolve DSPy prompts in an isolated sandbox",
+    )
+
+    p_load_common = argparse.ArgumentParser(add_help=False)
+    p_load_common.add_argument(
         "file",
         type=str,
         help="Path to compiled DSPy program JSON file to promote and load",
+    )
+
+    dspy_subs.add_parser(
+        "load-program",
+        parents=[common, p_load_common],
+        help="Promote a compiled DSPy program JSON into production and hot-reload in-memory",
+    )
+
+    domain_subparsers.add_parser(
+        "load-program",
+        parents=[common, p_load_common],
+        help="Alias for `yaw dspy load-program`: promote a compiled DSPy program JSON into production",
     )
 
     # -------------------------------------------------------------------------
@@ -518,7 +546,7 @@ def _load_dataset_splits(
             val_per_ds.append(d_examples[train_queries:])
         else:
             train_per_ds.append(d_examples)
-            val_per_ds.append([])
+            val_per_ds.append(list(d_examples))
 
     trainset: list[dspy.Example] = []
     max_t = max((len(t) for t in train_per_ds), default=0)
@@ -784,6 +812,12 @@ def handle_dspy_optimize(
     raw_auto = getattr(args, "auto", None)
     auto = raw_auto or config.optimize_auto or "light"
 
+    raw_trials = getattr(args, "num_trials", None)
+    num_trials = int(raw_trials) if raw_trials is not None else None
+
+    raw_candidates = getattr(args, "num_candidates", None)
+    num_candidates = int(raw_candidates) if raw_candidates is not None else None
+
     raw_mode = getattr(args, "mode", None)
     mode = raw_mode or config.optimize_mode or "gepa"
 
@@ -809,6 +843,8 @@ def handle_dspy_optimize(
             mode=mode,
             save_path=out_override or opt_config.compiled_program_path,
             auto=auto,
+            num_candidates=num_candidates,
+            num_trials=num_trials,
             corpus_docs=corpus_docs,
         )
         proposer_telemetry = saved_path.parent / f"{saved_path.stem}_proposer_telemetry.json"
@@ -989,6 +1025,13 @@ def main(
 
     domain = getattr(args, "domain", None)
     action = getattr(args, "action", None)
+    if domain == "optimize":
+        domain = "dspy"
+        action = "optimize"
+    elif domain == "load-program":
+        domain = "dspy"
+        action = "load-program"
+
     if not domain or not action:
         parser.print_help(sys.stderr)
         return 2

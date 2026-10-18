@@ -758,6 +758,8 @@ class YawRuntime:
         reflection_lm: Any = None,
         reflection_worker_lm: Any = None,
         auto: Literal["light", "medium", "heavy"] | None = None,
+        num_candidates: int | None = None,
+        num_trials: int | None = None,
         corpus_docs: Sequence[str] | None = None,
         progress_callback: Callable[[str], None] | None = None,
     ) -> Path:
@@ -805,6 +807,8 @@ class YawRuntime:
                 reflection_lm=eff_ref_lm,
                 reflection_worker_lm=eff_worker_lm,
                 auto=resolved_auto,
+                num_candidates=num_candidates,
+                num_trials=num_trials,
                 progress_callback=_progress,
             )
             return target_path
