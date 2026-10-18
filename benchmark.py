@@ -13,6 +13,7 @@ import gc
 import hashlib
 import json
 import logging
+import re
 import tempfile
 import urllib.request
 from contextlib import closing
@@ -48,10 +49,43 @@ from yaw.daemon.graph.inference.models import (
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 PINNED_COMMIT = "d5c8329422e0a0b834a15874545cb6a74b4f9b26"
+HF_BASE_URL = "https://huggingface.co/datasets/osunlp/HippoRAG_2/resolve/main"
 UPSTREAM_DATASET_BASE_URL = (
     f"https://raw.githubusercontent.com/OSU-NLP-Group/HippoRAG/{PINNED_COMMIT}/reproduce/dataset"
 )
-DATASETS = ("sample", "musique", "2wikimultihopqa", "hotpotqa")
+
+DATASETS = (
+    "sample",
+    "2wikimultihopqa",
+    "hotpotqa",
+    "musique",
+    "nq",
+    "popqa",
+    "lveval",
+    "narrativeqa",
+    "case_study_university",
+)
+
+ALIASES = {
+    "2wiki": "2wikimultihopqa",
+    "hotpot": "hotpotqa",
+    "naturalquestions": "nq",
+    "nq_rear": "nq",
+    "narrative": "narrativeqa",
+}
+
+DATASET_REGISTRY = {
+    "sample": ("sample.json", "sample_corpus.json"),
+    "2wikimultihopqa": ("2wikimultihopqa.json", "2wikimultihopqa_corpus.json"),
+    "hotpotqa": ("hotpotqa.json", "hotpotqa_corpus.json"),
+    "musique": ("musique.json", "musique_corpus.json"),
+    "nq": ("nq_rear.json", "nq_rear_corpus.json"),
+    "popqa": ("popqa.json", "popqa_corpus.json"),
+    "lveval": ("lveval.json", "lveval_corpus.json"),
+    "narrativeqa": ("narrativeqa_dev_10_doc.json", "narrativeqa_dev_10_doc_corpus.json"),
+    "case_study_university": ("case_study_university.json", "case_study_university_corpus.json"),
+}
+
 QA_TOP_K = 5
 RETRIEVAL_TOP_K = 10
 LINKING_TOP_K = 8
@@ -65,7 +99,20 @@ DAMPING = 0.5
 PASSAGE_SEED_POOL_K = 200
 FTS_SEED_POOL_K = 50
 
-# Reference numbers from HippoRAG 2 (arXiv:2502.14802v1, Tables 8 & 9, 1,000 queries).
+TEXT_STOPWORDS = {
+    "a", "about", "after", "all", "also", "an", "and", "any", "are", "as", "at",
+    "back", "be", "because", "been", "but", "by", "can", "come", "could", "day",
+    "do", "even", "first", "for", "from", "give", "good", "have", "he", "her",
+    "him", "his", "how", "if", "in", "into", "is", "it", "its", "just", "know",
+    "like", "look", "make", "me", "most", "my", "new", "no", "not", "now", "of",
+    "on", "one", "only", "or", "other", "our", "out", "over", "people", "see",
+    "she", "so", "some", "take", "than", "that", "the", "their", "them", "then",
+    "there", "these", "they", "think", "this", "time", "to", "two", "up", "use",
+    "was", "way", "we", "well", "were", "what", "when", "which", "who", "will",
+    "with", "work", "would", "year", "you", "your",
+}
+
+# Reference numbers from HippoRAG 2 (arXiv:2502.14802v1, Tables 2, 3, 8 & 9).
 PAPER_BASELINES = {
     "musique": {
         "hipporag2_llama3.3_70b_nvembed_v2": {"Recall@2": 0.561, "Recall@5": 0.747, "ExactMatch": 0.372, "F1": 0.486},
@@ -85,28 +132,167 @@ PAPER_BASELINES = {
         "hipporag2_gpt4o_mini_nvembed_v2": {"Recall@2": 0.805, "Recall@5": 0.957, "ExactMatch": 0.563, "F1": 0.711},
         "contriever_llama3.3_70b": {"Recall@2": 0.584, "Recall@5": 0.753, "ExactMatch": 0.513, "F1": 0.623},
     },
+    "nq": {
+        "hipporag2_llama3.3_70b_nvembed_v2": {"Recall@2": 0.456, "Recall@5": 0.780, "ExactMatch": 0.485, "F1": 0.633},
+        "standard_nvembed_v2_llama3.3_70b": {"Recall@2": 0.453, "Recall@5": 0.754, "F1": 0.619},
+        "hipporag_reproduced": {"Recall@2": 0.213, "Recall@5": 0.444, "F1": 0.553},
+    },
+    "popqa": {
+        "hipporag2_llama3.3_70b_nvembed_v2": {"Recall@2": 0.439, "Recall@5": 0.517, "ExactMatch": 0.490, "F1": 0.562},
+        "standard_nvembed_v2_llama3.3_70b": {"Recall@2": 0.453, "Recall@5": 0.510, "F1": 0.557},
+        "hipporag_reproduced": {"Recall@2": 0.400, "Recall@5": 0.538, "F1": 0.559},
+    },
+    "lveval": {
+        "hipporag2_llama3.3_70b_nvembed_v2": {"ExactMatch": 0.080, "F1": 0.129},
+        "standard_nvembed_v2_llama3.3_70b": {"F1": 0.098},
+        "hipporag_reproduced": {"F1": 0.084},
+    },
+    "narrativeqa": {
+        "hipporag2_llama3.3_70b_nvembed_v2": {"ExactMatch": 0.180, "F1": 0.259},
+        "standard_nvembed_v2_llama3.3_70b": {"F1": 0.257},
+        "hipporag_reproduced": {"F1": 0.163},
+    },
 }
 
 
-def get_gold_docs(samples: list[dict], dataset_name: str | None = None) -> list[list[str]]:
+def get_gold_docs(
+    samples: list[dict],
+    dataset_name: str | None = None,
+    corpus: list[dict] | None = None,
+) -> list[list[str]]:
     """Extract gold supporting passages using upstream main.py's exact formatting contract."""
     gold_docs = []
-    separator = "" if (dataset_name or "").startswith("hotpotqa") else " "
+    canonical_dataset = ALIASES.get(dataset_name or "", dataset_name or "")
+    separator = "" if canonical_dataset.startswith("hotpotqa") else " "
     for sample in samples:
-        if "supporting_facts" in sample:
+        if "gold_docs" in sample and sample["gold_docs"]:
+            gold_doc = [
+                f"{item['title']}\n{item['text']}" if isinstance(item, dict) else str(item)
+                for item in sample["gold_docs"]
+            ]
+        elif "supporting_facts" in sample:
             gold_titles = {item[0] for item in sample["supporting_facts"]}
             supporting_contexts = [item for item in sample["context"] if item[0] in gold_titles]
             gold_doc = [f"{item[0]}\n{separator.join(item[1])}" for item in supporting_contexts]
         elif "contexts" in sample:
-            gold_doc = [f"{item['title']}\n{item['text']}" for item in sample["contexts"] if item["is_supporting"]]
-        else:
-            if "paragraphs" not in sample:
-                raise ValueError("Each sample needs supporting_facts, contexts, or paragraphs for retrieval evaluation")
+            gold_doc = [
+                f"{item['title']}\n{item['text']}"
+                for item in sample["contexts"]
+                if item.get("is_supporting", False)
+            ]
+        elif "paragraphs" in sample:
             paragraphs = [item for item in sample["paragraphs"] if item.get("is_supporting", True)]
             gold_doc = [
                 f"{item['title']}\n{item['text'] if 'text' in item else item['paragraph_text']}"
                 for item in paragraphs
             ]
+        elif "context" in sample and isinstance(sample["context"], list):
+            gold_doc = [f"{item[0]}\n{separator.join(item[1])}" for item in sample["context"]]
+        elif isinstance(sample.get("context"), str):
+            passages = [
+                p.strip()
+                for p in re.split(r"\n*### Passage \d+\n*", sample["context"])
+                if p.strip()
+            ]
+            ans_set: set[str] = set()
+            if sample.get("gold_ans"):
+                ans_set.add(str(sample["gold_ans"]).strip())
+            for a in sample.get("answers", []):
+                if a:
+                    ans_set.add(str(a).strip())
+            if "answer" in sample and sample["answer"]:
+                if isinstance(sample["answer"], list):
+                    ans_set.update(str(x).strip() for x in sample["answer"] if x)
+                else:
+                    ans_set.add(str(sample["answer"]).strip())
+
+            question = sample.get("question", "")
+            q_keywords = {
+                w for w in re.findall(r"\w+", question.lower())
+                if len(w) >= 3 and w not in TEXT_STOPWORDS
+            }
+            a_keywords = {
+                w for a in ans_set
+                for w in re.findall(r"\w+", a.lower())
+                if len(w) >= 3 and w not in TEXT_STOPWORDS
+            }
+            ans_lower = [a.lower() for a in ans_set if a]
+
+            scored_passages: list[tuple[tuple[int, int, int, int], str]] = []
+            for idx, p in enumerate(passages):
+                p_lower = p.lower()
+                p_words = set(re.findall(r"\w+", p_lower))
+                exact_ans_matches = sum(1 for a in ans_lower if a in p_lower)
+                ans_kw_matches = len(a_keywords & p_words)
+                q_kw_matches = len(q_keywords & p_words)
+
+                if exact_ans_matches > 0 or ans_kw_matches > 0:
+                    scored_passages.append(
+                        ((exact_ans_matches, ans_kw_matches, q_kw_matches, -idx), p)
+                    )
+
+            if scored_passages:
+                scored_passages.sort(key=lambda x: x[0], reverse=True)
+                top_passages = [p for _, p in scored_passages[:2]]
+            elif passages:
+                top_passages = [passages[0]]
+            else:
+                top_passages = []
+
+            gold_doc = [f"\n{p}" for p in top_passages]
+        elif "document" in sample and isinstance(sample["document"], dict):
+            doc = sample["document"]
+            doc_id = doc.get("id")
+            gold_doc = []
+            if corpus and doc_id:
+                doc_chunks = [c for c in corpus if c.get("idx", "").startswith(f"{doc_id}_")]
+                answers = get_gold_answers([sample])[0]
+                ans_lower = [a.lower().strip() for a in answers if a.strip()]
+                a_keywords = {
+                    w for a in answers
+                    for w in re.findall(r"\w+", a.lower())
+                    if len(w) >= 3 and w not in TEXT_STOPWORDS
+                }
+                question = sample.get("question", "")
+                q_keywords = {
+                    w for w in re.findall(r"\w+", question.lower())
+                    if len(w) >= 3 and w not in TEXT_STOPWORDS
+                }
+
+                scored_chunks: list[tuple[tuple[int, int, int, int], str]] = []
+                for idx, c in enumerate(doc_chunks):
+                    c_text = c.get("text", "")
+                    c_lower = c_text.lower()
+                    c_words = set(re.findall(r"\w+", c_lower))
+                    exact_ans_matches = sum(1 for a in ans_lower if a in c_lower)
+                    ans_kw_matches = len(a_keywords & c_words)
+                    q_kw_matches = len(q_keywords & c_words)
+
+                    if exact_ans_matches > 0 or ans_kw_matches > 0:
+                        formatted = f"{c['title']}\n{c_text}"
+                        scored_chunks.append(
+                            ((exact_ans_matches, ans_kw_matches, q_kw_matches, -idx), formatted)
+                        )
+
+                if scored_chunks:
+                    scored_chunks.sort(key=lambda x: x[0], reverse=True)
+                    gold_doc = [chunk for _, chunk in scored_chunks[:2]]
+                elif doc_chunks:
+                    gold_doc = [f"{doc_chunks[0]['title']}\n{doc_chunks[0]['text']}"]
+            if not gold_doc:
+                summary = doc.get("summary")
+                if isinstance(summary, dict) and summary.get("text"):
+                    gold_doc = [f"{summary.get('title', '')}\n{summary['text']}".strip()]
+                elif isinstance(summary, str) and summary.strip():
+                    gold_doc = [summary.strip()]
+                elif doc.get("text"):
+                    gold_doc = [doc["text"].strip()]
+                else:
+                    gold_doc = []
+        else:
+            raise ValueError(
+                "Each sample needs supporting_facts, contexts, paragraphs, context, or document for retrieval evaluation"
+            )
         gold_docs.append(list(dict.fromkeys(gold_doc)))
     return gold_docs
 
@@ -115,15 +301,31 @@ def get_gold_answers(samples: list[dict]) -> list[list[str]]:
     """Extract gold answer sets and aliases using upstream main.py's exact contract."""
     gold_answers = []
     for sample in samples:
-        if "answer" in sample or "gold_ans" in sample:
+        if "answers" in sample and sample["answers"] is not None:
+            gold_answer = sample["answers"]
+        elif "answer" in sample or "gold_ans" in sample:
             gold_answer = sample.get("answer", sample.get("gold_ans"))
         elif "reference" in sample:
             gold_answer = sample["reference"]
         elif "obj" in sample:
-            gold_answer = [sample["obj"], sample["o_wiki_title"]]
+            gold_answer = [sample["obj"]]
+            if sample.get("o_wiki_title"):
+                gold_answer.append(sample["o_wiki_title"])
             for field in ("possible_answers", "o_aliases"):
                 value = sample.get(field, [])
-                gold_answer.extend(value if isinstance(value, list) else [value])
+                if isinstance(value, str):
+                    try:
+                        parsed = json.loads(value)
+                        if isinstance(parsed, list):
+                            gold_answer.extend(parsed)
+                        elif parsed:
+                            gold_answer.append(parsed)
+                    except (json.JSONDecodeError, TypeError):
+                        gold_answer.append(value)
+                elif isinstance(value, list):
+                    gold_answer.extend(value)
+                elif value:
+                    gold_answer.append(value)
         else:
             raise ValueError("Each query sample must contain an answer field")
         if gold_answer is None:
@@ -141,33 +343,103 @@ def build_benchmark_slice(
     max_queries: int | None = None,
     query_offset: int = 0,
     full_corpus: bool = False,
+    index_queries: int | None = None,
 ) -> tuple[list[str], list[str], list[list[str]], list[list[str]]]:
-    """Build (docs, queries, gold_docs, gold_answers) for a full or N-query slice."""
+    """Build (docs, queries, gold_docs, gold_answers) for a full or N-query slice with distractor padding."""
     if max_queries is not None and max_queries < 1:
         raise ValueError("max_queries must be a positive integer when specified.")
+    if index_queries is not None and index_queries < 1:
+        raise ValueError("index_queries must be a positive integer when specified.")
+
     start = max(0, query_offset)
     end = None if max_queries is None else start + max_queries
     selected = samples[start:end]
     queries = [sample["question"] for sample in selected]
-    gold_docs = get_gold_docs(selected, dataset_name)
+    canonical_dataset = ALIASES.get(dataset_name or "", dataset_name or "")
+    gold_docs = get_gold_docs(selected, canonical_dataset, corpus=corpus)
     gold_answers = get_gold_answers(selected)
 
-    if full_corpus or max_queries is None or dataset_name == "sample":
+    if full_corpus or max_queries is None or canonical_dataset == "sample":
         docs = [f"{doc['title']}\n{doc['text']}" for doc in corpus]
     else:
+        effective_index_queries = int(max_queries * 1.4) if index_queries is None else index_queries
+        pooled_end = start + effective_index_queries
+        pooled_samples = samples[start:pooled_end]
+
         docs = []
-        separator = "" if (dataset_name or "").startswith("hotpotqa") else " "
-        for sample in selected:
-            if "context" in sample:
-                for title, sents in sample["context"]:
-                    docs.append(f"{title}\n{separator.join(sents)}")
-            elif "contexts" in sample:
-                for item in sample["contexts"]:
-                    docs.append(f"{item['title']}\n{item['text']}")
-            elif "paragraphs" in sample:
-                for item in sample["paragraphs"]:
-                    text = item["text"] if "text" in item else item["paragraph_text"]
-                    docs.append(f"{item['title']}\n{text}")
+        separator = "" if canonical_dataset.startswith("hotpotqa") else " "
+
+        if canonical_dataset in ("lveval", "narrativeqa"):
+            # 1. Guarantee all gold docs for the evaluated queries are in docs
+            for gold_list in gold_docs:
+                docs.extend(gold_list)
+            gold_unique = list(dict.fromkeys(docs))
+            docs = list(gold_unique)
+
+            # Target pool size: bounded padding for long-context benchmarks
+            target_pool_size = max(
+                len(gold_unique) + (effective_index_queries - max_queries) * 2,
+                effective_index_queries * 2,
+            )
+
+            # 2. Gather candidate distractors from pooled samples/corpus
+            candidate_pool: list[str] = []
+            if canonical_dataset == "lveval":
+                for sample in pooled_samples:
+                    if isinstance(sample.get("context"), str):
+                        passages = [
+                            p.strip()
+                            for p in re.split(r"\n*### Passage \d+\n*", sample["context"])
+                            if p.strip()
+                        ]
+                        for p in passages:
+                            candidate_pool.append(f"\n{p}")
+                if corpus and len(candidate_pool) < target_pool_size:
+                    for c in corpus:
+                        candidate_pool.append(f"{c['title']}\n{c['text']}")
+            else:  # narrativeqa
+                for sample in pooled_samples:
+                    doc = sample.get("document", {})
+                    doc_id = doc.get("id") if isinstance(doc, dict) else None
+                    if doc_id and corpus:
+                        for c in corpus:
+                            if c.get("idx", "").startswith(f"{doc_id}_"):
+                                candidate_pool.append(f"{c['title']}\n{c['text']}")
+                    summary = doc.get("summary") if isinstance(doc, dict) else None
+                    if isinstance(summary, dict) and summary.get("text"):
+                        candidate_pool.append(f"{summary.get('title', '')}\n{summary['text']}".strip())
+                if corpus and len(candidate_pool) < target_pool_size:
+                    for c in corpus:
+                        candidate_pool.append(f"{c['title']}\n{c['text']}")
+
+            # 3. Add non-gold distractor passages up to target_pool_size
+            for cand in candidate_pool:
+                if len(docs) >= target_pool_size:
+                    break
+                if cand not in docs:
+                    docs.append(cand)
+        else:
+            for sample in pooled_samples:
+                if "context" in sample:
+                    if isinstance(sample["context"], list):
+                        for title, sents in sample["context"]:
+                            docs.append(f"{title}\n{separator.join(sents)}")
+                    elif isinstance(sample["context"], str):
+                        passages = [
+                            p.strip()
+                            for p in re.split(r"\n*### Passage \d+\n*", sample["context"])
+                            if p.strip()
+                        ]
+                        for p in passages:
+                            docs.append(f"\n{p}")
+                elif "contexts" in sample:
+                    for item in sample["contexts"]:
+                        docs.append(f"{item['title']}\n{item['text']}")
+                elif "paragraphs" in sample:
+                    for item in sample["paragraphs"]:
+                        text = item["text"] if "text" in item else item["paragraph_text"]
+                        docs.append(f"{item['title']}\n{text}")
+
     for gold_list in gold_docs:
         docs.extend(gold_list)
     return list(dict.fromkeys(docs)), queries, gold_docs, gold_answers
@@ -185,24 +457,51 @@ def load_dataset_files(
         raise ValueError("dataset_name must be a dataset name, not a path.")
     if max_queries is not None and max_queries < 1:
         raise ValueError("max_queries must be a positive integer when specified.")
+
+    canonical_name = ALIASES.get(dataset_name, dataset_name)
+    if canonical_name in DATASET_REGISTRY:
+        q_file, c_file = DATASET_REGISTRY[canonical_name]
+    else:
+        q_file = f"{canonical_name}.json"
+        c_file = f"{canonical_name}_corpus.json"
+
     cache_dir = dataset_dir or (PROJECT_ROOT / "outputs" / "datasets")
     cache_dir.mkdir(parents=True, exist_ok=True)
-    required_files = [f"{dataset_name}.json"]
+    required_files = [q_file]
     if include_corpus:
-        required_files.append(f"{dataset_name}_corpus.json")
+        required_files.append(c_file)
+
     for filename in required_files:
         target = cache_dir / filename
         if not target.exists():
-            url = f"{UPSTREAM_DATASET_BASE_URL}/{filename}"
-            logging.info("Downloading %s to %s", url, target)
-            data = urllib.request.urlopen(url).read()
-            target.write_bytes(data)
-    with open(cache_dir / f"{dataset_name}.json", encoding="utf-8") as f:
+            urls = [f"{HF_BASE_URL}/{filename}"]
+            if any(k in filename for k in ("sample", "2wiki", "hotpot", "musique")):
+                urls.append(f"{UPSTREAM_DATASET_BASE_URL}/{filename}")
+            downloaded = False
+            last_err = None
+            for url in urls:
+                try:
+                    logging.info("Downloading %s to %s", url, target)
+                    req = urllib.request.Request(
+                        url, headers={"User-Agent": "YAW-HippoRAG-DatasetDownloader/1.0"}
+                    )
+                    with urllib.request.urlopen(req) as resp:
+                        target.write_bytes(resp.read())
+                    downloaded = True
+                    break
+                except Exception as exc:
+                    last_err = exc
+                    if target.exists():
+                        target.unlink()
+            if not downloaded:
+                raise RuntimeError(f"Could not download {filename} from any source: {last_err}")
+
+    with open(cache_dir / q_file, encoding="utf-8") as f:
         samples = json.load(f)
     if max_queries is not None:
         samples = samples[:max_queries]
     if include_corpus:
-        with open(cache_dir / f"{dataset_name}_corpus.json", encoding="utf-8") as f:
+        with open(cache_dir / c_file, encoding="utf-8") as f:
             corpus = json.load(f)
     else:
         corpus = []
@@ -875,6 +1174,7 @@ def run_yaw_benchmark(
 def main(
     dataset: str = "sample",
     max_queries: int | None = None,
+    index_queries: int | None = None,
     full_corpus: bool = False,
     mode: str = "eval",
     engine: str = "hipporag",
@@ -909,16 +1209,21 @@ def main(
     graph_beta: float = 0.5,
     graph_dual_weight: float | None = 0.5,
 ):
+    dataset = ALIASES.get(dataset, dataset)
     if chat_model is not None:
         extraction_model = chat_model
         qa_model = chat_model
     include_qa = mode not in ("embeddings", "retrieval")
     profile = resolve_embedding_profile(embedding_model, embedding_task_mode)
-    include_corpus = bool(full_corpus or max_queries is None or dataset == "sample")
+    include_corpus = bool(
+        full_corpus or max_queries is None or dataset in ("sample", "narrativeqa", "lveval")
+    )
 
     total_needed = None
     if max_queries is not None:
-        total_needed = max_queries + max(query_offset, train_queries)
+        effective_index_q = index_queries if index_queries is not None else int(max_queries * 1.4)
+        pool_needed = max(max_queries, effective_index_q)
+        total_needed = pool_needed + max(query_offset, train_queries)
 
     samples, corpus = load_dataset_files(
         dataset, max_queries=total_needed, include_corpus=include_corpus,
@@ -932,7 +1237,13 @@ def main(
             eval_offset = max(query_offset, train_queries)
 
     docs, queries, gold_docs, gold_answers = build_benchmark_slice(
-        dataset, samples, corpus, max_queries=max_queries, query_offset=eval_offset, full_corpus=full_corpus,
+        dataset,
+        samples,
+        corpus,
+        max_queries=max_queries,
+        query_offset=eval_offset,
+        full_corpus=full_corpus,
+        index_queries=index_queries,
     )
     if train_samples:
         for gd in get_gold_docs(train_samples, dataset):
@@ -969,6 +1280,7 @@ def main(
         "evolve": evolve,
         "train_queries": len(train_samples),
         "num_queries": len(queries),
+        "index_queries": index_queries,
         "num_docs": num_docs,
         "full_corpus": full_corpus,
         "index_batch_size": index_batch_size,
@@ -1216,9 +1528,11 @@ def index_documents_in_batches(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset", choices=DATASETS, default="sample")
+    parser.add_argument("--dataset", choices=[*DATASETS, *ALIASES], default="sample")
     parser.add_argument("--max-queries", type=int, default=None,
-                        help="Number of queries to evaluate (pools their candidate passages unless --full-corpus).")
+                        help="Number of queries to evaluate (pools candidate passages up to --index-queries unless --full-corpus).")
+    parser.add_argument("--index-queries", type=int, default=None,
+                        help="Number of queries from which to pool candidate passages for indexing (defaults to int(max_queries * 1.4)).")
     parser.add_argument("--full-corpus", action="store_true",
                         help="Index the full dataset corpus even when --max-queries is set.")
     parser.add_argument("--mode", choices=("eval", "retrieval", "all", "embeddings"), default="eval",
@@ -1304,6 +1618,7 @@ if __name__ == "__main__":
     main(
         dataset=args.dataset,
         max_queries=args.max_queries,
+        index_queries=args.index_queries,
         full_corpus=args.full_corpus,
         mode=args.mode,
         engine=args.engine,

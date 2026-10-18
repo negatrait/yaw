@@ -8,7 +8,11 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 from benchmark import (
+    ALIASES,
+    DATASET_REGISTRY,
+    DATASETS,
     PAPER_BASELINES,
+    TEXT_STOPWORDS,
     build_benchmark_slice,
     check_benchmark_integrity,
     evaluate_benchmark,
@@ -134,6 +138,287 @@ class DatasetSliceTests(unittest.TestCase):
             self.assertEqual(empty_corpus, [])
             with self.assertRaises(ValueError):
                 load_dataset_files("sample", dataset_dir=tmp_path, max_queries=0, include_corpus=False)
+
+    def test_dataset_aliasing_and_registry_resolution(self):
+        expected_aliases = {
+            "2wiki": "2wikimultihopqa",
+            "hotpot": "hotpotqa",
+            "naturalquestions": "nq",
+            "nq_rear": "nq",
+            "narrative": "narrativeqa",
+        }
+        for alias, canonical in expected_aliases.items():
+            self.assertEqual(ALIASES.get(alias), canonical)
+
+        expected_registry = {
+            "sample": ("sample.json", "sample_corpus.json"),
+            "2wikimultihopqa": ("2wikimultihopqa.json", "2wikimultihopqa_corpus.json"),
+            "hotpotqa": ("hotpotqa.json", "hotpotqa_corpus.json"),
+            "musique": ("musique.json", "musique_corpus.json"),
+            "nq": ("nq_rear.json", "nq_rear_corpus.json"),
+            "popqa": ("popqa.json", "popqa_corpus.json"),
+            "lveval": ("lveval.json", "lveval_corpus.json"),
+            "narrativeqa": ("narrativeqa_dev_10_doc.json", "narrativeqa_dev_10_doc_corpus.json"),
+            "case_study_university": ("case_study_university.json", "case_study_university_corpus.json"),
+        }
+        for name, files in expected_registry.items():
+            self.assertEqual(DATASET_REGISTRY.get(name), files)
+
+        for ds in DATASETS:
+            self.assertIn(ds, DATASET_REGISTRY)
+
+        # Verify load_dataset_files with aliases resolves files correctly
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            (tmp_path / "nq_rear.json").write_text(
+                json.dumps([{"question": "Q1", "reference": ["A1"], "contexts": []}]),
+                encoding="utf-8",
+            )
+            (tmp_path / "nq_rear_corpus.json").write_text(json.dumps([]), encoding="utf-8")
+            samples, _ = load_dataset_files("naturalquestions", dataset_dir=tmp_path)
+            self.assertEqual(len(samples), 1)
+            self.assertEqual(samples[0]["question"], "Q1")
+
+            samples_nq, _ = load_dataset_files("nq_rear", dataset_dir=tmp_path)
+            self.assertEqual(len(samples_nq), 1)
+
+    def test_distractor_padding_in_benchmark_slice(self):
+        samples = [
+            {
+                "question": f"Question {i}?",
+                "reference": [f"Ans {i}"],
+                "contexts": [
+                    {"title": f"Doc {i}", "text": f"Content {i}", "is_supporting": True},
+                    {"title": f"Distractor {i}", "text": f"Noise {i}", "is_supporting": False},
+                ],
+            }
+            for i in range(15)
+        ]
+        # Explicit index_queries: max_queries=2, index_queries=4 -> pools passages from samples 0..3
+        docs, queries, gold_docs, gold_answers = build_benchmark_slice(
+            "nq", samples, corpus=[], max_queries=2, index_queries=4, full_corpus=False
+        )
+        self.assertEqual(len(queries), 2)
+        self.assertEqual(len(gold_docs), 2)
+        self.assertEqual(len(gold_answers), 2)
+        # Docs must contain passages from samples 0..3 (both supporting and distractors)
+        self.assertIn("Doc 0\nContent 0", docs)
+        self.assertIn("Distractor 0\nNoise 0", docs)
+        self.assertIn("Doc 3\nContent 3", docs)
+        self.assertIn("Distractor 3\nNoise 3", docs)
+        # Sample 4 must not be in docs
+        self.assertNotIn("Doc 4\nContent 4", docs)
+
+        # Default index_queries: max_queries=10, index_queries=None -> defaults to int(10 * 1.4) = 14
+        docs_def, queries_def, gold_docs_def, _ = build_benchmark_slice(
+            "nq", samples, corpus=[], max_queries=10, index_queries=None, full_corpus=False
+        )
+        self.assertEqual(len(queries_def), 10)
+        self.assertEqual(len(gold_docs_def), 10)
+        # Sample 13 must be in docs (pooled up to index 14)
+        self.assertIn("Doc 13\nContent 13", docs_def)
+        # Sample 14 must not be in docs
+        self.assertNotIn("Doc 14\nContent 14", docs_def)
+
+        # Negative boundary on index_queries
+        with self.assertRaises(ValueError):
+            build_benchmark_slice("nq", samples, corpus=[], max_queries=2, index_queries=0)
+
+    def test_nq_gold_extraction(self):
+        samples = [
+            {
+                "question": "who has the oldest team in the nba",
+                "reference": ["Sacramento Kings", "New York Knickerbockers"],
+                "answer_aliases": ["Kings", "Knicks"],
+                "contexts": [
+                    {"title": "Eddie Gottlieb", "text": "Basketball Association...", "is_supporting": True},
+                    {"title": "Unrelated", "text": "Some text...", "is_supporting": False},
+                ],
+            }
+        ]
+        gold_answers = get_gold_answers(samples)
+        self.assertEqual(
+            gold_answers,
+            [["Sacramento Kings", "New York Knickerbockers", "Kings", "Knicks"]],
+        )
+        gold_docs = get_gold_docs(samples, "nq")
+        self.assertEqual(gold_docs, [["Eddie Gottlieb\nBasketball Association..."]])
+
+    def test_popqa_gold_extraction(self):
+        samples = [
+            {
+                "question": "What is George Rankin's occupation?",
+                "obj": "politician",
+                "o_wiki_title": "Politician",
+                "possible_answers": '["politician", "political leader", "political figure"]',
+                "o_aliases": '["statesman"]',
+                "paragraphs": [
+                    {"title": "George Rankin", "text": "George was a politician.", "is_supporting": True},
+                    {"title": "Irrelevant", "text": "Irrelevant text.", "is_supporting": False},
+                ],
+            },
+            {
+                "question": "Native list possible answers test",
+                "obj": "author",
+                "possible_answers": ["author", "writer"],
+                "paragraphs": [
+                    {"title": "Author Doc", "paragraph_text": "Author text.", "is_supporting": True},
+                ],
+            },
+        ]
+        gold_answers = get_gold_answers(samples)
+        self.assertEqual(
+            gold_answers[0],
+            ["politician", "Politician", "political leader", "political figure", "statesman"],
+        )
+        self.assertEqual(gold_answers[1], ["author", "writer"])
+
+        gold_docs = get_gold_docs(samples, "popqa")
+        self.assertEqual(gold_docs[0], ["George Rankin\nGeorge was a politician."])
+        self.assertEqual(gold_docs[1], ["Author Doc\nAuthor text."])
+
+    def test_lveval_gold_extraction(self):
+        samples = [
+            {
+                "question": "Who is Poly Ii, Duke Of Bob's paternal grandfather?",
+                "answers": ["Arenas"],
+                "gold_ans": "Arenas",
+                "context": (
+                    "### Passage 1\n"
+                    "Arenas de Savoie, duc de Bob was a military commander.\n"
+                    "### Passage 2\n"
+                    "Formula Renault season was in 2003.\n"
+                ),
+            }
+        ]
+        gold_answers = get_gold_answers(samples)
+        self.assertEqual(gold_answers, [["Arenas"]])
+
+        gold_docs = get_gold_docs(samples, "lveval")
+        self.assertEqual(gold_docs, [["\nArenas de Savoie, duc de Bob was a military commander."]])
+
+        # Test bounded slice generation for lveval
+        slice_docs, queries, s_gold, _ = build_benchmark_slice(
+            "lveval", samples, corpus=[], max_queries=1, index_queries=2, full_corpus=False
+        )
+        self.assertEqual(len(queries), 1)
+        self.assertTrue(set(gold_docs[0]).issubset(set(slice_docs)))
+
+        # Test top-2 capping when multiple passages match
+        multi_passage_sample = [
+            {
+                "question": "Who is Duke Bob?",
+                "gold_ans": "Bob",
+                "answers": ["Bob"],
+                "context": (
+                    "### Passage 1\n"
+                    "Bob is a famous duke and military leader.\n"
+                    "### Passage 2\n"
+                    "Bob was born in 1800.\n"
+                    "### Passage 3\n"
+                    "Bob ruled the province peacefully.\n"
+                ),
+            }
+        ]
+        top2_gold = get_gold_docs(multi_passage_sample, "lveval")
+        self.assertEqual(len(top2_gold[0]), 2)
+        # Passage 1 has "bob", "duke" (both answer and question match, highest rank)
+        self.assertEqual(top2_gold[0][0], "\nBob is a famous duke and military leader.")
+
+    def test_narrativeqa_gold_extraction(self):
+        samples = [
+            {
+                "question": "What is Mary Horowitz's job?",
+                "answer": ["She is a crossword writer for the Sacramento Herald.", "Crossword puzzle writer."],
+                "document": {
+                    "id": "doc123",
+                    "summary": {
+                        "title": "All About Steve",
+                        "text": "Mary Horowitz, a crossword puzzle writer for the Sacramento Herald.",
+                    },
+                },
+            }
+        ]
+        gold_answers = get_gold_answers(samples)
+        self.assertEqual(
+            gold_answers,
+            [["She is a crossword writer for the Sacramento Herald.", "Crossword puzzle writer."]],
+        )
+        gold_docs = get_gold_docs(samples, "narrativeqa")
+        self.assertEqual(
+            gold_docs,
+            [["All About Steve\nMary Horowitz, a crossword puzzle writer for the Sacramento Herald."]],
+        )
+
+        # Test with corpus matching chunks by doc_id and answer keywords
+        corpus = [
+            {"idx": "doc123_0", "title": "Script", "text": "Unrelated scene."},
+            {"idx": "doc123_1", "title": "Script", "text": "Mary works as a crossword writer for the Herald."},
+            {"idx": "other_0", "title": "Other", "text": "Different document."},
+        ]
+        corpus_gold = get_gold_docs(samples, "narrativeqa", corpus=corpus)
+        self.assertEqual(corpus_gold, [["Script\nMary works as a crossword writer for the Herald."]])
+
+        # Test bounded slice generation for narrativeqa
+        slice_docs, queries, s_gold, _ = build_benchmark_slice(
+            "narrativeqa", samples, corpus, max_queries=1, index_queries=2, full_corpus=False
+        )
+        self.assertEqual(len(queries), 1)
+        self.assertTrue(set(corpus_gold[0]).issubset(set(slice_docs)))
+
+        # Test top-2 capping when multiple chunks match
+        multi_chunk_corpus = [
+            {"idx": "doc123_0", "title": "Script", "text": "Mary Horowitz is a crossword writer for the Sacramento Herald."},
+            {"idx": "doc123_1", "title": "Script", "text": "Crossword puzzle writer in the city."},
+            {"idx": "doc123_2", "title": "Script", "text": "Mary has a job."},
+            {"idx": "doc123_3", "title": "Script", "text": "Unrelated line."},
+        ]
+        multi_gold = get_gold_docs(samples, "narrativeqa", corpus=multi_chunk_corpus)
+        self.assertEqual(len(multi_gold[0]), 2)
+        self.assertEqual(
+            multi_gold[0][0],
+            "Script\nMary Horowitz is a crossword writer for the Sacramento Herald.",
+        )
+
+    def test_paper_baselines_contain_all_required_datasets(self):
+        for name in ("musique", "2wikimultihopqa", "hotpotqa", "nq", "popqa", "lveval", "narrativeqa"):
+            self.assertIn(name, PAPER_BASELINES)
+
+        # NQ
+        self.assertEqual(PAPER_BASELINES["nq"]["hipporag2_llama3.3_70b_nvembed_v2"]["Recall@5"], 0.780)
+        self.assertEqual(PAPER_BASELINES["nq"]["hipporag2_llama3.3_70b_nvembed_v2"]["ExactMatch"], 0.485)
+        self.assertEqual(PAPER_BASELINES["nq"]["hipporag2_llama3.3_70b_nvembed_v2"]["F1"], 0.633)
+        self.assertEqual(PAPER_BASELINES["nq"]["standard_nvembed_v2_llama3.3_70b"]["Recall@5"], 0.754)
+        self.assertEqual(PAPER_BASELINES["nq"]["standard_nvembed_v2_llama3.3_70b"]["F1"], 0.619)
+        self.assertEqual(PAPER_BASELINES["nq"]["hipporag_reproduced"]["Recall@5"], 0.444)
+        self.assertEqual(PAPER_BASELINES["nq"]["hipporag_reproduced"]["F1"], 0.553)
+
+        # PopQA
+        self.assertEqual(PAPER_BASELINES["popqa"]["hipporag2_llama3.3_70b_nvembed_v2"]["Recall@5"], 0.517)
+        self.assertEqual(PAPER_BASELINES["popqa"]["hipporag2_llama3.3_70b_nvembed_v2"]["ExactMatch"], 0.490)
+        self.assertEqual(PAPER_BASELINES["popqa"]["hipporag2_llama3.3_70b_nvembed_v2"]["F1"], 0.562)
+        self.assertEqual(PAPER_BASELINES["popqa"]["standard_nvembed_v2_llama3.3_70b"]["Recall@5"], 0.510)
+        self.assertEqual(PAPER_BASELINES["popqa"]["standard_nvembed_v2_llama3.3_70b"]["F1"], 0.557)
+        self.assertEqual(PAPER_BASELINES["popqa"]["hipporag_reproduced"]["Recall@5"], 0.538)
+        self.assertEqual(PAPER_BASELINES["popqa"]["hipporag_reproduced"]["F1"], 0.559)
+
+        # LV-Eval
+        self.assertEqual(PAPER_BASELINES["lveval"]["hipporag2_llama3.3_70b_nvembed_v2"]["ExactMatch"], 0.080)
+        self.assertEqual(PAPER_BASELINES["lveval"]["hipporag2_llama3.3_70b_nvembed_v2"]["F1"], 0.129)
+        self.assertEqual(PAPER_BASELINES["lveval"]["standard_nvembed_v2_llama3.3_70b"]["F1"], 0.098)
+        self.assertEqual(PAPER_BASELINES["lveval"]["hipporag_reproduced"]["F1"], 0.084)
+
+        # NarrativeQA
+        self.assertEqual(PAPER_BASELINES["narrativeqa"]["hipporag2_llama3.3_70b_nvembed_v2"]["ExactMatch"], 0.180)
+        self.assertEqual(PAPER_BASELINES["narrativeqa"]["hipporag2_llama3.3_70b_nvembed_v2"]["F1"], 0.259)
+        self.assertEqual(PAPER_BASELINES["narrativeqa"]["standard_nvembed_v2_llama3.3_70b"]["F1"], 0.257)
+        self.assertEqual(PAPER_BASELINES["narrativeqa"]["hipporag_reproduced"]["F1"], 0.163)
+
+    def test_text_stopwords(self):
+        self.assertGreater(len(TEXT_STOPWORDS), 50)
+        for expected in ("the", "and", "that", "with", "from", "they"):
+            self.assertIn(expected, TEXT_STOPWORDS)
+
 
 
 class EvaluationAndIntegrityTests(unittest.TestCase):
