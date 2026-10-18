@@ -9,16 +9,17 @@ Use Python 3.12 and uv:
 ```powershell
 uv sync --locked
 uv run --locked pytest -v
-uv run --locked python -m yaw daemon status --config yaw.toml
-uv run --locked python -m yaw daemon run --config yaw.toml
-uv run --locked python -m yaw daemon start --config yaw.toml
-uv run --locked python -m yaw daemon stop --config yaw.toml
-uv run --locked python -m yaw graph build --config yaw.toml
-uv run --locked python -m yaw graph rebuild --config yaw.toml
-uv run --locked python -m yaw dspy optimize --config yaw.toml --mode gepa --auto light
-uv run --locked python -m yaw dspy load-program .yaw/compiled_program_optimize_<datestamp>.json
-uv run --locked python -m yaw config get optimization.auto
-uv run --locked python -m yaw config set optimization.auto light
+uv run --locked yaw daemon status
+uv run --locked yaw daemon run
+uv run --locked yaw daemon start
+uv run --locked yaw daemon stop
+uv run --locked yaw graph build
+uv run --locked yaw graph rebuild
+uv run --locked yaw graph lint
+uv run --locked yaw optimize --mode gepa --auto light
+uv run --locked yaw load-program .yaw/compiled_program_optimize_<datestamp>.json
+uv run --locked yaw config get optimization.auto
+uv run --locked yaw config set optimization.auto light
 uv run --locked python benchmark.py --dataset sample --mode all
 uv run --locked python benchmark.py --dataset 2wikimultihopqa --max-queries 10
 uv run --locked python benchmark.py --dataset hotpotqa --max-queries 10 --mode retrieval
@@ -79,8 +80,8 @@ On the 2026-10-14 Tier 0 and Tier 1 upstream benchmark runs with the default spl
 - **Tier 1 (`hotpotqa`, 10 queries, 94 passages, `run-hotpotqa-zbp9k8e0`):** HippoRAG 2 Recall@1/@2/@5 = **0.500 / 0.850 / 1.000** vs. Standard DPR **0.450 / 0.700 / 0.950** (**`+5.0%` Recall@1**, **`+15.0%` Recall@2**, **`+5.0%` Recall@5**; 1,206 phrase nodes, 1,286 triples, 10/10 queries with graph seeds); HippoRAG 2 QA EM/F1 = **0.300 / 0.5483** vs. Standard DPR **0.300 / 0.4524** (**`+9.59%` F1**).
 - **Tier 1 (`musique`, 10 queries, 197 passages, `run-musique-_5f_uroh`):** HippoRAG 2 Recall@1/@2/@5 = **0.1833 / 0.3167 / 0.5417** vs. Standard DPR **0.2083 / 0.2833 / 0.5167** (**`+3.34%` Recall@2**, **`+2.5%` Recall@5**; 2,268 phrase nodes, 2,346 triples, 7/10 queries with graph seeds); HippoRAG 2 QA EM/F1 = **0.200 / 0.3000** vs. Standard DPR **0.300 / 0.4000**.
 
-Thirty-two offline regression tests pass (`uv run --locked python -m unittest discover -s tests -v`). See [evaluation](docs/evaluation.md) for commands, versions, answer-score limitations and preserved failure diagnostics.
+155 offline and integration regression tests pass (`uv run --locked pytest -v`). See [evaluation](docs/evaluation.md) for benchmark runs, closed-world SHACL validations, and live-silicon MIPROv2/GEPA optimization results.
 
-Epic 1 has its embedding and chat adapters plus Tier 0/1 benchmark harness implemented; multilingual/chunk-boundary validation and daemon work remain. Epic 2 is planned. No daemon commands or MCP endpoint are implemented yet.
+The native HippoRAG 2 engine (`yaw/daemon/graph/engine.py`), persistent single-owner daemon runtime (`yaw/daemon/runtime.py`), single `yaw.db` SQLite storage (`sqlite-vec` + FTS5 + sparse CSR PPR), CocoIndex incremental line-pointer ingestion, and DSPy MIPROv2 & GEPA prompt evolution with hot-reload program promotion are implemented and verified. Epic 2 (FastMCP over Streamable HTTP) follows as the next planned phase.
 
 Upstream: [pinned HippoRAG source](https://github.com/OSU-NLP-Group/HippoRAG/tree/d5c8329422e0a0b834a15874545cb6a74b4f9b26).

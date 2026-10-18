@@ -522,3 +522,52 @@ Offline test suite: `uv run --locked python -m unittest discover -s tests -v` â€
   - `uv run --locked ruff check .` $\to$ **All checks passed!**
   - `uv run --locked ty check` $\to$ **All checks passed!**
   - `git diff --check` $\to$ **Clean**.
+
+14. **Pre-Epic 2 Closed-World SKOS/SHACL Engine, 19-Predictor Separation, Geometric-Mean Pareto Metric, and Live-Silicon MIPROv2 & GEPA Prompt Optimization (2026-10-18):**
+
+- **Architecture & Implementation:**
+  - **Closed-World SKOS/SHACL Semantic Engine (`yaw/daemon/graph/storage/db.py`, `yaw/daemon/graph/engine.py`):**
+    - Extended single `yaw.db` with SKOS tables: `entity_labels` (`label_norm`, `entity_id`, `label_kind`, `raw_label`, `chunk_id`), `entity_redirects` (`alias_id`, `canonical_id`), and `entity_merge_lineage` (`src_id`, `dst_id`, `label_kind`, `timestamp`).
+    - Enforced W3C SKOS S13/S14 disjointness: `skos:prefLabel` strictly assigned when `label_norm == text_processing(entities.name)`; normalized to `skos:altLabel` across all chunks when merged.
+    - Implemented pure SQLite SQL closed-world SHACL linter (`lint_graph_shacl`) enforcing:
+      1. `ConceptShape/definition`: Every `skos:Concept` must have non-empty `skos:definition`.
+      2. `ConceptShape/S13-disjointLabels`: `skos:prefLabel` and `skos:altLabel` are strictly disjoint per concept.
+      3. `StatementShape/definition`: Every RDF statement must have a non-empty `skos:definition`.
+      4. `GraphTopology/noDanglingEdges`: Subject and object of all edges must exist in `entities` or `chunks`.
+    - Implemented W3C Turtle 1.1 exporter (`serialize_graph_turtle`) in pure Python without `rdflib`/`pySHACL` dependencies.
+    - Implemented in-transaction self-healing RLM (`shacl_healer_rlm`) equipped with isolated tools (`hydrate_chunk`, `inspect_focus_node`, `qwen_propose_shacl_repairs`, `apply_shacl_repairs`, `lint_shacl`).
+  - **Single-Extraction Handoff with First-Class Missing Entity Definitions:**
+    - Stage 1 (`ExtractEntities`): extracts named entities with contextual definitions `[["entity", "definition"], ...]`.
+    - Stage 2 (`ExtractTriples`): lean 4-field extraction `{"sub", "pred", "obj", "def"}` using dynamic GBNF grammar permitting known entity strings without repeating definitions and 2-element tuples `[new_entity, definition]` for newly discovered entities.
+    - Stage 3 (`DefineMissingEntities` / `OrchestrateMissingEntityDefinitions`): dedicated 15th/16th DSPy predictor that contextually defines any triple entities emitted without definitions directly from the passage, completely avoiding heuristic fallbacks.
+  - **19-Predictor Separation of Concerns:**
+    - Guaranteed zero predictor contamination across all 19 predictors (15 stage + 4 reflection): every predictor has its own distinct `dspy.Signature` class, its own dedicated `_PredictorBoundLM` copy, and isolated `track_usage()` telemetry trails.
+    - All 13 query/inference predictors exposed via `named_predictors()`.
+  - **Gate-Free Sizecoding Pareto Geometric-Mean Metric:**
+    - Replaced hard baseline gates with continuous Geometric Mean of Goods divided by Geometric Mean of Bads ($\text{GM}_{\text{good}} / \text{GM}_{\text{bad}}$), rewarding Recall@1/2/5/10/20, EM, F1, and SHACL conformance while penalizing latency, token counts, and RLM healing iterations.
+  - **Dynamic Active Trace Component Selector (`_ActiveTraceComponentSelector`):**
+    - Inspects sampled minibatch trajectories during GEPA reflection to select exclusively from predictors active in the execution trace (`qa_cot.predict`, `query_intent`, `fact_filter`), eliminating `No valid predictions found for any module` errors.
+  - **Production Promotion & Hot-Reload (`yaw load-program`):**
+    - Validates compiled DSPy program JSON, copies to `compiled_program_path` (`.yaw/compiled_program.json`), and signals running daemons via IPC signal files or stages for the next startup.
+
+- **Live Silicon Benchmark & Prompt Evolution Results (`http://localhost:13305/api/v1`):**
+  1. **MIPROv2 Smoke Test (`sample`, 1 query, 1 passage, 1 trial):**
+     - Indexed 1 chunk, 9 entities, 8 facts, 42 edges into isolated sandbox (`.yaw/yaw_optimize_20261018_082538.db`) with 100% SHACL conformance (`shacl_conforms: true`).
+     - Bootstrapped few-shot examples and instruction candidates sequentially (`num_threads=1`).
+     - Baseline score: **74.88%** $\to$ Trial 2 score: **75.92%** (candidate program accepted and saved).
+  2. **GEPA Evolutionary Optimization (`sample`, 1 query, 1 passage, 4 trials):**
+     - Base program evaluated on valset: **0.7488** (74.9%).
+     - In iteration 1, `RLMInstructionProposer` (Mistral NPU orchestrator + Qwen GPU proposer) synthesized an evolved, domain-grounded prompt for `fact_filter`.
+     - Re-evaluation demonstrated measurable Pareto improvement:
+       - Subsample score: $2.2465 \to 2.2789$ (**76.0%**).
+       - Full valset score: $0.7488 \to 0.7592$ (**75.9%**).
+     - Candidate accepted into Pareto frontier and saved to `.yaw/compiled_program_optimize_20261018_082953.json` with proposer telemetry and graph RLM audit trail.
+  3. **Daemon Production Promotion:**
+     - Promoted via `uv run yaw load-program .yaw/compiled_program_optimize_20261018_082953.json` to `.yaw/compiled_program.json`.
+     - Confirmed `HippoRAGProgram.from_config(config)` loads the optimized program and evolved instructions on initialization.
+
+- **Verification Status:**
+  - `uv run --locked pytest -v` $\to$ **155 passed, 2 warnings in 50.74s**.
+  - `uv run --locked ruff check .` $\to$ **All checks passed!**
+  - `uv run --locked ty check` $\to$ **All checks passed!**
+  - `git diff --check` $\to$ **Clean**.
