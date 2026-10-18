@@ -171,15 +171,6 @@ class YawRuntime:
             else DSPyEmbeddingAdapter.from_config(self.config)
         )
 
-        self.ingestor = CorpusIngestor(
-            corpus_root=self.config.corpus_root,
-            state_dir=self.config.state_dir,
-            included_patterns=self.config.included_patterns,
-            excluded_patterns=self.config.excluded_patterns,
-            chunk_size=self.config.chunk_size,
-            chunk_overlap=self.config.chunk_overlap,
-            min_chunk_size=self.config.min_chunk_size,
-        )
         self.engine = YawGraphEngine(
             db_path=self.config.db_path,
             workspace_root=self.config.corpus_root,
@@ -191,6 +182,16 @@ class YawRuntime:
             synonymy_threshold=self.config.synonymy_threshold,
             synonymy_top_k=self.config.synonymy_top_k,
             embed_batch_size=self.config.embed_batch_size,
+        )
+        self.ingestor = CorpusIngestor(
+            corpus_root=self.config.corpus_root,
+            state_dir=self.config.state_dir,
+            included_patterns=self.config.included_patterns,
+            excluded_patterns=self.config.excluded_patterns,
+            chunk_size=self.config.chunk_size,
+            chunk_overlap=self.config.chunk_overlap,
+            min_chunk_size=self.config.min_chunk_size,
+            on_delta=self._apply_delta,
         )
         fp = self.config.config_fingerprint()
         self.engine.set_meta(_CONFIG_FP_META_KEY, fp)
@@ -536,11 +537,17 @@ class YawRuntime:
         assert self.engine is not None
         if not delta.deleted_chunk_ids and not delta.added_chunks:
             return
+        cb = progress_callback
+        if cb is None:
+            def _default_sync_progress(msg: str) -> None:
+                self._update_state(active_op=msg, sync_state="syncing")
+
+            cb = _default_sync_progress
         self.engine.set_meta(_PENDING_DELTA_META_KEY, _serialize_sync_delta(delta))
         if delta.deleted_chunk_ids:
             self.engine.delete_chunks(delta.deleted_chunk_ids)
         if delta.added_chunks:
-            self.engine.index_chunks(delta.added_chunks, progress_callback=progress_callback)
+            self.engine.index_chunks(delta.added_chunks, progress_callback=cb)
         self.engine.set_meta(_PENDING_DELTA_META_KEY, None)
 
     def _execute_sync_worker(self) -> SyncDelta:
@@ -558,10 +565,11 @@ class YawRuntime:
         else:
             pending_delta = None
 
-        # 2. Poll CocoIndex for subsequent corpus changes and apply
+        # 2. Poll CocoIndex for subsequent corpus changes (compiled inside target sink before LMDB commit)
         _sync_progress("polling CocoIndex for corpus changes")
         polled_delta = self.ingestor.poll()
-        self._apply_delta(polled_delta, progress_callback=_sync_progress)
+        if getattr(self.ingestor, "on_delta", None) is None:
+            self._apply_delta(polled_delta, progress_callback=_sync_progress)
 
         new_stats = self.engine.get_stats(self.config.config_fingerprint())
         with self._state_lock:
@@ -813,7 +821,7 @@ class YawRuntime:
             if self.engine is None:
                 raise YawRuntimeError("NOT_READY", "Graph engine is not initialized.")
             self.engine.program.load(str(p))
-            self.engine.program.set_retrieval_hook(self.engine._program_retrieval_hook)
+            self.engine._bind_program_hooks()
             self.engine._apply_program_embedding_prefixes()
             self._update_state()
             return {

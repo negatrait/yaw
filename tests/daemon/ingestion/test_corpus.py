@@ -239,3 +239,37 @@ def test_ingestion_memoization_skips_untouched_files_unmocked(tmp_path: Path) ->
         d4 = ingestor_fresh.poll()
         assert len(d4.added_chunks) == 0
         assert len(d4.deleted_chunk_ids) == 0
+
+
+def test_target_sink_compiler_callback_and_retry_on_failure(tmp_path: Path) -> None:
+    import pytest
+
+    corpus_dir = tmp_path / "corpus"
+    state_dir = tmp_path / "state"
+    corpus_dir.mkdir()
+    state_dir.mkdir()
+
+    note = corpus_dir / "note.md"
+    note.write_text("# Target Sink\nFirst paragraph.\n", encoding="utf-8")
+
+    observed_deltas = []
+    should_fail = True
+
+    def compiler_callback(delta):
+        nonlocal should_fail
+        if should_fail:
+            raise RuntimeError("Simulated compiler failure inside target sink")
+        observed_deltas.append(delta)
+
+    with CorpusIngestor(corpus_dir, state_dir, on_delta=compiler_callback) as ingestor:
+        # First poll raises RuntimeError before CocoIndex commits state
+        with pytest.raises(RuntimeError, match="Simulated compiler failure"):
+            ingestor.poll()
+        assert len(observed_deltas) == 0
+
+        # Second poll succeeds and replays the uncommitted file delta
+        should_fail = False
+        delta = ingestor.poll()
+        assert len(delta.added_chunks) == 1
+        assert len(observed_deltas) == 1
+        assert observed_deltas[0] == delta

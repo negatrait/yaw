@@ -9,13 +9,20 @@ from yaw.core import ChunkPointer, OpenIERecord
 from yaw.daemon.graph.storage.db import (
     delete_chunks,
     deserialize_f32_vector,
+    find_entity_disambiguation_candidates,
     find_entity_synonym_candidates,
     get_chunk_pointer,
     get_chunk_pointers,
     get_entity_vectors,
     get_openie_checkpoints,
     initialize_schema,
+    inspect_focus_node,
+    lint_graph_shacl,
+    load_graph_topology,
+    merge_entities,
+    open_managed_yaw_db,
     open_yaw_db,
+    resolve_entity_labels,
     save_openie_checkpoints,
     search_chunk_vectors_knn,
     search_chunks_fts,
@@ -23,13 +30,16 @@ from yaw.daemon.graph.storage.db import (
     search_fact_vectors_knn,
     search_facts_fts,
     serialize_f32_vector,
+    serialize_graph_turtle,
     upsert_chunk_pointers,
     upsert_chunk_vectors,
     upsert_edges_with_sources,
     upsert_entities,
+    upsert_entity_labels,
     upsert_entity_vectors,
     upsert_fact_vectors,
     upsert_facts,
+    upsert_semantic_edges,
     upsert_synonymy_edges,
 )
 
@@ -489,3 +499,326 @@ def test_fact_fts_indexing_search_and_backfill(tmp_path: Path) -> None:
         conn.close()
 
 
+def test_open_managed_yaw_db_lock_and_read_only_wal_snapshot(tmp_path: Path) -> None:
+    db_file = tmp_path / "managed_yaw.db"
+    managed = open_managed_yaw_db(db_file)
+    try:
+        with managed.transaction() as conn:
+            upsert_entities(conn, [("ent-1", "Ada Lovelace", "First computer programmer")])
+
+        with managed.readonly() as ro_conn:
+            row = ro_conn.execute(
+                "SELECT name, definition FROM entities WHERE entity_id = 'ent-1';"
+            ).fetchone()
+            assert row is not None
+            assert row["name"] == "Ada Lovelace"
+            assert row["definition"] == "First computer programmer"
+    finally:
+        managed.close()
+
+
+def test_skos_labels_s13_disjointness_and_homograph_resolution(tmp_path: Path) -> None:
+    conn = open_yaw_db(tmp_path / "test_skos.db")
+    try:
+        upsert_entities(
+            conn,
+            [
+                ("ent-apple-inc", "Apple Inc.", "Technology company founded in Cupertino"),
+                ("ent-apple-fruit", "Malus domestica", "Edible pome fruit grown on orchard trees"),
+            ],
+        )
+        # Register "Apple" as skos:altLabel for both entities (homographs) and attempt S13 duplicate prefLabel as altLabel
+        upsert_entity_labels(
+            conn,
+            [
+                ("apple inc.", "ent-apple-inc", "skos:altLabel", "Apple Inc.", "c1"),
+                ("apple", "ent-apple-inc", "skos:altLabel", "Apple", "c1"),
+                ("apple", "ent-apple-fruit", "skos:altLabel", "Apple", "c2"),
+            ],
+        )
+
+        # Verify S13 disjointness: "Apple Inc." should only appear as skos:prefLabel, never as skos:altLabel
+        s13_rows = conn.execute(
+            "SELECT DISTINCT label_kind FROM entity_labels WHERE entity_id = 'ent-apple-inc' AND label_norm = 'apple inc.';"
+        ).fetchall()
+        assert [r["label_kind"] for r in s13_rows] == ["skos:prefLabel"]
+
+        # Give each entity orthogonal vectors
+        v_tech = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        v_fruit = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32)
+        upsert_entity_vectors(
+            conn,
+            [("ent-apple-inc", v_tech), ("ent-apple-fruit", v_fruit)],
+        )
+
+        # Resolve "Apple" with a tech query vector -> selects ent-apple-inc
+        resolved_tech = resolve_entity_labels(
+            conn, ["Apple"], query_vec=np.array([0.95, 0.05, 0.0, 0.0], dtype=np.float32)
+        )
+        assert resolved_tech["apple"] == ["ent-apple-inc"]
+
+        # Resolve "Apple" with a fruit query vector -> selects ent-apple-fruit
+        resolved_fruit = resolve_entity_labels(
+            conn, ["Apple"], query_vec=np.array([0.05, 0.95, 0.0, 0.0], dtype=np.float32)
+        )
+        assert resolved_fruit["apple"] == ["ent-apple-fruit"]
+
+        # 2-channel candidate generation finds lexical cousins even when cosine = 0.0
+        upsert_entities(conn, [("ent-apple-corp", "Apple Corp.", "Record label founded by The Beatles")])
+        upsert_entity_vectors(conn, [("ent-apple-corp", v_fruit)])
+        candidates = find_entity_disambiguation_candidates(
+            conn, ["ent-apple-inc"], dense_threshold=0.95, dense_top_k=5, lexical_threshold=0.6
+        )
+        pair_ids = {(a, b) for a, b, _, _ in candidates} | {(b, a) for a, b, _, _ in candidates}
+        assert ("ent-apple-inc", "ent-apple-corp") in pair_ids
+    finally:
+        conn.close()
+
+
+def test_merge_entities_and_semantic_edge_dominance(tmp_path: Path) -> None:
+    conn = open_yaw_db(tmp_path / "test_merge.db")
+    try:
+        p1 = ChunkPointer("c1", "doc.md", 1, 5, "Sec")
+        upsert_chunk_pointers(conn, [(p1, "NYC is New York City.")])
+        upsert_entities(
+            conn,
+            [
+                ("ent-nyc-canon", "New York City", "Most populous city in the United States"),
+                ("ent-nyc-alias", "NYC", "Abbreviation for New York City"),
+                ("ent-usa", "United States", "Federal republic in North America"),
+            ],
+        )
+        v1 = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        v2 = np.array([0.98, 0.02, 0.0, 0.0], dtype=np.float32)
+        v3 = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32)
+        upsert_entity_vectors(conn, [("ent-nyc-canon", v1), ("ent-nyc-alias", v2), ("ent-usa", v3)])
+
+        upsert_facts(
+            conn,
+            [
+                (
+                    "fact-alias-usa",
+                    "ent-nyc-alias",
+                    "located in",
+                    "ent-usa",
+                    '["NYC", "located in", "United States"]',
+                    "NYC is located in the United States",
+                )
+            ],
+        )
+        upsert_edges_with_sources(
+            conn,
+            [
+                ("ent-nyc-alias", "ent-usa", "fact", 1.0, "c1"),
+                ("c1", "ent-nyc-alias", "passage", 1.0, "c1"),
+            ],
+        )
+
+        # Merge src_id='ent-nyc-alias' into dst_id='ent-nyc-canon'
+        merge_entities(conn, "ent-nyc-alias", "ent-nyc-canon")
+
+        # Alias entity row is gone, its prefLabel "NYC" is now a skos:altLabel on ent-nyc-canon
+        assert (
+            conn.execute("SELECT COUNT(*) FROM entities WHERE entity_id = 'ent-nyc-alias';").fetchone()[0]
+            == 0
+        )
+        alt_rows = conn.execute(
+            "SELECT raw_label FROM entity_labels WHERE entity_id = 'ent-nyc-canon' AND label_kind = 'skos:altLabel';"
+        ).fetchall()
+        assert "NYC" in {r["raw_label"] for r in alt_rows}
+
+        # Fact and edges are redirected to ent-nyc-canon
+        fact_row = conn.execute(
+            "SELECT subj_id, obj_id FROM facts WHERE fact_id = 'fact-alias-usa';"
+        ).fetchone()
+        assert fact_row["subj_id"] == "ent-nyc-canon"
+        assert fact_row["obj_id"] == "ent-usa"
+
+        # Now test semantic edges and owl:differentFrom dominance
+        upsert_semantic_edges(conn, [("ent-nyc-canon", "ent-usa", "skos:related", 0.85)])
+        _, entity_ids, topo_edges = load_graph_topology(conn)
+        assert ("ent-nyc-canon" in entity_ids) and ("ent-usa" in entity_ids)
+        assert any(s == "ent-nyc-canon" and d == "ent-usa" for s, d, _ in topo_edges)
+
+        # Asserting owl:differentFrom dominates and deletes skos:related
+        upsert_semantic_edges(conn, [("ent-nyc-canon", "ent-usa", "owl:differentFrom", 0.90)])
+        edge_kinds = {
+            r["kind"]
+            for r in conn.execute(
+                "SELECT kind FROM edges WHERE src_id = 'ent-nyc-canon' AND dst_id = 'ent-usa';"
+            ).fetchall()
+        }
+        assert "skos:related" not in edge_kinds
+        assert "owl:differentFrom" in edge_kinds
+
+        # Verify load_graph_topology excludes owl:differentFrom (if we remove the fact edge, no edge remains)
+        conn.execute("DELETE FROM edges WHERE kind = 'fact';")
+        conn.commit()
+        _, _, topo_edges_after = load_graph_topology(conn)
+        assert not any(
+            {s, d} == {"ent-nyc-canon", "ent-usa"} for s, d, _ in topo_edges_after
+        )
+    finally:
+        conn.close()
+
+
+def test_closed_world_shacl_lint_auto_heal_and_turtle_export(tmp_path: Path) -> None:
+    conn = open_yaw_db(tmp_path / "test_shacl.db")
+    try:
+        # Insert an entity with empty definition, an entity with valid definition, and an asymmetric semantic edge
+        conn.execute(
+            "INSERT INTO entities(entity_id, name, definition) VALUES ('ent-a', 'Entity A', '');"
+        )
+        conn.execute(
+            "INSERT INTO entities(entity_id, name, definition) VALUES ('ent-b', 'Entity B', 'Valid definition B');"
+        )
+        conn.execute(
+            "INSERT INTO facts(fact_id, subj_id, pred, obj_id, raw_triple_json, definition) "
+            "VALUES ('fact-ab', 'ent-a', 'relates to', 'ent-b', '[\"Entity A\", \"relates to\", \"Entity B\"]', '');"
+        )
+        conn.execute(
+            "INSERT INTO edges(src_id, dst_id, kind, weight) VALUES ('ent-a', 'ent-b', 'fact', 1.0);"
+        )
+        conn.execute(
+            "INSERT INTO edges(src_id, dst_id, kind, weight) VALUES ('ent-a', 'ent-b', 'skos:related', 0.9);"
+        )
+        conn.commit()
+
+        violations_before = lint_graph_shacl(conn, auto_heal=False)
+        shapes_before = {v.shape for v in violations_before}
+        assert "ConceptShape/prefLabel" in shapes_before
+        assert "ConceptShape/definition" in shapes_before
+        assert "StatementShape/closedWorld" in shapes_before
+        assert "EdgeShape/closedWorld" in shapes_before
+
+        # Auto-heal repairs deterministic violations (prefLabels, empty definitions, asymmetric semantic edge)
+        violations_after = lint_graph_shacl(conn, auto_heal=True)
+        assert violations_after == []
+
+        # Inspect focus node neighbourhood
+        info = inspect_focus_node(conn, "ent-a")
+        assert info["entity"] is not None
+        assert info["entity"]["definition"] == "Entity A participates in relation: Entity A relates to Entity B."
+
+        # Export W3C Turtle with SHACL report
+        ttl = serialize_graph_turtle(conn, violations=violations_after)
+        assert "@prefix skos: <http://www.w3.org/2004/02/skos/core#> ." in ttl
+        assert "@prefix sh: <http://www.w3.org/ns/shacl#> ." in ttl
+        assert "sh:conforms true" in ttl
+        assert 'skos:prefLabel "Entity A"' in ttl
+    finally:
+        conn.close()
+
+
+def test_delete_chunks_homograph_promotion_preserves_owl_different_from(tmp_path: Path) -> None:
+    """Verify Hazard 1: promoting an altLabel to prefLabel during delete_chunks links surviving homographs via owl:differentFrom."""
+    conn = open_yaw_db(tmp_path / "test_hazard1.db")
+    try:
+        upsert_chunk_pointers(
+            conn,
+            [
+                (ChunkPointer("c1", "doc.md", 1, 5, "Doc 1"), "Apple Inc in Cupertino."),
+                (ChunkPointer("c2", "doc.md", 6, 10, "Doc 2"), "Apple designs consumer hardware."),
+                (ChunkPointer("c3", "doc.md", 11, 15, "Doc 3"), "Apple is an orchard fruit."),
+            ],
+        )
+        upsert_entities(
+            conn,
+            [
+                ("ent-tech", "Apple Inc", "Consumer electronics company in Cupertino"),
+                ("ent-fruit", "Apple", "Edible pome fruit grown on orchard trees"),
+            ],
+        )
+        upsert_entity_labels(
+            conn,
+            [
+                ("apple inc", "ent-tech", "skos:prefLabel", "Apple Inc", "c1"),
+                ("apple", "ent-tech", "skos:altLabel", "Apple", "c2"),
+                ("apple", "ent-fruit", "skos:prefLabel", "Apple", "c3"),
+            ],
+        )
+        upsert_edges_with_sources(
+            conn,
+            [
+                ("c1", "ent-tech", "passage", 1.0, "c1"),
+                ("ent-tech", "c1", "passage", 1.0, "c1"),
+                ("c2", "ent-tech", "passage", 1.0, "c2"),
+                ("ent-tech", "c2", "passage", 1.0, "c2"),
+                ("c3", "ent-fruit", "passage", 1.0, "c3"),
+                ("ent-fruit", "c3", "passage", 1.0, "c3"),
+            ],
+        )
+        assert lint_graph_shacl(conn, auto_heal=False) == []
+
+        # Deleting c1 removes "apple inc" prefLabel from ent-tech and promotes "apple" (from c2) to skos:prefLabel.
+        # Step 7 in delete_chunks must link ent-tech and ent-fruit with symmetric owl:differentFrom (weight = 0.0).
+        delete_chunks(conn, ["c1"])
+
+        tech_name = conn.execute(
+            "SELECT name FROM entities WHERE entity_id = 'ent-tech'"
+        ).fetchone()[0]
+        assert tech_name.lower() == "apple"
+
+        diff_rows = conn.execute(
+            """
+            SELECT src_id, dst_id, weight FROM edges
+            WHERE kind = 'owl:differentFrom'
+            ORDER BY src_id, dst_id
+            """
+        ).fetchall()
+        assert len(diff_rows) == 2
+        assert all(float(r[2]) == 0.0 for r in diff_rows)
+        assert lint_graph_shacl(conn, auto_heal=False) == []
+    finally:
+        conn.close()
+
+
+def test_multi_chunk_entity_labels_enforces_skos_s13_and_s14_disjointness(tmp_path: Path) -> None:
+    """Verify Hazard 4: multi-chunk provenance in entity_labels never violates SKOS S13 or S14 across upsert and merge."""
+    conn = open_yaw_db(tmp_path / "test_hazard4.db")
+    try:
+        upsert_entities(
+            conn,
+            [
+                ("ent-usa", "United States", "Federal republic in North America"),
+                ("ent-usa-acro", "USA", "Acronym for the United States of America"),
+            ],
+        )
+        # Attempt to insert conflicting label kinds across chunks c1 and c2
+        upsert_entity_labels(
+            conn,
+            [
+                ("united states", "ent-usa", "skos:prefLabel", "United States", "c1"),
+                ("united states", "ent-usa", "skos:altLabel", "United States", "c2"),
+                ("us", "ent-usa", "skos:hiddenLabel", "US", "c1"),
+                ("us", "ent-usa", "skos:altLabel", "US", "c2"),
+                ("usa", "ent-usa-acro", "skos:prefLabel", "USA", "c3"),
+                ("united states", "ent-usa-acro", "skos:altLabel", "United States", "c4"),
+            ],
+        )
+        # Merge ent-usa-acro into ent-usa with label_kind='skos:hiddenLabel'
+        merge_entities(conn, "ent-usa-acro", "ent-usa", label_kind="skos:hiddenLabel")
+
+        # Verify S13: every (entity_id, label_norm) has exactly 1 distinct label_kind across all chunks
+        s13_conflicts = conn.execute(
+            """
+            SELECT label_norm, COUNT(DISTINCT label_kind)
+            FROM entity_labels
+            WHERE entity_id = 'ent-usa'
+            GROUP BY label_norm
+            HAVING COUNT(DISTINCT label_kind) > 1
+            """
+        ).fetchall()
+        assert s13_conflicts == []
+
+        # Verify S14: exactly 1 distinct label_norm ("united states") has skos:prefLabel
+        pref_norms = [
+            str(r[0])
+            for r in conn.execute(
+                "SELECT DISTINCT label_norm FROM entity_labels WHERE entity_id = 'ent-usa' AND label_kind = 'skos:prefLabel'"
+            ).fetchall()
+        ]
+        assert pref_norms == ["united states"]
+        assert lint_graph_shacl(conn, auto_heal=False) == []
+    finally:
+        conn.close()

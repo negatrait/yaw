@@ -2,7 +2,7 @@
 
 Grammar:
   yaw daemon {start|stop|status|run} [--config <path>]
-  yaw graph {build|rebuild} [--config <path>]
+  yaw graph {build|rebuild|lint} [--config <path>] [--turtle]
   yaw dspy {optimize|load-program} [--flags]
   yaw config {get|set} [--flags]
 """
@@ -35,7 +35,12 @@ from yaw.core import (
     set_config_value,
 )
 from yaw.daemon.graph.inference import DSPyEmbeddingAdapter, HippoRAGProgram
-from yaw.daemon.graph.storage import get_graph_counts
+from yaw.daemon.graph.storage import (
+    get_graph_counts,
+    lint_graph_shacl,
+    open_yaw_db,
+    serialize_graph_turtle,
+)
 from yaw.daemon.runtime import YawRuntime
 
 
@@ -89,7 +94,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # -------------------------------------------------------------------------
-    # 2. yaw graph {build|rebuild}
+    # 2. yaw graph {build|rebuild|lint}
     # -------------------------------------------------------------------------
     p_graph = domain_subparsers.add_parser(
         "graph", help="Standalone graph and corpus index commands"
@@ -105,6 +110,16 @@ def build_parser() -> argparse.ArgumentParser:
         "rebuild",
         parents=[common],
         help="Wipe yaw.db and CocoIndex state and perform a full rebuild from scratch",
+    )
+    p_lint = graph_subs.add_parser(
+        "lint",
+        parents=[common],
+        help="Run closed-world SHACL graph lint or emit W3C Turtle (RDF/SKOS/OWL/SHACL)",
+    )
+    p_lint.add_argument(
+        "--turtle",
+        action="store_true",
+        help="Emit W3C Turtle (RDF/SKOS/OWL/SHACL) serialization instead of JSON",
     )
 
     # -------------------------------------------------------------------------
@@ -280,13 +295,18 @@ def _inspect_active_optimization(config: YawConfig) -> dict[str, Any] | None:
 def inspect_status(config: YawConfig) -> dict[str, Any]:
     """Read live daemon status if running, offline yaw.db stats if stopped, and active optimization progress."""
     running = is_daemon_locked(config)
-    chunks = entities = facts = edges = openie = 0
+    chunks = entities = facts = edges = openie = entity_labels = 0
+    shacl_conforms = True
     if config.db_path and Path(config.db_path).exists():
         with contextlib.suppress(sqlite3.Error):
             db_uri = f"file:{Path(config.db_path).resolve().as_posix()}?mode=ro"
             conn = sqlite3.connect(db_uri, uri=True, timeout=1.0)
             try:
                 chunks, entities, facts, edges, openie = get_graph_counts(conn)
+                with contextlib.suppress(sqlite3.Error):
+                    row = conn.execute("SELECT COUNT(*) FROM entity_labels").fetchone()
+                    entity_labels = int(row[0]) if row else 0
+                    shacl_conforms = len(lint_graph_shacl(conn, auto_heal=False)) == 0
             finally:
                 conn.close()
 
@@ -299,6 +319,8 @@ def inspect_status(config: YawConfig) -> dict[str, Any]:
                 data["stats"]["openie_checkpoints"] = max(
                     openie, data["stats"].get("openie_checkpoints", 0)
                 )
+                data["stats"].setdefault("entity_labels", entity_labels)
+                data["stats"].setdefault("shacl_conforms", shacl_conforms)
                 if not data["status"].get("active_op") and openie > data["stats"].get("chunks", 0):
                     data["status"]["active_op"] = f"indexing: {openie} openie passages processed"
                     data["status"]["sync_state"] = "syncing"
@@ -328,6 +350,8 @@ def inspect_status(config: YawConfig) -> dict[str, Any]:
         edges=edges,
         config_fingerprint=config.config_fingerprint(),
         openie_checkpoints=openie,
+        entity_labels=entity_labels,
+        shacl_conforms=shacl_conforms,
     )
     payload = {
         "status": status.to_dict(),
@@ -681,6 +705,44 @@ def handle_graph_rebuild(
         runtime.stop()
 
 
+def handle_graph_lint(
+    config: YawConfig,
+    *,
+    as_turtle: bool = False,
+) -> int:
+    """Validate closed-world SHACL graph shapes or emit W3C Turtle over a read-only WAL snapshot."""
+    db_file = Path(config.db_path).resolve() if config.db_path else None
+    if db_file is not None and db_file.exists() and db_file.stat().st_size > 0:
+        db_uri = f"file:{db_file.as_posix()}?mode=ro"
+        conn = sqlite3.connect(db_uri, uri=True, timeout=5.0)
+    else:
+        conn = open_yaw_db(":memory:")
+
+    try:
+        try:
+            violations = lint_graph_shacl(conn, auto_heal=False)
+        except sqlite3.OperationalError:
+            conn.close()
+            conn = open_yaw_db(":memory:")
+            violations = lint_graph_shacl(conn, auto_heal=False)
+
+        if as_turtle:
+            ttl = serialize_graph_turtle(conn, violations=violations)
+            if not ttl.endswith("\n"):
+                ttl += "\n"
+            sys.stdout.write(ttl)
+        else:
+            payload = {
+                "conforms": len(violations) == 0,
+                "violation_count": len(violations),
+                "violations": [v.to_dict() for v in violations],
+            }
+            sys.stdout.write(json.dumps(payload, indent=2) + "\n")
+        return 0
+    finally:
+        conn.close()
+
+
 def handle_dspy_optimize(
     config: YawConfig,
     args: argparse.Namespace,
@@ -750,6 +812,7 @@ def handle_dspy_optimize(
             corpus_docs=corpus_docs,
         )
         proposer_telemetry = saved_path.parent / f"{saved_path.stem}_proposer_telemetry.json"
+        graph_rlm_audit = saved_path.parent / f"{saved_path.stem}_graph_rlm_audit.json"
         gepa_telemetry_dir = saved_path.parent / f"{saved_path.stem}_telemetry"
         payload: dict[str, Any] = {
             "optimized": True,
@@ -763,6 +826,9 @@ def handle_dspy_optimize(
             "sandbox_db_path": str(opt_config.db_path),
             "proposer_telemetry_path": (
                 str(proposer_telemetry) if proposer_telemetry.exists() else None
+            ),
+            "graph_rlm_audit_path": (
+                str(graph_rlm_audit) if graph_rlm_audit.exists() else None
             ),
             "gepa_telemetry_dir": (
                 str(gepa_telemetry_dir) if gepa_telemetry_dir.exists() else None
@@ -943,12 +1009,14 @@ def main(
             if action == "stop":
                 return handle_daemon_stop(config)
 
-        # 2. yaw graph {build|rebuild}
+        # 2. yaw graph {build|rebuild|lint}
         if domain == "graph":
             if action == "build":
                 return handle_graph_build(config, program=program, embedder=embedder)
             if action == "rebuild":
                 return handle_graph_rebuild(config, program=program, embedder=embedder)
+            if action == "lint":
+                return handle_graph_lint(config, as_turtle=bool(getattr(args, "turtle", False)))
 
         # 3. yaw dspy {optimize|load-program}
         if domain == "dspy":
@@ -989,6 +1057,7 @@ __all__ = [
     "handle_dspy_load_program",
     "handle_dspy_optimize",
     "handle_graph_build",
+    "handle_graph_lint",
     "handle_graph_rebuild",
     "inspect_status",
     "is_daemon_locked",

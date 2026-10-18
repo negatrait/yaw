@@ -27,28 +27,62 @@ class DeterministicMockLM(dspy.LM):
                 {"prompt_tokens": 32, "completion_tokens": 16, "total_tokens": 48},
             )
         req_str = str(prompt or messages or kwargs)
+        if (
+            "JudgeSynonyms" in req_str
+            or "OrchestrateSynonymJudgment" in req_str
+            or "candidate_pairs_json" in req_str
+            or "candidate_pairs" in req_str
+        ):
+            return ['{"decisions": []}']
+        if (
+            "ProposeSHACLRepairs" in req_str
+            or "HealSHACLViolations" in req_str
+            or "violations_json" in req_str
+        ):
+            return ['{"repairs": []}']
+        if (
+            "DefineMissingEntities" in req_str
+            or "OrchestrateMissingEntityDefinitions" in req_str
+            or "missing_entities" in req_str
+            or "entity_definitions" in req_str
+        ):
+            if "Lovelace" in req_str:
+                return [
+                    '{"entity_definitions": [["Ada Lovelace", "English mathematician"], ["Analytical Engine", "Mechanical general-purpose computer"]]}'
+                ]
+            return [
+                '{"entity_definitions": [["Alan Turing", "English mathematician and computer scientist"], ["computer science", "Study of computation and information"]]}'
+            ]
         # Triples stage
         if "ExtractTriples" in req_str or "triples" in req_str:
             if "Lovelace" in req_str:
-                return ['{"triples": [["Ada Lovelace", "worked on", "Analytical Engine"]]}']
-            return ['{"triples": [["Alan Turing", "father of", "computer science"]]}']
+                return [
+                    '{"triples": [{"sub": "Ada Lovelace", "pred": "worked on", "obj": "Analytical Engine", "def": "Ada Lovelace worked on the Analytical Engine."}]}'
+                ]
+            return [
+                '{"triples": [{"sub": "Alan Turing", "pred": "father of", "obj": "computer science", "def": "Alan Turing is the father of computer science."}]}'
+            ]
         # Filter facts stage
         if "FilterFacts" in req_str or "fact_before_filter" in req_str or "filter" in req_str.lower():
             if "Lovelace" in req_str:
                 return ['{"fact": [["Ada Lovelace", "worked on", "Analytical Engine"]]}']
             return ['{"fact": [["Alan Turing", "father of", "computer science"]]}']
+        # NER stage
+        if "ExtractEntities" in req_str or "named_entities" in req_str:
+            if "Lovelace" in req_str:
+                return [
+                    '{"named_entities": [["Ada Lovelace", "English mathematician"], ["Analytical Engine", "Mechanical general-purpose computer"]]}'
+                ]
+            return [
+                '{"named_entities": [["Alan Turing", "English mathematician and computer scientist"], ["computer science", "Study of computation and information"]]}'
+            ]
         # QA stage
-        if "AnswerQuestion" in req_str or "context" in req_str:
+        if "AnswerQuestion" in req_str or "Retrieved evidence passages" in req_str or "context" in req_str:
             if "Turing" in req_str:
                 return ['{"reasoning": "Alan Turing founded computer science.", "answer": "Alan Turing"}']
             if "Lovelace" in req_str:
                 return ['{"reasoning": "Ada Lovelace worked on the Analytical Engine.", "answer": "Ada Lovelace"}']
             return ['{"reasoning": "Alan Turing founded computer science.", "answer": "Alan Turing"}']
-        # NER stage
-        if "ExtractEntities" in req_str or "named_entities" in req_str:
-            if "Lovelace" in req_str:
-                return ['{"named_entities": ["Ada Lovelace", "Analytical Engine"]}']
-            return ['{"named_entities": ["Alan Turing", "computer science"]}']
         return ['{"reasoning": "Alan Turing founded computer science.", "answer": "Alan Turing"}']
 
 
@@ -534,5 +568,684 @@ def test_engine_query_intent_escalation_once_without_infinite_recursion(tmp_path
         assert len(filter_calls) == 2
         assert kept_empty == []
         assert len(hits_fallback) == 2
+    finally:
+        engine.close()
+
+
+def test_engine_homograph_gate_edc_and_shacl_conformance(tmp_path: Path) -> None:
+    """Verify Same-Label Homograph Gate splits conflicting senses via JudgeSynonyms and passes SHACL linting."""
+    import json
+    import re
+
+    class HomographGateLM(DeterministicMockLM):
+        def __call__(
+            self,
+            prompt: str | None = None,
+            messages: list[dict[str, Any]] | None = None,
+            **kwargs: Any,
+        ) -> list[str]:
+            if getattr(dspy.settings, "usage_tracker", None) is not None:
+                dspy.settings.usage_tracker.add_usage(
+                    self.model,
+                    {"prompt_tokens": 32, "completion_tokens": 16, "total_tokens": 48},
+                )
+            req_str = str(prompt or messages or kwargs)
+            if "JudgeSynonyms" in req_str or "candidate_pairs" in req_str:
+                pair_ids = list(
+                    dict.fromkeys(re.findall(r"entity-[0-9a-f]+\|entity-[0-9a-f]+", req_str))
+                )
+                decisions = [
+                    {
+                        "pair_id": pid,
+                        "relation": "owl:differentFrom",
+                        "canonical": pid.split("|", 1)[0],
+                    }
+                    for pid in pair_ids
+                ]
+                return [json.dumps({"decisions": decisions})]
+            if "ExtractTriples" in req_str or "triples" in req_str:
+                if "Cupertino" in req_str:
+                    return [
+                        json.dumps(
+                            {
+                                "triples": [
+                                    {
+                                        "subj": "Apple",
+                                        "subj_def": "Technology company headquartered in Cupertino",
+                                        "pred": "headquartered in",
+                                        "obj": "Cupertino",
+                                        "obj_def": "City in Silicon Valley, California",
+                                        "spo_def": "Apple is a technology company headquartered in Cupertino.",
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                if "orchard" in req_str:
+                    return [
+                        json.dumps(
+                            {
+                                "triples": [
+                                    {
+                                        "subj": "Apple",
+                                        "subj_def": "Edible pome fruit harvested from orchard trees",
+                                        "pred": "harvested in",
+                                        "obj": "Autumn",
+                                        "obj_def": "Temperate harvest season",
+                                        "spo_def": "Apple fruit is harvested in autumn from orchard trees.",
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+            if "ExtractEntities" in req_str or "named_entities" in req_str:
+                if "Cupertino" in req_str:
+                    return [
+                        json.dumps(
+                            {
+                                "named_entities": [
+                                    ["Apple", "Technology company headquartered in Cupertino"],
+                                    ["Cupertino", "City in Silicon Valley, California"],
+                                ]
+                            }
+                        )
+                    ]
+                if "orchard" in req_str:
+                    return [
+                        json.dumps(
+                            {
+                                "named_entities": [
+                                    ["Apple", "Edible pome fruit harvested from orchard trees"],
+                                    ["Autumn", "Temperate harvest season"],
+                                ]
+                            }
+                        )
+                    ]
+            return super().__call__(prompt=prompt, messages=messages, **kwargs)
+
+    dspy.settings.configure(lm=HomographGateLM())
+    program = HippoRAGProgram(execution_mode="direct", qa_mode="cot", enable_gbnf=False)
+    embedder: Any = DeterministicMockEmbedder(dim=64)
+
+    engine = YawGraphEngine(
+        db_path=tmp_path / "yaw_homograph.db",
+        workspace_root=tmp_path,
+        program=program,
+        embedder=embedder,
+        retrieval_top_k=2,
+    )
+    try:
+        # Index first passage: creates primary "Apple" entity (tech company)
+        n1 = engine.index(["Apple is a technology company headquartered in Cupertino."])
+        assert n1 == 1
+
+        # Index second passage: "Apple" with different inline definition triggers provisional sense split
+        n2 = engine.index(["The apple is an edible pome fruit harvested in orchard trees during Autumn."])
+        assert n2 == 1
+
+        # Verify two distinct Apple entities exist, linked by owl:differentFrom and sharing prefLabel "apple"
+        apple_entities = engine.conn.execute(
+            "SELECT entity_id, name, definition FROM entities WHERE LOWER(name) LIKE 'apple%';"
+        ).fetchall()
+        assert len(apple_entities) == 2
+
+        diff_edges = engine.conn.execute(
+            "SELECT COUNT(*) FROM edges WHERE kind = 'owl:differentFrom';"
+        ).fetchone()[0]
+        assert diff_edges >= 2
+
+        report = engine.lint_graph(as_turtle=True)
+        assert report["conforms"] is True
+        assert report["violations"] == []
+        ttl = report["turtle"]
+        assert "sh:conforms true" in ttl
+        assert "owl:differentFrom" in ttl
+    finally:
+        engine.close()
+
+
+def test_engine_same_label_provisional_split_merged_by_judge_synonyms_and_stage1_standalone_ner(
+    tmp_path: Path,
+) -> None:
+    """Verify Hazard 2 (same-label cos < 0.85 merged back when JudgeSynonyms returns skos:altLabel) and Hazard 3 Option A (standalone Stage 1 NER entities preserved with definitions)."""
+    import json
+    import re
+
+    class SynonymMergeAndStandaloneNerLM(DeterministicMockLM):
+        def __call__(
+            self,
+            prompt: str | None = None,
+            messages: list[dict[str, Any]] | None = None,
+            **kwargs: Any,
+        ) -> list[str]:
+            if getattr(dspy.settings, "usage_tracker", None) is not None:
+                dspy.settings.usage_tracker.add_usage(
+                    self.model,
+                    {"prompt_tokens": 32, "completion_tokens": 16, "total_tokens": 48},
+                )
+            req_str = str(prompt or messages or kwargs)
+            if "JudgeSynonyms" in req_str or "candidate_pairs" in req_str:
+                pair_ids = list(
+                    dict.fromkeys(re.findall(r"entity-[0-9a-f]+\|entity-[0-9a-f]+", req_str))
+                )
+                decisions = []
+                for pid in pair_ids:
+                    ea, eb = pid.split("|", 1)
+                    # Merge same-label provisional sense back into canonical entity via skos:altLabel
+                    decisions.append(
+                        {
+                            "pair_id": pid,
+                            "relation": "skos:altLabel",
+                            "canonical": ea,
+                        }
+                    )
+                return [json.dumps({"decisions": decisions})]
+            if "ExtractTriples" in req_str or "triples" in req_str:
+                if "iPhone" in req_str:
+                    return [
+                        json.dumps(
+                            {
+                                "triples": [
+                                    ["Apple", "designed", "iPhone"],
+                                ]
+                            }
+                        )
+                    ]
+                if "MacBook" in req_str:
+                    return [
+                        json.dumps(
+                            {
+                                "triples": [
+                                    ["Apple", "manufactures", "MacBook"],
+                                ]
+                            }
+                        )
+                    ]
+            if "ExtractEntities" in req_str or "named_entities" in req_str:
+                if "iPhone" in req_str:
+                    return [
+                        json.dumps(
+                            {
+                                "named_entities": [
+                                    ["Apple", "Consumer electronics maker founded by Steve Jobs"],
+                                    ["iPhone", "Flagship smartphone line designed by Apple"],
+                                    ["2007", "Year the original iPhone was unveiled"],
+                                ]
+                            }
+                        )
+                    ]
+                if "MacBook" in req_str:
+                    return [
+                        json.dumps(
+                            {
+                                "named_entities": [
+                                    ["Apple", "Multinational personal computer corporation in California"],
+                                    ["MacBook", "Line of Macintosh portable computers"],
+                                    ["M3 Max", "System on a chip powering MacBook Pro laptops"],
+                                ]
+                            }
+                        )
+                    ]
+            return super().__call__(prompt=prompt, messages=messages, **kwargs)
+
+    dspy.settings.configure(lm=SynonymMergeAndStandaloneNerLM())
+    program = HippoRAGProgram(execution_mode="direct", qa_mode="cot", enable_gbnf=False)
+    embedder: Any = DeterministicMockEmbedder(dim=64)
+
+    engine = YawGraphEngine(
+        db_path=tmp_path / "yaw_hazard2_3.db",
+        workspace_root=tmp_path,
+        program=program,
+        embedder=embedder,
+        retrieval_top_k=2,
+        synonymy_threshold=0.99,  # Ensure only same-label candidate pair is surfaced
+    )
+    try:
+        engine.index(["Apple designed the iPhone in 2007."])
+        engine.index(["Apple manufactures the MacBook with the M3 Max chip."])
+
+        # Hazard 2: Provisional sense split for "Apple" (since mock embedder cos < 0.85 for different defs)
+        # had NO premature owl:differentFrom edge in Step 4 and was merged back into 1 Apple entity by JudgeSynonyms!
+        apple_rows = engine.conn.execute(
+            "SELECT entity_id, name, definition FROM entities WHERE name = 'apple'"
+        ).fetchall()
+        assert len(apple_rows) == 1
+        diff_edges = engine.conn.execute(
+            "SELECT COUNT(*) FROM edges WHERE kind = 'owl:differentFrom'"
+        ).fetchone()[0]
+        assert diff_edges == 0
+
+        # Hazard 3 Option A: Standalone Stage 1 NER entities ("2007" and "m3 max") that did NOT appear in any triple
+        # are preserved in entities with their Stage 1 definitions and linked via passage edges!
+        standalone_rows = {
+            str(r[0]): str(r[1])
+            for r in engine.conn.execute(
+                "SELECT name, definition FROM entities WHERE name IN ('2007', 'm3 max')"
+            ).fetchall()
+        }
+        assert "2007" in standalone_rows
+        assert "Year the original iPhone was unveiled" in standalone_rows["2007"]
+        assert "m3 max" in standalone_rows
+        assert "System on a chip powering MacBook Pro laptops" in standalone_rows["m3 max"]
+
+        passage_edges_for_standalone = engine.conn.execute(
+            """
+            SELECT COUNT(*) FROM edges ed
+            INNER JOIN entities e ON ed.src_id = e.entity_id
+            WHERE ed.kind = 'passage' AND e.name IN ('2007', 'm3 max')
+            """
+        ).fetchone()[0]
+        assert passage_edges_for_standalone == 2
+
+        # Verify 0 SHACL violations (including ConceptShape/S13-disjointLabels across both chunks)
+        assert engine._graph_rlm_stats["synonym_judge_tokens"] == 48
+        report = engine.lint_graph()
+        assert report["conforms"] is True
+        assert report["violations"] == []
+    finally:
+        engine.close()
+
+
+def test_engine_step7_heal_shacl_violations_rlm_repl_tools_and_token_stats(
+    tmp_path: Path,
+) -> None:
+    """Verify Step 6 synonym_judge_tokens and Step 7 heal_shacl_violations in RLM mode using all 5 bound REPL tools without nested track_usage() double-counting."""
+    import json
+    import re
+
+    repl_tool_events: list[str] = []
+
+    class RLMOrchestratorLM(dspy.LM):
+        """Heterogeneous NPU orchestrator LM (40 tokens per call, ChatAdapter, no GBNF)."""
+
+        def __init__(self) -> None:
+            super().__init__(model="mistral-orchestrator")
+            self._yaw_recipe = "ryzenai-llm"
+            self._yaw_supports_gbnf = False
+
+        def __call__(
+            self,
+            prompt: str | None = None,
+            messages: list[dict[str, Any]] | None = None,
+            **kwargs: Any,
+        ) -> list[str]:
+            if getattr(dspy.settings, "usage_tracker", None) is not None:
+                dspy.settings.usage_tracker.add_usage(
+                    self.model,
+                    {"prompt_tokens": 25, "completion_tokens": 15, "total_tokens": 40},
+                )
+            req_str = str(prompt or messages or kwargs)
+            if "qwen_propose_shacl_repairs" in req_str:
+                repl_tool_events.append("shacl_healer_rlm_invoked")
+                code = (
+                    "import json\n"
+                    "v_items = json.loads(violations)\n"
+                    "focus_id = v_items[0]['focus_node']\n"
+                    "node_ctx = inspect_focus_node(focus_id)\n"
+                    "chunk_text = hydrate_chunk(node_ctx['chunk_ids'][0])\n"
+                    "assert 'Alan Turing formulated the Turing machine' in chunk_text\n"
+                    "repairs = qwen_propose_shacl_repairs(violations=violations, focus_context=chunk_text)\n"
+                    "applied_first = apply_shacl_repairs([repairs[0]])\n"
+                    "applied_dup = apply_shacl_repairs([repairs[0]])\n"
+                    "remaining_mid = lint_shacl()\n"
+                    "assert applied_first == 1 and applied_dup == 0 and len(remaining_mid) == 1\n"
+                    "SUBMIT(repairs=repairs)"
+                )
+                return [
+                    f"[[ ## reasoning ## ]]\nInspect focus node, hydrate chunk, propose/apply repairs, and lint.\n\n"
+                    f"[[ ## code ## ]]\n```python\n{code}\n```\n\n[[ ## completed ## ]]"
+                ]
+            if "qwen_judge_synonyms" in req_str:
+                code = (
+                    "decisions = qwen_judge_synonyms(candidate_pairs=candidate_pairs)\n"
+                    "SUBMIT(decisions=decisions)"
+                )
+                return [
+                    f"[[ ## reasoning ## ]]\nDelegate synonym judgment to Qwen worker.\n\n"
+                    f"[[ ## code ## ]]\n```python\n{code}\n```\n\n[[ ## completed ## ]]"
+                ]
+            if "qwen_extract_triples" in req_str:
+                code = (
+                    "triples = qwen_extract_triples(passage=passage, named_entities=named_entities)\n"
+                    "SUBMIT(triples=triples)"
+                )
+                return [
+                    f"[[ ## reasoning ## ]]\nDelegate triple extraction to Qwen worker.\n\n"
+                    f"[[ ## code ## ]]\n```python\n{code}\n```\n\n[[ ## completed ## ]]"
+                ]
+            code = (
+                "entities = qwen_extract_entities(passage=passage)\n"
+                "SUBMIT(named_entities=entities)"
+            )
+            return [
+                f"[[ ## reasoning ## ]]\nDelegate entity extraction to Qwen worker.\n\n"
+                f"[[ ## code ## ]]\n```python\n{code}\n```\n\n[[ ## completed ## ]]"
+            ]
+
+    class QwenWorkerLM(dspy.LM):
+        """GBNF-constrained GPU worker LM (30 tokens per call, JSONAdapter)."""
+
+        def __init__(self) -> None:
+            super().__init__(model="qwen-worker")
+            self._yaw_recipe = "llamacpp"
+            self._yaw_supports_gbnf = True
+
+        def __call__(
+            self,
+            prompt: str | None = None,
+            messages: list[dict[str, Any]] | None = None,
+            **kwargs: Any,
+        ) -> list[str]:
+            if getattr(dspy.settings, "usage_tracker", None) is not None:
+                dspy.settings.usage_tracker.add_usage(
+                    self.model,
+                    {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30},
+                )
+            req_str = str(prompt or messages or kwargs)
+            if "[[ ## violations ## ]]" in req_str or "bounded closed-world SHACL repair" in req_str:
+                focus_matches = list(dict.fromkeys(re.findall(r"entity-[0-9a-f]+", req_str)))
+                for fn in focus_matches:
+                    repl_tool_events.append(f"qwen_propose_shacl_repairs:{fn}")
+                return [
+                    json.dumps(
+                        {
+                            "repairs": [
+                                {
+                                    "focus_node": fn,
+                                    "action": "set_definition",
+                                    "value": "Healed concept definition from Alan Turing formulated the Turing machine in 1936.",
+                                }
+                                for fn in focus_matches
+                            ]
+                        }
+                    )
+                ]
+            if "[[ ## candidate_pairs ## ]]" in req_str or "candidate_pairs" in req_str:
+                pair_ids = list(
+                    dict.fromkeys(re.findall(r"entity-[0-9a-f]+\|entity-[0-9a-f]+", req_str))
+                )
+                decisions = [
+                    {
+                        "pair_id": pid,
+                        "relation": "skos:related",
+                        "canonical": pid.split("|", 1)[0],
+                    }
+                    for pid in pair_ids
+                ]
+                return [json.dumps({"decisions": decisions})]
+            if "[[ ## named_entities ## ]]" in req_str or "Resource Description Framework" in req_str:
+                if "Bletchley" in req_str:
+                    return [
+                        json.dumps(
+                            {
+                                "triples": [
+                                    {
+                                        "subj": "Alan M. Turing",
+                                        "subj_def": "British cryptanalyst at Bletchley Park",
+                                        "pred": "worked at",
+                                        "obj": "Bletchley Park",
+                                        "obj_def": "British wartime codebreaking center",
+                                        "spo_def": "Alan M. Turing worked on cryptanalysis at Bletchley Park.",
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                return [
+                    json.dumps(
+                        {
+                            "triples": [
+                                {
+                                    "subj": "Alan Turing",
+                                    "subj_def": "English mathematician and logician",
+                                    "pred": "formulated",
+                                    "obj": "Turing machine",
+                                    "obj_def": "Mathematical model of computation",
+                                    "spo_def": "Alan Turing formulated the Turing machine in 1936.",
+                                }
+                            ]
+                        }
+                    )
+                ]
+            if "Bletchley" in req_str:
+                return [
+                    json.dumps(
+                        {
+                            "named_entities": [
+                                ["Alan M. Turing", "British cryptanalyst at Bletchley Park"],
+                                ["Bletchley Park", "British wartime codebreaking center"],
+                            ]
+                        }
+                    )
+                ]
+            return [
+                json.dumps(
+                    {
+                        "named_entities": [
+                            ["Alan Turing", "English mathematician and logician"],
+                            ["Turing machine", "Mathematical model of computation"],
+                        ]
+                    }
+                )
+            ]
+
+    orch_lm = RLMOrchestratorLM()
+    worker_lm = QwenWorkerLM()
+    program = HippoRAGProgram(
+        execution_mode="direct",
+        qa_mode="rlm",
+        enable_gbnf=True,
+        orchestrator_lm=orch_lm,
+        rlm_sub_lm=worker_lm,
+        rlm_max_iters=3,
+    )
+    embedder: Any = DeterministicMockEmbedder(dim=64)
+
+    engine = YawGraphEngine(
+        db_path=tmp_path / "yaw_step7_rlm.db",
+        workspace_root=tmp_path,
+        program=program,
+        embedder=embedder,
+        retrieval_top_k=2,
+        synonymy_threshold=-1.0,
+    )
+    try:
+        # 1. Index first document so "alan turing" and "turing machine" are materialized and linked to chunk 1 on disk
+        assert engine.index(["Alan Turing formulated the Turing machine in 1936."]) == 1
+        assert engine._graph_rlm_stats["synonym_judge_tokens"] == 30
+
+        # Verify _apply_shacl_repairs ignores nonexistent focus nodes without inserting orphan labels
+        with engine.managed_conn.transaction() as conn:
+            noop_cnt = engine._apply_shacl_repairs(
+                conn,
+                [
+                    {
+                        "focus_node": "entity-nonexistent",
+                        "action": "set_definition",
+                        "value": "Should not count",
+                    },
+                    {
+                        "focus_node": "entity-nonexistent",
+                        "action": "set_pref_label",
+                        "value": "Ghost Label",
+                    },
+                ],
+            )
+            assert noop_cnt == 0
+            orphan_lbls = conn.execute(
+                "SELECT COUNT(*) FROM entity_labels WHERE entity_id = 'entity-nonexistent'"
+            ).fetchone()[0]
+            assert orphan_lbls == 0
+
+            # Inject 2 ConceptShape/definition SHACL violations on "alan turing" and "turing machine"
+            conn.execute(
+                "UPDATE entities SET definition = '' WHERE name IN ('alan turing', 'turing machine')"
+            )
+
+        pre_lint = engine.lint_graph()
+        assert pre_lint["conforms"] is False
+        assert pre_lint["violation_count"] == 2
+        assert all(v["shape"] == "ConceptShape/definition" for v in pre_lint["violations"])
+
+        # 2. Switch to RLM mode and index second document:
+        #    - Step 6 runs synonym_judge_rlm on candidate pairs
+        #    - Step 7 runs shacl_healer_rlm using all 5 bound REPL tools (applying repair[0] in REPL + repair[1] post-RLM)
+        program.execution_mode = "rlm"
+        program.telemetry.clear()
+        program.synonym_audit_trail.clear()
+        program.shacl_audit_trail.clear()
+
+        assert (
+            engine.index(["Alan M. Turing worked on cryptanalysis at Bletchley Park."])
+            == 1
+        )
+
+        # Verify all 5 REPL tools ran inside shacl_healer_rlm and healed both violations
+        assert "shacl_healer_rlm_invoked" in repl_tool_events
+        assert sum(1 for ev in repl_tool_events if ev.startswith("qwen_propose_shacl_repairs:")) == 2
+
+        # Verify exact non-double-counted token accounting (40 orchestrator + 30 worker = 70 tokens per RLM stage)
+        assert len(program.synonym_audit_trail) == 2  # inner direct (30) + outer RLM (70)
+        assert program.synonym_audit_trail[0]["mode"] == "direct"
+        assert program.synonym_audit_trail[0]["tokens_used"] == 30
+        assert program.synonym_audit_trail[-1]["mode"] == "rlm"
+        assert program.synonym_audit_trail[-1]["tokens_used"] == 70
+        assert engine._graph_rlm_stats["synonym_judge_tokens"] == 100  # 30 (doc 1 direct) + 70 (doc 2 RLM)
+
+        assert len(program.shacl_audit_trail) == 2  # inner direct (30) + outer RLM (70)
+        assert program.shacl_audit_trail[0]["mode"] == "direct"
+        assert program.shacl_audit_trail[0]["tokens_used"] == 30
+        assert program.shacl_audit_trail[-1]["mode"] == "rlm"
+        assert program.shacl_audit_trail[-1]["tokens_used"] == 70
+        assert engine._graph_rlm_stats["shacl_healer_tokens"] == 70
+
+        # Verify Step 7 SHACL violation and deduplicated repair stats (1 in REPL + 1 post-RLM = 2, not 3)
+        assert engine._graph_rlm_stats["shacl_violations_initial"] > 0
+        assert engine._graph_rlm_stats["shacl_violations_initial"] == 2
+        assert engine._graph_rlm_stats["shacl_violations_before"] == 2
+        assert engine._graph_rlm_stats["shacl_violations_remaining"] == 0
+        assert engine._graph_rlm_stats["shacl_violations_after"] == 0
+        assert engine._graph_rlm_stats["shacl_repairs_applied"] == 2
+        assert engine._graph_rlm_stats["shacl_conforms"] is True
+
+        healed_defs = [
+            str(r[0])
+            for r in engine.conn.execute(
+                "SELECT definition FROM entities WHERE name IN ('alan turing', 'turing machine')"
+            ).fetchall()
+        ]
+        assert len(healed_defs) == 2
+        assert all("formulated the Turing machine" in d for d in healed_defs)
+
+        post_lint = engine.lint_graph()
+        assert post_lint["conforms"] is True
+        assert post_lint["violations"] == []
+    finally:
+        engine.close()
+
+
+def test_engine_define_missing_entities_telemetry_and_no_heuristic_fallbacks(
+    tmp_path: Path,
+) -> None:
+    """Verify index_chunks repairs missing entity definitions via DefineMissingEntities, tracks stats, and never uses heuristic fallbacks."""
+    import json
+
+    class MissingEntityRepairLM(DeterministicMockLM):
+        def __call__(
+            self,
+            prompt: str | None = None,
+            messages: list[dict[str, Any]] | None = None,
+            **kwargs: Any,
+        ) -> list[str]:
+            if getattr(dspy.settings, "usage_tracker", None) is not None:
+                dspy.settings.usage_tracker.add_usage(
+                    self.model,
+                    {"prompt_tokens": 30, "completion_tokens": 15, "total_tokens": 45},
+                )
+            req_str = str(prompt or messages or kwargs)
+            if (
+                "DefineMissingEntities" in req_str
+                or "missing_entities" in req_str
+                or "entity_definitions" in req_str
+            ):
+                return [
+                    json.dumps(
+                        {
+                            "entity_definitions": [
+                                [
+                                    "Charles Babbage",
+                                    "English polymath who originated the programmable computer",
+                                ]
+                            ]
+                        }
+                    )
+                ]
+            if "ExtractTriples" in req_str or "triples" in req_str:
+                return [
+                    json.dumps(
+                        {
+                            "triples": [
+                                {
+                                    "sub": "Ada Lovelace",
+                                    "pred": "collaborated with",
+                                    "obj": "Charles Babbage",
+                                    "def": "Ada Lovelace collaborated with Charles Babbage.",
+                                }
+                            ]
+                        }
+                    )
+                ]
+            if "ExtractEntities" in req_str or "named_entities" in req_str:
+                return [
+                    json.dumps(
+                        {
+                            "named_entities": [
+                                ["Ada Lovelace", "English mathematician and writer"],
+                            ]
+                        }
+                    )
+                ]
+            return super().__call__(prompt=prompt, messages=messages, **kwargs)
+
+    dspy.settings.configure(lm=MissingEntityRepairLM())
+    program = HippoRAGProgram(execution_mode="direct", qa_mode="cot", enable_gbnf=False)
+    embedder: Any = DeterministicMockEmbedder(dim=64)
+
+    engine = YawGraphEngine(
+        db_path=tmp_path / "yaw_missing_defs.db",
+        workspace_root=tmp_path,
+        program=program,
+        embedder=embedder,
+        retrieval_top_k=2,
+    )
+    try:
+        with dspy.context(track_usage=True):
+            n = engine.index(["Ada Lovelace collaborated with Charles Babbage."])
+        assert n == 1
+        assert engine._graph_rlm_stats["missing_entity_defs_count"] == 1
+        assert engine._graph_rlm_stats["missing_entity_defs_tokens"] == 45
+        assert len(program.entity_def_audit_trail) == 1
+        assert program.entity_def_audit_trail[0]["missing_count"] == 1
+        assert program.entity_def_audit_trail[0]["tokens"] == 45
+
+        rows = {
+            str(r[0]): str(r[1])
+            for r in engine.conn.execute(
+                "SELECT name, definition FROM entities"
+            ).fetchall()
+        }
+        assert rows["ada lovelace"] == "English mathematician and writer"
+        assert (
+            rows["charles babbage"]
+            == "English polymath who originated the programmable computer"
+        )
+        for defn in rows.values():
+            assert "(in statement:" not in defn
+            assert "(in passage:" not in defn
+            assert "extracted from" not in defn
+
+        report = engine.lint_graph()
+        assert report["conforms"] is True
+        assert report["violations"] == []
     finally:
         engine.close()

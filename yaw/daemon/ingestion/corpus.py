@@ -1,7 +1,7 @@
 """Textbook CocoIndex v1 incremental line-pointer ingestion pipeline."""
 
 import bisect
-from collections.abc import Collection, Sequence
+from collections.abc import Callable, Collection, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +29,8 @@ _ChunkAction = tuple[str, _ChunkValue | None]
 
 _SINK_KEY = coco.ContextKey[list[_ChunkAction]]("yaw_chunk_sink")
 _CORPUS_ROOT_KEY = coco.ContextKey[Path]("yaw_corpus_root")
+_COMPILER_KEY = coco.ContextKey[Callable[[SyncDelta], None] | None]("yaw_delta_compiler")
+_COMPILER_ERROR_KEY = coco.ContextKey[list[Exception]]("yaw_delta_compiler_errors")
 
 
 class _ChunkTargetHandler(coco.TargetHandler[_ChunkValue, bytes]):
@@ -40,6 +42,25 @@ class _ChunkTargetHandler(coco.TargetHandler[_ChunkValue, bytes]):
     def _apply_actions(
         self, context_provider: coco.ContextProvider, actions: Sequence[_ChunkAction]
     ) -> None:
+        compiler = context_provider.get(_COMPILER_KEY)
+        if compiler is not None and actions:
+            added_chunks: list[tuple[ChunkPointer, str]] = []
+            deleted_chunk_ids: list[str] = []
+            for chunk_id, value in actions:
+                if value is not None:
+                    ptr, chunk_text = value
+                    added_chunks.append((ptr, chunk_text))
+                else:
+                    deleted_chunk_ids.append(chunk_id)
+            delta = SyncDelta(
+                added_chunks=tuple(added_chunks),
+                deleted_chunk_ids=tuple(deleted_chunk_ids),
+            )
+            try:
+                compiler(delta)
+            except Exception as exc:
+                context_provider.get(_COMPILER_ERROR_KEY).append(exc)
+                raise
         context_provider.get(_SINK_KEY).extend(actions)
 
     def reconcile(
@@ -256,6 +277,7 @@ class CorpusIngestor:
         chunk_size: int = 1200,
         chunk_overlap: int = 100,
         min_chunk_size: int = 50,
+        on_delta: Callable[[SyncDelta], None] | None = None,
     ) -> None:
         self.corpus_root = Path(corpus_root).resolve()
         self.state_dir = Path(state_dir).resolve()
@@ -267,11 +289,15 @@ class CorpusIngestor:
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.min_chunk_size = min_chunk_size
+        self._on_delta = on_delta
 
         self._actions_list: list[_ChunkAction] = []
+        self._compiler_errors: list[Exception] = []
         self._cp = coco.ContextProvider()
         self._cp.provide(_SINK_KEY, self._actions_list)
         self._cp.provide(_CORPUS_ROOT_KEY, self.corpus_root)
+        self._cp.provide(_COMPILER_KEY, self._on_delta)
+        self._cp.provide(_COMPILER_ERROR_KEY, self._compiler_errors)
 
         lmdb_path = self.state_dir / "coco_lmdb"
         self._env = coco.Environment(
@@ -288,6 +314,11 @@ class CorpusIngestor:
             min_chunk_size=self.min_chunk_size,
         )
 
+    def set_delta_compiler(self, compiler: Callable[[SyncDelta], None] | None) -> None:
+        """Bind or update the target sink delta compiler callback."""
+        self._on_delta = compiler
+        self._cp.provide(_COMPILER_KEY, compiler)
+
     def close(self) -> None:
         """Close the underlying CocoIndex environment and release LMDB resources."""
         self._env.close()
@@ -301,7 +332,10 @@ class CorpusIngestor:
     def poll(self) -> SyncDelta:
         """Run incremental CocoIndex update and return coalesced batch SyncDelta."""
         self._actions_list.clear()
+        self._compiler_errors.clear()
         self._app.update_blocking()
+        if self._compiler_errors:
+            raise self._compiler_errors[0]
 
         added_chunks: list[tuple[ChunkPointer, str]] = []
         deleted_chunk_ids: list[str] = []
