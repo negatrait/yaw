@@ -559,6 +559,11 @@ class _PredictorBoundLM(dspy.BaseLM):
                 message=".*messages=.*",
                 category=DeprecationWarning,
             )
+            warnings.filterwarnings(
+                "ignore",
+                message=".*Pydantic serializer warnings.*",
+                category=UserWarning,
+            )
             if prompt is not None:
                 result = target(prompt, messages=messages, **kwargs)
             else:

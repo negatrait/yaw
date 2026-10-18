@@ -46,3 +46,7 @@ ignore = ["E501", "B010", "B009"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+filterwarnings = [
+    "ignore::pydantic.warnings.PydanticDeprecatedSince20:litellm.*",
+    "ignore:.*Pydantic serializer warnings.*:UserWarning:pydantic.main",
+]
