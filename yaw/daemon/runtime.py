@@ -679,31 +679,29 @@ class YawRuntime:
                 raise YawRuntimeError(
                     "EMPTY_INDEX", "Cannot execute rag_qa on an empty graph index."
                 )
-            hits = self.engine.retrieve(cleaned, top_k=self.config.retrieval_top_k)
-            formatted_context = "\n\n".join(
-                f"Wikipedia Title: {p.title}\n{text}" if p.title else text
-                for p, _, text in hits
-            )
-            pred = self.engine.program.answer_question(
-                context=formatted_context, question=cleaned
-            )
+            pred = self.engine.program(question=cleaned)
             ans = str(getattr(pred, "answer", "")).strip()
             reasoning = str(getattr(pred, "reasoning", "")).strip()
+            top_n = min(5, self.config.retrieval_top_k)
+            passages_text = tuple(getattr(pred, "retrieved_passages", ()))[:top_n]
+            scores = tuple(getattr(pred, "retrieved_scores", ()))[:top_n]
+            pids = tuple(getattr(pred, "retrieved_chunk_ids", ()))[:top_n]
+            ptrs_map = self.engine.resolve_chunk_pointers(pids)
             passages = [
                 {
                     "rank": idx + 1,
-                    "text": text,
-                    "score": score,
-                    "chunk_id": ptr.chunk_id,
+                    "text": str(text),
+                    "score": float(scores[idx]) if idx < len(scores) else 0.0,
+                    "chunk_id": str(cid),
                     "stale_on_disk": False,
                     "source": {
-                        "rel_posix_path": ptr.rel_posix_path,
-                        "start_line": ptr.start_line,
-                        "end_line": ptr.end_line,
-                        "title": ptr.title,
+                        "rel_posix_path": ptrs_map[cid].rel_posix_path if cid in ptrs_map else "",
+                        "start_line": ptrs_map[cid].start_line if cid in ptrs_map else 0,
+                        "end_line": ptrs_map[cid].end_line if cid in ptrs_map else 0,
+                        "title": ptrs_map[cid].title if cid in ptrs_map else "",
                     },
                 }
-                for idx, (ptr, score, text) in enumerate(hits[:5])
+                for idx, (cid, text) in enumerate(zip(pids, passages_text, strict=False))
             ]
             return {
                 "question": cleaned,

@@ -652,7 +652,7 @@ Offline test suite: `uv run --locked python -m unittest discover -s tests -v` â€
     - Wired `configure_yaw_dspy_cache(self._dspy_cache_dir, restrict_pickle=True)` in `YawGraphEngine.__init__` and released open disk cache handles in `YawGraphEngine.close()`.
     - Retired the ad-hoc `saved_cache_flags` dictionary in `YawGraphEngine.evolve_prompts` (`optimize`), replacing it with `configure_yaw_dspy_cache(self._dspy_cache_dir, enable_disk_cache=False, enable_memory_cache=False, restrict_pickle=True)` inside a `try / finally` block that restores `enable_disk_cache=True, enable_memory_cache=True, restrict_pickle=True`.
   - **Engine-Level `as_rm()`, `as_retriever()`, and `_search_graph_for_react` (`yaw/daemon/graph/engine.py`, `yaw/daemon/graph/inference/program.py`):**
-    - Added `YawGraphEngine._rm_retrieval_hook`, `YawGraphEngine.as_rm(k=None, *, configure_dspy=False) -> YawRM`, and `YawGraphEngine.as_retriever(k=None, *, configure_dspy=False) -> YawRetriever` so external `dspy.Retrieve(k=...)` modules resolve directly against `yaw.db` when `configure_dspy=True` is set.
+    - Added `YawGraphEngine._canonical_retrieval_hook`, `YawGraphEngine.as_rm(k=None, *, configure_dspy=False) -> YawRM`, and `YawGraphEngine.as_retriever(k=None, *, configure_dspy=False) -> YawRetriever` so external `dspy.Retrieve(k=...)` modules resolve directly against `yaw.db` when `configure_dspy=True` is set.
     - Implemented `YawGraphEngine._search_graph_for_react(query: str) -> str` combining dense KNN (`search_fact_vectors_knn`, `search_chunk_vectors_knn`) and FTS5 (`search_facts_fts`, `search_chunks_fts`) fact/passage lookup and bound it via `target.set_graph_search_tool(self._search_graph_for_react)` in `_bind_program_hooks`.
   - **Top-3 Pareto Frontier Export & `dspy.Evaluate` Harness (`yaw/daemon/graph/engine.py`):**
     - Enriched `_evaluate_prediction` with `dspy.evaluate.answer_passage_match` (`AnswerPassageMatch={0|1}`) in the GEPA diagnostic feedback string.
@@ -667,3 +667,24 @@ Offline test suite: `uv run --locked python -m unittest discover -s tests -v` â€
   - `git diff --check` $\to$ **Clean**.
   - `git grep -n "def forward" yaw/daemon/graph/inference/chat.py` $\to$ **0 matches**.
   - `git grep -w "saved_cache_flags" yaw/` $\to$ **0 matches**.
+
+## 19. Unification of Dual Retrieval Hooks & `rag_qa()` Forward Bypass Consolidation (2026-10-19)
+
+- **Scope:** Consolidated the three divergent retrieval/QA pathways (`_rm_retrieval_hook`, `_program_retrieval_hook`, and the manual `rag_qa` / `runtime.rag_qa_async` bypass) into a single canonical execution path:
+  - **Canonical Retrieval Hook (`yaw/daemon/graph/engine.py`):**
+    - Replaced `_rm_retrieval_hook` and `_program_retrieval_hook` with `YawGraphEngine._canonical_retrieval_hook(question, program=None, *, item_docs=None, k=None) -> tuple[str, tuple[str, ...], tuple[float, ...], tuple[str, ...]]`.
+    - Ensures candidate chunks are indexed in the optimization sandbox, replays captured GEPA chunk/graph extraction traces (`_captured_chunk_traces`, `_captured_graph_traces`) into `dspy.settings.trace`, executes hybrid PPR retrieval, formats AST-budgeted QA context (`self.format_qa_context(hits[:qa_top_k])`), and returns the canonical 4-tuple `(formatted_context, texts, scores, pids)`.
+  - **`HippoRAGProgram.forward` & `YawRetriever.forward` Chunk ID Propagation (`yaw/daemon/graph/inference/program.py`):**
+    - Enriched `YawRetriever.forward` with `all_pids` and `HippoRAGProgram.forward` with `retrieved_chunk_ids=pids` alongside `retrieved_passages` (hydrated texts) and `retrieved_scores`.
+  - **`rag_qa()` & `YawRuntime.rag_qa_async` Forward Routing (`yaw/daemon/graph/engine.py`, `yaw/daemon/runtime.py`):**
+    - Simplified `YawGraphEngine.rag_qa` and `YawRuntime.rag_qa_async` to invoke `self.program(question=...)` (`HippoRAGProgram.forward`), automatically inheriting AST-coalesced context formatting, `ParetoProgramEnsemble` consensus, `dspy.ReActV2` multi-hop fallback, and `track_usage()` telemetry.
+    - Added `YawGraphEngine.resolve_chunk_pointers(chunk_ids)` so `YawRuntime.rag_qa_async` resolves structured `ChunkPointer` evidence without protected attribute access (`_lock`) or cross-domain storage imports.
+
+- **Verification & Oblivion Gate Status:**
+  - `uv run --locked pytest tests/daemon/graph/test_engine.py tests/daemon/test_runtime.py -q` $\to$ **32 passed in 23.65s**.
+  - `uv run --locked pytest -m "not live_silicon" -k "not live_silicon" -q` $\to$ **173 passed, 2 deselected, 3 subtests passed in 31.79s**.
+  - `uv run --locked ruff check .` $\to$ **All checks passed!**
+  - `uv run --locked ty check` $\to$ **All checks passed!**
+  - `git diff --check` $\to$ **Clean**.
+  - `git grep -w "_rm_retrieval_hook" yaw/ tests/` $\to$ **0 matches**.
+  - `git grep -w "_program_retrieval_hook" yaw/ tests/` $\to$ **0 matches**.

@@ -693,7 +693,7 @@ class YawRM:
 
     def __init__(
         self,
-        hook: Callable[..., tuple[str, tuple[str, ...], tuple[float, ...]]] | None = None,
+        hook: Callable[..., tuple[str, tuple[str, ...], tuple[float, ...]] | tuple[str, tuple[str, ...], tuple[float, ...], tuple[str, ...]]] | None = None,
         *,
         program: Any = None,
         default_k: int = 10,
@@ -799,7 +799,7 @@ class YawRetriever(dspy.Retrieve):
         k: int = 10,
         *,
         rm: YawRM | None = None,
-        hook: Callable[..., tuple[str, tuple[str, ...], tuple[float, ...]]] | None = None,
+        hook: Callable[..., tuple[str, tuple[str, ...], tuple[float, ...]] | tuple[str, tuple[str, ...], tuple[float, ...], tuple[str, ...]]] | None = None,
     ) -> None:
         super().__init__(k=k)
         self.rm: YawRM = rm if rm is not None else YawRM(hook=hook, default_k=k)
@@ -807,13 +807,13 @@ class YawRetriever(dspy.Retrieve):
             self.rm.hook = hook
 
     @property
-    def hook(self) -> Callable[..., tuple[str, tuple[str, ...], tuple[float, ...]]] | None:
+    def hook(self) -> Callable[..., tuple[str, tuple[str, ...], tuple[float, ...]] | tuple[str, tuple[str, ...], tuple[float, ...], tuple[str, ...]]] | None:
         return self.rm.hook
 
     @hook.setter
     def hook(
         self,
-        value: Callable[..., tuple[str, tuple[str, ...], tuple[float, ...]]] | None,
+        value: Callable[..., tuple[str, tuple[str, ...], tuple[float, ...]] | tuple[str, tuple[str, ...], tuple[float, ...], tuple[str, ...]]] | None,
     ) -> None:
         self.rm.hook = value
 
@@ -847,6 +847,7 @@ class YawRetriever(dspy.Retrieve):
                 pids=tuple(raw_pids[:effective_k]),
                 all_passages=tuple(raw_passages),
                 all_scores=tuple(raw_scores),
+                all_pids=tuple(raw_pids),
             )
         active_rm = getattr(dspy.settings, "rm", None)
         if active_rm is not None:
@@ -871,12 +872,26 @@ class YawRetriever(dspy.Retrieve):
                 )
                 for psg in hits
             ]
+            pids = tuple(
+                str(
+                    getattr(
+                        psg,
+                        "pid",
+                        psg.get("pid", f"chunk-{i}")
+                        if isinstance(psg, Mapping)
+                        else (psg if str(psg).startswith("chunk-") else f"chunk-{i}"),
+                    )
+                )
+                for i, psg in enumerate(hits)
+            )
             return dspy.Prediction(
                 passages=passages,
                 context="\n\n".join(passages),
                 scores=scores,
+                pids=pids,
                 all_passages=tuple(passages),
                 all_scores=tuple(scores),
+                all_pids=pids,
             )
         raise ValueError(
             "No retrieval hook or dspy.settings.rm is configured for YawRetriever."
@@ -1457,7 +1472,7 @@ class HippoRAGProgram(dspy.Module):
         )
         self.orchestrator_lm: dspy.LM | None = orchestrator_lm
         self.rlm_sub_lm: dspy.LM | None = rlm_sub_lm
-        self._retrieval_hook: Callable[..., tuple[str, tuple[str, ...], tuple[float, ...]]] | None = None
+        self._retrieval_hook: Callable[..., tuple[str, tuple[str, ...], tuple[float, ...]] | tuple[str, tuple[str, ...], tuple[float, ...], tuple[str, ...]]] | None = None
         self.rm: YawRM = YawRM(hook=None, program=self, default_k=10)
         self.retriever: YawRetriever = YawRetriever(k=10, rm=self.rm)
         self._node_inspector: Callable[[str], dict[str, Any]] | None = None
@@ -2572,7 +2587,7 @@ class HippoRAGProgram(dspy.Module):
 
     def set_retrieval_hook(
         self,
-        hook: Callable[..., tuple[str, tuple[str, ...], tuple[float, ...]]] | None,
+        hook: Callable[..., tuple[str, tuple[str, ...], tuple[float, ...]] | tuple[str, tuple[str, ...], tuple[float, ...], tuple[str, ...]]] | None,
     ) -> None:
         """Register an optional end-to-end retrieval hook executed inside forward(question=...)."""
         self._retrieval_hook = hook
@@ -2667,6 +2682,9 @@ class HippoRAGProgram(dspy.Module):
                     scores = tuple(
                         getattr(ret_pred, "all_scores", getattr(ret_pred, "scores", ())) or ()
                     )
+                    pids = tuple(
+                        getattr(ret_pred, "all_pids", getattr(ret_pred, "pids", ())) or ()
+                    )
                     if self.pareto_ensemble is not None and not self._in_ensemble:
                         pred = self.pareto_ensemble.answer_question(
                             context=hydrated_ctx, question=question, use_gbnf=use_gbnf
@@ -2692,6 +2710,7 @@ class HippoRAGProgram(dspy.Module):
                     reasoning=getattr(pred, "reasoning", ""),
                     retrieved_passages=passages,
                     retrieved_scores=scores,
+                    retrieved_chunk_ids=pids,
                 )
                 if tokens and hasattr(res, "set_lm_usage"):
                     res.set_lm_usage(tokens)

@@ -344,7 +344,14 @@ class YawGraphEngine:
 
     def _bind_program_hooks(self, program: HippoRAGProgram | None = None) -> None:
         target = program if program is not None else self.program
-        target.set_retrieval_hook(self._program_retrieval_hook)
+        target_rm = getattr(target, "rm", None)
+        if target_rm is not None:
+            target_rm.default_k = self.retrieval_top_k
+        target_ret = getattr(target, "retriever", None)
+        if target_ret is not None:
+            target_ret.k = self.retrieval_top_k
+        if hasattr(target, "set_retrieval_hook"):
+            target.set_retrieval_hook(self._canonical_retrieval_hook)
         if hasattr(target, "set_graph_tools"):
             target.set_graph_tools(
                 node_inspector=lambda eid: inspect_focus_node(self.conn, eid),
@@ -360,13 +367,20 @@ class YawGraphEngine:
         if ensemble is not None and hasattr(ensemble, "programs"):
             for sub_prog in ensemble.programs:
                 if sub_prog is not target:
-                    sub_prog.set_retrieval_hook(self._program_retrieval_hook)
+                    sub_rm = getattr(sub_prog, "rm", None)
+                    if sub_rm is not None:
+                        sub_rm.default_k = self.retrieval_top_k
+                    sub_ret = getattr(sub_prog, "retriever", None)
+                    if sub_ret is not None:
+                        sub_ret.k = self.retrieval_top_k
+                    if hasattr(sub_prog, "set_retrieval_hook"):
+                        sub_prog.set_retrieval_hook(self._canonical_retrieval_hook)
                     if hasattr(sub_prog, "set_graph_search_tool"):
                         sub_prog.set_graph_search_tool(self._search_graph_for_react)
         if hasattr(self.embedder, "bind_telemetry_hook"):
             self.embedder.bind_telemetry_hook(self._on_embedding_telemetry)
 
-    def _rm_retrieval_hook(
+    def _canonical_retrieval_hook(
         self,
         question: str,
         program: HippoRAGProgram | None = None,
@@ -374,18 +388,37 @@ class YawGraphEngine:
         item_docs: Sequence[str] | None = None,
         k: int | None = None,
     ) -> tuple[str, tuple[str, ...], tuple[float, ...], tuple[str, ...]]:
-        """Retrieval hook for `YawRM` / `YawRetriever` returning hydrated passage texts and chunk IDs."""
+        """Canonical engine retrieval hook returning (formatted_context, hydrated_texts, scores, chunk_ids)."""
         active_program = program if program is not None else self.program
-        if item_docs is not None:
-            self._ensure_candidate_chunks_indexed(active_program, item_docs=item_docs)
-        top_k = max(1, int(k if k is not None else self.retrieval_top_k))
-        hits = self.retrieve(question, top_k=top_k, program=active_program)
+        target_cids = self._ensure_candidate_chunks_indexed(
+            active_program, item_docs=item_docs
+        )
+        active_trace = getattr(dspy.settings, "trace", None)
+        if isinstance(active_trace, list):
+            named_map = dict(active_program.named_predictors())
+            for cid in target_cids:
+                for pred_name, inp_dict, out_obj in self._captured_chunk_traces.get(cid, ()):
+                    pred_inst = named_map.get(pred_name)
+                    if pred_inst is not None:
+                        active_trace.append((pred_inst, dict(inp_dict), out_obj))
+            for pred_name, inp_dict, out_obj in self._captured_graph_traces:
+                pred_inst = named_map.get(pred_name)
+                if pred_inst is not None:
+                    active_trace.append((pred_inst, dict(inp_dict), out_obj))
+
+        qa_top_k = max(1, int(k if k is not None else self.retrieval_top_k))
+        fetch_top_k = max(20, qa_top_k)
+        hits = self.retrieve(
+            question,
+            top_k=fetch_top_k,
+            program=active_program,
+        )
         if not hits:
             return "", (), (), ()
         texts = tuple(self._format_hydrated_passage(p, text) for p, _, text in hits)
         scores = tuple(float(s) for _, s, _ in hits)
         pids = tuple(p.chunk_id for p, _, _ in hits)
-        formatted_context = self.format_qa_context(hits[:top_k])
+        formatted_context = self.format_qa_context(hits[:qa_top_k])
         return formatted_context, texts, scores, pids
 
     def as_rm(
@@ -397,7 +430,7 @@ class YawGraphEngine:
         """Return a first-class `YawRM` callable bound to this engine (optionally registering `dspy.configure(rm=...)`)."""
         eff_k = int(k if k is not None else self.retrieval_top_k)
         rm = YawRM(
-            hook=self._rm_retrieval_hook,
+            hook=self._canonical_retrieval_hook,
             program=self.program,
             default_k=eff_k,
         )
@@ -905,44 +938,6 @@ class YawGraphEngine:
                 self.index_chunks(missing_to_index, program=program)
             target_list = req_chunks if req_chunks else batch_candidates
             return [p.chunk_id for p, _ in target_list]
-
-    def _program_retrieval_hook(
-        self,
-        question: str,
-        program: HippoRAGProgram | None = None,
-        *,
-        item_docs: Sequence[str] | None = None,
-    ) -> tuple[str, tuple[str, ...], tuple[float, ...]]:
-        """Internal retrieval hook wired into HippoRAGProgram for end-to-end DSPy trace compilation."""
-        active_program = program if program is not None else self.program
-        target_cids = self._ensure_candidate_chunks_indexed(
-            active_program, item_docs=item_docs
-        )
-        active_trace = getattr(dspy.settings, "trace", None)
-        if isinstance(active_trace, list):
-            named_map = dict(active_program.named_predictors())
-            for cid in target_cids:
-                for pred_name, inp_dict, out_obj in self._captured_chunk_traces.get(cid, ()):
-                    pred_inst = named_map.get(pred_name)
-                    if pred_inst is not None:
-                        active_trace.append((pred_inst, dict(inp_dict), out_obj))
-            for pred_name, inp_dict, out_obj in self._captured_graph_traces:
-                pred_inst = named_map.get(pred_name)
-                if pred_inst is not None:
-                    active_trace.append((pred_inst, dict(inp_dict), out_obj))
-
-        hits = self.retrieve(
-            question,
-            top_k=max(20, self.retrieval_top_k),
-            program=active_program,
-        )
-        if not hits:
-            return "", (), ()
-        passages = tuple(p.chunk_id for p, _, _ in hits)
-        scores = tuple(s for _, s, _ in hits)
-        qa_hits = hits[: self.retrieval_top_k]
-        formatted_context = self.format_qa_context(qa_hits)
-        return formatted_context, passages, scores
 
     def index(
         self,
@@ -2180,6 +2175,16 @@ class YawGraphEngine:
                 return []
             return self._hydrate_maxp_passages(chunk_vec_hits, top_k)
 
+    def resolve_chunk_pointers(
+        self,
+        chunk_ids: Sequence[str],
+    ) -> dict[str, ChunkPointer]:
+        """Return ChunkPointer metadata for the requested chunk IDs under the engine lock."""
+        if not chunk_ids:
+            return {}
+        with self._lock:
+            return get_chunk_pointers(self.conn, list(chunk_ids))
+
     def rag_qa(
         self,
         queries: Sequence[str],
@@ -2190,21 +2195,22 @@ class YawGraphEngine:
         """Multi-hop QA retrieval and answer generation evaluated with Pareto sizecoding."""
         results: list[dict[str, Any]] = []
         for i, q in enumerate(queries):
-            hits = self.retrieve(q, top_k=self.retrieval_top_k)
-            retrieved_cids = [p.chunk_id for p, _, _ in hits]
-            retrieved_scores = [s for _, s, _ in hits]
-            formatted_context = self.format_qa_context(hits)
-
-            pred = self.program.answer_question(context=formatted_context, question=q)
+            pred = self.program(question=q)
             ans = str(getattr(pred, "answer", "")).strip()
             reasoning = str(getattr(pred, "reasoning", "")).strip()
+            formatted_context = str(getattr(pred, "context", ""))
+            cids = list(getattr(pred, "retrieved_chunk_ids", ()))[: self.retrieval_top_k]
+            scores = [
+                float(s)
+                for s in list(getattr(pred, "retrieved_scores", ()))[: self.retrieval_top_k]
+            ]
 
             item: dict[str, Any] = {
                 "question": q,
                 "answer": ans,
                 "reasoning": reasoning,
-                "retrieved_chunk_ids": retrieved_cids,
-                "retrieved_scores": retrieved_scores,
+                "retrieved_chunk_ids": cids,
+                "retrieved_scores": scores,
                 "context": formatted_context,
             }
             if gold_docs is not None and i < len(gold_docs):
@@ -2350,7 +2356,17 @@ class YawGraphEngine:
             context_str = str(getattr(pred, "context", ""))
 
             gold_docs_raw = getattr(gold, "gold_docs", None)
-            retrieved_seq = [str(x) for x in (getattr(pred, "retrieved_passages", None) or ())]
+            retrieved_cids_raw = getattr(pred, "retrieved_chunk_ids", None)
+            retrieved_passages_raw = getattr(pred, "retrieved_passages", None)
+            retrieved_seq = [
+                str(x)
+                for x in (
+                    retrieved_cids_raw
+                    if retrieved_cids_raw
+                    else (retrieved_passages_raw or ())
+                )
+            ]
+            retrieved_texts_seq = [str(x) for x in (retrieved_passages_raw or ())]
 
             missed: list[str] = []
             recalls_by_k: dict[int, float] = {1: 1.0, 2: 1.0, 5: 1.0, 10: 1.0, 20: 1.0}
@@ -2368,10 +2384,10 @@ class YawGraphEngine:
                                 hydrated_by_cid[hp.pointer.chunk_id] = hp.text.strip()
                 for k in (1, 2, 5, 10, 20):
                     top_k_cids = retrieved_seq[:k]
-                    top_k_set = set(top_k_cids)
+                    top_k_set = set(top_k_cids) | set(retrieved_texts_seq[:k])
                     top_k_texts = {
                         hydrated_by_cid[c] for c in top_k_cids if c in hydrated_by_cid
-                    }
+                    } | set(retrieved_texts_seq[:k])
                     hits_k = 0
                     for gd in gold_docs_raw:
                         gd_str = str(gd).strip()

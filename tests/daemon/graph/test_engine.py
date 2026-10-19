@@ -1727,3 +1727,131 @@ def test_sprint3_engine_evaluate_and_pareto_frontier_export(
         assert isinstance(reloaded.pareto_ensemble, ParetoProgramEnsemble)
     finally:
         engine.close()
+
+
+def test_canonical_retrieval_hook_and_rag_qa_forward_unification(
+    tmp_path: Path,
+) -> None:
+    """Verify _canonical_retrieval_hook unifies YawRM, YawRetriever, HippoRAGProgram.forward, and rag_qa with GEPA trace replay and ReActV2/Pareto support."""
+    import json
+
+    class UnifiedHookMockLM(DeterministicMockLM):
+        def __call__(
+            self,
+            prompt: str | None = None,
+            messages: list[dict[str, Any]] | None = None,
+            **kwargs: Any,
+        ) -> list[str]:
+            if getattr(dspy.settings, "usage_tracker", None) is not None:
+                dspy.settings.usage_tracker.add_usage(
+                    self.model,
+                    {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30},
+                )
+            req_str = str(prompt or messages or kwargs)
+            if "tool_name" in req_str or "tool_args" in req_str or "search_graph_facts" in req_str:
+                if "Facts:" in req_str and "computer science" in req_str:
+                    return [
+                        json.dumps(
+                            {
+                                "thought": "Found the answer in graph facts.",
+                                "tool_name": "finish",
+                                "tool_args": {
+                                    "reasoning": "Recovered via ReActV2 graph exploration.",
+                                    "answer": "Alan Turing",
+                                },
+                            }
+                        )
+                    ]
+                return [
+                    json.dumps(
+                        {
+                            "thought": "Search graph facts for Alan Turing.",
+                            "tool_name": "search_graph_facts",
+                            "tool_args": {"query": "Alan Turing"},
+                        }
+                    )
+                ]
+            if "ABSTAIN_DIRECT_QA" in req_str and (
+                "AnswerQuestion" in req_str
+                or "Retrieved evidence passages" in req_str
+                or ("context" in req_str and "question" in req_str and "triples" not in req_str)
+            ):
+                return [
+                    json.dumps(
+                        {
+                            "reasoning": "Abstaining on single-shot QA to trigger ReActV2 fallback.",
+                            "answer": "Insufficient context",
+                        }
+                    )
+                ]
+            return super().__call__(prompt=prompt, messages=messages, **kwargs)
+
+    lm = UnifiedHookMockLM()
+    dspy.settings.configure(lm=lm)
+    program = HippoRAGProgram(
+        enable_gbnf=False,
+        orchestrator_lm=lm,
+        rlm_sub_lm=lm,
+        enable_react_fallback=True,
+    )
+    embedder: Any = DeterministicMockEmbedder(dim=64)
+
+    engine = YawGraphEngine(
+        db_path=tmp_path / "yaw_unified_hook.db",
+        workspace_root=tmp_path,
+        program=program,
+        embedder=embedder,
+        retrieval_top_k=2,
+    )
+    try:
+        # 1. Oblivion verification: legacy dual hooks demolished, only _canonical_retrieval_hook bound
+        assert [m for m in dir(engine) if m.endswith("_retrieval_hook")] == [
+            "_canonical_retrieval_hook"
+        ]
+        assert engine.program._retrieval_hook == engine._canonical_retrieval_hook
+
+        doc_turing = "Alan Turing\nAlan Turing was an English mathematician and computer scientist."
+        doc_lovelace = "Ada Lovelace\nAda Lovelace worked on the Analytical Engine."
+        engine.index([doc_turing, doc_lovelace])
+
+        # 2. Canonical 4-tuple contract & parity across RM, Retriever, Program.forward, and rag_qa
+        q = "Who was the English computer scientist?"
+        ctx, texts, scores, pids = engine._canonical_retrieval_hook(q, k=2)
+        assert isinstance(ctx, str) and "Alan Turing" in ctx
+        assert len(texts) == 2 and all(not t.startswith("chunk-") for t in texts)
+        assert len(scores) == 2 and all(isinstance(s, float) for s in scores)
+        assert len(pids) == 2 and all(cid.startswith("chunk-") for cid in pids)
+
+        rm = engine.as_rm(k=2, configure_dspy=True)
+        assert rm.hook == engine._canonical_retrieval_hook
+
+        # 3. Verify GEPA extraction trace replay works even when invoked via external YawRM / dspy.Retrieve
+        ext_trace: list[Any] = []
+        with dspy.context(trace=ext_trace, track_usage=True):
+            rm_hits = rm(q, k=2, item_docs=[doc_turing, doc_lovelace])
+        assert len(rm_hits) == 2
+        assert [h.pid for h in rm_hits] == list(pids[:2])
+        assert len(ext_trace) >= 2  # Captured NER and triples traces replayed into dspy.settings.trace!
+
+        fwd_pred = engine.program(question=q)
+        assert tuple(getattr(fwd_pred, "retrieved_chunk_ids", ()))[:2] == pids[:2]
+        assert tuple(getattr(fwd_pred, "retrieved_passages", ()))[:2] == texts[:2]
+        assert tuple(getattr(fwd_pred, "retrieved_scores", ()))[:2] == scores[:2]
+        assert getattr(fwd_pred, "context", "") == ctx
+
+        qa_out = engine.rag_qa([q])
+        assert len(qa_out) == 1
+        assert qa_out[0]["retrieved_chunk_ids"] == list(pids[:2])
+        assert qa_out[0]["retrieved_scores"] == list(scores[:2])
+        assert qa_out[0]["context"] == ctx
+        assert qa_out[0]["answer"] == "Alan Turing"
+
+        # 4. Verify rag_qa() executes through HippoRAGProgram.forward (triggering ReActV2 fallback on abstention)
+        qa_fallback_out = engine.rag_qa(
+            ["ABSTAIN_DIRECT_QA: Who founded computer science?"]
+        )
+        assert len(qa_fallback_out) == 1
+        assert qa_fallback_out[0]["answer"] == "Alan Turing"
+    finally:
+        dspy.configure(rm=None)
+        engine.close()
