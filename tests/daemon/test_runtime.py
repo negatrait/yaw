@@ -993,12 +993,13 @@ def test_cli_dspy_optimize_sandbox_isolation_and_status(
         )
 
         class FastGEPA:
-            def __init__(self, metric: Any, **kwargs: Any) -> None:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
                 pass
-            def compile(self, student: Any, trainset: list[Any], valset: Any = None) -> Any:
+            def compile(self, student: Any, *args: Any, **kwargs: Any) -> Any:
                 return student
 
         monkeypatch.setattr(dspy, "GEPA", FastGEPA, raising=False)
+        monkeypatch.setattr(dspy, "MIPROv2", FastGEPA, raising=False)
 
         # Run optimization concurrently while production daemon holds yaw.db.lock
         buf = io.StringIO()

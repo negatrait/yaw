@@ -138,7 +138,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="mode",
         choices=["miprov2", "gepa", "hybrid"],
         default=None,
-        help="Prompt optimization mode (defaults to yaw.toml [optimization].mode, then 'gepa')",
+        help="Prompt optimization mode (defaults to yaw.toml [optimization].mode, then 'hybrid')",
     )
     p_opt_common.add_argument(
         "--dataset",

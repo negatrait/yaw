@@ -137,7 +137,7 @@ class YawConfig:
 
     # Prompt optimization settings ([optimization] in yaw.toml)
     optimize_datasets: tuple[str, ...] = ("2wikimultihopqa",)
-    optimize_mode: Literal["miprov2", "gepa", "hybrid"] = "gepa"
+    optimize_mode: Literal["miprov2", "gepa", "hybrid"] = "hybrid"
     optimize_max_queries: int = 20
     optimize_train_queries: int = 7
     optimize_query_offset: int = 0

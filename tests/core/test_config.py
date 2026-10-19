@@ -12,7 +12,7 @@ def test_yaw_config_defaults() -> None:
     cfg = YawConfig()
     assert cfg.optimize_auto == "light"
     assert not hasattr(cfg, "optimize_max_metric_calls")
-    assert cfg.optimize_mode == "gepa"
+    assert cfg.optimize_mode == "hybrid"
 
 
 def test_yaw_config_validation() -> None:
