@@ -1612,12 +1612,16 @@ class HippoRAGProgram(dspy.Module):
                         context=hydrated_ctx, question=question, use_gbnf=use_gbnf
                     )
                 tokens = usage_tracker.get_total_tokens()
-                if tokens and hasattr(pred, "set_lm_usage"):
-                    pred.set_lm_usage(tokens)
-                setattr(pred, "context", hydrated_ctx)
-                setattr(pred, "retrieved_passages", passages)
-                setattr(pred, "retrieved_scores", scores)
-                return pred
+                res = dspy.Prediction(
+                    context=hydrated_ctx,
+                    answer=getattr(pred, "answer", ""),
+                    reasoning=getattr(pred, "reasoning", ""),
+                    retrieved_passages=passages,
+                    retrieved_scores=scores,
+                )
+                if tokens and hasattr(res, "set_lm_usage"):
+                    res.set_lm_usage(tokens)
+                return res
             raise ValueError(
                 "context must be provided when no retrieval_hook is registered on HippoRAGProgram."
             )
