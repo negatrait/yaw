@@ -3,9 +3,9 @@
 import hashlib
 import json
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import asdict, dataclass, replace
-from typing import Any
+from typing import Any, cast
 
 import dspy
 import numpy as np
@@ -356,13 +356,13 @@ def _repack_overflow_batch(texts: list[str], context_tokens: int) -> list[list[s
     return [texts[:mid], texts[mid:]]
 
 
-class DSPyEmbeddingAdapter:
-    """Profile-aware retrieval embedding adapter wrapping a native dspy.Embedder."""
+class DSPyEmbeddingAdapter(dspy.Embedder):
+    """Profile-aware retrieval embedding adapter subclassing native `dspy.Embedder`."""
 
     def __init__(
         self,
         profile: EmbeddingProfile | None = None,
-        embedder: dspy.Embedder | None = None,
+        embedder: dspy.Embedder | Any = None,
         *,
         task_mode: str = "distinct-titled",
         base_url: str = DEFAULT_BASE_URL,
@@ -373,7 +373,7 @@ class DSPyEmbeddingAdapter:
     ) -> None:
         self.task_mode = task_mode
         self.profile = profile or resolve_embedding_profile(MODEL, task_mode)
-        self.embedder = embedder or create_dspy_embedder(
+        base_embedder = embedder or create_dspy_embedder(
             self.profile,
             base_url=base_url,
             api_key=api_key,
@@ -381,6 +381,21 @@ class DSPyEmbeddingAdapter:
             batch_size=batch_size,
             caching=caching,
         )
+        if isinstance(base_embedder, dspy.Embedder):
+            super().__init__(
+                base_embedder.model,
+                batch_size=base_embedder.batch_size,
+                caching=base_embedder.caching,
+                **getattr(base_embedder, "default_kwargs", {}),
+            )
+            self.embedder: Any = base_embedder
+        else:
+            super().__init__(
+                base_embedder,
+                batch_size=batch_size,
+                caching=caching,
+            )
+            self.embedder = base_embedder
         self.telemetry: list[dict[str, Any]] = []
         self._telemetry_hook: Callable[[dict[str, Any]], None] | None = None
 
@@ -413,7 +428,10 @@ class DSPyEmbeddingAdapter:
         call_kwargs: dict[str, Any],
     ) -> np.ndarray:
         try:
-            raw = self.embedder(prepared, **call_kwargs)
+            if isinstance(self.embedder, dspy.Embedder):
+                raw = dspy.Embedder.__call__(self, prepared, **call_kwargs)
+            else:
+                raw = self.embedder(prepared, **call_kwargs)
             vectors = np.asarray(raw, dtype=np.float32)
             if vectors.ndim == 1:
                 vectors = vectors.reshape(1, -1)
@@ -439,15 +457,60 @@ class DSPyEmbeddingAdapter:
             pooled = pool_subchunk_embeddings(sub_vecs, weights, norm=True)
             return pooled.reshape(1, -1)
 
-    def batch_encode(
+    async def _aencode_prepared(
+        self,
+        prepared: list[str],
+        call_kwargs: dict[str, Any],
+    ) -> np.ndarray:
+        try:
+            if isinstance(self.embedder, dspy.Embedder) and isinstance(self.model, str):
+                raw = await dspy.Embedder.acall(self, prepared, **call_kwargs)
+            else:
+                target_fn = (
+                    (lambda items, **kw: dspy.Embedder.__call__(self, items, **kw))
+                    if isinstance(self.embedder, dspy.Embedder)
+                    else self.embedder
+                )
+                async_fn = cast(
+                    Callable[..., Awaitable[Any]],
+                    dspy.asyncify(cast(Any, target_fn)),
+                )
+                raw = await async_fn(prepared, **call_kwargs)
+            vectors = np.asarray(raw, dtype=np.float32)
+            if vectors.ndim == 1:
+                vectors = vectors.reshape(1, -1)
+            return vectors
+        except Exception as exc:
+            if not is_batch_overflow_error(exc):
+                raise
+            if len(prepared) > 1:
+                mid = len(prepared) // 2
+                left = await self._aencode_prepared(
+                    prepared[:mid], {**call_kwargs, "batch_size": mid}
+                )
+                right = await self._aencode_prepared(
+                    prepared[mid:], {**call_kwargs, "batch_size": len(prepared) - mid}
+                )
+                return np.concatenate([left, right], axis=0)
+
+            single = prepared[0]
+            sub_chunks = split_text_gracefully(single, max_chars=max(256, len(single) // 2))
+            if len(sub_chunks) <= 1:
+                raise
+            sub_vecs = await self._aencode_prepared(
+                sub_chunks, {**call_kwargs, "batch_size": len(sub_chunks)}
+            )
+            weights = [max(1, len(s)) for s in sub_chunks]
+            pooled = pool_subchunk_embeddings(sub_vecs, weights, norm=True)
+            return pooled.reshape(1, -1)
+
+    def _prepare_pieces_and_batches(
         self,
         texts: list[str] | str,
         *,
         instruction: str | None = None,
-        norm: bool = True,
         batch_size: int | None = None,
-        stage: str | None = None,
-    ) -> np.ndarray:
+    ) -> tuple[list[str], bool, list[list[int]], list[str], list[int], list[list[int]]]:
         if instruction not in (None, "") and instruction not in QUERY_INSTRUCTIONS:
             raise ValueError(f"Unsupported retrieval instruction: {instruction!r}")
         if isinstance(texts, str):
@@ -461,7 +524,6 @@ class DSPyEmbeddingAdapter:
             batch_size if (isinstance(batch_size, int) and batch_size >= 1) else 16
         )
 
-        # 1. Gracefully divide texts exceeding max_chunk_chars and format with profile
         text_piece_map: list[list[int]] = []
         flat_pieces: list[str] = []
         piece_weights: list[int] = []
@@ -497,23 +559,27 @@ class DSPyEmbeddingAdapter:
                     piece_weights.append(max(1, len(sc)))
                 text_piece_map.append(indices)
 
-        # 2. Partition flat_pieces into micro-batches bounded by character budget and count
         micro_batches = batch_texts_by_budget(
             flat_pieces,
             max_batch_chars=max_batch_chars,
             max_batch_size=effective_max_batch_size,
         )
+        return texts, is_query, text_piece_map, flat_pieces, piece_weights, micro_batches
 
-        # 3. Encode micro-batches
-        flat_vectors: list[np.ndarray | None] = [None] * len(flat_pieces)
-        for mb in micro_batches:
-            mb_texts = [flat_pieces[i] for i in mb]
-            call_kwargs = {"batch_size": len(mb_texts)}
-            vecs = self._encode_prepared(mb_texts, call_kwargs)
-            for local_idx, global_idx in enumerate(mb):
-                flat_vectors[global_idx] = vecs[local_idx]
-
-        # 4. Pool sub-chunks back into document embeddings via length-weighted average
+    def _finalize_vectors_and_telemetry(
+        self,
+        texts: list[str],
+        text_piece_map: list[list[int]],
+        flat_pieces: list[str],
+        piece_weights: list[int],
+        micro_batches: list[list[int]],
+        flat_vectors: list[np.ndarray | None],
+        *,
+        is_query: bool,
+        instruction: str | None,
+        norm: bool,
+        stage: str | None,
+    ) -> np.ndarray:
         doc_vectors: list[np.ndarray] = []
         for indices in text_piece_map:
             sub_vecs = np.asarray(
@@ -581,6 +647,165 @@ class DSPyEmbeddingAdapter:
             self._telemetry_hook(entry)
 
         return vectors
+
+    def batch_encode(
+        self,
+        texts: list[str] | str,
+        *,
+        instruction: str | None = None,
+        norm: bool = True,
+        batch_size: int | None = None,
+        stage: str | None = None,
+    ) -> np.ndarray:
+        (
+            resolved_texts,
+            is_query,
+            text_piece_map,
+            flat_pieces,
+            piece_weights,
+            micro_batches,
+        ) = self._prepare_pieces_and_batches(
+            texts, instruction=instruction, batch_size=batch_size
+        )
+
+        flat_vectors: list[np.ndarray | None] = [None] * len(flat_pieces)
+        for mb in micro_batches:
+            mb_texts = [flat_pieces[i] for i in mb]
+            call_kwargs = {"batch_size": len(mb_texts)}
+            vecs = self._encode_prepared(mb_texts, call_kwargs)
+            for local_idx, global_idx in enumerate(mb):
+                flat_vectors[global_idx] = vecs[local_idx]
+
+        return self._finalize_vectors_and_telemetry(
+            resolved_texts,
+            text_piece_map,
+            flat_pieces,
+            piece_weights,
+            micro_batches,
+            flat_vectors,
+            is_query=is_query,
+            instruction=instruction,
+            norm=norm,
+            stage=stage,
+        )
+
+    async def abatch_encode(
+        self,
+        texts: list[str] | str,
+        *,
+        instruction: str | None = None,
+        norm: bool = True,
+        batch_size: int | None = None,
+        stage: str | None = None,
+    ) -> np.ndarray:
+        """Asynchronously encode micro-batches concurrently using anyio task groups and dspy.asyncify."""
+        import anyio
+
+        (
+            resolved_texts,
+            is_query,
+            text_piece_map,
+            flat_pieces,
+            piece_weights,
+            micro_batches,
+        ) = self._prepare_pieces_and_batches(
+            texts, instruction=instruction, batch_size=batch_size
+        )
+
+        flat_vectors: list[np.ndarray | None] = [None] * len(flat_pieces)
+
+        async def _run_micro_batch(mb: list[int]) -> None:
+            mb_texts = [flat_pieces[i] for i in mb]
+            call_kwargs = {"batch_size": len(mb_texts)}
+            vecs = await self._aencode_prepared(mb_texts, call_kwargs)
+            for local_idx, global_idx in enumerate(mb):
+                flat_vectors[global_idx] = vecs[local_idx]
+
+        if len(micro_batches) == 1:
+            await _run_micro_batch(micro_batches[0])
+        else:
+            async with anyio.create_task_group() as tg:
+                for mb in micro_batches:
+                    tg.start_soon(_run_micro_batch, mb)
+
+        return self._finalize_vectors_and_telemetry(
+            resolved_texts,
+            text_piece_map,
+            flat_pieces,
+            piece_weights,
+            micro_batches,
+            flat_vectors,
+            is_query=is_query,
+            instruction=instruction,
+            norm=norm,
+            stage=stage,
+        )
+
+    def __call__(
+        self,
+        inputs: str | list[str],
+        batch_size: int | None = None,
+        caching: bool | None = None,
+        **kwargs: Any,
+    ) -> np.ndarray:
+        """DSPy Embedder entrypoint delegating to profile-aware batch_encode."""
+        _ = caching
+        instruction = kwargs.pop("instruction", None)
+        norm = bool(kwargs.pop("norm", True))
+        stage = kwargs.pop("stage", None)
+        return self.batch_encode(
+            inputs,
+            instruction=instruction if isinstance(instruction, str) else None,
+            norm=norm,
+            batch_size=batch_size,
+            stage=stage if isinstance(stage, str) else None,
+        )
+
+    async def acall(
+        self,
+        inputs: str | list[str],
+        batch_size: int | None = None,
+        caching: bool | None = None,
+        *,
+        instruction: str | None = None,
+        norm: bool = True,
+        stage: str | None = None,
+        **kwargs: Any,
+    ) -> np.ndarray:
+        """Async DSPy Embedder entrypoint delegating to profile-aware abatch_encode."""
+        _ = (caching, kwargs)
+        return await self.abatch_encode(
+            inputs,
+            instruction=instruction,
+            norm=norm,
+            batch_size=batch_size,
+            stage=stage,
+        )
+
+    def forward(
+        self,
+        texts: list[str] | str,
+        *,
+        instruction: str | None = None,
+        norm: bool = True,
+        batch_size: int | None = None,
+        stage: str | None = None,
+    ) -> np.ndarray:
+        """Forward pass delegating to batch_encode."""
+        return self.batch_encode(
+            texts,
+            instruction=instruction,
+            norm=norm,
+            batch_size=batch_size,
+            stage=stage,
+        )
+
+    def as_async(self) -> Callable[..., Awaitable[np.ndarray]]:
+        """Return a thread-context-preserving async callable via dspy.asyncify(self)."""
+        return cast(
+            Callable[..., Awaitable[np.ndarray]],
+            dspy.asyncify(cast(Any, self)),
+        )
 
     def encode(
         self,

@@ -17,6 +17,7 @@ from yaw.core.types import OpenIERecord, StructuredTriple
 from .chat import create_dspy_lm
 from .grammars import (
     DSPY_INSTRUCTION_PROPOSAL_GBNF_GRAMMAR,
+    DSPY_RERANK_GBNF_GRAMMAR,
     build_dspy_instruction_proposal_grammar,
     build_dspy_missing_entity_defs_grammar,
     build_dspy_ner_grammar,
@@ -320,20 +321,86 @@ class _PositionalSafeRLM(_RLM_Base):
         return pred
 
 
+def _parse_react_v2_payload(fields: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Coerce ReActV2 tool-call payloads (`next_thought`/`tool_calls` or `thought`/`tool_name`/`tool_args`)."""
+    from dspy.adapters.types.reasoning import Reasoning
+    from dspy.adapters.types.tool import ToolCalls
+
+    if "tool_calls" in fields:
+        thought_val = fields.get("next_thought", fields.get("thought", ""))
+        tc_raw = fields["tool_calls"]
+        if isinstance(tc_raw, str):
+            import json_repair
+
+            tc_raw = json_repair.loads(tc_raw)
+        return {
+            "next_thought": (
+                thought_val
+                if isinstance(thought_val, Reasoning)
+                else Reasoning(content=str(thought_val or ""))
+            ),
+            "tool_calls": (
+                tc_raw
+                if isinstance(tc_raw, ToolCalls)
+                else ToolCalls.model_validate(tc_raw)
+            ),
+        }
+    if "tool_name" in fields:
+        raw_name = str(fields.get("tool_name", "") or "").strip()
+        tool_name = "submit" if raw_name in ("finish", "submit") else raw_name
+        raw_args = fields.get("tool_args", {})
+        if isinstance(raw_args, str):
+            import json_repair
+
+            loaded_args = json_repair.loads(raw_args)
+            raw_args = loaded_args if isinstance(loaded_args, dict) else {}
+        elif not isinstance(raw_args, Mapping):
+            raw_args = {}
+        thought_str = str(fields.get("next_thought") or fields.get("thought") or "")
+        return {
+            "next_thought": Reasoning(content=thought_str),
+            "tool_calls": ToolCalls.model_validate(
+                {"tool_calls": [{"name": tool_name, "args": dict(raw_args)}]}
+            ),
+        }
+    return None
+
+
 class YawJSONAdapter(dspy.JSONAdapter):
     """Robust JSON adapter that recovers from top-level arrays or mismatched single fields."""
 
     def parse(self, signature: type[dspy.Signature], completion: str) -> dict[str, Any]:
+        out_fields = list(signature.output_fields.keys())
         try:
             return super().parse(signature, completion)
         except Exception:
             if "[[ ##" in completion:
-                return dspy.ChatAdapter().parse(signature, completion)
+                try:
+                    return dspy.ChatAdapter().parse(signature, completion)
+                except Exception:
+                    if set(out_fields) == {"next_thought", "tool_calls"}:
+                        sections: dict[str, str] = {}
+                        current_key: str | None = None
+                        buf: list[str] = []
+                        for line in completion.splitlines():
+                            m = re.match(r"^\[\[\s*##\s*([^#]+?)\s*##\s*\]\]$", line.strip())
+                            if m:
+                                if current_key is not None:
+                                    sections[current_key] = "\n".join(buf).strip()
+                                current_key = m.group(1).strip()
+                                buf = []
+                            else:
+                                buf.append(line)
+                        if current_key is not None:
+                            sections[current_key] = "\n".join(buf).strip()
+                        coerced = _parse_react_v2_payload(sections)
+                        if coerced is not None:
+                            return coerced
+                    raise
             import json_repair
             from dspy.adapters.utils import parse_value
 
             fields = json_repair.loads(completion)
-            out_fields = list(signature.output_fields.keys())
             if isinstance(fields, list) and len(out_fields) == 1:
                 target_field = out_fields[0]
                 annotation = getattr(signature.output_fields[target_field], "annotation", Any)
@@ -344,6 +411,10 @@ class YawJSONAdapter(dspy.JSONAdapter):
                         cast_val = fields
                     return {target_field: cast_val}
             if isinstance(fields, dict):
+                if set(out_fields) == {"next_thought", "tool_calls"}:
+                    coerced = _parse_react_v2_payload(fields)
+                    if coerced is not None:
+                        return coerced
                 for out_f in out_fields:
                     if out_f in fields:
                         ann = getattr(signature.output_fields[out_f], "annotation", Any)
@@ -359,6 +430,120 @@ class YawJSONAdapter(dspy.JSONAdapter):
                     if "answer" in fields:
                         return {target_field: parse_value(fields["answer"], ann)}
             raise
+
+
+class YawGBNFAdapter(YawJSONAdapter):
+    """Unified `dspy.JSONAdapter` subclass with automatic per-signature GBNF grammar injection and fallback parsing."""
+
+    def __init__(
+        self,
+        *,
+        enable_gbnf: bool = False,
+        max_entities: int | None = None,
+        max_triples: int | None = None,
+        max_facts: int = 4,
+        max_reasoning_chars: int | None = None,
+        max_instruction_chars: int | None = 1500,
+        callbacks: list[Any] | None = None,
+        use_native_function_calling: bool = True,
+    ) -> None:
+        super().__init__(
+            callbacks=callbacks,
+            use_native_function_calling=use_native_function_calling,
+        )
+        self.enable_gbnf = bool(enable_gbnf)
+        self.max_entities = max_entities
+        self.max_triples = max_triples
+        self.max_facts = max_facts
+        self.max_reasoning_chars = max_reasoning_chars
+        self.max_instruction_chars = max_instruction_chars
+
+    def resolve_grammar(self, signature: Any) -> str | None:
+        """Resolve the pure-JSON GBNF grammar for any of the 10 direct Qwen signatures (or None for RLM signatures)."""
+        sig_name = getattr(signature, "__name__", str(signature))
+        if sig_name in ("HealSHACLViolations", "ReflectiveInnerDistillerSignature"):
+            return None
+        if sig_name == "ExtractEntities":
+            return build_dspy_ner_grammar(self.max_entities)
+        if sig_name == "ExtractTriples":
+            return build_dspy_triples_grammar(self.max_triples)
+        if sig_name == "DefineMissingEntities":
+            return build_dspy_missing_entity_defs_grammar()
+        if sig_name == "JudgeSynonyms":
+            return build_dspy_synonym_judge_grammar(self.max_entities)
+        if sig_name == "ProposeSHACLRepairs":
+            return build_dspy_shacl_repair_grammar(self.max_entities)
+        if sig_name == "ExtractQueryIntent":
+            return build_dspy_query_intent_grammar()
+        if sig_name == "FilterTriples":
+            return DSPY_RERANK_GBNF_GRAMMAR
+        if sig_name == "AnswerQuestion":
+            return build_dspy_qa_grammar(self.max_reasoning_chars)
+        if sig_name in ("ProposeInstructionSignature", "CompressInstructionSignature"):
+            return build_dspy_instruction_proposal_grammar(self.max_instruction_chars)
+
+        out_fields = getattr(signature, "output_fields", None)
+        in_fields = getattr(signature, "input_fields", None)
+        if isinstance(out_fields, Mapping):
+            out_keys = tuple(out_fields.keys())
+            in_keys = tuple(in_fields.keys()) if isinstance(in_fields, Mapping) else ()
+            if out_keys == ("named_entities",):
+                return build_dspy_ner_grammar(self.max_entities)
+            if out_keys == ("triples",):
+                return build_dspy_triples_grammar(self.max_triples)
+            if out_keys == ("entity_definitions",):
+                return build_dspy_missing_entity_defs_grammar()
+            if out_keys == ("decisions",):
+                return build_dspy_synonym_judge_grammar(self.max_entities)
+            if out_keys == ("repairs",) and "focus_context" in in_keys:
+                return build_dspy_shacl_repair_grammar(self.max_entities)
+            if out_keys == ("query_intent",):
+                return build_dspy_query_intent_grammar()
+            if out_keys == ("fact",):
+                return DSPY_RERANK_GBNF_GRAMMAR
+            if out_keys in (("answer",), ("reasoning", "answer")):
+                return build_dspy_qa_grammar(self.max_reasoning_chars)
+        return None
+
+    def _prepare_gbnf_kwargs(
+        self,
+        lm: Any,
+        lm_kwargs: dict[str, Any],
+        signature: Any,
+    ) -> None:
+        if not self.enable_gbnf or not lm_supports_gbnf(lm):
+            return
+        grammar = self.resolve_grammar(signature)
+        if not grammar:
+            return
+        extra_body = lm_kwargs.get("extra_body")
+        if isinstance(extra_body, Mapping):
+            if "grammar" not in extra_body:
+                lm_kwargs["extra_body"] = {**extra_body, "grammar": grammar}
+        else:
+            lm_kwargs["extra_body"] = {"grammar": grammar}
+
+    def __call__(
+        self,
+        lm: Any,
+        lm_kwargs: dict[str, Any],
+        signature: type[dspy.Signature],
+        demos: list[dict[str, Any]],
+        inputs: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        self._prepare_gbnf_kwargs(lm, lm_kwargs, signature)
+        return super().__call__(lm, lm_kwargs, signature, demos, inputs)
+
+    async def acall(
+        self,
+        lm: Any,
+        lm_kwargs: dict[str, Any],
+        signature: type[dspy.Signature],
+        demos: list[dict[str, Any]],
+        inputs: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        self._prepare_gbnf_kwargs(lm, lm_kwargs, signature)
+        return await super().acall(lm, lm_kwargs, signature, demos, inputs)
 
 
 class _PredictorBoundLM(dspy.BaseLM):
@@ -482,6 +667,732 @@ def _sum_usage_tokens(usage: Mapping[str, Any] | None) -> int:
     return total
 
 
+class YawPassage(dspy.Prediction):
+    """Passage object returned by `YawRM` exposing `.long_text`, `.pid`, `.score`, and `.rank` for `dspy.Retrieve`."""
+
+    def __init__(
+        self,
+        long_text: str,
+        *,
+        pid: str = "",
+        score: float = 0.0,
+        rank: int = 0,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(
+            long_text=str(long_text),
+            pid=str(pid),
+            score=float(score),
+            rank=int(rank),
+            **kwargs,
+        )
+
+
+class YawRM:
+    """First-class DSPy Retrieval Model (`dspy.RM`) backed by YAW's Forward-Push PPR & recognition memory hook."""
+
+    def __init__(
+        self,
+        hook: Callable[..., tuple[str, tuple[str, ...], tuple[float, ...]]] | None = None,
+        *,
+        program: Any = None,
+        default_k: int = 10,
+    ) -> None:
+        self.hook = hook
+        self.program = program
+        self.default_k = int(default_k)
+
+    def _invoke_hook_with_pids(
+        self,
+        query: str,
+        *,
+        k: int | None = None,
+        item_docs: Sequence[str] | None = None,
+    ) -> tuple[str, tuple[str, ...], tuple[float, ...], tuple[str, ...]]:
+        if self.hook is None:
+            raise ValueError("No retrieval hook is registered on YawRM.")
+        try:
+            sig = inspect.signature(self.hook)
+            param_names = list(sig.parameters.keys())
+            has_var_kw = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+            )
+            has_var_pos = any(
+                p.kind == inspect.Parameter.VAR_POSITIONAL for p in sig.parameters.values()
+            )
+            accepts_prog = len(param_names) >= 2 or has_var_pos
+            accepts_item_docs = (
+                "item_docs" in sig.parameters or len(param_names) >= 3 or has_var_kw
+            )
+            accepts_k = "k" in sig.parameters or has_var_kw
+        except (TypeError, ValueError):
+            accepts_prog = False
+            accepts_item_docs = False
+            accepts_k = False
+        kw: dict[str, Any] = {}
+        if accepts_item_docs and self.program is not None:
+            kw["item_docs"] = item_docs
+        if accepts_k and k is not None:
+            kw["k"] = int(k)
+        if accepts_prog and self.program is not None:
+            raw = self.hook(query, self.program, **kw)
+        else:
+            raw = self.hook(query, **kw)
+        if isinstance(raw, tuple) and len(raw) == 4:
+            ctx, passages, scores, pids = raw
+            return str(ctx), tuple(passages), tuple(scores), tuple(pids)
+        ctx, passages, scores = raw
+        pids = tuple(
+            str(p) if str(p).startswith("chunk-") else f"chunk-{i}"
+            for i, p in enumerate(passages)
+        )
+        return str(ctx), tuple(passages), tuple(scores), pids
+
+    def _invoke_hook(
+        self,
+        query: str,
+        *,
+        item_docs: Sequence[str] | None = None,
+    ) -> tuple[str, tuple[str, ...], tuple[float, ...]]:
+        ctx, passages, scores, _ = self._invoke_hook_with_pids(
+            query, item_docs=item_docs
+        )
+        return ctx, passages, scores
+
+    def __call__(
+        self,
+        query_or_queries: str | list[str],
+        k: int | None = None,
+        **kwargs: Any,
+    ) -> list[YawPassage]:
+        effective_k = self.default_k if k is None else int(k)
+        item_docs = kwargs.get("item_docs")
+        queries = (
+            [query_or_queries]
+            if isinstance(query_or_queries, str)
+            else [str(q) for q in query_or_queries]
+        )
+        results: list[YawPassage] = []
+        for q in queries:
+            _, passages, scores, pids = self._invoke_hook_with_pids(
+                q, k=effective_k, item_docs=item_docs
+            )
+            for idx, text in enumerate(passages[:effective_k]):
+                sc = float(scores[idx]) if idx < len(scores) else 0.0
+                pid = str(pids[idx]) if idx < len(pids) else f"chunk-{idx}"
+                results.append(
+                    YawPassage(
+                        long_text=str(text),
+                        pid=pid,
+                        score=sc,
+                        rank=idx + 1,
+                    )
+                )
+        return results
+
+
+class YawRetriever(dspy.Retrieve):
+    """First-class `dspy.Retrieve` module backed by `YawRM` and YAW's Forward-Push PPR + recognition memory."""
+
+    def __init__(
+        self,
+        k: int = 10,
+        *,
+        rm: YawRM | None = None,
+        hook: Callable[..., tuple[str, tuple[str, ...], tuple[float, ...]]] | None = None,
+    ) -> None:
+        super().__init__(k=k)
+        self.rm: YawRM = rm if rm is not None else YawRM(hook=hook, default_k=k)
+        if hook is not None and self.rm.hook is None:
+            self.rm.hook = hook
+
+    @property
+    def hook(self) -> Callable[..., tuple[str, tuple[str, ...], tuple[float, ...]]] | None:
+        return self.rm.hook
+
+    @hook.setter
+    def hook(
+        self,
+        value: Callable[..., tuple[str, tuple[str, ...], tuple[float, ...]]] | None,
+    ) -> None:
+        self.rm.hook = value
+
+    def dump_state(self, json_mode: bool = True, **_kwargs: Any) -> dict[str, Any]:
+        _ = json_mode
+        return {"k": self.k}
+
+    def load_state(self, state: dict[str, Any], **_kwargs: Any) -> None:
+        if isinstance(state, Mapping) and "k" in state:
+            self.k = int(state["k"])
+
+    def forward(
+        self,
+        query: str,
+        k: int | None = None,
+        **kwargs: Any,
+    ) -> dspy.Prediction:
+        effective_k = self.k if k is None else int(k)
+        if self.rm.hook is not None:
+            hydrated_ctx, raw_passages, raw_scores, raw_pids = (
+                self.rm._invoke_hook_with_pids(
+                    query, k=effective_k, item_docs=kwargs.get("item_docs")
+                )
+            )
+            sliced_passages = list(raw_passages[:effective_k])
+            sliced_scores = list(raw_scores[:effective_k])
+            return dspy.Prediction(
+                passages=sliced_passages,
+                context=hydrated_ctx,
+                scores=sliced_scores,
+                pids=tuple(raw_pids[:effective_k]),
+                all_passages=tuple(raw_passages),
+                all_scores=tuple(raw_scores),
+            )
+        active_rm = getattr(dspy.settings, "rm", None)
+        if active_rm is not None:
+            hits = active_rm(query, k=effective_k, **kwargs)
+            passages = [
+                str(
+                    getattr(
+                        psg,
+                        "long_text",
+                        psg.get("long_text", psg) if isinstance(psg, Mapping) else psg,
+                    )
+                )
+                for psg in hits
+            ]
+            scores = [
+                float(
+                    getattr(
+                        psg,
+                        "score",
+                        psg.get("score", 0.0) if isinstance(psg, Mapping) else 0.0,
+                    )
+                )
+                for psg in hits
+            ]
+            return dspy.Prediction(
+                passages=passages,
+                context="\n\n".join(passages),
+                scores=scores,
+                all_passages=tuple(passages),
+                all_scores=tuple(scores),
+            )
+        raise ValueError(
+            "No retrieval hook or dspy.settings.rm is configured for YawRetriever."
+        )
+
+
+_ABSTAIN_PATTERNS: tuple[str, ...] = (
+    "i don't know",
+    "i do not know",
+    "unknown",
+    "not enough information",
+    "insufficient information",
+    "insufficient context",
+    "cannot answer",
+    "cannot be determined",
+    "unable to answer",
+    "no information provided",
+    "not mentioned in the context",
+)
+
+
+def is_abstaining_answer(answer: str) -> bool:
+    """Return True if `answer` is empty or expresses abstention/uncertainty."""
+    cleaned = str(answer or "").strip().lower().rstrip(".!")
+    if not cleaned or cleaned in ("none", "n/a", "null"):
+        return True
+    return any(pat in cleaned for pat in _ABSTAIN_PATTERNS)
+
+
+class YawAssertionError(AssertionError):
+    """Hard invariant violation error raised by `yaw_assert`."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.feedback = str(message)
+
+
+def yaw_assert(condition: bool, message: str) -> None:
+    """Assert a hard structural or closed-world invariant, raising `YawAssertionError` on failure."""
+    if not condition:
+        raise YawAssertionError(message)
+
+
+def yaw_suggest(condition: bool, message: str) -> bool:
+    """Evaluate a soft invariant suggestion without raising an exception."""
+    _ = message
+    return bool(condition)
+
+
+_VALID_SYNONYM_RELATIONS: frozenset[str] = frozenset(
+    {
+        "skos:altLabel",
+        "skos:hiddenLabel",
+        "skos:related",
+        "owl:differentFrom",
+    }
+)
+
+_VALID_SHACL_ACTIONS: frozenset[str] = frozenset(
+    {
+        "set_definition",
+        "demote_alt_to_hidden_label",
+        "delete_alt_label",
+        "replace_edge_with_different_from",
+        "delete_semantic_edge",
+        "delete_orphan_fact",
+    }
+)
+
+_VALUE_BEARING_SHACL_ACTIONS: frozenset[str] = frozenset(
+    {
+        "set_definition",
+        "demote_alt_to_hidden_label",
+        "delete_alt_label",
+    }
+)
+
+
+def _count_connected_components(triples: Sequence[StructuredTriple]) -> int:
+    adj: dict[str, set[str]] = {}
+    for st in triples:
+        u = str(text_processing(st.subj)) or st.subj.strip().lower()
+        v = str(text_processing(st.obj)) or st.obj.strip().lower()
+        if not u or not v:
+            continue
+        adj.setdefault(u, set()).add(v)
+        adj.setdefault(v, set()).add(u)
+    if not adj:
+        return 0
+    visited: set[str] = set()
+    components = 0
+    for node in adj:
+        if node in visited:
+            continue
+        components += 1
+        stack = [node]
+        while stack:
+            cur = stack.pop()
+            if cur in visited:
+                continue
+            visited.add(cur)
+            stack.extend(adj.get(cur, set()) - visited)
+    return components
+
+
+def validate_stage_invariants(
+    stage_name: str,
+    inputs: Mapping[str, Any],
+    prediction: Any,
+    *,
+    shacl_linter: Callable[[], Sequence[Mapping[str, Any]]] | None = None,
+) -> tuple[float, str]:
+    """Validate all 9 stage contracts and 6 closed-world SHACL/SKOS/connected-node invariants.
+
+    Returns `(score, feedback)` where `score` is in `[0.0, 1.0]` (`1.0` = full pass).
+    """
+    stage = str(stage_name or "").strip()
+
+    if stage == "ner":
+        raw_entities = getattr(prediction, "named_entities", None)
+        passage_str = str(inputs.get("passage", "") or "").strip()
+        items = list(raw_entities) if isinstance(raw_entities, (list, tuple)) else []
+        if not items:
+            if len(passage_str) >= 20:
+                return 0.0, "[ner] Empty named_entities on informative passage (ConceptShape/prefLabel)."
+            return 1.0, "PASS [ner]"
+
+        seen_norms: set[str] = set()
+        dup_labels: list[str] = []
+        bad_defs: list[str] = []
+        valid_count = 0
+        for item in items:
+            if isinstance(item, (list, tuple)):
+                ename = str(item[0]).strip() if len(item) >= 1 else ""
+                edef = str(item[1]).strip() if len(item) >= 2 and item[1] is not None else ""
+            elif isinstance(item, Mapping):
+                ename = str(item.get("entity", item.get("name", ""))).strip()
+                edef = str(item.get("definition", item.get("def", ""))).strip()
+            else:
+                ename = str(item).strip()
+                edef = ""
+            if not ename:
+                bad_defs.append("<empty_name>")
+                continue
+            norm = str(text_processing(ename)) or ename.lower()
+            if norm in seen_norms:
+                dup_labels.append(ename)
+            else:
+                seen_norms.add(norm)
+            if not edef or edef.lower() == ename.lower():
+                bad_defs.append(ename)
+            else:
+                valid_count += 1
+
+        issues: list[str] = []
+        if dup_labels:
+            issues.append(f"ConceptShape/prefLabel duplicate normalized labels: {dup_labels}")
+        if bad_defs:
+            issues.append(f"ConceptShape/definition missing or tautological definitions: {bad_defs}")
+        if not issues:
+            return 1.0, "PASS [ner]"
+        ratio = valid_count / max(1, len(items))
+        penalty = 0.35 * (1 if dup_labels else 0) + 0.45 * (len(bad_defs) / max(1, len(items)))
+        score = max(0.0, min(0.85, round(ratio * (1.0 - penalty), 4)))
+        return score, f"[ner] {'; '.join(issues)}"
+
+    if stage == "triples":
+        raw_triples = getattr(prediction, "triples", None)
+        structured = list(extract_structured_triples(raw_triples))
+        if not structured:
+            return 0.0, "[triples] Empty or unparseable triples (StatementShape/closedWorld)."
+
+        stage1_raw = inputs.get("named_entities") or ()
+        stage1_norms: set[str] = set()
+        if isinstance(stage1_raw, Sequence) and not isinstance(stage1_raw, str):
+            for ent in stage1_raw:
+                ename = (
+                    str(ent[0]).strip()
+                    if isinstance(ent, (list, tuple)) and len(ent) >= 1
+                    else str(ent).strip()
+                )
+                if ename:
+                    stage1_norms.add(str(text_processing(ename)) or ename.lower())
+
+        closed_world_norms = set(stage1_norms)
+        for st in structured:
+            if st.subj and st.subj_def and st.subj_def.strip().lower() != st.subj.strip().lower():
+                closed_world_norms.add(str(text_processing(st.subj)) or st.subj.lower())
+            if st.obj and st.obj_def and st.obj_def.strip().lower() != st.obj.strip().lower():
+                closed_world_norms.add(str(text_processing(st.obj)) or st.obj.lower())
+
+        unregistered: list[str] = []
+        self_loops: list[str] = []
+        incomplete: int = 0
+        for st in structured:
+            if not (st.subj and st.pred and st.obj and st.spo_def):
+                incomplete += 1
+                continue
+            s_norm = str(text_processing(st.subj)) or st.subj.lower()
+            o_norm = str(text_processing(st.obj)) or st.obj.lower()
+            if s_norm == o_norm:
+                self_loops.append(st.subj)
+            if stage1_norms:
+                if s_norm not in closed_world_norms:
+                    unregistered.append(st.subj)
+                if o_norm not in closed_world_norms:
+                    unregistered.append(st.obj)
+
+        issues = []
+        if incomplete:
+            issues.append(f"StatementShape/closedWorld {incomplete} incomplete triple(s)")
+        if self_loops:
+            issues.append(f"Self-loop triple(s) on {self_loops}")
+        if unregistered:
+            issues.append(
+                f"StatementShape/closedWorld unregistered novel entities without inline [name, def]: {unregistered}"
+            )
+
+        components = _count_connected_components(structured)
+        if len(structured) >= 2 and len(stage1_norms) >= 2 and components > 1:
+            issues.append(
+                f"Disconnected subgraph ({components} components across {len(structured)} triples; missing bridge predicates)"
+            )
+
+        if not issues:
+            return 1.0, "PASS [triples]"
+        score = max(0.0, round(1.0 - 0.35 * len(issues), 4))
+        return score, f"[triples] {'; '.join(issues)}"
+
+    if stage == "entity_definer":
+        missing_in = [
+            str(x).strip()
+            for x in (inputs.get("missing_entities") or ())
+            if str(x).strip()
+        ]
+        raw_defs = getattr(
+            prediction,
+            "entity_definitions",
+            getattr(prediction, "named_entities", None),
+        )
+        parsed = extract_entity_definitions(raw_defs)
+        def_by_norm: dict[str, str] = {}
+        for ename, edef in parsed:
+            if ename and edef and edef.strip().lower() != ename.strip().lower():
+                def_by_norm[str(text_processing(ename)) or ename.lower()] = edef.strip()
+        if not missing_in:
+            return (1.0, "PASS [entity_definer]") if def_by_norm else (0.0, "[entity_definer] ConceptShape/definition empty.")
+        unrepaired = [
+            m
+            for m in missing_in
+            if (str(text_processing(m)) or m.lower()) not in def_by_norm
+        ]
+        if not unrepaired:
+            return 1.0, "PASS [entity_definer]"
+        cov = (len(missing_in) - len(unrepaired)) / max(1, len(missing_in))
+        return (
+            round(cov * 0.5, 4),
+            f"[entity_definer] ConceptShape/definition missing or tautological for: {unrepaired}",
+        )
+
+    if stage == "synonym_judge":
+        raw_decisions = getattr(prediction, "decisions", None)
+        items = list(raw_decisions) if isinstance(raw_decisions, (list, tuple)) else []
+        if not items:
+            return 0.0, "[synonym_judge] Empty decisions (EdgeShape/closedWorld)."
+        seen_pairs: dict[str, tuple[str, str]] = {}
+        issues = []
+        for d in items:
+            if not isinstance(d, Mapping):
+                issues.append("EdgeShape/closedWorld non-dict decision")
+                continue
+            pair_id = str(d.get("pair_id", "") or "").strip()
+            rel = str(d.get("relation", "") or "").strip()
+            canon = str(d.get("canonical", "") or "").strip()
+            if "|" not in pair_id:
+                issues.append(f"EdgeShape/closedWorld invalid pair_id={pair_id!r}")
+                continue
+            id_a, id_b = [p.strip() for p in pair_id.split("|", 1)]
+            if not id_a or not id_b or id_a == id_b:
+                issues.append(f"EdgeShape/closedWorld self-loop or empty pair_id={pair_id!r}")
+            if rel not in _VALID_SYNONYM_RELATIONS:
+                issues.append(
+                    f"ConceptShape/S13-disjointLabels invalid relation={rel!r}"
+                )
+            if canon not in ("A", "B", id_a, id_b):
+                issues.append(
+                    f"EdgeShape/closedWorld invalid canonical={canon!r} for {pair_id!r}"
+                )
+            if pair_id in seen_pairs and seen_pairs[pair_id] != (rel, canon):
+                issues.append(
+                    f"ConceptShape/homographDifferentFrom conflicting decisions for {pair_id!r}"
+                )
+            seen_pairs[pair_id] = (rel, canon)
+        if not issues:
+            return 1.0, "PASS [synonym_judge]"
+        return max(0.0, round(1.0 - 0.35 * len(issues), 4)), f"[synonym_judge] {'; '.join(issues)}"
+
+    if stage in ("shacl_repair", "shacl_healer_rlm"):
+        raw_repairs = getattr(prediction, "repairs", None)
+        repairs = list(raw_repairs) if isinstance(raw_repairs, (list, tuple)) else parse_shacl_repairs(raw_repairs)
+        allowed_nodes: set[str] = set()
+        raw_viol = inputs.get("violations", "")
+        try:
+            viol_list = json.loads(raw_viol) if isinstance(raw_viol, str) else list(raw_viol or ())
+            for v in viol_list:
+                if isinstance(v, Mapping) and v.get("focus_node"):
+                    allowed_nodes.add(str(v["focus_node"]).strip())
+        except (json.JSONDecodeError, TypeError, ValueError):
+            viol_list = []
+
+        issues = []
+        if not repairs and allowed_nodes:
+            issues.append("Empty repairs for non-empty SHACL violations")
+        for r in repairs:
+            if not isinstance(r, Mapping):
+                issues.append("Malformed repair item")
+                continue
+            fnode = str(r.get("focus_node", "") or "").strip()
+            act = str(r.get("action", "") or "").strip()
+            val = str(r.get("value", "") or "").strip()
+            if allowed_nodes and fnode not in allowed_nodes:
+                issues.append(f"StatementShape/closedWorld out-of-scope focus_node={fnode!r}")
+            if act not in _VALID_SHACL_ACTIONS:
+                issues.append(f"EdgeShape/closedWorld invalid action={act!r}")
+            elif act in _VALUE_BEARING_SHACL_ACTIONS and not val:
+                issues.append(f"ConceptShape/definition empty value for action={act!r}")
+
+        if shacl_linter is not None:
+            remaining = list(shacl_linter() or ())
+            if remaining:
+                rem_shapes = sorted(
+                    {
+                        str(v.get("source_shape", v.get("shape", "SHACLShape")))
+                        for v in remaining
+                        if isinstance(v, Mapping)
+                    }
+                )
+                issues.append(
+                    f"{len(remaining)} violation(s) remaining across shapes {rem_shapes}"
+                )
+        if not issues:
+            return 1.0, f"PASS [{stage}]"
+        return max(0.0, round(1.0 - 0.35 * len(issues), 4)), f"[{stage}] {'; '.join(issues)}"
+
+    if stage == "query_intent":
+        qi = str(getattr(prediction, "query_intent", "") or "").strip()
+        if len(qi) < 3:
+            return 0.0, "[query_intent] Empty or trivial query_intent."
+        return 1.0, "PASS [query_intent]"
+
+    if stage == "triple_filter":
+        raw_fact = getattr(prediction, "fact", getattr(prediction, "fact_after_filter", None))
+        generated = coerce_generated_facts(raw_fact)
+        max_facts = int(inputs.get("max_facts", 4) or 4)
+        cand_norms: set[tuple[str, str, str]] = set()
+        raw_before = inputs.get("fact_before_filter", "")
+        try:
+            parsed_before = json.loads(raw_before) if isinstance(raw_before, str) else raw_before
+            fact_list = parsed_before.get("fact", []) if isinstance(parsed_before, Mapping) else parsed_before
+            for item in fact_list or ():
+                if isinstance(item, (list, tuple)) and len(item) >= 3:
+                    cand_norms.add(
+                        (
+                            str(text_processing(str(item[0]))),
+                            str(text_processing(str(item[1]))),
+                            str(text_processing(str(item[2]))),
+                        )
+                    )
+        except (json.JSONDecodeError, TypeError, ValueError):
+            cand_norms = set()
+        issues = []
+        if len(generated) > max_facts:
+            issues.append(f"Exceeded max_facts ({len(generated)} > {max_facts})")
+        if cand_norms:
+            hallucinated = [
+                f
+                for f in generated
+                if (
+                    str(text_processing(f[0])),
+                    str(text_processing(f[1])),
+                    str(text_processing(f[2])),
+                )
+                not in cand_norms
+            ]
+            if hallucinated:
+                issues.append(
+                    f"Hallucinated facts outside closed-world candidate subset: {hallucinated}"
+                )
+        if not issues:
+            return 1.0, "PASS [triple_filter]"
+        return max(0.0, round(1.0 - 0.5 * len(issues), 4)), f"[triple_filter] {'; '.join(issues)}"
+
+    if stage == "qa":
+        ans = str(getattr(prediction, "answer", "") or "").strip()
+        reas = str(getattr(prediction, "reasoning", "") or "").strip()
+        ctx = str(inputs.get("context", "") or "").strip()
+        if not ans:
+            return 0.0, "[qa] Empty answer."
+        issues = []
+        if not reas:
+            issues.append("Empty reasoning")
+        if ctx and is_abstaining_answer(ans):
+            issues.append(f"Abstaining answer {ans!r} on non-empty context")
+        if not issues:
+            return 1.0, "PASS [qa]"
+        return max(0.2, round(1.0 - 0.45 * len(issues), 4)), f"[qa] {'; '.join(issues)}"
+
+    if stage in ("qwen_proposer", "qwen_compressor"):
+        new_inst = str(getattr(prediction, "new_instruction", "") or "").strip()
+        max_chars = int(inputs.get("max_instruction_chars", 1500) or 1500)
+        comp_name = str(inputs.get("component_name", "") or "").strip()
+        cur_inst = str(inputs.get("current_instruction", "") or "").strip()
+        if not new_inst:
+            return 0.0, f"[{stage}] Empty new_instruction."
+        issues = []
+        if len(new_inst) > max_chars:
+            issues.append(f"Instruction length {len(new_inst)} > {max_chars}")
+        for marker in ("<TargetAnswer>", "<TargetPassage>", "<TargetEntity>"):
+            if marker in new_inst:
+                issues.append(f"Leaked placeholder marker {marker}")
+        if comp_name in _STAGE_SCHEMA_CONTRACTS:
+            strict_key, alt_markers, _ = _STAGE_SCHEMA_CONTRACTS[comp_name]
+            had_strict = strict_key in cur_inst if cur_inst else True
+            has_strict = strict_key in new_inst
+            has_any = any(m.lower() in new_inst.lower() for m in alt_markers)
+            if not (has_strict or (not had_strict and has_any)):
+                issues.append(f"Missing required stage schema key {strict_key!r}")
+        if not issues:
+            return 1.0, f"PASS [{stage}]"
+        return max(0.0, round(1.0 - 0.4 * len(issues), 4)), f"[{stage}] {'; '.join(issues)}"
+
+    return 1.0, f"PASS [{stage}]"
+
+
+def wrap_stage_with_refine(
+    module: dspy.Module,
+    stage_name: str,
+    *,
+    N: int = 2,
+    threshold: float = 1.0,
+    use_refine: bool = True,
+    shacl_linter: Callable[[], Sequence[Mapping[str, Any]]] | None = None,
+) -> dspy.Module:
+    """Wrap a DSPy stage predictor in native `dspy.Refine` or `dspy.BestOfN` scored by `validate_stage_invariants`."""
+
+    def stage_reward_fn(inputs: dict[str, Any], pred: dspy.Prediction) -> float:
+        score, _ = validate_stage_invariants(
+            stage_name,
+            inputs,
+            pred,
+            shacl_linter=shacl_linter,
+        )
+        return float(score)
+
+    wrapper_cls = getattr(dspy, "Refine", None) if use_refine else getattr(dspy, "BestOfN", None)
+    if wrapper_cls is None:
+        wrapper_cls = dspy.BestOfN
+    return wrapper_cls(
+        module=module,
+        N=max(1, int(N)),
+        reward_fn=stage_reward_fn,
+        threshold=float(threshold),
+    )
+
+
+def _should_retry_stage_invariants(
+    stage_name: str,
+    pred: Any,
+    effective_lm: Any,
+) -> bool:
+    """Determine if `_invoke_stage` can perform a self-correction retry without exhausting scripted `DummyLM` queues."""
+    import copy
+
+    if stage_name == "triples":
+        # Stage 2 missing definitions are repaired by Stage 3 (DefineMissingEntities)
+        return False
+    if stage_name == "ner":
+        raw_entities = getattr(pred, "named_entities", None)
+        if (
+            isinstance(raw_entities, (list, tuple))
+            and raw_entities
+            and not any(isinstance(x, (list, tuple, Mapping)) for x in raw_entities)
+        ):
+            return False
+
+    target_lm = (
+        effective_lm._resolve_target_lm()
+        if isinstance(effective_lm, _PredictorBoundLM)
+        else effective_lm
+    )
+    if target_lm is None:
+        return False
+    answers_it = getattr(target_lm, "answers", None)
+    if answers_it is not None and not isinstance(answers_it, Mapping):
+        try:
+            peek_it = copy.copy(answers_it)
+            next_ans = next(peek_it, None)
+        except TypeError:
+            return False
+        if not isinstance(next_ans, Mapping):
+            return False
+        expected_key_map = {
+            "ner": "named_entities",
+            "entity_definer": "entity_definitions",
+            "synonym_judge": "decisions",
+            "shacl_repair": "repairs",
+            "triple_filter": "fact",
+            "query_intent": "query_intent",
+            "qa": "answer",
+        }
+        exp_key = expected_key_map.get(stage_name)
+        if exp_key and exp_key not in next_ans:
+            return False
+    return True
+
+
 class HippoRAGProgram(dspy.Module):
     """Unified DSPy Module for HippoRAG 2 OpenIE, EDC/SKOS Schema Canon, SHACL Repair, Recognition Memory, and Multi-Hop QA.
 
@@ -526,6 +1437,7 @@ class HippoRAGProgram(dspy.Module):
         rlm_tools: list[Callable[..., Any]] | None = None,
         rlm_interpreter_factory: Callable[[], Any] = dspy.PythonInterpreter,
         compiled_path: str | Path | None = None,
+        enable_react_fallback: bool = False,
     ) -> None:
         super().__init__()
         self.enable_gbnf: bool = enable_gbnf
@@ -536,15 +1448,29 @@ class HippoRAGProgram(dspy.Module):
         self.embedding_query_prefix: str | None = embedding_query_prefix
         self.embedding_fact_prefix: str | None = embedding_fact_prefix
         self.embedding_document_prefix: str | None = embedding_document_prefix
-        self.json_adapter: dspy.Adapter = adapter or YawJSONAdapter()
+        self.json_adapter: dspy.Adapter = adapter or YawGBNFAdapter(
+            enable_gbnf=self.enable_gbnf,
+            max_entities=self.gbnf_max_entities,
+            max_triples=self.gbnf_max_triples,
+            max_facts=self.gbnf_max_facts,
+            max_reasoning_chars=self.gbnf_max_reasoning_chars,
+        )
         self.orchestrator_lm: dspy.LM | None = orchestrator_lm
         self.rlm_sub_lm: dspy.LM | None = rlm_sub_lm
         self._retrieval_hook: Callable[..., tuple[str, tuple[str, ...], tuple[float, ...]]] | None = None
+        self.rm: YawRM = YawRM(hook=None, program=self, default_k=10)
+        self.retriever: YawRetriever = YawRetriever(k=10, rm=self.rm)
         self._node_inspector: Callable[[str], dict[str, Any]] | None = None
         self._chunk_hydrator: Callable[[str], str] | None = None
         self._shacl_repair_applier: Callable[[Sequence[Mapping[str, Any]]], int] | None = None
         self._shacl_linter: Callable[[], list[dict[str, str]]] | None = None
+        self._graph_search_tool: Callable[[str], str] | None = None
         self._last_ner_definitions: dict[str, str] = {}
+        self.max_invariant_retries: int = 1
+        self._in_ensemble: bool = False
+        self.enable_react_fallback: bool = bool(enable_react_fallback)
+        self.pareto_frontier_states: list[dict[str, Any]] = []
+        self.pareto_ensemble: ParetoProgramEnsemble | None = None
         self.telemetry: list[dict[str, Any]] = []
         self.embedding_audit_trail: list[dict[str, Any]] = []
         self.entity_def_audit_trail: list[dict[str, Any]] = []
@@ -680,6 +1606,13 @@ class HippoRAGProgram(dspy.Module):
         self._shacl_repair_applier = shacl_repair_applier
         self._shacl_linter = shacl_linter
 
+    def set_graph_search_tool(
+        self,
+        search_fn: Callable[[str], str] | None,
+    ) -> None:
+        """Bind a graph fact search callback for multi-hop `dspy.ReActV2` fallback exploration."""
+        self._graph_search_tool = search_fn
+
     @classmethod
     def from_config(cls, config: YawConfig) -> "HippoRAGProgram":
         """Construct a HippoRAGProgram from a YawConfig."""
@@ -709,9 +1642,9 @@ class HippoRAGProgram(dspy.Module):
         )
 
     def dump_state(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        """Serialize all DSPy predictors/RLMs plus EmbeddingGemma prefixes and GBNF structural bounds."""
+        """Serialize all DSPy predictors/RLMs plus EmbeddingGemma prefixes, GBNF structural bounds, and Pareto frontier."""
         state: dict[str, Any] = super().dump_state(*args, **kwargs)
-        state["yaw_surface"] = {
+        yaw_surface: dict[str, Any] = {
             "gbnf_max_entities": self.gbnf_max_entities,
             "gbnf_max_triples": self.gbnf_max_triples,
             "gbnf_max_facts": self.gbnf_max_facts,
@@ -720,11 +1653,15 @@ class HippoRAGProgram(dspy.Module):
             "embedding_fact_prefix": self.embedding_fact_prefix,
             "embedding_document_prefix": self.embedding_document_prefix,
         }
+        if self.pareto_frontier_states:
+            yaw_surface["pareto_frontier_states"] = list(self.pareto_frontier_states)
+        state["yaw_surface"] = yaw_surface
         return state
 
     def load_state(self, state: dict[str, Any], *args: Any, **kwargs: Any) -> Any:
-        """Restore DSPy predictor/RLM state plus EmbeddingGemma prefixes and GBNF structural bounds."""
+        """Restore DSPy predictor/RLM state plus EmbeddingGemma prefixes, GBNF structural bounds, and Pareto frontier."""
         state_copy = dict(state)
+        state_copy.setdefault("retriever", {"k": getattr(self.retriever, "k", 10)})
         yaw_surface = state_copy.pop("yaw_surface", None)
         res = super().load_state(state_copy, *args, **kwargs)
         if isinstance(yaw_surface, dict):
@@ -740,6 +1677,18 @@ class HippoRAGProgram(dspy.Module):
                     setattr(self, attr, yaw_surface[attr])
             if yaw_surface.get("gbnf_max_facts") is not None:
                 self.gbnf_max_facts = int(yaw_surface["gbnf_max_facts"])
+            frontier_states = yaw_surface.get("pareto_frontier_states")
+            if isinstance(frontier_states, list) and frontier_states:
+                self.pareto_frontier_states = list(frontier_states)
+                self.pareto_ensemble = ParetoProgramEnsemble.from_frontier_states(
+                    self, self.pareto_frontier_states
+                )
+        if isinstance(self.json_adapter, YawGBNFAdapter):
+            self.json_adapter.enable_gbnf = self.enable_gbnf
+            self.json_adapter.max_entities = self.gbnf_max_entities
+            self.json_adapter.max_triples = self.gbnf_max_triples
+            self.json_adapter.max_facts = self.gbnf_max_facts
+            self.json_adapter.max_reasoning_chars = self.gbnf_max_reasoning_chars
         self._bind_predictor_lms()
         if hasattr(self.qa, "predict") and not getattr(self.qa.predict, "demos", None):
             self.qa.predict.demos = list(QA_DEMOS)
@@ -759,13 +1708,26 @@ class HippoRAGProgram(dspy.Module):
                 "_chunk_hydrator",
                 "_shacl_repair_applier",
                 "_shacl_linter",
+                "_graph_search_tool",
                 "orchestrator_lm",
                 "rlm_sub_lm",
                 "json_adapter",
+                "rm",
+                "retriever",
+                "pareto_ensemble",
             ):
                 setattr(new_prog, k, v)
             else:
                 setattr(new_prog, k, copy.deepcopy(v, memo))
+        new_prog.rm = YawRM(
+            hook=self._retrieval_hook,
+            program=new_prog,
+            default_k=getattr(self.retriever, "k", 10),
+        )
+        new_prog.retriever = YawRetriever(
+            k=getattr(self.retriever, "k", 10),
+            rm=new_prog.rm,
+        )
         new_prog._bind_predictor_lms()
         return new_prog
 
@@ -854,6 +1816,9 @@ class HippoRAGProgram(dspy.Module):
         usage: dict[str, Any] | None,
         inputs_summary: str = "",
         outputs_summary: str = "",
+        invariant_score: float = 1.0,
+        invariant_feedback: str = "",
+        invariant_retries: int = 0,
     ) -> int:
         tokens_used = _sum_usage_tokens(usage)
         self.telemetry.append(
@@ -866,6 +1831,9 @@ class HippoRAGProgram(dspy.Module):
                 "usage": dict(usage or {}),
                 "inputs_summary": inputs_summary[:240],
                 "outputs_summary": outputs_summary[:240],
+                "invariant_score": float(invariant_score),
+                "invariant_feedback": str(invariant_feedback)[:240],
+                "invariant_retries": int(invariant_retries),
             }
         )
         return tokens_used
@@ -884,6 +1852,9 @@ class HippoRAGProgram(dspy.Module):
     ) -> Any:
         from dspy.utils.usage_tracker import track_usage
 
+        retry_count = 0
+        inv_score = 1.0
+        inv_feedback = ""
         with track_usage() as usage_tracker:
             if is_rlm and rlm_mod is not None:
                 orch_lm = self._resolve_orchestrator_lm(lm)
@@ -891,6 +1862,12 @@ class HippoRAGProgram(dspy.Module):
                     pred = rlm_mod(**inputs)
                 active_mod = rlm_mod
                 active_name = "shacl_healer_rlm"
+                inv_score, inv_feedback = validate_stage_invariants(
+                    stage_name or active_name,
+                    inputs,
+                    pred,
+                    shacl_linter=self._shacl_linter,
+                )
             else:
                 effective_lm = lm
                 if effective_lm is None:
@@ -908,6 +1885,36 @@ class HippoRAGProgram(dspy.Module):
                     call_kwargs["config"] = {"extra_body": {"grammar": grammar_fn()}}
                 with self._dspy_ctx(effective_lm, use_json_adapter=True):
                     pred = direct_mod(**direct_inputs, **call_kwargs)
+                    inv_score, inv_feedback = validate_stage_invariants(
+                        stage_name,
+                        direct_inputs,
+                        pred,
+                        shacl_linter=None,
+                    )
+                    max_retries = 0 if self._in_ensemble else self.max_invariant_retries
+                    while (
+                        inv_score < 1.0
+                        and retry_count < max_retries
+                        and _should_retry_stage_invariants(stage_name, pred, effective_lm)
+                    ):
+                        retry_count += 1
+                        retry_cfg = dict(call_kwargs.get("config") or {})
+                        retry_cfg["rollout_id"] = retry_count
+                        retry_kwargs = {**call_kwargs, "config": retry_cfg}
+                        try:
+                            cand_pred = direct_mod(**direct_inputs, **retry_kwargs)
+                        except Exception:
+                            break
+                        cand_score, cand_fb = validate_stage_invariants(
+                            stage_name,
+                            direct_inputs,
+                            cand_pred,
+                            shacl_linter=None,
+                        )
+                        if cand_score >= inv_score:
+                            pred = cand_pred
+                            inv_score = cand_score
+                            inv_feedback = cand_fb
                 active_mod = direct_mod
                 active_name = "qa" if stage_name == "qa" else (stage_name or "direct")
         tokens = usage_tracker.get_total_tokens()
@@ -924,6 +1931,9 @@ class HippoRAGProgram(dspy.Module):
                 usage=tokens,
                 inputs_summary=str(list(inputs.keys())),
                 outputs_summary=str(pred)[:240],
+                invariant_score=inv_score,
+                invariant_feedback=inv_feedback,
+                invariant_retries=retry_count,
             )
         return pred
 
@@ -1566,6 +2576,59 @@ class HippoRAGProgram(dspy.Module):
     ) -> None:
         """Register an optional end-to-end retrieval hook executed inside forward(question=...)."""
         self._retrieval_hook = hook
+        self.rm.hook = hook
+        self.retriever.hook = hook
+
+    def _run_react_qa_fallback(
+        self,
+        question: str,
+        initial_context: str,
+    ) -> dspy.Prediction | None:
+        """Run bounded `dspy.ReActV2` multi-hop graph exploration when single-shot PPR/QA abstains or retrieval confidence < 0.15."""
+        react_cls = getattr(dspy, "ReActV2", None)
+        if react_cls is None:
+            return None
+
+        def search_graph_facts(query: str) -> str:
+            """Search the knowledge graph or retrieval engine for facts matching query."""
+            if self._graph_search_tool is not None:
+                return str(self._graph_search_tool(str(query)))
+            if self._retrieval_hook is not None:
+                ctx, _, _ = self.rm._invoke_hook(str(query))
+                return str(ctx)
+            return ""
+
+        def inspect_entity_neighborhood(entity_id: str) -> str:
+            """Inspect the 1-hop entity neighborhood and definitions for entity_id."""
+            if self._node_inspector is not None:
+                return json.dumps(self._node_inspector(str(entity_id)), ensure_ascii=False)
+            return "{}"
+
+        def read_passage_chunk(chunk_id: str) -> str:
+            """Hydrate the original passage chunk text for chunk_id."""
+            if self._chunk_hydrator is not None:
+                return str(self._chunk_hydrator(str(chunk_id)))
+            return ""
+
+        sig = getattr(self.qa, "predict", self.qa).signature
+        eff_lm = self.orchestrator_lm or self.rlm_sub_lm
+        try:
+            agent = react_cls(
+                sig,
+                tools=[
+                    search_graph_facts,
+                    inspect_entity_neighborhood,
+                    read_passage_chunk,
+                ],
+                max_iters=3,
+            )
+            with self._dspy_ctx(eff_lm, use_json_adapter=True):
+                return agent(context=initial_context, question=question)
+        except Exception as exc:
+            logging.getLogger(__name__).debug(
+                "ReActV2 fallback skipped (%s: %s)", type(exc).__name__, exc
+            )
+            return None
 
     def forward(
         self,
@@ -1579,6 +2642,10 @@ class HippoRAGProgram(dspy.Module):
         from dspy.utils.usage_tracker import track_usage
 
         if context is not None and question is not None:
+            if self.pareto_ensemble is not None and not self._in_ensemble:
+                return self.pareto_ensemble.answer_question(
+                    context=context, question=question, use_gbnf=use_gbnf
+                )
             return self.answer_question(
                 context=context, question=question, use_gbnf=use_gbnf
             )
@@ -1590,27 +2657,34 @@ class HippoRAGProgram(dspy.Module):
                 use_gbnf=use_gbnf,
             )
         if question is not None:
-            if self._retrieval_hook is not None:
+            if self._retrieval_hook is not None or getattr(dspy.settings, "rm", None) is not None:
                 with track_usage() as usage_tracker:
-                    try:
-                        sig = inspect.signature(self._retrieval_hook)
-                        param_names = list(sig.parameters.keys())
-                        accepts_prog = len(param_names) >= 2
-                        accepts_item_docs = "item_docs" in sig.parameters or len(param_names) >= 3
-                    except (TypeError, ValueError):
-                        accepts_prog = False
-                        accepts_item_docs = False
-                    if accepts_item_docs:
-                        hydrated_ctx, passages, scores = self._retrieval_hook(
-                            question, self, item_docs=item_docs
-                        )
-                    elif accepts_prog:
-                        hydrated_ctx, passages, scores = self._retrieval_hook(question, self)
-                    else:
-                        hydrated_ctx, passages, scores = self._retrieval_hook(question)
-                    pred = self.answer_question(
-                        context=hydrated_ctx, question=question, use_gbnf=use_gbnf
+                    ret_pred = self.retriever(question, item_docs=item_docs)
+                    hydrated_ctx = str(getattr(ret_pred, "context", "") or "")
+                    passages = tuple(
+                        getattr(ret_pred, "all_passages", getattr(ret_pred, "passages", ())) or ()
                     )
+                    scores = tuple(
+                        getattr(ret_pred, "all_scores", getattr(ret_pred, "scores", ())) or ()
+                    )
+                    if self.pareto_ensemble is not None and not self._in_ensemble:
+                        pred = self.pareto_ensemble.answer_question(
+                            context=hydrated_ctx, question=question, use_gbnf=use_gbnf
+                        )
+                    else:
+                        pred = self.answer_question(
+                            context=hydrated_ctx, question=question, use_gbnf=use_gbnf
+                        )
+                    top_score = max(scores) if scores else 1.0
+                    if self.enable_react_fallback and (
+                        is_abstaining_answer(str(getattr(pred, "answer", "") or ""))
+                        or top_score < 0.15
+                    ):
+                        react_pred = self._run_react_qa_fallback(question, hydrated_ctx)
+                        if react_pred is not None and not is_abstaining_answer(
+                            str(getattr(react_pred, "answer", "") or "")
+                        ):
+                            pred = react_pred
                 tokens = usage_tracker.get_total_tokens()
                 res = dspy.Prediction(
                     context=hydrated_ctx,
@@ -1629,9 +2703,359 @@ class HippoRAGProgram(dspy.Module):
             "Either (context, question) or question must be provided to HippoRAGProgram."
         )
 
+    def as_async(self) -> Any:
+        """Return a `dspy.asyncify`-wrapped async callable for this `HippoRAGProgram`."""
+        return dspy.asyncify(self)
+
     def named_predictors(self) -> list[tuple[str, Any]]:
         """Return all 9 canonical stage predictors so `dspy.GEPA` inspects the full program surface."""
         return list(super().named_predictors())
+
+
+class ParetoProgramEnsemble(dspy.Module):
+    """Ensembles the top-M Pareto-optimal `HippoRAGProgram` candidates using `dspy.Ensemble` and `dspy.asyncify`.
+
+    Provides closed-world entity/triple unioning (`reduce_ner_predictions`, `reduce_triple_predictions`)
+    and multi-hop QA reasoning reconciliation (`reduce_qa_predictions`).
+    """
+
+    def __init__(self, programs: Sequence[HippoRAGProgram]) -> None:
+        super().__init__()
+        if not programs:
+            raise ValueError("ParetoProgramEnsemble requires at least 1 HippoRAGProgram candidate.")
+        self.programs: list[HippoRAGProgram] = list(programs)
+        self.qa_ensemble = dspy.Ensemble(reduce_fn=self.reduce_qa_predictions).compile(
+            self.programs
+        )
+        # Freeze as compiled so attaching onto HippoRAGProgram.pareto_ensemble never duplicates named_predictors()
+        self._compiled = True
+
+    @classmethod
+    def from_frontier_states(
+        cls,
+        template_program: HippoRAGProgram,
+        frontier_states: Sequence[Mapping[str, Any]],
+    ) -> "ParetoProgramEnsemble":
+        import copy
+
+        candidates: list[HippoRAGProgram] = []
+        for state in frontier_states:
+            cloned = copy.deepcopy(template_program)
+            cloned.pareto_frontier_states = []
+            cloned.pareto_ensemble = None
+            state_without_frontier = dict(state)
+            if isinstance(state_without_frontier.get("yaw_surface"), Mapping):
+                ys = dict(state_without_frontier["yaw_surface"])
+                ys.pop("pareto_frontier_states", None)
+                state_without_frontier["yaw_surface"] = ys
+            cloned.load_state(state_without_frontier)
+            candidates.append(cloned)
+        return cls(candidates or [template_program])
+
+    @staticmethod
+    def reduce_ner_predictions(predictions: Sequence[Any]) -> dspy.Prediction:
+        """Union extracted entities across Pareto candidates, preserving the richest non-tautological `skos:definition`."""
+        ordered_norms: list[str] = []
+        canonical_name_by_norm: dict[str, str] = {}
+        best_def_by_norm: dict[str, str] = {}
+
+        for pred in predictions:
+            raw_entities = getattr(pred, "named_entities", pred)
+            for ename, edef in extract_entity_definitions(raw_entities):
+                clean_name = str(ename).strip()
+                clean_def = str(edef or "").strip()
+                if not clean_name:
+                    continue
+                norm = str(text_processing(clean_name)) or clean_name.lower()
+                if norm not in canonical_name_by_norm:
+                    ordered_norms.append(norm)
+                    canonical_name_by_norm[norm] = clean_name
+                is_taut = clean_def.lower() == clean_name.lower()
+                existing_def = best_def_by_norm.get(norm, "")
+                if clean_def and not is_taut and len(clean_def) > len(existing_def):
+                    best_def_by_norm[norm] = clean_def
+
+        merged_pairs = [
+            [canonical_name_by_norm[n], best_def_by_norm.get(n, "")]
+            for n in ordered_norms
+        ]
+        return dspy.Prediction(named_entities=merged_pairs)
+
+    @staticmethod
+    def reduce_triple_predictions(
+        predictions: Sequence[Any],
+        *,
+        valid_entities: Sequence[tuple[str, str]] | Mapping[str, str] | None = None,
+    ) -> dspy.Prediction:
+        """Union and rank relation triples by vote count across Pareto candidates while enforcing closed-world entity linkage."""
+        def_map: dict[str, str] = {}
+        if isinstance(valid_entities, Mapping):
+            for k, v in valid_entities.items():
+                if k and v:
+                    def_map[str(k).strip()] = str(v).strip()
+                    def_map[str(text_processing(str(k)))] = str(v).strip()
+        elif isinstance(valid_entities, Sequence):
+            for pair in valid_entities:
+                if isinstance(pair, (list, tuple)) and len(pair) >= 2 and pair[0] and pair[1]:
+                    def_map[str(pair[0]).strip()] = str(pair[1]).strip()
+                    def_map[str(text_processing(str(pair[0])))] = str(pair[1]).strip()
+
+        votes: dict[tuple[str, str, str], int] = {}
+        first_seen: dict[tuple[str, str, str], int] = {}
+        best_triple_by_key: dict[tuple[str, str, str], StructuredTriple] = {}
+        seq_idx = 0
+
+        for pred in predictions:
+            raw_triples = getattr(pred, "triples", pred)
+            structured_list = (
+                list(raw_triples)
+                if isinstance(raw_triples, (list, tuple))
+                and all(isinstance(x, StructuredTriple) for x in raw_triples)
+                else list(extract_structured_triples(raw_triples, entity_definitions=def_map))
+            )
+            seen_in_cand: set[tuple[str, str, str]] = set()
+            for st in structured_list:
+                if not (st.subj and st.pred and st.obj):
+                    continue
+                s_norm = str(text_processing(st.subj)) or st.subj.lower()
+                p_norm = str(text_processing(st.pred)) or st.pred.lower()
+                o_norm = str(text_processing(st.obj)) or st.obj.lower()
+                if s_norm == o_norm:
+                    continue
+                key = (s_norm, p_norm, o_norm)
+                if key not in seen_in_cand:
+                    seen_in_cand.add(key)
+                    votes[key] = votes.get(key, 0) + 1
+                if key not in first_seen:
+                    first_seen[key] = seq_idx
+                    seq_idx += 1
+                prev = best_triple_by_key.get(key)
+                s_def = st.subj_def or (prev.subj_def if prev else "") or def_map.get(st.subj, "") or def_map.get(s_norm, "")
+                o_def = st.obj_def or (prev.obj_def if prev else "") or def_map.get(st.obj, "") or def_map.get(o_norm, "")
+                spo_def = (
+                    st.spo_def
+                    if not prev or len(st.spo_def) >= len(prev.spo_def)
+                    else prev.spo_def
+                )
+                best_triple_by_key[key] = StructuredTriple(
+                    subj=prev.subj if prev else st.subj,
+                    subj_def=s_def,
+                    pred=prev.pred if prev else st.pred,
+                    obj=prev.obj if prev else st.obj,
+                    obj_def=o_def,
+                    spo_def=spo_def,
+                )
+
+        ranked_keys = sorted(
+            votes.keys(),
+            key=lambda k: (-votes[k], first_seen[k]),
+        )
+        ranked_structured = [best_triple_by_key[k] for k in ranked_keys]
+        return dspy.Prediction(
+            structured_triples=tuple(ranked_structured),
+            triples=[list(st.as_tuple()) for st in ranked_structured],
+        )
+
+    @staticmethod
+    def reduce_qa_predictions(predictions: Sequence[Any]) -> dspy.Prediction:
+        """Select the consensus non-abstaining multi-hop QA answer across Pareto candidates."""
+        if not predictions:
+            return dspy.Prediction(reasoning="", answer="")
+
+        non_abstaining = [
+            p
+            for p in predictions
+            if not is_abstaining_answer(str(getattr(p, "answer", "") or ""))
+        ]
+        pool = non_abstaining if non_abstaining else list(predictions)
+        votes: dict[str, int] = {}
+        best_pred_by_norm: dict[str, Any] = {}
+        first_idx: dict[str, int] = {}
+
+        for idx, p in enumerate(pool):
+            ans = str(getattr(p, "answer", "") or "").strip()
+            reas = str(getattr(p, "reasoning", "") or "").strip()
+            norm = str(text_processing(ans)) or ans.lower()
+            votes[norm] = votes.get(norm, 0) + 1
+            if norm not in first_idx:
+                first_idx[norm] = idx
+            prev = best_pred_by_norm.get(norm)
+            prev_reas = str(getattr(prev, "reasoning", "") or "").strip() if prev is not None else ""
+            if prev is None or len(reas) > len(prev_reas):
+                best_pred_by_norm[norm] = p
+
+        winner_norm = min(
+            votes.keys(),
+            key=lambda n: (-votes[n], first_idx[n]),
+        )
+        winner = best_pred_by_norm[winner_norm]
+        return dspy.Prediction(
+            reasoning=str(getattr(winner, "reasoning", "") or ""),
+            answer=str(getattr(winner, "answer", "") or ""),
+        )
+
+    def extract_openie(
+        self,
+        chunk_id: str,
+        passage: str,
+        *,
+        lm: Any = None,
+        use_gbnf: bool | None = None,
+    ) -> OpenIERecord:
+        """Execute Pareto-ensembled OpenIE extraction across all candidate programs."""
+        ner_preds: list[dspy.Prediction] = []
+        for prog in self.programs:
+            prev_flag = prog._in_ensemble
+            prog._in_ensemble = True
+            try:
+                _, defs = prog._run_ner_stage(passage, lm=lm, use_gbnf=use_gbnf)
+                ner_preds.append(
+                    dspy.Prediction(named_entities=[[k, v] for k, v in defs])
+                )
+            finally:
+                prog._in_ensemble = prev_flag
+
+        merged_ner = self.reduce_ner_predictions(ner_preds)
+        merged_defs = list(extract_entity_definitions(merged_ner.named_entities))
+        stage2_input: list[Any] = (
+            [[k, v] for k, v in merged_defs]
+            if any(v for _, v in merged_defs)
+            else [k for k, _ in merged_defs]
+        )
+
+        triple_preds: list[dspy.Prediction] = []
+        for prog in self.programs:
+            prev_flag = prog._in_ensemble
+            prog._in_ensemble = True
+            try:
+                st_list = prog.extract_structured_triples(
+                    passage,
+                    stage2_input,
+                    entity_definitions=merged_defs,
+                    lm=lm,
+                    use_gbnf=use_gbnf,
+                )
+                triple_preds.append(dspy.Prediction(triples=list(st_list)))
+            finally:
+                prog._in_ensemble = prev_flag
+
+        merged_triples_pred = self.reduce_triple_predictions(
+            triple_preds,
+            valid_entities=merged_defs,
+        )
+        structured_triples: tuple[StructuredTriple, ...] = tuple(
+            merged_triples_pred.structured_triples
+        )
+
+        ordered_entities: list[str] = [k for k, _ in merged_defs]
+        seen_norms: set[str] = {
+            str(text_processing(k)) or k.lower() for k in ordered_entities
+        }
+        def_by_norm: dict[str, str] = {
+            (str(text_processing(k)) or k.lower()): v for k, v in merged_defs if v
+        }
+        for st in structured_triples:
+            for ename, edef in ((st.subj, st.subj_def), (st.obj, st.obj_def)):
+                if not ename:
+                    continue
+                enorm = str(text_processing(ename)) or ename.lower()
+                if enorm not in seen_norms:
+                    seen_norms.add(enorm)
+                    ordered_entities.append(ename)
+                if edef and not def_by_norm.get(enorm):
+                    def_by_norm[enorm] = edef
+
+        final_defs = tuple(
+            (ename, def_by_norm.get(str(text_processing(ename)) or ename.lower(), ""))
+            for ename in ordered_entities
+        )
+        return OpenIERecord(
+            chunk_id=chunk_id,
+            entities=tuple(ordered_entities),
+            triples=tuple(st.as_tuple() for st in structured_triples),
+            structured_triples=structured_triples,
+            entity_definitions=final_defs,
+        )
+
+    def answer_question(
+        self,
+        context: str,
+        question: str,
+        *,
+        lm: Any = None,
+        use_gbnf: bool | None = None,
+    ) -> dspy.Prediction:
+        """Execute Pareto-ensembled multi-hop QA across all candidate programs."""
+        preds: list[dspy.Prediction] = []
+        for prog in self.programs:
+            prev_flag = prog._in_ensemble
+            prog._in_ensemble = True
+            try:
+                preds.append(
+                    prog.answer_question(
+                        context=context,
+                        question=question,
+                        lm=lm,
+                        use_gbnf=use_gbnf,
+                    )
+                )
+            finally:
+                prog._in_ensemble = prev_flag
+        return self.reduce_qa_predictions(preds)
+
+    async def aanswer_question(
+        self,
+        context: str,
+        question: str,
+        *,
+        lm: Any = None,
+        use_gbnf: bool | None = None,
+    ) -> dspy.Prediction:
+        """Async Pareto-ensembled multi-hop QA using `dspy.asyncify` across all candidate programs."""
+        import anyio
+
+        results: list[Any] = [None] * len(self.programs)
+
+        async def _run_idx(idx: int, prog: HippoRAGProgram) -> None:
+            prev_flag = prog._in_ensemble
+            prog._in_ensemble = True
+            try:
+                async_prog: Any = prog.as_async()
+                if lm is not None:
+                    with dspy.context(lm=lm):
+                        results[idx] = await async_prog(
+                            context=context,
+                            question=question,
+                            use_gbnf=use_gbnf,
+                        )
+                else:
+                    results[idx] = await async_prog(
+                        context=context,
+                        question=question,
+                        use_gbnf=use_gbnf,
+                    )
+            finally:
+                prog._in_ensemble = prev_flag
+
+        async with anyio.create_task_group() as tg:
+            for idx, prog in enumerate(self.programs):
+                tg.start_soon(_run_idx, idx, prog)
+
+        return self.reduce_qa_predictions([r for r in results if r is not None])
+
+    def forward(
+        self,
+        context: str | None = None,
+        question: str | None = None,
+        **kwargs: Any,
+    ) -> dspy.Prediction:
+        if context is not None and question is not None:
+            return self.answer_question(
+                context=context,
+                question=question,
+                use_gbnf=kwargs.get("use_gbnf"),
+            )
+        return self.qa_ensemble(context=context, question=question, **kwargs)
 
 
 
@@ -2028,7 +3452,10 @@ class RLMInstructionProposer:
         self.max_feedback_examples = max(1, int(max_feedback_examples))
         self.reflection_temperature = float(reflection_temperature)
         self.worker_temperature = float(worker_temperature)
-        self.json_adapter: dspy.Adapter = adapter or YawJSONAdapter()
+        self.json_adapter: dspy.Adapter = adapter or YawGBNFAdapter(
+            enable_gbnf=self.enable_gbnf,
+            max_instruction_chars=self.max_instruction_chars or 1500,
+        )
         self.telemetry: list[dict[str, Any]] = []
         self.simba_telemetry: list[dict[str, Any]] = []
         self._simba_examples: list[dspy.Example] = []
@@ -2482,5 +3909,16 @@ class RLMInstructionProposer:
 
 __all__ = [
     "HippoRAGProgram",
+    "ParetoProgramEnsemble",
     "RLMInstructionProposer",
+    "YawAssertionError",
+    "YawGBNFAdapter",
+    "YawPassage",
+    "YawRM",
+    "YawRetriever",
+    "is_abstaining_answer",
+    "validate_stage_invariants",
+    "wrap_stage_with_refine",
+    "yaw_assert",
+    "yaw_suggest",
 ]

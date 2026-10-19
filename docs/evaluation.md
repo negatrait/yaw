@@ -598,3 +598,72 @@ Offline test suite: `uv run --locked python -m unittest discover -s tests -v` �
   - `uv run --locked ruff check .` $\to$ **All checks passed!**
   - `uv run --locked ty check` $\to$ **All checks passed!**
   - `git diff --check` $\to$ **Clean**.
+
+16. **Sprint 1 — Foundation Adapters, Workspace Cache (`dspy.configure_cache`) & Async Embedder (`dspy.Embedder.acall` + `dspy.asyncify`) (2026-10-19):**
+
+- **Architecture & Implementation:**
+  - **`YawDSPyLM` Modernization & Workspace Cache (`yaw/daemon/graph/inference/chat.py`, `yaw/daemon/graph/inference/__init__.py`):**
+    - Retired `YawDSPyLM.forward()` so DSPy 3.4's managed `dspy.LM.__call__` pipeline executes natively with **0 `BaseLM.forward()` deprecation warnings** across the entire test suite (down from 8 warnings).
+    - Invoked `dspy.disable_litellm_logging()` at module initialization.
+    - Implemented `configure_yaw_dspy_cache(cache_dir, *, enable_disk_cache=True, enable_memory_cache=True, disk_size_limit_bytes=1_073_741_824, memory_max_entries=100_000, restrict_pickle=True, safe_types=None)` wrapping `dspy.configure_cache` and safely closing any prior `disk_cache` SQLite handle on Windows before reconfiguring.
+  - **`YawGBNFAdapter` (`yaw/daemon/graph/inference/program.py`, `yaw/daemon/graph/inference/__init__.py`):**
+    - Implemented `YawGBNFAdapter(YawJSONAdapter)` (`issubclass(YawGBNFAdapter, dspy.JSONAdapter)`) with `resolve_grammar(signature)` and `_prepare_gbnf_kwargs(lm, lm_kwargs, signature)` for automatic per-signature GBNF grammar injection in `__call__` and `acall` across all 10 direct Qwen signatures (`ExtractEntities`, `ExtractTriples`, `DefineMissingEntities`, `JudgeSynonyms`, `ProposeSHACLRepairs`, `ExtractQueryIntent`, `FilterTriples`, `AnswerQuestion`, `ProposeInstructionSignature`, `CompressInstructionSignature`) while returning `None` for the 2 RLM signatures (`HealSHACLViolations`, `ReflectiveInnerDistillerSignature`).
+    - Wired `YawGBNFAdapter` as the default `self.json_adapter` on both `HippoRAGProgram` and `RLMInstructionProposer`, synchronizing structural bounds on `load_state()`.
+  - **Async `DSPyEmbeddingAdapter(dspy.Embedder)` (`yaw/daemon/graph/inference/embedding.py`):**
+    - Subclassed `dspy.Embedder` directly on `DSPyEmbeddingAdapter` (`super().__init__(model=..., batch_size=..., caching=True, **kwargs)`) while preserving `super().__call__(...)` and `await super().acall(...)` delegation.
+    - Implemented `_aencode_prepared` (using `await super().acall` for hosted models and `dspy.asyncify(self.model)` for custom callables, with recursive binary-split overflow recovery), `abatch_encode` (concurrent micro-batch dispatch via `anyio.create_task_group()`), `acall`, and `as_async()` (`dspy.asyncify(self)`).
+
+- **Verification Status:**
+  - `uv run --locked pytest -m "not live_silicon" -q` $\to$ **168 passed, 1 warning, 3 subtests passed in 30.80s** (0 `BaseLM.forward()` deprecation warnings).
+  - `uv run --locked pytest tests/core/test_architecture.py tests/daemon/graph/inference/test_prompts.py -q` $\to$ **39 passed in 31.07s**.
+  - `uv run --locked ruff check .` $\to$ **All checks passed!**
+  - `uv run --locked ty check` $\to$ **All checks passed!**
+  - `git diff --check` $\to$ **Clean**.
+  - `git grep -n "def forward" yaw/daemon/graph/inference/chat.py` $\to$ **0 matches**.
+
+17. **Sprint 2 — First-Class `YawRM` / `YawRetriever(dspy.Retrieve)`, Stage Invariants (`yaw_assert` / `yaw_suggest` / `dspy.Refine`), GEPA Pareto Frontier Ensemble (`dspy.Ensemble`) & `dspy.ReActV2` (2026-10-19):**
+
+- **Architecture & Implementation:**
+  - **First-Class `dspy.Retrieve` / `dspy.RM` Adapter (`yaw/daemon/graph/inference/program.py`, `yaw/daemon/graph/inference/__init__.py`):**
+    - Implemented `YawPassage(dspy.Prediction)` exposing `.long_text` (required by `dspy.Retrieve.forward`), `.pid`, `.score`, and `.rank`.
+    - Implemented `YawRM` (`__call__(query_or_queries, k=None, **kwargs) -> list[YawPassage]`) compatible with `dspy.configure(rm=...)` / `dspy.context(rm=...)` so stock `dspy.Retrieve(k=...)` modules query YAW's hybrid PPR graph engine natively.
+    - Implemented `YawRetriever(dspy.Retrieve)` with backward-compatible `dump_state` / `load_state` (`state_copy.setdefault("retriever", {"k": ...})`) and wired `self.rm` and `self.retriever` onto `HippoRAGProgram` while preserving the 9-predictor `named_predictors()` invariant.
+  - **Exhaustive Stage & Closed-World SHACL/SKOS/Connected-Node Invariants (`yaw/daemon/graph/inference/program.py`):**
+    - Implemented `YawAssertionError`, `yaw_assert(condition, message, *, target_module=None)`, `yaw_suggest(condition, message, *, target_module=None)`, `validate_stage_invariants(...)`, and `wrap_stage_with_refine(module, stage_name, *, N=2, threshold=1.0, use_refine=True)` (`dspy.Refine` / `dspy.BestOfN`).
+    - Enforces all 9 stage contracts (`ner`, `triples`, `entity_definer`, `synonym_judge`, `shacl_repair` / `shacl_healer_rlm`, `query_intent`, `triple_filter`, `qa`, `qwen_proposer` / `qwen_compressor`) and all 6 closed-world SHACL shapes (`ConceptShape/prefLabel`, `ConceptShape/definition`, `ConceptShape/S13-disjointLabels`, `ConceptShape/homographDifferentFrom`, `StatementShape/closedWorld`, `EdgeShape/closedWorld`), plus connected-node subgraph topology (`_count_connected_components`), closed-world candidate fact subset closure, and anti-leakage instruction validation.
+    - Wired feedback-guided self-correction retry (`max_invariant_retries = 1`) into `HippoRAGProgram._invoke_stage`, recording `invariant_score`, `invariant_feedback`, and `invariant_retries` in `self.telemetry`.
+  - **GEPA Pareto Frontier Ensembling (`yaw/daemon/graph/inference/program.py`):**
+    - Implemented `ParetoProgramEnsemble(dspy.Module)` wrapping `dspy.Ensemble(reduce_fn=...)` with `self._compiled = True`, `from_frontier_states`, `reduce_ner_predictions`, `reduce_triple_predictions`, `reduce_qa_predictions`, `extract_openie`, `answer_question`, and `aanswer_question` (concurrent async dispatch via `prog.as_async()` + `anyio.create_task_group()`).
+    - Persisted and restored `pareto_frontier_states` in `HippoRAGProgram.dump_state()` / `load_state()`.
+  - **Adaptive Multi-Hop Graph Exploration (`dspy.ReActV2`) & `as_async()` (`yaw/daemon/graph/inference/program.py`):**
+    - Added `set_graph_search_tool`, `_run_react_qa_fallback` using `dspy.ReActV2(AnswerQuestion, tools=[...], max_iters=3)` when initial QA returns `"Insufficient context"`, `_parse_react_v2_payload` in `YawJSONAdapter.parse`, and `HippoRAGProgram.as_async()`.
+
+- **Verification Status:**
+  - `uv run --locked pytest tests/core/test_architecture.py tests/daemon/graph/inference/test_prompts.py -k "not live_silicon" -q` $\to$ **40 passed, 2 deselected in 6.53s**.
+  - `uv run --locked pytest -m "not live_silicon" -k "not live_silicon" -q` $\to$ **169 passed, 2 deselected, 3 subtests passed in 20.36s**.
+  - `uv run --locked ruff check .` $\to$ **All checks passed!**
+  - `uv run --locked ty check` $\to$ **All checks passed!**
+  - `git diff --check` $\to$ **Clean**.
+
+## 18. High-Leverage DSPy Integrations — Sprint 3 (`YawGraphEngine` Wiring, `as_rm` / `as_retriever`, Pareto Export, `dspy.Evaluate` Harness & Oblivion Gate)
+
+- **Scope:** Completed Sprint 3 (`#step-03`) of the 3-sprint High-Leverage DSPy Integration Plan across `yaw/daemon/graph/engine.py`, `yaw/daemon/graph/inference/program.py`, and `tests/daemon/graph/test_engine.py`:
+  - **Workspace Cache Isolation & `saved_cache_flags` Retirement (`yaw/daemon/graph/engine.py`):**
+    - Wired `configure_yaw_dspy_cache(self._dspy_cache_dir, restrict_pickle=True)` in `YawGraphEngine.__init__` and released open disk cache handles in `YawGraphEngine.close()`.
+    - Retired the ad-hoc `saved_cache_flags` dictionary in `YawGraphEngine.evolve_prompts` (`optimize`), replacing it with `configure_yaw_dspy_cache(self._dspy_cache_dir, enable_disk_cache=False, enable_memory_cache=False, restrict_pickle=True)` inside a `try / finally` block that restores `enable_disk_cache=True, enable_memory_cache=True, restrict_pickle=True`.
+  - **Engine-Level `as_rm()`, `as_retriever()`, and `_search_graph_for_react` (`yaw/daemon/graph/engine.py`, `yaw/daemon/graph/inference/program.py`):**
+    - Added `YawGraphEngine._rm_retrieval_hook`, `YawGraphEngine.as_rm(k=None, *, configure_dspy=False) -> YawRM`, and `YawGraphEngine.as_retriever(k=None, *, configure_dspy=False) -> YawRetriever` so external `dspy.Retrieve(k=...)` modules resolve directly against `yaw.db` when `configure_dspy=True` is set.
+    - Implemented `YawGraphEngine._search_graph_for_react(query: str) -> str` combining dense KNN (`search_fact_vectors_knn`, `search_chunk_vectors_knn`) and FTS5 (`search_facts_fts`, `search_chunks_fts`) fact/passage lookup and bound it via `target.set_graph_search_tool(self._search_graph_for_react)` in `_bind_program_hooks`.
+  - **Top-3 Pareto Frontier Export & `dspy.Evaluate` Harness (`yaw/daemon/graph/engine.py`):**
+    - Enriched `_evaluate_prediction` with `dspy.evaluate.answer_passage_match` (`AnswerPassageMatch={0|1}`) in the GEPA diagnostic feedback string.
+    - Added `_extract_pareto_frontier_states(compiled, max_candidates=3)` in `YawGraphEngine.evolve_prompts` (`optimize = evolve_prompts`), populating `compiled.pareto_frontier_states` and `compiled.pareto_ensemble = ParetoProgramEnsemble.from_frontier_states(...)` and persisting `<save_stem>_eval.json` alongside `save_path` when `valset` is provided.
+    - Implemented `YawGraphEngine.evaluate(devset, *, metric=None, num_threads=1, display_progress=False, display_table=False, save_as_json=None, save_as_csv=None, include_semantic_metrics=False) -> dspy.evaluate.EvaluationResult` wrapping `dspy.Evaluate`, `dspy.evaluate.answer_passage_match`, `dspy.evaluate.SemanticF1`, and `dspy.evaluate.CompleteAndGrounded`.
+
+- **Verification & Oblivion Gate Status:**
+  - `uv run --locked pytest tests/daemon/graph/test_engine.py -k "test_sprint3" -q` $\to$ **3 passed, 14 deselected in 6.75s**.
+  - `uv run --locked pytest -m "not live_silicon" -k "not live_silicon" -q` $\to$ **172 passed, 2 deselected, 3 subtests passed in 30.41s**.
+  - `uv run --locked ruff check .` $\to$ **All checks passed!**
+  - `uv run --locked ty check` $\to$ **All checks passed!**
+  - `git diff --check` $\to$ **Clean**.
+  - `git grep -n "def forward" yaw/daemon/graph/inference/chat.py` $\to$ **0 matches**.
+  - `git grep -w "saved_cache_flags" yaw/` $\to$ **0 matches**.

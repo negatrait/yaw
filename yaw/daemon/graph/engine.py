@@ -18,10 +18,14 @@ from yaw.daemon.graph.inference import (
     PASSAGE_INSTRUCTION,
     DSPyEmbeddingAdapter,
     HippoRAGProgram,
+    ParetoProgramEnsemble,
     RLMInstructionProposer,
+    YawRetriever,
+    YawRM,
     compute_mdhash_id,
     compute_qa_em_f1,
     compute_sizecoding_pareto_score,
+    configure_yaw_dspy_cache,
     text_processing,
 )
 from yaw.daemon.graph.ppr import (
@@ -111,6 +115,12 @@ class YawGraphEngine:
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.db_path = db_path
+        db_path_str = str(db_path)
+        if db_path_str != ":memory:" and not db_path_str.startswith("file:"):
+            self._dspy_cache_dir = Path(db_path).resolve().parent / "dspy_cache"
+        else:
+            self._dspy_cache_dir = self.workspace_root / "dspy_cache"
+        configure_yaw_dspy_cache(self._dspy_cache_dir, restrict_pickle=True)
         self._lock = threading.RLock()
         self.managed_conn: ManagedConnection = open_managed_yaw_db(db_path)
         self.conn: sqlite3.Connection = self.managed_conn._conn
@@ -344,8 +354,135 @@ class YawGraphEngine:
                     v.to_dict() for v in lint_graph_shacl(self.conn, auto_heal=False)
                 ],
             )
+        if hasattr(target, "set_graph_search_tool"):
+            target.set_graph_search_tool(self._search_graph_for_react)
+        ensemble = getattr(target, "pareto_ensemble", None)
+        if ensemble is not None and hasattr(ensemble, "programs"):
+            for sub_prog in ensemble.programs:
+                if sub_prog is not target:
+                    sub_prog.set_retrieval_hook(self._program_retrieval_hook)
+                    if hasattr(sub_prog, "set_graph_search_tool"):
+                        sub_prog.set_graph_search_tool(self._search_graph_for_react)
         if hasattr(self.embedder, "bind_telemetry_hook"):
             self.embedder.bind_telemetry_hook(self._on_embedding_telemetry)
+
+    def _rm_retrieval_hook(
+        self,
+        question: str,
+        program: HippoRAGProgram | None = None,
+        *,
+        item_docs: Sequence[str] | None = None,
+        k: int | None = None,
+    ) -> tuple[str, tuple[str, ...], tuple[float, ...], tuple[str, ...]]:
+        """Retrieval hook for `YawRM` / `YawRetriever` returning hydrated passage texts and chunk IDs."""
+        active_program = program if program is not None else self.program
+        if item_docs is not None:
+            self._ensure_candidate_chunks_indexed(active_program, item_docs=item_docs)
+        top_k = max(1, int(k if k is not None else self.retrieval_top_k))
+        hits = self.retrieve(question, top_k=top_k, program=active_program)
+        if not hits:
+            return "", (), (), ()
+        texts = tuple(self._format_hydrated_passage(p, text) for p, _, text in hits)
+        scores = tuple(float(s) for _, s, _ in hits)
+        pids = tuple(p.chunk_id for p, _, _ in hits)
+        formatted_context = self.format_qa_context(hits[:top_k])
+        return formatted_context, texts, scores, pids
+
+    def as_rm(
+        self,
+        k: int | None = None,
+        *,
+        configure_dspy: bool = False,
+    ) -> YawRM:
+        """Return a first-class `YawRM` callable bound to this engine (optionally registering `dspy.configure(rm=...)`)."""
+        eff_k = int(k if k is not None else self.retrieval_top_k)
+        rm = YawRM(
+            hook=self._rm_retrieval_hook,
+            program=self.program,
+            default_k=eff_k,
+        )
+        if configure_dspy:
+            dspy.configure(rm=rm)
+        return rm
+
+    def as_retriever(
+        self,
+        k: int | None = None,
+        *,
+        configure_dspy: bool = False,
+    ) -> YawRetriever:
+        """Return a first-class `YawRetriever(dspy.Retrieve)` bound to this engine (optionally registering `dspy.configure(rm=...)`)."""
+        rm = self.as_rm(k=k, configure_dspy=configure_dspy)
+        return YawRetriever(k=rm.default_k, rm=rm)
+
+    def _search_graph_for_react(self, query: str) -> str:
+        """Execute hybrid dense + FTS fact and entity lookup in `yaw.db` for `dspy.ReActV2` multi-hop exploration."""
+        clean_q = str(query or "").strip()
+        if not clean_q:
+            return ""
+        with self._lock:
+            query_fact_vec = self._encode_texts(
+                [clean_q], instruction=FACT_INSTRUCTION, stage="react_fact_embed"
+            )[0]
+            dense_fact_hits = search_fact_vectors_knn(
+                self.conn, query_fact_vec, top_k=min(10, self.fact_candidate_pool_k)
+            )
+            fts_fact_hits = search_facts_fts(
+                self.conn, clean_q, top_k=min(10, self.fact_fts_pool_k)
+            )
+            ordered_fids: list[str] = []
+            seen_fids: set[str] = set()
+            for fid, _ in [*fts_fact_hits, *dense_fact_hits]:
+                if fid not in seen_fids:
+                    seen_fids.add(fid)
+                    ordered_fids.append(fid)
+                if len(ordered_fids) >= 8:
+                    break
+
+            fact_lines: list[str] = []
+            if ordered_fids:
+                triples_map = get_facts_by_ids(self.conn, ordered_fids)
+                placeholders = ",".join("?" for _ in ordered_fids)
+                def_rows = {
+                    str(r[0]): str(r[1] or "")
+                    for r in self.conn.execute(
+                        f"SELECT fact_id, COALESCE(definition, '') FROM facts WHERE fact_id IN ({placeholders})",
+                        ordered_fids,
+                    ).fetchall()
+                }
+                for fid in ordered_fids:
+                    triple = triples_map.get(fid)
+                    if triple is not None:
+                        s, p, o = triple
+                        f_def = def_rows.get(fid, "").strip()
+                        if f_def:
+                            fact_lines.append(f"- ({s}, {p}, {o}): {f_def}")
+                        else:
+                            fact_lines.append(f"- ({s}, {p}, {o})")
+
+            query_passage_vec = self._encode_texts(
+                [clean_q], instruction=PASSAGE_INSTRUCTION, stage="react_passage_embed"
+            )[0]
+            chunk_vec_hits = search_chunk_vectors_knn(self.conn, query_passage_vec, top_k=5)
+            chunk_fts_hits = search_chunks_fts(self.conn, clean_q, top_k=5)
+            merged_chunks: list[tuple[str, float]] = []
+            seen_cids: set[str] = set()
+            for cid, sc in [*chunk_fts_hits, *chunk_vec_hits]:
+                if cid not in seen_cids:
+                    seen_cids.add(cid)
+                    merged_chunks.append((cid, float(sc)))
+            hydrated = self._hydrate_maxp_passages(merged_chunks, top_k=3)
+            passage_lines = [
+                f"[{ptr.chunk_id}] {self._format_hydrated_passage(ptr, txt)}"
+                for ptr, _, txt in hydrated
+            ]
+
+            sections: list[str] = []
+            if fact_lines:
+                sections.append("Facts:\n" + "\n".join(fact_lines))
+            if passage_lines:
+                sections.append("Passages:\n" + "\n\n".join(passage_lines))
+            return "\n\n".join(sections) if sections else "No matching graph facts or passages found."
 
     def _apply_program_embedding_prefixes(self, program: HippoRAGProgram | None = None) -> None:
         target = program if program is not None else self.program
@@ -365,8 +502,13 @@ class YawGraphEngine:
                 setattr(target, "embedding_document_prefix", getattr(profile, "document_prefix", None))
 
     def close(self) -> None:
-        """Close SQLite database connection."""
+        """Close SQLite database connection and release any open DSPy disk cache handles."""
         with self._lock:
+            active_cache = getattr(dspy, "cache", None)
+            disk_cache = getattr(active_cache, "disk_cache", None) if active_cache is not None else None
+            close_fn = getattr(disk_cache, "close", None)
+            if callable(close_fn):
+                close_fn()
             if self.managed_conn is not None:
                 self.managed_conn.close()
 
@@ -2296,6 +2438,22 @@ class YawGraphEngine:
                     "Missing LM token usage on prediction (`pred.get_lm_usage()` returned 0 tokens). "
                     "Ensure `track_usage=True` is active and task LMs report non-zero token usage."
                 )
+            apm_hit: bool | None = None
+            if gold_answers:
+                passages_for_apm = (
+                    [p for p in context_str.split("\n\n") if p.strip()]
+                    if context_str.strip()
+                    else []
+                )
+                if passages_for_apm and hasattr(dspy, "evaluate") and hasattr(
+                    dspy.evaluate, "answer_passage_match"
+                ):
+                    ex_apm = dspy.Example(answer=list(gold_answers))
+                    pred_apm = dspy.Prediction(context=passages_for_apm)
+                    apm_hit = bool(dspy.evaluate.answer_passage_match(ex_apm, pred_apm))
+                else:
+                    apm_hit = False
+
             score_pred = compute_sizecoding_pareto_score(
                 recalls_by_k[5],
                 recall_at_1=recalls_by_k[1],
@@ -2328,6 +2486,11 @@ class YawGraphEngine:
                 pred_name=str(pred_name) if pred_name else None,
                 missed_items=missed,
             )
+            if apm_hit is not None:
+                score_pred.answer_passage_match = 1.0 if apm_hit else 0.0
+                score_pred.feedback = (
+                    f"{score_pred.feedback} | AnswerPassageMatch={1 if apm_hit else 0}"
+                )
             if pred_name:
                 stage_diag = _build_stage_diagnostic(
                     str(pred_name),
@@ -2374,21 +2537,15 @@ class YawGraphEngine:
             enable_gbnf=True,
         )
 
-        # Disable DSPy disk cache on task LMs during prompt evolution so DSPy's
-        # `if not result.cache_hit:` in `dspy/clients/execution.py` never drops token usage
+        # Disable DSPy disk and memory cache during prompt evolution via configure_yaw_dspy_cache
+        # so DSPy's `if not result.cache_hit:` in `dspy/clients/execution.py` never drops token usage
         # on repeated predictor calls across GEPA rounds.
-        task_lms = [
-            lm
-            for lm in (
-                self.program.orchestrator_lm,
-                self.program.rlm_sub_lm,
-                getattr(dspy.settings, "lm", None),
-            )
-            if lm is not None and hasattr(lm, "cache")
-        ]
-        saved_cache_flags = [(lm, bool(getattr(lm, "cache", False))) for lm in task_lms]
-        for lm, _ in saved_cache_flags:
-            setattr(lm, "cache", False)
+        configure_yaw_dspy_cache(
+            self._dspy_cache_dir,
+            enable_disk_cache=False,
+            enable_memory_cache=False,
+            restrict_pickle=True,
+        )
 
         try:
             if mode in ("miprov2", "hybrid") and hasattr(dspy, "MIPROv2"):
@@ -2457,8 +2614,21 @@ class YawGraphEngine:
                         valset=list(valset) if valset else None,
                     )
         finally:
-            for lm, orig_flag in saved_cache_flags:
-                setattr(lm, "cache", orig_flag)
+            configure_yaw_dspy_cache(
+                self._dspy_cache_dir,
+                enable_disk_cache=True,
+                enable_memory_cache=True,
+                restrict_pickle=True,
+            )
+
+        assert isinstance(compiled, HippoRAGProgram)
+        frontier_states = self._extract_pareto_frontier_states(compiled, max_candidates=3)
+        if frontier_states:
+            compiled.pareto_frontier_states = frontier_states
+            if len(frontier_states) >= 2:
+                compiled.pareto_ensemble = ParetoProgramEnsemble.from_frontier_states(
+                    compiled, frontier_states
+                )
 
         self.program = compiled
         self._bind_program_hooks()
@@ -2516,12 +2686,183 @@ class YawGraphEngine:
                 ),
             }
             audit_path.write_text(
-
                 json.dumps(audit_payload, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+            if valset:
+                eval_path = p.parent / f"{p.stem}_eval.json"
+                self.evaluate(valset, save_as_json=eval_path)
 
         return self.program
+
+    optimize = evolve_prompts
+
+    @staticmethod
+    def _extract_pareto_frontier_states(
+        compiled: Any,
+        *,
+        max_candidates: int = 3,
+    ) -> list[dict[str, Any]]:
+        """Extract up to `max_candidates` distinct non-dominated Pareto candidate states from `compiled.detailed_results`."""
+        detailed = getattr(compiled, "detailed_results", None)
+        if detailed is None:
+            return []
+        candidates = list(getattr(detailed, "candidates", None) or ())
+        if not candidates:
+            return []
+        scores = [
+            float(s)
+            for s in (getattr(detailed, "val_aggregate_scores", None) or ())
+        ]
+        pareto_indices: set[int] = set()
+        best_idx = getattr(detailed, "best_idx", None)
+        if isinstance(best_idx, int) and 0 <= best_idx < len(candidates):
+            pareto_indices.add(best_idx)
+        for mapping_attr in (
+            "per_val_instance_best_candidates",
+            "per_objective_best_candidates",
+        ):
+            mapping = getattr(detailed, mapping_attr, None)
+            if isinstance(mapping, Mapping):
+                for idx_group in mapping.values():
+                    if isinstance(idx_group, (list, tuple, set)):
+                        for idx in idx_group:
+                            if isinstance(idx, int) and 0 <= idx < len(candidates):
+                                pareto_indices.add(idx)
+                    elif isinstance(idx_group, int) and 0 <= idx_group < len(candidates):
+                        pareto_indices.add(idx_group)
+
+        ranked_indices = sorted(
+            range(len(candidates)),
+            key=lambda i: (
+                i == best_idx,
+                i in pareto_indices,
+                scores[i] if i < len(scores) else 0.0,
+                -i,
+            ),
+            reverse=True,
+        )
+
+        states: list[dict[str, Any]] = []
+        seen_hashes: set[str] = set()
+        for idx in ranked_indices:
+            cand = candidates[idx]
+            if not hasattr(cand, "dump_state"):
+                continue
+            cand_state = dict(cand.dump_state())
+            surface_free = dict(cand_state)
+            surface_free.pop("yaw_surface", None)
+            raw_hash = hashlib.sha256(
+                json.dumps(surface_free, sort_keys=True, default=str).encode("utf-8")
+            ).hexdigest()
+            if raw_hash in seen_hashes:
+                continue
+            seen_hashes.add(raw_hash)
+            states.append(cand_state)
+            if len(states) >= max_candidates:
+                break
+        return states
+
+    def evaluate(
+        self,
+        devset: Sequence[dspy.Example],
+        *,
+        metric: Callable[..., Any] | None = None,
+        num_threads: int = 1,
+        display_progress: bool = False,
+        display_table: bool | int = False,
+        save_as_json: str | Path | None = None,
+        save_as_csv: str | Path | None = None,
+        include_semantic_metrics: bool = False,
+    ) -> dspy.evaluate.EvaluationResult:
+        """Evaluate the bound `HippoRAGProgram` on `devset` using `dspy.Evaluate` and return `EvaluationResult`."""
+        semantic_f1_mod = (
+            dspy.evaluate.SemanticF1()
+            if include_semantic_metrics and hasattr(dspy.evaluate, "SemanticF1")
+            else None
+        )
+        grounded_mod = (
+            dspy.evaluate.CompleteAndGrounded()
+            if include_semantic_metrics and hasattr(dspy.evaluate, "CompleteAndGrounded")
+            else None
+        )
+
+        def _extract_gold_answers(example: Any) -> list[str]:
+            raw = getattr(example, "gold_answers", getattr(example, "answer", []))
+            if isinstance(raw, str):
+                return [raw] if raw.strip() else []
+            return [str(a) for a in (raw or ()) if str(a).strip()]
+
+        def _compute_apm(gold_answers: list[str], context_val: Any) -> bool:
+            if not gold_answers:
+                return False
+            if isinstance(context_val, str):
+                passages = [p for p in context_val.split("\n\n") if p.strip()]
+            elif isinstance(context_val, Sequence):
+                passages = [str(p) for p in context_val if str(p).strip()]
+            else:
+                passages = []
+            if not passages:
+                return False
+            ex_apm = dspy.Example(answer=list(gold_answers))
+            pred_apm = dspy.Prediction(context=passages)
+            return bool(dspy.evaluate.answer_passage_match(ex_apm, pred_apm))
+
+        def _wrapped_metric(example: Any, pred: Any, trace: Any = None) -> float:
+            _ = trace
+            gold_answers = _extract_gold_answers(example)
+            pred_answer = str(getattr(pred, "answer", "") or "").strip()
+            context_val = getattr(pred, "context", "")
+            apm_hit = _compute_apm(gold_answers, context_val)
+            em_score, f1_score = (
+                compute_qa_em_f1(pred_answer, gold_answers)
+                if gold_answers
+                else (0.0, 0.0)
+            )
+            if isinstance(pred, dspy.Prediction):
+                pred.answer_passage_match = 1.0 if apm_hit else 0.0
+                pred.em = float(em_score)
+                pred.f1 = float(f1_score)
+                if include_semantic_metrics and gold_answers:
+                    q_str = str(getattr(example, "question", "") or "")
+                    ctx_str = (
+                        context_val
+                        if isinstance(context_val, str)
+                        else "\n\n".join(str(x) for x in context_val)
+                    )
+                    sem_ex = dspy.Example(question=q_str, response=gold_answers[0])
+                    sem_pred = dspy.Prediction(response=pred_answer, context=ctx_str)
+                    if semantic_f1_mod is not None:
+                        sem_res = semantic_f1_mod(sem_ex, sem_pred)
+                        pred.semantic_f1 = float(getattr(sem_res, "score", sem_res))
+                    if grounded_mod is not None:
+                        grd_res = grounded_mod(sem_ex, sem_pred)
+                        pred.complete_and_grounded = float(
+                            getattr(grd_res, "score", grd_res)
+                        )
+
+            if metric is not None:
+                if metric is dspy.evaluate.answer_passage_match:
+                    return 1.0 if apm_hit else 0.0
+                norm_ex = example
+                if not hasattr(example, "answer") and gold_answers:
+                    norm_ex = dspy.Example(**example.toDict(), answer=list(gold_answers))
+                raw_score = metric(norm_ex, pred)
+                if hasattr(raw_score, "score"):
+                    return float(raw_score.score)
+                return float(raw_score)
+            return float(f1_score)
+
+        evaluator = dspy.Evaluate(
+            devset=list(devset),
+            metric=_wrapped_metric,
+            num_threads=num_threads,
+            display_progress=display_progress,
+            display_table=display_table,
+            save_as_json=str(save_as_json) if save_as_json is not None else None,
+            save_as_csv=str(save_as_csv) if save_as_csv is not None else None,
+        )
+        return evaluator(self.program)
 
 
 __all__ = [

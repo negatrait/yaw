@@ -1,4 +1,6 @@
 import logging
+import os
+from pathlib import Path
 from typing import Any
 
 import dspy
@@ -8,9 +10,12 @@ from .models import BASE_URL, CHAT_MODELS, DEFAULT_EXTRACTION_CHAT, DEFAULT_QA_C
 
 for _logger_name in ("LiteLLM", "LiteLLM Router", "LiteLLM Proxy", "litellm", "httpx"):
     logging.getLogger(_logger_name).setLevel(logging.WARNING)
+if hasattr(dspy, "disable_litellm_logging"):
+    dspy.disable_litellm_logging()
 
 __all__ = [
     "YawDSPyLM",
+    "configure_yaw_dspy_cache",
     "create_dspy_lm",
     "create_dspy_rlm_pair",
     "lm_supports_gbnf",
@@ -18,7 +23,7 @@ __all__ = [
 
 
 class YawDSPyLM(dspy.LM):
-    """Native dspy.LM wrapper providing recipe-aware fixes (e.g. Ryzen AI Jinja system folding)."""
+    """Native dspy.LM wrapper preserving recipe metadata across copies without overriding BaseLM.forward."""
 
     def __call__(self, prompt: Any = None, *, messages: Any = None, **kwargs: Any) -> Any:
         if (
@@ -41,32 +46,46 @@ class YawDSPyLM(dspy.LM):
             ]
         return super().__call__(prompt=prompt, messages=messages, **kwargs)
 
-    def forward(self, prompt: Any = None, messages: Any = None, **kwargs: Any) -> Any:
-        if (
-            getattr(self, "_yaw_recipe", None) == "ryzenai-llm"
-            and isinstance(messages, list)
-            and len(messages) >= 2
-            and isinstance(messages[0], dict)
-            and messages[0].get("role") == "system"
-            and isinstance(messages[1], dict)
-            and messages[1].get("role") == "user"
-        ):
-            messages = [
-                {
-                    "role": "user",
-                    "content": str(messages[0].get("content", "")).strip()
-                    + "\n\n"
-                    + str(messages[1].get("content", "")),
-                },
-                *messages[2:],
-            ]
-        return super().forward(prompt=prompt, messages=messages, **kwargs)
-
     def copy(self, **kwargs: Any) -> Any:
         copied = super().copy(**kwargs)
         setattr(copied, "_yaw_recipe", getattr(self, "_yaw_recipe", None))
         setattr(copied, "_yaw_supports_gbnf", getattr(self, "_yaw_supports_gbnf", False))
         return copied
+
+
+def configure_yaw_dspy_cache(
+    cache_dir: str | os.PathLike[str] | None = None,
+    *,
+    enable_disk_cache: bool = True,
+    enable_memory_cache: bool = True,
+    disk_size_limit_bytes: int = 1_073_741_824,
+    memory_max_entries: int = 100_000,
+    restrict_pickle: bool = True,
+    safe_types: list[type[Any]] | None = None,
+) -> None:
+    """Configure workspace-isolated DSPy cache via dspy.configure_cache with restrict_pickle=True by default."""
+    resolved_dir: str | None = None
+    if cache_dir is not None:
+        p = Path(cache_dir)
+        if enable_disk_cache:
+            p.mkdir(parents=True, exist_ok=True)
+        resolved_dir = str(p)
+    kwargs: dict[str, Any] = {
+        "enable_disk_cache": bool(enable_disk_cache),
+        "enable_memory_cache": bool(enable_memory_cache),
+        "disk_size_limit_bytes": int(disk_size_limit_bytes),
+        "memory_max_entries": int(memory_max_entries),
+        "restrict_pickle": bool(restrict_pickle),
+        "safe_types": safe_types,
+    }
+    if resolved_dir is not None:
+        kwargs["disk_cache_dir"] = resolved_dir
+    old_cache = getattr(dspy, "cache", None)
+    old_disk = getattr(old_cache, "disk_cache", None) if old_cache is not None else None
+    close_fn = getattr(old_disk, "close", None)
+    if callable(close_fn):
+        close_fn()
+    dspy.configure_cache(**kwargs)
 
 
 def create_dspy_lm(

@@ -8,6 +8,7 @@ _PUBLIC_API: dict[str, str] = {
     # Native DSPy LM & Heterogeneous RLM
     "create_dspy_lm": ".chat",
     "create_dspy_rlm_pair": ".chat",
+    "configure_yaw_dspy_cache": ".chat",
     "lm_supports_gbnf": ".grammars",
     # Native DSPy Embedder & Profiles
     "create_dspy_embedder": ".embedding",
@@ -33,6 +34,17 @@ _PUBLIC_API: dict[str, str] = {
     # Native DSPy Program & 12 Canonical Signatures
     "HippoRAGProgram": ".program",
     "RLMInstructionProposer": ".program",
+    "YawGBNFAdapter": ".program",
+    "YawPassage": ".program",
+    "YawRM": ".program",
+    "YawRetriever": ".program",
+    "YawAssertionError": ".program",
+    "yaw_assert": ".program",
+    "yaw_suggest": ".program",
+    "validate_stage_invariants": ".program",
+    "wrap_stage_with_refine": ".program",
+    "ParetoProgramEnsemble": ".program",
+    "is_abstaining_answer": ".program",
     "ExtractEntities": ".prompts",
     "ExtractQueryIntent": ".prompts",
     "ExtractTriples": ".prompts",

@@ -1471,3 +1471,259 @@ def test_engine_evolve_prompts_reindexes_on_extraction_mutation_and_captures_all
         assert "[qa.predict]" in feedback_by_stage["qa.predict"]
     finally:
         engine.close()
+
+
+def test_sprint3_engine_as_rm_and_as_retriever_and_dspy_retrieve_compatibility(
+    tmp_path: Path,
+) -> None:
+    """Verify YawGraphEngine.as_rm, as_retriever, workspace DSPy cache isolation, and stock dspy.Retrieve(k=...) compatibility."""
+    from yaw.daemon.graph.inference import YawPassage, YawRetriever, YawRM
+
+    dspy.settings.configure(lm=DeterministicMockLM())
+    program = HippoRAGProgram(enable_gbnf=False)
+    embedder: Any = DeterministicMockEmbedder(dim=64)
+
+    engine = YawGraphEngine(
+        db_path=tmp_path / "yaw_rm_sprint3.db",
+        workspace_root=tmp_path,
+        program=program,
+        embedder=embedder,
+        retrieval_top_k=2,
+    )
+    try:
+        assert (tmp_path / "dspy_cache").exists()
+        assert getattr(dspy, "cache", None) is not None
+
+        doc_turing = "Alan Turing designed the Automatic Computing Engine (ACE) at the National Physical Laboratory."
+        doc_lovelace = "Ada Lovelace wrote the first algorithm for Charles Babbage's Analytical Engine."
+        engine.index([doc_turing, doc_lovelace])
+
+        rm = engine.as_rm(k=2, configure_dspy=True)
+        assert isinstance(rm, YawRM)
+        assert dspy.settings.rm is rm
+
+        rm_hits = rm("Who designed the Automatic Computing Engine?", k=2)
+        assert len(rm_hits) == 2
+        assert all(isinstance(h, YawPassage) for h in rm_hits)
+        assert any("Alan Turing" in h.long_text for h in rm_hits)
+        assert all(h.pid.startswith("chunk-") for h in rm_hits)
+        assert [h.rank for h in rm_hits] == [1, 2]
+
+        stock_retrieve = dspy.Retrieve(k=2)
+        stock_pred = stock_retrieve("Who designed the Automatic Computing Engine?")
+        assert len(stock_pred.passages) == 2
+        assert any("Alan Turing" in p for p in stock_pred.passages)
+
+        retriever = engine.as_retriever(k=2, configure_dspy=True)
+        assert isinstance(retriever, YawRetriever)
+        assert isinstance(retriever, dspy.Retrieve)
+        ret_pred = retriever("Who wrote the algorithm for the Analytical Engine?", k=1)
+        assert len(ret_pred.passages) == 1
+        assert len(ret_pred.scores) == 1
+        assert ret_pred.context.strip() != ""
+    finally:
+        dspy.configure(rm=None)
+        engine.close()
+
+
+def test_sprint3_engine_search_graph_for_react_and_react_v2_fallback_integration(
+    tmp_path: Path,
+) -> None:
+    """Verify _search_graph_for_react queries real SQLite yaw.db facts and passages and powers dspy.ReActV2 multi-hop fallback."""
+    import json
+
+    class ReActEngineMockLM(DeterministicMockLM):
+        def __call__(
+            self,
+            prompt: str | None = None,
+            messages: list[dict[str, Any]] | None = None,
+            **kwargs: Any,
+        ) -> list[str]:
+            if getattr(dspy.settings, "usage_tracker", None) is not None:
+                dspy.settings.usage_tracker.add_usage(
+                    self.model,
+                    {"prompt_tokens": 24, "completion_tokens": 12, "total_tokens": 36},
+                )
+            req_str = str(prompt or messages or kwargs)
+            if "tool_name" in req_str or "tool_args" in req_str or "search_graph_facts" in req_str:
+                if "Facts:" in req_str and "1969" in req_str:
+                    return [
+                        json.dumps(
+                            {
+                                "thought": "Found the year in the graph facts.",
+                                "tool_name": "finish",
+                                "tool_args": {
+                                    "reasoning": "Alan Turing received the Presidential Medal of Freedom in 1969 according to the graph search.",
+                                    "answer": "1969",
+                                },
+                            }
+                        )
+                    ]
+                return [
+                    json.dumps(
+                        {
+                            "thought": "Search graph facts for Alan Turing.",
+                            "tool_name": "search_graph_facts",
+                            "tool_args": {"query": "Alan Turing"},
+                        }
+                    )
+                ]
+            if (
+                "AnswerQuestion" in req_str
+                or "Retrieved evidence passages" in req_str
+                or ("context" in req_str and "question" in req_str and "triples" not in req_str)
+            ):
+                return [
+                    json.dumps(
+                        {
+                            "reasoning": "Single-shot context lacks the medal year.",
+                            "answer": "Insufficient context",
+                        }
+                    )
+                ]
+            return super().__call__(prompt=prompt, messages=messages, **kwargs)
+
+    lm = ReActEngineMockLM()
+    dspy.settings.configure(lm=lm)
+    program = HippoRAGProgram(
+        enable_gbnf=False,
+        orchestrator_lm=lm,
+        rlm_sub_lm=lm,
+        enable_react_fallback=True,
+    )
+    embedder: Any = DeterministicMockEmbedder(dim=64)
+
+    engine = YawGraphEngine(
+        db_path=tmp_path / "yaw_react_sprint3.db",
+        workspace_root=tmp_path,
+        program=program,
+        embedder=embedder,
+        retrieval_top_k=2,
+    )
+    try:
+        engine.index(
+            [
+                "Alan Turing was an English mathematician and computer scientist who founded computer science.",
+                "Alan Turing received the Presidential Medal of Freedom in 1969.",
+            ]
+        )
+        graph_search_text = engine._search_graph_for_react("Alan Turing")
+        assert "Alan Turing" in graph_search_text
+        assert "computer science" in graph_search_text
+
+        pred = engine.program(
+            question="When did Alan Turing receive the Presidential Medal of Freedom?"
+        )
+        assert pred.answer == "1969"
+    finally:
+        engine.close()
+
+
+def test_sprint3_engine_evaluate_and_pareto_frontier_export(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify YawGraphEngine.evaluate (dspy.Evaluate + answer_passage_match) and top-3 Pareto frontier export in optimize()."""
+    import json
+    from types import SimpleNamespace
+
+    from yaw.daemon.graph.inference import ParetoProgramEnsemble
+
+    lm = DeterministicMockLM()
+    dspy.settings.configure(lm=lm)
+    program = HippoRAGProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
+    embedder: Any = DeterministicMockEmbedder(dim=64)
+
+    engine = YawGraphEngine(
+        db_path=tmp_path / "yaw_eval_sprint3.db",
+        workspace_root=tmp_path,
+        program=program,
+        embedder=embedder,
+        retrieval_top_k=2,
+    )
+    try:
+        doc = "Alan Turing designed the ACE and founded computer science."
+        engine.index([doc])
+
+        devset = [
+            dspy.Example(
+                question="Who designed the ACE?",
+                answer="Alan Turing",
+                gold_answers=["Alan Turing"],
+                gold_docs=[doc],
+            ).with_inputs("question")
+        ]
+
+        eval_json_path = tmp_path / "direct_eval.json"
+        eval_res = engine.evaluate(devset, save_as_json=eval_json_path)
+        assert isinstance(eval_res, dspy.evaluate.EvaluationResult)
+        assert eval_res.score == 100.0
+        assert len(eval_res.results) == 1
+        assert eval_json_path.exists()
+        saved_eval_rows = json.loads(eval_json_path.read_text(encoding="utf-8"))
+        assert isinstance(saved_eval_rows, list) and len(saved_eval_rows) == 1
+
+        apm_res = engine.evaluate(devset, metric=dspy.evaluate.answer_passage_match)
+        assert isinstance(apm_res, dspy.evaluate.EvaluationResult)
+        assert apm_res.score == 100.0
+
+        observed_feedbacks: list[str] = []
+
+        class FrontierMockGEPA:
+            def __init__(self, metric: Any, **kwargs: Any) -> None:
+                self.metric = metric
+                self.kwargs = kwargs
+
+            def compile(self, student: Any, trainset: list[Any], valset: Any = None) -> Any:
+                with dspy.context(track_usage=True):
+                    pred = student(question=trainset[0].question)
+                score_obj = self.metric(trainset[0], pred)
+                observed_feedbacks.append(str(score_obj.feedback))
+
+                cand_0 = student.deepcopy()
+                cand_0.qa.predict.signature = cand_0.qa.predict.signature.with_instructions(
+                    "Pareto candidate 0 instruction."
+                )
+                cand_1 = student.deepcopy()
+                cand_1.qa.predict.signature = cand_1.qa.predict.signature.with_instructions(
+                    "Pareto candidate 1 instruction."
+                )
+                cand_2 = student.deepcopy()
+                cand_2.qa.predict.signature = cand_2.qa.predict.signature.with_instructions(
+                    "Pareto candidate 2 instruction."
+                )
+                cand_dup = student.deepcopy()
+                cand_dup.qa.predict.signature = cand_dup.qa.predict.signature.with_instructions(
+                    "Pareto candidate 0 instruction."
+                )
+
+                cand_0.detailed_results = SimpleNamespace(
+                    candidates=[cand_0, cand_1, cand_2, cand_dup],
+                    val_aggregate_scores=[0.92, 0.89, 0.87, 0.92],
+                    per_val_instance_best_candidates={0: [0, 1], 1: [2]},
+                    per_objective_best_candidates=None,
+                    best_idx=0,
+                )
+                return cand_0
+
+        monkeypatch.setattr(dspy, "GEPA", FrontierMockGEPA, raising=False)
+        save_path = tmp_path / "compiled_sprint3.json"
+        compiled = engine.optimize(
+            devset,
+            valset=devset,
+            mode="gepa",
+            save_path=save_path,
+        )
+        assert len(observed_feedbacks) == 1
+        assert "AnswerPassageMatch=1" in observed_feedbacks[0]
+        assert len(compiled.pareto_frontier_states) == 3
+        assert isinstance(compiled.pareto_ensemble, ParetoProgramEnsemble)
+        assert len(compiled.pareto_ensemble.programs) == 3
+        assert save_path.exists()
+        assert (tmp_path / "compiled_sprint3_eval.json").exists()
+
+        reloaded = HippoRAGProgram(enable_gbnf=False, compiled_path=save_path)
+        assert len(reloaded.pareto_frontier_states) == 3
+        assert isinstance(reloaded.pareto_ensemble, ParetoProgramEnsemble)
+    finally:
+        engine.close()

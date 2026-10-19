@@ -1704,6 +1704,731 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         self.assertEqual(simba_entry["optimizer"], "dspy.SIMBA")
         self.assertGreaterEqual(simba_entry["trainset_size"], 2)
 
+    def test_sprint1_configure_yaw_dspy_cache_and_zero_deprecation_warning(self) -> None:
+        import tempfile
+        import warnings
+        from pathlib import Path
+
+        import dspy
+
+        import yaw.daemon.graph.inference as inf_pkg
+        from yaw.daemon.graph.inference.chat import (
+            YawDSPyLM,
+            configure_yaw_dspy_cache,
+            create_dspy_lm,
+        )
+
+        self.assertIn("configure_yaw_dspy_cache", inf_pkg.__all__)
+        self.assertIs(inf_pkg.configure_yaw_dspy_cache, configure_yaw_dspy_cache)
+        self.assertNotIn("forward", YawDSPyLM.__dict__)
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp_dir:
+            cache_path = Path(tmp_dir) / "dspy_cache"
+            configure_yaw_dspy_cache(
+                cache_path,
+                enable_disk_cache=True,
+                enable_memory_cache=True,
+                restrict_pickle=True,
+            )
+            self.assertTrue(getattr(dspy.cache, "enable_disk_cache", False))
+            self.assertTrue(getattr(dspy.cache, "enable_memory_cache", False))
+
+            configure_yaw_dspy_cache(
+                cache_path,
+                enable_disk_cache=False,
+                enable_memory_cache=False,
+                restrict_pickle=True,
+            )
+            self.assertFalse(getattr(dspy.cache, "enable_disk_cache", True))
+            self.assertFalse(getattr(dspy.cache, "enable_memory_cache", True))
+
+        # Restore default cache outside temp dir so temp dir can be removed cleanly
+        configure_yaw_dspy_cache(enable_disk_cache=True, enable_memory_cache=True)
+
+        lm = create_dspy_lm()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", DeprecationWarning)
+            copied = lm.copy(temperature=0.35)
+            self.assertIsInstance(copied, YawDSPyLM)
+            legacy_warnings = [
+                w for w in caught if "BaseLM.forward()" in str(w.message)
+            ]
+            self.assertEqual(len(legacy_warnings), 0)
+
+    def test_sprint1_yaw_gbnf_adapter_contract(self) -> None:
+        import dspy
+
+        import yaw.daemon.graph.inference as inf_pkg
+        from yaw.daemon.graph.inference import (
+            AnswerQuestion,
+            CompressInstructionSignature,
+            DefineMissingEntities,
+            ExtractEntities,
+            ExtractQueryIntent,
+            ExtractTriples,
+            FilterTriples,
+            HealSHACLViolations,
+            HippoRAGProgram,
+            JudgeSynonyms,
+            ProposeInstructionSignature,
+            ProposeSHACLRepairs,
+            ReflectiveInnerDistillerSignature,
+            RLMInstructionProposer,
+            YawGBNFAdapter,
+            create_dspy_lm,
+        )
+
+        self.assertIn("YawGBNFAdapter", inf_pkg.__all__)
+        self.assertTrue(issubclass(YawGBNFAdapter, dspy.JSONAdapter))
+
+        prog = HippoRAGProgram()
+        proposer = RLMInstructionProposer()
+        self.assertIsInstance(prog.json_adapter, YawGBNFAdapter)
+        self.assertIsInstance(proposer.json_adapter, YawGBNFAdapter)
+
+        adapter = YawGBNFAdapter(enable_gbnf=True, max_entities=16, max_facts=4)
+        for direct_sig in (
+            ExtractEntities,
+            ExtractTriples,
+            DefineMissingEntities,
+            JudgeSynonyms,
+            ProposeSHACLRepairs,
+            ExtractQueryIntent,
+            FilterTriples,
+            AnswerQuestion,
+            ProposeInstructionSignature,
+            CompressInstructionSignature,
+        ):
+            grammar = adapter.resolve_grammar(direct_sig)
+            self.assertIsInstance(grammar, str, f"Expected grammar string for {direct_sig.__name__}")
+            self.assertIn("root ::=", str(grammar))
+
+        for rlm_sig in (HealSHACLViolations, ReflectiveInnerDistillerSignature):
+            self.assertIsNone(adapter.resolve_grammar(rlm_sig))
+
+        gbnf_lm = create_dspy_lm(role="extraction")
+        rlm_lm = create_dspy_lm(role="rlm")
+
+        kw_enabled: dict[str, Any] = {}
+        adapter._prepare_gbnf_kwargs(gbnf_lm, kw_enabled, ExtractEntities)
+        self.assertIn("extra_body", kw_enabled)
+        self.assertIn("grammar", kw_enabled["extra_body"])
+
+        kw_rlm: dict[str, Any] = {}
+        adapter._prepare_gbnf_kwargs(rlm_lm, kw_rlm, ExtractEntities)
+        self.assertNotIn("extra_body", kw_rlm)
+
+        disabled_adapter = YawGBNFAdapter(enable_gbnf=False)
+        kw_disabled: dict[str, Any] = {}
+        disabled_adapter._prepare_gbnf_kwargs(gbnf_lm, kw_disabled, ExtractEntities)
+        self.assertNotIn("extra_body", kw_disabled)
+
+    def test_sprint1_dspy_embedding_adapter_asyncify_and_abatch_encode(self) -> None:
+        import anyio
+        import dspy
+        import numpy as np
+
+        from yaw.daemon.graph.inference.embedding import (
+            FACT_INSTRUCTION,
+            DSPyEmbeddingAdapter,
+            resolve_embedding_profile,
+        )
+
+        profile = resolve_embedding_profile("embeddinggemma-300m-GGUF", "distinct-titled")
+        call_records: list[dict[str, Any]] = []
+
+        def fake_embed_fn(batch_inputs: list[str], **_kwargs: Any) -> np.ndarray:
+            call_records.append(
+                {
+                    "batch_len": len(batch_inputs),
+                    "async_max_workers": dspy.settings.async_max_workers,
+                }
+            )
+            out = np.zeros((len(batch_inputs), profile.dimensions), dtype=np.float32)
+            for idx, text in enumerate(batch_inputs):
+                seed = sum(ord(ch) for ch in text) % 97
+                out[idx, seed % profile.dimensions] = 1.0
+                out[idx, (seed + 1) % profile.dimensions] = 0.5
+            return out
+
+        embedder = dspy.Embedder(fake_embed_fn, batch_size=2, caching=False)
+        adapter = DSPyEmbeddingAdapter(profile=profile, embedder=embedder, batch_size=2, caching=False)
+        self.assertTrue(issubclass(DSPyEmbeddingAdapter, dspy.Embedder))
+        self.assertIsInstance(adapter, dspy.Embedder)
+
+        texts = [
+            "# Alpha\nAlpha is the first concept.",
+            "# Beta\nBeta is the second concept.",
+            "# Gamma\nGamma is the third concept.",
+            "# Delta\nDelta is the fourth concept.",
+        ]
+        sync_vecs = adapter.batch_encode(texts, batch_size=2, stage="entity_embed")
+        self.assertEqual(sync_vecs.shape, (4, profile.dimensions))
+
+        call_records.clear()
+        with dspy.context(async_max_workers=3):
+            async_vecs = anyio.run(
+                lambda: adapter.abatch_encode(texts, batch_size=2, stage="entity_embed")
+            )
+            acall_vecs = anyio.run(
+                lambda: adapter.acall(texts, batch_size=2, stage="entity_embed")
+            )
+            async_fn = adapter.as_async()
+            asyncified_vecs = anyio.run(
+                lambda: async_fn(texts, instruction=FACT_INSTRUCTION, batch_size=2)
+            )
+
+        np.testing.assert_allclose(sync_vecs, async_vecs, rtol=1e-5, atol=1e-6)
+        np.testing.assert_allclose(sync_vecs, acall_vecs, rtol=1e-5, atol=1e-6)
+        self.assertEqual(asyncified_vecs.shape, (4, profile.dimensions))
+        self.assertTrue(all(r["async_max_workers"] == 3 for r in call_records))
+
+        with self.assertRaises(ValueError):
+            anyio.run(lambda: adapter.abatch_encode([]))
+        with self.assertRaises(ValueError):
+            anyio.run(lambda: adapter.abatch_encode(["hello"], instruction="not-valid"))
+
+    def test_sprint2_yaw_rm_and_yaw_retriever_contract(self) -> None:
+        import dspy
+        from dspy.utils.dummies import DummyLM
+
+        import yaw.daemon.graph.inference as inf_pkg
+        from yaw.daemon.graph.inference import (
+            HippoRAGProgram,
+            YawPassage,
+            YawRetriever,
+            YawRM,
+        )
+
+        for sym in ("YawPassage", "YawRM", "YawRetriever"):
+            self.assertIn(sym, inf_pkg.__all__)
+
+        psg = YawPassage(long_text="Erik Hort was born in Montebello.", pid="chunk-0", score=0.91, rank=1)
+        self.assertEqual(psg.long_text, "Erik Hort was born in Montebello.")
+        self.assertEqual(psg.pid, "chunk-0")
+        self.assertAlmostEqual(psg.score, 0.91)
+        self.assertEqual(psg.rank, 1)
+
+        unbound_rm = YawRM(hook=None, default_k=2)
+        with self.assertRaises(ValueError):
+            unbound_rm("What county is Montebello in?")
+
+        def fake_hook(
+            query: str,
+            program: Any = None,
+            *,
+            item_docs: Any = None,
+        ) -> tuple[str, tuple[str, ...], tuple[float, ...]]:
+            _ = (query, program, item_docs)
+            passages = (
+                "Montebello is in Rockland County.",
+                "Erik Hort was born in Montebello.",
+                "Distractor passage.",
+            )
+            scores = (0.95, 0.82, 0.12)
+            return "\n\n".join(passages[:2]), passages, scores
+
+        rm = YawRM(hook=fake_hook, default_k=2)
+        rm_hits = rm("What county is Erik Hort's birthplace a part of?", k=2)
+        self.assertEqual(len(rm_hits), 2)
+        self.assertIsInstance(rm_hits[0], YawPassage)
+        self.assertEqual(rm_hits[0].long_text, "Montebello is in Rockland County.")
+        self.assertAlmostEqual(rm_hits[0].score, 0.95)
+
+        # Standard dspy.Retrieve works out-of-the-box when YawRM is configured in dspy.context
+        with dspy.context(rm=rm):
+            stock_retrieve = dspy.Retrieve(k=2)
+            stock_pred = stock_retrieve("What county is Erik Hort's birthplace a part of?")
+            self.assertEqual(
+                stock_pred.passages,
+                [
+                    "Montebello is in Rockland County.",
+                    "Erik Hort was born in Montebello.",
+                ],
+            )
+
+        self.assertTrue(issubclass(YawRetriever, dspy.Retrieve))
+        qa_lm = DummyLM([{"reasoning": "Montebello is in Rockland County.", "answer": "Rockland County"}])
+        prog = HippoRAGProgram(orchestrator_lm=qa_lm, rlm_sub_lm=qa_lm)
+        self.assertIsInstance(prog.rm, YawRM)
+        self.assertIsInstance(prog.retriever, YawRetriever)
+        self.assertEqual(len(prog.named_predictors()), 10)
+
+        prog.set_retrieval_hook(fake_hook)
+        self.assertIs(prog.rm.hook, fake_hook)
+        ret_pred = prog.retriever("What county?", k=2)
+        self.assertEqual(len(ret_pred.passages), 2)
+        self.assertEqual(len(ret_pred.scores), 2)
+
+        fwd_pred = prog(question="What county is Erik Hort's birthplace a part of?")
+        self.assertEqual(fwd_pred.answer, "Rockland County")
+        self.assertEqual(len(fwd_pred.retrieved_passages), 3)
+
+        # Verify dump_state / load_state round-trip AND backward compatibility when 'retriever' is absent
+        dumped = prog.dump_state()
+        self.assertIn("retriever", dumped)
+        legacy_state = {k: v for k, v in dumped.items() if k != "retriever"}
+        prog2 = HippoRAGProgram()
+        prog2.load_state(legacy_state)
+        self.assertEqual(prog2.retriever.k, 10)
+
+    def test_sprint2_validate_stage_invariants_and_refine_retry(self) -> None:
+        import dspy
+        from dspy.utils.dummies import DummyLM
+
+        import yaw.daemon.graph.inference as inf_pkg
+        from yaw.daemon.graph.inference import (
+            HippoRAGProgram,
+            YawAssertionError,
+            is_abstaining_answer,
+            validate_stage_invariants,
+            wrap_stage_with_refine,
+            yaw_assert,
+            yaw_suggest,
+        )
+
+        for sym in (
+            "YawAssertionError",
+            "yaw_assert",
+            "yaw_suggest",
+            "validate_stage_invariants",
+            "wrap_stage_with_refine",
+            "is_abstaining_answer",
+        ):
+            self.assertIn(sym, inf_pkg.__all__)
+
+        with self.assertRaises(YawAssertionError):
+            yaw_assert(False, "closed-world violation")
+        self.assertFalse(yaw_suggest(False, "soft suggestion"))
+        self.assertTrue(yaw_suggest(True, "ok"))
+
+        self.assertTrue(is_abstaining_answer("I don't know"))
+        self.assertTrue(is_abstaining_answer("Not enough information provided in the context."))
+        self.assertFalse(is_abstaining_answer("Rockland County"))
+
+        # 1. Stage 1: ner (ConceptShape/prefLabel & ConceptShape/definition)
+        ner_ok_score, ner_ok_fb = validate_stage_invariants(
+            "ner",
+            {"passage": "Ada Lovelace was an English mathematician who wrote Note G."},
+            dspy.Prediction(
+                named_entities=[
+                    ["Ada Lovelace", "English mathematician who wrote Note G"],
+                    ["Note G", "First published computer algorithm"],
+                ]
+            ),
+        )
+        self.assertEqual(ner_ok_score, 1.0)
+        self.assertIn("PASS", ner_ok_fb)
+
+        ner_taut_score, ner_taut_fb = validate_stage_invariants(
+            "ner",
+            {"passage": "Ada Lovelace was an English mathematician who wrote Note G."},
+            dspy.Prediction(named_entities=[["Ada Lovelace", "Ada Lovelace"]]),
+        )
+        self.assertLess(ner_taut_score, 1.0)
+        self.assertIn("ConceptShape/definition", ner_taut_fb)
+
+        ner_dup_score, ner_dup_fb = validate_stage_invariants(
+            "ner",
+            {"passage": "New York is a state in the Northeastern United States."},
+            dspy.Prediction(
+                named_entities=[
+                    ["New York", "State in Northeastern US"],
+                    ["new york", "US state"],
+                ]
+            ),
+        )
+        self.assertLess(ner_dup_score, 1.0)
+        self.assertIn("ConceptShape/prefLabel", ner_dup_fb)
+
+        # 2. Stage 2: triples (StatementShape/closedWorld & Connected Nodes)
+        stage1_ents = [
+            ["Ada Lovelace", "English mathematician"],
+            ["Note G", "First computer algorithm"],
+        ]
+        triples_ok_score, _ = validate_stage_invariants(
+            "triples",
+            {"passage": "Ada Lovelace wrote Note G.", "named_entities": stage1_ents},
+            dspy.Prediction(
+                triples=[
+                    {
+                        "sub": "Ada Lovelace",
+                        "pred": "wrote",
+                        "obj": "Note G",
+                        "def": "Ada Lovelace wrote the Note G algorithm.",
+                    }
+                ]
+            ),
+        )
+        self.assertEqual(triples_ok_score, 1.0)
+
+        # Novel entity WITHOUT inline [name, def] violates StatementShape/closedWorld
+        triples_cw_score, triples_cw_fb = validate_stage_invariants(
+            "triples",
+            {"passage": "Ada Lovelace collaborated with Charles Babbage.", "named_entities": stage1_ents},
+            dspy.Prediction(
+                triples=[
+                    {
+                        "sub": "Ada Lovelace",
+                        "pred": "collaborated with",
+                        "obj": "Charles Babbage",
+                        "def": "Ada Lovelace collaborated with Charles Babbage.",
+                    }
+                ]
+            ),
+        )
+        self.assertLess(triples_cw_score, 1.0)
+        self.assertIn("StatementShape/closedWorld", triples_cw_fb)
+
+        # Novel entity WITH inline [name, def] satisfies StatementShape/closedWorld
+        triples_inline_score, _ = validate_stage_invariants(
+            "triples",
+            {"passage": "Ada Lovelace collaborated with Charles Babbage.", "named_entities": [["Ada Lovelace", "English mathematician"]]},
+            dspy.Prediction(
+                triples=[
+                    {
+                        "sub": "Ada Lovelace",
+                        "pred": "collaborated with",
+                        "obj": ["Charles Babbage", "English mechanical computer pioneer"],
+                        "def": "Ada Lovelace collaborated with Charles Babbage.",
+                    }
+                ]
+            ),
+        )
+        self.assertEqual(triples_inline_score, 1.0)
+
+        # Disconnected components across >= 2 entities violates connected-node topology
+        triples_disc_score, triples_disc_fb = validate_stage_invariants(
+            "triples",
+            {
+                "passage": "Alpha connects to Beta while Gamma connects to Delta.",
+                "named_entities": [
+                    ["Alpha", "Node A"],
+                    ["Beta", "Node B"],
+                    ["Gamma", "Node C"],
+                    ["Delta", "Node D"],
+                ],
+            },
+            dspy.Prediction(
+                triples=[
+                    {"sub": "Alpha", "pred": "links", "obj": "Beta", "def": "Alpha links to Beta."},
+                    {"sub": "Gamma", "pred": "links", "obj": "Delta", "def": "Gamma links to Delta."},
+                ]
+            ),
+        )
+        self.assertLess(triples_disc_score, 1.0)
+        self.assertIn("Disconnected subgraph", triples_disc_fb)
+
+        # 3. Stage 3: entity_definer
+        ed_ok, _ = validate_stage_invariants(
+            "entity_definer",
+            {"missing_entities": ["Charles Babbage"]},
+            dspy.Prediction(
+                entity_definitions=[["Charles Babbage", "English polymath and inventor"]]
+            ),
+        )
+        self.assertEqual(ed_ok, 1.0)
+        ed_bad, ed_bad_fb = validate_stage_invariants(
+            "entity_definer",
+            {"missing_entities": ["Charles Babbage", "Analytical Engine"]},
+            dspy.Prediction(
+                entity_definitions=[["Charles Babbage", "Charles Babbage"]]
+            ),
+        )
+        self.assertLess(ed_bad, 1.0)
+        self.assertIn("ConceptShape/definition", ed_bad_fb)
+
+        # 4. Stage 4: synonym_judge (S13, homographDifferentFrom, EdgeShape/closedWorld)
+        syn_ok, _ = validate_stage_invariants(
+            "synonym_judge",
+            {"candidate_pairs": '[{"pair_id": "ent-1|ent-2"}]'},
+            dspy.Prediction(
+                decisions=[{"pair_id": "ent-1|ent-2", "relation": "skos:altLabel", "canonical": "A"}]
+            ),
+        )
+        self.assertEqual(syn_ok, 1.0)
+        syn_bad, syn_bad_fb = validate_stage_invariants(
+            "synonym_judge",
+            {"candidate_pairs": '[{"pair_id": "ent-1|ent-1"}]'},
+            dspy.Prediction(
+                decisions=[
+                    {"pair_id": "ent-1|ent-1", "relation": "skos:altLabel", "canonical": "Z"},
+                ]
+            ),
+        )
+        self.assertLess(syn_bad, 1.0)
+        self.assertIn("EdgeShape/closedWorld", syn_bad_fb)
+
+        # 5. Stage 5: shacl_repair & shacl_healer_rlm (6 Closed-World SHACL Shapes)
+        shacl_ok, _ = validate_stage_invariants(
+            "shacl_repair",
+            {"violations": '[{"focus_node": "ent-1", "source_shape": "ConceptShape/definition"}]'},
+            dspy.Prediction(
+                repairs=[{"focus_node": "ent-1", "action": "set_definition", "value": "Valid contextual definition"}]
+            ),
+            shacl_linter=lambda: [],
+        )
+        self.assertEqual(shacl_ok, 1.0)
+        shacl_bad, shacl_bad_fb = validate_stage_invariants(
+            "shacl_repair",
+            {"violations": '[{"focus_node": "ent-1", "source_shape": "ConceptShape/definition"}]'},
+            dspy.Prediction(
+                repairs=[{"focus_node": "ent-999", "action": "set_definition", "value": ""}]
+            ),
+            shacl_linter=lambda: [{"focus_node": "ent-1", "source_shape": "ConceptShape/definition"}],
+        )
+        self.assertLess(shacl_bad, 1.0)
+        self.assertIn("ConceptShape/definition", shacl_bad_fb)
+
+        # 6. Stage 6: query_intent
+        qi_ok, _ = validate_stage_invariants(
+            "query_intent",
+            {"question": "What county is Montebello in?"},
+            dspy.Prediction(query_intent="Montebello village town county location"),
+        )
+        self.assertEqual(qi_ok, 1.0)
+        qi_bad, _ = validate_stage_invariants(
+            "query_intent",
+            {"question": "What county is Montebello in?"},
+            dspy.Prediction(query_intent=""),
+        )
+        self.assertEqual(qi_bad, 0.0)
+
+        # 7. Stage 7: triple_filter
+        tf_ok, _ = validate_stage_invariants(
+            "triple_filter",
+            {
+                "question": "Where was Erik Hort born?",
+                "fact_before_filter": '{"fact": [["Erik Hort", "born in", "Montebello"]]}',
+                "max_facts": 4,
+            },
+            dspy.Prediction(fact=[["Erik Hort", "born in", "Montebello"]]),
+        )
+        self.assertEqual(tf_ok, 1.0)
+        tf_bad, tf_bad_fb = validate_stage_invariants(
+            "triple_filter",
+            {
+                "question": "Where was Erik Hort born?",
+                "fact_before_filter": '{"fact": [["Erik Hort", "born in", "Montebello"]]}',
+                "max_facts": 4,
+            },
+            dspy.Prediction(fact=[["Hallucinated", "born in", "Nowhere"]]),
+        )
+        self.assertLess(tf_bad, 1.0)
+        self.assertIn("closed-world", tf_bad_fb)
+
+        # 8. Stage 8: qa
+        qa_ok, _ = validate_stage_invariants(
+            "qa",
+            {"context": "Montebello is in Rockland County.", "question": "What county?"},
+            dspy.Prediction(reasoning="Montebello is in Rockland County.", answer="Rockland County"),
+        )
+        self.assertEqual(qa_ok, 1.0)
+        qa_abstain, _ = validate_stage_invariants(
+            "qa",
+            {"context": "Montebello is in Rockland County.", "question": "What county?"},
+            dspy.Prediction(reasoning="Unclear.", answer="I don't know"),
+        )
+        self.assertLess(qa_abstain, 1.0)
+
+        # 9. Stage 9: qwen_proposer / qwen_compressor
+        prop_ok, _ = validate_stage_invariants(
+            "qwen_proposer",
+            {
+                "component_name": "ner",
+                "current_instruction": 'Return JSON with key `named_entities`.',
+            },
+            dspy.Prediction(
+                new_instruction="Extract all salient entities with definitions. Return JSON with key `named_entities`."
+            ),
+        )
+        self.assertEqual(prop_ok, 1.0)
+        prop_leak, prop_leak_fb = validate_stage_invariants(
+            "qwen_proposer",
+            {
+                "component_name": "ner",
+                "current_instruction": 'Return JSON with key `named_entities`.',
+            },
+            dspy.Prediction(
+                new_instruction="Extract <TargetEntity> from the passage."
+            ),
+        )
+        self.assertLess(prop_leak, 1.0)
+        self.assertIn("named_entities", prop_leak_fb)
+
+        # Verify wrap_stage_with_refine and feedback-guided _invoke_stage retry
+        retry_lm = DummyLM(
+            [
+                {"named_entities": [["Ada Lovelace", "Ada Lovelace"]]},
+                {"named_entities": [["Ada Lovelace", "English mathematician and writer"]]},
+            ]
+        )
+        prog = HippoRAGProgram(orchestrator_lm=retry_lm, rlm_sub_lm=retry_lm)
+        defs = prog.extract_entity_definitions("Ada Lovelace was an English mathematician and writer.")
+        self.assertEqual(defs, (("Ada Lovelace", "English mathematician and writer"),))
+        self.assertEqual(prog.telemetry[-1].get("invariant_retries"), 1)
+        self.assertEqual(prog.telemetry[-1].get("invariant_score"), 1.0)
+
+        refined_mod = wrap_stage_with_refine(prog.ner, "ner", N=2, threshold=1.0, use_refine=False)
+        self.assertIsInstance(refined_mod, dspy.BestOfN)
+
+    def test_sprint2_pareto_program_ensemble_and_react_v2_fallback(self) -> None:
+        import anyio
+        from dspy.utils.dummies import DummyLM
+
+        import yaw.daemon.graph.inference as inf_pkg
+        from yaw.daemon.graph.inference import (
+            HippoRAGProgram,
+            ParetoProgramEnsemble,
+        )
+
+        self.assertIn("ParetoProgramEnsemble", inf_pkg.__all__)
+
+        lm1 = DummyLM(
+            [
+                {"named_entities": [["Erik Hort", "American soccer player"]]},
+                {
+                    "triples": [
+                        {
+                            "sub": "Erik Hort",
+                            "pred": "born in",
+                            "obj": ["Montebello", "Village in Rockland County, New York"],
+                            "def": "Erik Hort was born in Montebello.",
+                        }
+                    ]
+                },
+                {"reasoning": "Erik Hort was born in Montebello, Rockland County.", "answer": "Rockland County"},
+                {"reasoning": "Erik Hort was born in Montebello, Rockland County.", "answer": "Rockland County"},
+            ]
+        )
+        lm2 = DummyLM(
+            [
+                {
+                    "named_entities": [
+                        ["Erik Hort", "American professional soccer defender born in Montebello"],
+                        ["Rockland County", "County in the state of New York"],
+                    ]
+                },
+                {
+                    "triples": [
+                        {
+                            "sub": "Erik Hort",
+                            "pred": "born in",
+                            "obj": ["Montebello", "Village in Rockland County, New York"],
+                            "def": "Erik Hort was born in Montebello, New York.",
+                        },
+                        {
+                            "sub": "Montebello",
+                            "pred": "located in",
+                            "obj": "Rockland County",
+                            "def": "Montebello is located in Rockland County.",
+                        },
+                    ]
+                },
+                {"reasoning": "Not sure.", "answer": "I don't know"},
+                {"reasoning": "Montebello is in Rockland County.", "answer": "Rockland County"},
+            ]
+        )
+
+        cand1 = HippoRAGProgram(orchestrator_lm=lm1, rlm_sub_lm=lm1)
+        cand2 = HippoRAGProgram(orchestrator_lm=lm2, rlm_sub_lm=lm2)
+        ensemble = ParetoProgramEnsemble([cand1, cand2])
+        self.assertTrue(getattr(ensemble, "_compiled", False))
+
+        openie_rec = ensemble.extract_openie(
+            "chunk-ens",
+            "Erik Hort was born in Montebello, a village located in Rockland County.",
+        )
+        self.assertIn("Erik Hort", openie_rec.entities)
+        self.assertIn("Montebello", openie_rec.entities)
+        self.assertIn("Rockland County", openie_rec.entities)
+        # Richest non-tautological definition preserved for Erik Hort
+        def_map = dict(openie_rec.entity_definitions)
+        self.assertIn("defender", def_map["Erik Hort"])
+        # Shared triple ranked first
+        self.assertEqual(openie_rec.triples[0], ("Erik Hort", "born in", "Montebello"))
+
+        # QA ensemble selects non-abstaining consensus answer
+        qa_ens_pred = ensemble.answer_question(
+            "Erik Hort was born in Montebello, Rockland County.",
+            "What county is Erik Hort's birthplace a part of?",
+        )
+        self.assertEqual(qa_ens_pred.answer, "Rockland County")
+
+        async_qa_pred = anyio.run(
+            lambda: ensemble.aanswer_question(
+                "Erik Hort was born in Montebello, Rockland County.",
+                "What county is Erik Hort's birthplace a part of?",
+            )
+        )
+        self.assertEqual(async_qa_pred.answer, "Rockland County")
+
+        # Verify Pareto frontier persistence in HippoRAGProgram.dump_state / load_state without polluting named_predictors
+        cand1.pareto_frontier_states = [cand1.dump_state(), cand2.dump_state()]
+        cand1.pareto_ensemble = ensemble
+        self.assertEqual(len(cand1.named_predictors()), 10)
+        dumped_with_frontier = cand1.dump_state()
+        self.assertEqual(len(dumped_with_frontier["yaw_surface"]["pareto_frontier_states"]), 2)
+
+        restored_prog = HippoRAGProgram(orchestrator_lm=lm1, rlm_sub_lm=lm1)
+        restored_prog.load_state(dumped_with_frontier)
+        self.assertEqual(len(restored_prog.pareto_frontier_states), 2)
+        self.assertIsInstance(restored_prog.pareto_ensemble, ParetoProgramEnsemble)
+        self.assertEqual(len(restored_prog.named_predictors()), 10)
+
+        # Verify dspy.ReActV2 multi-hop fallback when single-shot QA abstains or retrieval confidence < 0.15
+        react_lm = DummyLM(
+            [
+                # Single-shot QA call 1 & retry 2 abstain
+                {"reasoning": "Missing second hop.", "answer": "I don't know"},
+                {"reasoning": "Missing second hop.", "answer": "I don't know"},
+                # ReActV2 step 1: call search_graph_facts
+                {
+                    "thought": "Search graph facts for Montebello county.",
+                    "tool_name": "search_graph_facts",
+                    "tool_args": {"query": "Montebello"},
+                },
+                # ReActV2 step 2: finish with final answer
+                {
+                    "thought": "Montebello is in Rockland County.",
+                    "tool_name": "finish",
+                    "tool_args": {
+                        "reasoning": "Erik Hort was born in Montebello, which is in Rockland County.",
+                        "answer": "Rockland County",
+                    },
+                },
+            ]
+        )
+        react_prog = HippoRAGProgram(orchestrator_lm=react_lm, rlm_sub_lm=react_lm)
+        react_prog.enable_react_fallback = True
+        react_prog.set_retrieval_hook(
+            lambda q, *_a, **_kw: (
+                "Erik Hort was born in Montebello.",
+                ("Erik Hort was born in Montebello.",),
+                (0.08,),
+            )
+        )
+        react_prog.set_graph_search_tool(
+            lambda q: f"Fact for {q}: Montebello is located in Rockland County, New York."
+        )
+        react_pred = react_prog(question="What county is Erik Hort's birthplace a part of?")
+        self.assertEqual(react_pred.answer, "Rockland County")
+        self.assertEqual(len(react_prog.named_predictors()), 10)
+
+        # Verify HippoRAGProgram.as_async()
+        async_prog_lm = DummyLM(
+            [{"reasoning": "Montebello is in Rockland County.", "answer": "Rockland County"}]
+        )
+        async_prog = HippoRAGProgram(orchestrator_lm=async_prog_lm, rlm_sub_lm=async_prog_lm)
+        async_prog_fn = async_prog.as_async()
+        async_res = anyio.run(
+            lambda: async_prog_fn(
+                context="Montebello is in Rockland County.",
+                question="What county is Montebello in?",
+            )
+        )
+        self.assertEqual(async_res.answer, "Rockland County")
+
 
 if __name__ == "__main__":
     unittest.main()
