@@ -1,5 +1,6 @@
 """Native DSPy HippoRAG 2 Graph and Retrieval Engine backed by yaw.db and disk line hydration."""
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -95,8 +96,9 @@ class YawGraphEngine:
         damping: float = 0.5,
         synonymy_threshold: float = 0.8,
         synonymy_top_k: int = 100,
-        retrieval_top_k: int = 5,
+        retrieval_top_k: int = 10,
         embed_batch_size: int = 64,
+
         activation: str = "scaled_tanh",
         activation_param: float | None = 5.0,
         activation_renormalize: bool = False,
@@ -145,7 +147,24 @@ class YawGraphEngine:
 
         self._csr_graph: CSRGraph | None = None
         self._active_repl_repair_keys: set[tuple[str, str, str, str]] | None = None
-        self._graph_rlm_stats: dict[str, Any] = {
+        self._graph_rlm_stats: dict[str, Any] = self._empty_graph_rlm_stats()
+        self._active_extraction_fingerprint: str | None = None
+        self._active_openie_fingerprint: str | None = None
+        self._opt_chunks_pool: list[tuple[ChunkPointer, str]] = []
+        self._opt_indexed_cids: set[str] = set()
+        self._captured_chunk_traces: dict[str, list[tuple[str, dict[str, Any], Any]]] = {}
+        self._captured_graph_traces: list[tuple[str, dict[str, Any], Any]] = []
+        self._openie_fp_cache: dict[
+            tuple[str, str],
+            tuple[Any, list[tuple[str, dict[str, Any], Any]], set[str], int, int],
+        ] = {}
+
+        self._bind_program_hooks()
+        self._apply_program_embedding_prefixes()
+
+    @staticmethod
+    def _empty_graph_rlm_stats() -> dict[str, Any]:
+        return {
             "homograph_splits": 0,
             "candidate_pairs": 0,
             "merged_entities": 0,
@@ -165,8 +184,111 @@ class YawGraphEngine:
             "embedding_tokens": 0,
         }
 
-        self._bind_program_hooks()
-        self._apply_program_embedding_prefixes()
+    @staticmethod
+    def _serialize_predictor_surface(pred: Any) -> dict[str, Any]:
+        sig = getattr(pred, "signature", None)
+        instructions = str(getattr(sig, "instructions", "") or "")
+        demos_raw = getattr(pred, "demos", None) or ()
+        demos_repr = [
+            str(d.toDict()) if hasattr(d, "toDict") else str(d)
+            for d in demos_raw
+        ]
+        return {"instructions": instructions, "demos": demos_repr}
+
+    @classmethod
+    def _openie_fingerprint(cls, program: HippoRAGProgram) -> str:
+        named = (
+            dict(program.named_predictors())
+            if hasattr(program, "named_predictors")
+            else {}
+        )
+        payload = {
+            "stages": {
+                k: cls._serialize_predictor_surface(named[k])
+                for k in ("ner", "triples", "entity_definer")
+                if k in named
+            },
+            "gbnf_max_entities": getattr(program, "gbnf_max_entities", None),
+            "gbnf_max_triples": getattr(program, "gbnf_max_triples", None),
+        }
+        raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _extraction_fingerprint(cls, program: HippoRAGProgram) -> str:
+        named = (
+            dict(program.named_predictors())
+            if hasattr(program, "named_predictors")
+            else {}
+        )
+        graph_stage_keys = (
+            "ner",
+            "triples",
+            "entity_definer",
+            "synonym_judge",
+            "shacl_repair",
+            "shacl_healer_rlm.generate_action",
+            "shacl_healer_rlm.extract",
+        )
+        payload = {
+            "stages": {
+                k: cls._serialize_predictor_surface(named[k])
+                for k in graph_stage_keys
+                if k in named
+            },
+            "gbnf_max_entities": getattr(program, "gbnf_max_entities", None),
+            "gbnf_max_triples": getattr(program, "gbnf_max_triples", None),
+            "embedding_query_prefix": getattr(program, "embedding_query_prefix", None),
+            "embedding_fact_prefix": getattr(program, "embedding_fact_prefix", None),
+            "embedding_document_prefix": getattr(program, "embedding_document_prefix", None),
+        }
+        raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _extract_named_trace_entries(
+        program: HippoRAGProgram,
+        raw_trace: Sequence[Any],
+        *,
+        allowed_names: set[str] | None = None,
+    ) -> list[tuple[str, dict[str, Any], Any]]:
+        named_preds = (
+            list(program.named_predictors())
+            if hasattr(program, "named_predictors")
+            else []
+        )
+        captured: list[tuple[str, dict[str, Any], Any]] = []
+        for item in raw_trace:
+            if not isinstance(item, (list, tuple)) or len(item) < 3:
+                continue
+            pred_inst, inp, out = item[0], item[1], item[2]
+            matched_name: str | None = None
+            pred_sig = getattr(pred_inst, "signature", None)
+            for name, cand_pred in named_preds:
+                if pred_inst is cand_pred:
+                    matched_name = name
+                    break
+            if matched_name is None and pred_sig is not None:
+                for name, cand_pred in named_preds:
+                    cand_sig = getattr(cand_pred, "signature", None)
+                    if cand_sig is not None:
+                        is_eq = (
+                            cand_sig.equals(pred_sig)
+                            if hasattr(cand_sig, "equals")
+                            else cand_sig == pred_sig
+                        )
+                        if is_eq:
+                            matched_name = name
+                            break
+            if matched_name is not None:
+                if allowed_names is not None and not (
+                    matched_name in allowed_names
+                    or any(matched_name.startswith(f"{a}.") for a in allowed_names)
+                ):
+                    continue
+                inp_dict = dict(inp) if isinstance(inp, Mapping) else {"input": inp}
+                captured.append((matched_name, inp_dict, out))
+        return captured
 
     def _hydrate_single_chunk(self, chunk_id: str) -> str:
         hydrator = make_chunk_hydrator(self.conn, self.workspace_root)
@@ -210,10 +332,11 @@ class YawGraphEngine:
         if hasattr(self.program, "record_embedding_telemetry"):
             self.program.record_embedding_telemetry(entry)
 
-    def _bind_program_hooks(self) -> None:
-        self.program.set_retrieval_hook(self._program_retrieval_hook)
-        if hasattr(self.program, "set_graph_tools"):
-            self.program.set_graph_tools(
+    def _bind_program_hooks(self, program: HippoRAGProgram | None = None) -> None:
+        target = program if program is not None else self.program
+        target.set_retrieval_hook(self._program_retrieval_hook)
+        if hasattr(target, "set_graph_tools"):
+            target.set_graph_tools(
                 node_inspector=lambda eid: inspect_focus_node(self.conn, eid),
                 chunk_hydrator=self._hydrate_single_chunk,
                 shacl_repair_applier=self._apply_shacl_repairs_from_tool,
@@ -224,21 +347,22 @@ class YawGraphEngine:
         if hasattr(self.embedder, "bind_telemetry_hook"):
             self.embedder.bind_telemetry_hook(self._on_embedding_telemetry)
 
-    def _apply_program_embedding_prefixes(self) -> None:
+    def _apply_program_embedding_prefixes(self, program: HippoRAGProgram | None = None) -> None:
+        target = program if program is not None else self.program
         if hasattr(self.embedder, "update_prefixes"):
             self.embedder.update_prefixes(
-                query_prefix=getattr(self.program, "embedding_query_prefix", None),
-                fact_query_prefix=getattr(self.program, "embedding_fact_prefix", None),
-                document_prefix=getattr(self.program, "embedding_document_prefix", None),
+                query_prefix=getattr(target, "embedding_query_prefix", None),
+                fact_query_prefix=getattr(target, "embedding_fact_prefix", None),
+                document_prefix=getattr(target, "embedding_document_prefix", None),
             )
         profile = getattr(self.embedder, "profile", None)
         if profile is not None:
-            if getattr(self.program, "embedding_query_prefix", None) is None:
-                setattr(self.program, "embedding_query_prefix", getattr(profile, "query_prefix", None))
-            if getattr(self.program, "embedding_fact_prefix", None) is None:
-                setattr(self.program, "embedding_fact_prefix", getattr(profile, "fact_query_prefix", None))
-            if getattr(self.program, "embedding_document_prefix", None) is None:
-                setattr(self.program, "embedding_document_prefix", getattr(profile, "document_prefix", None))
+            if getattr(target, "embedding_query_prefix", None) is None:
+                setattr(target, "embedding_query_prefix", getattr(profile, "query_prefix", None))
+            if getattr(target, "embedding_fact_prefix", None) is None:
+                setattr(target, "embedding_fact_prefix", getattr(profile, "fact_query_prefix", None))
+            if getattr(target, "embedding_document_prefix", None) is None:
+                setattr(target, "embedding_document_prefix", getattr(profile, "document_prefix", None))
 
     def close(self) -> None:
         """Close SQLite database connection."""
@@ -532,13 +656,144 @@ class YawGraphEngine:
                     applied += 1
         return applied
 
+    def _reset_sandbox_graph(self, *, clear_openie: bool = True) -> None:
+        """Clear graph tables in the sandbox DB when a candidate mutates extraction/graph prompts."""
+        with self._lock, self.managed_conn.transaction() as conn:
+            conn.execute("DELETE FROM fact_vec")
+            conn.execute("DELETE FROM fact_fts")
+            conn.execute("DELETE FROM facts")
+            conn.execute("DELETE FROM edge_sources")
+            conn.execute("DELETE FROM edges")
+            conn.execute("DELETE FROM entity_labels")
+            conn.execute("DELETE FROM entity_vec")
+            conn.execute("DELETE FROM entities")
+            if clear_openie:
+                conn.execute("DELETE FROM openie_chunks")
+                self._captured_chunk_traces.clear()
+        self._captured_graph_traces.clear()
+        self._opt_indexed_cids.clear()
+        self._csr_graph = None
+        self._graph_rlm_stats = self._empty_graph_rlm_stats()
+
+    def _resolve_chunks_for_docs(
+        self,
+        item_docs: Sequence[str] | None,
+    ) -> list[tuple[ChunkPointer, str]]:
+        if not item_docs:
+            return list(self._opt_chunks_pool)
+        pool_by_cid = {ptr.chunk_id: (ptr, txt) for ptr, txt in self._opt_chunks_pool}
+        resolved: list[tuple[ChunkPointer, str]] = []
+        seen_cids: set[str] = set()
+        for raw_doc in item_docs:
+            d = str(raw_doc).strip()
+            if not d:
+                continue
+            direct_cid = compute_mdhash_id(d, prefix="chunk-")
+            if direct_cid in pool_by_cid:
+                if direct_cid not in seen_cids:
+                    seen_cids.add(direct_cid)
+                    resolved.append(pool_by_cid[direct_cid])
+                continue
+            doc_title = d.split("\n", 1)[0].strip() if "\n" in d else ""
+            doc_body = d.split("\n", 1)[1].strip() if "\n" in d else d
+            matched_any = False
+            for ptr, c_text in self._opt_chunks_pool:
+                c_strip = c_text.strip()
+                if not c_strip:
+                    continue
+                title_match = bool(
+                    doc_title and ptr.title and ptr.title.strip() == doc_title
+                )
+                body_match = (
+                    c_strip in (d, doc_body)
+                    or (len(c_strip) >= 30 and c_strip in d)
+                    or (title_match and (c_strip in doc_body or doc_body in c_strip))
+                )
+                if body_match:
+                    matched_any = True
+                    if ptr.chunk_id not in seen_cids:
+                        seen_cids.add(ptr.chunk_id)
+                        resolved.append((ptr, c_text))
+            if not matched_any:
+                # Materialize raw doc on disk if not yet in pool
+                self.index([d])
+                if direct_cid in {p.chunk_id for p, _ in self._opt_chunks_pool}:
+                    for p, t in self._opt_chunks_pool:
+                        if p.chunk_id == direct_cid and direct_cid not in seen_cids:
+                            seen_cids.add(direct_cid)
+                            resolved.append((p, t))
+        return resolved
+
+    def _ensure_candidate_chunks_indexed(
+        self,
+        program: HippoRAGProgram,
+        item_docs: Sequence[str] | None = None,
+    ) -> list[str]:
+        with self._lock:
+            ext_fp = self._extraction_fingerprint(program)
+            openie_fp = self._openie_fingerprint(program)
+            req_chunks = self._resolve_chunks_for_docs(item_docs)
+            if (
+                self._active_extraction_fingerprint is not None
+                and ext_fp != self._active_extraction_fingerprint
+            ):
+                clear_openie = openie_fp != self._active_openie_fingerprint
+                self._reset_sandbox_graph(clear_openie=clear_openie)
+                self._active_extraction_fingerprint = ext_fp
+                self._active_openie_fingerprint = openie_fp
+
+            if len(self._opt_chunks_pool) <= 64 and self._opt_chunks_pool:
+                batch_candidates = list(self._opt_chunks_pool)
+                existing_pool_cids = {p.chunk_id for p, _ in batch_candidates}
+                for p, t in req_chunks:
+                    if p.chunk_id not in existing_pool_cids:
+                        batch_candidates.append((p, t))
+                        existing_pool_cids.add(p.chunk_id)
+            else:
+                batch_candidates = (
+                    req_chunks if req_chunks else list(self._opt_chunks_pool[:32])
+                )
+
+            missing_to_index = [
+                (p, t)
+                for p, t in batch_candidates
+                if p.chunk_id not in self._opt_indexed_cids
+            ]
+            if missing_to_index:
+                self.index_chunks(missing_to_index, program=program)
+            target_list = req_chunks if req_chunks else batch_candidates
+            return [p.chunk_id for p, _ in target_list]
+
     def _program_retrieval_hook(
         self,
         question: str,
         program: HippoRAGProgram | None = None,
+        *,
+        item_docs: Sequence[str] | None = None,
     ) -> tuple[str, tuple[str, ...], tuple[float, ...]]:
         """Internal retrieval hook wired into HippoRAGProgram for end-to-end DSPy trace compilation."""
-        hits = self.retrieve(question, top_k=max(20, self.retrieval_top_k), program=program)
+        active_program = program if program is not None else self.program
+        target_cids = self._ensure_candidate_chunks_indexed(
+            active_program, item_docs=item_docs
+        )
+        active_trace = getattr(dspy.settings, "trace", None)
+        if isinstance(active_trace, list):
+            named_map = dict(active_program.named_predictors())
+            for cid in target_cids:
+                for pred_name, inp_dict, out_obj in self._captured_chunk_traces.get(cid, ()):
+                    pred_inst = named_map.get(pred_name)
+                    if pred_inst is not None:
+                        active_trace.append((pred_inst, dict(inp_dict), out_obj))
+            for pred_name, inp_dict, out_obj in self._captured_graph_traces:
+                pred_inst = named_map.get(pred_name)
+                if pred_inst is not None:
+                    active_trace.append((pred_inst, dict(inp_dict), out_obj))
+
+        hits = self.retrieve(
+            question,
+            top_k=max(20, self.retrieval_top_k),
+            program=active_program,
+        )
         if not hits:
             return "", (), ()
         passages = tuple(p.chunk_id for p, _, _ in hits)
@@ -649,12 +904,25 @@ class YawGraphEngine:
         chunks: Sequence[tuple[ChunkPointer, str]],
         *,
         progress_callback: Callable[[str], None] | None = None,
+        program: HippoRAGProgram | None = None,
     ) -> int:
         """Incremental chunk indexing into yaw.db, sqlite-vec, SKOS schema, and sparse CSR graph."""
         if not chunks:
             return 0
 
+        active_program = program if program is not None else self.program
         with self._lock:
+            self._bind_program_hooks(active_program)
+            self._apply_program_embedding_prefixes(active_program)
+            openie_fp = self._openie_fingerprint(active_program)
+            ext_fp = self._extraction_fingerprint(active_program)
+
+            existing_pool_cids = {p.chunk_id for p, _ in self._opt_chunks_pool}
+            for ptr, text in chunks:
+                if ptr.chunk_id not in existing_pool_cids:
+                    self._opt_chunks_pool.append((ptr, text))
+                    existing_pool_cids.add(ptr.chunk_id)
+
             chunk_ptrs = [ptr for ptr, _ in chunks]
             chunk_ids = [ptr.chunk_id for ptr in chunk_ptrs]
 
@@ -681,32 +949,57 @@ class YawGraphEngine:
             for idx, (ptr, text) in enumerate(chunks, 1):
                 if ptr.chunk_id in cached_openie:
                     all_records.append(cached_openie[ptr.chunk_id])
+                elif (openie_fp, ptr.chunk_id) in self._openie_fp_cache:
+                    rec, cached_tr, cached_norms, m_cnt, m_tok = self._openie_fp_cache[
+                        (openie_fp, ptr.chunk_id)
+                    ]
+                    self._captured_chunk_traces[ptr.chunk_id] = list(cached_tr)
+                    attempted_missing_by_cid[ptr.chunk_id] = set(cached_norms)
+                    self._graph_rlm_stats["missing_entity_defs_count"] += m_cnt
+                    self._graph_rlm_stats["missing_entity_defs_tokens"] += m_tok
+                    save_openie_checkpoints(self.conn, [rec])
+                    all_records.append(rec)
                 else:
                     if progress_callback is not None:
                         progress_callback(f"indexing: OpenIE extraction ({idx}/{total_chunks})")
                     prev_def_audit_len = len(
-                        getattr(self.program, "entity_def_audit_trail", ())
+                        getattr(active_program, "entity_def_audit_trail", ())
                     )
-                    rec = self.program.extract_openie(ptr.chunk_id, text)
+                    chunk_raw_trace: list[Any] = []
+                    with dspy.context(trace=chunk_raw_trace):
+                        rec = active_program.extract_openie(ptr.chunk_id, text)
+                    chunk_traces = self._extract_named_trace_entries(
+                        active_program, chunk_raw_trace
+                    )
+                    self._captured_chunk_traces[ptr.chunk_id] = chunk_traces
                     new_def_entries = list(
-                        getattr(self.program, "entity_def_audit_trail", ())[
+                        getattr(active_program, "entity_def_audit_trail", ())[
                             prev_def_audit_len:
                         ]
                     )
                     attempted_norms: set[str] = set()
+                    chunk_m_cnt = 0
+                    chunk_m_tok = 0
                     for entry in new_def_entries:
                         if isinstance(entry, dict):
-                            self._graph_rlm_stats["missing_entity_defs_count"] += int(
-                                entry.get("missing_count", 0)
-                            )
-                            self._graph_rlm_stats["missing_entity_defs_tokens"] += int(
-                                entry.get("tokens", 0)
-                            )
+                            c_cnt = int(entry.get("missing_count", 0))
+                            c_tok = int(entry.get("tokens", 0))
+                            chunk_m_cnt += c_cnt
+                            chunk_m_tok += c_tok
+                            self._graph_rlm_stats["missing_entity_defs_count"] += c_cnt
+                            self._graph_rlm_stats["missing_entity_defs_tokens"] += c_tok
                             for m_ent in entry.get("missing_entities") or ():
                                 m_norm = str(text_processing(str(m_ent)))
                                 if m_norm:
                                     attempted_norms.add(m_norm)
                     attempted_missing_by_cid[ptr.chunk_id] = attempted_norms
+                    self._openie_fp_cache[(openie_fp, ptr.chunk_id)] = (
+                        rec,
+                        list(chunk_traces),
+                        set(attempted_norms),
+                        chunk_m_cnt,
+                        chunk_m_tok,
+                    )
                     save_openie_checkpoints(self.conn, [rec])
                     all_records.append(rec)
 
@@ -835,25 +1128,30 @@ class YawGraphEngine:
                         seen_missing.add(e_norm)
                         missing_norms.append(e_norm)
 
-                if missing_norms and hasattr(self.program, "define_missing_entities"):
+                if missing_norms and hasattr(active_program, "define_missing_entities"):
                     prev_def_audit_len = len(
-                        getattr(self.program, "entity_def_audit_trail", ())
+                        getattr(active_program, "entity_def_audit_trail", ())
                     )
-                    repaired_pairs = self.program.define_missing_entities(
-                        chunk_text_by_id.get(cid, ""),
-                        missing_norms,
-                        [
-                            {
-                                "sub": st.subj,
-                                "pred": st.pred,
-                                "obj": st.obj,
-                                "def": st.spo_def,
-                            }
-                            for st in normalized_sts
-                        ],
+                    def_raw_trace: list[Any] = []
+                    with dspy.context(trace=def_raw_trace):
+                        repaired_pairs = active_program.define_missing_entities(
+                            chunk_text_by_id.get(cid, ""),
+                            missing_norms,
+                            [
+                                {
+                                    "sub": st.subj,
+                                    "pred": st.pred,
+                                    "obj": st.obj,
+                                    "def": st.spo_def,
+                                }
+                                for st in normalized_sts
+                            ],
+                        )
+                    self._captured_chunk_traces.setdefault(cid, []).extend(
+                        self._extract_named_trace_entries(active_program, def_raw_trace)
                     )
                     new_def_entries = list(
-                        getattr(self.program, "entity_def_audit_trail", ())[
+                        getattr(active_program, "entity_def_audit_trail", ())[
                             prev_def_audit_len:
                         ]
                     )
@@ -1249,14 +1547,22 @@ class YawGraphEngine:
                     decisions: list[dict[str, str]] = []
                     if llm_candidates:
                         syn_audit: list[dict[str, Any]] = getattr(
-                            self.program, "synonym_audit_trail", []
+                            active_program, "synonym_audit_trail", []
                         )
                         tel: list[dict[str, Any]] = getattr(
-                            self.program, "telemetry", []
+                            active_program, "telemetry", []
                         )
                         prev_syn_audit_len = len(syn_audit)
                         prev_tel_len = len(tel)
-                        decisions = self.program.judge_synonyms(llm_candidates)
+                        local_syn_trace: list[Any] = []
+                        with dspy.context(trace=local_syn_trace):
+                            decisions = active_program.judge_synonyms(llm_candidates)
+                        for t_entry in self._extract_named_trace_entries(
+                            active_program,
+                            local_syn_trace,
+                            allowed_names={"synonym_judge"},
+                        ):
+                            self._captured_graph_traces.append(t_entry)
                         if len(syn_audit) > prev_syn_audit_len:
                             self._graph_rlm_stats["synonym_judge_tokens"] += int(
                                 syn_audit[-1].get("tokens_used", 0)
@@ -1382,19 +1688,21 @@ class YawGraphEngine:
                         for v in violations[:16]
                     ]
                     shacl_audit: list[dict[str, Any]] = getattr(
-                        self.program, "shacl_audit_trail", []
+                        active_program, "shacl_audit_trail", []
                     )
                     shacl_tel: list[dict[str, Any]] = getattr(
-                        self.program, "telemetry", []
+                        active_program, "telemetry", []
                     )
                     prev_shacl_audit_len = len(shacl_audit)
                     prev_tel_len = len(shacl_tel)
                     self._active_repl_repair_keys = set()
+                    local_shacl_trace: list[Any] = []
                     try:
-                        repairs = self.program.heal_shacl_violations(
-                            bounded_violations,
-                            focus_context=json.dumps(focus_contexts, ensure_ascii=False),
-                        )
+                        with dspy.context(trace=local_shacl_trace):
+                            repairs = active_program.heal_shacl_violations(
+                                bounded_violations,
+                                focus_context=json.dumps(focus_contexts, ensure_ascii=False),
+                            )
                     except Exception as exc:
                         import logging
                         logging.warning("heal_shacl_violations encountered error: %s. Continuing indexing.", exc)
@@ -1402,6 +1710,12 @@ class YawGraphEngine:
                     finally:
                         repl_applied_keys = set(self._active_repl_repair_keys) if self._active_repl_repair_keys else set()
                         self._active_repl_repair_keys = None
+                    for t_entry in self._extract_named_trace_entries(
+                        active_program,
+                        local_shacl_trace,
+                        allowed_names={"shacl_repair", "shacl_healer_rlm"},
+                    ):
+                        self._captured_graph_traces.append(t_entry)
                     if len(shacl_audit) > prev_shacl_audit_len:
                         self._graph_rlm_stats["shacl_healer_tokens"] += int(
                             shacl_audit[-1].get("tokens_used", 0)
@@ -1424,6 +1738,9 @@ class YawGraphEngine:
                 self._graph_rlm_stats["shacl_conforms"] = len(violations) == 0
 
             self._csr_graph = None
+            self._active_extraction_fingerprint = ext_fp
+            self._active_openie_fingerprint = openie_fp
+            self._opt_indexed_cids.update(chunk_ids)
             return len(chunks)
 
     def delete_chunks(self, chunk_ids: Sequence[str]) -> None:
@@ -1825,14 +2142,58 @@ class YawGraphEngine:
         num_candidates: int | None = None,
         num_trials: int | None = None,
         progress_callback: Callable[[str], None] | None = None,
+        opt_chunks: Sequence[tuple[ChunkPointer, str]] | None = None,
     ) -> HippoRAGProgram:
         """Evolve DSPy prompts via MIPROv2, GEPA, or two-phase hybrid with composite Sizecoding feedback."""
         if not trainset:
             return self.program
 
+        if opt_chunks is not None:
+            existing_cids = {p.chunk_id for p, _ in self._opt_chunks_pool}
+            for ptr, text in opt_chunks:
+                if ptr.chunk_id not in existing_cids:
+                    self._opt_chunks_pool.append((ptr, text))
+                    existing_cids.add(ptr.chunk_id)
+
         eval_count = 0
 
-        def _evaluate_prediction(gold: Any, pred: Any, pred_name: Any = None) -> dspy.Prediction:
+        def _build_stage_diagnostic(
+            pred_name_str: str,
+            pred_trace: Any,
+            gold_answers: list[str],
+            missed: list[str],
+        ) -> str:
+            trace_entries = list(pred_trace) if isinstance(pred_trace, (list, tuple)) else []
+            out_summaries: list[str] = []
+            for entry in trace_entries[:3]:
+                if isinstance(entry, (list, tuple)) and len(entry) >= 3:
+                    outputs = entry[2]
+                    if isinstance(outputs, dict):
+                        out_summaries.append(
+                            ", ".join(f"{k}={repr(v)[:80]}" for k, v in list(outputs.items())[:3])
+                        )
+                    else:
+                        attrs = [
+                            f"{k}={repr(getattr(outputs, k))[:80]}"
+                            for k in ("named_entities", "triples", "definitions", "decisions", "repairs", "intent_query", "selected_fact_indices", "answer")
+                            if hasattr(outputs, k)
+                        ]
+                        if attrs:
+                            out_summaries.append(", ".join(attrs))
+            trace_summary = "; ".join(out_summaries) if out_summaries else "no_trace_outputs"
+            target_hint = f"gold_answers={gold_answers[:2]!r}" if gold_answers else "no_gold_answers"
+            miss_hint = f"missed={len(missed)}" if missed else "all_retrieved"
+            return (
+                f"Stage[{pred_name_str}]: trace_calls={len(trace_entries)} "
+                f"({trace_summary}) | {target_hint} | {miss_hint}"
+            )
+
+        def _evaluate_prediction(
+            gold: Any,
+            pred: Any,
+            pred_name: Any = None,
+            pred_trace: Any = None,
+        ) -> dspy.Prediction:
             nonlocal eval_count
             eval_count += 1
             if progress_callback is not None:
@@ -1935,7 +2296,7 @@ class YawGraphEngine:
                     "Missing LM token usage on prediction (`pred.get_lm_usage()` returned 0 tokens). "
                     "Ensure `track_usage=True` is active and task LMs report non-zero token usage."
                 )
-            return compute_sizecoding_pareto_score(
+            score_pred = compute_sizecoding_pareto_score(
                 recalls_by_k[5],
                 recall_at_1=recalls_by_k[1],
                 recall_at_2=recalls_by_k[2],
@@ -1967,6 +2328,15 @@ class YawGraphEngine:
                 pred_name=str(pred_name) if pred_name else None,
                 missed_items=missed,
             )
+            if pred_name:
+                stage_diag = _build_stage_diagnostic(
+                    str(pred_name),
+                    pred_trace,
+                    gold_answers,
+                    missed,
+                )
+                score_pred.feedback = f"{score_pred.feedback} | {stage_diag}"
+            return score_pred
 
         def _mipro_metric(gold: Any, pred: Any, trace: Any = None) -> float:
             return float(_evaluate_prediction(gold, pred).score)
@@ -1978,7 +2348,12 @@ class YawGraphEngine:
             pred_name: Any = None,
             pred_trace: Any = None,
         ) -> Any:
-            return _evaluate_prediction(gold, pred, pred_name=pred_name)
+            return _evaluate_prediction(
+                gold,
+                pred,
+                pred_name=pred_name,
+                pred_trace=pred_trace,
+            )
 
         compiled = self.program
         resolved_ref_lm = (
@@ -2088,6 +2463,27 @@ class YawGraphEngine:
         self.program = compiled
         self._bind_program_hooks()
         self._apply_program_embedding_prefixes()
+        if self._opt_chunks_pool and (
+            self._active_extraction_fingerprint != self._extraction_fingerprint(self.program)
+            or not self._opt_indexed_cids
+        ):
+            pool_by_cid = {p.chunk_id: (p, t) for p, t in self._opt_chunks_pool}
+            target_cids = list(self._opt_indexed_cids) or [
+                p.chunk_id for p, _ in self._opt_chunks_pool[:64]
+            ]
+            to_index = [
+                pool_by_cid[cid]
+                for cid in target_cids
+                if cid in pool_by_cid
+            ]
+            if to_index:
+                if (
+                    self._active_extraction_fingerprint is not None
+                    and self._active_extraction_fingerprint != self._extraction_fingerprint(self.program)
+                ):
+                    clear_openie = self._active_openie_fingerprint != self._openie_fingerprint(self.program)
+                    self._reset_sandbox_graph(clear_openie=clear_openie)
+                self.index_chunks(to_index, program=self.program)
 
         if save_path is not None:
             p = Path(save_path)
@@ -2115,8 +2511,12 @@ class YawGraphEngine:
                 "entity_def_audit_trail": list(
                     getattr(self.program, "entity_def_audit_trail", ())
                 ),
+                "proposer_simba_telemetry": list(
+                    getattr(proposer, "simba_telemetry", ())
+                ),
             }
             audit_path.write_text(
+
                 json.dumps(audit_payload, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )

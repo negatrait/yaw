@@ -121,8 +121,9 @@ class YawConfig:
 
     # Graph & PPR settings
     linking_top_k: int = 8
-    retrieval_top_k: int = 5
+    retrieval_top_k: int = 10
     damping: float = 0.5
+
     synonymy_threshold: float = 0.8
     synonymy_top_k: int = 100
     embed_batch_size: int = 64

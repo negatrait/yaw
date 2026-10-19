@@ -35,17 +35,17 @@ GITHUB_BASE_URL = (
     f"https://raw.githubusercontent.com/OSU-NLP-Group/HippoRAG/{GITHUB_PINNED_COMMIT}/reproduce/dataset"
 )
 
-# Stratified 180-query quotas (120 train, 60 val) across all 10 EnterpriseRAG-Bench categories
+# Stratified 250-query quotas (150 train, 100 val) across all 10 EnterpriseRAG-Bench categories
 ENTERPRISE_CATEGORY_QUOTAS: dict[str, tuple[int, int]] = {
-    "Basic": (24, 12),
-    "Semantic": (20, 10),
-    "Intra-Document Reasoning": (12, 6),
-    "Project Related": (12, 6),
-    "Constrained": (10, 5),
-    "Conflicting Info": (9, 4),
-    "Completeness": (9, 4),
-    "Miscellaneous": (9, 4),
-    "Info Not Found": (9, 5),
+    "Basic": (35, 24),
+    "Semantic": (27, 18),
+    "Intra-Document Reasoning": (16, 11),
+    "Project Related": (16, 11),
+    "Constrained": (12, 8),
+    "Conflicting Info": (10, 6),
+    "Completeness": (10, 6),
+    "Miscellaneous": (9, 6),
+    "Info Not Found": (9, 6),
     "High Level": (6, 4),
 }
 
@@ -118,7 +118,7 @@ DATASET_REGISTRY = {
     "enterprise_rag_bench": (
         "enterprise_rag_bench.json",
         "enterprise_rag_bench_corpus.json",
-        "EnterpriseRAG-Bench stratified 10-category multi-tool dataset (180 queries: 120 train + 60 val)",
+        "EnterpriseRAG-Bench stratified 10-category multi-tool dataset (250 queries: 150 train + 100 val)",
     ),
 }
 

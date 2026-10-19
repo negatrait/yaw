@@ -1450,6 +1450,260 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             repair_pareto.feedback,
         )
 
+    def test_rlm_instruction_proposer_top5_failing_selection_anonymization_and_schema_contract(
+        self,
+    ):
+        """TDD Contract: RLMInstructionProposer enforces anti-leakage rules, selects top-5 failing examples, anonymizes gold literals, and preserves stage JSON schema contracts."""
+        import dspy
+        from dspy.utils.dummies import DummyLM
+
+        from yaw.daemon.graph.inference.program import RLMInstructionProposer
+        from yaw.daemon.graph.inference.prompts import (
+            ProposeInstructionSignature,
+            ReflectiveInnerDistillerSignature,
+        )
+
+        # 1. Anti-leakage meta-instruction contract on ProposeInstructionSignature & ReflectiveInnerDistillerSignature
+        propose_doc = ProposeInstructionSignature.__doc__ or ""
+        distill_doc = ReflectiveInnerDistillerSignature.__doc__ or ""
+        self.assertNotIn("Identify all niche and domain specific factual information", propose_doc)
+        self.assertIn("NEVER include specific", propose_doc)
+        self.assertIn("never copying specific", distill_doc.lower())
+
+        # 2. Top-5 failing example selection & gold entity anonymization in _prepare_examples
+        raw_examples = [
+            {
+                "Inputs": {"question": "Pass Q1"},
+                "Generated Outputs": {"answer": "OK1"},
+                "Feedback": "[qa] Gate-free GM_good/GM_bad=0.9500 (Recall@5=1.0000, EM=1.0000, F1=1.0000) | Stage[qa]: trace_calls=1 | gold_answers=['Pass1'] | all_retrieved",
+            },
+            {
+                "Inputs": {"question": "Pass Q2"},
+                "Generated Outputs": {"answer": "OK2"},
+                "Feedback": "[qa] Gate-free GM_good/GM_bad=0.9200 (Recall@5=1.0000, EM=1.0000, F1=1.0000) | Stage[qa]: trace_calls=1 | gold_answers=['Pass2'] | all_retrieved",
+            },
+            {
+                "Inputs": {"question": "Fail Q1"},
+                "Generated Outputs": {"answer": "Wrong1"},
+                "Feedback": "[qa] Below reference floor (0.0000 < 0.7500). Gate-free GM_good/GM_bad=0.1200 (Recall@5=0.0000, EM=0.0000, F1=0.0000). Missed items: [\"Missed passage: 'Stanford University Professor Thomas C. Sudhof'\", \"Predicted='Wrong1' != Expected=['Port of Spain', '20 March 851']\"] | Stage[qa]: trace_calls=1 | gold_answers=['Port of Spain'] | missed=2",
+            },
+            {
+                "Inputs": {"question": "Fail Q2"},
+                "Generated Outputs": {"answer": "Wrong2"},
+                "Feedback": "[qa] Below reference floor (0.2000 < 0.7500). Gate-free GM_good/GM_bad=0.1800 (Recall@5=0.2000, EM=0.0000, F1=0.1000). Missed items: [\"Predicted='Wrong2' != Expected=['Rockland County']\"] | Stage[qa]: trace_calls=1 | gold_answers=['Rockland County'] | missed=1",
+            },
+            {
+                "Inputs": {"question": "Fail Q3"},
+                "Generated Outputs": {"answer": "Wrong3"},
+                "Feedback": "[qa] Below reference floor (0.4000 < 0.7500). Gate-free GM_good/GM_bad=0.2200 (Recall@5=0.4000, EM=0.0000, F1=0.2000). Missed items: [\"Missed passage: 'Alpha Corp Q3 Earnings'\"]",
+            },
+            {
+                "Inputs": {"question": "Fail Q4"},
+                "Generated Outputs": {"answer": "Wrong4"},
+                "Feedback": "[qa] Below reference floor (0.5000 < 0.7500). Gate-free GM_good/GM_bad=0.2500 (Recall@5=0.5000, EM=0.0000, F1=0.2500). Missed items: [\"Predicted='Wrong4' != Expected=['Bletchley Park']\"]",
+            },
+            {
+                "Inputs": {"question": "Fail Q5"},
+                "Generated Outputs": {"answer": "Wrong5"},
+                "Feedback": "[qa] Below reference floor (0.6000 < 0.7500). Gate-free GM_good/GM_bad=0.3000 (Recall@5=0.6000, EM=0.0000, F1=0.3000). Missed items: [\"Predicted='Wrong5' != Expected=['Alan Turing']\"]",
+            },
+            {
+                "Inputs": {"question": "Fail Q6 (mild)"},
+                "Generated Outputs": {"answer": "Partial6"},
+                "Feedback": "[qa] Gate-free GM_good/GM_bad=0.6500 (Recall@5=1.0000, EM=0.0000, F1=0.7500). Missed items: [\"Predicted='Partial6' != Expected=['Enigma Machine']\"]",
+            },
+        ]
+
+        prepared = RLMInstructionProposer._prepare_examples(raw_examples, max_examples=5)
+        self.assertEqual(len(prepared), 5)
+        selected_questions = [ex["Inputs"]["question"] for ex in prepared]
+        # Top-5 worst failing examples selected; passing examples and mildest 6th failure excluded
+        self.assertEqual(
+            selected_questions,
+            ["Fail Q1", "Fail Q2", "Fail Q3", "Fail Q4", "Fail Q5"],
+        )
+
+        # Verify gold entity/passage literals are anonymized in Feedback while structural metrics remain
+        fb1 = prepared[0]["Feedback"]
+        self.assertNotIn("Port of Spain", fb1)
+        self.assertNotIn("20 March 851", fb1)
+        self.assertNotIn("Thomas C. Sudhof", fb1)
+        self.assertIn("<Target", fb1)
+        self.assertIn("GM_good/GM_bad=0.1200", fb1)
+
+        # 3. Stage schema contract preservation when proposer omits required JSON schema keys
+        orch_lm = DummyLM(
+            [
+                {
+                    "reasoning": "Synthesize instruction via synthesize_instruction.",
+                    "code": (
+                        "res = synthesize_instruction(current_instruction=current_instruction, examples_with_feedback=examples_with_feedback)\n"
+                        "SUBMIT(new_instruction=res)"
+                    ),
+                }
+            ]
+        )
+        qwen_lm = DummyLM(
+            [
+                {
+                    "new_instruction": "Extract all coreferent and domain-relevant entities with concise definitions."
+                }
+            ]
+        )
+        proposer = RLMInstructionProposer(
+            orchestrator_lm=orch_lm,
+            worker_lm=qwen_lm,
+            enable_gbnf=True,
+            max_instruction_chars=600,
+        )
+        with dspy.context(track_usage=True):
+            updated = proposer(
+                {"ner": "Extract named entities."},
+                {"ner": raw_examples},
+                ["ner"],
+            )
+        self.assertIn("named_entities", updated["ner"])
+        self.assertLessEqual(len(updated["ner"]), 600)
+        self.assertEqual(proposer.telemetry[0]["num_feedback_examples"], 5)
+
+    def test_rlm_instruction_proposer_dspy_module_and_always_on_simba(self):
+        """TDD Contract: RLMInstructionProposer is a dspy.Module with an always-on dspy.SIMBA meta-optimizer."""
+        import dspy
+        from dspy.utils.dummies import DummyLM
+
+        from yaw.daemon.graph.inference.program import RLMInstructionProposer
+
+        orch_lm = DummyLM(
+            [
+                {
+                    "reasoning": "Distill NER failures.",
+                    "code": (
+                        "res = synthesize_instruction(current_instruction=current_instruction, examples_with_feedback=examples_with_feedback)\n"
+                        "SUBMIT(new_instruction=res)"
+                    ),
+                },
+                {
+                    "reasoning": "Distill QA failures.",
+                    "code": (
+                        "res = synthesize_instruction(current_instruction=current_instruction, examples_with_feedback=examples_with_feedback)\n"
+                        "SUBMIT(new_instruction=res)"
+                    ),
+                },
+            ]
+        )
+        # Responses for:
+        # 1-8+: SIMBA rollout sampling, OfferFeedback rule generation, candidate eval, and validation,
+        # plus direct qwen_proposer calls during propose_for_component.
+        qwen_lm = DummyLM(
+            [
+                # Rollout 1 (good, schema-compliant, no leakage)
+                {
+                    "new_instruction": "Extract all coreferent and domain-specific entities from the passage. Return a JSON object with key `named_entities`."
+                },
+                # Rollout 2 (bad, leaks literal entity and omits schema key)
+                {
+                    "new_instruction": "Always extract Port of Spain and 20 March 851."
+                },
+                # Rollout 3 (good QA instruction)
+                {
+                    "new_instruction": "Synthesize multi-hop facts concisely into the final answer without explanatory prefixes."
+                },
+                # Rollout 4 (bad QA instruction - empty/trivial)
+                {
+                    "new_instruction": "Answer."
+                },
+                # OfferFeedback response from SIMBA append_a_rule
+                {
+                    "discussion": "The better trajectory preserved JSON schema contracts and avoided entity leakage.",
+                    "module_advice": {
+                        "qwen_proposer": "If the module receives stage feedback, then it should preserve the stage JSON output key and never copy literal entities."
+                    },
+                },
+                # OfferFeedback response 2 (if second bucket triggers append_a_rule)
+                {
+                    "discussion": "Preserve concise schema instructions.",
+                    "module_advice": {
+                        "qwen_proposer": "Ensure concise generalizable rules."
+                    },
+                },
+            ]
+            + [
+                {
+                    "new_instruction": "Extract all coreferent and bridge entities from the passage. Return a JSON object with key `named_entities`."
+                }
+                for _ in range(16)
+            ]
+        )
+
+        proposer = RLMInstructionProposer(
+            orchestrator_lm=orch_lm,
+            worker_lm=qwen_lm,
+            enable_gbnf=True,
+            enable_simba=True,
+            simba_bsize=2,
+            simba_num_candidates=2,
+            simba_max_steps=1,
+            simba_max_demos=2,
+        )
+
+        # 1. Inner worker must be a first-class dspy.Module exposing its predictors to SIMBA
+        self.assertIsInstance(proposer.worker_module, dspy.Module)
+        self.assertTrue(proposer.enable_simba)
+        pred_names = dict(proposer.worker_module.named_predictors())
+        self.assertIn("qwen_proposer", pred_names)
+        self.assertIn("qwen_compressor", pred_names)
+
+
+        # 2. Direct dspy.Module forward(component_name=..., current_instruction=..., examples_with_feedback=...)
+        # must return a dspy.Prediction(new_instruction=...) and record trace for SIMBA
+        with dspy.context(trace=[], track_usage=True):
+            direct_pred = proposer(
+                component_name="ner",
+                current_instruction='Extract entities. Return JSON key `named_entities`.',
+                examples_with_feedback=[
+                    {
+                        "Inputs": {"passage": "Stanford University was founded in 1885."},
+                        "Generated Outputs": {"named_entities": []},
+                        "Feedback": "[ner] Gate-free GM_good/GM_bad=0.1500 (Recall@5=0.0000, EM=0.0000, F1=0.0000) | Stage[ner]: trace_calls=1 | missed=1",
+                    }
+                ],
+            )
+            captured_trace = list(dspy.settings.trace)
+        self.assertIsInstance(direct_pred, dspy.Prediction)
+        self.assertTrue(str(getattr(direct_pred, "new_instruction", "")).strip())
+        self.assertGreaterEqual(len(captured_trace), 1)
+
+        # 3. Calling GEPA ProposalFn across 2 components reaches simba_bsize=2 and triggers SIMBA compilation
+        reflective_dataset = {
+            "ner": [
+                {
+                    "Inputs": {"passage": "Port of Spain is the capital of Trinidad and Tobago."},
+                    "Generated Outputs": {"named_entities": ["Trinidad"]},
+                    "Feedback": "[ner] Gate-free GM_good/GM_bad=0.1400 (Recall@5=0.0000, EM=0.0000, F1=0.0000) | Stage[ner]: trace_calls=1 | missed=1",
+                }
+            ],
+            "qa": [
+                {
+                    "Inputs": {"question": "What is the capital?", "context": "Port of Spain is the capital."},
+                    "Generated Outputs": {"answer": "Unknown"},
+                    "Feedback": "[qa] Gate-free GM_good/GM_bad=0.1800 (Recall@5=1.0000, EM=0.0000, F1=0.0000) | Stage[qa]: trace_calls=1 | missed=1",
+                }
+            ],
+        }
+        candidate = {
+            "ner": "Extract named entities. Return a JSON object with key `named_entities`.",
+            "qa": "Answer the question concisely from context.",
+        }
+        with dspy.context(track_usage=True):
+            updated = proposer(candidate, reflective_dataset, ["ner", "qa"])
+
+        self.assertIn("ner", updated)
+        self.assertIn("qa", updated)
+        self.assertGreaterEqual(len(proposer.simba_telemetry), 1)
+        simba_entry = proposer.simba_telemetry[-1]
+        self.assertEqual(simba_entry["optimizer"], "dspy.SIMBA")
+        self.assertGreaterEqual(simba_entry["trainset_size"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

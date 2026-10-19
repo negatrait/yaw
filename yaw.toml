@@ -30,8 +30,9 @@ gbnf_max_facts = 4
 
 [graph]
 linking_top_k = 8
-retrieval_top_k = 5
+retrieval_top_k = 10
 damping = 0.5
+
 synonymy_threshold = 0.8
 synonymy_top_k = 100
 embed_batch_size = 64
@@ -45,7 +46,7 @@ http_path = "/mcp"
 [optimization]
 datasets = ["enterprise_rag_bench"]
 mode = "hybrid"
-max_queries = 180
-train_queries = 120
+max_queries = 250
+train_queries = 150
 query_offset = 0
 auto = "light"

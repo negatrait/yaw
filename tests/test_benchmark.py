@@ -442,8 +442,8 @@ class DatasetSliceTests(unittest.TestCase):
 
         quotas = dl_mod.ENTERPRISE_CATEGORY_QUOTAS
         self.assertEqual(len(quotas), 10)
-        self.assertEqual(sum(tr for tr, _ in quotas.values()), 120)
-        self.assertEqual(sum(va for _, va in quotas.values()), 60)
+        self.assertEqual(sum(tr for tr, _ in quotas.values()), 150)
+        self.assertEqual(sum(va for _, va in quotas.values()), 100)
 
         synthetic_questions = []
         synthetic_docs = []
@@ -475,7 +475,7 @@ class DatasetSliceTests(unittest.TestCase):
                 )
                 q_idx += 1
 
-        for d_idx in range(600):
+        for d_idx in range(800):
             tool = tools[d_idx % len(tools)]
             synthetic_docs.append(
                 {
@@ -501,9 +501,9 @@ class DatasetSliceTests(unittest.TestCase):
             self.assertTrue(c_path.exists())
 
             queries_data = json.loads(q_path.read_text(encoding="utf-8"))
-            self.assertEqual(len(queries_data), 180)
-            train_slice = queries_data[:120]
-            val_slice = queries_data[120:]
+            self.assertEqual(len(queries_data), 250)
+            train_slice = queries_data[:150]
+            val_slice = queries_data[150:]
 
             train_counts = Counter(q["question_type"] for q in train_slice)
             val_counts = Counter(q["question_type"] for q in val_slice)
@@ -514,6 +514,9 @@ class DatasetSliceTests(unittest.TestCase):
             for q in queries_data:
                 supp = [p for p in q["paragraphs"] if p["is_supporting"]]
                 dists = [p for p in q["paragraphs"] if not p["is_supporting"]]
+                supp_ids = {p["idx"] for p in supp}
+                dist_ids = {p["idx"] for p in dists}
+                self.assertTrue(supp_ids.isdisjoint(dist_ids))
                 if q["question_type"] == "Info Not Found":
                     self.assertEqual(len(supp), 0)
                     self.assertIn("Insufficient information", q["answer_aliases"])
@@ -524,14 +527,18 @@ class DatasetSliceTests(unittest.TestCase):
             trainset, valset, corpus_docs = _load_dataset_splits(
                 ["enterprise"],
                 workspace_root=tmp_root,
-                max_queries=180,
-                train_queries=120,
+                max_queries=250,
+                train_queries=150,
                 query_offset=0,
             )
-            self.assertEqual(len(trainset), 120)
+            self.assertEqual(len(trainset), 150)
             assert valset is not None
-            self.assertEqual(len(valset), 60)
-            self.assertGreater(len(corpus_docs), 200)
+            self.assertEqual(len(valset), 100)
+            self.assertGreater(len(corpus_docs), 300)
+            for ex in trainset[:5] + valset[:5]:
+                self.assertTrue(hasattr(ex, "item_docs"))
+                self.assertGreaterEqual(len(ex.item_docs), 2)
+                self.assertIn("item_docs", ex.inputs())
 
     def test_text_stopwords(self):
         self.assertGreater(len(TEXT_STOPWORDS), 50)

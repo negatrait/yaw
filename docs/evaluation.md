@@ -571,3 +571,30 @@ Offline test suite: `uv run --locked python -m unittest discover -s tests -v` â€
   - `uv run --locked ruff check .` $\to$ **All checks passed!**
   - `uv run --locked ty check` $\to$ **All checks passed!**
   - `git diff --check` $\to$ **Clean**.
+
+15. **250-Query Stratified `enterprise_rag_bench` (`150` Train + `100` Holdout) & End-to-End DSPy/GEPA Extraction, Graph & QA Prompt Evolution (2026-10-19):**
+
+- **Architecture & Implementation:**
+  - **Stratified 250-Query `enterprise_rag_bench` Dataset (`scripts/download-datasets.py`, `yaw.toml`):**
+    - Expanded `ENTERPRISE_CATEGORY_QUOTAS` to `150` train + `100` holdout (`250` total queries) proportionally stratified across all 10 `onyx-dot-app/EnterpriseRAG-Bench` categories (`Basic`: `(35, 24)`, `Semantic`: `(27, 18)`, `Intra-Document Reasoning`: `(16, 11)`, `Project Related`: `(16, 11)`, `Constrained`: `(12, 8)`, `Conflicting Info`: `(10, 6)`, `Completeness`: `(10, 6)`, `Miscellaneous`: `(9, 6)`, `Info Not Found`: `(9, 6)`, `High Level`: `(6, 4)`).
+    - Sampled `2.0x` same-tool (`source_type`) hard distractors (`is_supporting: False`) per query with zero overlap (`0` gold-as-distractor leakage across `418` unique gold passages and `890` unique distractor passages = `1,308` corpus passages in `outputs/datasets/enterprise_rag_bench_corpus.json`).
+    - Updated `yaw.toml` `[optimization]` defaults to `max_queries = 250` and `train_queries = 150`.
+  - **Causal End-to-End Extraction & Graph Re-Indexing + Trace Injection (`yaw/daemon/cli.py`, `yaw/daemon/graph/inference/program.py`, `yaw/daemon/graph/engine.py`, `yaw/daemon/runtime.py`):**
+    - Attached `item_docs` (`gold` + `2.0x` distractors) to each `dspy.Example` with `.with_inputs("question", "item_docs")` and threaded `item_docs` through `HippoRAGProgram.forward` $\to$ `YawGraphEngine._program_retrieval_hook`.
+    - Implemented two-level extraction/graph fingerprinting (`_openie_fingerprint` for `ner`, `triples`, `entity_definer` + `_extraction_fingerprint` adding `synonym_judge`, `shacl_repair`, `shacl_healer_rlm.*`, and `embedding_*_prefix`).
+    - When a candidate mutates any extraction/graph predictor or embedding prefix, `_ensure_candidate_chunks_indexed` invalidates stale SQLite graph tables (and `openie_chunks` when `_openie_fingerprint` changes) via `_reset_sandbox_graph` and re-indexes the active candidate chunks under the candidate `program`.
+    - Captured per-chunk OpenIE & `define_missing_entities` traces (`_captured_chunk_traces`) and graph-level `synonym_judge` & `shacl_healer_rlm` traces (`_captured_graph_traces`), injecting them bound to the candidate `program`'s predictor instances into `dspy.settings.trace` during `forward()` so `DspyAdapter.make_reflective_dataset` receives real execution traces for all 9 predictors.
+    - Wired `pred_name` and `pred_trace` into `_evaluate_prediction` / `_gepa_metric` to emit stage-specific diagnostics (`Stage[{pred_name}]: ...`) alongside the Sizecoding Pareto feedback.
+  - **`RLMInstructionProposer` Anti-Leakage & Top-5 Failing Example Hardening (`yaw/daemon/graph/inference/prompts.py`, `yaw/daemon/graph/inference/program.py`, `tests/daemon/graph/inference/test_prompts.py`):**
+    - Replaced stock DSPy's leaky meta-instruction (`"Identify all niche and domain specific factual information..."`) in `ProposeInstructionSignature` and `ReflectiveInnerDistillerSignature` with strict anti-leakage generalization rules (`NEVER include specific entity names, proper nouns, locations, dates, numbers, or question-specific facts from the examples in new_instruction`).
+    - Implemented `_example_failure_priority` and updated `_prepare_examples(..., max_examples: int = 5)` (`max_feedback_examples: int = 5`) so reflective datasets rank failing examples by lowest `GM_good/GM_bad` score ahead of passing examples and cap at the **top-5 failing examples**.
+    - Added `_anonymize_feedback_literals` to scrub specific gold entity/answer/passage literals (`Missed passage: '...'` $\to$ `'<TargetPassage>'`, `Expected=[...]` $\to$ `['<TargetAnswer>']`, `gold_answers=[...]` $\to$ `['<TargetAnswer>']`, `Missed gold items: [...]` $\to$ `['<TargetEntity>']`) from the `"Feedback"` field before `RLMInstructionProposer` inspects it, while preserving all numerical metrics (`GM_good/GM_bad`, `Recall@5`, `EM`, `F1`, `Stage[...]`).
+    - Added `_STAGE_SCHEMA_CONTRACTS` and `_ensure_stage_schema_contract` to guarantee evolved instructions preserve each component's required JSON output schema key (`named_entities`, `triples`, `entity_definitions`, `decisions`, `repairs`, `"fact"`) within `max_instruction_chars`.
+    - Updated `retrieval_top_k` default from `5` to `10` across `YawConfig`, `yaw.toml`, and `YawGraphEngine` (matching `benchmark.py`'s `RETRIEVAL_TOP_K = 10`).
+    - Encapsulated `RLMInstructionProposer`'s inner GBNF synthesizer (`qwen_proposer` + `qwen_compressor`) into `_InstructionSynthesizerWorker(dspy.Module)` (`proposer.worker_module`) and attached an always-on `dspy.SIMBA` meta-optimizer (`step_simba()`, `_score_proposer_prediction`) that continuously refines `qwen_proposer`'s rules (`OfferFeedback`) and demonstrations (`demos`) during prompt evolution, recording telemetry in `proposer.simba_telemetry` and `*_graph_rlm_audit.json`.
+
+- **Verification Status:**
+  - `uv run --locked pytest -q` $\to$ **165 passed, 8 warnings, 3 subtests passed**.
+  - `uv run --locked ruff check .` $\to$ **All checks passed!**
+  - `uv run --locked ty check` $\to$ **All checks passed!**
+  - `git diff --check` $\to$ **Clean**.

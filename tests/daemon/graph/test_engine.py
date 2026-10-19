@@ -1255,3 +1255,219 @@ def test_engine_define_missing_entities_telemetry_and_no_heuristic_fallbacks(
         assert report["violations"] == []
     finally:
         engine.close()
+
+
+def test_engine_evolve_prompts_reindexes_on_extraction_mutation_and_captures_all_stage_traces(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify mutating extraction/graph predictors in GEPA triggers candidate re-indexing, injects all stage traces into dspy.settings.trace, and emits per-predictor feedback."""
+    import json
+
+    ner_calls: list[str] = []
+
+    class CandidateSensitiveExtractionLM(DeterministicMockLM):
+        def __call__(
+            self,
+            prompt: str | None = None,
+            messages: list[dict[str, Any]] | None = None,
+            **kwargs: Any,
+        ) -> list[str]:
+            if getattr(dspy.settings, "usage_tracker", None) is not None:
+                dspy.settings.usage_tracker.add_usage(
+                    self.model,
+                    {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30},
+                )
+            req_str = str(prompt or messages or kwargs)
+            if "ExtractEntities" in req_str or "named_entities" in req_str:
+                ner_calls.append(req_str)
+                if "MUTATED_NER_MARKER" in req_str:
+                    return [
+                        json.dumps(
+                            {
+                                "named_entities": [
+                                    ["Alan Turing", "English mathematician and pioneer of theoretical computer science"],
+                                    ["Bletchley Park", "British wartime codebreaking center"],
+                                ]
+                            }
+                        )
+                    ]
+                return [
+                    json.dumps(
+                        {
+                            "named_entities": [
+                                ["Unknown Person", "Unspecified entity"],
+                            ]
+                        }
+                    )
+                ]
+            if "ExtractTriples" in req_str or "triples" in req_str:
+                if "Alan Turing" in req_str:
+                    return [
+                        json.dumps(
+                            {
+                                "triples": [
+                                    {
+                                        "sub": "Alan Turing",
+                                        "pred": "worked at",
+                                        "obj": "Bletchley Park",
+                                        "def": "Alan Turing worked at Bletchley Park.",
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                return [
+                    json.dumps(
+                        {
+                            "triples": [
+                                {
+                                    "sub": "Unknown Person",
+                                    "pred": "visited",
+                                    "obj": "Nowhere",
+                                    "def": "Unknown Person visited Nowhere.",
+                                }
+                            ]
+                        }
+                    )
+                ]
+            if (
+                "DefineMissingEntities" in req_str
+                or "missing_entities" in req_str
+                or "entity_definitions" in req_str
+            ):
+                return [
+                    json.dumps(
+                        {
+                            "entity_definitions": [
+                                ["Nowhere", "Unspecified place"],
+                                ["Bletchley Park", "British wartime codebreaking center"],
+                            ]
+                        }
+                    )
+                ]
+            if "JudgeSynonyms" in req_str or "candidate_pairs" in req_str:
+                return [json.dumps({"decisions": []})]
+            return super().__call__(prompt=prompt, messages=messages, **kwargs)
+
+    lm = CandidateSensitiveExtractionLM()
+    dspy.settings.configure(lm=lm)
+    program = HippoRAGProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
+    embedder: Any = DeterministicMockEmbedder(dim=64)
+
+    engine = YawGraphEngine(
+        db_path=tmp_path / "yaw_evo_extract.db",
+        workspace_root=tmp_path,
+        program=program,
+        embedder=embedder,
+        retrieval_top_k=2,
+        synonymy_threshold=-1.0,
+    )
+    try:
+        doc_gold = "Alan Turing\nAlan Turing worked at Bletchley Park during World War II."
+        doc_dist = "Distractor\nThe weather in London was rainy."
+        engine.index([doc_gold, doc_dist])
+
+        trainset = [
+            dspy.Example(
+                question="Where did Alan Turing work?",
+                gold_answers=["Bletchley Park"],
+                gold_docs=[doc_gold],
+                item_docs=[doc_gold, doc_dist],
+            ).with_inputs("question", "item_docs")
+        ]
+
+        # 1. Verify _extraction_fingerprint sensitivity
+        fp_base = engine._extraction_fingerprint(program)
+        qa_mutated = program.deepcopy()
+        qa_mutated.qa.predict.signature = qa_mutated.qa.predict.signature.with_instructions(
+            "QA-only mutation"
+        )
+        assert engine._extraction_fingerprint(qa_mutated) == fp_base
+
+        ner_mutated = program.deepcopy()
+        ner_mutated.ner.signature = ner_mutated.ner.signature.with_instructions(
+            "MUTATED_NER_MARKER: Extract all entities with definitions."
+        )
+        assert engine._extraction_fingerprint(ner_mutated) != fp_base
+
+        # 2. Verify GEPA compile loop triggers re-indexing on NER mutation, reuses cache on QA-only mutation,
+        #    captures extraction + QA traces in dspy.settings.trace, and provides stage-specific feedback.
+        observed_traces: list[Any] = []
+        feedback_by_stage: dict[str, str] = {}
+
+        class InspectingGEPA:
+            def __init__(self, metric: Any, **kwargs: Any) -> None:
+                self.metric = metric
+                self.kwargs = kwargs
+
+            def compile(self, student: Any, trainset: list[Any], valset: Any = None) -> Any:
+                ex = trainset[0]
+                # Evaluate baseline candidate with trace capture enabled
+                trace_base: list[Any] = []
+                with dspy.context(trace=trace_base, track_usage=True):
+                    _ = student(**ex.inputs())
+                entities_before = {
+                    str(r[0])
+                    for r in engine.conn.execute("SELECT name FROM entities").fetchall()
+                }
+                assert "unknown person" in entities_before
+
+                # Evaluate QA-only mutated candidate: must NOT re-run NER extraction
+                ner_count_after_base = len(ner_calls)
+                cand_qa = student.deepcopy()
+                cand_qa.qa.predict.signature = cand_qa.qa.predict.signature.with_instructions(
+                    "Answer concisely."
+                )
+                with dspy.context(trace=[], track_usage=True):
+                    _ = cand_qa(**ex.inputs())
+                assert len(ner_calls) == ner_count_after_base
+
+                # Evaluate NER-mutated candidate: MUST wipe openie_chunks and re-run NER extraction!
+                cand_ner = student.deepcopy()
+                cand_ner.ner.signature = cand_ner.ner.signature.with_instructions(
+                    "MUTATED_NER_MARKER: Extract all entities with definitions."
+                )
+                trace_mut: list[Any] = []
+                with dspy.context(trace=trace_mut, track_usage=True):
+                    pred_mut = cand_ner(**ex.inputs())
+                assert len(ner_calls) > ner_count_after_base
+
+                entities_after = {
+                    str(r[0])
+                    for r in engine.conn.execute("SELECT name FROM entities").fetchall()
+                }
+                assert "alan turing" in entities_after
+                assert "bletchley park" in entities_after
+
+                # Verify trace_mut contains extraction predictors (ner, triples) as well as QA predictors
+                observed_traces.extend(trace_mut)
+                named_preds = dict(cand_ner.named_predictors())
+                for req_stage in ("ner", "triples", "qa.predict"):
+                    target_sig = named_preds[req_stage].signature
+                    matching = [
+                        t for t in trace_mut if t[0].signature.equals(target_sig)
+                    ]
+                    assert len(matching) >= 1, f"Missing trace for {req_stage}"
+                    res = self.metric(
+                        ex,
+                        pred_mut,
+                        trace_mut,
+                        req_stage,
+                        matching,
+                    )
+                    feedback_by_stage[req_stage] = res.feedback
+
+                return cand_ner
+
+        monkeypatch.setattr(dspy, "GEPA", InspectingGEPA, raising=False)
+        compiled = engine.evolve_prompts(trainset, mode="gepa")
+        assert "MUTATED_NER_MARKER" in compiled.ner.signature.instructions
+        assert len(observed_traces) >= 3
+        assert "[ner]" in feedback_by_stage["ner"]
+        assert "Stage[ner]" in feedback_by_stage["ner"]
+        assert "[triples]" in feedback_by_stage["triples"]
+        assert "Stage[triples]" in feedback_by_stage["triples"]
+        assert "[qa.predict]" in feedback_by_stage["qa.predict"]
+    finally:
+        engine.close()

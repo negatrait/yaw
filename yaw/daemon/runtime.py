@@ -780,6 +780,7 @@ class YawRuntime:
                 if progress_callback is not None:
                     progress_callback(msg)
 
+            opt_chunks = []
             if corpus_docs:
                 _progress(f"indexing: preparing {len(corpus_docs)} corpus passages")
                 assert self.config.corpus_root is not None
@@ -809,9 +810,10 @@ class YawRuntime:
                     chunk_overlap=self.config.chunk_overlap,
                     min_chunk_size=self.config.min_chunk_size,
                 )
-                if delta.added_chunks:
+                opt_chunks = list(delta.added_chunks)
+                if opt_chunks and len(opt_chunks) <= 64:
                     self.engine.index_chunks(
-                        delta.added_chunks, progress_callback=_progress
+                        opt_chunks, progress_callback=_progress
                     )
                 new_stats = self.engine.get_stats(self.config.config_fingerprint())
                 with self._state_lock:
@@ -842,7 +844,11 @@ class YawRuntime:
                 num_candidates=num_candidates,
                 num_trials=num_trials,
                 progress_callback=_progress,
+                opt_chunks=opt_chunks,
             )
+            final_stats = self.engine.get_stats(self.config.config_fingerprint())
+            with self._state_lock:
+                self._stats = final_stats
             return target_path
 
         return self.submit("optimize", _run_optimize, progress_callback=progress_callback).result()

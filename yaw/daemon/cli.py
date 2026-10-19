@@ -503,7 +503,8 @@ def _load_single_dataset_examples(
                 question=str(item["question"]),
                 gold_answers=_extract_item_gold_answers(item),
                 gold_docs=gold_docs,
-            ).with_inputs("question")
+                item_docs=item_docs,
+            ).with_inputs("question", "item_docs")
         )
     return examples, list(dict.fromkeys(corpus_docs))
 
