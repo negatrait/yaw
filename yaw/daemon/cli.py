@@ -869,6 +869,39 @@ def handle_dspy_optimize(
         proposer_telemetry = saved_path.parent / f"{saved_path.stem}_proposer_telemetry.json"
         graph_rlm_audit = saved_path.parent / f"{saved_path.stem}_graph_rlm_audit.json"
         gepa_telemetry_dir = saved_path.parent / f"{saved_path.stem}_telemetry"
+        val_eval_file = saved_path.parent / f"{saved_path.stem}_eval.json"
+        eval_summary: dict[str, Any] | None = None
+        if val_eval_file.exists():
+            with contextlib.suppress(Exception):
+                raw_eval = json.loads(val_eval_file.read_text(encoding="utf-8"))
+                if isinstance(raw_eval, list) and raw_eval:
+                    f1_scores = [
+                        float(it.get("f1", it.get("score", 0.0)))
+                        for it in raw_eval
+                        if isinstance(it, dict)
+                    ]
+                    em_scores = [
+                        float(it.get("em", 0.0))
+                        for it in raw_eval
+                        if isinstance(it, dict)
+                    ]
+                    apm_scores = [
+                        float(it.get("answer_passage_match", 0.0))
+                        for it in raw_eval
+                        if isinstance(it, dict)
+                    ]
+                    eval_summary = {
+                        "num_evaluated": len(raw_eval),
+                        "mean_f1": (
+                            sum(f1_scores) / len(f1_scores) if f1_scores else 0.0
+                        ),
+                        "mean_em": (
+                            sum(em_scores) / len(em_scores) if em_scores else 0.0
+                        ),
+                        "answer_passage_match_rate": (
+                            sum(apm_scores) / len(apm_scores) if apm_scores else 0.0
+                        ),
+                    }
         payload: dict[str, Any] = {
             "optimized": True,
             "mode": mode,
@@ -878,6 +911,8 @@ def handle_dspy_optimize(
             "train_queries": len(trainset),
             "val_queries": len(valset) if valset is not None else 0,
             "compiled_program_path": str(saved_path),
+            "val_eval_path": str(val_eval_file) if val_eval_file.exists() else None,
+            "eval_summary": eval_summary,
             "sandbox_db_path": str(opt_config.db_path),
             "proposer_telemetry_path": (
                 str(proposer_telemetry) if proposer_telemetry.exists() else None
