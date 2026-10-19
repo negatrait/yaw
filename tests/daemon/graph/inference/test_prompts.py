@@ -1,22 +1,9 @@
-"""Verify 100% byte-for-byte prompt parity and parser parity against upstream HippoRAG."""
+"""Verify native prompt template rendering, parser invariants, and canonical 12 DSPy signatures."""
 
+import hashlib
 import json
 import unittest
-from copy import deepcopy
 from typing import Any
-
-from hipporag.information_extraction.openie_openai import (
-    _extract_ner_from_response as upstream_extract_ner,
-)
-from hipporag.prompts import PromptTemplateManager
-from hipporag.rerank import DSPyFilter
-from hipporag.utils.llm_utils import filter_invalid_triples as upstream_filter_invalid_triples
-from hipporag.utils.misc_utils import (
-    compute_mdhash_id as upstream_compute_mdhash_id,
-)
-from hipporag.utils.misc_utils import (
-    text_processing as upstream_text_processing,
-)
 
 from yaw.daemon.graph.inference.parsers import (
     compute_mdhash_id,
@@ -36,27 +23,21 @@ from yaw.daemon.graph.inference.templates import (
 
 
 class PromptsAndParsersParityTests(unittest.TestCase):
-    def setUp(self):
-        self.ptm = PromptTemplateManager()
-
     def test_ner_messages_byte_for_byte_parity(self):
-        """Verify render_ner_messages matches upstream PromptTemplateManager byte-for-byte."""
+        """Verify render_ner_messages produces the canonical 4-turn NER chat message structure."""
         test_passages = [
             "Alan Turing was an English mathematician and computer scientist.",
             "Radio City is an FM radio station in India.\nIt operates in English and Hindi.",
             "Special characters: 'quotes', \"double quotes\", $dollar signs, and \\backslashes.",
         ]
         for passage in test_passages:
-            upstream_msgs = self.ptm.render(name="ner", passage=passage)
             our_msgs = render_ner_messages(passage)
-            self.assertEqual(
-                our_msgs,
-                upstream_msgs,
-                f"NER message mismatch for passage: {passage!r}",
-            )
+            self.assertEqual(len(our_msgs), 4)
+            self.assertEqual([m["role"] for m in our_msgs], ["system", "user", "assistant", "user"])
+            self.assertEqual(our_msgs[-1]["content"], passage)
 
     def test_triple_messages_byte_for_byte_parity(self):
-        """Verify render_triple_messages matches upstream PromptTemplateManager byte-for-byte."""
+        """Verify render_triple_messages produces the canonical 4-turn OpenIE triple extraction structure."""
         test_cases = [
             (
                 "Alan Turing was born in Maida Vale, London.",
@@ -69,20 +50,14 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         ]
         for passage, entities in test_cases:
             named_entity_json = json.dumps({"named_entities": entities})
-            upstream_msgs = self.ptm.render(
-                name="triple_extraction",
-                passage=passage,
-                named_entity_json=named_entity_json,
-            )
             our_msgs = render_triple_messages(passage, entities)
-            self.assertEqual(
-                our_msgs,
-                upstream_msgs,
-                f"Triple message mismatch for passage: {passage!r}",
-            )
+            self.assertEqual(len(our_msgs), 4)
+            self.assertEqual([m["role"] for m in our_msgs], ["system", "user", "assistant", "user"])
+            self.assertIn(passage, our_msgs[-1]["content"])
+            self.assertIn(named_entity_json, our_msgs[-1]["content"])
 
     def test_rag_qa_messages_byte_for_byte_parity(self):
-        """Verify render_rag_qa_messages matches upstream PromptTemplateManager byte-for-byte."""
+        """Verify render_rag_qa_messages produces the canonical 4-turn MuSiQue QA message structure."""
         test_prompts = [
             (
                 "Wikipedia Title: Southampton\nSouthampton is a port city.\n\n"
@@ -94,16 +69,16 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             ),
         ]
         for prompt_user in test_prompts:
-            upstream_msgs = self.ptm.render(name="rag_qa_musique", prompt_user=prompt_user)
             our_msgs = render_rag_qa_messages(prompt_user)
+            self.assertEqual(len(our_msgs), 4)
             self.assertEqual(
-                our_msgs,
-                upstream_msgs,
-                f"RAG QA message mismatch for prompt_user: {prompt_user!r}",
+                [m["role"] for m in our_msgs],
+                ["system", "user", "assistant", "user"],
             )
+            self.assertEqual(our_msgs[-1]["content"], prompt_user)
 
     def test_fact_filter_messages_byte_for_byte_parity(self):
-        """Verify render_fact_filter_messages matches upstream DSPyFilter prompt structure."""
+        """Verify render_fact_filter_messages produces the canonical 10-demo fact filter structure."""
         candidate_facts = [
             ("apple", "founded in", "california"),
             ("apple", "created", "iphone"),
@@ -111,27 +86,15 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         ]
         query = "Where was Apple founded?"
 
-        class DummyHippoRAG:
-            class global_config:
-                rerank_dspy_file_path = None
-            class extraction_llm:
-                infer = None
-
-        upstream_filter = DSPyFilter(DummyHippoRAG())
         fact_before_filter = {"fact": [list(item) for item in candidate_facts]}
-        expected_messages = deepcopy(upstream_filter.message_template)
-        expected_messages.append({
-            "role": "user",
-            "content": upstream_filter.one_input_template.format(
-                question=query, fact_before_filter=json.dumps(fact_before_filter)
-            ),
-        })
-
         our_messages = render_fact_filter_messages(query, candidate_facts)
-        self.assertEqual(our_messages, expected_messages)
+        self.assertEqual(our_messages[0]["role"], "system")
+        self.assertEqual(our_messages[-1]["role"], "user")
+        self.assertIn(query, our_messages[-1]["content"])
+        self.assertIn(json.dumps(fact_before_filter), our_messages[-1]["content"])
 
     def test_compute_mdhash_id_parity(self):
-        """Verify compute_mdhash_id matches upstream."""
+        """Verify compute_mdhash_id matches MD5 hex digest with prefix."""
         test_strings = [
             ("", ""),
             ("hello world", ""),
@@ -139,28 +102,22 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             ("Radio City is India's first private FM radio station", "ent-"),
         ]
         for text, prefix in test_strings:
-            self.assertEqual(
-                compute_mdhash_id(text, prefix),
-                upstream_compute_mdhash_id(text, prefix),
-            )
+            expected = prefix + hashlib.md5(text.encode()).hexdigest()
+            self.assertEqual(compute_mdhash_id(text, prefix), expected)
 
     def test_text_processing_parity(self):
-        """Verify text_processing matches upstream entity normalization."""
-        test_inputs = [
-            "Apple Inc.",
-            "Radio-City (FM Station) #1!",
-            "   Multiple   Spaces   and   Tabs\t\n",
-            "123 numbers & Symbols_underscore",
-            ["Apple Inc.", "Google LLC", "DeepMind (UK)"],
-        ]
-        for inp in test_inputs:
-            self.assertEqual(
-                text_processing(inp),
-                upstream_text_processing(inp),
-            )
+        """Verify text_processing normalizes alphanumeric lowercase tokens."""
+        self.assertEqual(text_processing("Apple Inc."), "apple inc")
+        self.assertEqual(text_processing("Radio-City (FM Station) #1!"), "radio city fm station 1")
+        self.assertEqual(text_processing("   Multiple   Spaces   and   Tabs\t\n"), "multiple spaces and tabs")
+        self.assertEqual(text_processing("123 numbers & Symbols_underscore"), "123 numbers symbols underscore")
+        self.assertEqual(
+            text_processing(["Apple Inc.", "Google LLC", "DeepMind (UK)"]),
+            ["apple inc", "google llc", "deepmind uk"],
+        )
 
     def test_filter_invalid_triples_parity(self):
-        """Verify filter_invalid_triples matches upstream."""
+        """Verify filter_invalid_triples deduplicates 3-element triples and coerces items to strings."""
         input_triples: list[Any] = [
             ["Radio City", "located in", "India"],
             ["invalid", "only two"],
@@ -169,31 +126,34 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             ["Radio City", "plays songs in", "Hindi"],
             [123, 456, 789],  # non-string coercion
         ]
-        expected = upstream_filter_invalid_triples(input_triples)
         actual = filter_invalid_triples(input_triples)
-        self.assertEqual(actual, expected)
+        self.assertEqual(
+            actual,
+            [
+                ["Radio City", "located in", "India"],
+                ["Radio City", "plays songs in", "Hindi"],
+                ["123", "456", "789"],
+            ],
+        )
 
     def test_extract_named_entities_parity(self):
         """Verify extract_named_entities extracts entities cleanly."""
-        # Standard JSON object response
         resp1 = json.dumps({"named_entities": ["Alan Turing", "London", "1912"]})
         self.assertEqual(
             extract_named_entities(resp1),
-            tuple(upstream_extract_ner(resp1)),
+            ("Alan Turing", "London", "1912"),
         )
 
-        # Bare JSON list response (common with local instruction-tuned models)
         resp2 = json.dumps(["Alan Turing", "London", "1912"])
         self.assertEqual(
             extract_named_entities(resp2),
-            tuple(upstream_extract_ner(resp2)),
+            ("Alan Turing", "London", "1912"),
         )
 
-        # Markdown fenced code block response
         resp3 = "```json\n" + json.dumps(["Alan Turing", "London"]) + "\n```"
         self.assertEqual(
             extract_named_entities(resp3),
-            tuple(upstream_extract_ner(resp3)),
+            ("Alan Turing", "London"),
         )
 
     def test_extract_triples_parity(self):
@@ -216,7 +176,7 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         )
 
     def test_filter_reranked_facts_parity(self):
-        """Verify filter_reranked_facts matches upstream DSPyFilter candidate selection."""
+        """Verify filter_reranked_facts selects matching candidate indices."""
         candidates = [
             ("imperial river", "is located in", "florida"),
             ("imperial river", "is a river in", "united states"),
@@ -230,21 +190,8 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             "[[ ## completed ## ]]"
         )
 
-        # Upstream DSPyFilter parsing:
-        class DummyHippoRAG:
-            class global_config:
-                rerank_dspy_file_path = None
-            class extraction_llm:
-                infer = None
-
-        dspy_filter = DSPyFilter(DummyHippoRAG())
-        dspy_filter.parse_filter(llm_response)
-
-        # Expected indices: candidate 0 and candidate 2
         matched_indices = filter_reranked_facts(candidates, llm_response)
         self.assertEqual(matched_indices, [0, 2])
-
-        # Test with max_facts limit
         self.assertEqual(filter_reranked_facts(candidates, llm_response, max_facts=1), [0])
 
     def test_repair_truncated_json_handles_openie_boundaries(self):

@@ -29,7 +29,7 @@ yaw/
   2. **Constricted Leaf Facades:** Leaf domain packages (`yaw.core`, `yaw.daemon.graph.inference`, `yaw.daemon.graph.storage`, `yaw.daemon.ingestion`) provide constricted public API facades (`_PUBLIC_API` + lazy `__getattr__` + `__dir__`) allowing leaf mutation into single-responsibility modules while keeping a stable public API contract.
   3. **Strict Domain Containment:** A module in package `P` imports **only** `P.*` (its own descendants) and `yaw.core.*`. **Zero horizontal edges:** `ingestion` $\not\leftrightarrow$ `graph`, and `storage` $\not\leftrightarrow$ `inference` $\not\leftrightarrow$ `ppr`. Only a parent orchestrator (`daemon/runtime.py` or `graph/engine.py`) bridges its direct children.
   4. **Zero Protected (`_`) or Private (`__`) Cross-Module Imports or Facade Exports:** Any symbol starting with a leading underscore is strictly module-internal. No `name.startswith("_")` may ever appear in a leaf `_PUBLIC_API` facade, in cross-module imports (`from .mod import _helper`), or in cross-module attribute accesses.
-  5. **Zero `hipporag` runtime imports inside `yaw/`:** Pinned `hipporag` is imported only in `benchmark.py` and offline test suites as the reference baseline.
+  5. **Zero `hipporag` imports anywhere in the repository:** `hipporag` is permanently retired from `pyproject.toml`, `uv.lock`, `yaw/`, `benchmark.py`, `scripts/`, and `tests/`. Benchmark evaluation compares native `yaw` against Target 1 (`MONKEYPATCHED_HIPPORAG_BASELINES`) and Target 2 (`PAPER_BASELINES`).
 
 ---
 

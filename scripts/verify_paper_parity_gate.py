@@ -33,7 +33,7 @@ if callable(reconfigure_stdout):
     reconfigure_stdout(encoding="utf-8", errors="replace")
 
 import benchmark  # noqa: E402
-from benchmark import ALIASES, PAPER_BASELINES  # noqa: E402
+from benchmark import ALIASES, MONKEYPATCHED_HIPPORAG_BASELINES, PAPER_BASELINES  # noqa: E402
 
 DEFAULT_DATASETS: tuple[str, ...] = (
     "popqa",
@@ -46,6 +46,44 @@ DEFAULT_DATASETS: tuple[str, ...] = (
 )
 
 PER_DATASET_TOLERANCE = -0.02
+
+
+def build_monkeypatched_baseline_report(
+    dataset: str,
+    *,
+    queries_per_dataset: int = 25,
+) -> dict[str, Any]:
+    """Build a normalized report dictionary from consolidated historical monkeypatched HippoRAG 2 baselines."""
+    canonical_ds = ALIASES.get(dataset, dataset)
+    b = MONKEYPATCHED_HIPPORAG_BASELINES.get(canonical_ds, {})
+    return {
+        "engine": "hipporag",
+        "status": "passed",
+        "qa_model": benchmark.DEFAULT_QA_CHAT,
+        "num_docs": 0,
+        "num_queries": queries_per_dataset,
+        "indexing_seconds": float(b.get("indexing_seconds", 0.0)),
+        "evaluation_seconds": float(b.get("evaluation_seconds", 0.0)),
+        "elapsed_seconds": float(b.get("elapsed_seconds", 0.0)),
+        "run_dir": "outputs/benchmarks/consolidated_historical_baselines.json",
+        "index_dir": "",
+        "graph": {},
+        "evaluation_metrics": {
+            "hipporag": {
+                "retrieval": {
+                    "Recall@1": float(b.get("Recall@1", 0.0)),
+                    "Recall@2": float(b.get("Recall@2", 0.0)),
+                    "Recall@5": float(b.get("Recall@5", 0.0)),
+                },
+                "qa": {
+                    "ExactMatch": float(b["ExactMatch"]) if b.get("ExactMatch") is not None else None,
+                    "F1": float(b["F1"]) if b.get("F1") is not None else None,
+                },
+            },
+            "standard_dpr": {"retrieval": {}},
+            "recognition_memory": {},
+        },
+    }
 
 
 def extract_engine_summary(report: dict[str, Any]) -> dict[str, Any]:
@@ -101,7 +139,7 @@ def compare_engine_reports(
     index_queries: int,
     mode: str = "eval",
 ) -> dict[str, Any]:
-    """Compare upstream HippoRAG 2 and YAW reports on the same dataset slice."""
+    """Compare Target 1 (Monkeypatched HippoRAG 2) and Target 2 (Paper 70B) against YAW on the same dataset slice."""
     canonical_ds = ALIASES.get(dataset, dataset)
     hippo_sum = extract_engine_summary(hipporag_report)
     yaw_sum = extract_engine_summary(yaw_report)
@@ -125,6 +163,18 @@ def compare_engine_reports(
         if yaw_f1 is not None and hippo_f1 is not None
         else None
     )
+
+    paper_h2 = PAPER_BASELINES.get(canonical_ds, {}).get("hipporag2_llama3.3_70b_nvembed_v2", {})
+    paper_r2 = paper_h2.get("Recall@2")
+    paper_r5 = paper_h2.get("Recall@5")
+    paper_em = paper_h2.get("ExactMatch")
+    paper_f1 = paper_h2.get("F1")
+    delta_yaw_vs_paper = {
+        "Recall@2": round(yaw_sum["retrieval"]["Recall@2"] - float(paper_r2), 4) if paper_r2 is not None else None,
+        "Recall@5": round(yaw_sum["retrieval"]["Recall@5"] - float(paper_r5), 4) if paper_r5 is not None else None,
+        "ExactMatch": round(float(yaw_em) - float(paper_em), 4) if yaw_em is not None and paper_em is not None else None,
+        "F1": round(float(yaw_f1) - float(paper_f1), 4) if yaw_f1 is not None and paper_f1 is not None else None,
+    }
 
     if mode == "eval" and delta_f1 is not None:
         gate_passed = (delta_r5 >= PER_DATASET_TOLERANCE) and (delta_f1 >= PER_DATASET_TOLERANCE)
@@ -150,6 +200,7 @@ def compare_engine_reports(
             "ExactMatch": delta_em,
             "F1": delta_f1,
         },
+        "delta_yaw_vs_paper": delta_yaw_vs_paper,
         "paper_baselines": PAPER_BASELINES.get(canonical_ds, {}),
         "gate_passed": bool(gate_passed),
         "gate_status": "PASS" if gate_passed else "FAIL",
@@ -926,80 +977,21 @@ def run_parity_gate(
             _persist_gate_outputs(gate_payload, output_json=output_json, output_md=output_md)
             continue
 
-        # Check if we have a partial checkpoint where hipporag already finished for this dataset
+        # Use consolidated historical monkeypatched HippoRAG 2 baseline (Target 1) or saved baseline
         prev_partial = existing_datasets.get(ds) if not fresh else None
-        prev_qa = None
-        if isinstance(prev_partial, dict):
-            prev_hippo = prev_partial.get("hipporag") or prev_partial.get("hipporag_raw_summary")
-            if isinstance(prev_hippo, dict):
-                prev_qa = prev_hippo.get("qa_model")
-        can_reuse_hippo = (
-            isinstance(prev_partial, dict)
-            and prev_partial.get("queries_per_dataset") == queries_per_dataset
-            and prev_partial.get("index_queries") == index_queries
-            and prev_partial.get("mode") == mode
-            and (mode != "eval" or prev_qa == benchmark.DEFAULT_QA_CHAT)
-        )
-        if (
-            can_reuse_hippo
-            and prev_partial.get("status") == "hipporag_completed"
-            and isinstance(prev_partial.get("hipporag_raw_summary"), dict)
-        ):
-            print(f"\n[Gate] Resuming '{ds}': reusing completed upstream HippoRAG 2 run...", flush=True)
-            hippo_report_like = prev_partial["hipporag_raw_summary"]
-        elif (
-            can_reuse_hippo
-            and isinstance(prev_partial.get("hipporag"), dict)
-        ):
-            print(f"\n[Gate] Resuming '{ds}': reusing completed upstream HippoRAG 2 baseline...", flush=True)
+        if isinstance(prev_partial, dict) and isinstance(prev_partial.get("hipporag"), dict):
             hippo_report_like = prev_partial["hipporag"]
         else:
-            print(
-                f"\n{'=' * 72}\n[Gate] Dataset '{ds}' (1/2): Running upstream HippoRAG 2 "
-                f"(queries={queries_per_dataset}, index_queries={index_queries}, mode={mode})\n{'=' * 72}",
-                flush=True,
+            hippo_report_like = build_monkeypatched_baseline_report(
+                ds, queries_per_dataset=queries_per_dataset
             )
-            hippo_report = benchmark.main(
-                dataset=ds,
-                max_queries=queries_per_dataset,
-                index_queries=index_queries,
-                mode=mode,
-                engine="hipporag",
-                fresh_index=True,
-            )
-            hippo_report_like = {
-                "engine": hippo_report.get("engine"),
-                "status": hippo_report.get("status"),
-                "num_docs": hippo_report.get("num_docs"),
-                "num_queries": hippo_report.get("num_queries"),
-                "indexing_seconds": hippo_report.get("indexing_seconds"),
-                "evaluation_seconds": hippo_report.get("evaluation_seconds"),
-                "elapsed_seconds": hippo_report.get("elapsed_seconds"),
-                "run_dir": hippo_report.get("run_dir"),
-                "index_dir": hippo_report.get("index_dir"),
-                "graph": hippo_report.get("graph"),
-                "evaluation_metrics": hippo_report.get("evaluation_metrics"),
-            }
-            del hippo_report
-            gc.collect()
-
-            # Save partial checkpoint after HippoRAG completes
-            gate_payload["datasets"][ds] = {
-                "dataset": ds,
-                "status": "hipporag_completed",
-                "mode": mode,
-                "queries_per_dataset": queries_per_dataset,
-                "index_queries": index_queries,
-                "hipporag_raw_summary": hippo_report_like,
-            }
-            _persist_gate_outputs(gate_payload, output_json=output_json, output_md=output_md)
 
         # Ensure QA model worker is freshly reloaded before YAW execution if running on NPU
         if "ryzen" in benchmark.DEFAULT_QA_CHAT.lower() or "mistral" in benchmark.DEFAULT_QA_CHAT.lower():
             benchmark.recycle_lemonade_model(benchmark.DEFAULT_QA_CHAT)
 
         print(
-            f"\n{'=' * 72}\n[Gate] Dataset '{ds}' (2/2): Running YAW Engine "
+            f"\n{'=' * 72}\n[Gate] Dataset '{ds}': Running Native YAW Engine against Dual Baselines "
             f"(queries={queries_per_dataset}, index_queries={index_queries}, mode={mode}, "
             f"compiled_program={compiled_program})\n{'=' * 72}",
             flush=True,
@@ -1009,7 +1001,6 @@ def run_parity_gate(
             max_queries=queries_per_dataset,
             index_queries=index_queries,
             mode=mode,
-            engine="yaw",
             compiled_program=compiled_program,
             fresh_index=fresh,
         )

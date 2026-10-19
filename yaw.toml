@@ -43,9 +43,9 @@ http_port = 13306
 http_path = "/mcp"
 
 [optimization]
-datasets = ["2wikimultihopqa", "hotpotqa", "musique"]
+datasets = ["enterprise_rag_bench"]
 mode = "gepa"
-max_queries = 10
-train_queries = 7
+max_queries = 180
+train_queries = 120
 query_offset = 0
 auto = "light"

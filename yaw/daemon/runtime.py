@@ -795,28 +795,24 @@ class YawRuntime:
                 ]
                 opt_json_path.parent.mkdir(parents=True, exist_ok=True)
                 opt_json_path.write_text(
-                    json.dumps(records_payload, ensure_ascii=False),
+                    json.dumps(records_payload, ensure_ascii=False, indent=2),
                     encoding="utf-8",
                 )
-                try:
-                    delta = sync_corpus_once(
-                        corpus_root=self.config.corpus_root,
-                        state_dir=Path(self.config.state_dir) / "opt_slice_state",
-                        included_patterns=(opt_json_rel,),
-                        excluded_patterns=(),
-                        json_keys_whitelist=self.config.json_keys_whitelist,
-                        json_keys_blacklist=self.config.json_keys_blacklist,
-                        chunk_size=self.config.chunk_size,
-                        chunk_overlap=self.config.chunk_overlap,
-                        min_chunk_size=self.config.min_chunk_size,
+                delta = sync_corpus_once(
+                    corpus_root=self.config.corpus_root,
+                    state_dir=Path(self.config.state_dir) / "opt_slice_state",
+                    included_patterns=(opt_json_rel,),
+                    excluded_patterns=(),
+                    json_keys_whitelist=self.config.json_keys_whitelist,
+                    json_keys_blacklist=self.config.json_keys_blacklist,
+                    chunk_size=self.config.chunk_size,
+                    chunk_overlap=self.config.chunk_overlap,
+                    min_chunk_size=self.config.min_chunk_size,
+                )
+                if delta.added_chunks:
+                    self.engine.index_chunks(
+                        delta.added_chunks, progress_callback=_progress
                     )
-                    if delta.added_chunks:
-                        self.engine.index_chunks(
-                            delta.added_chunks, progress_callback=_progress
-                        )
-                finally:
-                    with contextlib.suppress(OSError):
-                        opt_json_path.unlink(missing_ok=True)
                 new_stats = self.engine.get_stats(self.config.config_fingerprint())
                 with self._state_lock:
                     self._stats = new_stats

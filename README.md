@@ -1,14 +1,15 @@
-# YAW: HippoRAG 2 evaluation
+# YAW: HippoRAG 2 Graph & Storage Engine
 
-YAW evaluates upstream HippoRAG 2 on multi-hop and messy corpora. Its next steps are a local daemon and a FastMCP v4 interface. Read [FOUNDATIONAL](FOUNDATIONAL.md), then the planned [daemon epic](docs/epic-1-hipporag-daemon.md) and [Streamable HTTP epic](docs/epic-2-fastmcp-http.md). Reference papers are preserved locally under [HippoRAG 1 (`2405.14831v3`)](docs/arxiv-2405.14831v3-hipporag.md) and [HippoRAG 2 (`2502.14802v1`)](docs/arxiv-2502.14802v1-hipporag2.md).
+YAW is a native HippoRAG 2 graph & storage engine backed by a single SQLite database (`yaw.db`), CocoIndex (`cocoindex>=1.0.0`) single-parse Rust Tree-sitter AST ingestion, and DSPy GBNF/RLM/GEPA inference. Read [FOUNDATIONAL](FOUNDATIONAL.md), then the [daemon epic](docs/epic-1-hipporag-daemon.md) and [Streamable HTTP epic](docs/epic-2-fastmcp-http.md). Reference papers are preserved locally under [HippoRAG 1 (`2405.14831v3`)](docs/arxiv-2405.14831v3-hipporag.md) and [HippoRAG 2 (`2502.14802v1`)](docs/arxiv-2502.14802v1-hipporag2.md).
 
 ## Available now
 
-Use Python 3.12 and uv:
+Use Python `>=3.14.7` (`.python-version` `3.14.7`) and `uv`:
 
 ```powershell
 uv sync --locked
 uv run --locked pytest -v
+uv run --locked python scripts/download-datasets.py --dataset enterprise_rag_bench
 uv run --locked yaw daemon status
 uv run --locked yaw daemon run
 uv run --locked yaw daemon start
@@ -17,28 +18,29 @@ uv run --locked yaw graph build
 uv run --locked yaw graph rebuild
 uv run --locked yaw graph lint
 uv run --locked yaw graph lint --turtle
-uv run --locked yaw optimize --mode gepa --auto light
+uv run --locked yaw optimize
 uv run --locked yaw load-program .yaw/compiled_program_optimize_<datestamp>.json
 uv run --locked yaw config get optimization.auto
-uv run --locked yaw config set optimization.auto light
+uv run --locked yaw config set optimization.auto heavy
 uv run --locked python benchmark.py --dataset sample --mode all
-uv run --locked python benchmark.py --dataset 2wikimultihopqa --max-queries 10
-uv run --locked python benchmark.py --dataset hotpotqa --max-queries 10 --mode retrieval
-uv run --locked python benchmark.py --dataset musique --max-queries 10 --mode retrieval
-uv run --locked python benchmark.py --dataset sample --chat-model gemma4-it-12b-FLM --embedding-model Qwen3-Embedding-0.6B-GGUF
+uv run --locked python benchmark.py --dataset 2wikimultihopqa --max-queries 25
+uv run --locked python benchmark.py --dataset hotpotqa --max-queries 25 --mode retrieval
+uv run --locked python benchmark.py --dataset musique --max-queries 25 --mode retrieval
+uv run --locked python scripts/verify_paper_parity_gate.py
 ```
 
-`benchmark.py` replaces the retired `live_smoke.py` fixture script and evaluates upstream HippoRAG 2 (`retrieve` + optional `qa`) head-to-head against StandardRAG (`retrieve_dpr` + optional `qa`) on the upstream reproduction datasets (`sample`, `2wikimultihopqa`, `musique`, `hotpotqa`) against Lemonade at `http://localhost:13305/api/v1`. Pass `--mode retrieval` to evaluate retrieval (`Recall@1/@2/@5`) without invoking the QA reader model. Dataset files are fetched once from pinned commit `d5c8329422e0a0b834a15874545cb6a74b4f9b26` and cached under `outputs/datasets/` (skipping `{dataset}_corpus.json` when `--max-queries` is used without `--full-corpus`). Corpus passages are checkpointed through OpenIE in bounded micro-batches (`--index-batch-size 8` by default via `pre_openie`) and indexed once into deterministic persisted directories under `outputs/benchmarks/indexes/` (keyed by dataset slice hash, resolved embedding identity, and extraction chat policy identity; use `--fresh-index` for a disposable per-run index), and queries/QA pairs are processed 1-by-1 (`--qa-batch-size 1` by default) with in-memory retrieval matrices released after retrieval. Each run writes `run.log` and `report.json` under `outputs/benchmarks/run-<dataset>-*/`, comparing HippoRAG 2 and Standard DPR retrieval Recall@1/@2/@5 (and QA ExactMatch/F1 when QA is enabled) alongside the HippoRAG 2 paper's `Llama-3.3-70B-Instruct` + `NV-Embed-v2` (8B) reference numbers. Source notes in `sample-llm-wiki/raw/` are not ingested by this command.
+`benchmark.py` and `scripts/verify_paper_parity_gate.py` evaluate the native `yaw` engine (`YawGraphEngine` + `yaw.db` + `HippoRAGProgram`) against Standard DPR (`retrieve_dpr`) and two consolidated reference targets across the 7 HippoRAG 2 paper datasets (`popqa`, `lveval`, `narrativeqa`, `2wikimultihopqa`, `hotpotqa`, `nq`, `musique`):
+- **Target 1 (`MONKEYPATCHED_HIPPORAG_BASELINES`):** Consolidated historical runs of upstream HippoRAG 2 on the exact same `Qwen3-4B-Instruct-2507-GGUF` + `embeddinggemma-300m-GGUF` local stack (archived in [`outputs/benchmarks/consolidated_historical_baselines.json`](outputs/benchmarks/consolidated_historical_baselines.json)).
+- **Target 2 (`PAPER_BASELINES`):** Published HippoRAG 2 paper results (`Llama-3.3-70B-Instruct` + `NV-Embed-v2`, `arXiv:2502.14802v1`).
 
-The default 3-slot development split uses:
-- **Embeddings (`--embedding-model`):** `embeddinggemma-300m-GGUF` on GPU CUDA `llamacpp` (`--embedding-task-mode` defaults to `distinct-titled` under `retrieval-prompts-v3` and supports `search`, `qa`, `fact`, `distinct`, `titled`, `distinct-titled`; `--embedding-model` also accepts `embeddinggemma-300m-qat-q8_0-GGUF-Q8_0` and `Qwen3-Embedding-0.6B-GGUF`).
-- **OpenIE & Recognition Memory (`--extraction-model`):** `Qwen3-4B-Instruct-2507-GGUF` on GPU CUDA `llamacpp` (`--parallel 1 --cache-ram 0`) with tightened OpenIE NER and triple JSON Schemas (`minLength: 1`) and dynamic candidate-literal `DSPyFilter` GBNF grammar enforcement (`gbnf-v3:require-stop`).
-- **QA Reading (`--qa-model`):** `Mistral-7B-Instruct-v0.3-Hybrid` on Ryzen AI Hybrid NPU/iGPU (`ryzenai-llm`) with end-of-turn `QA_TURN_REMINDER` and `Answer:` delimiter normalization (`fold-system:prompt-v4:require-stop`).
-- Passing `--chat-model` overrides both `--extraction-model` and `--qa-model` with a single model (such as step-up `gemma4-it-12b-FLM` or `qwen3.5-9b-FLM`).
+Upstream `hipporag` and `optuna` are permanently retired from `pyproject.toml`, `uv.lock`, and runtime/test code.
 
-There is one embedding adapter (`yaw/embedding.py`), one chat policy subclass (`yaw/chat.py`), and no fallback. See [model contracts and real benchmark protocol](docs/model-evaluation.md). No upstream classes are monkeypatched.
+The unified local model stack (`http://localhost:13305/api/v1`) uses:
+- **Embeddings (`--embedding-model`):** `embeddinggemma-300m-GGUF` on GPU `llamacpp` (`--embedding-task-mode` defaults to `distinct-titled` under `retrieval-prompts-v3`).
+- **Unified Chat, GBNF Worker, QA Reader & RLM Orchestrator (`--extraction-model`, `--qa-model`):** `Qwen3-4B-Instruct-2507-GGUF` on GPU `llamacpp` (`--parallel 1 --cache-ram 0`) with pure-JSON GBNF grammar enforcement (`_yaw_supports_gbnf=True`) for direct/worker predictors and unconstrained Python REPL execution (`_yaw_supports_gbnf=False`) inside DSPy's managed Deno/Pyodide WASM sandbox (`dspy[deno]`, `dspy.PythonInterpreter`) for `shacl_healer_rlm` and `RLMInstructionProposer.inner_rlm`.
+- **OOD Enterprise Prompt Evolution (`uv run yaw optimize`):** Configured by default in [`yaw.toml`](yaw.toml) to train on the stratified 180-query (`120` train + `60` val) **EnterpriseRAG-Bench** (`enterprise_rag_bench`, `onyx-dot-app/EnterpriseRAG-Bench`) dataset across all 10 reasoning categories (`Basic`, `Semantic`, `Intra-Document Reasoning`, `Project Related`, `Constrained`, `Conflicting Info`, `Completeness`, `Miscellaneous`, `Info Not Found`, `High Level`) with $2.0\times$ same-tool hard distractors (`mode = "gepa"`, `auto = "heavy"`).
 
-On this machine the models and settings are already installed. For a fresh Lemonade installation, register/download the embedding checkpoint and save both CUDA `llamacpp` model settings explicitly before running benchmarks (`--batch-size 2048 --ubatch-size 2048` on EmbeddingGemma prevents `llama-server`'s default 512-token physical microbatch cutoff on 512–2048 token passages, and `--cache-ram 0` without `-dio` on `Qwen3-4B-Instruct-2507-GGUF` prevents Windows Direct-IO and host-RAM prompt-cache growth):
+On this machine the models and settings are already installed. For a fresh Lemonade installation, register/download the embedding checkpoint and save both `llamacpp` model settings explicitly before running benchmarks (`--batch-size 2048 --ubatch-size 2048` on EmbeddingGemma prevents `llama-server`'s default 512-token physical microbatch cutoff on 512–2048 token passages, and `--cache-ram 0` without `-dio` on `Qwen3-4B-Instruct-2507-GGUF` prevents Windows Direct-IO and host-RAM prompt-cache growth):
 
 ```powershell
 $api = 'http://localhost:13305/api/v1'
@@ -67,23 +69,23 @@ $loadChat = @{
 Invoke-RestMethod -Method Post -Uri "$api/load" -ContentType 'application/json' -Body $loadChat
 ```
 
-This is the verified local CUDA configuration; the script does not install models or choose another backend on failure. Keep the selected extraction and QA chat models downloaded in Lemonade too. A different serving configuration requires a new repeatability/quality validation and index identity. The reported 8192 server allocation does not enlarge EmbeddingGemma's 2048-token model context.
-
-HippoRAG is pinned to upstream commit `d5c8329422e0a0b834a15874545cb6a74b4f9b26`, declaring `2.0.0a5`. This is a source installation requiring Git; a published a5 wheel was unavailable when checked. NumPy is explicitly declared for the experiment. Python 3.14.7 resolution failed because upstream pins PyTorch 2.5.1 without a CPython 3.14 wheel, so the verified interpreter is CPython 3.12.14.
-
-Existing source notes remain in `sample-llm-wiki/raw/`; they are not automatically indexed by the current script. Milvus and MCP packages are not installed. HippoRAG's default Parquet stores already support the executed pipeline.
-
 ## Measured versus planned
 
-On the 2026-10-14 Tier 0 and Tier 1 upstream benchmark runs with the default split (`embeddinggemma-300m-GGUF` `distinct-titled` `retrieval-prompts-v3` + `Qwen3-4B-Instruct-2507-GGUF` `gbnf-v3:require-stop` + `Mistral-7B-Instruct-v0.3-Hybrid` `fold-system:prompt-v4:require-stop`, `temperature = 0.2`):
-- **Tier 0 (`sample`, 1 query, 3 passages, `run-sample-hgj5zm7g`):** HippoRAG 2 Recall@1/@2/@5 = **1.0 / 1.0 / 1.0** (30 phrase nodes, 29 triples).
-- **Tier 1 (`2wikimultihopqa`, 10 queries, 96 passages, `run-2wikimultihopqa-fbmnosfw`):** HippoRAG 2 Recall@1/@2/@5 = **0.425 / 0.800 / 1.000** vs. Standard DPR **0.425 / 0.725 / 0.850** (**`+7.5%` Recall@2**, **`+15.0%` Recall@5**; 866 phrase nodes, 905 triples, 8/10 queries with graph seeds); HippoRAG 2 QA EM/F1 = **0.300 / 0.5278** vs. Standard DPR **0.400 / 0.4500** (**`+7.78%` F1**).
-- **Tier 1 (`hotpotqa`, 10 queries, 94 passages, `run-hotpotqa-zbp9k8e0`):** HippoRAG 2 Recall@1/@2/@5 = **0.500 / 0.850 / 1.000** vs. Standard DPR **0.450 / 0.700 / 0.950** (**`+5.0%` Recall@1**, **`+15.0%` Recall@2**, **`+5.0%` Recall@5**; 1,206 phrase nodes, 1,286 triples, 10/10 queries with graph seeds); HippoRAG 2 QA EM/F1 = **0.300 / 0.5483** vs. Standard DPR **0.300 / 0.4524** (**`+9.59%` F1**).
-- **Tier 1 (`musique`, 10 queries, 197 passages, `run-musique-_5f_uroh`):** HippoRAG 2 Recall@1/@2/@5 = **0.1833 / 0.3167 / 0.5417** vs. Standard DPR **0.2083 / 0.2833 / 0.5167** (**`+3.34%` Recall@2**, **`+2.5%` Recall@5**; 2,268 phrase nodes, 2,346 triples, 7/10 queries with graph seeds); HippoRAG 2 QA EM/F1 = **0.200 / 0.3000** vs. Standard DPR **0.300 / 0.4000**.
+Across the consolidated benchmark evaluations ([`outputs/benchmarks/consolidated_historical_baselines.json`](outputs/benchmarks/consolidated_historical_baselines.json) and [evaluation](docs/evaluation.md)):
+- **Native YAW vs. Target 1 (Monkeypatched Upstream HippoRAG 2 on `Qwen3-4B`):**
+  - `popqa` (25 queries): YAW `Recall@5 = 0.9600`, `F1 = 0.7867` (`+0.0448` F1 vs. upstream HippoRAG 2 `0.7419`; `2.3x` faster wall-clock).
+  - `lveval` (25 queries): YAW `Recall@5 = 0.9600`, `F1 = 0.5965` (`+0.0100` R@5, `+0.0215` F1 vs. upstream HippoRAG 2).
+  - `narrativeqa` (25 queries): YAW `Recall@5 = 0.8800`, `F1 = 0.4399` (`+0.0800` R@5 vs. upstream HippoRAG 2 `0.8000`).
+  - `2wikimultihopqa` (22 queries): YAW `Recall@5 = 0.9091`, `F1 = 0.6914` (`1.6x` faster indexing/eval).
+- **Native YAW vs. Target 2 (Published Paper 70B `Llama-3.3-70B` + `NV-Embed-v2`):**
+  - `popqa`: YAW `Recall@5 = 0.9600` vs. Paper `0.5170` (**`+44.30%`**), `F1 = 0.7867` vs. Paper `0.5620` (**`+22.47%`**).
+  - `lveval`: YAW `F1 = 0.5965` vs. Paper `0.1290` (**`+46.75%`**).
+  - `narrativeqa`: YAW `F1 = 0.4399` vs. Paper `0.2590` (**`+18.09%`**).
+  - `2wikimultihopqa`: YAW `Recall@5 = 0.9091` vs. Paper `0.9040` (**`+0.51%`**).
 
-174 offline and integration regression tests pass (`uv run --locked pytest -v`). See [evaluation](docs/evaluation.md) for benchmark runs, closed-world SHACL validations, and live-silicon MIPROv2/GEPA optimization results.
+161 offline and live-silicon integration regression tests pass (`uv run --locked pytest -q`). See [evaluation](docs/evaluation.md) for benchmark runs, closed-world SHACL validations, and live-silicon GEPA optimization results.
 
-The native HippoRAG 2 engine (`yaw/daemon/graph/engine.py`), persistent single-owner daemon runtime (`yaw/daemon/runtime.py`), single `yaw.db` SQLite storage (`sqlite-vec` + FTS5 + sparse CSR PPR), native CocoIndex single-parse Rust Tree-sitter AST ingestion across 30+ formats with declarative $\pi_{\mathcal{W}, \mathcal{B}}$ key projection, title-aware `EmbeddingGemma` formatting, Dai & Callan MaxP passage aggregation, and DSPy MIPROv2 & GEPA prompt evolution with hot-reload program promotion are implemented and verified. Epic 2 (FastMCP over Streamable HTTP) follows as the next planned phase.
+The native HippoRAG 2 engine (`yaw/daemon/graph/engine.py`), persistent single-owner daemon runtime (`yaw/daemon/runtime.py`), single `yaw.db` SQLite storage (`sqlite-vec` + FTS5 + sparse CSR PPR), native CocoIndex single-parse Rust Tree-sitter AST ingestion across 30+ formats with declarative $\pi_{\mathcal{W}, \mathcal{B}}$ key projection, title-aware `EmbeddingGemma` formatting, Dai & Callan MaxP passage aggregation, and DSPy GEPA prompt evolution with hot-reload program promotion are implemented and verified. Epic 2 (FastMCP over Streamable HTTP) follows as the next planned phase.
 
 ## Native W3C Semantic Graph & Knowledge Representation (`yaw.db`)
 

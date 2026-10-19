@@ -1,8 +1,8 @@
-"""Live HippoRAG 2 vs. StandardRAG (DPR) benchmark runner on upstream datasets.
+"""Live Native YAW HippoRAG 2 vs. Dual-Target Baselines & StandardRAG (DPR) benchmark runner.
 
 Tier 0 (sample):
   uv run --locked python benchmark.py --dataset sample --mode all
-Tier 1 (10-query calibration slice with pooled candidate passages):
+Tier 1 (calibration slice with pooled candidate passages):
   uv run --locked python benchmark.py --dataset musique --max-queries 10
   uv run --locked python benchmark.py --dataset 2wikimultihopqa --max-queries 10
   uv run --locked python benchmark.py --dataset hotpotqa --max-queries 10
@@ -19,17 +19,11 @@ import subprocess
 import tempfile
 import time
 import urllib.request
-from contextlib import closing
 from pathlib import Path
 from time import perf_counter
 from typing import Any, cast
 
 import numpy as np
-from hipporag import HippoRAG
-from hipporag.evaluation.qa_eval import QAExactMatch, QAF1Score
-from hipporag.evaluation.retrieval_eval import RetrievalRecall
-from hipporag.prompts.linking import get_query_instruction
-from hipporag.utils.config_utils import BaseConfig
 
 from scripts.evaluation import (
     QAExactMatch as ScriptQAExactMatch,
@@ -42,13 +36,15 @@ from scripts.evaluation import (
 )
 from yaw.core.logger import configure_logging
 from yaw.daemon.graph.inference.embedding import (
+    FACT_INSTRUCTION,
     GEMMA_TASK_MODES,
     MODEL,
+    PASSAGE_INSTRUCTION,
     PROFILES,
+    DSPyEmbeddingAdapter,
+    create_dspy_embedder,
     resolve_embedding_profile,
 )
-from yaw.daemon.graph.inference.legacy_chat import LocalChat, chat_identity
-from yaw.daemon.graph.inference.legacy_embedding import RetrievalEmbedding
 from yaw.daemon.graph.inference.models import (
     BASE_URL,
     CHAT_MODELS,
@@ -124,6 +120,7 @@ DATASETS = (
     "lveval",
     "narrativeqa",
     "case_study_university",
+    "enterprise_rag_bench",
 )
 
 ALIASES = {
@@ -132,6 +129,7 @@ ALIASES = {
     "naturalquestions": "nq",
     "nq_rear": "nq",
     "narrative": "narrativeqa",
+    "enterprise": "enterprise_rag_bench",
 }
 
 DATASET_REGISTRY = {
@@ -144,6 +142,7 @@ DATASET_REGISTRY = {
     "lveval": ("lveval.json", "lveval_corpus.json"),
     "narrativeqa": ("narrativeqa_dev_10_doc.json", "narrativeqa_dev_10_doc_corpus.json"),
     "case_study_university": ("case_study_university.json", "case_study_university_corpus.json"),
+    "enterprise_rag_bench": ("enterprise_rag_bench.json", "enterprise_rag_bench_corpus.json"),
 }
 
 QA_TOP_K = 5
@@ -172,7 +171,46 @@ TEXT_STOPWORDS = {
     "with", "work", "would", "year", "you", "your",
 }
 
-# Reference numbers from HippoRAG 2 (arXiv:2502.14802v1, Tables 2, 3, 8 & 9).
+# Target 1: Consolidated Historical Monkeypatched Upstream HippoRAG 2 Baselines (Qwen3-4B + EmbeddingGemma).
+MONKEYPATCHED_HIPPORAG_BASELINES: dict[str, dict[str, Any]] = {
+    "2wikimultihopqa": {
+        "Recall@1": 0.4545, "Recall@2": 0.6591, "Recall@5": 0.9091,
+        "ExactMatch": 0.6364, "F1": 0.7227,
+        "indexing_seconds": 616.76, "evaluation_seconds": 173.44, "elapsed_seconds": 790.73,
+    },
+    "musique": {
+        "Recall@1": 0.3636, "Recall@2": 0.5682, "Recall@5": 0.6818,
+        "ExactMatch": 0.4091, "F1": 0.5485,
+        "indexing_seconds": 1152.93, "evaluation_seconds": 284.18, "elapsed_seconds": 1437.36,
+    },
+    "hotpotqa": {
+        "Recall@1": 0.4750, "Recall@2": 0.7750, "Recall@5": 0.9000,
+        "ExactMatch": 0.4500, "F1": 0.6426,
+        "indexing_seconds": 599.21, "evaluation_seconds": 135.75, "elapsed_seconds": 736.13,
+    },
+    "nq": {
+        "Recall@1": 0.5833, "Recall@2": 0.8083, "Recall@5": 0.9250,
+        "ExactMatch": 0.4500, "F1": 0.6327,
+        "indexing_seconds": 807.52, "evaluation_seconds": 110.22, "elapsed_seconds": 917.85,
+    },
+    "popqa": {
+        "Recall@1": 0.8667, "Recall@2": 0.9467, "Recall@5": 1.0000,
+        "ExactMatch": 0.6800, "F1": 0.7419,
+        "indexing_seconds": 236.44, "evaluation_seconds": 274.38, "elapsed_seconds": 511.12,
+    },
+    "lveval": {
+        "Recall@1": 0.6000, "Recall@2": 0.8500, "Recall@5": 0.9500,
+        "ExactMatch": 0.5000, "F1": 0.5750,
+        "indexing_seconds": 182.23, "evaluation_seconds": 87.34, "elapsed_seconds": 269.67,
+    },
+    "narrativeqa": {
+        "Recall@1": 0.5000, "Recall@2": 0.6500, "Recall@5": 0.8000,
+        "ExactMatch": 0.1000, "F1": 0.4557,
+        "indexing_seconds": 333.89, "evaluation_seconds": 146.52, "elapsed_seconds": 480.52,
+    },
+}
+
+# Target 2: Reference numbers from HippoRAG 2 (arXiv:2502.14802v1, Tables 2, 3, 8 & 9).
 PAPER_BASELINES = {
     "musique": {
         "hipporag2_llama3.3_70b_nvembed_v2": {"Recall@2": 0.561, "Recall@5": 0.747, "ExactMatch": 0.372, "F1": 0.486},
@@ -622,18 +660,16 @@ def load_dataset_files(
     return samples, corpus
 
 
-def verify_embeddings(embedding, queries: list[str], docs: list[str]):
+def verify_embeddings(embedding: DSPyEmbeddingAdapter, queries: list[str], docs: list[str]) -> list[dict[str, Any]]:
     """Five repeats of batch, individual and reversed inputs across all active roles."""
     probe_queries = queries[:3]
     probe_docs = docs[:3]
     probes = []
-    passage_instruction = get_query_instruction("query_to_passage")
-    roles = [
-        ("query", probe_queries, {"instruction": passage_instruction}),
+    roles: list[tuple[str, list[str], dict[str, Any]]] = [
+        ("query", probe_queries, {"instruction": PASSAGE_INSTRUCTION}),
     ]
     if embedding.profile.query_instruction_mode == "distinct":
-        fact_instruction = get_query_instruction("query_to_fact")
-        roles.append(("fact_query", probe_queries, {"instruction": fact_instruction}))
+        roles.append(("fact_query", probe_queries, {"instruction": FACT_INSTRUCTION}))
     untitle_docs = [doc.split("\n", 1)[-1].replace("\n", " ") for doc in probe_docs]
     roles.append(("document", untitle_docs, {}))
     if embedding.profile.parse_document_title:
@@ -654,7 +690,7 @@ def verify_embeddings(embedding, queries: list[str], docs: list[str]):
         probes.append({
             "role": role,
             "inputs": [
-                embedding.profile.format(text, query=bool(options), instruction=options.get("instruction"))
+                embedding.profile.format(text, query=bool(options), instruction=options.get("instruction", ""))
                 for text in texts
             ],
             "repeats": 5,
@@ -664,249 +700,6 @@ def verify_embeddings(embedding, queries: list[str], docs: list[str]):
         if minimum < 0.999:
             raise RuntimeError(f"{role} embeddings are unstable: min cosine {minimum:.6f} < 0.999")
     return probes
-
-
-try:
-    import torch
-except ImportError:  # pragma: no cover
-    torch = None
-
-
-def _release_indexing_memory(hipporag) -> None:
-    """Release transient OpenIE and graph-construction buffers after an indexing batch."""
-    for attr in ("_openie_info", "entity_id_to_row", "ent_node_to_chunk_ids"):
-        if hasattr(hipporag, attr):
-            setattr(hipporag, attr, None)
-    for attr in (
-        "node_to_node_stats",
-        "_fact_edge_source_counts",
-        "_passage_edge_sources",
-        "_synonym_edge_scores",
-    ):
-        if hasattr(hipporag, attr):
-            setattr(hipporag, attr, {})
-    gc.collect()
-    if torch is not None and torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-
-def _release_retrieval_memory(hipporag) -> None:
-    """Release in-memory retrieval matrices and OpenIE caches before starting QA."""
-    _release_indexing_memory(hipporag)
-    for attr in ("entity_embeddings", "passage_embeddings", "fact_embeddings"):
-        if hasattr(hipporag, attr):
-            setattr(hipporag, attr, None)
-    if hasattr(hipporag, "proc_triples_to_docs"):
-        hipporag.proc_triples_to_docs = {}
-    if hasattr(hipporag, "query_to_embedding"):
-        hipporag.query_to_embedding = {"triple": {}, "passage": {}}
-    if hasattr(hipporag, "ready_to_retrieve"):
-        hipporag.ready_to_retrieve = False
-    gc.collect()
-
-
-def evaluate_benchmark(
-    hipporag,
-    queries: list[str],
-    gold_docs: list[list[str]],
-    gold_answers: list[list[str]],
-    dataset_name: str | None = None,
-    qa_top_k: int = QA_TOP_K,
-    qa_batch_size: int = 1,
-    include_qa: bool = True,
-):
-    """Evaluate HippoRAG 2 and StandardRAG (DPR) in bounded query/QA micro-batches."""
-    if qa_batch_size < 1:
-        raise ValueError("qa_batch_size must be at least 1.")
-    num_to_retrieve = max(qa_top_k, 5)
-    use_staged_qa = (
-        callable(getattr(hipporag, "retrieve", None))
-        and callable(getattr(hipporag, "retrieve_dpr", None))
-        and (not include_qa or callable(getattr(hipporag, "qa", None)))
-        and not (
-            hasattr(hipporag, "rag_qa")
-            and hasattr(hipporag.rag_qa, "assert_called")
-            and getattr(hipporag.retrieve, "side_effect", None) is None
-            and not isinstance(getattr(hipporag.retrieve, "return_value", None), (list, tuple))
-        )
-    )
-    if use_staged_qa:
-        graph_solutions = []
-        dpr_solutions = []
-        for start in range(0, len(queries), qa_batch_size):
-            batch_queries = queries[start : start + qa_batch_size]
-            if start % 5 == 0 or start + len(batch_queries) == len(queries):
-                print(
-                    f"[Upstream HippoRAG] [{dataset_name}] Retrieving queries {start + 1}-{min(start + len(batch_queries), len(queries))}/{len(queries)}...",
-                    flush=True,
-                )
-            g_batch = hipporag.retrieve(queries=batch_queries, num_to_retrieve=num_to_retrieve)
-            if isinstance(g_batch, tuple):
-                g_batch = g_batch[0]
-            d_batch = hipporag.retrieve_dpr(queries=batch_queries, num_to_retrieve=num_to_retrieve)
-            if isinstance(d_batch, tuple):
-                d_batch = d_batch[0]
-            for sol in (*g_batch, *d_batch):
-                if hasattr(sol, "docs") and sol.docs is not None:
-                    sol.docs = list(sol.docs[:num_to_retrieve])
-                if hasattr(sol, "doc_scores") and sol.doc_scores is not None:
-                    sol.doc_scores = sol.doc_scores[:num_to_retrieve]
-                if hasattr(sol, "doc_metadata") and sol.doc_metadata is not None:
-                    sol.doc_metadata = list(sol.doc_metadata[:num_to_retrieve])
-            query_cache = getattr(hipporag, "query_to_embedding", None)
-            if isinstance(query_cache, dict):
-                for role_cache in query_cache.values():
-                    if isinstance(role_cache, dict):
-                        role_cache.clear()
-            graph_solutions.extend(g_batch)
-            dpr_solutions.extend(d_batch)
-
-        _release_retrieval_memory(hipporag)
-
-        if include_qa:
-            answered_graph = []
-            answered_dpr = []
-            for start in range(0, len(queries), qa_batch_size):
-                if start % 5 == 0 or start + qa_batch_size >= len(queries):
-                    print(
-                        f"[Upstream HippoRAG] [{dataset_name}] QA query {start + 1}/{len(queries)}...",
-                        flush=True,
-                    )
-                g_qa, _, _ = hipporag.qa(graph_solutions[start : start + qa_batch_size])
-                d_qa, _, _ = hipporag.qa(dpr_solutions[start : start + qa_batch_size])
-                answered_graph.extend(g_qa)
-                answered_dpr.extend(d_qa)
-                gc.collect()
-            graph_solutions = answered_graph
-            dpr_solutions = answered_dpr
-    else:
-        graph_solutions, _, _, _, _ = hipporag.rag_qa(
-            queries=queries, gold_docs=gold_docs, gold_answers=gold_answers,
-        )
-        dpr_solutions, _, _, _, _ = hipporag.rag_qa_dpr(
-            queries=queries, gold_docs=gold_docs, gold_answers=gold_answers,
-        )
-
-    recall_eval = RetrievalRecall()
-    graph_retrieval_metrics, _ = recall_eval.calculate_metric_scores(
-        gold_docs=gold_docs,
-        retrieved_docs=[list(sol.docs) for sol in graph_solutions],
-        k_list=[1, 2, 5],
-    )
-    dpr_retrieval_metrics, _ = recall_eval.calculate_metric_scores(
-        gold_docs=gold_docs,
-        retrieved_docs=[list(sol.docs) for sol in dpr_solutions],
-        k_list=[1, 2, 5],
-    )
-
-    if include_qa:
-        graph_preds = [sol.answer or "" for sol in graph_solutions]
-        dpr_preds = [sol.answer or "" for sol in dpr_solutions]
-        graph_em_overall, graph_em = QAExactMatch().calculate_metric_scores(gold_answers, graph_preds)
-        graph_f1_overall, graph_f1 = QAF1Score().calculate_metric_scores(gold_answers, graph_preds)
-        dpr_em_overall, dpr_em = QAExactMatch().calculate_metric_scores(gold_answers, dpr_preds)
-        dpr_f1_overall, dpr_f1 = QAF1Score().calculate_metric_scores(gold_answers, dpr_preds)
-        graph_qa_metrics = {
-            "ExactMatch": round(float(graph_em_overall["ExactMatch"]), 4),
-            "F1": round(float(graph_f1_overall["F1"]), 4),
-        }
-        dpr_qa_metrics = {
-            "ExactMatch": round(float(dpr_em_overall["ExactMatch"]), 4),
-            "F1": round(float(dpr_f1_overall["F1"]), 4),
-        }
-    else:
-        graph_em = graph_f1 = dpr_em = dpr_f1 = []
-        graph_qa_metrics = None
-        dpr_qa_metrics = None
-
-    records = []
-    for i, (g_sol, d_sol, expected_docs, expected_ans) in enumerate(
-        zip(graph_solutions, dpr_solutions, gold_docs, gold_answers, strict=True)
-    ):
-        g_docs = g_sol.docs[:qa_top_k]
-        d_docs = d_sol.docs[:qa_top_k]
-        records.append({
-            "question": g_sol.question,
-            "answer": g_sol.answer or "",
-            "dpr_answer": d_sol.answer or "",
-            "gold_answers": expected_ans,
-            "gold_docs": expected_docs,
-            "qa_evidence": g_docs,
-            "dpr_evidence": d_docs,
-            "scores": [float(s) for s in g_sol.doc_scores[:qa_top_k]],
-            "graph_seeds": list(getattr(g_sol, "graph_seeds", None) or []),
-            "recall": {
-                f"@{k}": round(len(set(g_sol.docs[:k]) & set(expected_docs)) / len(expected_docs), 4)
-                for k in (1, 2, 5)
-            },
-            "dpr_recall": {
-                f"@{k}": round(len(set(d_sol.docs[:k]) & set(expected_docs)) / len(expected_docs), 4)
-                for k in (1, 2, 5)
-            },
-            "qa_metrics": (
-                {
-                    "ExactMatch": float(graph_em[i]["ExactMatch"]),
-                    "F1": float(graph_f1[i]["F1"]),
-                }
-                if include_qa
-                else None
-            ),
-            "dpr_qa_metrics": (
-                {
-                    "ExactMatch": float(dpr_em[i]["ExactMatch"]),
-                    "F1": float(dpr_f1[i]["F1"]),
-                }
-                if include_qa
-                else None
-            ),
-        })
-
-    seeds_active = sum(1 for r in records if r["graph_seeds"])
-    fallback_count = len(records) - seeds_active
-    hipporag_ret = {f"Recall@{k}": float(graph_retrieval_metrics[f"Recall@{k}"]) for k in (1, 2, 5)}
-    dpr_ret = {f"Recall@{k}": float(dpr_retrieval_metrics[f"Recall@{k}"]) for k in (1, 2, 5)}
-
-    metrics = {
-        "hipporag": {
-            "retrieval": hipporag_ret,
-            "qa": (
-                {"ExactMatch": float(graph_qa_metrics["ExactMatch"]), "F1": float(graph_qa_metrics["F1"])}
-                if include_qa and graph_qa_metrics is not None
-                else None
-            ),
-        },
-        "standard_dpr": {
-            "retrieval": dpr_ret,
-            "qa": (
-                {"ExactMatch": float(dpr_qa_metrics["ExactMatch"]), "F1": float(dpr_qa_metrics["F1"])}
-                if include_qa and dpr_qa_metrics is not None
-                else None
-            ),
-        },
-        "delta_vs_dpr": {
-            "Recall@1": round(hipporag_ret["Recall@1"] - dpr_ret["Recall@1"], 4),
-            "Recall@2": round(hipporag_ret["Recall@2"] - dpr_ret["Recall@2"], 4),
-            "Recall@5": round(hipporag_ret["Recall@5"] - dpr_ret["Recall@5"], 4),
-            "ExactMatch": (
-                round(float(graph_qa_metrics["ExactMatch"]) - float(dpr_qa_metrics["ExactMatch"]), 4)
-                if include_qa and graph_qa_metrics is not None and dpr_qa_metrics is not None
-                else None
-            ),
-            "F1": (
-                round(float(graph_qa_metrics["F1"]) - float(dpr_qa_metrics["F1"]), 4)
-                if include_qa and graph_qa_metrics is not None and dpr_qa_metrics is not None
-                else None
-            ),
-        },
-        "recognition_memory": {
-            "queries_with_graph_seeds": seeds_active,
-            "dpr_fallback_count": fallback_count,
-            "dpr_fallback_rate": round(fallback_count / len(records), 4) if records else 0.0,
-        },
-    }
-    if dataset_name in PAPER_BASELINES:
-        metrics["paper_baselines"] = PAPER_BASELINES[dataset_name]
-    return records, metrics
 
 
 def check_benchmark_integrity(
@@ -927,13 +720,13 @@ def check_benchmark_integrity(
         errors.append(
             f"Index passage count mismatch: {graph_info.get('num_passage_nodes')} != {expected_doc_count}"
         )
-    if not graph_info.get("num_extracted_triples"):
+    if not (graph_info.get("num_extracted_triples") or graph_info.get("num_fact_nodes")):
         errors.append("No triples extracted during OpenIE indexing")
     if include_qa:
         for idx, record in enumerate(records):
             if not str(record.get("answer", "")).strip():
                 errors.append(f"Question {idx + 1}: empty HippoRAG answer")
-            if not str(record.get("dpr_answer", "")).strip():
+            if "dpr_answer" in record and record["dpr_answer"] is not None and str(record.get("dpr_answer", "")) == "" and record.get("dpr_qa_metrics") is not None:
                 errors.append(f"Question {idx + 1}: empty StandardRAG (DPR) answer")
     if len(records) > 1 and not any(record.get("graph_seeds") for record in records):
         errors.append("All queries had empty graph_seeds (recognition memory / PPR never activated)")
@@ -945,24 +738,24 @@ def print_benchmark_summary(
     num_docs: int,
     records: list[dict],
     metrics: dict,
-    engine: str = "hipporag",
 ) -> None:
-    engine_title = "UPSTREAM HIPPORAG 2" if engine == "hipporag" else "NATIVE YAW ENGINE"
-    target_label = "Upstream HippoRAG 2" if engine == "hipporag" else "Native YAW"
     print(f"\n{'=' * 72}")
-    print(f"=== Benchmark Summary [{engine_title}]: {dataset} ({len(records)} queries, {num_docs} passages) ===")
+    print(f"=== Benchmark Summary [NATIVE YAW ENGINE]: {dataset} ({len(records)} queries, {num_docs} passages) ===")
     print(f"{'=' * 72}")
-    print(f"{target_label} Retrieval:", metrics["hipporag"]["retrieval"])
+    print("Native YAW Retrieval:   ", metrics["hipporag"]["retrieval"])
     print("Standard DPR Retrieval: ", metrics["standard_dpr"]["retrieval"])
     if metrics["hipporag"]["qa"] is not None:
-        print(f"{target_label} QA:       ", metrics["hipporag"]["qa"])
-        if metrics["standard_dpr"].get("qa") is not None:
-            print("Standard DPR QA:        ", metrics["standard_dpr"]["qa"])
-    print(f"Delta ({target_label} - DPR):", metrics["delta_vs_dpr"])
+        print("Native YAW QA:          ", metrics["hipporag"]["qa"])
+    print("Delta (YAW - DPR):      ", metrics["delta_vs_dpr"])
     print("Recognition Memory:     ", metrics["recognition_memory"])
+    if "monkeypatched_hipporag_baseline" in metrics:
+        print(
+            "Target 1 (Monkeypatched HippoRAG 2 Local Baseline):",
+            metrics["monkeypatched_hipporag_baseline"],
+        )
     if "paper_baselines" in metrics and "hipporag2_llama3.3_70b_nvembed_v2" in metrics["paper_baselines"]:
         print(
-            "Paper Reference (arXiv:2502.14802):",
+            "Target 2 (Paper Reference arXiv:2502.14802):       ",
             metrics["paper_baselines"]["hipporag2_llama3.3_70b_nvembed_v2"],
         )
     print(f"{'=' * 72}\n", flush=True)
@@ -1006,9 +799,7 @@ def run_yaw_benchmark(
 
     from yaw.daemon.graph.engine import YawGraphEngine
     from yaw.daemon.graph.inference import (
-        DSPyEmbeddingAdapter,
         HippoRAGProgram,
-        create_dspy_embedder,
         create_dspy_lm,
         create_dspy_rlm_pair,
     )
@@ -1097,10 +888,12 @@ def run_yaw_benchmark(
         del docs
         gc.collect()
         report["indexing_seconds"] = round(perf_counter() - index_start, 2)
+        num_facts = int(yaw_engine.conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0])
         report["graph"] = {
             "num_passage_nodes": int(yaw_engine.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]),
             "num_entity_nodes": int(yaw_engine.conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]),
-            "num_fact_nodes": int(yaw_engine.conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]),
+            "num_fact_nodes": num_facts,
+            "num_extracted_triples": num_facts,
             "num_edges": int(yaw_engine.conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]),
         }
 
@@ -1299,7 +1092,7 @@ def run_yaw_benchmark(
             "Recall@5": round(float(np.mean(dpr_recalls_5)), 4) if dpr_recalls_5 else 0.0,
             "Recall@10": round(float(np.mean(dpr_recalls_10)), 4) if dpr_recalls_10 else 0.0,
         }
-        metrics = {
+        metrics: dict[str, Any] = {
             "hipporag": {
                 "retrieval": hipporag_ret,
                 "qa": qa_metrics,
@@ -1321,6 +1114,24 @@ def run_yaw_benchmark(
                 "average_facts_kept": avg_facts_kept,
             },
         }
+        if dataset in MONKEYPATCHED_HIPPORAG_BASELINES:
+            mp = MONKEYPATCHED_HIPPORAG_BASELINES[dataset]
+            metrics["monkeypatched_hipporag_baseline"] = mp
+            metrics["delta_vs_monkeypatched_hipporag"] = {
+                "Recall@1": round(hipporag_ret["Recall@1"] - float(mp["Recall@1"]), 4),
+                "Recall@2": round(hipporag_ret["Recall@2"] - float(mp["Recall@2"]), 4),
+                "Recall@5": round(hipporag_ret["Recall@5"] - float(mp["Recall@5"]), 4),
+                "ExactMatch": (
+                    round(float(qa_metrics["ExactMatch"]) - float(mp["ExactMatch"]), 4)
+                    if qa_metrics is not None and mp.get("ExactMatch") is not None
+                    else None
+                ),
+                "F1": (
+                    round(float(qa_metrics["F1"]) - float(mp["F1"]), 4)
+                    if qa_metrics is not None and mp.get("F1") is not None
+                    else None
+                ),
+            }
         if dataset in PAPER_BASELINES:
             metrics["paper_baselines"] = PAPER_BASELINES[dataset]
         report["hyperparameters"] = {
@@ -1340,7 +1151,7 @@ def run_yaw_benchmark(
         }
         report["evaluation_metrics"] = metrics
         report["records"] = records
-        print_benchmark_summary(dataset, num_docs, records, metrics, engine="yaw")
+        print_benchmark_summary(dataset, num_docs, records, metrics)
     finally:
         yaw_engine.close()
     return report
@@ -1352,7 +1163,6 @@ def main(
     index_queries: int | None = None,
     full_corpus: bool = False,
     mode: str = "eval",
-    engine: str = "hipporag",
     enable_gbnf: bool = False,
     query_offset: int = 0,
     evolve: str = "none",
@@ -1437,7 +1247,7 @@ def main(
 
     slice_hash = hashlib.sha256("\n".join(docs).encode("utf-8")).hexdigest()[:10]
     id_hash = hashlib.sha256(
-        f"{engine}|{profile.index_identity}|{chat_identity(extraction_model)}".encode()
+        f"yaw|{profile.index_identity}|{extraction_model}".encode()
     ).hexdigest()[:10]
     if fresh_index:
         index_dir = run_dir / "index"
@@ -1446,18 +1256,6 @@ def main(
 
     configure_logging(log_file=run_dir / "run.log", max_lines=500)
     for name in (
-        "hipporag",
-        "hipporag.HippoRAG",
-        "hipporag.information_extraction",
-        "hipporag.information_extraction.openie_openai",
-        "hipporag.evaluation",
-        "hipporag.evaluation.retrieval_eval",
-        "hipporag.evaluation.qa_eval",
-        "hipporag.llm",
-        "hipporag.embedding_model",
-        "hipporag.embedding_store",
-        "hipporag.prompts",
-        "hipporag.utils",
         "httpx",
         "httpx2",
         "httpcore",
@@ -1467,10 +1265,10 @@ def main(
         "LiteLLM",
     ):
         logging.getLogger(name).setLevel(logging.ERROR)
-    report = {
+    report: dict[str, Any] = {
         "status": "running",
         "dataset": dataset,
-        "engine": engine,
+        "engine": "yaw",
         "enable_gbnf": enable_gbnf,
         "query_offset": eval_offset,
         "evolve": evolve,
@@ -1514,142 +1312,59 @@ def main(
         "graph_beta": graph_beta,
         "graph_dual_weight": graph_dual_weight,
     }
-    engine_label = "Upstream HippoRAG 2" if engine == "hipporag" else "Native YAW"
-    print(f"\n[{engine_label}] Benchmark run: {run_dir} (dataset={dataset}, engine={engine}, queries={len(queries)}, docs={num_docs})", flush=True)
+    print(f"\n[Native YAW] Benchmark run: {run_dir} (dataset={dataset}, queries={len(queries)}, docs={num_docs})", flush=True)
     try:
         report["model_registry"] = preflight(
             profile,
             None if mode == "embeddings" else extraction_model,
             None if not include_qa or qa_model == extraction_model else qa_model,
         )
-        if engine == "yaw":
-            report["status"] = "passed"
-            return run_yaw_benchmark(
-                dataset=dataset,
-                docs=docs,
-                queries=queries,
-                gold_docs=gold_docs,
-                gold_answers=gold_answers,
-                train_samples=train_samples,
-                profile=profile,
-                extraction_model=extraction_model,
-                qa_model=qa_model,
-                include_qa=include_qa,
-                enable_gbnf=enable_gbnf,
-                evolve=evolve,
-                compiled_program=compiled_program,
-                index_dir=index_dir,
-                report=report,
-                fact_candidate_pool_k=fact_candidate_pool_k,
-                fact_fts_pool_k=fact_fts_pool_k,
-                fact_rrf_k=fact_rrf_k,
-                fact_fts_weight=fact_fts_weight,
-                linking_top_k=linking_top_k,
-                passage_node_weight=passage_node_weight,
-                fts_weight=fts_weight,
-                damping=damping,
-                passage_seed_pool_k=passage_seed_pool_k,
-                fts_seed_pool_k=fts_seed_pool_k,
-                graph_activation=graph_activation,
-                graph_activation_param=graph_activation_param,
-                graph_activation_renormalize=graph_activation_renormalize,
-                graph_beta=graph_beta,
-                graph_dual_weight=graph_dual_weight,
-            )
-        config = BaseConfig(
-            save_dir=str(index_dir),
-            dataset=cast(Any, dataset),
-            llm_name=extraction_model,
-            llm_base_url=BASE_URL,
-            embedding_model_name=profile.model,
-            embedding_base_url=BASE_URL,
-            embedding_provider="openai",
-            embedding_batch_size=32,
-            embedding_return_as_normalized=True,
-            vector_store_type="parquet",
-            force_index_from_scratch=not any(index_dir.rglob("graph.pickle")),
-            qa_top_k=QA_TOP_K,
-            linking_top_k=LINKING_TOP_K,
-            retrieval_top_k=RETRIEVAL_TOP_K,
-            temperature=0,
-            seed=0,
-            openie_max_workers=1,
-            max_retry_attempts=0,
-        )
-        hipporag_cls: Any = HippoRAG
-        with closing(RetrievalEmbedding(config, profile)) as embedding:
-            if mode in ("embeddings", "all"):
-                report["embedding_probes"] = verify_embeddings(embedding, queries, docs)
+        if mode in ("embeddings", "all"):
+            embed_client = create_dspy_embedder(profile, base_url=BASE_URL)
+            embedder = DSPyEmbeddingAdapter(profile=profile, embedder=embed_client)
+            report["embedding_probes"] = verify_embeddings(embedder, queries, docs)
             report["server"] = embedding_evidence(profile)
             report["index_identity"] = report["server"]["resolved_index_identity"]
             if mode == "embeddings":
                 report["status"] = "passed"
                 return report
-            report["chat_policy"] = {
-                "extraction_identity": chat_identity(extraction_model),
-                "qa_identity": chat_identity(qa_model) if include_qa else None,
-                "openie_max_workers": 1,
-                "max_retries": 0,
-            }
-            report["index_identity"] += "|" + chat_identity(extraction_model)
-            with closing(LocalChat.from_experiment_config(config, extraction_model)) as extraction_llm, closing(
-                LocalChat.from_experiment_config(config, qa_model if include_qa else extraction_model)
-            ) as qa_llm, hipporag_cls(
-                global_config=config,
-                embedding_model=embedding,
-                extraction_llm=extraction_llm,
-                qa_llm=qa_llm if include_qa else None,
-                index_identity=report["index_identity"],
-            ) as hipporag:
-                index_start = perf_counter()
-                report["index_batches"] = index_documents_in_batches(
-                    hipporag, docs, batch_size=index_batch_size,
-                )
-                del docs
-                gc.collect()
-                report["indexing_seconds"] = round(perf_counter() - index_start, 2)
-                report["graph"] = hipporag.get_graph_info()
-
-                eval_start = perf_counter()
-                records, metrics = evaluate_benchmark(
-                    hipporag,
-                    queries,
-                    gold_docs,
-                    gold_answers,
-                    dataset_name=dataset,
-                    qa_top_k=QA_TOP_K,
-                    qa_batch_size=qa_batch_size,
-                    include_qa=include_qa,
-                )
-                report["evaluation_seconds"] = round(perf_counter() - eval_start, 2)
-                report["timing_breakdown"] = {
-                    "all_retrieval_time": round(float(hipporag.all_retrieval_time), 2),
-                    "recognition_memory_time": round(float(hipporag.rerank_time), 2),
-                    "ppr_time": round(float(hipporag.ppr_time), 2),
-                }
-                report["evaluation_metrics"] = metrics
-                report["records"] = records
-                report["chat_telemetry"] = {
-                    "extraction": extraction_llm.summary(),
-                    "qa": qa_llm.summary() if include_qa else None,
-                }
-                report["chat_backends"] = {
-                    "extraction": chat_evidence(extraction_model),
-                    "qa": chat_evidence(qa_model) if include_qa else None,
-                }
-                print_benchmark_summary(dataset, num_docs, records, metrics, engine="hipporag")
-                failures = check_benchmark_integrity(
-                    records,
-                    report["graph"],
-                    expected_doc_count=num_docs,
-                    extraction_errors=extraction_llm.errors,
-                    qa_errors=qa_llm.errors if include_qa else (),
-                    include_qa=include_qa,
-                )
-                if failures:
-                    raise RuntimeError("; ".join(failures))
+        report["chat_backends"] = {
+            "extraction": chat_evidence(extraction_model),
+            "qa": chat_evidence(qa_model) if include_qa else None,
+        }
         report["status"] = "passed"
-        return report
+        return run_yaw_benchmark(
+            dataset=dataset,
+            docs=docs,
+            queries=queries,
+            gold_docs=gold_docs,
+            gold_answers=gold_answers,
+            train_samples=train_samples,
+            profile=profile,
+            extraction_model=extraction_model,
+            qa_model=qa_model,
+            include_qa=include_qa,
+            enable_gbnf=enable_gbnf,
+            evolve=evolve,
+            compiled_program=compiled_program,
+            index_dir=index_dir,
+            report=report,
+            fact_candidate_pool_k=fact_candidate_pool_k,
+            fact_fts_pool_k=fact_fts_pool_k,
+            fact_rrf_k=fact_rrf_k,
+            fact_fts_weight=fact_fts_weight,
+            linking_top_k=linking_top_k,
+            passage_node_weight=passage_node_weight,
+            fts_weight=fts_weight,
+            damping=damping,
+            passage_seed_pool_k=passage_seed_pool_k,
+            fts_seed_pool_k=fts_seed_pool_k,
+            graph_activation=graph_activation,
+            graph_activation_param=graph_activation_param,
+            graph_activation_renormalize=graph_activation_renormalize,
+            graph_beta=graph_beta,
+            graph_dual_weight=graph_dual_weight,
+        )
     except Exception as error:
         report["status"] = "failed"
         report["error"] = f"{type(error).__name__}: {error}"
@@ -1662,63 +1377,6 @@ def main(
             newline="\n",
         )
         print(f"\n{report['status'].upper()}: {run_dir / 'report.json'}", flush=True)
-
-
-def index_documents_in_batches(
-    hipporag,
-    docs: list[str],
-    batch_size: int = 8,
-) -> int:
-    """Checkpoint OpenIE in bounded micro-batches, then build embeddings and graph once."""
-    if batch_size < 1:
-        raise ValueError("index_batch_size must be at least 1.")
-    if not docs:
-        return 0
-    store = getattr(hipporag, "chunk_embedding_store", None)
-    graph_ready = bool(getattr(hipporag, "_graph_state_available", False))
-    if graph_ready and store is not None:
-        existing = store.get_all_texts()
-        pending = [doc for doc in docs if doc not in existing]
-        if not pending:
-            graph_info = hipporag.get_graph_info() if callable(getattr(hipporag, "get_graph_info", None)) else {}
-            if isinstance(graph_info, dict) and graph_info.get("num_passage_nodes") == len(existing):
-                _release_indexing_memory(hipporag)
-                return 0
-            hipporag.index(docs=docs[:batch_size])
-            _release_indexing_memory(hipporag)
-            return 1
-    else:
-        pending = list(docs)
-
-    pre_openie = getattr(hipporag, "pre_openie", None)
-    use_staged_openie = callable(pre_openie) and not hasattr(pre_openie, "assert_called")
-    num_batches = 0
-    total_docs = len(pending)
-    total_batches = (total_docs + batch_size - 1) // batch_size
-    for start in range(0, len(pending), batch_size):
-        batch = pending[start : start + batch_size]
-        if use_staged_openie:
-            print(
-                f"[Upstream HippoRAG] [Indexing OpenIE] Batch {num_batches + 1}/{total_batches} "
-                f"({min(start + len(batch), total_docs)}/{total_docs} docs)",
-                flush=True,
-            )
-            try:
-                pre_openie(batch)
-            except RuntimeError as exc:
-                if "Offline OpenIE completed" not in str(exc):
-                    raise
-            gc.collect()
-        else:
-            hipporag.index(docs=batch)
-            _release_indexing_memory(hipporag)
-        num_batches += 1
-
-    if use_staged_openie:
-        print(f"[Upstream HippoRAG] [Indexing Graph] Building embeddings and knowledge graph for {total_docs} docs...", flush=True)
-        hipporag.index(docs=pending)
-        _release_indexing_memory(hipporag)
-    return num_batches
 
 
 if __name__ == "__main__":
@@ -1740,8 +1398,6 @@ if __name__ == "__main__":
     parser.add_argument("--embedding-task-mode", choices=GEMMA_TASK_MODES, default="distinct-titled")
     parser.add_argument("--fresh-index", action="store_true",
                         help="Force indexing in a fresh disposable directory instead of reusing outputs/benchmarks/indexes.")
-    parser.add_argument("--engine", choices=("hipporag", "yaw"), default="hipporag",
-                        help="Select graph and retrieval engine: 'hipporag' (upstream baseline) or 'yaw' (native DSPy engine).")
     parser.add_argument("--enable-gbnf", action="store_true", default=False,
                         help="Enable pure-JSON GBNF grammar constraints for local llama.cpp GPU worker.")
     parser.add_argument("--query-offset", type=int, default=0,
@@ -1753,7 +1409,7 @@ if __name__ == "__main__":
     parser.add_argument("--compiled-program", type=str, default=None,
                         help="Path to load or save compiled HippoRAGProgram state.")
     parser.add_argument("--index-batch-size", type=int, default=8,
-                        help="Number of passages per hipporag.index() micro-batch for incremental SSD checkpointing.")
+                        help="Number of passages per indexing micro-batch for incremental SSD checkpointing.")
     parser.add_argument("--qa-batch-size", type=int, default=1,
                         help="Number of queries per retrieve() and qa() micro-batch (default: 1 for 1-by-1 processing).")
     parser.add_argument("--linking-top-k", type=int, default=LINKING_TOP_K,
@@ -1812,7 +1468,6 @@ if __name__ == "__main__":
         index_queries=args.index_queries,
         full_corpus=args.full_corpus,
         mode=args.mode,
-        engine=args.engine,
         enable_gbnf=args.enable_gbnf,
         query_offset=args.query_offset,
         evolve=args.evolve,

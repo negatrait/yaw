@@ -216,9 +216,12 @@ class ArchitectureTests(unittest.TestCase):
         import yaw.daemon.graph.inference as inference
         self.assertTrue(hasattr(inference, "create_dspy_lm"))
         self.assertTrue(hasattr(inference, "HippoRAGProgram"))
-        self.assertTrue(hasattr(inference, "RetrievalEmbedding"))
-        self.assertTrue(hasattr(inference, "LocalChat"))
+        self.assertTrue(hasattr(inference, "DSPyEmbeddingAdapter"))
         self.assertTrue(hasattr(inference, "compute_sizecoding_pareto_score"))
+        self.assertFalse(hasattr(inference, "RetrievalEmbedding"))
+        self.assertFalse(hasattr(inference, "LocalChat"))
+        self.assertFalse(hasattr(inference, "CacheOpenAI"))
+        self.assertFalse(hasattr(inference, "chat_identity"))
 
         # Verify storage public facade
         import yaw.daemon.graph.storage as storage
@@ -332,12 +335,19 @@ class ArchitectureTests(unittest.TestCase):
         self.assertTrue(is_allowed_internal_import("yaw.daemon.graph.inference", "yaw.daemon.graph.inference.models"))
 
     def test_zero_hipporag_imports_in_yaw(self):
-        """Rule 4: Zero hipporag runtime imports inside yaw/ (upstream hipporag is strictly confined to benchmark.py and tests/)."""
-        py_files = list(YAW_DIR.rglob("*.py"))
+        """Rule 4: Zero hipporag imports across the entire repository (yaw/, benchmark.py, scripts/, tests/)."""
+        py_files = (
+            list(YAW_DIR.rglob("*.py"))
+            + [PROJECT_ROOT / "benchmark.py"]
+            + list((PROJECT_ROOT / "scripts").rglob("*.py"))
+            + list((PROJECT_ROOT / "tests").rglob("*.py"))
+        )
         self.assertGreater(len(py_files), 0)
 
         violations = []
         for py_file in py_files:
+            if not py_file.exists():
+                continue
             imports = parse_module_imports(py_file)
             for lineno, mod in imports:
                 top_pkg = mod.split(".")[0]
@@ -349,7 +359,7 @@ class ArchitectureTests(unittest.TestCase):
         self.assertEqual(
             violations,
             [],
-            "Forbidden hipporag imports detected inside yaw/:\n" + "\n".join(violations),
+            "Forbidden hipporag imports detected in repository:\n" + "\n".join(violations),
         )
 
     def test_zero_cross_module_private_imports_and_exports(self):

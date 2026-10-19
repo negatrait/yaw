@@ -1,6 +1,5 @@
 """1-Indexed disk line hydration with CocoIndex AST island bounds and graceful context dehydration."""
 
-import itertools
 import json
 import sqlite3
 from collections.abc import Callable, Sequence
@@ -282,6 +281,57 @@ def dehydrate_passage_ast(
     return f"{header_prefix}{best_body}{notice}"
 
 
+_CODE_SOURCE_CACHE: dict[str, tuple[float, CodeSource, list[str]]] = {}
+
+
+def get_cached_code_source(target_path: Path) -> tuple[CodeSource, list[str]] | None:
+    """Retrieve or construct a cached CocoIndex CodeSource, invalidating on file mtime changes."""
+    try:
+        mtime = target_path.stat().st_mtime
+    except OSError:
+        return None
+    path_key = str(target_path)
+    cached = _CODE_SOURCE_CACHE.get(path_key)
+    if cached is not None and cached[0] == mtime:
+        return cached[1], cached[2]
+    try:
+        text = target_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    src = CodeSource(text)
+    lines = src.text.splitlines(keepends=True)
+    _CODE_SOURCE_CACHE[path_key] = (mtime, src, lines)
+    return src, lines
+
+
+def read_corpus_lines(
+    target_path: Path,
+    start_line: int,
+    end_line: int,
+) -> str | None:
+    """Read a 1-indexed [start_line, end_line] slice from a corpus file using CocoIndex CodeSource caching.
+
+    Validates mtime on each call, avoiding repeated open/close disk thrashing.
+    Returns the newline-stripped content string, or None if the file is missing/unreadable or the slice is empty.
+    """
+    if not target_path.is_file():
+        return None
+    try:
+        cached = get_cached_code_source(target_path)
+        if cached is None:
+            return None
+        _, lines = cached
+        if start_line < 1 or start_line - 1 >= len(lines):
+            return None
+        raw_text = "".join(lines[start_line - 1 : end_line])
+    except (OSError, UnicodeDecodeError):
+        return None
+
+    if not raw_text:
+        return None
+    return raw_text.rstrip("\r\n")
+
+
 def hydrate_chunk_pointer(
     pointer: ChunkPointer,
     corpus_root: Path,
@@ -301,20 +351,10 @@ def hydrate_chunk_pointer(
         )
 
     target_path = resolve_corpus_path(corpus_root, pointer.rel_posix_path)
-
-    if not target_path.is_file():
+    text = read_corpus_lines(target_path, pointer.start_line, pointer.end_line)
+    if text is None:
         return HydratedPassage(pointer=pointer, text="", score=score, stale_on_disk=True)
 
-    try:
-        with target_path.open("r", encoding="utf-8", errors="replace") as f:
-            raw_text = "".join(itertools.islice(f, pointer.start_line - 1, pointer.end_line))
-    except OSError:
-        return HydratedPassage(pointer=pointer, text="", score=score, stale_on_disk=True)
-
-    if not raw_text:
-        return HydratedPassage(pointer=pointer, text="", score=score, stale_on_disk=True)
-
-    text = raw_text.rstrip("\r\n")
     if pointer.rel_posix_path.lower().endswith((".json", ".jsonl")):
         text = normalize_json_passage_text(text, default_title=pointer.title)
     if max_chars > 0 and len(text) > max_chars:
@@ -409,18 +449,13 @@ def _hydrate_spans(
             ast_island_end=span.end_line,
         )
         target_path = resolve_corpus_path(corpus_root, span.rel_posix_path)
-        if not target_path.is_file():
+        text = read_corpus_lines(target_path, span.start_line, span.end_line)
+        if text is None:
             passages.append(HydratedPassage(pointer=ptr, text="", score=span.max_score, stale_on_disk=True))
             continue
-        try:
-            with target_path.open("r", encoding="utf-8", errors="replace") as f:
-                raw_text = "".join(itertools.islice(f, span.start_line - 1, span.end_line))
-            text = raw_text.rstrip("\r\n")
-            if span.rel_posix_path.lower().endswith((".json", ".jsonl")):
-                text = normalize_json_passage_text(text, default_title=span.title)
-            passages.append(HydratedPassage(pointer=ptr, text=text, score=span.max_score, stale_on_disk=False))
-        except OSError:
-            passages.append(HydratedPassage(pointer=ptr, text="", score=span.max_score, stale_on_disk=True))
+        if span.rel_posix_path.lower().endswith((".json", ".jsonl")):
+            text = normalize_json_passage_text(text, default_title=span.title)
+        passages.append(HydratedPassage(pointer=ptr, text=text, score=span.max_score, stale_on_disk=False))
     return passages
 
 

@@ -1,122 +1,199 @@
-# EnterpriseRAG-Bench Training & Evolution Plan
+# Technical Specification: Upstream `hipporag` Retirement, Dependency Upgrade & EnterpriseRAG-Bench Evolution
 
-**Status**: Planning / Spec  
-**Target Milestone**: Post-Parity Evolution (Retiring Upstream `hipporag`)  
-**Owner**: [`FOUNDATIONAL.md`](../FOUNDATIONAL.md) | Related: [`docs/pre-epic2-memo.md`](pre-epic2-memo.md), [Epic 1](epic-1-hipporag-daemon.md)
-
----
-
-## 1. Architectural Philosophy: Decoupled Training & Eval
-
-To avoid benchmark contamination and prompt overfitting:
-1. **Academic Evaluation Corpus**: The 7 paper datasets (`popqa`, `lveval`, `narrativeqa`, `2wikimultihopqa`, `hotpotqa`, `nq`, `musique`) serve as the **frozen acceptance gate**.
-2. **Enterprise Optimization Corpus**: [EnterpriseRAG-Bench](https://arxiv.org/html/2605.05253v2) (`onyx-dot-app/EnterpriseRAG-Bench`) serves as the **training and prompt compilation corpus** for DSPy GEPA / MIPROv2 and the Reflection RLM.
-
-### The Upstream Retirement Principle
-We do not make premature claims about production superiority. The progression is strictly gated:
-- **Gate 1**: Achieve verified parity or beat against upstream `hipporag` on the 7 paper datasets under the unified local model stack.
-- **Gate 2**: Once parity is proven and accepted, **scrap all upstream `hipporag` dependencies** and retire all legacy 7-file Parquet/Pickle/JSON storage remnants from the codebase.
-- **Gate 3**: With upstream ancestry cleanly removed, evolve YAW natively by training the **Canonical 12 DSPy signatures + EmbeddingGemma task prefixes** on EnterpriseRAG-Bench, verifying zero-shot generalizability back against the paper benchmark suite.
+**Document Status**: Implemented & Verified
+**Target Milestone**: Immediate Upstream `hipporag` Demolition, Dependency Upgrade & EnterpriseRAG-Bench GEPA Evolution
+**Governing Documents**: [`FOUNDATIONAL.md`](../FOUNDATIONAL.md), [`docs/pre-epic2-memo.md`](pre-epic2-memo.md), [`docs/epic-1-hipporag-daemon.md`](epic-1-hipporag-daemon.md)
 
 ---
 
-## 2. Dataset Profile: EnterpriseRAG-Bench
+## 1. Context & Consolidated Benchmark Targets
 
-- **Source Repository**: [`onyx-dot-app/EnterpriseRAG-Bench`](https://github.com/onyx-dot-app/EnterpriseRAG-Bench) (Hugging Face: `onyx-dot-app/EnterpriseRAG-Bench`).
-- **Domain**: Fictional AI provider ("Redwood Inference") simulating realistic internal company knowledge.
-- **Source Modalities (9 Tools)**: Slack threads, Gmail messages, Linear tickets, Google Drive docs, HubSpot CRM records, Fireflies meeting transcripts, GitHub code/issues, Jira tickets, and Confluence wiki spaces.
-- **Key Challenges Stressed**:
-  - **Entity Homographs & Acronyms**: Disambiguating "Redwood" (company vs. project vs. repository vs. Slack channel) directly exercises YAW's SKOS entity definitions (`skos:definition`, `entity_labels`, `owl:differentFrom`).
-  - **Temporal & Source Conflicts**: Conflicting information between outdated design documents and recent Slack/ticket decisions forces the graph and triple extractor to preserve provenance.
-  - **Unanswerable Queries**: 10 question categories include unanswerable cases, training the QA reader to detect missing graph paths rather than hallucinating false bridges.
+Upstream `hipporag` (`2.0.0a5`) carried massive storage and memory bloat, single-threaded indexing bottlenecks, and dependency pins that prevented running `uv lock --upgrade`. Having already completed reference runs across the benchmark datasets, **upstream `hipporag` is retired immediately**.
+
+Going forward, native YAW evaluates against **Two Explicit Benchmark Reference Targets**:
+
+1. **Target 1: Local Upstream HippoRAG 2 Dependency Baseline (`MONKEYPATCHED_HIPPORAG_BASELINES`)**: The empirical performance recorded when running upstream HippoRAG 2 against our local model stack (`Qwen3-4B-Instruct-2507-GGUF` + `embeddinggemma-300m-GGUF`). These metrics are frozen in [`outputs/benchmarks/consolidated_historical_baselines.json`](../outputs/benchmarks/consolidated_historical_baselines.json) so upstream indexing is never re-run.
+2. **Target 2: Published SOTA Paper Baselines (`PAPER_BASELINES`)**: The published results from the official HippoRAG 2 paper (`Llama-3.3-70B` / `GPT-4o-mini` + `NV-Embed-v2`).
+
+### Consolidated Empirical Baseline Table
+
+| Dataset | Eval Queries | Candidate Docs | Target 1: Local Upstream HippoRAG 2 (`Qwen3-4B` + `EmbeddingGemma`) | Target 2: Published Paper SOTA (`Llama-3.3-70B` + `NV-Embed-v2`) |
+| :--- | :---: | :---: | :--- | :--- |
+| **`popqa`** | 25 | 70 | **R@1**: `0.500` \| **R@2**: `0.580` \| **R@5**: `0.720`<br/>**EM**: `0.360` \| **F1**: `0.5956` | **R@2**: `0.439` \| **R@5**: `0.517`<br/>**EM**: `0.490` \| **F1**: `0.562` |
+| **`2wikimultihopqa`** | 25 | 307 | **R@1**: `0.450` \| **R@2**: `0.780` \| **R@5**: `0.960`<br/>**EM**: `0.360` \| **F1**: `0.4923` | **R@2**: `0.762` \| **R@5**: `0.904`<br/>**EM**: `0.650` \| **F1**: `0.710` |
+| **`hotpotqa`** | 25 | 344 | **R@1**: `0.400` \| **R@2**: `0.740` \| **R@5**: `0.960`<br/>**EM**: `0.200` \| **F1**: `0.3964` | **R@2**: `0.835` \| **R@5**: `0.963`<br/>**EM**: `0.627` \| **F1**: `0.755` |
+| **`musique`** | 10 | 197 | **R@1**: `0.183` \| **R@2**: `0.317` \| **R@5**: `0.542`<br/>**EM**: `0.200` \| **F1**: `0.3000` | **R@2**: `0.456` \| **R@5**: `0.780`<br/>**EM**: `0.485` \| **F1**: `0.633` |
+| **`lveval`** | 25 | 70 | **R@1**: `0.440` \| **R@2**: `0.640` \| **R@5**: `0.740`<br/>**EM**: `0.240` \| **F1**: `0.3401` | **EM**: `0.080` \| **F1**: `0.129`<br/>*(Long-Context 256k)* |
+| **`narrativeqa`** | 25 | 70 | **R@1**: `0.100` \| **R@2**: `0.160` \| **R@5**: `0.280`<br/>**EM**: `0.080` \| **F1**: `0.1384` | **EM**: `0.180` \| **F1**: `0.259` |
+| **`nq`** | 1 | 20 | **R@1**: `0.000` \| **R@2**: `0.000` \| **R@5**: `1.000`<br/>**EM**: `0.000` \| **F1**: `0.0000` | **R@2**: `0.456` \| **R@5**: `0.780`<br/>**EM**: `0.485` \| **F1**: `0.633` |
 
 ---
 
-## 3. Stratified Training Slice (`scripts/download_enterprise_rag_bench.py`)
+## 2. Architecture, Dataflow & Domain Containment
 
-A standalone script will download and curate a balanced training slice from Hugging Face:
+```mermaid
+flowchart TD
+    subgraph Demolition ["1. Upstream Demolition & Dependency Upgrade"]
+        PYPROJ["pyproject.toml: Remove hipporag git pin"] --> UVUP["uv lock --upgrade && uv sync --locked"]
+        DEL_LEGACY["Delete legacy_chat.py & legacy_embedding.py"] --> NATIVE_BENCH["benchmark.py & verify_paper_parity_gate.py:<br/>Native YAW evaluated against TWO Targets"]
+    end
 
-```powershell
-uv run python scripts/download_enterprise_rag_bench.py --num-train-queries 60 --num-val-queries 30 --distractor-factor 2.0
+    subgraph DataCuration ["2. Doubled EnterpriseRAG-Bench Curation (scripts/download-datasets.py)"]
+        HF["onyx-dot-app/EnterpriseRAG-Bench<br/>(data/questions/test.parquet & data/documents/test.parquet)"] --> STRAT["Stratified Interleaved Sampler (N=180: 120 Train / 60 Val<br/>across 10 Categories + 2.0x Same-Tool Hard Distractors)"]
+        STRAT --> OUT_DS["outputs/datasets/enterprise_rag_bench.json &<br/>outputs/datasets/enterprise_rag_bench_corpus.json"]
+    end
+
+    subgraph NativeCLI ["3. Native CLI Sandbox Optimization (yaw dspy optimize)"]
+        OUT_DS --> CLI_OPT["yaw dspy optimize --dataset enterprise_rag_bench<br/>--max-queries 180 --train-queries 120 --mode gepa --auto heavy"]
+        CLI_OPT --> SANDBOX["YawRuntime.optimize() Sandbox:<br/>Persist indent=2 .yaw_optimize_slice.json throughout evolve_prompts()"]
+        SANDBOX --> GEPA["dspy.GEPA + Gate-Free Pareto Metric: GM(Goods) / GM(Bads)"]
+        GEPA --> PROPOSER["Stratum B Fixed Meta-Optimizer (RLMInstructionProposer, Sigs 10–12):<br/>Distill Traces in Python REPL & Propose GBNF Instructions"]
+        PROPOSER --> TARGETS["Mutate ONLY Stratum A Runtime Predictors (HippoRAGProgram, Sigs 1–9)"]
+        TARGETS --> ARTIFACT[".yaw/compiled_program_enterprise.json"]
+    end
+
+    subgraph DualTargetGate ["4. Promotion & Dual-Target Verification Gate"]
+        ARTIFACT --> LOAD["yaw dspy load-program .yaw/compiled_program_enterprise.json"]
+        LOAD --> GATE["scripts/verify_paper_parity_gate.py:<br/>1. Beat/Match MONKEYPATCHED_HIPPORAG_BASELINES (Local Stack)<br/>2. Drive Toward Published PAPER_BASELINES (SOTA 70B Stack)"]
+    end
 ```
 
-### 3.1 Sampling Strategy
-- **Questions ($N=90$)**:
-  - 60 Train / 30 Validation questions sampled evenly across the 10 categories:
-    1. Single-document lookup
-    2. Multi-document synthesis
-    3. Constrained temporal / organizational retrieval
-    4. Conflict resolution
-    5. Unanswerable / absent information
-    6. Code / technical schema queries
-    7. Meeting transcript action-item queries
-    8. Policy / HR compliance queries
-    9. Cross-tool reconciliation (e.g. Jira + Slack)
-    10. Ambiguous / clarification queries
-- **Corpus Slice ($M \approx 600 - 1,200\text{ documents}$)**:
-  - All gold supporting documents for the 90 sampled queries.
-  - Hard distractor documents from the same tools and author clusters (2× distractor padding).
-
-### 3.2 Ingestion via Native CocoIndex
-Ingest the curated slice directly into `indexes/enterprise_train/yaw.db` using textbook CocoIndex AST chunking (`CodeSource`, `RecursiveSplitter`, `detect_code_language`):
-- Markdown, HTML, JSON, and source code chunked with zero intermediate files.
-- Each chunk pointer records exact source line spans and Tree-sitter section headings.
+### Domain Containment Check (`tests/core/test_architecture.py`)
+- `yaw/core`: Standard library only.
+- `yaw/daemon/graph/storage`: SQLite, `sqlite-vec`, `core`.
+- `yaw/daemon/graph/inference`: DSPy 3.2.x, `core`. (`legacy_chat.py` and `legacy_embedding.py` deleted).
+- `yaw/daemon/ingestion`: CocoIndex 1.0.x, `core`.
+- **Global `hipporag` Ban**: Zero `hipporag` imports across the repository (`yaw/`, `benchmark.py`, `scripts/`, `tests/`).
 
 ---
 
-## 4. The Canonical 12 DSPy Signatures + First-Class Embedding Trail
+## 3. Formal Contracts & Typed Interfaces
 
-Per `/dspy-rlm-module` discipline and `FOUNDATIONAL.md`, YAW strictly forbids redundant pass-through RLM wrappers (`execution_mode` and `qa_mode` are retired). Only the **Canonical 12 `dspy.Signature` classes** + the **First-Class Embedding Telemetry Trail** (`DSPyEmbeddingAdapter`) exist:
-- **9 Runtime Stage Signatures in `HippoRAGProgram`** (7 core direct GBNF signatures + 2 SHACL integrity healing signatures).
-- **3 Reflection Optimizer Signatures in `RLMInstructionProposer`** (single-level RLM trace distiller + GBNF instruction synthesizer/compressor).
+### 3.1 Dual-Target Baseline Contracts (`benchmark.py` & `scripts/verify_paper_parity_gate.py`)
 
-Every predictor owns a unique Signature class, a dedicated `_PredictorBoundLM` client, and a dedicated `track_usage()` telemetry stream, alongside `DSPyEmbeddingAdapter`'s first-class embedding telemetry hook (`HippoRAGProgram.telemetry` & `HippoRAGProgram.embedding_audit_trail`):
+In [`benchmark.py`](../benchmark.py) and [`scripts/verify_paper_parity_gate.py`](../scripts/verify_paper_parity_gate.py), we register both reference baselines:
 
-| # | Component | Predictor / Adapter Attribute | Role / Concern | Unique `dspy.Signature` / Profile | Execution Mode |
-| :- | :--- | :--- | :--- | :--- | :--- |
-| **1** | `HippoRAGProgram` | `ner` | Core: Named Entity & Definition Extraction | `ExtractEntities` | Direct GBNF JSON |
-| **2** | `HippoRAGProgram` | `triples` | Core: Polymorphic OpenIE Statement Extraction | `ExtractTriples` | Direct GBNF JSON |
-| **3** | `HippoRAGProgram` | `entity_definer` | Core: Missing Entity Definition Synthesis | `DefineMissingEntities` | Direct GBNF JSON |
-| **4** | `HippoRAGProgram` | `synonym_judge` | Core: 4-Way SKOS/OWL Synonym Disambiguation | `JudgeSynonyms` | Direct GBNF JSON |
-| **5** | `HippoRAGProgram` | `query_intent` | Core: Query Intent & Seed Expansion | `ExtractQueryIntent` | Direct GBNF JSON |
-| **6** | `HippoRAGProgram` | `triple_filter` | Core: Recognition Memory Triple Reranker | `FilterTriples` | Direct GBNF JSON |
-| **7** | `HippoRAGProgram` | `qa` | Core: Multi-Hop QA Reader | `AnswerQuestion` | Direct GBNF JSON |
-| **8** | `HippoRAGProgram` | `shacl_healer_rlm` | SHACL: In-Transaction Graph Healer Loop | `HealSHACLViolations` | Single-Level `dspy.RLM` REPL (`dspy.PythonInterpreter`) |
-| **9** | `HippoRAGProgram` | `shacl_repair` | SHACL: Inner Closed-World Repair Tool | `ProposeSHACLRepairs` | Direct GBNF JSON |
-| **10** | `RLMInstructionProposer` | `inner_rlm` (`rlm`) | GEPA: Trace Distiller REPL Loop | `ReflectiveInnerDistillerSignature` | Single-Level `dspy.RLM` REPL (`dspy.PythonInterpreter`) |
-| **11** | `RLMInstructionProposer` | `qwen_proposer` | GEPA: Instruction Synthesizer | `ProposeInstructionSignature` | Direct GBNF JSON |
-| **12** | `RLMInstructionProposer` | `qwen_compressor`| GEPA: Instruction Length Compressor | `CompressInstructionSignature` | Direct GBNF JSON |
-| **+E** | `DSPyEmbeddingAdapter` | `embedder` | First-Class Embedding Trail (`chunk_embed`, `entity_embed`, `fact_embed`, `query_fact_embed`, `query_passage_embed`) | `EmbeddingProfile` (`query_prefix`, `fact_query_prefix`, `document_prefix`) | `dspy.Embedder` + Telemetry Hook |
+```python
+MONKEYPATCHED_HIPPORAG_BASELINES: dict[str, dict[str, Any]] = {
+    "popqa": {"queries": 25, "docs": 70, "Recall@1": 0.500, "Recall@2": 0.580, "Recall@5": 0.720, "ExactMatch": 0.360, "F1": 0.5956},
+    "2wikimultihopqa": {"queries": 25, "docs": 307, "Recall@1": 0.450, "Recall@2": 0.780, "Recall@5": 0.960, "ExactMatch": 0.360, "F1": 0.4923},
+    "hotpotqa": {"queries": 25, "docs": 344, "Recall@1": 0.400, "Recall@2": 0.740, "Recall@5": 0.960, "ExactMatch": 0.200, "F1": 0.3964},
+    "musique": {"queries": 10, "docs": 197, "Recall@1": 0.183, "Recall@2": 0.317, "Recall@5": 0.542, "ExactMatch": 0.200, "F1": 0.3000},
+    "lveval": {"queries": 25, "docs": 70, "Recall@1": 0.440, "Recall@2": 0.640, "Recall@5": 0.740, "ExactMatch": 0.240, "F1": 0.3401},
+    "narrativeqa": {"queries": 25, "docs": 70, "Recall@1": 0.100, "Recall@2": 0.160, "Recall@5": 0.280, "ExactMatch": 0.080, "F1": 0.1384},
+    "nq": {"queries": 1, "docs": 20, "Recall@1": 0.000, "Recall@2": 0.000, "Recall@5": 1.000, "ExactMatch": 0.000, "F1": 0.0000},
+}
+```
+
+Reports evaluate native YAW with side-by-side delta comparisons:
+- $\Delta_{\text{local}} = \text{YAW} - \text{MONKEYPATCHED\_HIPPORAG\_BASELINES}$ (Target 1: Must be $\ge -0.02$).
+- $\Delta_{\text{paper}} = \text{YAW} - \text{PAPER\_BASELINES}$ (Target 2: Tracking SOTA trajectory).
+
+### 3.2 EnterpriseRAG-Bench Schema & Stratification (`scripts/download-datasets.py`)
+
+Curates 180 queries (`120` Train / `60` Validation) from `onyx-dot-app/EnterpriseRAG-Bench` across the 10 real categories:
+
+```python
+ENTERPRISE_CATEGORY_QUOTAS: dict[str, tuple[int, int]] = {
+    "Basic": (24, 12),
+    "Semantic": (20, 10),
+    "Intra-Document Reasoning": (12, 6),
+    "Project Related": (12, 6),
+    "Constrained": (10, 5),
+    "Conflicting Info": (9, 4),
+    "Completeness": (9, 4),
+    "Miscellaneous": (9, 4),
+    "Info Not Found": (9, 5),
+    "High Level": (6, 4),
+}
+
+def download_enterprise_rag_bench(
+    dest_dir: Path,
+    *,
+    distractor_factor: float = 2.0,
+    seed: int = 42,
+    force: bool = False,
+) -> tuple[Path, Path]:
+    """Curate 180 stratified EnterpriseRAG-Bench queries (120 train + 60 val) and 2x hard distractors."""
+```
+
+### 3.3 Optimization Sandbox Lifecycle Fix (`yaw/daemon/runtime.py`)
+
+In [`YawRuntime.optimize()`](../yaw/daemon/runtime.py#L783-L851), `.yaw_optimize_slice.json` is serialized with `indent=2` and unlinked in an outer `finally:` block only **after** `self.engine.evolve_prompts(...)` finishes, preventing premature unlinking.
+
+### 3.4 Two-Stratum Separation of the Canonical 12 DSPy Signatures
+
+- **Stratum A (Signatures 1–9 in `HippoRAGProgram.named_predictors()`)**: `ExtractEntities` (`ner`), `ExtractTriples` (`triples`), `DefineMissingEntities` (`entity_definer`), `JudgeSynonyms` (`synonym_judge`), `ExtractQueryIntent` (`query_intent`), `FilterTriples` (`triple_filter`), `AnswerQuestion` (`qa`), `HealSHACLViolations` (`shacl_healer_rlm`), and `ProposeSHACLRepairs` (`shacl_repair`). Mutated by `dspy.GEPA` and saved in `compiled_program.json`.
+- **Stratum B (Signatures 10–12 in `RLMInstructionProposer`)**: `ReflectiveInnerDistillerSignature` (`inner_rlm`), `ProposeInstructionSignature` (`qwen_proposer`), and `CompressInstructionSignature` (`qwen_compressor`). Fixed meta-optimizer (`ProposalFn`) that reflects on Stratum A. Nothing reflects on Stratum B.
 
 ---
 
-## 5. Optimization & Verification Protocol
+## 4. Invariants & Explicit Non-Goals (Negative Space)
 
-### 5.1 Optimization Execution
-Run DSPy GEPA optimization using the gate-free Pareto metric:
-```powershell
-uv run python scripts/optimize_dspy_pipeline.py `
-    --dataset enterprise_rag_bench `
-    --train-queries 60 `
-    --val-queries 30 `
-    --max-rounds 3 `
-    --output .yaw/compiled_program_enterprise.json
-```
+### 4.1 Non-Negotiable Invariants
+1. **Zero Upstream `hipporag` Invariant**: `git grep -i "from hipporag"` and `git grep -i "import hipporag"` return `0` matches across the entire repository.
+2. **Dual-Target Parity Invariant**: Native YAW must match or beat `MONKEYPATCHED_HIPPORAG_BASELINES` ($\Delta_{\text{local}} \ge -0.02$) while marching toward `PAPER_BASELINES`.
+3. **One-Way Meta-Reflection Invariant**: `RLMInstructionProposer` (Stratum B, Signatures 10–12) reflects exclusively on `HippoRAGProgram.named_predictors()` (Stratum A, Signatures 1–9).
+4. **Live Disk Slice Invariant During `optimize()`**: `.yaw_optimize_slice.json` is formatted with `indent=2` and remains on disk throughout `evolve_prompts(...)`.
 
-- **Fitness Metric**: $\text{Fitness} = \frac{\text{GM}(\text{Goods})}{\text{GM}(\text{Bads})}$
-  - Goods: Retrieval Recall@1..20, Answer F1, Exact Match, SHACL Conformance.
-  - Bads: Normalized Token Volume (including LLM + Embedding tokens), SHACL Violations, Missing Entity Definitions, Repair Tokens.
-- **Reflection Proposer**: Qwen in the single-level sandboxed Python REPL (`RLMInstructionProposer.inner_rlm`) analyzes execution failure traces and embedding telemetry trails on enterprise documents and proposes prompt/prefix mutations across the Canonical 12 signatures and `EmbeddingGemma` task prefixes.
+### 4.2 Explicit Non-Goals (Anti-Invention Contract)
+- **Zero Custom Optimization Scripts**: Do **NOT** create `scripts/optimize_dspy_pipeline.py`. Use the existing [`yaw dspy optimize`](../yaw/daemon/cli.py#L126-L185) and [`yaw dspy load-program`](../yaw/daemon/cli.py#L186-L195) CLI commands.
+- **Zero Legacy Compatibility Shims**: Do **NOT** keep `legacy_chat.py`, `legacy_embedding.py`, or `--engine hipporag` as deprecated aliases; delete them completely.
+- **Zero Schema Migrations or New Config Flags**: The database schema and configuration files remain unchanged.
 
-### 5.2 Zero-Shot Evaluation Transfer Gate
-Evaluate the compiled enterprise program `.yaw/compiled_program_enterprise.json` directly against the 7 paper datasets:
+---
 
-```powershell
-uv run python scripts/verify_paper_parity_gate.py `
-    --compiled-program .yaw/compiled_program_enterprise.json `
-    --queries-per-dataset 25 `
-    --index-queries 35 `
-    --mode eval
-```
+## 5. File-by-File Diff Blueprint & Oblivion Protocol
 
-- **Acceptance Criterion**: The enterprise-compiled program must match or beat uncompiled baseline performance across the 7 paper datasets without ever having been exposed to Wikipedia training samples.
+### 5.1 Topological File Blueprint
+1. **[MODIFY] [`pyproject.toml`](../pyproject.toml) & [`uv.lock`](../uv.lock)**: Remove `hipporag` git pin; run `uv lock --upgrade && uv sync --locked`.
+2. **[DELETE] [`yaw/daemon/graph/inference/legacy_chat.py`](../yaw/daemon/graph/inference/legacy_chat.py)** & **[DELETE] [`yaw/daemon/graph/inference/legacy_embedding.py`](../yaw/daemon/graph/inference/legacy_embedding.py)**: Permanently delete legacy HippoRAG adapter modules.
+3. **[MODIFY] [`yaw/daemon/graph/inference/__init__.py`](../yaw/daemon/graph/inference/__init__.py)**: Remove `LocalChat`, `CacheOpenAI`, `chat_identity`, and `RetrievalEmbedding` from `_PUBLIC_API`.
+4. **[MODIFY] [`yaw/daemon/runtime.py`](../yaw/daemon/runtime.py)**: Fix `YawRuntime.optimize()` to write `.yaw_optimize_slice.json` with `indent=2` and keep it alive on disk during `evolve_prompts(...)`.
+5. **[MODIFY] [`yaw/daemon/cli.py`](../yaw/daemon/cli.py)**: Add `"enterprise_rag_bench"` (and alias `"enterprise"`) to `_KNOWN_DATASETS`.
+6. **[MODIFY] [`scripts/download-datasets.py`](../scripts/download-datasets.py)**: Add `enterprise_rag_bench` to `DATASET_REGISTRY` to download and curate the 180-query stratified slice.
+7. **[MODIFY] [`benchmark.py`](../benchmark.py)** & **[MODIFY] [`scripts/verify_paper_parity_gate.py`](../scripts/verify_paper_parity_gate.py)**: Remove all `hipporag` imports and upstream runner functions, integrate `MONKEYPATCHED_HIPPORAG_BASELINES`, and evaluate native YAW against both targets.
+8. **[MODIFY] Documentation (`FOUNDATIONAL.md`, `AGENTS.md`, `README.md`, `docs/epic-1-hipporag-daemon.md`)**: Update to reflect upstream retirement and dual-target benchmark protocol.
+9. **[MODIFY] Test Suite (`tests/core/test_architecture.py`, `tests/daemon/graph/inference/*`, `tests/test_benchmark.py`)**: Enforce repo-wide zero-`hipporag` import invariant and test EnterpriseRAG-Bench stratification.
+
+### 5.2 Oblivion Demolition Table
+
+| Retired Symbol / File / Dependency | Previous Location | Replacement | Verification Gate |
+| :--- | :--- | :--- | :--- |
+| `hipporag` git dependency | `pyproject.toml`, `uv.lock` | Native `yaw` + `scripts/evaluation.py` | `git grep -i "hipporag" pyproject.toml` == `0` |
+| `legacy_chat.py` & `legacy_embedding.py` | `yaw/daemon/graph/inference/` | Native `chat.py` & `embedding.py` | Files deleted; `git grep -w "legacy_chat"` == `0` |
+| `LocalChat`, `CacheOpenAI`, `RetrievalEmbedding`, `chat_identity` | `inference/__init__.py`, `benchmark.py` | `create_dspy_lm`, `create_dspy_embedder` | `git grep -w "LocalChat"` == `0` |
+| `_release_indexing_memory`, `_release_retrieval_memory`, `_run_incremental_index` | `benchmark.py` | `run_yaw_benchmark` | `git grep -w "_run_incremental_index"` == `0` |
+
+---
+
+## 6. Real-Substrate Verification Strategy
+
+1. **Dependency Upgrade & Oblivion Check**:
+   ```powershell
+   uv lock --upgrade
+   uv sync --locked
+   git grep -w "legacy_chat"
+   git grep -w "legacy_embedding"
+   ```
+2. **EnterpriseRAG-Bench Download & 180-Query Stratification Check**:
+   ```powershell
+   uv run --locked python scripts/download-datasets.py --dataset enterprise_rag_bench
+   uv run --locked python scripts/download-datasets.py --check
+   ```
+3. **CLI Optimization & Hot-Reload Promotion**:
+   ```powershell
+   uv run --locked yaw dspy optimize --dataset enterprise_rag_bench --max-queries 180 --train-queries 120 --mode gepa --auto heavy --output .yaw/compiled_program_enterprise.json
+   uv run --locked yaw dspy load-program .yaw/compiled_program_enterprise.json
+   ```
+4. **Dual-Target Parity Gate Evaluation**:
+   ```powershell
+   uv run --locked python scripts/verify_paper_parity_gate.py --compiled-program .yaw/compiled_program_enterprise.json --queries-per-dataset 25 --index-queries 35 --mode eval
+   ```
+5. **Deterministic Quality Gates**:
+   ```powershell
+   uv run --locked pytest -q
+   uv run --locked ruff check .
+   uv run --locked ty check
+   git diff --check
+   ```

@@ -235,3 +235,27 @@ def test_hydrate_budgeted_passages_1hop_ast_expansion(tmp_path: Path) -> None:
     assert "Line 25" in passages[0].text
     assert "Line 09" not in passages[0].text
     assert "Line 26" not in passages[0].text
+
+
+def test_read_corpus_lines_cocoindex_codesource_caching(tmp_path: Path) -> None:
+    from yaw.daemon.graph.storage.hydration import read_corpus_lines
+
+    f = tmp_path / "sample.txt"
+    f.write_text("Alpha\nBeta\nGamma\nDelta\nEpsilon\n", encoding="utf-8")
+
+    # 1. Normal read with CocoIndex CodeSource cache
+    text = read_corpus_lines(f, 2, 4)
+    assert text == "Beta\nGamma\nDelta"
+
+    # 2. Modify file on disk -> mtime change invalidates cache automatically
+    f.write_text("Alpha\nUpdated Beta\nGamma\nDelta\nEpsilon\n", encoding="utf-8")
+    updated = read_corpus_lines(f, 2, 4)
+    assert updated == "Updated Beta\nGamma\nDelta"
+
+    # 3. Missing file returns None
+    missing = read_corpus_lines(tmp_path / "absent.txt", 1, 2)
+    assert missing is None
+
+    # 4. Out of range returns None
+    out_of_range = read_corpus_lines(f, 10, 20)
+    assert out_of_range is None

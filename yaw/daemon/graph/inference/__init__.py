@@ -68,12 +68,6 @@ _PUBLIC_API: dict[str, str] = {
     "DSPY_QA_GBNF_GRAMMAR": ".grammars",
     "DSPY_INSTRUCTION_PROPOSAL_GBNF_GRAMMAR": ".grammars",
     "DSPY_QUERY_INTENT_GBNF_GRAMMAR": ".grammars",
-
-    # Pinned Upstream Baseline Adapters
-    "LocalChat": ".legacy_chat",
-    "CacheOpenAI": ".legacy_chat",
-    "chat_identity": ".legacy_chat",
-    "RetrievalEmbedding": ".legacy_embedding",
     # Models & Constants
     "CHAT_MODELS": ".models",
     "BASE_URL": ".models",

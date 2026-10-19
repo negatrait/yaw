@@ -1,24 +1,22 @@
 """Executable specifications for HippoRAG benchmark slicing, evaluation, and integrity gates."""
 
+import importlib.util
 import json
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import Mock
 
 from benchmark import (
     ALIASES,
     DATASET_REGISTRY,
     DATASETS,
+    MONKEYPATCHED_HIPPORAG_BASELINES,
     PAPER_BASELINES,
     TEXT_STOPWORDS,
     build_benchmark_slice,
     check_benchmark_integrity,
-    evaluate_benchmark,
     get_gold_answers,
     get_gold_docs,
-    index_documents_in_batches,
     load_dataset_files,
 )
 
@@ -146,6 +144,7 @@ class DatasetSliceTests(unittest.TestCase):
             "naturalquestions": "nq",
             "nq_rear": "nq",
             "narrative": "narrativeqa",
+            "enterprise": "enterprise_rag_bench",
         }
         for alias, canonical in expected_aliases.items():
             self.assertEqual(ALIASES.get(alias), canonical)
@@ -160,6 +159,7 @@ class DatasetSliceTests(unittest.TestCase):
             "lveval": ("lveval.json", "lveval_corpus.json"),
             "narrativeqa": ("narrativeqa_dev_10_doc.json", "narrativeqa_dev_10_doc_corpus.json"),
             "case_study_university": ("case_study_university.json", "case_study_university_corpus.json"),
+            "enterprise_rag_bench": ("enterprise_rag_bench.json", "enterprise_rag_bench_corpus.json"),
         }
         for name, files in expected_registry.items():
             self.assertEqual(DATASET_REGISTRY.get(name), files)
@@ -414,11 +414,129 @@ class DatasetSliceTests(unittest.TestCase):
         self.assertEqual(PAPER_BASELINES["narrativeqa"]["standard_nvembed_v2_llama3.3_70b"]["F1"], 0.257)
         self.assertEqual(PAPER_BASELINES["narrativeqa"]["hipporag_reproduced"]["F1"], 0.163)
 
+    def test_monkeypatched_hipporag_baselines_contain_all_required_datasets(self):
+        for name in ("musique", "2wikimultihopqa", "hotpotqa", "nq", "popqa", "lveval", "narrativeqa"):
+            self.assertIn(name, MONKEYPATCHED_HIPPORAG_BASELINES)
+            entry = MONKEYPATCHED_HIPPORAG_BASELINES[name]
+            self.assertIn("Recall@1", entry)
+            self.assertIn("Recall@2", entry)
+            self.assertIn("Recall@5", entry)
+            self.assertIn("ExactMatch", entry)
+            self.assertIn("F1", entry)
+            self.assertGreater(entry["indexing_seconds"], 0.0)
+            self.assertGreater(entry["evaluation_seconds"], 0.0)
+            self.assertGreater(entry["elapsed_seconds"], 0.0)
+
+    def test_enterprise_rag_bench_10_category_stratification_and_distractors(self):
+        from collections import Counter
+
+        from yaw.daemon.cli import _load_dataset_splits
+
+        spec = importlib.util.spec_from_file_location(
+            "download_datasets",
+            Path(__file__).resolve().parent.parent / "scripts" / "download-datasets.py",
+        )
+        assert spec is not None and spec.loader is not None
+        dl_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(dl_mod)
+
+        quotas = dl_mod.ENTERPRISE_CATEGORY_QUOTAS
+        self.assertEqual(len(quotas), 10)
+        self.assertEqual(sum(tr for tr, _ in quotas.values()), 120)
+        self.assertEqual(sum(va for _, va in quotas.values()), 60)
+
+        synthetic_questions = []
+        synthetic_docs = []
+        tools = ["slack", "github", "google_drive", "confluence", "jira"]
+        q_idx = 0
+        for cat, (n_tr, n_va) in quotas.items():
+            for _i in range(n_tr + n_va + 4):
+                qid = f"q_{q_idx}"
+                tool = tools[q_idx % len(tools)]
+                gold_id = f"gold_{q_idx}"
+                synthetic_docs.append(
+                    {
+                        "doc_id": gold_id,
+                        "source_type": tool,
+                        "title": f"Gold Doc {q_idx}",
+                        "content": f"Supporting enterprise content for {qid} in {cat}.",
+                    }
+                )
+                synthetic_questions.append(
+                    {
+                        "question_id": qid,
+                        "question": f"Enterprise question {q_idx} ({cat})?",
+                        "gold_answer": f"Answer {q_idx}",
+                        "answer_facts": [f"Fact {q_idx}"],
+                        "question_type": cat,
+                        "source_types": [tool],
+                        "expected_doc_ids": [] if cat == "Info Not Found" else [gold_id],
+                    }
+                )
+                q_idx += 1
+
+        for d_idx in range(600):
+            tool = tools[d_idx % len(tools)]
+            synthetic_docs.append(
+                {
+                    "doc_id": f"dist_{d_idx}",
+                    "source_type": tool,
+                    "title": f"Distractor {d_idx}",
+                    "content": f"Hard distractor passage {d_idx} for {tool}.",
+                }
+            )
+
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp_root = Path(tmp_str)
+            ds_dir = tmp_root / "outputs" / "datasets"
+            q_path, c_path = dl_mod.download_enterprise_rag_bench(
+                ds_dir,
+                distractor_factor=2.0,
+                seed=42,
+                force=True,
+                questions_rows=synthetic_questions,
+                documents_rows=synthetic_docs,
+            )
+            self.assertTrue(q_path.exists())
+            self.assertTrue(c_path.exists())
+
+            queries_data = json.loads(q_path.read_text(encoding="utf-8"))
+            self.assertEqual(len(queries_data), 180)
+            train_slice = queries_data[:120]
+            val_slice = queries_data[120:]
+
+            train_counts = Counter(q["question_type"] for q in train_slice)
+            val_counts = Counter(q["question_type"] for q in val_slice)
+            for cat, (exp_tr, exp_va) in quotas.items():
+                self.assertEqual(train_counts[cat], exp_tr)
+                self.assertEqual(val_counts[cat], exp_va)
+
+            for q in queries_data:
+                supp = [p for p in q["paragraphs"] if p["is_supporting"]]
+                dists = [p for p in q["paragraphs"] if not p["is_supporting"]]
+                if q["question_type"] == "Info Not Found":
+                    self.assertEqual(len(supp), 0)
+                    self.assertIn("Insufficient information", q["answer_aliases"])
+                else:
+                    self.assertEqual(len(supp), 1)
+                self.assertEqual(len(dists), 2)
+
+            trainset, valset, corpus_docs = _load_dataset_splits(
+                ["enterprise"],
+                workspace_root=tmp_root,
+                max_queries=180,
+                train_queries=120,
+                query_offset=0,
+            )
+            self.assertEqual(len(trainset), 120)
+            assert valset is not None
+            self.assertEqual(len(valset), 60)
+            self.assertGreater(len(corpus_docs), 200)
+
     def test_text_stopwords(self):
         self.assertGreater(len(TEXT_STOPWORDS), 50)
         for expected in ("the", "and", "that", "with", "from", "they"):
             self.assertIn(expected, TEXT_STOPWORDS)
-
 
 
 class EvaluationAndIntegrityTests(unittest.TestCase):
@@ -435,191 +553,6 @@ class EvaluationAndIntegrityTests(unittest.TestCase):
             ["George Rankin\nGeorge Rankin is a politician."],
         ]
         self.gold_answers = [["Rockland County"], ["Politician"]]
-
-    def test_evaluate_benchmark_compares_hipporag_and_standard_dpr(self):
-        with self.assertRaisesRegex(ValueError, "qa_batch_size"):
-            evaluate_benchmark(Mock(), self.queries, self.gold_docs, self.gold_answers, qa_batch_size=0)
-
-        graph_results = [
-            SimpleNamespace(
-                question=self.queries[0],
-                answer="Rockland County",
-                docs=list(self.gold_docs[0]),
-                doc_scores=[0.9, 0.8],
-                graph_seeds=[("erik hort", "born in", "montebello")],
-            ),
-            SimpleNamespace(
-                question=self.queries[1],
-                answer="Politician",
-                docs=list(self.gold_docs[1]),
-                doc_scores=[0.95],
-                graph_seeds=[],
-            ),
-        ]
-        dpr_results = [
-            SimpleNamespace(
-                question=self.queries[0],
-                answer="Montebello",
-                docs=[self.gold_docs[0][0], "Distractor\nUnrelated"],
-                doc_scores=[0.7, 0.6],
-                graph_seeds=[],
-            ),
-            SimpleNamespace(
-                question=self.queries[1],
-                answer="Politician",
-                docs=list(self.gold_docs[1]),
-                doc_scores=[0.95],
-                graph_seeds=[],
-            ),
-        ]
-        hipporag = Mock()
-        hipporag.rag_qa.return_value = (
-            graph_results,
-            [],
-            [],
-            {"Recall@1": 0.75, "Recall@2": 1.0, "Recall@5": 1.0, "Recall@200": 1.0},
-            {"ExactMatch": 1.0, "F1": 1.0},
-        )
-        hipporag.rag_qa_dpr.return_value = (
-            dpr_results,
-            [],
-            [],
-            {"Recall@1": 0.75, "Recall@2": 0.75, "Recall@5": 0.75, "Recall@200": 1.0},
-            {"ExactMatch": 0.5, "F1": 0.5},
-        )
-
-        records, metrics = evaluate_benchmark(
-            hipporag,
-            self.queries,
-            self.gold_docs,
-            self.gold_answers,
-            dataset_name="musique",
-            qa_top_k=5,
-        )
-        self.assertEqual(len(records), 2)
-        self.assertEqual(metrics["hipporag"]["retrieval"]["Recall@5"], 1.0)
-        self.assertEqual(metrics["standard_dpr"]["retrieval"]["Recall@5"], 0.75)
-        self.assertAlmostEqual(metrics["delta_vs_dpr"]["Recall@5"], 0.25)
-        self.assertAlmostEqual(metrics["delta_vs_dpr"]["F1"], 0.5)
-        self.assertEqual(
-            metrics["recognition_memory"],
-            {
-                "queries_with_graph_seeds": 1,
-                "dpr_fallback_count": 1,
-                "dpr_fallback_rate": 0.5,
-            },
-        )
-        self.assertEqual(metrics["paper_baselines"], PAPER_BASELINES["musique"])
-
-    def test_evaluate_benchmark_staged_one_by_one_qa_and_memory_release(self):
-        class StagedHippoRAGStub:
-            def __init__(self, queries, gold_docs):
-                self._queries = queries
-                self._gold_docs = gold_docs
-                self.retrieve_batches = []
-                self.retrieve_dpr_batches = []
-                self.qa_batches = []
-                self.memory_released_before_qa = False
-                self._openie_info = [{"idx": "c1"}]
-                self.entity_embeddings = [1, 2, 3]
-                self.passage_embeddings = [4, 5, 6]
-                self.fact_embeddings = [7, 8, 9]
-                self.query_to_embedding: dict[str, dict[str, object]] = {"triple": {"q": 1}, "passage": {"q": 2}}
-                self.ready_to_retrieve = True
-
-            def retrieve(self, queries, num_to_retrieve=None):
-                self.retrieve_batches.append((list(queries), num_to_retrieve))
-                self.query_to_embedding["triple"][queries[0]] = "vec"
-                self.query_to_embedding["passage"][queries[0]] = "vec"
-                q = queries[0]
-                idx = self._queries.index(q)
-                return [
-                    SimpleNamespace(
-                        question=q,
-                        answer=None,
-                        docs=list(self._gold_docs[idx]) + [f"Extra {i}" for i in range(10)],
-                        doc_scores=[0.9] * 12,
-                        doc_metadata=[{}] * 12,
-                        graph_seeds=[("erik hort", "born in", "montebello")] if idx == 0 else [],
-                        _mode="graph",
-                    )
-                ]
-
-            def retrieve_dpr(self, queries, num_to_retrieve=None):
-                self.retrieve_dpr_batches.append((list(queries), num_to_retrieve))
-                q = queries[0]
-                idx = self._queries.index(q)
-                return [
-                    SimpleNamespace(
-                        question=q,
-                        answer=None,
-                        docs=[self._gold_docs[idx][0], "Distractor\nUnrelated"],
-                        doc_scores=[0.7, 0.6],
-                        doc_metadata=[{}, {}],
-                        graph_seeds=[],
-                        _mode="dpr",
-                    )
-                ]
-
-            def qa(self, query_solutions):
-                if (
-                    self.entity_embeddings is None
-                    and self.passage_embeddings is None
-                    and self.fact_embeddings is None
-                    and self._openie_info is None
-                    and not self.ready_to_retrieve
-                ):
-                    self.memory_released_before_qa = True
-                self.qa_batches.append(len(query_solutions))
-                for sol in query_solutions:
-                    if sol.question == self._queries[0]:
-                        sol.answer = "Rockland County" if sol._mode == "graph" else "Montebello"
-                    else:
-                        sol.answer = "Politician"
-                return query_solutions, ["raw"], [{}]
-
-        stub = StagedHippoRAGStub(self.queries, self.gold_docs)
-        records, metrics = evaluate_benchmark(
-            stub,
-            self.queries,
-            self.gold_docs,
-            self.gold_answers,
-            dataset_name="2wikimultihopqa",
-            qa_top_k=5,
-            qa_batch_size=1,
-        )
-        self.assertEqual(stub.retrieve_batches, [([self.queries[0]], 5), ([self.queries[1]], 5)])
-        self.assertEqual(stub.retrieve_dpr_batches, [([self.queries[0]], 5), ([self.queries[1]], 5)])
-        self.assertEqual(stub.qa_batches, [1, 1, 1, 1])
-        self.assertTrue(stub.memory_released_before_qa)
-        self.assertEqual(stub.query_to_embedding, {"triple": {}, "passage": {}})
-        self.assertEqual(len(records[0]["qa_evidence"]), 5)
-        self.assertEqual(metrics["hipporag"]["qa"]["ExactMatch"], 1.0)
-        self.assertEqual(metrics["standard_dpr"]["qa"]["ExactMatch"], 0.5)
-
-        # Retrieval-only mode (include_qa=False) skips qa() calls entirely and sets qa metrics to None
-        retrieval_stub = StagedHippoRAGStub(self.queries, self.gold_docs)
-        ret_records, ret_metrics = evaluate_benchmark(
-            retrieval_stub,
-            self.queries,
-            self.gold_docs,
-            self.gold_answers,
-            dataset_name="hotpotqa",
-            qa_top_k=5,
-            qa_batch_size=1,
-            include_qa=False,
-        )
-        self.assertEqual(retrieval_stub.qa_batches, [])
-        self.assertEqual(ret_metrics["hipporag"]["retrieval"]["Recall@5"], 1.0)
-        self.assertIsNone(ret_metrics["hipporag"]["qa"])
-        self.assertIsNone(ret_metrics["standard_dpr"]["qa"])
-        self.assertIsNone(ret_metrics["delta_vs_dpr"]["ExactMatch"])
-        self.assertIsNone(ret_metrics["delta_vs_dpr"]["F1"])
-        self.assertIsNone(ret_records[0]["qa_metrics"])
-        self.assertEqual(
-            check_benchmark_integrity(ret_records, {"num_passage_nodes": 5, "num_extracted_triples": 10}, 5, include_qa=False),
-            [],
-        )
 
     def test_integrity_gate_catches_silent_failures(self):
         valid_records = [
@@ -660,72 +593,6 @@ class EvaluationAndIntegrityTests(unittest.TestCase):
         errs = check_benchmark_integrity(no_seed_records, valid_graph, expected_doc_count=5)
         self.assertTrue(any("graph_seeds" in e for e in errs))
 
-    def test_index_documents_in_batches_handles_fresh_partial_and_cached_stores(self):
-        docs = [f"Doc {i}\nText {i}" for i in range(18)]
-
-        # 1. Invalid batch size rejected
-        with self.assertRaisesRegex(ValueError, "index_batch_size"):
-            index_documents_in_batches(Mock(), docs, batch_size=0)
-
-        # 2. Empty docs returns 0 calls
-        empty_rag = Mock()
-        self.assertEqual(index_documents_in_batches(empty_rag, [], batch_size=8), 0)
-        empty_rag.index.assert_not_called()
-
-        # 3. Fresh index (_graph_state_available=False) indexes in 3 batches of 8, 8, 2 and releases transient state
-        fresh_rag = Mock(_graph_state_available=False, _openie_info=[{"idx": "1"}], entity_id_to_row={"e": 1})
-        self.assertEqual(index_documents_in_batches(fresh_rag, docs, batch_size=8), 3)
-        self.assertEqual(
-            [call.kwargs["docs"] for call in fresh_rag.index.call_args_list],
-            [docs[0:8], docs[8:16], docs[16:18]],
-        )
-        self.assertIsNone(fresh_rag._openie_info)
-        self.assertIsNone(fresh_rag.entity_id_to_row)
-
-        # 4. Partially built index (_graph_state_available=True) indexes only remaining docs in batches
-        partial_rag = Mock(_graph_state_available=True)
-        partial_rag.chunk_embedding_store.get_all_texts.return_value = set(docs[:8])
-        self.assertEqual(index_documents_in_batches(partial_rag, docs, batch_size=8), 2)
-        self.assertEqual(
-            [call.kwargs["docs"] for call in partial_rag.index.call_args_list],
-            [docs[8:16], docs[16:18]],
-        )
-
-        # 5. Store has all docs but graph has fewer passage nodes: reconciles with 1 bounded micro-batch (not full docs)
-        reconcile_rag = Mock(_graph_state_available=True)
-        reconcile_rag.chunk_embedding_store.get_all_texts.return_value = set(docs)
-        reconcile_rag.get_graph_info.return_value = {"num_passage_nodes": 10}
-        self.assertEqual(index_documents_in_batches(reconcile_rag, docs, batch_size=8), 1)
-        reconcile_rag.index.assert_called_once_with(docs=docs[:8])
-
-        # 6. Fully built index (_graph_state_available=True, all docs in store and graph) skips index() altogether
-        ready_rag = Mock(_graph_state_available=True)
-        ready_rag.chunk_embedding_store.get_all_texts.return_value = set(docs)
-        ready_rag.get_graph_info.return_value = {"num_passage_nodes": len(docs)}
-        self.assertEqual(index_documents_in_batches(ready_rag, docs, batch_size=8), 0)
-        ready_rag.index.assert_not_called()
-
-        # 7. Real HippoRAG pre_openie method checkpoints OpenIE in micro-batches and builds graph once
-        class StagedIndexStub:
-            def __init__(self):
-                self._graph_state_available = False
-                self._openie_info = [{"idx": "1"}]
-                self.pre_openie_batches = []
-                self.index_calls = []
-
-            def pre_openie(self, batch_docs):
-                self.pre_openie_batches.append(list(batch_docs))
-                raise RuntimeError("Offline OpenIE completed. Run indexing again with openie_mode='online' to build the graph.")
-
-            def index(self, docs):
-                self.index_calls.append(list(docs))
-
-        staged_index = StagedIndexStub()
-        self.assertEqual(index_documents_in_batches(staged_index, docs, batch_size=8), 3)
-        self.assertEqual(staged_index.pre_openie_batches, [docs[0:8], docs[8:16], docs[16:18]])
-        self.assertEqual(staged_index.index_calls, [docs])
-        self.assertIsNone(staged_index._openie_info)
-
 
 class PaperParityGateTests(unittest.TestCase):
     def test_popqa_slice_pads_to_at_least_two_passages_per_index_query(self):
@@ -752,8 +619,16 @@ class PaperParityGateTests(unittest.TestCase):
     def test_compare_and_aggregate_gate_reports_and_markdown_table(self):
         from scripts.verify_paper_parity_gate import (
             aggregate_gate_summary,
+            build_monkeypatched_baseline_report,
             compare_engine_reports,
             format_gate_markdown,
+        )
+
+        baseline_rep = build_monkeypatched_baseline_report("2wiki", queries_per_dataset=25)
+        self.assertEqual(baseline_rep["engine"], "hipporag")
+        self.assertAlmostEqual(
+            baseline_rep["evaluation_metrics"]["hipporag"]["retrieval"]["Recall@5"],
+            MONKEYPATCHED_HIPPORAG_BASELINES["2wikimultihopqa"]["Recall@5"],
         )
 
         hippo_rep = {
@@ -822,6 +697,7 @@ class PaperParityGateTests(unittest.TestCase):
         self.assertEqual(comp["gate_status"], "PASS")
         self.assertAlmostEqual(comp["delta_yaw_vs_hipporag"]["Recall@5"], 0.04)
         self.assertAlmostEqual(comp["delta_yaw_vs_hipporag"]["F1"], 0.04)
+        self.assertAlmostEqual(comp["delta_yaw_vs_paper"]["Recall@5"], round(0.88 - 0.904, 4))
 
         summary = aggregate_gate_summary({"2wikimultihopqa": comp}, mode="eval")
         self.assertTrue(summary["overall_gate_passed"])

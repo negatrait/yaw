@@ -115,7 +115,7 @@ class FilterTriples(dspy.Signature):
 
 
 class AnswerQuestion(dspy.Signature):
-    """As an advanced reading comprehension assistant, your task is to analyze text passages and corresponding questions meticulously. Break down the reasoning process methodically, illustrating how you arrive at conclusions, and present a concise, definitive final answer devoid of additional elaborations. For 'Who', 'What', 'When', or 'Where' questions, state only the exact bare entity, name, or number without conversational phrases or articles. For 'How' or 'Why' questions, state both the key condition/means and the resulting outcome from the passages."""
+    """As an advanced reading comprehension assistant, your task is to analyze text passages and corresponding questions meticulously. Break down the reasoning process methodically, illustrating how you arrive at conclusions, and present a concise, definitive final answer devoid of additional elaborations. For 'Who', 'What', 'When', or 'Where' questions, state only the exact bare entity, name, or number without conversational phrases or articles. For 'How' or 'Why' questions, state both the key condition/means and the resulting outcome from the passages. If the provided context lacks sufficient information to answer the question, state: "Insufficient references in corpus to answer properly, consider ingesting more supporting documents." or "Insufficient information"."""
 
     context: str = dspy.InputField(desc="Retrieved evidence passages")
     question: str = dspy.InputField(desc="Question to answer")

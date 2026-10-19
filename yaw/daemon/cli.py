@@ -146,7 +146,7 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="*",
         default=None,
         help=(
-            "One or more Tier 1 dataset names (sample, 2wikimultihopqa, musique, hotpotqa) "
+            "One or more dataset names (enterprise_rag_bench, sample, 2wikimultihopqa, musique, hotpotqa) "
             "or path to JSON training file (defaults to yaw.toml [optimization].datasets)"
         ),
     )
@@ -391,7 +391,17 @@ def inspect_status(config: YawConfig) -> dict[str, Any]:
 
 
 _TIER2_CORPORA = frozenset({"2wikimultihopqa", "musique", "hotpotqa"})
-_KNOWN_DATASETS = frozenset({"sample", "2wikimultihopqa", "musique", "hotpotqa"})
+_KNOWN_DATASETS = frozenset(
+    {
+        "sample",
+        "2wikimultihopqa",
+        "musique",
+        "hotpotqa",
+        "enterprise_rag_bench",
+        "enterprise",
+    }
+)
+_DATASET_ALIASES = {"enterprise": "enterprise_rag_bench"}
 
 
 def _extract_item_gold_answers(item: dict[str, Any]) -> list[str]:
@@ -405,6 +415,7 @@ def _extract_item_gold_answers(item: dict[str, Any]) -> list[str]:
         raw = []
     ans = [raw] if isinstance(raw, str) else [str(a) for a in (raw or ())]
     ans.extend(str(a) for a in item.get("answer_aliases", ()))
+    ans.extend(str(a) for a in item.get("answer_facts", ()))
     return list(dict.fromkeys(ans))
 
 
@@ -466,11 +477,12 @@ def _load_single_dataset_examples(
 
     candidate_path = Path(ds_clean)
     if not candidate_path.exists() and ds_clean in _KNOWN_DATASETS:
+        resolved_ds = _DATASET_ALIASES.get(ds_clean, ds_clean)
         roots = [Path.cwd()]
         if workspace_root is not None:
             roots.insert(0, workspace_root)
         for root in roots:
-            cached = root / "outputs" / "datasets" / f"{ds_clean}.json"
+            cached = root / "outputs" / "datasets" / f"{resolved_ds}.json"
             if cached.exists():
                 candidate_path = cached
                 break

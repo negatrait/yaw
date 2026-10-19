@@ -616,7 +616,8 @@ def test_cli_optimize_ergonomics_and_anti_overfitting_gate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Verify `yaw dspy optimize` CLI ergonomics: benchmark slice parsing, train/val split, telemetry paths, and Tier 2 anti-overfitting guard."""
-    _, toml_path = _make_test_config(tmp_path)
+    cfg, toml_path = _make_test_config(tmp_path)
+    assert cfg.corpus_root is not None
     prog, emb, _, _ = _make_program_and_embedder()
 
     # Write a 6-query benchmark-format dataset JSON (with paragraphs + is_supporting)
@@ -644,6 +645,7 @@ def test_cli_optimize_ergonomics_and_anti_overfitting_gate(
     bench_dataset_path.write_text(json.dumps(bench_samples), encoding="utf-8")
 
     captured_gepa: dict[str, Any] = {}
+    opt_slice_file = cfg.corpus_root / ".yaw_optimize_slice.json"
 
     class CaptureGEPA:
         def __init__(self, metric: Any, **kwargs: Any) -> None:
@@ -653,6 +655,12 @@ def test_cli_optimize_ergonomics_and_anti_overfitting_gate(
         def compile(self, student: Any, trainset: list[Any], valset: Any = None) -> Any:
             captured_gepa["trainset_len"] = len(trainset)
             captured_gepa["valset_len"] = len(valset) if valset is not None else 0
+            # Verify .yaw_optimize_slice.json stays on disk with indent=2 during GEPA evolution
+            assert opt_slice_file.exists()
+            raw_slice_text = opt_slice_file.read_text(encoding="utf-8")
+            assert "\n  {\n" in raw_slice_text
+            pred = student(question=trainset[0].question)
+            assert pred.context.strip() != ""
             proposer = captured_gepa.get("instruction_proposer")
             if proposer is not None and hasattr(proposer, "telemetry"):
                 proposer.telemetry.append(
@@ -693,6 +701,7 @@ def test_cli_optimize_ergonomics_and_anti_overfitting_gate(
             embedder=emb,
         )
     assert rc == 0
+    assert opt_slice_file.exists()
     opt_out = json.loads(buf.getvalue())
     assert opt_out["optimized"] is True
     assert opt_out["mode"] == "gepa"

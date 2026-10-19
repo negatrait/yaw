@@ -26,6 +26,7 @@ class DownloadDatasetsTests(unittest.TestCase):
             "lveval",
             "narrativeqa",
             "case_study_university",
+            "enterprise_rag_bench",
         }
         self.assertEqual(set(download_datasets.DATASET_REGISTRY.keys()), expected_benchmarks)
 
