@@ -848,6 +848,10 @@ def handle_dspy_optimize(
 
     runtime = YawRuntime(opt_config, program=program, embedder=embedder, auto_poll=False)
     runtime.start(sync_on_start=False)
+
+    def _cli_progress(msg: str) -> None:
+        print(f"\r[yaw optimize] {msg}\x1b[K", end="", file=sys.stderr, flush=True)
+
     try:
         saved_path = runtime.optimize(
             trainset=trainset,
@@ -858,7 +862,9 @@ def handle_dspy_optimize(
             num_candidates=num_candidates,
             num_trials=num_trials,
             corpus_docs=corpus_docs,
+            progress_callback=_cli_progress,
         )
+        print(file=sys.stderr)  # Move to next line before JSON output
         proposer_telemetry = saved_path.parent / f"{saved_path.stem}_proposer_telemetry.json"
         graph_rlm_audit = saved_path.parent / f"{saved_path.stem}_graph_rlm_audit.json"
         gepa_telemetry_dir = saved_path.parent / f"{saved_path.stem}_telemetry"
