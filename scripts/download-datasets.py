@@ -178,7 +178,7 @@ urllib.request.urlretrieve(q_url, q_tmp)
 q_table = pq.read_table(q_tmp)
 q_rows = q_table.to_pylist()
 
-# Determine stratified 180 queries to know which gold doc_ids we need
+# Determine stratified 250 queries to know which gold doc_ids we need
 by_cat = {}
 for r in q_rows:
     raw_c = str(r.get("question_type") or "").strip()
@@ -282,7 +282,7 @@ def download_enterprise_rag_bench(
     questions_rows: list[dict[str, Any]] | None = None,
     documents_rows: list[dict[str, Any]] | None = None,
 ) -> tuple[Path, Path]:
-    """Build stratified 180-query EnterpriseRAG-Bench dataset (120 train + 60 val) and 2.0x same-tool distractor corpus."""
+    """Build stratified 250-query EnterpriseRAG-Bench dataset (150 train + 100 val) and 2.0x same-tool distractor corpus."""
     q_file, c_file, _ = DATASET_REGISTRY["enterprise_rag_bench"]
     q_target = dest_dir / q_file
     c_target = dest_dir / c_file
