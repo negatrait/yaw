@@ -10,10 +10,63 @@ for _logger_name in ("LiteLLM", "LiteLLM Router", "LiteLLM Proxy", "litellm", "h
     logging.getLogger(_logger_name).setLevel(logging.WARNING)
 
 __all__ = [
+    "YawDSPyLM",
     "create_dspy_lm",
     "create_dspy_rlm_pair",
     "lm_supports_gbnf",
 ]
+
+
+class YawDSPyLM(dspy.LM):
+    """Native dspy.LM wrapper providing recipe-aware fixes (e.g. Ryzen AI Jinja system folding)."""
+
+    def __call__(self, prompt: Any = None, *, messages: Any = None, **kwargs: Any) -> Any:
+        if (
+            getattr(self, "_yaw_recipe", None) == "ryzenai-llm"
+            and isinstance(messages, list)
+            and len(messages) >= 2
+            and isinstance(messages[0], dict)
+            and messages[0].get("role") == "system"
+            and isinstance(messages[1], dict)
+            and messages[1].get("role") == "user"
+        ):
+            messages = [
+                {
+                    "role": "user",
+                    "content": str(messages[0].get("content", "")).strip()
+                    + "\n\n"
+                    + str(messages[1].get("content", "")),
+                },
+                *messages[2:],
+            ]
+        return super().__call__(prompt=prompt, messages=messages, **kwargs)
+
+    def forward(self, prompt: Any = None, messages: Any = None, **kwargs: Any) -> Any:
+        if (
+            getattr(self, "_yaw_recipe", None) == "ryzenai-llm"
+            and isinstance(messages, list)
+            and len(messages) >= 2
+            and isinstance(messages[0], dict)
+            and messages[0].get("role") == "system"
+            and isinstance(messages[1], dict)
+            and messages[1].get("role") == "user"
+        ):
+            messages = [
+                {
+                    "role": "user",
+                    "content": str(messages[0].get("content", "")).strip()
+                    + "\n\n"
+                    + str(messages[1].get("content", "")),
+                },
+                *messages[2:],
+            ]
+        return super().forward(prompt=prompt, messages=messages, **kwargs)
+
+    def copy(self, **kwargs: Any) -> Any:
+        copied = super().copy(**kwargs)
+        setattr(copied, "_yaw_recipe", getattr(self, "_yaw_recipe", None))
+        setattr(copied, "_yaw_supports_gbnf", getattr(self, "_yaw_supports_gbnf", False))
+        return copied
 
 
 def create_dspy_lm(
@@ -26,14 +79,17 @@ def create_dspy_lm(
     temperature: float | None = None,
     max_tokens: int | None = None,
     cache: bool = True,
-    num_retries: int = 0,
+    num_retries: int = 1,
+    timeout: float = 240.0,
     **kwargs: Any,
 ) -> dspy.LM:
     """Create a native dspy.LM configured for Lemonade (openai/...) or Ollama (ollama_chat/...).
 
-    Applies recipe-aware and role-aware defaults for our 3-slot hardware stack:
-    - Qwen3-4B-Instruct-2507-GGUF (llamacpp on Vulkan GPU, 8192-16384 ctx): supports GBNF, temp=0.2, freq_penalty=0.5.
-    - Mistral-7B-Instruct-v0.3-Hybrid (ryzenai-llm on NPU/OGA, 32786 ctx): NO GBNF, orchestrator for RLM.
+    Applies recipe-aware and role-aware defaults for our local hardware stack:
+    - Qwen3-4B-Instruct-2507-GGUF (llamacpp on Vulkan GPU, 16384 ctx): supports GBNF for direct/worker
+      roles (`extraction`, `qa`, `reflection_worker`) with temp=0.2, freq_penalty=0.5, and runs
+      unconstrained Python REPL code generation (`_yaw_supports_gbnf=False`) for RLM orchestrator roles
+      (`rlm`, `reflection`).
     - gemma4-it-12b-FLM (flm): extra_body={"think": False}.
     """
     clean_name = model_name
@@ -58,7 +114,7 @@ def create_dspy_lm(
             temperature = 0.0
 
     if max_tokens is None:
-        # Per-completion output token cap (total context window is 16384 on Qwen and 32786 on Mistral in Lemonade).
+        # Per-completion output token cap (total context window is 16384 on Qwen in Lemonade).
         max_tokens = 4096
 
     lm_kwargs: dict[str, Any] = dict(kwargs)
@@ -77,7 +133,7 @@ def create_dspy_lm(
             if model_name.startswith(("ollama_chat/", "ollama/"))
             else f"ollama_chat/{clean_name}"
         )
-        lm = dspy.LM(
+        lm = YawDSPyLM(
             model=litellm_model,
             model_type="chat",
             temperature=temperature,
@@ -85,11 +141,12 @@ def create_dspy_lm(
             cache=cache,
             num_retries=num_retries,
             api_base=base_url,
+            timeout=timeout,
             **lm_kwargs,
         )
     else:
         litellm_model = model_name if "/" in model_name else f"openai/{clean_name}"
-        lm = dspy.LM(
+        lm = YawDSPyLM(
             model=litellm_model,
             model_type="chat",
             temperature=temperature,
@@ -98,11 +155,12 @@ def create_dspy_lm(
             num_retries=num_retries,
             api_base=base_url,
             api_key=api_key,
+            timeout=timeout,
             **lm_kwargs,
         )
 
     setattr(lm, "_yaw_recipe", recipe)
-    setattr(lm, "_yaw_supports_gbnf", recipe == "llamacpp")
+    setattr(lm, "_yaw_supports_gbnf", (recipe == "llamacpp") and (role not in ("rlm", "reflection")))
     return lm
 
 
@@ -117,14 +175,14 @@ def create_dspy_rlm_pair(
     cache: bool = True,
     num_retries: int = 0,
 ) -> tuple[dspy.LM, dspy.LM]:
-    """Create the heterogeneous (Mistral NPU Orchestrator, Qwen GPU GBNF Worker) LM pair.
+    """Create the `(orchestrator_lm, sub_lm)` DSPy LM pair on `Qwen3-4B-Instruct-2507-GGUF`.
 
-    - `orchestrator_lm` (`Mistral-7B-Instruct-v0.3-Hybrid` on Ryzen AI NPU/OGA): runs outer `dspy.RLM`
-      Python REPL orchestration without GBNF (`_yaw_supports_gbnf=False`).
-    - `sub_lm` (`Qwen3-4B-Instruct-2507-GGUF` on `llama.cpp` Vulkan GPU): runs inner `llm_query` and
-      GBNF-constrained `qwen_*` worker calls (`_yaw_supports_gbnf=True`).
+    - `orchestrator_lm` (`role="rlm"` or `"reflection"`): runs `dspy.RLM` Python REPL code
+      generation without GBNF (`_yaw_supports_gbnf=False`).
+    - `sub_lm` (`role="extraction"` or `"reflection_worker"`): runs inner `llm_query`,
+      `synthesize_instruction`, and GBNF-constrained `qwen_*` worker calls (`_yaw_supports_gbnf=True`).
     - When `reflection=True`, configures `orchestrator_lm` with `role="reflection"` (`temp=0.8`, `max_tokens=4096`)
-      and `sub_lm` with `role="reflection_worker"` (`temp=0.7`, `max_tokens=2048`, `freq_penalty=0.3`).
+      and `sub_lm` with `role="reflection_worker"` (`temp=0.7`, `max_tokens=4096`, `freq_penalty=0.3`).
     """
     orchestrator_lm = create_dspy_lm(
         orchestrator_model,

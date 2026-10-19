@@ -273,3 +273,195 @@ def test_target_sink_compiler_callback_and_retry_on_failure(tmp_path: Path) -> N
         assert len(delta.added_chunks) == 1
         assert len(observed_deltas) == 1
         assert observed_deltas[0] == delta
+
+
+def test_zero_markdown_it_in_corpus_module() -> None:
+    import ast
+    import inspect
+
+    import yaw.daemon.ingestion.corpus as corpus_mod
+
+    source = inspect.getsource(corpus_mod)
+    tree = ast.parse(source)
+    imported_modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imported_modules.add(alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported_modules.add(node.module.split(".")[0])
+    assert "markdown_it" not in imported_modules
+    assert "cocoindex" in imported_modules
+
+
+def test_native_cocoindex_ast_headings_across_languages() -> None:
+    from yaw.daemon.ingestion import chunk_source_text, extract_ast_headings
+
+    # 1. HTML (<title>, <h1>, <h2>)
+    html_doc = (
+        "<html>\n"
+        "<head><title>Portal Overview</title></head>\n"
+        "<body>\n"
+        "<h1>Authentication</h1>\n"
+        "<p>OAuth2 flow details.</p>\n"
+        "<h2>Token Refresh</h2>\n"
+        "<p>Refresh token rotation policy.</p>\n"
+        "</body>\n"
+        "</html>\n"
+    )
+    html_headings = extract_ast_headings(html_doc, language="html")
+    html_titles = [t for _, t in html_headings]
+    assert "Portal Overview" in html_titles
+    assert "Authentication" in html_titles
+    assert "Token Refresh" in html_titles
+
+    # 2. TOML ([section])
+    toml_doc = (
+        "[ingestion]\n"
+        "chunk_size = 1200\n\n"
+        "[graph.ppr]\n"
+        "damping = 0.5\n"
+    )
+    toml_headings = extract_ast_headings(toml_doc, language="toml")
+    assert toml_headings == [(1, "ingestion"), (4, "graph.ppr")]
+
+    # 3. YAML (top-level keys)
+    yaml_doc = (
+        "service:\n"
+        "  host: localhost\n"
+        "database:\n"
+        "  path: yaw.db\n"
+    )
+    yaml_headings = extract_ast_headings(yaml_doc, language="yaml")
+    assert yaml_headings == [(1, "service"), (3, "database")]
+
+    # 4. Python (class and def AST scopes)
+    py_doc = (
+        "class TokenVerifier:\n"
+        "    def verify_signature(self, payload: bytes) -> bool:\n"
+        "        digest = len(payload)\n"
+        "        return digest > 0\n"
+    )
+    py_headings = extract_ast_headings(py_doc, language="python")
+    py_titles = [t for _, t in py_headings]
+    assert any("class TokenVerifier" in t for t in py_titles)
+    assert any("def verify_signature" in t for t in py_titles)
+
+    py_chunks = chunk_source_text(py_doc, "auth/verifier.py")
+    assert len(py_chunks) == 1
+    assert "TokenVerifier" in py_chunks[0][0].title
+
+
+def test_corporate_json_secret_blacklisting_and_hydration(tmp_path: Path) -> None:
+    import json
+
+    corpus_dir = tmp_path / "corpus"
+    state_dir = tmp_path / "state"
+    corpus_dir.mkdir()
+    state_dir.mkdir()
+
+    corporate_payload = [
+        {
+            "title": "Internal Payment Gateway",
+            "user": "corp_admin_secret_user",
+            "password": "super_secret_password_987",
+            "credentials": {
+                "db_password": "nested_password_456",
+                "auth_header": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.secret",
+            },
+            "endpoint": "https://payments.internal.example/v2",
+            "retries": 3,
+        }
+    ]
+    json_file = corpus_dir / "services.json"
+    json_file.write_text(json.dumps(corporate_payload, indent=2), encoding="utf-8")
+
+    delta = sync_corpus_once(
+        corpus_dir,
+        state_dir,
+        json_keys_whitelist=("*",),
+        json_keys_blacklist=("Bearer*", "*password*", "user"),
+    )
+    assert len(delta.added_chunks) == 1
+    ptr, chunk_text = delta.added_chunks[0]
+    assert ptr.title == "Internal Payment Gateway"
+    assert "https://payments.internal.example/v2" in chunk_text
+    assert "corp_admin_secret_user" not in chunk_text
+    assert "super_secret_password_987" not in chunk_text
+    assert "nested_password_456" not in chunk_text
+    assert "Bearer eyJ" not in chunk_text
+
+    # Physical air-gap check on source file and 1-indexed line hydration
+    hydrated = hydrate_chunk_pointer(ptr, corpus_dir)
+    assert not hydrated.stale_on_disk
+    assert "Internal Payment Gateway" in hydrated.text
+    assert "https://payments.internal.example/v2" in hydrated.text
+    assert "corp_admin_secret_user" not in hydrated.text
+    assert "super_secret_password_987" not in hydrated.text
+    assert "Bearer eyJ" not in hydrated.text
+
+
+def test_benchmark_json_air_gapping_and_exact_passage_hydration(tmp_path: Path) -> None:
+    import json
+
+    from benchmark import BENCHMARK_JSON_BLACKLIST, BENCHMARK_JSON_WHITELIST
+
+    corpus_dir = tmp_path / "corpus"
+    state_dir = tmp_path / "state"
+    corpus_dir.mkdir()
+    state_dir.mkdir()
+
+    hotpot_sample = [
+        {
+            "_id": "hp_leak_test_1",
+            "question": "LEAKED_QUESTION_STRING_XYZ?",
+            "answer": "LEAKED_ANSWER_STRING_ABC",
+            "supporting_facts": [["Montebello", 0], ["Rockland County", 0]],
+            "context": [
+                [
+                    "Montebello",
+                    [
+                        "Montebello is an incorporated village in the town of Ramapo.",
+                        "It is in Rockland County, New York.",
+                    ],
+                ],
+                [
+                    "Rockland County",
+                    [
+                        "Rockland County is the southernmost county on the west side of the Hudson River."
+                    ],
+                ],
+            ],
+        }
+    ]
+    hp_path = corpus_dir / "hotpotqa_sample.json"
+    hp_path.write_text(json.dumps(hotpot_sample, indent=2), encoding="utf-8")
+
+    delta = sync_corpus_once(
+        corpus_dir,
+        state_dir,
+        json_keys_whitelist=BENCHMARK_JSON_WHITELIST,
+        json_keys_blacklist=BENCHMARK_JSON_BLACKLIST,
+    )
+    assert len(delta.added_chunks) == 2
+
+    hydrated_texts = []
+    for ptr, c_text in sorted(delta.added_chunks, key=lambda item: item[0].start_line):
+        assert "LEAKED_QUESTION_STRING_XYZ" not in c_text
+        assert "LEAKED_ANSWER_STRING_ABC" not in c_text
+        hp = hydrate_chunk_pointer(ptr, corpus_dir)
+        assert not hp.stale_on_disk
+        assert "LEAKED_QUESTION_STRING_XYZ" not in hp.text
+        assert "LEAKED_ANSWER_STRING_ABC" not in hp.text
+        hydrated_texts.append(hp.text)
+
+    expected_p1 = (
+        "Montebello\n"
+        "Montebello is an incorporated village in the town of Ramapo."
+        "It is in Rockland County, New York."
+    )
+    expected_p2 = (
+        "Rockland County\n"
+        "Rockland County is the southernmost county on the west side of the Hudson River."
+    )
+    assert hydrated_texts == [expected_p1, expected_p2]

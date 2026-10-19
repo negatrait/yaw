@@ -40,52 +40,6 @@ class ChatTests(unittest.TestCase):
                     else:
                         self.assertNotIn("extra_body", params)
 
-    def test_ryzenai_folds_leading_system_message_and_unescapes_markdown_underscores(self):
-        from yaw.daemon.graph.inference.legacy_chat import QA_TURN_REMINDER, TIGHTENED_QA_SYSTEM
-
-        with TemporaryDirectory(ignore_cleanup_errors=True) as directory, closing(
-            LocalChat.from_experiment_config(BaseConfig(
-                save_dir=directory, llm_name="Mistral-7B-Instruct-v0.3-Hybrid",
-                llm_base_url="http://localhost:13305/api/v1", max_retry_attempts=0,
-            ))
-        ) as chat:
-            chat.openai_client.close()
-            chat.openai_client = MagicMock()
-            chat.openai_client.chat.completions.create.return_value = SimpleNamespace(
-                id="resp-1", model="mistral",
-                choices=[SimpleNamespace(message=SimpleNamespace(content=r'{"named\_entities": ["George"]}'), finish_reason="stop")],
-                usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5, total_tokens=15),
-            )
-            ptm = PromptTemplateManager()
-            raw_messages: Any = ptm.render(name="ner", passage="George Rankin is a politician.")
-            text, meta, hit = chat.infer(raw_messages, max_new_tokens=128)
-            self.assertFalse(hit)
-            self.assertEqual(text, '{"named_entities": ["George"]}')
-            sent_messages = chat.openai_client.chat.completions.create.call_args.kwargs["messages"]
-            self.assertEqual([m["role"] for m in sent_messages], ["user", "assistant", "user"])
-            self.assertTrue(sent_messages[0]["content"].startswith(raw_messages[0]["content"].strip()))
-            self.assertIn(raw_messages[1]["content"], sent_messages[0]["content"])
-            self.assertNotIn(QA_TURN_REMINDER, sent_messages[-1]["content"])
-
-            chat.openai_client.chat.completions.create.return_value = SimpleNamespace(
-                id="resp-2", model="mistral",
-                choices=[SimpleNamespace(message=SimpleNamespace(content="Reasoning.\nAnswer: George."), finish_reason="stop")],
-                usage=SimpleNamespace(prompt_tokens=20, completion_tokens=5, total_tokens=25),
-            )
-            qa_messages = ptm.render(
-                name="rag_qa_musique",
-                prompt_user="Wikipedia Title: George Rankin\nGeorge Rankin is a politician.\n\nQuestion: Who is George?\nThought: ",
-            )
-            chat.infer(qa_messages)
-            sent_qa = chat.openai_client.chat.completions.create.call_args.kwargs["messages"]
-            self.assertEqual([m["role"] for m in sent_qa], ["user", "assistant", "user"])
-            self.assertTrue(sent_qa[0]["content"].startswith(TIGHTENED_QA_SYSTEM))
-            self.assertIn(f"\n{QA_TURN_REMINDER}\nQuestion: Who is George?\nThought: ", sent_qa[-1]["content"])
-
-            self.assertEqual(chat.summary()["calls"], 2)
-            self.assertEqual(chat.summary()["total_tokens"], 40)
-            self.assertEqual(chat.errors, [])
-
     def test_llamacpp_applies_openie_json_schemas_and_dspy_rerank_gbnf_grammar(self):
         from yaw.daemon.graph.inference.legacy_chat import QA_GBNF_GRAMMAR, TIGHTENED_QA_SYSTEM
 
@@ -270,7 +224,8 @@ class ChatTests(unittest.TestCase):
 
     def test_chat_identity_distinguishes_all_registered_models_and_policies(self):
         self.assertIn("Phi-4-mini-instruct-GGUF", CHAT_MODELS)
-        self.assertIn("Mistral-7B-Instruct-v0.3-Hybrid", CHAT_MODELS)
+        self.assertIn("Qwen3-4B-Instruct-2507-GGUF", CHAT_MODELS)
+        self.assertNotIn("Mistral-7B-Instruct-v0.3-Hybrid", CHAT_MODELS)
         self.assertEqual(len({chat_identity(name) for name in CHAT_MODELS}), len(CHAT_MODELS))
         self.assertTrue(all("chat-v1" in chat_identity(name) for name in CHAT_MODELS))
 
@@ -289,16 +244,16 @@ class ChatTests(unittest.TestCase):
         self.assertAlmostEqual(qwen_lm.kwargs["frequency_penalty"], 0.5)
         self.assertTrue(lm_supports_gbnf(qwen_lm))
 
-        # Mistral-7B QA/RLM on Lemonade (32786 ctx window, ryzenai-llm NPU -> GBNF NOT supported)
-        mistral_lm = create_dspy_lm("Mistral-7B-Instruct-v0.3-Hybrid", role="qa")
-        self.assertEqual(mistral_lm.model, "openai/Mistral-7B-Instruct-v0.3-Hybrid")
-        self.assertAlmostEqual(mistral_lm.kwargs["temperature"], 0.2)
-        self.assertEqual(mistral_lm.kwargs["max_tokens"], 4096)
-        self.assertFalse(lm_supports_gbnf(mistral_lm))
+        # Qwen3-4B QA on Lemonade (llamacpp GPU -> GBNF supported for direct QA)
+        qwen_qa_lm = create_dspy_lm("Qwen3-4B-Instruct-2507-GGUF", role="qa")
+        self.assertEqual(qwen_qa_lm.model, "openai/Qwen3-4B-Instruct-2507-GGUF")
+        self.assertAlmostEqual(qwen_qa_lm.kwargs["temperature"], 0.2)
+        self.assertEqual(qwen_qa_lm.kwargs["max_tokens"], 4096)
+        self.assertTrue(lm_supports_gbnf(qwen_qa_lm))
 
-        # Heterogeneous RLM pair: (Mistral NPU orchestrator without GBNF, Qwen GPU worker with GBNF)
+        # Unified Qwen RLM pair: (Qwen RLM orchestrator without GBNF, Qwen GPU worker with GBNF)
         orch_lm, sub_lm = create_dspy_rlm_pair()
-        self.assertEqual(orch_lm.model, "openai/Mistral-7B-Instruct-v0.3-Hybrid")
+        self.assertEqual(orch_lm.model, "openai/Qwen3-4B-Instruct-2507-GGUF")
         self.assertEqual(sub_lm.model, "openai/Qwen3-4B-Instruct-2507-GGUF")
         self.assertFalse(lm_supports_gbnf(orch_lm))
         self.assertTrue(lm_supports_gbnf(sub_lm))

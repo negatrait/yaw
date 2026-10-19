@@ -3,6 +3,7 @@
 import functools
 import hashlib
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -11,7 +12,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from filelock import FileLock
-from openai import DefaultHttpxClient, OpenAI
+from openai import BadRequestError, DefaultHttpxClient, OpenAI
 
 from .grammars import gbnf_escape_literal
 from .models import BASE_URL, CHAT_MODELS
@@ -264,6 +265,39 @@ def cache_response(func):
     return wrapper
 
 
+def _guard_context_length(messages: list[dict[str, Any]], max_chars: int = 40000) -> list[dict[str, Any]]:
+    """Ensure prompt messages fit comfortably within the 16k context window (40k chars ~= 10k-12k tokens)."""
+    total_chars = sum(len(str(m.get("content", ""))) for m in messages)
+    if total_chars <= max_chars:
+        return messages
+
+    longest_idx = max(range(len(messages)), key=lambda i: len(str(messages[i].get("content", ""))))
+    longest_msg = messages[longest_idx]
+    content = str(longest_msg.get("content", ""))
+
+    excess = total_chars - max_chars
+    target_len = max(4000, len(content) - excess - 500)
+
+    # Preserve 85% head (instructions + top passages) and 15% tail (question and answer prefix)
+    head_len = int(target_len * 0.85)
+    tail_len = int(target_len * 0.15)
+    head = content[:head_len]
+    tail = content[-tail_len:]
+    truncated = f"{head}\n\n[... document context truncated to fit 16k context window ...]\n\n{tail}"
+
+    logging.warning(
+        "legacy_chat.py: Context guard truncated message %d from %d to %d chars to prevent context overflow",
+        longest_idx,
+        len(content),
+        len(truncated),
+    )
+    new_messages = list(messages)
+    new_msg = dict(longest_msg)
+    new_msg["content"] = truncated
+    new_messages[longest_idx] = new_msg
+    return new_messages
+
+
 class CacheOpenAI:
     """Self-contained OpenAI-compatible chat client with SQLite caching (zero hipporag imports)."""
 
@@ -339,9 +373,22 @@ class CacheOpenAI:
         params = normalize_generation_token_params(
             self.llm_config.generate_params, kwargs, "max_tokens"
         )
-        params["messages"] = messages
+        # Proactively guard messages to fit comfortably within the 16k context window
+        params["messages"] = _guard_context_length(messages, max_chars=40000)
 
-        response = self.openai_client.chat.completions.create(**params)
+        try:
+            response = self.openai_client.chat.completions.create(**params)
+        except BadRequestError as exc:
+            err_str = str(exc).lower()
+            if "context" in err_str or "exceed" in err_str or "token" in err_str:
+                logging.warning(
+                    "legacy_chat.py: Received context_length_exceeded from server (%s). Applying emergency truncation to 26k chars.",
+                    exc,
+                )
+                params["messages"] = _guard_context_length(messages, max_chars=26000)
+                response = self.openai_client.chat.completions.create(**params)
+            else:
+                raise
         if len(response.choices) != 1:
             raise ValueError(
                 f"Expected exactly one OpenAI choice, received {len(response.choices)}."

@@ -12,13 +12,13 @@ import dspy
 from yaw.core.config import YawConfig
 from yaw.core.types import OpenIERecord, StructuredTriple
 
-from .chat import create_dspy_lm, create_dspy_rlm_pair
+from .chat import create_dspy_lm
 from .grammars import (
     DSPY_INSTRUCTION_PROPOSAL_GBNF_GRAMMAR,
     build_dspy_instruction_proposal_grammar,
     build_dspy_missing_entity_defs_grammar,
     build_dspy_ner_grammar,
-    build_dspy_qa_cot_grammar,
+    build_dspy_qa_grammar,
     build_dspy_query_intent_grammar,
     build_dspy_rerank_grammar,
     build_dspy_shacl_repair_grammar,
@@ -39,105 +39,40 @@ from .parsers import (
     text_processing,
 )
 from .prompts import (
-    FACT_FILTER_DEMOS,
     NER_DEMOS,
     QA_DEMOS,
     TRIPLE_DEMOS,
+    TRIPLE_FILTER_DEMOS,
     AnswerQuestion,
     CompressInstructionSignature,
     DefineMissingEntities,
     ExtractEntities,
     ExtractQueryIntent,
     ExtractTriples,
-    FilterFacts,
+    FilterTriples,
     HealSHACLViolations,
     JudgeSynonyms,
-    OrchestrateEntityExtraction,
-    OrchestrateFactFiltering,
-    OrchestrateMissingEntityDefinitions,
-    OrchestrateQuestionAnswering,
-    OrchestrateSynonymJudgment,
-    OrchestrateTripleExtraction,
     ProposeInstructionSignature,
     ProposeSHACLRepairs,
     ReflectiveInnerDistillerSignature,
-    ReflectiveOuterOrchestratorSignature,
 )
 
 _STAGE_RLM_DELEGATION_RULES: dict[str, str] = {
-    "ner": (
-        "CRITICAL RLM SANDBOX RULE:\n"
-        "Do NOT import `nltk` or `spacy`. Delegate directly to `qwen_extract_entities` and call `SUBMIT` in iteration 1:\n"
-        "```python\n"
-        "entities = qwen_extract_entities(passage=passage)\n"
-        "SUBMIT(named_entities=entities)\n"
-        "```"
-    ),
-    "triples": (
-        "CRITICAL RLM SANDBOX RULE:\n"
-        "Do NOT call `qwen_extract_entities` or loop per entity. Pass `passage` and `named_entities` directly to "
-        "`qwen_extract_triples` once and call `SUBMIT` in iteration 1:\n"
-        "```python\n"
-        "triples = qwen_extract_triples(passage=passage, named_entities=named_entities)\n"
-        "SUBMIT(triples=triples)\n"
-        "```"
-    ),
-    "entity_definer": (
-        "CRITICAL RLM SANDBOX RULE:\n"
-        "Delegate directly to `qwen_define_missing_entities` and call `SUBMIT` in iteration 1:\n"
-        "```python\n"
-        "defs = qwen_define_missing_entities(passage=passage, missing_entities=missing_entities, triples=triples)\n"
-        "SUBMIT(entity_definitions=defs)\n"
-        "```"
-    ),
-    "synonym_judge": (
-        "CRITICAL RLM SANDBOX RULE:\n"
-        "Optionally inspect ambiguous nodes via `inspect_focus_node` or `hydrate_chunk`, then delegate to `qwen_judge_synonyms` and call `SUBMIT`:\n"
-        "```python\n"
-        "decisions = qwen_judge_synonyms(candidate_pairs=candidate_pairs)\n"
-        "SUBMIT(decisions=decisions)\n"
-        "```"
-    ),
     "shacl_repair": (
         "CRITICAL RLM SANDBOX RULE:\n"
-        "Inspect focus nodes via `inspect_focus_node` and `hydrate_chunk`, delegate to `qwen_propose_shacl_repairs`, optionally apply/verify via `apply_shacl_repairs` and `lint_shacl`, and call `SUBMIT`:\n"
+        "Inspect focus nodes via `inspect_focus_node(entity_id=...)` and `hydrate_chunk(chunk_id=...)`, delegate to `qwen_propose_shacl_repairs(violations=violations, focus_context=...)`, optionally apply/verify via `apply_shacl_repairs(repairs=repairs)` and `lint_shacl()`, and call `SUBMIT`:\n"
         "```python\n"
         "repairs = qwen_propose_shacl_repairs(violations=violations)\n"
         "SUBMIT(repairs=repairs)\n"
         "```"
     ),
-    "fact_filter": (
-        "CRITICAL RLM SANDBOX RULE:\n"
-        "Do NOT filter facts manually in Python. Delegate directly to `qwen_filter_facts` and call `SUBMIT` in iteration 1:\n"
-        "```python\n"
-        "kept = qwen_filter_facts(question=question, fact_before_filter=fact_before_filter)\n"
-        "SUBMIT(fact=kept)\n"
-        "```"
-    ),
-    "qa": (
-        "CRITICAL RLM SANDBOX RULE:\n"
-        "Delegate directly to `qwen_answer_cot` and call `SUBMIT` with `res['answer']` in iteration 1:\n"
-        "```python\n"
-        "res = qwen_answer_cot(context=context, question=question)\n"
-        "SUBMIT(answer=res[\"answer\"])\n"
-        "```"
-    ),
-    "instruction_proposer": (
-        "CRITICAL RLM SANDBOX RULE:\n"
-        "Do NOT import `qwen_propose_instruction` (`qwen_propose_instruction` and `SUBMIT` are already in global scope).\n"
-        "Inspect `examples_with_feedback` in Python, call `qwen_propose_instruction`, and `SUBMIT`:\n"
-        "```python\n"
-        "improved = qwen_propose_instruction(current_instruction, examples_with_feedback)\n"
-        "SUBMIT(new_instruction=improved)\n"
-        "```"
-    ),
     "instruction_proposer_inner": (
         "CRITICAL RLM SANDBOX RULE:\n"
         "Do NOT import `synthesize_instruction` (`synthesize_instruction` and `SUBMIT` are already in global scope).\n"
-        "Distill `examples_with_feedback` in Python so large inputs fit in context, call `synthesize_instruction`, and `SUBMIT`:\n"
+        "Distill `examples_with_feedback` in Python so large inputs fit in context, call `synthesize_instruction` by keyword, and `SUBMIT`:\n"
         "```python\n"
         "digest = [{'Inputs': {k: (v[:400] if isinstance(v, str) else v) for k, v in ex.get('Inputs', {}).items()}, 'Generated Outputs': ex.get('Generated Outputs', {}), 'Feedback': ex.get('Feedback', '')} for ex in examples_with_feedback]\n"
-        "res = synthesize_instruction(current_instruction, digest)\n"
+        "res = synthesize_instruction(current_instruction=current_instruction, examples_with_feedback=digest)\n"
         "SUBMIT(new_instruction=res)\n"
         "```"
     ),
@@ -149,49 +84,6 @@ def _build_rlm_action_demos() -> dict[str, list[dspy.Example]]:
 
     empty_history = REPLHistory()
     return {
-        "ner": [
-            dspy.Example(
-                variables_info="Variable: `passage` (type: str): Source passage text",
-                repl_history=empty_history,
-                iteration="1/3",
-                reasoning="Delegate named entity extraction to the Qwen worker and submit.",
-                code="```python\nentities = qwen_extract_entities(passage=passage)\nSUBMIT(named_entities=entities)\n```",
-            ).with_inputs("variables_info", "repl_history", "iteration")
-        ],
-        "triples": [
-            dspy.Example(
-                variables_info=(
-                    "Variable: `passage` (type: str): Source passage text\n"
-                    "Variable: `named_entities` (type: list): Named entity list extracted from the passage"
-                ),
-                repl_history=empty_history,
-                iteration="1/3",
-                reasoning="Delegate RDF triple extraction to the Qwen worker and submit.",
-                code="```python\ntriples = qwen_extract_triples(passage=passage, named_entities=named_entities)\nSUBMIT(triples=triples)\n```",
-            ).with_inputs("variables_info", "repl_history", "iteration")
-        ],
-        "entity_definer": [
-            dspy.Example(
-                variables_info=(
-                    "Variable: `passage` (type: str): Source passage text\n"
-                    "Variable: `missing_entities` (type: list): Entity names referenced in triples that lack contextual definitions\n"
-                    "Variable: `triples` (type: list): Extracted relation triples referencing the missing entities"
-                ),
-                repl_history=empty_history,
-                iteration="1/3",
-                reasoning="Delegate missing entity definition synthesis to the Qwen worker and submit.",
-                code="```python\ndefs = qwen_define_missing_entities(passage=passage, missing_entities=missing_entities, triples=triples)\nSUBMIT(entity_definitions=defs)\n```",
-            ).with_inputs("variables_info", "repl_history", "iteration")
-        ],
-        "synonym_judge": [
-            dspy.Example(
-                variables_info="Variable: `candidate_pairs` (type: str): JSON list of candidate entity pairs",
-                repl_history=empty_history,
-                iteration="1/3",
-                reasoning="Delegate SKOS/OWL entity disambiguation to the Qwen worker and submit.",
-                code="```python\ndecisions = qwen_judge_synonyms(candidate_pairs=candidate_pairs)\nSUBMIT(decisions=decisions)\n```",
-            ).with_inputs("variables_info", "repl_history", "iteration")
-        ],
         "shacl_repair": [
             dspy.Example(
                 variables_info="Variable: `violations` (type: str): JSON list of SHACLViolation report items",
@@ -199,47 +91,6 @@ def _build_rlm_action_demos() -> dict[str, list[dspy.Example]]:
                 iteration="1/3",
                 reasoning="Delegate SHACL repair generation to the Qwen worker and submit.",
                 code="```python\nrepairs = qwen_propose_shacl_repairs(violations=violations)\nSUBMIT(repairs=repairs)\n```",
-            ).with_inputs("variables_info", "repl_history", "iteration")
-        ],
-        "fact_filter": [
-            dspy.Example(
-                variables_info=(
-                    "Variable: `question` (type: str): Query for retrieval\n"
-                    "Variable: `fact_before_filter` (type: str): Candidate facts to be filtered"
-                ),
-                repl_history=empty_history,
-                iteration="1/3",
-                reasoning="Delegate candidate fact filtering to the Qwen worker and submit.",
-                code="```python\nkept = qwen_filter_facts(question=question, fact_before_filter=fact_before_filter)\nSUBMIT(fact=kept)\n```",
-            ).with_inputs("variables_info", "repl_history", "iteration")
-        ],
-        "qa": [
-            dspy.Example(
-                variables_info=(
-                    "Variable: `context` (type: str): Retrieved evidence passages\n"
-                    "Variable: `question` (type: str): Question to answer"
-                ),
-                repl_history=empty_history,
-                iteration="1/3",
-                reasoning="Delegate reading comprehension to the Qwen worker and submit.",
-                code='```python\nres = qwen_answer_cot(context=context, question=question)\nSUBMIT(answer=res["answer"])\n```',
-            ).with_inputs("variables_info", "repl_history", "iteration")
-        ],
-        "instruction_proposer": [
-            dspy.Example(
-                variables_info=(
-                    "Variable: `current_instruction` (type: str): The instructions currently provided to the assistant.\n"
-                    "Variable: `examples_with_feedback` (type: list): Task inputs, assistant responses, and diagnostic evaluation feedback."
-                ),
-                repl_history=empty_history,
-                iteration="1/3",
-                reasoning="Inspect the task examples and evaluation feedback and delegate to the inner RLM.",
-                code=(
-                    "```python\n"
-                    "improved = qwen_propose_instruction(current_instruction, examples_with_feedback)\n"
-                    "SUBMIT(new_instruction=improved)\n"
-                    "```"
-                ),
             ).with_inputs("variables_info", "repl_history", "iteration")
         ],
         "instruction_proposer_inner": [
@@ -254,7 +105,7 @@ def _build_rlm_action_demos() -> dict[str, list[dspy.Example]]:
                 code=(
                     "```python\n"
                     "digest = [{'Inputs': {k: (v[:400] if isinstance(v, str) else v) for k, v in ex.get('Inputs', {}).items()}, 'Generated Outputs': ex.get('Generated Outputs', {}), 'Feedback': ex.get('Feedback', '')} for ex in examples_with_feedback]\n"
-                    "res = synthesize_instruction(current_instruction, digest)\n"
+                    "res = synthesize_instruction(current_instruction=current_instruction, examples_with_feedback=digest)\n"
                     "SUBMIT(new_instruction=res)\n"
                     "```"
                 ),
@@ -426,7 +277,38 @@ class _PositionalSafeRLM(_RLM_Base):
         history: Any,
         output_field_names: list[str],
     ) -> dspy.Prediction:
-        pred = super()._extract_fallback(variables, history, output_field_names)
+        try:
+            pred = super()._extract_fallback(variables, history, output_field_names)
+        except Exception:
+            payload: dict[str, Any] = {}
+            for name in output_field_names:
+                for var in (variables if isinstance(variables, list) else []):
+                    if hasattr(var, "name") and var.name == name:
+                        payload[name] = var.value
+                        break
+                    elif isinstance(var, dict) and name in var:
+                        payload[name] = var[name]
+                        break
+                if name not in payload:
+                    field = self.signature.output_fields.get(name)
+                    annotation = getattr(field, "annotation", None)
+                    if annotation is list or getattr(annotation, "__origin__", None) is list:
+                        payload[name] = []
+                    elif annotation is dict or getattr(annotation, "__origin__", None) is dict:
+                        payload[name] = {}
+                    elif annotation in (int, float):
+                        payload[name] = 0
+                    else:
+                        payload[name] = ""
+            traj: list[Any] = []
+            for item in (history or []):
+                dump_fn = getattr(item, "model_dump", None)
+                traj.append(dump_fn() if callable(dump_fn) else str(item))
+            pred = dspy.Prediction(
+                trajectory=traj,
+                final_reasoning="Extract fallback recovered from REPL state",
+                **payload,
+            )
         for name in output_field_names:
             field = self.signature.output_fields[name]
             annotation = getattr(field, "annotation", str)
@@ -601,25 +483,29 @@ def _sum_usage_tokens(usage: Mapping[str, Any] | None) -> int:
 class HippoRAGProgram(dspy.Module):
     """Unified DSPy Module for HippoRAG 2 OpenIE, EDC/SKOS Schema Canon, SHACL Repair, Recognition Memory, and Multi-Hop QA.
 
-    Supports two execution styles across **all** stages (`ner`, `triples`, `synonym_judge`, `shacl_repair`, `fact_filter`, `qa`):
-    1. **Heterogeneous Mistral Orchestrator + Qwen RLM Worker (`execution_mode="rlm"`):**
-       - Outer `dspy.RLM` runs on `orchestrator_lm` (`Mistral-7B-Instruct-v0.3-Hybrid` on
-         Ryzen AI NPU/OGA, `ChatAdapter`, **never** GBNF) inside `dspy.LocalInterpreter`.
-       - Inner `llm_query` and built-in `qwen_*` sandbox tools (`qwen_extract_entities`,
-         `qwen_extract_triples`, `qwen_judge_synonyms`, `qwen_propose_shacl_repairs`,
-         `qwen_filter_facts`, `qwen_answer_cot`) execute on `rlm_sub_lm`
-         (`Qwen3-4B-Instruct-2507-GGUF` on `llama.cpp` Vulkan GPU) using `dspy.JSONAdapter()`
-         and **pure-JSON GBNF grammars** (`extra_body={"grammar": ...}`).
-    2. **Direct Single-Call (`execution_mode="direct"`):**
-       - Runs `dspy.Predict` / `dspy.ChainOfThought` directly with `dspy.JSONAdapter()` and
-         attaches GBNF grammars only when `lm_supports_gbnf(lm)` is `True`.
+    Exposes the 9 canonical runtime stage predictors (out of the 12 total DSPy signatures in YAW):
+    1. **8 Direct GBNF Predictors (`Qwen3-4B-Instruct-2507-GGUF` on `llama.cpp` GPU):**
+       - `ner` (`ExtractEntities`)
+       - `triples` (`ExtractTriples`)
+       - `entity_definer` (`DefineMissingEntities`)
+       - `synonym_judge` (`JudgeSynonyms`)
+       - `shacl_repair` (`ProposeSHACLRepairs`)
+       - `triple_filter` (`FilterTriples`)
+       - `query_intent` (`ExtractQueryIntent`)
+       - `qa` (`AnswerQuestion`)
+    2. **1 Single-Level RLM Python REPL Orchestrator (`shacl_healer_rlm`):**
+       - `shacl_healer_rlm` (`HealSHACLViolations`) running inside `dspy.PythonInterpreter` (managed Deno/Pyodide WASM) with
+         bound graph inspection, hydration, repair, and SQL SHACL linting tools (`inspect_focus_node`,
+         `hydrate_chunk`, `qwen_propose_shacl_repairs`, `apply_shacl_repairs`, `lint_shacl`).
+    3. **First-Class Embedding Trail (`record_embedding_telemetry` / `embedding_audit_trail`):**
+       - Tracks every `DSPyEmbeddingAdapter` (`dspy.Embedder`) invocation and the 3 optimizable
+         task prefixes (`embedding_query_prefix`, `embedding_fact_prefix`, `embedding_document_prefix`)
+         in `self.telemetry` and `self.embedding_audit_trail`.
     """
 
     def __init__(
         self,
         *,
-        execution_mode: Literal["direct", "rlm"] = "direct",
-        qa_mode: Literal["cot", "rlm"] | None = None,
         include_demos: bool = True,
         enable_gbnf: bool = False,
         gbnf_max_entities: int | None = None,
@@ -636,23 +522,10 @@ class HippoRAGProgram(dspy.Module):
         rlm_max_output_chars: int = 10000,
         rlm_sub_lm: Any = None,
         rlm_tools: list[Callable[..., Any]] | None = None,
-        rlm_interpreter_factory: Callable[[], Any] = dspy.LocalInterpreter,
+        rlm_interpreter_factory: Callable[[], Any] = dspy.PythonInterpreter,
         compiled_path: str | Path | None = None,
     ) -> None:
         super().__init__()
-        if execution_mode not in ("direct", "rlm"):
-            raise ValueError(
-                f"Unsupported execution_mode: {execution_mode!r}. Expected 'direct' or 'rlm'."
-            )
-        resolved_qa_mode: Literal["cot", "rlm"] = (
-            qa_mode if qa_mode is not None else ("rlm" if execution_mode == "rlm" else "cot")
-        )
-        if resolved_qa_mode not in ("cot", "rlm"):
-            raise ValueError(
-                f"Unsupported qa_mode: {resolved_qa_mode!r}. Expected 'cot' or 'rlm'."
-            )
-        self.execution_mode: Literal["direct", "rlm"] = execution_mode
-        self.qa_mode: Literal["cot", "rlm"] = resolved_qa_mode
         self.enable_gbnf: bool = enable_gbnf
         self.gbnf_max_entities: int | None = gbnf_max_entities
         self.gbnf_max_triples: int | None = gbnf_max_triples
@@ -671,116 +544,57 @@ class HippoRAGProgram(dspy.Module):
         self._shacl_linter: Callable[[], list[dict[str, str]]] | None = None
         self._last_ner_definitions: dict[str, str] = {}
         self.telemetry: list[dict[str, Any]] = []
+        self.embedding_audit_trail: list[dict[str, Any]] = []
         self.entity_def_audit_trail: list[dict[str, Any]] = []
         self.synonym_audit_trail: list[dict[str, Any]] = []
         self.shacl_audit_trail: list[dict[str, Any]] = []
 
-        # 8 Direct / Worker Predictors with distinct Signatures
+        # 8 Direct GBNF Predictors with distinct Signatures
         self.ner = dspy.Predict(ExtractEntities)
         self.triples = dspy.Predict(ExtractTriples)
         self.entity_definer = dspy.Predict(DefineMissingEntities)
         self.synonym_judge = dspy.Predict(JudgeSynonyms)
         self.shacl_repair = dspy.Predict(ProposeSHACLRepairs)
-        self.fact_filter = dspy.Predict(FilterFacts)
+        self.triple_filter = dspy.Predict(FilterTriples)
         self.query_intent = dspy.Predict(ExtractQueryIntent)
-        self.qa_cot = dspy.ChainOfThought(AnswerQuestion)
+        self.qa = dspy.ChainOfThought(AnswerQuestion)
 
-        (
-            qwen_ner_tool,
-            qwen_triples_tool,
-            qwen_entity_definer_tool,
-            qwen_synonym_tool,
-            qwen_shacl_tool,
-            qwen_filter_tool,
-            qwen_qa_tool,
-            inspect_focus_node_tool,
-            hydrate_chunk_tool,
-            read_source_chunk_tool,
-            apply_shacl_repairs_tool,
-            lint_shacl_tool,
-        ) = self._build_qwen_worker_tools()
+        shacl_tools = list(self._build_shacl_repl_tools())
+        if rlm_tools:
+            existing = {getattr(t, "__name__", "") for t in shacl_tools}
+            for user_tool in rlm_tools:
+                name = getattr(user_tool, "__name__", "")
+                if name not in existing:
+                    existing.add(name)
+                    shacl_tools.append(user_tool)
 
-        def _make_stage_rlm(
-            signature: Any,
-            stage_key: str,
-            primary: Callable[..., Any],
-            extra_tools: Sequence[Callable[..., Any]] = (),
-        ) -> _PositionalSafeRLM:
-            tools = [primary, *extra_tools]
-            if rlm_tools:
-                existing = {getattr(t, "__name__", "") for t in tools}
-                for user_tool in rlm_tools:
-                    name = getattr(user_tool, "__name__", "")
-                    if name not in existing:
-                        existing.add(name)
-                        tools.append(user_tool)
-            return _PositionalSafeRLM(
-                signature,
-                stage_rule=_STAGE_RLM_DELEGATION_RULES[stage_key],
-                max_iters=rlm_max_iters,
-                max_llm_calls=rlm_max_llm_calls,
-                max_output_chars=rlm_max_output_chars,
-                tools=tools,
-                sub_lm=rlm_sub_lm,
-                interpreter_factory=rlm_interpreter_factory,
-            )
-
-        # 7 RLM Orchestrator Predictors with distinct Signatures
-        self.ner_rlm = _make_stage_rlm(OrchestrateEntityExtraction, "ner", qwen_ner_tool)
-        self.triples_rlm = _make_stage_rlm(OrchestrateTripleExtraction, "triples", qwen_triples_tool)
-        self.entity_definer_rlm = _make_stage_rlm(
-            OrchestrateMissingEntityDefinitions,
-            "entity_definer",
-            qwen_entity_definer_tool,
-        )
-        self.synonym_judge_rlm = _make_stage_rlm(
-            OrchestrateSynonymJudgment,
-            "synonym_judge",
-            qwen_synonym_tool,
-            extra_tools=(inspect_focus_node_tool, hydrate_chunk_tool, read_source_chunk_tool),
-        )
-        self.shacl_healer_rlm = _make_stage_rlm(
+        # 1 Single-Level RLM Python REPL Predictor for Closed-World SHACL Healing
+        self.shacl_healer_rlm = _PositionalSafeRLM(
             HealSHACLViolations,
-            "shacl_repair",
-            qwen_shacl_tool,
-            extra_tools=(
-                hydrate_chunk_tool,
-                inspect_focus_node_tool,
-                apply_shacl_repairs_tool,
-                lint_shacl_tool,
-                read_source_chunk_tool,
-            ),
+            stage_rule=_STAGE_RLM_DELEGATION_RULES["shacl_repair"],
+            max_iters=rlm_max_iters,
+            max_llm_calls=rlm_max_llm_calls,
+            max_output_chars=rlm_max_output_chars,
+            tools=shacl_tools,
+            sub_lm=rlm_sub_lm or orchestrator_lm,
+            interpreter_factory=rlm_interpreter_factory,
         )
-        self.fact_filter_rlm = _make_stage_rlm(OrchestrateFactFiltering, "fact_filter", qwen_filter_tool)
-        self.qa_rlm = _make_stage_rlm(OrchestrateQuestionAnswering, "qa", qwen_qa_tool)
 
         self._bind_predictor_lms()
 
         if include_demos:
             setattr(self.ner, "demos", list(NER_DEMOS))
             setattr(self.triples, "demos", list(TRIPLE_DEMOS))
-            setattr(self.fact_filter, "demos", list(FACT_FILTER_DEMOS))
-            setattr(self.qa_cot, "demos", list(QA_DEMOS))
+            setattr(self.triple_filter, "demos", list(TRIPLE_FILTER_DEMOS))
+            setattr(self.qa, "demos", list(QA_DEMOS))
+            if hasattr(self.qa, "predict"):
+                setattr(self.qa.predict, "demos", list(QA_DEMOS))
             rlm_demos = _build_rlm_action_demos()
-            setattr(self.ner_rlm.generate_action, "demos", list(rlm_demos["ner"]))
-            setattr(self.triples_rlm.generate_action, "demos", list(rlm_demos["triples"]))
-            setattr(
-                self.entity_definer_rlm.generate_action,
-                "demos",
-                list(rlm_demos["entity_definer"]),
-            )
-            setattr(
-                self.synonym_judge_rlm.generate_action,
-                "demos",
-                list(rlm_demos["synonym_judge"]),
-            )
             setattr(
                 self.shacl_healer_rlm.generate_action,
                 "demos",
                 list(rlm_demos["shacl_repair"]),
             )
-            setattr(self.fact_filter_rlm.generate_action, "demos", list(rlm_demos["fact_filter"]))
-            setattr(self.qa_rlm.generate_action, "demos", list(rlm_demos["qa"]))
 
         if compiled_path is not None:
             path = Path(compiled_path)
@@ -795,8 +609,14 @@ class HippoRAGProgram(dspy.Module):
     def shacl_repair_rlm(self, value: _PositionalSafeRLM) -> None:
         self.shacl_healer_rlm = value
 
+    def record_embedding_telemetry(self, entry: Mapping[str, Any]) -> None:
+        """Record a DSPyEmbeddingAdapter invocation in both telemetry and embedding_audit_trail."""
+        record = dict(entry)
+        self.embedding_audit_trail.append(record)
+        self.telemetry.append(record)
+
     def _bind_predictor_lms(self) -> None:
-        """Bind a dedicated `_PredictorBoundLM` instance with isolated `.history` to every predictor."""
+        """Bind a dedicated `_PredictorBoundLM` instance with isolated `.history` to all 9 stage predictors."""
 
         def worker_getter() -> Any:
             return self.rlm_sub_lm or self.orchestrator_lm
@@ -810,49 +630,38 @@ class HippoRAGProgram(dspy.Module):
             ("entity_definer", self.entity_definer),
             ("synonym_judge", self.synonym_judge),
             ("shacl_repair", self.shacl_repair),
-            ("fact_filter", self.fact_filter),
+            ("triple_filter", self.triple_filter),
             ("query_intent", self.query_intent),
         ):
             pred.lm = _PredictorBoundLM(name, "worker", worker_getter)
 
-        qa_lm = _PredictorBoundLM("qa_cot", "orchestrator", orch_getter)
-        self.qa_cot.predict.lm = qa_lm
-        setattr(self.qa_cot, "lm", qa_lm)
-        setattr(self.qa_cot, "signature", self.qa_cot.predict.signature)
+        qa_lm = _PredictorBoundLM("qa", "orchestrator", orch_getter)
+        self.qa.predict.lm = qa_lm
+        setattr(self.qa, "lm", qa_lm)
+        setattr(self.qa, "signature", self.qa.predict.signature)
 
-        for rlm_name, rlm_mod in (
-            ("ner_rlm", self.ner_rlm),
-            ("triples_rlm", self.triples_rlm),
-            ("entity_definer_rlm", self.entity_definer_rlm),
-            ("synonym_judge_rlm", self.synonym_judge_rlm),
-            ("shacl_healer_rlm", self.shacl_healer_rlm),
-            ("fact_filter_rlm", self.fact_filter_rlm),
-            ("qa_rlm", self.qa_rlm),
-        ):
-            action_lm = _PredictorBoundLM(f"{rlm_name}.generate_action", "orchestrator", orch_getter)
-            extract_lm = _PredictorBoundLM(f"{rlm_name}.extract", "orchestrator", orch_getter)
-            rlm_mod.generate_action.lm = action_lm
-            rlm_mod.extract.lm = extract_lm
-            setattr(rlm_mod, "lm", action_lm)
+        action_lm = _PredictorBoundLM(
+            "shacl_healer_rlm.generate_action", "orchestrator", orch_getter
+        )
+        extract_lm = _PredictorBoundLM(
+            "shacl_healer_rlm.extract", "orchestrator", orch_getter
+        )
+        self.shacl_healer_rlm.generate_action.lm = action_lm
+        self.shacl_healer_rlm.extract.lm = extract_lm
+        setattr(self.shacl_healer_rlm, "lm", action_lm)
 
     def all_stage_predictors(self) -> list[tuple[str, Any]]:
-        """Return all 15 logical stage predictors (8 direct/worker + 7 RLM orchestrators)."""
+        """Return all 9 canonical stage predictors (8 direct GBNF + 1 SHACL RLM healer)."""
         return [
             ("ner", self.ner),
             ("triples", self.triples),
             ("entity_definer", self.entity_definer),
             ("synonym_judge", self.synonym_judge),
             ("shacl_repair", self.shacl_repair),
-            ("fact_filter", self.fact_filter),
-            ("query_intent", self.query_intent),
-            ("qa_cot", self.qa_cot),
-            ("ner_rlm", self.ner_rlm),
-            ("triples_rlm", self.triples_rlm),
-            ("entity_definer_rlm", self.entity_definer_rlm),
-            ("synonym_judge_rlm", self.synonym_judge_rlm),
             ("shacl_healer_rlm", self.shacl_healer_rlm),
-            ("fact_filter_rlm", self.fact_filter_rlm),
-            ("qa_rlm", self.qa_rlm),
+            ("triple_filter", self.triple_filter),
+            ("query_intent", self.query_intent),
+            ("qa", self.qa),
         ]
 
     def set_graph_tools(
@@ -863,7 +672,7 @@ class HippoRAGProgram(dspy.Module):
         shacl_repair_applier: Callable[[Sequence[Mapping[str, Any]]], int] | None = None,
         shacl_linter: Callable[[], list[dict[str, str]]] | None = None,
     ) -> None:
-        """Bind storage tools (`inspect_focus_node`, `hydrate_chunk`, `apply_shacl_repairs`, `lint_shacl`) for RLM sandboxes."""
+        """Bind storage tools (`inspect_focus_node`, `hydrate_chunk`, `apply_shacl_repairs`, `lint_shacl`) for the SHACL RLM sandbox."""
         self._node_inspector = node_inspector
         self._chunk_hydrator = chunk_hydrator
         self._shacl_repair_applier = shacl_repair_applier
@@ -871,33 +680,22 @@ class HippoRAGProgram(dspy.Module):
 
     @classmethod
     def from_config(cls, config: YawConfig) -> "HippoRAGProgram":
-        """Construct a HippoRAGProgram (including heterogeneous or direct LMs) from a YawConfig."""
-        if config.execution_mode == "rlm":
-            orch_lm, sub_lm = create_dspy_rlm_pair(
-                orchestrator_model=config.qa_model,
-                sub_model=config.extraction_model,
-                base_url=config.base_url,
-                api_key=config.api_key,
-                provider=config.provider,
-            )
-        else:
-            orch_lm = create_dspy_lm(
-                config.qa_model,
-                base_url=config.base_url,
-                api_key=config.api_key,
-                provider=config.provider,
-                role="qa",
-            )
-            sub_lm = create_dspy_lm(
-                config.extraction_model,
-                base_url=config.base_url,
-                api_key=config.api_key,
-                provider=config.provider,
-                role="extraction",
-            )
+        """Construct a HippoRAGProgram from a YawConfig."""
+        orch_lm = create_dspy_lm(
+            config.qa_model,
+            base_url=config.base_url,
+            api_key=config.api_key,
+            provider=config.provider,
+            role="qa",
+        )
+        sub_lm = create_dspy_lm(
+            config.extraction_model,
+            base_url=config.base_url,
+            api_key=config.api_key,
+            provider=config.provider,
+            role="extraction",
+        )
         return cls(
-            execution_mode=config.execution_mode,
-            qa_mode=config.qa_mode,
             enable_gbnf=config.enable_gbnf,
             gbnf_max_entities=config.gbnf_max_entities,
             gbnf_max_triples=config.gbnf_max_triples,
@@ -941,6 +739,8 @@ class HippoRAGProgram(dspy.Module):
             if yaw_surface.get("gbnf_max_facts") is not None:
                 self.gbnf_max_facts = int(yaw_surface["gbnf_max_facts"])
         self._bind_predictor_lms()
+        if hasattr(self.qa, "predict") and not getattr(self.qa.predict, "demos", None):
+            self.qa.predict.demos = list(QA_DEMOS)
         return res
 
     def __deepcopy__(self, memo: dict[int, Any]) -> "HippoRAGProgram":
@@ -973,80 +773,8 @@ class HippoRAGProgram(dspy.Module):
     def _resolve_orchestrator_lm(self, fallback_lm: dspy.LM | None = None) -> dspy.LM | None:
         return fallback_lm if fallback_lm is not None else self.orchestrator_lm
 
-    def _build_qwen_worker_tools(self) -> list[Callable[..., Any]]:
-        """Build GBNF-constrained Qwen (`llama.cpp` GPU) worker tools exposed inside Mistral's RLM REPL."""
-
-        def qwen_extract_entities(passage: str) -> list[Any]:
-            """Extract deduplicated named entities and definitions from a passage using the GBNF-constrained Qwen GPU model."""
-            worker_lm = self._resolve_worker_lm()
-            entity_defs = self.extract_entity_definitions(
-                passage,
-                mode="direct",
-                lm=worker_lm,
-                use_gbnf=self.enable_gbnf,
-            )
-            for ename, edef in entity_defs:
-                if edef:
-                    self._last_ner_definitions[ename] = edef
-            return [[ename, edef] if edef else ename for ename, edef in entity_defs]
-
-        def qwen_extract_triples(
-            passage: str, named_entities: list[Any]
-        ) -> list[dict[str, Any] | list[str]]:
-            """Extract inline-defined or 3-element triples using the GBNF-constrained Qwen GPU model."""
-            worker_lm = self._resolve_worker_lm()
-            structured = self.extract_structured_triples(
-                passage,
-                named_entities,
-                entity_definitions=self._last_ner_definitions,
-                mode="direct",
-                lm=worker_lm,
-                use_gbnf=self.enable_gbnf,
-                _repair_missing_defs=False,
-            )
-            out: list[dict[str, Any] | list[str]] = []
-            for st in structured:
-                if st.subj and st.subj_def:
-                    self._last_ner_definitions[st.subj] = st.subj_def
-                if st.obj and st.obj_def:
-                    self._last_ner_definitions[st.obj] = st.obj_def
-                if st.subj_def or st.spo_def or st.obj_def:
-                    out.append(st.to_dict())
-                else:
-                    out.append([st.subj, st.pred, st.obj])
-            return out
-
-        def qwen_define_missing_entities(
-            passage: str,
-            missing_entities: list[str],
-            triples: Any = None,
-        ) -> list[list[str]]:
-            """Synthesize concise contextual definitions for missing triple entities using the GBNF-constrained Qwen GPU model."""
-            worker_lm = self._resolve_worker_lm()
-            defs = self.define_missing_entities(
-                passage,
-                missing_entities,
-                triples=triples or (),
-                mode="direct",
-                lm=worker_lm,
-                use_gbnf=self.enable_gbnf,
-                _record_audit=False,
-            )
-            return [[ename, edef] for ename, edef in defs]
-
-        def qwen_judge_synonyms(
-            candidate_pairs: Any = None,
-            candidate_pairs_json: Any = None,
-        ) -> list[dict[str, str]]:
-            """Classify candidate entity pairs into SKOS/OWL relations using Qwen GPU GBNF."""
-            worker_lm = self._resolve_worker_lm()
-            raw = candidate_pairs if candidate_pairs is not None else candidate_pairs_json
-            return self.judge_synonyms(
-                raw,
-                mode="direct",
-                lm=worker_lm,
-                use_gbnf=self.enable_gbnf,
-            )
+    def _build_shacl_repl_tools(self) -> list[Callable[..., Any]]:
+        """Build the closed-world SHACL healing tools exposed inside `shacl_healer_rlm`."""
 
         def qwen_propose_shacl_repairs(
             violations: Any = None,
@@ -1063,45 +791,6 @@ class HippoRAGProgram(dspy.Module):
                 lm=worker_lm,
                 use_gbnf=self.enable_gbnf,
             )
-
-        def qwen_filter_facts(
-            question: str,
-            fact_before_filter: Any = None,
-            candidate_facts: list[list[str]] | None = None,
-        ) -> list[list[str]]:
-            """Filter candidate [s, p, o] facts using the dynamic candidate-literal GBNF Qwen GPU model."""
-            raw_source = candidate_facts if candidate_facts is not None else fact_before_filter
-            parsed_candidates = coerce_generated_facts(raw_source)
-            if not parsed_candidates:
-                return []
-            worker_lm = self._resolve_worker_lm()
-            indices = self.filter_facts(
-                question,
-                parsed_candidates,
-                mode="direct",
-                lm=worker_lm,
-                use_gbnf=self.enable_gbnf,
-            )
-            return [
-                list(parsed_candidates[i])
-                for i in indices
-                if 0 <= i < len(parsed_candidates)
-            ]
-
-        def qwen_answer_cot(context: str, question: str) -> dict[str, str]:
-            """Run GBNF-constrained Chain-of-Thought QA on the Qwen GPU model and return {reasoning, answer}."""
-            worker_lm = self._resolve_worker_lm()
-            pred = self.answer_question(
-                context,
-                question,
-                mode="cot",
-                lm=worker_lm,
-                use_gbnf=self.enable_gbnf,
-            )
-            return {
-                "reasoning": strip_mistral_bracket_prefix(str(getattr(pred, "reasoning", ""))),
-                "answer": strip_mistral_bracket_prefix(str(getattr(pred, "answer", ""))),
-            }
 
         def inspect_focus_node(entity_id: str) -> dict[str, Any]:
             """Inspect focus node labels, definition, semantic edges, facts, and chunk pointers."""
@@ -1133,13 +822,7 @@ class HippoRAGProgram(dspy.Module):
             return list(self._shacl_linter())
 
         return [
-            qwen_extract_entities,
-            qwen_extract_triples,
-            qwen_define_missing_entities,
-            qwen_judge_synonyms,
             qwen_propose_shacl_repairs,
-            qwen_filter_facts,
-            qwen_answer_cot,
             inspect_focus_node,
             hydrate_chunk,
             read_source_chunk,
@@ -1188,10 +871,10 @@ class HippoRAGProgram(dspy.Module):
     def _invoke_stage(
         self,
         direct_mod: Any,
-        rlm_mod: Any,
+        rlm_mod: Any = None,
         *,
         stage_name: str = "",
-        is_rlm: bool,
+        is_rlm: bool = False,
         lm: Any,
         use_gbnf: bool | None,
         grammar_fn: Callable[[], str],
@@ -1200,30 +883,31 @@ class HippoRAGProgram(dspy.Module):
         from dspy.utils.usage_tracker import track_usage
 
         with track_usage() as usage_tracker:
-            if is_rlm:
+            if is_rlm and rlm_mod is not None:
                 orch_lm = self._resolve_orchestrator_lm(lm)
                 with self._dspy_ctx(orch_lm, use_json_adapter=False):
                     pred = rlm_mod(**inputs)
                 active_mod = rlm_mod
-                active_name = (
-                    "shacl_healer_rlm"
-                    if stage_name == "shacl_repair"
-                    else (f"{stage_name}_rlm" if stage_name else "rlm")
-                )
+                active_name = "shacl_healer_rlm"
             else:
                 effective_lm = lm
                 if effective_lm is None:
-                    if direct_mod is self.qa_cot:
-                        effective_lm = self.orchestrator_lm
+                    if direct_mod is self.qa:
+                        effective_lm = self.orchestrator_lm or self.rlm_sub_lm
                     else:
                         effective_lm = self.rlm_sub_lm or self.orchestrator_lm
+                direct_inputs = dict(inputs)
+                if isinstance(direct_inputs.get("passage"), str) and len(direct_inputs["passage"]) > 24000:
+                    direct_inputs["passage"] = direct_inputs["passage"][:24000]
+                if isinstance(direct_inputs.get("context"), str) and len(direct_inputs["context"]) > 40000:
+                    direct_inputs["context"] = direct_inputs["context"][:40000]
                 call_kwargs: dict[str, Any] = {}
                 if self._should_use_gbnf(use_gbnf, effective_lm):
                     call_kwargs["config"] = {"extra_body": {"grammar": grammar_fn()}}
                 with self._dspy_ctx(effective_lm, use_json_adapter=True):
-                    pred = direct_mod(**inputs, **call_kwargs)
+                    pred = direct_mod(**direct_inputs, **call_kwargs)
                 active_mod = direct_mod
-                active_name = "qa_cot" if stage_name == "qa" else (stage_name or "direct")
+                active_name = "qa" if stage_name == "qa" else (stage_name or "direct")
         tokens = usage_tracker.get_total_tokens()
         if tokens and hasattr(pred, "set_lm_usage"):
             pred.set_lm_usage(tokens)
@@ -1234,7 +918,7 @@ class HippoRAGProgram(dspy.Module):
                 stage_name,
                 active_name,
                 signature_name=sig_name,
-                is_rlm=is_rlm,
+                is_rlm=bool(is_rlm and rlm_mod is not None),
                 usage=tokens,
                 inputs_summary=str(list(inputs.keys())),
                 outputs_summary=str(pred)[:240],
@@ -1245,33 +929,24 @@ class HippoRAGProgram(dspy.Module):
         self,
         passage: str,
         *,
-        mode: Literal["direct", "rlm"] | None = None,
         lm: Any = None,
         use_gbnf: bool | None = None,
     ) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
-        saved_defs = dict(self._last_ner_definitions)
-        is_rlm = (mode or self.execution_mode) == "rlm"
-        if is_rlm:
-            self._last_ner_definitions.clear()
-        try:
-            pred = self._invoke_stage(
-                self.ner,
-                self.ner_rlm,
-                stage_name="ner",
-                is_rlm=is_rlm,
-                lm=lm,
-                use_gbnf=use_gbnf,
-                grammar_fn=lambda: build_dspy_ner_grammar(self.gbnf_max_entities),
-                passage=passage,
-            )
-            raw_entities = getattr(pred, "named_entities", [])
-            parsed_defs = extract_entity_definitions(raw_entities)
-            enriched_defs: list[tuple[str, str]] = []
-            for ename, edef in parsed_defs:
-                final_def = edef or self._last_ner_definitions.get(ename, "")
-                enriched_defs.append((ename, final_def))
-        finally:
-            self._last_ner_definitions = saved_defs
+        pred = self._invoke_stage(
+            self.ner,
+            stage_name="ner",
+            is_rlm=False,
+            lm=lm,
+            use_gbnf=use_gbnf,
+            grammar_fn=lambda: build_dspy_ner_grammar(self.gbnf_max_entities),
+            passage=passage,
+        )
+        raw_entities = getattr(pred, "named_entities", [])
+        parsed_defs = extract_entity_definitions(raw_entities)
+        enriched_defs: list[tuple[str, str]] = [
+            (ename, edef or self._last_ner_definitions.get(ename, ""))
+            for ename, edef in parsed_defs
+        ]
         entities = tuple(ename for ename, _ in enriched_defs)
         return entities, tuple(enriched_defs)
 
@@ -1279,28 +954,22 @@ class HippoRAGProgram(dspy.Module):
         self,
         passage: str,
         *,
-        mode: Literal["direct", "rlm"] | None = None,
         lm: Any = None,
         use_gbnf: bool | None = None,
     ) -> tuple[tuple[str, str], ...]:
         """Run DSPy NER extraction and return deduplicated (entity_name, contextual_definition) pairs."""
-        _, entity_defs = self._run_ner_stage(
-            passage, mode=mode, lm=lm, use_gbnf=use_gbnf
-        )
+        _, entity_defs = self._run_ner_stage(passage, lm=lm, use_gbnf=use_gbnf)
         return entity_defs
 
     def extract_entities(
         self,
         passage: str,
         *,
-        mode: Literal["direct", "rlm"] | None = None,
         lm: Any = None,
         use_gbnf: bool | None = None,
     ) -> tuple[str, ...]:
-        """Run DSPy NER extraction (direct on Qwen w/ GBNF, or Mistral RLM orchestrating Qwen)."""
-        entities, _ = self._run_ner_stage(
-            passage, mode=mode, lm=lm, use_gbnf=use_gbnf
-        )
+        """Run DSPy NER extraction on Qwen w/ GBNF."""
+        entities, _ = self._run_ner_stage(passage, lm=lm, use_gbnf=use_gbnf)
         return entities
 
     def define_missing_entities(
@@ -1309,12 +978,11 @@ class HippoRAGProgram(dspy.Module):
         missing_entities: Sequence[str],
         triples: Sequence[Any] = (),
         *,
-        mode: Literal["direct", "rlm"] | None = None,
         lm: Any = None,
         use_gbnf: bool | None = None,
         _record_audit: bool = True,
     ) -> tuple[tuple[str, str], ...]:
-        """Synthesize contextual definitions via DefineMissingEntities / OrchestrateMissingEntityDefinitions for triple entities lacking definitions."""
+        """Synthesize contextual definitions via DefineMissingEntities for triple entities lacking definitions."""
         deduped: list[str] = []
         for item in missing_entities:
             name = str(item).strip()
@@ -1330,64 +998,50 @@ class HippoRAGProgram(dspy.Module):
             elif isinstance(t, (list, tuple, dict)):
                 triples_payload.append(t)
 
-        is_rlm = (mode or self.execution_mode) == "rlm"
         prev_telem_len = len(self.telemetry)
-        saved_defs = dict(self._last_ner_definitions) if _record_audit else None
-        if _record_audit and is_rlm:
-            self._last_ner_definitions.clear()
-        try:
-            pred = self._invoke_stage(
-                self.entity_definer,
-                self.entity_definer_rlm,
-                stage_name="entity_definer",
-                is_rlm=is_rlm,
-                lm=lm,
-                use_gbnf=use_gbnf,
-                grammar_fn=lambda: build_dspy_missing_entity_defs_grammar(deduped),
-                passage=passage,
-                missing_entities=list(deduped),
-                triples=triples_payload,
-            )
-            raw_defs = getattr(
-                pred, "entity_definitions", getattr(pred, "named_entities", [])
-            )
-            parsed = extract_entity_definitions(raw_defs)
-            exact_map: dict[str, str] = {}
-            norm_map: dict[str, str] = {}
-            for ename, edef in parsed:
-                if ename and edef:
-                    exact_map[ename] = edef
-                    norm_map[str(text_processing(ename))] = edef
-            if _record_audit and is_rlm:
-                for ename, edef in self._last_ner_definitions.items():
-                    if ename and edef and ename not in exact_map:
-                        exact_map[ename] = edef
-                        norm_map[str(text_processing(ename))] = edef
+        pred = self._invoke_stage(
+            self.entity_definer,
+            stage_name="entity_definer",
+            is_rlm=False,
+            lm=lm,
+            use_gbnf=use_gbnf,
+            grammar_fn=lambda: build_dspy_missing_entity_defs_grammar(deduped),
+            passage=passage,
+            missing_entities=list(deduped),
+            triples=triples_payload,
+        )
+        raw_defs = getattr(
+            pred, "entity_definitions", getattr(pred, "named_entities", [])
+        )
+        parsed = extract_entity_definitions(raw_defs)
+        exact_map: dict[str, str] = {}
+        norm_map: dict[str, str] = {}
+        for ename, edef in parsed:
+            if ename and edef:
+                exact_map[ename] = edef
+                norm_map[str(text_processing(ename))] = edef
 
-            resolved: list[tuple[str, str]] = []
-            seen_names: set[str] = set()
-            for idx, m_name in enumerate(deduped):
-                defn = (
-                    exact_map.get(m_name)
-                    or norm_map.get(str(text_processing(m_name)))
-                    or ""
-                )
-                if not defn and len(parsed) == len(deduped):
-                    defn = parsed[idx][1]
-                if defn:
-                    resolved.append((m_name, defn))
-                    seen_names.add(m_name)
-                    if not _record_audit:
-                        self._last_ner_definitions[m_name] = defn
-            for ename, edef in parsed:
-                if ename and edef and ename not in seen_names:
-                    resolved.append((ename, edef))
-                    seen_names.add(ename)
-                    if not _record_audit:
-                        self._last_ner_definitions[ename] = edef
-        finally:
-            if saved_defs is not None:
-                self._last_ner_definitions = saved_defs
+        resolved: list[tuple[str, str]] = []
+        seen_names: set[str] = set()
+        for idx, m_name in enumerate(deduped):
+            defn = (
+                exact_map.get(m_name)
+                or norm_map.get(str(text_processing(m_name)))
+                or ""
+            )
+            if not defn and len(parsed) == len(deduped):
+                defn = parsed[idx][1]
+            if defn:
+                resolved.append((m_name, defn))
+                seen_names.add(m_name)
+                if not _record_audit:
+                    self._last_ner_definitions[m_name] = defn
+        for ename, edef in parsed:
+            if ename and edef and ename not in seen_names:
+                resolved.append((ename, edef))
+                seen_names.add(ename)
+                if not _record_audit:
+                    self._last_ner_definitions[ename] = edef
 
         stage_tokens = (
             int(self.telemetry[-1].get("tokens_used", 0))
@@ -1397,13 +1051,9 @@ class HippoRAGProgram(dspy.Module):
         if _record_audit:
             self.entity_def_audit_trail.append(
                 {
-                    "mode": "rlm" if is_rlm else "direct",
-                    "predictor": "entity_definer_rlm" if is_rlm else "entity_definer",
-                    "signature": (
-                        OrchestrateMissingEntityDefinitions.__name__
-                        if is_rlm
-                        else DefineMissingEntities.__name__
-                    ),
+                    "mode": "direct",
+                    "predictor": "entity_definer",
+                    "signature": DefineMissingEntities.__name__,
                     "missing_count": len(deduped),
                     "repaired_count": len(resolved),
                     "tokens": stage_tokens,
@@ -1420,18 +1070,15 @@ class HippoRAGProgram(dspy.Module):
         named_entities: Sequence[Any],
         *,
         entity_definitions: Sequence[tuple[str, str]] | dict[str, str] | None = None,
-        mode: Literal["direct", "rlm"] | None = None,
         lm: Any = None,
         use_gbnf: bool | None = None,
         _repair_missing_defs: bool = True,
     ) -> tuple[StructuredTriple, ...]:
         """Run DSPy triple extraction and return structured triples with contextual definitions."""
         merged_defs: dict[str, str] = {}
-        exact_defs: dict[str, str] = {}
         defined_entity_names: list[str] = []
         for k, v in self._last_ner_definitions.items():
             if k and v:
-                exact_defs[k] = v
                 merged_defs[k] = v
                 merged_defs[str(text_processing(k))] = v
         if isinstance(entity_definitions, Mapping):
@@ -1439,7 +1086,6 @@ class HippoRAGProgram(dspy.Module):
                 ck = str(k).strip()
                 cv = str(v).strip()
                 if ck and cv:
-                    exact_defs[ck] = cv
                     merged_defs[ck] = cv
                     merged_defs[str(text_processing(ck))] = cv
                     if ck not in defined_entity_names:
@@ -1450,7 +1096,6 @@ class HippoRAGProgram(dspy.Module):
                     ck = str(pair[0]).strip()
                     cv = str(pair[1]).strip() if pair[1] is not None else ""
                     if ck and cv:
-                        exact_defs[ck] = cv
                         merged_defs[ck] = cv
                         merged_defs[str(text_processing(ck))] = cv
                         if ck not in defined_entity_names:
@@ -1460,7 +1105,6 @@ class HippoRAGProgram(dspy.Module):
                 k = str(item[0]).strip()
                 v = str(item[1]).strip() if item[1] is not None else ""
                 if k and v:
-                    exact_defs[k] = v
                     merged_defs[k] = v
                     merged_defs[str(text_processing(k))] = v
                     if k not in defined_entity_names:
@@ -1480,32 +1124,19 @@ class HippoRAGProgram(dspy.Module):
             )
         ]
 
-        is_rlm = (mode or self.execution_mode) == "rlm"
-        saved_defs = dict(self._last_ner_definitions)
-        if is_rlm:
-            self._last_ner_definitions = dict(exact_defs)
-        try:
-            pred = self._invoke_stage(
-                self.triples,
-                self.triples_rlm,
-                stage_name="triples",
-                is_rlm=is_rlm,
-                lm=lm,
-                use_gbnf=use_gbnf,
-                grammar_fn=lambda: build_dspy_triples_grammar(
-                    self.gbnf_max_triples,
-                    known_entities=known_entities_for_grammar,
-                ),
-                passage=passage,
-                named_entities=list(named_entities),
-            )
-            if is_rlm:
-                for k, v in self._last_ner_definitions.items():
-                    if k and v:
-                        merged_defs[k] = v
-                        merged_defs[str(text_processing(k))] = v
-        finally:
-            self._last_ner_definitions = saved_defs
+        pred = self._invoke_stage(
+            self.triples,
+            stage_name="triples",
+            is_rlm=False,
+            lm=lm,
+            use_gbnf=use_gbnf,
+            grammar_fn=lambda: build_dspy_triples_grammar(
+                self.gbnf_max_triples,
+                known_entities=known_entities_for_grammar,
+            ),
+            passage=passage,
+            named_entities=list(named_entities),
+        )
 
         raw_triples = getattr(pred, "triples", [])
         structured = list(
@@ -1552,7 +1183,6 @@ class HippoRAGProgram(dspy.Module):
                 passage,
                 missing_names,
                 triples=structured,
-                mode=mode,
                 lm=lm,
                 use_gbnf=use_gbnf,
             )
@@ -1588,15 +1218,13 @@ class HippoRAGProgram(dspy.Module):
         passage: str,
         named_entities: Sequence[Any],
         *,
-        mode: Literal["direct", "rlm"] | None = None,
         lm: Any = None,
         use_gbnf: bool | None = None,
     ) -> tuple[tuple[str, str, str], ...]:
-        """Run DSPy triple extraction (direct on Qwen w/ GBNF, or Mistral RLM orchestrating Qwen)."""
+        """Run DSPy triple extraction on Qwen w/ GBNF."""
         structured = self.extract_structured_triples(
             passage,
             named_entities,
-            mode=mode,
             lm=lm,
             use_gbnf=use_gbnf,
         )
@@ -1607,13 +1235,12 @@ class HippoRAGProgram(dspy.Module):
         chunk_id: str,
         passage: str,
         *,
-        mode: Literal["direct", "rlm"] | None = None,
         lm: Any = None,
         use_gbnf: bool | None = None,
     ) -> OpenIERecord:
-        """Execute two-stage OpenIE (NER w/ definitions -> Structured Triples) for a passage chunk."""
+        """Execute OpenIE (NER w/ definitions -> Structured Triples -> Missing Entity Definitions) for a passage chunk."""
         entities, entity_definitions = self._run_ner_stage(
-            passage, mode=mode, lm=lm, use_gbnf=use_gbnf
+            passage, lm=lm, use_gbnf=use_gbnf
         )
         has_nonempty_defs = any(defn for _, defn in entity_definitions)
         stage2_entities_input: list[Any] = (
@@ -1625,7 +1252,6 @@ class HippoRAGProgram(dspy.Module):
             passage,
             stage2_entities_input,
             entity_definitions=entity_definitions,
-            mode=mode,
             lm=lm,
             use_gbnf=use_gbnf,
         )
@@ -1685,12 +1311,10 @@ class HippoRAGProgram(dspy.Module):
             entity_definitions=tuple(merged_def_list),
         )
 
-
     def judge_synonyms(
         self,
         candidate_pairs: Sequence[Mapping[str, Any]] | str,
         *,
-        mode: Literal["direct", "rlm"] | None = None,
         lm: Any = None,
         use_gbnf: bool | None = None,
     ) -> list[dict[str, str]]:
@@ -1701,19 +1325,26 @@ class HippoRAGProgram(dspy.Module):
             pairs_json = candidate_pairs.strip()
             if not pairs_json or pairs_json == "[]":
                 return []
+            if len(pairs_json) > 12000:
+                try:
+                    parsed_pairs = json.loads(pairs_json)
+                    if isinstance(parsed_pairs, list):
+                        pairs_json = json.dumps(parsed_pairs[:16], ensure_ascii=False)
+                except (json.JSONDecodeError, TypeError):
+                    pairs_json = pairs_json[:12000]
         else:
             pairs_list = [dict(p) for p in candidate_pairs if isinstance(p, Mapping)]
             if not pairs_list:
                 return []
+            if len(pairs_list) > 16:
+                pairs_list = pairs_list[:16]
             pairs_json = json.dumps(pairs_list, ensure_ascii=False)
 
-        is_rlm = (mode or self.execution_mode) == "rlm"
         prev_telem_len = len(self.telemetry)
         pred = self._invoke_stage(
             self.synonym_judge,
-            self.synonym_judge_rlm,
             stage_name="synonym_judge",
-            is_rlm=is_rlm,
+            is_rlm=False,
             lm=lm,
             use_gbnf=use_gbnf,
             grammar_fn=build_dspy_synonym_judge_grammar,
@@ -1728,13 +1359,9 @@ class HippoRAGProgram(dspy.Module):
         )
         self.synonym_audit_trail.append(
             {
-                "mode": "rlm" if is_rlm else "direct",
-                "predictor": "synonym_judge_rlm" if is_rlm else "synonym_judge",
-                "signature": (
-                    OrchestrateSynonymJudgment.__name__
-                    if is_rlm
-                    else JudgeSynonyms.__name__
-                ),
+                "mode": "direct",
+                "predictor": "synonym_judge",
+                "signature": JudgeSynonyms.__name__,
                 "tokens_used": stage_tokens,
                 "candidate_pairs": pairs_json,
                 "decisions": decisions,
@@ -1751,13 +1378,28 @@ class HippoRAGProgram(dspy.Module):
         lm: Any = None,
         use_gbnf: bool | None = None,
     ) -> list[dict[str, str]]:
-        """Propose bounded closed-world SHACL repair actions for the given violations."""
+        """Propose bounded closed-world SHACL repair actions for the given violations.
+
+        By default (`mode=None`), executes the single-level RLM Python REPL healer
+        (`shacl_healer_rlm` / `HealSHACLViolations`), which inspects focus nodes,
+        hydrates source chunks, and delegates structured repair synthesis to its
+        inner `qwen_propose_shacl_repairs` tool (`mode="direct"` -> `shacl_repair` /
+        `ProposeSHACLRepairs` with pure-JSON GBNF).
+        """
         if not violations:
             return []
+        is_rlm = True if mode is None else (mode == "rlm")
         if isinstance(violations, str):
             violations_json = violations.strip()
             if not violations_json or violations_json == "[]":
                 return []
+            if not is_rlm and len(violations_json) > 12000:
+                try:
+                    parsed_v = json.loads(violations_json)
+                    if isinstance(parsed_v, list):
+                        violations_json = json.dumps(parsed_v[:16], ensure_ascii=False)
+                except (json.JSONDecodeError, TypeError):
+                    violations_json = violations_json[:12000]
         else:
             serialized: list[dict[str, str]] = []
             for v in violations:
@@ -1785,12 +1427,15 @@ class HippoRAGProgram(dspy.Module):
                     )
             if not serialized:
                 return []
+            if not is_rlm and len(serialized) > 16:
+                serialized = serialized[:16]
             violations_json = json.dumps(serialized, ensure_ascii=False)
 
-        is_rlm = (mode or self.execution_mode) == "rlm"
         stage_inputs: dict[str, Any] = {"violations": violations_json}
         if not is_rlm:
-            stage_inputs["focus_context"] = focus_context
+            stage_inputs["focus_context"] = (
+                focus_context[:12000] if len(focus_context) > 12000 else focus_context
+            )
         prev_telem_len = len(self.telemetry)
         pred = self._invoke_stage(
             self.shacl_repair,
@@ -1829,26 +1474,24 @@ class HippoRAGProgram(dspy.Module):
     repair_shacl_violations = propose_shacl_repairs
     heal_shacl_violations = propose_shacl_repairs
 
-    def filter_facts(
+    def filter_triples(
         self,
         question: str,
         candidate_facts: Sequence[tuple[str, str, str] | list[str]],
         *,
-        mode: Literal["direct", "rlm"] | None = None,
         max_facts: int | None = None,
         lm: Any = None,
         use_gbnf: bool | None = None,
     ) -> list[int]:
-        """Filter candidate facts (direct on Qwen w/ GBNF, or Mistral RLM orchestrating Qwen)."""
+        """Filter candidate triples on Qwen w/ dynamic candidate-literal GBNF."""
         if not candidate_facts:
             return []
         effective_max_facts = self.gbnf_max_facts if max_facts is None else max_facts
         fact_before_filter = json.dumps({"fact": [list(f) for f in candidate_facts]})
         pred = self._invoke_stage(
-            self.fact_filter,
-            self.fact_filter_rlm,
-            stage_name="fact_filter",
-            is_rlm=(mode or self.execution_mode) == "rlm",
+            self.triple_filter,
+            stage_name="triple_filter",
+            is_rlm=False,
             lm=lm,
             use_gbnf=use_gbnf,
             grammar_fn=lambda: build_dspy_rerank_grammar(
@@ -1900,22 +1543,17 @@ class HippoRAGProgram(dspy.Module):
         context: str,
         question: str,
         *,
-        mode: Literal["cot", "rlm"] | None = None,
         lm: Any = None,
         use_gbnf: bool | None = None,
     ) -> dspy.Prediction:
-        """Answer a question over retrieved context using either ChainOfThought or RLM."""
-        active_mode = mode or self.qa_mode
-        if active_mode not in ("cot", "rlm"):
-            raise ValueError(f"Unsupported QA mode: {active_mode!r}")
+        """Answer a question over retrieved context using `qa` (`AnswerQuestion`)."""
         return self._invoke_stage(
-            self.qa_cot,
-            self.qa_rlm,
+            self.qa,
             stage_name="qa",
-            is_rlm=active_mode == "rlm",
+            is_rlm=False,
             lm=lm,
             use_gbnf=use_gbnf,
-            grammar_fn=lambda: build_dspy_qa_cot_grammar(self.gbnf_max_reasoning_chars),
+            grammar_fn=lambda: build_dspy_qa_grammar(self.gbnf_max_reasoning_chars),
             context=context,
             question=question,
         )
@@ -1932,7 +1570,6 @@ class HippoRAGProgram(dspy.Module):
         context: str | None = None,
         question: str | None = None,
         *,
-        mode: Literal["cot", "rlm"] | None = None,
         use_gbnf: bool | None = None,
     ) -> dspy.Prediction:
         """Default DSPy forward pass executes multi-hop QA or the full retrieval+QA trace."""
@@ -1940,10 +1577,10 @@ class HippoRAGProgram(dspy.Module):
 
         if context is not None and question is not None:
             return self.answer_question(
-                context=context, question=question, mode=mode, use_gbnf=use_gbnf
+                context=context, question=question, use_gbnf=use_gbnf
             )
         if context is not None and question is None:
-            return self.forward(context=None, question=context, mode=mode, use_gbnf=use_gbnf)
+            return self.forward(context=None, question=context, use_gbnf=use_gbnf)
         if question is not None:
             if self._retrieval_hook is not None:
                 with track_usage() as usage_tracker:
@@ -1957,7 +1594,7 @@ class HippoRAGProgram(dspy.Module):
                     else:
                         hydrated_ctx, passages, scores = self._retrieval_hook(question)
                     pred = self.answer_question(
-                        context=hydrated_ctx, question=question, mode=mode, use_gbnf=use_gbnf
+                        context=hydrated_ctx, question=question, use_gbnf=use_gbnf
                     )
                 tokens = usage_tracker.get_total_tokens()
                 if tokens and hasattr(pred, "set_lm_usage"):
@@ -1974,32 +1611,8 @@ class HippoRAGProgram(dspy.Module):
         )
 
     def named_predictors(self) -> list[tuple[str, Any]]:
-        """Return all predictors active under the current execution_mode and qa_mode.
-
-        Unlike legacy hook filtering, OpenIE/EDC/SHACL predictors (`ner`, `triples`,
-        `entity_definer`, `synonym_judge`, `shacl_repair`) remain visible even when a
-        `_retrieval_hook` is registered so `dspy.GEPA` can inspect and optimize the full
-        program surface.
-        """
-        inactive_prefixes: set[str] = set()
-        if self.execution_mode != "rlm":
-            inactive_prefixes.update(
-                {
-                    "ner_rlm",
-                    "triples_rlm",
-                    "entity_definer_rlm",
-                    "synonym_judge_rlm",
-                    "shacl_healer_rlm",
-                    "fact_filter_rlm",
-                }
-            )
-        if self.qa_mode != "rlm":
-            inactive_prefixes.add("qa_rlm")
-        return [
-            (name, param)
-            for name, param in super().named_predictors()
-            if name.split(".", 1)[0] not in inactive_prefixes
-        ]
+        """Return all 9 canonical stage predictors so `dspy.GEPA` inspects the full program surface."""
+        return list(super().named_predictors())
 
 
 
@@ -2018,18 +1631,17 @@ def _bound_nested_strings(value: Any, max_chars: int) -> Any:
 
 
 class RLMInstructionProposer:
-    """Heterogeneous `RLM -> RLM` Cascade (`Mistral-7B` NPU $\\to$ `Qwen3-4B` GPU) GEPA ProposalFn.
+    """Single-level RLM + GBNF Synthesizer (`Qwen3-4B` GPU) GEPA ProposalFn.
 
     Conforms to `gepa.core.adapter.ProposalFn` and stock DSPy `InstructionProposer`:
     `(candidate, reflective_dataset, components_to_update) -> dict[str, str]`.
-    - **Outer RLM (`self.outer_rlm` on `orchestrator_lm`, `Mistral-7B`, NPU):**
-      Uses `ReflectiveOuterOrchestratorSignature`, holds the full untruncated `examples_with_feedback`
-      list in Python memory, and delegates to `qwen_propose_instruction`.
-    - **Inner RLM (`self.inner_rlm` on `worker_lm`, `Qwen3-4B`, GPU):**
-      Uses `ReflectiveInnerDistillerSignature`, distills `examples_with_feedback` in Python so neither
-      model's context window is flooded, then calls `synthesize_instruction` (backed by stock DSPy's
-      `ProposeInstructionSignature` and `CompressInstructionSignature` with `YawJSONAdapter` and
-      pure-JSON GBNF grammars).
+    - **Single-level RLM (`self.inner_rlm` / `self.rlm` on `orchestrator_lm` or `worker_lm`):**
+      Uses `ReflectiveInnerDistillerSignature` inside `dspy.PythonInterpreter` (managed Deno/Pyodide WASM),
+      holds the full `examples_with_feedback` list in Python memory, distills structured traces in Python so the
+      context window is not flooded, and calls `synthesize_instruction(current_instruction, digest)`.
+    - **GBNF Synthesizer (`self.qwen_proposer`, `self.qwen_compressor` on `worker_lm`):**
+      Runs stock DSPy's `ProposeInstructionSignature` and `CompressInstructionSignature` with
+      `YawJSONAdapter` and pure-JSON GBNF grammars (`DSPY_INSTRUCTION_PROPOSAL_GBNF_GRAMMAR`).
     """
 
     def __init__(
@@ -2047,7 +1659,7 @@ class RLMInstructionProposer:
         rlm_max_output_chars: int = 10000,
         include_demos: bool = True,
         adapter: dspy.Adapter | None = None,
-        rlm_interpreter_factory: Callable[[], Any] = dspy.LocalInterpreter,
+        rlm_interpreter_factory: Callable[[], Any] = dspy.PythonInterpreter,
     ) -> None:
         if max_instruction_chars is not None and max_instruction_chars <= 0:
             raise ValueError(
@@ -2183,80 +1795,17 @@ class RLMInstructionProposer:
             max_llm_calls=rlm_max_llm_calls,
             max_output_chars=rlm_max_output_chars,
             tools=[synthesize_instruction],
-            sub_lm=worker_lm,
+            sub_lm=worker_lm or orchestrator_lm,
             interpreter_factory=rlm_interpreter_factory,
         )
-        self.inner_rlm.generate_action.config = {"temperature": self.worker_temperature}
-        self.inner_rlm.extract.config = {"temperature": self.worker_temperature}
-
-        def qwen_propose_instruction(
-            arg1: Any,
-            arg2: Any = None,
-            arg3: Any = None,
-            arg4: Any = None,
-        ) -> str:
-            """Execute the Inner Qwen RLM over examples_with_feedback and synthesize the new instruction."""
-            from dspy.utils.usage_tracker import track_usage
-
-            if arg3 is not None:
-                curr_inst = str(arg2)
-                raw_examples = arg3
-            else:
-                curr_inst = str(arg1)
-                raw_examples = arg2
-            prepared = self._prepare_examples(raw_examples)
-            eff_worker = (
-                self.worker_lm or self.orchestrator_lm or getattr(dspy.settings, "lm", None)
-            )
-            before_count = len(self._synthesized_proposals)
-            with dspy.context(lm=eff_worker), track_usage() as inner_tracker:
-                inner_pred = self.inner_rlm(
-                    current_instruction=curr_inst,
-                    examples_with_feedback=prepared,
-                )
-            inner_usage = inner_tracker.get_total_tokens()
-            inner_inst = strip_mistral_bracket_prefix(
-                str(getattr(inner_pred, "new_instruction", "") or "")
-            ).strip()
-            self._sub_telemetry.append(
-                {
-                    "predictor": "inner_rlm",
-                    "signature": ReflectiveInnerDistillerSignature.__name__,
-                    "mode": "rlm",
-                    "tokens_used": _sum_usage_tokens(inner_usage),
-                    "usage": dict(inner_usage or {}),
-                    "inputs_summary": curr_inst[:120],
-                    "outputs_summary": inner_inst[:120],
-                }
-            )
-            if len(self._synthesized_proposals) > before_count:
-                return self._synthesized_proposals[-1]
-            return synthesize_instruction(curr_inst, prepared)
-
-        self._qwen_propose_tool = qwen_propose_instruction
-        self.outer_rlm = _PositionalSafeRLM(
-            ReflectiveOuterOrchestratorSignature,
-            stage_rule=_STAGE_RLM_DELEGATION_RULES["instruction_proposer"],
-            max_iters=rlm_max_iters,
-            max_llm_calls=rlm_max_llm_calls,
-            max_output_chars=rlm_max_output_chars,
-            tools=[qwen_propose_instruction],
-            sub_lm=worker_lm,
-            interpreter_factory=rlm_interpreter_factory,
-        )
-        self.outer_rlm.generate_action.config = {"temperature": self.reflection_temperature}
-        self.outer_rlm.extract.config = {"temperature": self.reflection_temperature}
-        self.rlm = self.outer_rlm
+        self.inner_rlm.generate_action.config = {"temperature": self.reflection_temperature}
+        self.inner_rlm.extract.config = {"temperature": self.reflection_temperature}
+        self.rlm = self.inner_rlm
 
         self._bind_predictor_lms()
 
         if include_demos:
             rlm_demos = _build_rlm_action_demos()
-            setattr(
-                self.outer_rlm.generate_action,
-                "demos",
-                list(rlm_demos["instruction_proposer"]),
-            )
             setattr(
                 self.inner_rlm.generate_action,
                 "demos",
@@ -2264,7 +1813,7 @@ class RLMInstructionProposer:
             )
 
     def _bind_predictor_lms(self) -> None:
-        """Bind dedicated `_PredictorBoundLM` instances to all 4 reflection predictors."""
+        """Bind dedicated `_PredictorBoundLM` instances to all 3 reflection predictors."""
 
         def worker_getter() -> Any:
             return self.worker_lm or self.orchestrator_lm
@@ -2275,22 +1824,15 @@ class RLMInstructionProposer:
         self.qwen_proposer.lm = _PredictorBoundLM("qwen_proposer", "worker", worker_getter)
         self.qwen_compressor.lm = _PredictorBoundLM("qwen_compressor", "worker", worker_getter)
 
-        inner_action_lm = _PredictorBoundLM("inner_rlm.generate_action", "worker", worker_getter)
-        inner_extract_lm = _PredictorBoundLM("inner_rlm.extract", "worker", worker_getter)
+        inner_action_lm = _PredictorBoundLM("inner_rlm.generate_action", "orchestrator", orch_getter)
+        inner_extract_lm = _PredictorBoundLM("inner_rlm.extract", "orchestrator", orch_getter)
         self.inner_rlm.generate_action.lm = inner_action_lm
         self.inner_rlm.extract.lm = inner_extract_lm
         setattr(self.inner_rlm, "lm", inner_action_lm)
 
-        outer_action_lm = _PredictorBoundLM("outer_rlm.generate_action", "orchestrator", orch_getter)
-        outer_extract_lm = _PredictorBoundLM("outer_rlm.extract", "orchestrator", orch_getter)
-        self.outer_rlm.generate_action.lm = outer_action_lm
-        self.outer_rlm.extract.lm = outer_extract_lm
-        setattr(self.outer_rlm, "lm", outer_action_lm)
-
     def all_reflection_predictors(self) -> list[tuple[str, Any]]:
-        """Return all 4 reflection predictors (`outer_rlm`, `inner_rlm`, `qwen_proposer`, `qwen_compressor`)."""
+        """Return all 3 active reflection predictors (`inner_rlm`, `qwen_proposer`, `qwen_compressor`)."""
         return [
-            ("outer_rlm", self.outer_rlm),
             ("inner_rlm", self.inner_rlm),
             ("qwen_proposer", self.qwen_proposer),
             ("qwen_compressor", self.qwen_compressor),
@@ -2337,7 +1879,7 @@ class RLMInstructionProposer:
         current_instruction: str,
         component_examples: Sequence[Mapping[str, Any]],
     ) -> str:
-        """Run Outer Mistral RLM -> Inner Qwen RLM -> Qwen GBNF synthesis for a predictor component."""
+        """Run single-level RLM trace distillation -> Qwen GBNF synthesis for a predictor component."""
         from dspy.utils.usage_tracker import track_usage
 
         prepared_examples = self._prepare_examples(component_examples)
@@ -2348,33 +1890,36 @@ class RLMInstructionProposer:
         self._sub_telemetry.clear()
 
         with track_usage() as usage_tracker:
-            if eff_orch is not None and not lm_supports_gbnf(eff_orch):
-                with dspy.context(lm=eff_orch), track_usage() as outer_tracker:
-                    outer_pred = self.outer_rlm(
+            if eff_orch is not None:
+                with dspy.context(lm=eff_orch), track_usage() as rlm_tracker:
+                    rlm_pred = self.inner_rlm(
                         current_instruction=current_instruction,
                         examples_with_feedback=prepared_examples,
                     )
-                outer_usage = outer_tracker.get_total_tokens()
+                rlm_usage = rlm_tracker.get_total_tokens()
+                rlm_inst = strip_mistral_bracket_prefix(
+                    str(getattr(rlm_pred, "new_instruction", "") or "")
+                ).strip()
                 self._sub_telemetry.append(
                     {
-                        "predictor": "outer_rlm",
-                        "signature": ReflectiveOuterOrchestratorSignature.__name__,
+                        "predictor": "inner_rlm",
+                        "signature": ReflectiveInnerDistillerSignature.__name__,
                         "mode": "rlm",
-                        "tokens_used": _sum_usage_tokens(outer_usage),
-                        "usage": dict(outer_usage or {}),
+                        "tokens_used": _sum_usage_tokens(rlm_usage),
+                        "usage": dict(rlm_usage or {}),
                         "inputs_summary": current_instruction[:120],
-                        "outputs_summary": str(getattr(outer_pred, "new_instruction", ""))[:120],
+                        "outputs_summary": rlm_inst[:120],
                     }
                 )
                 if self._synthesized_proposals:
                     proposed = self._synthesized_proposals[-1]
                 else:
-                    proposed = self._qwen_propose_tool(
+                    proposed = self._synthesize_tool(
                         current_instruction,
                         prepared_examples,
                     )
             else:
-                proposed = self._qwen_propose_tool(
+                proposed = self._synthesize_tool(
                     current_instruction,
                     prepared_examples,
                 )
@@ -2384,8 +1929,8 @@ class RLMInstructionProposer:
         self.telemetry.append(
             {
                 "component_name": component_name,
-                "predictor": "outer_rlm",
-                "signature": ReflectiveOuterOrchestratorSignature.__name__,
+                "predictor": "inner_rlm",
+                "signature": ReflectiveInnerDistillerSignature.__name__,
                 "mode": "rlm",
                 "tokens_used": _sum_usage_tokens(usage),
                 "previous_instruction": current_instruction,

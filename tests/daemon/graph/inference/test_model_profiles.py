@@ -52,31 +52,23 @@ class ProfileTests(unittest.TestCase):
         ):
             chat_evidence(name)
 
-    def test_ryzenai_chat_evidence_validates_npu_device_and_context(self):
-        name = "Mistral-7B-Instruct-v0.3-Hybrid"
+    def test_llamacpp_chat_evidence_validates_gpu_device(self):
+        name = "Qwen3-4B-Instruct-2507-GGUF"
         profile = CHAT_MODELS[name]
         valid_entry = {
             "id": name,
             "checkpoint": profile.checkpoint,
             "recipe": profile.recipe,
-            "device": "npu",
+            "device": "gpu",
             "backend_health": "ready",
-            "recipe_options": {"ctx_size": 32786},
+            "launch_command": ["llama-server.exe", "--parallel", "1", "--cache-ram", "0"],
         }
         with patch("yaw.daemon.graph.inference.models.get_json", return_value={"all_models_loaded": [valid_entry]}):
             self.assertEqual(chat_evidence(name)["id"], name)
         with patch(
             "yaw.daemon.graph.inference.models.get_json",
             return_value={"all_models_loaded": [{**valid_entry, "device": "cpu"}]},
-        ), self.assertRaisesRegex(ValueError, "expected device npu"):
-            chat_evidence(name)
-        with (
-            patch(
-                "yaw.daemon.graph.inference.models.get_json",
-                return_value={"all_models_loaded": [{**valid_entry, "recipe_options": {"ctx_size": 4096}}]},
-            ),
-            self.assertRaisesRegex(ValueError, "ctx_size >="),
-        ):
+        ), self.assertRaisesRegex(ValueError, "expected device gpu"):
             chat_evidence(name)
     def test_each_profile_preserves_its_request_format_and_dimensions(self):
         for profile in PROFILES.values():
@@ -129,9 +121,9 @@ class ProfileTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             RetrievalEmbedding(BaseConfig(embedding_model_name="another-model"), profile)
 
-    def test_no_download_or_substitution_for_missing_mistral(self):
+    def test_no_download_or_substitution_for_missing_qwen(self):
         profile = next(iter(PROFILES.values()))
-        name = "Mistral-7B-Instruct-v0.3-Hybrid"
+        name = "Qwen3-4B-Instruct-2507-GGUF"
         checkpoint, recipe = CHAT_MODELS[name]
         registry = [
             {"id": profile.model, "checkpoint": profile.checkpoint, "recipe": "llamacpp",
@@ -145,7 +137,7 @@ class ProfileTests(unittest.TestCase):
     def test_split_extraction_and_qa_models_are_both_validated(self):
         profile = next(iter(PROFILES.values()))
         ext_name = "Phi-4-mini-instruct-GGUF"
-        qa_name = "Mistral-7B-Instruct-v0.3-Hybrid"
+        qa_name = "Qwen3-4B-Instruct-2507-GGUF"
         ext_ckpt, ext_recipe = CHAT_MODELS[ext_name]
         qa_ckpt, qa_recipe = CHAT_MODELS[qa_name]
         registry = [

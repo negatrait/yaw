@@ -57,7 +57,7 @@ string ::= "\"" char+ "\""
 char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
 """
 
-DSPY_QA_COT_GBNF_GRAMMAR = r"""root ::= "{\"reasoning\": " string ", \"answer\": " string "}"
+DSPY_QA_GBNF_GRAMMAR = r"""root ::= "{\"reasoning\": " string ", \"answer\": " string "}"
 string ::= "\"" char+ "\""
 char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
 """
@@ -223,10 +223,10 @@ def build_dspy_shacl_repair_grammar(max_repairs: int | None = None) -> str:
     )
 
 
-def build_dspy_qa_cot_grammar(max_reasoning_chars: int | None = None) -> str:
-    """Build pure-JSON GBNF grammar for AnswerQuestion CoT, optionally capping reasoning length."""
+def build_dspy_qa_grammar(max_reasoning_chars: int | None = None) -> str:
+    """Build pure-JSON GBNF grammar for AnswerQuestion, optionally capping reasoning length."""
     if max_reasoning_chars is None or max_reasoning_chars <= 0:
-        return DSPY_QA_COT_GBNF_GRAMMAR
+        return DSPY_QA_GBNF_GRAMMAR
     return (
         'root ::= "{\\"reasoning\\": " reasoning-str ", \\"answer\\": " string "}"\n'
         f'reasoning-str ::= "\\"" char{{1,{int(max_reasoning_chars)}}} "\\""\n'
@@ -255,7 +255,7 @@ def build_dspy_rerank_grammar(
     candidate_facts: Sequence[tuple[str, str, str] | list[str]],
     max_facts: int = 4,
 ) -> str:
-    """Build dynamic candidate-literal pure-JSON GBNF grammar for DSPy FilterFacts (JSONAdapter)."""
+    """Build dynamic candidate-literal pure-JSON GBNF grammar for DSPy FilterTriples (JSONAdapter)."""
     candidates: list[str] = []
     for item in candidate_facts:
         if (
@@ -507,7 +507,7 @@ __all__ = [
     "DSPY_SYNONYM_JUDGMENT_GBNF_GRAMMAR",
     "DSPY_SHACL_REPAIR_GBNF_GRAMMAR",
     "DSPY_RERANK_GBNF_GRAMMAR",
-    "DSPY_QA_COT_GBNF_GRAMMAR",
+    "DSPY_QA_GBNF_GRAMMAR",
     "DSPY_INSTRUCTION_PROPOSAL_GBNF_GRAMMAR",
     "DSPY_QUERY_INTENT_GBNF_GRAMMAR",
     "gbnf_escape_literal",
@@ -517,7 +517,7 @@ __all__ = [
     "build_dspy_synonym_judge_grammar",
     "build_dspy_synonym_judgment_grammar",
     "build_dspy_shacl_repair_grammar",
-    "build_dspy_qa_cot_grammar",
+    "build_dspy_qa_grammar",
     "build_dspy_instruction_proposal_grammar",
     "build_dspy_query_intent_grammar",
     "build_dspy_rerank_grammar",

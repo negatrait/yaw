@@ -43,6 +43,7 @@ from yaw.daemon.graph.storage import (
     get_max_end_line,
     get_meta,
     get_openie_checkpoints,
+    hydrate_budgeted_passages,
     hydrate_passages,
     inspect_focus_node,
     lint_graph_shacl,
@@ -103,6 +104,8 @@ class YawGraphEngine:
         dual_weight: float | None = 0.5,
         same_sense_cosine_gate: float = _SAME_SENSE_COSINE_GATE,
         homograph_cosine_gate: float | None = None,
+        max_context_chars: int = 24000,
+        max_ast_expansion_hops: int = 1,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.db_path = db_path
@@ -112,6 +115,8 @@ class YawGraphEngine:
         self.program = program
         self.embedder = embedder
 
+        self.max_context_chars = max_context_chars
+        self.max_ast_expansion_hops = max_ast_expansion_hops
         self.linking_top_k = linking_top_k
         self.fact_candidate_pool_k = fact_candidate_pool_k
         self.fact_fts_pool_k = fact_fts_pool_k
@@ -156,6 +161,8 @@ class YawGraphEngine:
             "shacl_healer_tokens": 0,
             "missing_entity_defs_count": 0,
             "missing_entity_defs_tokens": 0,
+            "embedding_calls": 0,
+            "embedding_tokens": 0,
         }
 
         self._bind_program_hooks()
@@ -197,6 +204,12 @@ class YawGraphEngine:
         self._graph_rlm_stats["shacl_repairs_applied"] += applied
         return applied
 
+    def _on_embedding_telemetry(self, entry: Mapping[str, Any]) -> None:
+        self._graph_rlm_stats["embedding_calls"] += 1
+        self._graph_rlm_stats["embedding_tokens"] += int(entry.get("tokens_used", 0))
+        if hasattr(self.program, "record_embedding_telemetry"):
+            self.program.record_embedding_telemetry(entry)
+
     def _bind_program_hooks(self) -> None:
         self.program.set_retrieval_hook(self._program_retrieval_hook)
         if hasattr(self.program, "set_graph_tools"):
@@ -208,6 +221,8 @@ class YawGraphEngine:
                     v.to_dict() for v in lint_graph_shacl(self.conn, auto_heal=False)
                 ],
             )
+        if hasattr(self.embedder, "bind_telemetry_hook"):
+            self.embedder.bind_telemetry_hook(self._on_embedding_telemetry)
 
     def _apply_program_embedding_prefixes(self) -> None:
         if hasattr(self.embedder, "update_prefixes"):
@@ -216,6 +231,14 @@ class YawGraphEngine:
                 fact_query_prefix=getattr(self.program, "embedding_fact_prefix", None),
                 document_prefix=getattr(self.program, "embedding_document_prefix", None),
             )
+        profile = getattr(self.embedder, "profile", None)
+        if profile is not None:
+            if getattr(self.program, "embedding_query_prefix", None) is None:
+                setattr(self.program, "embedding_query_prefix", getattr(profile, "query_prefix", None))
+            if getattr(self.program, "embedding_fact_prefix", None) is None:
+                setattr(self.program, "embedding_fact_prefix", getattr(profile, "fact_query_prefix", None))
+            if getattr(self.program, "embedding_document_prefix", None) is None:
+                setattr(self.program, "embedding_document_prefix", getattr(profile, "document_prefix", None))
 
     def close(self) -> None:
         """Close SQLite database connection."""
@@ -283,10 +306,23 @@ class YawGraphEngine:
                 )
             return self._csr_graph
 
+    def _encode_texts(
+        self,
+        texts: Sequence[str],
+        *,
+        instruction: str = "",
+        stage: str | None = None,
+    ) -> Any:
+        if hasattr(self.embedder, "bind_telemetry_hook"):
+            return self.embedder.encode(texts, instruction=instruction, stage=stage)
+        return self.embedder.encode(texts, instruction=instruction)
+
     def _encode_in_batches(
         self,
         texts: Sequence[str],
         instruction: str = "",
+        *,
+        stage: str | None = None,
     ) -> list[np.ndarray]:
         """Encode texts in bounded micro-batches to prevent HTTP/VRAM OOM on large corpora."""
         if not texts:
@@ -295,7 +331,7 @@ class YawGraphEngine:
         step = max(1, self.embed_batch_size)
         for i in range(0, len(texts), step):
             batch = texts[i : i + step]
-            results.extend(self.embedder.encode(batch, instruction=instruction))
+            results.extend(self._encode_texts(batch, instruction=instruction, stage=stage))
         return results
 
     @staticmethod
@@ -305,6 +341,39 @@ class YawGraphEngine:
         if text.startswith(f"{p.title}\n") or text == p.title:
             return f"Wikipedia Title: {text}"
         return f"Wikipedia Title: {p.title}\n{text}"
+
+    def format_qa_context(
+        self,
+        hits: Sequence[tuple[ChunkPointer, float, str]],
+        *,
+        max_context_chars: int | None = None,
+        max_characters: int | None = None,
+    ) -> str:
+        """Pack top-k hydrated AST islands into QA context using budgeted AST-expansion and coalescence."""
+        if not hits:
+            return ""
+        budget = (
+            max_characters
+            if max_characters is not None
+            else (
+                max_context_chars
+                if max_context_chars is not None
+                else self.max_context_chars
+            )
+        )
+        ptrs_scores = [(p, s) for p, s, _ in hits]
+        hydrated = hydrate_budgeted_passages(
+            ptrs_scores,
+            corpus_root=self.workspace_root,
+            max_context_chars=budget,
+            max_expansion_hops=self.max_ast_expansion_hops,
+        )
+        blocks: list[str] = []
+        for hp in hydrated:
+            formatted = self._format_hydrated_passage(hp.pointer, hp.text)
+            if formatted:
+                blocks.append(formatted)
+        return "\n\n".join(blocks)
 
     @staticmethod
     def _format_entity_embedding_text(name: str, definition: str) -> str:
@@ -323,10 +392,8 @@ class YawGraphEngine:
         obj_def: str = "",
     ) -> str:
         s_d = spo_def.strip()
-        sub_d = subj_def.strip()
-        obj_d = obj_def.strip()
-        if s_d or sub_d or obj_d:
-            return f"# {s} {p} {o}\n{s_d} | {sub_d} | {obj_d}"
+        if s_d and s_d.lower().rstrip(".") != f"{s} {p} {o}".lower().rstrip("."):
+            return f"{s} {p} {o}. {s_d}"
         return f"{s} {p} {o}"
 
     @staticmethod
@@ -477,10 +544,7 @@ class YawGraphEngine:
         passages = tuple(p.chunk_id for p, _, _ in hits)
         scores = tuple(s for _, s, _ in hits)
         qa_hits = hits[: self.retrieval_top_k]
-        formatted_context = "\n\n".join(
-            self._format_hydrated_passage(p, text)
-            for p, _, text in qa_hits
-        )
+        formatted_context = self.format_qa_context(qa_hits)
         return formatted_context, passages, scores
 
     def index(
@@ -557,10 +621,28 @@ class YawGraphEngine:
                             start_line=start_line,
                             end_line=end_line,
                             title=title,
+                            ast_island_start=start_line,
+                            ast_island_end=end_line,
                         )
                         chunks_to_index.append((ptr, doc))
 
             return self.index_chunks(chunks_to_index, progress_callback=progress_callback)
+
+    def _format_chunk_for_embedding(self, ptr: ChunkPointer, text: str) -> str:
+        """Ensure AST-resolved ChunkPointer.title is passed as a Title: line for title-aware embedders."""
+        parse_title = bool(
+            getattr(getattr(self.embedder, "profile", None), "parse_document_title", False)
+        )
+        if not parse_title or not ptr.title or not ptr.title.strip():
+            return text
+        clean_title = ptr.title.strip()
+        first_line = text.split("\n", 1)[0].strip() if "\n" in text else text.strip()
+        if first_line.startswith("#") or first_line.lower().startswith(("title:", "wikipedia title:")):
+            return text
+        if text.startswith(f"{clean_title}\n"):
+            body = text[len(clean_title) + 1 :]
+            return f"Title: {clean_title}\n{body}" if body.strip() else text
+        return f"Title: {clean_title}\n{text}"
 
     def index_chunks(
         self,
@@ -583,8 +665,10 @@ class YawGraphEngine:
             if missing_chunks:
                 if progress_callback is not None:
                     progress_callback(f"indexing: embedding {len(missing_chunks)} chunk vectors")
-                texts_to_embed = [t for _, t in missing_chunks]
-                vecs = self._encode_in_batches(texts_to_embed, instruction="")
+                texts_to_embed = [self._format_chunk_for_embedding(p, t) for p, t in missing_chunks]
+                vecs = self._encode_in_batches(
+                    texts_to_embed, instruction="", stage="chunk_embed"
+                )
                 chunk_vec_pairs = [
                     (p.chunk_id, v) for (p, _), v in zip(missing_chunks, vecs, strict=False)
                 ]
@@ -819,6 +903,51 @@ class YawGraphEngine:
                     ).fetchall():
                         entity_info_by_id[str(row[0])] = (str(row[1]), str(row[2]))
 
+            # Bridge copular Stage 1 entity definitions to known graph concepts so definitions
+            # absorbed by Stage 1 NER still form explicit graph edges and retrievable facts.
+            if len(chunks) > 1:
+                known_concepts = {
+                    lbl
+                    for lbl in all_norm_labels
+                    if 3 <= len(lbl) <= 30
+                    and not lbl.isdigit()
+                    and len(lbl.split()) <= 3
+                }
+                for ptr, _ in chunks:
+                    if ptr.title:
+                        t_norm = str(text_processing(ptr.title))
+                        if 3 <= len(t_norm) <= 30 and not t_norm.isdigit():
+                            known_concepts.add(t_norm)
+                for _cid, normalized_sts, ner_entities in record_structured:
+                    existing_pairs = {(st.subj, st.obj) for st in normalized_sts} | {
+                        (st.obj, st.subj) for st in normalized_sts
+                    }
+                    for e_norm, e_def in ner_entities[:2]:
+                        if not e_def or len(e_norm) < 3:
+                            continue
+                        first_clause = e_def.split(".", 1)[0].lower()
+                        clause_words = set(re.findall(r"[a-z0-9]+", first_clause))
+                        for c_norm in known_concepts:
+                            if c_norm == e_norm or c_norm in e_norm or e_norm in c_norm:
+                                continue
+                            c_tokens = c_norm.split()
+                            if not all(tok in clause_words for tok in c_tokens):
+                                continue
+                            if (e_norm, c_norm) in existing_pairs:
+                                continue
+                            if re.search(rf"\b{re.escape(c_norm)}\b", first_clause):
+                                existing_pairs.add((e_norm, c_norm))
+                                normalized_sts.append(
+                                    StructuredTriple(
+                                        subj=e_norm,
+                                        pred="is a",
+                                        obj=c_norm,
+                                        spo_def=e_def,
+                                        subj_def=e_def,
+                                        obj_def="",
+                                    )
+                                )
+
             # Track senses per label_norm: list of (entity_id, name, definition, unit_vec_or_None)
             senses_by_label: dict[str, list[tuple[str, str, str, np.ndarray | None]]] = {}
             for lbl, eids in existing_by_label.items():
@@ -894,7 +1023,9 @@ class YawGraphEngine:
                 # WITHOUT writing any owl:differentFrom edge in Step 4 so Step 6 judge_synonyms
                 # adjudicates every ambiguous or divergent same-label pair.
                 cand_text = self._format_entity_embedding_text(label_norm, clean_def)
-                cand_vec = self._encode_in_batches([cand_text], instruction="")[0]
+                cand_vec = self._encode_in_batches(
+                    [cand_text], instruction="", stage="entity_embed"
+                )[0]
                 c_norm = float(np.linalg.norm(cand_vec))
                 if c_norm > 0:
                     cand_vec = cand_vec / c_norm
@@ -902,7 +1033,9 @@ class YawGraphEngine:
                 for idx_s, (eid, name, prev_def, prev_vec) in enumerate(existing_senses):
                     if prev_vec is None:
                         p_text = self._format_entity_embedding_text(name, prev_def)
-                        prev_vec = self._encode_in_batches([p_text], instruction="")[0]
+                        prev_vec = self._encode_in_batches(
+                            [p_text], instruction="", stage="entity_embed"
+                        )[0]
                         p_norm = float(np.linalg.norm(prev_vec))
                         if p_norm > 0:
                             prev_vec = prev_vec / p_norm
@@ -1003,7 +1136,9 @@ class YawGraphEngine:
                     self._format_entity_embedding_text(name, defn)
                     for _, name, defn in missing_entities
                 ]
-                e_vecs = self._encode_in_batches(e_texts, instruction="")
+                e_vecs = self._encode_in_batches(
+                    e_texts, instruction="", stage="entity_embed"
+                )
                 entity_vec_pairs.extend(
                     (eid, v) for (eid, _, _), v in zip(missing_entities, e_vecs, strict=False)
                 )
@@ -1026,7 +1161,9 @@ class YawGraphEngine:
                             items[0], pred, items[2], spo_d, subj_d, obj_d
                         )
                     )
-                f_vecs = self._encode_in_batches(fact_texts, instruction="")
+                f_vecs = self._encode_in_batches(
+                    fact_texts, instruction="", stage="fact_embed"
+                )
                 fact_vec_pairs = [
                     (f_row[0], v) for f_row, v in zip(missing_facts, f_vecs, strict=False)
                 ]
@@ -1099,8 +1236,18 @@ class YawGraphEngine:
                             }
                         )
 
+                    candidates.sort(
+                        key=lambda c: (
+                            str(c["name_a"]).strip().lower() == str(c["name_b"]).strip().lower(),
+                            float(c["similarity"]),
+                        ),
+                        reverse=True,
+                    )
+                    llm_candidates = candidates[:16]
+                    overflow_candidates = candidates[16:]
+
                     decisions: list[dict[str, str]] = []
-                    if candidates:
+                    if llm_candidates:
                         syn_audit: list[dict[str, Any]] = getattr(
                             self.program, "synonym_audit_trail", []
                         )
@@ -1109,7 +1256,7 @@ class YawGraphEngine:
                         )
                         prev_syn_audit_len = len(syn_audit)
                         prev_tel_len = len(tel)
-                        decisions = self.program.judge_synonyms(candidates)
+                        decisions = self.program.judge_synonyms(llm_candidates)
                         if len(syn_audit) > prev_syn_audit_len:
                             self._graph_rlm_stats["synonym_judge_tokens"] += int(
                                 syn_audit[-1].get("tokens_used", 0)
@@ -1135,6 +1282,7 @@ class YawGraphEngine:
                         ea, eb = str(c["entity_a"]), str(c["entity_b"])
                         cand_by_pair[(min(ea, eb), max(ea, eb))] = c
 
+                    adjudicated_pairs: set[tuple[str, str]] = set()
                     for dec in decisions:
                         pid = str(dec.get("pair_id", "")).strip()
                         if "|" in pid:
@@ -1147,16 +1295,21 @@ class YawGraphEngine:
                         canon = str(dec.get("canonical", "")).strip()
                         if not raw_src or not raw_tgt:
                             continue
+                        pkey = (min(raw_src, raw_tgt), max(raw_src, raw_tgt))
+                        adjudicated_pairs.add(pkey)
                         src = _resolve_active_eid(raw_src)
                         tgt = _resolve_active_eid(raw_tgt)
                         if src == tgt:
                             continue
-                        pkey = (min(raw_src, raw_tgt), max(raw_src, raw_tgt))
                         cand_info = cand_by_pair.get(pkey, {})
                         sim = float(cand_info.get("similarity", 0.5) or 0.5)
-                        if rel in ("skos:altLabel", "skos:hiddenLabel", "exact_match"):
-                            name_src, _ = cand_meta.get(src, cand_meta.get(raw_src, (src, "")))
-                            name_tgt, _ = cand_meta.get(tgt, cand_meta.get(raw_tgt, (tgt, "")))
+                        d_sim = float(cand_info.get("dense_sim", 0.0) or 0.0)
+                        name_src, _ = cand_meta.get(src, cand_meta.get(raw_src, (src, "")))
+                        name_tgt, _ = cand_meta.get(tgt, cand_meta.get(raw_tgt, (tgt, "")))
+                        same_name = name_src.strip().lower() == name_tgt.strip().lower()
+                        if rel in ("skos:altLabel", "skos:hiddenLabel", "exact_match") or (
+                            same_name and d_sim >= 0.45
+                        ):
                             if canon and (
                                 canon in (src, raw_src)
                                 or canon.lower() == name_src.lower()
@@ -1180,6 +1333,33 @@ class YawGraphEngine:
                             semantic_batch.append((src, tgt, "owl:differentFrom", 0.0))
                             self._graph_rlm_stats["different_from_edges"] += 1
 
+                    for c in llm_candidates:
+                        ea, eb = str(c["entity_a"]), str(c["entity_b"])
+                        pkey = (min(ea, eb), max(ea, eb))
+                        if pkey in adjudicated_pairs:
+                            continue
+                        if str(c["name_a"]).strip().lower() == str(c["name_b"]).strip().lower() and float(c.get("dense_sim", 0.0)) >= 0.45:
+                            src = _resolve_active_eid(ea)
+                            tgt = _resolve_active_eid(eb)
+                            if src != tgt:
+                                merge_entities(conn, src, tgt, label_kind="skos:altLabel")
+                                merged_into[src] = tgt
+                                self._graph_rlm_stats["merged_entities"] += 1
+
+                    for c in overflow_candidates:
+                        src = _resolve_active_eid(str(c["entity_a"]))
+                        tgt = _resolve_active_eid(str(c["entity_b"]))
+                        if src == tgt:
+                            continue
+                        if str(c["name_a"]).strip().lower() == str(c["name_b"]).strip().lower():
+                            merge_entities(conn, src, tgt, label_kind="skos:altLabel")
+                            merged_into[src] = tgt
+                            self._graph_rlm_stats["merged_entities"] += 1
+                        elif float(c.get("dense_sim", 0.0)) >= self.synonymy_threshold:
+                            sim = float(c.get("similarity", 0.5) or 0.5)
+                            semantic_batch.append((src, tgt, "skos:related", max(0.5, sim)))
+                            self._graph_rlm_stats["related_edges"] += 1
+
                     if semantic_batch:
                         resolved_semantic_batch = [
                             (_resolve_active_eid(s), _resolve_active_eid(d), k, w)
@@ -1196,6 +1376,7 @@ class YawGraphEngine:
                     "shacl_violations_before"
                 ]
                 if violations:
+                    bounded_violations = violations
                     focus_contexts = [
                         inspect_focus_node(conn, v.focus_node)
                         for v in violations[:16]
@@ -1211,11 +1392,15 @@ class YawGraphEngine:
                     self._active_repl_repair_keys = set()
                     try:
                         repairs = self.program.heal_shacl_violations(
-                            violations,
+                            bounded_violations,
                             focus_context=json.dumps(focus_contexts, ensure_ascii=False),
                         )
+                    except Exception as exc:
+                        import logging
+                        logging.warning("heal_shacl_violations encountered error: %s. Continuing indexing.", exc)
+                        repairs = []
                     finally:
-                        repl_applied_keys = set(self._active_repl_repair_keys)
+                        repl_applied_keys = set(self._active_repl_repair_keys) if self._active_repl_repair_keys else set()
                         self._active_repl_repair_keys = None
                     if len(shacl_audit) > prev_shacl_audit_len:
                         self._graph_rlm_stats["shacl_healer_tokens"] += int(
@@ -1266,7 +1451,9 @@ class YawGraphEngine:
 
             # 1. Pluggable Hybrid Fact Candidate Retrieval (Dense KNN + FTS5 + RRF)
             # Step 1: Retrieve top-k dense vector hits from fact_vec
-            query_fact_vec = self.embedder.encode([query], instruction=FACT_INSTRUCTION)[0]
+            query_fact_vec = self._encode_texts(
+                [query], instruction=FACT_INSTRUCTION, stage="query_fact_embed"
+            )[0]
             dense_hits = search_fact_vectors_knn(
                 self.conn, query_fact_vec, top_k=self.fact_candidate_pool_k
             )
@@ -1350,7 +1537,7 @@ class YawGraphEngine:
                     for fid, _, _ in top_candidates
                 ]
 
-                filter_indices = active_program.filter_facts(query, candidate_triples)
+                filter_indices = active_program.filter_triples(query, candidate_triples)
                 for idx in filter_indices:
                     if 0 <= idx < len(top_candidates):
                         kept_facts_with_scores.append((candidate_triples[idx], float(candidate_scores[idx])))
@@ -1364,7 +1551,9 @@ class YawGraphEngine:
                 )
 
             # 2. Hybrid Dense + Lexical Passage Seeding
-            query_passage_vec = self.embedder.encode([query], instruction=PASSAGE_INSTRUCTION)[0]
+            query_passage_vec = self._encode_texts(
+                [query], instruction=PASSAGE_INSTRUCTION, stage="query_passage_embed"
+            )[0]
             chunk_vec_hits = search_chunk_vectors_knn(
                 self.conn, query_passage_vec, top_k=self.passage_seed_pool_k
             )
@@ -1388,13 +1577,14 @@ class YawGraphEngine:
                     )
 
             # 3. PPR Execution or Dense Fallback
+            pool_k = max(top_k * 4, 50)
             ranked_chunks: list[tuple[str, float]] = []
 
             if not kept_facts_with_scores:
                 sorted_passages = sorted(
                     passage_weights.items(), key=lambda kv: kv[1], reverse=True
                 )
-                ranked_chunks = sorted_passages[:top_k]
+                ranked_chunks = sorted_passages[:pool_k]
             else:
                 surface_mentions: list[str] = []
                 for (s, _, o), _ in kept_facts_with_scores:
@@ -1447,26 +1637,60 @@ class YawGraphEngine:
                     renormalize=self.activation_renormalize,
                     dual_weight=self.dual_weight,
                 )
-                ranked_chunks = rank_passages_by_ppr(graph, ppr_scores, top_k=top_k)
+                ranked_chunks = rank_passages_by_ppr(graph, ppr_scores, top_k=pool_k)
 
             kept_facts_triples = [t for t, _ in kept_facts_with_scores]
             if not ranked_chunks:
                 return [], kept_facts_triples
 
-            # 4. 1-Indexed Line Hydration from Disk
-            ranked_cids = [cid for cid, _ in ranked_chunks]
-            pointers = get_chunk_pointers(self.conn, ranked_cids)
-            score_by_cid = dict(ranked_chunks)
-
-            ptrs_with_scores = [
-                (pointers[cid], score_by_cid[cid])
-                for cid in ranked_cids
-                if cid in pointers
-            ]
-            hydrated_passages = hydrate_passages(ptrs_with_scores, self.workspace_root)
-            hydrated_hits = [(hp.pointer, hp.score, hp.text) for hp in hydrated_passages]
-
+            # 4. MaxP Passage Span Deduplication + 1-Indexed Line Hydration from Disk
+            hydrated_hits = self._hydrate_maxp_passages(ranked_chunks, top_k)
             return hydrated_hits, kept_facts_triples
+
+    def _hydrate_maxp_passages(
+        self,
+        ranked_chunks: Sequence[tuple[str, float]],
+        top_k: int,
+    ) -> list[tuple[ChunkPointer, float, str]]:
+        """Deduplicate ranked sub-chunks by parent passage span (MaxP) and hydrate top_k passages."""
+        if not ranked_chunks or top_k <= 0:
+            return []
+        ranked_cids = [cid for cid, _ in ranked_chunks]
+        pointers = get_chunk_pointers(self.conn, ranked_cids)
+        score_by_cid = dict(ranked_chunks)
+
+        ptrs_with_scores: list[tuple[ChunkPointer, float]] = []
+        seen_spans: set[tuple[str, int, int]] = set()
+        pool_limit = max(top_k * 2, 10)
+        for cid in ranked_cids:
+            ptr = pointers.get(cid)
+            if ptr is None:
+                continue
+            span_key = (ptr.rel_posix_path, ptr.start_line, ptr.end_line)
+            if span_key in seen_spans:
+                continue
+            seen_spans.add(span_key)
+            ptrs_with_scores.append((ptr, score_by_cid[cid]))
+            if len(ptrs_with_scores) >= pool_limit:
+                break
+
+        hydrated_passages = hydrate_budgeted_passages(
+            ptrs_with_scores,
+            corpus_root=self.workspace_root,
+            max_context_chars=self.max_context_chars,
+            max_expansion_hops=self.max_ast_expansion_hops,
+        )
+        deduped_hits: list[tuple[ChunkPointer, float, str]] = []
+        seen_texts: set[str] = set()
+        for hp in hydrated_passages:
+            norm_text = hp.text.strip()
+            if not norm_text or norm_text in seen_texts:
+                continue
+            seen_texts.add(norm_text)
+            deduped_hits.append((hp.pointer, hp.score, hp.text))
+            if len(deduped_hits) >= top_k:
+                break
+        return deduped_hits
 
     def retrieve(
         self,
@@ -1488,20 +1712,14 @@ class YawGraphEngine:
         if top_k <= 0:
             return []
         with self._lock:
-            query_passage_vec = self.embedder.encode([query], instruction=PASSAGE_INSTRUCTION)[0]
-            chunk_vec_hits = search_chunk_vectors_knn(self.conn, query_passage_vec, top_k=top_k)
+            pool_k = max(top_k * 4, 50)
+            query_passage_vec = self._encode_texts(
+                [query], instruction=PASSAGE_INSTRUCTION, stage="query_passage_embed"
+            )[0]
+            chunk_vec_hits = search_chunk_vectors_knn(self.conn, query_passage_vec, top_k=pool_k)
             if not chunk_vec_hits:
                 return []
-            ranked_cids = [cid for cid, _ in chunk_vec_hits]
-            pointers = get_chunk_pointers(self.conn, ranked_cids)
-            score_by_cid = dict(chunk_vec_hits)
-            ptrs_with_scores = [
-                (pointers[cid], score_by_cid[cid])
-                for cid in ranked_cids
-                if cid in pointers
-            ]
-            hydrated_passages = hydrate_passages(ptrs_with_scores, self.workspace_root)
-            return [(hp.pointer, hp.score, hp.text) for hp in hydrated_passages]
+            return self._hydrate_maxp_passages(chunk_vec_hits, top_k)
 
     def rag_qa(
         self,
@@ -1516,10 +1734,7 @@ class YawGraphEngine:
             hits = self.retrieve(q, top_k=self.retrieval_top_k)
             retrieved_cids = [p.chunk_id for p, _, _ in hits]
             retrieved_scores = [s for _, s, _ in hits]
-            formatted_context = "\n\n".join(
-                self._format_hydrated_passage(p, text)
-                for p, _, text in hits
-            )
+            formatted_context = self.format_qa_context(hits)
 
             pred = self.program.answer_question(context=formatted_context, question=q)
             ans = str(getattr(pred, "answer", "")).strip()
@@ -1638,15 +1853,42 @@ class YawGraphEngine:
             recalls_by_k: dict[int, float] = {1: 1.0, 2: 1.0, 5: 1.0, 10: 1.0, 20: 1.0}
             if gold_docs_raw:
                 total_gold = max(1, len(gold_docs_raw))
+                top_20_cids = [c for c in retrieved_seq[:20] if c.startswith("chunk-")]
+                hydrated_by_cid: dict[str, str] = {}
+                if top_20_cids:
+                    with self._lock:
+                        ptrs = get_chunk_pointers(self.conn, top_20_cids)
+                    ptrs_scores = [(ptrs[c], 0.0) for c in top_20_cids if c in ptrs]
+                    if ptrs_scores:
+                        for hp in hydrate_passages(ptrs_scores, self.workspace_root):
+                            if hp.text:
+                                hydrated_by_cid[hp.pointer.chunk_id] = hp.text.strip()
                 for k in (1, 2, 5, 10, 20):
-                    top_k_set = set(retrieved_seq[:k])
+                    top_k_cids = retrieved_seq[:k]
+                    top_k_set = set(top_k_cids)
+                    top_k_texts = {
+                        hydrated_by_cid[c] for c in top_k_cids if c in hydrated_by_cid
+                    }
                     hits_k = 0
                     for gd in gold_docs_raw:
                         gd_str = str(gd).strip()
                         gd_cid = compute_mdhash_id(gd_str, prefix="chunk-")
+                        island_matched = False
+                        for ht in top_k_texts:
+                            clean_ht = ht.split("\n[... AST section cropped", 1)[0].strip()
+                            if len(clean_ht) >= 60 and clean_ht in gd_str:
+                                island_matched = True
+                                break
+                            if "\n" in clean_ht:
+                                body_ht = clean_ht.split("\n", 1)[1].strip()
+                                if len(body_ht) >= 60 and body_ht in gd_str:
+                                    island_matched = True
+                                    break
                         if (
                             gd_cid in top_k_set
                             or gd_str in top_k_set
+                            or gd_str in top_k_texts
+                            or island_matched
                             or (k >= 5 and gd_str and gd_str in context_str)
                         ):
                             hits_k += 1
@@ -1861,6 +2103,9 @@ class YawGraphEngine:
             audit_payload = {
                 "graph_rlm_stats": dict(self._graph_rlm_stats),
                 "program_telemetry": list(getattr(self.program, "telemetry", ())),
+                "embedding_audit_trail": list(
+                    getattr(self.program, "embedding_audit_trail", ())
+                ),
                 "synonym_audit_trail": list(
                     getattr(self.program, "synonym_audit_trail", ())
                 ),

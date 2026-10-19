@@ -56,7 +56,13 @@ _PUBLIC_API: dict[str, str] = {
     "serialize_graph_turtle": ".db",
     # Atomic cascading chunk deletion
     "delete_chunks": ".db",
-    # 1-Indexed disk line hydration
+    # 1-Indexed disk line hydration & AST dehydration
+    "CoalescedSpan": ".hydration",
+    "MutableSpan": ".hydration",
+    "coalesce_chunk_spans": ".hydration",
+    "coalesce_spans": ".hydration",
+    "dehydrate_passage_ast": ".hydration",
+    "hydrate_budgeted_passages": ".hydration",
     "hydrate_chunk_pointer": ".hydration",
     "hydrate_passages": ".hydration",
     "make_chunk_hydrator": ".hydration",

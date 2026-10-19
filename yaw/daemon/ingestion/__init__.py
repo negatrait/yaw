@@ -6,11 +6,17 @@ from typing import Any
 # Single source of truth: only these symbols are exposed as the public package contract.
 _PUBLIC_API: dict[str, str] = {
     "CorpusIngestor": ".corpus",
+    "chunk_json_text": ".corpus",
     "chunk_markdown_text": ".corpus",
-    "sync_corpus_once": ".corpus",
+    "chunk_source_text": ".corpus",
+    "detect_corpus_language": ".corpus",
+    "extract_ast_headings": ".corpus",
     "extract_chunk_title": ".corpus",
     "extract_markdown_headings": ".corpus",
+    "project_json_records": ".corpus",
     "resolve_heading_for_line": ".corpus",
+    "should_keep_json_key_path": ".corpus",
+    "sync_corpus_once": ".corpus",
 }
 
 __all__ = sorted(_PUBLIC_API.keys())

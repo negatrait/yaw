@@ -53,7 +53,9 @@ _CREATE_SCHEMA_STATEMENTS: tuple[str, ...] = (
         rel_posix_path TEXT NOT NULL,
         start_line INTEGER NOT NULL,
         end_line INTEGER NOT NULL,
-        title TEXT NOT NULL DEFAULT ''
+        title TEXT NOT NULL DEFAULT '',
+        ast_island_start INTEGER NOT NULL DEFAULT 0,
+        ast_island_end INTEGER NOT NULL DEFAULT 0
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(rel_posix_path)",
@@ -235,6 +237,10 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
         chunk_cols = {row[1] for row in conn.execute("PRAGMA table_info(chunks)").fetchall()}
         if "content_hash" in chunk_cols:
             conn.execute("ALTER TABLE chunks DROP COLUMN content_hash")
+        if "ast_island_start" not in chunk_cols:
+            conn.execute("ALTER TABLE chunks ADD COLUMN ast_island_start INTEGER NOT NULL DEFAULT 0")
+        if "ast_island_end" not in chunk_cols:
+            conn.execute("ALTER TABLE chunks ADD COLUMN ast_island_end INTEGER NOT NULL DEFAULT 0")
 
         # Auto-migrate openie_chunks.structured_triples_json
         openie_cols = {row[1] for row in conn.execute("PRAGMA table_info(openie_chunks)").fetchall()}
@@ -722,11 +728,11 @@ def upsert_chunk_pointers(
     with _write_tx(conn):
         conn.executemany(
             """
-            INSERT OR REPLACE INTO chunks (chunk_id, rel_posix_path, start_line, end_line, title)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO chunks (chunk_id, rel_posix_path, start_line, end_line, title, ast_island_start, ast_island_end)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                (p.chunk_id, p.rel_posix_path, p.start_line, p.end_line, p.title)
+                (p.chunk_id, p.rel_posix_path, p.start_line, p.end_line, p.title, p.ast_island_start, p.ast_island_end)
                 for p, _ in chunks
             ),
         )
@@ -741,19 +747,24 @@ def upsert_chunk_pointers(
 
 
 def _row_to_chunk_pointer(row: sqlite3.Row) -> ChunkPointer:
+    keys = row.keys()
+    ast_s = int(row["ast_island_start"]) if "ast_island_start" in keys else 0
+    ast_e = int(row["ast_island_end"]) if "ast_island_end" in keys else 0
     return ChunkPointer(
         chunk_id=row["chunk_id"],
         rel_posix_path=row["rel_posix_path"],
         start_line=row["start_line"],
         end_line=row["end_line"],
         title=row["title"],
+        ast_island_start=ast_s,
+        ast_island_end=ast_e,
     )
 
 
 def get_chunk_pointer(conn: sqlite3.Connection, chunk_id: str) -> ChunkPointer | None:
     """Retrieve ChunkPointer metadata for a single chunk_id."""
     row = conn.execute(
-        "SELECT chunk_id, rel_posix_path, start_line, end_line, title FROM chunks WHERE chunk_id = ?",
+        "SELECT chunk_id, rel_posix_path, start_line, end_line, title, ast_island_start, ast_island_end FROM chunks WHERE chunk_id = ?",
         (chunk_id,),
     ).fetchone()
     return _row_to_chunk_pointer(row) if row is not None else None
@@ -771,7 +782,7 @@ def get_chunk_pointers(
         placeholders = ",".join("?" for _ in batch)
         cursor = conn.execute(
             f"""
-            SELECT chunk_id, rel_posix_path, start_line, end_line, title
+            SELECT chunk_id, rel_posix_path, start_line, end_line, title, ast_island_start, ast_island_end
             FROM chunks WHERE chunk_id IN ({placeholders})
             """,
             tuple(batch),

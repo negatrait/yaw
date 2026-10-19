@@ -14,7 +14,10 @@ import hashlib
 import json
 import logging
 import re
+import shutil
+import subprocess
 import tempfile
+import time
 import urllib.request
 from contextlib import closing
 from pathlib import Path
@@ -28,6 +31,15 @@ from hipporag.evaluation.retrieval_eval import RetrievalRecall
 from hipporag.prompts.linking import get_query_instruction
 from hipporag.utils.config_utils import BaseConfig
 
+from scripts.evaluation import (
+    QAExactMatch as ScriptQAExactMatch,
+)
+from scripts.evaluation import (
+    QAF1Score as ScriptQAF1Score,
+)
+from scripts.evaluation import (
+    RetrievalRecall as ScriptRetrievalRecall,
+)
 from yaw.core.logger import configure_logging
 from yaw.daemon.graph.inference.embedding import (
     GEMMA_TASK_MODES,
@@ -46,12 +58,60 @@ from yaw.daemon.graph.inference.models import (
     embedding_evidence,
     preflight,
 )
+from yaw.daemon.ingestion import sync_corpus_once
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 PINNED_COMMIT = "d5c8329422e0a0b834a15874545cb6a74b4f9b26"
 HF_BASE_URL = "https://huggingface.co/datasets/osunlp/HippoRAG_2/resolve/main"
 UPSTREAM_DATASET_BASE_URL = (
     f"https://raw.githubusercontent.com/OSU-NLP-Group/HippoRAG/{PINNED_COMMIT}/reproduce/dataset"
+)
+
+BENCHMARK_JSON_WHITELIST: tuple[str, ...] = (
+    "title",
+    "text",
+    "paragraph_text",
+    "contents",
+    "context",
+    "context.*",
+    "contexts",
+    "contexts.*",
+    "paragraphs",
+    "paragraphs.*",
+    "document",
+    "document.title",
+    "document.text",
+    "document.summary",
+    "document.summary.*",
+)
+
+BENCHMARK_JSON_BLACKLIST: tuple[str, ...] = (
+    "question*",
+    "answer*",
+    "answers*",
+    "gold*",
+    "reference*",
+    "supporting_facts*",
+    "is_supporting*",
+    "evidences*",
+    "obj*",
+    "subj*",
+    "prop*",
+    "*_id",
+    "id",
+    "idx",
+    "type",
+    "level",
+    "all_classes",
+    "distractor",
+    "length",
+    "language",
+    "dataset",
+    "possible_answers*",
+    "s_*",
+    "o_*",
+    "question_decomposition*",
+    "answerable*",
 )
 
 DATASETS = (
@@ -153,6 +213,38 @@ PAPER_BASELINES = {
         "hipporag_reproduced": {"F1": 0.163},
     },
 }
+
+
+def clean_qa_answer(raw_ans: str) -> str:
+    """Normalize extracted QA answer by stripping conversational prefixes and enclosing quotes."""
+    ans = str(raw_ans or "").strip()
+    if "Answer:" in ans:
+        ans = ans.split("Answer:")[-1].strip()
+    if (ans.startswith('"') and ans.endswith('"')) or (ans.startswith("'") and ans.endswith("'")):
+        ans = ans[1:-1].strip()
+    return ans
+
+
+def recycle_lemonade_model(model_name: str) -> bool:
+    """Safely bounce a local Lemonade model worker (e.g. Ryzen AI NPU) if frozen or between heavy runs."""
+    lemonade_bin = shutil.which("lemonade")
+    if not lemonade_bin:
+        return False
+    try:
+        logging.info("Recycling Lemonade model '%s'...", model_name)
+        is_ryzen = "ryzenai" in model_name.lower() or "mistral" in model_name.lower()
+        if is_ryzen:
+            subprocess.run(["taskkill", "/F", "/IM", "ryzenai-server.exe"], capture_output=True, timeout=5)
+            time.sleep(1.0)
+        else:
+            subprocess.run([lemonade_bin, "unload", model_name], capture_output=True, timeout=15)
+            time.sleep(1.0)
+        subprocess.run([lemonade_bin, "load", model_name], capture_output=True, timeout=45)
+        time.sleep(2.0)
+        return True
+    except Exception as exc:
+        logging.warning("recycle_lemonade_model(%s) failed: %s", model_name, exc)
+        return False
 
 
 def get_gold_docs(
@@ -439,6 +531,28 @@ def build_benchmark_slice(
                     for item in sample["paragraphs"]:
                         text = item["text"] if "text" in item else item["paragraph_text"]
                         docs.append(f"{item['title']}\n{text}")
+            if canonical_dataset == "popqa":
+                min_popqa_docs = effective_index_queries * 2
+                docs = list(dict.fromkeys(docs))
+                if len(docs) < min_popqa_docs:
+                    for sample in samples[pooled_end:]:
+                        if "paragraphs" in sample:
+                            for item in sample["paragraphs"]:
+                                text = item["text"] if "text" in item else item["paragraph_text"]
+                                cand = f"{item['title']}\n{text}"
+                                if cand not in docs:
+                                    docs.append(cand)
+                                    if len(docs) >= min_popqa_docs:
+                                        break
+                        if len(docs) >= min_popqa_docs:
+                            break
+                if len(docs) < min_popqa_docs and corpus:
+                    for c in corpus:
+                        cand = f"{c['title']}\n{c['text']}"
+                        if cand not in docs:
+                            docs.append(cand)
+                            if len(docs) >= min_popqa_docs:
+                                break
 
     for gold_list in gold_docs:
         docs.extend(gold_list)
@@ -621,6 +735,11 @@ def evaluate_benchmark(
         dpr_solutions = []
         for start in range(0, len(queries), qa_batch_size):
             batch_queries = queries[start : start + qa_batch_size]
+            if start % 5 == 0 or start + len(batch_queries) == len(queries):
+                print(
+                    f"[Upstream HippoRAG] [{dataset_name}] Retrieving queries {start + 1}-{min(start + len(batch_queries), len(queries))}/{len(queries)}...",
+                    flush=True,
+                )
             g_batch = hipporag.retrieve(queries=batch_queries, num_to_retrieve=num_to_retrieve)
             if isinstance(g_batch, tuple):
                 g_batch = g_batch[0]
@@ -648,6 +767,11 @@ def evaluate_benchmark(
             answered_graph = []
             answered_dpr = []
             for start in range(0, len(queries), qa_batch_size):
+                if start % 5 == 0 or start + qa_batch_size >= len(queries):
+                    print(
+                        f"[Upstream HippoRAG] [{dataset_name}] QA query {start + 1}/{len(queries)}...",
+                        flush=True,
+                    )
                 g_qa, _, _ = hipporag.qa(graph_solutions[start : start + qa_batch_size])
                 d_qa, _, _ = hipporag.qa(dpr_solutions[start : start + qa_batch_size])
                 answered_graph.extend(g_qa)
@@ -816,18 +940,32 @@ def check_benchmark_integrity(
     return errors
 
 
-def print_benchmark_summary(dataset: str, num_docs: int, records: list[dict], metrics: dict):
-    print(f"\n=== Benchmark Summary: {dataset} ({len(records)} queries, {num_docs} passages) ===")
-    print("HippoRAG 2 Retrieval:", metrics["hipporag"]["retrieval"])
-    print("Standard DPR Retrieval:", metrics["standard_dpr"]["retrieval"])
+def print_benchmark_summary(
+    dataset: str,
+    num_docs: int,
+    records: list[dict],
+    metrics: dict,
+    engine: str = "hipporag",
+) -> None:
+    engine_title = "UPSTREAM HIPPORAG 2" if engine == "hipporag" else "NATIVE YAW ENGINE"
+    target_label = "Upstream HippoRAG 2" if engine == "hipporag" else "Native YAW"
+    print(f"\n{'=' * 72}")
+    print(f"=== Benchmark Summary [{engine_title}]: {dataset} ({len(records)} queries, {num_docs} passages) ===")
+    print(f"{'=' * 72}")
+    print(f"{target_label} Retrieval:", metrics["hipporag"]["retrieval"])
+    print("Standard DPR Retrieval: ", metrics["standard_dpr"]["retrieval"])
     if metrics["hipporag"]["qa"] is not None:
-        print("HippoRAG 2 QA:", metrics["hipporag"]["qa"])
-        print("Standard DPR QA:", metrics["standard_dpr"]["qa"])
-    print("Delta (HippoRAG 2 - DPR):", metrics["delta_vs_dpr"])
-    print("Recognition Memory:", metrics["recognition_memory"])
-    if "paper_baselines" in metrics:
-        print("Paper Reference (Llama-3.3-70B + NV-Embed-v2):",
-              metrics["paper_baselines"]["hipporag2_llama3.3_70b_nvembed_v2"])
+        print(f"{target_label} QA:       ", metrics["hipporag"]["qa"])
+        if metrics["standard_dpr"].get("qa") is not None:
+            print("Standard DPR QA:        ", metrics["standard_dpr"]["qa"])
+    print(f"Delta ({target_label} - DPR):", metrics["delta_vs_dpr"])
+    print("Recognition Memory:     ", metrics["recognition_memory"])
+    if "paper_baselines" in metrics and "hipporag2_llama3.3_70b_nvembed_v2" in metrics["paper_baselines"]:
+        print(
+            "Paper Reference (arXiv:2502.14802):",
+            metrics["paper_baselines"]["hipporag2_llama3.3_70b_nvembed_v2"],
+        )
+    print(f"{'=' * 72}\n", flush=True)
 
 
 def run_yaw_benchmark(
@@ -842,8 +980,6 @@ def run_yaw_benchmark(
     extraction_model: str,
     qa_model: str,
     include_qa: bool,
-    execution_mode: str,
-    qa_mode: str,
     enable_gbnf: bool,
     evolve: str,
     compiled_program: str | None,
@@ -877,41 +1013,23 @@ def run_yaw_benchmark(
         create_dspy_rlm_pair,
     )
 
-    if execution_mode == "rlm":
-        orch_lm, worker_lm = create_dspy_rlm_pair(
-            orchestrator_model=qa_model,
-            sub_model=extraction_model,
-            base_url=BASE_URL,
-        )
-        program = HippoRAGProgram(
-            execution_mode="rlm",
-            qa_mode=cast(Any, qa_mode),
-            orchestrator_lm=orch_lm,
-            rlm_sub_lm=worker_lm,
-            enable_gbnf=enable_gbnf,
-            compiled_path=compiled_program,
-        )
-        dspy.settings.configure(lm=orch_lm)
-    else:
-        extraction_lm = create_dspy_lm(
-            model_name=extraction_model,
-            base_url=BASE_URL,
-            role="extraction",
-        )
-        qa_lm = (
-            create_dspy_lm(model_name=qa_model, base_url=BASE_URL, role="qa")
-            if qa_model != extraction_model
-            else extraction_lm
-        )
-        program = HippoRAGProgram(
-            execution_mode="direct",
-            qa_mode=cast(Any, qa_mode),
-            orchestrator_lm=qa_lm,
-            rlm_sub_lm=extraction_lm,
-            enable_gbnf=enable_gbnf,
-            compiled_path=compiled_program,
-        )
-        dspy.settings.configure(lm=qa_lm)
+    extraction_lm = create_dspy_lm(
+        model_name=extraction_model,
+        base_url=BASE_URL,
+        role="extraction",
+    )
+    qa_lm = (
+        create_dspy_lm(model_name=qa_model, base_url=BASE_URL, role="qa")
+        if qa_model != extraction_model
+        else extraction_lm
+    )
+    program = HippoRAGProgram(
+        orchestrator_lm=qa_lm,
+        rlm_sub_lm=extraction_lm,
+        enable_gbnf=enable_gbnf,
+        compiled_path=compiled_program,
+    )
+    dspy.settings.configure(lm=qa_lm)
 
     embed_client = create_dspy_embedder(profile, base_url=BASE_URL)
     embedder = DSPyEmbeddingAdapter(profile=profile, embedder=embed_client)
@@ -944,7 +1062,38 @@ def run_yaw_benchmark(
     try:
         index_start = perf_counter()
         num_docs = len(docs)
-        report["index_batches"] = yaw_engine.index(docs)
+        corpus_dir = index_dir / "corpus"
+        corpus_dir.mkdir(parents=True, exist_ok=True)
+        slice_rel_path = f"corpus/{dataset}_slice.json"
+        slice_json_path = index_dir / slice_rel_path
+        slice_records: list[dict[str, Any]] = []
+        for doc_str in docs:
+            t_part = doc_str.split("\n", 1)[0] if "\n" in doc_str else ""
+            b_part = doc_str.split("\n", 1)[1] if "\n" in doc_str else doc_str
+            slice_records.append({
+                "title": t_part,
+                "text": b_part,
+            })
+        slice_json_path.write_text(
+            json.dumps(slice_records, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        delta = sync_corpus_once(
+            corpus_root=index_dir,
+            state_dir=index_dir / "coco_state",
+            included_patterns=(slice_rel_path,),
+            excluded_patterns=(".*", "*/.*", "__pycache__/*"),
+            json_keys_whitelist=BENCHMARK_JSON_WHITELIST,
+            json_keys_blacklist=BENCHMARK_JSON_BLACKLIST,
+        )
+        report["index_batches"] = (
+            yaw_engine.index_chunks(
+                delta.added_chunks,
+                progress_callback=lambda msg: print(f"[Native YAW] [{dataset}] {msg}", flush=True),
+            )
+            if delta.added_chunks
+            else int(yaw_engine.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
+        )
         del docs
         gc.collect()
         report["indexing_seconds"] = round(perf_counter() - index_start, 2)
@@ -1009,7 +1158,8 @@ def run_yaw_benchmark(
         timing_records: list[tuple[float, float]] = []
         retrieved_ids_list: list[list[str]] = []
 
-        for query in queries:
+        total_queries = len(queries)
+        for q_idx, query in enumerate(queries, start=1):
             t_q0 = perf_counter()
             hits, kept_facts = yaw_engine.retrieve_with_seeds(query, top_k=RETRIEVAL_TOP_K)
             retrieval_elapsed = perf_counter() - t_q0
@@ -1028,44 +1178,69 @@ def run_yaw_benchmark(
             qa_elapsed = 0.0
             if include_qa:
                 t_qa0 = perf_counter()
-                context = "\n\n".join(
-                    f"Wikipedia Title: {text}"
-                    for _, _, text in hits[:QA_TOP_K]
-                )
-                pred = yaw_engine.program.answer_question(context=context, question=query)
+                context = yaw_engine.format_qa_context(hits[:QA_TOP_K])
+                pred = None
+                for qa_attempt in range(3):
+                    try:
+                        pred = yaw_engine.program.answer_question(context=context, question=query)
+                        break
+                    except Exception as exc:
+                        if qa_attempt < 2:
+                            print(
+                                f"[Native YAW] [{dataset}] QA query {q_idx} encountered {type(exc).__name__}: {exc}. "
+                                f"Recycling {qa_model} and retrying (attempt {qa_attempt + 1}/3)...",
+                                flush=True,
+                            )
+                            recycle_lemonade_model(qa_model)
+                            try:
+                                if hasattr(yaw_engine.program, "orchestrator_lm") and hasattr(yaw_engine.program.orchestrator_lm, "close"):
+                                    yaw_engine.program.orchestrator_lm.close()
+                            except Exception:
+                                pass
+                        else:
+                            print(
+                                f"[Native YAW] [{dataset}] QA query {q_idx} failed after 3 attempts: {exc}. "
+                                "Falling back to empty prediction.",
+                                flush=True,
+                            )
+                            pred = None
                 qa_elapsed = perf_counter() - t_qa0
-                qa_answer = str(getattr(pred, "answer", "")).strip()
+                qa_raw = str(getattr(pred, "answer", "")).strip() if pred is not None else ""
+                qa_answer = clean_qa_answer(qa_raw)
                 qa_answers.append(qa_answer)
             timing_records.append((retrieval_elapsed, qa_elapsed))
+            if q_idx % 5 == 0 or q_idx == total_queries:
+                print(f"[Native YAW] [{dataset}] Query {q_idx}/{total_queries} completed (retrieval={retrieval_elapsed:.2f}s, qa={qa_elapsed:.2f}s)", flush=True)
 
-        recalls_1: list[float] = []
-        recalls_2: list[float] = []
-        recalls_5: list[float] = []
-        recalls_10: list[float] = []
-        dpr_recalls_1: list[float] = []
-        dpr_recalls_2: list[float] = []
-        dpr_recalls_5: list[float] = []
-        dpr_recalls_10: list[float] = []
-        for q_idx in range(len(queries)):
-            exp_docs = {d.strip() for d in gold_docs[q_idx]}
-            denom = max(1, len(exp_docs))
-            ret_pass = [p.strip() for p in all_retrieved_passages[q_idx]]
-            dpr_pass = [p.strip() for p in all_dpr_passages[q_idx]]
-            recalls_1.append(round(len(set(ret_pass[:1]) & exp_docs) / denom, 4))
-            recalls_2.append(round(len(set(ret_pass[:2]) & exp_docs) / denom, 4))
-            recalls_5.append(round(len(set(ret_pass[:5]) & exp_docs) / denom, 4))
-            recalls_10.append(round(len(set(ret_pass[:10]) & exp_docs) / denom, 4))
-            dpr_recalls_1.append(round(len(set(dpr_pass[:1]) & exp_docs) / denom, 4))
-            dpr_recalls_2.append(round(len(set(dpr_pass[:2]) & exp_docs) / denom, 4))
-            dpr_recalls_5.append(round(len(set(dpr_pass[:5]) & exp_docs) / denom, 4))
-            dpr_recalls_10.append(round(len(set(dpr_pass[:10]) & exp_docs) / denom, 4))
+        gold_docs_norm = [[d.strip() for d in gd] for gd in gold_docs]
+        ret_docs_norm = [[p.strip() for p in rp] for rp in all_retrieved_passages]
+        dpr_docs_norm = [[p.strip() for p in dp] for dp in all_dpr_passages]
+
+        _, ret_per_query = ScriptRetrievalRecall().calculate_metric_scores(
+            gold_docs=gold_docs_norm,
+            retrieved_docs=ret_docs_norm,
+            k_list=[1, 2, 5, 10],
+        )
+        _, dpr_per_query = ScriptRetrievalRecall().calculate_metric_scores(
+            gold_docs=gold_docs_norm,
+            retrieved_docs=dpr_docs_norm,
+            k_list=[1, 2, 5, 10],
+        )
+        recalls_1 = [round(float(r["Recall@1"]), 4) for r in ret_per_query]
+        recalls_2 = [round(float(r["Recall@2"]), 4) for r in ret_per_query]
+        recalls_5 = [round(float(r["Recall@5"]), 4) for r in ret_per_query]
+        recalls_10 = [round(float(r["Recall@10"]), 4) for r in ret_per_query]
+        dpr_recalls_1 = [round(float(r["Recall@1"]), 4) for r in dpr_per_query]
+        dpr_recalls_2 = [round(float(r["Recall@2"]), 4) for r in dpr_per_query]
+        dpr_recalls_5 = [round(float(r["Recall@5"]), 4) for r in dpr_per_query]
+        dpr_recalls_10 = [round(float(r["Recall@10"]), 4) for r in dpr_per_query]
 
         qa_metrics = None
         em_list: list[float] = []
         f1_list: list[float] = []
         if include_qa:
-            em_overall, per_query_em_raw = QAExactMatch().calculate_metric_scores(gold_answers, qa_answers)
-            f1_overall, per_query_f1_raw = QAF1Score().calculate_metric_scores(gold_answers, qa_answers)
+            em_overall, per_query_em_raw = ScriptQAExactMatch().calculate_metric_scores(gold_answers, qa_answers)
+            f1_overall, per_query_f1_raw = ScriptQAF1Score().calculate_metric_scores(gold_answers, qa_answers)
             em_list = [float(item["ExactMatch"]) for item in per_query_em_raw]
             f1_list = [float(item["F1"]) for item in per_query_f1_raw]
             qa_metrics = {
@@ -1165,7 +1340,7 @@ def run_yaw_benchmark(
         }
         report["evaluation_metrics"] = metrics
         report["records"] = records
-        print_benchmark_summary(dataset, num_docs, records, metrics)
+        print_benchmark_summary(dataset, num_docs, records, metrics, engine="yaw")
     finally:
         yaw_engine.close()
     return report
@@ -1178,8 +1353,6 @@ def main(
     full_corpus: bool = False,
     mode: str = "eval",
     engine: str = "hipporag",
-    execution_mode: str = "direct",
-    qa_mode: str = "cot",
     enable_gbnf: bool = False,
     query_offset: int = 0,
     evolve: str = "none",
@@ -1222,7 +1395,10 @@ def main(
     total_needed = None
     if max_queries is not None:
         effective_index_q = index_queries if index_queries is not None else int(max_queries * 1.4)
-        pool_needed = max(max_queries, effective_index_q)
+        pool_needed = max(
+            max_queries,
+            effective_index_q * 2 if dataset == "popqa" else effective_index_q,
+        )
         total_needed = pool_needed + max(query_offset, train_queries)
 
     samples, corpus = load_dataset_files(
@@ -1269,12 +1445,32 @@ def main(
         index_dir = root / "indexes" / f"{dataset}_d{num_docs}_{slice_hash}_{id_hash}"
 
     configure_logging(log_file=run_dir / "run.log", max_lines=500)
+    for name in (
+        "hipporag",
+        "hipporag.HippoRAG",
+        "hipporag.information_extraction",
+        "hipporag.information_extraction.openie_openai",
+        "hipporag.evaluation",
+        "hipporag.evaluation.retrieval_eval",
+        "hipporag.evaluation.qa_eval",
+        "hipporag.llm",
+        "hipporag.embedding_model",
+        "hipporag.embedding_store",
+        "hipporag.prompts",
+        "hipporag.utils",
+        "httpx",
+        "httpx2",
+        "httpcore",
+        "openai",
+        "urllib3",
+        "litellm",
+        "LiteLLM",
+    ):
+        logging.getLogger(name).setLevel(logging.ERROR)
     report = {
         "status": "running",
         "dataset": dataset,
         "engine": engine,
-        "execution_mode": execution_mode,
-        "qa_mode": qa_mode,
         "enable_gbnf": enable_gbnf,
         "query_offset": eval_offset,
         "evolve": evolve,
@@ -1318,7 +1514,8 @@ def main(
         "graph_beta": graph_beta,
         "graph_dual_weight": graph_dual_weight,
     }
-    print(f"Benchmark run: {run_dir} (dataset={dataset}, engine={engine}, queries={len(queries)}, docs={num_docs})", flush=True)
+    engine_label = "Upstream HippoRAG 2" if engine == "hipporag" else "Native YAW"
+    print(f"\n[{engine_label}] Benchmark run: {run_dir} (dataset={dataset}, engine={engine}, queries={len(queries)}, docs={num_docs})", flush=True)
     try:
         report["model_registry"] = preflight(
             profile,
@@ -1338,8 +1535,6 @@ def main(
                 extraction_model=extraction_model,
                 qa_model=qa_model,
                 include_qa=include_qa,
-                execution_mode=execution_mode,
-                qa_mode=qa_mode,
                 enable_gbnf=enable_gbnf,
                 evolve=evolve,
                 compiled_program=compiled_program,
@@ -1442,7 +1637,7 @@ def main(
                     "extraction": chat_evidence(extraction_model),
                     "qa": chat_evidence(qa_model) if include_qa else None,
                 }
-                print_benchmark_summary(dataset, num_docs, records, metrics)
+                print_benchmark_summary(dataset, num_docs, records, metrics, engine="hipporag")
                 failures = check_benchmark_integrity(
                     records,
                     report["graph"],
@@ -1504,7 +1699,7 @@ def index_documents_in_batches(
         batch = pending[start : start + batch_size]
         if use_staged_openie:
             print(
-                f"[Indexing OpenIE] Batch {num_batches + 1}/{total_batches} "
+                f"[Upstream HippoRAG] [Indexing OpenIE] Batch {num_batches + 1}/{total_batches} "
                 f"({min(start + len(batch), total_docs)}/{total_docs} docs)",
                 flush=True,
             )
@@ -1520,7 +1715,7 @@ def index_documents_in_batches(
         num_batches += 1
 
     if use_staged_openie:
-        print(f"[Indexing Graph] Building embeddings and knowledge graph for {total_docs} docs...", flush=True)
+        print(f"[Upstream HippoRAG] [Indexing Graph] Building embeddings and knowledge graph for {total_docs} docs...", flush=True)
         hipporag.index(docs=pending)
         _release_indexing_memory(hipporag)
     return num_batches
@@ -1547,10 +1742,6 @@ if __name__ == "__main__":
                         help="Force indexing in a fresh disposable directory instead of reusing outputs/benchmarks/indexes.")
     parser.add_argument("--engine", choices=("hipporag", "yaw"), default="hipporag",
                         help="Select graph and retrieval engine: 'hipporag' (upstream baseline) or 'yaw' (native DSPy engine).")
-    parser.add_argument("--execution-mode", choices=("direct", "rlm"), default="direct",
-                        help="Select DSPy execution mode for extraction stages: 'direct' or 'rlm'.")
-    parser.add_argument("--qa-mode", choices=("cot", "rlm"), default="cot",
-                        help="Select QA reading comprehension mode: 'cot' (ChainOfThought) or 'rlm'.")
     parser.add_argument("--enable-gbnf", action="store_true", default=False,
                         help="Enable pure-JSON GBNF grammar constraints for local llama.cpp GPU worker.")
     parser.add_argument("--query-offset", type=int, default=0,
@@ -1622,8 +1813,6 @@ if __name__ == "__main__":
         full_corpus=args.full_corpus,
         mode=args.mode,
         engine=args.engine,
-        execution_mode=args.execution_mode,
-        qa_mode=args.qa_mode,
         enable_gbnf=args.enable_gbnf,
         query_offset=args.query_offset,
         evolve=args.evolve,

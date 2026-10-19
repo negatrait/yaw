@@ -56,7 +56,6 @@ class DeterministicTestLM(dspy.LM):
             )
         if (
             "JudgeSynonyms" in req_str
-            or "OrchestrateSynonymJudgment" in req_str
             or "candidate_pairs_json" in req_str
             or "candidate_pairs" in req_str
         ):
@@ -69,7 +68,6 @@ class DeterministicTestLM(dspy.LM):
             return ['{"repairs": []}']
         if (
             "DefineMissingEntities" in req_str
-            or "OrchestrateMissingEntityDefinitions" in req_str
             or "missing_entities" in req_str
             or "entity_definitions" in req_str
         ):
@@ -84,7 +82,7 @@ class DeterministicTestLM(dspy.LM):
             return [
                 '{"entity_definitions": [["University of Southampton", "Public research university in Southampton"], ["1862", "Founding year of the Hartley Institution"]]}'
             ]
-        if "FilterFacts" in req_str or "fact_before_filter" in req_str:
+        if "FilterTriples" in req_str or "fact_before_filter" in req_str:
             if "Turing" in req_str:
                 return ['{"fact": [["Alan Turing", "worked at", "Bletchley Park"]]}']
             if "Lovelace" in req_str:
@@ -190,8 +188,6 @@ poll_interval_seconds = 0.2
 
 [inference]
 base_url = "http://localhost:13305/api/v1"
-execution_mode = "direct"
-qa_mode = "cot"
 enable_gbnf = false
 
 [graph]
@@ -214,8 +210,6 @@ def _make_program_and_embedder() -> tuple[HippoRAGProgram, Any, DeterministicTes
     lm = DeterministicTestLM()
     dspy.settings.configure(lm=lm)
     prog = HippoRAGProgram(
-        execution_mode="direct",
-        qa_mode="cot",
         enable_gbnf=False,
         orchestrator_lm=lm,
         rlm_sub_lm=lm,
@@ -230,7 +224,7 @@ def test_load_config_and_fingerprint(tmp_path: Path) -> None:
     assert repo_cfg.queue_maxsize == 32
     assert repo_cfg.embedding_model == "embeddinggemma-300m-GGUF"
     assert repo_cfg.extraction_model == "Qwen3-4B-Instruct-2507-GGUF"
-    assert repo_cfg.qa_model == "Mistral-7B-Instruct-v0.3-Hybrid"
+    assert repo_cfg.qa_model == "Qwen3-4B-Instruct-2507-GGUF"
     assert repo_cfg.config_fingerprint().startswith("yaw-cfg-v1:")
 
     cfg1, toml_path = _make_test_config(tmp_path)
@@ -663,7 +657,7 @@ def test_cli_optimize_ergonomics_and_anti_overfitting_gate(
             if proposer is not None and hasattr(proposer, "telemetry"):
                 proposer.telemetry.append(
                     {
-                        "component_name": "qa_cot.predict",
+                        "component_name": "qa.predict",
                         "previous_instruction": "old",
                         "new_instruction": "new",
                         "num_feedback_examples": len(trainset),

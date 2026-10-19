@@ -7,7 +7,15 @@ from typing import Any
 import numpy as np
 from openai import DefaultHttpxClient, OpenAI
 
-from .embedding import PROFILES, QUERY_INSTRUCTIONS
+from .embedding import (
+    PROFILES,
+    QUERY_INSTRUCTIONS,
+    TITLE_LINE_RE,
+    batch_texts_by_budget,
+    is_batch_overflow_error,
+    pool_subchunk_embeddings,
+    split_text_gracefully,
+)
 from .models import DEFAULT_BASE_URL
 
 
@@ -92,52 +100,128 @@ class RetrievalEmbedding:
             texts = [texts]
         if not texts:
             raise ValueError("OpenAI embedding input cannot be empty.")
-        prepared = [
-            self.profile.format(t, query=bool(instruction), instruction=instruction)
-            for t in texts
-        ]
+
         batch_size = kwargs.get("batch_size", self.embedding_config.encode_params["batch_size"])
         if not isinstance(batch_size, int) or batch_size < 1:
             raise ValueError("OpenAI embedding batch_size must be a positive integer.")
 
-        if len(prepared) <= batch_size:
-            results = self.encode(prepared)
-        else:
-            results = []
-            usage_totals = {"prompt_tokens": 0, "total_tokens": 0}
-            try:
-                for i in range(0, len(prepared), batch_size):
-                    batch = prepared[i : i + batch_size]
-                    results.append(self.encode(batch))
-                    if self.last_usage is not None:
-                        usage_totals["prompt_tokens"] += self.last_usage.get("prompt_tokens", 0)
-                        usage_totals["total_tokens"] += self.last_usage.get("total_tokens", 0)
-                    self.last_usage = {**usage_totals, "complete": False}
-            except Exception:
-                failed_usage = self.last_usage or {}
-                for token_key in ("prompt_tokens", "total_tokens"):
-                    token_count = failed_usage.get(token_key)
-                    if isinstance(token_count, int):
-                        usage_totals[token_key] += token_count
-                self.last_usage = {**usage_totals, "complete": False}
-                if failed_usage.get("usage_unknown") or not any(
-                    key in failed_usage for key in ("prompt_tokens", "total_tokens")
-                ):
-                    self.last_usage["usage_unknown"] = True
-                raise
-            results = np.concatenate(results)
-            self.last_usage = usage_totals
+        normalize = kwargs.get("norm", True)
+        max_chunk_chars = 3000
+        max_batch_chars = 3500
 
-        return self._normalize_embeddings(results, normalize=kwargs.get("norm"))
+        # 1. Gracefully divide texts exceeding max_chunk_chars and format with profile
+        text_piece_map: list[list[int]] = []
+        flat_pieces: list[str] = []
+        piece_weights: list[int] = []
+
+        is_query = bool(instruction)
+        for t in texts:
+            if len(t) <= max_chunk_chars:
+                formatted = self.profile.format(t, query=is_query, instruction=instruction)
+                text_piece_map.append([len(flat_pieces)])
+                flat_pieces.append(formatted)
+                piece_weights.append(max(1, len(t)))
+            else:
+                title = ""
+                body = t
+                if not is_query and self.profile.parse_document_title and "\n" in t:
+                    first_line, rest = t.split("\n", 1)
+                    match = TITLE_LINE_RE.match(first_line.strip())
+                    if match and match.group(1).strip() and rest.strip():
+                        title = match.group(1).strip()
+                        body = rest.strip()
+
+                sub_chunks = split_text_gracefully(body, max_chars=max_chunk_chars)
+                indices: list[int] = []
+                for sc in sub_chunks:
+                    indices.append(len(flat_pieces))
+                    if is_query:
+                        formatted = self.profile.format(sc, query=True, instruction=instruction)
+                    elif title:
+                        formatted = f"title: {title} | text: {sc}"
+                    else:
+                        formatted = self.profile.format(sc, query=False)
+                    flat_pieces.append(formatted)
+                    piece_weights.append(max(1, len(sc)))
+                text_piece_map.append(indices)
+
+        # 2. Partition flat_pieces into micro-batches bounded by character budget and count
+        micro_batches = batch_texts_by_budget(
+            flat_pieces,
+            max_batch_chars=max_batch_chars,
+            max_batch_size=batch_size,
+        )
+
+        # 3. Execute micro-batches with encode()
+        flat_vectors: list[np.ndarray | None] = [None] * len(flat_pieces)
+        usage_totals = {"prompt_tokens": 0, "total_tokens": 0}
+        for mb in micro_batches:
+            mb_texts = [flat_pieces[i] for i in mb]
+            vecs = self.encode(mb_texts)
+            if self.last_usage is not None:
+                usage_totals["prompt_tokens"] += self.last_usage.get("prompt_tokens", 0)
+                usage_totals["total_tokens"] += self.last_usage.get("total_tokens", 0)
+            for local_idx, global_idx in enumerate(mb):
+                flat_vectors[global_idx] = vecs[local_idx]
+
+        self.last_usage = usage_totals
+
+        # 4. Pool sub-chunks back into document embeddings via length-weighted average
+        doc_vectors: list[np.ndarray] = []
+        for indices in text_piece_map:
+            sub_vecs = np.asarray(
+                [flat_vectors[i] for i in indices if flat_vectors[i] is not None],
+                dtype=np.float32,
+            )
+            weights = [piece_weights[i] for i in indices]
+            doc_vec = pool_subchunk_embeddings(sub_vecs, weights, norm=normalize)
+            doc_vectors.append(doc_vec)
+
+        results = np.stack(doc_vectors)
+        return self._normalize_embeddings(results, normalize=normalize)
 
     def encode(self, texts):
         """Send prepared inputs unchanged; reject malformed/partial responses."""
         if not texts or any(not isinstance(t, str) for t in texts):
             raise ValueError("Expected a nonempty list of prepared text strings.")
         self.last_usage = {"usage_unknown": True, "complete": False}
-        response = self.client.embeddings.create(
-            input=texts, model=self.request_model_name, encoding_format="float",
-        )
+        try:
+            response = self.client.embeddings.create(
+                input=texts, model=self.request_model_name, encoding_format="float",
+            )
+        except Exception as exc:
+            if not is_batch_overflow_error(exc):
+                raise
+            if len(texts) > 1:
+                mid = len(texts) // 2
+                left = self.encode(texts[:mid])
+                left_usage = self.last_usage or {}
+                right = self.encode(texts[mid:])
+                right_usage = self.last_usage or {}
+                self.last_usage = {
+                    "prompt_tokens": left_usage.get("prompt_tokens", 0) + right_usage.get("prompt_tokens", 0),
+                    "total_tokens": left_usage.get("total_tokens", 0) + right_usage.get("total_tokens", 0),
+                }
+                return np.concatenate([left, right], axis=0)
+
+            # Single text overflow: divide gracefully into 2 sub-chunks and pool without truncation
+            single = texts[0]
+            sub_chunks = split_text_gracefully(single, max_chars=max(256, len(single) // 2))
+            if len(sub_chunks) <= 1:
+                raise
+            parts = []
+            usage_totals = {"prompt_tokens": 0, "total_tokens": 0}
+            for sc in sub_chunks:
+                parts.append(self.encode([sc]))
+                if self.last_usage:
+                    usage_totals["prompt_tokens"] += self.last_usage.get("prompt_tokens", 0)
+                    usage_totals["total_tokens"] += self.last_usage.get("total_tokens", 0)
+            self.last_usage = usage_totals
+            sub_vecs = np.concatenate(parts, axis=0)
+            weights = [max(1, len(s)) for s in sub_chunks]
+            pooled = pool_subchunk_embeddings(sub_vecs, weights, norm=True)
+            return pooled.reshape(1, -1)
+
         usage = getattr(response, "usage", None)
         prompt = getattr(usage, "prompt_tokens", None)
         total = getattr(usage, "total_tokens", None)

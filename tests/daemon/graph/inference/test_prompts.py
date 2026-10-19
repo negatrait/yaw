@@ -272,47 +272,47 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         import dspy
 
         from yaw.daemon.graph.inference.prompts import (
-            FACT_FILTER_DEMOS,
             NER_DEMOS,
             QA_DEMOS,
             TRIPLE_DEMOS,
+            TRIPLE_FILTER_DEMOS,
             AnswerQuestion,
             ExtractEntities,
             ExtractTriples,
             FactList,
-            FilterFacts,
+            FilterTriples,
         )
 
         self.assertTrue(issubclass(ExtractEntities, dspy.Signature))
         self.assertTrue(issubclass(ExtractTriples, dspy.Signature))
-        self.assertTrue(issubclass(FilterFacts, dspy.Signature))
+        self.assertTrue(issubclass(FilterTriples, dspy.Signature))
         self.assertTrue(issubclass(AnswerQuestion, dspy.Signature))
 
         self.assertEqual(list(ExtractEntities.input_fields.keys()), ["passage"])
         self.assertEqual(list(ExtractEntities.output_fields.keys()), ["named_entities"])
         self.assertEqual(list(ExtractTriples.input_fields.keys()), ["passage", "named_entities"])
         self.assertEqual(list(ExtractTriples.output_fields.keys()), ["triples"])
-        self.assertEqual(list(FilterFacts.input_fields.keys()), ["question", "fact_before_filter"])
-        self.assertEqual(list(FilterFacts.output_fields.keys()), ["fact"])
+        self.assertEqual(list(FilterTriples.input_fields.keys()), ["question", "fact_before_filter"])
+        self.assertEqual(list(FilterTriples.output_fields.keys()), ["fact"])
         self.assertEqual(list(AnswerQuestion.input_fields.keys()), ["context", "question"])
         self.assertEqual(list(AnswerQuestion.output_fields.keys()), ["answer"])
 
         self.assertEqual(len(NER_DEMOS), 1)
         self.assertEqual(len(TRIPLE_DEMOS), 1)
-        self.assertEqual(len(FACT_FILTER_DEMOS), 10)
-        self.assertIsInstance(FACT_FILTER_DEMOS[0].fact_before_filter, str)
-        self.assertIsInstance(FACT_FILTER_DEMOS[0].fact, list)
-        self.assertIsInstance(FactList(fact=FACT_FILTER_DEMOS[0].fact), FactList)
-        self.assertEqual(len(QA_DEMOS), 1)
+        self.assertEqual(len(TRIPLE_FILTER_DEMOS), 10)
+        self.assertIsInstance(TRIPLE_FILTER_DEMOS[0].fact_before_filter, str)
+        self.assertIsInstance(TRIPLE_FILTER_DEMOS[0].fact, list)
+        self.assertIsInstance(FactList(fact=TRIPLE_FILTER_DEMOS[0].fact), FactList)
+        self.assertEqual(len(QA_DEMOS), 2)
 
-    def test_hipporag_program_openie_fact_filter_and_cot_qa(self):
-        """Verify HippoRAGProgram executes OpenIE, fact filtering, and CoT QA via dspy.JSONAdapter (pure JSON output)."""
+    def test_hipporag_program_openie_triple_filter_and_qa(self):
+        """Verify HippoRAGProgram executes OpenIE, triple filtering, and QA via dspy.JSONAdapter (pure JSON output)."""
         import dspy
         from dspy.utils import DummyLM
 
         from yaw.daemon.graph.inference.program import HippoRAGProgram
 
-        program = HippoRAGProgram(qa_mode="cot")
+        program = HippoRAGProgram()
         lm = DummyLM(
             [
                 {
@@ -402,7 +402,7 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             ("imperial river", "is a river in", "united states"),
             ("amaradia", "flows through", "ro ia de amaradia"),
         ]
-        selected_indices = program.filter_facts(
+        selected_indices = program.filter_triples(
             "Where are Imperial River and Amaradia located?",
             candidates,
             lm=lm,
@@ -412,38 +412,78 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         qa_pred = program.answer_question(
             "University of Southampton was founded in 1862.",
             "When was it founded?",
-            mode="cot",
             lm=lm,
         )
         self.assertEqual(qa_pred.answer, "1862")
         self.assertIn("1862", qa_pred.reasoning)
 
-    def test_hipporag_program_rlm_qa_executes_in_local_interpreter(self):
-        """Verify HippoRAGProgram RLM mode executes real Python code inside dspy.LocalInterpreter."""
+    def test_shacl_healer_rlm_executes_in_python_interpreter_with_sub_lm_and_kwargs_tools(self):
+        """Verify shacl_healer_rlm executes Python REPL code in dspy.PythonInterpreter with sub_lm wired and kwargs tools."""
+        import dspy
         from dspy.utils import DummyLM
 
+        from yaw.daemon.graph.inference.grammars import DSPY_SHACL_REPAIR_GBNF_GRAMMAR
         from yaw.daemon.graph.inference.program import HippoRAGProgram
 
-        program = HippoRAGProgram(qa_mode="rlm", rlm_max_iters=4, rlm_max_llm_calls=5)
-        lm = DummyLM([
+        orch_lm = DummyLM([
             {
-                "reasoning": "Search the context in Python for the founding year and submit.",
+                "reasoning": "Propose SHACL repairs via GBNF tool using keyword argument violations=violations.",
                 "code": (
-                    "import re\n"
-                    "m = re.search(r'founded in (\\d{4})', context)\n"
-                    "SUBMIT(answer=m.group(1) if m else 'unknown')"
+                    "reps = qwen_propose_shacl_repairs(violations=violations)\n"
+                    "SUBMIT(repairs=reps)"
                 ),
             }
         ])
+        setattr(orch_lm, "_yaw_recipe", "llamacpp")
+        setattr(orch_lm, "_yaw_supports_gbnf", False)
 
-        rlm_pred = program.answer_question(
-            "The University of Southampton was founded in 1862 and received its Royal Charter in 1952.",
-            "When was the University of Southampton founded?",
-            mode="rlm",
-            lm=lm,
+        sub_lm = DummyLM(
+            [
+                {
+                    "repairs": [
+                        {
+                            "focus_node": "ent-1",
+                            "action": "set_definition",
+                            "value": "Repaired entity definition from GBNF sub-model.",
+                        }
+                    ]
+                }
+            ],
+            adapter=dspy.JSONAdapter(),
         )
-        self.assertEqual(rlm_pred.answer, "1862")
-        self.assertEqual(len(rlm_pred.trajectory), 1)
+        setattr(sub_lm, "_yaw_recipe", "llamacpp")
+        setattr(sub_lm, "_yaw_supports_gbnf", True)
+
+        program = HippoRAGProgram(
+            enable_gbnf=True,
+            orchestrator_lm=orch_lm,
+            rlm_sub_lm=sub_lm,
+            rlm_max_iters=3,
+            rlm_max_llm_calls=5,
+        )
+        self.assertIsNotNone(program.shacl_healer_rlm.sub_lm)
+
+        repairs = program.propose_shacl_repairs(
+            '[{"focus_node": "ent-1", "source_shape": "yaw:EntityConceptShape"}]',
+            mode="rlm",
+        )
+        self.assertEqual(
+            repairs,
+            [
+                {
+                    "focus_node": "ent-1",
+                    "action": "set_definition",
+                    "value": "Repaired entity definition from GBNF sub-model.",
+                }
+            ],
+        )
+        self.assertEqual(len(orch_lm.history), 1)
+        self.assertIsNone(orch_lm.history[0]["kwargs"].get("extra_body"))
+        self.assertEqual(len(sub_lm.history), 1)
+        self.assertEqual(
+            sub_lm.history[0]["kwargs"].get("extra_body"),
+            {"grammar": DSPY_SHACL_REPAIR_GBNF_GRAMMAR},
+        )
 
     def test_hipporag_program_save_and_load_gepa_state(self):
         """Verify HippoRAGProgram saves and reloads mutated GEPA instructions and demos cleanly."""
@@ -486,7 +526,7 @@ class PromptsAndParsersParityTests(unittest.TestCase):
 
         from yaw.daemon.graph.inference.grammars import (
             DSPY_NER_GBNF_GRAMMAR,
-            DSPY_QA_COT_GBNF_GRAMMAR,
+            DSPY_QA_GBNF_GRAMMAR,
             DSPY_TRIPLES_GBNF_GRAMMAR,
             build_dspy_rerank_grammar,
             build_dspy_triples_grammar,
@@ -520,7 +560,7 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         program.extract_openie("c-1", "Alan Turing was born in London.", lm=lm)
         self.assertNotIn("[[ ##", DSPY_NER_GBNF_GRAMMAR)
         self.assertNotIn("[[ ##", DSPY_TRIPLES_GBNF_GRAMMAR)
-        self.assertNotIn("[[ ##", DSPY_QA_COT_GBNF_GRAMMAR)
+        self.assertNotIn("[[ ##", DSPY_QA_GBNF_GRAMMAR)
         self.assertEqual(
             lm.history[0]["kwargs"].get("extra_body"),
             {"grammar": DSPY_NER_GBNF_GRAMMAR},
@@ -534,7 +574,7 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             ("alan turing", "born in", "london"),
             ("cinderella", "attended", "royal ball"),
         ]
-        selected = program.filter_facts("Where was Alan Turing born?", candidates, lm=lm)
+        selected = program.filter_triples("Where was Alan Turing born?", candidates, lm=lm)
         self.assertEqual(selected, [0])
         expected_rerank_grammar = build_dspy_rerank_grammar(candidates, max_facts=4)
         self.assertNotIn("[[ ##", expected_rerank_grammar)
@@ -544,10 +584,10 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             {"grammar": expected_rerank_grammar},
         )
 
-        program.answer_question("Alan Turing was born in London.", "Where?", mode="cot", lm=lm, use_gbnf=True)
+        program.answer_question("Alan Turing was born in London.", "Where?", lm=lm, use_gbnf=True)
         self.assertEqual(
             lm.history[3]["kwargs"].get("extra_body"),
-            {"grammar": DSPY_QA_COT_GBNF_GRAMMAR},
+            {"grammar": DSPY_QA_GBNF_GRAMMAR},
         )
 
     def test_sizecoding_gbnf_caps_and_gepa_pareto_metric(self):
@@ -558,7 +598,7 @@ class PromptsAndParsersParityTests(unittest.TestCase):
 
         from yaw.daemon.graph.inference.grammars import (
             build_dspy_ner_grammar,
-            build_dspy_qa_cot_grammar,
+            build_dspy_qa_grammar,
             build_dspy_triples_grammar,
             compute_sizecoding_pareto_score,
         )
@@ -602,14 +642,14 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             {"grammar": build_dspy_triples_grammar(2, stage1_pairs)},
         )
 
-        # Calling program(...) (GEPA's forward pass) automatically attaches the capped CoT GBNF grammar
+        # Calling program(...) (GEPA's forward pass) automatically attaches the capped QA GBNF grammar
         with dspy.context(lm=lm):
             pred = program(context="Alan Turing was born in London.", question="Where?")
         self.assertEqual(pred.answer, "London")
-        self.assertIn("char{1,180}", build_dspy_qa_cot_grammar(180))
+        self.assertIn("char{1,180}", build_dspy_qa_grammar(180))
         self.assertEqual(
             lm.history[2]["kwargs"].get("extra_body"),
-            {"grammar": build_dspy_qa_cot_grammar(180)},
+            {"grammar": build_dspy_qa_grammar(180)},
         )
 
         # 1. Below reference floor -> gate-free GM_good / GM_bad (zero hard-gate cliff)
@@ -693,268 +733,25 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         self.assertGreater(em_zero_high_recall.score, em_zero_low_recall.score)
         self.assertNotIn("preserve 100% of gold retrieval bridges", em_zero_high_recall.feedback)
 
-        # Full active predictor surface visibility for GEPA (never hides OpenIE/EDC/SHACL predictors behind _retrieval_hook)
-        direct_prog = HippoRAGProgram(execution_mode="direct", qa_mode="cot")
+        # Full canonical 9-predictor surface visibility for GEPA (never hides OpenIE/EDC/SHACL predictors behind _retrieval_hook)
+        direct_prog = HippoRAGProgram()
         direct_names = [name for name, _ in direct_prog.named_predictors()]
-        self.assertEqual(
-            direct_names,
-            [
-                "ner",
-                "triples",
-                "entity_definer",
-                "synonym_judge",
-                "shacl_repair",
-                "fact_filter",
-                "query_intent",
-                "qa_cot.predict",
-            ],
-        )
+        expected_canonical_9 = [
+            "ner",
+            "triples",
+            "entity_definer",
+            "synonym_judge",
+            "shacl_repair",
+            "triple_filter",
+            "query_intent",
+            "qa.predict",
+            "shacl_healer_rlm.generate_action",
+            "shacl_healer_rlm.extract",
+        ]
+        self.assertEqual(direct_names, expected_canonical_9)
         direct_prog.set_retrieval_hook(lambda q: ("ctx", ("c1",), (1.0,)))
         hooked_names = [name for name, _ in direct_prog.named_predictors()]
-        self.assertEqual(
-            hooked_names,
-            [
-                "ner",
-                "triples",
-                "entity_definer",
-                "synonym_judge",
-                "shacl_repair",
-                "fact_filter",
-                "query_intent",
-                "qa_cot.predict",
-            ],
-        )
-
-    def test_heterogeneous_mistral_orchestrator_and_qwen_gbnf_rlm_across_all_stages(self):
-        """Verify execution_mode='rlm' runs Mistral NPU orchestrator (zero GBNF) + Qwen GPU worker (pure-JSON GBNF) on every stage."""
-        import dspy
-        from dspy.utils import DummyLM
-
-        from yaw.daemon.graph.inference.grammars import (
-            DSPY_NER_GBNF_GRAMMAR,
-            DSPY_QA_COT_GBNF_GRAMMAR,
-            build_dspy_rerank_grammar,
-            build_dspy_triples_grammar,
-            lm_supports_gbnf,
-        )
-        from yaw.daemon.graph.inference.program import HippoRAGProgram
-
-        # Mistral orchestrator on Ryzen AI NPU/OGA (ChatAdapter, NO GBNF allowed)
-        mistral_lm = DummyLM([
-            {
-                "reasoning": "Delegate entity extraction to GBNF-constrained Qwen GPU worker.",
-                "code": (
-                    "ents = qwen_extract_entities(passage=passage)\n"
-                    "SUBMIT(named_entities=ents)"
-                ),
-            },
-            {
-                "reasoning": "Delegate triple extraction to GBNF-constrained Qwen GPU worker.",
-                "code": (
-                    "trips = qwen_extract_triples(passage=passage, named_entities=named_entities)\n"
-                    "SUBMIT(triples=trips)"
-                ),
-            },
-            {
-                "reasoning": "Parse candidates and delegate fact filtering to GBNF-constrained Qwen GPU worker.",
-                "code": (
-                    "import json\n"
-                    "cands = json.loads(fact_before_filter)['fact']\n"
-                    "kept = qwen_filter_facts(question=question, candidate_facts=cands)\n"
-                    "SUBMIT(fact=kept)"
-                ),
-            },
-            {
-                "reasoning": "Delegate multi-hop CoT reasoning to GBNF-constrained Qwen GPU worker.",
-                "code": (
-                    "res = qwen_answer_cot(context=context, question=question)\n"
-                    "SUBMIT(answer=res['answer'])"
-                ),
-            },
-        ])
-        setattr(mistral_lm, "_yaw_recipe", "ryzenai-llm")
-        setattr(mistral_lm, "_yaw_supports_gbnf", False)
-        self.assertFalse(lm_supports_gbnf(mistral_lm))
-
-        stage1_pairs = [
-            ["Alan Turing", "English mathematician"],
-            ["London", "Capital of the United Kingdom"],
-        ]
-        # Qwen worker on llama.cpp Vulkan GPU (JSONAdapter, pure-JSON GBNF enabled)
-        qwen_lm = DummyLM(
-            [
-                {"named_entities": stage1_pairs},
-                {
-                    "triples": [
-                        {
-                            "sub": "Alan Turing",
-                            "pred": "born in",
-                            "obj": "London",
-                            "def": "Alan Turing was born in London.",
-                        }
-                    ]
-                },
-                {"fact": [["alan turing", "born in", "london"]]},
-                {"reasoning": "Alan Turing was born in London.", "answer": "London"},
-            ],
-            adapter=dspy.JSONAdapter(),
-        )
-        setattr(qwen_lm, "_yaw_recipe", "llamacpp")
-        setattr(qwen_lm, "_yaw_supports_gbnf", True)
-        self.assertTrue(lm_supports_gbnf(qwen_lm))
-
-        program = HippoRAGProgram(
-            execution_mode="rlm",
-            enable_gbnf=True,
-            orchestrator_lm=mistral_lm,
-            rlm_sub_lm=qwen_lm,
-            rlm_max_iters=3,
-            rlm_max_llm_calls=8,
-        )
-
-        # 1 & 2: OpenIE (NER + Triples) via Mistral RLM -> Qwen GBNF worker
-        record = program.extract_openie("c-1", "Alan Turing was born in London.")
-        self.assertEqual(record.entities, ("Alan Turing", "London"))
-        self.assertEqual(record.triples, (("Alan Turing", "born in", "London"),))
-
-        # 3: Fact filter via Mistral RLM -> Qwen GBNF worker
-        candidates = [
-            ("alan turing", "born in", "london"),
-            ("cinderella", "attended", "royal ball"),
-        ]
-        selected = program.filter_facts("Where was Alan Turing born?", candidates)
-        self.assertEqual(selected, [0])
-
-        # 4: Multi-hop QA via Mistral RLM -> Qwen GBNF worker
-        qa_pred = program("Alan Turing was born in London.", "Where was Alan Turing born?")
-        self.assertEqual(qa_pred.answer, "London")
-
-        # Verify Mistral NPU orchestrator received 4 RLM calls and ZERO GBNF grammars
-        self.assertEqual(len(mistral_lm.history), 4)
-        for entry in mistral_lm.history:
-            self.assertIsNone(entry["kwargs"].get("extra_body"))
-
-        # Verify Qwen GPU worker received 4 inner calls, ALL with pure-JSON GBNF grammars
-        self.assertEqual(len(qwen_lm.history), 4)
-        self.assertEqual(
-            qwen_lm.history[0]["kwargs"].get("extra_body"),
-            {"grammar": DSPY_NER_GBNF_GRAMMAR},
-        )
-        self.assertEqual(
-            qwen_lm.history[1]["kwargs"].get("extra_body"),
-            {"grammar": build_dspy_triples_grammar(None, stage1_pairs)},
-        )
-        self.assertEqual(
-            qwen_lm.history[2]["kwargs"].get("extra_body"),
-            {"grammar": build_dspy_rerank_grammar(candidates, max_facts=4)},
-        )
-        self.assertEqual(
-            qwen_lm.history[3]["kwargs"].get("extra_body"),
-            {"grammar": DSPY_QA_COT_GBNF_GRAMMAR},
-        )
-
-    def test_rlm_positional_tool_calls_and_mistral_submit_quirks(self):
-        """Verify _PositionalSafeRLM handles real Mistral NPU outputs: positional tool args, dict-wrapped SUBMIT, JSON-string triples, and leading ']\\n'."""
-        import dspy
-        from dspy.utils import DummyLM
-
-        from yaw.daemon.graph.inference.program import HippoRAGProgram
-
-        # Real-silicon failure patterns observed on Mistral-7B-Instruct-v0.3-Hybrid (ryzenai-llm):
-        # 1. Positional tool calls: qwen_extract_entities(passage) instead of keyword args
-        # 2. JSON-serialized triples passed to SUBMIT(triples=json.dumps(...))
-        # 3. Raw fact_before_filter JSON string passed positionally + dict-wrapped SUBMIT({"fact": kept})
-        # 4. Single-key dict SUBMIT({"when": ...}) with leading "]\n" ChatAdapter bracket artifact
-        mistral_lm = DummyLM([
-            {
-                "reasoning": "]\nExtract entities positionally.",
-                "code": (
-                    "ents = qwen_extract_entities(passage)\n"
-                    "SUBMIT({'named_entities': ents})"
-                ),
-            },
-            {
-                "reasoning": "]\nExtract triples positionally and JSON-dump.",
-                "code": (
-                    "import json\n"
-                    "trips = qwen_extract_triples(passage, named_entities)\n"
-                    "SUBMIT(triples=json.dumps(trips))"
-                ),
-            },
-            {
-                "reasoning": "]\nFilter facts passing fact_before_filter positionally and dict-wrapping SUBMIT.",
-                "code": (
-                    "kept = qwen_filter_facts(question, fact_before_filter)\n"
-                    "SUBMIT({'fact': kept})"
-                ),
-            },
-            {
-                "reasoning": "]\nAnswer question positionally and submit dict.",
-                "code": (
-                    "res = qwen_answer_cot(context, question)\n"
-                    "SUBMIT({'when': ']\\n' + res['answer']})"
-                ),
-            },
-        ])
-        setattr(mistral_lm, "_yaw_recipe", "ryzenai-llm")
-        setattr(mistral_lm, "_yaw_supports_gbnf", False)
-
-        qwen_lm = DummyLM(
-            [
-                {
-                    "named_entities": [
-                        ["Radio City", "Private FM radio station in India"],
-                        ["Bangalore", "Capital city of Karnataka"],
-                        ["Abraham Thomas", "Chief executive of Radio City"],
-                    ]
-                },
-                {
-                    "triples": [
-                        {
-                            "sub": "Radio City",
-                            "pred": "started in",
-                            "obj": "Bangalore",
-                            "def": "Radio City was started in Bangalore.",
-                        }
-                    ]
-                },
-                {"fact": [["Radio City", "started in", "Bangalore"]]},
-                {"reasoning": "]\nStarted on 3 July 2001.", "answer": "]\n3 July 2001"},
-            ],
-            adapter=dspy.JSONAdapter(),
-        )
-        setattr(qwen_lm, "_yaw_recipe", "llamacpp")
-        setattr(qwen_lm, "_yaw_supports_gbnf", True)
-
-        program = HippoRAGProgram(
-            execution_mode="rlm",
-            enable_gbnf=True,
-            orchestrator_lm=mistral_lm,
-            rlm_sub_lm=qwen_lm,
-            rlm_max_iters=2,
-        )
-
-        record = program.extract_openie(
-            "c-pos",
-            "Radio City was started on 3 July 2001 in Bangalore by Abraham Thomas.",
-        )
-        self.assertEqual(record.entities, ("Radio City", "Bangalore", "Abraham Thomas"))
-        self.assertEqual(record.triples, (("Radio City", "started in", "Bangalore"),))
-
-        kept = program.filter_facts(
-            "Where was Radio City started?",
-            [("Radio City", "started in", "Bangalore"), ("Apple", "founded by", "Steve Jobs")],
-        )
-        self.assertEqual(kept, [0])
-
-        qa_pred = program(
-            "Radio City was started on 3 July 2001 in Bangalore by Abraham Thomas.",
-            "When was Radio City started?",
-        )
-        self.assertEqual(qa_pred.answer, "3 July 2001")
-        # Every stage must succeed on iteration 1 without falling back to self.extract
-        self.assertEqual(len(mistral_lm.history), 4)
-        self.assertEqual(len(qwen_lm.history), 4)
+        self.assertEqual(hooked_names, expected_canonical_9)
 
     @staticmethod
     def _probe_live_lemonade_models() -> set[str]:
@@ -974,10 +771,10 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         except Exception:
             return set()
 
-    def test_live_silicon_direct_qwen_gbnf_and_heterogeneous_mistral_qwen_rlm(self):
-        """Run un-mocked end-to-end HippoRAGProgram against live Lemonade Server (Qwen GPU GBNF + Mistral NPU RLM)."""
+    def test_live_silicon_direct_qwen_gbnf_and_shacl_healer_rlm(self):
+        """Run un-mocked end-to-end HippoRAGProgram against live Lemonade Server (Qwen GPU GBNF + SHACL Healer RLM)."""
         loaded_models = self._probe_live_lemonade_models()
-        required = {"Qwen3-4B-Instruct-2507-GGUF", "Mistral-7B-Instruct-v0.3-Hybrid"}
+        required = {"Qwen3-4B-Instruct-2507-GGUF"}
         if not required.issubset(loaded_models):
             self.skipTest(
                 f"Live Lemonade Server models {sorted(required)} not loaded (found {sorted(loaded_models)})"
@@ -995,7 +792,6 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             ("Apple", "founded by", "Steve Jobs"),
         ]
 
-        # 1. Live Direct Mode on Qwen3-4B-Instruct-2507-GGUF (llama.cpp GPU + pure-JSON GBNF)
         qwen_direct_lm = create_dspy_lm(
             "Qwen3-4B-Instruct-2507-GGUF",
             base_url="http://localhost:13305/api/v1",
@@ -1003,16 +799,22 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             max_tokens=512,
             cache=True,
         )
+        orch_lm, sub_lm = create_dspy_rlm_pair(
+            base_url="http://localhost:13305/api/v1",
+            cache=True,
+        )
         direct_prog = HippoRAGProgram(
-            execution_mode="direct",
             enable_gbnf=True,
+            orchestrator_lm=orch_lm,
+            rlm_sub_lm=sub_lm,
+            rlm_max_iters=3,
         )
         direct_record = direct_prog.extract_openie("c-live-direct", passage, lm=qwen_direct_lm)
         self.assertIn("Radio City", direct_record.entities)
         self.assertIn("Bangalore", direct_record.entities)
         self.assertTrue(len(direct_record.triples) >= 1)
 
-        direct_kept = direct_prog.filter_facts(
+        direct_kept = direct_prog.filter_triples(
             "Where was Radio City started?", candidates, lm=qwen_direct_lm
         )
         self.assertEqual(direct_kept, [0])
@@ -1024,39 +826,6 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         self.assertEqual(len(qwen_direct_lm.history), 4)
         for call_entry in qwen_direct_lm.history:
             self.assertIn("grammar", (call_entry["kwargs"].get("extra_body") or {}))
-
-        # 2. Live RLM Mode: Mistral-7B-Instruct-v0.3-Hybrid (Ryzen AI NPU) Orchestrator +
-        #    Qwen3-4B-Instruct-2507-GGUF (llama.cpp GPU + pure-JSON GBNF) Worker
-        orch_lm, sub_lm = create_dspy_rlm_pair(
-            base_url="http://localhost:13305/api/v1",
-            cache=True,
-        )
-        rlm_prog = HippoRAGProgram(
-            execution_mode="rlm",
-            enable_gbnf=True,
-            orchestrator_lm=orch_lm,
-            rlm_sub_lm=sub_lm,
-            rlm_max_iters=3,
-        )
-        rlm_record = rlm_prog.extract_openie("c-live-rlm", passage)
-        self.assertIn("Radio City", rlm_record.entities)
-        self.assertIn("Bangalore", rlm_record.entities)
-        self.assertTrue(len(rlm_record.triples) >= 1)
-
-        rlm_kept = rlm_prog.filter_facts("Where was Radio City started?", candidates)
-        self.assertEqual(rlm_kept, [0])
-
-        rlm_qa = rlm_prog.answer_question(passage, "When was Radio City started?")
-        self.assertIn("2001", rlm_qa.answer)
-        self.assertFalse(rlm_qa.answer.startswith("]"))
-
-        # Verify 1-iteration RLM completion across all 4 stages (4 Mistral NPU calls, 4 Qwen GPU GBNF calls)
-        self.assertEqual(len(orch_lm.history), 4)
-        for orch_entry in orch_lm.history:
-            self.assertIsNone(orch_entry["kwargs"].get("extra_body"))
-        self.assertEqual(len(sub_lm.history), 4)
-        for sub_entry in sub_lm.history:
-            self.assertIn("grammar", (sub_entry["kwargs"].get("extra_body") or {}))
 
     def test_leaf_modularization_and_inference_facade_integrity(self):
         """Verify program, grammars, and prompts are cleanly modularized and accessible via facade."""
@@ -1112,12 +881,12 @@ class PromptsAndParsersParityTests(unittest.TestCase):
                 DSPY_INSTRUCTION_PROPOSAL_GBNF_GRAMMAR,
             )
 
-        # 3. Reflection LM temperature & GBNF capability flags
-        mistral_ref = create_dspy_lm("Mistral-7B-Instruct-v0.3-Hybrid", role="reflection")
+        # 3. Reflection LM temperature & GBNF capability flags on Qwen3-4B-Instruct-2507-GGUF
+        qwen_orch_ref = create_dspy_lm("Qwen3-4B-Instruct-2507-GGUF", role="reflection")
         qwen_ref = create_dspy_lm("Qwen3-4B-Instruct-2507-GGUF", role="reflection_worker")
-        self.assertEqual(mistral_ref.kwargs["temperature"], 0.8)
-        self.assertEqual(mistral_ref.kwargs["max_tokens"], 4096)
-        self.assertFalse(getattr(mistral_ref, "_yaw_supports_gbnf", True))
+        self.assertEqual(qwen_orch_ref.kwargs["temperature"], 0.8)
+        self.assertEqual(qwen_orch_ref.kwargs["max_tokens"], 4096)
+        self.assertFalse(getattr(qwen_orch_ref, "_yaw_supports_gbnf", True))
 
         self.assertEqual(qwen_ref.kwargs["temperature"], 0.7)
         self.assertEqual(qwen_ref.kwargs["max_tokens"], 4096)
@@ -1131,7 +900,7 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         self.assertTrue(getattr(worker_ref, "_yaw_supports_gbnf", False))
 
     def test_rlm_instruction_proposer_contract_and_boundary_envelope(self):
-        """TDD Contract: RLMInstructionProposer executes Outer Mistral RLM -> Inner Qwen RLM -> Qwen GBNF synthesis."""
+        """TDD Contract: RLMInstructionProposer executes single-level RLM trace distillation -> Qwen GBNF synthesis."""
         import dspy
         from dspy.utils.dummies import DummyLM
 
@@ -1144,30 +913,23 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             RLMInstructionProposer(max_instruction_chars=0)
 
-        mistral_lm = DummyLM([
+        orch_lm = DummyLM([
             {
-                "reasoning": "Inspect examples_with_feedback in Python and delegate to Qwen inner RLM.",
+                "reasoning": "Distill examples_with_feedback in Python and call GBNF synthesize_instruction with keyword args.",
                 "code": (
-                    "improved = qwen_propose_instruction(current_instruction, examples_with_feedback)\n"
-                    "SUBMIT(new_instruction=improved)"
+                    "digest = [{'Inputs': {'passage': ex['Inputs']['passage'][:200]}, "
+                    "'Generated Outputs': ex['Generated Outputs'], 'Feedback': ex['Feedback']} "
+                    "for ex in examples_with_feedback]\n"
+                    "res = synthesize_instruction(current_instruction=current_instruction, examples_with_feedback=digest)\n"
+                    "SUBMIT(new_instruction=res)"
                 ),
             }
         ])
-        setattr(mistral_lm, "_yaw_recipe", "ryzenai-llm")
-        setattr(mistral_lm, "_yaw_supports_gbnf", False)
+        setattr(orch_lm, "_yaw_recipe", "llamacpp")
+        setattr(orch_lm, "_yaw_supports_gbnf", False)
 
         qwen_lm = DummyLM(
             [
-                {
-                    "reasoning": "Distill examples_with_feedback in Python and call GBNF synthesize_instruction.",
-                    "code": (
-                        "digest = [{'Inputs': {'passage': ex['Inputs']['passage'][:200]}, "
-                        "'Generated Outputs': ex['Generated Outputs'], 'Feedback': ex['Feedback']} "
-                        "for ex in examples_with_feedback]\n"
-                        "res = synthesize_instruction(current_instruction, digest)\n"
-                        "SUBMIT(new_instruction=res)"
-                    ),
-                },
                 {"new_instruction": "Extract all bridge named entities concisely without redundant titles."},
             ]
         )
@@ -1175,7 +937,7 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         setattr(qwen_lm, "_yaw_supports_gbnf", True)
 
         proposer = RLMInstructionProposer(
-            orchestrator_lm=mistral_lm,
+            orchestrator_lm=orch_lm,
             worker_lm=qwen_lm,
             enable_gbnf=True,
             max_instruction_chars=900,
@@ -1184,7 +946,7 @@ class PromptsAndParsersParityTests(unittest.TestCase):
 
         candidate = {
             "ner": "Extract named entities from the passage.",
-            "qa_cot": "Answer the question concisely.",
+            "qa": "Answer the question concisely.",
         }
         reflective_dataset = {
             "ner": [
@@ -1199,32 +961,31 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         # Boundary: empty or missing component updates make zero LM calls
         self.assertEqual(proposer(candidate, reflective_dataset, []), {})
         self.assertEqual(proposer(candidate, reflective_dataset, ["missing_comp"]), {})
-        self.assertEqual(len(mistral_lm.history), 0)
+        self.assertEqual(len(orch_lm.history), 0)
         self.assertEqual(len(qwen_lm.history), 0)
 
-        # Happy path: updates 'ner' via Outer Mistral RLM -> Inner Qwen RLM -> Qwen GBNF synthesis
+        # Happy path: updates 'ner' via single-level RLM trace distillation -> Qwen GBNF synthesis
         with dspy.context(track_usage=True):
             updated = proposer(candidate, reflective_dataset, ["ner"])
         self.assertEqual(
             updated,
             {"ner": "Extract all bridge named entities concisely without redundant titles."},
         )
-        self.assertEqual(len(mistral_lm.history), 1)
-        self.assertEqual(len(qwen_lm.history), 2)
+        self.assertEqual(len(orch_lm.history), 1)
+        self.assertEqual(len(qwen_lm.history), 1)
 
-        # Verify Mistral got instruction proposal prompt (not SPO/QA tools) and zero GBNF
-        mistral_call = mistral_lm.history[0]
-        self.assertIsNone(mistral_call["kwargs"].get("extra_body"))
-        self.assertEqual(mistral_call["kwargs"].get("temperature"), 0.8)
-        mistral_prompt_text = str(mistral_call.get("messages") or mistral_call.get("prompt"))
-        self.assertIn("qwen_propose_instruction", mistral_prompt_text)
-        self.assertIn("new_instruction", mistral_prompt_text)
-        self.assertNotIn("qwen_extract_triples", mistral_prompt_text)
+        # Verify RLM orchestrator got instruction proposal prompt (not SPO/QA tools) and zero GBNF
+        rlm_call = orch_lm.history[0]
+        self.assertIsNone(rlm_call["kwargs"].get("extra_body"))
+        self.assertEqual(rlm_call["kwargs"].get("temperature"), 0.8)
+        rlm_prompt_text = str(rlm_call.get("messages") or rlm_call.get("prompt"))
+        self.assertIn("synthesize_instruction", rlm_prompt_text)
+        self.assertIn("new_instruction", rlm_prompt_text)
+        self.assertNotIn("qwen_extract_triples", rlm_prompt_text)
+        self.assertNotIn("qwen_propose_instruction", rlm_prompt_text)
 
-        # Verify Qwen Call 1 was Inner RLM (no GBNF) and Call 2 was GBNF ProposeInstruction synthesis
-        qwen_rlm_call = qwen_lm.history[0]
-        self.assertIsNone(qwen_rlm_call["kwargs"].get("extra_body"))
-        qwen_synth_call = qwen_lm.history[1]
+        # Verify Qwen worker call was GBNF ProposeInstruction synthesis
+        qwen_synth_call = qwen_lm.history[0]
         self.assertEqual(qwen_synth_call["kwargs"].get("temperature"), 0.7)
         self.assertEqual(
             (qwen_synth_call["kwargs"].get("extra_body") or {}).get("grammar"),
@@ -1234,15 +995,16 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         # Verify telemetry was recorded on the proposer
         self.assertEqual(len(proposer.telemetry), 1)
         self.assertEqual(proposer.telemetry[0]["component_name"], "ner")
+        self.assertEqual(proposer.telemetry[0]["predictor"], "inner_rlm")
         self.assertEqual(
             proposer.telemetry[0]["new_instruction"],
             "Extract all bridge named entities concisely without redundant titles.",
         )
 
     def test_live_silicon_rlm_instruction_proposer(self):
-        """Run un-mocked RLMInstructionProposer (RLM -> RLM cascade) against live Lemonade Server."""
+        """Run un-mocked single-level RLMInstructionProposer against live Lemonade Server."""
         loaded_models = self._probe_live_lemonade_models()
-        required = {"Qwen3-4B-Instruct-2507-GGUF", "Mistral-7B-Instruct-v0.3-Hybrid"}
+        required = {"Qwen3-4B-Instruct-2507-GGUF"}
         if not required.issubset(loaded_models):
             self.skipTest(
                 f"Live Lemonade Server models {sorted(required)} not loaded (found {sorted(loaded_models)})"
@@ -1267,10 +1029,10 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             rlm_max_iters=3,
         )
         candidate = {
-            "qa_cot": "Read the retrieved Wikipedia passages and answer the multi-hop question."
+            "qa": "Read the retrieved Wikipedia passages and answer the multi-hop question."
         }
         reflective_dataset = {
-            "qa_cot": [
+            "qa": [
                 {
                     "Inputs": {
                         "context": "Wikipedia Title: Erik Hort\nErik Hort was born in Montebello, New York.\n\nWikipedia Title: Montebello, New York\nMontebello is an incorporated village in the town of Ramapo, Rockland County, New York.",
@@ -1280,14 +1042,14 @@ class PromptsAndParsersParityTests(unittest.TestCase):
                         "reasoning": "Erik Hort was born in Montebello, which is in Rockland County, New York.",
                         "answer": "Erik Hort's birthplace is part of Rockland County in New York.",
                     },
-                    "Feedback": "[qa_cot] PASS Tier 1 floor (1.0000 >= 0.0000). EM=0.0000, F1=0.3636. Missed gold items: ['Rockland County'].",
+                    "Feedback": "[qa] PASS Tier 1 floor (1.0000 >= 0.0000). EM=0.0000, F1=0.3636. Missed gold items: ['Rockland County'].",
                 }
             ]
         }
 
-        updated = proposer(candidate, reflective_dataset, ["qa_cot"])
-        self.assertIn("qa_cot", updated)
-        new_inst = updated["qa_cot"].strip()
+        updated = proposer(candidate, reflective_dataset, ["qa"])
+        self.assertIn("qa", updated)
+        new_inst = updated["qa"].strip()
         self.assertGreater(len(new_inst), 15)
         self.assertLessEqual(len(new_inst), 800)
         self.assertFalse(new_inst.startswith("]"))
@@ -1296,8 +1058,8 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         self.assertIsNone(orch_lm.history[0]["kwargs"].get("extra_body"))
         self.assertEqual(orch_lm.history[0]["kwargs"].get("temperature"), 0.8)
 
-        # Inner RLM on Qwen + GBNF ProposeInstruction synthesis
-        self.assertGreaterEqual(len(worker_lm.history), 2)
+        # GBNF ProposeInstruction synthesis on Qwen worker
+        self.assertGreaterEqual(len(worker_lm.history), 1)
         gbnf_calls = [
             c for c in worker_lm.history if (c["kwargs"].get("extra_body") or {}).get("grammar")
         ]
@@ -1326,8 +1088,6 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         setattr(qwen_lm, "_yaw_supports_gbnf", True)
 
         prog = HippoRAGProgram(
-            execution_mode="direct",
-            qa_mode="cot",
             enable_gbnf=True,
             rlm_sub_lm=qwen_lm,
         )
@@ -1342,16 +1102,16 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             DSPY_QUERY_INTENT_GBNF_GRAMMAR,
         )
 
-        # Boundary: non-GBNF LM (e.g. ryzenai-llm) omits extra_body.grammar
-        npu_lm = DummyLM([{"query_intent": "Erik Hort birthplace county"}])
-        setattr(npu_lm, "_yaw_recipe", "ryzenai-llm")
-        setattr(npu_lm, "_yaw_supports_gbnf", False)
-        intent_npu = prog.extract_query_intent("What county is Erik Hort's birthplace a part of?", lm=npu_lm)
-        self.assertEqual(intent_npu, "Erik Hort birthplace county")
-        self.assertIsNone(npu_lm.history[0]["kwargs"].get("extra_body"))
+        # Boundary: non-GBNF LM omits extra_body.grammar
+        non_gbnf_lm = DummyLM([{"query_intent": "Erik Hort birthplace county"}])
+        setattr(non_gbnf_lm, "_yaw_recipe", "flm")
+        setattr(non_gbnf_lm, "_yaw_supports_gbnf", False)
+        intent_non_gbnf = prog.extract_query_intent("What county is Erik Hort's birthplace a part of?", lm=non_gbnf_lm)
+        self.assertEqual(intent_non_gbnf, "Erik Hort birthplace county")
+        self.assertIsNone(non_gbnf_lm.history[0]["kwargs"].get("extra_body"))
 
-    def test_strict_17_predictor_separation_of_concerns_and_distinct_signatures(self):
-        """TDD Contract: All 19 predictors across HippoRAGProgram (15) and RLMInstructionProposer (4) have distinct Signatures and dedicated .lm instances."""
+    def test_canonical_12_predictor_separation_of_concerns_and_distinct_signatures(self):
+        """TDD Contract: All 12 canonical predictors across HippoRAGProgram (9) and RLMInstructionProposer (3) have distinct Signatures and dedicated .lm instances."""
         import dspy
         from dspy.utils.dummies import DummyLM
 
@@ -1399,9 +1159,8 @@ class PromptsAndParsersParityTests(unittest.TestCase):
 
         dspy.settings.configure(lm=primary_lm)
         prog = HippoRAGProgram(
-            execution_mode="direct",
-            qa_mode="cot",
             enable_gbnf=True,
+            orchestrator_lm=primary_lm,
             rlm_sub_lm=sub_lm,
         )
         proposer = RLMInstructionProposer(
@@ -1412,20 +1171,52 @@ class PromptsAndParsersParityTests(unittest.TestCase):
 
         stage_preds = prog.all_stage_predictors()
         refl_preds = proposer.all_reflection_predictors()
-        self.assertEqual(len(stage_preds), 15)
-        self.assertEqual(len(refl_preds), 4)
+        self.assertEqual(len(stage_preds), 9)
+        self.assertEqual(len(refl_preds), 3)
 
-        all_19 = dict(stage_preds + refl_preds)
-        self.assertEqual(len(all_19), 19)
+        all_12 = dict(stage_preds + refl_preds)
+        self.assertEqual(len(all_12), 12)
+        self.assertEqual(
+            list(all_12.keys()),
+            [
+                "ner",
+                "triples",
+                "entity_definer",
+                "synonym_judge",
+                "shacl_repair",
+                "shacl_healer_rlm",
+                "triple_filter",
+                "query_intent",
+                "qa",
+                "inner_rlm",
+                "qwen_proposer",
+                "qwen_compressor",
+            ],
+        )
 
-        # Pairwise-distinct Signature classes across all 19 predictors
-        sig_classes = [p.signature for p in all_19.values()]
-        self.assertEqual(len(set(sig_classes)), 19)
+        # Pairwise-distinct Signature classes across all 12 canonical predictors
+        sig_classes = [p.signature for p in all_12.values()]
+        self.assertEqual(len(set(sig_classes)), 12)
 
-        # Pairwise-distinct .lm instances across all 19 predictors
-        lm_ids = [id(getattr(p, "lm", None)) for p in all_19.values()]
-        self.assertTrue(all(getattr(p, "lm", None) is not None for p in all_19.values()))
-        self.assertEqual(len(set(lm_ids)), 19)
+        # Pairwise-distinct .lm instances across all 12 canonical predictors
+        lm_ids = [id(getattr(p, "lm", None)) for p in all_12.values()]
+        self.assertTrue(all(getattr(p, "lm", None) is not None for p in all_12.values()))
+        self.assertEqual(len(set(lm_ids)), 12)
+
+        # Test first-class embedding telemetry trail on HippoRAGProgram
+        prog.record_embedding_telemetry(
+            {
+                "stage": "fact_embed",
+                "predictor": "embedder",
+                "model": "openai/embeddinggemma-300m-GGUF",
+                "mode": "embed",
+                "num_inputs": 4,
+                "tokens_used": 64,
+            }
+        )
+        self.assertEqual(len(prog.embedding_audit_trail), 1)
+        self.assertEqual(prog.embedding_audit_trail[0]["stage"], "fact_embed")
+        self.assertEqual(prog.telemetry[-1]["predictor"], "embedder")
 
         # Test extract_structured_triples, judge_synonyms, propose_shacl_repairs
         structured = prog.extract_structured_triples(
@@ -1445,6 +1236,7 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         repairs = prog.propose_shacl_repairs(
             '[{"focus_node": "ent-1"}]',
             focus_context='{"entity": {"entity_id": "ent-1"}}',
+            mode="direct",
         )
         self.assertEqual(
             repairs,
@@ -1466,7 +1258,6 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         from yaw.daemon.graph.inference import (
             DefineMissingEntities,
             HippoRAGProgram,
-            OrchestrateMissingEntityDefinitions,
             build_dspy_missing_entity_defs_grammar,
             build_dspy_triples_grammar,
             compute_sizecoding_pareto_score,
@@ -1474,7 +1265,6 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         from yaw.daemon.graph.inference.parsers import extract_structured_triples
 
         self.assertTrue(issubclass(DefineMissingEntities, dspy.Signature))
-        self.assertTrue(issubclass(OrchestrateMissingEntityDefinitions, dspy.Signature))
 
         # 1. Dynamic GBNF grammar for known_entities and missing_entity_defs
         g_known = build_dspy_triples_grammar(
@@ -1511,7 +1301,7 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         self.assertEqual(parsed_bare[0].subj_def, "")
         self.assertEqual(parsed_bare[0].obj_def, "")
 
-        # 3. Direct mode: Stage 1 defines "Ada Lovelace", Stage 2 introduces bare "Charles Babbage" without inline pair -> DefineMissingEntities repairs it
+        # 3. Direct GBNF: Stage 1 defines "Ada Lovelace", Stage 2 introduces bare "Charles Babbage" without inline pair -> DefineMissingEntities repairs it
         direct_lm = DummyLM(
             [
                 {
@@ -1541,7 +1331,6 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         setattr(direct_lm, "_yaw_supports_gbnf", True)
 
         prog_direct = HippoRAGProgram(
-            execution_mode="direct",
             enable_gbnf=True,
             rlm_sub_lm=direct_lm,
         )
@@ -1659,7 +1448,6 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         setattr(cinderella_lm, "_yaw_recipe", "llamacpp")
         setattr(cinderella_lm, "_yaw_supports_gbnf", True)
         prog_cinderella = HippoRAGProgram(
-            execution_mode="direct",
             enable_gbnf=True,
             rlm_sub_lm=cinderella_lm,
         )
@@ -1700,61 +1488,7 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             "Young woman mistreated by her stepmother who attends the royal ball",
         )
 
-        # 4. RLM mode: OrchestrateMissingEntityDefinitions delegates to qwen_define_missing_entities
-        mistral_rlm = DummyLM(
-            [
-                {
-                    "reasoning": "Delegate missing entity definitions to Qwen GBNF worker.",
-                    "code": (
-                        "defs = qwen_define_missing_entities(passage, missing_entities, triples)\n"
-                        "SUBMIT(entity_definitions=defs)"
-                    ),
-                }
-            ]
-        )
-        setattr(mistral_rlm, "_yaw_recipe", "ryzenai-llm")
-        setattr(mistral_rlm, "_yaw_supports_gbnf", False)
-        qwen_rlm = DummyLM(
-            [
-                {
-                    "entity_definitions": [
-                        ["Analytical Engine", "Proposed mechanical general-purpose computer"],
-                    ]
-                }
-            ],
-            adapter=dspy.JSONAdapter(),
-        )
-        setattr(qwen_rlm, "_yaw_recipe", "llamacpp")
-        setattr(qwen_rlm, "_yaw_supports_gbnf", True)
-
-        prog_rlm = HippoRAGProgram(
-            execution_mode="rlm",
-            enable_gbnf=True,
-            orchestrator_lm=mistral_rlm,
-            rlm_sub_lm=qwen_rlm,
-            rlm_max_iters=2,
-        )
-        repaired_rlm = prog_rlm.define_missing_entities(
-            "Ada Lovelace worked on the Analytical Engine.",
-            ["Analytical Engine"],
-            [{"sub": "Ada Lovelace", "pred": "worked on", "obj": "Analytical Engine", "def": "Ada Lovelace worked on the Analytical Engine."}],
-        )
-        self.assertEqual(
-            repaired_rlm,
-            (("Analytical Engine", "Proposed mechanical general-purpose computer"),),
-        )
-        self.assertEqual(len(mistral_rlm.history), 1)
-        self.assertIsNone(mistral_rlm.history[0]["kwargs"].get("extra_body"))
-        self.assertEqual(len(qwen_rlm.history), 1)
-        self.assertEqual(
-            qwen_rlm.history[0]["kwargs"].get("extra_body"),
-            {"grammar": build_dspy_missing_entity_defs_grammar(["Analytical Engine"])},
-        )
-        # Only outer RLM call is recorded at top level (no inner double-counting)
-        self.assertEqual(len(prog_rlm.entity_def_audit_trail), 1)
-        self.assertEqual(prog_rlm.entity_def_audit_trail[0]["mode"], "rlm")
-
-        # 5. Pareto score penalizes missing_entity_defs_count and missing_entity_defs_tokens
+        # 4. Pareto score penalizes missing_entity_defs_count and missing_entity_defs_tokens
         clean_pareto = compute_sizecoding_pareto_score(0.80, tokens=100)
         repair_pareto = compute_sizecoding_pareto_score(
             0.80,

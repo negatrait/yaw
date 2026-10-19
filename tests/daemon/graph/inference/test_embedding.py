@@ -221,9 +221,13 @@ class EmbeddingTests(unittest.TestCase):
             embedder=custom_dspy_embedder,
         )
 
+        hook_entries: list[dict[str, Any]] = []
+        adapter.bind_telemetry_hook(hook_entries.append)
+
         doc_vecs = adapter.batch_encode(
             ["Title: Montebello\nMontebello is a village.", "Single line fact."],
             norm=True,
+            stage="chunk_embed",
         )
         self.assertEqual(
             recorded_inputs[-1],
@@ -235,13 +239,34 @@ class EmbeddingTests(unittest.TestCase):
         self.assertEqual(doc_vecs.shape, (2, 768))
         np.testing.assert_allclose(np.linalg.norm(doc_vecs, axis=1), 1.0, atol=1e-6)
 
-        fact_q_vecs = adapter.batch_encode("Where is Montebello?", instruction=FACT_INSTRUCTION, norm=True)
+        fact_q_vecs = adapter.batch_encode(
+            "Where is Montebello?",
+            instruction=FACT_INSTRUCTION,
+            norm=True,
+            stage="query_fact_embed",
+        )
         self.assertEqual(recorded_inputs[-1], [FACT_CHECK_PREFIX + "Where is Montebello?"])
         self.assertEqual(fact_q_vecs.shape, (1, 768))
 
-        passage_q_vecs = adapter.batch_encode("Where is Montebello?", instruction=PASSAGE_INSTRUCTION, norm=True)
+        passage_q_vecs = adapter.batch_encode(
+            "Where is Montebello?",
+            instruction=PASSAGE_INSTRUCTION,
+            norm=True,
+            stage="query_passage_embed",
+        )
         self.assertEqual(recorded_inputs[-1], [QA_QUERY_PREFIX + "Where is Montebello?"])
         self.assertEqual(passage_q_vecs.shape, (1, 768))
+
+        self.assertEqual(len(adapter.telemetry), 3)
+        self.assertEqual(len(hook_entries), 3)
+        self.assertEqual(
+            [e["stage"] for e in adapter.telemetry],
+            ["chunk_embed", "query_fact_embed", "query_passage_embed"],
+        )
+        self.assertEqual(adapter.telemetry[0]["predictor"], "embedder")
+        self.assertEqual(adapter.telemetry[0]["num_inputs"], 2)
+        adapter.reset_telemetry()
+        self.assertEqual(adapter.telemetry, [])
 
     def test_legacy_embedding_and_inference_facade_exports(self):
         """Verify RetrievalEmbedding is detangled to legacy_embedding and accessible via inference facade."""
@@ -255,6 +280,47 @@ class EmbeddingTests(unittest.TestCase):
 
         import yaw.daemon.graph.inference.embedding as embedding_module
         self.assertFalse(hasattr(embedding_module, "RetrievalEmbedding"))
+
+    def test_adaptive_batch_splitting_and_truncation_on_physical_batch_overflow(self):
+        """Verify both RetrievalEmbedding and DSPyEmbeddingAdapter gracefully split without truncation on physical batch overflow."""
+        from yaw.daemon.graph.inference.embedding import (
+            DSPyEmbeddingAdapter,
+            create_dspy_embedder,
+        )
+
+        def overflow_create(**request):
+            inputs = request["input"]
+            if len(inputs) > 1 or any(len(x) > 4000 for x in inputs):
+                raise RuntimeError(
+                    "Error code: 500 - {'error': {'code': 500, 'message': "
+                    "'input (4056 tokens) is too large to process. increase the physical batch size (current batch size: 2048)'}}"
+                )
+            return self.response(**request)
+
+        self.mock_client.embeddings.create.side_effect = overflow_create
+        long_doc = "A" * 12000
+        vecs = self.embedding.batch_encode([long_doc, "short doc"], norm=True)
+        self.assertEqual(vecs.shape, (2, 768))
+        np.testing.assert_allclose(np.linalg.norm(vecs, axis=1), 1.0, atol=1e-6)
+        # Without truncation, the 12,000 char doc is gracefully divided into sub-chunks plus the short doc (6 total pieces)
+        self.assertEqual(self.embedding.last_usage, {"prompt_tokens": 6, "total_tokens": 6})
+
+        def overflow_embed_fn(texts: list[str]) -> np.ndarray:
+            if len(texts) > 1 or any(len(x) > 4000 for x in texts):
+                raise RuntimeError(
+                    "input (4056 tokens) is too large to process. increase the physical batch size (current batch size: 2048)"
+                )
+            vec = np.zeros((1, 768), dtype=np.float32)
+            vec[0, 0] = 1.0
+            return vec
+
+        adapter = DSPyEmbeddingAdapter(
+            profile=resolve_embedding_profile(MODEL, "distinct-titled"),
+            embedder=create_dspy_embedder(overflow_embed_fn, batch_size=2, caching=False),
+        )
+        dspy_vecs = adapter.batch_encode([long_doc, "short doc"], norm=True)
+        self.assertEqual(dspy_vecs.shape, (2, 768))
+        np.testing.assert_allclose(np.linalg.norm(dspy_vecs, axis=1), 1.0, atol=1e-6)
 
 
 if __name__ == "__main__":

@@ -727,5 +727,315 @@ class EvaluationAndIntegrityTests(unittest.TestCase):
         self.assertIsNone(staged_index._openie_info)
 
 
+class PaperParityGateTests(unittest.TestCase):
+    def test_popqa_slice_pads_to_at_least_two_passages_per_index_query(self):
+        samples = [
+            {
+                "question": f"PopQA Q{i}?",
+                "obj": f"Ans{i}",
+                "paragraphs": [
+                    {"title": f"PopDoc{i}", "text": f"PopText{i}", "is_supporting": True},
+                ],
+            }
+            for i in range(10)
+        ]
+        docs, queries, gold_docs, _ = build_benchmark_slice(
+            "popqa", samples, corpus=[], max_queries=2, index_queries=4, full_corpus=False
+        )
+        self.assertEqual(len(queries), 2)
+        self.assertEqual(len(gold_docs), 2)
+        # 4 index_queries * 2 = 8 passages padded from subsequent samples
+        self.assertEqual(len(docs), 8)
+        for g in gold_docs:
+            self.assertTrue(set(g).issubset(set(docs)))
+
+    def test_compare_and_aggregate_gate_reports_and_markdown_table(self):
+        from scripts.verify_paper_parity_gate import (
+            aggregate_gate_summary,
+            compare_engine_reports,
+            format_gate_markdown,
+        )
+
+        hippo_rep = {
+            "engine": "hipporag",
+            "status": "passed",
+            "num_docs": 307,
+            "num_queries": 25,
+            "indexing_seconds": 42.5,
+            "evaluation_seconds": 18.2,
+            "elapsed_seconds": 60.7,
+            "run_dir": "outputs/benchmarks/run-2wikimultihopqa-hippo",
+            "index_dir": "outputs/benchmarks/indexes/2wiki_h",
+            "graph": {"num_passage_nodes": 307},
+            "evaluation_metrics": {
+                "hipporag": {
+                    "retrieval": {"Recall@1": 0.60, "Recall@2": 0.72, "Recall@5": 0.84},
+                    "qa": {"ExactMatch": 0.52, "F1": 0.64},
+                },
+                "standard_dpr": {
+                    "retrieval": {"Recall@1": 0.48, "Recall@2": 0.60, "Recall@5": 0.70},
+                },
+                "recognition_memory": {
+                    "queries_with_graph_seeds": 22,
+                    "dpr_fallback_count": 3,
+                    "dpr_fallback_rate": 0.12,
+                },
+            },
+        }
+        yaw_rep = {
+            "engine": "yaw",
+            "status": "passed",
+            "num_docs": 307,
+            "num_queries": 25,
+            "indexing_seconds": 38.0,
+            "evaluation_seconds": 15.4,
+            "elapsed_seconds": 53.4,
+            "run_dir": "outputs/benchmarks/run-2wikimultihopqa-yaw",
+            "index_dir": "outputs/benchmarks/indexes/2wiki_y",
+            "graph": {"num_passage_nodes": 307},
+            "evaluation_metrics": {
+                "hipporag": {
+                    "retrieval": {"Recall@1": 0.64, "Recall@2": 0.76, "Recall@5": 0.88},
+                    "qa": {"ExactMatch": 0.56, "F1": 0.68},
+                },
+                "standard_dpr": {
+                    "retrieval": {"Recall@1": 0.48, "Recall@2": 0.60, "Recall@5": 0.70},
+                },
+                "recognition_memory": {
+                    "queries_with_graph_seeds": 24,
+                    "dpr_fallback_count": 1,
+                    "dpr_fallback_rate": 0.04,
+                },
+            },
+        }
+
+        comp = compare_engine_reports(
+            "2wiki",
+            hippo_rep,
+            yaw_rep,
+            queries_per_dataset=25,
+            index_queries=35,
+            mode="eval",
+        )
+        self.assertEqual(comp["dataset"], "2wikimultihopqa")
+        self.assertTrue(comp["gate_passed"])
+        self.assertEqual(comp["gate_status"], "PASS")
+        self.assertAlmostEqual(comp["delta_yaw_vs_hipporag"]["Recall@5"], 0.04)
+        self.assertAlmostEqual(comp["delta_yaw_vs_hipporag"]["F1"], 0.04)
+
+        summary = aggregate_gate_summary({"2wikimultihopqa": comp}, mode="eval")
+        self.assertTrue(summary["overall_gate_passed"])
+        self.assertEqual(summary["overall_gate_status"], "PASS")
+        self.assertEqual(summary["datasets_completed"], 1)
+        self.assertEqual(summary["datasets_passed"], 1)
+
+        payload = {
+            "updated_at": "2026-10-18T10:20:00Z",
+            "config": {
+                "datasets": ["2wikimultihopqa", "musique"],
+                "queries_per_dataset": 25,
+                "index_queries": 35,
+                "compiled_program": ".yaw/compiled_program.json",
+                "mode": "eval",
+            },
+            "datasets": {"2wikimultihopqa": comp},
+            "summary": summary,
+        }
+        md = format_gate_markdown(payload)
+        self.assertIn("# Pre-Epic 2 HippoRAG 2 Paper Parity Gate Report", md)
+        self.assertIn("| `2wikimultihopqa` | 307 | 25 |", md)
+        self.assertIn("| `musique` | — | — |", md)
+        self.assertIn("**+0.0400**", md)
+
+    def test_maxp_passage_hydration_and_retrieval_recall_parity_on_split_json_passages(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        import numpy as np
+
+        from benchmark import BENCHMARK_JSON_BLACKLIST, BENCHMARK_JSON_WHITELIST
+        from scripts.evaluation import RetrievalRecall as ScriptRetrievalRecall
+        from yaw.core import OpenIERecord
+        from yaw.daemon.graph.engine import YawGraphEngine
+        from yaw.daemon.graph.inference.embedding import resolve_embedding_profile
+        from yaw.daemon.ingestion import sync_corpus_once
+
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp_path = Path(tmp_str)
+            corpus_dir = tmp_path / "corpus"
+            state_dir = tmp_path / "state"
+            corpus_dir.mkdir()
+            state_dir.mkdir()
+
+            long_body = (
+                "Montebello is an incorporated village in the town of Ramapo, Rockland County, New York. "
+                "Erik Hort was born in Montebello and grew up near the Hudson Valley region.\n\n"
+                "Rockland County is the southernmost county on the west side of the Hudson River in New York. "
+                "The county seat of Rockland County is New City, and it borders Bergen County, New Jersey.\n\n"
+                "Additional historical records confirm that Montebello was incorporated as a village in 1986 "
+                "within the town of Ramapo in Rockland County."
+            )
+            full_gold_passage = f"Montebello\n{long_body}"
+            distractor_passage = (
+                "Albany\nAlbany is the capital city of the U.S. state of New York and seat of Albany County."
+            )
+
+            dataset_payload = [
+                {
+                    "id": "musique_maxp_1",
+                    "question": "Which county is Erik Hort's birthplace part of?",
+                    "answer": "Rockland County",
+                    "paragraphs": [
+                        {
+                            "idx": 0,
+                            "title": "Montebello",
+                            "paragraph_text": long_body,
+                            "is_supporting": True,
+                        },
+                        {
+                            "idx": 1,
+                            "title": "Albany",
+                            "paragraph_text": distractor_passage.split("\n", 1)[1],
+                            "is_supporting": False,
+                        },
+                    ],
+                }
+            ]
+            (corpus_dir / "musique_slice.json").write_text(
+                json.dumps(dataset_payload, indent=2),
+                encoding="utf-8",
+            )
+
+            delta = sync_corpus_once(
+                corpus_dir,
+                state_dir,
+                chunk_size=180,
+                chunk_overlap=20,
+                min_chunk_size=30,
+                json_keys_whitelist=BENCHMARK_JSON_WHITELIST,
+                json_keys_blacklist=BENCHMARK_JSON_BLACKLIST,
+            )
+            # Long passage is split into multiple sub-chunks, plus 1 distractor chunk
+            self.assertGreaterEqual(len(delta.added_chunks), 3)
+            montebello_subchunks = [
+                (ptr, txt) for ptr, txt in delta.added_chunks if ptr.title == "Montebello"
+            ]
+            self.assertGreaterEqual(len(montebello_subchunks), 2)
+            # All Montebello sub-chunks share the exact same parent record AST island
+            ast_islands = {
+                (ptr.rel_posix_path, ptr.ast_island_start, ptr.ast_island_end)
+                for ptr, _ in montebello_subchunks
+            }
+            self.assertEqual(len(ast_islands), 1)
+
+            profile = resolve_embedding_profile(task_mode="distinct-titled")
+            formatted_doc_inputs: list[str] = []
+
+            class TitleCheckingEmbedder:
+                def __init__(self, prof):
+                    self.profile = prof
+                    self.dimensions = 4
+
+                def encode(self, texts, *, instruction=""):
+                    if not instruction:
+                        for t in texts:
+                            formatted_doc_inputs.append(
+                                self.profile.format(t, query=False)
+                            )
+                    out = []
+                    for t in texts:
+                        v = np.array(
+                            [
+                                1.0 if "montebello" in t.lower() or "erik hort" in t.lower() else 0.1,
+                                1.0 if "rockland" in t.lower() else 0.1,
+                                0.5,
+                                0.2,
+                            ],
+                            dtype=np.float32,
+                        )
+                        v /= np.linalg.norm(v)
+                        out.append(v)
+                    return np.vstack(out)
+
+                def batch_encode(self, texts, *, instruction="", batch_size=64):
+                    return self.encode(texts, instruction=instruction)
+
+            class MinimalProgram:
+                execution_mode = "direct"
+
+                def set_retrieval_hook(self, hook):
+                    self.hook = hook
+
+                def extract_openie(self, chunk_id, text):
+                    if "montebello" in text.lower():
+                        return OpenIERecord(
+                            chunk_id=chunk_id,
+                            entities=("erik hort", "montebello", "rockland county"),
+                            triples=(
+                                ("erik hort", "born in", "montebello"),
+                                ("montebello", "part of", "rockland county"),
+                            ),
+                        )
+                    return OpenIERecord(
+                        chunk_id=chunk_id,
+                        entities=("albany", "new york"),
+                        triples=(("albany", "capital of", "new york"),),
+                    )
+
+                def extract_query_intent(self, query):
+                    return query
+
+                def filter_triples(self, query, candidates):
+                    return [0] if candidates else []
+
+                def judge_synonyms(self, candidates):
+                    return []
+
+                def heal_shacl_violations(self, violations, focus_context="", *args, **kwargs):
+                    return []
+
+            engine = YawGraphEngine(
+                db_path=tmp_path / "yaw.db",
+                workspace_root=corpus_dir,
+                program=MinimalProgram(),
+                embedder=TitleCheckingEmbedder(profile),
+                retrieval_top_k=5,
+            )
+            try:
+                engine.index_chunks(delta.added_chunks)
+                # Verify zero titled chunks degraded to 'title: none'
+                self.assertTrue(len(formatted_doc_inputs) >= len(delta.added_chunks))
+                for fmt_str in formatted_doc_inputs[: len(delta.added_chunks)]:
+                    self.assertFalse(
+                        fmt_str.startswith("title: none"),
+                        f"Expected AST title in formatted embedding input, got: {fmt_str!r}",
+                    )
+                    self.assertTrue(
+                        fmt_str.startswith(("title: Montebello | text:", "title: Albany | text:")),
+                    )
+
+                hits, _ = engine.retrieve_with_seeds(
+                    "Which county is Erik Hort's birthplace part of?", top_k=5
+                )
+                dpr_hits = engine.retrieve_dpr(
+                    "Which county is Erik Hort's birthplace part of?", top_k=5
+                )
+                # MaxP deduplicates the multiple Montebello sub-chunks into 1 full passage hit
+                self.assertEqual(len(hits), 2)
+                self.assertEqual(len(dpr_hits), 2)
+                self.assertEqual(hits[0][2], full_gold_passage)
+                self.assertEqual(dpr_hits[0][2], full_gold_passage)
+
+                overall, _ = ScriptRetrievalRecall().calculate_metric_scores(
+                    gold_docs=[[full_gold_passage]],
+                    retrieved_docs=[[text for _, _, text in hits]],
+                    k_list=[1, 2, 5],
+                )
+                self.assertEqual(overall["Recall@1"], 1.0)
+            finally:
+                engine.close()
+
+
 if __name__ == "__main__":
     unittest.main()

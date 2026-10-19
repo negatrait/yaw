@@ -34,7 +34,7 @@ from yaw.daemon.graph.inference import (
     HippoRAGProgram,
     create_dspy_rlm_pair,
 )
-from yaw.daemon.ingestion import CorpusIngestor
+from yaw.daemon.ingestion import CorpusIngestor, sync_corpus_once
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -188,6 +188,8 @@ class YawRuntime:
             state_dir=self.config.state_dir,
             included_patterns=self.config.included_patterns,
             excluded_patterns=self.config.excluded_patterns,
+            json_keys_whitelist=self.config.json_keys_whitelist,
+            json_keys_blacklist=self.config.json_keys_blacklist,
             chunk_size=self.config.chunk_size,
             chunk_overlap=self.config.chunk_overlap,
             min_chunk_size=self.config.min_chunk_size,
@@ -780,7 +782,41 @@ class YawRuntime:
 
             if corpus_docs:
                 _progress(f"indexing: preparing {len(corpus_docs)} corpus passages")
-                self.engine.index(corpus_docs, progress_callback=_progress)
+                assert self.config.corpus_root is not None
+                assert self.config.state_dir is not None
+                opt_json_rel = ".yaw_optimize_slice.json"
+                opt_json_path = Path(self.config.corpus_root) / opt_json_rel
+                records_payload = [
+                    {
+                        "title": d.split("\n", 1)[0] if "\n" in d else "",
+                        "text": d.split("\n", 1)[1] if "\n" in d else d,
+                    }
+                    for d in corpus_docs
+                ]
+                opt_json_path.parent.mkdir(parents=True, exist_ok=True)
+                opt_json_path.write_text(
+                    json.dumps(records_payload, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                try:
+                    delta = sync_corpus_once(
+                        corpus_root=self.config.corpus_root,
+                        state_dir=Path(self.config.state_dir) / "opt_slice_state",
+                        included_patterns=(opt_json_rel,),
+                        excluded_patterns=(),
+                        json_keys_whitelist=self.config.json_keys_whitelist,
+                        json_keys_blacklist=self.config.json_keys_blacklist,
+                        chunk_size=self.config.chunk_size,
+                        chunk_overlap=self.config.chunk_overlap,
+                        min_chunk_size=self.config.min_chunk_size,
+                    )
+                    if delta.added_chunks:
+                        self.engine.index_chunks(
+                            delta.added_chunks, progress_callback=_progress
+                        )
+                finally:
+                    with contextlib.suppress(OSError):
+                        opt_json_path.unlink(missing_ok=True)
                 new_stats = self.engine.get_stats(self.config.config_fingerprint())
                 with self._state_lock:
                     self._stats = new_stats

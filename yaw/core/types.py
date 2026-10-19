@@ -34,6 +34,8 @@ class ChunkPointer:
     start_line: int
     end_line: int
     title: str = ""
+    ast_island_start: int = 0
+    ast_island_end: int = 0
 
 
 @dataclass(slots=True, frozen=True)

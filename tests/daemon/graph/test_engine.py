@@ -53,8 +53,13 @@ class DeterministicMockLM(dspy.LM):
             return [
                 '{"entity_definitions": [["Alan Turing", "English mathematician and computer scientist"], ["computer science", "Study of computation and information"]]}'
             ]
+        # Filter triples stage
+        if "FilterTriples" in req_str or "fact_before_filter" in req_str:
+            if "Lovelace" in req_str:
+                return ['{"fact": [["Ada Lovelace", "worked on", "Analytical Engine"]]}']
+            return ['{"fact": [["Alan Turing", "father of", "computer science"]]}']
         # Triples stage
-        if "ExtractTriples" in req_str or "triples" in req_str:
+        if "ExtractTriples" in req_str or '"triples"' in req_str or "`triples`" in req_str:
             if "Lovelace" in req_str:
                 return [
                     '{"triples": [{"sub": "Ada Lovelace", "pred": "worked on", "obj": "Analytical Engine", "def": "Ada Lovelace worked on the Analytical Engine."}]}'
@@ -62,11 +67,6 @@ class DeterministicMockLM(dspy.LM):
             return [
                 '{"triples": [{"sub": "Alan Turing", "pred": "father of", "obj": "computer science", "def": "Alan Turing is the father of computer science."}]}'
             ]
-        # Filter facts stage
-        if "FilterFacts" in req_str or "fact_before_filter" in req_str or "filter" in req_str.lower():
-            if "Lovelace" in req_str:
-                return ['{"fact": [["Ada Lovelace", "worked on", "Analytical Engine"]]}']
-            return ['{"fact": [["Alan Turing", "father of", "computer science"]]}']
         # NER stage
         if "ExtractEntities" in req_str or "named_entities" in req_str:
             if "Lovelace" in req_str:
@@ -87,12 +87,26 @@ class DeterministicMockLM(dspy.LM):
 
 
 class DeterministicMockEmbedder:
-    """Deterministic offline embedder producing 64-dimensional float32 unit vectors."""
+    """Deterministic offline embedder producing 64-dimensional float32 unit vectors and emitting telemetry."""
 
     def __init__(self, dim: int = 64) -> None:
         self.dim = dim
+        self.telemetry: list[dict[str, Any]] = []
+        self._telemetry_hook: Any = None
 
-    def encode(self, texts: Sequence[str], instruction: str = "") -> list[np.ndarray]:
+    def bind_telemetry_hook(self, hook: Any) -> None:
+        self._telemetry_hook = hook
+
+    def reset_telemetry(self) -> None:
+        self.telemetry.clear()
+
+    def encode(
+        self,
+        texts: Sequence[str],
+        instruction: str = "",
+        *,
+        stage: str | None = None,
+    ) -> list[np.ndarray]:
         results: list[np.ndarray] = []
         for t in texts:
             combined = f"{instruction}:{t}"
@@ -103,6 +117,19 @@ class DeterministicMockEmbedder:
             if norm > 0:
                 vec /= norm
             results.append(vec)
+        total_chars = sum(len(t) for t in texts)
+        tokens_est = max(1, (total_chars + 3) // 4) if texts else 0
+        entry = {
+            "stage": stage or "embed",
+            "predictor": "embedder",
+            "model": "mock-embedder",
+            "mode": "embed",
+            "num_inputs": len(texts),
+            "tokens_used": tokens_est,
+        }
+        self.telemetry.append(entry)
+        if self._telemetry_hook is not None:
+            self._telemetry_hook(entry)
         return results
 
 
@@ -112,11 +139,7 @@ def test_engine(tmp_path: Path) -> Iterator[YawGraphEngine]:
     mock_lm = DeterministicMockLM()
     dspy.settings.configure(lm=mock_lm)
 
-    program = HippoRAGProgram(
-        execution_mode="direct",
-        qa_mode="cot",
-        enable_gbnf=False,
-    )
+    program = HippoRAGProgram(enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
     engine = YawGraphEngine(
@@ -241,13 +264,19 @@ def test_engine_multi_batch_indexing_and_bounded_embedding_batches(tmp_path: Pat
     batch_sizes_seen: list[int] = []
 
     class TrackingEmbedder(DeterministicMockEmbedder):
-        def encode(self, texts: Sequence[str], instruction: str = "") -> list[np.ndarray]:
+        def encode(
+            self,
+            texts: Sequence[str],
+            instruction: str = "",
+            *,
+            stage: str | None = None,
+        ) -> list[np.ndarray]:
             batch_sizes_seen.append(len(texts))
-            return super().encode(texts, instruction=instruction)
+            return super().encode(texts, instruction=instruction, stage=stage)
 
     mock_lm = DeterministicMockLM()
     dspy.settings.configure(lm=mock_lm)
-    program = HippoRAGProgram(execution_mode="direct", qa_mode="cot", enable_gbnf=False)
+    program = HippoRAGProgram(enable_gbnf=False)
     embedder: Any = TrackingEmbedder(dim=64)
 
     engine = YawGraphEngine(
@@ -314,7 +343,7 @@ def test_engine_fact_score_weighting_and_thread_safe_retrieval(tmp_path: Path) -
             **kwargs: Any,
         ) -> list[str]:
             req_str = str(prompt or messages or kwargs)
-            if "FilterFacts" in req_str or "fact_before_filter" in req_str:
+            if "FilterTriples" in req_str or "fact_before_filter" in req_str:
                 return [
                     '{"fact": [["alan turing", "father of", "computer science"], '
                     '["ada lovelace", "worked on", "analytical engine"]]}'
@@ -322,7 +351,7 @@ def test_engine_fact_score_weighting_and_thread_safe_retrieval(tmp_path: Path) -
             return super().__call__(prompt=prompt, messages=messages, **kwargs)
 
     dspy.settings.configure(lm=KeepAllFactsLM())
-    program = HippoRAGProgram(execution_mode="direct", qa_mode="cot", enable_gbnf=False)
+    program = HippoRAGProgram(enable_gbnf=False)
     embedder: Any = ControlledFactEmbedder()
 
     engine = YawGraphEngine(
@@ -467,7 +496,7 @@ def test_engine_hybrid_fact_candidate_retrieval(tmp_path: Path) -> None:
             **kwargs: Any,
         ) -> list[str]:
             req_str = str(prompt or messages or kwargs)
-            if "FilterFacts" in req_str or "fact_before_filter" in req_str:
+            if "FilterTriples" in req_str or "fact_before_filter" in req_str:
                 return [
                     '{"fact": [["ada lovelace", "worked on", "analytical engine"], '
                     '["alan turing", "father of", "computer science"]]}'
@@ -475,7 +504,7 @@ def test_engine_hybrid_fact_candidate_retrieval(tmp_path: Path) -> None:
             return super().__call__(prompt=prompt, messages=messages, **kwargs)
 
     dspy.settings.configure(lm=InspectFilterLM())
-    program = HippoRAGProgram(execution_mode="direct", qa_mode="cot", enable_gbnf=False)
+    program = HippoRAGProgram(enable_gbnf=False)
     embedder: Any = HybridFactEmbedder()
 
     engine = YawGraphEngine(
@@ -529,7 +558,7 @@ def test_engine_query_intent_escalation_once_without_infinite_recursion(tmp_path
                 if "never_matches" in req_str:
                     return ['{"query_intent": "still_never_matches"}']
                 return ['{"query_intent": "Ada Lovelace worked on Analytical Engine"}']
-            if "FilterFacts" in req_str or "fact_before_filter" in req_str:
+            if "FilterTriples" in req_str or "fact_before_filter" in req_str:
                 filter_calls.append(req_str)
                 # Only keep facts when the rewritten intent includes 'Ada Lovelace'
                 if "Ada Lovelace worked on Analytical Engine" in req_str:
@@ -538,7 +567,7 @@ def test_engine_query_intent_escalation_once_without_infinite_recursion(tmp_path
             return super().__call__(prompt=prompt, messages=messages, **kwargs)
 
     dspy.settings.configure(lm=IntentEscalationLM())
-    program = HippoRAGProgram(execution_mode="direct", qa_mode="cot", enable_gbnf=False)
+    program = HippoRAGProgram(enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
     engine = YawGraphEngine(
@@ -666,7 +695,7 @@ def test_engine_homograph_gate_edc_and_shacl_conformance(tmp_path: Path) -> None
             return super().__call__(prompt=prompt, messages=messages, **kwargs)
 
     dspy.settings.configure(lm=HomographGateLM())
-    program = HippoRAGProgram(execution_mode="direct", qa_mode="cot", enable_gbnf=False)
+    program = HippoRAGProgram(enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
     engine = YawGraphEngine(
@@ -791,7 +820,7 @@ def test_engine_same_label_provisional_split_merged_by_judge_synonyms_and_stage1
             return super().__call__(prompt=prompt, messages=messages, **kwargs)
 
     dspy.settings.configure(lm=SynonymMergeAndStandaloneNerLM())
-    program = HippoRAGProgram(execution_mode="direct", qa_mode="cot", enable_gbnf=False)
+    program = HippoRAGProgram(enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
     engine = YawGraphEngine(
@@ -841,6 +870,9 @@ def test_engine_same_label_provisional_split_merged_by_judge_synonyms_and_stage1
 
         # Verify 0 SHACL violations (including ConceptShape/S13-disjointLabels across both chunks)
         assert engine._graph_rlm_stats["synonym_judge_tokens"] == 48
+        assert engine._graph_rlm_stats["embedding_calls"] > 0
+        assert engine._graph_rlm_stats["embedding_tokens"] > 0
+        assert len(program.embedding_audit_trail) > 0
         report = engine.lint_graph()
         assert report["conforms"] is True
         assert report["violations"] == []
@@ -851,18 +883,18 @@ def test_engine_same_label_provisional_split_merged_by_judge_synonyms_and_stage1
 def test_engine_step7_heal_shacl_violations_rlm_repl_tools_and_token_stats(
     tmp_path: Path,
 ) -> None:
-    """Verify Step 6 synonym_judge_tokens and Step 7 heal_shacl_violations in RLM mode using all 5 bound REPL tools without nested track_usage() double-counting."""
+    """Verify Step 6 direct GBNF synonym_judge_tokens and Step 7 heal_shacl_violations via shacl_healer_rlm using all 5 bound REPL tools."""
     import json
     import re
 
     repl_tool_events: list[str] = []
 
     class RLMOrchestratorLM(dspy.LM):
-        """Heterogeneous NPU orchestrator LM (40 tokens per call, ChatAdapter, no GBNF)."""
+        """RLM orchestrator LM (40 tokens per call, ChatAdapter, no GBNF)."""
 
         def __init__(self) -> None:
-            super().__init__(model="mistral-orchestrator")
-            self._yaw_recipe = "ryzenai-llm"
+            super().__init__(model="qwen-rlm-orchestrator")
+            self._yaw_recipe = "llamacpp"
             self._yaw_supports_gbnf = False
 
         def __call__(
@@ -897,32 +929,7 @@ def test_engine_step7_heal_shacl_violations_rlm_repl_tools_and_token_stats(
                     f"[[ ## reasoning ## ]]\nInspect focus node, hydrate chunk, propose/apply repairs, and lint.\n\n"
                     f"[[ ## code ## ]]\n```python\n{code}\n```\n\n[[ ## completed ## ]]"
                 ]
-            if "qwen_judge_synonyms" in req_str:
-                code = (
-                    "decisions = qwen_judge_synonyms(candidate_pairs=candidate_pairs)\n"
-                    "SUBMIT(decisions=decisions)"
-                )
-                return [
-                    f"[[ ## reasoning ## ]]\nDelegate synonym judgment to Qwen worker.\n\n"
-                    f"[[ ## code ## ]]\n```python\n{code}\n```\n\n[[ ## completed ## ]]"
-                ]
-            if "qwen_extract_triples" in req_str:
-                code = (
-                    "triples = qwen_extract_triples(passage=passage, named_entities=named_entities)\n"
-                    "SUBMIT(triples=triples)"
-                )
-                return [
-                    f"[[ ## reasoning ## ]]\nDelegate triple extraction to Qwen worker.\n\n"
-                    f"[[ ## code ## ]]\n```python\n{code}\n```\n\n[[ ## completed ## ]]"
-                ]
-            code = (
-                "entities = qwen_extract_entities(passage=passage)\n"
-                "SUBMIT(named_entities=entities)"
-            )
-            return [
-                f"[[ ## reasoning ## ]]\nDelegate entity extraction to Qwen worker.\n\n"
-                f"[[ ## code ## ]]\n```python\n{code}\n```\n\n[[ ## completed ## ]]"
-            ]
+            return ['{"repairs": []}']
 
     class QwenWorkerLM(dspy.LM):
         """GBNF-constrained GPU worker LM (30 tokens per call, JSONAdapter)."""
@@ -1034,8 +1041,6 @@ def test_engine_step7_heal_shacl_violations_rlm_repl_tools_and_token_stats(
     orch_lm = RLMOrchestratorLM()
     worker_lm = QwenWorkerLM()
     program = HippoRAGProgram(
-        execution_mode="direct",
-        qa_mode="rlm",
         enable_gbnf=True,
         orchestrator_lm=orch_lm,
         rlm_sub_lm=worker_lm,
@@ -1089,10 +1094,9 @@ def test_engine_step7_heal_shacl_violations_rlm_repl_tools_and_token_stats(
         assert pre_lint["violation_count"] == 2
         assert all(v["shape"] == "ConceptShape/definition" for v in pre_lint["violations"])
 
-        # 2. Switch to RLM mode and index second document:
-        #    - Step 6 runs synonym_judge_rlm on candidate pairs
+        # 2. Index second document:
+        #    - Step 6 runs direct GBNF synonym_judge on candidate pairs (30 tokens)
         #    - Step 7 runs shacl_healer_rlm using all 5 bound REPL tools (applying repair[0] in REPL + repair[1] post-RLM)
-        program.execution_mode = "rlm"
         program.telemetry.clear()
         program.synonym_audit_trail.clear()
         program.shacl_audit_trail.clear()
@@ -1106,14 +1110,14 @@ def test_engine_step7_heal_shacl_violations_rlm_repl_tools_and_token_stats(
         assert "shacl_healer_rlm_invoked" in repl_tool_events
         assert sum(1 for ev in repl_tool_events if ev.startswith("qwen_propose_shacl_repairs:")) == 2
 
-        # Verify exact non-double-counted token accounting (40 orchestrator + 30 worker = 70 tokens per RLM stage)
-        assert len(program.synonym_audit_trail) == 2  # inner direct (30) + outer RLM (70)
+        # Verify exact non-double-counted token accounting:
+        # Step 6 (direct GBNF synonym_judge) = 30 tokens on doc 2 (total 30 + 30 = 60 across doc 1 + doc 2)
+        assert len(program.synonym_audit_trail) == 1
         assert program.synonym_audit_trail[0]["mode"] == "direct"
         assert program.synonym_audit_trail[0]["tokens_used"] == 30
-        assert program.synonym_audit_trail[-1]["mode"] == "rlm"
-        assert program.synonym_audit_trail[-1]["tokens_used"] == 70
-        assert engine._graph_rlm_stats["synonym_judge_tokens"] == 100  # 30 (doc 1 direct) + 70 (doc 2 RLM)
+        assert engine._graph_rlm_stats["synonym_judge_tokens"] == 60
 
+        # Step 7 (shacl_healer_rlm) = 40 orchestrator + 30 worker = 70 tokens
         assert len(program.shacl_audit_trail) == 2  # inner direct (30) + outer RLM (70)
         assert program.shacl_audit_trail[0]["mode"] == "direct"
         assert program.shacl_audit_trail[0]["tokens_used"] == 30
@@ -1210,7 +1214,7 @@ def test_engine_define_missing_entities_telemetry_and_no_heuristic_fallbacks(
             return super().__call__(prompt=prompt, messages=messages, **kwargs)
 
     dspy.settings.configure(lm=MissingEntityRepairLM())
-    program = HippoRAGProgram(execution_mode="direct", qa_mode="cot", enable_gbnf=False)
+    program = HippoRAGProgram(enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
     engine = YawGraphEngine(

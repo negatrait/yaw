@@ -49,7 +49,7 @@ class EmbeddingProfile:
             json.dumps(contract, sort_keys=True).encode("utf-8")
         ).hexdigest()
 
-    def format(self, text, *, query, instruction=None):
+    def format(self, text, *, query, instruction=None, title: str | None = None):
         if not isinstance(text, str):
             raise TypeError("Embedding inputs must all be strings.")
         prefixes = tuple(
@@ -62,11 +62,20 @@ class EmbeddingProfile:
         ):
             raise ValueError("Pass raw text, not an already prefixed embedding input.")
         if not query:
-            if self.parse_document_title and "\n" in text:
-                first_line, body = text.split("\n", 1)
-                match = TITLE_LINE_RE.match(first_line.strip())
-                if match and match.group(1).strip() and body.strip():
-                    return f"title: {match.group(1).strip()} | text: {body.strip()}"
+            if self.parse_document_title:
+                if "\n" in text:
+                    first_line, body = text.split("\n", 1)
+                    match = TITLE_LINE_RE.match(first_line.strip())
+                    if match and match.group(1).strip() and body.strip():
+                        return f"title: {match.group(1).strip()} | text: {body.strip()}"
+                if title and title.strip():
+                    clean_title = title.strip()
+                    if text.startswith(f"{clean_title}\n"):
+                        body = text[len(clean_title) + 1 :].strip()
+                    else:
+                        body = text.strip()
+                    if body:
+                        return f"title: {clean_title} | text: {body}"
             return self.document_prefix + text
         if instruction == FACT_INSTRUCTION and self.fact_query_prefix:
             return self.fact_query_prefix + text
@@ -167,6 +176,186 @@ def create_dspy_embedder(
     )
 
 
+def is_batch_overflow_error(exc: Exception) -> bool:
+    """Detect embedding server token limit or physical batch size rejection."""
+    msg = str(exc).lower()
+    return (
+        "too large to process" in msg
+        or "physical batch size" in msg
+        or "context size" in msg
+        or "maximum context length" in msg
+        or "token limit" in msg
+        or "context window" in msg
+        or "too many tokens" in msg
+        or ("exceeds" in msg and "tokens" in msg)
+    )
+
+
+_is_batch_overflow_error = is_batch_overflow_error
+
+
+def split_text_gracefully(
+    text: str,
+    max_chars: int = 3000,
+    overlap_chars: int = 100,
+) -> list[str]:
+    """Gracefully divide a long text into sub-chunks without truncation.
+
+    Snaps split boundaries to paragraph (\\n\\n), newline (\\n), sentence (. ! ?),
+    or word boundaries (space), ensuring 100% of the original text is covered.
+    """
+    if not text:
+        return [""]
+    if len(text) <= max_chars:
+        return [text]
+
+    chunks: list[str] = []
+    start = 0
+    total_len = len(text)
+
+    while start < total_len:
+        if total_len - start <= max_chars:
+            chunks.append(text[start:])
+            break
+
+        target_end = min(start + max_chars, total_len)
+        min_split = start + max(1, max_chars // 3)
+        window = text[min_split:target_end]
+        split_pos = -1
+
+        # Priority 1: Paragraph break \n\n
+        idx = window.rfind("\n\n")
+        if idx != -1:
+            split_pos = min_split + idx + 2
+        else:
+            # Priority 2: Line break \n
+            idx = window.rfind("\n")
+            if idx != -1:
+                split_pos = min_split + idx + 1
+            else:
+                # Priority 3: Sentence boundary (. ! ?)
+                sentence_match = list(re.finditer(r"[.!?]\s+", window))
+                if sentence_match:
+                    split_pos = min_split + sentence_match[-1].end()
+                else:
+                    # Priority 4: Clause or phrase boundary (; ,)
+                    clause_match = list(re.finditer(r"[,;:]\s+", window))
+                    if clause_match:
+                        split_pos = min_split + clause_match[-1].end()
+                    else:
+                        # Priority 5: Word boundary
+                        idx = window.rfind(" ")
+                        split_pos = min_split + idx + 1 if idx != -1 else target_end
+
+        chunk = text[start:split_pos]
+        if chunk.strip():
+            chunks.append(chunk)
+
+        advance = (
+            max(1, split_pos - overlap_chars)
+            if overlap_chars > 0 and split_pos < total_len
+            else split_pos
+        )
+        start = max(start + 1, advance)
+
+    return chunks if chunks else [text]
+
+
+def pool_subchunk_embeddings(
+    vectors: np.ndarray,
+    weights: Sequence[int] | np.ndarray,
+    *,
+    norm: bool = True,
+) -> np.ndarray:
+    """Combine sub-chunk embedding vectors into a single document vector via length-weighted pooling.
+
+    Args:
+        vectors: Array of shape (K, dim) containing sub-chunk embeddings.
+        weights: Sequence of positive weights (typically character counts of sub-chunks).
+        norm: Whether to apply L2 normalization to the pooled vector.
+
+    Returns:
+        1D array of shape (dim,) representing the whole document.
+    """
+    if len(vectors) == 1:
+        vec = np.asarray(vectors[0], dtype=np.float32)
+    else:
+        w = np.asarray(weights, dtype=np.float32)
+        total_w = float(w.sum())
+        w = w / total_w if total_w > 0 else np.full_like(w, 1.0 / len(w))
+        vec = np.sum(vectors * w[:, None], axis=0)
+
+    if norm:
+        v_norm = float(np.linalg.norm(vec))
+        vec = vec / max(v_norm, 1e-12)
+    return vec
+
+
+def batch_texts_by_budget(
+    texts: Sequence[str],
+    *,
+    max_batch_chars: int = 3500,
+    max_batch_size: int = 16,
+) -> list[list[int]]:
+    """Partition flat texts into index micro-batches bounded by character budget and count."""
+    micro_batches: list[list[int]] = []
+    current_batch: list[int] = []
+    current_chars = 0
+
+    for idx, t in enumerate(texts):
+        t_len = len(t)
+        if current_batch and (
+            current_chars + t_len > max_batch_chars or len(current_batch) >= max_batch_size
+        ):
+            micro_batches.append(current_batch)
+            current_batch = [idx]
+            current_chars = t_len
+        else:
+            current_batch.append(idx)
+            current_chars += t_len
+
+    if current_batch:
+        micro_batches.append(current_batch)
+    return micro_batches
+
+
+def _repack_overflow_batch(texts: list[str], context_tokens: int) -> list[list[str]]:
+    """Gracefully split texts without truncation after embedding server rejection."""
+    char_budget = max(512, int(context_tokens * 1.5))
+    if len(texts) == 1:
+        sub_chunks = split_text_gracefully(texts[0], max_chars=max(256, char_budget // 2))
+        return [[sc] for sc in sub_chunks]
+
+    packed: list[list[str]] = []
+    current: list[str] = []
+    current_chars = 0
+    for t in texts:
+        if len(t) > char_budget:
+            if current:
+                packed.append(current)
+                current = []
+                current_chars = 0
+            for sc in split_text_gracefully(t, max_chars=char_budget):
+                packed.append([sc])
+            continue
+
+        if current and current_chars + len(t) > char_budget:
+            packed.append(current)
+            current = [t]
+            current_chars = len(t)
+        else:
+            current.append(t)
+            current_chars += len(t)
+    if current:
+        packed.append(current)
+
+    if len(packed) > 1:
+        return packed
+
+    mid = len(texts) // 2
+    return [texts[:mid], texts[mid:]]
+
+
 class DSPyEmbeddingAdapter:
     """Profile-aware retrieval embedding adapter wrapping a native dspy.Embedder."""
 
@@ -182,6 +371,7 @@ class DSPyEmbeddingAdapter:
         batch_size: int = 32,
         caching: bool = False,
     ) -> None:
+        self.task_mode = task_mode
         self.profile = profile or resolve_embedding_profile(MODEL, task_mode)
         self.embedder = embedder or create_dspy_embedder(
             self.profile,
@@ -191,6 +381,18 @@ class DSPyEmbeddingAdapter:
             batch_size=batch_size,
             caching=caching,
         )
+        self.telemetry: list[dict[str, Any]] = []
+        self._telemetry_hook: Callable[[dict[str, Any]], None] | None = None
+
+    def bind_telemetry_hook(
+        self, hook: Callable[[dict[str, Any]], None] | None
+    ) -> None:
+        """Bind a callback invoked with each structured embedding telemetry entry."""
+        self._telemetry_hook = hook
+
+    def reset_telemetry(self) -> None:
+        """Clear accumulated embedding telemetry entries."""
+        self.telemetry.clear()
 
     @classmethod
     def from_config(cls, config: YawConfig) -> "DSPyEmbeddingAdapter":
@@ -198,11 +400,44 @@ class DSPyEmbeddingAdapter:
         profile = resolve_embedding_profile(config.embedding_model, config.embedding_task_mode)
         return cls(
             profile=profile,
+            task_mode=config.embedding_task_mode,
             base_url=config.base_url,
             api_key=config.api_key,
             provider=config.provider,
             batch_size=config.embed_batch_size,
         )
+
+    def _encode_prepared(
+        self,
+        prepared: list[str],
+        call_kwargs: dict[str, Any],
+    ) -> np.ndarray:
+        try:
+            raw = self.embedder(prepared, **call_kwargs)
+            vectors = np.asarray(raw, dtype=np.float32)
+            if vectors.ndim == 1:
+                vectors = vectors.reshape(1, -1)
+            return vectors
+        except Exception as exc:
+            if not is_batch_overflow_error(exc):
+                raise
+            if len(prepared) > 1:
+                mid = len(prepared) // 2
+                left = self._encode_prepared(prepared[:mid], {**call_kwargs, "batch_size": mid})
+                right = self._encode_prepared(prepared[mid:], {**call_kwargs, "batch_size": len(prepared) - mid})
+                return np.concatenate([left, right], axis=0)
+
+            # Single item overflow: divide gracefully into 2+ sub-chunks and pool without truncation
+            single = prepared[0]
+            sub_chunks = split_text_gracefully(single, max_chars=max(256, len(single) // 2))
+            if len(sub_chunks) <= 1:
+                raise
+            sub_vecs = self._encode_prepared(
+                sub_chunks, {**call_kwargs, "batch_size": len(sub_chunks)}
+            )
+            weights = [max(1, len(s)) for s in sub_chunks]
+            pooled = pool_subchunk_embeddings(sub_vecs, weights, norm=True)
+            return pooled.reshape(1, -1)
 
     def batch_encode(
         self,
@@ -211,6 +446,7 @@ class DSPyEmbeddingAdapter:
         instruction: str | None = None,
         norm: bool = True,
         batch_size: int | None = None,
+        stage: str | None = None,
     ) -> np.ndarray:
         if instruction not in (None, "") and instruction not in QUERY_INSTRUCTIONS:
             raise ValueError(f"Unsupported retrieval instruction: {instruction!r}")
@@ -218,31 +454,133 @@ class DSPyEmbeddingAdapter:
             texts = [texts]
         if not texts:
             raise ValueError("Embedding input cannot be empty.")
-        prepared = [
-            self.profile.format(t, query=bool(instruction), instruction=instruction)
-            for t in texts
-        ]
-        call_kwargs: dict[str, Any] = {}
-        if batch_size is not None:
-            if not isinstance(batch_size, int) or batch_size < 1:
-                raise ValueError("batch_size must be a positive integer.")
-            call_kwargs["batch_size"] = batch_size
-        raw = self.embedder(prepared, **call_kwargs)
-        vectors = np.asarray(raw, dtype=np.float32)
-        if vectors.ndim == 1:
-            vectors = vectors.reshape(1, -1)
+
+        max_chunk_chars = 3000
+        max_batch_chars = 3500
+        effective_max_batch_size = (
+            batch_size if (isinstance(batch_size, int) and batch_size >= 1) else 16
+        )
+
+        # 1. Gracefully divide texts exceeding max_chunk_chars and format with profile
+        text_piece_map: list[list[int]] = []
+        flat_pieces: list[str] = []
+        piece_weights: list[int] = []
+
+        is_query = bool(instruction)
+        for t in texts:
+            if len(t) <= max_chunk_chars:
+                formatted = self.profile.format(t, query=is_query, instruction=instruction)
+                text_piece_map.append([len(flat_pieces)])
+                flat_pieces.append(formatted)
+                piece_weights.append(max(1, len(t)))
+            else:
+                title = ""
+                body = t
+                if not is_query and self.profile.parse_document_title and "\n" in t:
+                    first_line, rest = t.split("\n", 1)
+                    match = TITLE_LINE_RE.match(first_line.strip())
+                    if match and match.group(1).strip() and rest.strip():
+                        title = match.group(1).strip()
+                        body = rest.strip()
+
+                sub_chunks = split_text_gracefully(body, max_chars=max_chunk_chars)
+                indices: list[int] = []
+                for sc in sub_chunks:
+                    indices.append(len(flat_pieces))
+                    if is_query:
+                        formatted = self.profile.format(sc, query=True, instruction=instruction)
+                    elif title:
+                        formatted = f"title: {title} | text: {sc}"
+                    else:
+                        formatted = self.profile.format(sc, query=False)
+                    flat_pieces.append(formatted)
+                    piece_weights.append(max(1, len(sc)))
+                text_piece_map.append(indices)
+
+        # 2. Partition flat_pieces into micro-batches bounded by character budget and count
+        micro_batches = batch_texts_by_budget(
+            flat_pieces,
+            max_batch_chars=max_batch_chars,
+            max_batch_size=effective_max_batch_size,
+        )
+
+        # 3. Encode micro-batches
+        flat_vectors: list[np.ndarray | None] = [None] * len(flat_pieces)
+        for mb in micro_batches:
+            mb_texts = [flat_pieces[i] for i in mb]
+            call_kwargs = {"batch_size": len(mb_texts)}
+            vecs = self._encode_prepared(mb_texts, call_kwargs)
+            for local_idx, global_idx in enumerate(mb):
+                flat_vectors[global_idx] = vecs[local_idx]
+
+        # 4. Pool sub-chunks back into document embeddings via length-weighted average
+        doc_vectors: list[np.ndarray] = []
+        for indices in text_piece_map:
+            sub_vecs = np.asarray(
+                [flat_vectors[i] for i in indices if flat_vectors[i] is not None],
+                dtype=np.float32,
+            )
+            weights = [piece_weights[i] for i in indices]
+            doc_vec = pool_subchunk_embeddings(sub_vecs, weights, norm=norm)
+            doc_vectors.append(doc_vec)
+
+        vectors = np.stack(doc_vectors)
         if (
-            vectors.shape != (len(prepared), self.profile.dimensions)
+            vectors.shape != (len(texts), self.profile.dimensions)
             or not np.isfinite(vectors).all()
             or np.any(np.linalg.norm(vectors, axis=1) == 0)
         ):
             raise ValueError(
                 f"Expected finite, nonzero {self.profile.dimensions}-dimensional vectors."
             )
-        if not norm:
-            return vectors
-        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
-        return vectors / norms
+
+        if is_query:
+            active_prefix = (
+                self.profile.fact_query_prefix
+                if (instruction == FACT_INSTRUCTION and self.profile.fact_query_prefix)
+                else self.profile.query_prefix
+            )
+            resolved_stage = stage or (
+                "query_fact_embed" if instruction == FACT_INSTRUCTION else "query_passage_embed"
+            )
+        else:
+            active_prefix = self.profile.document_prefix
+            resolved_stage = stage or "document_embed"
+
+        total_chars = sum(len(p) for p in flat_pieces)
+        approx_tokens = max(1, (total_chars + 3) // 4)
+        entry: dict[str, Any] = {
+            "stage": resolved_stage,
+            "predictor": "embedder",
+            "model": self.profile.model,
+            "mode": "embed",
+            "task_mode": self.task_mode,
+            "query": is_query,
+            "instruction": instruction or "",
+            "active_prefix": active_prefix,
+            "parse_document_title": bool(self.profile.parse_document_title),
+            "num_inputs": len(texts),
+            "num_pieces": len(flat_pieces),
+            "num_batches": len(micro_batches),
+            "total_chars": total_chars,
+            "tokens_used": approx_tokens,
+            "usage": {
+                self.profile.model: {
+                    "prompt_tokens": approx_tokens,
+                    "completion_tokens": 0,
+                    "total_tokens": approx_tokens,
+                }
+            },
+            "inputs_summary": (
+                f"num_inputs={len(texts)}, num_pieces={len(flat_pieces)}, "
+                f"prefix={active_prefix!r}, sample={flat_pieces[0][:120]!r}"
+            ),
+        }
+        self.telemetry.append(entry)
+        if self._telemetry_hook is not None:
+            self._telemetry_hook(entry)
+
+        return vectors
 
     def encode(
         self,
@@ -251,11 +589,18 @@ class DSPyEmbeddingAdapter:
         instruction: str | None = None,
         norm: bool = True,
         batch_size: int | None = None,
+        stage: str | None = None,
     ) -> np.ndarray:
         """Alias for batch_encode matching sentence-transformers and DSPy embedder interfaces."""
         if not isinstance(texts, (str, list)):
             texts = list(texts)
-        return self.batch_encode(texts, instruction=instruction, norm=norm, batch_size=batch_size)
+        return self.batch_encode(
+            texts,
+            instruction=instruction,
+            norm=norm,
+            batch_size=batch_size,
+            stage=stage,
+        )
 
     def update_prefixes(
         self,
@@ -287,4 +632,8 @@ __all__ = [
     "resolve_embedding_profile",
     "create_dspy_embedder",
     "DSPyEmbeddingAdapter",
+    "is_batch_overflow_error",
+    "split_text_gracefully",
+    "pool_subchunk_embeddings",
+    "batch_texts_by_budget",
 ]
