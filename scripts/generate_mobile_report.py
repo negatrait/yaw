@@ -2198,7 +2198,7 @@ def generate_report_markdown(
 
 This dashboard documents real-time telemetry from the active **Two-Phase Hybrid Prompt Optimization Run** (`uv run yaw optimize`, `mode = "hybrid"`) over the canonical **250-Query Stratified EnterpriseRAG-Bench** (`150` train / `100` validation holdouts over `1,308` corpus chunks).
 
-*Dashboard Updated*: `{now_str}` *(Refreshed every 120s by background watch daemon)*
+*Dashboard Updated*: `{now_str}` *(Refreshed every 10 min by background watch daemon)*
 *Current Pipeline State*: {status_badge}
 
 ---
