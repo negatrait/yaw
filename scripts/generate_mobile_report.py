@@ -933,13 +933,13 @@ def generate_graph_projection_svg(dest: Path, sandbox: dict[str, Any]) -> dict[s
         degrees[u] += 1
         degrees[v] += 1
 
-    # Subgraph selection: all contrastive nodes + top hubs + immediate neighbors up to 550 nodes
+    # Subgraph selection: all contrastive nodes + top hubs + immediate neighbors up to 1000 nodes
     active_nodes = set(contrastive_nodes)
-    for n, _ in degrees.most_common(80):
+    for n, _ in degrees.most_common(160):
         active_nodes.add(n)
 
     for (u, v) in edge_pred_map:
-        if len(active_nodes) >= 550:
+        if len(active_nodes) >= 1000:
             break
         if u in active_nodes or v in active_nodes:
             active_nodes.add(u)
@@ -963,21 +963,21 @@ def generate_graph_projection_svg(dest: Path, sandbox: dict[str, Any]) -> dict[s
     # Force-Directed Physics Simulation (Pure Coulomb-Hooke Spring Embedder)
     np.random.seed(42)
     angles = np.linspace(0, 2 * math.pi, N, endpoint=False)
-    radii = 220.0 + np.random.randn(N) * 35.0
+    radii = 260.0 + np.random.randn(N) * 45.0
     pos = np.column_stack([np.cos(angles) * radii, np.sin(angles) * radii])
     vel = np.zeros_like(pos)
 
-    for _ in range(85):
+    for _ in range(80):
         diff = pos[:, None, :] - pos[None, :, :]
         d2 = np.sum(diff**2, axis=-1) + 40.0
         d = np.sqrt(d2)
-        f_rep_mag = 11000.0 / (d2 * d)
+        f_rep_mag = 12000.0 / (d2 * d)
         np.fill_diagonal(f_rep_mag, 0.0)
         f_rep = np.sum(diff * f_rep_mag[:, :, None], axis=1)
 
         d_e = pos[edges_np[:, 1]] - pos[edges_np[:, 0]]
         d_e_len = np.linalg.norm(d_e, axis=1, keepdims=True) + 1e-3
-        f_e = (d_e_len - 38.0) * 0.038 * (d_e / d_e_len)
+        f_e = (d_e_len - 35.0) * 0.035 * (d_e / d_e_len)
         f_att = np.zeros_like(pos)
         np.add.at(f_att, edges_np[:, 0], f_e)
         np.add.at(f_att, edges_np[:, 1], -f_e)
@@ -1033,19 +1033,19 @@ def generate_graph_projection_svg(dest: Path, sandbox: dict[str, Any]) -> dict[s
         deg_n = degrees[n]
         is_c = n in contrastive_nodes
         if is_c:
-            r = 3.6
+            r = 3.4
             col = "#f43f5e"
         elif deg_n >= 15:
-            r = 5.0
+            r = 4.6
             col = "#38bdf8"
         elif deg_n >= 5:
-            r = 3.2
+            r = 2.8
             col = "#818cf8"
         elif deg_n >= 2:
-            r = 2.2
+            r = 1.9
             col = "#94a3b8"
         else:
-            r = 1.6
+            r = 1.3
             col = "#64748b"
         esc_n = html.escape(n)
         dots_svg.append(
@@ -1090,13 +1090,13 @@ def generate_graph_projection_svg(dest: Path, sandbox: dict[str, Any]) -> dict[s
     <rect width="876" height="30" rx="5" fill="#0b1120" stroke="#1e293b" stroke-width="1"/>
 
     <circle cx="20" cy="15" r="4.5" fill="#38bdf8"/>
-    <text x="32" y="19" fill="#cbd5e1" font-size="10" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Core Hubs (r=5.0px)</text>
+    <text x="32" y="19" fill="#cbd5e1" font-size="10" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Core Hubs (r=4.6px)</text>
 
-    <circle cx="160" cy="15" r="3.0" fill="#818cf8"/>
+    <circle cx="160" cy="15" r="2.8" fill="#818cf8"/>
     <text x="172" y="19" fill="#cbd5e1" font-size="10" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Domain Entities (r=2-3px)</text>
 
-    <circle cx="310" cy="15" r="1.6" fill="#64748b"/>
-    <text x="320" y="19" fill="#cbd5e1" font-size="10" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Leaves (r=1.6px)</text>
+    <circle cx="310" cy="15" r="1.3" fill="#64748b"/>
+    <text x="320" y="19" fill="#cbd5e1" font-size="10" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Leaves (r=1.3px)</text>
 
     <line x1="410" y1="15" x2="435" y2="15" stroke="#64748b" stroke-width="1.2"/>
     <text x="445" y="19" fill="#cbd5e1" font-size="10" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Predicate Edges</text>
@@ -1912,8 +1912,8 @@ This dashboard documents real-time telemetry from the active **Two-Phase Hybrid 
 | Graph Dimension / Parameter | Current Value | Description |
 | :--- | :---: | :--- |
 | **Graph View Architecture** | **Coulomb-Hooke Force Simulation** | Organic force-directed spring embedder balancing repulsive electrostatic charges and edge spring tension |
-| **Rendered Subgraph Scope** | **`{proj_nodes:,}` Core Entities** (out of `{uniq_ent:,}` unique / `{total_ent:,}` mentions) | Focused 550-node core connected cluster comprising all contrastive nodes, top 80 hubs, and 1-hop neighborhoods |
-| **Rendered Subgraph Links** | **`{proj_edges:,}` Connections** (out of `{uniq_edges:,}` unique edges / `{total_trips:,}` total triples) | Geometric pairwise edges connecting the 550 rendered entities across the core component |
+| **Rendered Subgraph Scope** | **`{proj_nodes:,}` Core Entities** (out of `{uniq_ent:,}` unique / `{total_ent:,}` mentions) | Comprehensive top-{proj_nodes} core connected constellation comprising all contrastive nodes, top 160 hubs, and 1-hop neighborhoods |
+| **Rendered Subgraph Links** | **`{proj_edges:,}` Connections** (out of `{uniq_edges:,}` unique edges / `{total_trips:,}` total triples) | Geometric pairwise edges connecting the {proj_nodes} rendered entities across the core component |
 | **Contrastive Bounds** | **`{proj_contrast}` `owl:differentFrom` Links** | 100% of discovered semantic opposition and distinction bounds rendered with coral dashed lines and (≠) badges |
 
 ### Discovered Contrastive & Disjoint Relations (`owl:differentFrom`):
