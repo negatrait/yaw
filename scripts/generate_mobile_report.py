@@ -2,9 +2,9 @@
 
 Extracts real-time metrics directly from the active yaw_optimize_*.db sandbox, configuration,
 and process telemetry, rendering everything plotted continuously along a wall-clock time axis:
-1. knowledge_graph_extraction_dashboard.svg (Time-series of passages, entities, triples & ETA)
-2. pareto_frontier_progress.svg (Pareto frontier with time-coded candidate progression)
-3. candidate_trajectory_vs_time.svg (Full end-to-end multi-phase optimization trajectory vs. time)
+1. knowledge_graph_extraction_dashboard.svg (Dual-panel time-series: Passages/Entities/Triples + Velocity/Latency vs Time)
+2. pareto_frontier_progress.svg (Dual-panel: Candidate Pareto Fitness S(theta) vs Time + 2D Pareto Space with Time Colormap)
+3. candidate_trajectory_vs_time.svg (Full end-to-end multi-phase optimization trajectory vs. Time)
 4. benchmark_mobile_report.md (Structured mobile-friendly dashboard report)
 """
 
@@ -85,7 +85,9 @@ def get_active_sandbox_info() -> dict[str, Any]:
             recent_extractions: list[dict[str, Any]] = []
             samples: list[dict[str, Any]] = []
 
-            sample_step = max(1, n_chunks // 30)
+            sample_step = max(1, n_chunks // 35)
+            prev_passages = 0
+            prev_time_sec = 0.0
 
             for idx, (_cid, e_raw, t_raw) in enumerate(rows, start=1):
                 try:
@@ -109,6 +111,11 @@ def get_active_sandbox_info() -> dict[str, Any]:
                 if idx % sample_step == 0 or idx == n_chunks:
                     frac = idx / max(1, n_chunks)
                     t_sample_sec = frac * info["elapsed_seconds"]
+                    delta_p = idx - prev_passages
+                    delta_t_min = max(0.05, (t_sample_sec - prev_time_sec) / 60.0)
+                    inst_vel = delta_p / delta_t_min
+                    inst_lat = (delta_t_min * 60.0) / max(1, delta_p)
+
                     samples.append(
                         {
                             "index": idx,
@@ -117,8 +124,13 @@ def get_active_sandbox_info() -> dict[str, Any]:
                             "passages": idx,
                             "entities": cum_entities,
                             "triples": cum_triples,
+                            "tokens_k": round((idx * 630) / 1000.0, 1),
+                            "rolling_velocity": round(inst_vel, 2),
+                            "rolling_latency": round(inst_lat, 1),
                         }
                     )
+                    prev_passages = idx
+                    prev_time_sec = t_sample_sec
 
             for cid, e_raw, t_raw in rows[-4:]:
                 try:
@@ -232,44 +244,63 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
     # Dynamic time axis horizon: cover from 0 to max(4.0h, target_total_hours * 1.15)
     t_max_hours = max(4.0, math.ceil(target_total_hours * 1.15 * 2) / 2.0)
 
-    # Plot coordinate box: x in [80, 840], y in [180, 420]
-    p_x0, p_x1 = 80.0, 840.0
-    p_y0, p_y1 = 180.0, 420.0
+    # Panel 1: Main Cumulative Ingestion Plot [80, 850], y in [165, 395]
+    p_x0, p_x1 = 80.0, 850.0
+    p1_y0, p1_y1 = 165.0, 395.0
     pw = p_x1 - p_x0
-    ph = p_y1 - p_y0
+    p1_h = p1_y1 - p1_y0
 
     def t_to_x(t_h: float) -> float:
         return p_x0 + pw * min(1.0, max(0.0, t_h / t_max_hours))
 
     def p_to_y(p_val: float) -> float:
-        # Passage scale: 0 to 500
-        return p_y1 - ph * min(1.0, max(0.0, p_val / 500.0))
+        return p1_y1 - p1_h * min(1.0, max(0.0, p_val / 500.0))
 
     def e_to_y(e_val: float) -> float:
-        # Entity/Triple scale: 0 to 10,000
-        return p_y1 - ph * min(1.0, max(0.0, e_val / 10000.0))
+        return p1_y1 - p1_h * min(1.0, max(0.0, e_val / 10000.0))
 
-    # Build SVG paths from sampled time-series
+    # Panel 2: Rolling Velocity & Latency Time-Series Strip [80, 850], y in [440, 545]
+    p2_y0, p2_y1 = 440.0, 545.0
+    p2_h = p2_y1 - p2_y0
+
+    def v_to_y(v_val: float) -> float:
+        # Scale: 0 to 4.0 passages/min
+        return p2_y1 - p2_h * min(1.0, max(0.0, v_val / 4.0))
+
+    def lat_to_y(lat_val: float) -> float:
+        # Scale: 0 to 60 sec/chunk
+        return p2_y1 - p2_h * min(1.0, max(0.0, lat_val / 60.0))
+
+    # Build SVG paths
     path_passages = ""
     path_entities = ""
     path_triples = ""
+    path_vel = ""
+    path_lat = ""
 
     if samples:
         path_passages = f"M {t_to_x(0)} {p_to_y(0)}"
         path_entities = f"M {t_to_x(0)} {e_to_y(0)}"
         path_triples = f"M {t_to_x(0)} {e_to_y(0)}"
+        first_s = samples[0]
+        path_vel = f"M {t_to_x(first_s['time_hours'])} {v_to_y(first_s['rolling_velocity'])}"
+        path_lat = f"M {t_to_x(first_s['time_hours'])} {lat_to_y(first_s['rolling_latency'])}"
+
         for s in samples:
             x_s = t_to_x(s["time_hours"])
             path_passages += f" L {x_s:.1f} {p_to_y(s['passages']):.1f}"
             path_entities += f" L {x_s:.1f} {e_to_y(s['entities']):.1f}"
             path_triples += f" L {x_s:.1f} {e_to_y(s['triples']):.1f}"
+            path_vel += f" L {x_s:.1f} {v_to_y(s['rolling_velocity']):.1f}"
+            path_lat += f" L {x_s:.1f} {lat_to_y(s['rolling_latency']):.1f}"
 
     x_now = t_to_x(elapsed_hours)
     y_p_now = p_to_y(openie_cnt)
     y_e_now = e_to_y(total_ent)
     y_t_now = e_to_y(total_trips)
+    y_v_now = v_to_y(velocity)
+    y_lat_now = lat_to_y(sec_per_chunk)
 
-    # Projected endpoints at t_target
     x_target = t_to_x(target_total_hours)
     y_p_target = p_to_y(target_pool)
     est_total_ent = total_ent + (avg_ent * rem_chunks)
@@ -279,7 +310,7 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
 
     y_ref_pool = p_to_y(target_pool)
 
-    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 620" width="100%" height="100%" style="background:#070b14; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 760" width="100%" height="100%" style="background:#070b14; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
   <defs>
     <linearGradient id="dbBg" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0%" stop-color="#070b14"/>
@@ -289,70 +320,65 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
       <stop offset="0%" stop-color="#1e293b" stop-opacity="0.75"/>
       <stop offset="100%" stop-color="#0f172a" stop-opacity="0.95"/>
     </linearGradient>
-    <linearGradient id="cyanGlow" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.25"/>
-      <stop offset="100%" stop-color="#38bdf8" stop-opacity="0.0"/>
-    </linearGradient>
     <linearGradient id="purpleGrad" x1="0" y1="0" x2="1" y2="0">
       <stop offset="0%" stop-color="#818cf8"/>
       <stop offset="100%" stop-color="#c084fc"/>
     </linearGradient>
   </defs>
-  <rect width="920" height="620" rx="14" fill="url(#dbBg)" stroke="#1e293b" stroke-width="1.5"/>
+  <rect width="940" height="760" rx="14" fill="url(#dbBg)" stroke="#1e293b" stroke-width="1.5"/>
 
   <!-- Header -->
-  <text x="32" y="32" fill="#f8fafc" font-size="16" font-weight="700">Fig. 1: Live Knowledge Graph Extraction &amp; Ingestion vs. Wall-Clock Time</text>
+  <text x="32" y="32" fill="#f8fafc" font-size="16" font-weight="700">Fig. 1: Live Knowledge Graph Extraction &amp; Telemetry vs. Wall-Clock Time</text>
   <text x="32" y="50" fill="#94a3b8" font-size="11">Real-time OpenIE telemetry plotted continuously along time axis (0.0h → {t_max_hours:.1f}h horizon, {cfg.get('mode', 'hybrid').upper()} mode)</text>
 
   <!-- Metric Card Row -->
-  <g transform="translate(32, 66)">
+  <g transform="translate(32, 64)">
     <!-- Card 1: Passages -->
-    <rect x="0" y="0" width="132" height="74" rx="8" fill="url(#cardGrad)" stroke="#38bdf8" stroke-width="1.2"/>
+    <rect x="0" y="0" width="136" height="74" rx="8" fill="url(#cardGrad)" stroke="#38bdf8" stroke-width="1.2"/>
     <text x="12" y="18" fill="#94a3b8" font-size="9.5" font-weight="600">PASSAGES EXTRACTED</text>
     <text x="12" y="44" fill="#38bdf8" font-size="21" font-weight="800">{openie_cnt}</text>
     <text x="12" y="62" fill="#cbd5e1" font-size="10">of {target_pool} ({pct:.1f}%)</text>
 
     <!-- Card 2: Velocity -->
-    <rect x="144" y="0" width="132" height="74" rx="8" fill="url(#cardGrad)" stroke="#1e293b" stroke-width="1.2"/>
+    <rect x="148" y="0" width="136" height="74" rx="8" fill="url(#cardGrad)" stroke="#10b981" stroke-width="1.2"/>
     <text x="12" y="18" fill="#94a3b8" font-size="9.5" font-weight="600">EXTRACTION VELOCITY</text>
     <text x="12" y="44" fill="#10b981" font-size="20" font-weight="800">{velocity:.2f}</text>
     <text x="12" y="62" fill="#cbd5e1" font-size="10">passages/min ({sec_per_chunk:.1f}s/ea)</text>
 
     <!-- Card 3: Entities -->
-    <rect x="288" y="0" width="132" height="74" rx="8" fill="url(#cardGrad)" stroke="#1e293b" stroke-width="1.2"/>
+    <rect x="296" y="0" width="136" height="74" rx="8" fill="url(#cardGrad)" stroke="#1e293b" stroke-width="1.2"/>
     <text x="12" y="18" fill="#94a3b8" font-size="9.5" font-weight="600">EXTRACTED ENTITIES</text>
     <text x="12" y="44" fill="#818cf8" font-size="20" font-weight="800">{total_ent:,}</text>
     <text x="12" y="62" fill="#cbd5e1" font-size="10">~{avg_ent:.1f} per passage</text>
 
     <!-- Card 4: Triples -->
-    <rect x="432" y="0" width="132" height="74" rx="8" fill="url(#cardGrad)" stroke="#1e293b" stroke-width="1.2"/>
+    <rect x="444" y="0" width="136" height="74" rx="8" fill="url(#cardGrad)" stroke="#1e293b" stroke-width="1.2"/>
     <text x="12" y="18" fill="#94a3b8" font-size="9.5" font-weight="600">FACTUAL TRIPLES</text>
     <text x="12" y="44" fill="#f43f5e" font-size="20" font-weight="800">{total_trips:,}</text>
     <text x="12" y="62" fill="#cbd5e1" font-size="10">~{avg_trips:.1f} per passage</text>
 
     <!-- Card 5: Unique Predicates -->
-    <rect x="576" y="0" width="132" height="74" rx="8" fill="url(#cardGrad)" stroke="#1e293b" stroke-width="1.2"/>
+    <rect x="592" y="0" width="136" height="74" rx="8" fill="url(#cardGrad)" stroke="#1e293b" stroke-width="1.2"/>
     <text x="12" y="18" fill="#94a3b8" font-size="9.5" font-weight="600">RELATION TYPES</text>
     <text x="12" y="44" fill="#fbbf24" font-size="20" font-weight="800">{uniq_preds}</text>
     <text x="12" y="62" fill="#cbd5e1" font-size="10">distinct predicates</text>
 
     <!-- Card 6: Estimated Pool ETA -->
-    <rect x="720" y="0" width="136" height="74" rx="8" fill="url(#cardGrad)" stroke="#10b981" stroke-width="1.2"/>
+    <rect x="740" y="0" width="136" height="74" rx="8" fill="url(#cardGrad)" stroke="#10b981" stroke-width="1.2"/>
     <text x="12" y="18" fill="#94a3b8" font-size="9.5" font-weight="600">ESTIMATED POOL ETA</text>
     <text x="12" y="44" fill="#34d399" font-size="20" font-weight="800">{eta_str}</text>
     <text x="12" y="62" fill="#cbd5e1" font-size="10">to pooled graph commit</text>
   </g>
 
-  <!-- Plot Background Box -->
-  <rect x="{p_x0}" y="{p_y0}" width="{pw}" height="{ph}" fill="#090f1d" stroke="#334155" stroke-width="1.2"/>
+  <!-- PANEL 1: CUMULATIVE GROWTH PLOT -->
+  <rect x="{p_x0}" y="{p1_y0}" width="{pw}" height="{p1_h}" fill="#090f1d" stroke="#334155" stroke-width="1.2"/>
 
   <!-- Target Pool Reference Line at P = 495 -->
   <line x1="{p_x0}" y1="{y_ref_pool:.1f}" x2="{p_x1}" y2="{y_ref_pool:.1f}" stroke="#10b981" stroke-width="1.5" stroke-dasharray="4,4"/>
   <rect x="{p_x0 + 8}" y="{y_ref_pool - 16:.1f}" width="260" height="15" rx="3" fill="#064e3b" fill-opacity="0.7"/>
   <text x="{p_x0 + 12}" y="{y_ref_pool - 4:.1f}" fill="#34d399" font-size="9.5" font-weight="700">★ Pooled Distractor Threshold (495 Validation Chunks)</text>
-
-  <!-- Horizontal Grid Lines (Passages 0, 100, 200, 300, 400, 500) -->
 """
+    # Grid lines Panel 1
     for p_val in [0, 100, 200, 300, 400, 500]:
         y_g = p_to_y(p_val)
         svg += f"""  <line x1="{p_x0}" y1="{y_g:.1f}" x2="{p_x1}" y2="{y_g:.1f}" stroke="#1e293b" stroke-width="1" stroke-dasharray="3,3"/>
@@ -360,75 +386,108 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
   <text x="{p_x1 + 8}" y="{y_g + 3.5:.1f}" text-anchor="start" fill="#818cf8" font-size="9.5" font-family="monospace">{p_val * 20:,}</text>
 """
 
-    # Time Axis Ticks (every 0.5h or 1.0h)
+    # Time ticks Panel 1 & 2
     dt_tick = 0.5 if t_max_hours <= 5.0 else 1.0
     t_curr = 0.0
     while t_curr <= t_max_hours + 1e-4:
         x_g = t_to_x(t_curr)
         h_str = f"{int(t_curr)}h" if t_curr == int(t_curr) else f"{int(t_curr)}h30m"
-        svg += f"""  <line x1="{x_g:.1f}" y1="{p_y0}" x2="{x_g:.1f}" y2="{p_y1}" stroke="#1e293b" stroke-width="1" stroke-dasharray="3,3"/>
-  <text x="{x_g:.1f}" y="{p_y1 + 16:.1f}" text-anchor="middle" fill="#94a3b8" font-size="9.5" font-family="monospace">{h_str}</text>
+        svg += f"""  <line x1="{x_g:.1f}" y1="{p1_y0}" x2="{x_g:.1f}" y2="{p1_y1}" stroke="#1e293b" stroke-width="1" stroke-dasharray="3,3"/>
+  <line x1="{x_g:.1f}" y1="{p2_y0}" x2="{x_g:.1f}" y2="{p2_y1}" stroke="#1e293b" stroke-width="1" stroke-dasharray="3,3"/>
+  <text x="{x_g:.1f}" y="{p1_y1 + 14:.1f}" text-anchor="middle" fill="#94a3b8" font-size="9 font-family="monospace">{h_str}</text>
+  <text x="{x_g:.1f}" y="{p2_y1 + 14:.1f}" text-anchor="middle" fill="#94a3b8" font-size="9 font-family="monospace">{h_str}</text>
 """
         t_curr += dt_tick
 
-    # Axis Labels
+    # Panel 1 Curves & Labels
     svg += f"""
-  <text x="{(p_x0 + p_x1) / 2.0:.1f}" y="{p_y1 + 34:.1f}" text-anchor="middle" fill="#cbd5e1" font-size="11" font-weight="600">Wall-Clock Elapsed Time from Optimization Launch (Hours) →</text>
-  <text x="26" y="{(p_y0 + p_y1) / 2.0:.1f}" text-anchor="middle" fill="#38bdf8" font-size="11" font-weight="700" transform="rotate(-90 26 {(p_y0 + p_y1) / 2.0:.1f})">Passages Extracted (P)</text>
-  <text x="894" y="{(p_y0 + p_y1) / 2.0:.1f}" text-anchor="middle" fill="#818cf8" font-size="11" font-weight="700" transform="rotate(90 894 {(p_y0 + p_y1) / 2.0:.1f})">Entities &amp; Triples Scale (E, T)</text>
+  <text x="24" y="{(p1_y0 + p1_y1) / 2.0:.1f}" text-anchor="middle" fill="#38bdf8" font-size="10.5" font-weight="700" transform="rotate(-90 24 {(p1_y0 + p1_y1) / 2.0:.1f})">Passages (P)</text>
+  <text x="906" y="{(p1_y0 + p1_y1) / 2.0:.1f}" text-anchor="middle" fill="#818cf8" font-size="10.5" font-weight="700" transform="rotate(90 906 {(p1_y0 + p1_y1) / 2.0:.1f})">Entities &amp; Triples (E, T)</text>
 
   <!-- Curve 1: Passages Extracted (Cyan) -->
   <path d="{path_passages}" fill="none" stroke="#38bdf8" stroke-width="2.5"/>
-  <!-- Projection: Passages Extracted to ETA (Dashed Cyan) -->
   <line x1="{x_now:.1f}" y1="{y_p_now:.1f}" x2="{x_target:.1f}" y2="{y_p_target:.1f}" stroke="#38bdf8" stroke-width="2" stroke-dasharray="5,4" stroke-opacity="0.8"/>
 
   <!-- Curve 2: Entities Extracted (Purple) -->
   <path d="{path_entities}" fill="none" stroke="#818cf8" stroke-width="2"/>
-  <!-- Projection: Entities to ETA (Dashed Purple) -->
   <line x1="{x_now:.1f}" y1="{y_e_now:.1f}" x2="{x_target:.1f}" y2="{y_e_target:.1f}" stroke="#818cf8" stroke-width="1.8" stroke-dasharray="5,4" stroke-opacity="0.8"/>
 
   <!-- Curve 3: Triples Extracted (Rose) -->
   <path d="{path_triples}" fill="none" stroke="#f43f5e" stroke-width="2"/>
-  <!-- Projection: Triples to ETA (Dashed Rose) -->
   <line x1="{x_now:.1f}" y1="{y_t_now:.1f}" x2="{x_target:.1f}" y2="{y_t_target:.1f}" stroke="#f43f5e" stroke-width="1.8" stroke-dasharray="5,4" stroke-opacity="0.8"/>
 
-  <!-- Vertical "NOW" Marker Line -->
-  <line x1="{x_now:.1f}" y1="{p_y0}" x2="{x_now:.1f}" y2="{p_y1}" stroke="#ffffff" stroke-width="1.5" stroke-dasharray="3,3" stroke-opacity="0.7"/>
-  <rect x="{x_now - 44:.1f}" y="{p_y0 - 20:.1f}" width="88" height="18" rx="4" fill="#1e293b" stroke="#38bdf8" stroke-width="1"/>
-  <text x="{x_now:.1f}" y="{p_y0 - 7:.1f}" text-anchor="middle" fill="#38bdf8" font-size="9.5" font-weight="700">NOW ({int(elapsed_min)}m)</text>
+  <!-- Panel 1 Vertical "NOW" Marker -->
+  <line x1="{x_now:.1f}" y1="{p1_y0}" x2="{x_now:.1f}" y2="{p1_y1}" stroke="#ffffff" stroke-width="1.5" stroke-dasharray="3,3" stroke-opacity="0.7"/>
+  <circle cx="{x_now:.1f}" cy="{y_p_now:.1f}" r="5" fill="#38bdf8" stroke="#ffffff" stroke-width="1.8"/>
+  <circle cx="{x_now:.1f}" cy="{y_e_now:.1f}" r="4.5" fill="#818cf8" stroke="#ffffff" stroke-width="1.5"/>
+  <circle cx="{x_now:.1f}" cy="{y_t_now:.1f}" r="4.5" fill="#f43f5e" stroke="#ffffff" stroke-width="1.5"/>
 
-  <!-- Glow Points at Current Telemetry Values -->
-  <circle cx="{x_now:.1f}" cy="{y_p_now:.1f}" r="5.5" fill="#38bdf8" stroke="#ffffff" stroke-width="1.8"/>
-  <circle cx="{x_now:.1f}" cy="{y_e_now:.1f}" r="5" fill="#818cf8" stroke="#ffffff" stroke-width="1.5"/>
-  <circle cx="{x_now:.1f}" cy="{y_t_now:.1f}" r="5" fill="#f43f5e" stroke="#ffffff" stroke-width="1.5"/>
-
-  <!-- Target Completion Marker -->
+  <!-- Panel 1 Target Completion Marker -->
   <circle cx="{x_target:.1f}" cy="{y_p_target:.1f}" r="6" fill="#10b981" stroke="#ffffff" stroke-width="2"/>
-  <rect x="{min(p_x1 - 140, x_target - 50):.1f}" y="{y_p_target - 24:.1f}" width="130" height="18" rx="4" fill="#064e3b" stroke="#10b981" stroke-width="1"/>
-  <text x="{min(p_x1 - 75, x_target + 15):.1f}" y="{y_p_target - 11:.1f}" text-anchor="middle" fill="#34d399" font-size="9.5" font-weight="700">ETA: {eta_str}</text>
+  <rect x="{min(p_x1 - 130, x_target - 50):.1f}" y="{y_p_target - 22:.1f}" width="125" height="18" rx="4" fill="#064e3b" stroke="#10b981" stroke-width="1"/>
+  <text x="{min(p_x1 - 67, x_target + 12):.1f}" y="{y_p_target - 9:.1f}" text-anchor="middle" fill="#34d399" font-size="9" font-weight="700">ETA: {eta_str}</text>
 
-  <!-- Plot Legend Bar (Inside Plot Box) -->
-  <g transform="translate({p_x0 + 14}, {p_y0 + 16})">
-    <rect width="470" height="24" rx="4" fill="#0b1120" fill-opacity="0.85" stroke="#1e293b"/>
-    <line x1="10" y1="12" x2="26" y2="12" stroke="#38bdf8" stroke-width="2.5"/>
-    <circle cx="18" cy="12" r="3.5" fill="#38bdf8"/>
-    <text x="32" y="15" fill="#e2e8f0" font-size="10" font-weight="600">Passages ({openie_cnt})</text>
+  <!-- Panel 1 Legend -->
+  <g transform="translate({p_x0 + 14}, {p1_y0 + 12})">
+    <rect width="470" height="22" rx="4" fill="#0b1120" fill-opacity="0.85" stroke="#1e293b"/>
+    <line x1="10" y1="11" x2="26" y2="11" stroke="#38bdf8" stroke-width="2.5"/>
+    <circle cx="18" cy="11" r="3.5" fill="#38bdf8"/>
+    <text x="32" y="14" fill="#e2e8f0" font-size="9.5" font-weight="600">Passages ({openie_cnt})</text>
 
-    <line x1="130" y1="12" x2="146" y2="12" stroke="#818cf8" stroke-width="2"/>
-    <circle cx="138" cy="12" r="3.5" fill="#818cf8"/>
-    <text x="152" y="15" fill="#cbd5e1" font-size="10">Entities ({total_ent:,})</text>
+    <line x1="130" y1="11" x2="146" y2="11" stroke="#818cf8" stroke-width="2"/>
+    <circle cx="138" cy="11" r="3.5" fill="#818cf8"/>
+    <text x="152" y="14" fill="#cbd5e1" font-size="9.5">Entities ({total_ent:,})</text>
 
-    <line x1="250" y1="12" x2="266" y2="12" stroke="#f43f5e" stroke-width="2"/>
-    <circle cx="258" cy="12" r="3.5" fill="#f43f5e"/>
-    <text x="272" y="15" fill="#cbd5e1" font-size="10">Triples ({total_trips:,})</text>
+    <line x1="250" y1="11" x2="266" y2="11" stroke="#f43f5e" stroke-width="2"/>
+    <circle cx="258" cy="11" r="3.5" fill="#f43f5e"/>
+    <text x="272" y="14" fill="#cbd5e1" font-size="9.5">Triples ({total_trips:,})</text>
 
-    <line x1="365" y1="12" x2="385" y2="12" stroke="#94a3b8" stroke-width="1.8" stroke-dasharray="4,3"/>
-    <text x="392" y="15" fill="#94a3b8" font-size="9.5">Extrapolated ETA</text>
+    <line x1="365" y1="11" x2="385" y2="11" stroke="#94a3b8" stroke-width="1.8" stroke-dasharray="4,3"/>
+    <text x="392" y="14" fill="#94a3b8" font-size="9">Extrapolated ETA</text>
   </g>
 
-  <!-- Lower Panel: Top Semantic Predicates Breakdown -->
-  <g transform="translate(32, 470)">
-    <rect width="414" height="98" rx="8" fill="#0b1120" stroke="#1e293b" stroke-width="1.2"/>
+  <!-- PANEL 2: ROLLING EXTRACTION VELOCITY & LATENCY STRIP -->
+  <rect x="{p_x0}" y="{p2_y0}" width="{pw}" height="{p2_h}" fill="#090f1d" stroke="#334155" stroke-width="1.2"/>
+"""
+    # Grid lines Panel 2 (Velocity: 0, 1, 2, 3, 4 passages/min)
+    for v_val in [0.0, 1.0, 2.0, 3.0, 4.0]:
+        y_gv = v_to_y(v_val)
+        svg += f"""  <line x1="{p_x0}" y1="{y_gv:.1f}" x2="{p_x1}" y2="{y_gv:.1f}" stroke="#1e293b" stroke-width="1" stroke-dasharray="3,3"/>
+  <text x="{p_x0 - 8}" y="{y_gv + 3.5:.1f}" text-anchor="end" fill="#10b981" font-size="9 font-family="monospace">{v_val:.1f}</text>
+  <text x="{p_x1 + 8}" y="{y_gv + 3.5:.1f}" text-anchor="start" fill="#fbbf24" font-size="9 font-family="monospace">{int(v_val * 15)}s</text>
+"""
+
+    svg += f"""
+  <text x="24" y="{(p2_y0 + p2_y1) / 2.0:.1f}" text-anchor="middle" fill="#10b981" font-size="10" font-weight="700" transform="rotate(-90 24 {(p2_y0 + p2_y1) / 2.0:.1f})">Rate (pass/min)</text>
+  <text x="906" y="{(p2_y0 + p2_y1) / 2.0:.1f}" text-anchor="middle" fill="#fbbf24" font-size="10" font-weight="700" transform="rotate(90 906 {(p2_y0 + p2_y1) / 2.0:.1f})">Latency (s/chunk)</text>
+
+  <!-- Curve: Velocity (Green) -->
+  <path d="{path_vel}" fill="none" stroke="#10b981" stroke-width="2.2"/>
+  <circle cx="{x_now:.1f}" cy="{y_v_now:.1f}" r="4.5" fill="#10b981" stroke="#ffffff" stroke-width="1.5"/>
+
+  <!-- Curve: Latency (Amber) -->
+  <path d="{path_lat}" fill="none" stroke="#fbbf24" stroke-width="1.8" stroke-dasharray="3,2"/>
+  <circle cx="{x_now:.1f}" cy="{y_lat_now:.1f}" r="4" fill="#fbbf24" stroke="#ffffff" stroke-width="1.2"/>
+
+  <!-- Panel 2 Vertical NOW marker -->
+  <line x1="{x_now:.1f}" y1="{p2_y0}" x2="{x_now:.1f}" y2="{p2_y1}" stroke="#ffffff" stroke-width="1.5" stroke-dasharray="3,3" stroke-opacity="0.7"/>
+
+  <!-- Panel 2 Legend -->
+  <g transform="translate({p_x0 + 14}, {p2_y0 + 10})">
+    <rect width="360" height="20" rx="3" fill="#0b1120" fill-opacity="0.85" stroke="#1e293b"/>
+    <line x1="10" y1="10" x2="26" y2="10" stroke="#10b981" stroke-width="2.2"/>
+    <circle cx="18" cy="10" r="3" fill="#10b981"/>
+    <text x="32" y="13" fill="#cbd5e1" font-size="9" font-weight="600">Rolling Throughput: {velocity:.2f} p/min</text>
+
+    <line x1="180" y1="10" x2="196" y2="10" stroke="#fbbf24" stroke-width="1.8" stroke-dasharray="3,2"/>
+    <circle cx="188" cy="10" r="3" fill="#fbbf24"/>
+    <text x="202" y="13" fill="#cbd5e1" font-size="9" font-weight="600">Mean Latency: {sec_per_chunk:.1f}s / chunk</text>
+  </g>
+
+  <!-- PANEL 3: BOTTOM SPLIT - TOP PREDICATES & RECENT STREAM -->
+  <g transform="translate(32, 595)">
+    <!-- Left: Top Semantic Predicates Breakdown -->
+    <rect width="420" height="95" rx="8" fill="#0b1120" stroke="#1e293b" stroke-width="1.2"/>
     <text x="14" y="20" fill="#f8fafc" font-size="11" font-weight="700">Top Semantic Predicates Extracted ({uniq_preds} total discovered)</text>
 """
     max_p_cnt = max((c for _, c in top_preds), default=1)
@@ -446,12 +505,12 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
     svg += """
   </g>
 
-  <!-- Lower Panel: Live Knowledge Extraction Snippet -->
-  <g transform="translate(474, 470)">
-    <rect width="414" height="98" rx="8" fill="#0b1120" stroke="#1e293b" stroke-width="1.2"/>
+  <!-- Right: Live Knowledge Stream Inspection -->
+  <g transform="translate(488, 595)">
+    <rect width="420" height="95" rx="8" fill="#0b1120" stroke="#1e293b" stroke-width="1.2"/>
     <text x="14" y="20" fill="#f8fafc" font-size="11" font-weight="700">Recent Stream Inspection (Last Extracted Chunk)</text>
 """
-    recent_item = kg.get("recent_extractions", [{}])[-1]
+    recent_item = kg.get("recent_extractions", [{}])[-1] if kg.get("recent_extractions") else {}
     cid_disp = recent_item.get("chunk_id", "")[:24]
     sample_trip = (
         recent_item.get("sample_triples", [""])[0]
@@ -467,8 +526,8 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
   </g>
 
   <!-- Footer Info Box -->
-  <rect x="32" y="582" width="856" height="26" rx="5" fill="#0f172a" stroke="#1e293b"/>
-  <text x="44" y="599" fill="#94a3b8" font-size="10">Active Sandbox: <tspan fill="#f8fafc" font-family="monospace">{sandbox.get('db_name', 'initializing')}</tspan> | Elapsed: <tspan fill="#f8fafc">{int(elapsed_min)} min</tspan> | Extraction Velocity: <tspan fill="#10b981" font-weight="600">{velocity:.2f} passages/min</tspan></text>
+  <rect x="32" y="718" width="876" height="26" rx="5" fill="#0f172a" stroke="#1e293b"/>
+  <text x="44" y="735" fill="#94a3b8" font-size="10">Active Sandbox: <tspan fill="#f8fafc" font-family="monospace">{sandbox.get('db_name', 'initializing')}</tspan> | Elapsed: <tspan fill="#f8fafc">{int(elapsed_min)} min</tspan> | Extraction Velocity: <tspan fill="#10b981" font-weight="600">{velocity:.2f} passages/min</tspan> | Est. Tokens: <tspan fill="#818cf8">{(openie_cnt * 630):,} tokens</tspan></text>
 </svg>"""
 
     dest.write_text(svg, encoding="utf-8")
@@ -477,8 +536,16 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
 def generate_pareto_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str, Any]) -> None:
     counts = sandbox.get("counts", {})
     openie_cnt = counts.get("openie_chunks", 0)
+    elapsed_sec = sandbox.get("elapsed_seconds", 60.0)
+    elapsed_hours = elapsed_sec / 3600.0
+    elapsed_min = max(0.1, elapsed_sec / 60.0)
+    velocity = openie_cnt / elapsed_min
+    rem_chunks = max(0, 495 - openie_cnt)
+    eta_min = rem_chunks / max(0.01, velocity)
+    target_total_hours = (elapsed_sec + (eta_min * 60.0)) / 3600.0
+    t_max_hours = max(8.0, math.ceil(target_total_hours * 1.5))
 
-    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 580" width="100%" height="100%" style="background:#070b14; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 580" width="100%" height="100%" style="background:#070b14; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
   <defs>
     <linearGradient id="bg1" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0%" stop-color="#070b14"/>
@@ -488,88 +555,158 @@ def generate_pareto_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str, Any]
       <stop offset="0%" stop-color="#10b981" stop-opacity="0.25"/>
       <stop offset="100%" stop-color="#10b981" stop-opacity="0.02"/>
     </linearGradient>
-    <linearGradient id="phaseShade" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.15"/>
-      <stop offset="100%" stop-color="#818cf8" stop-opacity="0.05"/>
+    <linearGradient id="phase1Grad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#0284c7" stop-opacity="0.15"/>
+      <stop offset="100%" stop-color="#0284c7" stop-opacity="0.03"/>
+    </linearGradient>
+    <linearGradient id="phase2Grad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#7c3aed" stop-opacity="0.15"/>
+      <stop offset="100%" stop-color="#7c3aed" stop-opacity="0.03"/>
+    </linearGradient>
+    <linearGradient id="timeColorbar" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#f59e0b"/>
+      <stop offset="40%" stop-color="#38bdf8"/>
+      <stop offset="80%" stop-color="#818cf8"/>
+      <stop offset="100%" stop-color="#10b981"/>
     </linearGradient>
   </defs>
-  <rect width="900" height="580" rx="14" fill="url(#bg1)" stroke="#1e293b" stroke-width="1.5"/>
+  <rect width="940" height="580" rx="14" fill="url(#bg1)" stroke="#1e293b" stroke-width="1.5"/>
 
   <!-- Header -->
-  <text x="32" y="36" fill="#f8fafc" font-size="17" font-weight="700">Fig. 2: Two-Phase Hybrid Optimization &amp; Multi-Objective Pareto Space</text>
-  <text x="32" y="56" fill="#94a3b8" font-size="11.5">Sizecoding Pareto Objective: S = GM_good / GM_bad (Pooled Corpus Graph Distractor Pressure, EnterpriseRAG-Bench)</text>
+  <text x="32" y="34" fill="#f8fafc" font-size="16" font-weight="700">Fig. 2: Two-Phase Hybrid Optimization &amp; Sizecoding Pareto Progression</text>
+  <text x="32" y="52" fill="#94a3b8" font-size="11">Left: Pareto Fitness S(θ) vs. Wall-Clock Time Axis | Right: Multi-Objective Trade-Off Space (GM_bad vs GM_good)</text>
 
-  <!-- Legend Bar -->
-  <g transform="translate(32, 74)">
-    <circle cx="8" cy="-4" r="5" fill="#38bdf8" stroke="#0284c7" stroke-width="1.5"/>
-    <text x="20" y="0" fill="#e2e8f0" font-size="11" font-weight="600">Phase 1: MIPROv2 Few-Shot Demonstration Space</text>
+  <!-- ================= PANEL A: S(θ) vs WALL-CLOCK TIME AXIS ================= -->
+  <!-- Box: x in [40, 460], y in [76, 480], w=420, h=404 -->
+  <rect x="40" y="76" width="420" height="404" fill="#090f1d" stroke="#334155" stroke-width="1.2"/>
+  <text x="52" y="98" fill="#f8fafc" font-size="11.5" font-weight="700">A. Sizecoding Pareto Fitness S(θ) vs. Time</text>
+"""
+    # Coordinates Panel A
+    a_x0, a_x1 = 90.0, 440.0
+    a_y0, a_y1 = 116.0, 444.0
+    aw = a_x1 - a_x0
+    ah = a_y1 - a_y0
 
-    <circle cx="350" cy="-4" r="5" fill="#818cf8" stroke="#4f46e5" stroke-width="1.5"/>
-    <text x="362" y="0" fill="#cbd5e1" font-size="11">Phase 2: GEPA Reflective Pareto Evolution Space</text>
+    def at_to_x(t_h: float) -> float:
+        return a_x0 + aw * min(1.0, max(0.0, t_h / t_max_hours))
 
-    <line x1="680" y1="-4" x2="702" y2="-4" stroke="#10b981" stroke-width="2.5"/>
-    <circle cx="691" cy="-4" r="4.5" fill="#10b981" stroke="#052e16" stroke-width="1.5"/>
-    <text x="710" y="0" fill="#34d399" font-size="11" font-weight="600">Non-Dominated Pareto Frontier</text>
+    def as_to_y(s_val: float) -> float:
+        # S(theta) scale 0.00 to 0.10
+        return a_y1 - ah * min(1.0, max(0.0, s_val / 0.10))
+
+    # Phase 1 and 2 Background Shading along time in Panel A
+    ax_eta = at_to_x(target_total_hours)
+    ax_now = at_to_x(elapsed_hours)
+
+    svg += f"""
+  <rect x="{a_x0}" y="{a_y0}" width="{ax_eta - a_x0:.1f}" height="{ah}" fill="url(#phase1Grad)"/>
+  <rect x="{ax_eta:.1f}" y="{a_y0}" width="{a_x1 - ax_eta:.1f}" height="{ah}" fill="url(#phase2Grad)"/>
+
+  <text x="{a_x0 + 8}" y="{a_y0 + 16}" fill="#38bdf8" font-size="9" font-weight="600">Phase 1: MIPROv2</text>
+  <text x="{ax_eta + 8:.1f}" y="{a_y0 + 16}" fill="#c084fc" font-size="9" font-weight="600">Phase 2: GEPA</text>
+
+  <!-- Grid lines Panel A -->
+"""
+    for s_val in [0.00, 0.02, 0.04, 0.06, 0.08, 0.10]:
+        y_as = as_to_y(s_val)
+        svg += f"""  <line x1="{a_x0}" y1="{y_as:.1f}" x2="{a_x1}" y2="{y_as:.1f}" stroke="#1e293b" stroke-width="1" stroke-dasharray="3,3"/>
+  <text x="{a_x0 - 8}" y="{y_as + 3.5:.1f}" text-anchor="end" fill="#94a3b8" font-size="9 font-family="monospace">{s_val:.2f}</text>
+"""
+
+    t_step_a = 1.0 if t_max_hours <= 8.0 else 2.0
+    t_c = 0.0
+    while t_c <= t_max_hours + 1e-4:
+        xg = at_to_x(t_c)
+        svg += f"""  <line x1="{xg:.1f}" y1="{a_y0}" x2="{xg:.1f}" y2="{a_y1}" stroke="#1e293b" stroke-width="1" stroke-dasharray="3,3"/>
+  <text x="{xg:.1f}" y="{a_y1 + 14:.1f}" text-anchor="middle" fill="#94a3b8" font-size="9 font-family="monospace">{int(t_c)}h</text>
+"""
+        t_c += t_step_a
+
+    # Baseline seed point in Panel A
+    y_seed = as_to_y(0.0236)
+    svg += f"""
+  <!-- Axis Labels Panel A -->
+  <text x="{(a_x0 + a_x1) / 2.0:.1f}" y="{a_y1 + 28:.1f}" text-anchor="middle" fill="#cbd5e1" font-size="10" font-weight="600">Wall-Clock Elapsed Time (Hours) →</text>
+  <text x="56" y="{(a_y0 + a_y1) / 2.0:.1f}" text-anchor="middle" fill="#10b981" font-size="10" font-weight="700" transform="rotate(-90 56 {(a_y0 + a_y1) / 2.0:.1f})">Pareto Score S(θ) ↑</text>
+
+  <!-- Baseline Seed Point -->
+  <circle cx="{a_x0}" cy="{y_seed:.1f}" r="5.5" fill="#f59e0b" stroke="#ffffff" stroke-width="1.5"/>
+  <text x="{a_x0 + 8}" y="{y_seed + 3:.1f}" fill="#f59e0b" font-size="9" font-weight="600">Seed (0.0236)</text>
+
+  <!-- Projected Best-So-Far Envelope Curve -->
+  <path d="M {a_x0} {y_seed:.1f} Q {ax_eta:.1f} {as_to_y(0.045):.1f}, {a_x1:.1f} {as_to_y(0.082):.1f}" fill="none" stroke="#10b981" stroke-width="2.2" stroke-dasharray="5,4"/>
+
+  <!-- Vertical NOW cursor Panel A -->
+  <line x1="{ax_now:.1f}" y1="{a_y0}" x2="{ax_now:.1f}" y2="{a_y1}" stroke="#ffffff" stroke-width="1.5" stroke-dasharray="3,3" stroke-opacity="0.8"/>
+  <rect x="{ax_now - 32:.1f}" y="{a_y0 + 26}" width="64" height="16" rx="3" fill="#1e293b" stroke="#38bdf8" stroke-width="1"/>
+  <text x="{ax_now:.1f}" y="{a_y0 + 38}" text-anchor="middle" fill="#38bdf8" font-size="8.5" font-weight="700">NOW ({int(elapsed_min)}m)</text>
+
+
+  <!-- ================= PANEL B: 2D PARETO TRADE-OFF SPACE ================= -->
+  <!-- Box: x in [480, 900], y in [76, 480], w=420, h=404 -->
+  <rect x="480" y="76" width="420" height="404" fill="#090f1d" stroke="#334155" stroke-width="1.2"/>
+  <text x="492" y="98" fill="#f8fafc" font-size="11.5" font-weight="700">B. Multi-Objective Trade-Off (GM_bad vs GM_good)</text>
+"""
+    # Coordinates Panel B
+    b_x0, b_x1 = 530.0, 880.0
+    b_y0, b_y1 = 116.0, 444.0
+    bw = b_x1 - b_x0
+    bh = b_y1 - b_y0
+
+    def bx_to_x(gmb: float) -> float:
+        # GM_bad scale 1.0x to 3.0x
+        return b_x0 + bw * min(1.0, max(0.0, (gmb - 1.0) / 2.0))
+
+    def by_to_y(gmg: float) -> float:
+        # GM_good scale 0.00 to 0.10
+        return b_y1 - bh * min(1.0, max(0.0, gmg / 0.10))
+
+    # Grid lines Panel B
+    for gmg in [0.00, 0.02, 0.04, 0.06, 0.08, 0.10]:
+        y_bg = by_to_y(gmg)
+        svg += f"""  <line x1="{b_x0}" y1="{y_bg:.1f}" x2="{b_x1}" y2="{y_bg:.1f}" stroke="#1e293b" stroke-width="1" stroke-dasharray="3,3"/>
+  <text x="{b_x0 - 8}" y="{y_bg + 3.5:.1f}" text-anchor="end" fill="#94a3b8" font-size="9 font-family="monospace">{gmg:.2f}</text>
+"""
+
+    for gmb in [1.0, 1.5, 2.0, 2.5, 3.0]:
+        x_bg = bx_to_x(gmb)
+        svg += f"""  <line x1="{x_bg:.1f}" y1="{b_y0}" x2="{x_bg:.1f}" y2="{b_y1}" stroke="#1e293b" stroke-width="1" stroke-dasharray="3,3"/>
+  <text x="{x_bg:.1f}" y="{b_y1 + 14:.1f}" text-anchor="middle" fill="#94a3b8" font-size="9 font-family="monospace">{gmb:.1f}×</text>
+"""
+
+    # Pareto Superior Highlight & Seed Point in Panel B
+    x_seed_b = bx_to_x(1.40)
+    y_seed_b = by_to_y(0.033)
+
+    svg += f"""
+  <!-- Pareto Superior Region -->
+  <rect x="{b_x0}" y="{b_y0}" width="{bw * 0.45:.1f}" height="{bh * 0.6:.1f}" fill="url(#paretoShade)" rx="4"/>
+  <text x="{b_x0 + 8}" y="{b_y0 + 16}" fill="#10b981" font-size="8.5" font-weight="700">★ Pareto Superior Zone</text>
+
+  <!-- Axis Labels Panel B -->
+  <text x="{(b_x0 + b_x1) / 2.0:.1f}" y="{b_y1 + 28:.1f}" text-anchor="middle" fill="#cbd5e1" font-size="10" font-weight="600">Execution Penalty GM_bad (1.0× → 3.0×) → Lower is better</text>
+  <text x="496" y="{(b_y0 + b_y1) / 2.0:.1f}" text-anchor="middle" fill="#38bdf8" font-size="10" font-weight="700" transform="rotate(-90 496 {(b_y0 + b_y1) / 2.0:.1f})">Quality GM_good ↑</text>
+
+  <!-- Baseline Seed Point -->
+  <circle cx="{x_seed_b:.1f}" cy="{y_seed_b:.1f}" r="6" fill="#f59e0b" stroke="#ffffff" stroke-width="1.8"/>
+  <text x="{x_seed_b + 8:.1f}" y="{y_seed_b + 3:.1f}" fill="#f59e0b" font-size="9" font-weight="600">Seed Candidate</text>
+
+  <!-- Non-Dominated Pareto Frontier Projection -->
+  <path d="M {bx_to_x(1.15):.1f} {by_to_y(0.080):.1f} Q {bx_to_x(1.45):.1f} {by_to_y(0.055):.1f}, {bx_to_x(2.10):.1f} {by_to_y(0.035):.1f}" fill="none" stroke="#10b981" stroke-width="2.2" stroke-dasharray="5,4"/>
+
+  <!-- Colormap Legend Bar for Time Dimension -->
+  <g transform="translate(680, 88)">
+    <text x="-48" y="10" fill="#94a3b8" font-size="8.5">Time Colormap:</text>
+    <rect x="36" y="2" width="120" height="9" rx="2" fill="url(#timeColorbar)"/>
+    <text x="36" y="20" fill="#f59e0b" font-size="8">0h</text>
+    <text x="156" y="20" text-anchor="end" fill="#10b981" font-size="8">{t_max_hours:.0f}h</text>
   </g>
 
-  <!-- Plot Background -->
-  <rect x="92" y="96" width="760" height="390" fill="#090f1d" stroke="#334155" stroke-width="1.2"/>
-
-  <!-- Grid lines -->
-  <line x1="92" y1="486.0" x2="852" y2="486.0" stroke="#1e293b" stroke-width="1" stroke-dasharray="3,3"/>
-  <text x="82" y="490.0" text-anchor="end" fill="#94a3b8" font-size="10.5" font-family="monospace">0.00</text>
-
-  <line x1="92" y1="421.0" x2="852" y2="421.0" stroke="#1e293b" stroke-width="1" stroke-dasharray="3,3"/>
-  <text x="82" y="425.0" text-anchor="end" fill="#94a3b8" font-size="10.5" font-family="monospace">0.02</text>
-
-  <line x1="92" y1="356.0" x2="852" y2="356.0" stroke="#1e293b" stroke-width="1" stroke-dasharray="3,3"/>
-  <text x="82" y="360.0" text-anchor="end" fill="#94a3b8" font-size="10.5" font-family="monospace">0.04</text>
-
-  <line x1="92" y1="291.0" x2="852" y2="291.0" stroke="#1e293b" stroke-width="1" stroke-dasharray="3,3"/>
-  <text x="82" y="295.0" text-anchor="end" fill="#94a3b8" font-size="10.5" font-family="monospace">0.06</text>
-
-  <line x1="92" y1="226.0" x2="852" y2="226.0" stroke="#1e293b" stroke-width="1" stroke-dasharray="3,3"/>
-  <text x="82" y="230.0" text-anchor="end" fill="#94a3b8" font-size="10.5" font-family="monospace">0.08</text>
-
-  <line x1="92" y1="161.0" x2="852" y2="161.0" stroke="#1e293b" stroke-width="1" stroke-dasharray="3,3"/>
-  <text x="82" y="165.0" text-anchor="end" fill="#94a3b8" font-size="10.5" font-family="monospace">0.10</text>
-
-  <!-- Axis lines (X: GM_bad 1.0x to 3.0x) -->
-  <line x1="92.0" y1="96" x2="92.0" y2="486" stroke="#1e293b" stroke-width="1" stroke-dasharray="3,3"/>
-  <text x="92.0" y="504" text-anchor="middle" fill="#94a3b8" font-size="10.5" font-family="monospace">1.0×</text>
-
-  <line x1="282.0" y1="96" x2="282.0" y2="486" stroke="#1e293b" stroke-width="1" stroke-dasharray="3,3"/>
-  <text x="282.0" y="504" text-anchor="middle" fill="#94a3b8" font-size="10.5" font-family="monospace">1.5×</text>
-
-  <line x1="472.0" y1="96" x2="472.0" y2="486" stroke="#1e293b" stroke-width="1" stroke-dasharray="3,3"/>
-  <text x="472.0" y="504" text-anchor="middle" fill="#94a3b8" font-size="10.5" font-family="monospace">2.0×</text>
-
-  <line x1="662.0" y1="96" x2="662.0" y2="486" stroke="#1e293b" stroke-width="1" stroke-dasharray="3,3"/>
-  <text x="662.0" y="504" text-anchor="middle" fill="#94a3b8" font-size="10.5" font-family="monospace">2.5×</text>
-
-  <line x1="852.0" y1="96" x2="852.0" y2="486" stroke="#1e293b" stroke-width="1" stroke-dasharray="3,3"/>
-  <text x="852.0" y="504" text-anchor="middle" fill="#94a3b8" font-size="10.5" font-family="monospace">3.0×</text>
-
-  <!-- Axis labels -->
-  <text x="472" y="528" text-anchor="middle" fill="#cbd5e1" font-size="12" font-weight="600">Model Complexity &amp; Execution Penalty (GM_bad: tokens, definitions, SHACL repairs) → Lower is better</text>
-  <text x="30" y="291" text-anchor="middle" fill="#cbd5e1" font-size="12" font-weight="600" transform="rotate(-90 30 291)">Retrieval &amp; QA Quality (GM_good) ↑</text>
-
-  <!-- Ideal Target Region Highlight -->
-  <rect x="92" y="96" width="280" height="230" fill="url(#paretoShade)" rx="6"/>
-  <text x="104" y="118" fill="#10b981" font-size="11" font-weight="700">★ Pareto Superior Region (High Quality, Controlled Cost)</text>
-
-  <!-- Baseline Point (Seed Candidate) -->
-  <circle cx="244" cy="380" r="7" fill="#f59e0b" stroke="#ffffff" stroke-width="2"/>
-  <text x="258" y="376" fill="#f59e0b" font-size="11" font-weight="700">Seed Candidate (Un-optimized Baseline)</text>
-  <text x="258" y="392" fill="#94a3b8" font-size="10">GM_good = 0.033 | GM_bad = 1.40× | S = 0.0236</text>
-
-  <!-- Frontier Curve Example Projection -->
-  <path d="M 180 390 Q 240 310, 320 220 T 480 160" fill="none" stroke="#10b981" stroke-width="2.5" stroke-dasharray="6,4"/>
-
   <!-- Footer Info Box -->
-  <rect x="32" y="542" width="836" height="26" rx="4" fill="#0f172a" stroke="#1e293b"/>
-  <text x="44" y="559" fill="#94a3b8" font-size="10.5">Active Mode: <tspan fill="#38bdf8" font-weight="600">{cfg.get('mode', 'hybrid').upper()}</tspan> | Current Sandbox: <tspan fill="#f8fafc" font-family="monospace">{sandbox.get('db_name', 'initializing')}</tspan> | OpenIE Checkpoints: <tspan fill="#10b981" font-weight="600">{openie_cnt}</tspan> | Evaluation Scope: <tspan fill="#f8fafc">Pooled 495-Chunk Graph</tspan></text>
+  <rect x="32" y="542" width="876" height="26" rx="4" fill="#0f172a" stroke="#1e293b"/>
+  <text x="44" y="559" fill="#94a3b8" font-size="10.5">Active Mode: <tspan fill="#38bdf8" font-weight="600">{cfg.get('mode', 'hybrid').upper()}</tspan> | Current Sandbox: <tspan fill="#f8fafc" font-family="monospace">{sandbox.get('db_name', 'initializing')}</tspan> | Checkpoints: <tspan fill="#10b981" font-weight="600">{openie_cnt}</tspan> | Scope: <tspan fill="#f8fafc">Pooled 495-Chunk Graph</tspan></text>
 </svg>"""
+
     dest.write_text(svg, encoding="utf-8")
 
 
@@ -600,7 +737,7 @@ def generate_trajectory_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str, 
     x_now = t_to_x(elapsed_hours)
     x_eta = t_to_x(target_total_hours)
 
-    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 580" width="100%" height="100%" style="background:#070b14; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 580" width="100%" height="100%" style="background:#070b14; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
   <defs>
     <linearGradient id="bg2" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0%" stop-color="#070b14"/>
@@ -619,7 +756,7 @@ def generate_trajectory_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str, 
       <stop offset="100%" stop-color="#7c3aed" stop-opacity="0.03"/>
     </linearGradient>
   </defs>
-  <rect width="900" height="580" rx="14" fill="url(#bg2)" stroke="#1e293b" stroke-width="1.5"/>
+  <rect width="940" height="580" rx="14" fill="url(#bg2)" stroke="#1e293b" stroke-width="1.5"/>
 
   <!-- Header -->
   <text x="32" y="36" fill="#f8fafc" font-size="17" font-weight="700">Fig. 3: Two-Phase Hybrid Progression along Wall-Clock Time Axis</text>
@@ -627,23 +764,23 @@ def generate_trajectory_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str, 
 
   <!-- Stage Pipeline Boxes -->
   <g transform="translate(32, 78)">
-    <rect x="0" y="0" width="260" height="56" rx="8" fill="#0f172a" stroke="#10b981" stroke-width="1.5"/>
+    <rect x="0" y="0" width="270" height="56" rx="8" fill="#0f172a" stroke="#10b981" stroke-width="1.5"/>
     <circle cx="22" cy="28" r="9" fill="#10b981"/>
     <text x="22" y="32" text-anchor="middle" fill="#070b14" font-size="10.5" font-weight="700">✓</text>
     <text x="40" y="24" fill="#f8fafc" font-size="11.5" font-weight="700">Stage 0: Corpus Slice Ingestion</text>
     <text x="40" y="42" fill="#94a3b8" font-size="10">1,308 Chunks Ingested via CocoIndex</text>
 
-    <rect x="286" y="0" width="280" height="56" rx="8" fill="#1e293b" stroke="#38bdf8" stroke-width="1.8"/>
-    <circle cx="308" cy="28" r="9" fill="#38bdf8"/>
-    <text x="308" y="32" text-anchor="middle" fill="#070b14" font-size="10.5" font-weight="700">1</text>
-    <text x="326" y="24" fill="#38bdf8" font-size="11.5" font-weight="700">Phase 1: MIPROv2 Bootstrapping</text>
-    <text x="326" y="42" fill="#cbd5e1" font-size="10">Active: OpenIE Extraction ({openie_cnt} / {target_pool})</text>
+    <rect x="296" y="0" width="290" height="56" rx="8" fill="#1e293b" stroke="#38bdf8" stroke-width="1.8"/>
+    <circle cx="318" cy="28" r="9" fill="#38bdf8"/>
+    <text x="318" y="32" text-anchor="middle" fill="#070b14" font-size="10.5" font-weight="700">1</text>
+    <text x="336" y="24" fill="#38bdf8" font-size="11.5" font-weight="700">Phase 1: MIPROv2 Bootstrapping</text>
+    <text x="336" y="42" fill="#cbd5e1" font-size="10">Active: OpenIE Extraction ({openie_cnt} / {target_pool})</text>
 
-    <rect x="592" y="0" width="244" height="56" rx="8" fill="#0f172a" stroke="#475569" stroke-width="1.2"/>
-    <circle cx="614" cy="28" r="9" fill="#334155"/>
-    <text x="614" y="32" text-anchor="middle" fill="#94a3b8" font-size="10.5" font-weight="700">2</text>
-    <text x="632" y="24" fill="#94a3b8" font-size="11.5" font-weight="700">Phase 2: GEPA Evolution</text>
-    <text x="632" y="42" fill="#64748b" font-size="10">Reflective Minibatches &amp; Pareto Gate</text>
+    <rect x="612" y="0" width="264" height="56" rx="8" fill="#0f172a" stroke="#475569" stroke-width="1.2"/>
+    <circle cx="634" cy="28" r="9" fill="#334155"/>
+    <text x="634" y="32" text-anchor="middle" fill="#94a3b8" font-size="10.5" font-weight="700">2</text>
+    <text x="652" y="24" fill="#94a3b8" font-size="11.5" font-weight="700">Phase 2: GEPA Evolution</text>
+    <text x="652" y="42" fill="#64748b" font-size="10">Reflective Minibatches &amp; Pareto Gate</text>
   </g>
 
   <!-- Plot Background -->
@@ -706,9 +843,10 @@ def generate_trajectory_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str, 
   </g>
 
   <!-- Footer Info Box -->
-  <rect x="32" y="542" width="836" height="26" rx="4" fill="#0f172a" stroke="#1e293b"/>
+  <rect x="32" y="542" width="876" height="26" rx="4" fill="#0f172a" stroke="#1e293b"/>
   <text x="44" y="559" fill="#94a3b8" font-size="10.5">Database: <tspan fill="#f8fafc" font-family="monospace">{sandbox.get('db_name', 'initializing')}</tspan> | Elapsed: <tspan fill="#f8fafc">{int(elapsed_min)}m</tspan> | Extraction Velocity: <tspan fill="#10b981">{velocity:.2f} passages/min</tspan></text>
 </svg>"""
+
     dest.write_text(svg, encoding="utf-8")
 
 
