@@ -28,6 +28,8 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import scipy.sparse as sp
+from scipy.sparse.linalg import svds
 
 WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
 ARTIFACT_DIR = Path(
@@ -860,164 +862,169 @@ def generate_graph_projection_svg(dest: Path, sandbox: dict[str, Any]) -> dict[s
         degrees[u] += 1
         degrees[v] += 1
 
-    # Obsidian-style graph composition:
-    # Priority 1: All contrastive nodes & edges
-    active_edges_set = {e for e, is_c in edge_is_contrast.items() if is_c}
-    active_nodes = set(contrastive_nodes)
-
-    # Priority 2: Prominent hubs
-    top_hubs = [n for n, _ in degrees.most_common(45)]
-    for h in top_hubs:
-        active_nodes.add(h)
-
-    # Priority 3: Radiating leaf and neighbor connections from hubs (giving starburst structure)
-    for (u, v), _p in edge_pred_map.items():
-        if u in active_nodes and v in active_nodes:
-            active_edges_set.add((u, v))
-        elif (u in top_hubs[:30] or v in top_hubs[:30]) and len(active_nodes) < 185:
-            active_nodes.add(u)
-            active_nodes.add(v)
-            active_edges_set.add((u, v))
-
-    node_list = sorted(list(active_nodes), key=lambda x: degrees[x], reverse=True)
-    node_idx = {name: i for i, name in enumerate(node_list)}
+    # Full Obsidian Universe Graph: all connected entities and factual relations
+    node_list = sorted(list({n for e in edge_pred_map for n in e}))
     N = len(node_list)
+    node_idx = {name: i for i, name in enumerate(node_list)}
 
     if N == 0:
         return {}
 
-    active_edges: list[tuple[int, int, str, str, str, bool]] = []
-    for u, v in active_edges_set:
-        if u in node_idx and v in node_idx:
-            p = edge_pred_map.get((u, v), edge_pred_map.get((v, u), "relates to"))
-            is_c = edge_is_contrast.get((u, v), edge_is_contrast.get((v, u), False))
-            active_edges.append((node_idx[u], node_idx[v], u, v, p, is_c))
+    # Connected component decomposition
+    adj: dict[str, list[str]] = defaultdict(list)
+    for u, v in edge_pred_map:
+        adj[u].append(v)
+        adj[v].append(u)
 
-    # Fast Vectorized Force-Directed Physics Simulation (D3-force / Spring-Embedder)
-    np.random.seed(42)
-    angles = np.linspace(0, 2 * math.pi, N, endpoint=False)
-    radii_init = 180.0 + np.random.randn(N) * 20.0
-    pos = np.column_stack([np.cos(angles) * radii_init, np.sin(angles) * radii_init])
-    vel = np.zeros_like(pos)
+    visited: set[str] = set()
+    components: list[list[str]] = []
+    for n in adj:
+        if n not in visited:
+            comp: list[str] = []
+            q = [n]
+            visited.add(n)
+            for curr in q:
+                comp.append(curr)
+                for nxt in adj[curr]:
+                    if nxt not in visited:
+                        visited.add(nxt)
+                        q.append(nxt)
+            components.append(comp)
 
-    # Obsidian pinpoint dots: leaves are tiny 2.0px, major hubs at most 5.8px (ZERO oversized halos)
-    node_radii = np.array([
-        2.0 if degrees[name] <= 1 else (
-            2.8 if degrees[name] <= 3 else min(5.8, 3.2 + math.sqrt(degrees[name]) * 0.5)
-        )
-        for name in node_list
-    ])
-    edges_np = (
-        np.array([(u, v) for u, v, _, _, _, _ in active_edges], dtype=int)
-        if active_edges
-        else np.zeros((0, 2), dtype=int)
+    components.sort(key=len, reverse=True)
+
+    pos_dict: dict[str, np.ndarray] = {}
+
+    # Primary cluster (largest component): Normalized Laplacian Spectral Embedding + Bounded Spring Relaxation
+    c0 = components[0]
+    N0 = len(c0)
+    c0_idx = {n: i for i, n in enumerate(c0)}
+    c0_edges = np.array(
+        [(c0_idx[u], c0_idx[v]) for u in c0 for v in adj[u] if v in c0_idx and u < v],
+        dtype=int,
     )
 
-    k_rep = 8500.0
-    k_spring = 0.038
-    l_0 = 46.0
-    k_center = 0.012
+    rows_idx = list(c0_edges[:, 0]) + list(c0_edges[:, 1])
+    cols_idx = list(c0_edges[:, 1]) + list(c0_edges[:, 0])
+    data = np.ones(len(rows_idx), dtype=np.float32)
+    A = sp.csr_matrix((data, (rows_idx, cols_idx)), shape=(N0, N0))
+    deg = np.array(A.sum(axis=1)).squeeze()
+    d_inv_sqrt = np.power(np.maximum(deg, 1.0), -0.5)
+    D_inv = sp.diags(d_inv_sqrt)
+    norm_A = D_inv @ A @ D_inv
 
-    for _step in range(130):
-        diff = pos[:, None, :] - pos[None, :, :]
-        d2 = np.sum(diff**2, axis=-1) + 25.0
-        d = np.sqrt(d2)
+    u, _s, _vt = svds(norm_A, k=4)
+    pos0 = u[:, 1:3].copy()
+    pos0 = (pos0 - pos0.mean(axis=0)) / (pos0.std(axis=0) + 1e-6) * 360.0
 
-        f_rep_mag = k_rep / (d2 * d)
-        min_d = node_radii[:, None] + node_radii[None, :] + 14.0
-        overlap_mask = d < min_d
-        f_rep_mag[overlap_mask] += (min_d[overlap_mask] - d[overlap_mask]) * 0.55 / d[overlap_mask]
-        np.fill_diagonal(f_rep_mag, 0.0)
+    vel0 = np.zeros_like(pos0)
+    for _ in range(30):
+        d_e = pos0[c0_edges[:, 1]] - pos0[c0_edges[:, 0]]
+        d_e_len = np.linalg.norm(d_e, axis=1, keepdims=True) + 1e-3
+        f_e = np.clip((d_e_len - 18.0) * 0.04, -8.0, 8.0) * (d_e / d_e_len)
+        f_att = np.zeros_like(pos0)
+        np.add.at(f_att, c0_edges[:, 0], f_e)
+        np.add.at(f_att, c0_edges[:, 1], -f_e)
+        f_center = -pos0 * 0.003
+        vel0 = (vel0 + f_att + f_center) * 0.8
+        speed = np.linalg.norm(vel0, axis=1, keepdims=True)
+        mask = (speed > 4.0).squeeze()
+        if np.any(mask):
+            vel0[mask] = (vel0[mask] / speed[mask]) * 4.0
+        pos0 += vel0
 
-        f_rep = np.sum(diff * f_rep_mag[:, :, None], axis=1)
+    for i, n in enumerate(c0):
+        pos_dict[n] = pos0[i]
 
-        f_att = np.zeros_like(pos)
-        if len(edges_np) > 0:
-            d_e = pos[edges_np[:, 1]] - pos[edges_np[:, 0]]
-            d_e_len = np.linalg.norm(d_e, axis=1, keepdims=True) + 1e-4
-            f_e = (d_e_len - l_0) * k_spring * (d_e / d_e_len)
-            np.add.at(f_att, edges_np[:, 0], f_e)
-            np.add.at(f_att, edges_np[:, 1], -f_e)
+    # Satellite clusters: packed along golden spiral orbits
+    for idx, c in enumerate(components[1:], start=1):
+        r_center = 380.0 + math.sqrt(idx) * 32.0
+        theta = idx * 2.399963
+        cx = r_center * math.cos(theta)
+        cy = r_center * math.sin(theta)
+        Nc = len(c)
+        if Nc == 2:
+            pos_dict[c[0]] = np.array([cx - 5.0, cy])
+            pos_dict[c[1]] = np.array([cx + 5.0, cy])
+        else:
+            for j, n in enumerate(c):
+                ang = j * (2 * math.pi / Nc)
+                rad = 5.0 + math.sqrt(Nc) * 3.5
+                pos_dict[n] = np.array([cx + rad * math.cos(ang), cy + rad * math.sin(ang)])
 
-        f_center = -pos * k_center
+    all_pos = np.array([pos_dict[n] for n in node_list])
+    min_x, max_x = float(all_pos[:, 0].min()), float(all_pos[:, 0].max())
+    min_y, max_y = float(all_pos[:, 1].min()), float(all_pos[:, 1].max())
 
-        vel = (vel + f_rep + f_att + f_center) * 0.82
-        speed = np.linalg.norm(vel, axis=1, keepdims=True)
-        mask_fast = (speed > 12.0).squeeze()
-        if np.any(mask_fast):
-            vel[mask_fast] = (vel[mask_fast] / speed[mask_fast]) * 12.0
-        pos += vel
-
-    min_x, max_x = float(pos[:, 0].min()), float(pos[:, 0].max())
-    min_y, max_y = float(pos[:, 1].min()), float(pos[:, 1].max())
-
-    pad_x1, pad_x2 = 65.0, 875.0
+    pad_x1, pad_x2 = 45.0, 895.0
     pad_y1, pad_y2 = 120.0, 650.0
     sx = (pad_x2 - pad_x1) / max(1.0, max_x - min_x)
     sy = (pad_y2 - pad_y1) / max(1.0, max_y - min_y)
+    coords = np.column_stack([pad_x1 + (all_pos[:, 0] - min_x) * sx, pad_y1 + (all_pos[:, 1] - min_y) * sy])
 
-    coords = np.column_stack([pad_x1 + (pos[:, 0] - min_x) * sx, pad_y1 + (pos[:, 1] - min_y) * sy])
-
-    # Obsidian-style Rendering: simple lines and pinpoint dots with visible predicate edges
     lines_svg: list[str] = []
     edge_labels_svg: list[str] = []
 
-    for u, v, u_name, v_name, p, is_c in active_edges:
-        x1, y1 = coords[u]
-        x2, y2 = coords[v]
-        mx = (x1 + x2) / 2.0
-        my = (y1 + y2) / 2.0
-        dist = math.hypot(x2 - x1, y2 - y1)
-        esc_title = f"{html.escape(u_name)} —[{html.escape(p)}]→ {html.escape(v_name)}"
-
+    for (u, v), p in edge_pred_map.items():
+        is_c = edge_is_contrast.get((u, v), False)
+        u_i = node_idx[u]
+        v_i = node_idx[v]
+        x1, y1 = coords[u_i]
+        x2, y2 = coords[v_i]
+        esc_t = f"{html.escape(u)} —[{html.escape(p)}]→ {html.escape(v)}"
         if is_c:
             lines_svg.append(
-                f'<g><line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" stroke="#f43f5e" stroke-opacity="0.95" stroke-width="1.8" stroke-dasharray="4,2"><title>{esc_title}</title></line></g>'
+                f'<g><line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" stroke="#f43f5e" stroke-opacity="0.95" stroke-width="1.8" stroke-dasharray="4,2"><title>{esc_t}</title></line></g>'
             )
+            mx = (x1 + x2) / 2.0
+            my = (y1 + y2) / 2.0
             pred_label = f"≠ {p}" if not p.startswith("≠") else p
             edge_labels_svg.append(
                 f'<text x="{mx:.1f}" y="{my - 3:.1f}" fill="#fda4af" font-size="7.5" font-weight="700" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif" paint-order="stroke" stroke="#070b14" stroke-width="3px" stroke-linejoin="round">{html.escape(pred_label)}</text>'
             )
         else:
             lines_svg.append(
-                f'<g><line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" stroke="#94a3b8" stroke-opacity="0.75" stroke-width="1.15"><title>{esc_title}</title></line></g>'
+                f'<g><line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" stroke="#64748b" stroke-opacity="0.55" stroke-width="0.75"><title>{esc_t}</title></line></g>'
             )
-            if dist >= 55.0 and len(p) <= 18:
-                edge_labels_svg.append(
-                    f'<text x="{mx:.1f}" y="{my - 2:.1f}" fill="#94a3b8" font-size="6.5" font-weight="500" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif" paint-order="stroke" stroke="#070b14" stroke-width="2.5px" stroke-linejoin="round">{html.escape(p)}</text>'
-                )
 
     dots_svg: list[str] = []
     labels_svg: list[str] = []
 
-    for i, name in enumerate(node_list):
+    top_labeled = set(contrastive_nodes)
+    for n, _ in degrees.most_common(50):
+        top_labeled.add(n)
+
+    for i, n in enumerate(node_list):
         cx, cy = coords[i]
-        r = float(node_radii[i])
-        is_c = name in contrastive_nodes
-        deg = degrees[name]
-
+        deg_n = degrees[n]
+        is_c = n in contrastive_nodes
         if is_c:
-            dot_col = "#f43f5e"
-        elif deg >= 6:
-            dot_col = "#38bdf8"
-        elif deg >= 2:
-            dot_col = "#818cf8"
+            r = 3.5
+            col = "#f43f5e"
+        elif deg_n >= 15:
+            r = 4.8
+            col = "#38bdf8"
+        elif deg_n >= 5:
+            r = 2.8
+            col = "#818cf8"
+        elif deg_n >= 2:
+            r = 1.8
+            col = "#94a3b8"
         else:
-            dot_col = "#64748b"
-
-        esc_name = html.escape(name)
+            r = 1.2
+            col = "#64748b"
+        esc_n = html.escape(n)
         dots_svg.append(
-            f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{r:.1f}" fill="{dot_col}"><title>{esc_name} (degree: {deg})</title></circle>'
+            f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{r:.1f}" fill="{col}"><title>{esc_n} (degree: {deg_n})</title></circle>'
         )
 
-        # Discreet Obsidian-style labels on prominent/contrastive nodes
-        if deg >= 4 or is_c or r >= 4.2:
-            disp = name if len(name) <= 22 else f"{name[:20]}…"
+        if n in top_labeled and (deg_n >= 8 or is_c):
+            disp = n if len(n) <= 20 else f"{n[:18]}…"
             labels_svg.append(
-                f'<text x="{cx + r + 3.0:.1f}" y="{cy + 2.5:.1f}" fill="#cbd5e1" font-size="7.5" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif" paint-order="stroke" stroke="#070b14" stroke-width="2.5px" stroke-linejoin="round">{html.escape(disp)}</text>'
+                f'<text x="{cx + r + 2.5:.1f}" y="{cy + 2.5:.1f}" fill="#e2e8f0" font-size="7.2" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif" paint-order="stroke" stroke="#070b14" stroke-width="2.5px" stroke-linejoin="round">{html.escape(disp)}</text>'
             )
 
-    contrast_count = len([e for e in active_edges if e[5]])
+    contrast_count = len(contrastive_triples_list)
 
     svg = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 720" width="940" height="720">
   <defs>
@@ -1037,29 +1044,32 @@ def generate_graph_projection_svg(dest: Path, sandbox: dict[str, Any]) -> dict[s
 
   <!-- Header Card -->
   <g transform="translate(32, 22)">
-    <text x="0" y="16" fill="#f8fafc" font-size="16" font-weight="800" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Knowledge Graph Network (Obsidian-Style Graph View)</text>
-    <text x="0" y="34" fill="#94a3b8" font-size="11" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Force-directed physics simulation | Small pinpoint dots (r=2-6px) | Clear predicate edge links &amp; labels</text>
+    <text x="0" y="16" fill="#f8fafc" font-size="16" font-weight="800" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Full Knowledge Graph Network (Obsidian-Style Universe View)</text>
+    <text x="0" y="34" fill="#94a3b8" font-size="11" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Complete multi-cluster graph projection | Spectral Laplacian embedding + spring relaxation | All connected entities</text>
 
-    <rect x="530" y="0" width="346" height="34" rx="6" fill="#0f172a" stroke="#1e293b" stroke-width="1.2"/>
-    <text x="703" y="21" fill="#38bdf8" font-size="11" font-weight="700" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">{N} Entities • {len(active_edges)} Connections • {contrast_count} Contrastive Bounds</text>
+    <rect x="520" y="0" width="356" height="34" rx="6" fill="#0f172a" stroke="#1e293b" stroke-width="1.2"/>
+    <text x="698" y="21" fill="#38bdf8" font-size="11" font-weight="700" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">{N:,} Entities • {len(edge_pred_map):,} Connections • {contrast_count} Contrastive Bounds</text>
   </g>
 
   <!-- Legend Bar -->
   <g transform="translate(32, 68)">
     <rect width="876" height="30" rx="5" fill="#0b1120" stroke="#1e293b" stroke-width="1"/>
 
-    <circle cx="20" cy="15" r="4.8" fill="#38bdf8"/>
-    <text x="32" y="19" fill="#cbd5e1" font-size="10" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Core Hubs (r=4.5-5.8px)</text>
+    <circle cx="20" cy="15" r="4.5" fill="#38bdf8"/>
+    <text x="32" y="19" fill="#cbd5e1" font-size="10" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Major Hubs (r=4.8px)</text>
 
-    <circle cx="185" cy="15" r="2.0" fill="#64748b"/>
-    <text x="195" y="19" fill="#cbd5e1" font-size="10" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Leaf Entities (r=2.0px)</text>
+    <circle cx="160" cy="15" r="2.8" fill="#818cf8"/>
+    <text x="172" y="19" fill="#cbd5e1" font-size="10" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Domain Clusters (r=2.8px)</text>
 
-    <line x1="330" y1="15" x2="355" y2="15" stroke="#94a3b8" stroke-width="1.2"/>
-    <text x="365" y="19" fill="#cbd5e1" font-size="10" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Predicate Edges (s —[p]→ o)</text>
+    <circle cx="310" cy="15" r="1.2" fill="#64748b"/>
+    <text x="320" y="19" fill="#cbd5e1" font-size="10" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Leaves (r=1.2px)</text>
 
-    <line x1="565" y1="15" x2="595" y2="15" stroke="#f43f5e" stroke-width="1.8" stroke-dasharray="4,2"/>
-    <circle cx="602" cy="15" r="3.5" fill="#f43f5e"/>
-    <text x="614" y="19" fill="#fda4af" font-size="10" font-weight="600" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">owl:differentFrom Contrastive Bounds (≠ {{p}})</text>
+    <line x1="420" y1="15" x2="445" y2="15" stroke="#64748b" stroke-width="1.0"/>
+    <text x="455" y="19" fill="#cbd5e1" font-size="10" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Predicate Edges</text>
+
+    <line x1="570" y1="15" x2="600" y2="15" stroke="#f43f5e" stroke-width="1.8" stroke-dasharray="4,2"/>
+    <circle cx="607" cy="15" r="3.5" fill="#f43f5e"/>
+    <text x="618" y="19" fill="#fda4af" font-size="10" font-weight="600" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">owl:differentFrom Bounds (≠)</text>
   </g>
 
   <!-- Graph Canvas Area -->
@@ -1087,14 +1097,14 @@ def generate_graph_projection_svg(dest: Path, sandbox: dict[str, Any]) -> dict[s
 
   <!-- Footer Information -->
   <rect x="32" y="680" width="876" height="26" rx="5" fill="#0f172a" stroke="#1e293b"/>
-  <text x="44" y="697" fill="#94a3b8" font-size="10" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Active Sandbox: <tspan fill="#f8fafc" font-family="monospace">{sandbox.get('db_name', 'initializing')}</tspan> | View: <tspan fill="#38bdf8" font-weight="600">Obsidian-Style Force-Directed Graph</tspan> | Invariant Bounds: <tspan fill="#f43f5e" font-weight="600">{len(contrastive_triples_list)} owl:differentFrom triples</tspan></text>
+  <text x="44" y="697" fill="#94a3b8" font-size="10" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Active Sandbox: <tspan fill="#f8fafc" font-family="monospace">{sandbox.get('db_name', 'initializing')}</tspan> | View: <tspan fill="#38bdf8" font-weight="600">Full Obsidian Universe ({N:,} entities, {len(components)} components)</tspan> | Invariant Bounds: <tspan fill="#f43f5e" font-weight="600">{len(contrastive_triples_list)} owl:differentFrom triples</tspan></text>
 </svg>"""
 
     dest.write_text(svg, encoding="utf-8")
     return {
         "nodes_rendered": N,
         "contrastive_nodes": len(contrastive_nodes),
-        "active_edges": len(active_edges),
+        "active_edges": len(edge_pred_map),
         "contrastive_edges": contrast_count,
         "contrastive_triples": contrastive_triples_list,
     }
@@ -1852,9 +1862,9 @@ This dashboard documents real-time telemetry from the active **Two-Phase Hybrid 
 ### Obsidian-Style Graph View Highlights:
 | Graph Dimension / Parameter | Current Value | Description |
 | :--- | :---: | :--- |
-| **Graph View Architecture** | **Force-Directed Spring Embedder** | Natural D3-force physics simulation with Coulomb repulsion and Hooke spring attraction |
-| **Visible Node Count** | **`{proj_nodes}` Entities** | Connected entity dots sized proportionally by corpus frequency and degree |
-| **Explicit Relational Links** | **`{proj_edges}` Connections** | Uncurated graph topology connecting entities through extracted factual triples |
+| **Graph View Architecture** | **Spectral Laplacian + Spring Relaxation** | Global multi-cluster graph projection via Laplacian SVD with bounded spring relaxation |
+| **Rendered Entity Count** | **`{proj_nodes:,}` Entities** | Complete connected entity universe sized by degree and cluster role |
+| **Explicit Relational Links** | **`{proj_edges:,}` Connections** | Uncurated graph topology connecting entities across factual triples |
 | **Contrastive Bounds** | **`{proj_contrast}` `owl:differentFrom` Links** | Accented coral/red nodes and dashed links identifying semantic opposition and distinction |
 
 ### Discovered Contrastive & Disjoint Relations (`owl:differentFrom`):
