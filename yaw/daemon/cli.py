@@ -194,6 +194,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Sleep pause in seconds between LLM/embedding calls to manage thermal duty cycles (defaults to yaw.toml [optimization].sleep_seconds, default 0.0)",
     )
+    p_opt_common.add_argument(
+        "--db",
+        dest="db_path",
+        type=str,
+        default=None,
+        help="Path to existing sandbox database (or 'latest') to reuse (defaults to seeding from latest sandbox)",
+    )
 
     p_dspy = domain_subparsers.add_parser(
         "dspy", help="DSPy prompt optimization and program management"
@@ -852,7 +859,8 @@ def handle_dspy_optimize(
     )
 
     # Resolution order for sandbox: always isolate prompt compilation
-    opt_config = config.for_optimization()
+    raw_db = getattr(args, "db_path", None)
+    opt_config = config.for_optimization(db_override=raw_db)
     raw_sleep = getattr(args, "sleep_seconds", None)
     sleep_seconds = float(raw_sleep) if raw_sleep is not None else float(config.optimize_sleep_seconds or 0.0)
     object.__setattr__(opt_config, "optimize_sleep_seconds", sleep_seconds)

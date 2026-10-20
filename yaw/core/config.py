@@ -197,15 +197,54 @@ class YawConfig:
                 j_tuple if j_attr == "json_keys_blacklist" else (j_tuple or j_default),
             )
 
-    def for_optimization(self, datestamp: str | None = None) -> "YawConfig":
+    def for_optimization(
+        self,
+        datestamp: str | None = None,
+        db_override: Path | str | None = None,
+    ) -> "YawConfig":
         """Derive an isolated configuration for prompt optimization using *_optimize_<datestamp>.* paths."""
         from datetime import UTC, datetime
+        import re
 
-        ds = datestamp or datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
         base_db = Path(self.db_path) if self.db_path else Path(".yaw/yaw.db")
         base_dir = base_db.parent
 
-        opt_db = base_dir / f"yaw_optimize_{ds}.db"
+        if db_override is not None:
+            raw_path = str(db_override).strip()
+            if raw_path.lower() == "latest":
+                candidates = sorted(
+                    base_dir.glob("yaw_optimize_*.db"),
+                    key=lambda p: p.stat().st_size,
+                    reverse=True,
+                )
+                opt_db = candidates[0] if candidates else base_dir / f"yaw_optimize_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}.db"
+            else:
+                opt_db = Path(raw_path).resolve()
+            ds_match = re.search(r"yaw_optimize_(\d{8}_\d{6})", opt_db.name)
+            ds = ds_match.group(1) if ds_match else datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+        else:
+            ds = datestamp or datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+            opt_db = base_dir / f"yaw_optimize_{ds}.db"
+            if not opt_db.exists():
+                # Seed from the latest populated sandbox database so previous extraction work is never lost
+                pop_candidates = [
+                    p
+                    for p in sorted(
+                        base_dir.glob("yaw_optimize_*.db"),
+                        key=lambda p: p.stat().st_size,
+                        reverse=True,
+                    )
+                    if p.name != opt_db.name and p.stat().st_size > 1_000_000
+                ]
+                if pop_candidates:
+                    import shutil
+
+                    with contextlib.suppress(Exception):
+                        shutil.copyfile(pop_candidates[0], opt_db)
+                        wal_src = Path(f"{pop_candidates[0]}-wal")
+                        if wal_src.exists():
+                            shutil.copyfile(wal_src, Path(f"{opt_db}-wal"))
+
         opt_lock = base_dir / f"yaw_optimize_{ds}.db.lock"
         opt_status = base_dir / f"status_optimize_{ds}.json"
         opt_state = base_dir / f"coco_state_optimize_{ds}"
