@@ -832,7 +832,7 @@ def handle_dspy_optimize(
     num_candidates = int(raw_candidates) if raw_candidates is not None else None
 
     raw_mode = getattr(args, "mode", None)
-    mode = raw_mode or config.optimize_mode or "gepa"
+    mode = raw_mode or config.optimize_mode or "hybrid"
 
     out_override = getattr(args, "output", None)
 
