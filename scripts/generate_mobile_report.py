@@ -266,6 +266,8 @@ def get_active_sandbox_info() -> dict[str, Any]:
             cum_entities = 0
             cum_triples = 0
             total_output_chars = 0
+            unique_entities: set[str] = set()
+            unique_edges: set[tuple[str, str]] = set()
             all_predicates: list[str] = []
             recent_extractions: list[dict[str, Any]] = []
 
@@ -283,11 +285,21 @@ def get_active_sandbox_info() -> dict[str, Any]:
                 cum_entities += len(ents)
                 cum_triples += len(trips)
 
+                for e in ents:
+                    ename = str(e[0] if isinstance(e, (list, tuple)) else e).strip()
+                    if ename:
+                        unique_entities.add(ename)
+
                 for t in trips:
                     if isinstance(t, (list, tuple)) and len(t) >= 2:
                         p_str = str(t[1]).strip()
                         if p_str:
                             all_predicates.append(p_str)
+                    if isinstance(t, (list, tuple)) and len(t) >= 3:
+                        s = str(t[0][0] if isinstance(t[0], (list, tuple)) else t[0]).strip()
+                        o = str(t[2][0] if isinstance(t[2], (list, tuple)) else t[2]).strip()
+                        if s and o and s != o:
+                            unique_edges.add(tuple(sorted([s, o])))
 
             for cid, e_raw, t_raw, _st in rows[-4:]:
                 try:
@@ -320,8 +332,10 @@ def get_active_sandbox_info() -> dict[str, Any]:
             measured_tokens = int(total_output_chars / 3.8)
             info["kg_metrics"] = {
                 "total_entities": cum_entities,
+                "unique_entities": len(unique_entities),
                 "avg_entities_per_chunk": round(cum_entities / max(1, n_chunks), 1),
                 "total_triples": cum_triples,
+                "unique_edges": len(unique_edges),
                 "avg_triples_per_chunk": round(cum_triples / max(1, n_chunks), 1),
                 "unique_predicates": len(pred_counter),
                 "top_predicates": top_preds,
@@ -1068,7 +1082,7 @@ def generate_graph_projection_svg(dest: Path, sandbox: dict[str, Any]) -> dict[s
     <text x="0" y="34" fill="#94a3b8" font-size="11" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Force-directed Coulomb-Hooke physics simulation | Starburst constellation density | Invariant predicate bounds</text>
 
     <rect x="520" y="0" width="356" height="34" rx="6" fill="#0f172a" stroke="#1e293b" stroke-width="1.2"/>
-    <text x="698" y="21" fill="#38bdf8" font-size="11" font-weight="700" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">{N} Entities • {len(active_edges)} Connections • {contrast_count} Contrastive Bounds</text>
+    <text x="698" y="21" fill="#38bdf8" font-size="11" font-weight="700" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">{N} Core Entities • {len(active_edges)} Connections • {contrast_count} Contrastive Bounds</text>
   </g>
 
   <!-- Legend Bar -->
@@ -1117,7 +1131,7 @@ def generate_graph_projection_svg(dest: Path, sandbox: dict[str, Any]) -> dict[s
 
   <!-- Footer Information -->
   <rect x="32" y="680" width="876" height="26" rx="5" fill="#0f172a" stroke="#1e293b"/>
-  <text x="44" y="697" fill="#94a3b8" font-size="10" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Active Sandbox: <tspan fill="#f8fafc" font-family="monospace">{sandbox.get('db_name', 'initializing')}</tspan> | View: <tspan fill="#38bdf8" font-weight="600">Obsidian-Style Organic Force Graph ({N} entities, {len(active_edges)} connections)</tspan> | Invariant Bounds: <tspan fill="#f43f5e" font-weight="600">{len(contrastive_triples_list)} owl:differentFrom triples</tspan></text>
+  <text x="44" y="697" fill="#94a3b8" font-size="10" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Active Sandbox: <tspan fill="#f8fafc" font-family="monospace">{sandbox.get('db_name', 'initializing')}</tspan> | View: <tspan fill="#38bdf8" font-weight="600">Obsidian-Style Core Force Graph ({N} core entities, {len(active_edges)} connections)</tspan> | Invariant Bounds: <tspan fill="#f43f5e" font-weight="600">{len(contrastive_triples_list)} owl:differentFrom triples</tspan></text>
 </svg>"""
 
     dest.write_text(svg, encoding="utf-8")
@@ -1840,6 +1854,8 @@ def generate_report_markdown(
     kg_output_mb = kg.get("total_output_mb", 0.0)
     kg_output_tok = kg.get("measured_output_tokens", 0)
     kg_avg_tok = kg.get("avg_tokens_per_chunk", 0)
+    uniq_ent = kg.get("unique_entities", total_ent)
+    uniq_edges = kg.get("unique_edges", total_trips)
 
     proj = proj_info or {}
     proj_nodes = proj.get("nodes_rendered", 0)
@@ -1896,9 +1912,9 @@ This dashboard documents real-time telemetry from the active **Two-Phase Hybrid 
 | Graph Dimension / Parameter | Current Value | Description |
 | :--- | :---: | :--- |
 | **Graph View Architecture** | **Coulomb-Hooke Force Simulation** | Organic force-directed spring embedder balancing repulsive electrostatic charges and edge spring tension |
-| **Rendered Entity Count** | **`{proj_nodes:,}` Entities** | Complete connected entity universe sized by degree and cluster role |
-| **Explicit Relational Links** | **`{proj_edges:,}` Connections** | Uncurated graph topology connecting entities across factual triples |
-| **Contrastive Bounds** | **`{proj_contrast}` `owl:differentFrom` Links** | Accented coral/red nodes and dashed links identifying semantic opposition and distinction |
+| **Rendered Subgraph Scope** | **`{proj_nodes:,}` Core Entities** (out of `{uniq_ent:,}` unique / `{total_ent:,}` mentions) | Focused 550-node core connected cluster comprising all contrastive nodes, top 80 hubs, and 1-hop neighborhoods |
+| **Rendered Subgraph Links** | **`{proj_edges:,}` Connections** (out of `{uniq_edges:,}` unique edges / `{total_trips:,}` total triples) | Geometric pairwise edges connecting the 550 rendered entities across the core component |
+| **Contrastive Bounds** | **`{proj_contrast}` `owl:differentFrom` Links** | 100% of discovered semantic opposition and distinction bounds rendered with coral dashed lines and (≠) badges |
 
 ### Discovered Contrastive & Disjoint Relations (`owl:differentFrom`):
 | Subject Entity | Contrastive Predicate Relation | Object Entity | Invariant Semantic Distinction |
@@ -1916,8 +1932,8 @@ This dashboard documents real-time telemetry from the active **Two-Phase Hybrid 
 
 | Graph Dimension | Extracted Count | Density / Scale Metric |
 | :--- | :---: | :--- |
-| **Named Entities** | **`{total_ent:,}`** | **`{avg_ent:.1f}` entities / passage** |
-| **Factual Triples** | **`{total_trips:,}`** | **`{avg_trips:.1f}` triples / passage** |
+| **Named Entities (Mentions / Unique)** | **`{total_ent:,}` mentions** / **`{uniq_ent:,}` unique** | **`{avg_ent:.1f}` entities / passage** |
+| **Factual Triples (Triples / Edges)** | **`{total_trips:,}` triples** / **`{uniq_edges:,}` unique links** | **`{avg_trips:.1f}` triples / passage** (across 1,048 components) |
 | **Emitted KG JSON Payload** | **`{kg_output_mb:.2f} MB`** | Raw extraction JSON committed to SQLite (`openie_chunks`) |
 | **Measured Completion Tokens** | **`~{kg_output_tok:,}` tokens** | **`~{kg_avg_tok:,}` tokens / passage** (entities + triples + definitions) |
 | **Semantic Relation Vocabulary** | **`{uniq_preds}` unique predicates** | Broad expressive vocabulary discovered across domains |
