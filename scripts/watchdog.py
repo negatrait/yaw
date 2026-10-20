@@ -238,19 +238,24 @@ def get_empirical_telemetry_timeseries(
 
 
 def _open_snapshot_sqlite(db_path: Path) -> sqlite3.Connection:
-    """Copy the active SQLite DB (+ WAL/SHM if present) to a lock-free read snapshot."""
-    snap_path = db_path.parent / ".telemetry_read_snap.db"
-    shutil.copyfile(db_path, snap_path)
-    for suffix in ("-wal", "-shm"):
-        src_aux = Path(f"{db_path}{suffix}")
-        dst_aux = Path(f"{snap_path}{suffix}")
-        if src_aux.exists():
-            with contextlib.suppress(Exception):
-                shutil.copyfile(src_aux, dst_aux)
-        elif dst_aux.exists():
-            with contextlib.suppress(Exception):
-                dst_aux.unlink()
-    return sqlite3.connect(snap_path, timeout=5.0)
+    """Open a read-only WAL-aware SQLite connection, falling back to a snapshot copy if locked."""
+    try:
+        conn = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True, timeout=3.0)
+        conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+        return conn
+    except Exception:
+        snap_path = db_path.parent / ".telemetry_read_snap.db"
+        shutil.copyfile(db_path, snap_path)
+        for suffix in ("-wal", "-shm"):
+            src_aux = Path(f"{db_path}{suffix}")
+            dst_aux = Path(f"{snap_path}{suffix}")
+            if src_aux.exists():
+                with contextlib.suppress(Exception):
+                    shutil.copyfile(src_aux, dst_aux)
+            elif dst_aux.exists():
+                with contextlib.suppress(Exception):
+                    dst_aux.unlink()
+        return sqlite3.connect(snap_path, timeout=5.0)
 
 
 def _parse_db_timestamp(db_path: Path) -> datetime | None:

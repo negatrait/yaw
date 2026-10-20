@@ -42,6 +42,7 @@ from yaw.daemon.graph.storage import (
     get_chunk_pointers,
     get_entities_by_label_norm,
     get_entity_doc_frequencies,
+    get_entity_vectors,
     get_existing_ids,
     get_facts_by_ids,
     get_graph_counts,
@@ -190,6 +191,49 @@ class YawGraphEngine:
 
         self._bind_program_hooks()
         self._apply_program_embedding_prefixes()
+        self._hydrate_indexed_cids_from_db()
+
+    def _hydrate_indexed_cids_from_db(
+        self,
+        program: HippoRAGProgram | None = None,
+    ) -> None:
+        """Populate _opt_indexed_cids and _chunk_indexed_ext_fp for chunks already committed in SQLite."""
+        active_prog = program if program is not None else self.program
+        openie_fp = self._openie_fingerprint(active_prog)
+        ext_fp = self._extraction_fingerprint(active_prog)
+        if self._baseline_openie_fp is not None and openie_fp != self._baseline_openie_fp:
+            return
+        try:
+            rows = self.conn.execute(
+                "SELECT c.chunk_id FROM chunks c INNER JOIN openie_chunks o ON c.chunk_id = o.chunk_id"
+            ).fetchall()
+        except sqlite3.Error:
+            return
+        if not rows:
+            return
+        seeded_cids = [str(r[0]) for r in rows if r[0]]
+        if not seeded_cids:
+            return
+        vec_cids = get_existing_ids(self.conn, "chunk_vec", seeded_cids)
+        edge_cids: set[str] = set()
+        for i in range(0, len(seeded_cids), 900):
+            batch = seeded_cids[i : i + 900]
+            placeholders = ",".join("?" for _ in batch)
+            for erow in self.conn.execute(
+                f"SELECT DISTINCT source_chunk_id FROM edges WHERE source_chunk_id IN ({placeholders})",
+                batch,
+            ).fetchall():
+                if erow[0]:
+                    edge_cids.add(str(erow[0]))
+        ready_cids = set(seeded_cids) & vec_cids & edge_cids
+        if ready_cids:
+            self._opt_indexed_cids.update(ready_cids)
+            for cid in ready_cids:
+                self._chunk_indexed_ext_fp.setdefault(cid, ext_fp)
+            if self._active_extraction_fingerprint is None:
+                self._active_extraction_fingerprint = ext_fp
+            if self._active_openie_fingerprint is None:
+                self._active_openie_fingerprint = openie_fp
 
     @staticmethod
     def _empty_graph_rlm_stats() -> dict[str, Any]:
@@ -1102,6 +1146,7 @@ class YawGraphEngine:
         item_docs: Sequence[str] | None = None,
     ) -> list[str]:
         with self._lock:
+            self._hydrate_indexed_cids_from_db(program)
             ext_fp = self._extraction_fingerprint(program)
             req_chunks = self._resolve_chunks_for_docs(item_docs)
             pool_chunks = (
@@ -1357,7 +1402,31 @@ class YawGraphEngine:
                     self._baseline_openie_fp is None
                     or openie_fp == self._baseline_openie_fp
                 ) and ptr.chunk_id in cached_openie:
-                    all_records.append(cached_openie[ptr.chunk_id])
+                    rec = cached_openie[ptr.chunk_id]
+                    if getattr(rec, "entity_definitions", None):
+                        cached_norms: set[str] = set()
+                        for raw_ent in getattr(rec, "entities", ()) or ():
+                            e_s = (
+                                str(raw_ent[0])
+                                if isinstance(raw_ent, (list, tuple)) and raw_ent
+                                else str(raw_ent)
+                            )
+                            en = str(text_processing(e_s))
+                            if en:
+                                cached_norms.add(en)
+                        for st_item in getattr(rec, "structured_triples", ()) or ():
+                            for side in (getattr(st_item, "subj", ""), getattr(st_item, "obj", "")):
+                                sn = str(text_processing(str(side)))
+                                if sn:
+                                    cached_norms.add(sn)
+                        for t_item in getattr(rec, "triples", ()) or ():
+                            if len(t_item) >= 3:
+                                for side in (t_item[0], t_item[2]):
+                                    sn = str(text_processing(str(side)))
+                                    if sn:
+                                        cached_norms.add(sn)
+                        attempted_missing_by_cid[ptr.chunk_id] = cached_norms
+                    all_records.append(rec)
                 else:
                     if progress_callback is not None:
                         progress_callback(f"indexing: OpenIE extraction ({idx}/{total_chunks})")
@@ -1602,6 +1671,7 @@ class YawGraphEngine:
             existing_by_label = get_entities_by_label_norm(self.conn, list(all_norm_labels))
             all_existing_eids = list({eid for eids in existing_by_label.values() for eid in eids})
             entity_info_by_id: dict[str, tuple[str, str]] = {}
+            existing_vecs_by_id: dict[str, np.ndarray] = {}
             if all_existing_eids:
                 for i in range(0, len(all_existing_eids), 900):
                     batch_eids = all_existing_eids[i : i + 900]
@@ -1611,6 +1681,10 @@ class YawGraphEngine:
                         batch_eids,
                     ).fetchall():
                         entity_info_by_id[str(row[0])] = (str(row[1]), str(row[2]))
+                raw_vecs = get_entity_vectors(self.conn, all_existing_eids)
+                for eid_v, vec_v in raw_vecs.items():
+                    v_norm = float(np.linalg.norm(vec_v))
+                    existing_vecs_by_id[eid_v] = vec_v / v_norm if v_norm > 0 else vec_v
 
             # Bridge copular Stage 1 entity definitions to known graph concepts so definitions
             # absorbed by Stage 1 NER still form explicit graph edges and retrievable facts.
@@ -1665,10 +1739,52 @@ class YawGraphEngine:
                         eid,
                         entity_info_by_id.get(eid, (lbl, ""))[0],
                         entity_info_by_id.get(eid, (lbl, ""))[1],
-                        None,
+                        existing_vecs_by_id.get(eid),
                     )
                     for eid in eids
                 ]
+
+            # Pre-batch candidate disambiguation embeddings across the batch to avoid 1-by-1 HTTP calls
+            defs_by_label: dict[str, set[str]] = {}
+            for lbl, senses in senses_by_label.items():
+                for _, _, s_def, _ in senses:
+                    if s_def.strip():
+                        defs_by_label.setdefault(lbl, set()).add(s_def.strip().lower())
+            cand_pairs_by_label: dict[str, list[tuple[str, str]]] = {}
+            for _cid, st_list, ner_entities in record_structured:
+                for st in st_list:
+                    for m_lbl, m_def in ((st.subj, st.subj_def), (st.obj, st.obj_def)):
+                        c_def = m_def.strip()
+                        if c_def:
+                            defs_by_label.setdefault(m_lbl, set()).add(c_def.lower())
+                            cand_pairs_by_label.setdefault(m_lbl, []).append((m_lbl, c_def))
+                for e_norm, e_def in ner_entities:
+                    c_def = e_def.strip()
+                    if c_def:
+                        defs_by_label.setdefault(e_norm, set()).add(c_def.lower())
+                        cand_pairs_by_label.setdefault(e_norm, []).append((e_norm, c_def))
+            prebatch_texts: list[str] = []
+            seen_prebatch: set[str] = set()
+            for lbl, dset in defs_by_label.items():
+                if len(dset) >= 2:
+                    for m_lbl, c_def in cand_pairs_by_label.get(lbl, ()):
+                        sense_cand_id = compute_mdhash_id(
+                            f"{m_lbl}::{c_def.lower()}", prefix="entity-"
+                        )
+                        if sense_cand_id in existing_vecs_by_id:
+                            continue
+                        ct = self._format_entity_embedding_text(m_lbl, c_def)
+                        if ct not in seen_prebatch:
+                            seen_prebatch.add(ct)
+                            prebatch_texts.append(ct)
+                    for eid_s, name_s, prev_def_s, prev_vec_s in senses_by_label.get(lbl, ()):
+                        if prev_vec_s is None and prev_def_s:
+                            pt = self._format_entity_embedding_text(name_s, prev_def_s)
+                            if pt not in seen_prebatch:
+                                seen_prebatch.add(pt)
+                                prebatch_texts.append(pt)
+            if prebatch_texts:
+                self._encode_in_batches(prebatch_texts, instruction="", stage="entity_embed")
 
             entity_map: dict[str, tuple[str, str, str]] = {}
             entity_labels_to_upsert: list[tuple[str, str, str, str, str]] = []
@@ -1690,7 +1806,9 @@ class YawGraphEngine:
                 existing_senses = senses_by_label.get(label_norm, [])
                 if not existing_senses:
                     eid = compute_mdhash_id(label_norm, prefix="entity-")
-                    senses_by_label[label_norm] = [(eid, label_norm, clean_def, None)]
+                    senses_by_label[label_norm] = [
+                        (eid, label_norm, clean_def, existing_vecs_by_id.get(eid))
+                    ]
                     entity_map[eid] = (eid, label_norm, clean_def)
                     entity_labels_to_upsert.append(
                         (label_norm, eid, "skos:prefLabel", label_norm, chunk_id)
@@ -1731,13 +1849,22 @@ class YawGraphEngine:
                 # When cos < 0.85 (whether in [0.65, 0.85) or < 0.65), mint a provisional sense_id
                 # WITHOUT writing any owl:differentFrom edge in Step 4 so Step 6 judge_synonyms
                 # adjudicates every ambiguous or divergent same-label pair.
-                cand_text = self._format_entity_embedding_text(label_norm, clean_def)
-                cand_vec = self._encode_in_batches(
-                    [cand_text], instruction="", stage="entity_embed"
-                )[0]
-                c_norm = float(np.linalg.norm(cand_vec))
-                if c_norm > 0:
-                    cand_vec = cand_vec / c_norm
+                sense_id = compute_mdhash_id(
+                    f"{label_norm}::{clean_def.lower()}", prefix="entity-"
+                )
+                cached_sense_vec = existing_vecs_by_id.get(sense_id) or precomputed_entity_vecs.get(
+                    sense_id
+                )
+                if cached_sense_vec is not None:
+                    cand_vec = cached_sense_vec
+                else:
+                    cand_text = self._format_entity_embedding_text(label_norm, clean_def)
+                    cand_vec = self._encode_in_batches(
+                        [cand_text], instruction="", stage="entity_embed"
+                    )[0]
+                    c_norm = float(np.linalg.norm(cand_vec))
+                    if c_norm > 0:
+                        cand_vec = cand_vec / c_norm
 
                 for idx_s, (eid, name, prev_def, prev_vec) in enumerate(existing_senses):
                     if prev_vec is None:
@@ -2288,6 +2415,9 @@ class YawGraphEngine:
             return
         with self._lock:
             delete_chunks(self.conn, chunk_ids)
+            for cid in chunk_ids:
+                self._opt_indexed_cids.discard(cid)
+                self._chunk_indexed_ext_fp.pop(cid, None)
             self._csr_graph = None
 
     def retrieve_with_seeds(
@@ -2723,6 +2853,7 @@ class YawGraphEngine:
                     existing_cids.add(ptr.chunk_id)
 
         self._baseline_openie_fp = self._openie_fingerprint(self.program)
+        self._hydrate_indexed_cids_from_db(self.program)
         if len(self._opt_chunks_pool) <= 64 and self._opt_chunks_pool:
             self._opt_val_chunks_pool = list(self._opt_chunks_pool)
         else:
