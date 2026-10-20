@@ -145,6 +145,24 @@ def get_empirical_telemetry_timeseries(
             except Exception:
                 pass
 
+    # Sanitize existing checkpoints to ensure monotonic non-decreasing passage progression
+    if checkpoints:
+        checkpoints.sort(key=lambda x: float(x.get("time_sec", 0.0)))
+        sanitized: list[dict[str, Any]] = []
+        running_max_p = 0
+        for cp in checkpoints:
+            p_val = int(cp.get("passages", 0))
+            if p_val >= running_max_p - 5:
+                running_max_p = max(running_max_p, p_val)
+                sanitized.append(cp)
+        checkpoints = sanitized
+
+    # Ensure current_elapsed_sec continues monotonically after the last recorded checkpoint
+    if checkpoints:
+        last_t = float(checkpoints[-1].get("time_sec", 0.0))
+        if current_elapsed_sec < last_t:
+            current_elapsed_sec = last_t + 1.0
+
     # Append current live reading if new
     if current_passages > 0:
         should_append = True
@@ -154,7 +172,7 @@ def get_empirical_telemetry_timeseries(
                 should_append = False
         if should_append:
             checkpoints.append({
-                "time_sec": current_elapsed_sec,
+                "time_sec": round(current_elapsed_sec, 2),
                 "passages": current_passages,
                 "entities": current_entities,
                 "triples": current_triples,
@@ -163,8 +181,13 @@ def get_empirical_telemetry_timeseries(
     # Sort and deduplicate by time_sec and passages
     seen = set()
     deduped = []
+    max_p_seen = 0
     for cp in sorted(checkpoints, key=lambda x: (x.get("time_sec", 0), x.get("passages", 0))):
-        key = (round(cp.get("time_sec", 0), 0), cp.get("passages", 0))
+        p_val = int(cp.get("passages", 0))
+        if p_val < max_p_seen - 5:
+            continue
+        max_p_seen = max(max_p_seen, p_val)
+        key = (round(cp.get("time_sec", 0), 0), p_val)
         if key not in seen:
             seen.add(key)
             deduped.append(cp)
@@ -183,13 +206,16 @@ def get_empirical_telemetry_timeseries(
         trip_cnt = cp["triples"]
 
         dt_sec = t_sec - prev_sec
-        dp = pass_cnt - prev_pass
+        dp = max(0, pass_cnt - prev_pass)
         if idx == 0:
             vel = (pass_cnt / max(1.0, t_sec)) * 60.0
             lat = t_sec / max(1, pass_cnt)
-        elif dt_sec > 10:
+        elif dt_sec > 10 and dp > 0:
             vel = (dp / dt_sec) * 60.0
             lat = dt_sec / max(1, dp)
+        elif dt_sec > 10 and dp == 0:
+            vel = 0.0
+            lat = samples[-1]["rolling_latency"] if samples else 30.0
         else:
             vel = samples[-1]["rolling_velocity"] if samples else 2.0
             lat = samples[-1]["rolling_latency"] if samples else 30.0
@@ -227,6 +253,15 @@ def _open_snapshot_sqlite(db_path: Path) -> sqlite3.Connection:
     return sqlite3.connect(snap_path, timeout=5.0)
 
 
+def _parse_db_timestamp(db_path: Path) -> datetime | None:
+    stem = db_path.stem
+    if stem.startswith("yaw_optimize_") and len(stem) >= 28:
+        ds_part = stem[len("yaw_optimize_") : len("yaw_optimize_") + 15]
+        with contextlib.suppress(Exception):
+            return datetime.strptime(ds_part, "%Y%m%d_%H%M%S").replace(tzinfo=UTC)
+    return None
+
+
 def get_active_sandbox_info() -> dict[str, Any]:
     yaw_dir = WORKSPACE_ROOT / ".yaw"
     if not yaw_dir.exists():
@@ -241,29 +276,29 @@ def get_active_sandbox_info() -> dict[str, Any]:
         return {}
 
     latest_db = sandbox_dbs[0]
+    latest_size = latest_db.stat().st_size
     info: dict[str, Any] = {
         "db_name": latest_db.name,
         "db_path": str(latest_db),
-        "db_size_mb": round(latest_db.stat().st_size / (1024 * 1024), 2),
+        "db_size_mb": round(latest_size / (1024 * 1024), 2),
         "mtime": datetime.fromtimestamp(latest_db.stat().st_mtime, tz=UTC).isoformat(),
         "counts": {},
         "kg_metrics": {},
         "timeseries_samples": [],
     }
 
-    stem = latest_db.stem
-    start_dt = datetime.now(UTC)
-    if stem.startswith("yaw_optimize_") and len(stem) >= 28:
-        ds_part = stem[len("yaw_optimize_") : len("yaw_optimize_") + 15]
-        try:
-            start_dt = datetime.strptime(ds_part, "%Y%m%d_%H%M%S").replace(tzinfo=UTC)
-            info["start_time"] = start_dt.isoformat()
-            elapsed_sec = (datetime.now(UTC) - start_dt).total_seconds()
-            info["elapsed_seconds"] = max(1.0, elapsed_sec)
-        except Exception:
-            info["elapsed_seconds"] = 60.0
-    else:
-        info["elapsed_seconds"] = 60.0
+    # Anchor start_dt to the earliest DB in the same seeded lineage (>= 100 MB or within 15% size)
+    lineage_dbs = [
+        p
+        for p in sandbox_dbs
+        if p.stat().st_size >= 100 * 1024 * 1024
+        or abs(p.stat().st_size - latest_size) / max(1, latest_size) < 0.15
+    ]
+    parsed_dts = [dt for p in lineage_dbs if (dt := _parse_db_timestamp(p)) is not None]
+    start_dt = min(parsed_dts) if parsed_dts else (_parse_db_timestamp(latest_db) or datetime.now(UTC))
+    info["start_time"] = start_dt.isoformat()
+    elapsed_sec = (datetime.now(UTC) - start_dt).total_seconds()
+    info["elapsed_seconds"] = max(1.0, elapsed_sec)
 
     snap_cache_file = WORKSPACE_ROOT / "outputs" / "telemetry" / "last_good_sandbox_snapshot.json"
     snap_cache_file.parent.mkdir(parents=True, exist_ok=True)
@@ -645,15 +680,26 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
     train_pct = min(100.0, (train_done / train_target_pool) * 100.0)
     corpus_pct = min(100.0, (openie_cnt / corpus_total_pool) * 100.0)
 
+    samples = sandbox.get("timeseries_samples", [])
     elapsed_sec = sandbox.get("elapsed_seconds", 60.0)
+    if samples:
+        elapsed_sec = max(elapsed_sec, float(samples[-1]["time_sec"]))
     elapsed_hours = elapsed_sec / 3600.0
     elapsed_min = max(0.1, elapsed_sec / 60.0)
-    velocity = openie_cnt / elapsed_min
-    sec_per_chunk = elapsed_sec / max(1, openie_cnt)
+
+    # Measure active extraction velocity over the extraction phase (up to first plateau near openie_cnt)
+    extract_phase_sec = elapsed_sec
+    for s in samples:
+        if s["passages"] >= max(1, openie_cnt - 5):
+            extract_phase_sec = max(60.0, float(s["time_sec"]))
+            break
+    extract_phase_min = max(0.1, extract_phase_sec / 60.0)
+    velocity = openie_cnt / extract_phase_min
+    sec_per_chunk = extract_phase_sec / max(1, openie_cnt)
 
     rem_train = max(0, train_target_pool - train_done)
     rem_corpus = max(0, corpus_total_pool - openie_cnt)
-    eta_corpus_min = rem_corpus / max(0.01, velocity)
+    eta_corpus_min = rem_corpus / max(0.05, velocity)
     target_total_hours = (elapsed_sec + (eta_corpus_min * 60.0)) / 3600.0
     eta_corpus_str = (
         f"{int(eta_corpus_min // 60)}h {int(eta_corpus_min % 60)}m"
@@ -670,13 +716,12 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
     avg_trips = kg.get("avg_triples_per_chunk", 0.0)
     uniq_preds = kg.get("unique_predicates", 0)
     top_preds = kg.get("top_predicates", [])
-    samples = sandbox.get("timeseries_samples", [])
 
-    t_max_hours = max(11.0, math.ceil(target_total_hours * 1.15))
+    t_max_hours = max(12.0, math.ceil(target_total_hours * 1.08))
 
-    # Panel 1: Main Cumulative Ingestion Plot
+    # Panel 1: Main Cumulative Ingestion Plot (with dedicated Legend strip at y=146..168 above Panel 1)
     p_x0, p_x1 = 80.0, 850.0
-    p1_y0, p1_y1 = 165.0, 395.0
+    p1_y0, p1_y1 = 176.0, 396.0
     pw = p_x1 - p_x0
     p1_h = p1_y1 - p1_y0
 
@@ -740,7 +785,8 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
     y_corpus_target = p_to_y(corpus_total_pool)
 
     v_mean_y = v_to_y(velocity)
-    latest_vel = samples[-1]["rolling_velocity"] if samples else velocity
+    active_vel_samples = [s["rolling_velocity"] for s in samples if s["rolling_velocity"] > 0]
+    latest_vel = active_vel_samples[-1] if active_vel_samples else velocity
     latest_lat = samples[-1]["rolling_latency"] if samples else sec_per_chunk
 
     svg = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 760" width="100%" height="100%" style="background:#070b14; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
@@ -809,18 +855,40 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
     </g>
   </g>
 
+  <!-- Dedicated Legend Strip Above Panel 1 (Zero Canvas Overlap) -->
+  <g transform="translate({p_x0}, 146)">
+    <rect width="{pw}" height="22" rx="4" fill="#0b1120" stroke="#1e293b"/>
+    <line x1="12" y1="11" x2="28" y2="11" stroke="#38bdf8" stroke-width="2.5"/>
+    <circle cx="20" cy="11" r="3.5" fill="#38bdf8"/>
+    <text x="34" y="14.5" fill="#e2e8f0" font-size="9.5" font-weight="600">Passages ({openie_cnt})</text>
+
+    <line x1="145" y1="11" x2="161" y2="11" stroke="#818cf8" stroke-width="2"/>
+    <circle cx="153" cy="11" r="3.5" fill="#818cf8"/>
+    <text x="167" y="14.5" fill="#cbd5e1" font-size="9.5">Entities ({total_ent:,})</text>
+
+    <line x1="285" y1="11" x2="301" y2="11" stroke="#f43f5e" stroke-width="2"/>
+    <circle cx="293" cy="11" r="3.5" fill="#f43f5e"/>
+    <text x="307" y="14.5" fill="#cbd5e1" font-size="9.5">Triples ({total_trips:,})</text>
+
+    <line x1="415" y1="11" x2="435" y2="11" stroke="#94a3b8" stroke-width="1.8" stroke-dasharray="4,3"/>
+    <text x="442" y="14.5" fill="#94a3b8" font-size="9.5">Extrapolated Trajectory</text>
+
+    <line x1="595" y1="11" x2="611" y2="11" stroke="#ffffff" stroke-width="1.5" stroke-dasharray="3,3"/>
+    <text x="617" y="14.5" fill="#e2e8f0" font-size="9.5">Current Wall-Clock ({elapsed_hours:.1f}h)</text>
+  </g>
+
   <!-- PANEL 1: CUMULATIVE GROWTH PLOT -->
   <rect x="{p_x0}" y="{p1_y0}" width="{pw}" height="{p1_h}" fill="#090f1d" stroke="#334155" stroke-width="1.2"/>
 
   <!-- Target Pool Reference Line at P = 495 (Validation Threshold) -->
   <line x1="{p_x0}" y1="{y_val_pool:.1f}" x2="{p_x1}" y2="{y_val_pool:.1f}" stroke="#10b981" stroke-width="1.5" stroke-dasharray="4,4"/>
-  <rect x="{p_x0 + 8}" y="{y_val_pool - 16:.1f}" width="310" height="15" rx="3" fill="#064e3b" fill-opacity="0.75"/>
-  <text x="{p_x0 + 12}" y="{y_val_pool - 4:.1f}" fill="#34d399" font-size="9.5" font-weight="700">[Threshold] Validation Pool: 495 / 495 (100% Committed [Ready])</text>
+  <rect x="{p_x0 + 8}" y="{y_val_pool + 4:.1f}" width="310" height="15" rx="3" fill="#064e3b" fill-opacity="0.85"/>
+  <text x="{p_x0 + 12}" y="{y_val_pool + 15:.1f}" fill="#34d399" font-size="9" font-weight="700">[Threshold] Validation Pool: 495 / 495 (100% Committed [Ready])</text>
 
   <!-- Full Corpus Horizon Line at P = 1,308 -->
   <line x1="{p_x0}" y1="{y_corpus_target:.1f}" x2="{p_x1}" y2="{y_corpus_target:.1f}" stroke="#f59e0b" stroke-width="1.5" stroke-dasharray="4,4"/>
-  <rect x="{p_x0 + 8}" y="{y_corpus_target - 16:.1f}" width="350" height="15" rx="3" fill="#78350f" fill-opacity="0.75"/>
-  <text x="{p_x0 + 12}" y="{y_corpus_target - 4:.1f}" fill="#fde68a" font-size="9.5" font-weight="700">[Horizon] Training Pool Target: 818 / 818 (1,308 Total Chunks)</text>
+  <rect x="{p_x0 + 8}" y="{y_corpus_target + 4:.1f}" width="340" height="15" rx="3" fill="#78350f" fill-opacity="0.85"/>
+  <text x="{p_x0 + 12}" y="{y_corpus_target + 15:.1f}" fill="#fde68a" font-size="9" font-weight="700">[Horizon] Training Pool Target: 818 / 818 (1,308 Total Chunks)</text>
 """
     for p_val in [0, 200, 400, 600, 800, 1000, 1200, 1400]:
         y_g = p_to_y(p_val)
@@ -842,6 +910,7 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
 """
         t_curr += dt_tick
 
+    eta_badge_x = max(p_x0 + 365.0, min(p_x1 - 212.0, x_target - 105.0))
     svg += f"""
   <text x="24" y="{(p1_y0 + p1_y1) / 2.0:.1f}" text-anchor="middle" fill="#38bdf8" font-size="10.5" font-weight="700" transform="rotate(-90 24 {(p1_y0 + p1_y1) / 2.0:.1f})">Passages (P)</text>
   <text x="906" y="{(p1_y0 + p1_y1) / 2.0:.1f}" text-anchor="middle" fill="#818cf8" font-size="10.5" font-weight="700" transform="rotate(90 906 {(p1_y0 + p1_y1) / 2.0:.1f})">Entities &amp; Triples (E, T)</text>
@@ -861,26 +930,8 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
   <circle cx="{x_now:.1f}" cy="{y_t_now:.1f}" r="4.5" fill="#f43f5e" stroke="#ffffff" stroke-width="1.5"/>
 
   <circle cx="{x_target:.1f}" cy="{y_p_target:.1f}" r="6" fill="#10b981" stroke="#ffffff" stroke-width="2"/>
-  <rect x="{min(p_x1 - 200, x_target - 95):.1f}" y="{y_p_target - 22:.1f}" width="200" height="18" rx="4" fill="#064e3b" stroke="#10b981" stroke-width="1"/>
-  <text x="{min(p_x1 - 100, x_target + 5):.1f}" y="{y_p_target - 9:.1f}" text-anchor="middle" fill="#34d399" font-size="9" font-weight="700">Both Pools 100%: ~{eta_corpus_str} rem (~{finish_clock_str} UTC)</text>
-
-  <g transform="translate({p_x0 + 14}, {p1_y0 + 12})">
-    <rect width="470" height="22" rx="4" fill="#0b1120" fill-opacity="0.85" stroke="#1e293b"/>
-    <line x1="10" y1="11" x2="26" y2="11" stroke="#38bdf8" stroke-width="2.5"/>
-    <circle cx="18" cy="11" r="3.5" fill="#38bdf8"/>
-    <text x="32" y="14" fill="#e2e8f0" font-size="9.5" font-weight="600">Passages ({openie_cnt})</text>
-
-    <line x1="130" y1="11" x2="146" y2="11" stroke="#818cf8" stroke-width="2"/>
-    <circle cx="138" cy="11" r="3.5" fill="#818cf8"/>
-    <text x="152" y="14" fill="#cbd5e1" font-size="9.5">Entities ({total_ent:,})</text>
-
-    <line x1="250" y1="11" x2="266" y2="11" stroke="#f43f5e" stroke-width="2"/>
-    <circle cx="258" cy="11" r="3.5" fill="#f43f5e"/>
-    <text x="272" y="14" fill="#cbd5e1" font-size="9.5">Triples ({total_trips:,})</text>
-
-    <line x1="365" y1="11" x2="385" y2="11" stroke="#94a3b8" stroke-width="1.8" stroke-dasharray="4,3"/>
-    <text x="392" y="14" fill="#94a3b8" font-size="9">Extrapolated ETA</text>
-  </g>
+  <rect x="{eta_badge_x:.1f}" y="{y_p_target + 4:.1f}" width="208" height="16" rx="4" fill="#064e3b" stroke="#10b981" stroke-width="1"/>
+  <text x="{eta_badge_x + 104.0:.1f}" y="{y_p_target + 15:.1f}" text-anchor="middle" fill="#34d399" font-size="8.8" font-weight="700">Both Pools 100%: ~{eta_corpus_str} rem (~{finish_clock_str} UTC)</text>
 
   <!-- PANEL 2: EMPIRICAL EXTRACTION VELOCITY & LATENCY STRIP -->
   <rect x="{p_x0}" y="{p2_y0}" width="{pw}" height="{p2_h}" fill="#090f1d" stroke="#334155" stroke-width="1.2"/>
@@ -1159,6 +1210,14 @@ def generate_graph_projection_svg(dest: Path, sandbox: dict[str, Any]) -> dict[s
 
     lines_svg: list[str] = []
     edge_labels_svg: list[str] = []
+    placed_boxes: list[tuple[float, float, float, float]] = []
+
+    def _can_place_box(x0: float, y0: float, x1: float, y1: float) -> bool:
+        for bx0, by0, bx1, by1 in placed_boxes:
+            if not (x1 < bx0 or x0 > bx1 or y1 < by0 or y0 > by1):
+                return False
+        placed_boxes.append((x0, y0, x1, y1))
+        return True
 
     for u, v, u_name, v_name, p, is_c in active_edges:
         x1, y1 = coords[u]
@@ -1171,9 +1230,11 @@ def generate_graph_projection_svg(dest: Path, sandbox: dict[str, Any]) -> dict[s
             mx = (x1 + x2) / 2.0
             my = (y1 + y2) / 2.0
             pred_label = f"≠ {p}" if not p.startswith("≠") else p
-            edge_labels_svg.append(
-                f'<text x="{mx:.1f}" y="{my - 3:.1f}" fill="#fda4af" font-size="7.5" font-weight="700" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif" paint-order="stroke" stroke="#070b14" stroke-width="3px" stroke-linejoin="round">{html.escape(pred_label)}</text>'
-            )
+            est_w = len(pred_label) * 4.5 + 8.0
+            if _can_place_box(mx - est_w / 2.0, my - 11.0, mx + est_w / 2.0, my + 1.0):
+                edge_labels_svg.append(
+                    f'<text x="{mx:.1f}" y="{my - 3:.1f}" fill="#fda4af" font-size="7.5" font-weight="700" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif" paint-order="stroke" stroke="#070b14" stroke-width="3px" stroke-linejoin="round">{html.escape(pred_label)}</text>'
+                )
         else:
             lines_svg.append(
                 f'<g><line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" stroke="#64748b" stroke-opacity="0.65" stroke-width="1.0"><title>{esc_t}</title></line></g>'
@@ -1212,9 +1273,13 @@ def generate_graph_projection_svg(dest: Path, sandbox: dict[str, Any]) -> dict[s
 
         if n in top_labeled and (deg_n >= 6 or is_c):
             disp = n if len(n) <= 22 else f"{n[:20]}…"
-            labels_svg.append(
-                f'<text x="{cx + r + 2.8:.1f}" y="{cy + 2.5:.1f}" fill="#cbd5e1" font-size="7.5" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif" paint-order="stroke" stroke="#070b14" stroke-width="2.5px" stroke-linejoin="round">{html.escape(disp)}</text>'
-            )
+            lx = cx + r + 2.8
+            ly = cy + 2.5
+            est_w = len(disp) * 4.4 + 6.0
+            if _can_place_box(lx - 2.0, ly - 8.5, lx + est_w, ly + 2.5):
+                labels_svg.append(
+                    f'<text x="{lx:.1f}" y="{ly:.1f}" fill="#cbd5e1" font-size="7.5" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif" paint-order="stroke" stroke="#070b14" stroke-width="2.5px" stroke-linejoin="round">{html.escape(disp)}</text>'
+                )
 
     contrast_count = len([e for e in active_edges if e[5]])
 
@@ -1322,10 +1387,10 @@ def generate_candidate_pareto_vs_time_svg(
     px0, pw = 88.0, 800.0
     px1 = px0 + pw
 
-    pa_y0, pa_h = 88.0, 235.0
+    pa_y0, pa_h = 88.0, 232.0
     pa_y1 = pa_y0 + pa_h
 
-    pb_y0, pb_h = 368.0, 205.0
+    pb_y0, pb_h = 358.0, 190.0
     pb_y1 = pb_y0 + pb_h
 
     max_r_hr = max((r["elapsed_hr"] for r in records), default=0.5)
@@ -1466,8 +1531,8 @@ def generate_candidate_pareto_vs_time_svg(
                 bx = min(px1 - 220.0, max(px0 + 8.0, rx - 110.0))
                 svg += f"""
   <line x1="{rx:.1f}" y1="{pa_y0}" x2="{rx:.1f}" y2="{pb_y1}" stroke="#f59e0b" stroke-width="1.3" stroke-dasharray="5,4"/>
-  <rect x="{bx:.1f}" y="{pa_y0 + 24}" width="215" height="18" rx="3" fill="#451a03" fill-opacity="0.9" stroke="#f59e0b" stroke-width="1"/>
-  <text x="{bx + 8:.1f}" y="{pa_y0 + 36}" fill="#fde68a" font-size="9" font-weight="700">Trial {cur_tr} Minibatch Start (Cand #{r['cand']})</text>
+  <rect x="{bx:.1f}" y="{pa_y1 - 22.0:.1f}" width="215" height="18" rx="3" fill="#451a03" fill-opacity="0.92" stroke="#f59e0b" stroke-width="1"/>
+  <text x="{bx + 8:.1f}" y="{pa_y1 - 10.0:.1f}" fill="#fde68a" font-size="9" font-weight="700">Trial {cur_tr} Minibatch Start (Cand #{r['cand']})</text>
 """
                 prev_tr = cur_tr
 
@@ -1503,8 +1568,6 @@ def generate_candidate_pareto_vs_time_svg(
 
         best_rec = max(records, key=lambda r: r["marginal_s"])
         best_val_pct = best_rec["best_so_far"] * 100.0
-        bx_peak = min(px1 - 190.0, max(px0 + 12.0, sx(best_rec["elapsed_hr"]) - 80.0))
-        by_peak = max(pa_y0 + 26.0, sy_a(best_val_pct) - 8.0)
         final_mean_pct = records[-1]["pct"]
 
         svg += f"""
@@ -1514,7 +1577,8 @@ def generate_candidate_pareto_vs_time_svg(
   <polyline points="{line_mean}" fill="none" stroke="#38bdf8" stroke-width="2.0"/>
   {cand_dots}
   <circle cx="{sx(best_rec['elapsed_hr']):.1f}" cy="{sy_a(best_val_pct):.1f}" r="4.5" fill="#10b981" stroke="#ffffff" stroke-width="1.5"/>
-  <text x="{bx_peak:.1f}" y="{by_peak:.1f}" fill="#fde047" font-size="10" font-weight="700">Peak: S* = {best_val_pct:.1f}% (Cand #{best_rec['cand']})</text>
+  <rect x="{px1 - 210:.1f}" y="{pa_y0 + 6:.1f}" width="202" height="18" rx="3" fill="#064e3b" fill-opacity="0.92" stroke="#10b981" stroke-width="1"/>
+  <text x="{px1 - 109:.1f}" y="{pa_y0 + 18:.1f}" text-anchor="middle" fill="#fde047" font-size="9.5" font-weight="700">Peak: S* = {best_val_pct:.1f}% (Cand #{best_rec['cand']})</text>
   <text x="{px1 - 16}" y="{pa_y1 - 10}" text-anchor="end" fill="#7dd3fc" font-size="9.5" font-weight="600">N={len(records)} evals | Running Mean={final_mean_pct:.1f}%</text>
 """
 
@@ -1572,10 +1636,10 @@ def generate_recall_em_f1_vs_time_svg(
     px0, pw = 88.0, 800.0
     px1 = px0 + pw
 
-    pa_y0, pa_h = 88.0, 235.0
+    pa_y0, pa_h = 88.0, 232.0
     pa_y1 = pa_y0 + pa_h
 
-    pb_y0, pb_h = 368.0, 205.0
+    pb_y0, pb_h = 358.0, 190.0
     pb_y1 = pb_y0 + pb_h
 
     max_r_hr = max((r["elapsed_hr"] for r in records), default=0.5)
@@ -1740,8 +1804,8 @@ def generate_recall_em_f1_vs_time_svg(
         best_r5_rec = max(records, key=lambda r: r["r5"])
         cx_r5 = sx(best_r5_rec["elapsed_hr"])
         cy_r5 = sy_ra(best_r5_rec["r5"])
-        bx_r5 = min(px1 - 245.0, max(px0 + 10.0, cx_r5 + 8.0))
-        by_r5 = max(pa_y0 + 22.0, min(pa_y1 - 24.0, cy_r5 - 18.0))
+        bx_r5 = px1 - 245.0
+        by_r5 = pa_y0 + 5.0
         delta_r5 = (best_r5_rec["r5"] - 0.72) * 100.0
 
         svg += f"""
@@ -1752,7 +1816,7 @@ def generate_recall_em_f1_vs_time_svg(
   <path d="{path_r1}" fill="none" stroke="#38bdf8" stroke-width="1.8"/>
 
   <circle cx="{cx_r5:.1f}" cy="{cy_r5:.1f}" r="4.5" fill="#10b981" stroke="#ffffff" stroke-width="1.5"/>
-  <rect x="{bx_r5:.1f}" y="{by_r5:.1f}" width="235" height="20" rx="3" fill="#064e3b" stroke="#10b981" stroke-width="1"/>
+  <rect x="{bx_r5:.1f}" y="{by_r5:.1f}" width="237" height="19" rx="3" fill="#064e3b" fill-opacity="0.92" stroke="#10b981" stroke-width="1"/>
   <text x="{bx_r5 + 8:.1f}" y="{by_r5 + 13:.1f}" fill="#34d399" font-size="9" font-weight="700">Peak R@5 = {best_r5_rec['r5'] * 100:.1f}% | R@2 = {best_r5_rec['r2'] * 100:.1f}% ({delta_r5:+.1f}% Beat)</text>
 """
 
@@ -1773,7 +1837,7 @@ def generate_recall_em_f1_vs_time_svg(
     y_pap_f1 = sy_qa(0.5620)
     svg += f"""
   <line x1="{px0}" y1="{y_up_f1:.1f}" x2="{px1}" y2="{y_up_f1:.1f}" stroke="#38bdf8" stroke-width="1.2" stroke-dasharray="4,4"/>
-  <text x="{px1 - 10}" y="{max(pb_y0 + 14.0, y_up_f1 - 4.0):.1f}" text-anchor="end" fill="#38bdf8" font-size="9">Upstream Baseline F1 = 0.5956</text>
+  <text x="{px1 - 10}" y="{max(pb_y0 + 30.0, y_up_f1 - 4.0):.1f}" text-anchor="end" fill="#38bdf8" font-size="9">Upstream Baseline F1 = 0.5956</text>
 
   <line x1="{px0}" y1="{y_pap_f1:.1f}" x2="{px1}" y2="{y_pap_f1:.1f}" stroke="#c084fc" stroke-width="1.2" stroke-dasharray="4,4"/>
   <text x="{px1 - 10}" y="{min(pb_y1 - 6.0, y_pap_f1 + 12.0):.1f}" text-anchor="end" fill="#c084fc" font-size="9">Published Paper 70B F1 = 0.5620</text>
@@ -1786,8 +1850,8 @@ def generate_recall_em_f1_vs_time_svg(
         best_f1_rec = max(records, key=lambda r: r["f1"])
         cx_f1 = sx(best_f1_rec["elapsed_hr"])
         cy_f1 = sy_qa(best_f1_rec["f1"])
-        bx_f1 = min(px1 - 250.0, max(px0 + 10.0, cx_f1 + 8.0))
-        by_f1 = max(pb_y0 + 22.0, min(pb_y1 - 24.0, cy_f1 - 18.0))
+        bx_f1 = px1 - 250.0
+        by_f1 = pb_y0 + 5.0
         delta_f1 = (best_f1_rec["f1"] - 0.5956) * 100.0
 
         svg += f"""
@@ -1795,7 +1859,7 @@ def generate_recall_em_f1_vs_time_svg(
   <path d="{path_f1}" fill="none" stroke="#f43f5e" stroke-width="2.4"/>
 
   <circle cx="{cx_f1:.1f}" cy="{cy_f1:.1f}" r="4.5" fill="#f43f5e" stroke="#ffffff" stroke-width="1.5"/>
-  <rect x="{bx_f1:.1f}" y="{by_f1:.1f}" width="242" height="20" rx="3" fill="#4c0519" stroke="#f43f5e" stroke-width="1"/>
+  <rect x="{bx_f1:.1f}" y="{by_f1:.1f}" width="242" height="19" rx="3" fill="#4c0519" fill-opacity="0.92" stroke="#f43f5e" stroke-width="1"/>
   <text x="{bx_f1 + 8:.1f}" y="{by_f1 + 13:.1f}" fill="#fda4af" font-size="9" font-weight="700">Peak F1 = {best_f1_rec['f1']:.4f} ({delta_f1:+.1f}% Beat vs Upstream)</text>
 """
     else:
@@ -1919,7 +1983,7 @@ def generate_pareto_svg(
     non_dom_a.sort(key=lambda p: p["tau"])
 
     # PANEL B Dimensions (Right): Pareto Hypervolume & Archive Size Evolution
-    b_x0, b_x1 = 520.0, 875.0
+    b_x0, b_x1 = 528.0, 875.0
     b_y0, b_y1 = 110.0, 465.0
     bw = b_x1 - b_x0
     bh = b_y1 - b_y0
@@ -2048,17 +2112,15 @@ def generate_pareto_svg(
         # Clamped, non-overlapping callout badges for key non-dominated candidates
         c_fast = non_dom_a[0]
         c_peak = non_dom_a[-1]
-        fx = min(a_x1 - 172.0, max(a_x0 + 8.0, ax_to_x(c_fast["tau"]) + 6.0))
-        fy = min(a_y1 - 24.0, max(a_y0 + 24.0, ay_to_y(c_fast["gmg"]) + 8.0))
-        svg += f"""  <rect x="{fx:.1f}" y="{fy:.1f}" width="166" height="18" rx="3" fill="#064e3b" stroke="#10b981" stroke-width="1"/>
+        fx = a_x1 - 172.0
+        fy = a_y0 + 8.0
+        svg += f"""  <rect x="{fx:.1f}" y="{fy:.1f}" width="166" height="18" rx="3" fill="#064e3b" fill-opacity="0.92" stroke="#10b981" stroke-width="1"/>
   <text x="{fx + 6:.1f}" y="{fy + 12:.1f}" fill="#34d399" font-size="8.2" font-weight="700">Cand #{c_fast['cand']} (Fastest: {c_fast['tau']:.1f}s, GM={c_fast['gmg']:.3f})</text>
 """
         if c_peak["cand"] != c_fast["cand"]:
-            px_b = min(a_x1 - 172.0, max(a_x0 + 8.0, ax_to_x(c_peak["tau"]) + 6.0))
-            py_b = min(a_y1 - 24.0, max(a_y0 + 24.0, ay_to_y(c_peak["gmg"]) - 22.0))
-            if abs(py_b - fy) < 20.0:
-                py_b = max(a_y0 + 24.0, fy - 22.0) if fy > a_y0 + 48.0 else min(a_y1 - 24.0, fy + 22.0)
-            svg += f"""  <rect x="{px_b:.1f}" y="{py_b:.1f}" width="166" height="18" rx="3" fill="#064e3b" stroke="#10b981" stroke-width="1"/>
+            px_b = a_x1 - 172.0
+            py_b = a_y0 + 30.0
+            svg += f"""  <rect x="{px_b:.1f}" y="{py_b:.1f}" width="166" height="18" rx="3" fill="#064e3b" fill-opacity="0.92" stroke="#10b981" stroke-width="1"/>
   <text x="{px_b + 6:.1f}" y="{py_b + 12:.1f}" fill="#34d399" font-size="8.2" font-weight="700">Cand #{c_peak['cand']} (Peak: {c_peak['tau']:.1f}s, GM={c_peak['gmg']:.3f})</text>
 """
 
@@ -2165,8 +2227,19 @@ def generate_report_markdown(
 
     elapsed_sec = sandbox.get("elapsed_seconds", 60.0)
     elapsed_min = max(0.1, elapsed_sec / 60.0)
-    velocity = openie_cnt / elapsed_min
-    sec_per_chunk = elapsed_sec / max(1, openie_cnt)
+    emp_history = get_empirical_telemetry_timeseries(
+        sandbox, val_target_pool, train_target_pool, overlap_passages, kg.get("total_triples", 0)
+    )
+    extract_phase_sec = elapsed_sec
+    if len(emp_history) >= 2:
+        max_p = emp_history[-1]["passages"]
+        for pt in emp_history:
+            if pt["passages"] >= max_p - 3:
+                extract_phase_sec = max(60.0, pt["time_sec"])
+                break
+    extract_phase_min = max(0.1, extract_phase_sec / 60.0)
+    velocity = openie_cnt / extract_phase_min
+    sec_per_chunk = extract_phase_sec / max(1, openie_cnt)
 
     rem_train = max(0, train_target_pool - train_done)
     rem_corpus = max(0, corpus_total_pool - openie_cnt)
