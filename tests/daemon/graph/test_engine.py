@@ -1855,3 +1855,138 @@ def test_canonical_retrieval_hook_and_rag_qa_forward_unification(
     finally:
         dspy.configure(rm=None)
         engine.close()
+
+
+def test_hybrid_e2e_per_query_isolation_stage_caching_and_reflective_stats(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify per-query sandbox isolation, 4-tier stage caching, component selector mutation resilience, and minibatch q_stats lookup."""
+    import json
+    from types import SimpleNamespace
+
+    stage_call_counts = {"ner": 0, "synonym_judge": 0}
+
+    class StageCountingMockLM(DeterministicMockLM):
+        def __call__(
+            self,
+            prompt: str | None = None,
+            messages: list[dict[str, Any]] | None = None,
+            **kwargs: Any,
+        ) -> list[str]:
+            if getattr(dspy.settings, "usage_tracker", None) is not None:
+                dspy.settings.usage_tracker.add_usage(
+                    self.model,
+                    {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30},
+                )
+            req_str = str(prompt or messages or kwargs)
+            if "ExtractEntities" in req_str or "named_entities" in req_str:
+                stage_call_counts["ner"] += 1
+            elif "JudgeSynonyms" in req_str or "candidate_pairs" in req_str:
+                stage_call_counts["synonym_judge"] += 1
+                return [json.dumps({"decisions": []})]
+            return super().__call__(prompt=prompt, messages=messages, **kwargs)
+
+    lm = StageCountingMockLM()
+    dspy.settings.configure(lm=lm)
+    program = HippoRAGProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
+    embedder: Any = DeterministicMockEmbedder(dim=64)
+
+    engine = YawGraphEngine(
+        db_path=tmp_path / "yaw_hybrid_e2e.db",
+        workspace_root=tmp_path,
+        program=program,
+        embedder=embedder,
+        retrieval_top_k=2,
+        synonymy_threshold=-1.0,
+    )
+    try:
+        doc_q1 = "Alan Turing\nAlan Turing designed the Automatic Computing Engine in 1945."
+        doc_q2_a = "Ada Lovelace\nAda Lovelace wrote the first computer algorithm."
+        doc_q2_b = "Charles Babbage\nCharles Babbage designed the Analytical Engine."
+
+        ex1 = dspy.Example(
+            question="Who designed the Automatic Computing Engine?",
+            gold_answers=["Alan Turing"],
+            gold_docs=[doc_q1],
+            item_docs=[doc_q1],
+        ).with_inputs("question", "item_docs")
+        ex2 = dspy.Example(
+            question="Who wrote the first computer algorithm?",
+            gold_answers=["Ada Lovelace"],
+            gold_docs=[doc_q2_a],
+            item_docs=[doc_q2_a, doc_q2_b],
+        ).with_inputs("question", "item_docs")
+
+        # Verify _ActiveTraceComponentSelector continues matching after candidate instructions mutate
+        selector = YawGraphEngine._ActiveTraceComponentSelector(program)
+        mut_ner_sig = program.ner.signature.with_instructions("Mutated NER instruction v2")
+        fake_pred_obj = SimpleNamespace(signature=mut_ner_sig)
+        fake_state = SimpleNamespace(
+            list_of_named_predictors=["ner", "qa.predict"],
+            named_predictor_id_to_update_next_for_program_candidate=[0],
+        )
+        selected = selector(
+            fake_state,
+            [{"trace": [(fake_pred_obj, {}, {})]}],
+            [0.8],
+            0,
+            {"ner": "Mutated NER instruction v2", "qa.predict": program.qa.predict.signature.instructions},
+        )
+        assert selected == ["ner"]
+
+        class VerifyingGEPA:
+            def __init__(self, metric: Any, **kwargs: Any) -> None:
+                self.metric = metric
+
+            def compile(self, student: Any, trainset: list[Any], valset: Any = None) -> Any:
+                # 1. Run ex1 then ex2 on student (live indexing)
+                with dspy.context(trace=[], track_usage=True):
+                    pred1_live = student(**ex1.inputs())
+                c_cnt_q1 = engine.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+                assert c_cnt_q1 == 1
+
+                with dspy.context(trace=[], track_usage=True):
+                    pred2_live = student(**ex2.inputs())
+                # Verify per-query isolation: ex1's chunk did NOT accumulate into ex2's sandbox!
+                c_cnt_q2 = engine.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+                assert c_cnt_q2 == 2
+
+                # Verify post-hoc reflective evaluation on ex1 vs ex2 uses each example's own q_stats
+                score1_live = self.metric(ex1, pred1_live)
+                score2_live = self.metric(ex2, pred2_live)
+                assert score1_live.score > 0.0
+                assert score2_live.score > 0.0
+
+                # 2. Mutate QA only: OpenIE and SynonymJudge must hit stage caches (0 extra LLM calls)
+                ner_before = stage_call_counts["ner"]
+                syn_before = stage_call_counts["synonym_judge"]
+                cand_qa = student.deepcopy()
+                cand_qa.qa.predict.signature = cand_qa.qa.predict.signature.with_instructions(
+                    "Mutated QA instruction"
+                )
+                with dspy.context(trace=[], track_usage=True):
+                    pred1_cached = cand_qa(**ex1.inputs())
+                assert stage_call_counts["ner"] == ner_before
+                assert stage_call_counts["synonym_judge"] == syn_before
+                score1_cached = self.metric(ex1, pred1_cached)
+                # Verify token accounting and score parity between live indexing and cache hit
+                assert abs(score1_live.score - score1_cached.score) < 1e-9
+
+                # 3. Mutate SynonymJudge only: OpenIE hits cache (0 extra NER calls), SynonymJudge runs live!
+                cand_syn = student.deepcopy()
+                cand_syn.synonym_judge.signature = (
+                    cand_syn.synonym_judge.signature.with_instructions(
+                        "Mutated SynonymJudge instruction"
+                    )
+                )
+                with dspy.context(trace=[], track_usage=True):
+                    _ = cand_syn(**ex2.inputs())
+                assert stage_call_counts["ner"] == ner_before
+                assert stage_call_counts["synonym_judge"] > syn_before
+                return cand_syn
+
+        monkeypatch.setattr(dspy, "GEPA", VerifyingGEPA, raising=False)
+        _ = engine.evolve_prompts([ex1, ex2], mode="gepa")
+    finally:
+        engine.close()
