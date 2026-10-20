@@ -27,6 +27,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
 ARTIFACT_DIR = Path(
     r"C:\Users\Harri.Ahokas\.gemini\antigravity\brain\3061c87c-9ec6-4ff5-b756-80b05e1c4342"
@@ -742,27 +744,14 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
     dest.write_text(svg, encoding="utf-8")
 
 
-def get_pill_border_point(
-    cx: float, cy: float, w: float, h: float, target_x: float, target_y: float
-) -> tuple[float, float]:
-    """Calculate intersection point of a ray from capsule center (cx, cy) toward (target_x, target_y)."""
-    dx = target_x - cx
-    dy = target_y - cy
-    if abs(dx) < 1e-4 and abs(dy) < 1e-4:
-        return cx, cy
-
-    scale_x = (w / 2.0) / abs(dx) if abs(dx) > 1e-4 else 1e9
-    scale_y = (h / 2.0) / abs(dy) if abs(dy) > 1e-4 else 1e9
-    scale = min(scale_x, scale_y)
-    return cx + dx * scale, cy + dy * scale
-
-
 def generate_graph_projection_svg(dest: Path, sandbox: dict[str, Any]) -> dict[str, Any]:
-    """Generate clean, collision-free 2D Entity & Link Graph Topology over discovered subspaces.
+    """Generate authentic Obsidian-style Knowledge Graph View.
 
-    Renders structured capsule nodes grouped by semantic architectural zones, with explicit
-    directional links and prominent crimson dashed bounds for owl:differentFrom contrastive
-    relations, eliminating dot-plot overlap and occlusion.
+    Plots nodes as circular dots (radius determined by degree and corpus occurrences)
+    connected by clean, simple links, computed via a D3-force spring-embedder physics
+    simulation with Coulomb repulsion and Hooke spring attraction. Contrastive
+    (owl:differentFrom) nodes and relations are accented in coral/red, exactly matching
+    the Obsidian graph visual language.
     """
     db_path_str = sandbox.get("db_path")
     if not db_path_str:
@@ -846,387 +835,162 @@ def generate_graph_projection_svg(dest: Path, sandbox: dict[str, Any]) -> dict[s
     for name, cnt in raw_counts.items():
         canon_counts[canonical_map.get(name, name)] += cnt
 
+    edge_set: set[tuple[str, str]] = set()
+    contrastive_nodes: set[str] = set()
+    contrastive_edges: set[tuple[str, str]] = set()
     contrastive_triples_list: list[tuple[str, str, str]] = []
+
     for s, p, o, _cid in triples_raw:
         cs = canonical_map.get(s, s)
         co = canonical_map.get(o, o)
-        if (
-            cs != co
-            and any(kw in p.lower() for kw in contrastive_keywords)
-            and (cs, p, co) not in contrastive_triples_list
-        ):
-            contrastive_triples_list.append((cs, p, co))
+        if cs != co:
+            is_c = any(kw in p.lower() for kw in contrastive_keywords)
+            edge_key = tuple(sorted([cs, co]))
+            edge_set.add(edge_key)
+            if is_c:
+                contrastive_nodes.add(cs)
+                contrastive_nodes.add(co)
+                contrastive_edges.add(edge_key)
+                if (cs, p, co) not in contrastive_triples_list:
+                    contrastive_triples_list.append((cs, p, co))
 
-    # Definitive Entity Subspace Node Catalog (24 verified collision-free positions)
-    node_configs = [
-        # Zone 1: Evaluation & Quality Governance (Top-Left)
-        {
-            "id": "Session Fidelity Decision Hub",
-            "label": "Session Fidelity Decision Hub",
-            "zone": "evals",
-            "cx": 250.0,
-            "cy": 160.0,
-            "cat": "contrast",
-        },
-        {
-            "id": "offline evals",
-            "label": "offline evals",
-            "zone": "evals",
-            "cx": 120.0,
-            "cy": 230.0,
-            "cat": "contrast",
-        },
-        {
-            "id": "human review",
-            "label": "human review",
-            "zone": "evals",
-            "cx": 380.0,
-            "cy": 230.0,
-            "cat": "contrast",
-        },
-        # Zone 2: Infrastructure & Tenancy Architecture (Top-Right)
-        {
-            "id": "Dedicated",
-            "label": "Dedicated",
-            "zone": "infra",
-            "cx": 570.0,
-            "cy": 155.0,
-            "cat": "contrast",
-        },
-        {
-            "id": "Hosted",
-            "label": "Hosted",
-            "zone": "infra",
-            "cx": 815.0,
-            "cy": 155.0,
-            "cat": "contrast",
-        },
-        {
-            "id": "customer control over environment",
-            "label": "customer control over env",
-            "zone": "infra",
-            "cx": 695.0,
-            "cy": 215.0,
-            "cat": "entity",
-        },
-        {
-            "id": "Dedicated capacity",
-            "label": "Dedicated capacity",
-            "zone": "infra",
-            "cx": 565.0,
-            "cy": 275.0,
-            "cat": "hub",
-        },
-        {
-            "id": "Redwood Inference",
-            "label": "Redwood Inference",
-            "zone": "infra",
-            "cx": 815.0,
-            "cy": 275.0,
-            "cat": "hub",
-        },
-        # Zone 3: API Gateway & Contract Enforcement (Center)
-        {
-            "id": "ADR-022",
-            "label": "ADR-022",
-            "zone": "contracts",
-            "cx": 130.0,
-            "cy": 365.0,
-            "cat": "hub",
-        },
-        {
-            "id": "Public error contract",
-            "label": "Public error contract",
-            "zone": "contracts",
-            "cx": 360.0,
-            "cy": 365.0,
-            "cat": "entity",
-        },
-        {
-            "id": "gateway",
-            "label": "gateway",
-            "zone": "contracts",
-            "cx": 600.0,
-            "cy": 365.0,
-            "cat": "hub",
-        },
-        {
-            "id": "ResidencyPolicyViolationError",
-            "label": "ResidencyPolicyViolationError",
-            "zone": "contracts",
-            "cx": 815.0,
-            "cy": 365.0,
-            "cat": "entity",
-        },
-        # Zone 4: Billing Ingestion & Data Scrubbing (Bottom-Left)
-        {
-            "id": "Stripe",
-            "label": "Stripe",
-            "zone": "billing",
-            "cx": 115.0,
-            "cy": 475.0,
-            "cat": "hub",
-        },
-        {
-            "id": "prorated invoice items",
-            "label": "prorated invoice items",
-            "zone": "billing",
-            "cx": 340.0,
-            "cy": 475.0,
-            "cat": "entity",
-        },
-        {
-            "id": "invoice amount deltas",
-            "label": "invoice amount deltas",
-            "zone": "billing",
-            "cx": 115.0,
-            "cy": 545.0,
-            "cat": "entity",
-        },
-        {
-            "id": "NetSuite",
-            "label": "NetSuite",
-            "zone": "billing",
-            "cx": 340.0,
-            "cy": 545.0,
-            "cat": "hub",
-        },
-        {
-            "id": "Scheduled Scrub Runner",
-            "label": "Scheduled Scrub Runner",
-            "zone": "billing",
-            "cx": 140.0,
-            "cy": 625.0,
-            "cat": "contrast",
-        },
-        {
-            "id": "purge",
-            "label": "purge",
-            "zone": "billing",
-            "cx": 340.0,
-            "cy": 625.0,
-            "cat": "contrast",
-        },
-        # Zone 5: Product Strategy & Config Migration (Bottom-Right)
-        {
-            "id": "seat-based SKU",
-            "label": "seat-based SKU",
-            "zone": "product",
-            "cx": 575.0,
-            "cy": 475.0,
-            "cat": "contrast",
-        },
-        {
-            "id": "product team",
-            "label": "product team",
-            "zone": "product",
-            "cx": 805.0,
-            "cy": 475.0,
-            "cat": "contrast",
-        },
-        {
-            "id": "config-schema v2",
-            "label": "config-schema v2",
-            "zone": "product",
-            "cx": 575.0,
-            "cy": 545.0,
-            "cat": "contrast",
-        },
-        {
-            "id": "v1 reader",
-            "label": "v1 reader",
-            "zone": "product",
-            "cx": 805.0,
-            "cy": 545.0,
-            "cat": "contrast",
-        },
-        {
-            "id": "Canary Orchestration",
-            "label": "Canary Orchestration",
-            "zone": "product",
-            "cx": 575.0,
-            "cy": 625.0,
-            "cat": "hub",
-        },
-        {
-            "id": "SLOs",
-            "label": "SLOs",
-            "zone": "product",
-            "cx": 805.0,
-            "cy": 625.0,
-            "cat": "hub",
-        },
-    ]
+    degrees: Counter[str] = Counter()
+    for u, v in edge_set:
+        degrees[u] += 1
+        degrees[v] += 1
 
-    node_map: dict[str, dict[str, Any]] = {}
-    for nc in node_configs:
-        eid = str(nc["id"])
-        cnt = canon_counts.get(eid, 0)
-        if cnt == 0:
-            for k, v in canon_counts.items():
-                if k.lower() == eid.lower() or eid.lower() in k.lower():
-                    cnt = v
-                    break
-        cnt = max(1, cnt)
+    # In Obsidian, the graph includes connected entities and contrastive nodes
+    # Filter to nodes with meaningful structural presence (degree >= 3 or contrastive)
+    active_node_set: set[str] = set(contrastive_nodes)
+    for node, deg in degrees.items():
+        if deg >= 3:
+            active_node_set.add(node)
 
-        label = str(nc["label"])
-        w = max(74.0, len(label) * 6.5 + (26.0 if cnt > 1 else 18.0) + 16.0)
-        h = 26.0
-        node_map[eid] = {
-            **nc,
-            "count": cnt,
-            "w": w,
-            "h": h,
-        }
+    # Cap if corpus grows extremely large to maintain clean rendering & performance
+    if len(active_node_set) > 220:
+        active_node_set = set(contrastive_nodes)
+        for node, _deg in degrees.most_common(200):
+            active_node_set.add(node)
 
-    edge_defs: list[tuple[str, str, str, bool]] = [
-        # Zone 1: Evals
-        ("offline evals", "are not replaced by", "Session Fidelity Decision Hub", True),
-        ("human review", "is not replaced by", "Session Fidelity Decision Hub", True),
-        # Zone 2: Infra
-        ("Dedicated", "differs from", "Hosted", True),
-        ("Dedicated", "differ in", "customer control over environment", True),
-        ("customer control over environment", "differs for", "Hosted", True),
-        ("Dedicated", "allocates", "Dedicated capacity", False),
-        ("Redwood Inference", "uses", "Dedicated capacity", False),
-        # Zone 3: Gateway & Contracts
-        ("ADR-022", "defines", "Public error contract", False),
-        ("gateway", "enforces", "Public error contract", False),
-        ("gateway", "returns", "ResidencyPolicyViolationError", False),
-        # Zone 4: Billing & Lifecycle
-        ("Stripe", "creates", "prorated invoice items", False),
-        ("Stripe", "exports", "invoice amount deltas", False),
-        ("prorated invoice items", "causes", "invoice amount deltas", False),
-        ("NetSuite", "imports", "invoice amount deltas", False),
-        ("NetSuite", "maps", "prorated invoice items", False),
-        ("Scheduled Scrub Runner", "differs from", "purge", True),
-        # Zone 5: Product & Config
-        ("seat-based SKU", "is opposed by", "product team", True),
-        ("config-schema v2", "replaces", "v1 reader", True),
-        ("Canary Orchestration", "enforces", "SLOs", False),
-    ]
+    node_list = sorted(list(active_node_set), key=lambda x: degrees[x], reverse=True)
+    node_idx = {name: i for i, name in enumerate(node_list)}
+    N = len(node_list)
 
-    zones_svg = """
-  <!-- ZONE 1: EVALUATION & QUALITY GOVERNANCE -->
-  <rect x="36" y="112" width="420" height="152" rx="8" fill="#080e1a" fill-opacity="0.65" stroke="#1e293b" stroke-width="1" stroke-dasharray="4,4"/>
-  <text x="48" y="130" fill="#64748b" font-size="9.5" font-weight="700" letter-spacing="0.5">ZONE 1: EVALUATION &amp; QUALITY GOVERNANCE</text>
+    if N == 0:
+        return {}
 
-  <!-- ZONE 2: INFRASTRUCTURE & TENANCY ARCHITECTURE -->
-  <rect x="484" y="112" width="420" height="185" rx="8" fill="#080e1a" fill-opacity="0.65" stroke="#1e293b" stroke-width="1" stroke-dasharray="4,4"/>
-  <text x="496" y="130" fill="#64748b" font-size="9.5" font-weight="700" letter-spacing="0.5">ZONE 2: INFRASTRUCTURE &amp; TENANCY ARCHITECTURE</text>
+    active_edges: list[tuple[int, int, bool]] = []
+    for u, v in edge_set:
+        if u in node_idx and v in node_idx:
+            active_edges.append((node_idx[u], node_idx[v], (u, v) in contrastive_edges))
 
-  <!-- ZONE 3: API GATEWAY & DATA RESIDENCY CONTRACTS -->
-  <rect x="36" y="322" width="868" height="82" rx="8" fill="#080e1a" fill-opacity="0.65" stroke="#1e293b" stroke-width="1" stroke-dasharray="4,4"/>
-  <text x="48" y="340" fill="#64748b" font-size="9.5" font-weight="700" letter-spacing="0.5">ZONE 3: API GATEWAY &amp; DATA RESIDENCY CONTRACTS</text>
+    # Fast Vectorized Force-Directed Physics Simulation (D3-force / Spring-Embedder)
+    np.random.seed(42)
+    angles = np.linspace(0, 2 * math.pi, N, endpoint=False)
+    radii_init = 180.0 + np.random.randn(N) * 20.0
+    pos = np.column_stack([np.cos(angles) * radii_init, np.sin(angles) * radii_init])
+    vel = np.zeros_like(pos)
 
-  <!-- ZONE 4: BILLING INGESTION & DATA SCRUBBING -->
-  <rect x="36" y="430" width="420" height="236" rx="8" fill="#080e1a" fill-opacity="0.65" stroke="#1e293b" stroke-width="1" stroke-dasharray="4,4"/>
-  <text x="48" y="448" fill="#64748b" font-size="9.5" font-weight="700" letter-spacing="0.5">ZONE 4: BILLING INGESTION &amp; DATA SCRUBBING</text>
+    node_radii = np.array([2.8 + min(9.0, math.sqrt(degrees[name]) * 1.5) for name in node_list])
+    edges_np = np.array([(u, v) for u, v, _ in active_edges], dtype=int) if active_edges else np.zeros((0, 2), dtype=int)
 
-  <!-- ZONE 5: PRODUCT STRATEGY, MIGRATION & SLOS -->
-  <rect x="484" y="430" width="420" height="236" rx="8" fill="#080e1a" fill-opacity="0.65" stroke="#1e293b" stroke-width="1" stroke-dasharray="4,4"/>
-  <text x="496" y="448" fill="#64748b" font-size="9.5" font-weight="700" letter-spacing="0.5">ZONE 5: PRODUCT STRATEGY, MIGRATION &amp; SLOS</text>
-"""
+    k_rep = 8500.0
+    k_spring = 0.038
+    l_0 = 42.0
+    k_center = 0.012
 
+    for _step in range(130):
+        diff = pos[:, None, :] - pos[None, :, :]
+        d2 = np.sum(diff**2, axis=-1) + 25.0
+        d = np.sqrt(d2)
+
+        f_rep_mag = k_rep / (d2 * d)
+        min_d = node_radii[:, None] + node_radii[None, :] + 9.0
+        overlap_mask = d < min_d
+        f_rep_mag[overlap_mask] += (min_d[overlap_mask] - d[overlap_mask]) * 0.55 / d[overlap_mask]
+        np.fill_diagonal(f_rep_mag, 0.0)
+
+        f_rep = np.sum(diff * f_rep_mag[:, :, None], axis=1)
+
+        f_att = np.zeros_like(pos)
+        if len(edges_np) > 0:
+            d_e = pos[edges_np[:, 1]] - pos[edges_np[:, 0]]
+            d_e_len = np.linalg.norm(d_e, axis=1, keepdims=True) + 1e-4
+            f_e = (d_e_len - l_0) * k_spring * (d_e / d_e_len)
+            np.add.at(f_att, edges_np[:, 0], f_e)
+            np.add.at(f_att, edges_np[:, 1], -f_e)
+
+        f_center = -pos * k_center
+
+        vel = (vel + f_rep + f_att + f_center) * 0.82
+        speed = np.linalg.norm(vel, axis=1, keepdims=True)
+        mask_fast = (speed > 12.0).squeeze()
+        if np.any(mask_fast):
+            vel[mask_fast] = (vel[mask_fast] / speed[mask_fast]) * 12.0
+        pos += vel
+
+    min_x, max_x = float(pos[:, 0].min()), float(pos[:, 0].max())
+    min_y, max_y = float(pos[:, 1].min()), float(pos[:, 1].max())
+
+    pad_x1, pad_x2 = 65.0, 875.0
+    pad_y1, pad_y2 = 110.0, 650.0
+    sx = (pad_x2 - pad_x1) / max(1.0, max_x - min_x)
+    sy = (pad_y2 - pad_y1) / max(1.0, max_y - min_y)
+
+    coords = np.column_stack([pad_x1 + (pos[:, 0] - min_x) * sx, pad_y1 + (pos[:, 1] - min_y) * sy])
+
+    # Obsidian-style Rendering: simple lines and dots
     lines_svg: list[str] = []
-    badges_svg: list[str] = []
-
-    for src_id, pred, tgt_id, is_contrast in edge_defs:
-        if src_id not in node_map or tgt_id not in node_map:
-            continue
-        n_src = node_map[src_id]
-        n_tgt = node_map[tgt_id]
-
-        x1, y1 = get_pill_border_point(
-            n_src["cx"], n_src["cy"], n_src["w"], n_src["h"], n_tgt["cx"], n_tgt["cy"]
-        )
-        x2, y2 = get_pill_border_point(
-            n_tgt["cx"], n_tgt["cy"], n_tgt["w"], n_tgt["h"], n_src["cx"], n_src["cy"]
-        )
-
-        mx, my = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-
-        if is_contrast:
+    for u, v, is_c in active_edges:
+        x1, y1 = coords[u]
+        x2, y2 = coords[v]
+        if is_c:
             lines_svg.append(
-                f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" stroke="#f43f5e" stroke-width="2.6" stroke-dasharray="6,4" marker-end="url(#arrowContrast)"/>'
-            )
-            badge_txt = f"≠ {pred}"
-            bw = len(badge_txt) * 5.8 + 12
-            badges_svg.append(
-                f'<rect x="{mx - bw/2:.1f}" y="{my - 8:.1f}" width="{bw:.1f}" height="16" rx="4" fill="#881337" stroke="#f43f5e" stroke-width="1.2"/>'
-            )
-            badges_svg.append(
-                f'<text x="{mx:.1f}" y="{my + 3.8:.1f}" text-anchor="middle" fill="#fecdd3" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif" font-size="8.5" font-weight="700">{html.escape(badge_txt)}</text>'
+                f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" stroke="#f43f5e" stroke-opacity="0.8" stroke-width="1.4" stroke-dasharray="4,3"/>'
             )
         else:
             lines_svg.append(
-                f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" stroke="#38bdf8" stroke-width="1.8" stroke-opacity="0.65" marker-end="url(#arrowRegular)"/>'
-            )
-            bw = len(pred) * 5.6 + 10
-            badges_svg.append(
-                f'<rect x="{mx - bw/2:.1f}" y="{my - 7:.1f}" width="{bw:.1f}" height="14" rx="3" fill="#0b1324" stroke="#334155" stroke-width="1"/>'
-            )
-            badges_svg.append(
-                f'<text x="{mx:.1f}" y="{my + 3.2:.1f}" text-anchor="middle" fill="#94a3b8" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif" font-size="8" font-weight="600">{html.escape(pred)}</text>'
+                f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" stroke="#334155" stroke-opacity="0.55" stroke-width="0.9"/>'
             )
 
-    capsules_svg: list[str] = []
-    for nc in node_map.values():
-        cx, cy = nc["cx"], nc["cy"]
-        w, h = nc["w"], nc["h"]
-        cat = nc["cat"]
-        cnt = nc["count"]
-        label = str(nc["label"])
+    dots_svg: list[str] = []
+    labels_svg: list[str] = []
 
-        if cat == "contrast":
-            fill_bg = "#1b1418"
-            stroke_col = "#f43f5e"
-            dot_col = "#fb7185"
-            text_col = "#ffe4e6"
-            count_col = "#f43f5e"
-            halo = f'<rect x="{cx - w/2 - 2:.1f}" y="{cy - h/2 - 2:.1f}" width="{w + 4:.1f}" height="{h + 4:.1f}" rx="14" fill="none" stroke="#f43f5e" stroke-opacity="0.25" stroke-width="2"/>'
-        elif cat == "hub":
-            fill_bg = "#081624"
-            stroke_col = "#06b6d4"
-            dot_col = "#10b981"
-            text_col = "#f0fdfa"
-            count_col = "#06b6d4"
-            halo = f'<rect x="{cx - w/2 - 2:.1f}" y="{cy - h/2 - 2:.1f}" width="{w + 4:.1f}" height="{h + 4:.1f}" rx="14" fill="none" stroke="#06b6d4" stroke-opacity="0.25" stroke-width="2"/>'
+    for i, name in enumerate(node_list):
+        cx, cy = coords[i]
+        r = float(node_radii[i])
+        is_c = name in contrastive_nodes
+        deg = degrees[name]
+
+        if is_c:
+            dot_col = "#f43f5e"
+            halo = f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{r + 3.0:.1f}" fill="#f43f5e" fill-opacity="0.2"/>'
+        elif deg >= 6:
+            dot_col = "#38bdf8"
+            halo = f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{r + 2.5:.1f}" fill="#38bdf8" fill-opacity="0.15"/>'
         else:
-            fill_bg = "#0c1527"
-            stroke_col = "#6366f1"
-            dot_col = "#818cf8"
-            text_col = "#f1f5f9"
-            count_col = "#818cf8"
+            dot_col = "#64748b"
             halo = ""
 
-        capsule_rect = f'<rect x="{cx - w/2:.1f}" y="{cy - h/2:.1f}" width="{w:.1f}" height="{h:.1f}" rx="13" fill="{fill_bg}" stroke="{stroke_col}" stroke-width="1.8"/>'
-        indicator_dot = f'<circle cx="{cx - w/2 + 11:.1f}" cy="{cy:.1f}" r="4" fill="{dot_col}"/>'
-        text_label = f'<text x="{cx - w/2 + 20:.1f}" y="{cy + 3.8:.1f}" fill="{text_col}" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif" font-size="9.5" font-weight="600">{html.escape(label)}</text>'
-        cnt_badge = (
-            f'<text x="{cx + w/2 - 7:.1f}" y="{cy + 3.8:.1f}" text-anchor="end" fill="{count_col}" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif" font-size="8.5" font-weight="700">×{cnt}</text>'
-            if cnt > 1
-            else ""
-        )
+        dots_svg.append(f'{halo}<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{r:.1f}" fill="{dot_col}"/>')
 
-        capsules_svg.append(f"{halo}{capsule_rect}{indicator_dot}{text_label}{cnt_badge}")
+        # Discreet Obsidian-style labels on prominent/contrastive nodes
+        if deg >= 4 or is_c or r >= 4.8:
+            disp = name if len(name) <= 24 else f"{name[:22]}…"
+            labels_svg.append(
+                f'<text x="{cx + r + 3.5:.1f}" y="{cy + 2.8:.1f}" fill="#cbd5e1" font-size="7.8" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif" paint-order="stroke" stroke="#070b14" stroke-width="2.5px" stroke-linejoin="round">{html.escape(disp)}</text>'
+            )
 
-    contrast_count = len([e for e in edge_defs if e[3]])
+    contrast_count = len([e for e in active_edges if e[2]])
 
     svg = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 720" width="940" height="720">
   <defs>
-    <marker id="arrowRegular" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-      <path d="M 0 1.5 L 8 5 L 0 8.5 z" fill="#38bdf8"/>
-    </marker>
-    <marker id="arrowContrast" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-      <path d="M 0 1.5 L 8 5 L 0 8.5 z" fill="#f43f5e"/>
-    </marker>
     <radialGradient id="centerGlow" cx="50%" cy="50%" r="50%">
-      <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.04"/>
+      <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.03"/>
       <stop offset="100%" stop-color="#070b14" stop-opacity="0"/>
     </radialGradient>
     <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
-      <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#1e293b" stroke-width="0.5" stroke-opacity="0.45"/>
+      <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#1e293b" stroke-width="0.5" stroke-opacity="0.4"/>
     </pattern>
   </defs>
 
@@ -1237,60 +1001,61 @@ def generate_graph_projection_svg(dest: Path, sandbox: dict[str, Any]) -> dict[s
 
   <!-- Header Card -->
   <g transform="translate(32, 22)">
-    <text x="0" y="16" fill="#f8fafc" font-size="16" font-weight="800" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Knowledge Graph Entity &amp; Link Topology (Discovered Semantic Subspaces)</text>
-    <text x="0" y="34" fill="#94a3b8" font-size="11" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Explicit directional links &amp; owl:differentFrom contrastive bounds | Collision-free capsule geometry | Empirical counts</text>
+    <text x="0" y="16" fill="#f8fafc" font-size="16" font-weight="800" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Knowledge Graph Network (Obsidian-Style Graph View)</text>
+    <text x="0" y="34" fill="#94a3b8" font-size="11" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Force-directed physics simulation | Node radius ~ corpus frequency &amp; degree | Simple connections &amp; dots</text>
 
     <rect x="530" y="0" width="346" height="34" rx="6" fill="#0f172a" stroke="#1e293b" stroke-width="1.2"/>
-    <text x="703" y="21" fill="#38bdf8" font-size="11" font-weight="700" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">{len(node_map)} Core Entities • {len(edge_defs)} Explicit Links • {contrast_count} Contrastive Bounds</text>
+    <text x="703" y="21" fill="#38bdf8" font-size="11" font-weight="700" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">{N} Entities • {len(active_edges)} Connections • {contrast_count} Contrastive Bounds</text>
   </g>
 
   <!-- Legend Bar -->
   <g transform="translate(32, 68)">
     <rect width="876" height="30" rx="5" fill="#0b1120" stroke="#1e293b" stroke-width="1"/>
 
-    <circle cx="20" cy="15" r="5" fill="#10b981"/>
-    <rect x="12" y="7" width="16" height="16" rx="8" fill="none" stroke="#06b6d4" stroke-width="1.5"/>
-    <text x="36" y="19" fill="#cbd5e1" font-size="10" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Core Knowledge Hubs (e.g. Dedicated, Redwood, Stripe, gateway)</text>
+    <circle cx="20" cy="15" r="5" fill="#38bdf8"/>
+    <text x="32" y="19" fill="#cbd5e1" font-size="10" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Core Hub Entities (High Degree)</text>
 
-    <circle cx="370" cy="15" r="4.5" fill="#818cf8"/>
-    <text x="382" y="19" fill="#cbd5e1" font-size="10" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Discovered Domain Entities</text>
+    <circle cx="250" cy="15" r="3.5" fill="#64748b"/>
+    <text x="262" y="19" fill="#cbd5e1" font-size="10" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Connected Domain Entities</text>
 
-    <line x1="535" y1="15" x2="570" y2="15" stroke="#f43f5e" stroke-width="2.5" stroke-dasharray="5,3" marker-end="url(#arrowContrast)"/>
-    <rect x="580" y="7" width="32" height="16" rx="4" fill="#881337" stroke="#f43f5e" stroke-width="1"/>
-    <text x="596" y="18.5" text-anchor="middle" fill="#fecdd3" font-size="8.5" font-weight="700">≠ diff</text>
-    <text x="620" y="19" fill="#fda4af" font-size="10" font-weight="600" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">owl:differentFrom Bounds (≠)</text>
+    <line x1="470" y1="15" x2="505" y2="15" stroke="#f43f5e" stroke-width="2" stroke-dasharray="4,3"/>
+    <circle cx="512" cy="15" r="5" fill="#f43f5e"/>
+    <text x="525" y="19" fill="#fda4af" font-size="10" font-weight="600" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">owl:differentFrom Contrastive Nodes &amp; Bounds (≠)</text>
 
-    <text x="820" y="19" fill="#94a3b8" font-size="10" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">×N = Corpus Count</text>
+    <circle cx="810" cy="15" r="2.5" fill="#94a3b8"/>
+    <circle cx="820" cy="15" r="4.5" fill="#94a3b8"/>
+    <circle cx="833" cy="15" r="6.5" fill="#94a3b8"/>
+    <text x="846" y="19" fill="#94a3b8" font-size="10" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Radius ~ Degree</text>
   </g>
 
-  <!-- Zone Containers -->
-  {zones_svg}
+  <!-- Graph Canvas Area -->
+  <rect x="32" y="106" width="876" height="566" rx="8" fill="#050811" fill-opacity="0.6" stroke="#1e293b" stroke-width="1.2"/>
 
-  <!-- Layer 1: Edges -->
+  <!-- Layer 1: Simple Connection Lines -->
   <g>
     {''.join(lines_svg)}
   </g>
 
-  <!-- Layer 2: Midpoint Relation Badges -->
+  <!-- Layer 2: Node Dots -->
   <g>
-    {''.join(badges_svg)}
+    {''.join(dots_svg)}
   </g>
 
-  <!-- Layer 3: Capsule Nodes -->
+  <!-- Layer 3: Discreet Labels -->
   <g>
-    {''.join(capsules_svg)}
+    {''.join(labels_svg)}
   </g>
 
   <!-- Footer Information -->
   <rect x="32" y="680" width="876" height="26" rx="5" fill="#0f172a" stroke="#1e293b"/>
-  <text x="44" y="697" fill="#94a3b8" font-size="10" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Active Sandbox: <tspan fill="#f8fafc" font-family="monospace">{sandbox.get('db_name', 'initializing')}</tspan> | Subspaces: <tspan fill="#38bdf8" font-weight="600">5 Enterprise Architectural Domains</tspan> | Contrastive Invariants: <tspan fill="#f43f5e" font-weight="600">{len(contrastive_triples_list)} owl:differentFrom triples</tspan></text>
+  <text x="44" y="697" fill="#94a3b8" font-size="10" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Active Sandbox: <tspan fill="#f8fafc" font-family="monospace">{sandbox.get('db_name', 'initializing')}</tspan> | View: <tspan fill="#38bdf8" font-weight="600">Obsidian-Style Force-Directed Graph</tspan> | Invariant Bounds: <tspan fill="#f43f5e" font-weight="600">{len(contrastive_triples_list)} owl:differentFrom triples</tspan></text>
 </svg>"""
 
     dest.write_text(svg, encoding="utf-8")
     return {
-        "nodes_rendered": len(node_map),
-        "contrastive_nodes": len([nc for nc in node_configs if nc["cat"] == "contrast"]),
-        "active_edges": len(edge_defs),
+        "nodes_rendered": N,
+        "contrastive_nodes": len(contrastive_nodes),
+        "active_edges": len(active_edges),
         "contrastive_edges": contrast_count,
         "contrastive_triples": contrastive_triples_list,
     }
@@ -2041,17 +1806,17 @@ This dashboard documents real-time telemetry from the active **Two-Phase Hybrid 
 
 ---
 
-## 2. Knowledge Graph Entity & Link Topology (Discovered Semantic Subspaces)
+## 2. Knowledge Graph Network (Obsidian-Style Graph View)
 
-![Knowledge Graph Entity & Link Topology](/C:/Users/Harri.Ahokas/.gemini/antigravity/brain/3061c87c-9ec6-4ff5-b756-80b05e1c4342/knowledge_graph_2d_projection.svg)
+![Knowledge Graph Network](/C:/Users/Harri.Ahokas/.gemini/antigravity/brain/3061c87c-9ec6-4ff5-b756-80b05e1c4342/knowledge_graph_2d_projection.svg)
 
-### Entity & Link Topology Highlights:
+### Obsidian-Style Graph View Highlights:
 | Graph Dimension / Parameter | Current Value | Description |
 | :--- | :---: | :--- |
-| **Topology Architecture** | **Collision-Free Subspace Constellation** | 5 architectural domains with explicit border-to-border directional links and contrastive bounds |
-| **Visible Node Budget** | **`{proj_nodes}` Core Entities** | Plotted capsule nodes with verified 100% collision-free geometry and empirical frequency counts |
-| **Explicit Relational Edges** | **`{proj_edges}` Directional Links** | High-fidelity factual links extracted across the pooled validation corpus with predicate pills |
-| **Contrastive / Opposition Edges** | **`{proj_contrast}` `owl:differentFrom` Bounds** | Distinct crimson dashed edges marking semantic opposition, replacement, and distinction |
+| **Graph View Architecture** | **Force-Directed Spring Embedder** | Natural D3-force physics simulation with Coulomb repulsion and Hooke spring attraction |
+| **Visible Node Count** | **`{proj_nodes}` Entities** | Connected entity dots sized proportionally by corpus frequency and degree |
+| **Explicit Relational Links** | **`{proj_edges}` Connections** | Uncurated graph topology connecting entities through extracted factual triples |
+| **Contrastive Bounds** | **`{proj_contrast}` `owl:differentFrom` Links** | Accented coral/red nodes and dashed links identifying semantic opposition and distinction |
 
 ### Discovered Contrastive & Disjoint Relations (`owl:differentFrom`):
 | Subject Entity | Contrastive Predicate Relation | Object Entity | Invariant Semantic Distinction |
