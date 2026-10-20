@@ -3,26 +3,31 @@
 Extracts real-time metrics directly from the active yaw_optimize_*.db sandbox, configuration,
 and candidate evaluation logs, rendering everything plotted continuously along a wall-clock time axis:
 1. knowledge_graph_extraction_dashboard.svg (Dual-panel: Passages/Entities/Triples + Velocity/Latency vs Time)
-2. candidate_pareto_metric_vs_time.svg (Dual-panel: Candidate Pareto Metric S*(t), S_avg(t), S_i + Latency vs Time)
-3. recall_em_f1_vs_time.svg (Dual-panel: Retrieval Recall@1..20 + QA EM & F1 vs Time)
-4. pareto_frontier_progress.svg (2D Multi-Objective Pareto Space with Time Colormap)
-5. candidate_trajectory_vs_time.svg (End-to-end multi-phase optimization roadmap vs Time)
-6. benchmark_mobile_report.md (Structured mobile-friendly dashboard report)
+2. knowledge_graph_2d_projection.svg (2D Eigen-PCA + force relaxation layout with owl:differentFrom edges)
+3. candidate_pareto_metric_vs_time.svg (Dual-panel: Candidate Pareto Metric S*(t), S_avg(t), S_i + Latency vs Time)
+4. recall_em_f1_vs_time.svg (Dual-panel: Retrieval Recall@1..20 + QA EM & F1 vs Time)
+5. pareto_frontier_progress.svg (2D Multi-Objective Pareto Space with Time Colormap)
+6. candidate_trajectory_vs_time.svg (End-to-end multi-phase optimization roadmap vs Time)
+7. benchmark_mobile_report.md (Structured mobile-friendly dashboard report)
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
+import html
 import json
 import math
 import re
 import sqlite3
 import sys
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
 ARTIFACT_DIR = Path(
@@ -114,10 +119,8 @@ def get_empirical_telemetry_timeseries(
             deduped.append(cp)
     checkpoints = deduped
 
-    try:
+    with contextlib.suppress(Exception):
         telemetry_file.write_text(json.dumps(checkpoints, indent=2), encoding="utf-8")
-    except Exception:
-        pass
 
     samples: list[dict[str, Any]] = []
     prev_sec = 0.0
@@ -215,7 +218,7 @@ def get_active_sandbox_info() -> dict[str, Any]:
             all_predicates: list[str] = []
             recent_extractions: list[dict[str, Any]] = []
 
-            for idx, (_cid, e_raw, t_raw) in enumerate(rows, start=1):
+            for _idx, (_cid, e_raw, t_raw) in enumerate(rows, start=1):
                 try:
                     ents = json.loads(e_raw or "[]")
                 except Exception:
@@ -501,8 +504,6 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
     y_p_now = p_to_y(openie_cnt)
     y_e_now = e_to_y(total_ent)
     y_t_now = e_to_y(total_trips)
-    y_v_now = v_to_y(velocity)
-    y_lat_now = lat_to_y(sec_per_chunk)
 
     x_target = t_to_x(target_total_hours)
     y_p_target = p_to_y(target_pool)
@@ -514,7 +515,6 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
     y_ref_pool = p_to_y(target_pool)
 
     v_mean_y = v_to_y(velocity)
-    lat_mean_y = lat_to_y(sec_per_chunk)
     latest_vel = samples[-1]["rolling_velocity"] if samples else velocity
     latest_lat = samples[-1]["rolling_latency"] if samples else sec_per_chunk
 
@@ -744,6 +744,352 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
     dest.write_text(svg, encoding="utf-8")
 
 
+def generate_graph_projection_svg(dest: Path, sandbox: dict[str, Any]) -> dict[str, Any]:
+    """Generate 2D topological projection of the knowledge graph entity/triple space.
+
+    Computes 2D layout via Eigen-PCA (SVD on normalized adjacency matrix) followed by
+    vectorized spring-electrical force relaxation. Node radius is proportional to
+    occurrence frequency (with canonicalized altLabels/casing), explicit relations are
+    rendered as sleek directed lines, and contrastive / owl:differentFrom edges are
+    highlighted with crimson dashed lines and centered inequality badges.
+    """
+    db_path_str = sandbox.get("db_path")
+    if not db_path_str:
+        return {}
+
+    db_path = Path(db_path_str)
+    if not db_path.exists():
+        return {}
+
+    contrastive_keywords = [
+        "diff",
+        "oppose",
+        "contrast",
+        "not replace",
+        "replace",
+        "conflict",
+        "distinguish",
+        "unlike",
+        "versus",
+        "vs",
+        "different",
+        "never",
+        "disjoint",
+        "exclusive",
+    ]
+
+    try:
+        conn = sqlite3.connect(db_path, timeout=3.0)
+        rows = conn.execute(
+            "SELECT chunk_id, entities_json, triples_json FROM openie_chunks ORDER BY rowid ASC"
+        ).fetchall()
+        conn.close()
+    except Exception:
+        return {}
+
+    if not rows:
+        return {}
+
+    raw_counts: Counter[str] = Counter()
+    triples_raw: list[tuple[str, str, str, str]] = []
+
+    for cid, ej, tj in rows:
+        try:
+            ents = json.loads(ej or "[]")
+        except Exception:
+            ents = []
+        try:
+            trips = json.loads(tj or "[]")
+        except Exception:
+            trips = []
+
+        for e in ents:
+            name = str(e[0] if isinstance(e, (list, tuple)) else e).strip()
+            if name:
+                raw_counts[name] += 1
+        for t in trips:
+            if isinstance(t, (list, tuple)) and len(t) >= 3:
+                s, p, o = str(t[0]).strip(), str(t[1]).strip(), str(t[2]).strip()
+                if s and p and o:
+                    triples_raw.append((s, p, o, str(cid)))
+                    raw_counts[s] += 1
+                    raw_counts[o] += 1
+
+    # Canonicalize casing and whitespace
+    canonical_map: dict[str, str] = {}
+    lower_to_variants: dict[str, Counter[str]] = defaultdict(Counter)
+    for name, cnt in raw_counts.items():
+        clean = " ".join(name.split())
+        if clean:
+            lower_to_variants[clean.lower()][clean] += cnt
+
+    for _l_name, variants in lower_to_variants.items():
+        best_variant = variants.most_common(1)[0][0]
+        for v in variants:
+            canonical_map[v] = best_variant
+
+    canon_counts: Counter[str] = Counter()
+    for name, cnt in raw_counts.items():
+        canon_counts[canonical_map.get(name, name)] += cnt
+
+    # Canonicalize triples and identify contrastive relationships
+    canon_triples: list[tuple[str, str, str, bool]] = []
+    contrastive_nodes: set[str] = set()
+    contrastive_triples_list: list[tuple[str, str, str]] = []
+
+    for s, p, o, _cid in triples_raw:
+        cs = canonical_map.get(s, s)
+        co = canonical_map.get(o, o)
+        if cs != co:
+            is_contrast = any(kw in p.lower() for kw in contrastive_keywords)
+            canon_triples.append((cs, p, co, is_contrast))
+            if is_contrast:
+                contrastive_nodes.add(cs)
+                contrastive_nodes.add(co)
+                if (cs, p, co) not in contrastive_triples_list:
+                    contrastive_triples_list.append((cs, p, co))
+
+    # Select node budget: all contrastive nodes + top frequent canonical entities
+    selected_nodes = set(contrastive_nodes)
+    top_frequent = [name for name, _ in canon_counts.most_common(160) if name not in selected_nodes]
+    selected_nodes.update(top_frequent[: max(0, 80 - len(selected_nodes))])
+
+    node_list = sorted(list(selected_nodes), key=lambda x: canon_counts[x], reverse=True)
+    node_idx = {name: i for i, name in enumerate(node_list)}
+    N = len(node_list)
+
+    if N == 0:
+        return {}
+
+    # Adjacency matrix for Spectral PCA embedding
+    A = np.zeros((N, N), dtype=np.float64)
+    active_triples: list[tuple[int, int, str, str, str, bool]] = []
+    seen_edges: set[tuple[int, int]] = set()
+
+    for cs, p, co, is_contrast in canon_triples:
+        if cs in node_idx and co in node_idx:
+            u = node_idx[cs]
+            v = node_idx[co]
+            A[u, v] += 1.0
+            A[v, u] += 1.0
+            if (u, v) not in seen_edges and (v, u) not in seen_edges:
+                seen_edges.add((u, v))
+                active_triples.append((u, v, cs, p, co, is_contrast))
+
+    # Spectral Eigen-PCA initialization
+    deg = np.sum(A, axis=1) + 0.1
+    D_inv_sqrt = np.diag(1.0 / np.sqrt(deg))
+    L_sym = D_inv_sqrt @ A @ D_inv_sqrt
+
+    try:
+        U, S, Vt = np.linalg.svd(L_sym + 0.05 * np.eye(N))
+        pos = U[:, 1:3].copy() if N >= 3 else np.random.randn(N, 2)
+    except Exception:
+        angles = np.linspace(0, 2 * math.pi, N, endpoint=False)
+        pos = np.column_stack([np.cos(angles), np.sin(angles)])
+
+    if np.std(pos[:, 0]) < 1e-4 or np.std(pos[:, 1]) < 1e-4:
+        angles = np.linspace(0, 2 * math.pi, N, endpoint=False)
+        pos = np.column_stack([np.cos(angles), np.sin(angles)])
+
+    pos = (pos - np.mean(pos, axis=0)) / (np.std(pos, axis=0) + 1e-6)
+
+    # Vectorized Spring-Electrical Force Relaxation (35 iterations)
+    k_dist = 1.0 / math.sqrt(N)
+    temp = 0.5
+    for _it in range(35):
+        diff = pos[:, np.newaxis, :] - pos[np.newaxis, :, :]
+        dist = np.linalg.norm(diff, axis=-1) + 1e-4
+        rep_force = (k_dist**2 / dist**2)[:, :, np.newaxis] * (diff / dist[:, :, np.newaxis])
+        np.fill_diagonal(rep_force[:, :, 0], 0)
+        np.fill_diagonal(rep_force[:, :, 1], 0)
+        F_rep = np.sum(rep_force, axis=1)
+
+        F_att = np.zeros_like(pos)
+        for u, v, _, _, _, _ in active_triples:
+            d_vec = pos[v] - pos[u]
+            d_val = np.linalg.norm(d_vec) + 1e-4
+            f = (d_val**2 / k_dist) * (d_vec / d_val)
+            F_att[u] += f
+            F_att[v] -= f
+
+        F_center = -0.05 * pos
+        F_total = F_rep + F_att + F_center
+        f_norm = np.linalg.norm(F_total, axis=-1, keepdims=True) + 1e-6
+        step = (F_total / f_norm) * np.minimum(f_norm, temp)
+        pos += step
+        temp *= 0.94
+
+    # Map to SVG Canvas (940 x 720)
+    pad_x1, pad_x2 = 75, 865
+    pad_y1, pad_y2 = 145, 645
+    min_x, max_x = float(pos[:, 0].min()), float(pos[:, 0].max())
+    min_y, max_y = float(pos[:, 1].min()), float(pos[:, 1].max())
+    sx = (pad_x2 - pad_x1) / max(1e-4, max_x - min_x)
+    sy = (pad_y2 - pad_y1) / max(1e-4, max_y - min_y)
+
+    coords = [(pad_x1 + (pos[i, 0] - min_x) * sx, pad_y1 + (pos[i, 1] - min_y) * sy) for i in range(N)]
+
+    regular_lines: list[str] = []
+    contrast_lines: list[str] = []
+    contrast_badges: list[str] = []
+
+    for u, v, _cs, p, _co, is_contrast in active_triples:
+        x1, y1 = coords[u]
+        x2, y2 = coords[v]
+        if is_contrast:
+            contrast_lines.append(
+                f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" stroke="#f43f5e" stroke-width="2.6" stroke-dasharray="6,4" stroke-opacity="0.95"/>'
+            )
+            mx, my = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+            badge_txt = f"≠ {p[:18]}" if len(p) <= 18 else f"≠ {p[:16]}…"
+            bw = len(badge_txt) * 6.2 + 12
+            bh = 16
+            contrast_badges.append(
+                f'<rect x="{mx - bw/2:.1f}" y="{my - bh/2:.1f}" width="{bw:.1f}" height="{bh}" rx="4" fill="#881337" fill-opacity="0.95" stroke="#f43f5e" stroke-width="1.2"/>'
+            )
+            contrast_badges.append(
+                f'<text x="{mx:.1f}" y="{my + 3.8:.1f}" text-anchor="middle" fill="#fecdd3" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif" font-size="9" font-weight="700">{html.escape(badge_txt)}</text>'
+            )
+        else:
+            regular_lines.append(
+                f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" stroke="#38bdf8" stroke-opacity="0.22" stroke-width="1.2"/>'
+            )
+
+    nodes_markup: list[str] = []
+    labels_markup: list[str] = []
+
+    for i, name in enumerate(node_list):
+        cx, cy = coords[i]
+        cnt = canon_counts[name]
+        r = min(22.0, max(7.0, 6.0 + math.sqrt(cnt) * 2.2))
+        is_contrast = name in contrastive_nodes
+
+        if is_contrast:
+            fill_grad = "url(#gradRose)"
+            stroke_col = "#fda4af"
+            stroke_w = "2.2"
+            nodes_markup.append(
+                f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{r + 4:.1f}" fill="#f43f5e" fill-opacity="0.18"/>'
+            )
+        elif cnt >= 8:
+            fill_grad = "url(#gradCyan)"
+            stroke_col = "#67e8f9"
+            stroke_w = "1.8"
+        else:
+            fill_grad = "url(#gradIndigo)"
+            stroke_col = "#93c5fd"
+            stroke_w = "1.2"
+
+        nodes_markup.append(
+            f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{r:.1f}" fill="{fill_grad}" stroke="{stroke_col}" stroke-width="{stroke_w}"/>'
+        )
+
+        disp_name = name if len(name) <= 22 else f"{name[:20]}…"
+        ty = cy + 3.5 if r >= 14 else cy + r + 10.5
+        labels_markup.append(
+            f'<text x="{cx:.1f}" y="{ty:.1f}" text-anchor="middle" fill="#f8fafc" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif" font-size="9.5" font-weight="600" paint-order="stroke" stroke="#070b14" stroke-width="3.5px" stroke-linejoin="round">{html.escape(disp_name)}</text>'
+        )
+
+    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 720" width="940" height="720">
+  <defs>
+    <linearGradient id="gradCyan" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#06b6d4"/>
+      <stop offset="100%" stop-color="#10b981"/>
+    </linearGradient>
+    <linearGradient id="gradIndigo" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#6366f1"/>
+      <stop offset="100%" stop-color="#3b82f6"/>
+    </linearGradient>
+    <linearGradient id="gradRose" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#fb7185"/>
+      <stop offset="100%" stop-color="#e11d48"/>
+    </linearGradient>
+    <radialGradient id="centerGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.04"/>
+      <stop offset="100%" stop-color="#070b14" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#1e293b" stroke-width="0.5" stroke-opacity="0.45"/>
+    </pattern>
+  </defs>
+
+  <!-- Background -->
+  <rect width="940" height="720" fill="#070b14"/>
+  <rect width="940" height="720" fill="url(#grid)"/>
+  <circle cx="470" cy="390" r="350" fill="url(#centerGlow)"/>
+
+  <!-- Header Card -->
+  <g transform="translate(32, 22)">
+    <text x="0" y="16" fill="#f8fafc" font-size="16" font-weight="800" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Knowledge Graph 2D Topological Projection &amp; Contrastive Space</text>
+    <text x="0" y="34" fill="#94a3b8" font-size="11" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Eigen-PCA spectral embedding + force relaxation | Node radius ~ corpus frequency | owl:differentFrom edges highlighted</text>
+
+    <rect x="520" y="0" width="356" height="34" rx="6" fill="#0f172a" stroke="#1e293b" stroke-width="1.2"/>
+    <text x="698" y="21" fill="#38bdf8" font-size="11" font-weight="700" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">{N} Core Entities • {len(active_triples)} Induced Triples • {len(contrast_lines)} Contrastive Edges</text>
+  </g>
+
+  <!-- Legend Bar -->
+  <g transform="translate(32, 68)">
+    <rect width="876" height="30" rx="5" fill="#0b1120" stroke="#1e293b" stroke-width="1"/>
+    <circle cx="20" cy="15" r="6" fill="url(#gradCyan)" stroke="#67e8f9" stroke-width="1.5"/>
+    <text x="32" y="19" fill="#cbd5e1" font-size="10" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Core Knowledge Hubs (Deg ≥ 8)</text>
+
+    <circle cx="240" cy="15" r="5" fill="url(#gradIndigo)" stroke="#93c5fd" stroke-width="1"/>
+    <text x="252" y="19" fill="#cbd5e1" font-size="10" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Discovered Domain Entities</text>
+
+    <line x1="430" y1="15" x2="465" y2="15" stroke="#f43f5e" stroke-width="2.5" stroke-dasharray="5,3"/>
+    <circle cx="475" cy="15" r="6" fill="url(#gradRose)" stroke="#fda4af" stroke-width="2"/>
+    <text x="490" y="19" fill="#fda4af" font-size="10" font-weight="600" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">owl:differentFrom / Contrastive Edges (≠)</text>
+
+    <circle cx="755" cy="15" r="3.5" fill="#94a3b8"/>
+    <circle cx="768" cy="15" r="5.5" fill="#94a3b8"/>
+    <circle cx="784" cy="15" r="7.5" fill="#94a3b8"/>
+    <text x="798" y="19" fill="#94a3b8" font-size="10" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Radius ~ Frequency</text>
+  </g>
+
+  <!-- Graph Canvas Area -->
+  <rect x="32" y="108" width="876" height="562" rx="8" fill="#050811" fill-opacity="0.75" stroke="#1e293b" stroke-width="1.2"/>
+
+  <!-- Layer 1: Regular Relational Edges -->
+  <g>
+    {''.join(regular_lines)}
+  </g>
+
+  <!-- Layer 2: Contrastive Edges -->
+  <g>
+    {''.join(contrast_lines)}
+  </g>
+
+  <!-- Layer 3: Contrastive Midpoint Badges -->
+  <g>
+    {''.join(contrast_badges)}
+  </g>
+
+  <!-- Layer 4: Node Glyphs & Halos -->
+  <g>
+    {''.join(nodes_markup)}
+  </g>
+
+  <!-- Layer 5: Node Labels -->
+  <g>
+    {''.join(labels_markup)}
+  </g>
+
+  <!-- Footer Information -->
+  <rect x="32" y="680" width="876" height="26" rx="5" fill="#0f172a" stroke="#1e293b"/>
+  <text x="44" y="697" fill="#94a3b8" font-size="10" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Active Sandbox: <tspan fill="#f8fafc" font-family="monospace">{sandbox.get('db_name', 'initializing')}</tspan> | Projection Method: <tspan fill="#38bdf8" font-weight="600">SVD Eigen-PCA Affinity + Force Relaxation (35 iters)</tspan> | Contrastive Invariants: <tspan fill="#f43f5e" font-weight="600">{len(contrastive_triples_list)} owl:differentFrom triples</tspan></text>
+</svg>"""
+
+    dest.write_text(svg, encoding="utf-8")
+    return {
+        "nodes_rendered": N,
+        "contrastive_nodes": len(contrastive_nodes),
+        "active_edges": len(active_triples),
+        "contrastive_edges": len(contrast_lines),
+        "contrastive_triples": contrastive_triples_list,
+    }
+
+
 def generate_candidate_pareto_vs_time_svg(
     dest: Path,
     records: list[dict[str, Any]],
@@ -782,7 +1128,7 @@ def generate_candidate_pareto_vs_time_svg(
     sub_header = (
         f"Live telemetry: {len(records)} candidates evaluated across wall-clock time"
         if is_active
-        else f"Historical Baseline Benchmark (task-21330: 75 Candidates) | Comparative Reference Target"
+        else "Historical Baseline Benchmark (task-21330: 75 Candidates) | Comparative Reference Target"
     )
 
     badge_text = (
@@ -988,7 +1334,7 @@ def generate_recall_em_f1_vs_time_svg(
     sub_header = (
         f"Live telemetry: constituent retrieval & QA metrics across {len(records)} candidates"
         if is_active
-        else f"Historical Baseline Dynamics (task-21330: 75 Candidates) | Comparative Reference Target"
+        else "Historical Baseline Dynamics (task-21330: 75 Candidates) | Comparative Reference Target"
     )
 
     badge_text = (
@@ -1152,7 +1498,7 @@ def generate_pareto_svg(
     sub_header = (
         f"Live telemetry: 2D Pareto trade-off mapping across {len(records)} candidates"
         if is_active
-        else f"Historical Baseline 2D Pareto Space (task-21330: 75 Candidates) | Real Evaluated Data Points"
+        else "Historical Baseline 2D Pareto Space (task-21330: 75 Candidates) | Real Evaluated Data Points"
     )
 
     badge_text = (
@@ -1335,7 +1681,7 @@ def generate_pareto_svg(
 """
 
     # PANEL B: PARETO HYPERVOLUME & ARCHIVE PROGRESSION
-    svg += f"""
+    svg += """
   <!-- PANEL B: PARETO HYPERVOLUME & ARCHIVE PROGRESSION -->
   <rect x="474" y="68" width="430" height="435" rx="8" fill="#090f1d" stroke="#334155" stroke-width="1.2"/>
   <text x="488" y="90" fill="#f8fafc" font-size="11" font-weight="700">B. Pareto Hypervolume HV(t) &amp; Archive Cardinality</text>
@@ -1416,6 +1762,7 @@ def generate_report_markdown(
     cfg: dict[str, Any],
     records: list[dict[str, Any]],
     is_active: bool,
+    proj_info: dict[str, Any] | None = None,
 ) -> None:
     now_str = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
     counts = sandbox.get("counts", {})
@@ -1444,6 +1791,12 @@ def generate_report_markdown(
     uniq_preds = kg.get("unique_predicates", 0)
     top_preds = kg.get("top_predicates", [])
     recent_list = kg.get("recent_extractions", [])
+
+    proj = proj_info or {}
+    proj_nodes = proj.get("nodes_rendered", 0)
+    proj_edges = proj.get("active_edges", 0)
+    proj_contrast = proj.get("contrastive_edges", 0)
+    contrast_triples = proj.get("contrastive_triples", [])
 
     best_record = max(records, key=lambda r: r.get("marginal_s", 0.0)) if records else {}
     best_cand = best_record.get("cand", 15)
@@ -1482,7 +1835,31 @@ This dashboard documents real-time telemetry from the active **Two-Phase Hybrid 
 
 ---
 
-## 2. Knowledge Graph Topology & Semantic Density
+## 2. Knowledge Graph 2D Topological Projection & Contrastive Subspace
+
+![Knowledge Graph 2D Topological Projection](/C:/Users/Harri.Ahokas/.gemini/antigravity/brain/3061c87c-9ec6-4ff5-b756-80b05e1c4342/knowledge_graph_2d_projection.svg)
+
+### 2D Graph Projection & Contrastive Semantics Highlights:
+| Projection Parameter | Current Value | Description |
+| :--- | :---: | :--- |
+| **Spectral Embedding** | **Eigen-PCA + Force Relaxation** | 2D projection via SVD on normalized adjacency matrix followed by 35-iteration spring-electrical repulsion |
+| **Visible Node Budget** | **`{proj_nodes}` Core Entities** | Top frequent canonical entities + all contrastive relationship participants |
+| **Explicit Relational Edges** | **`{proj_edges}` Triples** | High-fidelity factual links extracted across the pooled validation corpus |
+| **Contrastive / Opposition Edges** | **`{proj_contrast}` `owl:differentFrom` Links** | Distinct crimson dashed edges marking semantic opposition, replacement, and distinction |
+
+### Discovered Contrastive & Disjoint Relations (`owl:differentFrom`):
+| Subject Entity | Contrastive Predicate Relation | Object Entity | Invariant Semantic Distinction |
+| :--- | :---: | :--- | :--- |
+"""
+    for s_c, p_c, o_c in contrast_triples[:10]:
+        md += f"| `{s_c}` | **`{p_c}`** | `{o_c}` | Distinct semantic entity class (`owl:differentFrom`) |\n"
+    if not contrast_triples:
+        md += "| *(collecting...)* | *(analyzing relations)* | *(streaming)* | Discovered contrastive assertions stream dynamically |\n"
+
+    md += f"""
+---
+
+## 3. Knowledge Graph Topology & Semantic Density
 
 | Graph Dimension | Extracted Count | Density / Scale Metric |
 | :--- | :---: | :--- |
@@ -1520,11 +1897,11 @@ This dashboard documents real-time telemetry from the active **Two-Phase Hybrid 
 > [!IMPORTANT]
 > **Active Optimization Run Status vs. Reference Trajectory Disambiguation**
 > * **Active Run (`task-22349`, sandbox `{db_name}`)**: Currently executing **Stage 1 (Pooled Distractor Graph Ingestion)** at **`{openie_cnt}` / `{target_pool}` passages** (`{pct:.1f}%`, `{int(elapsed_min)} min` / `{elapsed_min / 60.0:.2f}h` elapsed). Candidate #1 evaluation begins once all {target_pool} chunks commit to `yaw.db` (~`{eta_str}` remaining).
-> * **Plots Below (Fig. 2 & Fig. 3)**: Display the **75-candidate reference run (`task-21330`, 7.25h)** alongside the **`LIVE NOW` cursor ({elapsed_min / 60.0:.2f}h)** to preserve comparative baseline visibility until active candidate evaluations start.
+> * **Plots Below (Fig. 3 & Fig. 4)**: Display the **75-candidate reference run (`task-21330`, 7.25h)** alongside the **`LIVE NOW` cursor ({elapsed_min / 60.0:.2f}h)** to preserve comparative baseline visibility until active candidate evaluations start.
 
 ---
 
-## 3. Candidate Pareto Metric Trajectory & Evaluation Latency vs. Wall-Clock Time
+## 4. Candidate Pareto Metric Trajectory & Evaluation Latency vs. Wall-Clock Time
 
 ![Candidate Pareto Metric vs Time](/C:/Users/Harri.Ahokas/.gemini/antigravity/brain/3061c87c-9ec6-4ff5-b756-80b05e1c4342/candidate_pareto_metric_vs_time.svg)
 
@@ -1537,7 +1914,7 @@ This dashboard documents real-time telemetry from the active **Two-Phase Hybrid 
 
 ---
 
-## 4. Constituent Retrieval (Recall@1..20) & QA (EM, F1) Dynamics vs. Wall-Clock Time
+## 5. Constituent Retrieval (Recall@1..20) & QA (EM, F1) Dynamics vs. Wall-Clock Time
 
 ![Recall@N, EM, F1 vs Time](/C:/Users/Harri.Ahokas/.gemini/antigravity/brain/3061c87c-9ec6-4ff5-b756-80b05e1c4342/recall_em_f1_vs_time.svg)
 
@@ -1556,7 +1933,7 @@ This dashboard documents real-time telemetry from the active **Two-Phase Hybrid 
 
 ---
 
-## 5. Multi-Objective 2D Pareto Frontier & Sizecoding Formulation
+## 6. Multi-Objective 2D Pareto Frontier & Sizecoding Formulation
 
 Each candidate program evaluation is scored under the 14-metric sizecoding Pareto objective:
 
@@ -1585,7 +1962,7 @@ $$S(\\theta) = \\frac{{\\text{{GM}}_{{\\text{{good}}}}(\\theta)}}{{\\text{{GM}}_
 
 ---
 
-## 6. Historical Baseline Parity Gate (`popqa` Target 1 vs. Target 2)
+## 7. Historical Baseline Parity Gate (`popqa` Target 1 vs. Target 2)
 
 ![Quality Comparison](/C:/Users/Harri.Ahokas/.gemini/antigravity/brain/3061c87c-9ec6-4ff5-b756-80b05e1c4342/benchmark_quality_comparison.svg)
 
@@ -1597,7 +1974,7 @@ $$S(\\theta) = \\frac{{\\text{{GM}}_{{\\text{{good}}}}(\\theta)}}{{\\text{{GM}}_
 
 ---
 
-## 7. Wall-Clock Latency & Efficiency Comparison
+## 8. Wall-Clock Latency & Efficiency Comparison
 
 ![Latency Comparison](/C:/Users/Harri.Ahokas/.gemini/antigravity/brain/3061c87c-9ec6-4ff5-b756-80b05e1c4342/benchmark_latency_comparison.svg)
 """
@@ -1611,16 +1988,18 @@ def run_once() -> None:
     records, is_active = get_candidate_evaluation_records()
 
     kg_dash_svg_path = ARTIFACT_DIR / "knowledge_graph_extraction_dashboard.svg"
+    kg_proj_svg_path = ARTIFACT_DIR / "knowledge_graph_2d_projection.svg"
     cand_pareto_svg_path = ARTIFACT_DIR / "candidate_pareto_metric_vs_time.svg"
     recall_f1_svg_path = ARTIFACT_DIR / "recall_em_f1_vs_time.svg"
     pareto_svg_path = ARTIFACT_DIR / "pareto_frontier_progress.svg"
     report_md_path = ARTIFACT_DIR / "benchmark_mobile_report.md"
 
     generate_kg_dashboard_svg(kg_dash_svg_path, sandbox, cfg)
+    proj_info = generate_graph_projection_svg(kg_proj_svg_path, sandbox)
     generate_candidate_pareto_vs_time_svg(cand_pareto_svg_path, records, sandbox, is_active)
     generate_recall_em_f1_vs_time_svg(recall_f1_svg_path, records, sandbox, is_active)
     generate_pareto_svg(pareto_svg_path, records, sandbox, cfg, is_active)
-    generate_report_markdown(report_md_path, sandbox, cfg, records, is_active)
+    generate_report_markdown(report_md_path, sandbox, cfg, records, is_active, proj_info)
 
     now_str = datetime.now(UTC).strftime("%H:%M:%S")
     openie_cnt = sandbox.get("counts", {}).get("openie_chunks", 0)
