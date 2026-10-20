@@ -2171,130 +2171,14 @@ def generate_report_markdown(
     best_score_pct = round(best_record.get("best_so_far", 0.061) * 100.0, 1)
 
     status_badge = (
-        "**`LIVE RUN EVALUATION ACTIVE`**"
+        f"**`STAGE 3: CANDIDATE EVALUATION ({len(records)} evals • Peak: {best_score_pct}%)`**"
         if is_active
         else (
-            f"**`STAGE 2 MIPROv2 TRAINING BOOTSTRAP ACTIVE (Train: {train_done}/{train_target_pool} [{train_pct:.1f}%] • Val: {val_done}/{val_target_pool} [100%])`**"
+            f"**`STAGE 2: TRAINING BOOTSTRAP (Train: {train_done}/{train_target_pool} [{train_pct:.1f}%] • Val: {val_done}/{val_target_pool} [100%])`**"
             if openie_cnt >= 495
-            else f"**`STAGE 1 POOLED EXTRACTION ACTIVE (Val: {openie_cnt}/{val_target_pool} [{val_pct:.1f}%])`**"
+            else f"**`STAGE 1: POOLED EXTRACTION (Val: {openie_cnt}/{val_target_pool} [{val_pct:.1f}%])`**"
         )
     )
-
-    if openie_cnt >= 495:
-        ingestion_status_rows = f"""| **Validation Pool Progress** | **`{val_done}` / `{val_target_pool}`** (`{val_pct:.1f}%` **Committed**) | 100% of canonical validation holdout chunks committed to sandbox `yaw.db` |
-| **Training Pool Progress** | **`{train_done}` / `{train_target_pool}`** (`{train_pct:.1f}%` **Ingesting**) | Bootstrapping few-shot exemplars across 150 training queries ({rem_train} chunks remaining) |
-| **Combined Corpus Progress** | **`{openie_cnt}` / `{corpus_total_pool}`** (`{corpus_pct:.1f}%` **Total**) | Unified knowledge graph across all EnterpriseRAG-bench documents |
-| **Ingestion Readiness Criterion** | **Both Pools at `100.0%`** | Pipeline is ready for evaluation when Training Pool reaches {train_target_pool}/{train_target_pool} (Corpus reaches {corpus_total_pool}) |
-| **Pipeline Stage** | **Stage 2: MIPROv2 Demonstration Bootstrap** | Actively synthesizing few-shot demonstration candidates for prompt evolution |
-| **Sandbox Database Isolation** | [`{db_name}`](file:///{sandbox.get('db_path', '')}) | Dedicated sandbox DB; production `yaw.db` is strictly isolated |"""
-    else:
-        ingestion_status_rows = f"""| **Validation Pool Progress** | **`{val_done}` / `{val_target_pool}`** (`{val_pct:.1f}%`) | Unique validation corpus chunks processed through Stage 1–3 OpenIE |
-| **Training Pool Progress** | **`{train_done}` / `{train_target_pool}`** (`{train_pct:.1f}%`) | Training pool ingestion begins after validation pool completes |
-| **Combined Corpus Progress** | **`{openie_cnt}` / `{corpus_total_pool}`** (`{corpus_pct:.1f}%`) | Total corpus progress toward {corpus_total_pool} passages |
-| **Ingestion Readiness Criterion** | **Both Pools at `100.0%`** | Ready when both Validation Pool (495) and Training Pool (818) hit 100% |
-| **Time Remaining to Commit** | **`~{eta_corpus_str}`** (`{int(eta_corpus_min)} min`) | Estimated duration remaining to finish remaining {rem_corpus} chunks |"""
-
-    md = f"""# HippoRAG 2 Optimization & Benchmark Live Dashboard
-
-This dashboard documents real-time telemetry from the active **Two-Phase Hybrid Prompt Optimization Run** (`uv run yaw optimize`, `mode = "hybrid"`) over the canonical **250-Query Stratified EnterpriseRAG-Bench** (`150` train / `100` validation holdouts over `1,308` corpus chunks).
-
-*Dashboard Updated*: `{now_str}` *(Refreshed every 10 min by background watch daemon)*
-*Current Pipeline State*: {status_badge}
-
----
-
-## 1. Live Ingestion & Knowledge Graph Extraction vs. Time
-
-![Live Ingestion & Knowledge Graph Extraction Dashboard](/C:/Users/Harri.Ahokas/.gemini/antigravity/brain/3061c87c-9ec6-4ff5-b756-80b05e1c4342/knowledge_graph_extraction_dashboard.svg)
-
-### Real-Time Ingestion & Model Telemetry:
-| Metric / Parameter | Current Value | Description |
-| :--- | :---: | :--- |
-{ingestion_status_rows}
-| **Extraction Velocity** | **`{velocity:.2f}` passages/min** | Rolling throughput on local `Qwen3-4B-Instruct` |
-| **Mean Latency per Chunk** | **`{sec_per_chunk:.1f}s / chunk`** | Mean end-to-end time per passage (NER + Triples + Definitions) |
-| **Elapsed Wall-Clock** | **`{int(elapsed_min)} min`** (`{elapsed_min / 60.0:.2f}h`) | Total execution time since active optimization launch |
-| **Projected Completion Clock** | **`~{finish_clock_str} UTC`** | Estimated wall-clock completion time |
-| **Estimated Total Duration** | **`~{target_total_hours:.1f}h`** (`{int(target_total_hours * 60)} min`) | Total run duration (Elapsed + Remaining) |
-| **Live Model Generation Speed** | **`{lem_tps:.1f} tokens/s`** | Real-time token generation speed queried from Lemonade Prometheus `/metrics` |
-| **Live Time to First Token (TTFT)** | **`{lem_ttft_ms} ms`** | Real prefill latency on active `Qwen3-4B-Instruct-2507-GGUF` |
-| **Emitted Knowledge Graph Volume** | **`{kg_output_mb:.2f} MB`** | Raw structured JSON payload committed to SQLite (`openie_chunks`) |
-| **Measured Output Tokens** | **`~{kg_output_tok:,} tokens`** | `~{kg_avg_tok:,}` completion tokens/passage (entities + triples + statement definitions) |
-| **Inference Host Resources** | **`{lem_cpu:.1f}% CPU` • `{lem_ram:.1f} GB RAM`** | Live system resource allocation on local inference daemon |
-
----
-
-## 2. Knowledge Graph Network (Obsidian-Style Graph View)
-
-![Knowledge Graph Network](/C:/Users/Harri.Ahokas/.gemini/antigravity/brain/3061c87c-9ec6-4ff5-b756-80b05e1c4342/knowledge_graph_2d_projection.svg)
-
-### Obsidian-Style Graph View Highlights:
-| Graph Dimension / Parameter | Current Value | Description |
-| :--- | :---: | :--- |
-| **Graph View Architecture** | **Coulomb-Hooke Force Simulation** | Organic force-directed spring embedder balancing repulsive electrostatic charges and edge spring tension |
-| **Rendered Subgraph Scope** | **`{proj_nodes:,}` Core Entities** (out of `{uniq_ent:,}` unique / `{total_ent:,}` mentions) | Comprehensive top-{proj_nodes} core connected constellation comprising all contrastive nodes, top 160 hubs, and 1-hop neighborhoods |
-| **Rendered Subgraph Links** | **`{proj_edges:,}` Connections** (out of `{uniq_edges:,}` unique edges / `{total_trips:,}` total triples) | Geometric pairwise edges connecting the {proj_nodes} rendered entities across the core component |
-| **Contrastive Bounds** | **`{proj_contrast}` `owl:differentFrom` Links** | 100% of discovered semantic opposition and distinction bounds rendered with coral dashed lines and (≠) badges |
-
-### Discovered Contrastive & Disjoint Relations (`owl:differentFrom`):
-| Subject Entity | Contrastive Predicate Relation | Object Entity | Invariant Semantic Distinction |
-| :--- | :---: | :--- | :--- |
-"""
-    for s_c, p_c, o_c in contrast_triples[:10]:
-        md += f"| `{s_c}` | **`{p_c}`** | `{o_c}` | Distinct semantic entity class (`owl:differentFrom`) |\n"
-    if not contrast_triples:
-        md += "| *(collecting...)* | *(analyzing relations)* | *(streaming)* | Discovered contrastive assertions stream dynamically |\n"
-
-    md += f"""
----
-
-## 3. Knowledge Graph Topology & Semantic Density
-
-| Graph Dimension | Extracted Count | Density / Scale Metric |
-| :--- | :---: | :--- |
-| **Named Entities (Mentions / Unique)** | **`{total_ent:,}` mentions** / **`{uniq_ent:,}` unique** | **`{avg_ent:.1f}` entities / passage** |
-| **Factual Triples (Triples / Edges)** | **`{total_trips:,}` triples** / **`{uniq_edges:,}` unique links** | **`{avg_trips:.1f}` triples / passage** (across 1,048 components) |
-| **Emitted KG JSON Payload** | **`{kg_output_mb:.2f} MB`** | Raw extraction JSON committed to SQLite (`openie_chunks`) |
-| **Measured Completion Tokens** | **`~{kg_output_tok:,}` tokens** | **`~{kg_avg_tok:,}` tokens / passage** (entities + triples + definitions) |
-| **Semantic Relation Vocabulary** | **`{uniq_preds}` unique predicates** | Broad expressive vocabulary discovered across domains |
-| **Active Inference Backend** | **`Qwen3-4B-Instruct` @ `{lem_tps:.1f} tok/s`** | Lemonade GPU engine (`llama.cpp`, TTFT `{lem_ttft_ms} ms`) |
-| **Active Sandbox DB** | [`{db_name}`](file:///{sandbox.get('db_path', '')}) | **`{db_size} MB`** on disk |
-
-### Top Discovered Semantic Predicates:
-| Rank | Predicate Relation | Occurrences | Semantic Category |
-| :---: | :--- | :---: | :--- |
-"""
-    for rank, (p_name, p_cnt) in enumerate(top_preds, start=1):
-        md += f"| **#{rank}** | `{p_name}` | **`{p_cnt}`** | Domain Relation |\n"
-
-    md += """
-### Recent Knowledge Graph Extractions Stream:
-| Chunk Identifier | Entities Captured | Triples Captured | Sample Triples Extracted |
-| :--- | :---: | :---: | :--- |
-"""
-    for r_item in recent_list[-4:]:
-        cid_str = f"`{r_item.get('chunk_id', '')[:22]}...`"
-        cnt_e = r_item.get("entity_count", 0)
-        cnt_t = r_item.get("triple_count", 0)
-        trips_preview = (
-            "<br>".join(f"`{t}`" for t in r_item.get("sample_triples", [])[:2])
-            if r_item.get("sample_triples")
-            else "*no triples*"
-        )
-        md += f"| {cid_str} | **`{cnt_e}`** | **`{cnt_t}`** | {trips_preview} |\n"
-
-    if is_active:
-        callout_status = f"* **Active Run (`task-22349`, sandbox `{db_name}`)**: Currently executing **Stage 3 (MIPROv2 Multi-Trial Candidate Evaluation)** (`{int(elapsed_min)} min` / `{elapsed_min / 60.0:.2f}h` elapsed). **`{len(records)}` candidate evaluations** streamed so far (Peak marginal score: **`{best_score_pct}%`** at Cand `#{best_cand}`). Validation Pool (`{val_done}/{val_target_pool}`, `100%`) and Training Pool (`{train_done}/{train_target_pool}`, `{train_pct:.1f}%`) are live in `{db_name}`."
-        candidate_active_status = f"* **Active Status**: Live MIPROv2 Candidate Evaluation in progress (**`{len(records)}` candidates evaluated** across Trial 1 & Minibatch Trials)."
-        plots_below_note = f"* **Plots Below (Figs. 2, 3 & 4)**: Dynamically auto-scaled to live `task-22349` candidate evaluation telemetry (**`{len(records)}` points**, peak **`{best_score_pct}%`**)."
-    elif openie_cnt >= 495:
-        callout_status = f"* **Active Run (`task-22349`, sandbox `{db_name}`)**: Currently executing **Stage 2 (MIPROv2 Demonstration Bootstrapping)** (`{int(elapsed_min)} min` / `{elapsed_min / 60.0:.2f}h` elapsed). The **full 495-chunk validation graph is 100% committed to `yaw.db`**. Active run has now indexed **`{openie_cnt}` / `1,308`** total corpus passages across training queries. Streaming candidate evaluations follow demonstration synthesis."
-        candidate_active_status = f"* **Active Status**: Stage 2 MIPROv2 Demonstration Bootstrapping active ({openie_cnt}/1,308 corpus chunks indexed). Candidate evaluations stream upon demonstration compilation."
-        plots_below_note = f"* **Plots Below (Figs. 2, 3 & 4)**: Display the **75-candidate reference run (`task-21330`, 7.25h)** alongside the **`LIVE NOW` cursor ({elapsed_min / 60.0:.2f}h)** until active candidate evaluations start."
-    else:
-        callout_status = f"* **Active Run (`task-22349`, sandbox `{db_name}`)**: Currently executing **Stage 1 (Pooled Distractor Graph Ingestion)** at **`{openie_cnt}` / `{target_pool}` passages** (`{pct:.1f}%`, `{int(elapsed_min)} min` / `{elapsed_min / 60.0:.2f}h` elapsed). Candidate #1 evaluation begins once all {target_pool} chunks commit to `yaw.db` (~`{eta_str}` remaining)."
-        candidate_active_status = f"* **Active Status**: Stage 1 Pooled Graph Ingestion in progress ({openie_cnt}/{target_pool} chunks). **0 active candidates evaluated yet** (streaming starts at Stage 2)."
-        plots_below_note = f"* **Plots Below (Figs. 2, 3 & 4)**: Display the **75-candidate reference run (`task-21330`, 7.25h)** alongside the **`LIVE NOW` cursor ({elapsed_min / 60.0:.2f}h)** until active candidate evaluations start."
 
     steady_records = [r for r in records if r["s_per_it"] < 150.0] or records
     mean_steady_lat = (
@@ -2303,7 +2187,6 @@ This dashboard documents real-time telemetry from the active **Two-Phase Hybrid 
         else 0.0
     )
 
-    # Compute dynamic Pareto table rows
     pareto_cands = []
     for r in records:
         dom = False
@@ -2320,101 +2203,80 @@ This dashboard documents real-time telemetry from the active **Two-Phase Hybrid 
     pareto_cands.sort(key=lambda x: x["s_per_it"])
     baseline_lat = records[0]["s_per_it"] if records else 200.0
     pareto_rows_md = ""
-    for idx_p, pc in enumerate(pareto_cands[:6]):
+    for pc in pareto_cands[:6]:
         speedup = baseline_lat / max(pc["s_per_it"], 0.1)
         t_hr = pc["elapsed_hr"]
-        profile = (
-            "**Minimum Latency** (Fastest graph evaluation)"
-            if idx_p == 0
-            else (
-                "**Peak Multi-Metric Quality** (Highest $GM_{\\text{good}}$)"
-                if idx_p == len(pareto_cands[:6]) - 1
-                else "**Balanced Pareto Compromise**"
-            )
+        pareto_rows_md += f"| **#{pc['cand']}** | `{t_hr:.2f}h` | **`{pc['s_per_it']:.1f}s/it`** | `{speedup:.2f}x` | **`{pc['gm_good']:.4f}`** | `{pc['marginal_s'] * 100:.1f}%` |\n"
+
+    recent_rows_md = ""
+    for r_item in recent_list[-4:]:
+        cid_str = f"`{r_item.get('chunk_id', '')[:20]}...`"
+        cnt_e = r_item.get("entity_count", 0)
+        cnt_t = r_item.get("triple_count", 0)
+        trips_preview = (
+            "<br>".join(f"`{t}`" for t in r_item.get("sample_triples", [])[:2])
+            if r_item.get("sample_triples")
+            else "*none*"
         )
-        pareto_rows_md += f"| **Cand #{pc['cand']}** | $t = {t_hr:.2f}\\text{{h}}$ | **`{pc['s_per_it']:.1f}s/it`** | **`{speedup:.2f}x`** | **`{pc['gm_good']:.4f}`** | {profile} |\n"
+        recent_rows_md += f"| {cid_str} | **`{cnt_e}`** | **`{cnt_t}`** | {trips_preview} |\n"
 
-    md += f"""
+    md = f"""# Live Optimization Telemetry (`{db_name}`)
+
+*Updated*: `{now_str}` *(10m interval)* • *State*: {status_badge}
+
+| Pool / Metric | Live Value |
+| :--- | :--- |
+| **Validation Pool** | **`{val_done}` / `{val_target_pool}`** (`{val_pct:.1f}%`) |
+| **Training Pool** | **`{train_done}` / `{train_target_pool}`** (`{train_pct:.1f}%`, `{rem_train}` left) |
+| **Combined Corpus** | **`{openie_cnt}` / `{corpus_total_pool}`** (`{corpus_pct:.1f}%`, `{rem_corpus}` left) |
+| **Elapsed / Remaining** | **`{int(elapsed_min)}m` (`{elapsed_min / 60.0:.2f}h`)** elapsed • **`~{eta_corpus_str}`** remaining (ETA `~{finish_clock_str} UTC`) |
+| **Throughput** | **`{velocity:.2f}` chunks/m** (`{sec_per_chunk:.1f}s/chunk`) • **`{lem_tps:.1f}` tok/s** (TTFT `{lem_ttft_ms}ms`) |
+| **Host & Storage** | **`{lem_cpu:.1f}%` CPU** • **`{lem_ram:.1f} GB` RAM** • **`{db_size} MB` DB** (`{kg_output_mb:.2f} MB` JSON, `~{kg_output_tok:,}` tok) |
+| **Graph Scale** | **`{uniq_ent:,}` unique entities** (`{total_ent:,}` mentions) • **`{uniq_edges:,}` unique links** (`{total_trips:,}` triples, `{uniq_preds}` predicates) |
+| **Candidate Evals** | **`{len(records)}` evaluated** • Peak **`{best_score_pct}%`** (Cand `#{best_cand}`) • Cached **`~{mean_steady_lat:.1f}s/it`** |
+
 ---
 
-> [!IMPORTANT]
-> **Active Optimization Run Telemetry (`task-22349`)**
-> {callout_status}
-> {plots_below_note}
+## 1. Ingestion & Extraction Progress
+
+![Live Ingestion & Knowledge Graph Extraction Dashboard](/C:/Users/Harri.Ahokas/.gemini/antigravity/brain/3061c87c-9ec6-4ff5-b756-80b05e1c4342/knowledge_graph_extraction_dashboard.svg)
+
+| Recent Chunk | Entities | Triples | Sample Triples |
+| :--- | :---: | :---: | :--- |
+{recent_rows_md}
+---
+
+## 2. Knowledge Graph Network (`{proj_nodes:,}` Nodes • `{proj_edges:,}` Links • `{proj_contrast}` `≠` Links)
+
+![Knowledge Graph Network](/C:/Users/Harri.Ahokas/.gemini/antigravity/brain/3061c87c-9ec6-4ff5-b756-80b05e1c4342/knowledge_graph_2d_projection.svg)
 
 ---
 
-## 4. Candidate Pareto Metric Trajectory & Evaluation Latency vs. Wall-Clock Time
+## 3. Candidate Score & Latency vs. Time
 
 ![Candidate Pareto Metric vs Time](/C:/Users/Harri.Ahokas/.gemini/antigravity/brain/3061c87c-9ec6-4ff5-b756-80b05e1c4342/candidate_pareto_metric_vs_time.svg)
 
-### Candidate Evolution Telemetry:
-{candidate_active_status}
-* **Evaluated Candidates Tracked**: **`{len(records)}` candidate evaluations** mapped with dynamic X/Y axis auto-scaling
-* **Peak Marginal Score**: **`{best_score_pct}%`** (Candidate `#{best_cand}`)
-* **Cached Steady-State Throughput**: **`~{mean_steady_lat:.1f}s/it`** mean execution time per cached candidate evaluation
-* **Multi-Trial Extraction Spikes**: When a new MIPROv2 minibatch trial introduces an uncached prompt candidate, uncached corpus passages trigger fresh OpenIE extraction (`~330s/it`) before settling back to cached steady-state latency (`~15-30s/it`).
-
 ---
 
-## 5. Constituent Retrieval (Recall@1..20) & QA (EM, F1) Dynamics vs. Wall-Clock Time
+## 4. Retrieval (`Recall@1..20`) & QA (`EM`, `F1`) vs. Time
 
 ![Recall@N, EM, F1 vs Time](/C:/Users/Harri.Ahokas/.gemini/antigravity/brain/3061c87c-9ec6-4ff5-b756-80b05e1c4342/recall_em_f1_vs_time.svg)
 
-### Constituent Quality Metrics Breakdown:
-| Metric Objective | Baseline / Seed (Cand #1) | Peak Optimized (Cand #{best_cand}) | Upstream Target | Delta vs. Upstream |
+| Metric | Seed (#1) | Peak (#{best_cand}) | Target | Delta |
 | :--- | :---: | :---: | :---: | :---: |
-| **Recall@1** | `{records[0]['r1']:.4f}` | **`{best_record.get('r1', 0.45):.4f}`** | `0.4200` | **`{(best_record.get('r1', 0.45) - 0.42) * 100:+.2f}%`** |
-| **Recall@2** | `{records[0]['r2']:.4f}` | **`{best_record.get('r2', 0.62):.4f}`** | `0.5800` | **`{(best_record.get('r2', 0.62) - 0.58) * 100:+.2f}%`** |
-| **Recall@5** | `{records[0]['r5']:.4f}` | **`{best_record.get('r5', 0.76):.4f}`** | `0.7200` | **`{(best_record.get('r5', 0.76) - 0.72) * 100:+.2f}%`** |
-| **Recall@10** | `{records[0]['r10']:.4f}` | **`{best_record.get('r10', 0.84):.4f}`** | `0.8100` | **`{(best_record.get('r10', 0.84) - 0.81) * 100:+.2f}%`** |
-| **Recall@20** | `{records[0]['r20']:.4f}` | **`{best_record.get('r20', 0.89):.4f}`** | `0.8600` | **`{(best_record.get('r20', 0.89) - 0.86) * 100:+.2f}%`** |
-| **ExactMatch (EM)** | `{records[0]['em']:.4f}` | **`{best_record.get('em', 0.36):.4f}`** | `0.3600` | **`{(best_record.get('em', 0.36) - 0.36) * 100:+.2f}%`** |
-| **Answer F1 Score** | `{records[0]['f1']:.4f}` | **`{best_record.get('f1', 0.6326):.4f}`** | `0.5956` | **`{(best_record.get('f1', 0.6326) - 0.5956) * 100:+.2f}%`** |
+| **R@1 / R@2 / R@5** | `{records[0]['r1']:.2f}` / `{records[0]['r2']:.2f}` / `{records[0]['r5']:.2f}` | **`{best_record.get('r1', 0):.2f}` / `{best_record.get('r2', 0):.2f}` / `{best_record.get('r5', 0):.2f}`** | `0.42 / 0.58 / 0.72` | **`{(best_record.get('r5', 0) - 0.72) * 100:+.1f}%` (R@5)** |
+| **R@10 / R@20** | `{records[0]['r10']:.2f}` / `{records[0]['r20']:.2f}` | **`{best_record.get('r10', 0):.2f}` / `{best_record.get('r20', 0):.2f}`** | `0.81 / 0.86` | **`{(best_record.get('r20', 0) - 0.86) * 100:+.1f}%` (R@20)** |
+| **EM / F1** | `{records[0]['em']:.2f}` / `{records[0]['f1']:.4f}` | **`{best_record.get('em', 0):.2f}` / `{best_record.get('f1', 0):.4f}`** | `0.36 / 0.5956` | **`{(best_record.get('f1', 0) - 0.5956) * 100:+.2f}%` (F1)** |
 
 ---
 
-## 6. Multi-Objective 2D Pareto Frontier & Sizecoding Formulation
-
-Each candidate program evaluation is scored under the 14-metric sizecoding Pareto objective:
-
-$$S(\\theta) = \\frac{{\\text{{GM}}_{{\\text{{good}}}}(\\theta)}}{{\\text{{GM}}_{{\\text{{bad}}}}(\\theta)}} = \\frac{{\\left(R@1 \\cdot R@2 \\cdot R@5 \\cdot R@10 \\cdot R@20 \\cdot \\text{{EM}} \\cdot \\text{{F1}}\\right)^{{1/7}}}}{{\\left(\\hat{{T}}_{{\\text{{QA}}}} \\cdot \\hat{{T}}_{{\\text{{syn}}}} \\cdot \\hat{{T}}_{{\\text{{heal}}}} \\cdot \\hat{{V}}_{{\\text{{init}}}} \\cdot \\hat{{V}}_{{\\text{{rem}}}} \\cdot \\hat{{D}}_{{\\text{{cnt}}}} \\cdot \\hat{{D}}_{{\\text{{tok}}}}\\right)^{{1/7}}}}$$
+## 5. Multi-Objective Pareto Frontier & Hypervolume
 
 ![Multi-Objective Pareto Frontier](/C:/Users/Harri.Ahokas/.gemini/antigravity/brain/3061c87c-9ec6-4ff5-b756-80b05e1c4342/pareto_frontier_progress.svg)
 
-### Non-Dominated Compromise Candidates (The Empirical Pareto Frontier):
-| Candidate | Discovery Time | Latency ($\\tau$) | Relative Speed | $GM_{{\\text{{good}}}}$ Score | Trade-Off Profile |
-| :---: | :---: | :---: | :---: | :---: | :--- |
-{pareto_rows_md}
-
-### Architectural Invariants Enforced:
-1. **Pooled Multi-Document Graph (Zero Stat-Juking)**:
-   - Every query retrieves against the **full 495-chunk pooled validation graph** in `yaw.db`.
-   - The engine never wipes `yaw.db` down to 13-chunk subsets, ensuring authentic corpus distractor pressure.
-2. **Exact Per-Query Token & SHACL Attribution (`q_stats`)**:
-   - `_chunk_rlm_stats[cid]` tracks per-chunk token usage, definitions, and healing operations.
-   - `q_stats` sums strictly over each query's `target_cids` (`item_docs`), eliminating cumulative token drift across queries.
-3. **4-Tier Stage Caching**:
-   - Fingerprinted caching for extraction, synonym judge, and SHACL repair avoids redundant LLM re-extraction.
-
----
-
-## 7. Historical Baseline Parity Gate (`popqa` Target 1 vs. Target 2)
-
-![Quality Comparison](/C:/Users/Harri.Ahokas/.gemini/antigravity/brain/3061c87c-9ec6-4ff5-b756-80b05e1c4342/benchmark_quality_comparison.svg)
-
-### Parity Gate Benchmarks:
-- **Recall@2**: YAW **`0.6200`** vs. Upstream `0.5800` vs. Paper `0.4390` (**+4.00% Beat**)
-- **Recall@5**: YAW **`0.7600`** vs. Upstream `0.7200` vs. Paper `0.5170` (**+4.00% Beat**, Dense DPR: `0.5400`)
-- **ExactMatch (EM)**: YAW **`0.3600`** vs. Upstream `0.3600` vs. Paper `0.4900` (**Parity Tie**)
-- **QA F1 Score**: YAW **`0.6326`** vs. Upstream `0.5956` vs. Paper `0.5620` (**+3.70% Beat, beats 70B paper reference!**)
-
----
-
-## 8. Wall-Clock Latency & Efficiency Comparison
-
-![Latency Comparison](/C:/Users/Harri.Ahokas/.gemini/antigravity/brain/3061c87c-9ec6-4ff5-b756-80b05e1c4342/benchmark_latency_comparison.svg)
-"""
+| Cand | Time | Latency | Speedup | $GM_{{\\text{{good}}}}$ | Score |
+| :---: | :---: | :---: | :---: | :---: | :---: |
+{pareto_rows_md}"""
     dest.write_text(md, encoding="utf-8")
 
 
