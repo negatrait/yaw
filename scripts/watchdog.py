@@ -2231,6 +2231,7 @@ def generate_report_markdown(
     is_active: bool,
     proj_info: dict[str, Any] | None = None,
     interval_sec: int = 180,
+    crisis_temp: float = 70.0,
 ) -> None:
     now_str = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
     counts = sandbox.get("counts", {})
@@ -2381,7 +2382,7 @@ def generate_report_markdown(
 
     gpu_temp = get_gpu_temperature()
     gpu_thermals_str = (
-        f"**`{gpu_temp:.0f}°C`** (Thermal Guard: active, crisis ceiling 80°C)"
+        f"**`{gpu_temp:.0f}°C`** (Thermal Guard: active, crisis ceiling {crisis_temp:.0f}°C)"
         if gpu_temp is not None
         else "Standby (Thermal Guard: active)"
     )
@@ -2439,7 +2440,7 @@ def generate_report_markdown(
     dest.write_text(md, encoding="utf-8")
 
 
-def run_once(interval_sec: int = 180) -> None:
+def run_once(interval_sec: int = 180, crisis_temp: float = 70.0) -> None:
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
     sandbox = get_active_sandbox_info()
     cfg = read_config_info()
@@ -2457,7 +2458,7 @@ def run_once(interval_sec: int = 180) -> None:
     generate_candidate_pareto_vs_time_svg(cand_pareto_svg_path, records, sandbox, is_active)
     generate_recall_em_f1_vs_time_svg(recall_f1_svg_path, records, sandbox, is_active)
     generate_pareto_svg(pareto_svg_path, records, sandbox, cfg, is_active)
-    generate_report_markdown(report_md_path, sandbox, cfg, records, is_active, proj_info, interval_sec=interval_sec)
+    generate_report_markdown(report_md_path, sandbox, cfg, records, is_active, proj_info, interval_sec=interval_sec, crisis_temp=crisis_temp)
 
     now_str = datetime.now(UTC).strftime("%H:%M:%S")
     openie_cnt = sandbox.get("counts", {}).get("openie_chunks", 0)
@@ -2501,8 +2502,8 @@ def get_gpu_temperature() -> float | None:
 
 
 def check_thermal_guard(
-    crisis_temp: float = 80.0,
-    target_temp: float = 65.0,
+    crisis_temp: float = 70.0,
+    target_temp: float = 62.0,
     max_pause_sec: int = 300,
 ) -> bool:
     """Guard against hardware thermal crisis by suspending inference servers if temperature spikes."""
@@ -2637,14 +2638,14 @@ def main() -> int:
     parser.add_argument(
         "--crisis-temp",
         type=float,
-        default=80.0,
-        help="GPU temperature threshold in Celsius to trigger thermal crisis suspension (default: 80.0°C)",
+        default=70.0,
+        help="GPU temperature threshold in Celsius to trigger thermal crisis suspension (default: 70.0°C)",
     )
     parser.add_argument(
         "--target-temp",
         type=float,
-        default=65.0,
-        help="GPU temperature target in Celsius before resuming after thermal crisis (default: 65.0°C)",
+        default=62.0,
+        help="GPU temperature target in Celsius before resuming after thermal crisis (default: 62.0°C)",
     )
     args = parser.parse_args()
 
@@ -2655,7 +2656,7 @@ def main() -> int:
         print(f"Starting continuous watchdog daemon (interval={interval}s, cool_seconds={cool_sec}s, {tg_info})...", flush=True)
         while True:
             try:
-                run_once(interval_sec=interval)
+                run_once(interval_sec=interval, crisis_temp=args.crisis_temp)
             except Exception as exc:
                 print(f"Error updating dashboard: {exc}", file=sys.stderr, flush=True)
 
@@ -2673,7 +2674,7 @@ def main() -> int:
 
             time.sleep(interval)
 
-    run_once()
+    run_once(crisis_temp=args.crisis_temp)
     if args.thermal_guard:
         check_thermal_guard(crisis_temp=args.crisis_temp, target_temp=args.target_temp)
     return 0
