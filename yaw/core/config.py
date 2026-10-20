@@ -239,11 +239,26 @@ class YawConfig:
                 if pop_candidates:
                     import shutil
 
+                    src_db = pop_candidates[0]
                     with contextlib.suppress(Exception):
-                        shutil.copyfile(pop_candidates[0], opt_db)
-                        wal_src = Path(f"{pop_candidates[0]}-wal")
+                        shutil.copyfile(src_db, opt_db)
+                        wal_src = Path(f"{src_db}-wal")
                         if wal_src.exists():
                             shutil.copyfile(wal_src, Path(f"{opt_db}-wal"))
+                    src_match = re.search(r"yaw_optimize_(\d{8}_\d{6})", src_db.name)
+                    if src_match:
+                        src_ds = src_match.group(1)
+                        for suffix in ("_graph_rlm_audit.json", "_proposer_telemetry.json"):
+                            src_trail = base_dir / f"compiled_program_optimize_{src_ds}{suffix}"
+                            dst_trail = base_dir / f"compiled_program_optimize_{ds}{suffix}"
+                            if src_trail.exists() and not dst_trail.exists():
+                                with contextlib.suppress(Exception):
+                                    shutil.copyfile(src_trail, dst_trail)
+                        src_tel_dir = base_dir / f"compiled_program_optimize_{src_ds}_telemetry"
+                        dst_tel_dir = base_dir / f"compiled_program_optimize_{ds}_telemetry"
+                        if src_tel_dir.is_dir() and not dst_tel_dir.exists():
+                            with contextlib.suppress(Exception):
+                                shutil.copytree(src_tel_dir, dst_tel_dir)
 
         opt_lock = base_dir / f"yaw_optimize_{ds}.db.lock"
         opt_status = base_dir / f"status_optimize_{ds}.json"

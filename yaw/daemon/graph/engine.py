@@ -1,5 +1,6 @@
 """Native DSPy HippoRAG 2 Graph and Retrieval Engine backed by yaw.db and disk line hydration."""
 
+import contextlib
 import hashlib
 import json
 import re
@@ -197,7 +198,7 @@ class YawGraphEngine:
         self,
         program: HippoRAGProgram | None = None,
     ) -> None:
-        """Populate _opt_indexed_cids and _chunk_indexed_ext_fp for chunks already committed in SQLite."""
+        """Populate _opt_indexed_cids, _chunk_indexed_ext_fp, and persisted DSPy trails from SQLite."""
         active_prog = program if program is not None else self.program
         openie_fp = self._openie_fingerprint(active_prog)
         ext_fp = self._extraction_fingerprint(active_prog)
@@ -224,6 +225,187 @@ class YawGraphEngine:
                 self._active_extraction_fingerprint = ext_fp
             if self._active_openie_fingerprint is None:
                 self._active_openie_fingerprint = openie_fp
+
+            try:
+                raw_trails = get_meta(self.conn, "dspy_trails_state")
+                if raw_trails:
+                    state_obj = json.loads(raw_trails)
+                    if isinstance(state_obj, dict):
+                        g_stats = state_obj.get("graph_rlm_stats")
+                        if isinstance(g_stats, dict):
+                            for k, v in g_stats.items():
+                                if k in self._graph_rlm_stats and not self._graph_rlm_stats.get(k):
+                                    self._graph_rlm_stats[k] = v
+                        c_stats = state_obj.get("chunk_rlm_stats")
+                        if isinstance(c_stats, dict):
+                            for cid_k, c_val in c_stats.items():
+                                if isinstance(c_val, dict) and cid_k not in self._chunk_rlm_stats:
+                                    self._chunk_rlm_stats[str(cid_k)] = {
+                                        str(sk): float(sv) for sk, sv in c_val.items()
+                                    }
+                        for trail_attr in (
+                            "telemetry",
+                            "embedding_audit_trail",
+                            "synonym_audit_trail",
+                            "shacl_audit_trail",
+                            "entity_def_audit_trail",
+                        ):
+                            saved_list = state_obj.get(trail_attr)
+                            curr_list = getattr(active_prog, trail_attr, None)
+                            if (
+                                isinstance(saved_list, list)
+                                and saved_list
+                                and isinstance(curr_list, list)
+                                and not curr_list
+                            ):
+                                curr_list.extend(saved_list)
+                else:
+                    rel_cnt_row = self.conn.execute(
+                        "SELECT count(*) FROM edges WHERE kind = 'skos:related'"
+                    ).fetchone()
+                    diff_cnt_row = self.conn.execute(
+                        "SELECT count(*) FROM edges WHERE kind = 'owl:differentFrom'"
+                    ).fetchone()
+                    if rel_cnt_row and not self._graph_rlm_stats.get("related_edges"):
+                        self._graph_rlm_stats["related_edges"] = int(rel_cnt_row[0]) // 2
+                    if diff_cnt_row and not self._graph_rlm_stats.get("different_from_edges"):
+                        self._graph_rlm_stats["different_from_edges"] = int(diff_cnt_row[0]) // 2
+                    db_str = str(self.db_path)
+                    if db_str != ":memory:" and not db_str.startswith("file:"):
+                        base_dir = Path(db_str).resolve().parent
+                        audit_files = sorted(
+                            base_dir.glob("compiled_program_optimize_*_graph_rlm_audit.json"),
+                            key=lambda p: p.stat().st_mtime,
+                            reverse=True,
+                        )
+                        if audit_files:
+                            audit_obj = json.loads(
+                                audit_files[0].read_text(encoding="utf-8")
+                            )
+                            if isinstance(audit_obj, dict):
+                                for src_k, dst_attr in (
+                                    ("program_telemetry", "telemetry"),
+                                    ("embedding_audit_trail", "embedding_audit_trail"),
+                                    ("synonym_audit_trail", "synonym_audit_trail"),
+                                    ("shacl_audit_trail", "shacl_audit_trail"),
+                                    ("entity_def_audit_trail", "entity_def_audit_trail"),
+                                ):
+                                    s_list = audit_obj.get(src_k)
+                                    c_list = getattr(active_prog, dst_attr, None)
+                                    if (
+                                        isinstance(s_list, list)
+                                        and s_list
+                                        and isinstance(c_list, list)
+                                        and not c_list
+                                    ):
+                                        c_list.extend(s_list)
+                    self._persist_dspy_trails_to_db(active_prog)
+            except Exception:
+                pass
+
+    def _persist_dspy_trails_to_db(
+        self,
+        program: HippoRAGProgram | None = None,
+    ) -> None:
+        """Persist graph RLM stats, per-chunk RLM stats, and DSPy audit trails into SQLite meta."""
+        active_prog = program if program is not None else self.program
+        try:
+            payload = {
+                "graph_rlm_stats": dict(self._graph_rlm_stats),
+                "chunk_rlm_stats": dict(self._chunk_rlm_stats),
+                "telemetry": list(getattr(active_prog, "telemetry", ()))[-250:],
+                "embedding_audit_trail": list(
+                    getattr(active_prog, "embedding_audit_trail", ())
+                )[-250:],
+                "synonym_audit_trail": list(
+                    getattr(active_prog, "synonym_audit_trail", ())
+                )[-100:],
+                "shacl_audit_trail": list(getattr(active_prog, "shacl_audit_trail", ()))[-100:],
+                "entity_def_audit_trail": list(
+                    getattr(active_prog, "entity_def_audit_trail", ())
+                )[-250:],
+            }
+            set_meta(self.conn, "dspy_trails_state", json.dumps(payload, ensure_ascii=False))
+        except Exception:
+            pass
+
+    def _hydrate_chunk_traces_and_stats_from_db(
+        self,
+        target_list: Sequence[tuple[ChunkPointer, str]],
+    ) -> None:
+        """Reconstruct DSPy Stage 1/2 traces and per-chunk token stats from openie_chunks for seeded chunks."""
+        missing_cids = [
+            p.chunk_id
+            for p, _ in target_list
+            if p.chunk_id not in self._captured_chunk_traces
+            or p.chunk_id not in self._chunk_rlm_stats
+        ]
+        if not missing_cids:
+            return
+        try:
+            cached_openie = get_openie_checkpoints(self.conn, missing_cids)
+        except sqlite3.Error:
+            return
+        if not cached_openie:
+            return
+        text_by_cid = {p.chunk_id: t for p, t in target_list}
+        for cid, rec in cached_openie.items():
+            passage_text = text_by_cid.get(cid, "")
+            named_ents = [
+                [str(ename), str(edef)]
+                for ename, edef in (getattr(rec, "entity_definitions", None) or ())
+            ]
+            if not named_ents and getattr(rec, "entities", None):
+                named_ents = [
+                    [str(e[0]), str(e[1]) if len(e) >= 2 else ""]
+                    if isinstance(e, (list, tuple)) and e
+                    else [str(e), ""]
+                    for e in rec.entities
+                ]
+            triples_out = [
+                {
+                    "sub": st.subj,
+                    "pred": st.pred,
+                    "obj": st.obj,
+                    "def": st.spo_def,
+                }
+                for st in (getattr(rec, "structured_triples", None) or ())
+            ]
+            if cid not in self._captured_chunk_traces:
+                c_traces: list[tuple[str, dict[str, Any], Any]] = []
+                if named_ents:
+                    c_traces.append(
+                        (
+                            "ner",
+                            {"passage": passage_text},
+                            dspy.Prediction(named_entities=named_ents),
+                        )
+                    )
+                if triples_out:
+                    c_traces.append(
+                        (
+                            "triples",
+                            {"passage": passage_text, "named_entities": named_ents},
+                            dspy.Prediction(triples=triples_out),
+                        )
+                    )
+                if c_traces:
+                    self._captured_chunk_traces[cid] = c_traces
+            if cid not in self._chunk_rlm_stats:
+                est_json = json.dumps(
+                    {"named_entities": named_ents, "triples": triples_out},
+                    ensure_ascii=False,
+                )
+                est_openie_tok = float(max(64, len(est_json) // 4))
+                self._chunk_rlm_stats[cid] = {
+                    "synonym_judge_tokens": 0.0,
+                    "shacl_healer_tokens": 0.0,
+                    "shacl_violations_initial": 0.0,
+                    "shacl_violations_remaining": 0.0,
+                    "missing_entity_defs_count": 0.0,
+                    "missing_entity_defs_tokens": 0.0,
+                    "openie_tokens": est_openie_tok,
+                }
 
     @staticmethod
     def _empty_graph_rlm_stats() -> dict[str, Any]:
@@ -1177,6 +1359,7 @@ class YawGraphEngine:
             ]
             if missing_targets:
                 self.index_chunks(missing_targets, program=program)
+            self._hydrate_chunk_traces_and_stats_from_db(target_list)
             target_cids = [p.chunk_id for p, _ in target_list]
 
             if target_cids and any(cid in self._chunk_rlm_stats for cid in target_cids):
@@ -2397,6 +2580,7 @@ class YawGraphEngine:
             self._opt_indexed_cids.update(chunk_ids)
             for cid in chunk_ids:
                 self._chunk_indexed_ext_fp[cid] = ext_fp
+            self._persist_dspy_trails_to_db(active_program)
             return len(chunks)
 
     def delete_chunks(self, chunk_ids: Sequence[str]) -> None:
@@ -3088,6 +3272,33 @@ class YawGraphEngine:
                     missed,
                 )
                 score_pred.feedback = f"{score_pred.feedback} | {stage_diag}"
+            if eval_count == 1 or eval_count % 5 == 0:
+                self._persist_dspy_trails_to_db(self.program)
+                if save_path is not None:
+                    with contextlib.suppress(Exception):
+                        p_inc = Path(save_path)
+                        p_inc.parent.mkdir(parents=True, exist_ok=True)
+                        inc_audit = p_inc.parent / f"{p_inc.stem}_graph_rlm_audit.json"
+                        inc_payload = {
+                            "graph_rlm_stats": dict(self._graph_rlm_stats),
+                            "program_telemetry": list(getattr(self.program, "telemetry", ()))[-250:],
+                            "embedding_audit_trail": list(
+                                getattr(self.program, "embedding_audit_trail", ())
+                            )[-250:],
+                            "synonym_audit_trail": list(
+                                getattr(self.program, "synonym_audit_trail", ())
+                            )[-100:],
+                            "shacl_audit_trail": list(
+                                getattr(self.program, "shacl_audit_trail", ())
+                            )[-100:],
+                            "entity_def_audit_trail": list(
+                                getattr(self.program, "entity_def_audit_trail", ())
+                            )[-250:],
+                        }
+                        inc_audit.write_text(
+                            json.dumps(inc_payload, ensure_ascii=False, indent=2),
+                            encoding="utf-8",
+                        )
             return score_pred
 
         def _mipro_metric(gold: Any, pred: Any, trace: Any = None) -> float | bool:
