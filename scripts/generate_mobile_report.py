@@ -373,7 +373,7 @@ $$S(\\theta) = \\frac{{\\text{{GM}}_{{\\text{{good}}}}(\\theta)}}{{\\text{{GM}}_
     dest.write_text(md, encoding="utf-8")
 
 
-def main() -> int:
+def run_once() -> None:
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
     sandbox = get_active_sandbox_info()
     cfg = read_config_info()
@@ -386,9 +386,36 @@ def main() -> int:
     generate_trajectory_svg(traj_svg_path, sandbox, cfg)
     generate_report_markdown(report_md_path, sandbox, cfg)
 
-    print(f"Generated: {pareto_svg_path.name}")
-    print(f"Generated: {traj_svg_path.name}")
-    print(f"Generated: {report_md_path.name}")
+    now_str = datetime.now(UTC).strftime("%H:%M:%S")
+    openie_cnt = sandbox.get("counts", {}).get("openie_chunks", 0)
+    print(f"[{now_str}] Updated report and SVGs (openie_chunks={openie_cnt})")
+
+
+def main() -> int:
+    import argparse
+    import time
+
+    parser = argparse.ArgumentParser(description="Deterministic report generator")
+    parser.add_argument(
+        "--watch",
+        type=int,
+        metavar="SECONDS",
+        default=None,
+        help="Run continuously every SECONDS seconds",
+    )
+    args = parser.parse_args()
+
+    if args.watch is not None:
+        interval = max(5, args.watch)
+        print(f"Starting continuous report generator daemon (interval={interval}s)...")
+        while True:
+            try:
+                run_once()
+            except Exception as exc:
+                print(f"Error updating report: {exc}", file=sys.stderr)
+            time.sleep(interval)
+
+    run_once()
     return 0
 
 
