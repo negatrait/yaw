@@ -19,6 +19,7 @@ import html
 import json
 import math
 import re
+import shutil
 import sqlite3
 import sys
 import time
@@ -210,6 +211,22 @@ def get_empirical_telemetry_timeseries(
     return samples
 
 
+def _open_snapshot_sqlite(db_path: Path) -> sqlite3.Connection:
+    """Copy the active SQLite DB (+ WAL/SHM if present) to a lock-free read snapshot."""
+    snap_path = db_path.parent / ".telemetry_read_snap.db"
+    shutil.copyfile(db_path, snap_path)
+    for suffix in ("-wal", "-shm"):
+        src_aux = Path(f"{db_path}{suffix}")
+        dst_aux = Path(f"{snap_path}{suffix}")
+        if src_aux.exists():
+            with contextlib.suppress(Exception):
+                shutil.copyfile(src_aux, dst_aux)
+        elif dst_aux.exists():
+            with contextlib.suppress(Exception):
+                dst_aux.unlink()
+    return sqlite3.connect(snap_path, timeout=5.0)
+
+
 def get_active_sandbox_info() -> dict[str, Any]:
     yaw_dir = WORKSPACE_ROOT / ".yaw"
     if not yaw_dir.exists():
@@ -248,8 +265,11 @@ def get_active_sandbox_info() -> dict[str, Any]:
     else:
         info["elapsed_seconds"] = 60.0
 
+    snap_cache_file = WORKSPACE_ROOT / "outputs" / "telemetry" / "last_good_sandbox_snapshot.json"
+    snap_cache_file.parent.mkdir(parents=True, exist_ok=True)
+
     try:
-        conn = sqlite3.connect(latest_db, timeout=2.0)
+        conn = _open_snapshot_sqlite(latest_db)
         for tbl in ["chunks", "entities", "facts", "edges", "openie_chunks"]:
             try:
                 row = conn.execute(f"SELECT count(*) FROM {tbl}").fetchone()
@@ -360,6 +380,25 @@ def get_active_sandbox_info() -> dict[str, Any]:
         conn.close()
     except Exception as exc:
         info["error"] = str(exc)
+
+    if info.get("counts", {}).get("openie_chunks", 0) > 0:
+        with contextlib.suppress(Exception):
+            snap_cache_file.write_text(
+                json.dumps(
+                    {
+                        "counts": info["counts"],
+                        "kg_metrics": info["kg_metrics"],
+                        "timeseries_samples": info["timeseries_samples"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+    elif snap_cache_file.exists():
+        with contextlib.suppress(Exception):
+            cached = json.loads(snap_cache_file.read_text(encoding="utf-8"))
+            info["counts"] = cached.get("counts", info["counts"])
+            info["kg_metrics"] = cached.get("kg_metrics", info["kg_metrics"])
+            info["timeseries_samples"] = cached.get("timeseries_samples", info["timeseries_samples"])
 
     info["lemonade_metrics"] = get_lemonade_server_metrics()
     return info
@@ -971,7 +1010,7 @@ def generate_graph_projection_svg(dest: Path, sandbox: dict[str, Any]) -> dict[s
     ]
 
     try:
-        conn = sqlite3.connect(db_path, timeout=3.0)
+        conn = _open_snapshot_sqlite(db_path)
         rows = conn.execute(
             "SELECT chunk_id, entities_json, triples_json FROM openie_chunks ORDER BY rowid ASC"
         ).fetchall()
@@ -2208,17 +2247,22 @@ def generate_report_markdown(
         t_hr = pc["elapsed_hr"]
         pareto_rows_md += f"| **#{pc['cand']}** | `{t_hr:.2f}h` | **`{pc['s_per_it']:.1f}s/it`** | `{speedup:.2f}x` | **`{pc['gm_good']:.4f}`** | `{pc['marginal_s'] * 100:.1f}%` |\n"
 
-    recent_rows_md = ""
-    for r_item in recent_list[-4:]:
-        cid_str = f"`{r_item.get('chunk_id', '')[:20]}...`"
-        cnt_e = r_item.get("entity_count", 0)
-        cnt_t = r_item.get("triple_count", 0)
-        trips_preview = (
-            "<br>".join(f"`{t}`" for t in r_item.get("sample_triples", [])[:2])
-            if r_item.get("sample_triples")
-            else "*none*"
-        )
-        recent_rows_md += f"| {cid_str} | **`{cnt_e}`** | **`{cnt_t}`** | {trips_preview} |\n"
+    s_r1, s_r2, s_r5, s_r10, s_r20, s_em, s_f1 = (
+        records[0]["r1"],
+        records[0]["r2"],
+        records[0]["r5"],
+        records[0]["r10"],
+        records[0]["r20"],
+        records[0]["em"],
+        records[0]["f1"],
+    )
+    p_r1 = best_record.get("r1", s_r1)
+    p_r2 = best_record.get("r2", s_r2)
+    p_r5 = best_record.get("r5", s_r5)
+    p_r10 = best_record.get("r10", s_r10)
+    p_r20 = best_record.get("r20", s_r20)
+    p_em = best_record.get("em", s_em)
+    p_f1 = best_record.get("f1", s_f1)
 
     md = f"""# Live Optimization Telemetry (`{db_name}`)
 
@@ -2241,9 +2285,6 @@ def generate_report_markdown(
 
 ![Live Ingestion & Knowledge Graph Extraction Dashboard](/C:/Users/Harri.Ahokas/.gemini/antigravity/brain/3061c87c-9ec6-4ff5-b756-80b05e1c4342/knowledge_graph_extraction_dashboard.svg)
 
-| Recent Chunk | Entities | Triples | Sample Triples |
-| :--- | :---: | :---: | :--- |
-{recent_rows_md}
 ---
 
 ## 2. Knowledge Graph Network (`{proj_nodes:,}` Nodes • `{proj_edges:,}` Links • `{proj_contrast}` `≠` Links)
@@ -2262,11 +2303,12 @@ def generate_report_markdown(
 
 ![Recall@N, EM, F1 vs Time](/C:/Users/Harri.Ahokas/.gemini/antigravity/brain/3061c87c-9ec6-4ff5-b756-80b05e1c4342/recall_em_f1_vs_time.svg)
 
-| Metric | Seed (#1) | Peak (#{best_cand}) | Target | Delta |
-| :--- | :---: | :---: | :---: | :---: |
-| **R@1 / R@2 / R@5** | `{records[0]['r1']:.2f}` / `{records[0]['r2']:.2f}` / `{records[0]['r5']:.2f}` | **`{best_record.get('r1', 0):.2f}` / `{best_record.get('r2', 0):.2f}` / `{best_record.get('r5', 0):.2f}`** | `0.42 / 0.58 / 0.72` | **`{(best_record.get('r5', 0) - 0.72) * 100:+.1f}%` (R@5)** |
-| **R@10 / R@20** | `{records[0]['r10']:.2f}` / `{records[0]['r20']:.2f}` | **`{best_record.get('r10', 0):.2f}` / `{best_record.get('r20', 0):.2f}`** | `0.81 / 0.86` | **`{(best_record.get('r20', 0) - 0.86) * 100:+.1f}%` (R@20)** |
-| **EM / F1** | `{records[0]['em']:.2f}` / `{records[0]['f1']:.4f}` | **`{best_record.get('em', 0):.2f}` / `{best_record.get('f1', 0):.4f}`** | `0.36 / 0.5956` | **`{(best_record.get('f1', 0) - 0.5956) * 100:+.2f}%` (F1)** |
+| Stage | R@1 | R@2 | R@5 | R@10 | R@20 | EM | F1 |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Seed (#1)** | `{s_r1:.4f}` | `{s_r2:.4f}` | `{s_r5:.4f}` | `{s_r10:.4f}` | `{s_r20:.4f}` | `{s_em:.4f}` | `{s_f1:.4f}` |
+| **Target** | `0.4200` | `0.5800` | `0.7200` | `0.8100` | `0.8600` | `0.3600` | `0.5956` |
+| **Peak (#{best_cand})** | **`{p_r1:.4f}`** | **`{p_r2:.4f}`** | **`{p_r5:.4f}`** | **`{p_r10:.4f}`** | **`{p_r20:.4f}`** | **`{p_em:.4f}`** | **`{p_f1:.4f}`** |
+| **Delta** | **`{(p_r1 - 0.42) * 100:+.2f}%`** | **`{(p_r2 - 0.58) * 100:+.2f}%`** | **`{(p_r5 - 0.72) * 100:+.2f}%`** | **`{(p_r10 - 0.81) * 100:+.2f}%`** | **`{(p_r20 - 0.86) * 100:+.2f}%`** | **`{(p_em - 0.36) * 100:+.2f}%`** | **`{(p_f1 - 0.5956) * 100:+.2f}%`** |
 
 ---
 
