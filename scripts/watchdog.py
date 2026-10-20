@@ -450,7 +450,7 @@ def compute_nice_axis(
 
 
 def get_candidate_evaluation_records() -> tuple[list[dict[str, Any]], bool]:
-    """Parse candidate evaluation records from task logs, distinguishing active run vs historical reference."""
+    """Parse candidate evaluation records from the active optimization task log."""
     task_dir = ARTIFACT_DIR / ".system_generated" / "tasks"
     active_log = None
     if task_dir.exists():
@@ -467,69 +467,62 @@ def get_candidate_evaluation_records() -> tuple[list[dict[str, Any]], bool]:
             candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
             active_log = candidates[0]
 
-    hist_log = ARTIFACT_DIR / ".system_generated" / "tasks" / "task-21330.log"
-    log_candidates = [active_log] if active_log is not None else []
-    if hist_log.exists():
-        log_candidates.append(hist_log)
+    if active_log is None or not active_log.exists():
+        return [], False
 
     metric_pattern = re.compile(
         r"Average Metric:\s*([0-9.]+)\s*/\s*(\d+)\s*\(([0-9.]+)%\):\s*\d+%\|[^|]*\|\s*(\d+)/(\d+)\s*\[([0-9:]+)<([0-9:]+),\s*([0-9.]+)s/it\]"
     )
 
     records: list[dict[str, Any]] = []
-    is_active = False
+    is_active = True
 
-    for idx, p in enumerate(log_candidates):
-        if not p.exists():
-            continue
-        try:
-            raw = p.read_text(encoding="utf-8", errors="replace")
-            chunks = re.split(r"evaluating candidate \((\d+)\)", raw)
-            parsed: list[dict[str, Any]] = []
-            for c_i in range(1, len(chunks) - 1, 2):
-                cand_id = int(chunks[c_i])
-                body = chunks[c_i + 1]
-                matches = list(metric_pattern.finditer(body))
-                if not matches:
-                    continue
-                m = matches[-1]
-                cumsum = float(m.group(1))
-                n_eval = int(m.group(2))
-                pct = float(m.group(3))
-                bar_tot = int(m.group(5))
-                elapsed_str = m.group(6)
-                s_per_it = float(m.group(8))
+    try:
+        raw = active_log.read_text(encoding="utf-8", errors="replace")
+        chunks = re.split(r"evaluating candidate \((\d+)\)", raw)
+        parsed: list[dict[str, Any]] = []
+        for c_i in range(1, len(chunks) - 1, 2):
+            cand_id = int(chunks[c_i])
+            body = chunks[c_i + 1]
+            matches = list(metric_pattern.finditer(body))
+            if not matches:
+                continue
+            m = matches[-1]
+            cumsum = float(m.group(1))
+            n_eval = int(m.group(2))
+            pct = float(m.group(3))
+            bar_tot = int(m.group(5))
+            elapsed_str = m.group(6)
+            s_per_it = float(m.group(8))
 
-                parts = [int(x) for x in elapsed_str.split(":")]
-                if len(parts) == 3:
-                    raw_elapsed_sec = parts[0] * 3600 + parts[1] * 60 + parts[2]
-                elif len(parts) == 2:
-                    raw_elapsed_sec = parts[0] * 60 + parts[1]
-                else:
-                    raw_elapsed_sec = 0
+            parts = [int(x) for x in elapsed_str.split(":")]
+            if len(parts) == 3:
+                raw_elapsed_sec = parts[0] * 3600 + parts[1] * 60 + parts[2]
+            elif len(parts) == 2:
+                raw_elapsed_sec = parts[0] * 60 + parts[1]
+            else:
+                raw_elapsed_sec = 0
 
-                parsed.append(
-                    {
-                        "cand": cand_id,
-                        "cumsum": cumsum,
-                        "n": n_eval,
-                        "bar_tot": bar_tot,
-                        "trial_pct": pct,
-                        "pct": pct,
-                        "raw_elapsed_sec": raw_elapsed_sec,
-                        "s_per_it": s_per_it,
-                    }
-                )
+            parsed.append(
+                {
+                    "cand": cand_id,
+                    "cumsum": cumsum,
+                    "n": n_eval,
+                    "bar_tot": bar_tot,
+                    "trial_pct": pct,
+                    "pct": pct,
+                    "raw_elapsed_sec": raw_elapsed_sec,
+                    "s_per_it": s_per_it,
+                }
+            )
 
-            if parsed:
-                records = parsed
-                is_active = idx == 0
-                break
-        except Exception:
-            continue
+        if parsed:
+            records = parsed
+    except Exception:
+        pass
 
     if not records:
-        return [], False
+        return [], is_active
 
     # Calculate exact marginal S_i, best-so-far, monotonic multi-trial elapsed time, and constituent metrics
     prev_exact_cum = 0.0
@@ -1368,6 +1361,26 @@ def generate_candidate_pareto_vs_time_svg(
     pb_y0, pb_h = 358.0, 190.0
     pb_y1 = pb_y0 + pb_h
 
+    if not records:
+        openie_cnt = sandbox.get("counts", {}).get("openie_chunks", 0)
+        svg = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="100%" height="100%" style="background:#070b14; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+  <defs>
+    <linearGradient id="bg2_empty" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#070b14"/>
+      <stop offset="100%" stop-color="#0f172a"/>
+    </linearGradient>
+  </defs>
+  <rect width="{W}" height="{H}" rx="14" fill="url(#bg2_empty)" stroke="#1e293b" stroke-width="1.5"/>
+  <text x="32" y="44" fill="#f8fafc" font-size="20" font-weight="700">Fig. 2: Candidate Pareto Metric Trajectory &amp; Evaluation Latency vs. Time</text>
+  <text x="32" y="66" fill="#94a3b8" font-size="13">Stage 1 Ingestion in progress ({openie_cnt}/1308 passages) • Awaiting First Candidate Evaluation</text>
+  <rect x="{px0}" y="{pa_y0}" width="{pw}" height="{pa_h}" rx="8" fill="#0b1120" stroke="#1e293b" stroke-width="1"/>
+  <text x="{px0 + pw/2}" y="{pa_y0 + pa_h/2}" fill="#64748b" font-size="14" font-weight="600" text-anchor="middle">Awaiting Candidate Evaluation Traces...</text>
+  <rect x="{px0}" y="{pb_y0}" width="{pw}" height="{pb_h}" rx="8" fill="#0b1120" stroke="#1e293b" stroke-width="1"/>
+  <text x="{px0 + pw/2}" y="{pb_y0 + pb_h/2}" fill="#64748b" font-size="14" font-weight="600" text-anchor="middle">Candidate Latency Tracking (Offline until Step 1 / Step 3 evaluation begins)</text>
+</svg>"""
+        dest.write_text(svg, encoding="utf-8")
+        return
+
     max_r_hr = max((r["elapsed_hr"] for r in records), default=0.5)
     _, t_max, t_ticks = compute_nice_axis(
         0.0, max_r_hr, num_ticks=6, clamp_zero=True, pad_high=0.08, min_span=0.20
@@ -1617,6 +1630,27 @@ def generate_recall_em_f1_vs_time_svg(
     pb_y0, pb_h = 358.0, 190.0
     pb_y1 = pb_y0 + pb_h
 
+    if not records:
+        openie_cnt = sandbox.get("counts", {}).get("openie_chunks", 0)
+        svg = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="100%" height="100%" style="background:#070b14; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+  <defs>
+    <linearGradient id="bg3_empty" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#070b14"/>
+      <stop offset="100%" stop-color="#0f172a"/>
+    </linearGradient>
+  </defs>
+  <rect width="{W}" height="{H}" rx="14" fill="url(#bg3_empty)" stroke="#1e293b" stroke-width="1.5"/>
+  <text x="32" y="44" fill="#f8fafc" font-size="20" font-weight="700">Fig. 3: Constituent Retrieval &amp; QA Quality Metrics vs. Wall-Clock Time</text>
+  <text x="32" y="66" fill="#94a3b8" font-size="13">Stage 1 Ingestion in progress ({openie_cnt}/1308 passages) • Awaiting First Candidate Evaluation</text>
+  <rect x="{px0}" y="{pa_y0}" width="{pw}" height="{pa_h}" rx="8" fill="#0b1120" stroke="#1e293b" stroke-width="1"/>
+  <text x="{px0 + pw/2}" y="{pa_y0 + pa_h/2}" fill="#64748b" font-size="14" font-weight="600" text-anchor="middle">Retrieval Recall@1..20 (Offline until evaluation begins)</text>
+  <rect x="{px0}" y="{pb_y0}" width="{pw}" height="{pb_h}" rx="8" fill="#0b1120" stroke="#1e293b" stroke-width="1"/>
+  <text x="{px0 + pw/2}" y="{pb_y0 + pb_h/2}" fill="#64748b" font-size="14" font-weight="600" text-anchor="middle">QA Exact Match &amp; F1 (Offline until evaluation begins)</text>
+</svg>"""
+        dest.write_text(svg, encoding="utf-8")
+        (dest.parent / "quality_metrics_vs_time.svg").write_text(svg, encoding="utf-8")
+        return
+
     max_r_hr = max((r["elapsed_hr"] for r in records), default=0.5)
     _, t_max, t_ticks = compute_nice_axis(
         0.0, max_r_hr, num_ticks=6, clamp_zero=True, pad_high=0.08, min_span=0.20
@@ -1863,6 +1897,25 @@ def generate_pareto_svg(
     """Build Fig. 4: Multi-Objective Sizecoding Pareto Frontier & Trade-Off Space. Real evaluated data points."""
     W, H = 940, 560
     openie_cnt = sandbox.get("counts", {}).get("openie_chunks", 0)
+
+    if not records:
+        svg = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="100%" height="100%" style="background:#070b14; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+  <defs>
+    <linearGradient id="bg4_empty" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#070b14"/>
+      <stop offset="100%" stop-color="#0f172a"/>
+    </linearGradient>
+  </defs>
+  <rect width="{W}" height="{H}" rx="14" fill="url(#bg4_empty)" stroke="#1e293b" stroke-width="1.5"/>
+  <text x="32" y="44" fill="#f8fafc" font-size="20" font-weight="700">Fig. 4: Multi-Objective Sizecoding Pareto Frontier &amp; Trade-Off Space</text>
+  <text x="32" y="66" fill="#94a3b8" font-size="13">Stage 1 Ingestion in progress ({openie_cnt}/1308 passages) • Awaiting Pareto Frontier Candidates</text>
+  <rect x="74" y="110" width="360" height="355" rx="8" fill="#0b1120" stroke="#1e293b" stroke-width="1"/>
+  <text x="254" y="287" fill="#64748b" font-size="14" font-weight="600" text-anchor="middle">Awaiting 2D Pareto Points...</text>
+  <rect x="496" y="110" width="360" height="355" rx="8" fill="#0b1120" stroke="#1e293b" stroke-width="1"/>
+  <text x="676" y="287" fill="#64748b" font-size="14" font-weight="600" text-anchor="middle">Awaiting Hypervolume Expansion...</text>
+</svg>"""
+        dest.write_text(svg, encoding="utf-8")
+        return
     active_sec = sandbox.get("elapsed_seconds", 60.0)
     active_hr = active_sec / 3600.0
 
@@ -2253,64 +2306,77 @@ def generate_report_markdown(
     proj_contrast = proj.get("contrastive_edges", 0)
     contrast_triples = proj.get("contrastive_triples", [])
 
-    best_record = max(records, key=lambda r: r.get("marginal_s", 0.0)) if records else {}
-    best_cand = best_record.get("cand", 15)
-    best_score_pct = round(best_record.get("best_so_far", 0.061) * 100.0, 1)
-
-    status_badge = (
-        f"**`STAGE 3: CANDIDATE EVALUATION ({len(records)} evals • Peak: {best_score_pct}%)`**"
-        if is_active
-        else (
+    if records:
+        best_record = max(records, key=lambda r: r.get("marginal_s", 0.0))
+        best_cand = best_record.get("cand", 1)
+        best_score_pct = round(best_record.get("best_so_far", 0.0) * 100.0, 1)
+        status_badge = f"**`STAGE 3: CANDIDATE EVALUATION ({len(records)} evals • Peak: {best_score_pct}%)`**"
+        steady_records = [r for r in records if r["s_per_it"] < 150.0] or records
+        mean_steady_lat = sum(r["s_per_it"] for r in steady_records) / len(steady_records)
+        cand_evals_str = f"**`{len(records)}` evaluated** • Peak **`{best_score_pct}%`** (Cand `#{best_cand}`) • Cached **`~{mean_steady_lat:.1f}s/it`**"
+    else:
+        best_record = {}
+        best_cand = 0
+        best_score_pct = 0.0
+        status_badge = (
             f"**`STAGE 2: TRAINING BOOTSTRAP (Train: {train_done}/{train_target_pool} [{train_pct:.1f}%] • Val: {val_done}/{val_target_pool} [100%])`**"
             if openie_cnt >= 495
             else f"**`STAGE 1: POOLED EXTRACTION (Val: {openie_cnt}/{val_target_pool} [{val_pct:.1f}%])`**"
         )
-    )
+        cand_evals_str = "**`0` evaluated** • *Awaiting first candidate evaluation (Stage 1 ingestion in progress)*"
 
-    steady_records = [r for r in records if r["s_per_it"] < 150.0] or records
-    mean_steady_lat = (
-        sum(r["s_per_it"] for r in steady_records) / len(steady_records)
-        if steady_records
-        else 0.0
-    )
+    if records:
+        pareto_cands = []
+        for r in records:
+            dom = False
+            for o in records:
+                if (
+                    o["s_per_it"] <= r["s_per_it"]
+                    and o["gm_good"] >= r["gm_good"]
+                    and (o["s_per_it"] < r["s_per_it"] or o["gm_good"] > r["gm_good"])
+                ):
+                    dom = True
+                    break
+            if not dom:
+                pareto_cands.append(r)
+        pareto_cands.sort(key=lambda x: x["s_per_it"])
+        baseline_lat = records[0]["s_per_it"]
+        pareto_rows_md = ""
+        for pc in pareto_cands[:6]:
+            speedup = baseline_lat / max(pc["s_per_it"], 0.1)
+            t_hr = pc["elapsed_hr"]
+            pareto_rows_md += f"| **#{pc['cand']}** | `{t_hr:.2f}h` | **`{pc['s_per_it']:.1f}s/it`** | `{speedup:.2f}x` | **`{pc['gm_good']:.4f}`** | `{pc['marginal_s'] * 100:.1f}%` |\n"
+        pareto_table_md = f"""| Cand | Time | Latency | Speedup | $GM_{{\\text{{good}}}}$ | Score |
+| :---: | :---: | :---: | :---: | :---: | :---: |
+{pareto_rows_md}"""
+    else:
+        pareto_table_md = "*No candidates evaluated yet — Stage 1 pooled extraction in progress.*"
 
-    pareto_cands = []
-    for r in records:
-        dom = False
-        for o in records:
-            if (
-                o["s_per_it"] <= r["s_per_it"]
-                and o["gm_good"] >= r["gm_good"]
-                and (o["s_per_it"] < r["s_per_it"] or o["gm_good"] > r["gm_good"])
-            ):
-                dom = True
-                break
-        if not dom:
-            pareto_cands.append(r)
-    pareto_cands.sort(key=lambda x: x["s_per_it"])
-    baseline_lat = records[0]["s_per_it"] if records else 200.0
-    pareto_rows_md = ""
-    for pc in pareto_cands[:6]:
-        speedup = baseline_lat / max(pc["s_per_it"], 0.1)
-        t_hr = pc["elapsed_hr"]
-        pareto_rows_md += f"| **#{pc['cand']}** | `{t_hr:.2f}h` | **`{pc['s_per_it']:.1f}s/it`** | `{speedup:.2f}x` | **`{pc['gm_good']:.4f}`** | `{pc['marginal_s'] * 100:.1f}%` |\n"
-
-    s_r1, s_r2, s_r5, s_r10, s_r20, s_em, s_f1 = (
-        records[0]["r1"],
-        records[0]["r2"],
-        records[0]["r5"],
-        records[0]["r10"],
-        records[0]["r20"],
-        records[0]["em"],
-        records[0]["f1"],
-    )
-    p_r1 = best_record.get("r1", s_r1)
-    p_r2 = best_record.get("r2", s_r2)
-    p_r5 = best_record.get("r5", s_r5)
-    p_r10 = best_record.get("r10", s_r10)
-    p_r20 = best_record.get("r20", s_r20)
-    p_em = best_record.get("em", s_em)
-    p_f1 = best_record.get("f1", s_f1)
+    if records:
+        s_r1, s_r2, s_r5, s_r10, s_r20, s_em, s_f1 = (
+            records[0]["r1"],
+            records[0]["r2"],
+            records[0]["r5"],
+            records[0]["r10"],
+            records[0]["r20"],
+            records[0]["em"],
+            records[0]["f1"],
+        )
+        p_r1 = best_record.get("r1", s_r1)
+        p_r2 = best_record.get("r2", s_r2)
+        p_r5 = best_record.get("r5", s_r5)
+        p_r10 = best_record.get("r10", s_r10)
+        p_r20 = best_record.get("r20", s_r20)
+        p_em = best_record.get("em", s_em)
+        p_f1 = best_record.get("f1", s_f1)
+        qa_table_md = f"""| Stage | R@1 | R@2 | R@5 | R@10 | R@20 | EM | F1 |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Seed (#1)** | `{s_r1:.4f}` | `{s_r2:.4f}` | `{s_r5:.4f}` | `{s_r10:.4f}` | `{s_r20:.4f}` | `{s_em:.4f}` | `{s_f1:.4f}` |
+| **Target** | `0.4200` | `0.5800` | `0.7200` | `0.8100` | `0.8600` | `0.3600` | `0.5956` |
+| **Peak (#{best_cand})** | **`{p_r1:.4f}`** | **`{p_r2:.4f}`** | **`{p_r5:.4f}`** | **`{p_r10:.4f}`** | **`{p_r20:.4f}`** | **`{p_em:.4f}`** | **`{p_f1:.4f}`** |
+| **Delta** | **`{(p_r1 - 0.42) * 100:+.2f}%`** | **`{(p_r2 - 0.58) * 100:+.2f}%`** | **`{(p_r5 - 0.72) * 100:+.2f}%`** | **`{(p_r10 - 0.81) * 100:+.2f}%`** | **`{(p_r20 - 0.86) * 100:+.2f}%`** | **`{(p_em - 0.36) * 100:+.2f}%`** | **`{(p_f1 - 0.5956) * 100:+.2f}%`** |"""
+    else:
+        qa_table_md = "*No candidates evaluated yet — Stage 1 pooled extraction in progress.*"
 
     gpu_temp = get_gpu_temperature()
     gpu_thermals_str = (
@@ -2333,7 +2399,7 @@ def generate_report_markdown(
 | **GPU Thermals** | {gpu_thermals_str} |
 | **Host & Storage** | **`{lem_cpu:.1f}%` CPU** • **`{lem_ram:.1f} GB` RAM** • **`{db_size} MB` DB** (`{kg_output_mb:.2f} MB` JSON, `~{kg_output_tok:,}` tok) |
 | **Graph Scale** | **`{uniq_ent:,}` unique entities** (`{total_ent:,}` mentions) • **`{uniq_edges:,}` unique links** (`{total_trips:,}` triples, `{uniq_preds}` predicates) |
-| **Candidate Evals** | **`{len(records)}` evaluated** • Peak **`{best_score_pct}%`** (Cand `#{best_cand}`) • Cached **`~{mean_steady_lat:.1f}s/it`** |
+| **Candidate Evals** | {cand_evals_str} |
 
 ---
 
@@ -2359,12 +2425,7 @@ def generate_report_markdown(
 
 ![Recall@N, EM, F1 vs Time](/C:/Users/Harri.Ahokas/.gemini/antigravity/brain/3061c87c-9ec6-4ff5-b756-80b05e1c4342/recall_em_f1_vs_time.svg)
 
-| Stage | R@1 | R@2 | R@5 | R@10 | R@20 | EM | F1 |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Seed (#1)** | `{s_r1:.4f}` | `{s_r2:.4f}` | `{s_r5:.4f}` | `{s_r10:.4f}` | `{s_r20:.4f}` | `{s_em:.4f}` | `{s_f1:.4f}` |
-| **Target** | `0.4200` | `0.5800` | `0.7200` | `0.8100` | `0.8600` | `0.3600` | `0.5956` |
-| **Peak (#{best_cand})** | **`{p_r1:.4f}`** | **`{p_r2:.4f}`** | **`{p_r5:.4f}`** | **`{p_r10:.4f}`** | **`{p_r20:.4f}`** | **`{p_em:.4f}`** | **`{p_f1:.4f}`** |
-| **Delta** | **`{(p_r1 - 0.42) * 100:+.2f}%`** | **`{(p_r2 - 0.58) * 100:+.2f}%`** | **`{(p_r5 - 0.72) * 100:+.2f}%`** | **`{(p_r10 - 0.81) * 100:+.2f}%`** | **`{(p_r20 - 0.86) * 100:+.2f}%`** | **`{(p_em - 0.36) * 100:+.2f}%`** | **`{(p_f1 - 0.5956) * 100:+.2f}%`** |
+{qa_table_md}
 
 ---
 
@@ -2372,9 +2433,7 @@ def generate_report_markdown(
 
 ![Multi-Objective Pareto Frontier](/C:/Users/Harri.Ahokas/.gemini/antigravity/brain/3061c87c-9ec6-4ff5-b756-80b05e1c4342/pareto_frontier_progress.svg)
 
-| Cand | Time | Latency | Speedup | $GM_{{\\text{{good}}}}$ | Score |
-| :---: | :---: | :---: | :---: | :---: | :---: |
-{pareto_rows_md}"""
+{pareto_table_md}"""
     dest.write_text(md, encoding="utf-8")
 
 
