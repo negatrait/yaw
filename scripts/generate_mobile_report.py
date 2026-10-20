@@ -1823,7 +1823,7 @@ This dashboard documents real-time telemetry from the active **Two-Phase Hybrid 
 ### Obsidian-Style Graph View Highlights:
 | Graph Dimension / Parameter | Current Value | Description |
 | :--- | :---: | :--- |
-| **Graph View Architecture** | **Spectral Laplacian + Spring Relaxation** | Global multi-cluster graph projection via Laplacian SVD with bounded spring relaxation |
+| **Graph View Architecture** | **Coulomb-Hooke Force Simulation** | Organic force-directed spring embedder balancing repulsive electrostatic charges and edge spring tension |
 | **Rendered Entity Count** | **`{proj_nodes:,}` Entities** | Complete connected entity universe sized by degree and cluster role |
 | **Explicit Relational Links** | **`{proj_edges:,}` Connections** | Uncurated graph topology connecting entities across factual triples |
 | **Contrastive Bounds** | **`{proj_contrast}` `owl:differentFrom` Links** | Accented coral/red nodes and dashed links identifying semantic opposition and distinction |
