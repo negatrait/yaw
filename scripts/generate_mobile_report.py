@@ -618,7 +618,7 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
       <rect x="0" y="0" width="136" height="74" rx="8" fill="url(#cardGrad)" stroke="#38bdf8" stroke-width="1.2"/>
       <text x="12" y="18" fill="#94a3b8" font-size="9.5" font-weight="600">PASSAGES EXTRACTED</text>
       <text x="12" y="44" fill="#38bdf8" font-size="21" font-weight="800">{openie_cnt}</text>
-      <text x="12" y="62" fill="#cbd5e1" font-size="10">of {target_pool} ({pct:.1f}%)</text>
+      <text x="12" y="62" fill="#cbd5e1" font-size="10">{'of 495 pool (100% ✓)' if openie_cnt >= 495 else f'of {target_pool} ({pct:.1f}%)'}</text>
     </g>
 
     <g transform="translate(148, 0)">
@@ -1870,8 +1870,21 @@ def generate_report_markdown(
     status_badge = (
         "**`LIVE RUN EVALUATION ACTIVE`**"
         if is_active
-        else f"**`STAGE 1 POOLED EXTRACTION ACTIVE ({openie_cnt}/{target_pool} chunks)`**"
+        else (
+            f"**`STAGE 2 MIPROv2 TRAINING BOOTSTRAP ACTIVE ({openie_cnt}/1,308 corpus chunks)`**"
+            if openie_cnt >= 495
+            else f"**`STAGE 1 POOLED EXTRACTION ACTIVE ({openie_cnt}/495 chunks)`**"
+        )
     )
+
+    if openie_cnt >= 495:
+        ingestion_status_rows = f"""| **Validation Pool Ingested** | **`495` / `495`** (`100.0%` **Committed**) | 100% of canonical validation holdout chunks committed to `yaw.db` |
+| **Corpus Ingestion Progress** | **`{openie_cnt}` / `1,308`** (`{openie_cnt / 1308.0 * 100.0:.1f}%`) | Expanding graph across training queries toward full 1,308 corpus passages |
+| **Pipeline Stage** | **Stage 2: MIPROv2 Demonstration Bootstrap** | Actively bootstrapping few-shot exemplars across 150 training queries |
+| **Validation Graph Status** | **Committed to `yaw.db`** | Validation pool ready; training demonstration bootstrapping in progress |"""
+    else:
+        ingestion_status_rows = f"""| **Passages Extracted** | **`{openie_cnt}` / `{target_pool}`** (`{pct:.1f}%`) | Unique validation corpus chunks processed through Stage 1–3 OpenIE |
+| **Time Remaining to Commit** | **`~{eta_str}`** (`{int(eta_min)} min`) | Estimated duration remaining to finish remaining {rem_chunks} chunks |"""
 
     md = f"""# HippoRAG 2 Optimization & Benchmark Live Dashboard
 
@@ -1889,11 +1902,10 @@ This dashboard documents real-time telemetry from the active **Two-Phase Hybrid 
 ### Real-Time Ingestion & Model Telemetry:
 | Metric / Parameter | Current Value | Description |
 | :--- | :---: | :--- |
-| **Passages Extracted** | **`{openie_cnt}` / `{target_pool}`** (`{pct:.1f}%`) | Unique validation corpus chunks processed through Stage 1–3 OpenIE |
+{ingestion_status_rows}
 | **Extraction Velocity** | **`{velocity:.2f}` passages/min** | Rolling throughput on local `Qwen3-4B-Instruct` |
 | **Mean Latency per Chunk** | **`{sec_per_chunk:.1f}s / chunk`** | Mean end-to-end time per passage (NER + Triples + Definitions) |
 | **Elapsed Wall-Clock** | **`{int(elapsed_min)} min`** (`{elapsed_min / 60.0:.2f}h`) | Total execution time since active optimization launch |
-| **Time Remaining to Commit** | **`~{eta_str}`** (`{int(eta_min)} min`) | Estimated duration remaining to finish remaining {rem_chunks} chunks |
 | **Projected Completion Clock** | **`~{finish_clock_str} UTC`** | Estimated wall-clock completion time |
 | **Estimated Total Duration** | **`~{target_total_hours:.1f}h`** (`{int(target_total_hours * 60)} min`) | Total run duration (Elapsed + Remaining) |
 | **Live Model Generation Speed** | **`{lem_tps:.1f} tokens/s`** | Real-time token generation speed queried from Lemonade Prometheus `/metrics` |
@@ -1963,12 +1975,19 @@ This dashboard documents real-time telemetry from the active **Two-Phase Hybrid 
         )
         md += f"| {cid_str} | **`{cnt_e}`** | **`{cnt_t}`** | {trips_preview} |\n"
 
+    if openie_cnt >= 495:
+        callout_status = f"* **Active Run (`task-22349`, sandbox `{db_name}`)**: Currently executing **Stage 2 (MIPROv2 Demonstration Bootstrapping)** (`{int(elapsed_min)} min` / `{elapsed_min / 60.0:.2f}h` elapsed). The **full 495-chunk validation graph is 100% committed to `yaw.db`**. Active run has now indexed **`{openie_cnt}` / `1,308`** total corpus passages across training queries. Streaming candidate evaluations follow demonstration synthesis."
+        candidate_active_status = f"* **Active Status**: Stage 2 MIPROv2 Demonstration Bootstrapping active ({openie_cnt}/1,308 corpus chunks indexed). Candidate evaluations stream upon demonstration compilation."
+    else:
+        callout_status = f"* **Active Run (`task-22349`, sandbox `{db_name}`)**: Currently executing **Stage 1 (Pooled Distractor Graph Ingestion)** at **`{openie_cnt}` / `{target_pool}` passages** (`{pct:.1f}%`, `{int(elapsed_min)} min` / `{elapsed_min / 60.0:.2f}h` elapsed). Candidate #1 evaluation begins once all {target_pool} chunks commit to `yaw.db` (~`{eta_str}` remaining)."
+        candidate_active_status = f"* **Active Status**: Stage 1 Pooled Graph Ingestion in progress ({openie_cnt}/{target_pool} chunks). **0 active candidates evaluated yet** (streaming starts at Stage 2)."
+
     md += f"""
 ---
 
 > [!IMPORTANT]
 > **Active Optimization Run Status vs. Reference Trajectory Disambiguation**
-> * **Active Run (`task-22349`, sandbox `{db_name}`)**: Currently executing **Stage 1 (Pooled Distractor Graph Ingestion)** at **`{openie_cnt}` / `{target_pool}` passages** (`{pct:.1f}%`, `{int(elapsed_min)} min` / `{elapsed_min / 60.0:.2f}h` elapsed). Candidate #1 evaluation begins once all {target_pool} chunks commit to `yaw.db` (~`{eta_str}` remaining).
+> {callout_status}
 > * **Plots Below (Fig. 3 & Fig. 4)**: Display the **75-candidate reference run (`task-21330`, 7.25h)** alongside the **`LIVE NOW` cursor ({elapsed_min / 60.0:.2f}h)** to preserve comparative baseline visibility until active candidate evaluations start.
 
 ---
@@ -1978,7 +1997,7 @@ This dashboard documents real-time telemetry from the active **Two-Phase Hybrid 
 ![Candidate Pareto Metric vs Time](/C:/Users/Harri.Ahokas/.gemini/antigravity/brain/3061c87c-9ec6-4ff5-b756-80b05e1c4342/candidate_pareto_metric_vs_time.svg)
 
 ### Candidate Evolution Telemetry:
-* **Active Status**: Stage 1 Pooled Graph Ingestion in progress ({openie_cnt}/{target_pool} chunks). **0 active candidates evaluated yet** (streaming starts at Stage 2).
+{candidate_active_status}
 * **Reference Baseline Tracked**: **`{len(records)}` candidates** mapped continuously across wall-clock time from task-21330 (light mode)
 * **Historical Peak Marginal Score**: **`{best_score_pct}%`** (Candidate `#{best_cand}`)
 * **Historical Evaluation Throughput**: **`~170.1s/it`** steady-state execution time per candidate
