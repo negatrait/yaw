@@ -1337,7 +1337,7 @@ This dashboard documents real-time telemetry from the active **Two-Phase Hybrid 
 * **Evaluated Candidates**: **`{len(records)}` candidates** mapped continuously across wall-clock time
 * **Peak Marginal Score**: **`{best_score_pct}%`** (Candidate `#{best_cand}`)
 * **Evaluation Throughput**: **`~170.1s/it`** steady-state execution time per candidate
-* **Regime Boundary**: Transition at $t = 2.11\text{{h}}$ exposed unhealed SHACL RLM loops, resolved by scoped per-query chunk attribution.
+* **Regime Boundary**: Transition at $t = 2.11\\text{{h}}$ exposed unhealed SHACL RLM loops, resolved by scoped per-query chunk attribution.
 
 ---
 
