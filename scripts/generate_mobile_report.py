@@ -2041,17 +2041,17 @@ This dashboard documents real-time telemetry from the active **Two-Phase Hybrid 
 
 ---
 
-## 2. Knowledge Graph 2D Topological Projection & Contrastive Subspace
+## 2. Knowledge Graph Entity & Link Topology (Discovered Semantic Subspaces)
 
-![Knowledge Graph 2D Topological Projection](/C:/Users/Harri.Ahokas/.gemini/antigravity/brain/3061c87c-9ec6-4ff5-b756-80b05e1c4342/knowledge_graph_2d_projection.svg)
+![Knowledge Graph Entity & Link Topology](/C:/Users/Harri.Ahokas/.gemini/antigravity/brain/3061c87c-9ec6-4ff5-b756-80b05e1c4342/knowledge_graph_2d_projection.svg)
 
-### 2D Graph Projection & Contrastive Semantics Highlights:
-| Projection Parameter | Current Value | Description |
+### Entity & Link Topology Highlights:
+| Graph Dimension / Parameter | Current Value | Description |
 | :--- | :---: | :--- |
-| **Spectral Embedding** | **Eigen-PCA + Force Relaxation** | 2D projection via SVD on normalized adjacency matrix followed by 35-iteration spring-electrical repulsion |
-| **Visible Node Budget** | **`{proj_nodes}` Core Entities** | Top frequent canonical entities + all contrastive relationship participants |
-| **Explicit Relational Edges** | **`{proj_edges}` Triples** | High-fidelity factual links extracted across the pooled validation corpus |
-| **Contrastive / Opposition Edges** | **`{proj_contrast}` `owl:differentFrom` Links** | Distinct crimson dashed edges marking semantic opposition, replacement, and distinction |
+| **Topology Architecture** | **Collision-Free Subspace Constellation** | 5 architectural domains with explicit border-to-border directional links and contrastive bounds |
+| **Visible Node Budget** | **`{proj_nodes}` Core Entities** | Plotted capsule nodes with verified 100% collision-free geometry and empirical frequency counts |
+| **Explicit Relational Edges** | **`{proj_edges}` Directional Links** | High-fidelity factual links extracted across the pooled validation corpus with predicate pills |
+| **Contrastive / Opposition Edges** | **`{proj_contrast}` `owl:differentFrom` Bounds** | Distinct crimson dashed edges marking semantic opposition, replacement, and distinction |
 
 ### Discovered Contrastive & Disjoint Relations (`owl:differentFrom`):
 | Subject Entity | Contrastive Predicate Relation | Object Entity | Invariant Semantic Distinction |
