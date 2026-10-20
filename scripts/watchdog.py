@@ -92,14 +92,15 @@ def get_empirical_telemetry_timeseries(
     current_passages: int,
     current_entities: int,
     current_triples: int,
+    db_stem: str = "sidecar",
 ) -> list[dict[str, Any]]:
     """Maintain and return genuine, empirical periodic telemetry checkpoints.
 
-    Loads checkpoints from .yaw/sidecar_telemetry.json, appends the current live observation,
+    Loads checkpoints from .yaw/{db_stem}_telemetry.json, appends the current live observation,
     and computes genuine empirical rolling velocity and latency.
     """
     yaw_dir = WORKSPACE_ROOT / ".yaw"
-    telemetry_file = yaw_dir / "sidecar_telemetry.json"
+    telemetry_file = yaw_dir / f"{db_stem}_telemetry.json"
 
     checkpoints: list[dict[str, Any]] = []
     if telemetry_file.exists():
@@ -382,6 +383,7 @@ def get_active_sandbox_info() -> dict[str, Any]:
                 current_passages=n_chunks,
                 current_entities=cum_entities,
                 current_triples=cum_triples,
+                db_stem=latest_db.stem,
             )
         except Exception as exc:
             info["kg_error"] = str(exc)
@@ -713,32 +715,35 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
     def lat_to_y(lat_val: float) -> float:
         return p2_y1 - p2_h * min(1.0, max(0.0, lat_val / 60.0))
 
-    path_passages = ""
-    path_entities = ""
-    path_triples = ""
-    path_vel = ""
-    path_lat = ""
-
-    if samples:
-        path_passages = f"M {t_to_x(0)} {p_to_y(0)}"
-        path_entities = f"M {t_to_x(0)} {e_to_y(0)}"
-        path_triples = f"M {t_to_x(0)} {e_to_y(0)}"
-        first_s = samples[0]
-        path_vel = f"M {t_to_x(first_s['time_hours'])} {v_to_y(first_s['rolling_velocity'])}"
-        path_lat = f"M {t_to_x(first_s['time_hours'])} {lat_to_y(first_s['rolling_latency'])}"
-
-        for s in samples:
-            x_s = t_to_x(s["time_hours"])
-            path_passages += f" L {x_s:.1f} {p_to_y(s['passages']):.1f}"
-            path_entities += f" L {x_s:.1f} {e_to_y(s['entities']):.1f}"
-            path_triples += f" L {x_s:.1f} {e_to_y(s['triples']):.1f}"
-            path_vel += f" L {x_s:.1f} {v_to_y(s['rolling_velocity']):.1f}"
-            path_lat += f" L {x_s:.1f} {lat_to_y(s['rolling_latency']):.1f}"
-
     x_now = t_to_x(elapsed_hours)
     y_p_now = p_to_y(openie_cnt)
     y_e_now = e_to_y(total_ent)
     y_t_now = e_to_y(total_trips)
+
+    # Build sequence of cumulative points starting from origin (0, 0, 0, 0)
+    p1_pts: list[tuple[float, float, float, float]] = [(0.0, 0.0, 0.0, 0.0)]
+    for s in samples:
+        t_h = float(s["time_hours"])
+        if t_h > p1_pts[-1][0]:
+            p1_pts.append((t_h, float(s["passages"]), float(s["entities"]), float(s["triples"])))
+
+    if elapsed_hours > p1_pts[-1][0] or openie_cnt != p1_pts[-1][1]:
+        p1_pts.append((elapsed_hours, float(openie_cnt), float(total_ent), float(total_trips)))
+
+    path_passages = f"M {t_to_x(p1_pts[0][0]):.1f} {p_to_y(p1_pts[0][1]):.1f}"
+    path_entities = f"M {t_to_x(p1_pts[0][0]):.1f} {e_to_y(p1_pts[0][2]):.1f}"
+    path_triples = f"M {t_to_x(p1_pts[0][0]):.1f} {e_to_y(p1_pts[0][3]):.1f}"
+
+    panel1_sample_circles = ""
+    for pt in p1_pts[1:]:
+        x_pt = t_to_x(pt[0])
+        path_passages += f" L {x_pt:.1f} {p_to_y(pt[1]):.1f}"
+        path_entities += f" L {x_pt:.1f} {e_to_y(pt[2]):.1f}"
+        path_triples += f" L {x_pt:.1f} {e_to_y(pt[3]):.1f}"
+        if abs(x_pt - x_now) > 5.0:
+            panel1_sample_circles += f"""  <circle cx="{x_pt:.1f}" cy="{p_to_y(pt[1]):.1f}" r="3" fill="#38bdf8" opacity="0.9"/>\n"""
+            panel1_sample_circles += f"""  <circle cx="{x_pt:.1f}" cy="{e_to_y(pt[2]):.1f}" r="2.8" fill="#818cf8" opacity="0.9"/>\n"""
+            panel1_sample_circles += f"""  <circle cx="{x_pt:.1f}" cy="{e_to_y(pt[3]):.1f}" r="2.8" fill="#f43f5e" opacity="0.9"/>\n"""
 
     x_target = t_to_x(target_total_hours)
     y_p_target = p_to_y(corpus_total_pool)
@@ -754,6 +759,40 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
     active_vel_samples = [s["rolling_velocity"] for s in samples if s["rolling_velocity"] > 0]
     latest_vel = active_vel_samples[-1] if active_vel_samples else velocity
     latest_lat = samples[-1]["rolling_latency"] if samples else sec_per_chunk
+
+    # Build sequence of velocity and latency points connecting through x_now
+    v_pts: list[tuple[float, float]] = []
+    lat_pts: list[tuple[float, float]] = []
+    if samples:
+        for s in samples:
+            t_h = float(s["time_hours"])
+            v_pts.append((t_h, float(s["rolling_velocity"])))
+            lat_pts.append((t_h, float(s["rolling_latency"])))
+    else:
+        v_pts.append((0.0, velocity))
+        lat_pts.append((0.0, sec_per_chunk))
+
+    if abs(elapsed_hours - v_pts[-1][0]) > 1e-4:
+        v_pts.append((elapsed_hours, latest_vel))
+        lat_pts.append((elapsed_hours, latest_lat))
+
+    path_vel = f"M {t_to_x(v_pts[0][0]):.1f} {v_to_y(v_pts[0][1]):.1f}"
+    for pt in v_pts[1:]:
+        path_vel += f" L {t_to_x(pt[0]):.1f} {v_to_y(pt[1]):.1f}"
+
+    path_lat = f"M {t_to_x(lat_pts[0][0]):.1f} {lat_to_y(lat_pts[0][1]):.1f}"
+    for pt in lat_pts[1:]:
+        path_lat += f" L {t_to_x(pt[0]):.1f} {lat_to_y(pt[1]):.1f}"
+
+    panel2_sample_circles = ""
+    for pt in v_pts:
+        xs = t_to_x(pt[0])
+        if abs(xs - x_now) > 5.0:
+            panel2_sample_circles += f"""  <circle cx="{xs:.1f}" cy="{v_to_y(pt[1]):.1f}" r="2.8" fill="#10b981" opacity="0.9"/>\n"""
+    for pt in lat_pts:
+        xs = t_to_x(pt[0])
+        if abs(xs - x_now) > 5.0:
+            panel2_sample_circles += f"""  <circle cx="{xs:.1f}" cy="{lat_to_y(pt[1]):.1f}" r="2.5" fill="#fbbf24" opacity="0.9"/>\n"""
 
     svg = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 760" width="100%" height="100%" style="background:#070b14; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
   <defs>
@@ -890,7 +929,7 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
   <path d="{path_triples}" fill="none" stroke="#f43f5e" stroke-width="2"/>
   <line x1="{x_now:.1f}" y1="{y_t_now:.1f}" x2="{x_target:.1f}" y2="{y_t_target:.1f}" stroke="#f43f5e" stroke-width="1.8" stroke-dasharray="5,4" stroke-opacity="0.8"/>
 
-  <line x1="{x_now:.1f}" y1="{p1_y0}" x2="{x_now:.1f}" y2="{p1_y1}" stroke="#ffffff" stroke-width="1.5" stroke-dasharray="3,3" stroke-opacity="0.7"/>
+{panel1_sample_circles}  <line x1="{x_now:.1f}" y1="{p1_y0}" x2="{x_now:.1f}" y2="{p1_y1}" stroke="#ffffff" stroke-width="1.5" stroke-dasharray="3,3" stroke-opacity="0.7"/>
   <circle cx="{x_now:.1f}" cy="{y_p_now:.1f}" r="5" fill="#38bdf8" stroke="#ffffff" stroke-width="1.8"/>
   <circle cx="{x_now:.1f}" cy="{y_e_now:.1f}" r="4.5" fill="#818cf8" stroke="#ffffff" stroke-width="1.5"/>
   <circle cx="{x_now:.1f}" cy="{y_t_now:.1f}" r="4.5" fill="#f43f5e" stroke="#ffffff" stroke-width="1.5"/>
@@ -922,11 +961,7 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
   <path d="{path_lat}" fill="none" stroke="#fbbf24" stroke-width="1.8" stroke-dasharray="3,2"/>
 """
 
-    for s in samples:
-        xs = t_to_x(s["time_hours"])
-        ys_v = v_to_y(s["rolling_velocity"])
-        svg += f"""  <circle cx="{xs:.1f}" cy="{ys_v:.1f}" r="2.2" fill="#10b981" opacity="0.8"/>
-"""
+    svg += panel2_sample_circles
 
     svg += f"""
   <circle cx="{x_now:.1f}" cy="{v_to_y(latest_vel):.1f}" r="4.5" fill="#10b981" stroke="#ffffff" stroke-width="1.5"/>
@@ -2257,9 +2292,7 @@ def generate_report_markdown(
 
     elapsed_sec = sandbox.get("elapsed_seconds", 60.0)
     elapsed_min = max(0.1, elapsed_sec / 60.0)
-    emp_history = get_empirical_telemetry_timeseries(
-        sandbox, val_target_pool, train_target_pool, overlap_passages, kg.get("total_triples", 0)
-    )
+    emp_history = sandbox.get("timeseries_samples", [])
     extract_phase_sec = elapsed_sec
     if len(emp_history) >= 2:
         max_p = emp_history[-1]["passages"]
