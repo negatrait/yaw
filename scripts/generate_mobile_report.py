@@ -2420,8 +2420,8 @@ def main() -> int:
         "--cool-seconds",
         type=int,
         metavar="SECONDS",
-        default=90,
-        help="Suspend inference servers for SECONDS seconds on each polling cycle for hardware cooldown (default: 90, 0 to disable)",
+        default=200,
+        help="Suspend inference servers for SECONDS seconds on each polling cycle for hardware cooldown (default: 200, 0 to disable)",
     )
     args = parser.parse_args()
 
