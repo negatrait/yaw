@@ -200,20 +200,25 @@ def get_empirical_telemetry_timeseries(
     return samples
 
 
-def _open_ro_sqlite(db_path: Path, max_retries: int = 3) -> sqlite3.Connection | None:
+def _open_ro_sqlite(
+    db_path: Path,
+    backoff_delays: tuple[float, ...] = (5.0, 10.0, 20.0),
+) -> sqlite3.Connection | None:
     """Open a read-only WAL-aware SQLite connection with exponential backoff on busy/locked.
 
-    Never creates snapshot copies or filesystem bloat. If locked after retries, returns None
-    so the watchdog aborts cleanly and tries again on the subsequent polling round.
+    Uses (5s, 10s, 20s) retry intervals and a generous 10.0s connection timeout to accommodate
+    large batch ingestion transactions without filesystem snapshot bloat. If still locked after
+    all retries, returns None so the watchdog aborts cleanly and tries again on the subsequent round.
     """
-    for attempt in range(max_retries):
+    total_attempts = len(backoff_delays) + 1
+    for attempt in range(total_attempts):
         try:
-            conn = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True, timeout=3.0)
+            conn = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True, timeout=10.0)
             conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
             return conn
         except (sqlite3.OperationalError, sqlite3.DatabaseError):
-            if attempt < max_retries - 1:
-                time.sleep(0.5 * (2 ** attempt))
+            if attempt < len(backoff_delays):
+                time.sleep(backoff_delays[attempt])
             else:
                 return None
         except Exception:
