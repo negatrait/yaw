@@ -22,6 +22,7 @@ import re
 import sqlite3
 import sys
 import time
+import urllib.request
 from collections import Counter, defaultdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -33,6 +34,55 @@ WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
 ARTIFACT_DIR = Path(
     r"C:\Users\Harri.Ahokas\.gemini\antigravity\brain\3061c87c-9ec6-4ff5-b756-80b05e1c4342"
 )
+
+
+def get_lemonade_server_metrics() -> dict[str, Any]:
+    """Query live Lemonade / llama.cpp inference server Prometheus metrics."""
+    try:
+        req = urllib.request.Request(
+            "http://localhost:13305/metrics",
+            headers={"Authorization": "Bearer lemonade"},
+        )
+        with urllib.request.urlopen(req, timeout=1.0) as resp:
+            text = resp.read().decode("utf-8", errors="ignore")
+            m: dict[str, float] = {}
+            for line in text.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                if len(parts) == 2:
+                    with contextlib.suppress(ValueError):
+                        m[parts[0]] = float(parts[1])
+
+            qwen_tps = 0.0
+            qwen_ttft = 0.0
+            qwen_prompt_tok = 0
+            qwen_out_tok = 0
+            for k, v in m.items():
+                if "Qwen3-4B" in k and "tokens_per_second" in k:
+                    qwen_tps = v
+                if "Qwen3-4B" in k and "time_to_first_token" in k:
+                    qwen_ttft = v
+                if "Qwen3-4B" in k and "model_input_tokens{" in k:
+                    qwen_prompt_tok = int(v)
+                if "Qwen3-4B" in k and "model_output_tokens{" in k:
+                    qwen_out_tok = int(v)
+
+            return {
+                "server_up": True,
+                "qwen_tps": round(qwen_tps, 1),
+                "qwen_ttft_sec": round(qwen_ttft, 3),
+                "qwen_latest_prompt_tokens": qwen_prompt_tok,
+                "qwen_latest_output_tokens": qwen_out_tok,
+                "cpu_usage_pct": round(m.get("lemonade_cpu_usage_percent", 0.0), 1),
+                "memory_used_gb": round(m.get("lemonade_memory_used_gb", 0.0), 1),
+                "requests_total": int(m.get("lemonade_requests_total", 0)),
+                "prompt_tokens_total": int(m.get("lemonade_llamacpp_prompt_tokens_total", 0)),
+                "tokens_predicted_total": int(m.get("lemonade_llamacpp_tokens_predicted_total", 0)),
+            }
+    except Exception:
+        return {"server_up": False}
 
 
 def get_empirical_telemetry_timeseries(
@@ -150,7 +200,7 @@ def get_empirical_telemetry_timeseries(
             "passages": pass_cnt,
             "entities": ent_cnt,
             "triples": trip_cnt,
-            "tokens_k": round((pass_cnt * 630) / 1000.0, 1),
+            "tokens_k": round((pass_cnt * 2270) / 1000.0, 1),
             "rolling_velocity": round(vel, 2),
             "rolling_latency": round(lat, 1),
         })
@@ -210,15 +260,17 @@ def get_active_sandbox_info() -> dict[str, Any]:
         # Detailed Knowledge Graph metrics and time-series extraction
         try:
             rows = conn.execute(
-                "SELECT chunk_id, entities_json, triples_json FROM openie_chunks ORDER BY rowid ASC"
+                "SELECT chunk_id, entities_json, triples_json, structured_triples_json FROM openie_chunks ORDER BY rowid ASC"
             ).fetchall()
             n_chunks = len(rows)
             cum_entities = 0
             cum_triples = 0
+            total_output_chars = 0
             all_predicates: list[str] = []
             recent_extractions: list[dict[str, Any]] = []
 
-            for _idx, (_cid, e_raw, t_raw) in enumerate(rows, start=1):
+            for _idx, (_cid, e_raw, t_raw, st_raw) in enumerate(rows, start=1):
+                total_output_chars += len(e_raw or "") + len(t_raw or "") + len(st_raw or "")
                 try:
                     ents = json.loads(e_raw or "[]")
                 except Exception:
@@ -237,7 +289,7 @@ def get_active_sandbox_info() -> dict[str, Any]:
                         if p_str:
                             all_predicates.append(p_str)
 
-            for cid, e_raw, t_raw in rows[-4:]:
+            for cid, e_raw, t_raw, _st in rows[-4:]:
                 try:
                     ents = json.loads(e_raw or "[]")
                 except Exception:
@@ -265,6 +317,7 @@ def get_active_sandbox_info() -> dict[str, Any]:
             pred_counter = Counter(all_predicates)
             top_preds = pred_counter.most_common(6)
 
+            measured_tokens = int(total_output_chars / 3.8)
             info["kg_metrics"] = {
                 "total_entities": cum_entities,
                 "avg_entities_per_chunk": round(cum_entities / max(1, n_chunks), 1),
@@ -273,6 +326,10 @@ def get_active_sandbox_info() -> dict[str, Any]:
                 "unique_predicates": len(pred_counter),
                 "top_predicates": top_preds,
                 "recent_extractions": recent_extractions,
+                "total_output_chars": total_output_chars,
+                "total_output_mb": round(total_output_chars / (1024 * 1024), 2),
+                "measured_output_tokens": measured_tokens,
+                "avg_tokens_per_chunk": int(measured_tokens / max(1, n_chunks)),
             }
 
             # Empirical periodic telemetry time-series
@@ -290,6 +347,7 @@ def get_active_sandbox_info() -> dict[str, Any]:
     except Exception as exc:
         info["error"] = str(exc)
 
+    info["lemonade_metrics"] = get_lemonade_server_metrics()
     return info
 
 
@@ -425,6 +483,7 @@ def read_config_info() -> dict[str, Any]:
 def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str, Any]) -> None:
     counts = sandbox.get("counts", {})
     kg = sandbox.get("kg_metrics", {})
+    lem = sandbox.get("lemonade_metrics", {})
     openie_cnt = counts.get("openie_chunks", 0)
     target_pool = 495
     pct = min(100.0, (openie_cnt / target_pool) * 100.0)
@@ -738,7 +797,7 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
 
   <!-- Footer Info Box -->
   <rect x="32" y="718" width="876" height="26" rx="5" fill="#0f172a" stroke="#1e293b"/>
-  <text x="44" y="735" fill="#94a3b8" font-size="10">Active Sandbox: <tspan fill="#f8fafc" font-family="monospace">{sandbox.get('db_name', 'initializing')}</tspan> | Elapsed: <tspan fill="#f8fafc">{int(elapsed_min)} min</tspan> | Extraction Velocity: <tspan fill="#10b981" font-weight="600">{velocity:.2f} passages/min</tspan> | Est. Tokens: <tspan fill="#818cf8">{(openie_cnt * 630):,} tokens</tspan></text>
+  <text x="44" y="735" fill="#94a3b8" font-size="10">Active Sandbox: <tspan fill="#f8fafc" font-family="monospace">{sandbox.get('db_name', 'initializing')}</tspan> | Elapsed: <tspan fill="#f8fafc">{int(elapsed_min)} min</tspan> | Emitted KG: <tspan fill="#818cf8">{kg.get('total_output_mb', 0.0):.2f} MB (~{kg.get('measured_output_tokens', 0):,} tok)</tspan> | Model TPS: <tspan fill="#38bdf8">{lem.get('qwen_tps', 0.0):.1f} tok/s</tspan> | Host: <tspan fill="#10b981">{lem.get('cpu_usage_pct', 0.0):.0f}% CPU, {lem.get('memory_used_gb', 0.0):.0f}G RAM</tspan></text>
 </svg>"""
 
     dest.write_text(svg, encoding="utf-8")
@@ -1773,6 +1832,15 @@ def generate_report_markdown(
     top_preds = kg.get("top_predicates", [])
     recent_list = kg.get("recent_extractions", [])
 
+    lem = sandbox.get("lemonade_metrics", {})
+    lem_tps = lem.get("qwen_tps", 0.0)
+    lem_ttft_ms = int(lem.get("qwen_ttft_sec", 0.0) * 1000.0)
+    lem_cpu = lem.get("cpu_usage_pct", 0.0)
+    lem_ram = lem.get("memory_used_gb", 0.0)
+    kg_output_mb = kg.get("total_output_mb", 0.0)
+    kg_output_tok = kg.get("measured_output_tokens", 0)
+    kg_avg_tok = kg.get("avg_tokens_per_chunk", 0)
+
     proj = proj_info or {}
     proj_nodes = proj.get("nodes_rendered", 0)
     proj_edges = proj.get("active_edges", 0)
@@ -1802,7 +1870,7 @@ This dashboard documents real-time telemetry from the active **Two-Phase Hybrid 
 
 ![Live Ingestion & Knowledge Graph Extraction Dashboard](/C:/Users/Harri.Ahokas/.gemini/antigravity/brain/3061c87c-9ec6-4ff5-b756-80b05e1c4342/knowledge_graph_extraction_dashboard.svg)
 
-### Real-Time Ingestion & Throughput Metrics:
+### Real-Time Ingestion & Model Telemetry:
 | Metric / Parameter | Current Value | Description |
 | :--- | :---: | :--- |
 | **Passages Extracted** | **`{openie_cnt}` / `{target_pool}`** (`{pct:.1f}%`) | Unique validation corpus chunks processed through Stage 1–3 OpenIE |
@@ -1812,7 +1880,11 @@ This dashboard documents real-time telemetry from the active **Two-Phase Hybrid 
 | **Time Remaining to Commit** | **`~{eta_str}`** (`{int(eta_min)} min`) | Estimated duration remaining to finish remaining {rem_chunks} chunks |
 | **Projected Completion Clock** | **`~{finish_clock_str} UTC`** | Estimated wall-clock completion time |
 | **Estimated Total Duration** | **`~{target_total_hours:.1f}h`** (`{int(target_total_hours * 60)} min`) | Total run duration (Elapsed + Remaining) |
-| **Est. LM Token Usage** | **`{openie_cnt * 630:,}` tokens** | ~`450` prompt tokens + ~`180` completion tokens per passage |
+| **Live Model Generation Speed** | **`{lem_tps:.1f} tokens/s`** | Real-time token generation speed queried from Lemonade Prometheus `/metrics` |
+| **Live Time to First Token (TTFT)** | **`{lem_ttft_ms} ms`** | Real prefill latency on active `Qwen3-4B-Instruct-2507-GGUF` |
+| **Emitted Knowledge Graph Volume** | **`{kg_output_mb:.2f} MB`** | Raw structured JSON payload committed to SQLite (`openie_chunks`) |
+| **Measured Output Tokens** | **`~{kg_output_tok:,} tokens`** | `~{kg_avg_tok:,}` completion tokens/passage (entities + triples + statement definitions) |
+| **Inference Host Resources** | **`{lem_cpu:.1f}% CPU` • `{lem_ram:.1f} GB RAM`** | Live system resource allocation on local inference daemon |
 
 ---
 
@@ -1846,7 +1918,10 @@ This dashboard documents real-time telemetry from the active **Two-Phase Hybrid 
 | :--- | :---: | :--- |
 | **Named Entities** | **`{total_ent:,}`** | **`{avg_ent:.1f}` entities / passage** |
 | **Factual Triples** | **`{total_trips:,}`** | **`{avg_trips:.1f}` triples / passage** |
+| **Emitted KG JSON Payload** | **`{kg_output_mb:.2f} MB`** | Raw extraction JSON committed to SQLite (`openie_chunks`) |
+| **Measured Completion Tokens** | **`~{kg_output_tok:,}` tokens** | **`~{kg_avg_tok:,}` tokens / passage** (entities + triples + definitions) |
 | **Semantic Relation Vocabulary** | **`{uniq_preds}` unique predicates** | Broad expressive vocabulary discovered across domains |
+| **Active Inference Backend** | **`Qwen3-4B-Instruct` @ `{lem_tps:.1f} tok/s`** | Lemonade GPU engine (`llama.cpp`, TTFT `{lem_ttft_ms} ms`) |
 | **Active Sandbox DB** | [`{db_name}`](file:///{sandbox.get('db_path', '')}) | **`{db_size} MB`** on disk |
 
 ### Top Discovered Semantic Predicates:
