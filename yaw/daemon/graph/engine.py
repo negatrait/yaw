@@ -3009,7 +3009,13 @@ class YawGraphEngine:
                     if valset and len(valset) < 35:
                         compile_kwargs["minibatch"] = False
 
+                baseline_demos = {
+                    name: list(getattr(pred, "demos", ()) or ())
+                    for name, pred in compiled.named_predictors()
+                }
                 optimizer = dspy.MIPROv2(**optimizer_kwargs)
+                if hasattr(optimizer, "_propose_instructions"):
+                    optimizer._propose_instructions = proposer.propose_mipro_instructions
                 compile_sig = inspect.signature(optimizer.compile).parameters
                 if not any(
                     p.kind == inspect.Parameter.VAR_KEYWORD
@@ -3024,6 +3030,11 @@ class YawGraphEngine:
                         **compile_kwargs,
                     )
                 self._prune_mismatching_demos(compiled)
+                for name, pred in compiled.named_predictors():
+                    if not getattr(pred, "demos", None) and baseline_demos.get(name):
+                        pred.demos = list(baseline_demos[name])
+                if hasattr(compiled.qa, "predict") and getattr(compiled.qa.predict, "demos", None):
+                    compiled.qa.demos = list(compiled.qa.predict.demos)
 
             if mode in ("gepa", "hybrid") and hasattr(dspy, "GEPA"):
                 gepa_log_dir = (
@@ -3124,9 +3135,23 @@ class YawGraphEngine:
             len(self._opt_indexed_cids) < len(self._opt_chunks_pool)
             or self._active_extraction_fingerprint != self._extraction_fingerprint(self.program)
         ):
-            clear_openie = self._active_openie_fingerprint != self._openie_fingerprint(self.program)
+            target_openie_fp = self._openie_fingerprint(self.program)
+            clear_openie = self._active_openie_fingerprint != target_openie_fp
             self._reset_sandbox_graph(clear_openie=clear_openie)
-            self.index_chunks(list(self._opt_chunks_pool), program=self.program)
+            if len(self._opt_chunks_pool) <= 32:
+                rehydrate_pool = list(self._opt_chunks_pool)
+            else:
+                cached_pool = [
+                    cp
+                    for cp in self._opt_chunks_pool
+                    if (cp[0].chunk_id, target_openie_fp) in self._openie_fp_cache
+                ]
+                rehydrate_pool = (
+                    cached_pool[:64]
+                    if cached_pool
+                    else list(self._opt_chunks_pool[:16])
+                )
+            self.index_chunks(rehydrate_pool, program=self.program)
 
         return self.program
 

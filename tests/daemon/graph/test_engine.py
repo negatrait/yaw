@@ -1990,3 +1990,142 @@ def test_hybrid_e2e_per_query_isolation_stage_caching_and_reflective_stats(
         _ = engine.evolve_prompts([ex1, ex2], mode="gepa")
     finally:
         engine.close()
+
+
+def test_evolve_prompts_real_unmocked_gepa_and_miprov2_with_context_limit_guard(
+    tmp_path: Path,
+) -> None:
+    """Run real un-mocked dspy.MIPROv2 and dspy.GEPA end-to-end with a strict context-size guard and RLM proposer."""
+    import json
+
+    max_observed_prompt_chars = 0
+
+    class ContextGuardedRealOptLM(DeterministicMockLM):
+        def __call__(
+            self,
+            prompt: str | None = None,
+            messages: list[dict[str, Any]] | None = None,
+            **kwargs: Any,
+        ) -> list[str]:
+            nonlocal max_observed_prompt_chars
+            if getattr(dspy.settings, "usage_tracker", None) is not None:
+                dspy.settings.usage_tracker.add_usage(
+                    self.model,
+                    {"prompt_tokens": 25, "completion_tokens": 12, "total_tokens": 37},
+                )
+            req_str = str(prompt or messages or kwargs)
+            max_observed_prompt_chars = max(max_observed_prompt_chars, len(req_str))
+            if len(req_str) > 32000:
+                raise RuntimeError(
+                    f"Request ({len(req_str)} chars) exceeds available context size (32000 chars)"
+                )
+            if "variables_info" in req_str and "repl_history" in req_str:
+                return [
+                    "[[ ## reasoning ## ]]\n"
+                    "Distill examples_with_feedback in the Python REPL and call synthesize_instruction.\n\n"
+                    "[[ ## code ## ]]\n"
+                    "```python\n"
+                    "digest = [{'Inputs': {k: (v[:300] if isinstance(v, str) else v) for k, v in ex.get('Inputs', {}).items()}, 'Generated Outputs': ex.get('Generated Outputs', {}), 'Feedback': ex.get('Feedback', '')} for ex in examples_with_feedback[:3]]\n"
+                    "res = synthesize_instruction(current_instruction=current_instruction, examples_with_feedback=digest)\n"
+                    "SUBMIT(new_instruction=res)\n"
+                    "```\n"
+                    "[[ ## completed ## ]]"
+                ]
+            if "new_instruction" in req_str and (
+                "examples_with_feedback" in req_str or "length_limit" in req_str
+            ):
+                return [
+                    json.dumps(
+                        {
+                            "new_instruction": (
+                                "Extract accurate entities, triples, and answers strictly grounded in the passage context. "
+                                'Respond with JSON: {"named_entities": [["Entity", "Definition"]], "triples": [["s", "s_def", "p", "o", "o_def", "spo_def"]], "entity_definitions": [["E", "D"]], "decisions": [], "repairs": [], "fact": [["s", "p", "o"]], "query_intent": "...", "reasoning": "...", "answer": "..."}.'
+                            )
+                        }
+                    )
+                ]
+            if "Automatic Computing Engine" in req_str and (
+                "AnswerQuestion" in req_str or "Retrieved evidence passages" in req_str
+            ):
+                # Return a suboptimal answer on baseline so GEPA reflects and mutates
+                if " strictly grounded in the passage context" not in req_str:
+                    return [
+                        json.dumps(
+                            {
+                                "reasoning": "Initial incomplete guess.",
+                                "answer": "Babbage",
+                            }
+                        )
+                    ]
+                return [
+                    json.dumps(
+                        {
+                            "reasoning": "Alan Turing designed the Automatic Computing Engine.",
+                            "answer": "Alan Turing",
+                        }
+                    )
+                ]
+            return super().__call__(prompt=prompt, messages=messages, **kwargs)
+
+    lm = ContextGuardedRealOptLM()
+    dspy.settings.configure(lm=lm)
+    program = HippoRAGProgram(
+        enable_gbnf=False,
+        orchestrator_lm=lm,
+        rlm_sub_lm=lm,
+    )
+    embedder: Any = DeterministicMockEmbedder(dim=64)
+
+    engine = YawGraphEngine(
+        db_path=tmp_path / "yaw_real_unmocked_opt.db",
+        workspace_root=tmp_path,
+        program=program,
+        embedder=embedder,
+        retrieval_top_k=2,
+    )
+    try:
+        doc_turing = "Alan Turing\nAlan Turing designed the Automatic Computing Engine in 1945."
+        doc_lovelace = "Ada Lovelace\nAda Lovelace wrote the first computer algorithm."
+        # Pad item_docs with large distractor strings so 10 raw examples would exceed 60,000 chars if un-distilled
+        filler_docs = [
+            f"Distractor {i}\n" + ("Historical archive notes on mechanical calculators. " * 25)
+            for i in range(6)
+        ]
+
+        trainset = [
+            dspy.Example(
+                question="Who designed the Automatic Computing Engine?",
+                gold_answers=["Alan Turing"],
+                gold_docs=[doc_turing],
+                item_docs=[doc_turing, *filler_docs[:3]],
+            ).with_inputs("question", "item_docs"),
+            dspy.Example(
+                question="Who wrote the first computer algorithm?",
+                gold_answers=["Ada Lovelace"],
+                gold_docs=[doc_lovelace],
+                item_docs=[doc_lovelace, *filler_docs[3:]],
+            ).with_inputs("question", "item_docs"),
+        ]
+        valset = [trainset[0], trainset[1]]
+
+        save_path = tmp_path / "real_compiled.json"
+        compiled = engine.evolve_prompts(
+            trainset,
+            valset=valset,
+            mode="hybrid",
+            num_candidates=2,
+            num_trials=5,
+            save_path=save_path,
+        )
+        assert isinstance(compiled, HippoRAGProgram)
+        assert max_observed_prompt_chars < 32000
+        assert save_path.exists()
+        assert getattr(compiled, "detailed_results", None) is not None
+        assert len(compiled.shacl_healer_rlm.generate_action.demos) >= 1
+        telemetry_path = tmp_path / "real_compiled_proposer_telemetry.json"
+        assert telemetry_path.exists()
+        telemetry_data = json.loads(telemetry_path.read_text(encoding="utf-8"))
+        assert len(telemetry_data) >= 1
+        assert all(entry.get("mode") == "rlm" for entry in telemetry_data)
+    finally:
+        engine.close()

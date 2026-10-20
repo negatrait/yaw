@@ -3168,17 +3168,30 @@ def _example_failure_priority(ex: Mapping[str, Any], index: int) -> tuple[int, f
     return (0 if is_fail else 1, score_val if is_fail else 1.0 + score_val, index)
 
 
-def _bound_nested_strings(value: Any, max_chars: int) -> Any:
-    """Bound oversized leaf strings inside reflective examples while keeping structure intact."""
+def _bound_nested_strings(value: Any, max_chars: int, *, _depth: int = 0) -> Any:
+    """Bound oversized leaf strings and nested list lengths inside reflective examples while keeping structure intact."""
     if isinstance(value, str):
         if len(value) > max_chars:
             cut = len(value) - max_chars
             return f"{value[:max_chars]} [{cut:,} chars omitted]"
         return value
     if isinstance(value, Mapping):
-        return {str(k): _bound_nested_strings(v, max_chars) for k, v in value.items()}
+        return {
+            str(k): _bound_nested_strings(v, max_chars, _depth=_depth + 1)
+            for k, v in value.items()
+        }
     if isinstance(value, (list, tuple)):
-        return [_bound_nested_strings(v, max_chars) for v in value]
+        if _depth >= 1 and len(value) > 6:
+            bounded_head = [
+                _bound_nested_strings(v, max_chars, _depth=_depth + 1)
+                for v in value[:6]
+            ]
+            bounded_head.append(f"[{len(value) - 6} items omitted]")
+            return bounded_head
+        return [
+            _bound_nested_strings(v, max_chars, _depth=_depth + 1)
+            for v in value
+        ]
     return value
 
 
@@ -3633,6 +3646,7 @@ class RLMInstructionProposer:
                 num_candidates=self.simba_num_candidates,
                 max_steps=self.simba_max_steps,
                 max_demos=self.simba_max_demos,
+                demo_input_field_maxlen=self.max_field_chars * 2,
                 prompt_model=eff_worker,
                 num_threads=1,
             )
@@ -3897,7 +3911,9 @@ class RLMInstructionProposer:
                     dspy.Example(
                         component_name=comp_name,
                         current_instruction=candidate[comp_name],
-                        examples_with_feedback=prepared,
+                        examples_with_feedback=_bound_nested_strings(
+                            prepared, self.max_field_chars
+                        ),
                     ).with_inputs(
                         "component_name",
                         "current_instruction",
@@ -3921,6 +3937,110 @@ class RLMInstructionProposer:
                 component_examples=comp_examples,
             )
         return updated
+
+    def propose_mipro_instructions(
+        self,
+        program: Any,
+        trainset: Sequence[Any],
+        demo_candidates: Any = None,
+        view_data_batch_size: int = 10,
+        program_aware_proposer: bool = True,
+        data_aware_proposer: bool = True,
+        tip_aware_proposer: bool = True,
+        fewshot_aware_proposer: bool = True,
+        *,
+        num_instruct_candidates: int = 1,
+    ) -> dict[int, list[str]]:
+        """Propose MIPROv2 instruction candidates per predictor using `self.inner_rlm` (`dspy.RLM`) instead of stock `GroundedProposer`."""
+        named_preds = list(program.named_predictors())
+        program_summary = (
+            ", ".join(
+                f"{name}:{getattr(getattr(p, 'signature', None), '__name__', type(p).__name__)}"
+                for name, p in named_preds
+            )
+            if program_aware_proposer
+            else ""
+        )
+        batch_limit = max(1, min(len(trainset), int(view_data_batch_size or 5)))
+        dataset_records: list[dict[str, Any]] = []
+        if data_aware_proposer:
+            for ex in list(trainset)[:batch_limit]:
+                if hasattr(ex, "inputs"):
+                    inp_d = dict(ex.inputs())
+                    lbl_d = dict(ex.labels()) if hasattr(ex, "labels") else {}
+                elif isinstance(ex, Mapping):
+                    inp_d = dict(ex)
+                    lbl_d = {}
+                else:
+                    inp_d = {"example": str(ex)}
+                    lbl_d = {}
+                dataset_records.append(
+                    {
+                        "Inputs": inp_d,
+                        "Generated Outputs": lbl_d,
+                        "Feedback": (
+                            f"[MIPROv2 RLM Dataset/Program Context] modules=[{program_summary}]"
+                            if program_summary
+                            else "[MIPROv2 RLM Dataset Context]"
+                        ),
+                    }
+                )
+
+        tips = (
+            "Keep the instruction clear and concise.",
+            "Make sure your instruction is very informative and descriptive.",
+            "Don't be afraid to be creative when creating the new instruction!",
+        )
+        instruction_candidates: dict[int, list[str]] = {}
+        target_n = max(1, int(num_instruct_candidates))
+        for pred_i, (pred_name, pred) in enumerate(named_preds):
+            sig = getattr(pred, "signature", None)
+            base_inst = str(getattr(sig, "instructions", "") or "")
+            cands: list[str] = [base_inst]
+            for cand_idx in range(1, target_n):
+                tip_str = tips[(cand_idx - 1) % len(tips)] if tip_aware_proposer else ""
+                comp_examples: list[dict[str, Any]] = []
+                if (
+                    fewshot_aware_proposer
+                    and isinstance(demo_candidates, Mapping)
+                    and pred_i in demo_candidates
+                    and demo_candidates[pred_i]
+                ):
+                    demo_sets = demo_candidates[pred_i]
+                    chosen_set = demo_sets[cand_idx % len(demo_sets)] or ()
+                    sig_fields = getattr(sig, "fields", {}) or {}
+                    in_keys = {
+                        k
+                        for k, f in sig_fields.items()
+                        if getattr(f, "json_schema_extra", {}).get("__dspy_field_type") == "input"
+                    }
+                    for d_ex in list(chosen_set)[: self.max_feedback_examples]:
+                        if isinstance(d_ex, Mapping):
+                            d_in = {k: v for k, v in d_ex.items() if k in in_keys and k != "augmented"}
+                            d_out = {k: v for k, v in d_ex.items() if k not in in_keys and k != "augmented"}
+                            comp_examples.append(
+                                {
+                                    "Inputs": d_in,
+                                    "Generated Outputs": d_out,
+                                    "Feedback": f"Bootstrapped demonstration for {pred_name}. {tip_str}".strip(),
+                                }
+                            )
+                if not comp_examples:
+                    comp_examples = [
+                        {
+                            **rec,
+                            "Feedback": f"{rec.get('Feedback', '')} {tip_str}".strip(),
+                        }
+                        for rec in (dataset_records[: self.max_feedback_examples] or [{"Inputs": {}, "Generated Outputs": {}, "Feedback": tip_str}])
+                    ]
+                proposed = self.propose_for_component(
+                    component_name=pred_name,
+                    current_instruction=base_inst,
+                    component_examples=comp_examples,
+                )
+                cands.append(proposed)
+            instruction_candidates[pred_i] = cands
+        return instruction_candidates
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return self.forward(*args, **kwargs)
