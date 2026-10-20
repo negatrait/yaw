@@ -2994,6 +2994,8 @@ class YawGraphEngine:
             orchestrator_lm=resolved_ref_lm,
             worker_lm=resolved_worker_lm,
             enable_gbnf=True,
+            rlm_max_iters=10,
+            rlm_max_llm_calls=20,
         )
 
         # Disable DSPy disk and memory cache during prompt evolution via configure_yaw_dspy_cache

@@ -63,7 +63,8 @@ from .prompts import (
 _STAGE_RLM_DELEGATION_RULES: dict[str, str] = {
     "shacl_repair": (
         "CRITICAL RLM SANDBOX RULE:\n"
-        "Inspect focus nodes via `inspect_focus_node(entity_id=...)` and `hydrate_chunk(chunk_id=...)`, delegate to `qwen_propose_shacl_repairs(violations=violations, focus_context=...)`, optionally apply/verify via `apply_shacl_repairs(repairs=repairs)` and `lint_shacl()`, and call `SUBMIT`:\n"
+        "Prioritize aggressive 2-step resolution: do NOT perform exploratory node inspections unless strictly necessary.\n"
+        "Immediately delegate to `qwen_propose_shacl_repairs(violations=violations)` on Step 1, verify if needed, and call `SUBMIT(repairs=repairs)` by Step 2 without wandering:\n"
         "```python\n"
         "repairs = qwen_propose_shacl_repairs(violations=violations)\n"
         "SUBMIT(repairs=repairs)\n"
@@ -71,8 +72,8 @@ _STAGE_RLM_DELEGATION_RULES: dict[str, str] = {
     ),
     "instruction_proposer_inner": (
         "CRITICAL RLM SANDBOX RULE:\n"
-        "Do NOT import `synthesize_instruction` (`synthesize_instruction` and `SUBMIT` are already in global scope).\n"
-        "Distill `examples_with_feedback` in Python so large inputs fit in context, call `synthesize_instruction` by keyword, and `SUBMIT`:\n"
+        "Prioritize aggressive 1-step or 2-step resolution: do NOT import `synthesize_instruction` (`synthesize_instruction` and `SUBMIT` are already in global scope).\n"
+        "Never make redundant exploratory tool calls or iterative loops. Immediately distill `examples_with_feedback` in Python, call `synthesize_instruction`, and immediately call `SUBMIT`:\n"
         "```python\n"
         "digest = [{'Inputs': {k: (v[:400] if isinstance(v, str) else v) for k, v in ex.get('Inputs', {}).items()}, 'Generated Outputs': ex.get('Generated Outputs', {}), 'Feedback': ex.get('Feedback', '')} for ex in examples_with_feedback]\n"
         "res = synthesize_instruction(current_instruction=current_instruction, examples_with_feedback=digest)\n"
@@ -91,8 +92,8 @@ def _build_rlm_action_demos() -> dict[str, list[dspy.Example]]:
             dspy.Example(
                 variables_info="Variable: `violations` (type: str): JSON list of SHACLViolation report items",
                 repl_history=empty_history,
-                iteration="1/3",
-                reasoning="Delegate SHACL repair generation to the Qwen worker and submit.",
+                iteration="1/10",
+                reasoning="Immediately delegate to Qwen worker and submit in step 1 without wandering.",
                 code="```python\nrepairs = qwen_propose_shacl_repairs(violations=violations)\nSUBMIT(repairs=repairs)\n```",
             ).with_inputs("variables_info", "repl_history", "iteration")
         ],
@@ -103,8 +104,8 @@ def _build_rlm_action_demos() -> dict[str, list[dspy.Example]]:
                     "Variable: `examples_with_feedback` (type: list): Task inputs, assistant responses, and diagnostic evaluation feedback."
                 ),
                 repl_history=empty_history,
-                iteration="1/3",
-                reasoning="Distill the examples and feedback in Python and call synthesize_instruction.",
+                iteration="1/10",
+                reasoning="Distill the examples and feedback in Python and immediately call synthesize_instruction and SUBMIT.",
                 code=(
                     "```python\n"
                     "digest = [{'Inputs': {k: (v[:400] if isinstance(v, str) else v) for k, v in ex.get('Inputs', {}).items()}, 'Generated Outputs': ex.get('Generated Outputs', {}), 'Feedback': ex.get('Feedback', '')} for ex in examples_with_feedback]\n"
@@ -2635,7 +2636,7 @@ class HippoRAGProgram(dspy.Module):
                     inspect_entity_neighborhood,
                     read_passage_chunk,
                 ],
-                max_iters=3,
+                max_iters=10,
             )
             with self._dspy_ctx(eff_lm, use_json_adapter=True):
                 return agent(context=initial_context, question=question)
@@ -3457,8 +3458,8 @@ class RLMInstructionProposer:
         max_feedback_examples: int = 5,
         reflection_temperature: float = 0.8,
         worker_temperature: float = 0.7,
-        rlm_max_iters: int = 3,
-        rlm_max_llm_calls: int = 6,
+        rlm_max_iters: int = 10,
+        rlm_max_llm_calls: int = 20,
         rlm_max_output_chars: int = 10000,
         include_demos: bool = True,
         adapter: dspy.Adapter | None = None,
