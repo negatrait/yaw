@@ -215,17 +215,7 @@ class YawGraphEngine:
         if not seeded_cids:
             return
         vec_cids = get_existing_ids(self.conn, "chunk_vec", seeded_cids)
-        edge_cids: set[str] = set()
-        for i in range(0, len(seeded_cids), 900):
-            batch = seeded_cids[i : i + 900]
-            placeholders = ",".join("?" for _ in batch)
-            for erow in self.conn.execute(
-                f"SELECT DISTINCT source_chunk_id FROM edges WHERE source_chunk_id IN ({placeholders})",
-                batch,
-            ).fetchall():
-                if erow[0]:
-                    edge_cids.add(str(erow[0]))
-        ready_cids = set(seeded_cids) & vec_cids & edge_cids
+        ready_cids = set(seeded_cids) & vec_cids
         if ready_cids:
             self._opt_indexed_cids.update(ready_cids)
             for cid in ready_cids:
