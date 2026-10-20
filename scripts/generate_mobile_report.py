@@ -2364,6 +2364,49 @@ def run_once() -> None:
     )
 
 
+def cool_inference_servers(cool_seconds: int) -> None:
+    """Suspend inference server processes to allow hardware cooldown."""
+    if cool_seconds <= 0:
+        return
+
+    import ctypes
+    import psutil
+
+    kernel32 = ctypes.WinDLL("kernel32")
+    ntdll = ctypes.WinDLL("ntdll")
+    PROCESS_ALL_ACCESS = 0x1F0FFF
+
+    targets: list[tuple[int, str, Any]] = []
+    for p in psutil.process_iter(["pid", "name"]):
+        try:
+            n = (p.info["name"] or "").lower()
+            if "llama-server" in n:
+                h = kernel32.OpenProcess(PROCESS_ALL_ACCESS, False, p.info["pid"])
+                if h:
+                    targets.append((p.info["pid"], p.info["name"], h))
+        except Exception:
+            continue
+
+    if not targets:
+        return
+
+    now_str = datetime.now(UTC).strftime("%H:%M:%S")
+    names_str = ", ".join(f"{name} (PID {pid})" for pid, name, _ in targets)
+    print(f"[{now_str}] Pausing {names_str} for {cool_seconds}s hardware cooldown...", flush=True)
+
+    for pid, name, h in targets:
+        ntdll.NtSuspendProcess(h)
+
+    time.sleep(cool_seconds)
+
+    for pid, name, h in targets:
+        ntdll.NtResumeProcess(h)
+        kernel32.CloseHandle(h)
+
+    resumed_str = datetime.now(UTC).strftime("%H:%M:%S")
+    print(f"[{resumed_str}] Resumed inference servers. Hardware cooldown complete.", flush=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Deterministic report and dashboard generator")
     parser.add_argument(
@@ -2373,16 +2416,29 @@ def main() -> int:
         default=None,
         help="Run continuously every SECONDS seconds",
     )
+    parser.add_argument(
+        "--cool-seconds",
+        type=int,
+        metavar="SECONDS",
+        default=90,
+        help="Suspend inference servers for SECONDS seconds on each polling cycle for hardware cooldown (default: 90, 0 to disable)",
+    )
     args = parser.parse_args()
 
     if args.watch is not None:
         interval = max(5, args.watch)
-        print(f"Starting continuous dashboard generator daemon (interval={interval}s)...", flush=True)
+        cool_sec = max(0, args.cool_seconds)
+        print(f"Starting continuous dashboard generator daemon (interval={interval}s, cool_seconds={cool_sec}s)...", flush=True)
         while True:
             try:
                 run_once()
             except Exception as exc:
                 print(f"Error updating dashboard: {exc}", file=sys.stderr, flush=True)
+            if cool_sec > 0:
+                try:
+                    cool_inference_servers(cool_sec)
+                except Exception as exc:
+                    print(f"Error during hardware cooldown: {exc}", file=sys.stderr, flush=True)
             time.sleep(interval)
 
     run_once()
