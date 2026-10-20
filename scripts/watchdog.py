@@ -95,9 +95,8 @@ def get_empirical_telemetry_timeseries(
 ) -> list[dict[str, Any]]:
     """Maintain and return genuine, empirical periodic telemetry checkpoints.
 
-    Loads checkpoints from .yaw/sidecar_telemetry.json (or recovers from task-22*.log),
-    appends the current live observation, and computes genuine empirical rolling velocity
-    and latency without synthetic linear interpolation.
+    Loads checkpoints from .yaw/sidecar_telemetry.json, appends the current live observation,
+    and computes genuine empirical rolling velocity and latency.
     """
     yaw_dir = WORKSPACE_ROOT / ".yaw"
     telemetry_file = yaw_dir / "sidecar_telemetry.json"
@@ -108,42 +107,6 @@ def get_empirical_telemetry_timeseries(
             checkpoints = json.loads(telemetry_file.read_text(encoding="utf-8"))
         except Exception:
             checkpoints = []
-
-    # If telemetry_file has fewer than 10 points, backfill from existing task-22*.log files
-    if len(checkpoints) < 10:
-        pattern = re.compile(
-            r"\[([0-9:]+)\]\s+Dashboard updated:\s+(\d+)/495 passages,\s+(\d+)\s+entities,\s+(\d+)\s+triples"
-        )
-        task_dir = ARTIFACT_DIR / ".system_generated" / "tasks"
-        discovered: dict[int, tuple[str, int, int]] = {}
-        if task_dir.exists():
-            for p in task_dir.glob("task-22*.log"):
-                try:
-                    with p.open("r", encoding="utf-8", errors="replace") as f:
-                        for line in f:
-                            m = pattern.search(line)
-                            if m:
-                                t_str, p_cnt, e_cnt, tr_cnt = m.groups()
-                                pi = int(p_cnt)
-                                if pi not in discovered:
-                                    discovered[pi] = (t_str, int(e_cnt), int(tr_cnt))
-                except Exception:
-                    pass
-
-        for pi in sorted(discovered.keys()):
-            t_str, ei, tri = discovered[pi]
-            try:
-                dt_pt = datetime.strptime(f"2026-10-20 {t_str}", "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
-                el_s = (dt_pt - start_dt).total_seconds()
-                if el_s > 0:
-                    checkpoints.append({
-                        "time_sec": el_s,
-                        "passages": pi,
-                        "entities": ei,
-                        "triples": tri,
-                    })
-            except Exception:
-                pass
 
     # Sanitize existing checkpoints to ensure monotonic non-decreasing passage progression
     if checkpoints:
@@ -501,8 +464,26 @@ def compute_nice_axis(
 
 def get_candidate_evaluation_records() -> tuple[list[dict[str, Any]], bool]:
     """Parse candidate evaluation records from task logs, distinguishing active run vs historical reference."""
-    active_log = ARTIFACT_DIR / ".system_generated" / "tasks" / "task-22349.log"
+    task_dir = ARTIFACT_DIR / ".system_generated" / "tasks"
+    active_log = None
+    if task_dir.exists():
+        candidates = []
+        for p in task_dir.glob("task-*.log"):
+            try:
+                with p.open("r", encoding="utf-8", errors="replace") as f:
+                    content_start = f.read(4096)
+                    if "[yaw optimize]" in content_start or "mipro_optimizer_v2" in content_start or "evaluating candidate" in content_start:
+                        candidates.append(p)
+            except Exception:
+                pass
+        if candidates:
+            candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            active_log = candidates[0]
+
     hist_log = ARTIFACT_DIR / ".system_generated" / "tasks" / "task-21330.log"
+    log_candidates = [active_log] if active_log is not None else []
+    if hist_log.exists():
+        log_candidates.append(hist_log)
 
     metric_pattern = re.compile(
         r"Average Metric:\s*([0-9.]+)\s*/\s*(\d+)\s*\(([0-9.]+)%\):\s*\d+%\|[^|]*\|\s*(\d+)/(\d+)\s*\[([0-9:]+)<([0-9:]+),\s*([0-9.]+)s/it\]"
@@ -511,7 +492,7 @@ def get_candidate_evaluation_records() -> tuple[list[dict[str, Any]], bool]:
     records: list[dict[str, Any]] = []
     is_active = False
 
-    for idx, p in enumerate([active_log, hist_log]):
+    for idx, p in enumerate(log_candidates):
         if not p.exists():
             continue
         try:
