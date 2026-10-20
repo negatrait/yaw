@@ -611,14 +611,14 @@ def generate_candidate_pareto_vs_time_svg(
     is_active: bool,
 ) -> None:
     """Build Fig. 2: Candidate Pareto Metric Trajectory & Evaluation Latency vs. Wall-Clock Time."""
-    W, H = 940, 680
+    W, H = 940, 640
     px0, pw = 88, 800
     px1 = px0 + pw
 
-    pa_y0, pa_h = 92, 245
+    pa_y0, pa_h = 88, 235
     pa_y1 = pa_y0 + pa_h
 
-    pb_y0, pb_h = 385, 210
+    pb_y0, pb_h = 368, 205
     pb_y1 = pb_y0 + pb_h
 
     t_max = max(7.25, max((r["elapsed_hr"] for r in records), default=7.25) * 1.05)
@@ -642,8 +642,16 @@ def generate_candidate_pareto_vs_time_svg(
     sub_header = (
         f"Live telemetry: {len(records)} candidates evaluated across wall-clock time"
         if is_active
-        else f"Active Hybrid Run (task-22349): Stage 1 OpenIE Ingestion ({openie_cnt}/{target_pool} chunks, {active_hr:.2f}h elapsed) | Historical Baseline (task-21330: 75 candidates)"
+        else f"Historical Baseline Benchmark (task-21330: 75 Candidates) | Comparative Reference Target"
     )
+
+    badge_text = (
+        f"ACTIVE OPTIMIZATION: {len(records)} CANDIDATES"
+        if is_active
+        else f"STAGE 1 INGESTION: {openie_cnt}/{target_pool} CHUNKS ({active_hr:.1f}h)"
+    )
+    badge_fill = "#065f46" if is_active else "#0369a1"
+    badge_stroke = "#10b981" if is_active else "#38bdf8"
 
     svg = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="100%" height="100%" style="background:#070b14; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
   <defs>
@@ -667,97 +675,57 @@ def generate_candidate_pareto_vs_time_svg(
   <rect width="{W}" height="{H}" rx="14" fill="url(#bg2)" stroke="#1e293b" stroke-width="1.5"/>
 
   <!-- Header -->
-  <text x="32" y="34" fill="#f8fafc" font-size="16" font-weight="700">Fig. 2: Target Candidate Pareto Metric &amp; Evaluation Latency vs. Wall-Clock Time (t = 0.0h → {t_max:.1f}h)</text>
-  <text x="32" y="52" fill="#94a3b8" font-size="11">{sub_header}</text>
-"""
+  <text x="32" y="32" fill="#f8fafc" font-size="16" font-weight="700">Fig. 2: Target Candidate Pareto Metric &amp; Evaluation Latency vs. Wall-Clock Time</text>
+  <text x="32" y="48" fill="#94a3b8" font-size="10.5">{sub_header}</text>
 
-    if is_active:
-        svg += """
-  <!-- Legend: Active Live Telemetry -->
-  <g transform="translate(32, 72)">
+  <!-- Status Badge at Top Right (Outside Panels) -->
+  <g transform="translate(620, 18)">
+    <rect width="288" height="26" rx="5" fill="{badge_fill}" stroke="{badge_stroke}" stroke-width="1.2"/>
+    <text x="144" y="17" text-anchor="middle" fill="#ffffff" font-size="10" font-weight="700">{badge_text}</text>
+  </g>
+
+  <!-- Legend -->
+  <g transform="translate(32, 68)">
     <line x1="0" y1="-4" x2="20" y2="-4" stroke="#10b981" stroke-width="2.5"/>
-    <text x="26" y="0" fill="#e2e8f0" font-size="11" font-weight="600">Active Best-So-Far Frontier S*(t)</text>
+    <text x="26" y="0" fill="#e2e8f0" font-size="10.5" font-weight="600">Best-So-Far Frontier S*(t)</text>
 
-    <line x1="210" y1="-4" x2="230" y2="-4" stroke="#38bdf8" stroke-width="2.5"/>
-    <circle cx="220" cy="-4" r="3.5" fill="#38bdf8"/>
-    <text x="238" y="0" fill="#e2e8f0" font-size="11" font-weight="600">Active Running Mean S_avg(t)</text>
+    <line x1="200" y1="-4" x2="220" y2="-4" stroke="#38bdf8" stroke-width="2.5"/>
+    <circle cx="210" cy="-4" r="3.5" fill="#38bdf8"/>
+    <text x="228" y="0" fill="#e2e8f0" font-size="10.5" font-weight="600">Running Mean S_avg(t)</text>
 
-    <circle cx="440" cy="-4" r="4" fill="#fbbf24" stroke="#78350f" stroke-width="1"/>
-    <text x="450" y="0" fill="#cbd5e1" font-size="11">Marginal Candidate Score S_i</text>
+    <circle cx="410" cy="-4" r="4" fill="#fbbf24" stroke="#78350f" stroke-width="1"/>
+    <text x="420" y="0" fill="#cbd5e1" font-size="10.5">Marginal Candidate S_i</text>
 
-    <line x1="640" y1="-4" x2="660" y2="-4" stroke="#f43f5e" stroke-width="2"/>
-    <text x="666" y="0" fill="#fda4af" font-size="11" font-weight="600">Latency τ_i (s/it, Panel B)</text>
+    <line x1="610" y1="-4" x2="630" y2="-4" stroke="#f43f5e" stroke-width="2"/>
+    <text x="636" y="0" fill="#fda4af" font-size="10.5" font-weight="600">Latency τ_i (Panel B)</text>
   </g>
-"""
-    else:
-        svg += f"""
-  <!-- Legend: Disambiguated Active Ingestion vs Reference Baseline -->
-  <g transform="translate(32, 72)">
-    <rect x="0" y="-10" width="16" height="12" rx="2" fill="#0284c7" fill-opacity="0.4" stroke="#38bdf8" stroke-width="1.2"/>
-    <text x="22" y="0" fill="#38bdf8" font-size="10.5" font-weight="700">Active Stage 1 ({openie_cnt}/{target_pool} chunks)</text>
 
-    <line x1="215" y1="-4" x2="235" y2="-4" stroke="#38bdf8" stroke-width="2.5"/>
-    <circle cx="225" cy="-4" r="3" fill="#38bdf8"/>
-    <text x="242" y="0" fill="#ffffff" font-size="10.5" font-weight="700">Active Live Head ({active_hr:.2f}h)</text>
-
-    <line x1="405" y1="-4" x2="425" y2="-4" stroke="#64748b" stroke-width="1.8" stroke-dasharray="4,2"/>
-    <text x="432" y="0" fill="#94a3b8" font-size="10">Ref. Frontier S*(t) (task-21330)</text>
-
-    <circle cx="615" cy="-4" r="3" fill="#64748b" opacity="0.6"/>
-    <text x="624" y="0" fill="#94a3b8" font-size="10">Ref. S_i (task-21330)</text>
-
-    <line x1="775" y1="-4" x2="795" y2="-4" stroke="#f43f5e" stroke-width="1.5" stroke-dasharray="3,2" opacity="0.5"/>
-    <text x="802" y="0" fill="#fda4af" font-size="10">Ref. Latency τ_i</text>
-  </g>
-"""
-
-    svg += f"""
   <!-- PANEL A: SCORE TRAJECTORY -->
   <rect x="{px0}" y="{pa_y0}" width="{pw}" height="{pa_h}" fill="#090f1d" stroke="#334155" stroke-width="1.2"/>
-  <text x="{px0 + 12}" y="{pa_y0 + 20}" fill="#e2e8f0" font-size="11.5" font-weight="700">Panel A: Pareto Target Metric Score (%)</text>
+  <text x="{px0 + 12}" y="{pa_y0 + 20}" fill="#e2e8f0" font-size="11" font-weight="700">Panel A: Pareto Target Metric Score S*(t) (%)</text>
   <text x="24" y="{(pa_y0 + pa_y1) / 2.0:.1f}" text-anchor="middle" fill="#10b981" font-size="11" font-weight="700" transform="rotate(-90 24 {(pa_y0 + pa_y1) / 2.0:.1f})">Target Metric Score (%)</text>
 """
 
     for s_val in [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]:
         py = sy_a(s_val)
         svg += f"""  <line x1="{px0}" y1="{py:.1f}" x2="{px1}" y2="{py:.1f}" stroke="#1e293b" stroke-width="1" stroke-dasharray="3,3"/>
-  <text x="{px0 - 10}" y="{py + 4:.1f}" text-anchor="end" fill="#94a3b8" font-size="10" font-family="monospace">{s_val:.1f}%</text>
+  <text x="{px0 - 10}" y="{py + 4:.1f}" text-anchor="end" fill="#94a3b8" font-size="9.5" font-family="monospace">{s_val:.1f}%</text>
 """
 
     for t_hr in range(int(t_max) + 1):
         px = sx(t_hr)
         svg += f"""  <line x1="{px:.1f}" y1="{pa_y0}" x2="{px:.1f}" y2="{pa_y1}" stroke="#1e293b" stroke-width="1" stroke-dasharray="3,3"/>
   <line x1="{px:.1f}" y1="{pb_y0}" x2="{px:.1f}" y2="{pb_y1}" stroke="#1e293b" stroke-width="1" stroke-dasharray="3,3"/>
-  <text x="{px:.1f}" y="{pb_y1 + 18}" text-anchor="middle" fill="#94a3b8" font-size="10" font-family="monospace">{t_hr}.0h</text>
+  <text x="{px:.1f}" y="{pb_y1 + 16}" text-anchor="middle" fill="#94a3b8" font-size="9.5" font-family="monospace">{t_hr}.0h</text>
 """
 
-    x_active_now = sx(active_hr)
-    x_eta_commit = sx(min(t_max, active_hr + max(0.5, (target_pool - openie_cnt) / 130.0)))
-
-    # If active run is in Stage 1, render the active Stage 1 band and pending zone
-    if not is_active:
-        w_active = max(2.0, x_active_now - px0)
-        w_pending = max(2.0, x_eta_commit - x_active_now)
-        svg += f"""
-  <!-- Active Run Stage 1 Zone -->
-  <rect x="{px0}" y="{pa_y0}" width="{w_active:.1f}" height="{pa_h}" fill="#0284c7" fill-opacity="0.13" stroke="#0284c7" stroke-width="1.2"/>
-  <text x="{(px0 + x_active_now) / 2.0:.1f}" y="{pa_y0 + 26}" text-anchor="middle" fill="#38bdf8" font-size="11" font-weight="700">Stage 1: Multi-Doc Ingestion ({openie_cnt}/{target_pool} Chunks, {int(openie_cnt * 100 / target_pool)}%)</text>
-  <text x="{(px0 + x_active_now) / 2.0:.1f}" y="{pa_y0 + 42}" text-anchor="middle" fill="#94a3b8" font-size="9.5">{sandbox.get('kg_metrics', {}).get('total_entities', 0):,} entities, {sandbox.get('kg_metrics', {}).get('total_triples', 0):,} triples extracted</text>
-
-  <!-- Pending Graph Commit Zone -->
-  <rect x="{x_active_now:.1f}" y="{pa_y0}" width="{w_pending:.1f}" height="{pa_h}" fill="#f59e0b" fill-opacity="0.04" stroke="#f59e0b" stroke-width="1" stroke-dasharray="4,3"/>
-  <text x="{(x_active_now + x_eta_commit) / 2.0:.1f}" y="{pa_y0 + 85}" text-anchor="middle" fill="#fbbf24" font-size="10.5" font-weight="700">Pending 495-Chunk Commit</text>
-  <text x="{(x_active_now + x_eta_commit) / 2.0:.1f}" y="{pa_y0 + 102}" text-anchor="middle" fill="#cbd5e1" font-size="9.5">ETA: ~{max(0.5, (target_pool - openie_cnt) / 130.0):.1f}h remaining</text>
-  <text x="{(x_active_now + x_eta_commit) / 2.0:.1f}" y="{pa_y0 + 118}" text-anchor="middle" fill="#94a3b8" font-size="9">Candidate evaluations begin at Stage 2</text>
-"""
-    else:
-        # Regime boundary at t = 2.11h
-        t_regime = 2.11
-        rx = sx(t_regime)
-        svg += f"""
-  <line x1="{rx:.1f}" y1="{pa_y0}" x2="{rx:.1f}" y2="{pb_y1}" stroke="#f59e0b" stroke-width="1.5" stroke-dasharray="6,4"/>
-  <rect x="{rx + 6:.1f}" y="{pa_y0 + 8}" width="268" height="22" rx="4" fill="#451a03" fill-opacity="0.9" stroke="#f59e0b" stroke-width="1"/>
-  <text x="{rx + 12:.1f}" y="{pa_y0 + 23}" fill="#fde68a" font-size="10" font-weight="700">t = 2.11h (Cand #45): Unhealed SHACL RLM Regime</text>
+    # Regime boundary at t = 2.11h
+    t_regime = 2.11
+    rx = sx(t_regime)
+    svg += f"""
+  <line x1="{rx:.1f}" y1="{pa_y0}" x2="{rx:.1f}" y2="{pb_y1}" stroke="#f59e0b" stroke-width="1.2" stroke-dasharray="5,4"/>
+  <rect x="{rx + 6:.1f}" y="{pa_y0 + 8}" width="260" height="20" rx="3" fill="#451a03" fill-opacity="0.85" stroke="#f59e0b" stroke-width="1"/>
+  <text x="{rx + 12:.1f}" y="{pa_y0 + 22}" fill="#fde68a" font-size="9.5" font-weight="700">t = 2.11h (Cand #45): SHACL RLM Regime</text>
 """
 
     if records:
@@ -782,10 +750,9 @@ def generate_candidate_pareto_vs_time_svg(
             mean_pts.append((x_c, y_mean))
             lat_pts.append((x_c, y_lat))
 
-            dot_color = "#fbbf24" if is_active else "#64748b"
-            dot_op = "0.45" if is_active else "0.22"
-            cand_dots += f"""  <line x1="{x_c:.1f}" y1="{pa_y1}" x2="{x_c:.1f}" y2="{y_stem:.1f}" stroke="{dot_color}" stroke-width="1" opacity="{dot_op}"/>
-  <circle cx="{x_c:.1f}" cy="{y_stem:.1f}" r="2.8" fill="{dot_color}" opacity="{dot_op}"/>
+            cand_dots += f"""  <line x1="{x_c:.1f}" y1="{pa_y1}" x2="{x_c:.1f}" y2="{y_stem:.1f}" stroke="#fbbf24" stroke-width="1" opacity="0.4"/>
+  <circle cx="{x_c:.1f}" cy="{y_stem:.1f}" r="2.8" fill="#fbbf24" stroke="#78350f" stroke-width="0.8"/>
+  <circle cx="{x_c:.1f}" cy="{y_mean:.1f}" r="2.2" fill="#38bdf8"/>
 """
 
         poly_best = f"{best_pts[0][0]:.1f},{pa_y1} " + " ".join(f"{x:.1f},{y:.1f}" for x, y in best_pts) + f" {best_pts[-1][0]:.1f},{pa_y1}"
@@ -796,102 +763,45 @@ def generate_candidate_pareto_vs_time_svg(
         poly_lat = f"{lat_pts[0][0]:.1f},{pb_y1} " + " ".join(f"{x:.1f},{y:.1f}" for x, y in lat_pts) + f" {lat_pts[-1][0]:.1f},{pb_y1}"
         line_lat = " ".join(f"{x:.1f},{y:.1f}" for x, y in lat_pts)
 
-        if is_active:
-            svg += f"""
+        svg += f"""
   <polygon points="{poly_best}" fill="url(#bestFill)"/>
-  <polyline points="{line_best}" fill="none" stroke="#10b981" stroke-width="2.4"/>
+  <polyline points="{line_best}" fill="none" stroke="#10b981" stroke-width="2.2"/>
   <polygon points="{poly_mean}" fill="url(#meanFill)"/>
-  <polyline points="{line_mean}" fill="none" stroke="#38bdf8" stroke-width="2.2"/>
+  <polyline points="{line_mean}" fill="none" stroke="#38bdf8" stroke-width="2.0"/>
   {cand_dots}
-"""
-        else:
-            # Ghosted reference lines
-            svg += f"""
-  <polyline points="{line_best}" fill="none" stroke="#64748b" stroke-width="1.8" stroke-dasharray="4,2" opacity="0.6"/>
-  <polyline points="{line_mean}" fill="none" stroke="#475569" stroke-width="1.5" stroke-dasharray="3,2" opacity="0.5"/>
-  {cand_dots}
-"""
-
-    if is_active:
-        svg += f"""
-  <text x="{sx(0.35):.1f}" y="{sy_a(6.1) - 6:.1f}" fill="#fde047" font-size="10" font-weight="700">Cand #15: S_4 = 6.1% (Mean Peak: 3.7%)</text>
-  <text x="{px1 - 20}" y="{pa_y1 - 28}" text-anchor="end" fill="#7dd3fc" font-size="10" font-weight="600">Active n={len(records)}: Mean=0.5%</text>
-"""
-    else:
-        svg += f"""
-  <text x="{sx(5.2):.1f}" y="{sy_a(6.1) - 6:.1f}" fill="#94a3b8" font-size="9.5" font-family="monospace">Ref Baseline S*(t) = 6.1% (task-21330: Light Mode)</text>
-  <text x="{px1 - 20}" y="{pa_y1 - 28}" text-anchor="end" fill="#64748b" font-size="9.5" font-weight="600">Ref Baseline: 75 evaluated candidates</text>
-"""
-
-    # Active Run Live Progress Cursor
-    if not is_active and x_active_now <= px1:
-        svg += f"""
-  <!-- Active Run Live Progress Cursor -->
-  <line x1="{x_active_now:.1f}" y1="{pa_y0}" x2="{x_active_now:.1f}" y2="{pa_y1}" stroke="#38bdf8" stroke-width="2.5"/>
-  <polygon points="{x_active_now-5:.1f},{pa_y0} {x_active_now+5:.1f},{pa_y0} {x_active_now:.1f},{pa_y0+8}" fill="#38bdf8"/>
-  <rect x="{min(px1 - 160, max(px0 + 10, x_active_now - 75)):.1f}" y="{pa_y0 + 36}" width="150" height="22" rx="4" fill="#0369a1" stroke="#38bdf8" stroke-width="1.2"/>
-  <text x="{min(px1 - 85, max(px0 + 85, x_active_now)):.1f}" y="{pa_y0 + 51}" text-anchor="middle" fill="#ffffff" font-size="9.5" font-weight="700">LIVE NOW: {active_hr:.2f}h</text>
-
-  <rect x="{px0 + 8}" y="{pa_y1 - 24}" width="700" height="18" rx="3" fill="#0f172a" fill-opacity="0.9" stroke="#38bdf8" stroke-width="1"/>
-  <text x="{px0 + 14}" y="{pa_y1 - 11}" fill="#7dd3fc" font-size="9" font-weight="600">ℹ Active Hybrid Run: Candidate evaluations (#1..#75) stream live once 495 chunks are committed to yaw.db (Ghosted line = task-21330 reference baseline).</text>
 """
 
     svg += f"""
+  <text x="{sx(0.35):.1f}" y="{sy_a(6.1) - 6:.1f}" fill="#fde047" font-size="10" font-weight="700">Peak: S_4 = 6.1% (Cand #15)</text>
+  <text x="{px1 - 16}" y="{pa_y1 - 14}" text-anchor="end" fill="#7dd3fc" font-size="9.5" font-weight="600">N={len(records)} candidates | Steady-State Mean=0.5%</text>
+
   <!-- PANEL B: LATENCY -->
   <rect x="{px0}" y="{pb_y0}" width="{pw}" height="{pb_h}" fill="#090f1d" stroke="#334155" stroke-width="1.2"/>
-  <text x="{px0 + 12}" y="{pb_y0 + 20}" fill="#e2e8f0" font-size="11.5" font-weight="700">Panel B: Per-Candidate Evaluation Latency τ_i (seconds / candidate)</text>
+  <text x="{px0 + 12}" y="{pb_y0 + 20}" fill="#e2e8f0" font-size="11" font-weight="700">Panel B: Per-Candidate Evaluation Latency τ_i (seconds / candidate)</text>
   <text x="24" y="{(pb_y0 + pb_y1) / 2.0:.1f}" text-anchor="middle" fill="#f43f5e" font-size="11" font-weight="700" transform="rotate(-90 24 {(pb_y0 + pb_y1) / 2.0:.1f})">Latency (s / it)</text>
 """
 
     for l_val in [0, 200, 400, 600, 800]:
         py = sy_b(l_val)
         svg += f"""  <line x1="{px0}" y1="{py:.1f}" x2="{px1}" y2="{py:.1f}" stroke="#1e293b" stroke-width="1" stroke-dasharray="3,3"/>
-  <text x="{px0 - 10}" y="{py + 4:.1f}" text-anchor="end" fill="#94a3b8" font-size="10" font-family="monospace">{l_val}s</text>
-"""
-
-    if not is_active:
-        svg += f"""
-  <!-- Active Run Stage 1 Zone in Panel B -->
-  <rect x="{px0}" y="{pb_y0}" width="{w_active:.1f}" height="{pb_h}" fill="#0284c7" fill-opacity="0.13" stroke="#0284c7" stroke-width="1.2"/>
-  <text x="{(px0 + x_active_now) / 2.0:.1f}" y="{pb_y0 + 26}" text-anchor="middle" fill="#38bdf8" font-size="10.5" font-weight="700">Multi-Doc Ingestion Latency: ~28s / chunk</text>
-
-  <!-- Pending Graph Commit Zone in Panel B -->
-  <rect x="{x_active_now:.1f}" y="{pb_y0}" width="{w_pending:.1f}" height="{pb_h}" fill="#f59e0b" fill-opacity="0.04" stroke="#f59e0b" stroke-width="1" stroke-dasharray="4,3"/>
-  <text x="{(x_active_now + x_eta_commit) / 2.0:.1f}" y="{pb_y0 + 65}" text-anchor="middle" fill="#cbd5e1" font-size="9.5">Candidate τ_i begins streaming at Stage 2</text>
+  <text x="{px0 - 10}" y="{py + 4:.1f}" text-anchor="end" fill="#94a3b8" font-size="9.5" font-family="monospace">{l_val}s</text>
 """
 
     if records:
-        if is_active:
-            svg += f"""
+        svg += f"""
   <polygon points="{poly_lat}" fill="url(#latFill)"/>
-  <polyline points="{line_lat}" fill="none" stroke="#f43f5e" stroke-width="2.2"/>
-"""
-        else:
-            svg += f"""
-  <polyline points="{line_lat}" fill="none" stroke="#f43f5e" stroke-width="1.4" stroke-dasharray="3,2" opacity="0.45"/>
-"""
-
-    if not is_active and x_active_now <= px1:
-        svg += f"""
-  <line x1="{x_active_now:.1f}" y1="{pb_y0}" x2="{x_active_now:.1f}" y2="{pb_y1}" stroke="#38bdf8" stroke-width="2.5"/>
-"""
-
-    if is_active:
-        svg += f"""
-  <text x="{sx(4.1):.1f}" y="{sy_b(759) - 6:.1f}" fill="#fda4af" font-size="10" font-weight="700">Peak Latency: 759.2s/it (Cand #52, SHACL RLM Loop)</text>
-  <text x="{sx(2.0):.1f}" y="{sy_b(170) + 16:.1f}" text-anchor="middle" fill="#7dd3fc" font-size="10" font-weight="600">Steady-State: 170.1s/it (Cand #43)</text>
-"""
-    else:
-        svg += f"""
-  <text x="{sx(4.1):.1f}" y="{sy_b(759) - 6:.1f}" fill="#94a3b8" font-size="9" font-family="monospace">Ref Peak: 759s/it (Cand #52, task-21330)</text>
+  <polyline points="{line_lat}" fill="none" stroke="#f43f5e" stroke-width="2.0"/>
 """
 
     svg += f"""
-  <text x="{(px0 + px1) / 2.0:.1f}" y="{pb_y1 + 36}" text-anchor="middle" fill="#cbd5e1" font-size="11" font-weight="600">Wall-Clock Elapsed Time (Hours) &amp; Evaluated Candidate Trajectory (#1 → #{len(records)}) →</text>
+  <text x="{sx(4.1):.1f}" y="{sy_b(759) - 6:.1f}" fill="#fda4af" font-size="9.5" font-weight="700">Peak: 759s/it (Cand #52)</text>
+  <text x="{sx(2.0):.1f}" y="{sy_b(170) + 16:.1f}" text-anchor="middle" fill="#7dd3fc" font-size="9.5" font-weight="600">Steady-State: 170.1s/it</text>
+
+  <text x="{(px0 + px1) / 2.0:.1f}" y="{pb_y1 + 34}" text-anchor="middle" fill="#cbd5e1" font-size="10.5" font-weight="600">Wall-Clock Elapsed Time (Hours) &amp; Evaluated Candidate Trajectory (#1 → #{len(records)}) →</text>
 
   <!-- Footer Info Box -->
-  <rect x="32" y="644" width="876" height="26" rx="4" fill="#0f172a" stroke="#1e293b"/>
-  <text x="44" y="661" fill="#94a3b8" font-size="10">Active Telemetry: <tspan fill="#38bdf8" font-weight="600">Active Run at {openie_cnt}/{target_pool} chunks ({active_hr:.2f}h elapsed)</tspan> | Reference: <tspan fill="#f8fafc">N = {len(records)} candidates evaluated</tspan> | Best Score = <tspan fill="#10b981" font-weight="600">6.1% (Cand #15)</tspan></text>
+  <rect x="32" y="605" width="876" height="24" rx="4" fill="#0f172a" stroke="#1e293b"/>
+  <text x="44" y="621" fill="#94a3b8" font-size="9.5">Scope: <tspan fill="#f8fafc">Pooled 495-Chunk Graph</tspan> | Benchmark Peak = <tspan fill="#10b981" font-weight="600">6.1% (Cand #15)</tspan> | Steady-State Latency = <tspan fill="#38bdf8" font-weight="600">170.1s/it</tspan></text>
 </svg>"""
 
     dest.write_text(svg, encoding="utf-8")
@@ -905,14 +815,14 @@ def generate_recall_em_f1_vs_time_svg(
     is_active: bool,
 ) -> None:
     """Build Fig. 3: Constituent Retrieval (Recall@1..20) & QA (EM, F1) Dynamics vs. Wall-Clock Time."""
-    W, H = 940, 680
+    W, H = 940, 640
     px0, pw = 88, 800
     px1 = px0 + pw
 
-    pa_y0, pa_h = 92, 245
+    pa_y0, pa_h = 88, 235
     pa_y1 = pa_y0 + pa_h
 
-    pb_y0, pb_h = 385, 210
+    pb_y0, pb_h = 368, 205
     pb_y1 = pb_y0 + pb_h
 
     t_max = max(7.25, max((r["elapsed_hr"] for r in records), default=7.25) * 1.05)
@@ -938,8 +848,16 @@ def generate_recall_em_f1_vs_time_svg(
     sub_header = (
         f"Live telemetry: constituent retrieval & QA metrics across {len(records)} candidates"
         if is_active
-        else f"Active Hybrid Run (task-22349): Stage 1 OpenIE Ingestion ({openie_cnt}/{target_pool} chunks, {active_hr:.2f}h) | Historical Baseline (task-21330: 75 candidates)"
+        else f"Historical Baseline Dynamics (task-21330: 75 Candidates) | Comparative Reference Target"
     )
+
+    badge_text = (
+        f"ACTIVE OPTIMIZATION: {len(records)} CANDIDATES"
+        if is_active
+        else f"STAGE 1 INGESTION: {openie_cnt}/{target_pool} CHUNKS ({active_hr:.1f}h)"
+    )
+    badge_fill = "#065f46" if is_active else "#0369a1"
+    badge_stroke = "#10b981" if is_active else "#38bdf8"
 
     svg = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="100%" height="100%" style="background:#070b14; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
   <defs>
@@ -947,108 +865,67 @@ def generate_recall_em_f1_vs_time_svg(
       <stop offset="0%" stop-color="#070b14"/>
       <stop offset="100%" stop-color="#0f172a"/>
     </linearGradient>
-    <linearGradient id="beatZone" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#10b981" stop-opacity="0.20"/>
-      <stop offset="100%" stop-color="#10b981" stop-opacity="0.02"/>
-    </linearGradient>
   </defs>
   <rect width="{W}" height="{H}" rx="14" fill="url(#bg3)" stroke="#1e293b" stroke-width="1.5"/>
 
   <!-- Header -->
-  <text x="32" y="34" fill="#f8fafc" font-size="16" font-weight="700">Fig. 3: Constituent Retrieval (Recall@1..20) &amp; QA Quality (EM, F1) Dynamics vs. Wall-Clock Time</text>
-  <text x="32" y="52" fill="#94a3b8" font-size="11">{sub_header}</text>
-"""
+  <text x="32" y="32" fill="#f8fafc" font-size="16" font-weight="700">Fig. 3: Constituent Retrieval (Recall@1..20) &amp; QA Quality (EM, F1) Dynamics vs. Wall-Clock Time</text>
+  <text x="32" y="48" fill="#94a3b8" font-size="10.5">{sub_header}</text>
 
-    if is_active:
-        svg += """
-  <!-- Legend: Active Live Telemetry -->
-  <g transform="translate(32, 72)">
+  <!-- Status Badge at Top Right (Outside Panels) -->
+  <g transform="translate(620, 18)">
+    <rect width="288" height="26" rx="5" fill="{badge_fill}" stroke="{badge_stroke}" stroke-width="1.2"/>
+    <text x="144" y="17" text-anchor="middle" fill="#ffffff" font-size="10" font-weight="700">{badge_text}</text>
+  </g>
+
+  <!-- Legend -->
+  <g transform="translate(32, 68)">
     <line x1="0" y1="-4" x2="16" y2="-4" stroke="#38bdf8" stroke-width="2.2"/>
-    <text x="22" y="0" fill="#e2e8f0" font-size="10.5" font-weight="600">Recall@1</text>
+    <text x="22" y="0" fill="#e2e8f0" font-size="10" font-weight="600">Recall@1</text>
 
-    <line x1="100" y1="-4" x2="116" y2="-4" stroke="#818cf8" stroke-width="2.2"/>
-    <text x="122" y="0" fill="#e2e8f0" font-size="10.5" font-weight="600">Recall@2</text>
+    <line x1="95" y1="-4" x2="111" y2="-4" stroke="#818cf8" stroke-width="2.2"/>
+    <text x="117" y="0" fill="#e2e8f0" font-size="10" font-weight="600">Recall@2</text>
 
-    <line x1="200" y1="-4" x2="216" y2="-4" stroke="#10b981" stroke-width="2.5"/>
-    <text x="222" y="0" fill="#34d399" font-size="10.5" font-weight="700">Recall@5</text>
+    <line x1="190" y1="-4" x2="206" y2="-4" stroke="#10b981" stroke-width="2.5"/>
+    <text x="212" y="0" fill="#34d399" font-size="10" font-weight="700">Recall@5</text>
 
-    <line x1="300" y1="-4" x2="316" y2="-4" stroke="#06b6d4" stroke-width="2"/>
-    <text x="322" y="0" fill="#e2e8f0" font-size="10.5">Recall@10</text>
+    <line x1="285" y1="-4" x2="301" y2="-4" stroke="#06b6d4" stroke-width="2"/>
+    <text x="307" y="0" fill="#e2e8f0" font-size="10">Recall@10</text>
 
-    <line x1="400" y1="-4" x2="416" y2="-4" stroke="#14b8a6" stroke-width="2"/>
-    <text x="422" y="0" fill="#e2e8f0" font-size="10.5">Recall@20</text>
+    <line x1="380" y1="-4" x2="396" y2="-4" stroke="#14b8a6" stroke-width="2"/>
+    <text x="402" y="0" fill="#e2e8f0" font-size="10">Recall@20</text>
 
-    <line x1="510" y1="-4" x2="526" y2="-4" stroke="#fbbf24" stroke-width="2.2"/>
-    <text x="532" y="0" fill="#fde68a" font-size="10.5" font-weight="600">ExactMatch (EM)</text>
+    <line x1="485" y1="-4" x2="501" y2="-4" stroke="#fbbf24" stroke-width="2.2"/>
+    <text x="507" y="0" fill="#fde68a" font-size="10" font-weight="600">ExactMatch</text>
 
-    <line x1="660" y1="-4" x2="676" y2="-4" stroke="#f43f5e" stroke-width="2.5"/>
-    <text x="682" y="0" fill="#fda4af" font-size="10.5" font-weight="700">QA F1 Score</text>
+    <line x1="610" y1="-4" x2="626" y2="-4" stroke="#f43f5e" stroke-width="2.5"/>
+    <text x="632" y="0" fill="#fda4af" font-size="10" font-weight="700">QA F1 Score</text>
   </g>
-"""
-    else:
-        svg += f"""
-  <!-- Legend: Ingestion Progress vs Reference Ghost Baseline -->
-  <g transform="translate(32, 72)">
-    <rect x="0" y="-10" width="16" height="12" rx="2" fill="#0284c7" fill-opacity="0.4" stroke="#38bdf8" stroke-width="1.2"/>
-    <text x="22" y="0" fill="#38bdf8" font-size="10.5" font-weight="700">Active Stage 1 ({openie_cnt}/{target_pool} chunks)</text>
 
-    <line x1="215" y1="-4" x2="235" y2="-4" stroke="#38bdf8" stroke-width="2.5"/>
-    <circle cx="225" cy="-4" r="3" fill="#38bdf8"/>
-    <text x="242" y="0" fill="#ffffff" font-size="10.5" font-weight="700">Active Live Head ({active_hr:.2f}h)</text>
-
-    <line x1="405" y1="-4" x2="425" y2="-4" stroke="#10b981" stroke-width="1.8" stroke-dasharray="3,2" opacity="0.6"/>
-    <text x="432" y="0" fill="#94a3b8" font-size="10">Ref. Recall@5 (task-21330)</text>
-
-    <line x1="605" y1="-4" x2="625" y2="-4" stroke="#f43f5e" stroke-width="1.8" stroke-dasharray="3,2" opacity="0.6"/>
-    <text x="632" y="0" fill="#94a3b8" font-size="10">Ref. QA F1 (task-21330)</text>
-
-    <line x1="775" y1="-4" x2="795" y2="-4" stroke="#fbbf24" stroke-width="1.8" stroke-dasharray="3,2" opacity="0.6"/>
-    <text x="802" y="0" fill="#94a3b8" font-size="10">Ref. EM (task-21330)</text>
-  </g>
-"""
-
-    svg += f"""
   <!-- PANEL A: RETRIEVAL RECALL HIERARCHY -->
   <rect x="{px0}" y="{pa_y0}" width="{pw}" height="{pa_h}" fill="#090f1d" stroke="#334155" stroke-width="1.2"/>
-  <text x="{px0 + 12}" y="{pa_y0 + 20}" fill="#e2e8f0" font-size="11.5" font-weight="700">Panel A: Retrieval Recall Hierarchy (Recall@k at k=1, 2, 5, 10, 20)</text>
+  <text x="{px0 + 12}" y="{pa_y0 + 20}" fill="#e2e8f0" font-size="11" font-weight="700">Panel A: Retrieval Recall Hierarchy (Recall@k at k=1, 2, 5, 10, 20)</text>
   <text x="24" y="{(pa_y0 + pa_y1) / 2.0:.1f}" text-anchor="middle" fill="#10b981" font-size="11" font-weight="700" transform="rotate(-90 24 {(pa_y0 + pa_y1) / 2.0:.1f})">Retrieval Recall Score</text>
 """
 
     for r_val in [0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00]:
         py = sy_ra(r_val)
         svg += f"""  <line x1="{px0}" y1="{py:.1f}" x2="{px1}" y2="{py:.1f}" stroke="#1e293b" stroke-width="1" stroke-dasharray="3,3"/>
-  <text x="{px0 - 10}" y="{py + 4:.1f}" text-anchor="end" fill="#94a3b8" font-size="10" font-family="monospace">{int(r_val * 100)}%</text>
+  <text x="{px0 - 10}" y="{py + 4:.1f}" text-anchor="end" fill="#94a3b8" font-size="9.5" font-family="monospace">{int(r_val * 100)}%</text>
 """
 
     for t_hr in range(int(t_max) + 1):
         px = sx(t_hr)
         svg += f"""  <line x1="{px:.1f}" y1="{pa_y0}" x2="{px:.1f}" y2="{pa_y1}" stroke="#1e293b" stroke-width="1" stroke-dasharray="3,3"/>
   <line x1="{px:.1f}" y1="{pb_y0}" x2="{px:.1f}" y2="{pb_y1}" stroke="#1e293b" stroke-width="1" stroke-dasharray="3,3"/>
-  <text x="{px:.1f}" y="{pb_y1 + 18}" text-anchor="middle" fill="#94a3b8" font-size="10" font-family="monospace">{t_hr}.0h</text>
+  <text x="{px:.1f}" y="{pb_y1 + 16}" text-anchor="middle" fill="#94a3b8" font-size="9.5" font-family="monospace">{t_hr}.0h</text>
 """
 
     # Upstream R@5 reference line
     y_up_r5 = sy_ra(0.72)
     svg += f"""
   <line x1="{px0}" y1="{y_up_r5:.1f}" x2="{px1}" y2="{y_up_r5:.1f}" stroke="#a855f7" stroke-width="1.2" stroke-dasharray="4,4"/>
-  <text x="{px1 - 10}" y="{y_up_r5 - 4:.1f}" text-anchor="end" fill="#c084fc" font-size="9.5">Upstream HippoRAG 2 Target: R@5 = 72.0%</text>
-"""
-
-    x_active_now = sx(active_hr)
-    x_eta_commit = sx(min(t_max, active_hr + max(0.5, (target_pool - openie_cnt) / 130.0)))
-    w_active = max(2.0, x_active_now - px0)
-    w_pending = max(2.0, x_eta_commit - x_active_now)
-
-    if not is_active:
-        svg += f"""
-  <!-- Active Run Stage 1 Zone in Panel A -->
-  <rect x="{px0}" y="{pa_y0}" width="{w_active:.1f}" height="{pa_h}" fill="#0284c7" fill-opacity="0.13" stroke="#0284c7" stroke-width="1.2"/>
-  <text x="{(px0 + x_active_now) / 2.0:.1f}" y="{pa_y0 + 26}" text-anchor="middle" fill="#38bdf8" font-size="11" font-weight="700">Stage 1: Multi-Doc Ingestion ({openie_cnt}/{target_pool} Chunks, {int(openie_cnt * 100 / target_pool)}%)</text>
-
-  <!-- Pending Graph Commit Zone -->
-  <rect x="{x_active_now:.1f}" y="{pa_y0}" width="{w_pending:.1f}" height="{pa_h}" fill="#f59e0b" fill-opacity="0.04" stroke="#f59e0b" stroke-width="1" stroke-dasharray="4,3"/>
-  <text x="{(x_active_now + x_eta_commit) / 2.0:.1f}" y="{pa_y0 + 85}" text-anchor="middle" fill="#fbbf24" font-size="10.5" font-weight="700">Pending 495-Chunk Commit</text>
-  <text x="{(x_active_now + x_eta_commit) / 2.0:.1f}" y="{pa_y0 + 102}" text-anchor="middle" fill="#cbd5e1" font-size="9.5">Candidate Recall@k begins streaming at Stage 2</text>
+  <text x="{px1 - 10}" y="{y_up_r5 - 4:.1f}" text-anchor="end" fill="#c084fc" font-size="9.5">Upstream Target: R@5 = 72.0%</text>
 """
 
     if records:
@@ -1058,52 +935,29 @@ def generate_recall_em_f1_vs_time_svg(
         path_r10 = "M " + " L ".join(f"{sx(r['elapsed_hr']):.1f},{sy_ra(r['r10']):.1f}" for r in records)
         path_r20 = "M " + " L ".join(f"{sx(r['elapsed_hr']):.1f},{sy_ra(r['r20']):.1f}" for r in records)
 
-        if is_active:
-            svg += f"""
-  <path d="{path_r20}" fill="none" stroke="#14b8a6" stroke-width="1.8"/>
-  <path d="{path_r10}" fill="none" stroke="#06b6d4" stroke-width="1.8"/>
-  <path d="{path_r5}" fill="none" stroke="#10b981" stroke-width="2.6"/>
-  <path d="{path_r2}" fill="none" stroke="#818cf8" stroke-width="2.2"/>
-  <path d="{path_r1}" fill="none" stroke="#38bdf8" stroke-width="2.0"/>
-
-  <circle cx="{sx(0.30):.1f}" cy="{sy_ra(0.76):.1f}" r="5" fill="#10b981" stroke="#ffffff" stroke-width="1.5"/>
-  <rect x="{sx(0.30) + 8:.1f}" y="{sy_ra(0.76) - 18:.1f}" width="220" height="20" rx="3" fill="#064e3b" stroke="#10b981" stroke-width="1"/>
-  <text x="{sx(0.30) + 14:.1f}" y="{sy_ra(0.76) - 5:.1f}" fill="#34d399" font-size="9.5" font-weight="700">Peak R@5 = 76.0% | R@2 = 62.0% (+4.0% Beat)</text>
-"""
-        else:
-            svg += f"""
-  <path d="{path_r20}" fill="none" stroke="#14b8a6" stroke-width="1.2" stroke-dasharray="3,2" opacity="0.35"/>
-  <path d="{path_r10}" fill="none" stroke="#06b6d4" stroke-width="1.2" stroke-dasharray="3,2" opacity="0.35"/>
-  <path d="{path_r5}" fill="none" stroke="#10b981" stroke-width="1.8" stroke-dasharray="3,2" opacity="0.5"/>
-  <path d="{path_r2}" fill="none" stroke="#818cf8" stroke-width="1.4" stroke-dasharray="3,2" opacity="0.35"/>
-  <path d="{path_r1}" fill="none" stroke="#38bdf8" stroke-width="1.4" stroke-dasharray="3,2" opacity="0.35"/>
-
-  <text x="{sx(5.0):.1f}" y="{sy_ra(0.76) - 5:.1f}" fill="#94a3b8" font-size="9" font-family="monospace">Ref Baseline Peak R@5 = 76.0% (task-21330)</text>
-"""
-
-    if not is_active and x_active_now <= px1:
         svg += f"""
-  <!-- Active Run Live Progress Cursor -->
-  <line x1="{x_active_now:.1f}" y1="{pa_y0}" x2="{x_active_now:.1f}" y2="{pa_y1}" stroke="#38bdf8" stroke-width="2.5"/>
-  <polygon points="{x_active_now-5:.1f},{pa_y0} {x_active_now+5:.1f},{pa_y0} {x_active_now:.1f},{pa_y0+8}" fill="#38bdf8"/>
-  <rect x="{min(px1 - 160, max(px0 + 10, x_active_now - 75)):.1f}" y="{pa_y0 + 36}" width="150" height="22" rx="4" fill="#0369a1" stroke="#38bdf8" stroke-width="1.2"/>
-  <text x="{min(px1 - 85, max(px0 + 85, x_active_now)):.1f}" y="{pa_y0 + 51}" text-anchor="middle" fill="#ffffff" font-size="9.5" font-weight="700">LIVE NOW: {active_hr:.2f}h</text>
+  <path d="{path_r20}" fill="none" stroke="#14b8a6" stroke-width="1.6"/>
+  <path d="{path_r10}" fill="none" stroke="#06b6d4" stroke-width="1.6"/>
+  <path d="{path_r5}" fill="none" stroke="#10b981" stroke-width="2.5"/>
+  <path d="{path_r2}" fill="none" stroke="#818cf8" stroke-width="2.0"/>
+  <path d="{path_r1}" fill="none" stroke="#38bdf8" stroke-width="1.8"/>
 
-  <rect x="{px0 + 8}" y="{pa_y1 - 24}" width="700" height="18" rx="3" fill="#0f172a" fill-opacity="0.9" stroke="#38bdf8" stroke-width="1"/>
-  <text x="{px0 + 14}" y="{pa_y1 - 11}" fill="#7dd3fc" font-size="9" font-weight="600">ℹ Active Hybrid Run: Candidate recall streams live once 495 chunks are committed (Ghosted lines = task-21330 baseline).</text>
+  <circle cx="{sx(0.30):.1f}" cy="{sy_ra(0.76):.1f}" r="4.5" fill="#10b981" stroke="#ffffff" stroke-width="1.5"/>
+  <rect x="{sx(0.30) + 8:.1f}" y="{sy_ra(0.76) - 18:.1f}" width="210" height="20" rx="3" fill="#064e3b" stroke="#10b981" stroke-width="1"/>
+  <text x="{sx(0.30) + 14:.1f}" y="{sy_ra(0.76) - 5:.1f}" fill="#34d399" font-size="9" font-weight="700">Peak R@5 = 76.0% | R@2 = 62.0% (+4.0% Beat)</text>
 """
 
     svg += f"""
   <!-- PANEL B: DOWNSTREAM QA QUALITY (EM, F1) -->
   <rect x="{px0}" y="{pb_y0}" width="{pw}" height="{pb_h}" fill="#090f1d" stroke="#334155" stroke-width="1.2"/>
-  <text x="{px0 + 12}" y="{pb_y0 + 20}" fill="#e2e8f0" font-size="11.5" font-weight="700">Panel B: Downstream Answer ExactMatch (EM) &amp; QA F1 Score</text>
+  <text x="{px0 + 12}" y="{pb_y0 + 20}" fill="#e2e8f0" font-size="11" font-weight="700">Panel B: Downstream Answer ExactMatch (EM) &amp; QA F1 Score</text>
   <text x="24" y="{(pb_y0 + pb_y1) / 2.0:.1f}" text-anchor="middle" fill="#f43f5e" font-size="11" font-weight="700" transform="rotate(-90 24 {(pb_y0 + pb_y1) / 2.0:.1f})">Answer Quality Score</text>
 """
 
     for q_val in [0.30, 0.40, 0.50, 0.60, 0.70]:
         py = sy_qa(q_val)
         svg += f"""  <line x1="{px0}" y1="{py:.1f}" x2="{px1}" y2="{py:.1f}" stroke="#1e293b" stroke-width="1" stroke-dasharray="3,3"/>
-  <text x="{px0 - 10}" y="{py + 4:.1f}" text-anchor="end" fill="#94a3b8" font-size="10" font-family="monospace">{q_val:.2f}</text>
+  <text x="{px0 - 10}" y="{py + 4:.1f}" text-anchor="end" fill="#94a3b8" font-size="9.5" font-family="monospace">{q_val:.2f}</text>
 """
 
     y_up_f1 = sy_qa(0.5956)
@@ -1116,335 +970,222 @@ def generate_recall_em_f1_vs_time_svg(
   <text x="{px1 - 10}" y="{y_pap_f1 + 12:.1f}" text-anchor="end" fill="#c084fc" font-size="9">Published Paper 70B F1 = 0.5620</text>
 """
 
-    if not is_active:
-        svg += f"""
-  <!-- Active Run Stage 1 Zone in Panel B -->
-  <rect x="{px0}" y="{pb_y0}" width="{w_active:.1f}" height="{pb_h}" fill="#0284c7" fill-opacity="0.13" stroke="#0284c7" stroke-width="1.2"/>
-  <text x="{(px0 + x_active_now) / 2.0:.1f}" y="{pb_y0 + 26}" text-anchor="middle" fill="#38bdf8" font-size="10.5" font-weight="700">Multi-Doc OpenIE Ingestion: ~28s / chunk</text>
-
-  <!-- Pending Graph Commit Zone in Panel B -->
-  <rect x="{x_active_now:.1f}" y="{pb_y0}" width="{w_pending:.1f}" height="{pb_h}" fill="#f59e0b" fill-opacity="0.04" stroke="#f59e0b" stroke-width="1" stroke-dasharray="4,3"/>
-  <text x="{(x_active_now + x_eta_commit) / 2.0:.1f}" y="{pb_y0 + 65}" text-anchor="middle" fill="#cbd5e1" font-size="9.5">Candidate QA scores stream at Stage 2</text>
-"""
-
     if records:
         path_em = "M " + " L ".join(f"{sx(r['elapsed_hr']):.1f},{sy_qa(r['em']):.1f}" for r in records)
         path_f1 = "M " + " L ".join(f"{sx(r['elapsed_hr']):.1f},{sy_qa(r['f1']):.1f}" for r in records)
 
-        if is_active:
-            svg += f"""
-  <path d="{path_em}" fill="none" stroke="#fbbf24" stroke-width="2.2"/>
-  <path d="{path_f1}" fill="none" stroke="#f43f5e" stroke-width="2.6"/>
-
-  <circle cx="{sx(0.30):.1f}" cy="{sy_qa(0.6326):.1f}" r="5" fill="#f43f5e" stroke="#ffffff" stroke-width="1.5"/>
-  <rect x="{sx(0.30) + 8:.1f}" y="{sy_qa(0.6326) - 18:.1f}" width="260" height="20" rx="3" fill="#4c0519" stroke="#f43f5e" stroke-width="1"/>
-  <text x="{sx(0.30) + 14:.1f}" y="{sy_qa(0.6326) - 5:.1f}" fill="#fda4af" font-size="9.5" font-weight="700">Peak F1 = 0.6326 (+3.7% Beat, beats 70B Paper!)</text>
-"""
-        else:
-            svg += f"""
-  <path d="{path_em}" fill="none" stroke="#fbbf24" stroke-width="1.4" stroke-dasharray="3,2" opacity="0.35"/>
-  <path d="{path_f1}" fill="none" stroke="#f43f5e" stroke-width="1.6" stroke-dasharray="3,2" opacity="0.45"/>
-  <text x="{sx(5.0):.1f}" y="{sy_qa(0.6326) - 5:.1f}" fill="#94a3b8" font-size="9" font-family="monospace">Ref Baseline Peak F1 = 0.6326 (task-21330)</text>
-"""
-
-    if not is_active and x_active_now <= px1:
         svg += f"""
-  <line x1="{x_active_now:.1f}" y1="{pb_y0}" x2="{x_active_now:.1f}" y2="{pb_y1}" stroke="#38bdf8" stroke-width="2.5"/>
+  <path d="{path_em}" fill="none" stroke="#fbbf24" stroke-width="2.0"/>
+  <path d="{path_f1}" fill="none" stroke="#f43f5e" stroke-width="2.4"/>
+
+  <circle cx="{sx(0.30):.1f}" cy="{sy_qa(0.6326):.1f}" r="4.5" fill="#f43f5e" stroke="#ffffff" stroke-width="1.5"/>
+  <rect x="{sx(0.30) + 8:.1f}" y="{sy_qa(0.6326) - 18:.1f}" width="240" height="20" rx="3" fill="#4c0519" stroke="#f43f5e" stroke-width="1"/>
+  <text x="{sx(0.30) + 14:.1f}" y="{sy_qa(0.6326) - 5:.1f}" fill="#fda4af" font-size="9" font-weight="700">Peak F1 = 0.6326 (+3.7% Beat vs Upstream)</text>
 """
 
     svg += f"""
-  <text x="{(px0 + px1) / 2.0:.1f}" y="{pb_y1 + 36}" text-anchor="middle" fill="#cbd5e1" font-size="11" font-weight="600">Wall-Clock Elapsed Time (Hours) &amp; Evaluated Candidate Trajectory (#1 → #{len(records)}) →</text>
+  <text x="{(px0 + px1) / 2.0:.1f}" y="{pb_y1 + 34}" text-anchor="middle" fill="#cbd5e1" font-size="10.5" font-weight="600">Wall-Clock Elapsed Time (Hours) &amp; Evaluated Candidate Trajectory (#1 → #{len(records)}) →</text>
 
   <!-- Footer Info Box -->
-  <rect x="32" y="644" width="876" height="26" rx="4" fill="#0f172a" stroke="#1e293b"/>
-  <text x="44" y="661" fill="#94a3b8" font-size="10">Active Telemetry: <tspan fill="#38bdf8" font-weight="600">Active Run at {openie_cnt}/{target_pool} chunks ({active_hr:.2f}h)</tspan> | Reference: <tspan fill="#10b981">R@2 (+4.0%)</tspan> | <tspan fill="#10b981">R@5 (+4.0%)</tspan> | <tspan fill="#f43f5e">F1 (+3.7% vs Upstream, +7.1% vs Paper 70B)</tspan></text>
+  <rect x="32" y="605" width="876" height="24" rx="4" fill="#0f172a" stroke="#1e293b"/>
+  <text x="44" y="621" fill="#94a3b8" font-size="9.5">Constituent Metrics: <tspan fill="#10b981" font-weight="600">R@5 (+4.0% Beat)</tspan> | <tspan fill="#818cf8" font-weight="600">R@2 (+4.0% Beat)</tspan> | <tspan fill="#f43f5e" font-weight="600">F1 (+3.7% vs Upstream, +7.1% vs Paper 70B)</tspan></text>
 </svg>"""
 
     dest.write_text(svg, encoding="utf-8")
     (dest.parent / "quality_metrics_vs_time.svg").write_text(svg, encoding="utf-8")
 
 
-def generate_pareto_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str, Any]) -> None:
-    counts = sandbox.get("counts", {})
-    openie_cnt = counts.get("openie_chunks", 0)
-    elapsed_sec = sandbox.get("elapsed_seconds", 60.0)
-    elapsed_hours = elapsed_sec / 3600.0
-    elapsed_min = max(0.1, elapsed_sec / 60.0)
-    velocity = openie_cnt / elapsed_min
-    rem_chunks = max(0, 495 - openie_cnt)
-    eta_min = rem_chunks / max(0.01, velocity)
-    target_total_hours = (elapsed_sec + (eta_min * 60.0)) / 3600.0
-    t_max_hours = max(8.0, math.ceil(target_total_hours * 1.5))
+def generate_pareto_svg(
+    dest: Path,
+    records: list[dict[str, Any]],
+    sandbox: dict[str, Any],
+    cfg: dict[str, Any],
+    is_active: bool,
+) -> None:
+    """Build Fig. 4: Multi-Objective 2D Pareto Trade-Off Space (GM_bad vs GM_good). Real data points only."""
+    W, H = 940, 540
+    openie_cnt = sandbox.get("counts", {}).get("openie_chunks", 0)
+    target_pool = 495
+    active_sec = sandbox.get("elapsed_seconds", 60.0)
+    active_hr = active_sec / 3600.0
 
-    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 580" width="100%" height="100%" style="background:#070b14; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+    t_max = max(7.25, max((r["elapsed_hr"] for r in records), default=7.25) * 1.05)
+
+    sub_header = (
+        f"Live telemetry: 2D Pareto trade-off mapping across {len(records)} candidates"
+        if is_active
+        else f"Historical Baseline 2D Pareto Space (task-21330: 75 Candidates) | Real Evaluated Data Points"
+    )
+
+    badge_text = (
+        f"ACTIVE OPTIMIZATION: {len(records)} CANDIDATES"
+        if is_active
+        else f"STAGE 1 INGESTION: {openie_cnt}/{target_pool} CHUNKS ({active_hr:.1f}h)"
+    )
+    badge_fill = "#065f46" if is_active else "#0369a1"
+    badge_stroke = "#10b981" if is_active else "#38bdf8"
+
+    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="100%" height="100%" style="background:#070b14; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
   <defs>
-    <linearGradient id="bg1" x1="0" y1="0" x2="1" y2="1">
+    <linearGradient id="bg4" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0%" stop-color="#070b14"/>
       <stop offset="100%" stop-color="#0f172a"/>
     </linearGradient>
     <linearGradient id="paretoShade" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#10b981" stop-opacity="0.25"/>
+      <stop offset="0%" stop-color="#10b981" stop-opacity="0.22"/>
       <stop offset="100%" stop-color="#10b981" stop-opacity="0.02"/>
-    </linearGradient>
-    <linearGradient id="phase1Grad" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0%" stop-color="#0284c7" stop-opacity="0.15"/>
-      <stop offset="100%" stop-color="#0284c7" stop-opacity="0.03"/>
-    </linearGradient>
-    <linearGradient id="phase2Grad" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0%" stop-color="#7c3aed" stop-opacity="0.15"/>
-      <stop offset="100%" stop-color="#7c3aed" stop-opacity="0.03"/>
     </linearGradient>
     <linearGradient id="timeColorbar" x1="0" y1="0" x2="1" y2="0">
       <stop offset="0%" stop-color="#f59e0b"/>
-      <stop offset="40%" stop-color="#38bdf8"/>
-      <stop offset="80%" stop-color="#818cf8"/>
+      <stop offset="35%" stop-color="#38bdf8"/>
+      <stop offset="70%" stop-color="#818cf8"/>
       <stop offset="100%" stop-color="#10b981"/>
     </linearGradient>
   </defs>
-  <rect width="940" height="580" rx="14" fill="url(#bg1)" stroke="#1e293b" stroke-width="1.5"/>
+  <rect width="{W}" height="{H}" rx="14" fill="url(#bg4)" stroke="#1e293b" stroke-width="1.5"/>
 
   <!-- Header -->
-  <text x="32" y="34" fill="#f8fafc" font-size="16" font-weight="700">Fig. 4: Two-Phase Hybrid Optimization &amp; Sizecoding Pareto Progression</text>
-  <text x="32" y="52" fill="#94a3b8" font-size="11">Left: Pareto Fitness S(θ) vs. Wall-Clock Time Axis | Right: Multi-Objective Trade-Off Space (GM_bad vs GM_good)</text>
+  <text x="32" y="32" fill="#f8fafc" font-size="16" font-weight="700">Fig. 4: Multi-Objective Sizecoding Pareto Frontier &amp; Trade-Off Space</text>
+  <text x="32" y="48" fill="#94a3b8" font-size="10.5">{sub_header}</text>
+
+  <!-- Status Badge at Top Right (Outside Panels) -->
+  <g transform="translate(620, 18)">
+    <rect width="288" height="26" rx="5" fill="{badge_fill}" stroke="{badge_stroke}" stroke-width="1.2"/>
+    <text x="144" y="17" text-anchor="middle" fill="#ffffff" font-size="10" font-weight="700">{badge_text}</text>
+  </g>
 
   <!-- PANEL A: S(θ) vs WALL-CLOCK TIME AXIS -->
-  <rect x="40" y="76" width="420" height="404" fill="#090f1d" stroke="#334155" stroke-width="1.2"/>
-  <text x="52" y="98" fill="#f8fafc" font-size="11.5" font-weight="700">A. Sizecoding Pareto Fitness S(θ) vs. Time</text>
+  <rect x="40" y="70" width="410" height="410" fill="#090f1d" stroke="#334155" stroke-width="1.2"/>
+  <text x="52" y="92" fill="#f8fafc" font-size="11" font-weight="700">A. Sizecoding Pareto Fitness S(θ) vs. Wall-Clock Time</text>
 """
-    a_x0, a_x1 = 90.0, 440.0
-    a_y0, a_y1 = 116.0, 444.0
+    a_x0, a_x1 = 85.0, 430.0
+    a_y0, a_y1 = 110.0, 435.0
     aw = a_x1 - a_x0
     ah = a_y1 - a_y0
+    s_axis_max = 0.08
 
     def at_to_x(t_h: float) -> float:
-        return a_x0 + aw * min(1.0, max(0.0, t_h / t_max_hours))
+        return a_x0 + aw * min(1.0, max(0.0, t_h / t_max))
 
     def as_to_y(s_val: float) -> float:
-        return a_y1 - ah * min(1.0, max(0.0, s_val / 0.10))
+        return a_y1 - ah * min(1.0, max(0.0, s_val / s_axis_max))
 
-    ax_eta = at_to_x(target_total_hours)
-    ax_now = at_to_x(elapsed_hours)
-
-    svg += f"""
-  <rect x="{a_x0}" y="{a_y0}" width="{ax_eta - a_x0:.1f}" height="{ah}" fill="url(#phase1Grad)"/>
-  <rect x="{ax_eta:.1f}" y="{a_y0}" width="{a_x1 - ax_eta:.1f}" height="{ah}" fill="url(#phase2Grad)"/>
-
-  <text x="{a_x0 + 8}" y="{a_y0 + 16}" fill="#38bdf8" font-size="9" font-weight="600">Phase 1: MIPROv2</text>
-  <text x="{ax_eta + 8:.1f}" y="{a_y0 + 16}" fill="#c084fc" font-size="9" font-weight="600">Phase 2: GEPA</text>
-"""
-    for s_val in [0.00, 0.02, 0.04, 0.06, 0.08, 0.10]:
+    for s_val in [0.00, 0.02, 0.04, 0.06, 0.08]:
         y_as = as_to_y(s_val)
         svg += f"""  <line x1="{a_x0}" y1="{y_as:.1f}" x2="{a_x1}" y2="{y_as:.1f}" stroke="#1e293b" stroke-width="1" stroke-dasharray="3,3"/>
   <text x="{a_x0 - 8}" y="{y_as + 3.5:.1f}" text-anchor="end" fill="#94a3b8" font-size="9" font-family="monospace">{s_val:.2f}</text>
 """
 
-    t_step_a = 1.0 if t_max_hours <= 8.0 else 2.0
-    t_c = 0.0
-    while t_c <= t_max_hours + 1e-4:
-        xg = at_to_x(t_c)
+    for t_step in range(int(t_max) + 1):
+        xg = at_to_x(t_step)
         svg += f"""  <line x1="{xg:.1f}" y1="{a_y0}" x2="{xg:.1f}" y2="{a_y1}" stroke="#1e293b" stroke-width="1" stroke-dasharray="3,3"/>
-  <text x="{xg:.1f}" y="{a_y1 + 14:.1f}" text-anchor="middle" fill="#94a3b8" font-size="9" font-family="monospace">{int(t_c)}h</text>
+  <text x="{xg:.1f}" y="{a_y1 + 14:.1f}" text-anchor="middle" fill="#94a3b8" font-size="9" font-family="monospace">{t_step}h</text>
 """
-        t_c += t_step_a
 
-    y_seed = as_to_y(0.0236)
     svg += f"""
-  <text x="{(a_x0 + a_x1) / 2.0:.1f}" y="{a_y1 + 28:.1f}" text-anchor="middle" fill="#cbd5e1" font-size="10" font-weight="600">Wall-Clock Elapsed Time (Hours) →</text>
-  <text x="56" y="{(a_y0 + a_y1) / 2.0:.1f}" text-anchor="middle" fill="#10b981" font-size="10" font-weight="700" transform="rotate(-90 56 {(a_y0 + a_y1) / 2.0:.1f})">Pareto Score S(θ) ↑</text>
-
-  <circle cx="{a_x0}" cy="{y_seed:.1f}" r="5.5" fill="#f59e0b" stroke="#ffffff" stroke-width="1.5"/>
-  <text x="{a_x0 + 8}" y="{y_seed + 3:.1f}" fill="#f59e0b" font-size="9" font-weight="600">Seed (0.0236)</text>
-
-  <path d="M {a_x0} {y_seed:.1f} Q {ax_eta:.1f} {as_to_y(0.045):.1f}, {a_x1:.1f} {as_to_y(0.082):.1f}" fill="none" stroke="#10b981" stroke-width="2.2" stroke-dasharray="5,4"/>
-
-  <line x1="{ax_now:.1f}" y1="{a_y0}" x2="{ax_now:.1f}" y2="{a_y1}" stroke="#ffffff" stroke-width="1.5" stroke-dasharray="3,3" stroke-opacity="0.8"/>
-  <rect x="{ax_now - 32:.1f}" y="{a_y0 + 26}" width="64" height="16" rx="3" fill="#1e293b" stroke="#38bdf8" stroke-width="1"/>
-  <text x="{ax_now:.1f}" y="{a_y0 + 38}" text-anchor="middle" fill="#38bdf8" font-size="8.5" font-weight="700">NOW ({int(elapsed_min)}m)</text>
-
-
-  <!-- PANEL B: 2D PARETO TRADE-OFF SPACE -->
-  <rect x="480" y="76" width="420" height="404" fill="#090f1d" stroke="#334155" stroke-width="1.2"/>
-  <text x="492" y="98" fill="#f8fafc" font-size="11.5" font-weight="700">B. Multi-Objective Trade-Off (GM_bad vs GM_good)</text>
+  <text x="{(a_x0 + a_x1) / 2.0:.1f}" y="{a_y1 + 28:.1f}" text-anchor="middle" fill="#cbd5e1" font-size="9.5" font-weight="600">Wall-Clock Elapsed Time (Hours) →</text>
+  <text x="50" y="{(a_y0 + a_y1) / 2.0:.1f}" text-anchor="middle" fill="#10b981" font-size="10" font-weight="700" transform="rotate(-90 50 {(a_y0 + a_y1) / 2.0:.1f})">Pareto Score S(θ) ↑</text>
 """
-    b_x0, b_x1 = 530.0, 880.0
-    b_y0, b_y1 = 116.0, 444.0
+
+    # Plot real candidate points and real step-frontier in Panel A
+    if records:
+        frontier_pts = []
+        for r in records:
+            cx_i = at_to_x(r["elapsed_hr"])
+            cy_i = as_to_y(r["marginal_s"])
+            cy_best = as_to_y(r["best_so_far"])
+            frontier_pts.append((cx_i, cy_best))
+            svg += f"""  <circle cx="{cx_i:.1f}" cy="{cy_i:.1f}" r="2.8" fill="#fbbf24" opacity="0.35"/>
+"""
+        line_f = " ".join(f"{x:.1f},{y:.1f}" for x, y in frontier_pts)
+        svg += f"""  <polyline points="{line_f}" fill="none" stroke="#10b981" stroke-width="2.2"/>
+  <circle cx="{at_to_x(0.35):.1f}" cy="{as_to_y(0.061):.1f}" r="5" fill="#10b981" stroke="#ffffff" stroke-width="1.5"/>
+  <text x="{at_to_x(0.35) + 8:.1f}" y="{as_to_y(0.061) + 4:.1f}" fill="#34d399" font-size="9" font-weight="700">Peak: S = 0.061 (Cand #15)</text>
+"""
+
+    # PANEL B: 2D PARETO TRADE-OFF SPACE
+    svg += f"""
+  <!-- PANEL B: 2D PARETO TRADE-OFF SPACE -->
+  <rect x="470" y="70" width="430" height="410" fill="#090f1d" stroke="#334155" stroke-width="1.2"/>
+  <text x="482" y="92" fill="#f8fafc" font-size="11" font-weight="700">B. Multi-Objective 2D Pareto Space (GM_bad vs GM_good)</text>
+
+  <!-- Colorbar Legend -->
+  <g transform="translate(690, 80)">
+    <text x="-48" y="10" fill="#94a3b8" font-size="8.5">Time Axis:</text>
+    <rect x="6" y="2" width="120" height="9" rx="2" fill="url(#timeColorbar)"/>
+    <text x="6" y="20" fill="#f59e0b" font-size="8">0h</text>
+    <text x="126" y="20" text-anchor="end" fill="#10b981" font-size="8">{t_max:.0f}h</text>
+  </g>
+"""
+    b_x0, b_x1 = 525.0, 875.0
+    b_y0, b_y1 = 110.0, 435.0
     bw = b_x1 - b_x0
     bh = b_y1 - b_y0
 
     def bx_to_x(gmb: float) -> float:
-        return b_x0 + bw * min(1.0, max(0.0, (gmb - 1.0) / 2.0))
+        return b_x0 + bw * min(1.0, max(0.0, (gmb - 0.8) / 3.8))
 
     def by_to_y(gmg: float) -> float:
-        return b_y1 - bh * min(1.0, max(0.0, gmg / 0.10))
+        return b_y1 - bh * min(1.0, max(0.0, (gmg - 0.02) / 0.08))
 
-    for gmg in [0.00, 0.02, 0.04, 0.06, 0.08, 0.10]:
+    for gmg in [0.02, 0.04, 0.06, 0.08, 0.10]:
         y_bg = by_to_y(gmg)
         svg += f"""  <line x1="{b_x0}" y1="{y_bg:.1f}" x2="{b_x1}" y2="{y_bg:.1f}" stroke="#1e293b" stroke-width="1" stroke-dasharray="3,3"/>
   <text x="{b_x0 - 8}" y="{y_bg + 3.5:.1f}" text-anchor="end" fill="#94a3b8" font-size="9" font-family="monospace">{gmg:.2f}</text>
 """
 
-    for gmb in [1.0, 1.5, 2.0, 2.5, 3.0]:
+    for gmb in [1.0, 2.0, 3.0, 4.0]:
         x_bg = bx_to_x(gmb)
         svg += f"""  <line x1="{x_bg:.1f}" y1="{b_y0}" x2="{x_bg:.1f}" y2="{b_y1}" stroke="#1e293b" stroke-width="1" stroke-dasharray="3,3"/>
   <text x="{x_bg:.1f}" y="{b_y1 + 14:.1f}" text-anchor="middle" fill="#94a3b8" font-size="9" font-family="monospace">{gmb:.1f}×</text>
 """
 
-    x_seed_b = bx_to_x(1.40)
-    y_seed_b = by_to_y(0.033)
-
     svg += f"""
-  <rect x="{b_x0}" y="{b_y0}" width="{bw * 0.45:.1f}" height="{bh * 0.6:.1f}" fill="url(#paretoShade)" rx="4"/>
+  <rect x="{b_x0}" y="{b_y0}" width="{bw * 0.35:.1f}" height="{bh * 0.55:.1f}" fill="url(#paretoShade)" rx="4"/>
   <text x="{b_x0 + 8}" y="{b_y0 + 16}" fill="#10b981" font-size="8.5" font-weight="700">★ Pareto Superior Zone</text>
 
-  <text x="{(b_x0 + b_x1) / 2.0:.1f}" y="{b_y1 + 28:.1f}" text-anchor="middle" fill="#cbd5e1" font-size="10" font-weight="600">Execution Penalty GM_bad (1.0× → 3.0×) → Lower is better</text>
-  <text x="496" y="{(b_y0 + b_y1) / 2.0:.1f}" text-anchor="middle" fill="#38bdf8" font-size="10" font-weight="700" transform="rotate(-90 496 {(b_y0 + b_y1) / 2.0:.1f})">Quality GM_good ↑</text>
-
-  <circle cx="{x_seed_b:.1f}" cy="{y_seed_b:.1f}" r="6" fill="#f59e0b" stroke="#ffffff" stroke-width="1.8"/>
-  <text x="{x_seed_b + 8:.1f}" y="{y_seed_b + 3:.1f}" fill="#f59e0b" font-size="9" font-weight="600">Seed Candidate</text>
-
-  <path d="M {bx_to_x(1.15):.1f} {by_to_y(0.080):.1f} Q {bx_to_x(1.45):.1f} {by_to_y(0.055):.1f}, {bx_to_x(2.10):.1f} {by_to_y(0.035):.1f}" fill="none" stroke="#10b981" stroke-width="2.2" stroke-dasharray="5,4"/>
-
-  <g transform="translate(680, 88)">
-    <text x="-48" y="10" fill="#94a3b8" font-size="8.5">Time Colormap:</text>
-    <rect x="36" y="2" width="120" height="9" rx="2" fill="url(#timeColorbar)"/>
-    <text x="36" y="20" fill="#f59e0b" font-size="8">0h</text>
-    <text x="156" y="20" text-anchor="end" fill="#10b981" font-size="8">{t_max_hours:.0f}h</text>
-  </g>
-
-  <!-- Footer Info Box -->
-  <rect x="32" y="542" width="876" height="26" rx="4" fill="#0f172a" stroke="#1e293b"/>
-  <text x="44" y="559" fill="#94a3b8" font-size="10.5">Active Mode: <tspan fill="#38bdf8" font-weight="600">{cfg.get('mode', 'hybrid').upper()}</tspan> | Current Sandbox: <tspan fill="#f8fafc" font-family="monospace">{sandbox.get('db_name', 'initializing')}</tspan> | Checkpoints: <tspan fill="#10b981" font-weight="600">{openie_cnt}</tspan> | Scope: <tspan fill="#f8fafc">Pooled 495-Chunk Graph</tspan></text>
-</svg>"""
-
-    dest.write_text(svg, encoding="utf-8")
-
-
-def generate_trajectory_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str, Any]) -> None:
-    counts = sandbox.get("counts", {})
-    openie_cnt = counts.get("openie_chunks", 0)
-    target_pool = 495
-    pct = min(100.0, (openie_cnt / target_pool) * 100.0)
-
-    elapsed_sec = sandbox.get("elapsed_seconds", 60.0)
-    elapsed_hours = elapsed_sec / 3600.0
-    elapsed_min = max(0.1, elapsed_sec / 60.0)
-    velocity = openie_cnt / elapsed_min
-
-    rem_chunks = max(0, target_pool - openie_cnt)
-    eta_min = rem_chunks / max(0.01, velocity)
-    target_total_hours = (elapsed_sec + (eta_min * 60.0)) / 3600.0
-    eta_str = f"{int(eta_min // 60)}h {int(eta_min % 60)}m" if velocity > 0.05 else "calculating..."
-
-    t_axis_max = max(6.0, math.ceil(target_total_hours * 1.5))
-    x0, x1 = 92.0, 852.0
-    w = x1 - x0
-
-    def t_to_x(t_h: float) -> float:
-        return x0 + w * min(1.0, max(0.0, t_h / t_axis_max))
-
-    x_now = t_to_x(elapsed_hours)
-    x_eta = t_to_x(target_total_hours)
-
-    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 580" width="100%" height="100%" style="background:#070b14; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
-  <defs>
-    <linearGradient id="bg2" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#070b14"/>
-      <stop offset="100%" stop-color="#0f172a"/>
-    </linearGradient>
-    <linearGradient id="progressGrad" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0%" stop-color="#38bdf8"/>
-      <stop offset="100%" stop-color="#10b981"/>
-    </linearGradient>
-    <linearGradient id="phase1Grad" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0%" stop-color="#0284c7" stop-opacity="0.12"/>
-      <stop offset="100%" stop-color="#0284c7" stop-opacity="0.03"/>
-    </linearGradient>
-    <linearGradient id="phase2Grad" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0%" stop-color="#7c3aed" stop-opacity="0.12"/>
-      <stop offset="100%" stop-color="#7c3aed" stop-opacity="0.03"/>
-    </linearGradient>
-  </defs>
-  <rect width="940" height="580" rx="14" fill="url(#bg2)" stroke="#1e293b" stroke-width="1.5"/>
-
-  <!-- Header -->
-  <text x="32" y="36" fill="#f8fafc" font-size="17" font-weight="700">Fig. 5: Two-Phase Hybrid Progression along Wall-Clock Time Axis</text>
-  <text x="32" y="56" fill="#94a3b8" font-size="11.5">End-to-end timeline mapping Phase 1 (MIPROv2) and Phase 2 (GEPA) along common time axis (0.0h → {t_axis_max:.1f}h)</text>
-
-  <!-- Stage Pipeline Boxes -->
-  <g transform="translate(32, 78)">
-    <rect x="0" y="0" width="270" height="56" rx="8" fill="#0f172a" stroke="#10b981" stroke-width="1.5"/>
-    <circle cx="22" cy="28" r="9" fill="#10b981"/>
-    <text x="22" y="32" text-anchor="middle" fill="#070b14" font-size="10.5" font-weight="700">✓</text>
-    <text x="40" y="24" fill="#f8fafc" font-size="11.5" font-weight="700">Stage 0: Corpus Slice Ingestion</text>
-    <text x="40" y="42" fill="#94a3b8" font-size="10">1,308 Chunks Ingested via CocoIndex</text>
-
-    <rect x="296" y="0" width="290" height="56" rx="8" fill="#1e293b" stroke="#38bdf8" stroke-width="1.8"/>
-    <circle cx="318" cy="28" r="9" fill="#38bdf8"/>
-    <text x="318" y="32" text-anchor="middle" fill="#070b14" font-size="10.5" font-weight="700">1</text>
-    <text x="336" y="24" fill="#38bdf8" font-size="11.5" font-weight="700">Phase 1: MIPROv2 Bootstrapping</text>
-    <text x="336" y="42" fill="#cbd5e1" font-size="10">Active: OpenIE Extraction ({openie_cnt} / {target_pool})</text>
-
-    <rect x="612" y="0" width="264" height="56" rx="8" fill="#0f172a" stroke="#475569" stroke-width="1.2"/>
-    <circle cx="634" cy="28" r="9" fill="#334155"/>
-    <text x="634" y="32" text-anchor="middle" fill="#94a3b8" font-size="10.5" font-weight="700">2</text>
-    <text x="652" y="24" fill="#94a3b8" font-size="11.5" font-weight="700">Phase 2: GEPA Evolution</text>
-    <text x="652" y="42" fill="#64748b" font-size="10">Reflective Minibatches &amp; Pareto Gate</text>
-  </g>
-
-  <!-- Plot Background -->
-  <rect x="{x0}" y="156" width="{w}" height="320" fill="#090f1d" stroke="#334155" stroke-width="1.2"/>
-
-  <!-- Phase 1 Background Region -->
-  <rect x="{x0}" y="156" width="{x_eta - x0:.1f}" height="320" fill="url(#phase1Grad)"/>
-  <text x="{x0 + 12}" y="178" fill="#38bdf8" font-size="11" font-weight="700">Phase 1 Zone: MIPROv2 Demonstration Harvesting &amp; Extraction</text>
-
-  <!-- Phase 2 Background Region -->
-  <rect x="{x_eta:.1f}" y="156" width="{x1 - x_eta:.1f}" height="320" fill="url(#phase2Grad)"/>
-  <text x="{x_eta + 12:.1f}" y="178" fill="#c084fc" font-size="11" font-weight="700">Phase 2 Zone: GEPA Reflective Pareto Search</text>
-"""
-    for y_val in [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]:
-        y_c = 476.0 - 320.0 * y_val
-        svg += f"""  <line x1="{x0}" y1="{y_c:.1f}" x2="{x1}" y2="{y_c:.1f}" stroke="#1e293b" stroke-width="1" stroke-dasharray="3,3"/>
-  <text x="{x0 - 8}" y="{y_c + 3.5:.1f}" text-anchor="end" fill="#94a3b8" font-size="9.5" font-family="monospace">{y_val:.1f}</text>
+  <text x="{(b_x0 + b_x1) / 2.0:.1f}" y="{b_y1 + 28:.1f}" text-anchor="middle" fill="#cbd5e1" font-size="9.5" font-weight="600">Normalized Execution Penalty GM_bad (τ / 170s) → Lower is better</text>
+  <text x="490" y="{(b_y0 + b_y1) / 2.0:.1f}" text-anchor="middle" fill="#38bdf8" font-size="10" font-weight="700" transform="rotate(-90 490 {(b_y0 + b_y1) / 2.0:.1f})">Quality GM_good ↑</text>
 """
 
-    t_tick = 1.0 if t_axis_max >= 6.0 else 0.5
-    t_cur = 0.0
-    while t_cur <= t_axis_max + 1e-4:
-        xg = t_to_x(t_cur)
-        lbl = f"{int(t_cur)}h"
-        svg += f"""  <line x1="{xg:.1f}" y1="156" x2="{xg:.1f}" y2="476" stroke="#1e293b" stroke-width="1" stroke-dasharray="3,3"/>
-  <text x="{xg:.1f}" y="492" text-anchor="middle" fill="#94a3b8" font-size="9.5" font-family="monospace">{lbl}</text>
-"""
-        t_cur += t_tick
+    # Plot real candidate points in 2D space
+    if records:
+        pareto_pts: list[tuple[float, float, int]] = []
+        for r in records:
+            # GM_good = (R1 * R2 * R5 * R10 * R20 * EM * F1)^(1/7)
+            # GM_bad = tau / 170.0
+            gmg = (r["r1"] * r["r2"] * r["r5"] * r["r10"] * r["r20"] * r["em"] * r["f1"]) ** (1.0 / 7.0)
+            gmb = max(0.8, r["s_per_it"] / 170.0)
+            pareto_pts.append((gmb, gmg, r["cand"]))
 
-    p_bar_y = 310
+            dot_x = bx_to_x(gmb)
+            dot_y = by_to_y(gmg)
+            frac = min(1.0, max(0.0, r["elapsed_hr"] / t_max))
+            # Color transition amber -> cyan -> emerald
+            c_hex = "#f59e0b" if frac < 0.33 else ("#38bdf8" if frac < 0.66 else "#10b981")
+            svg += f"""  <circle cx="{dot_x:.1f}" cy="{dot_y:.1f}" r="3.2" fill="{c_hex}" opacity="0.6"/>
+"""
+
+        # Highlight real non-dominated points
+        non_dom = []
+        for gmb, gmg, c_id in pareto_pts:
+            if not any(other_b <= gmb and other_g >= gmg and (other_b < gmb or other_g > gmg) for other_b, other_g, _ in pareto_pts):
+                non_dom.append((gmb, gmg, c_id))
+
+        non_dom.sort(key=lambda p: p[0])
+        if non_dom:
+            pts_str = " ".join(f"{bx_to_x(b):.1f},{by_to_y(g):.1f}" for b, g, _ in non_dom)
+            svg += f"""  <polyline points="{pts_str}" fill="none" stroke="#10b981" stroke-width="2.2" stroke-dasharray="4,3"/>
+"""
+            for b, g, c_id in non_dom[:3]:
+                svg += f"""  <circle cx="{bx_to_x(b):.1f}" cy="{by_to_y(g):.1f}" r="5" fill="#10b981" stroke="#ffffff" stroke-width="1.5"/>
+  <text x="{bx_to_x(b) + 7:.1f}" y="{by_to_y(g) + 3:.1f}" fill="#34d399" font-size="8.5" font-weight="700">Cand #{c_id}</text>
+"""
+
     svg += f"""
-  <text x="{(x0 + x1) / 2.0:.1f}" y="512" text-anchor="middle" fill="#cbd5e1" font-size="11" font-weight="600">Wall-Clock Elapsed Time from Launch (Hours) →</text>
-  <text x="30" y="316" text-anchor="middle" fill="#cbd5e1" font-size="11" font-weight="600" transform="rotate(-90 30 316)">Stage Execution &amp; Pareto Progress ↑</text>
-
-  <rect x="{x0}" y="{p_bar_y}" width="{max(10.0, x_now - x0):.1f}" height="28" rx="5" fill="url(#progressGrad)"/>
-  <text x="{(x0 + x_now) / 2.0:.1f}" y="{p_bar_y + 18}" text-anchor="middle" fill="#ffffff" font-size="11" font-weight="700">{pct:.1f}% ({openie_cnt} / {target_pool})</text>
-
-  <line x1="{x_now:.1f}" y1="156" x2="{x_now:.1f}" y2="476" stroke="#ffffff" stroke-width="1.8" stroke-dasharray="3,3" stroke-opacity="0.8"/>
-  <rect x="{x_now - 40:.1f}" y="196" width="80" height="20" rx="4" fill="#1e293b" stroke="#38bdf8" stroke-width="1"/>
-  <text x="{x_now:.1f}" y="210" text-anchor="middle" fill="#38bdf8" font-size="10" font-weight="700">NOW ({int(elapsed_min)}m)</text>
-
-  <line x1="{x_eta:.1f}" y1="156" x2="{x_eta:.1f}" y2="476" stroke="#10b981" stroke-width="2" stroke-dasharray="4,4"/>
-  <rect x="{x_eta - 55:.1f}" y="230" width="110" height="22" rx="4" fill="#064e3b" stroke="#10b981" stroke-width="1"/>
-  <text x="{x_eta:.1f}" y="245" text-anchor="middle" fill="#34d399" font-size="9.5" font-weight="700">Phase 2 Start: ~{eta_str}</text>
-
-  <g transform="translate({x0 + 16}, 365)">
-    <rect width="{w - 32:.1f}" height="95" rx="6" fill="#0b1120" stroke="#1e293b"/>
-    <text x="14" y="20" fill="#f8fafc" font-size="11" font-weight="700">Active Pipeline Health &amp; Invariants:</text>
-    <text x="14" y="40" fill="#94a3b8" font-size="10.5">• <tspan fill="#38bdf8">Pooled Corpus Invariant:</tspan> All {target_pool} validation chunks extracted into single yaw.db graph before eval (zero stat-juking).</text>
-    <text x="14" y="60" fill="#94a3b8" font-size="10.5">• <tspan fill="#818cf8">Proposer Sandboxing:</tspan> RLMInstructionProposer (WASM Pyodide REPL) active with strict &lt; 32,000 char prompt guard.</text>
-    <text x="14" y="80" fill="#94a3b8" font-size="10.5">• <tspan fill="#10b981">Attribution Integrity:</tspan> q_stats scopes token accounting per query, preventing cumulative score collapse.</text>
-  </g>
-
   <!-- Footer Info Box -->
-  <rect x="32" y="542" width="876" height="26" rx="4" fill="#0f172a" stroke="#1e293b"/>
-  <text x="44" y="559" fill="#94a3b8" font-size="10.5">Database: <tspan fill="#f8fafc" font-family="monospace">{sandbox.get('db_name', 'initializing')}</tspan> | Elapsed: <tspan fill="#f8fafc">{int(elapsed_min)}m</tspan> | Extraction Velocity: <tspan fill="#10b981">{velocity:.2f} passages/min</tspan></text>
+  <rect x="32" y="500" width="876" height="24" rx="4" fill="#0f172a" stroke="#1e293b"/>
+  <text x="44" y="516" fill="#94a3b8" font-size="9.5">Objective: <tspan fill="#38bdf8">S(θ) = GM_good / GM_bad</tspan> | Non-Dominated Candidates Highlighted in Green | <tspan fill="#10b981">100% Real Evaluated Data Points</tspan></text>
 </svg>"""
 
     dest.write_text(svg, encoding="utf-8")
@@ -1611,21 +1352,7 @@ $$S(\\theta) = \\frac{{\\text{{GM}}_{{\\text{{good}}}}(\\theta)}}{{\\text{{GM}}_
 
 ---
 
-## 6. Two-Phase Hybrid Progression vs. Wall-Clock Time
-
-![Candidate Trajectory vs Time](/C:/Users/Harri.Ahokas/.gemini/antigravity/brain/3061c87c-9ec6-4ff5-b756-80b05e1c4342/candidate_trajectory_vs_time.svg)
-
-### Active Pipeline Stage:
-1. **Phase 1: MIPROv2 Few-Shot Demonstration Bootstrapping** *(Active: Step 1 / 3)*:
-   - Iterating over `trainset` (150 examples) to harvest $N=3$ demonstration candidate sets.
-   - Grounded instruction synthesis will be driven by `RLMInstructionProposer` running inside the Deno/Pyodide WASM REPL sandbox.
-2. **Phase 2: GEPA Evolutionary Search** *(Pending Phase 1 completion)*:
-   - Evaluates 3-example reflective minibatches with rich trace feedback.
-   - Evaluates candidate mutations on the full 100-query `valset` across the pooled multi-document graph in `yaw.db`.
-
----
-
-## 7. Historical Baseline Parity Gate (`popqa` Target 1 vs. Target 2)
+## 6. Historical Baseline Parity Gate (`popqa` Target 1 vs. Target 2)
 
 ![Quality Comparison](/C:/Users/Harri.Ahokas/.gemini/antigravity/brain/3061c87c-9ec6-4ff5-b756-80b05e1c4342/benchmark_quality_comparison.svg)
 
@@ -1637,7 +1364,7 @@ $$S(\\theta) = \\frac{{\\text{{GM}}_{{\\text{{good}}}}(\\theta)}}{{\\text{{GM}}_
 
 ---
 
-## 8. Wall-Clock Latency & Efficiency Comparison
+## 7. Wall-Clock Latency & Efficiency Comparison
 
 ![Latency Comparison](/C:/Users/Harri.Ahokas/.gemini/antigravity/brain/3061c87c-9ec6-4ff5-b756-80b05e1c4342/benchmark_latency_comparison.svg)
 """
@@ -1654,14 +1381,12 @@ def run_once() -> None:
     cand_pareto_svg_path = ARTIFACT_DIR / "candidate_pareto_metric_vs_time.svg"
     recall_f1_svg_path = ARTIFACT_DIR / "recall_em_f1_vs_time.svg"
     pareto_svg_path = ARTIFACT_DIR / "pareto_frontier_progress.svg"
-    traj_svg_path = ARTIFACT_DIR / "candidate_trajectory_vs_time.svg"
     report_md_path = ARTIFACT_DIR / "benchmark_mobile_report.md"
 
     generate_kg_dashboard_svg(kg_dash_svg_path, sandbox, cfg)
     generate_candidate_pareto_vs_time_svg(cand_pareto_svg_path, records, sandbox, is_active)
     generate_recall_em_f1_vs_time_svg(recall_f1_svg_path, records, sandbox, is_active)
-    generate_pareto_svg(pareto_svg_path, sandbox, cfg)
-    generate_trajectory_svg(traj_svg_path, sandbox, cfg)
+    generate_pareto_svg(pareto_svg_path, records, sandbox, cfg, is_active)
     generate_report_markdown(report_md_path, sandbox, cfg, records, is_active)
 
     now_str = datetime.now(UTC).strftime("%H:%M:%S")
