@@ -968,7 +968,7 @@ def generate_graph_projection_svg(dest: Path, sandbox: dict[str, Any]) -> dict[s
         mx = (x1 + x2) / 2.0
         my = (y1 + y2) / 2.0
         dist = math.hypot(x2 - x1, y2 - y1)
-        esc_title = f"{html.escape(u_name)} &mdash;[{html.escape(p)}]&rarr; {html.escape(v_name)}"
+        esc_title = f"{html.escape(u_name)} —[{html.escape(p)}]→ {html.escape(v_name)}"
 
         if is_c:
             lines_svg.append(
