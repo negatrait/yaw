@@ -499,8 +499,11 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
     kg = sandbox.get("kg_metrics", {})
     lem = sandbox.get("lemonade_metrics", {})
     openie_cnt = counts.get("openie_chunks", 0)
-    target_pool = 495
-    pct = min(100.0, (openie_cnt / target_pool) * 100.0)
+
+    val_target_pool = 495
+    corpus_total_pool = 1308
+    val_pct = min(100.0, (openie_cnt / val_target_pool) * 100.0)
+    corpus_pct = min(100.0, (openie_cnt / corpus_total_pool) * 100.0)
 
     elapsed_sec = sandbox.get("elapsed_seconds", 60.0)
     elapsed_hours = elapsed_sec / 3600.0
@@ -508,12 +511,16 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
     velocity = openie_cnt / elapsed_min
     sec_per_chunk = elapsed_sec / max(1, openie_cnt)
 
-    rem_chunks = max(0, target_pool - openie_cnt)
-    eta_min = rem_chunks / max(0.01, velocity)
-    target_total_hours = (elapsed_sec + (eta_min * 60.0)) / 3600.0
-    eta_str = f"{int(eta_min // 60)}h {int(eta_min % 60)}m" if velocity > 0.05 else "calculating..."
+    rem_corpus = max(0, corpus_total_pool - openie_cnt)
+    eta_corpus_min = rem_corpus / max(0.01, velocity)
+    target_total_hours = (elapsed_sec + (eta_corpus_min * 60.0)) / 3600.0
+    eta_corpus_str = (
+        f"{int(eta_corpus_min // 60)}h {int(eta_corpus_min % 60)}m"
+        if velocity > 0.05
+        else "calculating..."
+    )
 
-    finish_dt = datetime.now(UTC) + timedelta(minutes=eta_min)
+    finish_dt = datetime.now(UTC) + timedelta(minutes=eta_corpus_min)
     finish_clock_str = finish_dt.strftime("%H:%M")
 
     total_ent = kg.get("total_entities", 0)
@@ -524,7 +531,7 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
     top_preds = kg.get("top_predicates", [])
     samples = sandbox.get("timeseries_samples", [])
 
-    t_max_hours = max(4.0, math.ceil(target_total_hours * 1.15 * 2) / 2.0)
+    t_max_hours = max(11.0, math.ceil(target_total_hours * 1.15))
 
     # Panel 1: Main Cumulative Ingestion Plot
     p_x0, p_x1 = 80.0, 850.0
@@ -532,14 +539,17 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
     pw = p_x1 - p_x0
     p1_h = p1_y1 - p1_y0
 
+    p_axis_max = 1400.0
+    e_axis_max = 28000.0
+
     def t_to_x(t_h: float) -> float:
         return p_x0 + pw * min(1.0, max(0.0, t_h / t_max_hours))
 
     def p_to_y(p_val: float) -> float:
-        return p1_y1 - p1_h * min(1.0, max(0.0, p_val / 500.0))
+        return p1_y1 - p1_h * min(1.0, max(0.0, p_val / p_axis_max))
 
     def e_to_y(e_val: float) -> float:
-        return p1_y1 - p1_h * min(1.0, max(0.0, e_val / 10000.0))
+        return p1_y1 - p1_h * min(1.0, max(0.0, e_val / e_axis_max))
 
     # Panel 2: Rolling Velocity & Latency Time-Series Strip
     p2_y0, p2_y1 = 440.0, 545.0
@@ -579,13 +589,14 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
     y_t_now = e_to_y(total_trips)
 
     x_target = t_to_x(target_total_hours)
-    y_p_target = p_to_y(target_pool)
-    est_total_ent = total_ent + (avg_ent * rem_chunks)
-    est_total_trips = total_trips + (avg_trips * rem_chunks)
+    y_p_target = p_to_y(corpus_total_pool)
+    est_total_ent = total_ent + (avg_ent * rem_corpus)
+    est_total_trips = total_trips + (avg_trips * rem_corpus)
     y_e_target = e_to_y(est_total_ent)
     y_t_target = e_to_y(est_total_trips)
 
-    y_ref_pool = p_to_y(target_pool)
+    y_val_pool = p_to_y(val_target_pool)
+    y_corpus_target = p_to_y(corpus_total_pool)
 
     v_mean_y = v_to_y(velocity)
     latest_vel = samples[-1]["rolling_velocity"] if samples else velocity
@@ -616,9 +627,9 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
   <g transform="translate(32, 64)">
     <g transform="translate(0, 0)">
       <rect x="0" y="0" width="136" height="74" rx="8" fill="url(#cardGrad)" stroke="#38bdf8" stroke-width="1.2"/>
-      <text x="12" y="18" fill="#94a3b8" font-size="9.5" font-weight="600">PASSAGES EXTRACTED</text>
+      <text x="12" y="18" fill="#94a3b8" font-size="9.5" font-weight="600">CORPUS INGESTION</text>
       <text x="12" y="44" fill="#38bdf8" font-size="21" font-weight="800">{openie_cnt}</text>
-      <text x="12" y="62" fill="#cbd5e1" font-size="10">{'of 495 pool (100% ✓)' if openie_cnt >= 495 else f'of {target_pool} ({pct:.1f}%)'}</text>
+      <text x="12" y="62" fill="#cbd5e1" font-size="10">of 1,308 ({corpus_pct:.1f}%) [Val 100%]</text>
     </g>
 
     <g transform="translate(148, 0)">
@@ -651,8 +662,8 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
 
     <g transform="translate(740, 0)">
       <rect x="0" y="0" width="136" height="74" rx="8" fill="url(#cardGrad)" stroke="#10b981" stroke-width="1.2"/>
-      <text x="12" y="18" fill="#94a3b8" font-size="9.5" font-weight="600">TIME REMAINING</text>
-      <text x="12" y="44" fill="#34d399" font-size="20" font-weight="800">~{eta_str}</text>
+      <text x="12" y="18" fill="#94a3b8" font-size="9.5" font-weight="600">CORPUS HORIZON ETA</text>
+      <text x="12" y="44" fill="#34d399" font-size="20" font-weight="800">~{eta_corpus_str}</text>
       <text x="12" y="62" fill="#cbd5e1" font-size="9.5">Est. {finish_clock_str} UTC ({target_total_hours:.1f}h tot)</text>
     </g>
   </g>
@@ -660,19 +671,25 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
   <!-- PANEL 1: CUMULATIVE GROWTH PLOT -->
   <rect x="{p_x0}" y="{p1_y0}" width="{pw}" height="{p1_h}" fill="#090f1d" stroke="#334155" stroke-width="1.2"/>
 
-  <!-- Target Pool Reference Line at P = 495 -->
-  <line x1="{p_x0}" y1="{y_ref_pool:.1f}" x2="{p_x1}" y2="{y_ref_pool:.1f}" stroke="#10b981" stroke-width="1.5" stroke-dasharray="4,4"/>
-  <rect x="{p_x0 + 8}" y="{y_ref_pool - 16:.1f}" width="260" height="15" rx="3" fill="#064e3b" fill-opacity="0.7"/>
-  <text x="{p_x0 + 12}" y="{y_ref_pool - 4:.1f}" fill="#34d399" font-size="9.5" font-weight="700">★ Pooled Distractor Threshold (495 Validation Chunks)</text>
+  <!-- Target Pool Reference Line at P = 495 (Validation Threshold) -->
+  <line x1="{p_x0}" y1="{y_val_pool:.1f}" x2="{p_x1}" y2="{y_val_pool:.1f}" stroke="#10b981" stroke-width="1.5" stroke-dasharray="4,4"/>
+  <rect x="{p_x0 + 8}" y="{y_val_pool - 16:.1f}" width="280" height="15" rx="3" fill="#064e3b" fill-opacity="0.75"/>
+  <text x="{p_x0 + 12}" y="{y_val_pool - 4:.1f}" fill="#34d399" font-size="9.5" font-weight="700">[Threshold] Validation Pool (495 Chunks - 100% Committed)</text>
+
+  <!-- Full Corpus Horizon Line at P = 1,308 -->
+  <line x1="{p_x0}" y1="{y_corpus_target:.1f}" x2="{p_x1}" y2="{y_corpus_target:.1f}" stroke="#f59e0b" stroke-width="1.5" stroke-dasharray="4,4"/>
+  <rect x="{p_x0 + 8}" y="{y_corpus_target - 16:.1f}" width="290" height="15" rx="3" fill="#78350f" fill-opacity="0.75"/>
+  <text x="{p_x0 + 12}" y="{y_corpus_target - 4:.1f}" fill="#fde68a" font-size="9.5" font-weight="700">[Horizon] Full EnterpriseRAG Corpus (1,308 Chunks)</text>
 """
-    for p_val in [0, 100, 200, 300, 400, 500]:
+    for p_val in [0, 200, 400, 600, 800, 1000, 1200, 1400]:
         y_g = p_to_y(p_val)
+        e_val = int(p_val * 20)
         svg += f"""  <line x1="{p_x0}" y1="{y_g:.1f}" x2="{p_x1}" y2="{y_g:.1f}" stroke="#1e293b" stroke-width="1" stroke-dasharray="3,3"/>
   <text x="{p_x0 - 8}" y="{y_g + 3.5:.1f}" text-anchor="end" fill="#94a3b8" font-size="9.5" font-family="monospace">{p_val}</text>
-  <text x="{p_x1 + 8}" y="{y_g + 3.5:.1f}" text-anchor="start" fill="#818cf8" font-size="9.5" font-family="monospace">{p_val * 20:,}</text>
+  <text x="{p_x1 + 8}" y="{y_g + 3.5:.1f}" text-anchor="start" fill="#818cf8" font-size="9.5" font-family="monospace">{e_val:,}</text>
 """
 
-    dt_tick = 0.5 if t_max_hours <= 5.0 else 1.0
+    dt_tick = 1.0 if t_max_hours <= 12.0 else 2.0
     t_curr = 0.0
     while t_curr <= t_max_hours + 1e-4:
         x_g = t_to_x(t_curr)
@@ -703,8 +720,8 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
   <circle cx="{x_now:.1f}" cy="{y_t_now:.1f}" r="4.5" fill="#f43f5e" stroke="#ffffff" stroke-width="1.5"/>
 
   <circle cx="{x_target:.1f}" cy="{y_p_target:.1f}" r="6" fill="#10b981" stroke="#ffffff" stroke-width="2"/>
-  <rect x="{min(p_x1 - 150, x_target - 65):.1f}" y="{y_p_target - 22:.1f}" width="150" height="18" rx="4" fill="#064e3b" stroke="#10b981" stroke-width="1"/>
-  <text x="{min(p_x1 - 75, x_target + 10):.1f}" y="{y_p_target - 9:.1f}" text-anchor="middle" fill="#34d399" font-size="9" font-weight="700">Target: ~{eta_str} rem (~{finish_clock_str} UTC)</text>
+  <rect x="{min(p_x1 - 180, x_target - 80):.1f}" y="{y_p_target - 22:.1f}" width="180" height="18" rx="4" fill="#064e3b" stroke="#10b981" stroke-width="1"/>
+  <text x="{min(p_x1 - 90, x_target + 10):.1f}" y="{y_p_target - 9:.1f}" text-anchor="middle" fill="#34d399" font-size="9" font-weight="700">Corpus Horizon: ~{eta_corpus_str} rem (~{finish_clock_str} UTC)</text>
 
   <g transform="translate({p_x0 + 14}, {p1_y0 + 12})">
     <rect width="470" height="22" rx="4" fill="#0b1120" fill-opacity="0.85" stroke="#1e293b"/>
