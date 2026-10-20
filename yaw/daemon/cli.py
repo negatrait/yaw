@@ -2,7 +2,7 @@
 
 Grammar:
   yaw daemon {start|stop|status|run} [--config <path>]
-  yaw graph {build|rebuild} [--config <path>]
+  yaw graph {build|rebuild|lint} [--config <path>] [--turtle]
   yaw dspy {optimize|load-program} [--flags]
   yaw config {get|set} [--flags]
 """
@@ -35,7 +35,12 @@ from yaw.core import (
     set_config_value,
 )
 from yaw.daemon.graph.inference import DSPyEmbeddingAdapter, HippoRAGProgram
-from yaw.daemon.graph.storage import get_graph_counts
+from yaw.daemon.graph.storage import (
+    get_graph_counts,
+    lint_graph_shacl,
+    open_yaw_db,
+    serialize_graph_turtle,
+)
 from yaw.daemon.runtime import YawRuntime
 
 
@@ -89,7 +94,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # -------------------------------------------------------------------------
-    # 2. yaw graph {build|rebuild}
+    # 2. yaw graph {build|rebuild|lint}
     # -------------------------------------------------------------------------
     p_graph = domain_subparsers.add_parser(
         "graph", help="Standalone graph and corpus index commands"
@@ -106,79 +111,117 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[common],
         help="Wipe yaw.db and CocoIndex state and perform a full rebuild from scratch",
     )
-
-    # -------------------------------------------------------------------------
-    # 3. yaw dspy {optimize|load-program}
-    # -------------------------------------------------------------------------
-    p_dspy = domain_subparsers.add_parser(
-        "dspy", help="DSPy prompt optimization and program management"
-    )
-    dspy_subs = p_dspy.add_subparsers(dest="action", help="DSPy action")
-
-    p_opt = dspy_subs.add_parser(
-        "optimize",
+    p_lint = graph_subs.add_parser(
+        "lint",
         parents=[common],
-        help="Compile and evolve DSPy prompts in an isolated sandbox and save candidate JSON",
+        help="Run closed-world SHACL graph lint or emit W3C Turtle (RDF/SKOS/OWL/SHACL)",
     )
-    p_opt.add_argument(
+    p_lint.add_argument(
+        "--turtle",
+        action="store_true",
+        help="Emit W3C Turtle (RDF/SKOS/OWL/SHACL) serialization instead of JSON",
+    )
+
+    # -------------------------------------------------------------------------
+    # 3. yaw dspy {optimize|load-program} + top-level aliases {optimize|load-program}
+    # -------------------------------------------------------------------------
+    p_opt_common = argparse.ArgumentParser(add_help=False)
+    p_opt_common.add_argument(
         "--auto",
         dest="auto",
         choices=["light", "medium", "heavy"],
         default=None,
         help="GEPA/MIPROv2 evaluation budget mode (defaults to yaw.toml [optimization].auto, then 'light')",
     )
-    p_opt.add_argument(
+    p_opt_common.add_argument(
         "--mode",
         dest="mode",
         choices=["miprov2", "gepa", "hybrid"],
         default=None,
-        help="Prompt optimization mode (defaults to yaw.toml [optimization].mode, then 'gepa')",
+        help="Prompt optimization mode (defaults to yaw.toml [optimization].mode, then 'hybrid')",
     )
-    p_opt.add_argument(
+    p_opt_common.add_argument(
         "--dataset",
         dest="dataset",
         nargs="*",
         default=None,
         help=(
-            "One or more Tier 1 dataset names (sample, 2wikimultihopqa, musique, hotpotqa) "
+            "One or more dataset names (enterprise_rag_bench, sample, 2wikimultihopqa, musique, hotpotqa) "
             "or path to JSON training file (defaults to yaw.toml [optimization].datasets)"
         ),
     )
-    p_opt.add_argument(
+    p_opt_common.add_argument(
         "--max-queries",
         type=int,
         default=None,
         help="Maximum queries to load (defaults to yaw.toml [optimization].max_queries, max 50 on Tier 2 corpora)",
     )
-    p_opt.add_argument(
+    p_opt_common.add_argument(
         "--train-queries",
         type=int,
         default=None,
         help="Number of queries for training [0:K] (defaults to yaw.toml [optimization].train_queries)",
     )
-    p_opt.add_argument(
+    p_opt_common.add_argument(
         "--query-offset",
         type=int,
         default=None,
         help="Starting query offset in dataset (defaults to yaw.toml [optimization].query_offset)",
     )
-    p_opt.add_argument(
+    p_opt_common.add_argument(
         "--output",
         dest="output",
         type=str,
         default=None,
         help="Override output path for candidate compiled_program JSON",
     )
-
-    p_load = dspy_subs.add_parser(
-        "load-program",
-        parents=[common],
-        help="Promote a compiled DSPy program JSON into production and hot-reload in-memory",
+    p_opt_common.add_argument(
+        "--num-trials",
+        type=int,
+        default=None,
+        help="Explicit number of optimization trials (sets auto to None for fast smoke tests)",
     )
-    p_load.add_argument(
+    p_opt_common.add_argument(
+        "--num-candidates",
+        type=int,
+        default=None,
+        help="Explicit number of instruction/fewshot candidates per predictor",
+    )
+
+    p_dspy = domain_subparsers.add_parser(
+        "dspy", help="DSPy prompt optimization and program management"
+    )
+    dspy_subs = p_dspy.add_subparsers(dest="action", help="DSPy action")
+
+    dspy_subs.add_parser(
+        "optimize",
+        parents=[common, p_opt_common],
+        help="Compile and evolve DSPy prompts in an isolated sandbox and save candidate JSON",
+    )
+
+    domain_subparsers.add_parser(
+        "optimize",
+        parents=[common, p_opt_common],
+        help="Alias for `yaw dspy optimize`: compile and evolve DSPy prompts in an isolated sandbox",
+    )
+
+    p_load_common = argparse.ArgumentParser(add_help=False)
+    p_load_common.add_argument(
         "file",
         type=str,
         help="Path to compiled DSPy program JSON file to promote and load",
+    )
+
+    dspy_subs.add_parser(
+        "load-program",
+        parents=[common, p_load_common],
+        help="Promote a compiled DSPy program JSON into production and hot-reload in-memory",
+    )
+
+    domain_subparsers.add_parser(
+        "load-program",
+        parents=[common, p_load_common],
+        help="Alias for `yaw dspy load-program`: promote a compiled DSPy program JSON into production",
     )
 
     # -------------------------------------------------------------------------
@@ -280,13 +323,18 @@ def _inspect_active_optimization(config: YawConfig) -> dict[str, Any] | None:
 def inspect_status(config: YawConfig) -> dict[str, Any]:
     """Read live daemon status if running, offline yaw.db stats if stopped, and active optimization progress."""
     running = is_daemon_locked(config)
-    chunks = entities = facts = edges = openie = 0
+    chunks = entities = facts = edges = openie = entity_labels = 0
+    shacl_conforms = True
     if config.db_path and Path(config.db_path).exists():
         with contextlib.suppress(sqlite3.Error):
             db_uri = f"file:{Path(config.db_path).resolve().as_posix()}?mode=ro"
             conn = sqlite3.connect(db_uri, uri=True, timeout=1.0)
             try:
                 chunks, entities, facts, edges, openie = get_graph_counts(conn)
+                with contextlib.suppress(sqlite3.Error):
+                    row = conn.execute("SELECT COUNT(*) FROM entity_labels").fetchone()
+                    entity_labels = int(row[0]) if row else 0
+                    shacl_conforms = len(lint_graph_shacl(conn, auto_heal=False)) == 0
             finally:
                 conn.close()
 
@@ -299,6 +347,8 @@ def inspect_status(config: YawConfig) -> dict[str, Any]:
                 data["stats"]["openie_checkpoints"] = max(
                     openie, data["stats"].get("openie_checkpoints", 0)
                 )
+                data["stats"].setdefault("entity_labels", entity_labels)
+                data["stats"].setdefault("shacl_conforms", shacl_conforms)
                 if not data["status"].get("active_op") and openie > data["stats"].get("chunks", 0):
                     data["status"]["active_op"] = f"indexing: {openie} openie passages processed"
                     data["status"]["sync_state"] = "syncing"
@@ -328,6 +378,8 @@ def inspect_status(config: YawConfig) -> dict[str, Any]:
         edges=edges,
         config_fingerprint=config.config_fingerprint(),
         openie_checkpoints=openie,
+        entity_labels=entity_labels,
+        shacl_conforms=shacl_conforms,
     )
     payload = {
         "status": status.to_dict(),
@@ -339,7 +391,17 @@ def inspect_status(config: YawConfig) -> dict[str, Any]:
 
 
 _TIER2_CORPORA = frozenset({"2wikimultihopqa", "musique", "hotpotqa"})
-_KNOWN_DATASETS = frozenset({"sample", "2wikimultihopqa", "musique", "hotpotqa"})
+_KNOWN_DATASETS = frozenset(
+    {
+        "sample",
+        "2wikimultihopqa",
+        "musique",
+        "hotpotqa",
+        "enterprise_rag_bench",
+        "enterprise",
+    }
+)
+_DATASET_ALIASES = {"enterprise": "enterprise_rag_bench"}
 
 
 def _extract_item_gold_answers(item: dict[str, Any]) -> list[str]:
@@ -353,6 +415,7 @@ def _extract_item_gold_answers(item: dict[str, Any]) -> list[str]:
         raw = []
     ans = [raw] if isinstance(raw, str) else [str(a) for a in (raw or ())]
     ans.extend(str(a) for a in item.get("answer_aliases", ()))
+    ans.extend(str(a) for a in item.get("answer_facts", ()))
     return list(dict.fromkeys(ans))
 
 
@@ -414,11 +477,12 @@ def _load_single_dataset_examples(
 
     candidate_path = Path(ds_clean)
     if not candidate_path.exists() and ds_clean in _KNOWN_DATASETS:
+        resolved_ds = _DATASET_ALIASES.get(ds_clean, ds_clean)
         roots = [Path.cwd()]
         if workspace_root is not None:
             roots.insert(0, workspace_root)
         for root in roots:
-            cached = root / "outputs" / "datasets" / f"{ds_clean}.json"
+            cached = root / "outputs" / "datasets" / f"{resolved_ds}.json"
             if cached.exists():
                 candidate_path = cached
                 break
@@ -439,7 +503,8 @@ def _load_single_dataset_examples(
                 question=str(item["question"]),
                 gold_answers=_extract_item_gold_answers(item),
                 gold_docs=gold_docs,
-            ).with_inputs("question")
+                item_docs=item_docs,
+            ).with_inputs("question", "item_docs")
         )
     return examples, list(dict.fromkeys(corpus_docs))
 
@@ -494,7 +559,7 @@ def _load_dataset_splits(
             val_per_ds.append(d_examples[train_queries:])
         else:
             train_per_ds.append(d_examples)
-            val_per_ds.append([])
+            val_per_ds.append(list(d_examples))
 
     trainset: list[dspy.Example] = []
     max_t = max((len(t) for t in train_per_ds), default=0)
@@ -681,6 +746,44 @@ def handle_graph_rebuild(
         runtime.stop()
 
 
+def handle_graph_lint(
+    config: YawConfig,
+    *,
+    as_turtle: bool = False,
+) -> int:
+    """Validate closed-world SHACL graph shapes or emit W3C Turtle over a read-only WAL snapshot."""
+    db_file = Path(config.db_path).resolve() if config.db_path else None
+    if db_file is not None and db_file.exists() and db_file.stat().st_size > 0:
+        db_uri = f"file:{db_file.as_posix()}?mode=ro"
+        conn = sqlite3.connect(db_uri, uri=True, timeout=5.0)
+    else:
+        conn = open_yaw_db(":memory:")
+
+    try:
+        try:
+            violations = lint_graph_shacl(conn, auto_heal=False)
+        except sqlite3.OperationalError:
+            conn.close()
+            conn = open_yaw_db(":memory:")
+            violations = lint_graph_shacl(conn, auto_heal=False)
+
+        if as_turtle:
+            ttl = serialize_graph_turtle(conn, violations=violations)
+            if not ttl.endswith("\n"):
+                ttl += "\n"
+            sys.stdout.write(ttl)
+        else:
+            payload = {
+                "conforms": len(violations) == 0,
+                "violation_count": len(violations),
+                "violations": [v.to_dict() for v in violations],
+            }
+            sys.stdout.write(json.dumps(payload, indent=2) + "\n")
+        return 0
+    finally:
+        conn.close()
+
+
 def handle_dspy_optimize(
     config: YawConfig,
     args: argparse.Namespace,
@@ -722,8 +825,14 @@ def handle_dspy_optimize(
     raw_auto = getattr(args, "auto", None)
     auto = raw_auto or config.optimize_auto or "light"
 
+    raw_trials = getattr(args, "num_trials", None)
+    num_trials = int(raw_trials) if raw_trials is not None else None
+
+    raw_candidates = getattr(args, "num_candidates", None)
+    num_candidates = int(raw_candidates) if raw_candidates is not None else None
+
     raw_mode = getattr(args, "mode", None)
-    mode = raw_mode or config.optimize_mode or "gepa"
+    mode = raw_mode or config.optimize_mode or "hybrid"
 
     out_override = getattr(args, "output", None)
 
@@ -740,6 +849,10 @@ def handle_dspy_optimize(
 
     runtime = YawRuntime(opt_config, program=program, embedder=embedder, auto_poll=False)
     runtime.start(sync_on_start=False)
+
+    def _cli_progress(msg: str) -> None:
+        print(f"\r[yaw optimize] {msg}\x1b[K", end="", file=sys.stderr, flush=True)
+
     try:
         saved_path = runtime.optimize(
             trainset=trainset,
@@ -747,10 +860,48 @@ def handle_dspy_optimize(
             mode=mode,
             save_path=out_override or opt_config.compiled_program_path,
             auto=auto,
+            num_candidates=num_candidates,
+            num_trials=num_trials,
             corpus_docs=corpus_docs,
+            progress_callback=_cli_progress,
         )
+        print(file=sys.stderr)  # Move to next line before JSON output
         proposer_telemetry = saved_path.parent / f"{saved_path.stem}_proposer_telemetry.json"
+        graph_rlm_audit = saved_path.parent / f"{saved_path.stem}_graph_rlm_audit.json"
         gepa_telemetry_dir = saved_path.parent / f"{saved_path.stem}_telemetry"
+        val_eval_file = saved_path.parent / f"{saved_path.stem}_eval.json"
+        eval_summary: dict[str, Any] | None = None
+        if val_eval_file.exists():
+            with contextlib.suppress(Exception):
+                raw_eval = json.loads(val_eval_file.read_text(encoding="utf-8"))
+                if isinstance(raw_eval, list) and raw_eval:
+                    f1_scores = [
+                        float(it.get("f1", it.get("score", 0.0)))
+                        for it in raw_eval
+                        if isinstance(it, dict)
+                    ]
+                    em_scores = [
+                        float(it.get("em", 0.0))
+                        for it in raw_eval
+                        if isinstance(it, dict)
+                    ]
+                    apm_scores = [
+                        float(it.get("answer_passage_match", 0.0))
+                        for it in raw_eval
+                        if isinstance(it, dict)
+                    ]
+                    eval_summary = {
+                        "num_evaluated": len(raw_eval),
+                        "mean_f1": (
+                            sum(f1_scores) / len(f1_scores) if f1_scores else 0.0
+                        ),
+                        "mean_em": (
+                            sum(em_scores) / len(em_scores) if em_scores else 0.0
+                        ),
+                        "answer_passage_match_rate": (
+                            sum(apm_scores) / len(apm_scores) if apm_scores else 0.0
+                        ),
+                    }
         payload: dict[str, Any] = {
             "optimized": True,
             "mode": mode,
@@ -760,9 +911,14 @@ def handle_dspy_optimize(
             "train_queries": len(trainset),
             "val_queries": len(valset) if valset is not None else 0,
             "compiled_program_path": str(saved_path),
+            "val_eval_path": str(val_eval_file) if val_eval_file.exists() else None,
+            "eval_summary": eval_summary,
             "sandbox_db_path": str(opt_config.db_path),
             "proposer_telemetry_path": (
                 str(proposer_telemetry) if proposer_telemetry.exists() else None
+            ),
+            "graph_rlm_audit_path": (
+                str(graph_rlm_audit) if graph_rlm_audit.exists() else None
             ),
             "gepa_telemetry_dir": (
                 str(gepa_telemetry_dir) if gepa_telemetry_dir.exists() else None
@@ -923,6 +1079,13 @@ def main(
 
     domain = getattr(args, "domain", None)
     action = getattr(args, "action", None)
+    if domain == "optimize":
+        domain = "dspy"
+        action = "optimize"
+    elif domain == "load-program":
+        domain = "dspy"
+        action = "load-program"
+
     if not domain or not action:
         parser.print_help(sys.stderr)
         return 2
@@ -943,12 +1106,14 @@ def main(
             if action == "stop":
                 return handle_daemon_stop(config)
 
-        # 2. yaw graph {build|rebuild}
+        # 2. yaw graph {build|rebuild|lint}
         if domain == "graph":
             if action == "build":
                 return handle_graph_build(config, program=program, embedder=embedder)
             if action == "rebuild":
                 return handle_graph_rebuild(config, program=program, embedder=embedder)
+            if action == "lint":
+                return handle_graph_lint(config, as_turtle=bool(getattr(args, "turtle", False)))
 
         # 3. yaw dspy {optimize|load-program}
         if domain == "dspy":
@@ -989,6 +1154,7 @@ __all__ = [
     "handle_dspy_load_program",
     "handle_dspy_optimize",
     "handle_graph_build",
+    "handle_graph_lint",
     "handle_graph_rebuild",
     "inspect_status",
     "is_daemon_locked",

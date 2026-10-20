@@ -12,7 +12,9 @@ def test_yaw_config_defaults() -> None:
     cfg = YawConfig()
     assert cfg.optimize_auto == "light"
     assert not hasattr(cfg, "optimize_max_metric_calls")
-    assert cfg.optimize_mode == "gepa"
+    assert cfg.optimize_mode == "hybrid"
+    assert cfg.retrieval_top_k == 10
+
 
 
 def test_yaw_config_validation() -> None:
@@ -53,7 +55,7 @@ auto = "light"
 mode = "gepa"
 
 [inference]
-qa_model = "Mistral-7B-Instruct-v0.3-Hybrid"
+qa_model = "Qwen3-4B-Instruct-2507-GGUF"
 """,
         encoding="utf-8",
     )
@@ -83,3 +85,21 @@ qa_model = "Mistral-7B-Instruct-v0.3-Hybrid"
     all_cfg = get_config_value(path=toml_file, workspace_override=tmp_path)
     assert isinstance(all_cfg, dict)
     assert all_cfg["optimize_auto"] == "heavy"
+
+
+def test_yaw_config_json_keys_and_patterns(tmp_path: Path) -> None:
+    cfg = YawConfig(workspace_root=tmp_path)
+    assert cfg.json_keys_whitelist == ("*",)
+    assert cfg.json_keys_blacklist == ()
+    for ext in ("*.md", "*.txt", "*.json", "*.jsonl", "*.py", "*.rs", "*.ts", "*.html", "*.toml", "*.yaml"):
+        assert ext in cfg.included_patterns
+
+    fp_default = cfg.config_fingerprint()
+    cfg_filtered = YawConfig(
+        workspace_root=tmp_path,
+        json_keys_whitelist=cast(Any, "title,text,paragraphs.*"),
+        json_keys_blacklist=("question*", "answer*", "Bearer*"),
+    )
+    assert cfg_filtered.json_keys_whitelist == ("title", "text", "paragraphs.*")
+    assert cfg_filtered.json_keys_blacklist == ("question*", "answer*", "Bearer*")
+    assert cfg_filtered.config_fingerprint() != fp_default

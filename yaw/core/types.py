@@ -34,6 +34,8 @@ class ChunkPointer:
     start_line: int
     end_line: int
     title: str = ""
+    ast_island_start: int = 0
+    ast_island_end: int = 0
 
 
 @dataclass(slots=True, frozen=True)
@@ -47,12 +49,57 @@ class HydratedPassage:
 
 
 @dataclass(slots=True, frozen=True)
+class StructuredTriple:
+    """An OpenIE relation triple enriched with inline subject, object, and statement definitions."""
+
+    subj: str
+    subj_def: str = ""
+    pred: str = ""
+    obj: str = ""
+    obj_def: str = ""
+    spo_def: str = ""
+
+    @property
+    def subject(self) -> str:
+        return self.subj
+
+    @property
+    def predicate(self) -> str:
+        return self.pred
+
+    @property
+    def object(self) -> str:
+        return self.obj
+
+    def as_tuple(self) -> tuple[str, str, str]:
+        return (self.subj, self.pred, self.obj)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True, frozen=True)
 class OpenIERecord:
     """NER entities and relation triples extracted from a single chunk."""
 
     chunk_id: str
     entities: tuple[str, ...]
     triples: tuple[tuple[str, str, str], ...]
+    structured_triples: tuple[StructuredTriple, ...] = ()
+    entity_definitions: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(slots=True, frozen=True)
+class SHACLViolation:
+    """Closed-world SHACL validation report item on the SQLite knowledge graph."""
+
+    shape: str
+    focus_node: str
+    result_path: str
+    message: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass(slots=True, frozen=True)
@@ -82,6 +129,8 @@ class IndexStats:
     edges: int = 0
     config_fingerprint: str = ""
     openie_checkpoints: int = 0
+    entity_labels: int = 0
+    shacl_conforms: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

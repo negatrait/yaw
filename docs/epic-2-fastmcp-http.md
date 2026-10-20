@@ -15,11 +15,11 @@ All query inputs trimmed, non-empty, $\le 1024$ UTF-8 bytes.
 
 | Tool | Args | Action & Return (`yaw/daemon/runtime.py` queue) |
 | --- | --- | --- |
-| `retrieve` | `query: str`, `top_k: int = 5` (1–20) | `readOnlyHint=true`. Queue `runtime.retrieve(query, top_k)`. Return `{rank, text, score, chunk_id, content_hash, stale_on_disk, source: {rel_posix_path, start_line, end_line, title}}`. |
+| `retrieve` | `query: str`, `top_k: int = 5` (1–20) | `readOnlyHint=true`. Queue `runtime.retrieve(query, top_k)`. Return `{rank, text, score, chunk_id, content_hash, stale_on_disk, source: {rel_posix_path, start_line, end_line, title}}` with MaxP canonical passage span aggregation ($S(\text{passage}) = \max_{c \in \text{passage}} S(c)$) and 1-indexed line hydration. |
 | `rag_qa` | `question: str` | `readOnlyHint=true`. Queue `runtime.rag_qa(question)`. Return `{answer, evidence: passages[:5], last_sync_at}`. |
-| `index_stats` | none | `readOnlyHint=true`. Read cached `runtime.stats()` (`chunks`, `entities`, `facts`, `edges`, config fingerprint) without blocking on worker thread. |
+| `index_stats` | none | `readOnlyHint=true`. Read cached `runtime.stats()` (`chunks`, `entities`, `facts`, `edges`, `entity_labels`, `shacl_conforms`, config fingerprint) without blocking on worker thread. |
 | `daemon_status` | none | `readOnlyHint=true`. Read cached `runtime.status()` (lifecycle, `provider_ready`, CocoIndex sync state, queue depth, active op, redacted last error). |
-| `sync_sources` | none | `destructiveHint=true`. Call `runtime.request_sync()`; return `{scan_id, status: "accepted" \| "already_pending"}`. |
+| `sync_sources` | none | `destructiveHint=true`. Call `runtime.request_sync()`; return `{scan_id, status: "accepted" \| "already_pending"}`. Triggers CocoIndex incremental sync across 30+ supported Tree-sitter file formats with $\pi_{\mathcal{W}, \mathcal{B}}$ key projection. |
 
 ## Execution & Error Rules
 

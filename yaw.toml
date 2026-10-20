@@ -24,16 +24,15 @@ provider = "openai"
 embedding_model = "embeddinggemma-300m-GGUF"
 embedding_task_mode = "distinct-titled"
 extraction_model = "Qwen3-4B-Instruct-2507-GGUF"
-qa_model = "Mistral-7B-Instruct-v0.3-Hybrid"
-execution_mode = "direct"
-qa_mode = "cot"
+qa_model = "Qwen3-4B-Instruct-2507-GGUF"
 enable_gbnf = true
 gbnf_max_facts = 4
 
 [graph]
 linking_top_k = 8
-retrieval_top_k = 5
+retrieval_top_k = 10
 damping = 0.5
+
 synonymy_threshold = 0.8
 synonymy_top_k = 100
 embed_batch_size = 64
@@ -45,9 +44,9 @@ http_port = 13306
 http_path = "/mcp"
 
 [optimization]
-datasets = ["2wikimultihopqa", "hotpotqa", "musique"]
-mode = "gepa"
-max_queries = 10
-train_queries = 7
+datasets = ["enterprise_rag_bench"]
+mode = "hybrid"
+max_queries = 250
+train_queries = 150
 query_offset = 0
 auto = "light"

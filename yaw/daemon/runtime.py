@@ -34,7 +34,7 @@ from yaw.daemon.graph.inference import (
     HippoRAGProgram,
     create_dspy_rlm_pair,
 )
-from yaw.daemon.ingestion import CorpusIngestor
+from yaw.daemon.ingestion import CorpusIngestor, sync_corpus_once
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -171,15 +171,6 @@ class YawRuntime:
             else DSPyEmbeddingAdapter.from_config(self.config)
         )
 
-        self.ingestor = CorpusIngestor(
-            corpus_root=self.config.corpus_root,
-            state_dir=self.config.state_dir,
-            included_patterns=self.config.included_patterns,
-            excluded_patterns=self.config.excluded_patterns,
-            chunk_size=self.config.chunk_size,
-            chunk_overlap=self.config.chunk_overlap,
-            min_chunk_size=self.config.min_chunk_size,
-        )
         self.engine = YawGraphEngine(
             db_path=self.config.db_path,
             workspace_root=self.config.corpus_root,
@@ -191,6 +182,18 @@ class YawRuntime:
             synonymy_threshold=self.config.synonymy_threshold,
             synonymy_top_k=self.config.synonymy_top_k,
             embed_batch_size=self.config.embed_batch_size,
+        )
+        self.ingestor = CorpusIngestor(
+            corpus_root=self.config.corpus_root,
+            state_dir=self.config.state_dir,
+            included_patterns=self.config.included_patterns,
+            excluded_patterns=self.config.excluded_patterns,
+            json_keys_whitelist=self.config.json_keys_whitelist,
+            json_keys_blacklist=self.config.json_keys_blacklist,
+            chunk_size=self.config.chunk_size,
+            chunk_overlap=self.config.chunk_overlap,
+            min_chunk_size=self.config.min_chunk_size,
+            on_delta=self._apply_delta,
         )
         fp = self.config.config_fingerprint()
         self.engine.set_meta(_CONFIG_FP_META_KEY, fp)
@@ -536,11 +539,17 @@ class YawRuntime:
         assert self.engine is not None
         if not delta.deleted_chunk_ids and not delta.added_chunks:
             return
+        cb = progress_callback
+        if cb is None:
+            def _default_sync_progress(msg: str) -> None:
+                self._update_state(active_op=msg, sync_state="syncing")
+
+            cb = _default_sync_progress
         self.engine.set_meta(_PENDING_DELTA_META_KEY, _serialize_sync_delta(delta))
         if delta.deleted_chunk_ids:
             self.engine.delete_chunks(delta.deleted_chunk_ids)
         if delta.added_chunks:
-            self.engine.index_chunks(delta.added_chunks, progress_callback=progress_callback)
+            self.engine.index_chunks(delta.added_chunks, progress_callback=cb)
         self.engine.set_meta(_PENDING_DELTA_META_KEY, None)
 
     def _execute_sync_worker(self) -> SyncDelta:
@@ -558,10 +567,11 @@ class YawRuntime:
         else:
             pending_delta = None
 
-        # 2. Poll CocoIndex for subsequent corpus changes and apply
+        # 2. Poll CocoIndex for subsequent corpus changes (compiled inside target sink before LMDB commit)
         _sync_progress("polling CocoIndex for corpus changes")
         polled_delta = self.ingestor.poll()
-        self._apply_delta(polled_delta, progress_callback=_sync_progress)
+        if getattr(self.ingestor, "on_delta", None) is None:
+            self._apply_delta(polled_delta, progress_callback=_sync_progress)
 
         new_stats = self.engine.get_stats(self.config.config_fingerprint())
         with self._state_lock:
@@ -669,31 +679,29 @@ class YawRuntime:
                 raise YawRuntimeError(
                     "EMPTY_INDEX", "Cannot execute rag_qa on an empty graph index."
                 )
-            hits = self.engine.retrieve(cleaned, top_k=self.config.retrieval_top_k)
-            formatted_context = "\n\n".join(
-                f"Wikipedia Title: {p.title}\n{text}" if p.title else text
-                for p, _, text in hits
-            )
-            pred = self.engine.program.answer_question(
-                context=formatted_context, question=cleaned
-            )
+            pred = self.engine.program(question=cleaned)
             ans = str(getattr(pred, "answer", "")).strip()
             reasoning = str(getattr(pred, "reasoning", "")).strip()
+            top_n = min(5, self.config.retrieval_top_k)
+            passages_text = tuple(getattr(pred, "retrieved_passages", ()))[:top_n]
+            scores = tuple(getattr(pred, "retrieved_scores", ()))[:top_n]
+            pids = tuple(getattr(pred, "retrieved_chunk_ids", ()))[:top_n]
+            ptrs_map = self.engine.resolve_chunk_pointers(pids)
             passages = [
                 {
                     "rank": idx + 1,
-                    "text": text,
-                    "score": score,
-                    "chunk_id": ptr.chunk_id,
+                    "text": str(text),
+                    "score": float(scores[idx]) if idx < len(scores) else 0.0,
+                    "chunk_id": str(cid),
                     "stale_on_disk": False,
                     "source": {
-                        "rel_posix_path": ptr.rel_posix_path,
-                        "start_line": ptr.start_line,
-                        "end_line": ptr.end_line,
-                        "title": ptr.title,
+                        "rel_posix_path": ptrs_map[cid].rel_posix_path if cid in ptrs_map else "",
+                        "start_line": ptrs_map[cid].start_line if cid in ptrs_map else 0,
+                        "end_line": ptrs_map[cid].end_line if cid in ptrs_map else 0,
+                        "title": ptrs_map[cid].title if cid in ptrs_map else "",
                     },
                 }
-                for idx, (ptr, score, text) in enumerate(hits[:5])
+                for idx, (cid, text) in enumerate(zip(pids, passages_text, strict=False))
             ]
             return {
                 "question": cleaned,
@@ -750,6 +758,8 @@ class YawRuntime:
         reflection_lm: Any = None,
         reflection_worker_lm: Any = None,
         auto: Literal["light", "medium", "heavy"] | None = None,
+        num_candidates: int | None = None,
+        num_trials: int | None = None,
         corpus_docs: Sequence[str] | None = None,
         progress_callback: Callable[[str], None] | None = None,
     ) -> Path:
@@ -768,9 +778,41 @@ class YawRuntime:
                 if progress_callback is not None:
                     progress_callback(msg)
 
+            opt_chunks = []
             if corpus_docs:
                 _progress(f"indexing: preparing {len(corpus_docs)} corpus passages")
-                self.engine.index(corpus_docs, progress_callback=_progress)
+                assert self.config.corpus_root is not None
+                assert self.config.state_dir is not None
+                opt_json_rel = ".yaw_optimize_slice.json"
+                opt_json_path = Path(self.config.corpus_root) / opt_json_rel
+                records_payload = [
+                    {
+                        "title": d.split("\n", 1)[0] if "\n" in d else "",
+                        "text": d.split("\n", 1)[1] if "\n" in d else d,
+                    }
+                    for d in corpus_docs
+                ]
+                opt_json_path.parent.mkdir(parents=True, exist_ok=True)
+                opt_json_path.write_text(
+                    json.dumps(records_payload, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                delta = sync_corpus_once(
+                    corpus_root=self.config.corpus_root,
+                    state_dir=Path(self.config.state_dir) / "opt_slice_state",
+                    included_patterns=(opt_json_rel,),
+                    excluded_patterns=(),
+                    json_keys_whitelist=self.config.json_keys_whitelist,
+                    json_keys_blacklist=self.config.json_keys_blacklist,
+                    chunk_size=self.config.chunk_size,
+                    chunk_overlap=self.config.chunk_overlap,
+                    min_chunk_size=self.config.min_chunk_size,
+                )
+                opt_chunks = list(delta.added_chunks)
+                if opt_chunks and len(opt_chunks) <= 64:
+                    self.engine.index_chunks(
+                        opt_chunks, progress_callback=_progress
+                    )
                 new_stats = self.engine.get_stats(self.config.config_fingerprint())
                 with self._state_lock:
                     self._stats = new_stats
@@ -797,8 +839,14 @@ class YawRuntime:
                 reflection_lm=eff_ref_lm,
                 reflection_worker_lm=eff_worker_lm,
                 auto=resolved_auto,
+                num_candidates=num_candidates,
+                num_trials=num_trials,
                 progress_callback=_progress,
+                opt_chunks=opt_chunks,
             )
+            final_stats = self.engine.get_stats(self.config.config_fingerprint())
+            with self._state_lock:
+                self._stats = final_stats
             return target_path
 
         return self.submit("optimize", _run_optimize, progress_callback=progress_callback).result()
@@ -813,7 +861,7 @@ class YawRuntime:
             if self.engine is None:
                 raise YawRuntimeError("NOT_READY", "Graph engine is not initialized.")
             self.engine.program.load(str(p))
-            self.engine.program.set_retrieval_hook(self.engine._program_retrieval_hook)
+            self.engine._bind_program_hooks()
             self.engine._apply_program_embedding_prefixes()
             self._update_state()
             return {

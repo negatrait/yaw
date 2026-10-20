@@ -65,6 +65,33 @@ class FIFOLineRotatingHandler(logging.Handler):
         super().close()
 
 
+class SuppressThirdPartyInfoFilter(logging.Filter):
+    """Filter to suppress noisy INFO chatter from upstream hipporag, litellm, httpx, httpx2, and openai."""
+
+    _SUPPRESSED_PREFIXES = (
+        "hipporag",
+        "httpx",
+        "httpx2",
+        "httpcore",
+        "openai",
+        "urllib3",
+        "litellm",
+        "LiteLLM",
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno < logging.WARNING and any(
+            record.name == prefix or record.name.startswith(f"{prefix}.")
+            for prefix in self._SUPPRESSED_PREFIXES
+        ):
+            return False
+        # Suppress repetitive benign warnings from upstream hipporag
+        return not (
+            record.name.startswith("hipporag")
+            and "does not have a customized prompt template" in record.getMessage()
+        )
+
+
 def configure_logging(
     log_file: str | Path | None = None,
     level: int = logging.INFO,
@@ -82,6 +109,7 @@ def configure_logging(
     if quiet_third_party:
         for name in (
             "httpx",
+            "httpx2",
             "httpcore",
             "openai",
             "urllib3",
@@ -89,12 +117,27 @@ def configure_logging(
             "LiteLLM",
             "LiteLLM Router",
             "LiteLLM Proxy",
+            "hipporag",
+            "hipporag.HippoRAG",
+            "hipporag.information_extraction",
+            "hipporag.evaluation",
+            "hipporag.llm",
+            "hipporag.embedding_model",
+            "hipporag.embedding_store",
+            "hipporag.prompts",
+            "hipporag.utils",
         ):
             logging.getLogger(name).setLevel(logging.WARNING)
 
-    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    stream_handler = logging.StreamHandler()
+    if quiet_third_party:
+        stream_handler.addFilter(SuppressThirdPartyInfoFilter())
+    handlers: list[logging.Handler] = [stream_handler]
     if log_file is not None:
-        handlers.append(FIFOLineRotatingHandler(log_file, max_lines=max_lines))
+        file_handler = FIFOLineRotatingHandler(log_file, max_lines=max_lines)
+        if quiet_third_party:
+            file_handler.addFilter(SuppressThirdPartyInfoFilter())
+        handlers.append(file_handler)
 
     # force=True reconfigures any previously installed handlers
     logging.basicConfig(level=level, handlers=handlers, force=True)

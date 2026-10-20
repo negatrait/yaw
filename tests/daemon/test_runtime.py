@@ -54,7 +54,35 @@ class DeterministicTestLM(dspy.LM):
                 self.model,
                 {"prompt_tokens": 32, "completion_tokens": 16, "total_tokens": 48},
             )
-        if "FilterFacts" in req_str or "fact_before_filter" in req_str:
+        if (
+            "JudgeSynonyms" in req_str
+            or "candidate_pairs_json" in req_str
+            or "candidate_pairs" in req_str
+        ):
+            return ['{"decisions": []}']
+        if (
+            "ProposeSHACLRepairs" in req_str
+            or "HealSHACLViolations" in req_str
+            or "violations_json" in req_str
+        ):
+            return ['{"repairs": []}']
+        if (
+            "DefineMissingEntities" in req_str
+            or "missing_entities" in req_str
+            or "entity_definitions" in req_str
+        ):
+            if "Turing" in req_str:
+                return [
+                    '{"entity_definitions": [["Alan Turing", "English mathematician and cryptanalyst"], ["Bletchley Park", "British wartime codebreaking center"]]}'
+                ]
+            if "Lovelace" in req_str:
+                return [
+                    '{"entity_definitions": [["Ada Lovelace", "English mathematician"], ["Analytical Engine", "Early mechanical general-purpose computer"]]}'
+                ]
+            return [
+                '{"entity_definitions": [["University of Southampton", "Public research university in Southampton"], ["1862", "Founding year of the Hartley Institution"]]}'
+            ]
+        if "FilterTriples" in req_str or "fact_before_filter" in req_str:
             if "Turing" in req_str:
                 return ['{"fact": [["Alan Turing", "worked at", "Bletchley Park"]]}']
             if "Lovelace" in req_str:
@@ -62,16 +90,28 @@ class DeterministicTestLM(dspy.LM):
             return ['{"fact": [["University of Southampton", "founded in", "1862"]]}']
         if "ExtractTriples" in req_str or '"triples"' in req_str or "`triples`" in req_str:
             if "Turing" in req_str:
-                return ['{"triples": [["Alan Turing", "worked at", "Bletchley Park"]]}']
+                return [
+                    '{"triples": [{"sub": "Alan Turing", "pred": "worked at", "obj": "Bletchley Park", "def": "Alan Turing worked at Bletchley Park."}]}'
+                ]
             if "Lovelace" in req_str:
-                return ['{"triples": [["Ada Lovelace", "programmed", "Analytical Engine"]]}']
-            return ['{"triples": [["University of Southampton", "founded in", "1862"]]}']
+                return [
+                    '{"triples": [{"sub": "Ada Lovelace", "pred": "programmed", "obj": "Analytical Engine", "def": "Ada Lovelace programmed the Analytical Engine."}]}'
+                ]
+            return [
+                '{"triples": [{"sub": "University of Southampton", "pred": "founded in", "obj": "1862", "def": "University of Southampton was founded in 1862."}]}'
+            ]
         if "ExtractEntities" in req_str or "named_entities" in req_str:
             if "Turing" in req_str:
-                return ['{"named_entities": ["Alan Turing", "Bletchley Park"]}']
+                return [
+                    '{"named_entities": [["Alan Turing", "English mathematician and cryptanalyst"], ["Bletchley Park", "British wartime codebreaking center"]]}'
+                ]
             if "Lovelace" in req_str:
-                return ['{"named_entities": ["Ada Lovelace", "Analytical Engine"]}']
-            return ['{"named_entities": ["University of Southampton", "1862"]}']
+                return [
+                    '{"named_entities": [["Ada Lovelace", "English mathematician"], ["Analytical Engine", "Early mechanical general-purpose computer"]]}'
+                ]
+            return [
+                '{"named_entities": [["University of Southampton", "Public research university in Southampton"], ["1862", "Founding year of the Hartley Institution"]]}'
+            ]
         if "ExtractQueryIntent" in req_str or "query_intent" in req_str:
             return ['{"query_intent": "Alan Turing worked at Bletchley Park"}']
         return ['{"reasoning": "Derived from retrieved passages.", "answer": "Bletchley Park"}']
@@ -148,8 +188,6 @@ poll_interval_seconds = 0.2
 
 [inference]
 base_url = "http://localhost:13305/api/v1"
-execution_mode = "direct"
-qa_mode = "cot"
 enable_gbnf = false
 
 [graph]
@@ -172,8 +210,6 @@ def _make_program_and_embedder() -> tuple[HippoRAGProgram, Any, DeterministicTes
     lm = DeterministicTestLM()
     dspy.settings.configure(lm=lm)
     prog = HippoRAGProgram(
-        execution_mode="direct",
-        qa_mode="cot",
         enable_gbnf=False,
         orchestrator_lm=lm,
         rlm_sub_lm=lm,
@@ -188,7 +224,7 @@ def test_load_config_and_fingerprint(tmp_path: Path) -> None:
     assert repo_cfg.queue_maxsize == 32
     assert repo_cfg.embedding_model == "embeddinggemma-300m-GGUF"
     assert repo_cfg.extraction_model == "Qwen3-4B-Instruct-2507-GGUF"
-    assert repo_cfg.qa_model == "Mistral-7B-Instruct-v0.3-Hybrid"
+    assert repo_cfg.qa_model == "Qwen3-4B-Instruct-2507-GGUF"
     assert repo_cfg.config_fingerprint().startswith("yaw-cfg-v1:")
 
     cfg1, toml_path = _make_test_config(tmp_path)
@@ -580,7 +616,8 @@ def test_cli_optimize_ergonomics_and_anti_overfitting_gate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Verify `yaw dspy optimize` CLI ergonomics: benchmark slice parsing, train/val split, telemetry paths, and Tier 2 anti-overfitting guard."""
-    _, toml_path = _make_test_config(tmp_path)
+    cfg, toml_path = _make_test_config(tmp_path)
+    assert cfg.corpus_root is not None
     prog, emb, _, _ = _make_program_and_embedder()
 
     # Write a 6-query benchmark-format dataset JSON (with paragraphs + is_supporting)
@@ -608,6 +645,7 @@ def test_cli_optimize_ergonomics_and_anti_overfitting_gate(
     bench_dataset_path.write_text(json.dumps(bench_samples), encoding="utf-8")
 
     captured_gepa: dict[str, Any] = {}
+    opt_slice_file = cfg.corpus_root / ".yaw_optimize_slice.json"
 
     class CaptureGEPA:
         def __init__(self, metric: Any, **kwargs: Any) -> None:
@@ -617,11 +655,17 @@ def test_cli_optimize_ergonomics_and_anti_overfitting_gate(
         def compile(self, student: Any, trainset: list[Any], valset: Any = None) -> Any:
             captured_gepa["trainset_len"] = len(trainset)
             captured_gepa["valset_len"] = len(valset) if valset is not None else 0
+            # Verify .yaw_optimize_slice.json stays on disk with indent=2 during GEPA evolution
+            assert opt_slice_file.exists()
+            raw_slice_text = opt_slice_file.read_text(encoding="utf-8")
+            assert "\n  {\n" in raw_slice_text
+            pred = student(question=trainset[0].question)
+            assert pred.context.strip() != ""
             proposer = captured_gepa.get("instruction_proposer")
             if proposer is not None and hasattr(proposer, "telemetry"):
                 proposer.telemetry.append(
                     {
-                        "component_name": "qa_cot.predict",
+                        "component_name": "qa.predict",
                         "previous_instruction": "old",
                         "new_instruction": "new",
                         "num_feedback_examples": len(trainset),
@@ -657,6 +701,7 @@ def test_cli_optimize_ergonomics_and_anti_overfitting_gate(
             embedder=emb,
         )
     assert rc == 0
+    assert opt_slice_file.exists()
     opt_out = json.loads(buf.getvalue())
     assert opt_out["optimized"] is True
     assert opt_out["mode"] == "gepa"
@@ -948,12 +993,13 @@ def test_cli_dspy_optimize_sandbox_isolation_and_status(
         )
 
         class FastGEPA:
-            def __init__(self, metric: Any, **kwargs: Any) -> None:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
                 pass
-            def compile(self, student: Any, trainset: list[Any], valset: Any = None) -> Any:
+            def compile(self, student: Any, *args: Any, **kwargs: Any) -> Any:
                 return student
 
         monkeypatch.setattr(dspy, "GEPA", FastGEPA, raising=False)
+        monkeypatch.setattr(dspy, "MIPROv2", FastGEPA, raising=False)
 
         # Run optimization concurrently while production daemon holds yaw.db.lock
         buf = io.StringIO()
@@ -988,5 +1034,40 @@ def test_cli_dspy_optimize_sandbox_isolation_and_status(
         # Production compiled_program.json was NOT overwritten by random optimization run
         assert cfg.compiled_program_path is not None
         assert not Path(cfg.compiled_program_path).exists()
+    finally:
+        prod_rt.stop()
+
+
+def test_cli_graph_lint_and_turtle_over_read_only_snapshot_while_daemon_locked(
+    tmp_path: Path,
+) -> None:
+    """Verify `yaw graph lint [--turtle]` runs over a read-only WAL snapshot while daemon holds yaw.db.lock."""
+    from yaw.daemon.cli import is_daemon_locked
+
+    cfg, toml_path = _make_test_config(tmp_path)
+    prog, emb, _, _ = _make_program_and_embedder()
+
+    prod_rt = YawRuntime(cfg, program=prog, embedder=emb)
+    prod_rt.start(sync_on_start=True)
+    try:
+        assert is_daemon_locked(cfg) is True
+
+        # 1. JSON SHACL report over read-only WAL snapshot while daemon holds yaw.db.lock
+        buf_json = io.StringIO()
+        with redirect_stdout(buf_json):
+            rc_json = main(["graph", "lint", "--config", str(toml_path)])
+        assert rc_json == 0
+        report = json.loads(buf_json.getvalue())
+        assert report["conforms"] is True
+        assert report["violation_count"] == 0
+
+        # 2. W3C Turtle report over read-only WAL snapshot while daemon holds yaw.db.lock
+        buf_ttl = io.StringIO()
+        with redirect_stdout(buf_ttl):
+            rc_ttl = main(["graph", "lint", "--config", str(toml_path), "--turtle"])
+        assert rc_ttl == 0
+        ttl_out = buf_ttl.getvalue()
+        assert "@prefix skos: <http://www.w3.org/2004/02/skos/core#> ." in ttl_out
+        assert "sh:conforms true" in ttl_out
     finally:
         prod_rt.stop()

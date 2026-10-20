@@ -59,24 +59,13 @@ CHAT_MODELS = {
     "Qwen3-4B-Instruct-2507-GGUF": ChatProfile(
         checkpoint="unsloth/Qwen3-4B-Instruct-2507-GGUF:Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
         recipe="llamacpp",
-        role="extraction",
+        role="both",
         default_temperature=0.2,
         extraction_temperature=0.2,
         qa_temperature=0.2,
         frequency_penalty=0.5,
         expected_device="gpu",
         expected_context=16384,
-    ),
-    "Mistral-7B-Instruct-v0.3-Hybrid": ChatProfile(
-        checkpoint="amd/Mistral-7B-Instruct-v0.3-onnx-ryzenai-1.7-hybrid",
-        recipe="ryzenai-llm",
-        role="qa",
-        default_temperature=0.2,
-        extraction_temperature=0.2,
-        qa_temperature=0.2,
-        frequency_penalty=0.0,
-        expected_device="npu",
-        expected_context=32786,
     ),
     "gemma4-it-12b-FLM": ChatProfile(
         checkpoint="gemma4-it:12b",
@@ -98,7 +87,7 @@ CHAT_MODELS = {
     ),
 }
 DEFAULT_EXTRACTION_CHAT = "Qwen3-4B-Instruct-2507-GGUF"
-DEFAULT_QA_CHAT = "Mistral-7B-Instruct-v0.3-Hybrid"
+DEFAULT_QA_CHAT = "Qwen3-4B-Instruct-2507-GGUF"
 DEFAULT_CHAT = DEFAULT_QA_CHAT
 BASE_URL = "http://localhost:13305/api/v1"
 DEFAULT_BASE_URL = BASE_URL

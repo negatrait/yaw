@@ -146,3 +146,116 @@ def test_hydration_rejects_excessive_line_span(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="exceeds maximum"):
         hydrate_chunk_pointer(pointer, tmp_path)
+
+
+def test_coalesce_spans_merges_overlapping_and_contiguous_spans() -> None:
+    from yaw.daemon.graph.storage.hydration import MutableSpan, coalesce_chunk_spans, coalesce_spans
+
+    spans = [
+        MutableSpan("c1", "doc.txt", 1, 10, "TitleA", 0.8, 1, 100),
+        MutableSpan("c2", "doc.txt", 11, 20, "TitleA", 0.95, 1, 100),  # contiguous
+        MutableSpan("c3", "doc.txt", 15, 25, "TitleA", 0.5, 1, 100),   # overlapping
+        MutableSpan("c4", "doc.txt", 35, 40, "TitleB", 0.7, 1, 100),   # disjoint
+        MutableSpan("c5", "other.txt", 1, 5, "Other", 0.88, 1, 20),     # different file
+    ]
+
+    coalesced = coalesce_spans(spans)
+    assert len(coalesced) == 3
+
+    # Most relevant coalesced span first
+    assert coalesced[0].rel_posix_path == "doc.txt"
+    assert coalesced[0].start_line == 1
+    assert coalesced[0].end_line == 25
+    assert coalesced[0].max_score == 0.95
+    assert set(coalesced[0].hit_chunk_ids) == {"c1", "c2", "c3"}
+
+    # Second is other.txt with 0.88
+    assert coalesced[1].rel_posix_path == "other.txt"
+    assert coalesced[1].start_line == 1
+    assert coalesced[1].end_line == 5
+    assert coalesced[1].max_score == 0.88
+
+    # Third is disjoint span with 0.7
+    assert coalesced[2].rel_posix_path == "doc.txt"
+    assert coalesced[2].start_line == 35
+    assert coalesced[2].end_line == 40
+    assert coalesced[2].max_score == 0.7
+
+    # Alias check
+    assert coalesce_chunk_spans(spans) == coalesced
+
+
+def test_hydrate_budgeted_passages_inviolate_hits(tmp_path: Path) -> None:
+    from yaw.daemon.graph.storage.hydration import hydrate_budgeted_passages
+
+    f = tmp_path / "long_doc.txt"
+    lines = [f"This is sentence line {i} with some content.\n" for i in range(1, 51)]
+    f.write_text("".join(lines), encoding="utf-8")
+
+    p1 = ChunkPointer("c1", "long_doc.txt", 5, 10, "Sec1", ast_island_start=1, ast_island_end=20)
+    p2 = ChunkPointer("c2", "long_doc.txt", 25, 30, "Sec2", ast_island_start=21, ast_island_end=40)
+
+    # Even with max_context_chars smaller than the combined hits, both hit spans are preserved (Inviolate Hit Invariant)
+    passages = hydrate_budgeted_passages(
+        [(p1, 0.9), (p2, 0.7)],
+        corpus_root=tmp_path,
+        max_context_chars=100,  # very tight budget
+        max_expansion_hops=1,
+    )
+
+    assert len(passages) == 2
+    assert not passages[0].stale_on_disk
+    assert not passages[1].stale_on_disk
+    assert "sentence line 5" in passages[0].text
+    assert "sentence line 10" in passages[0].text
+    assert "sentence line 25" in passages[1].text
+    assert "sentence line 30" in passages[1].text
+
+
+def test_hydrate_budgeted_passages_1hop_ast_expansion(tmp_path: Path) -> None:
+    from yaw.daemon.graph.storage.hydration import hydrate_budgeted_passages
+
+    f = tmp_path / "article.txt"
+    lines = [f"Line {i:02d}: Context statement for testing.\n" for i in range(1, 41)]
+    f.write_text("".join(lines), encoding="utf-8")
+
+    p1 = ChunkPointer("c_hit", "article.txt", 15, 18, "Article", ast_island_start=10, ast_island_end=25)
+
+    # Large budget: expands to ±10 lines bounded by [ast_island_start, ast_island_end] = [10, 25]
+    passages = hydrate_budgeted_passages(
+        [(p1, 0.9)],
+        corpus_root=tmp_path,
+        max_context_chars=24000,
+        max_expansion_hops=1,
+    )
+    assert len(passages) == 1
+    assert passages[0].pointer.start_line == 10  # max(10, 15 - 10)
+    assert passages[0].pointer.end_line == 25    # min(25, 18 + 10)
+    assert "Line 10" in passages[0].text
+    assert "Line 25" in passages[0].text
+    assert "Line 09" not in passages[0].text
+    assert "Line 26" not in passages[0].text
+
+
+def test_read_corpus_lines_cocoindex_codesource_caching(tmp_path: Path) -> None:
+    from yaw.daemon.graph.storage.hydration import read_corpus_lines
+
+    f = tmp_path / "sample.txt"
+    f.write_text("Alpha\nBeta\nGamma\nDelta\nEpsilon\n", encoding="utf-8")
+
+    # 1. Normal read with CocoIndex CodeSource cache
+    text = read_corpus_lines(f, 2, 4)
+    assert text == "Beta\nGamma\nDelta"
+
+    # 2. Modify file on disk -> mtime change invalidates cache automatically
+    f.write_text("Alpha\nUpdated Beta\nGamma\nDelta\nEpsilon\n", encoding="utf-8")
+    updated = read_corpus_lines(f, 2, 4)
+    assert updated == "Updated Beta\nGamma\nDelta"
+
+    # 3. Missing file returns None
+    missing = read_corpus_lines(tmp_path / "absent.txt", 1, 2)
+    assert missing is None
+
+    # 4. Out of range returns None
+    out_of_range = read_corpus_lines(f, 10, 20)
+    assert out_of_range is None

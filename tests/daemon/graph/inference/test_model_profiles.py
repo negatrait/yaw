@@ -1,19 +1,20 @@
 """Model-profile and serving identity contracts, without local model calls."""
+
 import unittest
 from dataclasses import replace
-from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
-from hipporag.prompts.linking import get_query_instruction
-from hipporag.utils.config_utils import BaseConfig
+import numpy as np
 
 from yaw.daemon.graph.inference.embedding import (
     GEMMA_TASK_MODES,
     MODEL,
+    PASSAGE_INSTRUCTION,
     PROFILES,
+    DSPyEmbeddingAdapter,
+    create_dspy_embedder,
     resolve_embedding_profile,
 )
-from yaw.daemon.graph.inference.legacy_embedding import RetrievalEmbedding
 from yaw.daemon.graph.inference.models import CHAT_MODELS, chat_evidence, check_registry
 
 
@@ -52,61 +53,56 @@ class ProfileTests(unittest.TestCase):
         ):
             chat_evidence(name)
 
-    def test_ryzenai_chat_evidence_validates_npu_device_and_context(self):
-        name = "Mistral-7B-Instruct-v0.3-Hybrid"
+    def test_llamacpp_chat_evidence_validates_gpu_device(self):
+        name = "Qwen3-4B-Instruct-2507-GGUF"
         profile = CHAT_MODELS[name]
         valid_entry = {
             "id": name,
             "checkpoint": profile.checkpoint,
             "recipe": profile.recipe,
-            "device": "npu",
+            "device": "gpu",
             "backend_health": "ready",
-            "recipe_options": {"ctx_size": 32786},
+            "launch_command": ["llama-server.exe", "--parallel", "1", "--cache-ram", "0"],
         }
         with patch("yaw.daemon.graph.inference.models.get_json", return_value={"all_models_loaded": [valid_entry]}):
             self.assertEqual(chat_evidence(name)["id"], name)
         with patch(
             "yaw.daemon.graph.inference.models.get_json",
             return_value={"all_models_loaded": [{**valid_entry, "device": "cpu"}]},
-        ), self.assertRaisesRegex(ValueError, "expected device npu"):
+        ), self.assertRaisesRegex(ValueError, "expected device gpu"):
             chat_evidence(name)
-        with (
-            patch(
-                "yaw.daemon.graph.inference.models.get_json",
-                return_value={"all_models_loaded": [{**valid_entry, "recipe_options": {"ctx_size": 4096}}]},
-            ),
-            self.assertRaisesRegex(ValueError, "ctx_size >="),
-        ):
-            chat_evidence(name)
+
     def test_each_profile_preserves_its_request_format_and_dimensions(self):
         for profile in PROFILES.values():
             with self.subTest(model=profile.model):
-                model = RetrievalEmbedding(BaseConfig(
-                    embedding_model_name=profile.model,
-                    embedding_base_url="http://localhost:13305/api/v1",
-                ), profile)
-                model.client.close()
-                model.client = Mock()
-                model.client.embeddings.create.return_value = SimpleNamespace(
-                    usage=SimpleNamespace(prompt_tokens=1, total_tokens=1),
-                    data=[SimpleNamespace(index=0, embedding=[1.] * profile.dimensions)],
+                recorded_inputs: list[list[str]] = []
+
+                def make_embed_fn(dims: int, sink: list[list[str]] = recorded_inputs):
+                    def _embed(texts: list[str]) -> np.ndarray:
+                        sink.append(list(texts))
+                        mat = np.ones((len(texts), dims), dtype=np.float32)
+                        return mat
+                    return _embed
+
+                adapter = DSPyEmbeddingAdapter(
+                    profile=profile,
+                    embedder=create_dspy_embedder(make_embed_fn(profile.dimensions), batch_size=2, caching=False),
                 )
-                try:
-                    model.batch_encode(["a document"])
-                    self.assertEqual(model.client.embeddings.create.call_args.kwargs["input"],
-                                     [profile.document_prefix + "a document"])
-                    result = model.batch_encode("who?", instruction=get_query_instruction("query_to_passage"))
-                    request = model.client.embeddings.create.call_args.kwargs
-                    self.assertEqual(request["model"], profile.model)
-                    self.assertEqual(request["input"], [profile.query_prefix + "who?"])
-                    self.assertEqual(result.shape, (1, profile.dimensions))
-                    if profile.model.startswith("Qwen"):
-                        self.assertIn("\nQuery:", request["input"][0])
-                        model.client.embeddings.create.return_value.data[0].embedding = [1.] * 768
-                        with self.assertRaises(ValueError):
-                            model.batch_encode(["wrong dimensions"])
-                finally:
-                    model.close()
+                adapter.batch_encode(["a document"])
+                self.assertEqual(recorded_inputs[-1], [profile.document_prefix + "a document"])
+
+                result = adapter.batch_encode("who?", instruction=PASSAGE_INSTRUCTION)
+                self.assertEqual(recorded_inputs[-1], [profile.query_prefix + "who?"])
+                self.assertEqual(result.shape, (1, profile.dimensions))
+
+                if profile.model.startswith("Qwen"):
+                    self.assertIn("\nQuery:", recorded_inputs[-1][0])
+                    bad_adapter = DSPyEmbeddingAdapter(
+                        profile=profile,
+                        embedder=create_dspy_embedder(make_embed_fn(768), batch_size=2, caching=False),
+                    )
+                    with self.assertRaises(ValueError):
+                        bad_adapter.batch_encode(["wrong dimensions"])
 
     def test_identity_changes_for_quant_prompt_pooling_dimensions_and_task_modes(self):
         self.assertEqual(len({p.index_identity for p in PROFILES.values()}), 3)
@@ -124,14 +120,9 @@ class ProfileTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             resolve_embedding_profile("Qwen3-Embedding-0.6B-GGUF", "qa")
 
-    def test_config_cannot_claim_another_embedding_model(self):
+    def test_no_download_or_substitution_for_missing_qwen(self):
         profile = next(iter(PROFILES.values()))
-        with self.assertRaises(ValueError):
-            RetrievalEmbedding(BaseConfig(embedding_model_name="another-model"), profile)
-
-    def test_no_download_or_substitution_for_missing_mistral(self):
-        profile = next(iter(PROFILES.values()))
-        name = "Mistral-7B-Instruct-v0.3-Hybrid"
+        name = "Qwen3-4B-Instruct-2507-GGUF"
         checkpoint, recipe = CHAT_MODELS[name]
         registry = [
             {"id": profile.model, "checkpoint": profile.checkpoint, "recipe": "llamacpp",
@@ -145,7 +136,7 @@ class ProfileTests(unittest.TestCase):
     def test_split_extraction_and_qa_models_are_both_validated(self):
         profile = next(iter(PROFILES.values()))
         ext_name = "Phi-4-mini-instruct-GGUF"
-        qa_name = "Mistral-7B-Instruct-v0.3-Hybrid"
+        qa_name = "Qwen3-4B-Instruct-2507-GGUF"
         ext_ckpt, ext_recipe = CHAT_MODELS[ext_name]
         qa_ckpt, qa_recipe = CHAT_MODELS[qa_name]
         registry = [
@@ -177,5 +168,3 @@ class ProfileTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-

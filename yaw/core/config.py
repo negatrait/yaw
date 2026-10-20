@@ -41,8 +41,65 @@ class YawConfig:
     compiled_program_path: Path | None = None
 
     # Ingestion settings
-    included_patterns: tuple[str, ...] = ("*.md", "*.txt")
+    included_patterns: tuple[str, ...] = (
+        "*.md",
+        "*.mdx",
+        "*.txt",
+        "*.rst",
+        "*.adoc",
+        "*.org",
+        "*.py",
+        "*.pyi",
+        "*.rs",
+        "*.ts",
+        "*.tsx",
+        "*.js",
+        "*.jsx",
+        "*.mjs",
+        "*.cjs",
+        "*.go",
+        "*.java",
+        "*.kt",
+        "*.kts",
+        "*.c",
+        "*.h",
+        "*.cpp",
+        "*.hpp",
+        "*.cc",
+        "*.cs",
+        "*.rb",
+        "*.php",
+        "*.swift",
+        "*.scala",
+        "*.lua",
+        "*.r",
+        "*.R",
+        "*.sh",
+        "*.bash",
+        "*.zsh",
+        "*.sql",
+        "*.graphql",
+        "*.proto",
+        "*.yaml",
+        "*.yml",
+        "*.toml",
+        "*.json",
+        "*.jsonl",
+        "*.xml",
+        "*.html",
+        "*.css",
+        "*.scss",
+        "*.tex",
+        "*.bib",
+        "*.pas",
+        "*.dpr",
+        "*.f90",
+        "*.sol",
+        "*.dtd",
+    )
     excluded_patterns: tuple[str, ...] = (".*", "*/.*", "__pycache__/*")
+    json_keys_whitelist: tuple[str, ...] = ("*",)
+    json_keys_blacklist: tuple[str, ...] = ()
     chunk_size: int = 1200
     chunk_overlap: int = 100
     min_chunk_size: int = 50
@@ -55,9 +112,7 @@ class YawConfig:
     embedding_model: str = "embeddinggemma-300m-GGUF"
     embedding_task_mode: str = "distinct-titled"
     extraction_model: str = "Qwen3-4B-Instruct-2507-GGUF"
-    qa_model: str = "Mistral-7B-Instruct-v0.3-Hybrid"
-    execution_mode: Literal["direct", "rlm"] = "direct"
-    qa_mode: Literal["cot", "rlm"] = "cot"
+    qa_model: str = "Qwen3-4B-Instruct-2507-GGUF"
     enable_gbnf: bool = True
     gbnf_max_entities: int | None = None
     gbnf_max_triples: int | None = None
@@ -66,11 +121,14 @@ class YawConfig:
 
     # Graph & PPR settings
     linking_top_k: int = 8
-    retrieval_top_k: int = 5
+    retrieval_top_k: int = 10
     damping: float = 0.5
+
     synonymy_threshold: float = 0.8
     synonymy_top_k: int = 100
     embed_batch_size: int = 64
+    max_context_chars: int = 24000
+    max_ast_expansion_hops: int = 1
 
     # Runtime & HTTP transport settings
     queue_maxsize: int = 32
@@ -80,7 +138,7 @@ class YawConfig:
 
     # Prompt optimization settings ([optimization] in yaw.toml)
     optimize_datasets: tuple[str, ...] = ("2wikimultihopqa",)
-    optimize_mode: Literal["miprov2", "gepa", "hybrid"] = "gepa"
+    optimize_mode: Literal["miprov2", "gepa", "hybrid"] = "hybrid"
     optimize_max_queries: int = 20
     optimize_train_queries: int = 7
     optimize_query_offset: int = 0
@@ -99,12 +157,6 @@ class YawConfig:
             raise YawRuntimeError("INVALID_INPUT", "queue_maxsize must be >= 1")
         if self.chunk_size < 1:
             raise YawRuntimeError("INVALID_INPUT", "chunk_size must be >= 1")
-        if self.execution_mode not in ("direct", "rlm"):
-            raise YawRuntimeError(
-                "INVALID_INPUT", f"Unsupported execution_mode: {self.execution_mode!r}"
-            )
-        if self.qa_mode not in ("cot", "rlm"):
-            raise YawRuntimeError("INVALID_INPUT", f"Unsupported qa_mode: {self.qa_mode!r}")
         if self.optimize_mode not in ("miprov2", "gepa", "hybrid"):
             raise YawRuntimeError(
                 "INVALID_INPUT", f"Unsupported optimize_mode: {self.optimize_mode!r}"
@@ -121,6 +173,23 @@ class YawConfig:
         else:
             ds_tuple = ("2wikimultihopqa",)
         object.__setattr__(self, "optimize_datasets", ds_tuple or ("2wikimultihopqa",))
+
+        for j_attr, j_default in (
+            ("json_keys_whitelist", ("*",)),
+            ("json_keys_blacklist", ()),
+        ):
+            raw_j = getattr(self, j_attr)
+            if isinstance(raw_j, str):
+                j_tuple = tuple(p.strip() for p in raw_j.split(",") if p.strip())
+            elif isinstance(raw_j, (list, tuple)):
+                j_tuple = tuple(str(p).strip() for p in raw_j if str(p).strip())
+            else:
+                j_tuple = j_default
+            object.__setattr__(
+                self,
+                j_attr,
+                j_tuple if j_attr == "json_keys_blacklist" else (j_tuple or j_default),
+            )
 
     def for_optimization(self, datestamp: str | None = None) -> "YawConfig":
         """Derive an isolated configuration for prompt optimization using *_optimize_<datestamp>.* paths."""
@@ -161,6 +230,8 @@ class YawConfig:
             "corpus_root": Path(self.corpus_root).as_posix() if self.corpus_root else "",
             "included_patterns": list(self.included_patterns),
             "excluded_patterns": list(self.excluded_patterns),
+            "json_keys_whitelist": list(self.json_keys_whitelist),
+            "json_keys_blacklist": list(self.json_keys_blacklist),
             "chunk_size": self.chunk_size,
             "chunk_overlap": self.chunk_overlap,
             "min_chunk_size": self.min_chunk_size,
@@ -168,7 +239,6 @@ class YawConfig:
             "embedding_task_mode": self.embedding_task_mode,
             "extraction_model": self.extraction_model,
             "qa_model": self.qa_model,
-            "execution_mode": self.execution_mode,
             "synonymy_threshold": self.synonymy_threshold,
             "damping": self.damping,
         }
@@ -195,6 +265,8 @@ _FIELD_TO_SECTION: dict[str, str] = {
     "compiled_program_path": "paths",
     "included_patterns": "ingestion",
     "excluded_patterns": "ingestion",
+    "json_keys_whitelist": "ingestion",
+    "json_keys_blacklist": "ingestion",
     "chunk_size": "ingestion",
     "chunk_overlap": "ingestion",
     "min_chunk_size": "ingestion",
@@ -206,8 +278,6 @@ _FIELD_TO_SECTION: dict[str, str] = {
     "embedding_task_mode": "inference",
     "extraction_model": "inference",
     "qa_model": "inference",
-    "execution_mode": "inference",
-    "qa_mode": "inference",
     "enable_gbnf": "inference",
     "gbnf_max_entities": "inference",
     "gbnf_max_triples": "inference",
@@ -219,6 +289,8 @@ _FIELD_TO_SECTION: dict[str, str] = {
     "synonymy_threshold": "graph",
     "synonymy_top_k": "graph",
     "embed_batch_size": "graph",
+    "max_context_chars": "graph",
+    "max_ast_expansion_hops": "graph",
     "queue_maxsize": "runtime",
     "http_host": "runtime",
     "http_port": "runtime",

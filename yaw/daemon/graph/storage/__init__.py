@@ -6,6 +6,8 @@ from typing import Any
 # Single source of truth: only these symbols are exposed as the public package contract.
 _PUBLIC_API: dict[str, str] = {
     # Database lifecycle & schema
+    "ManagedConnection": ".db",
+    "open_managed_yaw_db": ".db",
     "open_yaw_db": ".db",
     "initialize_schema": ".db",
     # Vector serialization & bounded SQL cosine KNN
@@ -19,6 +21,7 @@ _PUBLIC_API: dict[str, str] = {
     "search_fact_vectors_knn": ".db",
     "get_entity_vectors": ".db",
     "find_entity_synonym_candidates": ".db",
+    "find_entity_disambiguation_candidates": ".db",
     # Chunk metadata & Contentless FTS5 lexical search
     "upsert_chunk_pointers": ".db",
     "get_chunk_pointer": ".db",
@@ -29,21 +32,37 @@ _PUBLIC_API: dict[str, str] = {
     # OpenIE checkpoint cache
     "get_openie_checkpoints": ".db",
     "save_openie_checkpoints": ".db",
-    # Graph nodes, edges & provenance
+    # Graph nodes, SKOS labels, edges & provenance
     "upsert_entities": ".db",
+    "upsert_entity_labels": ".db",
+    "get_entities_by_label_norm": ".db",
+    "resolve_entity_labels": ".db",
+    "merge_entities": ".db",
     "upsert_facts": ".db",
     "upsert_edges_with_sources": ".db",
+    "upsert_semantic_edges": ".db",
     "upsert_synonymy_edges": ".db",
     "get_existing_ids": ".db",
     "get_facts_by_ids": ".db",
+    "get_facts_with_meta_by_ids": ".db",
+    "inspect_focus_node": ".db",
     "get_entity_doc_frequencies": ".db",
     "get_graph_counts": ".db",
     "get_meta": ".db",
     "set_meta": ".db",
     "load_graph_topology": ".db",
+    # Closed-world SQL SHACL linter & W3C Turtle serializer
+    "lint_graph_shacl": ".db",
+    "serialize_graph_turtle": ".db",
     # Atomic cascading chunk deletion
     "delete_chunks": ".db",
-    # 1-Indexed disk line hydration
+    # 1-Indexed disk line hydration & AST dehydration
+    "CoalescedSpan": ".hydration",
+    "MutableSpan": ".hydration",
+    "coalesce_chunk_spans": ".hydration",
+    "coalesce_spans": ".hydration",
+    "dehydrate_passage_ast": ".hydration",
+    "hydrate_budgeted_passages": ".hydration",
     "hydrate_chunk_pointer": ".hydration",
     "hydrate_passages": ".hydration",
     "make_chunk_hydrator": ".hydration",
