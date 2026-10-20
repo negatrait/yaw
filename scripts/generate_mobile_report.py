@@ -835,9 +835,9 @@ def generate_graph_projection_svg(dest: Path, sandbox: dict[str, Any]) -> dict[s
     for name, cnt in raw_counts.items():
         canon_counts[canonical_map.get(name, name)] += cnt
 
-    edge_set: set[tuple[str, str]] = set()
+    edge_pred_map: dict[tuple[str, str], str] = {}
+    edge_is_contrast: dict[tuple[str, str], bool] = {}
     contrastive_nodes: set[str] = set()
-    contrastive_edges: set[tuple[str, str]] = set()
     contrastive_triples_list: list[tuple[str, str, str]] = []
 
     for s, p, o, _cid in triples_raw:
@@ -846,43 +846,52 @@ def generate_graph_projection_svg(dest: Path, sandbox: dict[str, Any]) -> dict[s
         if cs != co:
             is_c = any(kw in p.lower() for kw in contrastive_keywords)
             edge_key = tuple(sorted([cs, co]))
-            edge_set.add(edge_key)
+            if edge_key not in edge_pred_map or is_c:
+                edge_pred_map[edge_key] = p
+                edge_is_contrast[edge_key] = is_c
             if is_c:
                 contrastive_nodes.add(cs)
                 contrastive_nodes.add(co)
-                contrastive_edges.add(edge_key)
                 if (cs, p, co) not in contrastive_triples_list:
                     contrastive_triples_list.append((cs, p, co))
 
     degrees: Counter[str] = Counter()
-    for u, v in edge_set:
+    for u, v in edge_pred_map:
         degrees[u] += 1
         degrees[v] += 1
 
-    # In Obsidian, the graph includes connected entities and contrastive nodes
-    # Filter to nodes with meaningful structural presence (degree >= 3 or contrastive)
-    active_node_set: set[str] = set(contrastive_nodes)
-    for node, deg in degrees.items():
-        if deg >= 3:
-            active_node_set.add(node)
+    # Obsidian-style graph composition:
+    # Priority 1: All contrastive nodes & edges
+    active_edges_set = {e for e, is_c in edge_is_contrast.items() if is_c}
+    active_nodes = set(contrastive_nodes)
 
-    # Cap if corpus grows extremely large to maintain clean rendering & performance
-    if len(active_node_set) > 220:
-        active_node_set = set(contrastive_nodes)
-        for node, _deg in degrees.most_common(200):
-            active_node_set.add(node)
+    # Priority 2: Prominent hubs
+    top_hubs = [n for n, _ in degrees.most_common(45)]
+    for h in top_hubs:
+        active_nodes.add(h)
 
-    node_list = sorted(list(active_node_set), key=lambda x: degrees[x], reverse=True)
+    # Priority 3: Radiating leaf and neighbor connections from hubs (giving starburst structure)
+    for (u, v), _p in edge_pred_map.items():
+        if u in active_nodes and v in active_nodes:
+            active_edges_set.add((u, v))
+        elif (u in top_hubs[:30] or v in top_hubs[:30]) and len(active_nodes) < 185:
+            active_nodes.add(u)
+            active_nodes.add(v)
+            active_edges_set.add((u, v))
+
+    node_list = sorted(list(active_nodes), key=lambda x: degrees[x], reverse=True)
     node_idx = {name: i for i, name in enumerate(node_list)}
     N = len(node_list)
 
     if N == 0:
         return {}
 
-    active_edges: list[tuple[int, int, bool]] = []
-    for u, v in edge_set:
+    active_edges: list[tuple[int, int, str, str, str, bool]] = []
+    for u, v in active_edges_set:
         if u in node_idx and v in node_idx:
-            active_edges.append((node_idx[u], node_idx[v], (u, v) in contrastive_edges))
+            p = edge_pred_map.get((u, v), edge_pred_map.get((v, u), "relates to"))
+            is_c = edge_is_contrast.get((u, v), edge_is_contrast.get((v, u), False))
+            active_edges.append((node_idx[u], node_idx[v], u, v, p, is_c))
 
     # Fast Vectorized Force-Directed Physics Simulation (D3-force / Spring-Embedder)
     np.random.seed(42)
@@ -891,12 +900,22 @@ def generate_graph_projection_svg(dest: Path, sandbox: dict[str, Any]) -> dict[s
     pos = np.column_stack([np.cos(angles) * radii_init, np.sin(angles) * radii_init])
     vel = np.zeros_like(pos)
 
-    node_radii = np.array([2.8 + min(9.0, math.sqrt(degrees[name]) * 1.5) for name in node_list])
-    edges_np = np.array([(u, v) for u, v, _ in active_edges], dtype=int) if active_edges else np.zeros((0, 2), dtype=int)
+    # Obsidian pinpoint dots: leaves are tiny 2.0px, major hubs at most 5.8px (ZERO oversized halos)
+    node_radii = np.array([
+        2.0 if degrees[name] <= 1 else (
+            2.8 if degrees[name] <= 3 else min(5.8, 3.2 + math.sqrt(degrees[name]) * 0.5)
+        )
+        for name in node_list
+    ])
+    edges_np = (
+        np.array([(u, v) for u, v, _, _, _, _ in active_edges], dtype=int)
+        if active_edges
+        else np.zeros((0, 2), dtype=int)
+    )
 
     k_rep = 8500.0
     k_spring = 0.038
-    l_0 = 42.0
+    l_0 = 46.0
     k_center = 0.012
 
     for _step in range(130):
@@ -905,7 +924,7 @@ def generate_graph_projection_svg(dest: Path, sandbox: dict[str, Any]) -> dict[s
         d = np.sqrt(d2)
 
         f_rep_mag = k_rep / (d2 * d)
-        min_d = node_radii[:, None] + node_radii[None, :] + 9.0
+        min_d = node_radii[:, None] + node_radii[None, :] + 14.0
         overlap_mask = d < min_d
         f_rep_mag[overlap_mask] += (min_d[overlap_mask] - d[overlap_mask]) * 0.55 / d[overlap_mask]
         np.fill_diagonal(f_rep_mag, 0.0)
@@ -933,25 +952,40 @@ def generate_graph_projection_svg(dest: Path, sandbox: dict[str, Any]) -> dict[s
     min_y, max_y = float(pos[:, 1].min()), float(pos[:, 1].max())
 
     pad_x1, pad_x2 = 65.0, 875.0
-    pad_y1, pad_y2 = 110.0, 650.0
+    pad_y1, pad_y2 = 120.0, 650.0
     sx = (pad_x2 - pad_x1) / max(1.0, max_x - min_x)
     sy = (pad_y2 - pad_y1) / max(1.0, max_y - min_y)
 
     coords = np.column_stack([pad_x1 + (pos[:, 0] - min_x) * sx, pad_y1 + (pos[:, 1] - min_y) * sy])
 
-    # Obsidian-style Rendering: simple lines and dots
+    # Obsidian-style Rendering: simple lines and pinpoint dots with visible predicate edges
     lines_svg: list[str] = []
-    for u, v, is_c in active_edges:
+    edge_labels_svg: list[str] = []
+
+    for u, v, u_name, v_name, p, is_c in active_edges:
         x1, y1 = coords[u]
         x2, y2 = coords[v]
+        mx = (x1 + x2) / 2.0
+        my = (y1 + y2) / 2.0
+        dist = math.hypot(x2 - x1, y2 - y1)
+        esc_title = f"{html.escape(u_name)} &mdash;[{html.escape(p)}]&rarr; {html.escape(v_name)}"
+
         if is_c:
             lines_svg.append(
-                f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" stroke="#f43f5e" stroke-opacity="0.8" stroke-width="1.4" stroke-dasharray="4,3"/>'
+                f'<g><line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" stroke="#f43f5e" stroke-opacity="0.95" stroke-width="1.8" stroke-dasharray="4,2"><title>{esc_title}</title></line></g>'
+            )
+            pred_label = f"≠ {p}" if not p.startswith("≠") else p
+            edge_labels_svg.append(
+                f'<text x="{mx:.1f}" y="{my - 3:.1f}" fill="#fda4af" font-size="7.5" font-weight="700" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif" paint-order="stroke" stroke="#070b14" stroke-width="3px" stroke-linejoin="round">{html.escape(pred_label)}</text>'
             )
         else:
             lines_svg.append(
-                f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" stroke="#334155" stroke-opacity="0.55" stroke-width="0.9"/>'
+                f'<g><line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" stroke="#94a3b8" stroke-opacity="0.75" stroke-width="1.15"><title>{esc_title}</title></line></g>'
             )
+            if dist >= 55.0 and len(p) <= 18:
+                edge_labels_svg.append(
+                    f'<text x="{mx:.1f}" y="{my - 2:.1f}" fill="#94a3b8" font-size="6.5" font-weight="500" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif" paint-order="stroke" stroke="#070b14" stroke-width="2.5px" stroke-linejoin="round">{html.escape(p)}</text>'
+                )
 
     dots_svg: list[str] = []
     labels_svg: list[str] = []
@@ -964,24 +998,26 @@ def generate_graph_projection_svg(dest: Path, sandbox: dict[str, Any]) -> dict[s
 
         if is_c:
             dot_col = "#f43f5e"
-            halo = f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{r + 3.0:.1f}" fill="#f43f5e" fill-opacity="0.2"/>'
         elif deg >= 6:
             dot_col = "#38bdf8"
-            halo = f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{r + 2.5:.1f}" fill="#38bdf8" fill-opacity="0.15"/>'
+        elif deg >= 2:
+            dot_col = "#818cf8"
         else:
             dot_col = "#64748b"
-            halo = ""
 
-        dots_svg.append(f'{halo}<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{r:.1f}" fill="{dot_col}"/>')
+        esc_name = html.escape(name)
+        dots_svg.append(
+            f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{r:.1f}" fill="{dot_col}"><title>{esc_name} (degree: {deg})</title></circle>'
+        )
 
         # Discreet Obsidian-style labels on prominent/contrastive nodes
-        if deg >= 4 or is_c or r >= 4.8:
-            disp = name if len(name) <= 24 else f"{name[:22]}…"
+        if deg >= 4 or is_c or r >= 4.2:
+            disp = name if len(name) <= 22 else f"{name[:20]}…"
             labels_svg.append(
-                f'<text x="{cx + r + 3.5:.1f}" y="{cy + 2.8:.1f}" fill="#cbd5e1" font-size="7.8" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif" paint-order="stroke" stroke="#070b14" stroke-width="2.5px" stroke-linejoin="round">{html.escape(disp)}</text>'
+                f'<text x="{cx + r + 3.0:.1f}" y="{cy + 2.5:.1f}" fill="#cbd5e1" font-size="7.5" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif" paint-order="stroke" stroke="#070b14" stroke-width="2.5px" stroke-linejoin="round">{html.escape(disp)}</text>'
             )
 
-    contrast_count = len([e for e in active_edges if e[2]])
+    contrast_count = len([e for e in active_edges if e[5]])
 
     svg = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 720" width="940" height="720">
   <defs>
@@ -1002,7 +1038,7 @@ def generate_graph_projection_svg(dest: Path, sandbox: dict[str, Any]) -> dict[s
   <!-- Header Card -->
   <g transform="translate(32, 22)">
     <text x="0" y="16" fill="#f8fafc" font-size="16" font-weight="800" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Knowledge Graph Network (Obsidian-Style Graph View)</text>
-    <text x="0" y="34" fill="#94a3b8" font-size="11" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Force-directed physics simulation | Node radius ~ corpus frequency &amp; degree | Simple connections &amp; dots</text>
+    <text x="0" y="34" fill="#94a3b8" font-size="11" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Force-directed physics simulation | Small pinpoint dots (r=2-6px) | Clear predicate edge links &amp; labels</text>
 
     <rect x="530" y="0" width="346" height="34" rx="6" fill="#0f172a" stroke="#1e293b" stroke-width="1.2"/>
     <text x="703" y="21" fill="#38bdf8" font-size="11" font-weight="700" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">{N} Entities • {len(active_edges)} Connections • {contrast_count} Contrastive Bounds</text>
@@ -1012,36 +1048,39 @@ def generate_graph_projection_svg(dest: Path, sandbox: dict[str, Any]) -> dict[s
   <g transform="translate(32, 68)">
     <rect width="876" height="30" rx="5" fill="#0b1120" stroke="#1e293b" stroke-width="1"/>
 
-    <circle cx="20" cy="15" r="5" fill="#38bdf8"/>
-    <text x="32" y="19" fill="#cbd5e1" font-size="10" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Core Hub Entities (High Degree)</text>
+    <circle cx="20" cy="15" r="4.8" fill="#38bdf8"/>
+    <text x="32" y="19" fill="#cbd5e1" font-size="10" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Core Hubs (r=4.5-5.8px)</text>
 
-    <circle cx="250" cy="15" r="3.5" fill="#64748b"/>
-    <text x="262" y="19" fill="#cbd5e1" font-size="10" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Connected Domain Entities</text>
+    <circle cx="185" cy="15" r="2.0" fill="#64748b"/>
+    <text x="195" y="19" fill="#cbd5e1" font-size="10" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Leaf Entities (r=2.0px)</text>
 
-    <line x1="470" y1="15" x2="505" y2="15" stroke="#f43f5e" stroke-width="2" stroke-dasharray="4,3"/>
-    <circle cx="512" cy="15" r="5" fill="#f43f5e"/>
-    <text x="525" y="19" fill="#fda4af" font-size="10" font-weight="600" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">owl:differentFrom Contrastive Nodes &amp; Bounds (≠)</text>
+    <line x1="330" y1="15" x2="355" y2="15" stroke="#94a3b8" stroke-width="1.2"/>
+    <text x="365" y="19" fill="#cbd5e1" font-size="10" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Predicate Edges (s —[p]→ o)</text>
 
-    <circle cx="810" cy="15" r="2.5" fill="#94a3b8"/>
-    <circle cx="820" cy="15" r="4.5" fill="#94a3b8"/>
-    <circle cx="833" cy="15" r="6.5" fill="#94a3b8"/>
-    <text x="846" y="19" fill="#94a3b8" font-size="10" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">Radius ~ Degree</text>
+    <line x1="565" y1="15" x2="595" y2="15" stroke="#f43f5e" stroke-width="1.8" stroke-dasharray="4,2"/>
+    <circle cx="602" cy="15" r="3.5" fill="#f43f5e"/>
+    <text x="614" y="19" fill="#fda4af" font-size="10" font-weight="600" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">owl:differentFrom Contrastive Bounds (≠ {{p}})</text>
   </g>
 
   <!-- Graph Canvas Area -->
   <rect x="32" y="106" width="876" height="566" rx="8" fill="#050811" fill-opacity="0.6" stroke="#1e293b" stroke-width="1.2"/>
 
-  <!-- Layer 1: Simple Connection Lines -->
+  <!-- Layer 1: Visible Connection Lines (Predicate Edges) -->
   <g>
     {''.join(lines_svg)}
   </g>
 
-  <!-- Layer 2: Node Dots -->
+  <!-- Layer 2: Edge Predicate Labels -->
+  <g>
+    {''.join(edge_labels_svg)}
+  </g>
+
+  <!-- Layer 3: Pinpoint Node Dots -->
   <g>
     {''.join(dots_svg)}
   </g>
 
-  <!-- Layer 3: Discreet Labels -->
+  <!-- Layer 4: Discreet Node Labels -->
   <g>
     {''.join(labels_svg)}
   </g>
