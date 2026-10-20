@@ -143,6 +143,7 @@ class YawConfig:
     optimize_train_queries: int = 7
     optimize_query_offset: int = 0
     optimize_auto: Literal["light", "medium", "heavy"] = "light"
+    optimize_sleep_seconds: float = 0.0
 
     def __post_init__(self) -> None:
         ws = Path(self.workspace_root).resolve()
@@ -165,6 +166,11 @@ class YawConfig:
             raise YawRuntimeError(
                 "INVALID_INPUT", f"Unsupported optimize_auto: {self.optimize_auto!r}"
             )
+        object.__setattr__(
+            self,
+            "optimize_sleep_seconds",
+            max(0.0, float(self.optimize_sleep_seconds or 0.0)),
+        )
         raw_ds = self.optimize_datasets
         if isinstance(raw_ds, str):
             ds_tuple = tuple(p.strip() for p in raw_ds.split(",") if p.strip())
@@ -253,6 +259,8 @@ _OPTIMIZATION_KEY_ALIASES: dict[str, str] = {
     "train_queries": "optimize_train_queries",
     "query_offset": "optimize_query_offset",
     "auto": "optimize_auto",
+    "sleep_seconds": "optimize_sleep_seconds",
+    "sleep": "optimize_sleep_seconds",
 }
 
 _FIELD_TO_SECTION: dict[str, str] = {
@@ -301,6 +309,7 @@ _FIELD_TO_SECTION: dict[str, str] = {
     "optimize_train_queries": "optimization",
     "optimize_query_offset": "optimization",
     "optimize_auto": "optimization",
+    "optimize_sleep_seconds": "optimization",
 }
 
 

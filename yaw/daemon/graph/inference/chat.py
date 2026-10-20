@@ -1,6 +1,8 @@
+from contextvars import ContextVar
 import logging
 import os
 from pathlib import Path
+import time
 from typing import Any
 
 import dspy
@@ -13,12 +15,27 @@ for _logger_name in ("LiteLLM", "LiteLLM Router", "LiteLLM Proxy", "litellm", "h
 if hasattr(dspy, "disable_litellm_logging"):
     dspy.disable_litellm_logging()
 
+_YAW_SLEEP_SECONDS: ContextVar[float] = ContextVar("yaw_sleep_seconds", default=0.0)
+
+
+def get_yaw_sleep_seconds() -> float:
+    """Return the currently configured sleep duration injected between inference calls."""
+    return _YAW_SLEEP_SECONDS.get()
+
+
+def set_yaw_sleep_seconds(seconds: float) -> None:
+    """Set the sleep duration injected between inference calls (0.0 to disable)."""
+    _YAW_SLEEP_SECONDS.set(max(0.0, float(seconds or 0.0)))
+
+
 __all__ = [
     "YawDSPyLM",
     "configure_yaw_dspy_cache",
     "create_dspy_lm",
     "create_dspy_rlm_pair",
+    "get_yaw_sleep_seconds",
     "lm_supports_gbnf",
+    "set_yaw_sleep_seconds",
 ]
 
 
@@ -44,7 +61,11 @@ class YawDSPyLM(dspy.LM):
                 },
                 *messages[2:],
             ]
-        return super().__call__(prompt=prompt, messages=messages, **kwargs)
+        res = super().__call__(prompt=prompt, messages=messages, **kwargs)
+        sleep_sec = get_yaw_sleep_seconds()
+        if sleep_sec > 0:
+            time.sleep(sleep_sec)
+        return res
 
     def copy(self, **kwargs: Any) -> Any:
         copied = super().copy(**kwargs)

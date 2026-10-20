@@ -1295,6 +1295,12 @@ class YawGraphEngine:
         if not chunks:
             return 0
 
+        opt_sleep = getattr(self.config, "optimize_sleep_seconds", 0.0)
+        if opt_sleep > 0:
+            from .inference.chat import set_yaw_sleep_seconds
+
+            set_yaw_sleep_seconds(opt_sleep)
+
         active_program = program if program is not None else self.program
         with self._lock:
             self._bind_program_hooks(active_program)
@@ -2693,10 +2699,16 @@ class YawGraphEngine:
         num_trials: int | None = None,
         progress_callback: Callable[[str], None] | None = None,
         opt_chunks: Sequence[tuple[ChunkPointer, str]] | None = None,
+        sleep_seconds: float = 0.0,
     ) -> HippoRAGProgram:
         """Evolve DSPy prompts via MIPROv2, GEPA, or two-phase hybrid with composite Sizecoding feedback."""
         if not trainset:
             return self.program
+
+        eff_sleep = sleep_seconds if sleep_seconds > 0 else getattr(self.config, "optimize_sleep_seconds", 0.0)
+        from .inference.chat import set_yaw_sleep_seconds
+
+        set_yaw_sleep_seconds(eff_sleep)
 
         if opt_chunks is not None:
             existing_cids = {p.chunk_id for p, _ in self._opt_chunks_pool}

@@ -435,6 +435,13 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
             vectors = np.asarray(raw, dtype=np.float32)
             if vectors.ndim == 1:
                 vectors = vectors.reshape(1, -1)
+            from .chat import get_yaw_sleep_seconds
+
+            sleep_sec = get_yaw_sleep_seconds()
+            if sleep_sec > 0:
+                import time
+
+                time.sleep(sleep_sec)
             return vectors
         except Exception as exc:
             if not is_batch_overflow_error(exc):
@@ -479,6 +486,13 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
             vectors = np.asarray(raw, dtype=np.float32)
             if vectors.ndim == 1:
                 vectors = vectors.reshape(1, -1)
+            from .chat import get_yaw_sleep_seconds
+
+            sleep_sec = get_yaw_sleep_seconds()
+            if sleep_sec > 0:
+                import time
+
+                time.sleep(sleep_sec)
             return vectors
         except Exception as exc:
             if not is_batch_overflow_error(exc):

@@ -187,6 +187,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Explicit number of instruction/fewshot candidates per predictor",
     )
+    p_opt_common.add_argument(
+        "--sleep",
+        dest="sleep_seconds",
+        type=float,
+        default=None,
+        help="Sleep pause in seconds between LLM/embedding calls to manage thermal duty cycles (defaults to yaw.toml [optimization].sleep_seconds, default 0.0)",
+    )
 
     p_dspy = domain_subparsers.add_parser(
         "dspy", help="DSPy prompt optimization and program management"
@@ -846,6 +853,9 @@ def handle_dspy_optimize(
 
     # Resolution order for sandbox: always isolate prompt compilation
     opt_config = config.for_optimization()
+    raw_sleep = getattr(args, "sleep_seconds", None)
+    sleep_seconds = float(raw_sleep) if raw_sleep is not None else float(config.optimize_sleep_seconds or 0.0)
+    object.__setattr__(opt_config, "optimize_sleep_seconds", sleep_seconds)
 
     runtime = YawRuntime(opt_config, program=program, embedder=embedder, auto_poll=False)
     runtime.start(sync_on_start=False)
@@ -862,6 +872,7 @@ def handle_dspy_optimize(
             auto=auto,
             num_candidates=num_candidates,
             num_trials=num_trials,
+            sleep_seconds=sleep_seconds,
             corpus_docs=corpus_docs,
             progress_callback=_cli_progress,
         )

@@ -760,6 +760,7 @@ class YawRuntime:
         auto: Literal["light", "medium", "heavy"] | None = None,
         num_candidates: int | None = None,
         num_trials: int | None = None,
+        sleep_seconds: float | None = None,
         corpus_docs: Sequence[str] | None = None,
         progress_callback: Callable[[str], None] | None = None,
     ) -> Path:
@@ -831,6 +832,11 @@ class YawRuntime:
                 )
 
             _progress(f"optimizing: starting {mode} (auto={resolved_auto}) evolution")
+            eff_sleep = (
+                sleep_seconds
+                if sleep_seconds is not None
+                else getattr(self.config, "optimize_sleep_seconds", 0.0)
+            )
             self.engine.evolve_prompts(
                 trainset=trainset,
                 valset=valset,
@@ -843,6 +849,7 @@ class YawRuntime:
                 num_trials=num_trials,
                 progress_callback=_progress,
                 opt_chunks=opt_chunks,
+                sleep_seconds=eff_sleep,
             )
             final_stats = self.engine.get_stats(self.config.config_fingerprint())
             with self._state_lock:
