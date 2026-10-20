@@ -183,6 +183,7 @@ class YawRuntime:
             synonymy_top_k=self.config.synonymy_top_k,
             embed_batch_size=self.config.embed_batch_size,
         )
+        self.engine.config = self.config
         self.ingestor = CorpusIngestor(
             corpus_root=self.config.corpus_root,
             state_dir=self.config.state_dir,

@@ -126,6 +126,7 @@ class YawGraphEngine:
         self.conn: sqlite3.Connection = self.managed_conn._conn
         self.program = program
         self.embedder = embedder
+        self.config: Any = None
 
         self.max_context_chars = max_context_chars
         self.max_ast_expansion_hops = max_ast_expansion_hops
@@ -1295,7 +1296,7 @@ class YawGraphEngine:
         if not chunks:
             return 0
 
-        opt_sleep = getattr(self.config, "optimize_sleep_seconds", 0.0)
+        opt_sleep = getattr(getattr(self, "config", None), "optimize_sleep_seconds", 0.0)
         if opt_sleep > 0:
             from .inference.chat import set_yaw_sleep_seconds
 
@@ -2705,7 +2706,11 @@ class YawGraphEngine:
         if not trainset:
             return self.program
 
-        eff_sleep = sleep_seconds if sleep_seconds > 0 else getattr(self.config, "optimize_sleep_seconds", 0.0)
+        eff_sleep = (
+            sleep_seconds
+            if sleep_seconds > 0
+            else getattr(getattr(self, "config", None), "optimize_sleep_seconds", 0.0)
+        )
         from .inference.chat import set_yaw_sleep_seconds
 
         set_yaw_sleep_seconds(eff_sleep)
