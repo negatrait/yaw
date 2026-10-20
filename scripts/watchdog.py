@@ -200,25 +200,25 @@ def get_empirical_telemetry_timeseries(
     return samples
 
 
-def _open_snapshot_sqlite(db_path: Path) -> sqlite3.Connection:
-    """Open a read-only WAL-aware SQLite connection, falling back to a snapshot copy if locked."""
-    try:
-        conn = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True, timeout=3.0)
-        conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
-        return conn
-    except Exception:
-        snap_path = db_path.parent / ".telemetry_read_snap.db"
-        shutil.copyfile(db_path, snap_path)
-        for suffix in ("-wal", "-shm"):
-            src_aux = Path(f"{db_path}{suffix}")
-            dst_aux = Path(f"{snap_path}{suffix}")
-            if src_aux.exists():
-                with contextlib.suppress(Exception):
-                    shutil.copyfile(src_aux, dst_aux)
-            elif dst_aux.exists():
-                with contextlib.suppress(Exception):
-                    dst_aux.unlink()
-        return sqlite3.connect(snap_path, timeout=5.0)
+def _open_ro_sqlite(db_path: Path, max_retries: int = 3) -> sqlite3.Connection | None:
+    """Open a read-only WAL-aware SQLite connection with exponential backoff on busy/locked.
+
+    Never creates snapshot copies or filesystem bloat. If locked after retries, returns None
+    so the watchdog aborts cleanly and tries again on the subsequent polling round.
+    """
+    for attempt in range(max_retries):
+        try:
+            conn = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True, timeout=3.0)
+            conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+            return conn
+        except (sqlite3.OperationalError, sqlite3.DatabaseError):
+            if attempt < max_retries - 1:
+                time.sleep(0.5 * (2 ** attempt))
+            else:
+                return None
+        except Exception:
+            return None
+    return None
 
 
 def _parse_db_timestamp(db_path: Path) -> datetime | None:
@@ -268,11 +268,12 @@ def get_active_sandbox_info() -> dict[str, Any]:
     elapsed_sec = (datetime.now(UTC) - start_dt).total_seconds()
     info["elapsed_seconds"] = max(1.0, elapsed_sec)
 
-    snap_cache_file = WORKSPACE_ROOT / "outputs" / "telemetry" / "last_good_sandbox_snapshot.json"
-    snap_cache_file.parent.mkdir(parents=True, exist_ok=True)
+    conn = _open_ro_sqlite(latest_db)
+    if conn is None:
+        info["error"] = "Database is busy or locked; retry-backoff aborted for this round."
+        return info
 
     try:
-        conn = _open_snapshot_sqlite(latest_db)
         for tbl in ["chunks", "entities", "facts", "edges", "openie_chunks"]:
             try:
                 row = conn.execute(f"SELECT count(*) FROM {tbl}").fetchone()
@@ -383,25 +384,6 @@ def get_active_sandbox_info() -> dict[str, Any]:
         conn.close()
     except Exception as exc:
         info["error"] = str(exc)
-
-    if info.get("counts", {}).get("openie_chunks", 0) > 0:
-        with contextlib.suppress(Exception):
-            snap_cache_file.write_text(
-                json.dumps(
-                    {
-                        "counts": info["counts"],
-                        "kg_metrics": info["kg_metrics"],
-                        "timeseries_samples": info["timeseries_samples"],
-                    }
-                ),
-                encoding="utf-8",
-            )
-    elif snap_cache_file.exists():
-        with contextlib.suppress(Exception):
-            cached = json.loads(snap_cache_file.read_text(encoding="utf-8"))
-            info["counts"] = cached.get("counts", info["counts"])
-            info["kg_metrics"] = cached.get("kg_metrics", info["kg_metrics"])
-            info["timeseries_samples"] = cached.get("timeseries_samples", info["timeseries_samples"])
 
     info["lemonade_metrics"] = get_lemonade_server_metrics()
     return info
@@ -1046,8 +1028,10 @@ def generate_graph_projection_svg(dest: Path, sandbox: dict[str, Any]) -> dict[s
         "exclusive",
     ]
 
+    conn = _open_ro_sqlite(db_path)
+    if conn is None:
+        return {}
     try:
-        conn = _open_snapshot_sqlite(db_path)
         rows = conn.execute(
             "SELECT chunk_id, entities_json, triples_json FROM openie_chunks ORDER BY rowid ASC"
         ).fetchall()
