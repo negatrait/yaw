@@ -86,6 +86,121 @@ def get_lemonade_server_metrics() -> dict[str, Any]:
         return {"server_up": False}
 
 
+def get_pipeline_resource_metrics() -> dict[str, Any]:
+    """Measure exact RAM, VRAM, and CPU consumption across Lemonade, llama.cpp, and YAW."""
+    import psutil
+    import subprocess
+
+    pipeline_procs: list[tuple[str, Any]] = []
+    for p in psutil.process_iter(["pid", "name", "cmdline"]):
+        try:
+            name = (p.info["name"] or "").lower()
+            cmdline = " ".join(p.info["cmdline"] or []).lower()
+
+            role = None
+            if "lemonade" in name or "lemonade-server" in cmdline:
+                role = "lemonade"
+            elif "llama-server" in name:
+                role = "llama"
+            elif "yaw" in cmdline or ("python" in name and "yaw" in cmdline):
+                role = "yaw"
+
+            if role:
+                pipeline_procs.append((role, p))
+        except Exception:
+            pass
+
+    t1 = time.time()
+    cpu_t1: dict[int, Any] = {}
+    for role, p in pipeline_procs:
+        try:
+            cpu_t1[p.pid] = p.cpu_times()
+        except Exception:
+            pass
+
+    time.sleep(0.25)
+
+    t2 = time.time()
+    dt = max(1e-4, t2 - t1)
+    num_cpus = psutil.cpu_count() or 1
+
+    yaw_ram = 0
+    llama_ram = 0
+    lemonade_ram = 0
+    yaw_cpu = 0.0
+    llama_cpu = 0.0
+    lemonade_cpu = 0.0
+
+    for role, p in pipeline_procs:
+        try:
+            rss = p.memory_info().rss
+            if role == "lemonade":
+                lemonade_ram += rss
+            elif role == "llama":
+                llama_ram += rss
+            elif role == "yaw":
+                yaw_ram += rss
+
+            if p.pid in cpu_t1:
+                ct2 = p.cpu_times()
+                ct1 = cpu_t1[p.pid]
+                c_used = (ct2.user - ct1.user) + (ct2.system - ct1.system)
+                pct = (c_used / dt) / num_cpus * 100.0
+                if role == "lemonade":
+                    lemonade_cpu += pct
+                elif role == "llama":
+                    llama_cpu += pct
+                elif role == "yaw":
+                    yaw_cpu += pct
+        except Exception:
+            pass
+
+    total_pipe_ram_gb = (yaw_ram + llama_ram + lemonade_ram) / (1024**3)
+    total_pipe_cpu_pct = yaw_cpu + llama_cpu + lemonade_cpu
+
+    vram_used_mb = 0.0
+    vram_total_mb = 8192.0
+    gpu_util_pct = 0.0
+    try:
+        res = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total,utilization.gpu", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            parts = [x.strip() for x in res.stdout.strip().split(",")]
+            if len(parts) >= 2:
+                vram_used_mb = float(parts[0])
+                vram_total_mb = float(parts[1])
+            if len(parts) >= 3:
+                gpu_util_pct = float(parts[2])
+    except Exception:
+        pass
+
+    sys_mem = psutil.virtual_memory()
+    sys_cpu = psutil.cpu_percent()
+
+    return {
+        "pipeline_ram_gb": round(total_pipe_ram_gb, 2),
+        "llama_ram_gb": round(llama_ram / (1024**3), 2),
+        "yaw_ram_gb": round(yaw_ram / (1024**3), 2),
+        "lemonade_ram_mb": round(lemonade_ram / (1024**2), 1),
+        "pipeline_vram_gb": round(vram_used_mb / 1024.0, 2),
+        "total_vram_gb": round(vram_total_mb / 1024.0, 2),
+        "vram_pct": round((vram_used_mb / max(1.0, vram_total_mb)) * 100.0, 1),
+        "pipeline_cpu_pct": round(total_pipe_cpu_pct, 1),
+        "llama_cpu_pct": round(llama_cpu, 1),
+        "yaw_cpu_pct": round(yaw_cpu, 1),
+        "lemonade_cpu_pct": round(lemonade_cpu, 1),
+        "gpu_util_pct": round(gpu_util_pct, 0),
+        "host_ram_used_gb": round(sys_mem.used / (1024**3), 1),
+        "host_ram_total_gb": round(sys_mem.total / (1024**3), 1),
+        "host_cpu_pct": round(sys_cpu, 1),
+    }
+
+
 def get_empirical_telemetry_timeseries(
     start_dt: datetime,
     current_elapsed_sec: float,
@@ -393,6 +508,7 @@ def get_active_sandbox_info() -> dict[str, Any]:
         info["error"] = str(exc)
 
     info["lemonade_metrics"] = get_lemonade_server_metrics()
+    info["pipeline_resources"] = get_pipeline_resource_metrics()
     return info
 
 
@@ -2327,8 +2443,35 @@ def generate_report_markdown(
     lem = sandbox.get("lemonade_metrics", {})
     lem_tps = lem.get("qwen_tps", 0.0)
     lem_ttft_ms = int(lem.get("qwen_ttft_sec", 0.0) * 1000.0)
-    lem_cpu = lem.get("cpu_usage_pct", 0.0)
-    lem_ram = lem.get("memory_used_gb", 0.0)
+
+    res = sandbox.get("pipeline_resources", {})
+    pipe_ram_gb = res.get("pipeline_ram_gb", 0.0)
+    llama_ram_gb = res.get("llama_ram_gb", 0.0)
+    yaw_ram_gb = res.get("yaw_ram_gb", 0.0)
+    lem_ram_mb = res.get("lemonade_ram_mb", 0.0)
+
+    pipe_vram_gb = res.get("pipeline_vram_gb", 0.0)
+    tot_vram_gb = res.get("total_vram_gb", 8.0)
+    vram_pct = res.get("vram_pct", 0.0)
+
+    pipe_cpu = res.get("pipeline_cpu_pct", 0.0)
+    llama_cpu = res.get("llama_cpu_pct", 0.0)
+    yaw_cpu = res.get("yaw_cpu_pct", 0.0)
+    gpu_util = res.get("gpu_util_pct", 0.0)
+
+    host_ram = res.get("host_ram_used_gb", 0.0)
+    host_ram_tot = res.get("host_ram_total_gb", 0.0)
+    host_cpu = res.get("host_cpu_pct", 0.0)
+
+    pipe_ram_str = (
+        f"**`{pipe_ram_gb:.2f} GB` RAM** (llama `{llama_ram_gb:.1f}G`, yaw `{yaw_ram_gb:.1f}G`, lem `{lem_ram_mb:.0f}M`) • "
+        f"**`{pipe_vram_gb:.2f} GB` VRAM** (`{vram_pct:.0f}%` of `{tot_vram_gb:.1f}G`)"
+    )
+    pipe_compute_str = (
+        f"**`{pipe_cpu:.1f}%` CPU** (llama `{llama_cpu:.1f}%`, yaw `{yaw_cpu:.1f}%`) • "
+        f"**`{gpu_util:.0f}%` GPU Util** • Host: `{host_cpu:.0f}%` CPU, `{host_ram:.1f}`/`{host_ram_tot:.1f} GB` RAM"
+    )
+
     kg_output_mb = kg.get("total_output_mb", 0.0)
     kg_output_tok = kg.get("measured_output_tokens", 0)
     kg_avg_tok = kg.get("avg_tokens_per_chunk", 0)
@@ -2433,7 +2576,9 @@ def generate_report_markdown(
 | **Elapsed / Remaining** | **`{int(elapsed_min)}m` (`{elapsed_min / 60.0:.2f}h`)** elapsed • **`~{eta_corpus_str}`** remaining (ETA `~{finish_clock_str} UTC`) |
 | **Throughput** | **`{velocity:.2f}` chunks/m** (`{sec_per_chunk:.1f}s/chunk`) • **`{lem_tps:.1f}` tok/s** (TTFT `{lem_ttft_ms}ms`) |
 | **GPU Thermals** | {gpu_thermals_str} |
-| **Host & Storage** | **`{lem_cpu:.1f}%` CPU** • **`{lem_ram:.1f} GB` RAM** • **`{db_size} MB` DB** (`{kg_output_mb:.2f} MB` JSON, `~{kg_output_tok:,}` tok) |
+| **Pipeline Memory** | {pipe_ram_str} |
+| **Pipeline Compute** | {pipe_compute_str} |
+| **Storage Footprint** | **`{db_size} MB` DB** (`{kg_output_mb:.2f} MB` JSON, `~{kg_output_tok:,}` tok) |
 | **Graph Scale** | **`{uniq_ent:,}` unique entities** (`{total_ent:,}` mentions) • **`{uniq_edges:,}` unique links** (`{total_trips:,}` triples, `{uniq_preds}` predicates) |
 | **Candidate Evals** | {cand_evals_str} |
 
