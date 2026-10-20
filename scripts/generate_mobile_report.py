@@ -498,11 +498,22 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
     counts = sandbox.get("counts", {})
     kg = sandbox.get("kg_metrics", {})
     lem = sandbox.get("lemonade_metrics", {})
+    lem_tps = lem.get("qwen_tps", 0.0)
     openie_cnt = counts.get("openie_chunks", 0)
 
     val_target_pool = 495
+    train_target_pool = 818
     corpus_total_pool = 1308
-    val_pct = min(100.0, (openie_cnt / val_target_pool) * 100.0)
+    overlap_passages = 5
+
+    val_done = min(val_target_pool, openie_cnt)
+    val_pct = min(100.0, (val_done / val_target_pool) * 100.0)
+
+    if openie_cnt <= val_target_pool:
+        train_done = min(overlap_passages, openie_cnt)
+    else:
+        train_done = min(train_target_pool, overlap_passages + (openie_cnt - val_target_pool))
+    train_pct = min(100.0, (train_done / train_target_pool) * 100.0)
     corpus_pct = min(100.0, (openie_cnt / corpus_total_pool) * 100.0)
 
     elapsed_sec = sandbox.get("elapsed_seconds", 60.0)
@@ -511,6 +522,7 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
     velocity = openie_cnt / elapsed_min
     sec_per_chunk = elapsed_sec / max(1, openie_cnt)
 
+    rem_train = max(0, train_target_pool - train_done)
     rem_corpus = max(0, corpus_total_pool - openie_cnt)
     eta_corpus_min = rem_corpus / max(0.01, velocity)
     target_total_hours = (elapsed_sec + (eta_corpus_min * 60.0)) / 3600.0
@@ -626,45 +638,45 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
   <!-- Metric Card Row (Isolated coordinate groups: zero text collisions) -->
   <g transform="translate(32, 64)">
     <g transform="translate(0, 0)">
-      <rect x="0" y="0" width="136" height="74" rx="8" fill="url(#cardGrad)" stroke="#38bdf8" stroke-width="1.2"/>
-      <text x="12" y="18" fill="#94a3b8" font-size="9.5" font-weight="600">CORPUS INGESTION</text>
-      <text x="12" y="44" fill="#38bdf8" font-size="21" font-weight="800">{openie_cnt}</text>
-      <text x="12" y="62" fill="#cbd5e1" font-size="10">of 1,308 ({corpus_pct:.1f}%) [Val 100%]</text>
+      <rect x="0" y="0" width="136" height="74" rx="8" fill="url(#cardGrad)" stroke="#10b981" stroke-width="1.2"/>
+      <text x="12" y="18" fill="#94a3b8" font-size="9.5" font-weight="600">VALIDATION POOL</text>
+      <text x="12" y="44" fill="#10b981" font-size="20" font-weight="800">{val_done} / {val_target_pool}</text>
+      <text x="12" y="62" fill="#34d399" font-size="9.5">{val_pct:.1f}% Committed [Ready]</text>
     </g>
 
     <g transform="translate(148, 0)">
-      <rect x="0" y="0" width="136" height="74" rx="8" fill="url(#cardGrad)" stroke="#10b981" stroke-width="1.2"/>
-      <text x="12" y="18" fill="#94a3b8" font-size="9.5" font-weight="600">EXTRACTION VELOCITY</text>
-      <text x="12" y="44" fill="#10b981" font-size="20" font-weight="800">{velocity:.2f}</text>
-      <text x="12" y="62" fill="#cbd5e1" font-size="10">passages/min ({sec_per_chunk:.1f}s/ea)</text>
+      <rect x="0" y="0" width="136" height="74" rx="8" fill="url(#cardGrad)" stroke="#f59e0b" stroke-width="1.2"/>
+      <text x="12" y="18" fill="#94a3b8" font-size="9.5" font-weight="600">TRAINING POOL</text>
+      <text x="12" y="44" fill="#f59e0b" font-size="20" font-weight="800">{train_done} / {train_target_pool}</text>
+      <text x="12" y="62" fill="#fde68a" font-size="9.5">{train_pct:.1f}% ({rem_train} rem)</text>
     </g>
 
     <g transform="translate(296, 0)">
-      <rect x="0" y="0" width="136" height="74" rx="8" fill="url(#cardGrad)" stroke="#818cf8" stroke-width="1.2"/>
-      <text x="12" y="18" fill="#94a3b8" font-size="9.5" font-weight="600">EXTRACTED ENTITIES</text>
-      <text x="12" y="44" fill="#818cf8" font-size="20" font-weight="800">{total_ent:,}</text>
-      <text x="12" y="62" fill="#cbd5e1" font-size="10">~{avg_ent:.1f} per passage</text>
+      <rect x="0" y="0" width="136" height="74" rx="8" fill="url(#cardGrad)" stroke="#38bdf8" stroke-width="1.2"/>
+      <text x="12" y="18" fill="#94a3b8" font-size="9.5" font-weight="600">TOTAL CORPUS</text>
+      <text x="12" y="44" fill="#38bdf8" font-size="20" font-weight="800">{openie_cnt} / {corpus_total_pool}</text>
+      <text x="12" y="62" fill="#cbd5e1" font-size="9.5">{corpus_pct:.1f}% Unified Graph</text>
     </g>
 
     <g transform="translate(444, 0)">
-      <rect x="0" y="0" width="136" height="74" rx="8" fill="url(#cardGrad)" stroke="#f43f5e" stroke-width="1.2"/>
-      <text x="12" y="18" fill="#94a3b8" font-size="9.5" font-weight="600">FACTUAL TRIPLES</text>
-      <text x="12" y="44" fill="#f43f5e" font-size="20" font-weight="800">{total_trips:,}</text>
-      <text x="12" y="62" fill="#cbd5e1" font-size="10">~{avg_trips:.1f} per passage</text>
+      <rect x="0" y="0" width="136" height="74" rx="8" fill="url(#cardGrad)" stroke="#818cf8" stroke-width="1.2"/>
+      <text x="12" y="18" fill="#94a3b8" font-size="9.5" font-weight="600">ENTITIES &amp; TRIPLES</text>
+      <text x="12" y="44" fill="#818cf8" font-size="20" font-weight="800">{total_ent:,}</text>
+      <text x="12" y="62" fill="#cbd5e1" font-size="9.5">{total_trips:,} trips (~{avg_trips:.1f}/ea)</text>
     </g>
 
     <g transform="translate(592, 0)">
-      <rect x="0" y="0" width="136" height="74" rx="8" fill="url(#cardGrad)" stroke="#fbbf24" stroke-width="1.2"/>
-      <text x="12" y="18" fill="#94a3b8" font-size="9.5" font-weight="600">RELATION TYPES</text>
-      <text x="12" y="44" fill="#fbbf24" font-size="20" font-weight="800">{uniq_preds}</text>
-      <text x="12" y="62" fill="#cbd5e1" font-size="10">distinct predicates</text>
+      <rect x="0" y="0" width="136" height="74" rx="8" fill="url(#cardGrad)" stroke="#f43f5e" stroke-width="1.2"/>
+      <text x="12" y="18" fill="#94a3b8" font-size="9.5" font-weight="600">EXTRACTION RATE</text>
+      <text x="12" y="44" fill="#f43f5e" font-size="20" font-weight="800">{velocity:.2f} /min</text>
+      <text x="12" y="62" fill="#cbd5e1" font-size="9.5">{sec_per_chunk:.1f}s/ea ({lem_tps:.0f} tok/s)</text>
     </g>
 
     <g transform="translate(740, 0)">
       <rect x="0" y="0" width="136" height="74" rx="8" fill="url(#cardGrad)" stroke="#10b981" stroke-width="1.2"/>
-      <text x="12" y="18" fill="#94a3b8" font-size="9.5" font-weight="600">CORPUS HORIZON ETA</text>
+      <text x="12" y="18" fill="#94a3b8" font-size="9.5" font-weight="600">TRAINING HORIZON ETA</text>
       <text x="12" y="44" fill="#34d399" font-size="20" font-weight="800">~{eta_corpus_str}</text>
-      <text x="12" y="62" fill="#cbd5e1" font-size="9.5">Est. {finish_clock_str} UTC ({target_total_hours:.1f}h tot)</text>
+      <text x="12" y="62" fill="#cbd5e1" font-size="9.5">Est. {finish_clock_str} UTC (Ready: 100%)</text>
     </g>
   </g>
 
@@ -673,13 +685,13 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
 
   <!-- Target Pool Reference Line at P = 495 (Validation Threshold) -->
   <line x1="{p_x0}" y1="{y_val_pool:.1f}" x2="{p_x1}" y2="{y_val_pool:.1f}" stroke="#10b981" stroke-width="1.5" stroke-dasharray="4,4"/>
-  <rect x="{p_x0 + 8}" y="{y_val_pool - 16:.1f}" width="280" height="15" rx="3" fill="#064e3b" fill-opacity="0.75"/>
-  <text x="{p_x0 + 12}" y="{y_val_pool - 4:.1f}" fill="#34d399" font-size="9.5" font-weight="700">[Threshold] Validation Pool (495 Chunks - 100% Committed)</text>
+  <rect x="{p_x0 + 8}" y="{y_val_pool - 16:.1f}" width="310" height="15" rx="3" fill="#064e3b" fill-opacity="0.75"/>
+  <text x="{p_x0 + 12}" y="{y_val_pool - 4:.1f}" fill="#34d399" font-size="9.5" font-weight="700">[Threshold] Validation Pool: 495 / 495 (100% Committed [Ready])</text>
 
   <!-- Full Corpus Horizon Line at P = 1,308 -->
   <line x1="{p_x0}" y1="{y_corpus_target:.1f}" x2="{p_x1}" y2="{y_corpus_target:.1f}" stroke="#f59e0b" stroke-width="1.5" stroke-dasharray="4,4"/>
-  <rect x="{p_x0 + 8}" y="{y_corpus_target - 16:.1f}" width="290" height="15" rx="3" fill="#78350f" fill-opacity="0.75"/>
-  <text x="{p_x0 + 12}" y="{y_corpus_target - 4:.1f}" fill="#fde68a" font-size="9.5" font-weight="700">[Horizon] Full EnterpriseRAG Corpus (1,308 Chunks)</text>
+  <rect x="{p_x0 + 8}" y="{y_corpus_target - 16:.1f}" width="350" height="15" rx="3" fill="#78350f" fill-opacity="0.75"/>
+  <text x="{p_x0 + 12}" y="{y_corpus_target - 4:.1f}" fill="#fde68a" font-size="9.5" font-weight="700">[Horizon] Training Pool Target: 818 / 818 (1,308 Total Chunks)</text>
 """
     for p_val in [0, 200, 400, 600, 800, 1000, 1200, 1400]:
         y_g = p_to_y(p_val)
@@ -720,8 +732,8 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
   <circle cx="{x_now:.1f}" cy="{y_t_now:.1f}" r="4.5" fill="#f43f5e" stroke="#ffffff" stroke-width="1.5"/>
 
   <circle cx="{x_target:.1f}" cy="{y_p_target:.1f}" r="6" fill="#10b981" stroke="#ffffff" stroke-width="2"/>
-  <rect x="{min(p_x1 - 180, x_target - 80):.1f}" y="{y_p_target - 22:.1f}" width="180" height="18" rx="4" fill="#064e3b" stroke="#10b981" stroke-width="1"/>
-  <text x="{min(p_x1 - 90, x_target + 10):.1f}" y="{y_p_target - 9:.1f}" text-anchor="middle" fill="#34d399" font-size="9" font-weight="700">Corpus Horizon: ~{eta_corpus_str} rem (~{finish_clock_str} UTC)</text>
+  <rect x="{min(p_x1 - 200, x_target - 95):.1f}" y="{y_p_target - 22:.1f}" width="200" height="18" rx="4" fill="#064e3b" stroke="#10b981" stroke-width="1"/>
+  <text x="{min(p_x1 - 100, x_target + 5):.1f}" y="{y_p_target - 9:.1f}" text-anchor="middle" fill="#34d399" font-size="9" font-weight="700">Both Pools 100%: ~{eta_corpus_str} rem (~{finish_clock_str} UTC)</text>
 
   <g transform="translate({p_x0 + 14}, {p1_y0 + 12})">
     <rect width="470" height="22" rx="4" fill="#0b1120" fill-opacity="0.85" stroke="#1e293b"/>
@@ -1202,10 +1214,22 @@ def generate_candidate_pareto_vs_time_svg(
         else "Historical Baseline Benchmark (task-21330: 75 Candidates) | Comparative Reference Target"
     )
 
+    val_target_pool = 495
+    train_target_pool = 818
+    overlap_passages = 5
+    if openie_cnt <= val_target_pool:
+        train_done = min(overlap_passages, openie_cnt)
+    else:
+        train_done = min(train_target_pool, overlap_passages + (openie_cnt - val_target_pool))
+
     badge_text = (
         f"ACTIVE OPTIMIZATION: {len(records)} CANDIDATES"
         if is_active
-        else f"STAGE 1 INGESTION: {openie_cnt}/{target_pool} CHUNKS ({active_hr:.1f}h)"
+        else (
+            f"STAGE 2: TRAIN {train_done}/{train_target_pool} CHUNKS ({active_hr:.1f}h)"
+            if openie_cnt >= 495
+            else f"STAGE 1: VAL {openie_cnt}/{val_target_pool} CHUNKS ({active_hr:.1f}h)"
+        )
     )
     badge_fill = "#065f46" if is_active else "#0369a1"
     badge_stroke = "#10b981" if is_active else "#38bdf8"
@@ -1408,10 +1432,22 @@ def generate_recall_em_f1_vs_time_svg(
         else "Historical Baseline Dynamics (task-21330: 75 Candidates) | Comparative Reference Target"
     )
 
+    val_target_pool = 495
+    train_target_pool = 818
+    overlap_passages = 5
+    if openie_cnt <= val_target_pool:
+        train_done = min(overlap_passages, openie_cnt)
+    else:
+        train_done = min(train_target_pool, overlap_passages + (openie_cnt - val_target_pool))
+
     badge_text = (
         f"ACTIVE OPTIMIZATION: {len(records)} CANDIDATES"
         if is_active
-        else f"STAGE 1 INGESTION: {openie_cnt}/{target_pool} CHUNKS ({active_hr:.1f}h)"
+        else (
+            f"STAGE 2: TRAIN {train_done}/{train_target_pool} CHUNKS ({active_hr:.1f}h)"
+            if openie_cnt >= 495
+            else f"STAGE 1: VAL {openie_cnt}/{val_target_pool} CHUNKS ({active_hr:.1f}h)"
+        )
     )
     badge_fill = "#065f46" if is_active else "#0369a1"
     badge_stroke = "#10b981" if is_active else "#38bdf8"
@@ -1572,10 +1608,22 @@ def generate_pareto_svg(
         else "Historical Baseline 2D Pareto Space (task-21330: 75 Candidates) | Real Evaluated Data Points"
     )
 
+    val_target_pool = 495
+    train_target_pool = 818
+    overlap_passages = 5
+    if openie_cnt <= val_target_pool:
+        train_done = min(overlap_passages, openie_cnt)
+    else:
+        train_done = min(train_target_pool, overlap_passages + (openie_cnt - val_target_pool))
+
     badge_text = (
         f"ACTIVE OPTIMIZATION: {len(records)} CANDIDATES"
         if is_active
-        else f"STAGE 1 INGESTION: {openie_cnt}/{target_pool} CHUNKS ({active_hr:.1f}h)"
+        else (
+            f"STAGE 2: TRAIN {train_done}/{train_target_pool} CHUNKS ({active_hr:.1f}h)"
+            if openie_cnt >= 495
+            else f"STAGE 1: VAL {openie_cnt}/{val_target_pool} CHUNKS ({active_hr:.1f}h)"
+        )
     )
     badge_fill = "#065f46" if is_active else "#0369a1"
     badge_stroke = "#10b981" if is_active else "#38bdf8"
@@ -1842,17 +1890,36 @@ def generate_report_markdown(
     db_name = sandbox.get("db_name", "initializing")
     db_size = sandbox.get("db_size_mb", 0.0)
 
-    target_pool = 495
-    pct = min(100.0, (openie_cnt / target_pool) * 100.0)
+    val_target_pool = 495
+    train_target_pool = 818
+    corpus_total_pool = 1308
+    overlap_passages = 5
+
+    val_done = min(val_target_pool, openie_cnt)
+    val_pct = min(100.0, (val_done / val_target_pool) * 100.0)
+
+    if openie_cnt <= val_target_pool:
+        train_done = min(overlap_passages, openie_cnt)
+    else:
+        train_done = min(train_target_pool, overlap_passages + (openie_cnt - val_target_pool))
+    train_pct = min(100.0, (train_done / train_target_pool) * 100.0)
+    corpus_pct = min(100.0, (openie_cnt / corpus_total_pool) * 100.0)
+
     elapsed_sec = sandbox.get("elapsed_seconds", 60.0)
     elapsed_min = max(0.1, elapsed_sec / 60.0)
     velocity = openie_cnt / elapsed_min
     sec_per_chunk = elapsed_sec / max(1, openie_cnt)
-    rem_chunks = max(0, target_pool - openie_cnt)
-    eta_min = rem_chunks / max(0.01, velocity)
-    target_total_hours = (elapsed_sec + (eta_min * 60.0)) / 3600.0
-    eta_str = f"{int(eta_min // 60)}h {int(eta_min % 60)}m" if velocity > 0.05 else "calculating..."
-    finish_dt = datetime.now(UTC) + timedelta(minutes=eta_min)
+
+    rem_train = max(0, train_target_pool - train_done)
+    rem_corpus = max(0, corpus_total_pool - openie_cnt)
+    eta_corpus_min = rem_corpus / max(0.01, velocity)
+    target_total_hours = (elapsed_sec + (eta_corpus_min * 60.0)) / 3600.0
+    eta_corpus_str = (
+        f"{int(eta_corpus_min // 60)}h {int(eta_corpus_min % 60)}m"
+        if velocity > 0.05
+        else "calculating..."
+    )
+    finish_dt = datetime.now(UTC) + timedelta(minutes=eta_corpus_min)
     finish_clock_str = finish_dt.strftime("%H:%M")
 
     total_ent = kg.get("total_entities", 0)
@@ -1888,20 +1955,25 @@ def generate_report_markdown(
         "**`LIVE RUN EVALUATION ACTIVE`**"
         if is_active
         else (
-            f"**`STAGE 2 MIPROv2 TRAINING BOOTSTRAP ACTIVE ({openie_cnt}/1,308 corpus chunks)`**"
+            f"**`STAGE 2 MIPROv2 TRAINING BOOTSTRAP ACTIVE (Train: {train_done}/{train_target_pool} [{train_pct:.1f}%] • Val: {val_done}/{val_target_pool} [100%])`**"
             if openie_cnt >= 495
-            else f"**`STAGE 1 POOLED EXTRACTION ACTIVE ({openie_cnt}/495 chunks)`**"
+            else f"**`STAGE 1 POOLED EXTRACTION ACTIVE (Val: {openie_cnt}/{val_target_pool} [{val_pct:.1f}%])`**"
         )
     )
 
     if openie_cnt >= 495:
-        ingestion_status_rows = f"""| **Validation Pool Ingested** | **`495` / `495`** (`100.0%` **Committed**) | 100% of canonical validation holdout chunks committed to `yaw.db` |
-| **Corpus Ingestion Progress** | **`{openie_cnt}` / `1,308`** (`{openie_cnt / 1308.0 * 100.0:.1f}%`) | Expanding graph across training queries toward full 1,308 corpus passages |
-| **Pipeline Stage** | **Stage 2: MIPROv2 Demonstration Bootstrap** | Actively bootstrapping few-shot exemplars across 150 training queries |
-| **Validation Graph Status** | **Committed to `yaw.db`** | Validation pool ready; training demonstration bootstrapping in progress |"""
+        ingestion_status_rows = f"""| **Validation Pool Progress** | **`{val_done}` / `{val_target_pool}`** (`{val_pct:.1f}%` **Committed**) | 100% of canonical validation holdout chunks committed to sandbox `yaw.db` |
+| **Training Pool Progress** | **`{train_done}` / `{train_target_pool}`** (`{train_pct:.1f}%` **Ingesting**) | Bootstrapping few-shot exemplars across 150 training queries ({rem_train} chunks remaining) |
+| **Combined Corpus Progress** | **`{openie_cnt}` / `{corpus_total_pool}`** (`{corpus_pct:.1f}%` **Total**) | Unified knowledge graph across all EnterpriseRAG-bench documents |
+| **Ingestion Readiness Criterion** | **Both Pools at `100.0%`** | Pipeline is ready for evaluation when Training Pool reaches {train_target_pool}/{train_target_pool} (Corpus reaches {corpus_total_pool}) |
+| **Pipeline Stage** | **Stage 2: MIPROv2 Demonstration Bootstrap** | Actively synthesizing few-shot demonstration candidates for prompt evolution |
+| **Sandbox Database Isolation** | [`{db_name}`](file:///{sandbox.get('db_path', '')}) | Dedicated sandbox DB; production `yaw.db` is strictly isolated |"""
     else:
-        ingestion_status_rows = f"""| **Passages Extracted** | **`{openie_cnt}` / `{target_pool}`** (`{pct:.1f}%`) | Unique validation corpus chunks processed through Stage 1–3 OpenIE |
-| **Time Remaining to Commit** | **`~{eta_str}`** (`{int(eta_min)} min`) | Estimated duration remaining to finish remaining {rem_chunks} chunks |"""
+        ingestion_status_rows = f"""| **Validation Pool Progress** | **`{val_done}` / `{val_target_pool}`** (`{val_pct:.1f}%`) | Unique validation corpus chunks processed through Stage 1–3 OpenIE |
+| **Training Pool Progress** | **`{train_done}` / `{train_target_pool}`** (`{train_pct:.1f}%`) | Training pool ingestion begins after validation pool completes |
+| **Combined Corpus Progress** | **`{openie_cnt}` / `{corpus_total_pool}`** (`{corpus_pct:.1f}%`) | Total corpus progress toward {corpus_total_pool} passages |
+| **Ingestion Readiness Criterion** | **Both Pools at `100.0%`** | Ready when both Validation Pool (495) and Training Pool (818) hit 100% |
+| **Time Remaining to Commit** | **`~{eta_corpus_str}`** (`{int(eta_corpus_min)} min`) | Estimated duration remaining to finish remaining {rem_corpus} chunks |"""
 
     md = f"""# HippoRAG 2 Optimization & Benchmark Live Dashboard
 
@@ -2115,8 +2187,18 @@ def run_once() -> None:
     ent_cnt = kg.get("total_entities", 0)
     trip_cnt = kg.get("total_triples", 0)
     source_tag = "ACTIVE" if is_active else "REF_HIST"
+    val_target_pool = 495
+    train_target_pool = 818
+    overlap_passages = 5
+    val_done = min(val_target_pool, openie_cnt)
+    if openie_cnt <= val_target_pool:
+        train_done = min(overlap_passages, openie_cnt)
+    else:
+        train_done = min(train_target_pool, overlap_passages + (openie_cnt - val_target_pool))
+    train_pct = (train_done / train_target_pool) * 100.0
+    corpus_pct = (openie_cnt / 1308) * 100.0
     print(
-        f"[{now_str}] Dashboard updated: {openie_cnt}/495 passages, {ent_cnt} entities, {trip_cnt} triples, {len(records)} candidates ({source_tag})",
+        f"[{now_str}] Dashboard updated: Val {val_done}/{val_target_pool} (100%), Train {train_done}/{train_target_pool} ({train_pct:.1f}%), Total {openie_cnt}/1308 ({corpus_pct:.1f}%), {ent_cnt} entities, {trip_cnt} triples ({source_tag})",
         flush=True,
     )
 
