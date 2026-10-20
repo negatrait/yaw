@@ -1940,17 +1940,16 @@ def test_hybrid_e2e_per_query_isolation_stage_caching_and_reflective_stats(
                 self.metric = metric
 
             def compile(self, student: Any, trainset: list[Any], valset: Any = None) -> Any:
-                # 1. Run ex1 then ex2 on student (live indexing)
+                # 1. Run ex1 then ex2 on student (pooled corpus graph indexed once, zero query-order drift)
                 with dspy.context(trace=[], track_usage=True):
                     pred1_live = student(**ex1.inputs())
                 c_cnt_q1 = engine.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-                assert c_cnt_q1 == 1
+                assert c_cnt_q1 == 3
 
                 with dspy.context(trace=[], track_usage=True):
                     pred2_live = student(**ex2.inputs())
-                # Verify per-query isolation: ex1's chunk did NOT accumulate into ex2's sandbox!
                 c_cnt_q2 = engine.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-                assert c_cnt_q2 == 2
+                assert c_cnt_q2 == 3
 
                 # Verify post-hoc reflective evaluation on ex1 vs ex2 uses each example's own q_stats
                 score1_live = self.metric(ex1, pred1_live)

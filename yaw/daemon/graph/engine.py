@@ -165,7 +165,10 @@ class YawGraphEngine:
         self._last_scope_by_cids: dict[tuple[str, ...], dict[str, int]] = {}
         self._active_extraction_fingerprint: str | None = None
         self._active_openie_fingerprint: str | None = None
+        self._baseline_openie_fp: str | None = None
+        self._chunk_indexed_ext_fp: dict[str, str] = {}
         self._opt_chunks_pool: list[tuple[ChunkPointer, str]] = []
+        self._opt_val_chunks_pool: list[tuple[ChunkPointer, str]] = []
         self._opt_indexed_cids: set[str] = set()
         self._resolved_docs_cache: dict[tuple[int, str], list[tuple[ChunkPointer, str]]] = {}
         self._captured_chunk_traces: dict[str, list[tuple[str, dict[str, Any], Any]]] = {}
@@ -988,6 +991,7 @@ class YawGraphEngine:
                 self._captured_chunk_traces.clear()
         self._captured_graph_traces.clear()
         self._opt_indexed_cids.clear()
+        self._chunk_indexed_ext_fp.clear()
         self._attempted_shacl_keys.clear()
         self._chunk_rlm_stats.clear()
         self._active_query_rlm_stats = None
@@ -1098,49 +1102,46 @@ class YawGraphEngine:
     ) -> list[str]:
         with self._lock:
             ext_fp = self._extraction_fingerprint(program)
-            openie_fp = self._openie_fingerprint(program)
             req_chunks = self._resolve_chunks_for_docs(item_docs)
+            pool_chunks = (
+                list(self._opt_val_chunks_pool)
+                if self._opt_val_chunks_pool
+                else (
+                    list(self._opt_chunks_pool)
+                    if len(self._opt_chunks_pool) <= 64 and self._opt_chunks_pool
+                    else (req_chunks if req_chunks else list(self._opt_chunks_pool[:32]))
+                )
+            )
+            missing_pool = [
+                (p, t)
+                for p, t in pool_chunks
+                if p.chunk_id not in self._opt_indexed_cids
+            ]
+            if missing_pool:
+                self.index_chunks(missing_pool, program=program)
 
-            if item_docs:
-                batch_candidates = req_chunks
-                target_cids = [p.chunk_id for p, _ in batch_candidates]
-                target_cids_set = set(target_cids)
-                if (
-                    self._active_extraction_fingerprint != ext_fp
-                    or self._opt_indexed_cids != target_cids_set
-                ):
-                    clear_openie = openie_fp != self._active_openie_fingerprint
-                    self._reset_sandbox_graph(clear_openie=clear_openie)
-                    self._active_extraction_fingerprint = ext_fp
-                    self._active_openie_fingerprint = openie_fp
-                    if batch_candidates:
-                        self.index_chunks(batch_candidates, program=program)
-            else:
-                if (
-                    self._active_extraction_fingerprint is not None
-                    and ext_fp != self._active_extraction_fingerprint
-                ):
-                    clear_openie = openie_fp != self._active_openie_fingerprint
-                    self._reset_sandbox_graph(clear_openie=clear_openie)
-                    self._active_extraction_fingerprint = ext_fp
-                    self._active_openie_fingerprint = openie_fp
+            target_list = req_chunks if req_chunks else pool_chunks
+            stale_targets = [
+                (p, t)
+                for p, t in target_list
+                if p.chunk_id in self._opt_indexed_cids
+                and self._chunk_indexed_ext_fp.get(p.chunk_id) != ext_fp
+            ]
+            if stale_targets:
+                stale_cids = [p.chunk_id for p, _ in stale_targets]
+                self.delete_chunks(stale_cids)
+                for cid in stale_cids:
+                    self._opt_indexed_cids.discard(cid)
+                    self._chunk_indexed_ext_fp.pop(cid, None)
 
-                if len(self._opt_chunks_pool) <= 64 and self._opt_chunks_pool:
-                    batch_candidates = list(self._opt_chunks_pool)
-                else:
-                    batch_candidates = (
-                        req_chunks if req_chunks else list(self._opt_chunks_pool[:32])
-                    )
-
-                missing_to_index = [
-                    (p, t)
-                    for p, t in batch_candidates
-                    if p.chunk_id not in self._opt_indexed_cids
-                ]
-                if missing_to_index:
-                    self.index_chunks(missing_to_index, program=program)
-                target_list = req_chunks if req_chunks else batch_candidates
-                target_cids = [p.chunk_id for p, _ in target_list]
+            missing_targets = [
+                (p, t)
+                for p, t in target_list
+                if p.chunk_id not in self._opt_indexed_cids
+            ]
+            if missing_targets:
+                self.index_chunks(missing_targets, program=program)
+            target_cids = [p.chunk_id for p, _ in target_list]
 
             if target_cids and any(cid in self._chunk_rlm_stats for cid in target_cids):
                 agg: dict[str, float] = {
@@ -1345,7 +1346,10 @@ class YawGraphEngine:
                     self._graph_rlm_stats["missing_entity_defs_tokens"] += m_tok
                     save_openie_checkpoints(self.conn, [rec])
                     all_records.append(rec)
-                elif ptr.chunk_id in cached_openie:
+                elif (
+                    self._baseline_openie_fp is None
+                    or openie_fp == self._baseline_openie_fp
+                ) and ptr.chunk_id in cached_openie:
                     all_records.append(cached_openie[ptr.chunk_id])
                 else:
                     if progress_callback is not None:
@@ -2105,11 +2109,21 @@ class YawGraphEngine:
                             upsert_semantic_edges(conn, resolved_semantic_batch)
 
                 # In-transaction Closed-World SHACL Linting & Bounded Self-Healing via shacl_healer_rlm
+                batch_node_ids = set(chunk_ids) | set(all_entity_ids) | set(all_fact_ids)
                 all_violations = lint_graph_shacl(conn, auto_heal=False)
                 violations = [
                     v
                     for v in all_violations
                     if (v.focus_node, v.shape) not in self._attempted_shacl_keys
+                    or v.focus_node in batch_node_ids
+                    or (
+                        "|" in v.focus_node
+                        and any(p.strip() in batch_node_ids for p in v.focus_node.split("|"))
+                    )
+                    or (
+                        "->" in v.focus_node
+                        and any(p.strip() in batch_node_ids for p in v.focus_node.split("->"))
+                    )
                 ]
                 batch_shacl_before = len(violations)
                 self._graph_rlm_stats["shacl_violations_before"] += batch_shacl_before
@@ -2257,6 +2271,8 @@ class YawGraphEngine:
             self._active_extraction_fingerprint = ext_fp
             self._active_openie_fingerprint = openie_fp
             self._opt_indexed_cids.update(chunk_ids)
+            for cid in chunk_ids:
+                self._chunk_indexed_ext_fp[cid] = ext_fp
             return len(chunks)
 
     def delete_chunks(self, chunk_ids: Sequence[str]) -> None:
@@ -2688,6 +2704,23 @@ class YawGraphEngine:
                 if ptr.chunk_id not in existing_cids:
                     self._opt_chunks_pool.append((ptr, text))
                     existing_cids.add(ptr.chunk_id)
+
+        self._baseline_openie_fp = self._openie_fingerprint(self.program)
+        if len(self._opt_chunks_pool) <= 64 and self._opt_chunks_pool:
+            self._opt_val_chunks_pool = list(self._opt_chunks_pool)
+        else:
+            val_pool: list[tuple[ChunkPointer, str]] = []
+            seen_val_cids: set[str] = set()
+            for ex in valset or trainset:
+                ex_docs = getattr(ex, "item_docs", None)
+                if ex_docs:
+                    for p, t in self._resolve_chunks_for_docs(ex_docs):
+                        if p.chunk_id not in seen_val_cids:
+                            seen_val_cids.add(p.chunk_id)
+                            val_pool.append((p, t))
+            self._opt_val_chunks_pool = (
+                val_pool if val_pool else list(self._opt_chunks_pool[:64])
+            )
 
         eval_count = 0
 
