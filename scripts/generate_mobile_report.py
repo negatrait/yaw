@@ -388,7 +388,7 @@ def run_once() -> None:
 
     now_str = datetime.now(UTC).strftime("%H:%M:%S")
     openie_cnt = sandbox.get("counts", {}).get("openie_chunks", 0)
-    print(f"[{now_str}] Updated report and SVGs (openie_chunks={openie_cnt})")
+    print(f"[{now_str}] Updated report and SVGs (openie_chunks={openie_cnt})", flush=True)
 
 
 def main() -> int:
@@ -407,12 +407,12 @@ def main() -> int:
 
     if args.watch is not None:
         interval = max(5, args.watch)
-        print(f"Starting continuous report generator daemon (interval={interval}s)...")
+        print(f"Starting continuous report generator daemon (interval={interval}s)...", flush=True)
         while True:
             try:
                 run_once()
             except Exception as exc:
-                print(f"Error updating report: {exc}", file=sys.stderr)
+                print(f"Error updating report: {exc}", file=sys.stderr, flush=True)
             time.sleep(interval)
 
     run_once()
