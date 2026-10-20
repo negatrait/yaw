@@ -2230,6 +2230,7 @@ def generate_report_markdown(
     records: list[dict[str, Any]],
     is_active: bool,
     proj_info: dict[str, Any] | None = None,
+    interval_sec: int = 180,
 ) -> None:
     now_str = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
     counts = sandbox.get("counts", {})
@@ -2385,9 +2386,10 @@ def generate_report_markdown(
         else "Standby (Thermal Guard: active)"
     )
 
+    interval_desc = f"{int(round(interval_sec / 60.0))}m" if interval_sec >= 60 else f"{interval_sec}s"
     md = f"""# Live Optimization Telemetry (`{db_name}`)
 
-*Updated*: `{now_str}` *(10m interval)* • *State*: {status_badge}
+*Updated*: `{now_str}` *({interval_desc} interval)* • *State*: {status_badge}
 
 | Pool / Metric | Live Value |
 | :--- | :--- |
@@ -2437,7 +2439,7 @@ def generate_report_markdown(
     dest.write_text(md, encoding="utf-8")
 
 
-def run_once() -> None:
+def run_once(interval_sec: int = 180) -> None:
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
     sandbox = get_active_sandbox_info()
     cfg = read_config_info()
@@ -2455,7 +2457,7 @@ def run_once() -> None:
     generate_candidate_pareto_vs_time_svg(cand_pareto_svg_path, records, sandbox, is_active)
     generate_recall_em_f1_vs_time_svg(recall_f1_svg_path, records, sandbox, is_active)
     generate_pareto_svg(pareto_svg_path, records, sandbox, cfg, is_active)
-    generate_report_markdown(report_md_path, sandbox, cfg, records, is_active, proj_info)
+    generate_report_markdown(report_md_path, sandbox, cfg, records, is_active, proj_info, interval_sec=interval_sec)
 
     now_str = datetime.now(UTC).strftime("%H:%M:%S")
     openie_cnt = sandbox.get("counts", {}).get("openie_chunks", 0)
@@ -2653,7 +2655,7 @@ def main() -> int:
         print(f"Starting continuous watchdog daemon (interval={interval}s, cool_seconds={cool_sec}s, {tg_info})...", flush=True)
         while True:
             try:
-                run_once()
+                run_once(interval_sec=interval)
             except Exception as exc:
                 print(f"Error updating dashboard: {exc}", file=sys.stderr, flush=True)
 
