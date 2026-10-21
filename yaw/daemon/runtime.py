@@ -762,6 +762,8 @@ class YawRuntime:
         num_candidates: int | None = None,
         num_trials: int | None = None,
         sleep_seconds: float | None = None,
+        max_bootstrapped_demos: int | None = None,
+        max_labeled_demos: int | None = None,
         corpus_docs: Sequence[str] | None = None,
         progress_callback: Callable[[str], None] | None = None,
     ) -> Path:
@@ -851,6 +853,8 @@ class YawRuntime:
                 progress_callback=_progress,
                 opt_chunks=opt_chunks,
                 sleep_seconds=eff_sleep,
+                max_bootstrapped_demos=max_bootstrapped_demos,
+                max_labeled_demos=max_labeled_demos,
             )
             final_stats = self.engine.get_stats(self.config.config_fingerprint())
             with self._state_lock:

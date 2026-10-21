@@ -3005,6 +3005,8 @@ class YawGraphEngine:
         progress_callback: Callable[[str], None] | None = None,
         opt_chunks: Sequence[tuple[ChunkPointer, str]] | None = None,
         sleep_seconds: float = 0.0,
+        max_bootstrapped_demos: int | None = None,
+        max_labeled_demos: int | None = None,
     ) -> HippoRAGProgram:
         """Evolve DSPy prompts via MIPROv2, GEPA, or two-phase hybrid with composite Sizecoding feedback."""
         if not trainset:
@@ -3362,12 +3364,30 @@ class YawGraphEngine:
                 import inspect
 
                 auto_val = auto if auto not in ("none", None, "") else None
+                eff_bootstrapped_demos = (
+                    max_bootstrapped_demos
+                    if max_bootstrapped_demos is not None
+                    else getattr(
+                        getattr(self, "config", None),
+                        "optimize_max_bootstrapped_demos",
+                        0,
+                    )
+                )
+                eff_labeled_demos = (
+                    max_labeled_demos
+                    if max_labeled_demos is not None
+                    else getattr(
+                        getattr(self, "config", None),
+                        "optimize_max_labeled_demos",
+                        0,
+                    )
+                )
                 optimizer_kwargs: dict[str, Any] = {
                     "metric": _mipro_metric,
                     "prompt_model": resolved_ref_lm,
                     "task_model": resolved_worker_lm,
-                    "max_bootstrapped_demos": 2,
-                    "max_labeled_demos": 0,
+                    "max_bootstrapped_demos": eff_bootstrapped_demos,
+                    "max_labeled_demos": eff_labeled_demos,
                     "num_threads": 1,
                 }
                 compile_kwargs: dict[str, Any] = {
@@ -3383,8 +3403,8 @@ class YawGraphEngine:
                     optimizer_kwargs["auto"] = None
                     optimizer_kwargs["num_candidates"] = 3
                     compile_kwargs["num_trials"] = 4
-                    compile_kwargs["max_bootstrapped_demos"] = 2
-                    compile_kwargs["max_labeled_demos"] = 0
+                    compile_kwargs["max_bootstrapped_demos"] = eff_bootstrapped_demos
+                    compile_kwargs["max_labeled_demos"] = eff_labeled_demos
                     compile_kwargs["minibatch"] = True
                     compile_kwargs["minibatch_size"] = min(25, len(valset))
                     compile_kwargs["minibatch_full_eval_steps"] = 4
@@ -3414,11 +3434,19 @@ class YawGraphEngine:
                         **compile_kwargs,
                     )
                 self._prune_mismatching_demos(compiled)
-                for name, pred in compiled.named_predictors():
-                    if not getattr(pred, "demos", None) and baseline_demos.get(name):
-                        pred.demos = list(baseline_demos[name])
-                if hasattr(compiled.qa, "predict") and getattr(compiled.qa.predict, "demos", None):
-                    compiled.qa.demos = list(compiled.qa.predict.demos)
+                if eff_bootstrapped_demos == 0 and eff_labeled_demos == 0:
+                    for name, pred in compiled.named_predictors():
+                        pred.demos = []
+                    if hasattr(compiled, "qa"):
+                        compiled.qa.demos = []
+                        if hasattr(compiled.qa, "predict"):
+                            compiled.qa.predict.demos = []
+                else:
+                    for name, pred in compiled.named_predictors():
+                        if not getattr(pred, "demos", None) and baseline_demos.get(name):
+                            pred.demos = list(baseline_demos[name])
+                    if hasattr(compiled.qa, "predict") and getattr(compiled.qa.predict, "demos", None):
+                        compiled.qa.demos = list(compiled.qa.predict.demos)
 
             if mode in ("gepa", "hybrid") and hasattr(dspy, "GEPA"):
                 gepa_log_dir = (

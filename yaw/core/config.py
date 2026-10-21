@@ -144,6 +144,8 @@ class YawConfig:
     optimize_query_offset: int = 0
     optimize_auto: Literal["light", "medium", "heavy"] = "light"
     optimize_sleep_seconds: float = 0.0
+    optimize_max_bootstrapped_demos: int = 0
+    optimize_max_labeled_demos: int = 0
 
     def __post_init__(self) -> None:
         ws = Path(self.workspace_root).resolve()
@@ -170,6 +172,16 @@ class YawConfig:
             self,
             "optimize_sleep_seconds",
             max(0.0, float(self.optimize_sleep_seconds or 0.0)),
+        )
+        object.__setattr__(
+            self,
+            "optimize_max_bootstrapped_demos",
+            max(0, int(self.optimize_max_bootstrapped_demos or 0)),
+        )
+        object.__setattr__(
+            self,
+            "optimize_max_labeled_demos",
+            max(0, int(self.optimize_max_labeled_demos or 0)),
         )
         raw_ds = self.optimize_datasets
         if isinstance(raw_ds, str):
@@ -315,6 +327,8 @@ _OPTIMIZATION_KEY_ALIASES: dict[str, str] = {
     "auto": "optimize_auto",
     "sleep_seconds": "optimize_sleep_seconds",
     "sleep": "optimize_sleep_seconds",
+    "max_bootstrapped_demos": "optimize_max_bootstrapped_demos",
+    "max_labeled_demos": "optimize_max_labeled_demos",
 }
 
 _FIELD_TO_SECTION: dict[str, str] = {
@@ -364,6 +378,8 @@ _FIELD_TO_SECTION: dict[str, str] = {
     "optimize_query_offset": "optimization",
     "optimize_auto": "optimization",
     "optimize_sleep_seconds": "optimization",
+    "optimize_max_bootstrapped_demos": "optimization",
+    "optimize_max_labeled_demos": "optimization",
 }
 
 

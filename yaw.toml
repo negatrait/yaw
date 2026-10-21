@@ -51,3 +51,5 @@ train_queries = 150
 query_offset = 0
 auto = "light"
 sleep_seconds = 0.0
+max_bootstrapped_demos = 0
+max_labeled_demos = 0

@@ -195,6 +195,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Sleep pause in seconds between LLM/embedding calls to manage thermal duty cycles (defaults to yaw.toml [optimization].sleep_seconds, default 0.0)",
     )
     p_opt_common.add_argument(
+        "--max-bootstrapped-demos",
+        dest="max_bootstrapped_demos",
+        type=int,
+        default=None,
+        help="Maximum bootstrapped demonstrations for MIPROv2 (defaults to yaw.toml [optimization].max_bootstrapped_demos, 0 to disable)",
+    )
+    p_opt_common.add_argument(
+        "--max-labeled-demos",
+        dest="max_labeled_demos",
+        type=int,
+        default=None,
+        help="Maximum labeled demonstrations for MIPROv2 (defaults to yaw.toml [optimization].max_labeled_demos, 0 to disable)",
+    )
+    p_opt_common.add_argument(
         "--db",
         dest="db_path",
         type=str,
@@ -865,6 +879,21 @@ def handle_dspy_optimize(
     sleep_seconds = float(raw_sleep) if raw_sleep is not None else float(config.optimize_sleep_seconds or 0.0)
     object.__setattr__(opt_config, "optimize_sleep_seconds", sleep_seconds)
 
+    raw_bootstrapped = getattr(args, "max_bootstrapped_demos", None)
+    max_bootstrapped_demos = (
+        int(raw_bootstrapped)
+        if raw_bootstrapped is not None
+        else int(config.optimize_max_bootstrapped_demos or 0)
+    )
+    raw_labeled = getattr(args, "max_labeled_demos", None)
+    max_labeled_demos = (
+        int(raw_labeled)
+        if raw_labeled is not None
+        else int(config.optimize_max_labeled_demos or 0)
+    )
+    object.__setattr__(opt_config, "optimize_max_bootstrapped_demos", max_bootstrapped_demos)
+    object.__setattr__(opt_config, "optimize_max_labeled_demos", max_labeled_demos)
+
     runtime = YawRuntime(opt_config, program=program, embedder=embedder, auto_poll=False)
     runtime.start(sync_on_start=False)
 
@@ -881,6 +910,8 @@ def handle_dspy_optimize(
             num_candidates=num_candidates,
             num_trials=num_trials,
             sleep_seconds=sleep_seconds,
+            max_bootstrapped_demos=max_bootstrapped_demos,
+            max_labeled_demos=max_labeled_demos,
             corpus_docs=corpus_docs,
             progress_callback=_cli_progress,
         )
