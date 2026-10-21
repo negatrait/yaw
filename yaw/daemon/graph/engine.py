@@ -104,7 +104,6 @@ class YawGraphEngine:
         synonymy_top_k: int = 100,
         retrieval_top_k: int = 10,
         embed_batch_size: int = 64,
-
         activation: str = "scaled_tanh",
         activation_param: float | None = 5.0,
         activation_renormalize: bool = False,
@@ -152,9 +151,7 @@ class YawGraphEngine:
         self.beta = beta
         self.dual_weight = dual_weight
         self.same_sense_cosine_gate = float(
-            homograph_cosine_gate
-            if homograph_cosine_gate is not None
-            else same_sense_cosine_gate
+            homograph_cosine_gate if homograph_cosine_gate is not None else same_sense_cosine_gate
         )
         self.homograph_cosine_gate = self.same_sense_cosine_gate
 
@@ -165,6 +162,7 @@ class YawGraphEngine:
         self._attempted_shacl_keys: set[tuple[str, str]] = set()
         self._chunk_rlm_stats: dict[str, dict[str, float]] = {}
         self._active_query_rlm_stats: dict[str, int] | None = None
+        self._active_progress_callback: Callable[[str], None] | None = None
         self._last_scope_by_cids: dict[tuple[str, ...], dict[str, int]] = {}
         self._active_extraction_fingerprint: str | None = None
         self._active_openie_fingerprint: str | None = None
@@ -270,35 +268,6 @@ class YawGraphEngine:
                         self._graph_rlm_stats["related_edges"] = int(rel_cnt_row[0]) // 2
                     if diff_cnt_row and not self._graph_rlm_stats.get("different_from_edges"):
                         self._graph_rlm_stats["different_from_edges"] = int(diff_cnt_row[0]) // 2
-                    db_str = str(self.db_path)
-                    if db_str != ":memory:" and not db_str.startswith("file:"):
-                        base_dir = Path(db_str).resolve().parent
-                        audit_files = sorted(
-                            base_dir.glob("compiled_program_optimize_*_graph_rlm_audit.json"),
-                            key=lambda p: p.stat().st_mtime,
-                            reverse=True,
-                        )
-                        if audit_files:
-                            audit_obj = json.loads(
-                                audit_files[0].read_text(encoding="utf-8")
-                            )
-                            if isinstance(audit_obj, dict):
-                                for src_k, dst_attr in (
-                                    ("program_telemetry", "telemetry"),
-                                    ("embedding_audit_trail", "embedding_audit_trail"),
-                                    ("synonym_audit_trail", "synonym_audit_trail"),
-                                    ("shacl_audit_trail", "shacl_audit_trail"),
-                                    ("entity_def_audit_trail", "entity_def_audit_trail"),
-                                ):
-                                    s_list = audit_obj.get(src_k)
-                                    c_list = getattr(active_prog, dst_attr, None)
-                                    if (
-                                        isinstance(s_list, list)
-                                        and s_list
-                                        and isinstance(c_list, list)
-                                        and not c_list
-                                    ):
-                                        c_list.extend(s_list)
                     self._persist_dspy_trails_to_db(active_prog)
             except Exception:
                 pass
@@ -314,16 +283,14 @@ class YawGraphEngine:
                 "graph_rlm_stats": dict(self._graph_rlm_stats),
                 "chunk_rlm_stats": dict(self._chunk_rlm_stats),
                 "telemetry": list(getattr(active_prog, "telemetry", ()))[-250:],
-                "embedding_audit_trail": list(
-                    getattr(active_prog, "embedding_audit_trail", ())
-                )[-250:],
-                "synonym_audit_trail": list(
-                    getattr(active_prog, "synonym_audit_trail", ())
-                )[-100:],
+                "embedding_audit_trail": list(getattr(active_prog, "embedding_audit_trail", ()))[
+                    -250:
+                ],
+                "synonym_audit_trail": list(getattr(active_prog, "synonym_audit_trail", ()))[-100:],
                 "shacl_audit_trail": list(getattr(active_prog, "shacl_audit_trail", ()))[-100:],
-                "entity_def_audit_trail": list(
-                    getattr(active_prog, "entity_def_audit_trail", ())
-                )[-250:],
+                "entity_def_audit_trail": list(getattr(active_prog, "entity_def_audit_trail", ()))[
+                    -250:
+                ],
             }
             set_meta(self.conn, "dspy_trails_state", json.dumps(payload, ensure_ascii=False))
         except Exception:
@@ -444,10 +411,7 @@ class YawGraphEngine:
                 else (dict(d) if isinstance(d, Mapping) else None)
             )
             if isinstance(d_dict, dict) and in_fields and out_fields:
-                if not (
-                    in_fields.issubset(d_dict.keys())
-                    and out_fields.issubset(d_dict.keys())
-                ):
+                if not (in_fields.issubset(d_dict.keys()) and out_fields.issubset(d_dict.keys())):
                     continue
                 filtered = {k: d_dict[k] for k in sorted(in_fields | out_fields)}
                 demos_repr.append(
@@ -497,11 +461,7 @@ class YawGraphEngine:
 
     @classmethod
     def _synonym_fingerprint(cls, program: HippoRAGProgram) -> str:
-        named = (
-            dict(program.named_predictors())
-            if hasattr(program, "named_predictors")
-            else {}
-        )
+        named = dict(program.named_predictors()) if hasattr(program, "named_predictors") else {}
         payload = (
             cls._serialize_predictor_surface(named["synonym_judge"])
             if "synonym_judge" in named
@@ -512,31 +472,19 @@ class YawGraphEngine:
 
     @classmethod
     def _shacl_fingerprint(cls, program: HippoRAGProgram) -> str:
-        named = (
-            dict(program.named_predictors())
-            if hasattr(program, "named_predictors")
-            else {}
-        )
+        named = dict(program.named_predictors()) if hasattr(program, "named_predictors") else {}
         shacl_keys = (
             "shacl_repair",
             "shacl_healer_rlm.generate_action",
             "shacl_healer_rlm.extract",
         )
-        payload = {
-            k: cls._serialize_predictor_surface(named[k])
-            for k in shacl_keys
-            if k in named
-        }
+        payload = {k: cls._serialize_predictor_surface(named[k]) for k in shacl_keys if k in named}
         raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     @classmethod
     def _openie_fingerprint(cls, program: HippoRAGProgram) -> str:
-        named = (
-            dict(program.named_predictors())
-            if hasattr(program, "named_predictors")
-            else {}
-        )
+        named = dict(program.named_predictors()) if hasattr(program, "named_predictors") else {}
         payload = {
             "stages": {
                 k: cls._serialize_predictor_surface(named[k])
@@ -551,11 +499,7 @@ class YawGraphEngine:
 
     @classmethod
     def _extraction_fingerprint(cls, program: HippoRAGProgram) -> str:
-        named = (
-            dict(program.named_predictors())
-            if hasattr(program, "named_predictors")
-            else {}
-        )
+        named = dict(program.named_predictors()) if hasattr(program, "named_predictors") else {}
         graph_stage_keys = (
             "ner",
             "triples",
@@ -588,9 +532,7 @@ class YawGraphEngine:
         allowed_names: set[str] | None = None,
     ) -> list[tuple[str, dict[str, Any], Any]]:
         named_preds = (
-            list(program.named_predictors())
-            if hasattr(program, "named_predictors")
-            else []
+            list(program.named_predictors()) if hasattr(program, "named_predictors") else []
         )
         captured: list[tuple[str, dict[str, Any], Any]] = []
         for item in raw_trace:
@@ -720,9 +662,7 @@ class YawGraphEngine:
     ) -> tuple[str, tuple[str, ...], tuple[float, ...], tuple[str, ...]]:
         """Canonical engine retrieval hook returning (formatted_context, hydrated_texts, scores, chunk_ids)."""
         active_program = program if program is not None else self.program
-        target_cids = self._ensure_candidate_chunks_indexed(
-            active_program, item_docs=item_docs
-        )
+        target_cids = self._ensure_candidate_chunks_indexed(active_program, item_docs=item_docs)
         active_trace = getattr(dspy.settings, "trace", None)
         if isinstance(active_trace, list):
             named_map = dict(active_program.named_predictors())
@@ -738,6 +678,9 @@ class YawGraphEngine:
 
         qa_top_k = max(1, int(k if k is not None else self.retrieval_top_k))
         fetch_top_k = max(20, qa_top_k)
+        if self._active_progress_callback is not None:
+            q_preview = str(question or "").strip().replace("\n", " ")[:48]
+            self._active_progress_callback(f"retrieving + QA: {q_preview!r}...")
         hits = self.retrieve(
             question,
             top_k=fetch_top_k,
@@ -845,7 +788,9 @@ class YawGraphEngine:
                 sections.append("Facts:\n" + "\n".join(fact_lines))
             if passage_lines:
                 sections.append("Passages:\n" + "\n\n".join(passage_lines))
-            return "\n\n".join(sections) if sections else "No matching graph facts or passages found."
+            return (
+                "\n\n".join(sections) if sections else "No matching graph facts or passages found."
+            )
 
     def _apply_program_embedding_prefixes(self, program: HippoRAGProgram | None = None) -> None:
         target = program if program is not None else self.program
@@ -860,15 +805,21 @@ class YawGraphEngine:
             if getattr(target, "embedding_query_prefix", None) is None:
                 setattr(target, "embedding_query_prefix", getattr(profile, "query_prefix", None))
             if getattr(target, "embedding_fact_prefix", None) is None:
-                setattr(target, "embedding_fact_prefix", getattr(profile, "fact_query_prefix", None))
+                setattr(
+                    target, "embedding_fact_prefix", getattr(profile, "fact_query_prefix", None)
+                )
             if getattr(target, "embedding_document_prefix", None) is None:
-                setattr(target, "embedding_document_prefix", getattr(profile, "document_prefix", None))
+                setattr(
+                    target, "embedding_document_prefix", getattr(profile, "document_prefix", None)
+                )
 
     def close(self) -> None:
         """Close SQLite database connection and release any open DSPy disk cache handles."""
         with self._lock:
             active_cache = getattr(dspy, "cache", None)
-            disk_cache = getattr(active_cache, "disk_cache", None) if active_cache is not None else None
+            disk_cache = (
+                getattr(active_cache, "disk_cache", None) if active_cache is not None else None
+            )
             close_fn = getattr(disk_cache, "close", None)
             if callable(close_fn):
                 close_fn()
@@ -950,20 +901,20 @@ class YawGraphEngine:
             seen_missing: set[str] = set()
             for t in texts:
                 ts = str(t)
-                if (embed_fp, instruction, ts) not in self._text_vec_cache and ts not in seen_missing:
+                if (
+                    embed_fp,
+                    instruction,
+                    ts,
+                ) not in self._text_vec_cache and ts not in seen_missing:
                     seen_missing.add(ts)
                     missing_texts.append(ts)
             if missing_texts:
-                encoded = self.embedder.encode(
-                    missing_texts, instruction=instruction, stage=stage
-                )
+                encoded = self.embedder.encode(missing_texts, instruction=instruction, stage=stage)
                 for ts, vec in zip(missing_texts, encoded, strict=False):
                     self._text_vec_cache[(embed_fp, instruction, ts)] = np.asarray(
                         vec, dtype=np.float32
                     )
-            return [
-                self._text_vec_cache[(embed_fp, instruction, str(t))] for t in texts
-            ]
+            return [self._text_vec_cache[(embed_fp, instruction, str(t))] for t in texts]
         return self.embedder.encode(texts, instruction=instruction)
 
     def _encode_in_batches(
@@ -1004,11 +955,7 @@ class YawGraphEngine:
         budget = (
             max_characters
             if max_characters is not None
-            else (
-                max_context_chars
-                if max_context_chars is not None
-                else self.max_context_chars
-            )
+            else (max_context_chars if max_context_chars is not None else self.max_context_chars)
         )
         ptrs_scores = [(p, s) for p, s, _ in hits]
         hydrated = hydrate_budgeted_passages(
@@ -1121,11 +1068,7 @@ class YawGraphEngine:
                         src_node, dst_node = ea, eb
                 else:
                     src_node, dst_node = focus, target
-                lkind = (
-                    "skos:hiddenLabel"
-                    if action == "merge_hiddenLabel"
-                    else "skos:altLabel"
-                )
+                lkind = "skos:hiddenLabel" if action == "merge_hiddenLabel" else "skos:altLabel"
                 if src_node and dst_node and src_node != dst_node:
                     existing_pair = get_existing_ids(conn, "entity", [src_node, dst_node])
                     if src_node in existing_pair and dst_node in existing_pair:
@@ -1232,9 +1175,7 @@ class YawGraphEngine:
             ),
             default=0,
         )
-        current_lines = max(
-            get_max_end_line(self.conn, "corpus/passages.txt"), pool_max_line
-        )
+        current_lines = max(get_max_end_line(self.conn, "corpus/passages.txt"), pool_max_line)
         open_mode = "w" if current_lines == 0 else "a"
         with passages_path.open(open_mode, encoding="utf-8") as f:
             start_line = current_lines + 1
@@ -1289,9 +1230,7 @@ class YawGraphEngine:
                     c_strip = c_text.strip()
                     if not c_strip:
                         continue
-                    title_match = bool(
-                        doc_title and ptr.title and ptr.title.strip() == doc_title
-                    )
+                    title_match = bool(doc_title and ptr.title and ptr.title.strip() == doc_title)
                     body_match = (
                         c_strip in (d, doc_body)
                         or (len(c_strip) >= 30 and c_strip in d)
@@ -1331,12 +1270,15 @@ class YawGraphEngine:
                 )
             )
             missing_pool = [
-                (p, t)
-                for p, t in pool_chunks
-                if p.chunk_id not in self._opt_indexed_cids
+                (p, t) for p, t in pool_chunks if p.chunk_id not in self._opt_indexed_cids
             ]
             if missing_pool:
-                self.index_chunks(missing_pool, program=program)
+                for b_start in range(0, len(missing_pool), 8):
+                    self.index_chunks(
+                        missing_pool[b_start : b_start + 8],
+                        program=program,
+                        progress_callback=self._active_progress_callback,
+                    )
 
             target_list = req_chunks if req_chunks else pool_chunks
             stale_targets = [
@@ -1353,12 +1295,15 @@ class YawGraphEngine:
                     self._chunk_indexed_ext_fp.pop(cid, None)
 
             missing_targets = [
-                (p, t)
-                for p, t in target_list
-                if p.chunk_id not in self._opt_indexed_cids
+                (p, t) for p, t in target_list if p.chunk_id not in self._opt_indexed_cids
             ]
             if missing_targets:
-                self.index_chunks(missing_targets, program=program)
+                for b_start in range(0, len(missing_targets), 8):
+                    self.index_chunks(
+                        missing_targets[b_start : b_start + 8],
+                        program=program,
+                        progress_callback=self._active_progress_callback,
+                    )
             self._hydrate_chunk_traces_and_stats_from_db(target_list)
             target_cids = [p.chunk_id for p, _ in target_list]
 
@@ -1386,9 +1331,7 @@ class YawGraphEngine:
                             "openie_tokens",
                         ):
                             agg[k] += float(c_stats.get(k, 0.0))
-                        agg["cached_openie_tokens"] += float(
-                            c_stats.get("openie_tokens", 0.0)
-                        )
+                        agg["cached_openie_tokens"] += float(c_stats.get("openie_tokens", 0.0))
                 q_stats = {k: int(round(v)) for k, v in agg.items()}
                 self._active_query_rlm_stats = q_stats
                 self._last_scope_by_cids[tuple(target_cids)] = q_stats
@@ -1496,7 +1439,9 @@ class YawGraphEngine:
             return text
         clean_title = ptr.title.strip()
         first_line = text.split("\n", 1)[0].strip() if "\n" in text else text.strip()
-        if first_line.startswith("#") or first_line.lower().startswith(("title:", "wikipedia title:")):
+        if first_line.startswith("#") or first_line.lower().startswith(
+            ("title:", "wikipedia title:")
+        ):
             return text
         if text.startswith(f"{clean_title}\n"):
             body = text[len(clean_title) + 1 :]
@@ -1546,9 +1491,7 @@ class YawGraphEngine:
                 if progress_callback is not None:
                     progress_callback(f"indexing: embedding {len(missing_chunks)} chunk vectors")
                 texts_to_embed = [self._format_chunk_for_embedding(p, t) for p, t in missing_chunks]
-                vecs = self._encode_in_batches(
-                    texts_to_embed, instruction="", stage="chunk_embed"
-                )
+                vecs = self._encode_in_batches(texts_to_embed, instruction="", stage="chunk_embed")
                 chunk_vec_pairs = [
                     (p.chunk_id, v) for (p, _), v in zip(missing_chunks, vecs, strict=False)
                 ]
@@ -1572,8 +1515,7 @@ class YawGraphEngine:
                     save_openie_checkpoints(self.conn, [rec])
                     all_records.append(rec)
                 elif (
-                    self._baseline_openie_fp is None
-                    or openie_fp == self._baseline_openie_fp
+                    self._baseline_openie_fp is None or openie_fp == self._baseline_openie_fp
                 ) and ptr.chunk_id in cached_openie:
                     rec = cached_openie[ptr.chunk_id]
                     if getattr(rec, "entity_definitions", None):
@@ -1603,9 +1545,7 @@ class YawGraphEngine:
                 else:
                     if progress_callback is not None:
                         progress_callback(f"indexing: OpenIE extraction ({idx}/{total_chunks})")
-                    prev_def_audit_len = len(
-                        getattr(active_program, "entity_def_audit_trail", ())
-                    )
+                    prev_def_audit_len = len(getattr(active_program, "entity_def_audit_trail", ()))
                     prev_telem_len = len(getattr(active_program, "telemetry", ()))
                     chunk_raw_trace: list[Any] = []
                     with dspy.context(trace=chunk_raw_trace, usage_tracker=None):
@@ -1623,9 +1563,7 @@ class YawGraphEngine:
                         if isinstance(t_entry, dict)
                     )
                     new_def_entries = list(
-                        getattr(active_program, "entity_def_audit_trail", ())[
-                            prev_def_audit_len:
-                        ]
+                        getattr(active_program, "entity_def_audit_trail", ())[prev_def_audit_len:]
                     )
                     attempted_norms: set[str] = set()
                     chunk_m_cnt = 0
@@ -1658,25 +1596,26 @@ class YawGraphEngine:
 
             # 3. Resolve Stage 1 NER Entities, Stage 2 StructuredTriples, Provisional Sense-Split Gate, and Contextual Embeddings
             chunk_text_by_id = {ptr.chunk_id: text for ptr, text in chunks}
-            record_structured: list[
-                tuple[str, list[StructuredTriple], list[tuple[str, str]]]
-            ] = []
+            record_structured: list[tuple[str, list[StructuredTriple], list[tuple[str, str]]]] = []
             all_norm_labels: set[str] = set()
             for rec in all_records:
                 cid = rec.chunk_id
                 stage1_defs: dict[str, str] = {}
+                stage1_senses: dict[str, list[str]] = {}
                 for raw_pair in getattr(rec, "entity_definitions", ()) or ():
                     if isinstance(raw_pair, (list, tuple)) and len(raw_pair) >= 2:
                         enorm = str(text_processing(str(raw_pair[0])))
                         edef = str(raw_pair[1]).strip()
-                        if enorm and edef and (
-                            enorm not in stage1_defs
-                            or len(edef) > len(stage1_defs[enorm])
-                        ):
-                            stage1_defs[enorm] = edef
+                        if enorm and edef:
+                            if enorm not in stage1_defs:
+                                stage1_defs[enorm] = edef
+                            senses_lst = stage1_senses.setdefault(enorm, [])
+                            if all(d.lower() != edef.lower() for d in senses_lst):
+                                senses_lst.append(edef)
 
                 ner_entities: list[tuple[str, str]] = []
                 seen_ner_norms: set[str] = set()
+                seen_ner_sense_keys: set[tuple[str, str]] = set()
                 for raw_ent in getattr(rec, "entities", ()) or ():
                     if isinstance(raw_ent, (list, tuple)) and len(raw_ent) >= 1:
                         e_str = str(raw_ent[0])
@@ -1689,23 +1628,31 @@ class YawGraphEngine:
                         e_str = str(raw_ent)
                         e_inline_def = ""
                     e_norm = str(text_processing(e_str))
-                    if not e_norm or e_norm in seen_ner_norms:
+                    if not e_norm:
+                        continue
+                    e_def = e_inline_def or stage1_defs.get(e_norm, "")
+                    s_key = (e_norm, e_def.lower())
+                    if s_key in seen_ner_sense_keys or (not e_def and e_norm in seen_ner_norms):
                         continue
                     seen_ner_norms.add(e_norm)
-                    if e_inline_def and (
-                        e_norm not in stage1_defs
-                        or len(e_inline_def) > len(stage1_defs[e_norm])
-                    ):
-                        stage1_defs[e_norm] = e_inline_def
-                    e_def = e_inline_def or stage1_defs.get(e_norm, "")
+                    seen_ner_sense_keys.add(s_key)
+                    if e_inline_def:
+                        if e_norm not in stage1_defs:
+                            stage1_defs[e_norm] = e_inline_def
+                        senses_lst = stage1_senses.setdefault(e_norm, [])
+                        if all(d.lower() != e_inline_def.lower() for d in senses_lst):
+                            senses_lst.append(e_inline_def)
                     all_norm_labels.add(e_norm)
                     ner_entities.append((e_norm, e_def))
 
-                for enorm, edef in stage1_defs.items():
-                    if enorm not in seen_ner_norms:
-                        seen_ner_norms.add(enorm)
-                        all_norm_labels.add(enorm)
-                        ner_entities.append((enorm, edef))
+                for enorm, senses_lst in stage1_senses.items():
+                    for edef in senses_lst:
+                        s_key = (enorm, edef.lower())
+                        if s_key not in seen_ner_sense_keys:
+                            seen_ner_norms.add(enorm)
+                            seen_ner_sense_keys.add(s_key)
+                            all_norm_labels.add(enorm)
+                            ner_entities.append((enorm, edef))
 
                 st_list: list[StructuredTriple] = list(getattr(rec, "structured_triples", ()) or ())
                 if not st_list and getattr(rec, "triples", ()):
@@ -1719,13 +1666,22 @@ class YawGraphEngine:
                             spo_synth = f"{s_raw} {p_raw} {o_raw}."
                             s_raw_norm = str(text_processing(s_raw))
                             o_raw_norm = str(text_processing(o_raw))
+                            s_def_val = stage1_defs.get(s_raw_norm, "")
+                            o_def_val = stage1_defs.get(o_raw_norm, "")
+                            if (
+                                s_raw_norm
+                                and s_raw_norm == o_raw_norm
+                                and len(stage1_senses.get(s_raw_norm, ())) >= 2
+                            ):
+                                s_def_val = stage1_senses[s_raw_norm][0]
+                                o_def_val = stage1_senses[s_raw_norm][1]
                             st_list.append(
                                 StructuredTriple(
                                     subj=s_raw,
-                                    subj_def=stage1_defs.get(s_raw_norm, ""),
+                                    subj_def=s_def_val,
                                     pred=p_raw,
                                     obj=o_raw,
-                                    obj_def=stage1_defs.get(o_raw_norm, ""),
+                                    obj_def=o_def_val,
                                     spo_def=spo_synth,
                                 )
                             )
@@ -1741,19 +1697,36 @@ class YawGraphEngine:
                     spo_d = st.spo_def.strip() or f"{s_norm} {p_norm} {o_norm}."
                     raw_subj_d = st.subj_def.strip()
                     subj_d = raw_subj_d or stage1_defs.get(s_norm, "")
-                    if subj_d and (
-                        s_norm not in stage1_defs
-                        or len(subj_d) > len(stage1_defs[s_norm])
-                    ):
-                        stage1_defs[s_norm] = subj_d
+                    if subj_d:
+                        if s_norm not in stage1_defs:
+                            stage1_defs[s_norm] = subj_d
+                        senses_lst = stage1_senses.setdefault(s_norm, [])
+                        if all(d.lower() != subj_d.lower() for d in senses_lst):
+                            senses_lst.append(subj_d)
 
                     raw_obj_d = st.obj_def.strip()
                     obj_d = raw_obj_d or stage1_defs.get(o_norm, "")
-                    if obj_d and (
-                        o_norm not in stage1_defs
-                        or len(obj_d) > len(stage1_defs[o_norm])
+                    if (
+                        s_norm == o_norm
+                        and subj_d
+                        and obj_d
+                        and subj_d.lower() == obj_d.lower()
+                        and len(stage1_senses.get(o_norm, ())) >= 2
                     ):
-                        stage1_defs[o_norm] = obj_d
+                        obj_d = next(
+                            (
+                                d
+                                for d in stage1_senses[o_norm]
+                                if d.lower() != subj_d.lower()
+                            ),
+                            obj_d,
+                        )
+                    if obj_d:
+                        if o_norm not in stage1_defs:
+                            stage1_defs[o_norm] = obj_d
+                        senses_lst = stage1_senses.setdefault(o_norm, [])
+                        if all(d.lower() != obj_d.lower() for d in senses_lst):
+                            senses_lst.append(obj_d)
 
                     normalized_sts.append(
                         StructuredTriple(
@@ -1770,10 +1743,18 @@ class YawGraphEngine:
                 missing_norms: list[str] = []
                 seen_missing: set[str] = set(already_attempted)
                 for st in normalized_sts:
-                    if not st.subj_def and not stage1_defs.get(st.subj) and st.subj not in seen_missing:
+                    if (
+                        not st.subj_def
+                        and not stage1_defs.get(st.subj)
+                        and st.subj not in seen_missing
+                    ):
                         seen_missing.add(st.subj)
                         missing_norms.append(st.subj)
-                    if not st.obj_def and not stage1_defs.get(st.obj) and st.obj not in seen_missing:
+                    if (
+                        not st.obj_def
+                        and not stage1_defs.get(st.obj)
+                        and st.obj not in seen_missing
+                    ):
                         seen_missing.add(st.obj)
                         missing_norms.append(st.obj)
                 for e_norm, e_def in ner_entities:
@@ -1782,9 +1763,7 @@ class YawGraphEngine:
                         missing_norms.append(e_norm)
 
                 if missing_norms and hasattr(active_program, "define_missing_entities"):
-                    prev_def_audit_len = len(
-                        getattr(active_program, "entity_def_audit_trail", ())
-                    )
+                    prev_def_audit_len = len(getattr(active_program, "entity_def_audit_trail", ()))
                     def_raw_trace: list[Any] = []
                     with dspy.context(trace=def_raw_trace):
                         repaired_pairs = active_program.define_missing_entities(
@@ -1804,9 +1783,7 @@ class YawGraphEngine:
                         self._extract_named_trace_entries(active_program, def_raw_trace)
                     )
                     new_def_entries = list(
-                        getattr(active_program, "entity_def_audit_trail", ())[
-                            prev_def_audit_len:
-                        ]
+                        getattr(active_program, "entity_def_audit_trail", ())[prev_def_audit_len:]
                     )
                     for entry in new_def_entries:
                         if isinstance(entry, dict):
@@ -1865,9 +1842,7 @@ class YawGraphEngine:
                 known_concepts = {
                     lbl
                     for lbl in all_norm_labels
-                    if 3 <= len(lbl) <= 30
-                    and not lbl.isdigit()
-                    and len(lbl.split()) <= 3
+                    if 3 <= len(lbl) <= 30 and not lbl.isdigit() and len(lbl.split()) <= 3
                 }
                 for ptr, _ in chunks:
                     if ptr.title:
@@ -1974,6 +1949,8 @@ class YawGraphEngine:
                 label_norm: str,
                 defn: str,
                 chunk_id: str,
+                *,
+                exclude_eid: str | None = None,
             ) -> str:
                 clean_def = defn.strip()
                 existing_senses = senses_by_label.get(label_norm, [])
@@ -1989,6 +1966,21 @@ class YawGraphEngine:
                     return eid
 
                 if not clean_def:
+                    for eid, name, prev_def, _ in existing_senses:
+                        if exclude_eid is not None and eid == exclude_eid:
+                            continue
+                        if eid not in entity_map:
+                            entity_map[eid] = (eid, name, prev_def)
+                        entity_labels_to_upsert.append(
+                            (
+                                label_norm,
+                                eid,
+                                _label_kind_for(name, label_norm),
+                                label_norm,
+                                chunk_id,
+                            )
+                        )
+                        return eid
                     eid, name, prev_def, _ = existing_senses[0]
                     if eid not in entity_map:
                         entity_map[eid] = (eid, name, prev_def)
@@ -1999,21 +1991,27 @@ class YawGraphEngine:
 
                 # Check if any existing sense has no definition yet or identical definition
                 for idx_s, (eid, name, prev_def, prev_vec) in enumerate(existing_senses):
+                    if exclude_eid is not None and eid == exclude_eid:
+                        continue
                     if not prev_def or prev_def.lower() == clean_def.lower():
                         merged_def = (
-                            clean_def
-                            if len(clean_def) > len(prev_def)
-                            else (prev_def or clean_def)
+                            clean_def if len(clean_def) > len(prev_def) else (prev_def or clean_def)
                         )
                         existing_senses[idx_s] = (
                             eid,
                             name,
                             merged_def,
-                            prev_vec if merged_def == prev_def else None,
+                            prev_vec if (merged_def == prev_def) else None,
                         )
                         entity_map[eid] = (eid, name, merged_def)
                         entity_labels_to_upsert.append(
-                            (label_norm, eid, _label_kind_for(name, label_norm), label_norm, chunk_id)
+                            (
+                                label_norm,
+                                eid,
+                                _label_kind_for(name, label_norm),
+                                label_norm,
+                                chunk_id,
+                            )
                         )
                         return eid
 
@@ -2022,12 +2020,10 @@ class YawGraphEngine:
                 # When cos < 0.85 (whether in [0.65, 0.85) or < 0.65), mint a provisional sense_id
                 # WITHOUT writing any owl:differentFrom edge in Step 4 so Step 6 judge_synonyms
                 # adjudicates every ambiguous or divergent same-label pair.
-                sense_id = compute_mdhash_id(
-                    f"{label_norm}::{clean_def.lower()}", prefix="entity-"
-                )
-                cached_sense_vec = existing_vecs_by_id.get(sense_id) or precomputed_entity_vecs.get(
-                    sense_id
-                )
+                sense_id = compute_mdhash_id(f"{label_norm}::{clean_def.lower()}", prefix="entity-")
+                cached_sense_vec = existing_vecs_by_id.get(sense_id)
+                if cached_sense_vec is None:
+                    cached_sense_vec = precomputed_entity_vecs.get(sense_id)
                 if cached_sense_vec is not None:
                     cand_vec = cached_sense_vec
                 else:
@@ -2040,6 +2036,8 @@ class YawGraphEngine:
                         cand_vec = cand_vec / c_norm
 
                 for idx_s, (eid, name, prev_def, prev_vec) in enumerate(existing_senses):
+                    if exclude_eid is not None and eid == exclude_eid:
+                        continue
                     if prev_vec is None:
                         p_text = self._format_entity_embedding_text(name, prev_def)
                         prev_vec = self._encode_in_batches(
@@ -2052,21 +2050,23 @@ class YawGraphEngine:
                         precomputed_entity_vecs[eid] = prev_vec
                     cos_sim = float(np.dot(cand_vec, prev_vec))
                     if cos_sim >= self.same_sense_cosine_gate:
-                        merged_def = (
-                            clean_def if len(clean_def) > len(prev_def) else prev_def
-                        )
+                        merged_def = clean_def if len(clean_def) > len(prev_def) else prev_def
                         if merged_def != prev_def:
                             existing_senses[idx_s] = (eid, name, merged_def, cand_vec)
                             precomputed_entity_vecs[eid] = cand_vec
                         entity_map[eid] = (eid, name, merged_def)
                         entity_labels_to_upsert.append(
-                            (label_norm, eid, _label_kind_for(name, label_norm), label_norm, chunk_id)
+                            (
+                                label_norm,
+                                eid,
+                                _label_kind_for(name, label_norm),
+                                label_norm,
+                                chunk_id,
+                            )
                         )
                         return eid
 
-                sense_id = compute_mdhash_id(
-                    f"{label_norm}::{clean_def.lower()}", prefix="entity-"
-                )
+                sense_id = compute_mdhash_id(f"{label_norm}::{clean_def.lower()}", prefix="entity-")
                 precomputed_entity_vecs[sense_id] = cand_vec
                 existing_senses.append((sense_id, label_norm, clean_def, cand_vec))
                 entity_map[sense_id] = (sense_id, label_norm, clean_def)
@@ -2079,20 +2079,37 @@ class YawGraphEngine:
             chunk_to_entities: dict[str, set[str]] = {}
             fact_nodes_map: dict[str, tuple[str, str, str, str, str, str, str, str]] = {}
             edges_with_sources: list[tuple[str, str, str, float, str]] = []
+            fact_linked_pairs: set[tuple[str, str]] = set()
 
             for cid, st_list, ner_entities in record_structured:
                 chunk_to_entities.setdefault(cid, set())
-                resolved_in_chunk: set[str] = set()
+                resolved_in_chunk: set[tuple[str, str]] = set()
                 for st in st_list:
                     s_id = _resolve_mention_entity_id(st.subj, st.subj_def, cid)
-                    o_id = _resolve_mention_entity_id(st.obj, st.obj_def, cid)
-                    resolved_in_chunk.add(st.subj)
-                    resolved_in_chunk.add(st.obj)
+                    distinct_homograph_pole = (
+                        st.subj == st.obj
+                        and bool(st.subj_def.strip())
+                        and bool(st.obj_def.strip())
+                        and st.subj_def.strip().lower() != st.obj_def.strip().lower()
+                    )
+                    o_id = _resolve_mention_entity_id(
+                        st.obj,
+                        st.obj_def,
+                        cid,
+                        exclude_eid=s_id if distinct_homograph_pole else None,
+                    )
+                    resolved_in_chunk.add((st.subj, st.subj_def.strip().lower()))
+                    resolved_in_chunk.add((st.obj, st.obj_def.strip().lower()))
                     chunk_to_entities[cid].add(s_id)
                     chunk_to_entities[cid].add(o_id)
 
-                    raw_triple_str = str((st.subj, st.pred, st.obj))
-                    fid = compute_mdhash_id(raw_triple_str, prefix="fact-")
+                    base_s_id = compute_mdhash_id(st.subj, prefix="entity-")
+                    base_o_id = compute_mdhash_id(st.obj, prefix="entity-")
+                    if st.subj == st.obj or s_id != base_s_id or o_id != base_o_id:
+                        fid = compute_mdhash_id(str((s_id, st.pred, o_id)), prefix="fact-")
+                    else:
+                        raw_triple_str = str((st.subj, st.pred, st.obj))
+                        fid = compute_mdhash_id(raw_triple_str, prefix="fact-")
                     raw_json = json.dumps([st.subj, st.pred, st.obj])
                     prev_fact = fact_nodes_map.get(fid)
                     if prev_fact is None or (not prev_fact[5] and st.spo_def):
@@ -2107,13 +2124,17 @@ class YawGraphEngine:
                             st.obj_def,
                         )
                     if s_id != o_id:
+                        fact_linked_pairs.add((min(s_id, o_id), max(s_id, o_id)))
                         edges_with_sources.append((s_id, o_id, "fact", 1.0, cid))
                         edges_with_sources.append((o_id, s_id, "fact", 1.0, cid))
 
                 for e_norm, e_def in ner_entities:
-                    if e_norm in resolved_in_chunk:
+                    e_key = (e_norm, e_def.strip().lower())
+                    if e_key in resolved_in_chunk:
                         continue
-                    resolved_in_chunk.add(e_norm)
+                    if not e_def.strip() and any(k[0] == e_norm for k in resolved_in_chunk):
+                        continue
+                    resolved_in_chunk.add(e_key)
                     ner_eid = _resolve_mention_entity_id(e_norm, e_def.strip(), cid)
                     chunk_to_entities[cid].add(ner_eid)
 
@@ -2145,9 +2166,7 @@ class YawGraphEngine:
                     self._format_entity_embedding_text(name, defn)
                     for _, name, defn in missing_entities
                 ]
-                e_vecs = self._encode_in_batches(
-                    e_texts, instruction="", stage="entity_embed"
-                )
+                e_vecs = self._encode_in_batches(e_texts, instruction="", stage="entity_embed")
                 entity_vec_pairs.extend(
                     (eid, v) for (eid, _, _), v in zip(missing_entities, e_vecs, strict=False)
                 )
@@ -2155,9 +2174,7 @@ class YawGraphEngine:
             # Compute missing fact vectors using contextual `# {s} {p} {o}\n{spo_def} | {subj_def} | {obj_def}`
             all_fact_ids = [fid for fid, _, _, _, _, _, _, _ in fact_nodes]
             existing_fact_vecs = get_existing_ids(self.conn, "fact_vec", all_fact_ids)
-            missing_facts = [
-                f_row for f_row in fact_nodes if f_row[0] not in existing_fact_vecs
-            ]
+            missing_facts = [f_row for f_row in fact_nodes if f_row[0] not in existing_fact_vecs]
             fact_vec_pairs: list[tuple[str, np.ndarray]] = []
             if missing_facts:
                 if progress_callback is not None:
@@ -2170,9 +2187,7 @@ class YawGraphEngine:
                             items[0], pred, items[2], spo_d, subj_d, obj_d
                         )
                     )
-                f_vecs = self._encode_in_batches(
-                    fact_texts, instruction="", stage="fact_embed"
-                )
+                f_vecs = self._encode_in_batches(fact_texts, instruction="", stage="fact_embed")
                 fact_vec_pairs = [
                     (f_row[0], v) for f_row, v in zip(missing_facts, f_vecs, strict=False)
                 ]
@@ -2248,6 +2263,8 @@ class YawGraphEngine:
                     candidates.sort(
                         key=lambda c: (
                             text_processing(str(c["name_a"])) == text_processing(str(c["name_b"])),
+                            float(c["lexical_sim"]) >= 0.72,
+                            0.5 * float(c["lexical_sim"]) + 0.5 * float(c["dense_sim"]),
                             float(c["similarity"]),
                         ),
                         reverse=True,
@@ -2259,14 +2276,14 @@ class YawGraphEngine:
                     if llm_candidates:
                         syn_fp = self._synonym_fingerprint(active_program)
                         pairs_fp = hashlib.sha256(
-                            json.dumps(
-                                llm_candidates, sort_keys=True, ensure_ascii=False
-                            ).encode("utf-8")
+                            json.dumps(llm_candidates, sort_keys=True, ensure_ascii=False).encode(
+                                "utf-8"
+                            )
                         ).hexdigest()
                         if (syn_fp, pairs_fp) in self._synonym_fp_cache:
-                            cached_decs, cached_syn_tr, cached_syn_tok = (
-                                self._synonym_fp_cache[(syn_fp, pairs_fp)]
-                            )
+                            cached_decs, cached_syn_tr, cached_syn_tok = self._synonym_fp_cache[
+                                (syn_fp, pairs_fp)
+                            ]
                             decisions = list(cached_decs)
                             self._captured_graph_traces.extend(cached_syn_tr)
                             self._graph_rlm_stats["synonym_judge_tokens"] += cached_syn_tok
@@ -2274,9 +2291,7 @@ class YawGraphEngine:
                             syn_audit: list[dict[str, Any]] = getattr(
                                 active_program, "synonym_audit_trail", []
                             )
-                            tel: list[dict[str, Any]] = getattr(
-                                active_program, "telemetry", []
-                            )
+                            tel: list[dict[str, Any]] = getattr(active_program, "telemetry", [])
                             prev_syn_audit_len = len(syn_audit)
                             prev_tel_len = len(tel)
                             local_syn_trace: list[Any] = []
@@ -2341,13 +2356,20 @@ class YawGraphEngine:
                         name_src, _ = cand_meta.get(src, cand_meta.get(raw_src, (src, "")))
                         name_tgt, _ = cand_meta.get(tgt, cand_meta.get(raw_tgt, (tgt, "")))
                         same_name = text_processing(name_src) == text_processing(name_tgt)
-                        if rel in ("skos:altLabel", "skos:hiddenLabel", "exact_match") or (
-                            same_name and d_sim >= 0.45
+                        active_pkey = (min(src, tgt), max(src, tgt))
+                        is_fact_pole_pair = active_pkey in fact_linked_pairs
+                        if (
+                            rel in ("skos:altLabel", "skos:hiddenLabel", "exact_match")
+                            and not (same_name and is_fact_pole_pair)
                         ):
                             if canon and (
-                                canon in (src, raw_src)
-                                or text_processing(canon) == text_processing(name_src)
-                            ) and text_processing(canon) != text_processing(name_tgt):
+                                canon.upper() == "A"
+                                or canon in (src, raw_src)
+                                or (
+                                    text_processing(canon) == text_processing(name_src)
+                                    and text_processing(canon) != text_processing(name_tgt)
+                                )
+                            ):
                                 merge_src, merge_dst = tgt, src
                             else:
                                 merge_src, merge_dst = src, tgt
@@ -2360,14 +2382,19 @@ class YawGraphEngine:
                             merge_entities(conn, merge_src, merge_dst, label_kind=lkind)
                             merged_into[merge_src] = merge_dst
                             self._graph_rlm_stats["merged_entities"] += 1
+                        elif rel in ("owl:differentFrom", "different", "different_from"):
+                            semantic_batch.append((src, tgt, "owl:differentFrom", 0.0))
+                            self._graph_rlm_stats["different_from_edges"] += 1
                         elif rel in ("skos:related", "related"):
                             if same_name:
                                 semantic_batch.append((src, tgt, "owl:differentFrom", 0.0))
                                 self._graph_rlm_stats["different_from_edges"] += 1
+                                semantic_batch.append((src, tgt, "skos:related", max(0.5, sim)))
+                                self._graph_rlm_stats["related_edges"] += 1
                             else:
                                 semantic_batch.append((src, tgt, "skos:related", max(0.5, sim)))
                                 self._graph_rlm_stats["related_edges"] += 1
-                        elif rel in ("owl:differentFrom", "different", "different_from"):
+                        elif same_name and is_fact_pole_pair:
                             semantic_batch.append((src, tgt, "owl:differentFrom", 0.0))
                             self._graph_rlm_stats["different_from_edges"] += 1
 
@@ -2380,7 +2407,11 @@ class YawGraphEngine:
                             src = _resolve_active_eid(ea)
                             tgt = _resolve_active_eid(eb)
                             if src != tgt:
-                                if float(c.get("dense_sim", 0.0)) >= 0.45:
+                                active_pkey = (min(src, tgt), max(src, tgt))
+                                if (
+                                    float(c.get("dense_sim", 0.0)) >= 0.45
+                                    and active_pkey not in fact_linked_pairs
+                                ):
                                     merge_entities(conn, src, tgt, label_kind="skos:altLabel")
                                     merged_into[src] = tgt
                                     self._graph_rlm_stats["merged_entities"] += 1
@@ -2394,7 +2425,11 @@ class YawGraphEngine:
                         if src == tgt:
                             continue
                         if text_processing(str(c["name_a"])) == text_processing(str(c["name_b"])):
-                            if float(c.get("dense_sim", 0.0)) >= 0.45:
+                            active_pkey = (min(src, tgt), max(src, tgt))
+                            if (
+                                float(c.get("dense_sim", 0.0)) >= 0.45
+                                and active_pkey not in fact_linked_pairs
+                            ):
                                 merge_entities(conn, src, tgt, label_kind="skos:altLabel")
                                 merged_into[src] = tgt
                                 self._graph_rlm_stats["merged_entities"] += 1
@@ -2445,8 +2480,7 @@ class YawGraphEngine:
                         batch_attempted_keys.add(v_key)
                     bounded_violations = violations
                     focus_contexts = [
-                        inspect_focus_node(conn, v.focus_node)
-                        for v in violations[:16]
+                        inspect_focus_node(conn, v.focus_node) for v in violations[:16]
                     ]
                     shacl_fp = self._shacl_fingerprint(active_program)
                     viol_fp = hashlib.sha256(
@@ -2461,9 +2495,9 @@ class YawGraphEngine:
                         ).encode("utf-8")
                     ).hexdigest()
                     if (shacl_fp, viol_fp) in self._shacl_fp_cache:
-                        cached_reps, cached_shacl_tr, cached_shacl_tok = (
-                            self._shacl_fp_cache[(shacl_fp, viol_fp)]
-                        )
+                        cached_reps, cached_shacl_tr, cached_shacl_tok = self._shacl_fp_cache[
+                            (shacl_fp, viol_fp)
+                        ]
                         self._captured_graph_traces.extend(cached_shacl_tr)
                         self._graph_rlm_stats["shacl_healer_tokens"] += cached_shacl_tok
                         if cached_reps:
@@ -2474,9 +2508,7 @@ class YawGraphEngine:
                         shacl_audit: list[dict[str, Any]] = getattr(
                             active_program, "shacl_audit_trail", []
                         )
-                        shacl_tel: list[dict[str, Any]] = getattr(
-                            active_program, "telemetry", []
-                        )
+                        shacl_tel: list[dict[str, Any]] = getattr(active_program, "telemetry", [])
                         prev_shacl_audit_len = len(shacl_audit)
                         prev_tel_len = len(shacl_tel)
                         self._active_repl_repair_keys = set()
@@ -2490,7 +2522,11 @@ class YawGraphEngine:
                                 )
                         except Exception as exc:
                             import logging
-                            logging.warning("heal_shacl_violations encountered error: %s. Continuing indexing.", exc)
+
+                            logging.warning(
+                                "heal_shacl_violations encountered error: %s. Continuing indexing.",
+                                exc,
+                            )
                             repairs = []
                         finally:
                             repl_applied_keys = (
@@ -2534,9 +2570,7 @@ class YawGraphEngine:
                         )
                         all_violations = lint_graph_shacl(conn, auto_heal=False)
                 batch_shacl_remaining = sum(
-                    1
-                    for v in all_violations
-                    if (v.focus_node, v.shape) in batch_attempted_keys
+                    1 for v in all_violations if (v.focus_node, v.shape) in batch_attempted_keys
                 )
                 self._graph_rlm_stats["shacl_violations_after"] = len(all_violations)
                 self._graph_rlm_stats["shacl_violations_remaining"] = len(all_violations)
@@ -2619,13 +2653,9 @@ class YawGraphEngine:
             )
 
             # Step 2: Retrieve top-k lexical FTS hits from fact_fts (plus query_intent expansion)
-            fts_hits = search_facts_fts(
-                self.conn, query, top_k=self.fact_fts_pool_k
-            )
+            fts_hits = search_facts_fts(self.conn, query, top_k=self.fact_fts_pool_k)
             intent_query = (
-                active_program.extract_query_intent(query)
-                if allow_intent_path
-                else query
+                active_program.extract_query_intent(query) if allow_intent_path else query
             )
             intent_fts_hits = (
                 search_facts_fts(self.conn, intent_query, top_k=self.fact_fts_pool_k)
@@ -2672,18 +2702,14 @@ class YawGraphEngine:
                 else np.array([])
             )
             dense_norm_dict = {
-                fid: float(dense_norm_all[i])
-                for i, (fid, _) in enumerate(dense_hits)
+                fid: float(dense_norm_all[i]) for i, (fid, _) in enumerate(dense_hits)
             }
             fts_norm_all = (
                 min_max_normalize(np.array([s for _, s in fts_hits], dtype=np.float64))
                 if fts_hits
                 else np.array([])
             )
-            fts_norm_dict = {
-                fid: float(fts_norm_all[i])
-                for i, (fid, _) in enumerate(fts_hits)
-            }
+            fts_norm_dict = {fid: float(fts_norm_all[i]) for i, (fid, _) in enumerate(fts_hits)}
 
             kept_facts_with_scores: list[tuple[tuple[str, str, str], float]] = []
             if top_candidates:
@@ -2700,7 +2726,9 @@ class YawGraphEngine:
                 filter_indices = active_program.filter_triples(query, candidate_triples)
                 for idx in filter_indices:
                     if 0 <= idx < len(top_candidates):
-                        kept_facts_with_scores.append((candidate_triples[idx], float(candidate_scores[idx])))
+                        kept_facts_with_scores.append(
+                            (candidate_triples[idx], float(candidate_scores[idx]))
+                        )
 
             if not kept_facts_with_scores and allow_intent_path:
                 return self.retrieve_with_seeds(
@@ -2728,12 +2756,10 @@ class YawGraphEngine:
                     passage_weights[cid] = float(s)
 
             if fts_hits:
-                fts_scores = min_max_normalize(
-                    np.array([s for _, s in fts_hits], dtype=np.float64)
-                )
+                fts_scores = min_max_normalize(np.array([s for _, s in fts_hits], dtype=np.float64))
                 for (cid, _), s in zip(fts_hits, fts_scores, strict=False):
-                    passage_weights[cid] = (
-                        passage_weights.get(cid, 0.0) + self.fts_weight * float(s)
+                    passage_weights[cid] = passage_weights.get(cid, 0.0) + self.fts_weight * float(
+                        s
                     )
 
             # 3. PPR Execution or Dense Fallback
@@ -3028,25 +3054,58 @@ class YawGraphEngine:
                     self._opt_chunks_pool.append((ptr, text))
                     existing_cids.add(ptr.chunk_id)
 
+        self._active_progress_callback = progress_callback
         self._baseline_openie_fp = self._openie_fingerprint(self.program)
         self._hydrate_indexed_cids_from_db(self.program)
-        if len(self._opt_chunks_pool) <= 64 and self._opt_chunks_pool:
+        val_slice = list(valset)[:35] if (mode in ("gepa", "hybrid") and valset) else list(valset or trainset)
+        val_pool: list[tuple[ChunkPointer, str]] = []
+        seen_val_cids: set[str] = set()
+        for ex in val_slice:
+            ex_docs = getattr(ex, "item_docs", None)
+            if ex_docs:
+                for p, t in self._resolve_chunks_for_docs(ex_docs):
+                    if p.chunk_id not in seen_val_cids:
+                        seen_val_cids.add(p.chunk_id)
+                        val_pool.append((p, t))
+        if val_pool:
+            self._opt_val_chunks_pool = val_pool
+        elif len(self._opt_chunks_pool) <= 64 and self._opt_chunks_pool:
             self._opt_val_chunks_pool = list(self._opt_chunks_pool)
         else:
-            val_pool: list[tuple[ChunkPointer, str]] = []
-            seen_val_cids: set[str] = set()
-            for ex in valset or trainset:
-                ex_docs = getattr(ex, "item_docs", None)
-                if ex_docs:
-                    for p, t in self._resolve_chunks_for_docs(ex_docs):
-                        if p.chunk_id not in seen_val_cids:
-                            seen_val_cids.add(p.chunk_id)
-                            val_pool.append((p, t))
-            self._opt_val_chunks_pool = (
-                val_pool if val_pool else list(self._opt_chunks_pool[:64])
-            )
+            self._opt_val_chunks_pool = list(self._opt_chunks_pool[:64])
+
+        val_cids_set = {p.chunk_id for p, _ in self._opt_val_chunks_pool}
+        train_cids_set: set[str] = set()
+        for ex in trainset or ():
+            ex_docs = getattr(ex, "item_docs", None)
+            if ex_docs:
+                for p, _ in self._resolve_chunks_for_docs(ex_docs):
+                    train_cids_set.add(p.chunk_id)
+        all_pool_cids = val_cids_set | train_cids_set | {p.chunk_id for p, _ in self._opt_chunks_pool}
+        self._graph_rlm_stats["val_pool_size"] = len(val_cids_set)
+        self._graph_rlm_stats["train_pool_size"] = len(train_cids_set)
+        self._graph_rlm_stats["corpus_pool_size"] = max(1, len(all_pool_cids))
+
+        missing_val_pool = [
+            (p, t) for p, t in self._opt_val_chunks_pool if p.chunk_id not in self._opt_indexed_cids
+        ]
+        if missing_val_pool:
+            total_val_missing = len(missing_val_pool)
+            for b_start in range(0, total_val_missing, 8):
+                batch_slice = missing_val_pool[b_start : b_start + 8]
+                if progress_callback is not None:
+                    progress_callback(
+                        f"indexing: validation passages ({min(b_start + len(batch_slice), total_val_missing)}/{total_val_missing})"
+                    )
+                self.index_chunks(
+                    batch_slice,
+                    program=self.program,
+                    progress_callback=progress_callback,
+                )
 
         eval_count = 0
+        eval_history: list[dict[str, Any]] = []
+        last_eval_ts = time.time()
 
         def _build_stage_diagnostic(
             pred_name_str: str,
@@ -3066,13 +3125,24 @@ class YawGraphEngine:
                     else:
                         attrs = [
                             f"{k}={repr(getattr(outputs, k))[:80]}"
-                            for k in ("named_entities", "triples", "definitions", "decisions", "repairs", "intent_query", "selected_fact_indices", "answer")
+                            for k in (
+                                "named_entities",
+                                "triples",
+                                "definitions",
+                                "decisions",
+                                "repairs",
+                                "intent_query",
+                                "selected_fact_indices",
+                                "answer",
+                            )
                             if hasattr(outputs, k)
                         ]
                         if attrs:
                             out_summaries.append(", ".join(attrs))
             trace_summary = "; ".join(out_summaries) if out_summaries else "no_trace_outputs"
-            target_hint = f"gold_answers={gold_answers[:2]!r}" if gold_answers else "no_gold_answers"
+            target_hint = (
+                f"gold_answers={gold_answers[:2]!r}" if gold_answers else "no_gold_answers"
+            )
             miss_hint = f"missed={len(missed)}" if missed else "all_retrieved"
             return (
                 f"Stage[{pred_name_str}]: trace_calls={len(trace_entries)} "
@@ -3086,14 +3156,15 @@ class YawGraphEngine:
             pred_trace: Any = None,
         ) -> dspy.Prediction:
             nonlocal eval_count
-            eval_count += 1
-            if progress_callback is not None:
-                progress_callback(f"optimizing ({mode}, auto={auto}): evaluating candidate ({eval_count})")
-            gold_answers_raw = getattr(gold, "gold_answers", getattr(gold, "answer", []))
-            if isinstance(gold_answers_raw, str):
+            if pred_name is None:
+                eval_count += 1
+            gold_answers_raw = getattr(gold, "gold_answers", getattr(gold, "answer", None))
+            if gold_answers_raw is None:
+                gold_answers = []
+            elif isinstance(gold_answers_raw, str):
                 gold_answers = [gold_answers_raw]
             else:
-                gold_answers = [str(a) for a in (gold_answers_raw or ())]
+                gold_answers = [str(a) for a in gold_answers_raw]
 
             pred_answer = str(getattr(pred, "answer", "")).strip()
             context_str = str(getattr(pred, "context", ""))
@@ -3101,19 +3172,21 @@ class YawGraphEngine:
             gold_docs_raw = getattr(gold, "gold_docs", None)
             retrieved_cids_raw = getattr(pred, "retrieved_chunk_ids", None)
             retrieved_passages_raw = getattr(pred, "retrieved_passages", None)
-            retrieved_seq = [
-                str(x)
-                for x in (
-                    retrieved_cids_raw
-                    if retrieved_cids_raw
-                    else (retrieved_passages_raw or ())
-                )
-            ]
-            retrieved_texts_seq = [str(x) for x in (retrieved_passages_raw or ())]
+            if retrieved_cids_raw is not None and len(retrieved_cids_raw) > 0:
+                retrieved_seq = [str(x) for x in retrieved_cids_raw]
+            elif retrieved_passages_raw is not None and len(retrieved_passages_raw) > 0:
+                retrieved_seq = [str(x) for x in retrieved_passages_raw]
+            else:
+                retrieved_seq = []
+            retrieved_texts_seq = (
+                [str(x) for x in retrieved_passages_raw]
+                if retrieved_passages_raw is not None
+                else []
+            )
 
             missed: list[str] = []
             recalls_by_k: dict[int, float] = {1: 1.0, 2: 1.0, 5: 1.0, 10: 1.0, 20: 1.0}
-            if gold_docs_raw:
+            if gold_docs_raw is not None and len(gold_docs_raw) > 0:
                 total_gold = max(1, len(gold_docs_raw))
                 top_20_cids = [c for c in retrieved_seq[:20] if c.startswith("chunk-")]
                 hydrated_by_cid: dict[str, str] = {}
@@ -3162,11 +3235,11 @@ class YawGraphEngine:
 
             em_score: float | None = None
             f1_score: float | None = None
-            if gold_answers:
+            if gold_answers is not None and len(gold_answers) > 0:
                 em_score, f1_score = compute_qa_em_f1(pred_answer, gold_answers)
                 if em_score < 1.0:
                     missed.append(f"Predicted={pred_answer!r} != Expected={gold_answers!r}")
-                if not gold_docs_raw:
+                if gold_docs_raw is None or len(gold_docs_raw) == 0:
                     for k in (1, 2, 5, 10, 20):
                         recalls_by_k[k] = em_score
 
@@ -3198,14 +3271,16 @@ class YawGraphEngine:
                     "Ensure `track_usage=True` is active and task LMs report non-zero token usage."
                 )
             apm_hit: bool | None = None
-            if gold_answers:
+            if gold_answers is not None and len(gold_answers) > 0:
                 passages_for_apm = (
                     [p for p in context_str.split("\n\n") if p.strip()]
                     if context_str.strip()
                     else []
                 )
-                if passages_for_apm and hasattr(dspy, "evaluate") and hasattr(
-                    dspy.evaluate, "answer_passage_match"
+                if (
+                    passages_for_apm
+                    and hasattr(dspy, "evaluate")
+                    and hasattr(dspy.evaluate, "answer_passage_match")
                 ):
                     ex_apm = dspy.Example(answer=list(gold_answers))
                     pred_apm = dspy.Prediction(context=passages_for_apm)
@@ -3215,7 +3290,7 @@ class YawGraphEngine:
 
             gold_item_docs = getattr(gold, "item_docs", None)
             q_stats: dict[str, Any] | None = None
-            if gold_item_docs:
+            if gold_item_docs is not None and len(gold_item_docs) > 0:
                 gold_cids = tuple(
                     p.chunk_id for p, _ in self._resolve_chunks_for_docs(gold_item_docs)
                 )
@@ -3252,12 +3327,8 @@ class YawGraphEngine:
                         q_stats.get("shacl_violations_after", 0),
                     )
                 ),
-                missing_entity_defs_count=int(
-                    q_stats.get("missing_entity_defs_count", 0)
-                ),
-                missing_entity_defs_tokens=int(
-                    q_stats.get("missing_entity_defs_tokens", 0)
-                ),
+                missing_entity_defs_count=int(q_stats.get("missing_entity_defs_count", 0)),
+                missing_entity_defs_tokens=int(q_stats.get("missing_entity_defs_tokens", 0)),
                 pred_name=str(pred_name) if pred_name else None,
                 missed_items=missed,
             )
@@ -3274,7 +3345,35 @@ class YawGraphEngine:
                     missed,
                 )
                 score_pred.feedback = f"{score_pred.feedback} | {stage_diag}"
-            if eval_count == 1 or eval_count % 5 == 0:
+            if progress_callback is not None and pred_name is None:
+                now_ts = time.time()
+                dt_eval = max(1.0, now_ts - last_eval_ts)
+                last_eval_ts = now_ts
+                sc_val = float(score_pred.score)
+                em_val = float(em_score or 0.0)
+                f1_val = float(f1_score or 0.0)
+                eval_history.append(
+                    {
+                        "cand": eval_count,
+                        "score": round(sc_val, 4),
+                        "r1": round(recalls_by_k[1], 4),
+                        "r2": round(recalls_by_k[2], 4),
+                        "r5": round(recalls_by_k[5], 4),
+                        "r10": round(recalls_by_k[10], 4),
+                        "r20": round(recalls_by_k[20], 4),
+                        "em": round(em_val, 4),
+                        "f1": round(f1_val, 4),
+                        "tokens": int(usage_tokens),
+                        "s_per_it": round(dt_eval, 2),
+                        "ts": round(now_ts, 2),
+                    }
+                )
+                progress_callback(
+                    f"optimizing ({mode}, auto={auto}): eval #{eval_count} -> "
+                    f"score={sc_val:.3f}, R@5={recalls_by_k[5]:.2f}, "
+                    f"F1={f1_val:.2f}, EM={em_val:.2f}, dt={dt_eval:.1f}s, tok={usage_tokens}"
+                )
+            if pred_name is None:
                 self._persist_dspy_trails_to_db(self.program)
                 if save_path is not None:
                     with contextlib.suppress(Exception):
@@ -3283,7 +3382,10 @@ class YawGraphEngine:
                         inc_audit = p_inc.parent / f"{p_inc.stem}_graph_rlm_audit.json"
                         inc_payload = {
                             "graph_rlm_stats": dict(self._graph_rlm_stats),
-                            "program_telemetry": list(getattr(self.program, "telemetry", ()))[-250:],
+                            "eval_records": eval_history[-500:],
+                            "program_telemetry": list(getattr(self.program, "telemetry", ()))[
+                                -250:
+                            ],
                             "embedding_audit_trail": list(
                                 getattr(self.program, "embedding_audit_trail", ())
                             )[-250:],
@@ -3309,9 +3411,7 @@ class YawGraphEngine:
                 f1_val = float(getattr(res, "f1", 0.0) or 0.0)
                 apm_val = float(getattr(res, "answer_passage_match", 0.0) or 0.0)
                 r5_val = float(getattr(res, "recall_at_5", 0.0) or 0.0)
-                return bool(
-                    f1_val >= 0.25 or apm_val > 0.0 or (r5_val >= 1.0 and f1_val > 0.0)
-                )
+                return bool(f1_val >= 0.25 or apm_val > 0.0 or (r5_val >= 1.0 and f1_val > 0.0))
             return float(res.score)
 
         def _gepa_metric(
@@ -3421,13 +3521,8 @@ class YawGraphEngine:
                 if hasattr(optimizer, "_propose_instructions"):
                     optimizer._propose_instructions = proposer.propose_mipro_instructions
                 compile_sig = inspect.signature(optimizer.compile).parameters
-                if not any(
-                    p.kind == inspect.Parameter.VAR_KEYWORD
-                    for p in compile_sig.values()
-                ):
-                    compile_kwargs = {
-                        k: v for k, v in compile_kwargs.items() if k in compile_sig
-                    }
+                if not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in compile_sig.values()):
+                    compile_kwargs = {k: v for k, v in compile_kwargs.items() if k in compile_sig}
                 with dspy.context(track_usage=True):
                     compiled = optimizer.compile(
                         compiled,
@@ -3445,7 +3540,9 @@ class YawGraphEngine:
                     for name, pred in compiled.named_predictors():
                         if not getattr(pred, "demos", None) and baseline_demos.get(name):
                             pred.demos = list(baseline_demos[name])
-                    if hasattr(compiled.qa, "predict") and getattr(compiled.qa.predict, "demos", None):
+                    if hasattr(compiled.qa, "predict") and getattr(
+                        compiled.qa.predict, "demos", None
+                    ):
                         compiled.qa.demos = list(compiled.qa.predict.demos)
 
             if mode in ("gepa", "hybrid") and hasattr(dspy, "GEPA"):
@@ -3454,6 +3551,61 @@ class YawGraphEngine:
                     if save_path is not None
                     else None
                 )
+                gepa_valset = list(valset)[:35] if valset else None
+                if gepa_log_dir is not None:
+                    state_bin = Path(gepa_log_dir) / "gepa_state.bin"
+                    if state_bin.exists():
+                        with contextlib.suppress(Exception):
+                            import pickle
+
+                            with state_bin.open("rb") as f:
+                                saved_state = pickle.load(f)
+                            expected_val_len = len(gepa_valset) if gepa_valset is not None else len(trainset)
+                            saved_val_len = len(
+                                getattr(saved_state, "valset_evaluations", [{}])[0]
+                                if getattr(saved_state, "valset_evaluations", None)
+                                else getattr(saved_state, "prog_candidate_val_subscores", [{}])[0]
+                            )
+                            if saved_val_len != expected_val_len:
+                                state_bin.unlink(missing_ok=True)
+
+                class _GepaProgressCallback:
+                    def on_optimization_start(self, event: Any) -> None:
+                        if progress_callback is not None:
+                            progress_callback(
+                                f"GEPA started (train={event.get('trainset_size')}, val={event.get('valset_size')})"
+                            )
+
+                    def on_iteration_start(self, event: Any) -> None:
+                        if progress_callback is not None:
+                            progress_callback(
+                                f"GEPA iteration {event.get('iteration')}: selecting candidate..."
+                            )
+
+                    def on_proposal_start(self, event: Any) -> None:
+                        if progress_callback is not None:
+                            comps = ",".join(str(c) for c in (event.get("components") or ()))
+                            progress_callback(
+                                f"GEPA iteration {event.get('iteration')}: RLM reflecting on [{comps}]..."
+                            )
+
+                    def on_proposal_end(self, event: Any) -> None:
+                        if progress_callback is not None:
+                            comps = ",".join(
+                                str(c) for c in (event.get("new_instructions") or {}).keys()
+                            )
+                            progress_callback(
+                                f"GEPA iteration {event.get('iteration')}: proposed new [{comps}], scoring subsample..."
+                            )
+
+                    def on_valset_evaluated(self, event: Any) -> None:
+                        if progress_callback is not None:
+                            progress_callback(
+                                f"GEPA iteration {event.get('iteration')}: candidate #{event.get('candidate_idx')} "
+                                f"val_score={float(event.get('average_score', 0.0)):.4f} "
+                                f"(best={event.get('is_best_program')})"
+                            )
+
                 gepa_kwargs: dict[str, Any] = {
                     "metric": _gepa_metric,
                     "reflection_lm": resolved_ref_lm,
@@ -3469,7 +3621,11 @@ class YawGraphEngine:
                     "warn_on_score_mismatch": False,
                     "log_dir": gepa_log_dir,
                     "seed": 0,
-                    "gepa_kwargs": {"use_cloudpickle": True, "frontier_type": "hybrid"},
+                    "gepa_kwargs": {
+                        "use_cloudpickle": True,
+                        "frontier_type": "hybrid",
+                        "callbacks": [_GepaProgressCallback()],
+                    },
                 }
                 if num_trials is not None:
                     gepa_kwargs["max_metric_calls"] = num_trials
@@ -3482,9 +3638,10 @@ class YawGraphEngine:
                     compiled = gepa.compile(
                         compiled,
                         trainset=list(trainset),
-                        valset=list(valset) if valset else None,
+                        valset=gepa_valset,
                     )
         finally:
+            self._active_progress_callback = None
             configure_yaw_dspy_cache(
                 self._dspy_cache_dir,
                 enable_disk_cache=True,
@@ -3518,22 +3675,13 @@ class YawGraphEngine:
             audit_path = p.parent / f"{p.stem}_graph_rlm_audit.json"
             audit_payload = {
                 "graph_rlm_stats": dict(self._graph_rlm_stats),
+                "eval_records": eval_history[-500:],
                 "program_telemetry": list(getattr(self.program, "telemetry", ())),
-                "embedding_audit_trail": list(
-                    getattr(self.program, "embedding_audit_trail", ())
-                ),
-                "synonym_audit_trail": list(
-                    getattr(self.program, "synonym_audit_trail", ())
-                ),
-                "shacl_audit_trail": list(
-                    getattr(self.program, "shacl_audit_trail", ())
-                ),
-                "entity_def_audit_trail": list(
-                    getattr(self.program, "entity_def_audit_trail", ())
-                ),
-                "proposer_simba_telemetry": list(
-                    getattr(proposer, "simba_telemetry", ())
-                ),
+                "embedding_audit_trail": list(getattr(self.program, "embedding_audit_trail", ())),
+                "synonym_audit_trail": list(getattr(self.program, "synonym_audit_trail", ())),
+                "shacl_audit_trail": list(getattr(self.program, "shacl_audit_trail", ())),
+                "entity_def_audit_trail": list(getattr(self.program, "entity_def_audit_trail", ())),
+                "proposer_simba_telemetry": list(getattr(proposer, "simba_telemetry", ())),
             }
             audit_path.write_text(
                 json.dumps(audit_payload, ensure_ascii=False, indent=2),
@@ -3559,9 +3707,7 @@ class YawGraphEngine:
                     if (cp[0].chunk_id, target_openie_fp) in self._openie_fp_cache
                 ]
                 rehydrate_pool = (
-                    cached_pool[:64]
-                    if cached_pool
-                    else list(self._opt_chunks_pool[:16])
+                    cached_pool[:64] if cached_pool else list(self._opt_chunks_pool[:16])
                 )
             self.index_chunks(rehydrate_pool, program=self.program)
 
@@ -3582,10 +3728,7 @@ class YawGraphEngine:
         candidates = list(getattr(detailed, "candidates", None) or ())
         if not candidates:
             return []
-        scores = [
-            float(s)
-            for s in (getattr(detailed, "val_aggregate_scores", None) or ())
-        ]
+        scores = [float(s) for s in (getattr(detailed, "val_aggregate_scores", None) or ())]
         pareto_indices: set[int] = set()
         best_idx = getattr(detailed, "best_idx", None)
         if isinstance(best_idx, int) and 0 <= best_idx < len(candidates):
@@ -3687,9 +3830,7 @@ class YawGraphEngine:
             context_val = getattr(pred, "context", "")
             apm_hit = _compute_apm(gold_answers, context_val)
             em_score, f1_score = (
-                compute_qa_em_f1(pred_answer, gold_answers)
-                if gold_answers
-                else (0.0, 0.0)
+                compute_qa_em_f1(pred_answer, gold_answers) if gold_answers else (0.0, 0.0)
             )
             if isinstance(pred, dspy.Prediction):
                 pred.answer_passage_match = 1.0 if apm_hit else 0.0
@@ -3709,9 +3850,7 @@ class YawGraphEngine:
                         pred.semantic_f1 = float(getattr(sem_res, "score", sem_res))
                     if grounded_mod is not None:
                         grd_res = grounded_mod(sem_ex, sem_pred)
-                        pred.complete_and_grounded = float(
-                            getattr(grd_res, "score", grd_res)
-                        )
+                        pred.complete_and_grounded = float(getattr(grd_res, "score", grd_res))
 
             if metric is not None:
                 if metric is dspy.evaluate.answer_passage_match:
@@ -3740,4 +3879,3 @@ class YawGraphEngine:
 __all__ = [
     "YawGraphEngine",
 ]
-

@@ -16,7 +16,6 @@ def test_yaw_config_defaults() -> None:
     assert cfg.retrieval_top_k == 10
 
 
-
 def test_yaw_config_validation() -> None:
     with pytest.raises(YawRuntimeError) as exc_info:
         YawConfig(optimize_auto=cast(Any, "invalid"))
@@ -61,7 +60,9 @@ qa_model = "Qwen3-4B-Instruct-2507-GGUF"
     )
 
     # 1. get specific keys
-    auto_val = get_config_value(path=toml_file, key="optimization.auto", workspace_override=tmp_path)
+    auto_val = get_config_value(
+        path=toml_file, key="optimization.auto", workspace_override=tmp_path
+    )
     assert auto_val == "light"
 
     # Alias check
@@ -79,7 +80,10 @@ qa_model = "Qwen3-4B-Instruct-2507-GGUF"
     assert val == "heavy"
 
     # Verify updated
-    assert get_config_value(path=toml_file, key="optimization.auto", workspace_override=tmp_path) == "heavy"
+    assert (
+        get_config_value(path=toml_file, key="optimization.auto", workspace_override=tmp_path)
+        == "heavy"
+    )
 
     # 3. get all keys
     all_cfg = get_config_value(path=toml_file, workspace_override=tmp_path)
@@ -91,7 +95,18 @@ def test_yaw_config_json_keys_and_patterns(tmp_path: Path) -> None:
     cfg = YawConfig(workspace_root=tmp_path)
     assert cfg.json_keys_whitelist == ("*",)
     assert cfg.json_keys_blacklist == ()
-    for ext in ("*.md", "*.txt", "*.json", "*.jsonl", "*.py", "*.rs", "*.ts", "*.html", "*.toml", "*.yaml"):
+    for ext in (
+        "*.md",
+        "*.txt",
+        "*.json",
+        "*.jsonl",
+        "*.py",
+        "*.rs",
+        "*.ts",
+        "*.html",
+        "*.toml",
+        "*.yaml",
+    ):
         assert ext in cfg.included_patterns
 
     fp_default = cfg.config_fingerprint()

@@ -77,9 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_daemon = domain_subparsers.add_parser("daemon", help="Daemon lifecycle commands")
     daemon_subs = p_daemon.add_subparsers(dest="action", help="Daemon action")
 
-    daemon_subs.add_parser(
-        "start", parents=[common], help="Start persistent daemon in background"
-    )
+    daemon_subs.add_parser("start", parents=[common], help="Start persistent daemon in background")
 
     daemon_subs.add_parser("stop", parents=[common], help="Gracefully stop a running daemon")
     daemon_subs.add_parser(
@@ -873,10 +871,13 @@ def handle_dspy_optimize(
     )
 
     # Resolution order for sandbox: always isolate prompt compilation
+    dspy.settings.configure(provide_traceback=True)
     raw_db = getattr(args, "db_path", None)
     opt_config = config.for_optimization(db_override=raw_db)
     raw_sleep = getattr(args, "sleep_seconds", None)
-    sleep_seconds = float(raw_sleep) if raw_sleep is not None else float(config.optimize_sleep_seconds or 0.0)
+    sleep_seconds = (
+        float(raw_sleep) if raw_sleep is not None else float(config.optimize_sleep_seconds or 0.0)
+    )
     object.__setattr__(opt_config, "optimize_sleep_seconds", sleep_seconds)
 
     raw_bootstrapped = getattr(args, "max_bootstrapped_demos", None)
@@ -887,9 +888,7 @@ def handle_dspy_optimize(
     )
     raw_labeled = getattr(args, "max_labeled_demos", None)
     max_labeled_demos = (
-        int(raw_labeled)
-        if raw_labeled is not None
-        else int(config.optimize_max_labeled_demos or 0)
+        int(raw_labeled) if raw_labeled is not None else int(config.optimize_max_labeled_demos or 0)
     )
     object.__setattr__(opt_config, "optimize_max_bootstrapped_demos", max_bootstrapped_demos)
     object.__setattr__(opt_config, "optimize_max_labeled_demos", max_labeled_demos)
@@ -898,7 +897,7 @@ def handle_dspy_optimize(
     runtime.start(sync_on_start=False)
 
     def _cli_progress(msg: str) -> None:
-        print(f"\r[yaw optimize] {msg}\x1b[K", end="", file=sys.stderr, flush=True)
+        print(f"[yaw optimize] {msg}", file=sys.stderr, flush=True)
 
     try:
         saved_path = runtime.optimize(
@@ -931,9 +930,7 @@ def handle_dspy_optimize(
                         if isinstance(it, dict)
                     ]
                     em_scores = [
-                        float(it.get("em", 0.0))
-                        for it in raw_eval
-                        if isinstance(it, dict)
+                        float(it.get("em", 0.0)) for it in raw_eval if isinstance(it, dict)
                     ]
                     apm_scores = [
                         float(it.get("answer_passage_match", 0.0))
@@ -942,12 +939,8 @@ def handle_dspy_optimize(
                     ]
                     eval_summary = {
                         "num_evaluated": len(raw_eval),
-                        "mean_f1": (
-                            sum(f1_scores) / len(f1_scores) if f1_scores else 0.0
-                        ),
-                        "mean_em": (
-                            sum(em_scores) / len(em_scores) if em_scores else 0.0
-                        ),
+                        "mean_f1": (sum(f1_scores) / len(f1_scores) if f1_scores else 0.0),
+                        "mean_em": (sum(em_scores) / len(em_scores) if em_scores else 0.0),
                         "answer_passage_match_rate": (
                             sum(apm_scores) / len(apm_scores) if apm_scores else 0.0
                         ),
@@ -967,9 +960,7 @@ def handle_dspy_optimize(
             "proposer_telemetry_path": (
                 str(proposer_telemetry) if proposer_telemetry.exists() else None
             ),
-            "graph_rlm_audit_path": (
-                str(graph_rlm_audit) if graph_rlm_audit.exists() else None
-            ),
+            "graph_rlm_audit_path": (str(graph_rlm_audit) if graph_rlm_audit.exists() else None),
             "gepa_telemetry_dir": (
                 str(gepa_telemetry_dir) if gepa_telemetry_dir.exists() else None
             ),

@@ -187,7 +187,5 @@ def to_rel_posix_path(corpus_root: Path, file_path: Path | str) -> str:
     root_resolved = corpus_root.resolve()
     target_path = Path(file_path).resolve()
     if not target_path.is_relative_to(root_resolved):
-        raise ValueError(
-            f"File path {file_path!r} resolves outside corpus root {corpus_root}"
-        )
+        raise ValueError(f"File path {file_path!r} resolves outside corpus root {corpus_root}")
     return target_path.relative_to(root_resolved).as_posix()

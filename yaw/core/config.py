@@ -213,10 +213,10 @@ class YawConfig:
         self,
         datestamp: str | None = None,
         db_override: Path | str | None = None,
-    ) -> "YawConfig":
+    ) -> YawConfig:
         """Derive an isolated configuration for prompt optimization using *_optimize_<datestamp>.* paths."""
-        from datetime import UTC, datetime
         import re
+        from datetime import UTC, datetime
 
         base_db = Path(self.db_path) if self.db_path else Path(".yaw/yaw.db")
         base_dir = base_db.parent
@@ -229,7 +229,11 @@ class YawConfig:
                     key=lambda p: p.stat().st_size,
                     reverse=True,
                 )
-                opt_db = candidates[0] if candidates else base_dir / f"yaw_optimize_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}.db"
+                opt_db = (
+                    candidates[0]
+                    if candidates
+                    else base_dir / f"yaw_optimize_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}.db"
+                )
             else:
                 opt_db = Path(raw_path).resolve()
             ds_match = re.search(r"yaw_optimize_(\d{8}_\d{6})", opt_db.name)
@@ -237,40 +241,6 @@ class YawConfig:
         else:
             ds = datestamp or datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
             opt_db = base_dir / f"yaw_optimize_{ds}.db"
-            if not opt_db.exists():
-                # Seed from the latest populated sandbox database so previous extraction work is never lost
-                pop_candidates = [
-                    p
-                    for p in sorted(
-                        base_dir.glob("yaw_optimize_*.db"),
-                        key=lambda p: p.stat().st_size,
-                        reverse=True,
-                    )
-                    if p.name != opt_db.name and p.stat().st_size > 1_000_000
-                ]
-                if pop_candidates:
-                    import shutil
-
-                    src_db = pop_candidates[0]
-                    with contextlib.suppress(Exception):
-                        shutil.copyfile(src_db, opt_db)
-                        wal_src = Path(f"{src_db}-wal")
-                        if wal_src.exists():
-                            shutil.copyfile(wal_src, Path(f"{opt_db}-wal"))
-                    src_match = re.search(r"yaw_optimize_(\d{8}_\d{6})", src_db.name)
-                    if src_match:
-                        src_ds = src_match.group(1)
-                        for suffix in ("_graph_rlm_audit.json", "_proposer_telemetry.json"):
-                            src_trail = base_dir / f"compiled_program_optimize_{src_ds}{suffix}"
-                            dst_trail = base_dir / f"compiled_program_optimize_{ds}{suffix}"
-                            if src_trail.exists() and not dst_trail.exists():
-                                with contextlib.suppress(Exception):
-                                    shutil.copyfile(src_trail, dst_trail)
-                        src_tel_dir = base_dir / f"compiled_program_optimize_{src_ds}_telemetry"
-                        dst_tel_dir = base_dir / f"compiled_program_optimize_{ds}_telemetry"
-                        if src_tel_dir.is_dir() and not dst_tel_dir.exists():
-                            with contextlib.suppress(Exception):
-                                shutil.copytree(src_tel_dir, dst_tel_dir)
 
         opt_lock = base_dir / f"yaw_optimize_{ds}.db.lock"
         opt_status = base_dir / f"status_optimize_{ds}.json"
@@ -280,7 +250,8 @@ class YawConfig:
         cfg_dict: dict[str, Any] = {
             f.name: getattr(self, f.name)
             for f in fields(self)
-            if f.name not in (
+            if f.name
+            not in (
                 "db_path",
                 "lock_path",
                 "status_path",
@@ -445,11 +416,7 @@ def load_config(
         section = data.get(sec_name)
         if isinstance(section, dict):
             for k, v in section.items():
-                mapped_k = (
-                    _OPTIMIZATION_KEY_ALIASES.get(k, k)
-                    if sec_name == "optimization"
-                    else k
-                )
+                mapped_k = _OPTIMIZATION_KEY_ALIASES.get(k, k) if sec_name == "optimization" else k
                 if mapped_k in valid_fields:
                     if mapped_k == "optimize_datasets":
                         if isinstance(v, str):

@@ -61,7 +61,9 @@ class TypesTests(unittest.TestCase):
         self.assertEqual(passage.score, 0.95)
         self.assertFalse(passage.stale_on_disk)
 
-        stale_passage = HydratedPassage(pointer=pointer, text="Stale", score=0.5, stale_on_disk=True)
+        stale_passage = HydratedPassage(
+            pointer=pointer, text="Stale", score=0.5, stale_on_disk=True
+        )
         self.assertTrue(stale_passage.stale_on_disk)
 
         with self.assertRaises((FrozenInstanceError, AttributeError)):

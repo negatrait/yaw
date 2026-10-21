@@ -64,8 +64,7 @@ def _serialize_sync_delta(delta: SyncDelta) -> str:
 def _deserialize_sync_delta(raw: str) -> SyncDelta:
     data = json.loads(raw)
     added = tuple(
-        (ChunkPointer(**ptr_dict), str(text))
-        for ptr_dict, text in data.get("added_chunks", ())
+        (ChunkPointer(**ptr_dict), str(text)) for ptr_dict, text in data.get("added_chunks", ())
     )
     deleted = tuple(str(cid) for cid in data.get("deleted_chunk_ids", ()))
     return SyncDelta(added_chunks=added, deleted_chunk_ids=deleted)
@@ -87,7 +86,7 @@ class YawRuntime:
     """Single-owner persistent daemon runtime managing yaw.db, CocoIndex, and bounded worker execution."""
 
     _active_lock: ClassVar[threading.Lock] = threading.Lock()
-    _active_instances: ClassVar[dict[Path, "YawRuntime"]] = {}
+    _active_instances: ClassVar[dict[Path, YawRuntime]] = {}
 
     def __init__(
         self,
@@ -361,7 +360,7 @@ class YawRuntime:
         """Alias for stop()."""
         self.stop()
 
-    def __enter__(self) -> "YawRuntime":
+    def __enter__(self) -> YawRuntime:
         self.start()
         return self
 
@@ -480,7 +479,9 @@ class YawRuntime:
                 self._update_state()
                 continue
 
-            sync_state = "syncing" if item.op_name in ("sync", "rebuild") else self._status.sync_state
+            sync_state = (
+                "syncing" if item.op_name in ("sync", "rebuild") else self._status.sync_state
+            )
             self._update_state(active_op=item.op_name, sync_state=sync_state)
             if item.progress_callback is not None:
                 item.progress_callback("started")
@@ -502,9 +503,7 @@ class YawRuntime:
             except Exception as exc:
                 msg = f"{type(exc).__name__}: {exc}"
                 err_code: Literal["CONSISTENCY_ERROR", "MODEL_ERROR"] = (
-                    "CONSISTENCY_ERROR"
-                    if isinstance(exc, sqlite3.DatabaseError)
-                    else "MODEL_ERROR"
+                    "CONSISTENCY_ERROR" if isinstance(exc, sqlite3.DatabaseError) else "MODEL_ERROR"
                 )
                 wrapped = YawRuntimeError(err_code, msg)
                 self._update_state(
@@ -518,7 +517,11 @@ class YawRuntime:
             else:
                 if item.progress_callback is not None:
                     item.progress_callback("ready")
-                now_ts = time.time() if item.op_name in ("sync", "rebuild") else self._status.last_sync_at
+                now_ts = (
+                    time.time()
+                    if item.op_name in ("sync", "rebuild")
+                    else self._status.last_sync_at
+                )
                 self._update_state(
                     lifecycle="ready",
                     provider_ready=True,
@@ -542,6 +545,7 @@ class YawRuntime:
             return
         cb = progress_callback
         if cb is None:
+
             def _default_sync_progress(msg: str) -> None:
                 self._update_state(active_op=msg, sync_state="syncing")
 
@@ -656,9 +660,7 @@ class YawRuntime:
         progress_callback: Callable[[str], None] | None = None,
     ) -> list[HydratedPassage]:
         """Synchronously retrieve top-k hydrated passages via the bounded worker queue."""
-        return self.retrieve_async(
-            query, top_k=top_k, progress_callback=progress_callback
-        ).result()
+        return self.retrieve_async(query, top_k=top_k, progress_callback=progress_callback).result()
 
     def rag_qa_async(
         self,
@@ -669,9 +671,7 @@ class YawRuntime:
         """Validate question and enqueue multi-hop HippoRAG 2 QA on the worker queue."""
         cleaned = validate_query_input(question)
         if self.stats().chunks == 0:
-            raise YawRuntimeError(
-                "EMPTY_INDEX", "Cannot execute rag_qa on an empty graph index."
-            )
+            raise YawRuntimeError("EMPTY_INDEX", "Cannot execute rag_qa on an empty graph index.")
 
         def _run_qa() -> dict[str, Any]:
             if self.engine is None:
@@ -813,10 +813,6 @@ class YawRuntime:
                     min_chunk_size=self.config.min_chunk_size,
                 )
                 opt_chunks = list(delta.added_chunks)
-                if opt_chunks and len(opt_chunks) <= 64:
-                    self.engine.index_chunks(
-                        opt_chunks, progress_callback=_progress
-                    )
                 new_stats = self.engine.get_stats(self.config.config_fingerprint())
                 with self._state_lock:
                     self._stats = new_stats

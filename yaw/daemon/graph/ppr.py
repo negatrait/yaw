@@ -32,19 +32,34 @@ def apply_graph_activation(
     if activation == "linear":
         return x
     if activation == "scaled_tanh":
-        c = float(param) if param is not None and param > 0.0 else DEFAULT_ACTIVATION_PARAMS["scaled_tanh"]
+        c = (
+            float(param)
+            if param is not None and param > 0.0
+            else DEFAULT_ACTIVATION_PARAMS["scaled_tanh"]
+        )
         return np.tanh(c * x) / c
     if activation == "hard_tanh":
-        c = float(param) if param is not None and param > 0.0 else DEFAULT_ACTIVATION_PARAMS["hard_tanh"]
+        c = (
+            float(param)
+            if param is not None and param > 0.0
+            else DEFAULT_ACTIVATION_PARAMS["hard_tanh"]
+        )
         return np.clip(x, 0.0, c)
     if activation == "shifted_tanh":
-        c = float(param) if param is not None and param >= 0.0 else DEFAULT_ACTIVATION_PARAMS["shifted_tanh"]
+        c = (
+            float(param)
+            if param is not None and param >= 0.0
+            else DEFAULT_ACTIVATION_PARAMS["shifted_tanh"]
+        )
         return np.maximum(0.0, np.tanh(np.maximum(0.0, x) - c))
     if activation == "threshold_relu":
-        theta = float(param) if param is not None and param >= 0.0 else DEFAULT_ACTIVATION_PARAMS["threshold_relu"]
+        theta = (
+            float(param)
+            if param is not None and param >= 0.0
+            else DEFAULT_ACTIVATION_PARAMS["threshold_relu"]
+        )
         return np.maximum(0.0, x - theta)
     raise ValueError(f"Unknown graph activation: {activation}")
-
 
 
 @dataclass(frozen=True, slots=True)

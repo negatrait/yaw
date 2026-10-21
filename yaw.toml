@@ -45,9 +45,9 @@ http_path = "/mcp"
 
 [optimization]
 datasets = ["enterprise_rag_bench"]
-mode = "hybrid"
-max_queries = 250
-train_queries = 150
+mode = "gepa"
+max_queries = 40
+train_queries = 30
 query_offset = 0
 auto = "light"
 sleep_seconds = 0.0

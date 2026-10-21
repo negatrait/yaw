@@ -45,9 +45,10 @@ class EmbeddingProfile:
         if not self.parse_document_title:
             payload.pop("parse_document_title", None)
         contract = {"adapter": "retrieval-prompts-v3", "normalization": "l2", **payload}
-        return "yaw-embedding-v2:" + hashlib.sha256(
-            json.dumps(contract, sort_keys=True).encode("utf-8")
-        ).hexdigest()
+        return (
+            "yaw-embedding-v2:"
+            + hashlib.sha256(json.dumps(contract, sort_keys=True).encode("utf-8")).hexdigest()
+        )
 
     def format(self, text, *, query, instruction=None, title: str | None = None):
         if not isinstance(text, str):
@@ -92,17 +93,27 @@ PROFILES = {
     "embeddinggemma-300m-GGUF": EmbeddingProfile(
         "embeddinggemma-300m-GGUF",
         "ggml-org/embeddinggemma-300M-GGUF:embeddinggemma-300M-Q8_0.gguf",
-        768, 2048, "mean", QUERY_PREFIX, DOCUMENT_PREFIX,
+        768,
+        2048,
+        "mean",
+        QUERY_PREFIX,
+        DOCUMENT_PREFIX,
     ),
     "embeddinggemma-300m-qat-q8_0-GGUF-Q8_0": EmbeddingProfile(
         "embeddinggemma-300m-qat-q8_0-GGUF-Q8_0",
         "ggml-org/embeddinggemma-300m-qat-q8_0-GGUF:Q8_0",
-        768, 2048, "mean", QUERY_PREFIX, DOCUMENT_PREFIX,
+        768,
+        2048,
+        "mean",
+        QUERY_PREFIX,
+        DOCUMENT_PREFIX,
     ),
     "Qwen3-Embedding-0.6B-GGUF": EmbeddingProfile(
         "Qwen3-Embedding-0.6B-GGUF",
         "Qwen/Qwen3-Embedding-0.6B-GGUF:Qwen3-Embedding-0.6B-Q8_0.gguf",
-        1024, 32768, "last",
+        1024,
+        32768,
+        "last",
         "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:",
         "",
     ),
@@ -399,9 +410,7 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
         self.telemetry: list[dict[str, Any]] = []
         self._telemetry_hook: Callable[[dict[str, Any]], None] | None = None
 
-    def bind_telemetry_hook(
-        self, hook: Callable[[dict[str, Any]], None] | None
-    ) -> None:
+    def bind_telemetry_hook(self, hook: Callable[[dict[str, Any]], None] | None) -> None:
         """Bind a callback invoked with each structured embedding telemetry entry."""
         self._telemetry_hook = hook
 
@@ -410,7 +419,7 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
         self.telemetry.clear()
 
     @classmethod
-    def from_config(cls, config: YawConfig) -> "DSPyEmbeddingAdapter":
+    def from_config(cls, config: YawConfig) -> DSPyEmbeddingAdapter:
         """Construct a profile-aware DSPyEmbeddingAdapter from a YawConfig."""
         profile = resolve_embedding_profile(config.embedding_model, config.embedding_task_mode)
         return cls(
@@ -449,7 +458,9 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
             if len(prepared) > 1:
                 mid = len(prepared) // 2
                 left = self._encode_prepared(prepared[:mid], {**call_kwargs, "batch_size": mid})
-                right = self._encode_prepared(prepared[mid:], {**call_kwargs, "batch_size": len(prepared) - mid})
+                right = self._encode_prepared(
+                    prepared[mid:], {**call_kwargs, "batch_size": len(prepared) - mid}
+                )
                 return np.concatenate([left, right], axis=0)
 
             # Single item overflow: divide gracefully into 2+ sub-chunks and pool without truncation
@@ -678,9 +689,7 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
             flat_pieces,
             piece_weights,
             micro_batches,
-        ) = self._prepare_pieces_and_batches(
-            texts, instruction=instruction, batch_size=batch_size
-        )
+        ) = self._prepare_pieces_and_batches(texts, instruction=instruction, batch_size=batch_size)
 
         flat_vectors: list[np.ndarray | None] = [None] * len(flat_pieces)
         for mb in micro_batches:
@@ -722,9 +731,7 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
             flat_pieces,
             piece_weights,
             micro_batches,
-        ) = self._prepare_pieces_and_batches(
-            texts, instruction=instruction, batch_size=batch_size
-        )
+        ) = self._prepare_pieces_and_batches(texts, instruction=instruction, batch_size=batch_size)
 
         flat_vectors: list[np.ndarray | None] = [None] * len(flat_pieces)
 

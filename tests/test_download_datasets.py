@@ -44,7 +44,9 @@ class DownloadDatasetsTests(unittest.TestCase):
 
             # 2. Present and valid JSON
             (dest / "sample.json").write_text(json.dumps([{"q": 1}]), encoding="utf-8")
-            (dest / "sample_corpus.json").write_text(json.dumps([{"c": 1}, {"c": 2}]), encoding="utf-8")
+            (dest / "sample_corpus.json").write_text(
+                json.dumps([{"c": 1}, {"c": 2}]), encoding="utf-8"
+            )
             valid_status = download_datasets.verify_dataset("sample", dest)
             self.assertTrue(valid_status["ready"])
             self.assertEqual(valid_status["queries"], 1)

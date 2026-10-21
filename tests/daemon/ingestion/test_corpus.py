@@ -316,22 +316,12 @@ def test_native_cocoindex_ast_headings_across_languages() -> None:
     assert "Token Refresh" in html_titles
 
     # 2. TOML ([section])
-    toml_doc = (
-        "[ingestion]\n"
-        "chunk_size = 1200\n\n"
-        "[graph.ppr]\n"
-        "damping = 0.5\n"
-    )
+    toml_doc = "[ingestion]\nchunk_size = 1200\n\n[graph.ppr]\ndamping = 0.5\n"
     toml_headings = extract_ast_headings(toml_doc, language="toml")
     assert toml_headings == [(1, "ingestion"), (4, "graph.ppr")]
 
     # 3. YAML (top-level keys)
-    yaml_doc = (
-        "service:\n"
-        "  host: localhost\n"
-        "database:\n"
-        "  path: yaw.db\n"
-    )
+    yaml_doc = "service:\n  host: localhost\ndatabase:\n  path: yaw.db\n"
     yaml_headings = extract_ast_headings(yaml_doc, language="yaml")
     assert yaml_headings == [(1, "service"), (3, "database")]
 

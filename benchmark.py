@@ -159,84 +159,278 @@ PASSAGE_SEED_POOL_K = 200
 FTS_SEED_POOL_K = 50
 
 TEXT_STOPWORDS = {
-    "a", "about", "after", "all", "also", "an", "and", "any", "are", "as", "at",
-    "back", "be", "because", "been", "but", "by", "can", "come", "could", "day",
-    "do", "even", "first", "for", "from", "give", "good", "have", "he", "her",
-    "him", "his", "how", "if", "in", "into", "is", "it", "its", "just", "know",
-    "like", "look", "make", "me", "most", "my", "new", "no", "not", "now", "of",
-    "on", "one", "only", "or", "other", "our", "out", "over", "people", "see",
-    "she", "so", "some", "take", "than", "that", "the", "their", "them", "then",
-    "there", "these", "they", "think", "this", "time", "to", "two", "up", "use",
-    "was", "way", "we", "well", "were", "what", "when", "which", "who", "will",
-    "with", "work", "would", "year", "you", "your",
+    "a",
+    "about",
+    "after",
+    "all",
+    "also",
+    "an",
+    "and",
+    "any",
+    "are",
+    "as",
+    "at",
+    "back",
+    "be",
+    "because",
+    "been",
+    "but",
+    "by",
+    "can",
+    "come",
+    "could",
+    "day",
+    "do",
+    "even",
+    "first",
+    "for",
+    "from",
+    "give",
+    "good",
+    "have",
+    "he",
+    "her",
+    "him",
+    "his",
+    "how",
+    "if",
+    "in",
+    "into",
+    "is",
+    "it",
+    "its",
+    "just",
+    "know",
+    "like",
+    "look",
+    "make",
+    "me",
+    "most",
+    "my",
+    "new",
+    "no",
+    "not",
+    "now",
+    "of",
+    "on",
+    "one",
+    "only",
+    "or",
+    "other",
+    "our",
+    "out",
+    "over",
+    "people",
+    "see",
+    "she",
+    "so",
+    "some",
+    "take",
+    "than",
+    "that",
+    "the",
+    "their",
+    "them",
+    "then",
+    "there",
+    "these",
+    "they",
+    "think",
+    "this",
+    "time",
+    "to",
+    "two",
+    "up",
+    "use",
+    "was",
+    "way",
+    "we",
+    "well",
+    "were",
+    "what",
+    "when",
+    "which",
+    "who",
+    "will",
+    "with",
+    "work",
+    "would",
+    "year",
+    "you",
+    "your",
 }
 
 # Target 1: Consolidated Historical Monkeypatched Upstream HippoRAG 2 Baselines (Qwen3-4B + EmbeddingGemma).
 MONKEYPATCHED_HIPPORAG_BASELINES: dict[str, dict[str, Any]] = {
     "2wikimultihopqa": {
-        "Recall@1": 0.4545, "Recall@2": 0.6591, "Recall@5": 0.9091,
-        "ExactMatch": 0.6364, "F1": 0.7227,
-        "indexing_seconds": 616.76, "evaluation_seconds": 173.44, "elapsed_seconds": 790.73,
+        "Recall@1": 0.4545,
+        "Recall@2": 0.6591,
+        "Recall@5": 0.9091,
+        "ExactMatch": 0.6364,
+        "F1": 0.7227,
+        "indexing_seconds": 616.76,
+        "evaluation_seconds": 173.44,
+        "elapsed_seconds": 790.73,
     },
     "musique": {
-        "Recall@1": 0.3636, "Recall@2": 0.5682, "Recall@5": 0.6818,
-        "ExactMatch": 0.4091, "F1": 0.5485,
-        "indexing_seconds": 1152.93, "evaluation_seconds": 284.18, "elapsed_seconds": 1437.36,
+        "Recall@1": 0.3636,
+        "Recall@2": 0.5682,
+        "Recall@5": 0.6818,
+        "ExactMatch": 0.4091,
+        "F1": 0.5485,
+        "indexing_seconds": 1152.93,
+        "evaluation_seconds": 284.18,
+        "elapsed_seconds": 1437.36,
     },
     "hotpotqa": {
-        "Recall@1": 0.4750, "Recall@2": 0.7750, "Recall@5": 0.9000,
-        "ExactMatch": 0.4500, "F1": 0.6426,
-        "indexing_seconds": 599.21, "evaluation_seconds": 135.75, "elapsed_seconds": 736.13,
+        "Recall@1": 0.4750,
+        "Recall@2": 0.7750,
+        "Recall@5": 0.9000,
+        "ExactMatch": 0.4500,
+        "F1": 0.6426,
+        "indexing_seconds": 599.21,
+        "evaluation_seconds": 135.75,
+        "elapsed_seconds": 736.13,
     },
     "nq": {
-        "Recall@1": 0.5833, "Recall@2": 0.8083, "Recall@5": 0.9250,
-        "ExactMatch": 0.4500, "F1": 0.6327,
-        "indexing_seconds": 807.52, "evaluation_seconds": 110.22, "elapsed_seconds": 917.85,
+        "Recall@1": 0.5833,
+        "Recall@2": 0.8083,
+        "Recall@5": 0.9250,
+        "ExactMatch": 0.4500,
+        "F1": 0.6327,
+        "indexing_seconds": 807.52,
+        "evaluation_seconds": 110.22,
+        "elapsed_seconds": 917.85,
     },
     "popqa": {
-        "Recall@1": 0.8667, "Recall@2": 0.9467, "Recall@5": 1.0000,
-        "ExactMatch": 0.6800, "F1": 0.7419,
-        "indexing_seconds": 236.44, "evaluation_seconds": 274.38, "elapsed_seconds": 511.12,
+        "Recall@1": 0.8667,
+        "Recall@2": 0.9467,
+        "Recall@5": 1.0000,
+        "ExactMatch": 0.6800,
+        "F1": 0.7419,
+        "indexing_seconds": 236.44,
+        "evaluation_seconds": 274.38,
+        "elapsed_seconds": 511.12,
     },
     "lveval": {
-        "Recall@1": 0.6000, "Recall@2": 0.8500, "Recall@5": 0.9500,
-        "ExactMatch": 0.5000, "F1": 0.5750,
-        "indexing_seconds": 182.23, "evaluation_seconds": 87.34, "elapsed_seconds": 269.67,
+        "Recall@1": 0.6000,
+        "Recall@2": 0.8500,
+        "Recall@5": 0.9500,
+        "ExactMatch": 0.5000,
+        "F1": 0.5750,
+        "indexing_seconds": 182.23,
+        "evaluation_seconds": 87.34,
+        "elapsed_seconds": 269.67,
     },
     "narrativeqa": {
-        "Recall@1": 0.5000, "Recall@2": 0.6500, "Recall@5": 0.8000,
-        "ExactMatch": 0.1000, "F1": 0.4557,
-        "indexing_seconds": 333.89, "evaluation_seconds": 146.52, "elapsed_seconds": 480.52,
+        "Recall@1": 0.5000,
+        "Recall@2": 0.6500,
+        "Recall@5": 0.8000,
+        "ExactMatch": 0.1000,
+        "F1": 0.4557,
+        "indexing_seconds": 333.89,
+        "evaluation_seconds": 146.52,
+        "elapsed_seconds": 480.52,
     },
 }
 
 # Target 2: Reference numbers from HippoRAG 2 (arXiv:2502.14802v1, Tables 2, 3, 8 & 9).
 PAPER_BASELINES = {
     "musique": {
-        "hipporag2_llama3.3_70b_nvembed_v2": {"Recall@2": 0.561, "Recall@5": 0.747, "ExactMatch": 0.372, "F1": 0.486},
-        "standard_nvembed_v2_llama3.3_70b": {"Recall@2": 0.527, "Recall@5": 0.697, "ExactMatch": 0.347, "F1": 0.457},
-        "hipporag2_gpt4o_mini_nvembed_v2": {"Recall@2": 0.535, "Recall@5": 0.742, "ExactMatch": 0.350, "F1": 0.493},
-        "contriever_llama3.3_70b": {"Recall@2": 0.348, "Recall@5": 0.466, "ExactMatch": 0.240, "F1": 0.313},
+        "hipporag2_llama3.3_70b_nvembed_v2": {
+            "Recall@2": 0.561,
+            "Recall@5": 0.747,
+            "ExactMatch": 0.372,
+            "F1": 0.486,
+        },
+        "standard_nvembed_v2_llama3.3_70b": {
+            "Recall@2": 0.527,
+            "Recall@5": 0.697,
+            "ExactMatch": 0.347,
+            "F1": 0.457,
+        },
+        "hipporag2_gpt4o_mini_nvembed_v2": {
+            "Recall@2": 0.535,
+            "Recall@5": 0.742,
+            "ExactMatch": 0.350,
+            "F1": 0.493,
+        },
+        "contriever_llama3.3_70b": {
+            "Recall@2": 0.348,
+            "Recall@5": 0.466,
+            "ExactMatch": 0.240,
+            "F1": 0.313,
+        },
     },
     "2wikimultihopqa": {
-        "hipporag2_llama3.3_70b_nvembed_v2": {"Recall@2": 0.762, "Recall@5": 0.904, "ExactMatch": 0.650, "F1": 0.710},
-        "standard_nvembed_v2_llama3.3_70b": {"Recall@2": 0.671, "Recall@5": 0.765, "ExactMatch": 0.575, "F1": 0.615},
-        "hipporag2_gpt4o_mini_nvembed_v2": {"Recall@2": 0.746, "Recall@5": 0.902, "ExactMatch": 0.605, "F1": 0.697},
-        "contriever_llama3.3_70b": {"Recall@2": 0.466, "Recall@5": 0.575, "ExactMatch": 0.381, "F1": 0.419},
+        "hipporag2_llama3.3_70b_nvembed_v2": {
+            "Recall@2": 0.762,
+            "Recall@5": 0.904,
+            "ExactMatch": 0.650,
+            "F1": 0.710,
+        },
+        "standard_nvembed_v2_llama3.3_70b": {
+            "Recall@2": 0.671,
+            "Recall@5": 0.765,
+            "ExactMatch": 0.575,
+            "F1": 0.615,
+        },
+        "hipporag2_gpt4o_mini_nvembed_v2": {
+            "Recall@2": 0.746,
+            "Recall@5": 0.902,
+            "ExactMatch": 0.605,
+            "F1": 0.697,
+        },
+        "contriever_llama3.3_70b": {
+            "Recall@2": 0.466,
+            "Recall@5": 0.575,
+            "ExactMatch": 0.381,
+            "F1": 0.419,
+        },
     },
     "hotpotqa": {
-        "hipporag2_llama3.3_70b_nvembed_v2": {"Recall@2": 0.835, "Recall@5": 0.963, "ExactMatch": 0.627, "F1": 0.755},
-        "standard_nvembed_v2_llama3.3_70b": {"Recall@2": 0.841, "Recall@5": 0.945, "ExactMatch": 0.628, "F1": 0.753},
-        "hipporag2_gpt4o_mini_nvembed_v2": {"Recall@2": 0.805, "Recall@5": 0.957, "ExactMatch": 0.563, "F1": 0.711},
-        "contriever_llama3.3_70b": {"Recall@2": 0.584, "Recall@5": 0.753, "ExactMatch": 0.513, "F1": 0.623},
+        "hipporag2_llama3.3_70b_nvembed_v2": {
+            "Recall@2": 0.835,
+            "Recall@5": 0.963,
+            "ExactMatch": 0.627,
+            "F1": 0.755,
+        },
+        "standard_nvembed_v2_llama3.3_70b": {
+            "Recall@2": 0.841,
+            "Recall@5": 0.945,
+            "ExactMatch": 0.628,
+            "F1": 0.753,
+        },
+        "hipporag2_gpt4o_mini_nvembed_v2": {
+            "Recall@2": 0.805,
+            "Recall@5": 0.957,
+            "ExactMatch": 0.563,
+            "F1": 0.711,
+        },
+        "contriever_llama3.3_70b": {
+            "Recall@2": 0.584,
+            "Recall@5": 0.753,
+            "ExactMatch": 0.513,
+            "F1": 0.623,
+        },
     },
     "nq": {
-        "hipporag2_llama3.3_70b_nvembed_v2": {"Recall@2": 0.456, "Recall@5": 0.780, "ExactMatch": 0.485, "F1": 0.633},
+        "hipporag2_llama3.3_70b_nvembed_v2": {
+            "Recall@2": 0.456,
+            "Recall@5": 0.780,
+            "ExactMatch": 0.485,
+            "F1": 0.633,
+        },
         "standard_nvembed_v2_llama3.3_70b": {"Recall@2": 0.453, "Recall@5": 0.754, "F1": 0.619},
         "hipporag_reproduced": {"Recall@2": 0.213, "Recall@5": 0.444, "F1": 0.553},
     },
     "popqa": {
-        "hipporag2_llama3.3_70b_nvembed_v2": {"Recall@2": 0.439, "Recall@5": 0.517, "ExactMatch": 0.490, "F1": 0.562},
+        "hipporag2_llama3.3_70b_nvembed_v2": {
+            "Recall@2": 0.439,
+            "Recall@5": 0.517,
+            "ExactMatch": 0.490,
+            "F1": 0.562,
+        },
         "standard_nvembed_v2_llama3.3_70b": {"Recall@2": 0.453, "Recall@5": 0.510, "F1": 0.557},
         "hipporag_reproduced": {"Recall@2": 0.400, "Recall@5": 0.538, "F1": 0.559},
     },
@@ -272,7 +466,9 @@ def recycle_lemonade_model(model_name: str) -> bool:
         logging.info("Recycling Lemonade model '%s'...", model_name)
         is_ryzen = "ryzenai" in model_name.lower() or "mistral" in model_name.lower()
         if is_ryzen:
-            subprocess.run(["taskkill", "/F", "/IM", "ryzenai-server.exe"], capture_output=True, timeout=5)
+            subprocess.run(
+                ["taskkill", "/F", "/IM", "ryzenai-server.exe"], capture_output=True, timeout=5
+            )
             time.sleep(1.0)
         else:
             subprocess.run([lemonade_bin, "unload", model_name], capture_output=True, timeout=15)
@@ -338,11 +534,13 @@ def get_gold_docs(
 
             question = sample.get("question", "")
             q_keywords = {
-                w for w in re.findall(r"\w+", question.lower())
+                w
+                for w in re.findall(r"\w+", question.lower())
                 if len(w) >= 3 and w not in TEXT_STOPWORDS
             }
             a_keywords = {
-                w for a in ans_set
+                w
+                for a in ans_set
                 for w in re.findall(r"\w+", a.lower())
                 if len(w) >= 3 and w not in TEXT_STOPWORDS
             }
@@ -379,13 +577,15 @@ def get_gold_docs(
                 answers = get_gold_answers([sample])[0]
                 ans_lower = [a.lower().strip() for a in answers if a.strip()]
                 a_keywords = {
-                    w for a in answers
+                    w
+                    for a in answers
                     for w in re.findall(r"\w+", a.lower())
                     if len(w) >= 3 and w not in TEXT_STOPWORDS
                 }
                 question = sample.get("question", "")
                 q_keywords = {
-                    w for w in re.findall(r"\w+", question.lower())
+                    w
+                    for w in re.findall(r"\w+", question.lower())
                     if len(w) >= 3 and w not in TEXT_STOPWORDS
                 }
 
@@ -537,7 +737,9 @@ def build_benchmark_slice(
                                 candidate_pool.append(f"{c['title']}\n{c['text']}")
                     summary = doc.get("summary") if isinstance(doc, dict) else None
                     if isinstance(summary, dict) and summary.get("text"):
-                        candidate_pool.append(f"{summary.get('title', '')}\n{summary['text']}".strip())
+                        candidate_pool.append(
+                            f"{summary.get('title', '')}\n{summary['text']}".strip()
+                        )
                 if corpus and len(candidate_pool) < target_pool_size:
                     for c in corpus:
                         candidate_pool.append(f"{c['title']}\n{c['text']}")
@@ -660,7 +862,9 @@ def load_dataset_files(
     return samples, corpus
 
 
-def verify_embeddings(embedding: DSPyEmbeddingAdapter, queries: list[str], docs: list[str]) -> list[dict[str, Any]]:
+def verify_embeddings(
+    embedding: DSPyEmbeddingAdapter, queries: list[str], docs: list[str]
+) -> list[dict[str, Any]]:
     """Five repeats of batch, individual and reversed inputs across all active roles."""
     probe_queries = queries[:3]
     probe_docs = docs[:3]
@@ -677,26 +881,32 @@ def verify_embeddings(embedding: DSPyEmbeddingAdapter, queries: list[str], docs:
     for role, texts, options in roles:
         observations = []
         for _ in range(5):
-            observations.extend([
-                embedding.batch_encode(texts, norm=True, **options),
-                np.concatenate([
-                    embedding.batch_encode([text], norm=True, **options) for text in texts
-                ]),
-                embedding.batch_encode(texts[::-1], norm=True, **options)[::-1],
-            ])
+            observations.extend(
+                [
+                    embedding.batch_encode(texts, norm=True, **options),
+                    np.concatenate(
+                        [embedding.batch_encode([text], norm=True, **options) for text in texts]
+                    ),
+                    embedding.batch_encode(texts[::-1], norm=True, **options)[::-1],
+                ]
+            )
         samples = np.stack(observations)
         cosine = np.einsum("rid,sid->irs", samples, samples)
         minimum = float(cosine.min())
-        probes.append({
-            "role": role,
-            "inputs": [
-                embedding.profile.format(text, query=bool(options), instruction=options.get("instruction", ""))
-                for text in texts
-            ],
-            "repeats": 5,
-            "dimensions": embedding.profile.dimensions,
-            "min_pairwise_cosine": minimum,
-        })
+        probes.append(
+            {
+                "role": role,
+                "inputs": [
+                    embedding.profile.format(
+                        text, query=bool(options), instruction=options.get("instruction", "")
+                    )
+                    for text in texts
+                ],
+                "repeats": 5,
+                "dimensions": embedding.profile.dimensions,
+                "min_pairwise_cosine": minimum,
+            }
+        )
         if minimum < 0.999:
             raise RuntimeError(f"{role} embeddings are unstable: min cosine {minimum:.6f} < 0.999")
     return probes
@@ -726,10 +936,17 @@ def check_benchmark_integrity(
         for idx, record in enumerate(records):
             if not str(record.get("answer", "")).strip():
                 errors.append(f"Question {idx + 1}: empty HippoRAG answer")
-            if "dpr_answer" in record and record["dpr_answer"] is not None and str(record.get("dpr_answer", "")) == "" and record.get("dpr_qa_metrics") is not None:
+            if (
+                "dpr_answer" in record
+                and record["dpr_answer"] is not None
+                and str(record.get("dpr_answer", "")) == ""
+                and record.get("dpr_qa_metrics") is not None
+            ):
                 errors.append(f"Question {idx + 1}: empty StandardRAG (DPR) answer")
     if len(records) > 1 and not any(record.get("graph_seeds") for record in records):
-        errors.append("All queries had empty graph_seeds (recognition memory / PPR never activated)")
+        errors.append(
+            "All queries had empty graph_seeds (recognition memory / PPR never activated)"
+        )
     return errors
 
 
@@ -740,7 +957,9 @@ def print_benchmark_summary(
     metrics: dict,
 ) -> None:
     print(f"\n{'=' * 72}")
-    print(f"=== Benchmark Summary [NATIVE YAW ENGINE]: {dataset} ({len(records)} queries, {num_docs} passages) ===")
+    print(
+        f"=== Benchmark Summary [NATIVE YAW ENGINE]: {dataset} ({len(records)} queries, {num_docs} passages) ==="
+    )
     print(f"{'=' * 72}")
     print("Native YAW Retrieval:   ", metrics["hipporag"]["retrieval"])
     print("Standard DPR Retrieval: ", metrics["standard_dpr"]["retrieval"])
@@ -753,7 +972,10 @@ def print_benchmark_summary(
             "Target 1 (Monkeypatched HippoRAG 2 Local Baseline):",
             metrics["monkeypatched_hipporag_baseline"],
         )
-    if "paper_baselines" in metrics and "hipporag2_llama3.3_70b_nvembed_v2" in metrics["paper_baselines"]:
+    if (
+        "paper_baselines" in metrics
+        and "hipporag2_llama3.3_70b_nvembed_v2" in metrics["paper_baselines"]
+    ):
         print(
             "Target 2 (Paper Reference arXiv:2502.14802):       ",
             metrics["paper_baselines"]["hipporag2_llama3.3_70b_nvembed_v2"],
@@ -861,10 +1083,12 @@ def run_yaw_benchmark(
         for doc_str in docs:
             t_part = doc_str.split("\n", 1)[0] if "\n" in doc_str else ""
             b_part = doc_str.split("\n", 1)[1] if "\n" in doc_str else doc_str
-            slice_records.append({
-                "title": t_part,
-                "text": b_part,
-            })
+            slice_records.append(
+                {
+                    "title": t_part,
+                    "text": b_part,
+                }
+            )
         slice_json_path.write_text(
             json.dumps(slice_records, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -890,8 +1114,12 @@ def run_yaw_benchmark(
         report["indexing_seconds"] = round(perf_counter() - index_start, 2)
         num_facts = int(yaw_engine.conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0])
         report["graph"] = {
-            "num_passage_nodes": int(yaw_engine.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]),
-            "num_entity_nodes": int(yaw_engine.conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]),
+            "num_passage_nodes": int(
+                yaw_engine.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+            ),
+            "num_entity_nodes": int(
+                yaw_engine.conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
+            ),
             "num_fact_nodes": num_facts,
             "num_extracted_triples": num_facts,
             "num_edges": int(yaw_engine.conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]),
@@ -899,7 +1127,10 @@ def run_yaw_benchmark(
 
         # Disjoint Prompt Evolution
         if evolve != "none" and train_samples:
-            print(f"[Prompt Evolution] Running {evolve} on {len(train_samples)} training queries...", flush=True)
+            print(
+                f"[Prompt Evolution] Running {evolve} on {len(train_samples)} training queries...",
+                flush=True,
+            )
             train_golds = get_gold_answers(train_samples)
             train_gold_docs = get_gold_docs(train_samples, dataset)
             trainset = [
@@ -986,7 +1217,9 @@ def run_yaw_benchmark(
                             )
                             recycle_lemonade_model(qa_model)
                             try:
-                                if hasattr(yaw_engine.program, "orchestrator_lm") and hasattr(yaw_engine.program.orchestrator_lm, "close"):
+                                if hasattr(yaw_engine.program, "orchestrator_lm") and hasattr(
+                                    yaw_engine.program.orchestrator_lm, "close"
+                                ):
                                     yaw_engine.program.orchestrator_lm.close()
                             except Exception:
                                 pass
@@ -1003,7 +1236,10 @@ def run_yaw_benchmark(
                 qa_answers.append(qa_answer)
             timing_records.append((retrieval_elapsed, qa_elapsed))
             if q_idx % 5 == 0 or q_idx == total_queries:
-                print(f"[Native YAW] [{dataset}] Query {q_idx}/{total_queries} completed (retrieval={retrieval_elapsed:.2f}s, qa={qa_elapsed:.2f}s)", flush=True)
+                print(
+                    f"[Native YAW] [{dataset}] Query {q_idx}/{total_queries} completed (retrieval={retrieval_elapsed:.2f}s, qa={qa_elapsed:.2f}s)",
+                    flush=True,
+                )
 
         gold_docs_norm = [[d.strip() for d in gd] for gd in gold_docs]
         ret_docs_norm = [[p.strip() for p in rp] for rp in all_retrieved_passages]
@@ -1032,8 +1268,12 @@ def run_yaw_benchmark(
         em_list: list[float] = []
         f1_list: list[float] = []
         if include_qa:
-            em_overall, per_query_em_raw = ScriptQAExactMatch().calculate_metric_scores(gold_answers, qa_answers)
-            f1_overall, per_query_f1_raw = ScriptQAF1Score().calculate_metric_scores(gold_answers, qa_answers)
+            em_overall, per_query_em_raw = ScriptQAExactMatch().calculate_metric_scores(
+                gold_answers, qa_answers
+            )
+            f1_overall, per_query_f1_raw = ScriptQAF1Score().calculate_metric_scores(
+                gold_answers, qa_answers
+            )
             em_list = [float(item["ExactMatch"]) for item in per_query_em_raw]
             f1_list = [float(item["F1"]) for item in per_query_f1_raw]
             qa_metrics = {
@@ -1043,34 +1283,36 @@ def run_yaw_benchmark(
 
         for q_idx, query in enumerate(queries):
             retrieval_elapsed, qa_elapsed = timing_records[q_idx]
-            records.append({
-                "query_index": q_idx,
-                "question": query,
-                "answer": qa_answers[q_idx] if include_qa else "",
-                "dpr_answer": "",
-                "gold_answers": gold_answers[q_idx],
-                "gold_docs": gold_docs[q_idx],
-                "qa_evidence": all_retrieved_passages[q_idx],
-                "dpr_evidence": all_dpr_passages[q_idx],
-                "graph_seeds": kept_facts_per_query[q_idx],
-                "recall": {
-                    "@1": recalls_1[q_idx],
-                    "@2": recalls_2[q_idx],
-                    "@5": recalls_5[q_idx],
-                    "@10": recalls_10[q_idx],
-                },
-                "dpr_recall": {
-                    "@1": dpr_recalls_1[q_idx],
-                    "@2": dpr_recalls_2[q_idx],
-                    "@5": dpr_recalls_5[q_idx],
-                    "@10": dpr_recalls_10[q_idx],
-                },
-                "retrieved_chunk_ids": retrieved_ids_list[q_idx],
-                "exact_match": em_list[q_idx] if include_qa else None,
-                "f1": f1_list[q_idx] if include_qa else None,
-                "retrieval_seconds": round(retrieval_elapsed, 4),
-                "qa_seconds": round(qa_elapsed, 4),
-            })
+            records.append(
+                {
+                    "query_index": q_idx,
+                    "question": query,
+                    "answer": qa_answers[q_idx] if include_qa else "",
+                    "dpr_answer": "",
+                    "gold_answers": gold_answers[q_idx],
+                    "gold_docs": gold_docs[q_idx],
+                    "qa_evidence": all_retrieved_passages[q_idx],
+                    "dpr_evidence": all_dpr_passages[q_idx],
+                    "graph_seeds": kept_facts_per_query[q_idx],
+                    "recall": {
+                        "@1": recalls_1[q_idx],
+                        "@2": recalls_2[q_idx],
+                        "@5": recalls_5[q_idx],
+                        "@10": recalls_10[q_idx],
+                    },
+                    "dpr_recall": {
+                        "@1": dpr_recalls_1[q_idx],
+                        "@2": dpr_recalls_2[q_idx],
+                        "@5": dpr_recalls_5[q_idx],
+                        "@10": dpr_recalls_10[q_idx],
+                    },
+                    "retrieved_chunk_ids": retrieved_ids_list[q_idx],
+                    "exact_match": em_list[q_idx] if include_qa else None,
+                    "f1": f1_list[q_idx] if include_qa else None,
+                    "retrieval_seconds": round(retrieval_elapsed, 4),
+                    "qa_seconds": round(qa_elapsed, 4),
+                }
+            )
 
         report["evaluation_seconds"] = round(perf_counter() - eval_start, 2)
         seeds_active = sum(1 for seeds in kept_facts_per_query if seeds)
@@ -1212,7 +1454,9 @@ def main(
         total_needed = pool_needed + max(query_offset, train_queries)
 
     samples, corpus = load_dataset_files(
-        dataset, max_queries=total_needed, include_corpus=include_corpus,
+        dataset,
+        max_queries=total_needed,
+        include_corpus=include_corpus,
     )
 
     train_samples: list[dict] = []
@@ -1312,7 +1556,10 @@ def main(
         "graph_beta": graph_beta,
         "graph_dual_weight": graph_dual_weight,
     }
-    print(f"\n[Native YAW] Benchmark run: {run_dir} (dataset={dataset}, queries={len(queries)}, docs={num_docs})", flush=True)
+    print(
+        f"\n[Native YAW] Benchmark run: {run_dir} (dataset={dataset}, queries={len(queries)}, docs={num_docs})",
+        flush=True,
+    )
     try:
         report["model_registry"] = preflight(
             profile,
@@ -1382,56 +1629,150 @@ def main(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", choices=[*DATASETS, *ALIASES], default="sample")
-    parser.add_argument("--max-queries", type=int, default=None,
-                        help="Number of queries to evaluate (pools candidate passages up to --index-queries unless --full-corpus).")
-    parser.add_argument("--index-queries", type=int, default=None,
-                        help="Number of queries from which to pool candidate passages for indexing (defaults to int(max_queries * 1.4)).")
-    parser.add_argument("--full-corpus", action="store_true",
-                        help="Index the full dataset corpus even when --max-queries is set.")
-    parser.add_argument("--mode", choices=("eval", "retrieval", "all", "embeddings"), default="eval",
-                        help="Run full benchmark ('eval'), retrieval-only ('retrieval'), include probes ('all'), or probes only.")
-    parser.add_argument("--chat-model", choices=tuple(CHAT_MODELS), default=None,
-                        help="Override both extraction and QA chat models with a single model.")
-    parser.add_argument("--extraction-model", choices=tuple(CHAT_MODELS), default=DEFAULT_EXTRACTION_CHAT)
+    parser.add_argument(
+        "--max-queries",
+        type=int,
+        default=None,
+        help="Number of queries to evaluate (pools candidate passages up to --index-queries unless --full-corpus).",
+    )
+    parser.add_argument(
+        "--index-queries",
+        type=int,
+        default=None,
+        help="Number of queries from which to pool candidate passages for indexing (defaults to int(max_queries * 1.4)).",
+    )
+    parser.add_argument(
+        "--full-corpus",
+        action="store_true",
+        help="Index the full dataset corpus even when --max-queries is set.",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("eval", "retrieval", "all", "embeddings"),
+        default="eval",
+        help="Run full benchmark ('eval'), retrieval-only ('retrieval'), include probes ('all'), or probes only.",
+    )
+    parser.add_argument(
+        "--chat-model",
+        choices=tuple(CHAT_MODELS),
+        default=None,
+        help="Override both extraction and QA chat models with a single model.",
+    )
+    parser.add_argument(
+        "--extraction-model", choices=tuple(CHAT_MODELS), default=DEFAULT_EXTRACTION_CHAT
+    )
     parser.add_argument("--qa-model", choices=tuple(CHAT_MODELS), default=DEFAULT_QA_CHAT)
     parser.add_argument("--embedding-model", choices=tuple(PROFILES), default=MODEL)
-    parser.add_argument("--embedding-task-mode", choices=GEMMA_TASK_MODES, default="distinct-titled")
-    parser.add_argument("--fresh-index", action="store_true",
-                        help="Force indexing in a fresh disposable directory instead of reusing outputs/benchmarks/indexes.")
-    parser.add_argument("--enable-gbnf", action="store_true", default=False,
-                        help="Enable pure-JSON GBNF grammar constraints for local llama.cpp GPU worker.")
-    parser.add_argument("--query-offset", type=int, default=0,
-                        help="Starting index offset into dataset queries for evaluation.")
-    parser.add_argument("--evolve", choices=("none", "miprov2", "gepa", "hybrid"), default="none",
-                        help="Prompt evolution strategy on training slice: 'none', 'miprov2', 'gepa', or 'hybrid'.")
-    parser.add_argument("--train-queries", type=int, default=0,
-                        help="Number of queries from dataset head reserved for prompt evolution (disjoint from eval).")
-    parser.add_argument("--compiled-program", type=str, default=None,
-                        help="Path to load or save compiled HippoRAGProgram state.")
-    parser.add_argument("--index-batch-size", type=int, default=8,
-                        help="Number of passages per indexing micro-batch for incremental SSD checkpointing.")
-    parser.add_argument("--qa-batch-size", type=int, default=1,
-                        help="Number of queries per retrieve() and qa() micro-batch (default: 1 for 1-by-1 processing).")
-    parser.add_argument("--linking-top-k", type=int, default=LINKING_TOP_K,
-                        help="Top-N fact candidates passed to recognition memory filter (default: 8).")
-    parser.add_argument("--fact-candidate-pool-k", type=int, default=FACT_CANDIDATE_POOL_K,
-                        help="Dense KNN fact candidate pool size before RRF merge (default: 50).")
-    parser.add_argument("--fact-fts-pool-k", type=int, default=FACT_FTS_POOL_K,
-                        help="FTS5 BM25 fact candidate pool size before RRF merge (default: 50).")
-    parser.add_argument("--fact-rrf-k", type=int, default=FACT_RRF_K,
-                        help="RRF smoothing constant k_rrf for reciprocal rank fusion (default: 60).")
-    parser.add_argument("--fact-fts-weight", type=float, default=FACT_FTS_WEIGHT,
-                        help="Weight applied to FTS5 reciprocal ranks in fact RRF merge (default: 0.2).")
-    parser.add_argument("--passage-node-weight", type=float, default=PASSAGE_NODE_WEIGHT,
-                        help="Weight applied to passage reset distribution in PPR (default: 0.05).")
-    parser.add_argument("--fts-weight", type=float, default=FTS_WEIGHT,
-                        help="Weight applied to FTS5 lexical scores in passage reset weights (default: 0.2).")
-    parser.add_argument("--damping", type=float, default=DAMPING,
-                        help="PPR damping restart probability parameter (default: 0.5).")
-    parser.add_argument("--passage-seed-pool-k", type=int, default=PASSAGE_SEED_POOL_K,
-                        help="Dense KNN passage candidate pool size (default: 200).")
-    parser.add_argument("--fts-seed-pool-k", type=int, default=FTS_SEED_POOL_K,
-                        help="FTS5 lexical passage candidate pool size (default: 50).")
+    parser.add_argument(
+        "--embedding-task-mode", choices=GEMMA_TASK_MODES, default="distinct-titled"
+    )
+    parser.add_argument(
+        "--fresh-index",
+        action="store_true",
+        help="Force indexing in a fresh disposable directory instead of reusing outputs/benchmarks/indexes.",
+    )
+    parser.add_argument(
+        "--enable-gbnf",
+        action="store_true",
+        default=False,
+        help="Enable pure-JSON GBNF grammar constraints for local llama.cpp GPU worker.",
+    )
+    parser.add_argument(
+        "--query-offset",
+        type=int,
+        default=0,
+        help="Starting index offset into dataset queries for evaluation.",
+    )
+    parser.add_argument(
+        "--evolve",
+        choices=("none", "miprov2", "gepa", "hybrid"),
+        default="none",
+        help="Prompt evolution strategy on training slice: 'none', 'miprov2', 'gepa', or 'hybrid'.",
+    )
+    parser.add_argument(
+        "--train-queries",
+        type=int,
+        default=0,
+        help="Number of queries from dataset head reserved for prompt evolution (disjoint from eval).",
+    )
+    parser.add_argument(
+        "--compiled-program",
+        type=str,
+        default=None,
+        help="Path to load or save compiled HippoRAGProgram state.",
+    )
+    parser.add_argument(
+        "--index-batch-size",
+        type=int,
+        default=8,
+        help="Number of passages per indexing micro-batch for incremental SSD checkpointing.",
+    )
+    parser.add_argument(
+        "--qa-batch-size",
+        type=int,
+        default=1,
+        help="Number of queries per retrieve() and qa() micro-batch (default: 1 for 1-by-1 processing).",
+    )
+    parser.add_argument(
+        "--linking-top-k",
+        type=int,
+        default=LINKING_TOP_K,
+        help="Top-N fact candidates passed to recognition memory filter (default: 8).",
+    )
+    parser.add_argument(
+        "--fact-candidate-pool-k",
+        type=int,
+        default=FACT_CANDIDATE_POOL_K,
+        help="Dense KNN fact candidate pool size before RRF merge (default: 50).",
+    )
+    parser.add_argument(
+        "--fact-fts-pool-k",
+        type=int,
+        default=FACT_FTS_POOL_K,
+        help="FTS5 BM25 fact candidate pool size before RRF merge (default: 50).",
+    )
+    parser.add_argument(
+        "--fact-rrf-k",
+        type=int,
+        default=FACT_RRF_K,
+        help="RRF smoothing constant k_rrf for reciprocal rank fusion (default: 60).",
+    )
+    parser.add_argument(
+        "--fact-fts-weight",
+        type=float,
+        default=FACT_FTS_WEIGHT,
+        help="Weight applied to FTS5 reciprocal ranks in fact RRF merge (default: 0.2).",
+    )
+    parser.add_argument(
+        "--passage-node-weight",
+        type=float,
+        default=PASSAGE_NODE_WEIGHT,
+        help="Weight applied to passage reset distribution in PPR (default: 0.05).",
+    )
+    parser.add_argument(
+        "--fts-weight",
+        type=float,
+        default=FTS_WEIGHT,
+        help="Weight applied to FTS5 lexical scores in passage reset weights (default: 0.2).",
+    )
+    parser.add_argument(
+        "--damping",
+        type=float,
+        default=DAMPING,
+        help="PPR damping restart probability parameter (default: 0.5).",
+    )
+    parser.add_argument(
+        "--passage-seed-pool-k",
+        type=int,
+        default=PASSAGE_SEED_POOL_K,
+        help="Dense KNN passage candidate pool size (default: 200).",
+    )
+    parser.add_argument(
+        "--fts-seed-pool-k",
+        type=int,
+        default=FTS_SEED_POOL_K,
+        help="FTS5 lexical passage candidate pool size (default: 50).",
+    )
     parser.add_argument(
         "--graph-activation",
         choices=["linear", "scaled_tanh", "hard_tanh", "shifted_tanh", "threshold_relu"],

@@ -7,26 +7,26 @@ YAW is a native HippoRAG 2 graph & storage engine backed by a single SQLite data
 Use Python `>=3.14.7` (`.python-version` `3.14.7`) and `uv`:
 
 ```powershell
-uv sync --locked
-uv run --locked pytest -v
-uv run --locked python scripts/download-datasets.py --dataset enterprise_rag_bench
-uv run --locked yaw daemon status
-uv run --locked yaw daemon run
-uv run --locked yaw daemon start
-uv run --locked yaw daemon stop
-uv run --locked yaw graph build
-uv run --locked yaw graph rebuild
-uv run --locked yaw graph lint
-uv run --locked yaw graph lint --turtle
-uv run --locked yaw optimize
-uv run --locked yaw load-program .yaw/compiled_program_optimize_<datestamp>.json
-uv run --locked yaw config get optimization.auto
-uv run --locked yaw config set optimization.auto heavy
-uv run --locked python benchmark.py --dataset sample --mode all
-uv run --locked python benchmark.py --dataset 2wikimultihopqa --max-queries 25
-uv run --locked python benchmark.py --dataset hotpotqa --max-queries 25 --mode retrieval
-uv run --locked python benchmark.py --dataset musique --max-queries 25 --mode retrieval
-uv run --locked python scripts/verify_paper_parity_gate.py
+uv sync
+uv run pytest -v
+uv run python scripts/download-datasets.py --dataset enterprise_rag_bench
+uv run yaw daemon status
+uv run yaw daemon run
+uv run yaw daemon start
+uv run yaw daemon stop
+uv run yaw graph build
+uv run yaw graph rebuild
+uv run yaw graph lint
+uv run yaw graph lint --turtle
+uv run yaw optimize
+uv run yaw load-program .yaw/compiled_program_optimize_<datestamp>.json
+uv run yaw config get optimization.auto
+uv run yaw config set optimization.auto heavy
+uv run python benchmark.py --dataset sample --mode all
+uv run python benchmark.py --dataset 2wikimultihopqa --max-queries 25
+uv run python benchmark.py --dataset hotpotqa --max-queries 25 --mode retrieval
+uv run python benchmark.py --dataset musique --max-queries 25 --mode retrieval
+uv run python scripts/verify_paper_parity_gate.py
 ```
 
 `benchmark.py` and `scripts/verify_paper_parity_gate.py` evaluate the native `yaw` engine (`YawGraphEngine` + `yaw.db` + `HippoRAGProgram`) against Standard DPR (`retrieve_dpr`) and two consolidated reference targets across the 7 HippoRAG 2 paper datasets (`popqa`, `lveval`, `narrativeqa`, `2wikimultihopqa`, `hotpotqa`, `nq`, `musique`):
@@ -40,34 +40,7 @@ The unified local model stack (`http://localhost:13305/api/v1`) uses:
 - **Unified Chat, GBNF Worker, QA Reader & RLM Orchestrator (`--extraction-model`, `--qa-model`):** `Qwen3-4B-Instruct-2507-GGUF` on GPU `llamacpp` (`--parallel 1 --cache-ram 0`) with pure-JSON GBNF grammar enforcement (`_yaw_supports_gbnf=True`) for direct/worker predictors and unconstrained Python REPL execution (`_yaw_supports_gbnf=False`) inside DSPy's managed Deno/Pyodide WASM sandbox (`dspy[deno]`, `dspy.PythonInterpreter`) for `shacl_healer_rlm` and `RLMInstructionProposer.inner_rlm`.
 - **OOD Enterprise Prompt Evolution (`uv run yaw optimize`):** Configured by default in [`yaw.toml`](yaw.toml) to train on the stratified 250-query (`150` train + `100` val) **EnterpriseRAG-Bench** (`enterprise_rag_bench`, `onyx-dot-app/EnterpriseRAG-Bench`) dataset across all 10 reasoning categories (`Basic`, `Semantic`, `Intra-Document Reasoning`, `Project Related`, `Constrained`, `Conflicting Info`, `Completeness`, `Miscellaneous`, `Info Not Found`, `High Level`) with $2.0\times$ same-tool hard distractors (`mode = "gepa"`, `auto = "heavy"`).
 
-On this machine the models and settings are already installed. For a fresh Lemonade installation, register/download the embedding checkpoint and save both `llamacpp` model settings explicitly before running benchmarks (`--batch-size 2048 --ubatch-size 2048` on EmbeddingGemma prevents `llama-server`'s default 512-token physical microbatch cutoff on 512–2048 token passages, and `--cache-ram 0` without `-dio` on `Qwen3-4B-Instruct-2507-GGUF` prevents Windows Direct-IO and host-RAM prompt-cache growth):
-
-```powershell
-$api = 'http://localhost:13305/api/v1'
-$pull = @{
-    model_name = 'user.embeddinggemma-300m-GGUF'
-    checkpoint = 'ggml-org/embeddinggemma-300M-GGUF:embeddinggemma-300M-Q8_0.gguf'
-    recipe = 'llamacpp'
-    embedding = $true
-} | ConvertTo-Json
-Invoke-RestMethod -Method Post -Uri "$api/pull" -ContentType 'application/json' -Body $pull
-$loadEmbed = @{
-    model_name = 'user.embeddinggemma-300m-GGUF'
-    ctx_size = 2048
-    llamacpp_backend = 'cuda'
-    llamacpp_args = '--pooling mean --parallel 1 --batch-size 2048 --ubatch-size 2048'
-    save_options = $true
-} | ConvertTo-Json
-Invoke-RestMethod -Method Post -Uri "$api/load" -ContentType 'application/json' -Body $loadEmbed
-$loadChat = @{
-    model_name = 'Qwen3-4B-Instruct-2507-GGUF'
-    ctx_size = 16384
-    llamacpp_backend = 'cuda'
-    llamacpp_args = '--parallel 1 --cache-ram 0'
-    save_options = $true
-} | ConvertTo-Json
-Invoke-RestMethod -Method Post -Uri "$api/load" -ContentType 'application/json' -Body $loadChat
-```
+On this machine the models and settings are already installed. For a fresh Lemonade installation, register/download the embedding checkpoint and save both `llamacpp` models and settings explicitly before running benchmarks. 
 
 ## Measured versus planned
 

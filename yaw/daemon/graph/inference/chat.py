@@ -1,8 +1,8 @@
-from contextvars import ContextVar
 import logging
 import os
-from pathlib import Path
 import time
+from contextvars import ContextVar
+from pathlib import Path
 from typing import Any
 
 import dspy
@@ -200,7 +200,9 @@ def create_dspy_lm(
         )
 
     setattr(lm, "_yaw_recipe", recipe)
-    setattr(lm, "_yaw_supports_gbnf", (recipe == "llamacpp") and (role not in ("rlm", "reflection")))
+    setattr(
+        lm, "_yaw_supports_gbnf", (recipe == "llamacpp") and (role not in ("rlm", "reflection"))
+    )
     return lm
 
 

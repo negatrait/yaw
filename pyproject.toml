@@ -10,12 +10,14 @@ readme = "README.md"
 requires-python = ">=3.14.7"
 dependencies = [
     "cocoindex>=1.0.25",
-    "dspy[deno]>=3.0.0",
-    "filelock>=3.18.0",
+    "dspy[deno]>=3.4.1",
+    "filelock>=3.32.7",
+    "matplotlib>=3.11.2",
     "numpy>=2.5.4",
-    "optuna>=4.0.0",
-    "scipy>=1.15.0",
-    "sqlite-vec>=0.1.6",
+    "optuna>=5.0.0",
+    "psutil>=7.2.2",
+    "scipy>=1.18.1",
+    "sqlite-vec>=0.1.9",
 ]
 
 [project.scripts]
@@ -23,9 +25,9 @@ yaw = "yaw.daemon.cli:cli_entrypoint"
 
 [dependency-groups]
 dev = [
-    "pytest>=9.0.3",
-    "ruff>=0.11.0",
-    "ty>=0.0.1a0",
+    "pytest>=9.1.1",
+    "ruff>=0.17.1",
+    "ty>=0.0.89",
 ]
 
 [tool.uv]
@@ -36,16 +38,11 @@ include = ["yaw*"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py312"
+target-version = "py314"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
-ignore = ["E501", "B010", "B009"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-filterwarnings = [
-    "ignore::pydantic.warnings.PydanticDeprecatedSince20:litellm.*",
-    "ignore:.*Pydantic serializer warnings.*:UserWarning:pydantic.main",
-]

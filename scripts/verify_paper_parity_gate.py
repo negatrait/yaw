@@ -76,7 +76,9 @@ def build_monkeypatched_baseline_report(
                     "Recall@5": float(b.get("Recall@5", 0.0)),
                 },
                 "qa": {
-                    "ExactMatch": float(b["ExactMatch"]) if b.get("ExactMatch") is not None else None,
+                    "ExactMatch": float(b["ExactMatch"])
+                    if b.get("ExactMatch") is not None
+                    else None,
                     "F1": float(b["F1"]) if b.get("F1") is not None else None,
                 },
             },
@@ -119,8 +121,12 @@ def extract_engine_summary(report: dict[str, Any]) -> dict[str, Any]:
             "Recall@5": round(float(dpr_ret.get("Recall@5", 0.0)), 4),
         },
         "qa": {
-            "ExactMatch": round(float(qa["ExactMatch"]), 4) if isinstance(qa, dict) and qa.get("ExactMatch") is not None else None,
-            "F1": round(float(qa["F1"]), 4) if isinstance(qa, dict) and qa.get("F1") is not None else None,
+            "ExactMatch": round(float(qa["ExactMatch"]), 4)
+            if isinstance(qa, dict) and qa.get("ExactMatch") is not None
+            else None,
+            "F1": round(float(qa["F1"]), 4)
+            if isinstance(qa, dict) and qa.get("F1") is not None
+            else None,
         },
         "recognition_memory": {
             "queries_with_graph_seeds": int(rec_mem.get("queries_with_graph_seeds", 0)),
@@ -170,10 +176,18 @@ def compare_engine_reports(
     paper_em = paper_h2.get("ExactMatch")
     paper_f1 = paper_h2.get("F1")
     delta_yaw_vs_paper = {
-        "Recall@2": round(yaw_sum["retrieval"]["Recall@2"] - float(paper_r2), 4) if paper_r2 is not None else None,
-        "Recall@5": round(yaw_sum["retrieval"]["Recall@5"] - float(paper_r5), 4) if paper_r5 is not None else None,
-        "ExactMatch": round(float(yaw_em) - float(paper_em), 4) if yaw_em is not None and paper_em is not None else None,
-        "F1": round(float(yaw_f1) - float(paper_f1), 4) if yaw_f1 is not None and paper_f1 is not None else None,
+        "Recall@2": round(yaw_sum["retrieval"]["Recall@2"] - float(paper_r2), 4)
+        if paper_r2 is not None
+        else None,
+        "Recall@5": round(yaw_sum["retrieval"]["Recall@5"] - float(paper_r5), 4)
+        if paper_r5 is not None
+        else None,
+        "ExactMatch": round(float(yaw_em) - float(paper_em), 4)
+        if yaw_em is not None and paper_em is not None
+        else None,
+        "F1": round(float(yaw_f1) - float(paper_f1), 4)
+        if yaw_f1 is not None and paper_f1 is not None
+        else None,
     }
 
     if mode == "eval" and delta_f1 is not None:
@@ -221,7 +235,8 @@ def aggregate_gate_summary(
 ) -> dict[str, Any]:
     """Compute macro-averaged metrics and overall gate status across completed datasets."""
     completed = [
-        entry for entry in dataset_results.values()
+        entry
+        for entry in dataset_results.values()
         if isinstance(entry, dict) and entry.get("status") == "completed"
     ]
     if not completed:
@@ -362,17 +377,19 @@ def format_gate_markdown(gate_payload: dict[str, Any]) -> str:
             f"| **{summary.get('overall_gate_status', 'FAIL')}** |"
         )
 
-    lines.extend([
-        "",
-        "### Quality Comparison Chart",
-        "",
-        "![Retrieval & QA Quality Plot](paper_parity_quality.svg)",
-        "",
-        "## 2. Standard DPR Baseline, Recognition Memory & Runtime Telemetry",
-        "",
-        "| Dataset | DPR R@5 | Hippo Seeds | YAW Seeds | Hippo Fallback | YAW Fallback | Hippo Idx (s) | YAW Idx (s) | Hippo Eval (s) | YAW Eval (s) |",
-        "| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
-    ])
+    lines.extend(
+        [
+            "",
+            "### Quality Comparison Chart",
+            "",
+            "![Retrieval & QA Quality Plot](paper_parity_quality.svg)",
+            "",
+            "## 2. Standard DPR Baseline, Recognition Memory & Runtime Telemetry",
+            "",
+            "| Dataset | DPR R@5 | Hippo Seeds | YAW Seeds | Hippo Fallback | YAW Fallback | Hippo Idx (s) | YAW Idx (s) | Hippo Eval (s) | YAW Eval (s) |",
+            "| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
 
     for ds in ordered_names:
         entry = datasets_map.get(ds)
@@ -391,17 +408,19 @@ def format_gate_markdown(gate_payload: dict[str, Any]) -> str:
             f"| {h['evaluation_seconds']:.1f} | {y['evaluation_seconds']:.1f} |"
         )
 
-    lines.extend([
-        "",
-        "### Wall-Clock Latency Chart",
-        "",
-        "![Wall-Clock Latency Plot](paper_parity_latency.svg)",
-        "",
-        "## 3. Published HippoRAG 2 Paper Reference Baselines (arXiv:2502.14802v1)",
-        "",
-        "| Dataset | Paper HippoRAG 2 R@2 | Paper HippoRAG 2 R@5 | Paper HippoRAG 2 EM | Paper HippoRAG 2 F1 | Paper Standard RAG R@5 | Paper Standard RAG F1 |",
-        "| :--- | ---: | ---: | ---: | ---: | ---: | ---: |",
-    ])
+    lines.extend(
+        [
+            "",
+            "### Wall-Clock Latency Chart",
+            "",
+            "![Wall-Clock Latency Plot](paper_parity_latency.svg)",
+            "",
+            "## 3. Published HippoRAG 2 Paper Reference Baselines (arXiv:2502.14802v1)",
+            "",
+            "| Dataset | Paper HippoRAG 2 R@2 | Paper HippoRAG 2 R@5 | Paper HippoRAG 2 EM | Paper HippoRAG 2 F1 | Paper Standard RAG R@5 | Paper Standard RAG F1 |",
+            "| :--- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
 
     for ds in ordered_names:
         pb = PAPER_BASELINES.get(ds, {})
@@ -418,7 +437,13 @@ def format_gate_markdown(gate_payload: dict[str, Any]) -> str:
 
 
 def _esc_svg(val: Any) -> str:
-    return str(val).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    return (
+        str(val)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
 
 
 def generate_quality_svg(gate_payload: dict[str, Any]) -> str:
@@ -426,26 +451,34 @@ def generate_quality_svg(gate_payload: dict[str, Any]) -> str:
     cfg = gate_payload.get("config", {}) or {}
     datasets_map = gate_payload.get("datasets", {}) or {}
     ordered_names = cfg.get("datasets", list(datasets_map.keys()))
-    completed = [ds for ds in ordered_names if isinstance(datasets_map.get(ds), dict) and datasets_map[ds].get("status") == "completed"]
+    completed = [
+        ds
+        for ds in ordered_names
+        if isinstance(datasets_map.get(ds), dict) and datasets_map[ds].get("status") == "completed"
+    ]
     if not completed:
-        completed = [ds for ds, val in datasets_map.items() if isinstance(val, dict) and val.get("status") == "completed"]
+        completed = [
+            ds
+            for ds, val in datasets_map.items()
+            if isinstance(val, dict) and val.get("status") == "completed"
+        ]
 
     item_h = 320
     total_h = max(380, 130 + len(completed) * item_h)
 
     svg = [
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 840 {total_h}" width="100%" height="100%" style="background:#0b1120; font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',Roboto,Helvetica,Arial,sans-serif;">',
-        '  <defs>',
+        "  <defs>",
         '    <linearGradient id="bgGrad" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#0b1120"/><stop offset="100%" stop-color="#0f172a"/></linearGradient>',
         '    <linearGradient id="yawGrad" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#059669"/><stop offset="100%" stop-color="#10b981"/></linearGradient>',
         '    <linearGradient id="hippoGrad" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#7e22ce"/><stop offset="100%" stop-color="#a855f7"/></linearGradient>',
         '    <linearGradient id="paperGrad" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#0284c7"/><stop offset="100%" stop-color="#38bdf8"/></linearGradient>',
         '    <linearGradient id="dprGrad" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#d97706"/><stop offset="100%" stop-color="#fbbf24"/></linearGradient>',
-        '  </defs>',
+        "  </defs>",
         f'  <rect width="840" height="{total_h}" rx="16" fill="url(#bgGrad)" stroke="#1e293b" stroke-width="1.5"/>',
         '  <text x="36" y="44" fill="#f8fafc" font-size="20" font-weight="700">Pre-Epic 2 Gate: Retrieval &amp; QA Quality</text>',
         f'  <text x="36" y="68" fill="#94a3b8" font-size="12">Head-to-head comparison ({len(completed)} datasets completed) • Consistent engine color mapping</text>',
-        '  <!-- Consistent Global Legend -->',
+        "  <!-- Consistent Global Legend -->",
         '  <g transform="translate(36, 92)">',
         '    <rect x="0" y="0" width="12" height="12" rx="3" fill="url(#yawGrad)"/>',
         '    <text x="18" y="10" fill="#f8fafc" font-size="11" font-weight="600">Native YAW (Qwen3-4B + yaw.db)</text>',
@@ -455,7 +488,7 @@ def generate_quality_svg(gate_payload: dict[str, Any]) -> str:
         '    <text x="493" y="10" fill="#f8fafc" font-size="11" font-weight="600">Paper Reference (70B Llama-3.3)</text>',
         '    <rect x="670" y="0" width="12" height="12" rx="3" fill="url(#dprGrad)"/>',
         '    <text x="688" y="10" fill="#f8fafc" font-size="11" font-weight="600">Standard DPR</text>',
-        '  </g>',
+        "  </g>",
         '  <line x1="36" y1="116" x2="804" y2="116" stroke="#1e293b" stroke-width="1"/>',
     ]
 
@@ -492,9 +525,15 @@ def generate_quality_svg(gate_payload: dict[str, Any]) -> str:
         badge_color = "#10b981" if status_text == "PASS" else "#ef4444"
 
         svg.append(f'  <g transform="translate(36, {curr_y})">')
-        svg.append('    <rect x="0" y="0" width="768" height="300" rx="10" fill="#0f172a" stroke="#1e293b" stroke-width="1"/>')
-        svg.append(f'    <text x="16" y="24" fill="#f8fafc" font-size="14" font-weight="700">Dataset: {_esc_svg(ds)} ({entry.get("num_queries", 25)} queries, {entry.get("num_docs", 70)} docs)</text>')
-        svg.append(f'    <text x="752" y="24" text-anchor="end" fill="{badge_color}" font-size="12" font-weight="700">{status_text} (ΔR@5={delta_r5:+.2%}, ΔF1={delta_f1:+.2%})</text>')
+        svg.append(
+            '    <rect x="0" y="0" width="768" height="300" rx="10" fill="#0f172a" stroke="#1e293b" stroke-width="1"/>'
+        )
+        svg.append(
+            f'    <text x="16" y="24" fill="#f8fafc" font-size="14" font-weight="700">Dataset: {_esc_svg(ds)} ({entry.get("num_queries", 25)} queries, {entry.get("num_docs", 70)} docs)</text>'
+        )
+        svg.append(
+            f'    <text x="752" y="24" text-anchor="end" fill="{badge_color}" font-size="12" font-weight="700">{status_text} (ΔR@5={delta_r5:+.2%}, ΔF1={delta_f1:+.2%})</text>'
+        )
         svg.append('    <line x1="16" y1="36" x2="752" y2="36" stroke="#1e293b" stroke-width="1"/>')
 
         metrics: list[tuple[str, float, float, float, float | None]] = [
@@ -507,35 +546,53 @@ def generate_quality_svg(gate_payload: dict[str, Any]) -> str:
         m_y = 48
         for m_name, y_val, h_val, p_val, d_val in metrics:
             svg.append(f'    <g transform="translate(16, {m_y})">')
-            svg.append(f'      <text x="0" y="11" fill="#94a3b8" font-size="11" font-weight="600">{m_name}</text>')
+            svg.append(
+                f'      <text x="0" y="11" fill="#94a3b8" font-size="11" font-weight="600">{m_name}</text>'
+            )
             b_x = 120
             bar_w_max = 480
 
             yw = max(3, int(y_val * bar_w_max))
-            svg.append(f'      <rect x="{b_x}" y="0" width="{yw}" height="11" rx="2" fill="url(#yawGrad)"/>')
-            svg.append(f'      <text x="{b_x + yw + 6}" y="10" fill="#10b981" font-size="10" font-weight="700">YAW {y_val:.4f}</text>')
+            svg.append(
+                f'      <rect x="{b_x}" y="0" width="{yw}" height="11" rx="2" fill="url(#yawGrad)"/>'
+            )
+            svg.append(
+                f'      <text x="{b_x + yw + 6}" y="10" fill="#10b981" font-size="10" font-weight="700">YAW {y_val:.4f}</text>'
+            )
 
             hw = max(3, int(h_val * bar_w_max))
-            svg.append(f'      <rect x="{b_x}" y="14" width="{hw}" height="11" rx="2" fill="url(#hippoGrad)"/>')
-            svg.append(f'      <text x="{b_x + hw + 6}" y="24" fill="#c084fc" font-size="10" font-weight="600">Hippo {h_val:.4f}</text>')
+            svg.append(
+                f'      <rect x="{b_x}" y="14" width="{hw}" height="11" rx="2" fill="url(#hippoGrad)"/>'
+            )
+            svg.append(
+                f'      <text x="{b_x + hw + 6}" y="24" fill="#c084fc" font-size="10" font-weight="600">Hippo {h_val:.4f}</text>'
+            )
 
             if p_val > 0.0:
                 pw = max(3, int(p_val * bar_w_max))
-                svg.append(f'      <rect x="{b_x}" y="28" width="{pw}" height="11" rx="2" fill="url(#paperGrad)"/>')
-                svg.append(f'      <text x="{b_x + pw + 6}" y="38" fill="#7dd3fc" font-size="10">Paper {p_val:.4f}</text>')
+                svg.append(
+                    f'      <rect x="{b_x}" y="28" width="{pw}" height="11" rx="2" fill="url(#paperGrad)"/>'
+                )
+                svg.append(
+                    f'      <text x="{b_x + pw + 6}" y="38" fill="#7dd3fc" font-size="10">Paper {p_val:.4f}</text>'
+                )
 
             if d_val is not None and d_val > 0.0:
                 dw = max(3, int(d_val * bar_w_max))
-                svg.append(f'      <rect x="{b_x}" y="42" width="{dw}" height="11" rx="2" fill="url(#dprGrad)"/>')
-                svg.append(f'      <text x="{b_x + dw + 6}" y="52" fill="#fbbf24" font-size="10">DPR {d_val:.4f}</text>')
+                svg.append(
+                    f'      <rect x="{b_x}" y="42" width="{dw}" height="11" rx="2" fill="url(#dprGrad)"/>'
+                )
+                svg.append(
+                    f'      <text x="{b_x + dw + 6}" y="52" fill="#fbbf24" font-size="10">DPR {d_val:.4f}</text>'
+                )
 
-            svg.append('    </g>')
+            svg.append("    </g>")
             m_y += 62
 
-        svg.append('  </g>')
+        svg.append("  </g>")
         curr_y += item_h
 
-    svg.append('</svg>')
+    svg.append("</svg>")
     return "\n".join(svg)
 
 
@@ -544,30 +601,38 @@ def generate_latency_svg(gate_payload: dict[str, Any]) -> str:
     cfg = gate_payload.get("config", {}) or {}
     datasets_map = gate_payload.get("datasets", {}) or {}
     ordered_names = cfg.get("datasets", list(datasets_map.keys()))
-    completed = [ds for ds in ordered_names if isinstance(datasets_map.get(ds), dict) and datasets_map[ds].get("status") == "completed"]
+    completed = [
+        ds
+        for ds in ordered_names
+        if isinstance(datasets_map.get(ds), dict) and datasets_map[ds].get("status") == "completed"
+    ]
     if not completed:
-        completed = [ds for ds, val in datasets_map.items() if isinstance(val, dict) and val.get("status") == "completed"]
+        completed = [
+            ds
+            for ds, val in datasets_map.items()
+            if isinstance(val, dict) and val.get("status") == "completed"
+        ]
 
     item_h = 240
     total_h = max(340, 130 + len(completed) * item_h)
 
     svg = [
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 840 {total_h}" width="100%" height="100%" style="background:#0b1120; font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',Roboto,Helvetica,Arial,sans-serif;">',
-        '  <defs>',
+        "  <defs>",
         '    <linearGradient id="bgGrad2" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#0b1120"/><stop offset="100%" stop-color="#0f172a"/></linearGradient>',
         '    <linearGradient id="yawGrad2" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#059669"/><stop offset="100%" stop-color="#10b981"/></linearGradient>',
         '    <linearGradient id="hippoGrad2" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#7e22ce"/><stop offset="100%" stop-color="#a855f7"/></linearGradient>',
-        '  </defs>',
+        "  </defs>",
         f'  <rect width="840" height="{total_h}" rx="16" fill="url(#bgGrad2)" stroke="#1e293b" stroke-width="1.5"/>',
         '  <text x="36" y="44" fill="#f8fafc" font-size="20" font-weight="700">Pre-Epic 2 Gate: Wall-Clock Latency &amp; Speedup</text>',
         f'  <text x="36" y="68" fill="#94a3b8" font-size="12">Lower is better • Local GPU/NPU server • {len(completed)} datasets completed</text>',
-        '  <!-- Consistent Global Legend -->',
+        "  <!-- Consistent Global Legend -->",
         '  <g transform="translate(36, 92)">',
         '    <rect x="0" y="0" width="12" height="12" rx="3" fill="url(#yawGrad2)"/>',
         '    <text x="18" y="10" fill="#f8fafc" font-size="11" font-weight="600">Native YAW (yaw.db + CocoIndex AST + pure-JSON GBNF)</text>',
         '    <rect x="420" y="0" width="12" height="12" rx="3" fill="url(#hippoGrad2)"/>',
         '    <text x="438" y="10" fill="#f8fafc" font-size="11" font-weight="600">Upstream HippoRAG 2 (File Storage + Unconstrained Prompt)</text>',
-        '  </g>',
+        "  </g>",
         '  <line x1="36" y1="116" x2="804" y2="116" stroke="#1e293b" stroke-width="1"/>',
     ]
 
@@ -589,9 +654,15 @@ def generate_latency_svg(gate_payload: dict[str, Any]) -> str:
         tot_speedup = (h_tot / y_tot) if y_tot > 0 else 1.0
 
         svg.append(f'  <g transform="translate(36, {curr_y})">')
-        svg.append('    <rect x="0" y="0" width="768" height="220" rx="10" fill="#0f172a" stroke="#1e293b" stroke-width="1"/>')
-        svg.append(f'    <text x="16" y="24" fill="#f8fafc" font-size="14" font-weight="700">Dataset: {_esc_svg(ds)} ({entry.get("num_queries", 25)} queries, {entry.get("num_docs", 70)} docs)</text>')
-        svg.append(f'    <text x="752" y="24" text-anchor="end" fill="#10b981" font-size="12" font-weight="700">{tot_speedup:.1f}× OVERALL SPEEDUP</text>')
+        svg.append(
+            '    <rect x="0" y="0" width="768" height="220" rx="10" fill="#0f172a" stroke="#1e293b" stroke-width="1"/>'
+        )
+        svg.append(
+            f'    <text x="16" y="24" fill="#f8fafc" font-size="14" font-weight="700">Dataset: {_esc_svg(ds)} ({entry.get("num_queries", 25)} queries, {entry.get("num_docs", 70)} docs)</text>'
+        )
+        svg.append(
+            f'    <text x="752" y="24" text-anchor="end" fill="#10b981" font-size="12" font-weight="700">{tot_speedup:.1f}× OVERALL SPEEDUP</text>'
+        )
         svg.append('    <line x1="16" y1="36" x2="752" y2="36" stroke="#1e293b" stroke-width="1"/>')
 
         lat_metrics = [
@@ -603,18 +674,26 @@ def generate_latency_svg(gate_payload: dict[str, Any]) -> str:
         l_y = 48
         for m_name, y_val, h_val, sp_text in lat_metrics:
             svg.append(f'    <g transform="translate(16, {l_y})">')
-            svg.append(f'      <text x="0" y="14" fill="#94a3b8" font-size="11" font-weight="600">{m_name}</text>')
-            svg.append(f'      <text x="736" y="14" text-anchor="end" fill="#10b981" font-size="11" font-weight="700">{sp_text}</text>')
+            svg.append(
+                f'      <text x="0" y="14" fill="#94a3b8" font-size="11" font-weight="600">{m_name}</text>'
+            )
+            svg.append(
+                f'      <text x="736" y="14" text-anchor="end" fill="#10b981" font-size="11" font-weight="700">{sp_text}</text>'
+            )
 
             max_val = max(h_val, y_val, 1.0)
             bar_w_max = 440
             b_x = 120
 
             yw = max(4, int((y_val / max_val) * bar_w_max))
-            svg.append(f'      <rect x="{b_x}" y="3" width="{yw}" height="14" rx="3" fill="url(#yawGrad2)"/>')
-            svg.append(f'      <text x="{b_x + yw + 6}" y="14" fill="#10b981" font-size="10" font-weight="700">YAW {y_val:.1f}s</text>')
+            svg.append(
+                f'      <rect x="{b_x}" y="3" width="{yw}" height="14" rx="3" fill="url(#yawGrad2)"/>'
+            )
+            svg.append(
+                f'      <text x="{b_x + yw + 6}" y="14" fill="#10b981" font-size="10" font-weight="700">YAW {y_val:.1f}s</text>'
+            )
 
-    svg.append('</svg>')
+    svg.append("</svg>")
     return "\n".join(svg)
 
 
@@ -629,7 +708,9 @@ def format_gate_html(gate_payload: dict[str, Any], quality_svg: str, latency_svg
     for ds in ordered_names:
         entry = datasets_map.get(ds)
         if not isinstance(entry, dict) or entry.get("status") != "completed":
-            table1_rows.append(f"<tr><td style='font-weight:600; color:#fff;'>{_esc_svg(ds)}</td><td colspan='7' style='color:#64748b; font-style:italic;'>Pending</td></tr>")
+            table1_rows.append(
+                f"<tr><td style='font-weight:600; color:#fff;'>{_esc_svg(ds)}</td><td colspan='7' style='color:#64748b; font-style:italic;'>Pending</td></tr>"
+            )
             continue
         h = entry["hipporag"]
         y = entry["yaw"]
@@ -674,7 +755,12 @@ def format_gate_html(gate_payload: dict[str, Any], quality_svg: str, latency_svg
     for ds in ordered_names:
         pb = PAPER_BASELINES.get(ds, {})
         h2 = pb.get("hipporag2_llama3.3_70b_nvembed_v2", {})
-        status = "PASS" if isinstance(datasets_map.get(ds), dict) and datasets_map[ds].get("status") == "completed" else "QUEUED"
+        status = (
+            "PASS"
+            if isinstance(datasets_map.get(ds), dict)
+            and datasets_map[ds].get("status") == "completed"
+            else "QUEUED"
+        )
         color_class = "highlight-yaw" if status == "PASS" else ""
         table3_rows.append(
             f"<tr>"
@@ -884,12 +970,16 @@ def _persist_gate_outputs(
     latency_svg_path.write_text(latency_svg_str, encoding="utf-8")
 
     # Generate self-contained HTML report with inlined SVGs (renders natively on mobile)
-    html_content = format_gate_html(gate_payload, quality_svg=quality_svg_str, latency_svg=latency_svg_str)
+    html_content = format_gate_html(
+        gate_payload, quality_svg=quality_svg_str, latency_svg=latency_svg_str
+    )
     output_html_path = output_md.parent / "paper_parity_gate.html"
     output_html_path.write_text(html_content, encoding="utf-8")
 
     # Mirror to brain artifact directory if present
-    brain_dir = Path("C:/Users/Harri.Ahokas/.gemini/antigravity/brain/3061c87c-9ec6-4ff5-b756-80b05e1c4342")
+    brain_dir = Path(
+        "C:/Users/Harri.Ahokas/.gemini/antigravity/brain/3061c87c-9ec6-4ff5-b756-80b05e1c4342"
+    )
     if brain_dir.exists():
         try:
             (brain_dir / "paper_parity_quality.svg").write_text(quality_svg_str, encoding="utf-8")
@@ -987,7 +1077,10 @@ def run_parity_gate(
             )
 
         # Ensure QA model worker is freshly reloaded before YAW execution if running on NPU
-        if "ryzen" in benchmark.DEFAULT_QA_CHAT.lower() or "mistral" in benchmark.DEFAULT_QA_CHAT.lower():
+        if (
+            "ryzen" in benchmark.DEFAULT_QA_CHAT.lower()
+            or "mistral" in benchmark.DEFAULT_QA_CHAT.lower()
+        ):
             benchmark.recycle_lemonade_model(benchmark.DEFAULT_QA_CHAT)
 
         print(

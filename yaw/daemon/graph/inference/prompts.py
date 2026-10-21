@@ -74,11 +74,11 @@ class DefineMissingEntities(dspy.Signature):
 
 
 class JudgeSynonyms(dspy.Signature):
-    """Classify candidate entity pairs into SKOS/OWL semantic relations:
-    - 'skos:altLabel': Exact coreferent synonym (merge into canonical entity).
-    - 'skos:hiddenLabel': Acronym, initialism, or lexical/spelling variant (merge into canonical entity).
-    - 'skos:related': Associatively related but distinct concept (keep separate, add symmetric edge).
-    - 'owl:differentFrom': Homograph or disjoint concept (keep separate, add repulsive edge).
+    """Judge candidate pairs of entities that look similar semantically and in writing/spelling (including typos, acronyms, lookalikes like "Cindy Real" vs "Cinderella", or homonyms/homographs with the same name like "a ball" vs "a ball"):
+    - 'skos:altLabel': True synonym or coreferent alias referring to the exact same entity/concept (merge into canonical entity).
+    - 'skos:hiddenLabel': Typo, misspelling, transcription error, acronym, or surface spelling variant referring to the exact same entity/concept (merge into canonical entity).
+    - 'owl:differentFrom': Confusable homonym, homograph (e.g., "a ball" [formal dance] vs "a ball" [spherical toy]), or false-friend lookalike (e.g., "Cindy Real" vs "Cinderella") that is easy to mix up due to similar/identical surface form or context, but actually refers to a genuinely different entity/concept (keep separate, add repulsive owl:differentFrom edge).
+    - 'skos:related': Distinct concepts that are associatively related in the domain without being coreferent synonyms or confusable homonyms/lookalikes (keep separate, add symmetric skos:related edge).
     Respond with JSON: {"decisions": [{"pair_id": "id_a|id_b", "relation": "skos:altLabel|skos:hiddenLabel|skos:related|owl:differentFrom", "canonical": "id_a_or_id_b"}, ...]}"""
 
     candidate_pairs: str = dspy.InputField(
@@ -126,9 +126,7 @@ class ExtractQueryIntent(dspy.Signature):
     """Rewrite a question as a concise declarative statement or target relation phrase for fact retrieval."""
 
     question: str = dspy.InputField(desc="User question")
-    query_intent: str = dspy.OutputField(
-        desc="Concise declarative statement of the sought fact"
-    )
+    query_intent: str = dspy.OutputField(desc="Concise declarative statement of the sought fact")
 
 
 # ---------------------------------------------------------------------------
@@ -160,9 +158,7 @@ class ReflectiveInnerDistillerSignature(dspy.Signature):
     examples_with_feedback: list[dict[str, Any]] = dspy.InputField(
         desc="Task inputs, assistant responses, and diagnostic evaluation feedback."
     )
-    new_instruction: str = dspy.OutputField(
-        desc="The distilled new instruction for the assistant."
-    )
+    new_instruction: str = dspy.OutputField(desc="The distilled new instruction for the assistant.")
 
 
 class ProposeInstructionSignature(dspy.Signature):
@@ -176,15 +172,11 @@ class ProposeInstructionSignature(dspy.Signature):
     - Preserve the exact required JSON output schema and structural contract for the component.
     - Your instruction must generalize cleanly across completely unseen domains, documents, and questions."""
 
-    current_instruction: str = dspy.InputField(
-        desc="The instructions I provided to the assistant."
-    )
+    current_instruction: str = dspy.InputField(desc="The instructions I provided to the assistant.")
     examples_with_feedback: list[dict[str, Any]] = dspy.InputField(
         desc="Task inputs provided to the assistant, the assistant's response for each, and feedback on how the response could be better."
     )
-    new_instruction: str = dspy.OutputField(
-        desc="The new instruction for the assistant."
-    )
+    new_instruction: str = dspy.OutputField(desc="The new instruction for the assistant.")
 
 
 class CompressInstructionSignature(dspy.Signature):
@@ -194,9 +186,7 @@ class CompressInstructionSignature(dspy.Signature):
 
     instruction: str = dspy.InputField()
     length_limit: str = dspy.InputField()
-    new_instruction: str = dspy.OutputField(
-        desc="The shortened instruction for the assistant."
-    )
+    new_instruction: str = dspy.OutputField(desc="The shortened instruction for the assistant.")
 
 
 _NER_DEMO_ENTITY_DEFINITIONS: list[list[str]] = [

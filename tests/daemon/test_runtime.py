@@ -47,7 +47,9 @@ class DeterministicTestLM(dspy.LM):
         **kwargs: Any,
     ) -> list[str]:
         if self.fail_online:
-            raise ConnectionError("Inference server at http://localhost:13305/api/v1 is unreachable")
+            raise ConnectionError(
+                "Inference server at http://localhost:13305/api/v1 is unreachable"
+            )
         req_str = str(prompt or messages or kwargs)
         if dspy.settings.usage_tracker is not None:
             dspy.settings.usage_tracker.add_usage(
@@ -206,7 +208,9 @@ http_port = 13306
     return cfg, toml_path
 
 
-def _make_program_and_embedder() -> tuple[HippoRAGProgram, Any, DeterministicTestLM, DeterministicTestEmbedder]:
+def _make_program_and_embedder() -> tuple[
+    HippoRAGProgram, Any, DeterministicTestLM, DeterministicTestEmbedder
+]:
     lm = DeterministicTestLM()
     dspy.settings.configure(lm=lm)
     prog = HippoRAGProgram(
@@ -539,7 +543,9 @@ def test_optimize_and_reload_compiled_program_with_composite_fitness(tmp_path: P
         assert loaded_p.gbnf_max_facts == 3
         assert loaded_p.gbnf_max_reasoning_chars == 160
         assert rt2.engine.embedder.profile.query_prefix == "task: custom optimized query | query: "
-        assert rt2.engine.embedder.profile.fact_query_prefix == "task: custom optimized fact | query: "
+        assert (
+            rt2.engine.embedder.profile.fact_query_prefix == "task: custom optimized fact | query: "
+        )
         assert rt2.engine.embedder.profile.document_prefix == "title: custom | text: "
     finally:
         rt2.stop()
@@ -901,7 +907,9 @@ def test_cli_config_get_and_set(tmp_path: Path) -> None:
     # 3. Setting invalid value fails with INVALID_INPUT and preserves yaw.toml integrity
     err_buf = io.StringIO()
     with redirect_stderr(err_buf):
-        rc_err = main(["config", "set", "optimization.auto", "super_heavy", "--config", str(toml_path)])
+        rc_err = main(
+            ["config", "set", "optimization.auto", "super_heavy", "--config", str(toml_path)]
+        )
     assert rc_err == 1
     err_payload = json.loads(err_buf.getvalue())
     assert err_payload["error"] == "INVALID_INPUT"
@@ -981,20 +989,25 @@ def test_cli_dspy_optimize_sandbox_isolation_and_status(
         # Write small synthetic dataset
         bench_ds = tmp_path / "bench.json"
         bench_ds.write_text(
-            json.dumps([
-                {
-                    "id": "q1",
-                    "question": "Question 1?",
-                    "answer": ["Answer 1"],
-                    "paragraphs": [{"title": "Doc 1", "text": "Content 1.", "is_supporting": True}],
-                }
-            ]),
+            json.dumps(
+                [
+                    {
+                        "id": "q1",
+                        "question": "Question 1?",
+                        "answer": ["Answer 1"],
+                        "paragraphs": [
+                            {"title": "Doc 1", "text": "Content 1.", "is_supporting": True}
+                        ],
+                    }
+                ]
+            ),
             encoding="utf-8",
         )
 
         class FastGEPA:
             def __init__(self, *args: Any, **kwargs: Any) -> None:
                 pass
+
             def compile(self, student: Any, *args: Any, **kwargs: Any) -> Any:
                 return student
 

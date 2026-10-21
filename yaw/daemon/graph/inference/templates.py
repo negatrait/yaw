@@ -91,9 +91,7 @@ def render_triple_messages(
 ) -> list[dict[str, str]]:
     """Render 4-message chat history for triple extraction."""
     named_entity_json = json.dumps({"named_entities": list(named_entities)})
-    user_content = TRIPLE_FRAME.format(
-        passage=passage, named_entity_json=named_entity_json
-    )
+    user_content = TRIPLE_FRAME.format(passage=passage, named_entity_json=named_entity_json)
     return [
         {"role": "system", "content": TRIPLE_SYSTEM},
         {"role": "user", "content": TRIPLE_ONE_SHOT_INPUT},
@@ -217,7 +215,7 @@ best_dspy_prompt: dict[str, Any] = {
             },
         ],
         "signature": {
-            "instructions": "You are a critical component of a high-stakes question-answering system used by top researchers and decision-makers worldwide. Your task is to filter facts based on their relevance to a given query, ensuring that the most crucial information is presented to these stakeholders. The query requires careful analysis and possibly multi-hop reasoning to connect different pieces of information. You must select up to 4 relevant facts from the provided candidate list that have a strong connection to the query, aiding in reasoning and providing an accurate answer. The output should be in JSON format, e.g., {\"fact\": [[\"s1\", \"p1\", \"o1\"], [\"s2\", \"p2\", \"o2\"]]}, and if no facts are relevant, return an empty list, {\"fact\": []}. The accuracy of your response is paramount, as it will directly impact the decisions made by these high-level stakeholders. You must only use facts from the candidate list and not generate new facts. The future of critical decision-making relies on your ability to accurately filter and present relevant information.",
+            "instructions": 'You are a critical component of a high-stakes question-answering system used by top researchers and decision-makers worldwide. Your task is to filter facts based on their relevance to a given query, ensuring that the most crucial information is presented to these stakeholders. The query requires careful analysis and possibly multi-hop reasoning to connect different pieces of information. You must select up to 4 relevant facts from the provided candidate list that have a strong connection to the query, aiding in reasoning and providing an accurate answer. The output should be in JSON format, e.g., {"fact": [["s1", "p1", "o1"], ["s2", "p2", "o2"]]}, and if no facts are relevant, return an empty list, {"fact": []}. The accuracy of your response is paramount, as it will directly impact the decisions made by these high-level stakeholders. You must only use facts from the candidate list and not generate new facts. The future of critical decision-making relies on your ability to accurately filter and present relevant information.',
             "fields": [
                 {"prefix": "Question:", "description": "Query for retrieval"},
                 {"prefix": "Fact Before Filter:", "description": "Candidate facts to be filtered"},
@@ -230,25 +228,31 @@ best_dspy_prompt: dict[str, Any] = {
 
 FACT_FILTER_SYSTEM = best_dspy_prompt["prog"]["system"]
 FACT_FILTER_INPUT_TEMPLATE = """[[ ## question ## ]]\n{question}\n\n[[ ## fact_before_filter ## ]]\n{fact_before_filter}\n\nRespond with the corresponding output fields, starting with the field `[[ ## fact_after_filter ## ]]` (must be formatted as a valid Python Fact), and then ending with the marker for `[[ ## completed ## ]]`."""
-FACT_FILTER_OUTPUT_TEMPLATE = """[[ ## fact_after_filter ## ]]\n{fact_after_filter}\n\n[[ ## completed ## ]]"""
+FACT_FILTER_OUTPUT_TEMPLATE = (
+    """[[ ## fact_after_filter ## ]]\n{fact_after_filter}\n\n[[ ## completed ## ]]"""
+)
 
 
 def _build_fact_filter_base_messages() -> list[dict[str, str]]:
     messages = [{"role": "system", "content": FACT_FILTER_SYSTEM}]
     for demo in best_dspy_prompt["prog"]["demos"]:
-        messages.append({
-            "role": "user",
-            "content": FACT_FILTER_INPUT_TEMPLATE.format(
-                question=demo["question"],
-                fact_before_filter=demo["fact_before_filter"],
-            ),
-        })
-        messages.append({
-            "role": "assistant",
-            "content": FACT_FILTER_OUTPUT_TEMPLATE.format(
-                fact_after_filter=demo["fact_after_filter"]
-            ),
-        })
+        messages.append(
+            {
+                "role": "user",
+                "content": FACT_FILTER_INPUT_TEMPLATE.format(
+                    question=demo["question"],
+                    fact_before_filter=demo["fact_before_filter"],
+                ),
+            }
+        )
+        messages.append(
+            {
+                "role": "assistant",
+                "content": FACT_FILTER_OUTPUT_TEMPLATE.format(
+                    fact_after_filter=demo["fact_after_filter"]
+                ),
+            }
+        )
     return messages
 
 

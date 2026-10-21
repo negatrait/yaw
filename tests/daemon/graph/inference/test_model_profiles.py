@@ -30,14 +30,20 @@ class ProfileTests(unittest.TestCase):
             "backend_health": "ready",
             "launch_command": ["llama-server.exe", "--parallel", "1", "--cache-ram", "0"],
         }
-        with patch("yaw.daemon.graph.inference.models.get_json", return_value={"all_models_loaded": [base_entry]}):
+        with patch(
+            "yaw.daemon.graph.inference.models.get_json",
+            return_value={"all_models_loaded": [base_entry]},
+        ):
             self.assertEqual(chat_evidence(name)["id"], name)
         with (
             patch(
                 "yaw.daemon.graph.inference.models.get_json",
                 return_value={
                     "all_models_loaded": [
-                        {**base_entry, "launch_command": ["llama-server.exe", "-dio", "--cache-ram", "0"]}
+                        {
+                            **base_entry,
+                            "launch_command": ["llama-server.exe", "-dio", "--cache-ram", "0"],
+                        }
                     ]
                 },
             ),
@@ -47,7 +53,11 @@ class ProfileTests(unittest.TestCase):
         with (
             patch(
                 "yaw.daemon.graph.inference.models.get_json",
-                return_value={"all_models_loaded": [{**base_entry, "launch_command": ["llama-server.exe", "--parallel", "1"]}]},
+                return_value={
+                    "all_models_loaded": [
+                        {**base_entry, "launch_command": ["llama-server.exe", "--parallel", "1"]}
+                    ]
+                },
             ),
             self.assertRaisesRegex(ValueError, "--cache-ram 0"),
         ):
@@ -64,12 +74,18 @@ class ProfileTests(unittest.TestCase):
             "backend_health": "ready",
             "launch_command": ["llama-server.exe", "--parallel", "1", "--cache-ram", "0"],
         }
-        with patch("yaw.daemon.graph.inference.models.get_json", return_value={"all_models_loaded": [valid_entry]}):
-            self.assertEqual(chat_evidence(name)["id"], name)
         with patch(
             "yaw.daemon.graph.inference.models.get_json",
-            return_value={"all_models_loaded": [{**valid_entry, "device": "cpu"}]},
-        ), self.assertRaisesRegex(ValueError, "expected device gpu"):
+            return_value={"all_models_loaded": [valid_entry]},
+        ):
+            self.assertEqual(chat_evidence(name)["id"], name)
+        with (
+            patch(
+                "yaw.daemon.graph.inference.models.get_json",
+                return_value={"all_models_loaded": [{**valid_entry, "device": "cpu"}]},
+            ),
+            self.assertRaisesRegex(ValueError, "expected device gpu"),
+        ):
             chat_evidence(name)
 
     def test_each_profile_preserves_its_request_format_and_dimensions(self):
@@ -82,11 +98,14 @@ class ProfileTests(unittest.TestCase):
                         sink.append(list(texts))
                         mat = np.ones((len(texts), dims), dtype=np.float32)
                         return mat
+
                     return _embed
 
                 adapter = DSPyEmbeddingAdapter(
                     profile=profile,
-                    embedder=create_dspy_embedder(make_embed_fn(profile.dimensions), batch_size=2, caching=False),
+                    embedder=create_dspy_embedder(
+                        make_embed_fn(profile.dimensions), batch_size=2, caching=False
+                    ),
                 )
                 adapter.batch_encode(["a document"])
                 self.assertEqual(recorded_inputs[-1], [profile.document_prefix + "a document"])
@@ -99,7 +118,9 @@ class ProfileTests(unittest.TestCase):
                     self.assertIn("\nQuery:", recorded_inputs[-1][0])
                     bad_adapter = DSPyEmbeddingAdapter(
                         profile=profile,
-                        embedder=create_dspy_embedder(make_embed_fn(768), batch_size=2, caching=False),
+                        embedder=create_dspy_embedder(
+                            make_embed_fn(768), batch_size=2, caching=False
+                        ),
                     )
                     with self.assertRaises(ValueError):
                         bad_adapter.batch_encode(["wrong dimensions"])
@@ -125,10 +146,20 @@ class ProfileTests(unittest.TestCase):
         name = "Qwen3-4B-Instruct-2507-GGUF"
         checkpoint, recipe = CHAT_MODELS[name]
         registry = [
-            {"id": profile.model, "checkpoint": profile.checkpoint, "recipe": "llamacpp",
-             "labels": ["embeddings"], "downloaded": True},
-            {"id": name, "checkpoint": checkpoint, "recipe": recipe,
-             "labels": ["chat"], "downloaded": False},
+            {
+                "id": profile.model,
+                "checkpoint": profile.checkpoint,
+                "recipe": "llamacpp",
+                "labels": ["embeddings"],
+                "downloaded": True,
+            },
+            {
+                "id": name,
+                "checkpoint": checkpoint,
+                "recipe": recipe,
+                "labels": ["chat"],
+                "downloaded": False,
+            },
         ]
         with self.assertRaisesRegex(ValueError, "not downloaded"):
             check_registry(registry, profile, name)
@@ -140,12 +171,27 @@ class ProfileTests(unittest.TestCase):
         ext_ckpt, ext_recipe = CHAT_MODELS[ext_name]
         qa_ckpt, qa_recipe = CHAT_MODELS[qa_name]
         registry = [
-            {"id": profile.model, "checkpoint": profile.checkpoint, "recipe": "llamacpp",
-             "labels": ["embeddings"], "downloaded": True},
-            {"id": ext_name, "checkpoint": ext_ckpt, "recipe": ext_recipe,
-             "labels": ["chat"], "downloaded": True},
-            {"id": qa_name, "checkpoint": qa_ckpt, "recipe": qa_recipe,
-             "labels": ["chat"], "downloaded": True},
+            {
+                "id": profile.model,
+                "checkpoint": profile.checkpoint,
+                "recipe": "llamacpp",
+                "labels": ["embeddings"],
+                "downloaded": True,
+            },
+            {
+                "id": ext_name,
+                "checkpoint": ext_ckpt,
+                "recipe": ext_recipe,
+                "labels": ["chat"],
+                "downloaded": True,
+            },
+            {
+                "id": qa_name,
+                "checkpoint": qa_ckpt,
+                "recipe": qa_recipe,
+                "labels": ["chat"],
+                "downloaded": True,
+            },
         ]
         checked = check_registry(registry, profile, ext_name, qa_name)
         self.assertEqual(checked["chat"]["id"], ext_name)
@@ -153,16 +199,26 @@ class ProfileTests(unittest.TestCase):
 
     def test_wrong_role_or_checkpoint_is_rejected(self):
         profile = next(iter(PROFILES.values()))
-        model = {"id": profile.model, "checkpoint": profile.checkpoint, "recipe": "llamacpp",
-                 "labels": ["embeddings"], "downloaded": True}
+        model = {
+            "id": profile.model,
+            "checkpoint": profile.checkpoint,
+            "recipe": "llamacpp",
+            "labels": ["embeddings"],
+            "downloaded": True,
+        }
         for change in ({"labels": ["chat"]}, {"checkpoint": "different/weights"}):
             with self.assertRaises(ValueError):
                 check_registry([{**model, **change}], profile)
 
     def test_embeddings_only_does_not_require_chat(self):
         profile = next(iter(PROFILES.values()))
-        model = {"id": profile.model, "checkpoint": profile.checkpoint, "recipe": "llamacpp",
-                 "labels": ["embeddings"], "downloaded": True}
+        model = {
+            "id": profile.model,
+            "checkpoint": profile.checkpoint,
+            "recipe": "llamacpp",
+            "labels": ["embeddings"],
+            "downloaded": True,
+        }
         self.assertEqual(check_registry([model], profile), {"embeddings": model})
 
 
