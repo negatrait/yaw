@@ -1,6 +1,7 @@
 import logging
 import os
 import time
+from collections.abc import Mapping
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,85 @@ if hasattr(dspy, "disable_litellm_logging"):
     dspy.disable_litellm_logging()
 
 _YAW_SLEEP_SECONDS: ContextVar[float] = ContextVar("yaw_sleep_seconds", default=0.0)
+
+
+class _UsageAccountingCache:
+    """Delegate storage/keys to DSPy while replaying logical inference cost.
+
+    DSPy intentionally records zero physical usage on hits. YAW's optimization
+    metric needs the original cost instead, so cached candidates do not get an
+    artificial advantage. LM history retains DSPy's zero physical usage.
+    """
+
+    def __init__(self, backend: Any) -> None:
+        self.backend = backend
+        self.cache_hits = 0
+        self.cached_tokens = 0
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.backend, name)
+
+    @staticmethod
+    def _is_lm_request(request: dict[str, Any]) -> bool:
+        return str(request.get("_fn_identifier", "")).startswith(
+            ("dspy.clients.lm.", "dspy.clients.lm15.")
+        )
+
+    @staticmethod
+    def _ignored(ignored: list[str] | None) -> list[str]:
+        # DSPy excludes endpoints by default; local servers may serve different
+        # weights under the same model name. Retain endpoints in YAW cache keys.
+        return [key for key in (ignored or ()) if key not in {"api_base", "base_url"}]
+
+    def _usage_key(self, request: dict[str, Any], ignored: list[str] | None) -> dict[str, str]:
+        return {"yaw_logical_usage_v1": self.backend.cache_key(request, ignored)}
+
+    def get(
+        self, request: dict[str, Any], ignored_args_for_cache_key: list[str] | None = None,
+    ) -> Any:
+        ignored_args_for_cache_key = self._ignored(ignored_args_for_cache_key)
+        record = self.backend.get(request, ignored_args_for_cache_key)
+        if record is None or not self._is_lm_request(request):
+            return record
+        if isinstance(record, dict) and "_dspy_format" in record:
+            usage = record.get("usage")
+        else:
+            # Legacy SDK responses have their usage cleared by DSPy's get().
+            # New writes retain a small usage companion in the same disk cache.
+            metadata = self.backend.get(self._usage_key(request, ignored_args_for_cache_key))
+            if metadata is None:
+                return None  # Unverifiable old usage: recompute instead of scoring it as zero.
+            usage = metadata.get("usage")
+        model = request.get("model") or request.get("request", {}).get("model")
+        if not isinstance(usage, Mapping) or not isinstance(model, str):
+            return None
+        tracker = dspy.settings.usage_tracker
+        if tracker is not None:
+            tracker.add_usage(model, dict(usage))
+        self.cache_hits += 1
+        self.cached_tokens += int(usage.get("total_tokens") or (
+            (usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+            + (usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+        ))
+        return record
+
+    def put(
+        self, request: dict[str, Any], value: Any,
+        ignored_args_for_cache_key: list[str] | None = None,
+        enable_memory_cache: bool = True,
+    ) -> None:
+        ignored_args_for_cache_key = self._ignored(ignored_args_for_cache_key)
+        self.backend.put(request, value, ignored_args_for_cache_key, enable_memory_cache)
+        if not self._is_lm_request(request):
+            return
+        if not (isinstance(value, dict) and "_dspy_format" in value):
+            usage = getattr(value, "usage", None)
+            if usage is None and isinstance(value, Mapping):
+                usage = value.get("usage")
+            self.backend.put(
+                self._usage_key(request, ignored_args_for_cache_key),
+                {"usage": dict(usage or {})}, enable_memory_cache=enable_memory_cache,
+            )
 
 
 def get_yaw_sleep_seconds() -> float:
@@ -83,6 +163,7 @@ def configure_yaw_dspy_cache(
     memory_max_entries: int = 100_000,
     restrict_pickle: bool = True,
     safe_types: list[type[Any]] | None = None,
+    account_cached_usage: bool = False,
 ) -> None:
     """Configure workspace-isolated DSPy cache via dspy.configure_cache with restrict_pickle=True by default."""
     resolved_dir: str | None = None
@@ -107,6 +188,8 @@ def configure_yaw_dspy_cache(
     if callable(close_fn):
         close_fn()
     dspy.configure_cache(**kwargs)
+    if account_cached_usage:
+        dspy.cache = _UsageAccountingCache(dspy.cache)
 
 
 def create_dspy_lm(
@@ -126,6 +209,8 @@ def create_dspy_lm(
     """Create a native dspy.LM configured for Lemonade (openai/...) or Ollama (ollama_chat/...).
 
     Applies recipe-aware and role-aware defaults for our local hardware stack:
+    - Gemma-4-E4B-it-GGUF (llamacpp GPU, 32768 ctx): default chat/reflection model;
+      direct/worker roles support GBNF, while RLM orchestrators generate plain code.
     - Qwen3-4B-Instruct-2507-GGUF (llamacpp on Vulkan GPU, 16384 ctx): supports GBNF for direct/worker
       roles (`extraction`, `qa`, `reflection_worker`) with temp=0.2, freq_penalty=0.5, and runs
       unconstrained Python REPL code generation (`_yaw_supports_gbnf=False`) for RLM orchestrator roles
@@ -154,7 +239,7 @@ def create_dspy_lm(
             temperature = 0.0
 
     if max_tokens is None:
-        # Per-completion output token cap (total context window is 16384 on Qwen in Lemonade).
+        # Per-completion output cap; model context is a separate server setting.
         max_tokens = 4096
 
     lm_kwargs: dict[str, Any] = dict(kwargs)
@@ -217,14 +302,14 @@ def create_dspy_rlm_pair(
     cache: bool = True,
     num_retries: int = 0,
 ) -> tuple[dspy.LM, dspy.LM]:
-    """Create the `(orchestrator_lm, sub_lm)` DSPy LM pair on `Qwen3-4B-Instruct-2507-GGUF`.
+    """Create the `(orchestrator_lm, sub_lm)` DSPy pair on the configured chat models.
 
     - `orchestrator_lm` (`role="rlm"` or `"reflection"`): runs `dspy.RLM` Python REPL code
       generation without GBNF (`_yaw_supports_gbnf=False`).
     - `sub_lm` (`role="extraction"` or `"reflection_worker"`): runs inner `llm_query`,
       `synthesize_instruction`, and GBNF-constrained `qwen_*` worker calls (`_yaw_supports_gbnf=True`).
     - When `reflection=True`, configures `orchestrator_lm` with `role="reflection"` (`temp=0.8`, `max_tokens=4096`)
-      and `sub_lm` with `role="reflection_worker"` (`temp=0.7`, `max_tokens=4096`, `freq_penalty=0.3`).
+      and `sub_lm` with `role="reflection_worker"`; sampling follows each model profile.
     """
     orchestrator_lm = create_dspy_lm(
         orchestrator_model,

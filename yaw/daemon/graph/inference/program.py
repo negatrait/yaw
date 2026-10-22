@@ -15,6 +15,7 @@ from yaw.core.config import YawConfig
 from yaw.core.types import OpenIERecord, StructuredTriple
 
 from .chat import create_dspy_lm
+from .diagnostics import DiagnosticHistory, diagnostic_boundary, trim_diagnostics
 from .grammars import (
     DSPY_INSTRUCTION_PROPOSAL_GBNF_GRAMMAR,
     DSPY_RERANK_GBNF_GRAMMAR,
@@ -591,6 +592,22 @@ class _PredictorBoundLM(dspy.BaseLM):
     def dump_state(self) -> dict[str, Any]:
         return {}
 
+    def cache_identity(self) -> dict[str, Any]:
+        """Expose effective inference settings for persistent stage-cache keys."""
+        identities = {}
+        for role, target in (
+            ("effective", self._resolve_target_lm()), ("bound", self._base_lm_getter())
+        ):
+            identities[role] = {
+                "model": getattr(target, "model", self._fallback_model),
+                "model_type": getattr(target, "model_type", None),
+                "kwargs": {
+                    k: v for k, v in (getattr(target, "kwargs", {}) or {}).items()
+                    if k not in {"api_key", "api_token"}
+                },
+            }
+        return identities
+
     def copy(self, **kwargs: Any) -> _PredictorBoundLM:
         cloned = _PredictorBoundLM(
             self.predictor_name,
@@ -618,7 +635,8 @@ class _PredictorBoundLM(dspy.BaseLM):
             raise ValueError(
                 f"No LM is configured for predictor {self.predictor_name!r} (role={self.role!r})."
             )
-        prev_len = len(getattr(target, "history", ()))
+        target_hist = getattr(target, "history", ())
+        previous_entry = target_hist[-1] if target_hist else None
         with warnings.catch_warnings():
             warnings.filterwarnings(
                 "ignore",
@@ -636,13 +654,17 @@ class _PredictorBoundLM(dspy.BaseLM):
                 result = target(messages=messages, **kwargs)
         target_hist = getattr(target, "history", None)
         if isinstance(target_hist, list):
-            for entry in target_hist[prev_len:]:
+            new_entries = (
+                target_hist[-1:] if target_hist and target_hist[-1] is not previous_entry else ()
+            )
+            for entry in new_entries:
                 if isinstance(entry, Mapping):
                     rec = dict(entry)
                     rec["predictor"] = self.predictor_name
                     self.history.append(rec)
                 else:
                     self.history.append({"predictor": self.predictor_name, "entry": entry})
+            del self.history[:-100]
         return result
 
 
@@ -1438,7 +1460,7 @@ class HippoRAGProgram(dspy.Module):
     """Unified DSPy Module for HippoRAG 2 OpenIE, EDC/SKOS Schema Canon, SHACL Repair, Recognition Memory, and Multi-Hop QA.
 
     Exposes the 9 canonical runtime stage predictors (out of the 12 total DSPy signatures in YAW):
-    1. **8 Direct GBNF Predictors (`Qwen3-4B-Instruct-2507-GGUF` on `llama.cpp` GPU):**
+    1. **8 Direct GBNF Predictors (configured chat model on `llama.cpp` GPU):**
        - `ner` (`ExtractEntities`)
        - `triples` (`ExtractTriples`)
        - `entity_definer` (`DefineMissingEntities`)
@@ -1519,11 +1541,12 @@ class HippoRAGProgram(dspy.Module):
         self.enable_react_fallback: bool = bool(enable_react_fallback)
         self.pareto_frontier_states: list[dict[str, Any]] = []
         self.pareto_ensemble: ParetoProgramEnsemble | None = None
-        self.telemetry: list[dict[str, Any]] = []
-        self.embedding_audit_trail: list[dict[str, Any]] = []
-        self.entity_def_audit_trail: list[dict[str, Any]] = []
-        self.synonym_audit_trail: list[dict[str, Any]] = []
-        self.shacl_audit_trail: list[dict[str, Any]] = []
+        self.telemetry: list[dict[str, Any]] = DiagnosticHistory()
+        self.history = DiagnosticHistory()
+        self.embedding_audit_trail: list[dict[str, Any]] = DiagnosticHistory()
+        self.entity_def_audit_trail: list[dict[str, Any]] = DiagnosticHistory()
+        self.synonym_audit_trail: list[dict[str, Any]] = DiagnosticHistory()
+        self.shacl_audit_trail: list[dict[str, Any]] = DiagnosticHistory()
 
         # 8 Direct GBNF Predictors with distinct Signatures
         self.ner = dspy.Predict(ExtractEntities)
@@ -2615,6 +2638,7 @@ class HippoRAGProgram(dspy.Module):
         )
         return out_intent
 
+    @diagnostic_boundary
     def answer_question(
         self,
         context: str,
@@ -2700,6 +2724,7 @@ class HippoRAGProgram(dspy.Module):
             )
             return None
 
+    @diagnostic_boundary
     def forward(
         self,
         context: str | None = None,
@@ -3476,7 +3501,7 @@ class _InstructionSynthesizerWorker(dspy.Module):
 
 
 class RLMInstructionProposer:
-    """Single-level RLM + SIMBA-Optimized GBNF Synthesizer (`Qwen3-4B` GPU) GEPA ProposalFn.
+    """Single-level RLM + SIMBA-optimized GBNF worker on the configured reflection model.
 
     Conforms to `gepa.core.adapter.ProposalFn` and stock DSPy `InstructionProposer`:
     `(candidate, reflective_dataset, components_to_update) -> dict[str, str]`, while its
@@ -3532,8 +3557,9 @@ class RLMInstructionProposer:
             enable_gbnf=self.enable_gbnf,
             max_instruction_chars=self.max_instruction_chars or 1500,
         )
-        self.telemetry: list[dict[str, Any]] = []
-        self.simba_telemetry: list[dict[str, Any]] = []
+        self.telemetry: list[dict[str, Any]] = DiagnosticHistory()
+        self.simba_telemetry: list[dict[str, Any]] = DiagnosticHistory()
+        self._simba_steps = 0
         self._simba_examples: list[dspy.Example] = []
         self._sub_telemetry: list[dict[str, Any]] = []
         self._synthesized_proposals: list[str] = []
@@ -3697,7 +3723,7 @@ class RLMInstructionProposer:
                 compiled_worker = simba.compile(
                     self.worker_module,
                     trainset=trainset,
-                    seed=len(self.simba_telemetry),
+                    seed=self._simba_steps,
                 )
             new_inst = str(compiled_worker.qwen_proposer.signature.instructions).strip()
             if (
@@ -3731,6 +3757,8 @@ class RLMInstructionProposer:
                 "proposer_instruction": new_inst,
             }
             self.simba_telemetry.append(entry)
+            self._simba_steps += 1
+            trim_diagnostics(self)
             return True
         except (
             RuntimeError,
@@ -3824,6 +3852,7 @@ class RLMInstructionProposer:
             combined = f"{draft[:budget].rstrip()} {schema_clause}"
         return combined
 
+    @diagnostic_boundary
     def propose_for_component(
         self,
         component_name: str,
@@ -3895,7 +3924,7 @@ class RLMInstructionProposer:
                 "num_feedback_examples": len(prepared_examples),
                 "usage": dict(usage or {}),
                 "sub_telemetry": list(self._sub_telemetry),
-                "simba_steps": len(self.simba_telemetry),
+                "simba_steps": self._simba_steps,
             }
         )
         return final_instruction
@@ -3956,6 +3985,7 @@ class RLMInstructionProposer:
                     )
                 )
 
+        del self._simba_examples[:-max(self.simba_bsize, 8)]
         if self.enable_simba and len(self._simba_examples) >= self.simba_bsize:
             self.step_simba()
 

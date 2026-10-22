@@ -1,5 +1,13 @@
 # FOUNDATIONAL
 
+Accepted runtime update (2026-10-22): the configured/default chat, extraction,
+QA and reflection model is now `Gemma-4-E4B-it-GGUF`, checkpoint
+`unsloth/gemma-4-E4B-it-GGUF:Q4_K_M`, on the existing external llama.cpp GPU
+service (32,768 context, `--parallel 1 --cache-ram 0`). This supersedes the Qwen
+runtime-model selection below; historical Qwen benchmark targets remain valid
+as historical comparisons. Existing embedding selection is unchanged. Gemma's
+direct/worker roles retain GBNF; RLM code generation remains unconstrained.
+
 Baseline: 2026-10-19. YAW is a native HippoRAG 2 graph & storage engine (`yaw/daemon/graph/{engine.py,ppr.py,storage/*}`) backed by one SQLite file (`yaw.db`), CocoIndex (`cocoindex>=1.0.0`) ingestion, sparse PPR with 1-indexed line hydration, and FastMCP over Streamable HTTP on Python `>=3.14.7`. Upstream `hipporag` and `optuna` are permanently retired from `pyproject.toml`, `uv.lock`, and runtime/test code; [`benchmark.py`](benchmark.py) and [`scripts/verify_paper_parity_gate.py`](scripts/verify_paper_parity_gate.py) evaluate native `yaw` against two consolidated reference targets: **Target 1 (`MONKEYPATCHED_HIPPORAG_BASELINES`)** (historical upstream HippoRAG 2 runs on `Qwen3-4B` + `EmbeddingGemma`, archived in [`outputs/benchmarks/consolidated_historical_baselines.json`](outputs/benchmarks/consolidated_historical_baselines.json)) and **Target 2 (`PAPER_BASELINES`)** (published HippoRAG 2 paper results on `Llama-3.3-70B` + `NV-Embed-v2`). No `hipporag`, `rdflib`, OWL, `pySHACL`, `spaCy`, Parquet, or Pickle in runtime.
 
 ## 6 Core Rules (Max Perf, Min Bloat)

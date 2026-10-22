@@ -1,6 +1,7 @@
 """Pure-JSON Context-Free Grammars (GBNF) and Sizecoding Pareto Metric for DSPy."""
 
 import json
+import math
 from collections.abc import Sequence
 from typing import Any
 
@@ -325,7 +326,10 @@ def compute_sizecoding_pareto_score(
     latency_ms: float | None = None,
     target_latency_ms: float = 1000.0,
     min_baseline_recall: float = 0.0,
-    target_tokens: float = 100.0,
+    # ~30k tokens/query is roughly a $0.10/query enterprise cost ceiling; at this budget the token
+    # penalty is a smooth tie-breaker instead of swamping answer quality (the old 100 made a
+    # 20k-token query carry a ~228x cost factor).
+    target_tokens: float = 30_000.0,
     pred_name: str | None = None,
     missed_items: Sequence[str] = (),
 ) -> dspy.Prediction:
@@ -370,6 +374,11 @@ def compute_sizecoding_pareto_score(
         for factor in rank_qa_factors:
             quality_numerator *= factor
         goods: list[float] = list(rank_qa_factors)
+        # Recall@5 and F1 are the primary signal: triple weight in the geometric mean.
+        for _ in range(2):
+            goods.append(_smooth_floor(r5))
+            if c_f1 is not None:
+                goods.append(_smooth_floor(c_f1))
     else:
         r1 = r2 = r5 = r10 = r20 = clamped_recall
         c_em = None
@@ -393,7 +402,9 @@ def compute_sizecoding_pareto_score(
 
     gm_good = _geometric_mean(goods)
 
-    b_tokens = 1.0 + (float(safe_tokens) / target_budget)
+    # Half-weight token cost (sqrt): tokens break ties between equal-quality candidates but a
+    # 50% token cut must never outrank a real F1/Recall@5 gain.
+    b_tokens = math.sqrt(1.0 + (float(safe_tokens) / target_budget))
     b_shacl_initial = 1.0 + float(eff_v_init + eff_missing_defs)
     b_shacl_remaining = 1.0 + float(eff_v_rem)
     aux_rlm_tokens = max(
@@ -435,12 +446,13 @@ def compute_sizecoding_pareto_score(
         f"SHACL={g_shacl:.4f} / [{safe_tokens} tokens], efficiency={efficiency:.4f})."
         f"{missed_str}{missing_defs_str}"
     )
+    # Full score card for GEPA's per-objective Pareto frontier, which feeds the
+    # `ParetoProgramEnsemble` (`dspy.Ensemble`). Every objective is higher-is-better: GEPA keeps
+    # the best candidate per key, so cost is expressed as `efficiency` (never `gm_bad`, which
+    # would reward the most expensive candidate) and composites are left out.
     obj_scores: dict[str, float] = {
         "recall_at_5": clamped_recall,
-        "pareto_raw": pareto_raw,
         "efficiency": efficiency,
-        "gm_good": gm_good,
-        "gm_bad": gm_bad,
         "shacl_conforms": g_shacl,
     }
     if has_multi_rank:
@@ -450,7 +462,6 @@ def compute_sizecoding_pareto_score(
                 "recall_at_2": r2,
                 "recall_at_10": r10,
                 "recall_at_20": r20,
-                "quality_numerator": quality_numerator,
             }
         )
         if c_em is not None and c_f1 is not None:

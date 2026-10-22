@@ -1,19 +1,25 @@
 """Native DSPy HippoRAG 2 Graph and Retrieval Engine backed by yaw.db and disk line hydration."""
 
 import contextlib
+import functools
 import hashlib
+import importlib.metadata
 import json
+import os
 import re
 import sqlite3
 import threading
+import time
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any, Literal
 
 import dspy
 import numpy as np
 
-from yaw.core import ChunkPointer, IndexStats, StructuredTriple
+from yaw.core import ChunkPointer, IndexStats, StructuredTriple, YawRuntimeError
+from yaw.daemon.graph.candidate_cache import CandidateStageCache
 from yaw.daemon.graph.inference import (
     FACT_INSTRUCTION,
     PASSAGE_INSTRUCTION,
@@ -29,6 +35,7 @@ from yaw.daemon.graph.inference import (
     configure_yaw_dspy_cache,
     text_processing,
 )
+from yaw.daemon.graph.inference.diagnostics import trim_diagnostics
 from yaw.daemon.graph.ppr import (
     CSRGraph,
     build_transition_matrix,
@@ -37,6 +44,7 @@ from yaw.daemon.graph.ppr import (
     run_ppr,
 )
 from yaw.daemon.graph.storage import (
+    CandidateCacheStore,
     ManagedConnection,
     delete_chunks,
     find_entity_disambiguation_candidates,
@@ -80,6 +88,28 @@ from yaw.daemon.graph.storage import (
 _SAME_SENSE_COSINE_GATE = 0.85
 
 
+def _write_text_atomic(path: Path, text: str) -> None:
+    """Write via sibling temp file + os.replace so concurrent readers never observe partial JSON."""
+    tmp = path.with_name(f"{path.name}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    try:
+        os.replace(tmp, path)
+    except PermissionError:
+        # Windows: a reader holding the target open blocks replace; fall back to in-place write.
+        path.write_text(text, encoding="utf-8")
+        tmp.unlink(missing_ok=True)
+
+
+def _optimization_history_scope(fn: Callable) -> Callable:
+    @functools.wraps(fn)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        # GEPA consumes DSPy traces and usage, not inspection histories containing
+        # full prompts/responses on every LM, caller module and GLOBAL_HISTORY.
+        with dspy.context(disable_history=True, max_history_size=0):
+            return fn(*args, **kwargs)
+    return wrapped
+
+
 class YawGraphEngine:
     """HippoRAG 2 engine backed by yaw.db, CSR Personalized PageRank, and lazy disk line hydration."""
 
@@ -121,7 +151,9 @@ class YawGraphEngine:
             self._dspy_cache_dir = Path(db_path).resolve().parent / "dspy_cache"
         else:
             self._dspy_cache_dir = self.workspace_root / "dspy_cache"
-        configure_yaw_dspy_cache(self._dspy_cache_dir, restrict_pickle=True)
+        configure_yaw_dspy_cache(
+            self._dspy_cache_dir, restrict_pickle=True, account_cached_usage=True
+        )
         self._lock = threading.RLock()
         self.managed_conn: ManagedConnection = open_managed_yaw_db(db_path)
         self.conn: sqlite3.Connection = self.managed_conn._conn
@@ -163,6 +195,7 @@ class YawGraphEngine:
         self._chunk_rlm_stats: dict[str, dict[str, float]] = {}
         self._active_query_rlm_stats: dict[str, int] | None = None
         self._active_progress_callback: Callable[[str], None] | None = None
+        self._last_hook_program: HippoRAGProgram | None = None
         self._last_scope_by_cids: dict[tuple[str, ...], dict[str, int]] = {}
         self._active_extraction_fingerprint: str | None = None
         self._active_openie_fingerprint: str | None = None
@@ -174,23 +207,84 @@ class YawGraphEngine:
         self._resolved_docs_cache: dict[tuple[int, str], list[tuple[ChunkPointer, str]]] = {}
         self._captured_chunk_traces: dict[str, list[tuple[str, dict[str, Any], Any]]] = {}
         self._captured_graph_traces: list[tuple[str, dict[str, Any], Any]] = []
-        self._text_vec_cache: dict[tuple[str, str, str], np.ndarray] = {}
-        self._openie_fp_cache: dict[
-            tuple[str, str],
-            tuple[Any, list[tuple[str, dict[str, Any], Any]], set[str], int, int, int],
-        ] = {}
-        self._synonym_fp_cache: dict[
-            tuple[str, str],
-            tuple[list[dict[str, str]], list[tuple[str, dict[str, Any], Any]], int],
-        ] = {}
-        self._shacl_fp_cache: dict[
-            tuple[str, str],
-            tuple[list[dict[str, str]], list[tuple[str, dict[str, Any], Any]], int],
-        ] = {}
+        # One versioned, bounded disk cache in yaw.db. Candidate histories must
+        # not accumulate vectors, extraction records and RLM traces in RAM.
+        graph_dir = Path(__file__).parent
+        self._candidate_cache_code_fp = hashlib.sha256(b"".join(
+            p.relative_to(graph_dir).as_posix().encode("utf-8") + b"\0" + p.read_bytes()
+            for p in sorted(graph_dir.rglob("*.py"))
+        ) + importlib.metadata.version("dspy").encode() + np.__version__.encode()).hexdigest()
+        with self.managed_conn.transaction():
+            cache_store = CandidateCacheStore(self.conn)
+        self._text_vec_cache = CandidateStageCache(
+            cache_store, self.managed_conn, "embedding", self._candidate_cache_namespace
+        )
+        self._openie_fp_cache = CandidateStageCache(
+            cache_store, self.managed_conn, "openie", self._candidate_cache_namespace,
+            sources=self._candidate_cache_sources,
+        )
+        self._synonym_fp_cache = CandidateStageCache(
+            cache_store, self.managed_conn, "synonym", self._candidate_cache_namespace,
+            sources=self._candidate_cache_sources,
+        )
+        self._shacl_fp_cache = CandidateStageCache(
+            cache_store, self.managed_conn, "shacl", self._candidate_cache_namespace,
+            sources=self._candidate_cache_sources,
+        )
 
         self._bind_program_hooks()
         self._apply_program_embedding_prefixes()
         self._hydrate_indexed_cids_from_db()
+
+    def _candidate_cache_namespace(self) -> str:
+        profile = getattr(self.embedder, "profile", None)
+        profile_identity = asdict(profile) if is_dataclass(profile) else str(profile)
+        if isinstance(profile_identity, dict):
+            # Query prefixes belong to query-vector keys, not document encoding
+            # or graph stages. Document prefix/model/endpoint remain dependencies.
+            profile_identity.pop("query_prefix", None)
+            profile_identity.pop("fact_query_prefix", None)
+        payload = {
+            "codec": 1,
+            "implementation": self._candidate_cache_code_fp,
+            "config": self.config.config_fingerprint() if self.config is not None else None,
+            "embedder": {
+                "class": type(self.embedder).__module__ + "." + type(self.embedder).__qualname__,
+                "profile": profile_identity,
+                "kwargs": getattr(self.embedder, "default_kwargs", {}),
+                **{name: getattr(self.embedder, name, None) for name in (
+                    "base_url", "provider", "task_mode", "dim",
+                )},
+            },
+            "gbnf": {
+                name: value for name, value in vars(self.program).items()
+                if name.startswith("gbnf_") or name == "enable_gbnf"
+            },
+        }
+        return hashlib.sha256(json.dumps(
+            payload, sort_keys=True, ensure_ascii=False, default=str
+        ).encode("utf-8")).hexdigest()
+
+    def _candidate_cache_sources(self) -> dict[str, str]:
+        return {
+            hashlib.sha256(text.encode("utf-8")).hexdigest(): text
+            for _, text in self._opt_chunks_pool
+        }
+
+    def _graph_cache_context(self) -> str:
+        """Hash the graph visible to SHACL's inspection/repair tools, in bounded rows."""
+        digest = hashlib.sha256()
+        for table, order in (
+            ("entities", "entity_id"), ("facts", "fact_id"),
+            ("edges", "src_id, dst_id, kind"),
+            ("entity_labels", "label_norm, entity_id, label_kind, chunk_id"),
+            ("edge_sources", "src_id, dst_id, kind, chunk_id"), ("chunks", "chunk_id"),
+        ):
+            digest.update(table.encode())
+            for row in self.conn.execute(f"SELECT * FROM {table} ORDER BY {order}"):
+                digest.update(json.dumps(tuple(row), ensure_ascii=False).encode("utf-8"))
+        digest.update(json.dumps(sorted(self._candidate_cache_sources())).encode())
+        return digest.hexdigest()
 
     def _hydrate_indexed_cids_from_db(
         self,
@@ -198,19 +292,23 @@ class YawGraphEngine:
     ) -> None:
         """Populate _opt_indexed_cids, _chunk_indexed_ext_fp, and persisted DSPy trails from SQLite."""
         active_prog = program if program is not None else self.program
-        openie_fp = self._openie_fingerprint(active_prog)
-        ext_fp = self._extraction_fingerprint(active_prog)
-        if self._baseline_openie_fp is not None and openie_fp != self._baseline_openie_fp:
-            return
         try:
             rows = self.conn.execute(
-                "SELECT c.chunk_id FROM chunks c INNER JOIN openie_chunks o ON c.chunk_id = o.chunk_id"
+                "SELECT c.chunk_id, m.value, p.value FROM chunks c "
+                "INNER JOIN openie_chunks o ON c.chunk_id = o.chunk_id "
+                "INNER JOIN meta m ON m.key = 'indexed_fp:' || c.chunk_id "
+                "INNER JOIN meta p ON p.key = 'openie_fp:' || c.chunk_id"
             ).fetchall()
         except sqlite3.Error:
             return
         if not rows:
             return
-        seeded_cids = [str(r[0]) for r in rows if r[0]]
+        provenance = {}
+        for cid, raw, saved_openie_fp in rows:
+            recorded = json.loads(raw)
+            if recorded[1] == saved_openie_fp:
+                provenance[str(cid)] = recorded
+        seeded_cids = list(provenance)
         if not seeded_cids:
             return
         vec_cids = get_existing_ids(self.conn, "chunk_vec", seeded_cids)
@@ -218,11 +316,11 @@ class YawGraphEngine:
         if ready_cids:
             self._opt_indexed_cids.update(ready_cids)
             for cid in ready_cids:
-                self._chunk_indexed_ext_fp.setdefault(cid, ext_fp)
+                self._chunk_indexed_ext_fp[cid] = provenance[cid][0]
             if self._active_extraction_fingerprint is None:
-                self._active_extraction_fingerprint = ext_fp
+                self._active_extraction_fingerprint = provenance[next(iter(ready_cids))][0]
             if self._active_openie_fingerprint is None:
-                self._active_openie_fingerprint = openie_fp
+                self._active_openie_fingerprint = provenance[next(iter(ready_cids))][1]
 
             try:
                 raw_trails = get_meta(self.conn, "dspy_trails_state")
@@ -419,7 +517,17 @@ class YawGraphEngine:
                 )
             else:
                 demos_repr.append(str(d_dict) if d_dict is not None else str(d))
-        return {"instructions": instructions, "demos": demos_repr}
+        lm = getattr(pred, "lm", None)
+        identity = getattr(lm, "cache_identity", None)
+        return {
+            "instructions": instructions, "demos": demos_repr,
+            "fields": {name: str(f.annotation) for name, f in sig.fields.items()} if sig else {},
+            "config": getattr(pred, "config", {}),
+            "lm": identity() if callable(identity) else {
+                "model": getattr(lm, "model", None),
+                "kwargs": getattr(lm, "kwargs", {}),
+            },
+        }
 
     @staticmethod
     def _prune_mismatching_demos(program: HippoRAGProgram) -> None:
@@ -450,12 +558,22 @@ class YawGraphEngine:
             pred.demos = valid_demos
 
     @classmethod
-    def _embed_fingerprint(cls, program: HippoRAGProgram) -> str:
-        payload = {
-            "embedding_query_prefix": getattr(program, "embedding_query_prefix", None),
-            "embedding_fact_prefix": getattr(program, "embedding_fact_prefix", None),
-            "embedding_document_prefix": getattr(program, "embedding_document_prefix", None),
-        }
+    def _embed_fingerprint(cls, program: Any, instruction: str = "") -> str:
+        query_prefix = getattr(
+            program, "query_prefix", getattr(program, "embedding_query_prefix", None)
+        )
+        fact_prefix = getattr(
+            program, "fact_query_prefix", getattr(program, "embedding_fact_prefix", None)
+        )
+        if not instruction:
+            prefix = getattr(
+                program, "document_prefix", getattr(program, "embedding_document_prefix", None)
+            )
+        elif instruction == FACT_INSTRUCTION:
+            prefix = fact_prefix or query_prefix
+        else:
+            prefix = query_prefix
+        payload = {"prefix": prefix}
         raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -479,6 +597,11 @@ class YawGraphEngine:
             "shacl_healer_rlm.extract",
         )
         payload = {k: cls._serialize_predictor_surface(named[k]) for k in shacl_keys if k in named}
+        healer = getattr(program, "shacl_healer_rlm", None)
+        payload["rlm_limits"] = {
+            name: getattr(healer, name, None)
+            for name in ("max_iters", "max_llm_calls", "max_output_chars")
+        }
         raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -517,12 +640,23 @@ class YawGraphEngine:
             },
             "gbnf_max_entities": getattr(program, "gbnf_max_entities", None),
             "gbnf_max_triples": getattr(program, "gbnf_max_triples", None),
-            "embedding_query_prefix": getattr(program, "embedding_query_prefix", None),
-            "embedding_fact_prefix": getattr(program, "embedding_fact_prefix", None),
             "embedding_document_prefix": getattr(program, "embedding_document_prefix", None),
         }
         raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _candidate_fingerprint(cls, program: HippoRAGProgram) -> str:
+        """Identify an optimizer candidate by hashing every predictor surface and embedding prefix."""
+        named = dict(program.named_predictors()) if hasattr(program, "named_predictors") else {}
+        payload = {
+            "stages": {k: cls._serialize_predictor_surface(v) for k, v in sorted(named.items())},
+            "embedding_query_prefix": getattr(program, "embedding_query_prefix", None),
+            "embedding_fact_prefix": getattr(program, "embedding_fact_prefix", None),
+            "embedding_document_prefix": getattr(program, "embedding_document_prefix", None),
+        }
+        raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
     @staticmethod
     def _extract_named_trace_entries(
@@ -662,6 +796,7 @@ class YawGraphEngine:
     ) -> tuple[str, tuple[str, ...], tuple[float, ...], tuple[str, ...]]:
         """Canonical engine retrieval hook returning (formatted_context, hydrated_texts, scores, chunk_ids)."""
         active_program = program if program is not None else self.program
+        self._last_hook_program = active_program
         target_cids = self._ensure_candidate_chunks_indexed(active_program, item_docs=item_docs)
         active_trace = getattr(dspy.settings, "trace", None)
         if isinstance(active_trace, list):
@@ -896,25 +1031,28 @@ class YawGraphEngine:
         if not texts:
             return []
         if hasattr(self.embedder, "bind_telemetry_hook"):
-            embed_fp = self._embed_fingerprint(self.program)
+            embed_fp = self._embed_fingerprint(
+                getattr(self.embedder, "profile", None) or self.program, instruction
+            )
             missing_texts: list[str] = []
-            seen_missing: set[str] = set()
+            missing_keys: set[str] = set()
+            vectors: dict[str, np.ndarray] = {}
             for t in texts:
                 ts = str(t)
-                if (
-                    embed_fp,
-                    instruction,
-                    ts,
-                ) not in self._text_vec_cache and ts not in seen_missing:
-                    seen_missing.add(ts)
+                if ts in vectors or ts in missing_keys:
+                    continue
+                cached = self._text_vec_cache.get((embed_fp, instruction, ts))
+                if cached is None:
                     missing_texts.append(ts)
+                    missing_keys.add(ts)
+                else:
+                    vectors[ts] = cached
             if missing_texts:
                 encoded = self.embedder.encode(missing_texts, instruction=instruction, stage=stage)
                 for ts, vec in zip(missing_texts, encoded, strict=False):
-                    self._text_vec_cache[(embed_fp, instruction, ts)] = np.asarray(
-                        vec, dtype=np.float32
-                    )
-            return [self._text_vec_cache[(embed_fp, instruction, str(t))] for t in texts]
+                    vectors[ts] = np.asarray(vec, dtype=np.float32)
+                    self._text_vec_cache[(embed_fp, instruction, ts)] = vectors[ts]
+            return [vectors[str(t)] for t in texts]
         return self.embedder.encode(texts, instruction=instruction)
 
     def _encode_in_batches(
@@ -1135,6 +1273,7 @@ class YawGraphEngine:
     def _reset_sandbox_graph(self, *, clear_openie: bool = True) -> None:
         """Clear graph tables in the sandbox DB when a candidate mutates extraction/graph prompts or query scope."""
         with self._lock, self.managed_conn.transaction() as conn:
+            conn.execute("DELETE FROM meta WHERE key GLOB 'indexed_fp:*'")
             conn.execute("DELETE FROM chunk_vec")
             conn.execute("DELETE FROM chunk_fts")
             conn.execute("DELETE FROM chunks")
@@ -1148,6 +1287,7 @@ class YawGraphEngine:
             conn.execute("DELETE FROM entities")
             if clear_openie:
                 conn.execute("DELETE FROM openie_chunks")
+                conn.execute("DELETE FROM meta WHERE key GLOB 'openie_fp:*'")
                 self._captured_chunk_traces.clear()
         self._captured_graph_traces.clear()
         self._opt_indexed_cids.clear()
@@ -1289,7 +1429,18 @@ class YawGraphEngine:
             ]
             if stale_targets:
                 stale_cids = [p.chunk_id for p, _ in stale_targets]
+                # A synonym/healing-only mutation still uses the same OpenIE.
+                # Preserve matching extraction checkpoints across graph rebuilds.
+                openie_records = get_openie_checkpoints(self.conn, stale_cids)
+                openie_fps = {
+                    cid: get_meta(self.conn, f"openie_fp:{cid}") for cid in stale_cids
+                }
                 self.delete_chunks(stale_cids)
+                with self.managed_conn.transaction():
+                    save_openie_checkpoints(self.conn, list(openie_records.values()))
+                    for cid, fp in openie_fps.items():
+                        if fp is not None:
+                            set_meta(self.conn, f"openie_fp:{cid}", fp)
                 for cid in stale_cids:
                     self._opt_indexed_cids.discard(cid)
                     self._chunk_indexed_ext_fp.pop(cid, None)
@@ -1467,6 +1618,7 @@ class YawGraphEngine:
 
         active_program = program if program is not None else self.program
         with self._lock:
+            trim_diagnostics(active_program)
             self._bind_program_hooks(active_program)
             self._apply_program_embedding_prefixes(active_program)
             openie_fp = self._openie_fingerprint(active_program)
@@ -1503,20 +1655,25 @@ class YawGraphEngine:
             chunk_openie_tok_by_cid: dict[str, int] = {}
             total_chunks = len(chunks)
             for idx, (ptr, text) in enumerate(chunks, 1):
-                if (openie_fp, ptr.chunk_id) in self._openie_fp_cache:
-                    rec, cached_tr, cached_norms, m_cnt, m_tok, o_tok = self._openie_fp_cache[
-                        (openie_fp, ptr.chunk_id)
-                    ]
+                # The previous chunk's slices are already consumed. Do not trim
+                # inside extract_openie: its caller still needs the new records.
+                trim_diagnostics(active_program)
+                openie_key = (openie_fp, ptr.chunk_id, hashlib.sha256(text.encode()).hexdigest())
+                cached_stage = self._openie_fp_cache.get(openie_key, passage=text)
+                if cached_stage is not None:
+                    rec, cached_tr, cached_norms, m_cnt, m_tok, o_tok = cached_stage
                     self._captured_chunk_traces[ptr.chunk_id] = list(cached_tr)
                     attempted_missing_by_cid[ptr.chunk_id] = set(cached_norms)
                     chunk_openie_tok_by_cid[ptr.chunk_id] = o_tok
                     self._graph_rlm_stats["missing_entity_defs_count"] += m_cnt
                     self._graph_rlm_stats["missing_entity_defs_tokens"] += m_tok
-                    save_openie_checkpoints(self.conn, [rec])
+                    with self.managed_conn.transaction():
+                        save_openie_checkpoints(self.conn, [rec])
+                        set_meta(self.conn, f"openie_fp:{ptr.chunk_id}", openie_fp)
                     all_records.append(rec)
-                elif (
-                    self._baseline_openie_fp is None or openie_fp == self._baseline_openie_fp
-                ) and ptr.chunk_id in cached_openie:
+                elif ptr.chunk_id in cached_openie and (
+                    get_meta(self.conn, f"openie_fp:{ptr.chunk_id}") == openie_fp
+                ):
                     rec = cached_openie[ptr.chunk_id]
                     if getattr(rec, "entity_definitions", None):
                         cached_norms: set[str] = set()
@@ -1583,7 +1740,7 @@ class YawGraphEngine:
                     chunk_openie_tok = max(0, raw_openie_tok - chunk_m_tok)
                     chunk_openie_tok_by_cid[ptr.chunk_id] = chunk_openie_tok
                     attempted_missing_by_cid[ptr.chunk_id] = attempted_norms
-                    self._openie_fp_cache[(openie_fp, ptr.chunk_id)] = (
+                    self._openie_fp_cache[openie_key] = (
                         rec,
                         list(chunk_traces),
                         set(attempted_norms),
@@ -1591,7 +1748,9 @@ class YawGraphEngine:
                         chunk_m_tok,
                         chunk_openie_tok,
                     )
-                    save_openie_checkpoints(self.conn, [rec])
+                    with self.managed_conn.transaction():
+                        save_openie_checkpoints(self.conn, [rec])
+                        set_meta(self.conn, f"openie_fp:{ptr.chunk_id}", openie_fp)
                     all_records.append(rec)
 
             # 3. Resolve Stage 1 NER Entities, Stage 2 StructuredTriples, Provisional Sense-Split Gate, and Contextual Embeddings
@@ -2280,10 +2439,9 @@ class YawGraphEngine:
                                 "utf-8"
                             )
                         ).hexdigest()
-                        if (syn_fp, pairs_fp) in self._synonym_fp_cache:
-                            cached_decs, cached_syn_tr, cached_syn_tok = self._synonym_fp_cache[
-                                (syn_fp, pairs_fp)
-                            ]
+                        cached_syn = self._synonym_fp_cache.get((syn_fp, pairs_fp))
+                        if cached_syn is not None:
+                            cached_decs, cached_syn_tr, cached_syn_tok = cached_syn
                             decisions = list(cached_decs)
                             self._captured_graph_traces.extend(cached_syn_tr)
                             self._graph_rlm_stats["synonym_judge_tokens"] += cached_syn_tok
@@ -2488,16 +2646,16 @@ class YawGraphEngine:
                             {
                                 "violations": [v.to_dict() for v in bounded_violations],
                                 "focus_contexts": focus_contexts,
+                                "graph_context": self._graph_cache_context(),
                             },
                             sort_keys=True,
                             ensure_ascii=False,
                             default=str,
                         ).encode("utf-8")
                     ).hexdigest()
-                    if (shacl_fp, viol_fp) in self._shacl_fp_cache:
-                        cached_reps, cached_shacl_tr, cached_shacl_tok = self._shacl_fp_cache[
-                            (shacl_fp, viol_fp)
-                        ]
+                    cached_shacl = self._shacl_fp_cache.get((shacl_fp, viol_fp))
+                    if cached_shacl is not None:
+                        cached_reps, cached_shacl_tr, cached_shacl_tok = cached_shacl
                         self._captured_graph_traces.extend(cached_shacl_tr)
                         self._graph_rlm_stats["shacl_healer_tokens"] += cached_shacl_tok
                         if cached_reps:
@@ -2514,6 +2672,7 @@ class YawGraphEngine:
                         self._active_repl_repair_keys = set()
                         self._active_repl_repairs_list = []
                         local_shacl_trace: list[Any] = []
+                        shacl_succeeded = True
                         try:
                             with dspy.context(trace=local_shacl_trace, usage_tracker=None):
                                 repairs = active_program.heal_shacl_violations(
@@ -2528,6 +2687,7 @@ class YawGraphEngine:
                                 exc,
                             )
                             repairs = []
+                            shacl_succeeded = False
                         finally:
                             repl_applied_keys = (
                                 set(self._active_repl_repair_keys)
@@ -2563,11 +2723,12 @@ class YawGraphEngine:
                             applied = self._apply_shacl_repairs(conn, unapplied_repairs)
                             self._graph_rlm_stats["shacl_repairs_applied"] += applied
                         all_repairs_for_cache = [*repl_repairs_list, *unapplied_repairs]
-                        self._shacl_fp_cache[(shacl_fp, viol_fp)] = (
-                            all_repairs_for_cache,
-                            list(shacl_traces),
-                            shacl_tok,
-                        )
+                        if shacl_succeeded:
+                            self._shacl_fp_cache[(shacl_fp, viol_fp)] = (
+                                all_repairs_for_cache,
+                                list(shacl_traces),
+                                shacl_tok,
+                            )
                         all_violations = lint_graph_shacl(conn, auto_heal=False)
                 batch_shacl_remaining = sum(
                     1 for v in all_violations if (v.focus_node, v.shape) in batch_attempted_keys
@@ -2575,6 +2736,8 @@ class YawGraphEngine:
                 self._graph_rlm_stats["shacl_violations_after"] = len(all_violations)
                 self._graph_rlm_stats["shacl_violations_remaining"] = len(all_violations)
                 self._graph_rlm_stats["shacl_conforms"] = len(all_violations) == 0
+                for cid in chunk_ids:
+                    set_meta(conn, f"indexed_fp:{cid}", json.dumps([ext_fp, openie_fp]))
 
             n_batch = max(1, len(chunk_ids))
             b_syn_tok = max(
@@ -2615,6 +2778,7 @@ class YawGraphEngine:
             for cid in chunk_ids:
                 self._chunk_indexed_ext_fp[cid] = ext_fp
             self._persist_dspy_trails_to_db(active_program)
+            trim_diagnostics(active_program)
             return len(chunks)
 
     def delete_chunks(self, chunk_ids: Sequence[str]) -> None:
@@ -2623,6 +2787,10 @@ class YawGraphEngine:
             return
         with self._lock:
             delete_chunks(self.conn, chunk_ids)
+            with self.managed_conn.transaction():
+                for cid in chunk_ids:
+                    set_meta(self.conn, f"indexed_fp:{cid}", None)
+                    set_meta(self.conn, f"openie_fp:{cid}", None)
             for cid in chunk_ids:
                 self._opt_indexed_cids.discard(cid)
                 self._chunk_indexed_ext_fp.pop(cid, None)
@@ -3016,6 +3184,7 @@ class YawGraphEngine:
             self.cursor += 1
             return [selected]
 
+    @_optimization_history_scope
     def evolve_prompts(
         self,
         trainset: Sequence[Any],
@@ -3038,6 +3207,16 @@ class YawGraphEngine:
         if not trainset:
             return self.program
 
+        gepa_seed_path = (
+            Path(save_path).parent / f"{Path(save_path).stem}_telemetry" / "seed_program.json"
+            if save_path is not None and mode in ("gepa", "hybrid") else None
+        )
+        resumed_seed = gepa_seed_path is not None and gepa_seed_path.exists()
+        if resumed_seed:
+            self.program.load(str(gepa_seed_path))
+            self._bind_program_hooks()
+            self._apply_program_embedding_prefixes()
+
         eff_sleep = (
             sleep_seconds
             if sleep_seconds > 0
@@ -3057,7 +3236,15 @@ class YawGraphEngine:
         self._active_progress_callback = progress_callback
         self._baseline_openie_fp = self._openie_fingerprint(self.program)
         self._hydrate_indexed_cids_from_db(self.program)
-        val_slice = list(valset)[:35] if (mode in ("gepa", "hybrid") and valset) else list(valset or trainset)
+        # Legacy rows have no durable prompt provenance. Never relabel them as
+        # results of the current seed; only verified checkpoints can be reused.
+        unverified_cids = [
+            str(cid) for (cid,) in self.conn.execute("SELECT chunk_id FROM chunks")
+            if str(cid) not in self._opt_indexed_cids
+        ]
+        if unverified_cids:
+            self.delete_chunks(unverified_cids)
+        val_slice = list(valset or trainset)
         val_pool: list[tuple[ChunkPointer, str]] = []
         seen_val_cids: set[str] = set()
         for ex in val_slice:
@@ -3085,6 +3272,26 @@ class YawGraphEngine:
         self._graph_rlm_stats["val_pool_size"] = len(val_cids_set)
         self._graph_rlm_stats["train_pool_size"] = len(train_cids_set)
         self._graph_rlm_stats["corpus_pool_size"] = max(1, len(all_pool_cids))
+        if save_path is not None:
+            # Publish the real split/pool composition immediately so monitors never guess it.
+            with contextlib.suppress(OSError):
+                p_save = Path(save_path)
+                p_save.parent.mkdir(parents=True, exist_ok=True)
+                _write_text_atomic(
+                    p_save.parent / f"{p_save.stem}_pools.json",
+                    json.dumps(
+                        {
+                            "mode": mode,
+                            "train_queries": len(trainset),
+                            "val_queries": len(valset or ()),
+                            "gepa_val_queries": len(val_slice),
+                            "val_chunk_ids": sorted(val_cids_set),
+                            "train_chunk_ids": sorted(train_cids_set),
+                            "corpus_chunk_ids": sorted(all_pool_cids),
+                            "written_at": time.time(),
+                        }
+                    ),
+                )
 
         missing_val_pool = [
             (p, t) for p, t in self._opt_val_chunks_pool if p.chunk_id not in self._opt_indexed_cids
@@ -3106,6 +3313,51 @@ class YawGraphEngine:
         eval_count = 0
         eval_history: list[dict[str, Any]] = []
         last_eval_ts = time.time()
+        # Per-candidate aggregates keyed by full predictor-surface fingerprint (first-seen order = candidate #).
+        candidate_stats: dict[str, dict[str, Any]] = {}
+        opt_phase = "gepa" if mode == "gepa" else "miprov2"
+        last_eval_fp: str | None = None
+        last_event_eval_count = 0
+        self._last_hook_program = None
+        _metric_keys = ("score", "r1", "r2", "r5", "r10", "r20", "em", "f1", "s_per_it", "tokens")
+
+        def _record_candidate_eval(rec: dict[str, Any]) -> None:
+            cs = candidate_stats.get(rec["cand_fp"])
+            if cs is None:
+                cs = candidate_stats[rec["cand_fp"]] = {
+                    "cand": len(candidate_stats) + 1,
+                    "fp": rec["cand_fp"],
+                    "optimizer": rec["optimizer"],
+                    "n": 0,
+                    "first_eval": rec["eval"],
+                    "score_min": float(rec["score"]),
+                    "score_max": float(rec["score"]),
+                    **{f"{k}_sum": 0.0 for k in _metric_keys},
+                }
+            cs["n"] += 1
+            cs["last_eval"] = rec["eval"]
+            cs["score_min"] = min(cs["score_min"], float(rec["score"]))
+            cs["score_max"] = max(cs["score_max"], float(rec["score"]))
+            for k in _metric_keys:
+                cs[f"{k}_sum"] += float(rec[k])
+
+        def _candidate_records() -> list[dict[str, Any]]:
+            out: list[dict[str, Any]] = []
+            for cs in sorted(candidate_stats.values(), key=lambda c: int(c["cand"])):
+                n = max(1, int(cs["n"]))
+                row = {
+                    k: cs[k]
+                    for k in ("cand", "fp", "optimizer", "n", "first_eval", "last_eval")
+                    if k in cs
+                }
+                row.update({k: round(cs[f"{k}_sum"] / n, 4) for k in _metric_keys})
+                row["score_min"] = round(cs["score_min"], 4)
+                row["score_max"] = round(cs["score_max"], 4)
+                for k in ("gepa_idx", "gepa_iteration", "val_score", "is_best"):
+                    if k in cs:
+                        row[k] = cs[k]
+                out.append(row)
+            return out
 
         def _build_stage_diagnostic(
             pred_name_str: str,
@@ -3155,7 +3407,7 @@ class YawGraphEngine:
             pred_name: Any = None,
             pred_trace: Any = None,
         ) -> dspy.Prediction:
-            nonlocal eval_count
+            nonlocal eval_count, last_eval_ts, last_eval_fp
             if pred_name is None:
                 eval_count += 1
             gold_answers_raw = getattr(gold, "gold_answers", getattr(gold, "answer", None))
@@ -3345,34 +3597,43 @@ class YawGraphEngine:
                     missed,
                 )
                 score_pred.feedback = f"{score_pred.feedback} | {stage_diag}"
-            if progress_callback is not None and pred_name is None:
+            if pred_name is None:
                 now_ts = time.time()
                 dt_eval = max(1.0, now_ts - last_eval_ts)
                 last_eval_ts = now_ts
                 sc_val = float(score_pred.score)
                 em_val = float(em_score or 0.0)
                 f1_val = float(f1_score or 0.0)
-                eval_history.append(
-                    {
-                        "cand": eval_count,
-                        "score": round(sc_val, 4),
-                        "r1": round(recalls_by_k[1], 4),
-                        "r2": round(recalls_by_k[2], 4),
-                        "r5": round(recalls_by_k[5], 4),
-                        "r10": round(recalls_by_k[10], 4),
-                        "r20": round(recalls_by_k[20], 4),
-                        "em": round(em_val, 4),
-                        "f1": round(f1_val, 4),
-                        "tokens": int(usage_tokens),
-                        "s_per_it": round(dt_eval, 2),
-                        "ts": round(now_ts, 2),
-                    }
-                )
-                progress_callback(
-                    f"optimizing ({mode}, auto={auto}): eval #{eval_count} -> "
-                    f"score={sc_val:.3f}, R@5={recalls_by_k[5]:.2f}, "
-                    f"F1={f1_val:.2f}, EM={em_val:.2f}, dt={dt_eval:.1f}s, tok={usage_tokens}"
-                )
+                cand_prog = self._last_hook_program or self.program
+                cand_fp = self._candidate_fingerprint(cand_prog)
+                last_eval_fp = cand_fp
+                eval_rec: dict[str, Any] = {
+                    "eval": eval_count,
+                    "cand_fp": cand_fp,
+                    "optimizer": opt_phase,
+                    "score": round(sc_val, 4),
+                    "r1": round(recalls_by_k[1], 4),
+                    "r2": round(recalls_by_k[2], 4),
+                    "r5": round(recalls_by_k[5], 4),
+                    "r10": round(recalls_by_k[10], 4),
+                    "r20": round(recalls_by_k[20], 4),
+                    "em": round(em_val, 4),
+                    "f1": round(f1_val, 4),
+                    "tokens": int(usage_tokens),
+                    "s_per_it": round(dt_eval, 2),
+                    "ts": round(now_ts, 2),
+                }
+                _record_candidate_eval(eval_rec)
+                eval_rec["cand"] = candidate_stats[cand_fp]["cand"]
+                eval_history.append(eval_rec)
+                del eval_history[:-500]
+                if progress_callback is not None:
+                    progress_callback(
+                        f"optimizing ({mode}, auto={auto}): eval #{eval_count} "
+                        f"[cand #{eval_rec['cand']}] -> "
+                        f"score={sc_val:.3f}, R@5={recalls_by_k[5]:.2f}, "
+                        f"F1={f1_val:.2f}, EM={em_val:.2f}, dt={dt_eval:.1f}s, tok={usage_tokens}"
+                    )
             if pred_name is None:
                 self._persist_dspy_trails_to_db(self.program)
                 if save_path is not None:
@@ -3382,6 +3643,7 @@ class YawGraphEngine:
                         inc_audit = p_inc.parent / f"{p_inc.stem}_graph_rlm_audit.json"
                         inc_payload = {
                             "graph_rlm_stats": dict(self._graph_rlm_stats),
+                            "candidate_records": _candidate_records(),
                             "eval_records": eval_history[-500:],
                             "program_telemetry": list(getattr(self.program, "telemetry", ()))[
                                 -250:
@@ -3399,9 +3661,8 @@ class YawGraphEngine:
                                 getattr(self.program, "entity_def_audit_trail", ())
                             )[-250:],
                         }
-                        inc_audit.write_text(
-                            json.dumps(inc_payload, ensure_ascii=False, indent=2),
-                            encoding="utf-8",
+                        _write_text_atomic(
+                            inc_audit, json.dumps(inc_payload, ensure_ascii=False, indent=2)
                         )
             return score_pred
 
@@ -3449,18 +3710,22 @@ class YawGraphEngine:
             rlm_max_llm_calls=20,
         )
 
-        # Disable DSPy disk and memory cache during prompt evolution via configure_yaw_dspy_cache
-        # so DSPy's `if not result.cache_hit:` in `dspy/clients/execution.py` never drops token usage
-        # on repeated predictor calls across GEPA rounds.
+        # Let DSPy reuse identical requests on disk while keeping logical token
+        # cost comparable across live and cached candidates. Avoid a RAM cache
+        # during evolution; request keys and cache=False remain DSPy's own.
         configure_yaw_dspy_cache(
             self._dspy_cache_dir,
-            enable_disk_cache=False,
+            enable_disk_cache=True,
             enable_memory_cache=False,
             restrict_pickle=True,
+            account_cached_usage=True,
         )
 
         try:
-            if mode in ("miprov2", "hybrid") and hasattr(dspy, "MIPROv2"):
+            if (
+                mode in ("miprov2", "hybrid")
+                and not resumed_seed and hasattr(dspy, "MIPROv2")
+            ):
                 import inspect
 
                 auto_val = auto if auto not in ("none", None, "") else None
@@ -3546,28 +3811,32 @@ class YawGraphEngine:
                         compiled.qa.demos = list(compiled.qa.predict.demos)
 
             if mode in ("gepa", "hybrid") and hasattr(dspy, "GEPA"):
+                if gepa_seed_path is not None and not resumed_seed:
+                    gepa_seed_path.parent.mkdir(parents=True, exist_ok=True)
+                    seed_tmp = gepa_seed_path.with_name("seed_program.tmp.json")
+                    compiled.save(str(seed_tmp), save_program=False)
+                    seed_tmp.replace(gepa_seed_path)
                 gepa_log_dir = (
                     str(Path(save_path).parent / f"{Path(save_path).stem}_telemetry")
                     if save_path is not None
                     else None
                 )
-                gepa_valset = list(valset)[:35] if valset else None
+                gepa_valset = list(valset) if valset else None
                 if gepa_log_dir is not None:
                     state_bin = Path(gepa_log_dir) / "gepa_state.bin"
                     if state_bin.exists():
-                        with contextlib.suppress(Exception):
-                            import pickle
+                        from gepa.core.state import GEPAState
 
-                            with state_bin.open("rb") as f:
-                                saved_state = pickle.load(f)
-                            expected_val_len = len(gepa_valset) if gepa_valset is not None else len(trainset)
-                            saved_val_len = len(
-                                getattr(saved_state, "valset_evaluations", [{}])[0]
-                                if getattr(saved_state, "valset_evaluations", None)
-                                else getattr(saved_state, "prog_candidate_val_subscores", [{}])[0]
+                        # Use GEPA's loader: its on-disk representation is a dict,
+                        # not the object the previous preflight expected. Never
+                        # delete a checkpoint to conceal an incompatibility.
+                        saved_state = GEPAState.load(gepa_log_dir)
+                        expected_val_len = len(gepa_valset or trainset)
+                        if len(saved_state.prog_candidate_val_subscores[0]) != expected_val_len:
+                            raise YawRuntimeError(
+                                "INVALID_INPUT", "GEPA checkpoint validation set changed; "
+                                "start a fresh run. The checkpoint was preserved.",
                             )
-                            if saved_val_len != expected_val_len:
-                                state_bin.unlink(missing_ok=True)
 
                 class _GepaProgressCallback:
                     def on_optimization_start(self, event: Any) -> None:
@@ -3599,6 +3868,17 @@ class YawGraphEngine:
                             )
 
                     def on_valset_evaluated(self, event: Any) -> None:
+                        nonlocal last_event_eval_count
+                        # The valset pass that triggered this event scored the candidate whose
+                        # fingerprint was seen last; skip attribution if no new evals ran (resumed state).
+                        if last_eval_fp is not None and eval_count > last_event_eval_count:
+                            cs = candidate_stats.get(last_eval_fp)
+                            if cs is not None:
+                                cs["gepa_idx"] = int(event.get("candidate_idx", -1))
+                                cs["gepa_iteration"] = int(event.get("iteration", 0))
+                                cs["val_score"] = round(float(event.get("average_score", 0.0)), 4)
+                                cs["is_best"] = bool(event.get("is_best_program"))
+                        last_event_eval_count = eval_count
                         if progress_callback is not None:
                             progress_callback(
                                 f"GEPA iteration {event.get('iteration')}: candidate #{event.get('candidate_idx')} "
@@ -3610,7 +3890,8 @@ class YawGraphEngine:
                     "metric": _gepa_metric,
                     "reflection_lm": resolved_ref_lm,
                     "instruction_proposer": proposer,
-                    "reflection_minibatch_size": 3,
+                    # 3 examples let single lucky answers accept/reject candidates; 10 is the floor.
+                    "reflection_minibatch_size": 10,
                     "candidate_selection_strategy": "pareto",
                     "skip_perfect_score": True,
                     "use_merge": True,
@@ -3634,6 +3915,7 @@ class YawGraphEngine:
                     gepa_kwargs["auto"] = auto if auto in ("light", "medium", "heavy") else "light"
 
                 gepa = dspy.GEPA(**gepa_kwargs)
+                opt_phase = "gepa"
                 with dspy.context(track_usage=True):
                     compiled = gepa.compile(
                         compiled,
@@ -3647,6 +3929,7 @@ class YawGraphEngine:
                 enable_disk_cache=True,
                 enable_memory_cache=True,
                 restrict_pickle=True,
+                account_cached_usage=True,
             )
 
         assert isinstance(compiled, HippoRAGProgram)
@@ -3675,6 +3958,7 @@ class YawGraphEngine:
             audit_path = p.parent / f"{p.stem}_graph_rlm_audit.json"
             audit_payload = {
                 "graph_rlm_stats": dict(self._graph_rlm_stats),
+                "candidate_records": _candidate_records(),
                 "eval_records": eval_history[-500:],
                 "program_telemetry": list(getattr(self.program, "telemetry", ())),
                 "embedding_audit_trail": list(getattr(self.program, "embedding_audit_trail", ())),
@@ -3683,10 +3967,7 @@ class YawGraphEngine:
                 "entity_def_audit_trail": list(getattr(self.program, "entity_def_audit_trail", ())),
                 "proposer_simba_telemetry": list(getattr(proposer, "simba_telemetry", ())),
             }
-            audit_path.write_text(
-                json.dumps(audit_payload, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            _write_text_atomic(audit_path, json.dumps(audit_payload, ensure_ascii=False, indent=2))
             if valset:
                 eval_path = p.parent / f"{p.stem}_eval.json"
                 self.evaluate(valset, save_as_json=eval_path)
@@ -3704,7 +3985,10 @@ class YawGraphEngine:
                 cached_pool = [
                     cp
                     for cp in self._opt_chunks_pool
-                    if (cp[0].chunk_id, target_openie_fp) in self._openie_fp_cache
+                    if (
+                        target_openie_fp, cp[0].chunk_id,
+                        hashlib.sha256(cp[1].encode()).hexdigest(),
+                    ) in self._openie_fp_cache
                 ]
                 rehydrate_pool = (
                     cached_pool[:64] if cached_pool else list(self._opt_chunks_pool[:16])

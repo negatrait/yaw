@@ -1,12 +1,15 @@
 """Single-owner persistent daemon runtime with FileLock, 32-slot bounded queue, and crash-resilient CocoIndex sync."""
 
 import contextlib
+import hashlib
+import importlib.metadata
 import json
 import logging
 import os
 import queue
 import shutil
 import sqlite3
+import tempfile
 import threading
 import time
 import uuid
@@ -766,6 +769,7 @@ class YawRuntime:
         max_labeled_demos: int | None = None,
         corpus_docs: Sequence[str] | None = None,
         progress_callback: Callable[[str], None] | None = None,
+        run_options: dict[str, Any] | None = None,
     ) -> Path:
         """Compile DSPy prompts and surface bounds on the worker thread and save artifact."""
         target_path = Path(
@@ -776,6 +780,10 @@ class YawRuntime:
         def _run_optimize() -> Path:
             if self.engine is None:
                 raise YawRuntimeError("NOT_READY", "Graph engine is not initialized.")
+
+            self.validate_optimization_run(
+                target_path, trainset, valset, corpus_docs, mode, run_options
+            )
 
             def _progress(msg: str) -> None:
                 self._update_state(active_op=msg)
@@ -801,17 +809,24 @@ class YawRuntime:
                     json.dumps(records_payload, ensure_ascii=False, indent=2),
                     encoding="utf-8",
                 )
-                delta = sync_corpus_once(
-                    corpus_root=self.config.corpus_root,
-                    state_dir=Path(self.config.state_dir) / "opt_slice_state",
-                    included_patterns=(opt_json_rel,),
-                    excluded_patterns=(),
-                    json_keys_whitelist=self.config.json_keys_whitelist,
-                    json_keys_blacklist=self.config.json_keys_blacklist,
-                    chunk_size=self.config.chunk_size,
-                    chunk_overlap=self.config.chunk_overlap,
-                    min_chunk_size=self.config.min_chunk_size,
-                )
+                # Reconstruct the complete pointer pool on restart. A memoized
+                # incremental scan returns only changes, losing unchanged passages
+                # from the optimizer's in-memory candidate pool.
+                Path(self.config.state_dir).mkdir(parents=True, exist_ok=True)
+                with tempfile.TemporaryDirectory(
+                    prefix="opt_slice_", dir=self.config.state_dir
+                ) as scan_state:
+                    delta = sync_corpus_once(
+                        corpus_root=self.config.corpus_root,
+                        state_dir=scan_state,
+                        included_patterns=(opt_json_rel,),
+                        excluded_patterns=(),
+                        json_keys_whitelist=self.config.json_keys_whitelist,
+                        json_keys_blacklist=self.config.json_keys_blacklist,
+                        chunk_size=self.config.chunk_size,
+                        chunk_overlap=self.config.chunk_overlap,
+                        min_chunk_size=self.config.min_chunk_size,
+                    )
                 opt_chunks = list(delta.added_chunks)
                 new_stats = self.engine.get_stats(self.config.config_fingerprint())
                 with self._state_lock:
@@ -858,6 +873,93 @@ class YawRuntime:
             return target_path
 
         return self.submit("optimize", _run_optimize, progress_callback=progress_callback).result()
+
+    def validate_optimization_run(
+        self,
+        target_path: Path,
+        trainset: Sequence[Any],
+        valset: Sequence[Any] | None,
+        corpus_docs: Sequence[str] | None,
+        mode: str,
+        run_options: dict[str, Any] | None = None,
+    ) -> None:
+        """Bind checkpoints to their ordered data, inference settings and scoring code.
+
+        Called on the writer thread, before replacing corpus sources or indexing.
+        Budgets may be increased when continuing an existing search.
+        """
+        assert self.engine is not None
+        settings = {
+            k: v for k, v in asdict(self.config).items()
+            if not k.endswith(("_path", "_dir", "_root"))
+            and not k.startswith(("optimize_", "http_"))
+            and k not in {"api_key", "poll_interval_seconds", "queue_maxsize"}
+        }
+        settings.update(
+            max_bootstrapped_demos=self.config.optimize_max_bootstrapped_demos,
+            max_labeled_demos=self.config.optimize_max_labeled_demos,
+        )
+        daemon_dir = Path(__file__).parent
+        source_paths = sorted((daemon_dir / "graph").rglob("*.py"))
+        source_paths.append(daemon_dir / "ingestion" / "corpus.py")
+        identity = {
+            "version": 1,
+            "mode": mode,
+            "settings": settings,
+            "data_sha256": hashlib.sha256(json.dumps(
+                {
+                    "train": [ex.toDict() for ex in trainset],
+                    "val": [ex.toDict() for ex in (valset or trainset)],
+                    "corpus": list(corpus_docs or ()),
+                }, sort_keys=True, ensure_ascii=False,
+            ).encode("utf-8")).hexdigest(),
+            "code_sha256": hashlib.sha256(b"".join(
+                p.relative_to(daemon_dir).as_posix().encode("utf-8") + b"\0" + p.read_bytes()
+                for p in source_paths
+            )).hexdigest(),
+            "packages": {
+                name: importlib.metadata.version(name)
+                for name in ("dspy", "gepa", "cocoindex", "sqlite-vec", "scipy")
+            },
+        }
+        # TOML tuples become JSON lists on disk; compare the canonical form.
+        identity = json.loads(json.dumps(identity))
+        conn = self.engine.conn
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key = 'optimization_run'"
+        ).fetchone()
+        if row is not None:
+            saved = json.loads(row[0])
+            if saved["identity"] != identity or saved["output_path"] != str(target_path):
+                raise YawRuntimeError(
+                    "INVALID_INPUT",
+                    "Cannot resume: optimization data, settings, code, packages or output path "
+                    "changed. Start a fresh run without --resume/--db-path; "
+                    "old state is preserved.",
+                )
+            if run_options is not None:
+                saved["cli_options"] = run_options
+                with self.engine.managed_conn.transaction() as tx:
+                    tx.execute(
+                        "UPDATE meta SET value = ? WHERE key = 'optimization_run'",
+                        (json.dumps(saved),),
+                    )
+            return
+        checkpoint = target_path.parent / f"{target_path.stem}_telemetry" / "gepa_state.bin"
+        if checkpoint.exists():
+            raise YawRuntimeError(
+                "INVALID_INPUT",
+                "Cannot verify this legacy GEPA checkpoint: no run identity was recorded. "
+                "Start a fresh run; the existing checkpoint is preserved.",
+            )
+        with self.engine.managed_conn.transaction() as tx:
+            tx.execute(
+                "INSERT INTO meta(key, value) VALUES ('optimization_run', ?)",
+                (json.dumps({
+                    "output_path": str(target_path), "identity": identity,
+                    "cli_options": run_options or {},
+                }),),
+            )
 
     def reload_program(self, program_path: Path | str) -> dict[str, Any]:
         """Hot-reload a compiled DSPy program into the running engine in-memory."""

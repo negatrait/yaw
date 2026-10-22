@@ -67,6 +67,17 @@ CHAT_MODELS = {
         expected_device="gpu",
         expected_context=16384,
     ),
+    "Gemma-4-E4B-it-GGUF": ChatProfile(
+        checkpoint="unsloth/gemma-4-E4B-it-GGUF:Q4_K_M",
+        recipe="llamacpp",
+        role="both",
+        default_temperature=0.2,
+        extraction_temperature=0.2,
+        qa_temperature=0.2,
+        reflection_frequency_penalty=0.0,
+        expected_device="gpu",
+        expected_context=32768,
+    ),
     "gemma4-it-12b-FLM": ChatProfile(
         checkpoint="gemma4-it:12b",
         recipe="flm",
@@ -86,8 +97,8 @@ CHAT_MODELS = {
         frequency_penalty=0.0,
     ),
 }
-DEFAULT_EXTRACTION_CHAT = "Qwen3-4B-Instruct-2507-GGUF"
-DEFAULT_QA_CHAT = "Qwen3-4B-Instruct-2507-GGUF"
+DEFAULT_EXTRACTION_CHAT = "Gemma-4-E4B-it-GGUF"
+DEFAULT_QA_CHAT = "Gemma-4-E4B-it-GGUF"
 DEFAULT_CHAT = DEFAULT_QA_CHAT
 BASE_URL = "http://localhost:13305/api/v1"
 DEFAULT_BASE_URL = BASE_URL

@@ -275,6 +275,52 @@ def test_target_sink_compiler_callback_and_retry_on_failure(tmp_path: Path) -> N
         assert observed_deltas[0] == delta
 
 
+def test_parser_helper_edit_invalidates_persistent_memo_across_processes(tmp_path: Path) -> None:
+    import json
+    import os
+    import shutil
+    import subprocess
+    import sys
+
+    snapshot = tmp_path / "implementation"
+    shutil.copytree(
+        Path(__file__).resolve().parents[3] / "yaw", snapshot / "yaw",
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "note.md").write_text("# Original\nA passage about graph indexing.\n")
+    worker = """
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from yaw.daemon.ingestion import CorpusIngestor
+with CorpusIngestor(sys.argv[2], sys.argv[3]) as ingestor:
+    delta = ingestor.poll()
+print(json.dumps([p.title for p, text in delta.added_chunks]))
+"""
+
+    def scan() -> list[str]:
+        result = subprocess.run(
+            [sys.executable, "-c", worker, str(snapshot), str(corpus), str(tmp_path / "state")],
+            capture_output=True, text=True, check=True, timeout=60,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        return json.loads(result.stdout.strip().splitlines()[-1])
+
+    assert scan() == ["Original"]
+    assert scan() == []
+    module = snapshot / "yaw/daemon/ingestion/corpus.py"
+    before = module.read_text(encoding="utf-8")
+    after = before.replace(
+        "title = resolve_heading_for_line(headings, start_line, fallback_title)",
+        'title = "Changed by parser helper"',
+    )
+    assert before != after
+    module.write_text(after, encoding="utf-8")
+    assert scan() == ["Changed by parser helper"]
+    assert scan() == []
+
+
 def test_zero_markdown_it_in_corpus_module() -> None:
     import ast
     import inspect

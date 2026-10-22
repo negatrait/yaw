@@ -208,10 +208,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_opt_common.add_argument(
         "--db",
+        "--db-path",
         dest="db_path",
         type=str,
         default=None,
-        help="Path to existing sandbox database (or 'latest') to reuse (defaults to seeding from latest sandbox)",
+        help="Resume an existing sandbox database; 'latest' selects the newest run by timestamp",
+    )
+    p_opt_common.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume the newest optimization run (or the run selected by --db-path)",
     )
 
     p_dspy = domain_subparsers.add_parser(
@@ -818,6 +824,37 @@ def handle_dspy_optimize(
     embedder: DSPyEmbeddingAdapter | None = None,
 ) -> int:
     """Compile DSPy prompts in an isolated sandbox and save candidate JSON."""
+    raw_db = getattr(args, "db_path", None)
+    if getattr(args, "resume", False) and raw_db is None:
+        raw_db = "latest"
+    opt_config = config.for_optimization(db_override=raw_db)
+    out_override = getattr(args, "output", None)
+    if raw_db is not None:
+        # Read metadata before loading datasets, so bare --resume can recover
+        # the original slice and budget even when they were CLI overrides.
+        assert opt_config.db_path is not None
+        with contextlib.closing(sqlite3.connect(
+            opt_config.db_path.as_uri() + "?mode=ro", uri=True
+        )) as conn:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key = 'optimization_run'"
+            ).fetchone()
+        if row is not None:
+            saved_run = json.loads(row[0])
+            saved_output = Path(saved_run["output_path"])
+            if out_override and Path(out_override).resolve() != saved_output:
+                raise YawRuntimeError(
+                    "INVALID_INPUT", f"Resume must use the original output path: {saved_output}"
+                )
+            out_override = str(saved_output)
+            for key, value in saved_run.get("cli_options", {}).items():
+                if getattr(args, key, None) is None:
+                    setattr(args, key, value)
+        print(
+            f"[yaw optimize] Resuming {opt_config.db_path}; "
+            f"output={out_override or opt_config.compiled_program_path}",
+            file=sys.stderr, flush=True,
+        )
     raw_dataset = getattr(args, "dataset", None)
     if raw_dataset is not None:
         if isinstance(raw_dataset, str):
@@ -860,8 +897,6 @@ def handle_dspy_optimize(
     raw_mode = getattr(args, "mode", None)
     mode = raw_mode or config.optimize_mode or "hybrid"
 
-    out_override = getattr(args, "output", None)
-
     trainset, valset, corpus_docs = _load_dataset_splits(
         dataset_args,
         workspace_root=config.workspace_root,
@@ -872,8 +907,6 @@ def handle_dspy_optimize(
 
     # Resolution order for sandbox: always isolate prompt compilation
     dspy.settings.configure(provide_traceback=True)
-    raw_db = getattr(args, "db_path", None)
-    opt_config = config.for_optimization(db_override=raw_db)
     raw_sleep = getattr(args, "sleep_seconds", None)
     sleep_seconds = (
         float(raw_sleep) if raw_sleep is not None else float(config.optimize_sleep_seconds or 0.0)
@@ -913,6 +946,14 @@ def handle_dspy_optimize(
             max_labeled_demos=max_labeled_demos,
             corpus_docs=corpus_docs,
             progress_callback=_cli_progress,
+            run_options={
+                "dataset": dataset_args, "max_queries": max_queries,
+                "train_queries": train_queries, "query_offset": query_offset,
+                "mode": mode, "auto": auto, "num_trials": num_trials,
+                "num_candidates": num_candidates, "sleep_seconds": sleep_seconds,
+                "max_bootstrapped_demos": max_bootstrapped_demos,
+                "max_labeled_demos": max_labeled_demos,
+            },
         )
         print(file=sys.stderr)  # Move to next line before JSON output
         proposer_telemetry = saved_path.parent / f"{saved_path.stem}_proposer_telemetry.json"

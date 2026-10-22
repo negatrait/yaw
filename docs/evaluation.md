@@ -688,3 +688,464 @@ Offline test suite: `uv run --locked python -m unittest discover -s tests -v` �
   - `git diff --check` $\to$ **Clean**.
   - `git grep -w "_rm_retrieval_hook" yaw/ tests/` $\to$ **0 matches**.
   - `git grep -w "_program_retrieval_hook" yaw/ tests/` $\to$ **0 matches**.
+
+## 20. Candidate-Indexed Optimizer Telemetry & Watchdog Staleness Fixes (2026-10-21)
+
+- **Scope:**
+  - **Engine (`yaw/daemon/graph/engine.py`):** Every scored metric call in `evolve_prompts` is now attributed to an optimizer candidate via `_candidate_fingerprint(program)` (SHA-256 over all predictor surfaces + embedding prefixes), captured from the program passed to `_canonical_retrieval_hook`. Candidates are numbered in first-evaluation order (MIPROv2 trials and GEPA proposals alike; re-evaluated parents map back to their original number). The audit JSON gains `candidate_records` (per-candidate n, mean/min/max score, R@1..20, EM, F1, s/eval, tokens, plus GEPA `gepa_idx`/`val_score`/`is_best` from `on_valset_evaluated`). Audit writes are atomic (`_write_text_atomic`).
+  - **Fixed real crash:** `engine.py` used `time.time()` without `import time` (also missing at `HEAD`); `yaw optimize` failed with `NameError: name 'time' is not defined` right after validation indexing. `last_eval_ts` was also missing from the metric closure's `nonlocal`.
+  - **Watchdog (`scripts/watchdog.py`):** Figs 3–5 are indexed by candidate # (not wall-clock). Removed stale/synthetic sources: fallback to other runs' audit files, scraping old task logs, and R@1/R@2/R@10/R@20/EM values fabricated from R@5. Reads only `compiled_program_optimize_<datestamp>_graph_rlm_audit.json` for the active sandbox, cached by (mtime, size) with last-good reuse on torn reads. Removed `immutable=1` SQLite reads on the live DB, scoped the DB snapshot cache per database, derived "running" from the status-file PID instead of "records found", wrote placeholders instead of skipping when data is empty, clamped Fig 1's time axis until throughput is measurable, rendered figures atomically and isolated them so one failure doesn't stop the rest.
+
+- **Verification:**
+  - Synthetic audit render check (1 candidate, 25 candidates, legacy untagged, empty, torn JSON) $\to$ all figures rendered, no temp files left, torn read reused last snapshot.
+  - `uv run --no-sync pytest tests/core/test_architecture.py tests/daemon/graph/test_engine.py -k "architecture or homographs or evolve_prompts_reindexes"` $\to$ **11 passed**.
+  - `test_evolve_prompts_real_unmocked_gepa_and_miprov2_with_context_limit_guard` $\to$ **fails** on `len(compiled.shacl_healer_rlm.generate_action.demos) >= 1` (demos are cleared when `max_*_demos == 0`). This assertion was unreachable at `HEAD` because of the `NameError`, and the code involved was not changed here.
+  - `uv run --no-sync ruff check scripts/watchdog.py` $\to$ **All checks passed!**; `git diff --check` $\to$ **Clean**.
+  - Live: `yaw optimize --db latest` resumed on `yaw_optimize_20261021_170138.db`; watchdog cycle reports `OPTIMIZER RUNNING • indexing: …` with no stale eval counts.
+
+## 21. GEPA Metric Fix: Quality-Led Score, 10-Example Minibatch, Clean Objective Score Card (2026-10-22)
+
+- **Observed failure (run `yaw_optimize_20261021_174008`, 150 train / 100 val, Qwen3-4B):** after 10 candidates (401 evals) the seed stayed "best" (val score `0.0573`) while candidate #5 had higher full-valset R@5 (`0.90` vs `0.87`) and F1 (`0.359` vs `0.350`). Six of ten candidates were judged on 3-example minibatches only.
+- **Root causes (`compute_sizecoding_pareto_score`, `yaw/daemon/graph/inference/grammars.py`):**
+  - `target_tokens=100` against ~20k tokens/query made the token cost term ~228; a 50% token cut moved the score ~20% while a +10pt F1 gain moved it ~3%. The score tracked cost, not quality.
+  - `objective_scores` (GEPA per-objective frontier -> `ParetoProgramEnsemble` / `dspy.Ensemble`) included `gm_bad` (lower-is-better), so the frontier kept the most expensive candidate, plus redundant composites (`gm_good`, `pareto_raw`, `quality_numerator`).
+  - `reflection_minibatch_size=3` (`yaw/daemon/graph/engine.py`) let a single answer accept/reject a proposal.
+- **Changes:**
+  - `target_tokens` default `30_000` (about USD 0.10/query enterprise ceiling); token cost enters the denominator at half weight (`sqrt`).
+  - Recall@5 and F1 carry triple weight in the quality geometric mean.
+  - `objective_scores` now holds only higher-is-better metrics: Recall@1/2/5/10/20, EM, F1, `shacl_conforms`, `efficiency`.
+  - `reflection_minibatch_size=10`.
+- **Sensitivity at candidate #1's real numbers (R@5 0.87, F1 0.35, 22.8k tokens):** +10pt F1 -> x1.065; -50% tokens -> x1.031; +5pt R@5 -> x1.014 (previously -50% tokens dominated).
+- **Verification:**
+  - `uv run --no-sync pytest tests/daemon/graph/inference/test_prompts.py tests/daemon/test_runtime.py -k "pareto or sizecoding or gepa or metric or composite or Pareto or repair"` -> **5 passed** (new assertions: a +10pt F1 gain outranks halving tokens; no lower-is-better objective keys).
+  - `git diff --check` -> **Clean**; no new ruff findings on changed lines (repo baseline already has 712).
+- **Restart:** stopped the old run; archived its GEPA state and audit as `*_oldmetric` (old scores are not comparable); restarted `yaw optimize --db .yaw/yaw_optimize_20261021_174008.db`, reusing the indexed sandbox.
+
+## 22. E1-S6 Explicit Optimization Resume and Checkpoint Provenance (2026-10-22)
+
+- **Checkout verified:** `C:\Users\Harri.Ahokas\Documents\yaw`, origin
+  `https://github.com/negatrait/yaw.git`. Existing working-tree edits and live
+  optimization databases were preserved; no user run was stopped or launched.
+- **Failures identified:** default CLI invocations create new sandboxes;
+  `--db latest` selected by database size; `--db-path` and `--resume` were not
+  parser options. YAW's preflight treated GEPA's serialized dictionary as an
+  object and could delete a valid `gepa_state.bin`. Restart hydration assigned
+  the current prompt fingerprint to old graph rows without durable provenance.
+  Incremental ingestion could return an empty optimizer passage pool on restart.
+- **Changes:** `--resume`, `--db-path latest`, and retained `--db` alias select
+  existing runs by their filename creation timestamp. Missing runs fail.
+  SQLite run metadata restores the original CLI dataset/slice/budget and custom
+  output path. Writer-locked validation fingerprints ordered datasets/corpus,
+  inference/indexing settings, graph/ingestion code, and relevant package versions.
+  Incompatible and unverifiable legacy GEPA checkpoints are preserved and rejected.
+  GEPA state is loaded through its own loader. A saved seed program supports
+  restarting GEPA after completed MIPRO initialization. Fresh temporary CocoIndex
+  scan state reconstructs the complete pointer pool without discarding saved graph
+  results. Transactional per-chunk OpenIE/index fingerprints in `meta` distinguish
+  matching cached results from mutated candidate prompts; legacy unverified rows
+  are recomputed. DSPy response caching during evolution is unchanged (disabled).
+- **Environment / installation:** first sandboxed `uv run --locked` failed while
+  initializing the external uv cache; installed package-source reads were also
+  denied by sandbox access. Approved access to the existing environment resolved
+  verification. Python **3.14.7**, DSPy **3.4.1**, GEPA **0.1.4**.
+  `uv sync --locked` resolved and checked **97 packages** without dependency or
+  lockfile changes.
+- **Focused verification:**
+  - `uv run --locked pytest tests/core/test_config.py tests/core/test_architecture.py
+    tests/daemon/test_runtime.py tests/daemon/graph/test_engine.py -q
+    -k 'not real_unmocked_gepa_and_miprov2_with_context_limit_guard' --tb=short`
+    -> **55 passed, 1 deselected** before adding the final missing-run CLI test
+    (`outputs/resume-focused-tests.txt`).
+  - Final `uv run --locked pytest tests/core/test_config.py tests/daemon/test_runtime.py
+    tests/daemon/graph/test_engine.py -q
+    -k 'resume or optimization_latest or optimization_custom' --tb=short`
+    -> **9 passed, 39 deselected** (`outputs/resume-regression-tests.txt`). Includes
+    bare resume and `--db-path latest`, recovery without a final compiled JSON,
+    real GEPA state containing a superior saved candidate, unchanged stored
+    frontier/budget, complete nonempty passage pools, persisted OpenIE reuse after
+    object recreation, prompt-mutation invalidation, changed-data refusal with
+    byte-identical checkpoint/corpus preservation, and legacy/missing-run errors.
+  - The first new legacy-state test had a misplaced assertion from its neighboring
+    test (`NameError`); corrected placement, and the final regression run passes.
+  - Full focused suite initially: **48 passed, 1 failed**. The existing hybrid
+    context-limit test asserts that SHACL RLM demos are nonempty although configured
+    defaults clear demos. Running that test with the committed `HEAD` engine loaded
+    in memory reproduces the same **`assert 0 >= 1`** without changing checkout
+    sources (`outputs/resume-hybrid-baseline.txt`). It remains an existing failure.
+  - Lint across the seven touched Python files reports **173 findings**. Comparison
+    against committed source found only three extra line-length findings, all in
+    the pre-existing working-tree candidate-telemetry edits; this resume patch adds
+    no lint findings. Import-order check passes. `git diff --check` passes.
+- **Scope of evidence:** real SQLite, CocoIndex, DSPy and GEPA checkpoint loading
+  with deterministic offline model/embedding providers validate orchestration and
+  storage reuse. No live inference, process-kill/power-loss experiment, retrieval
+  quality benchmark, full-corpus Tier 2 parity, or HTTP transport acceptance is
+  claimed. In-flight work can repeat; GEPA 0.1.4 reevaluates the seed validation
+  batch before loading saved state. GEPA budgets are total metric-call caps,
+  including calls already recorded; an exhausted run needs a larger budget.
+
+## 23. E1-S6 Priority 1: Persistent Candidate-Stage Caches (2026-10-22)
+
+- **Authorized scope:** prioritize candidate-stage persistence for low-memory
+  machines. Native DSPy request/response caching (priority 2) remains disabled
+  during optimization; no claim of caching every QA/filter/reflection request.
+  Checkout and remote were reverified; pre-existing edits, experiments, and the
+  user's concurrent `inference/prompts.py` improvements were preserved.
+- **Implementation:** replace the four result dictionaries (embedding, OpenIE,
+  synonym, SHACL) with disk-only `CandidateStageCache` views over one
+  `candidate_stage_cache` table in `yaw.db`. The shared compressed-payload limit
+  is **256 MiB**, with transactional FIFO eviction and trigger-maintained byte
+  accounting. No extra dependencies, pickle, resident historical result maps,
+  or source-text index files. Entries hold typed JSON with float32 vector bytes,
+  OpenIE/StructuredTriple records, DSPy predictions, and typed REPLHistory.
+  Trace source text is replaced with content references and hydrated from the
+  current source pool, including text embedded in JSON/REPL history.
+- **Validity and accounting:** keys include source/input content, predictor
+  instructions/demos/schema/config, effective and bound LM settings, embedding
+  profile/endpoint/settings, implementation hash, and DSPy/NumPy versions.
+  SHACL also fingerprints the graph and source content visible to its tools.
+  Original OpenIE/synonym/SHACL token statistics and traces are replayed, keeping
+  cached stages from appearing artificially cheaper in GEPA. Failed SHACL calls
+  are not memoized. Corrupt, incompatible, missing-source, and evicted entries
+  miss and recompute. Uncommitted/in-flight work can repeat after a crash.
+- **Verification:**
+  - `uv sync --locked`: **97 packages resolved/checked**; dependencies and lockfile
+    unchanged.
+  - Initial architecture/stage checks: **12 passed, 19 deselected**
+    (`outputs/candidate-cache-initial-tests.txt`).
+  - Real SQLite tests verify shared-budget eviction, replacement accounting,
+    transaction rollback restoring evicted entries, zero/negative limits, typed
+    record/prediction/vector/RLM-history round trips, Unicode source hydration,
+    invalidation, and corrupt-entry removal. Existing SHACL/RLM integration also
+    exercises serialization of real DSPy trace objects and token statistics.
+  - Broad focused run across architecture, storage, graph, runtime and new cache
+    tests: **76 passed, 1 failed, 1 deselected**. The process test failed because
+    the implementation changed between workers (recorded code fingerprints
+    `d04cb5b338f99811015cff139803953fd3656ebe3c0ad113f1f71081a46bb7e7`
+    and `06a9c732f301857675b876de8f5c6216fdd24997924ec6fe34170c34030d9500`).
+    The user confirmed concurrent prompt improvements. This correctly invalidated
+    cached results; it was not a valid unchanged-code replay measurement.
+    Evidence: `outputs/candidate-cache-regression-tests.txt`.
+  - The final process test copies one immutable implementation snapshot and
+    asserts both workers imported it. `uv run --locked pytest
+    tests/daemon/graph/test_candidate_cache.py -q -s --tb=short` -> **2 passed**
+    in **130.19 s** (`outputs/candidate-cache-process-final.txt`). Uses a real
+    loopback OpenAI-compatible HTTP server, native DSPy LM/embedding clients with
+    native response caching disabled, actual SHACL RLM execution, and independent
+    Python processes. Each worker deletes the materialized graph and OpenIE rows
+    before rebuilding; only persisted candidate-stage results can satisfy replay.
+  - **Measured:** first worker **16 HTTP inference requests**; second worker
+    **0 additional requests**. Second-process cache hits: **embedding 8,
+    OpenIE 2, synonym 2, SHACL 1**. Preserved logical tokens: OpenIE **60 + 60**,
+    synonym **120**, SHACL **60**, missing definitions **0**. Trace predictor names
+    match. Prompt, model, sampling-temperature, and source mutations each cause
+    fresh inference requests.
+  - New cache modules and test helpers: **ruff clean**. Comparing touched existing
+    runtime modules against HEAD finds only the three already-existing telemetry
+    line-length additions recorded in section 22. `git diff --check`: **clean**.
+- **Development failures fixed:** nested ManagedConnection acquisition blocked
+  the first test; cache writes now join an existing transaction. The initial
+  loopback fixture returned the wrong embedding dimension and used an incorrect
+  HTTP-server cleanup interface; corrected. Real RLM traces exposed REPLHistory
+  as an unsupported type; added explicit lossless serialization rather than
+  stringification or pickle. Cross-process verification now isolates source
+  snapshots so concurrent edits cannot masquerade as cache-key drift.
+- **Limits:** loopback responses are scripted and establish orchestration,
+  persistence, trace/cost parity and actual HTTP request counts, not model quality
+  or measured RAM/VRAM savings. No live inference-server benchmark, power-loss
+  experiment, Tier 2 parity gate, or HTTP MCP transport acceptance was run. The
+  pre-existing hybrid-demo assertion from section 22 remains deselected.
+
+## 24. E1-S6 Priority 2: Native DSPy Response Disk Cache (2026-10-22)
+
+- **Scope:** surgical feature in two runtime modules: `inference/chat.py` and
+  `graph/engine.py`. One new focused test module, plus README/epic/evaluation
+  updates. No GEPA, signature, stage-cache, dependency, or lockfile rewrites;
+  the user's prompt improvements remain intact.
+- **Implementation:** continue using `dspy.configure_cache` and DSPy's native
+  request hashing, restricted disk serialization, eviction, cache controls, and
+  response loading. A small adapter on the public `get`/`put` interface restores
+  persisted logical usage into the active DSPy tracker on LM hits. DSPy's own
+  LM-history usage remains zero for hits, keeping physical usage separate from
+  optimization cost. Native records already include original usage; legacy
+  LiteLLM SDK records get a small usage companion in the same DSPy cache.
+  Old legacy entries without recoverable cost miss rather than scoring as free.
+  Non-LM cache traffic passes through. Endpoint fields remain in cache keys;
+  DSPy's default ignore list would otherwise conflate local servers sharing a
+  model name. Explicit `cache=False` is respected.
+- **Engine configuration:** native disk response caching is enabled and its
+  memory tier disabled during evolution. Logical accounting is also enabled at
+  engine initialization and after compilation so warm preparatory indexing and
+  final evaluation have the same cost semantics. No new CLI flags are needed.
+- **Installed-source inspection:** DSPy 3.4.1 persists native `CallResult.usage`,
+  clears it in `CallResult.load`, and skips `usage_tracker.add_usage` for hits.
+  The adapter supplies that missing accounting step without modifying DSPy or
+  GEPA internals or replacing their provider execution path.
+- **Verification:**
+  - `uv run --locked pytest tests/daemon/graph/inference/test_response_cache.py
+    -q --tb=short` -> **4 passed in 212.11 s**
+    (`outputs/response-cache-tests.txt`). Real loopback HTTP and independent
+    Python processes; memory response caching disabled. Identical requests:
+    **1 initial HTTP call**, **0 extra calls after restart**, original logical
+    usage **30 tokens per call**, native history usage **0 on hits**. Changed
+    prompt/model/temperature/grammar/endpoint cause new calls. `cache=False`
+    causes both repeated calls to execute. Legacy SDK disk hits retain costs.
+  - Real `dspy.GEPA` is compiled independently in each process with distinct
+    checkpoint directories and a one-call metric budget. The second compilation
+    makes no additional HTTP call while retaining **30 logical tokens** and the
+    identical validation score **1 / 1.3**. This verifies response caching rather
+    than reuse of GEPA's saved evaluation scores.
+  - Final checks after the small nullable-usage counter guard and passthrough
+    test: architecture, real GEPA score parity, non-LM passthrough/unreported usage,
+    and existing cache configuration -> **12 passed, 35 deselected in 52.04 s**
+    (`outputs/response-cache-final-checks.txt`).
+  - Broader targeted architecture/cache/GEPA/metric/resume run -> **14 passed,
+    1 failed, 67 deselected** (`outputs/response-cache-regression-tests.txt`).
+    The failure is the already-reproduced hybrid-demo assertion from section 22
+    (`assert len(compiled.shacl_healer_rlm.generate_action.demos) >= 1`, actual 0).
+    It is unrelated to request-cache accounting and is left unchanged.
+  - `uv sync --locked`: **97 packages checked**, no dependency/lockfile changes.
+    New test-module lint and `git diff --check` pass. Existing runtime-file lint
+    diagnostics are not suppressed or broadened into this feature.
+- **Limits:** scripted loopback responses verify actual HTTP request counts,
+  persistence, explicit bypass/invalidation, and native GEPA cost/score parity;
+  no live GPU/VRAM measurement, retrieval-quality benchmark, Tier 2 gate, or
+  power-loss test is claimed. Requests with changed parameters, evicted entries,
+  or missing legacy usage can recompute. GEPA still performs seed evaluation on
+  restart, but identical LM calls within it can now be disk hits.
+
+## 25. CocoIndex optimization performance audit (2026-10-22)
+
+- **Scope:** focused audit requested before a long DSPy optimization run, using
+  `.agents/skills/cocoindex/SKILL.md`. Verified the designated Documents checkout
+  and `https://github.com/negatrait/yaw.git` remote. Preserved existing config edits.
+  No runtime, dependency, lockfile, source corpus, or production DB changes.
+- **Report:** [CocoIndex optimization audit](cocoindex-optimize-audit.md) records
+  dependency tracking, target-state boundaries, batching, invalidation, and RAM
+  limitations. Installed packages: CocoIndex **1.0.25**, DSPy **3.4.1**.
+- **Real-substrate checks:**
+  - `uv run --locked pytest tests/daemon/ingestion/test_corpus.py
+    tests/daemon/graph/test_candidate_cache.py
+    tests/daemon/graph/storage/test_candidate_cache.py
+    tests/daemon/graph/inference/test_response_cache.py -q --tb=short`
+    -> **21 passed in 381.28 s**. Includes add/no-op/edit/rename/delete ingestion,
+    reopened persistent ingestion state, failed target compiler retry, typed
+    SQLite stage payloads, FIFO eviction, independent-process zero-request stage
+    replay, and native DSPy response-cache/GEPA accounting checks.
+  - `uv run --locked python outputs/cocoindex_optimize_audit.py` -> **passed**;
+    results saved in `outputs/cocoindex-optimize-audit.json`. Uses disposable
+    source snapshots and real temporary LMDB/SQLite, without inference calls.
+    A parsing-helper-only edit yielded **zero changes** with existing state,
+    whereas fresh state emitted the changed title: missing helper-code tracking.
+  - Configured outer batches of 64 were prepared as **4 / 11 / 32 batches** for
+    100 / 500 / 1,200-character inputs respectively. Effective inner limits are
+    16 items and 3,500 formatted characters, independent of the configured 64.
+  - Query-prefix-only mutation preserved the document prefix but changed the
+    shared stage namespace: avoidable invalidation of unrelated cached stages.
+  - 100 warm SQLite reads with a 5,000-passage, 5,068,890-byte source pool took
+    **3.142 s**, versus **0.061 s** without rebuilding the source map. Both ran
+    with tracemalloc; the first showed **639,729 bytes** peak traced allocation.
+    These are synthetic CPU measurements, not whole-run speedups or peak RSS.
+- **Checks:** `git diff --check` passes after the audit documentation changes.
+- **Limits:** loopback providers validate orchestration and request counts only.
+  No live inference-server throughput, GPU/VRAM, full-optimization peak RSS,
+  retrieval-quality benchmark, Tier 1/Tier 2 acceptance, or power-loss measurement
+  was performed. The audit recommends contained fixes; it does not claim they
+  have been implemented. Fresh optimization scans intentionally reconstruct the
+  complete candidate pool, so the helper-tracking defect primarily affects
+  persistent daemon ingestion rather than that fresh scan.
+
+## 26. Optimization RAM retention and contained audit fixes (2026-10-22)
+
+- **Priority and scope:** implement the audit's RAM-retention fixes first, plus
+  query-prefix invalidation, effective embedding batch controls, and parser-helper
+  tracking. Source-map reconstruction performance remains deferred. The existing
+  user edits to `yaw.toml` and `yaw/core/config.py` were preserved; only the new
+  embedding character-budget setting was added alongside them. No dependency,
+  lockfile, prompt, benchmark-corpus, or production database changes.
+- **RAM behavior:**
+  - `evolve_prompts` uses DSPy's supported `disable_history=True` /
+    `max_history_size=0` context throughout validation, compilation, reflection,
+    and final evaluation. It suppresses full LM/module/global inspection history,
+    while DSPy traces, disk response caching and usage trackers remain active.
+    Context exit restores the caller's settings, including on failure.
+  - Recent diagnostics retain 250 telemetry/embedding/definition records and 100
+    synonym/SHACL/SIMBA records. Trimming occurs after accounting slices have
+    been consumed, per chunk and at QA/reflection boundaries; it also runs on
+    failed QA/reflection operations. Candidate deep copies omit these diagnostic
+    lists and module inspection history while retaining predictor instructions
+    and demonstrations. Per-predictor inspection history is capped at 100.
+  - Reflection training retains the same last `max(simba_bsize, 8)` examples that
+    SIMBA already consumes. Its seed/step counter is independent of trimmed
+    diagnostics. Evaluation detail retains the last 500 records, matching the
+    existing exported window; per-candidate aggregates remain available.
+- **Other contained fixes:**
+  - Shared stage namespaces exclude mutable query prefixes. Document vectors
+    and graph materialization no longer invalidate for query-only evolution;
+    query-vector keys use the effective adapter prefix, including when evaluating
+    a candidate distinct from `engine.program`. Document/model/endpoint and
+    other existing dependencies remain in the namespace.
+  - `embed_batch_size` now reaches the adapter's request partitioner rather than
+    silently falling back to 16. `[graph].embed_batch_chars` exposes the aggregate
+    formatted-character budget, retaining the conservative 3,500 default and
+    existing overflow splitting. Outer groups of eight indexing passages remain;
+    no larger server request budget or concurrency increase was assumed safe.
+  - CocoIndex's memoized per-file component tracks its parser module's source
+    digest through `deps`, with a one-time version bump for existing memos. Plain
+    helper/projection-constant edits therefore invalidate persistent parsing
+    state without moving DSPy/graph mutations into CocoIndex memoized calls.
+- **Focused verification:**
+  - `uv run --locked pytest
+    tests/daemon/graph/inference/test_diagnostics.py
+    tests/daemon/graph/inference/test_batch_budget.py
+    tests/daemon/ingestion/test_corpus.py
+    tests/daemon/graph/inference/test_embedding.py
+    tests/core/test_architecture.py -q --tb=short`
+    -> **29 passed in 26.14 s**. Includes predictor-copy preservation, operation
+    slice accounting and failure trimming, effective item/character budgets,
+    and parser-helper invalidation across separate processes using real LMDB.
+  - Cache integration/storage suites (`test_candidate_cache.py`,
+    `test_response_cache.py`, storage `test_candidate_cache.py`) -> **10 passed
+    in 376.69 s**. The 600-call real-DSPy QA test used real disk caching and
+    loopback HTTP: **1 provider request**, **18,000 logical tokens**, no LM/module/
+    global inspection-history growth, 250 retained telemetry entries, and
+    **-9,056 bytes** change in retained tracemalloc allocation between calls
+    300 and 600 (after GC). GEPA-required prediction traces remained present.
+  - Strengthened separate-process stage test rerun -> **2 passed in 155.89 s**.
+    Initial materialization made 16 HTTP requests; unchanged replay made zero,
+    with embedding/OpenIE/synonym/SHACL hits and unchanged logical cost. Changing
+    the query prefix produced different query vectors and exactly two embedding
+    requests (original and changed query), with no additional graph-stage HTTP
+    requests; repeating the changed query hit the stage cache.
+  - Runtime config/parser/real-checkpoint-resume selection -> **3 passed,
+    15 deselected in 23.86 s**.
+- **Broader checks and failures:**
+  - Diagnostic/batch tests plus the full prompt suite -> **34 passed, 2 failed
+    in 51.16 s**. Failures: a case-sensitive `NEVER include specific` prompt-text
+    assertion and an invariant assertion expecting duplicate NER names to lower
+    the score. Both reproduce against isolated HEAD runtime sources: **2 failed,
+    31 deselected in 14.56 s** (`outputs/stability-prompt-baseline.txt`). They do
+    not involve these changes; prompt and invariant implementation files were
+    left untouched. The existing live-server smoke tests in that suite passed;
+    they are not throughput or benchmark-parity measurements.
+  - Optimizer/telemetry selection -> **5 passed, 1 failed, 18 deselected in
+    65.46 s**. The failure is the same previously reproduced zero-demo/hybrid
+    assertion documented in sections 22 and 24; real GEPA/MIPRO compilation ran.
+  - New modules/test helpers are ruff-clean. Whole touched-file lint still finds
+    existing diagnostics; comparing current and HEAD source diagnostics reports
+    **zero new diagnostics** (`outputs/check_stability_lint.py`).
+    `git diff --check` passes. Initial candidate-copy test attempts incorrectly
+    targeted the ChainOfThought wrapper rather than its `.predict` parameter;
+    the corrected test verifies the actual serialized/optimized predictor.
+- **Limits:** this bounds accumulated diagnostic history, not the entire process.
+  Active corpus/graph data, current operation traces, and GEPA's required
+  candidate/frontier state still consume RAM. The retention experiment measures
+  Python allocations with a scripted loopback provider, not full-corpus RSS or
+  peak VRAM. No unattended multi-hour run, increased-budget GPU throughput,
+  Tier 1/Tier 2 quality gate, or power-loss durability result is claimed.
+
+## 27. MIPROv2 zero-shot warm-up audit (2026-10-22)
+
+- **Scope:** audit requested for unwanted few-shot work before GEPA. Verified
+  the Documents checkout/remote and inspected installed DSPy 3.4.1 and native
+  TPE behavior. No runtime/config/prompt/dependency changes for this audit.
+  Full findings: [MIPROv2 zero-shot audit](mipro-zero-shot-audit.md).
+- **Confirmed mismatches:**
+  - Native MIPRO bootstraps proposal context even with both demo limits zero
+    (installed constants: 3 bootstrapped, 0 labeled). Zero limits remove demo-set
+    search, not the bootstrap stage itself.
+  - YAW seeds built-in demos and clears them only after MIPRO evaluation. Native
+    instruction-only selection does not clear inherited demos, so the scored
+    program can differ from the demo-free GEPA seed.
+  - Large-validation hybrid defaults force 3 candidates / 4 new trials rather
+    than native auto sizing. TPE defaults to 10 startup observations; baseline
+    plus 4 trials never reaches adaptive sampling. Setting only `--num-trials`
+    also defaults the instruction candidate count to 1, eliminating alternatives.
+  - MIPRO's default `track_stats=True` attaches program archives to its winner;
+    YAW deepcopy carries those archives into later candidates. This is separate
+    from the diagnostic-retention fix in section 26.
+  - Reflection SIMBA has its own two-demo default, independent of task-level
+    MIPRO limits. Current `yaw.toml` selects GEPA-only, which skips MIPRO entirely
+    and also skips the MIPRO-specific postcompile demo clearing.
+- **Probe:** `uv run --locked python outputs/audit_mipro.py` -> **passed**.
+  Uses actual installed native bootstrap/search stages, real DSPy evaluation,
+  Optuna and loopback HTTP with a small scripted task, without GPU calls.
+  `outputs/mipro-audit.json` records:
+  - Zero limits still made **4 bootstrap requests**, producing demo sets of
+    sizes **[0, 1, 3]**.
+  - Instruction-only search retained **1 inherited demo** in all **5 evaluations**
+    (baseline plus 4 new trials), and in the selected program.
+  - MIPRO attached **5 archived programs**; a YAW deepcopy retained independent
+    copies of the archive and its program objects.
+  - YAW's default seed has **15 built-in demos across 10 predictors**. Native
+    light/zero-shot sizing for those predictors would request **51 new trials**,
+    unlike the hybrid shortcut's four.
+- **Limits:** the probe supplies instruction candidates directly to the native
+  search and does not run the complete YAW CLI/RLM warm-up, measure full-run RSS,
+  or establish quality lift. Proposed fixes are not implemented in this audit.
+  `git diff --check` passes after recording it.
+
+## 28. SIMBA reflection-worker wiring verification (2026-10-22)
+
+- **Scope:** verify trigger, native compilation, metric, resampling and adoption
+  of the learned reflection worker. No SIMBA runtime behavior was changed.
+  Details: [SIMBA wiring audit](simba-wiring-audit.md).
+- `uv run --locked python outputs/audit_simba.py` -> **passed**. Uses real DSPy
+  3.4.1 SIMBA with its default two-example/two-sample/one-step/two-demo bounds and
+  a scripted loopback provider. **14 training HTTP requests + 1 next-call check**.
+  Both sampled buckets had score variation; native `append_a_rule` produced the
+  selected rule. Winner score **1.0** versus baseline **0.45** on the proxy metric;
+  the next real worker request contained the adopted rule and returned its
+  intended output. All four rollout requests used **temperature 1.0**.
+  This deterministic run selected rules and added zero demos. Results:
+  `outputs/simba-audit.json`.
+- Existing integration contract (`test_prompts.py -k
+  dspy_module_and_always_on_simba`) -> **1 passed, 32 deselected in 22.77 s**.
+  The existing test confirms compilation telemetry; the new probe additionally
+  verifies that the winning predictor is used by subsequent calls.
+- **Limits found:** a sensible extraction instruction and an instruction to
+  ignore every passage and emit an empty `named_entities` list both receive
+  **1.0** from the meta-metric. It measures formatting/generalization proxies,
+  not retrieval or answer lift. A fresh proposer loses learned worker state;
+  YAW has no restore path for the SIMBA worker/training window/step counter.
+  Compilation is attempted on each eligible proposal after the threshold, and
+  caught failures are only debug-logged; the outer callback ignores False.
+- Native SIMBA's rule-advice call emitted input-type warnings for stringified
+  rewards/module names but completed; no upstream type behavior was patched.
+  This verifies mechanics with scripted responses, not held-out quality, full
+  interrupted-run restoration, GPU throughput, or multi-hour RAM behavior.
+
+## 29. Gemma 4 runtime model migration (2026-10-22)
+
+- **User-authorized change after the SIMBA check:** switch Qwen chat/extraction/
+  QA/reflection roles to Gemma 4. Read-only registry/health inspection identified
+  the already-downloaded and loaded **Gemma-4-E4B-it-GGUF**,
+  `unsloth/gemma-4-E4B-it-GGUF:Q4_K_M`, on the existing external GPU llama.cpp
+  service with **32,768 context**, `--parallel 1 --cache-ram 0`. No model download,
+  server restart, model-management API call, or embedding-selection change.
+- Added the exact registry profile, updated native LM and `YawConfig` defaults
+  plus `yaw.toml`, and reconciled README/FOUNDATIONAL/Epic 1 runtime selection.
+  Historical Qwen benchmark targets and explicit Qwen profile tests remain.
+  Role-aware GBNF flags remain enabled for direct/worker calls and disabled for
+  RLM code generation. Existing temperatures are retained; the Gemma profile
+  has no Qwen-specific frequency penalty.
+- **Live verification:** `uv run --locked python outputs/verify_gemma4.py`
+  -> **passed in 25.23 s**. Native OpenIE extracted Ada Lovelace, Charles Babbage
+  and Analytical Engine with a grounded triple. Direct constrained QA answered
+  **Ada Lovelace**. A bounded RLM reflection run invoked its GBNF worker and
+  returned an instruction preserving `named_entities`. Reflection telemetry
+  reports **3,101 tokens** under `openai/Gemma-4-E4B-it-GGUF`, including the
+  worker call. Evidence: `outputs/gemma4-migration-smoke.json`.
+- Profile/chat/core-config tests -> **19 passed, 3 subtests passed in 11.80 s**.
+  Runtime config/resume-parser selection -> **2 passed, 25 deselected in 14.28 s**.
+  The broad selection also deselected architecture tests; those were run
+  separately: **9 passed in 14.52 s**. `git diff --check` passes.
+  New-source lint comparison against HEAD reports **zero new
+  diagnostics**; preexisting touched-file lint diagnostics remain.
+- Initial disposable smoke-script attempts used the wrong `load_config` argument
+  shape and failed before inference; corrected to its actual path plus
+  `workspace_override` interface before the successful live run.
+- **Limits:** live smoke validates the configured backend and inference paths,
+  not GEPA convergence, benchmark parity, sustained memory use, or performance
+  relative to Qwen. Model changes intentionally use distinct cache/run identities;
+  this does not migrate Qwen optimization checkpoints into Gemma runs.

@@ -1,6 +1,7 @@
 """Textbook CocoIndex v1 incremental line-pointer and native Tree-sitter AST ingestion pipeline."""
 
 import bisect
+import hashlib
 import json
 import re
 from collections.abc import Callable, Collection, Sequence
@@ -990,7 +991,13 @@ def chunk_markdown_text(
     )
 
 
-@coco.fn(memo=True)
+@coco.fn(
+    memo=True,
+    version=2,
+    # Plain helpers and projection constants are in this module. Track their
+    # source too; adopting a new dependency must invalidate older memo entries.
+    deps={"parser_source": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()},
+)
 async def process_corpus_file(
     file: FileLike,
     corpus_root_str: str,

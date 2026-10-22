@@ -12,6 +12,8 @@ import numpy as np
 
 from yaw.core.config import YawConfig
 
+from .diagnostics import DiagnosticHistory, trim_diagnostics
+
 FACT_INSTRUCTION = "Given a question, retrieve relevant triplet facts that matches this question."
 PASSAGE_INSTRUCTION = "Given a question, retrieve relevant documents that best answer the question."
 QUERY_INSTRUCTIONS = {FACT_INSTRUCTION, PASSAGE_INSTRUCTION}
@@ -381,8 +383,14 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
         provider: str = "openai",
         batch_size: int = 32,
         caching: bool = False,
+        max_batch_chars: int = 3500,
     ) -> None:
+        if batch_size < 1 or max_batch_chars < 1:
+            raise ValueError("Embedding batch size and character budget must be positive.")
+        self.max_batch_chars = max_batch_chars
         self.task_mode = task_mode
+        self.base_url = base_url
+        self.provider = provider
         self.profile = profile or resolve_embedding_profile(MODEL, task_mode)
         base_embedder = embedder or create_dspy_embedder(
             self.profile,
@@ -407,7 +415,7 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
                 caching=caching,
             )
             self.embedder = base_embedder
-        self.telemetry: list[dict[str, Any]] = []
+        self.telemetry: list[dict[str, Any]] = DiagnosticHistory()
         self._telemetry_hook: Callable[[dict[str, Any]], None] | None = None
 
     def bind_telemetry_hook(self, hook: Callable[[dict[str, Any]], None] | None) -> None:
@@ -429,6 +437,7 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
             api_key=config.api_key,
             provider=config.provider,
             batch_size=config.embed_batch_size,
+            max_batch_chars=config.embed_batch_chars,
         )
 
     def _encode_prepared(
@@ -544,9 +553,9 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
             raise ValueError("Embedding input cannot be empty.")
 
         max_chunk_chars = 3000
-        max_batch_chars = 3500
+        max_batch_chars = self.max_batch_chars
         effective_max_batch_size = (
-            batch_size if (isinstance(batch_size, int) and batch_size >= 1) else 16
+            batch_size if (isinstance(batch_size, int) and batch_size >= 1) else self.batch_size
         )
 
         text_piece_map: list[list[int]] = []
@@ -668,6 +677,7 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
             ),
         }
         self.telemetry.append(entry)
+        trim_diagnostics(self)
         if self._telemetry_hook is not None:
             self._telemetry_hook(entry)
 

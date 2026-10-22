@@ -4,6 +4,12 @@ Owner: [FOUNDATIONAL](../FOUNDATIONAL.md) | Results: [evaluation](evaluation.md)
 
 ## Hard Gates
 
+Runtime model update, 2026-10-22: the user selected `Gemma-4-E4B-it-GGUF`
+(`unsloth/gemma-4-E4B-it-GGUF:Q4_K_M`) for extraction, QA and reflection on the
+existing external llama.cpp GPU service (32,768 context). This supersedes Qwen
+as the runtime default in the packet descriptions below. GBNF worker / plain
+RLM separation, embedding selection, and historical benchmark targets remain.
+
 - **Zero Cross-Domain Edges (`E1-S1`):** Lock the containment tree and AST boundary test (`tests/core/test_architecture.py`) **before** writing engine code. Sibling packages never import each other (`0` horizontal edges).
 - **Lean Architecture (No Code-Golfing, No LOC Quotas):** Eliminate dead abstractions and multi-file synchronization sprawl (retire the 7-file Parquet/Pickle/JSON store and multi-provider wrappers). Write direct, readable, strongly-typed code without line-count obsession or code-golfing.
 - **Dev Gate (`E1-S4`):** Native `yaw.daemon.graph` engine matches or beats upstream `hipporag` on **Tier 1** (`sample`, `2wikimultihopqa`, `musique` 10-query slices) on the 3-model local setup.
@@ -154,6 +160,29 @@ Execute strictly in order `E1-S1` $\to$ `E1-S6`. Never start Sprint $k+1$ until 
 ---
 
 ### Sprint 6 (`E1-S6`): `yaw/daemon/{runtime.py, cli.py}`, Two-Phase `MIPROv2` + `GEPA` Evolution & Tier 2 Holdout Gate
+- **Restart acceptance packet (2026-10-22):** `yaw dspy optimize --resume` and
+  `--db-path latest` reopen the newest timestamped sandbox, recover its original
+  output path and invocation, preserve the GEPA candidate frontier/budget, and
+  reuse only database checkpoints with matching durable prompt provenance.
+  Incompatible run identities and unverifiable legacy GEPA state fail without
+  deleting checkpoints. Observable exit: real SQLite/CocoIndex/DSPy/GEPA restart
+  tests retain a previously saved superior candidate and reject changed data.
+  This packet does not satisfy the separate Tier 2 parity acceptance gate.
+- **Candidate-stage disk-cache packet (2026-10-22):** replace growing in-memory
+  embedding/OpenIE/synonym/SHACL cache dictionaries with a shared, bounded SQLite
+  cache in `yaw.db`. Preserve typed DSPy/RLM traces and logical token costs;
+  hash complete inference inputs/settings and hydrate source content rather than
+  copying passages into cache payloads. Observable exit: independent Python
+  processes rebuild identical graphs with zero additional loopback inference
+  requests, while changed prompts/models/sampling/source content force misses.
+  This packet does not eliminate GEPA seed reevaluation or claim Tier 2 parity.
+- **Priority 2 response-cache packet (2026-10-22):** enable DSPy's native disk
+  request cache during evolution with its memory tier disabled. Keep this change
+  in `inference/chat.py` (public cache-interface usage accounting) and `engine.py`
+  (configuration). Replay logical usage without altering native response history,
+  retain endpoints in request keys, and preserve explicit cache bypass. Observable
+  exit: separate-process loopback requests hit disk with no new HTTP calls, and
+  independent real GEPA runs produce equal live/cached scores and token costs.
 - **Files:** `yaw/core/config.py`, `yaw/daemon/{runtime.py, cli.py}`, `yaw/__main__.py`, `yaw.toml`, `tests/daemon/test_runtime.py`.
 - **Allowed imports:** `runtime.py` & `cli.py` import `yaw.daemon.{ingestion,graph}`, `yaw.core.*`, `filelock`, `tomllib`, `argparse`, `queue`, `threading`.
 - **Copy/Adapt From:**

@@ -100,19 +100,19 @@ class YawConfig:
     excluded_patterns: tuple[str, ...] = (".*", "*/.*", "__pycache__/*")
     json_keys_whitelist: tuple[str, ...] = ("*",)
     json_keys_blacklist: tuple[str, ...] = ()
-    chunk_size: int = 1200
-    chunk_overlap: int = 100
-    min_chunk_size: int = 50
-    poll_interval_seconds: float = 5.0
+    chunk_size: int = 1500
+    chunk_overlap: int = 120
+    min_chunk_size: int = 100
+    poll_interval_seconds: float = 10.0
 
     # Inference settings
     base_url: str = "http://localhost:13305/api/v1"
     api_key: str = "lemonade"
     provider: str = "openai"
-    embedding_model: str = "embeddinggemma-300m-GGUF"
+    embedding_model: str = "embeddinggemma-300m-qat-q8_0-GGUF-Q8_0"
     embedding_task_mode: str = "distinct-titled"
-    extraction_model: str = "Qwen3-4B-Instruct-2507-GGUF"
-    qa_model: str = "Qwen3-4B-Instruct-2507-GGUF"
+    extraction_model: str = "Gemma-4-E4B-it-GGUF"
+    qa_model: str = "Gemma-4-E4B-it-GGUF"
     enable_gbnf: bool = True
     gbnf_max_entities: int | None = None
     gbnf_max_triples: int | None = None
@@ -127,6 +127,7 @@ class YawConfig:
     synonymy_threshold: float = 0.8
     synonymy_top_k: int = 100
     embed_batch_size: int = 64
+    embed_batch_chars: int = 3500
     max_context_chars: int = 24000
     max_ast_expansion_hops: int = 1
 
@@ -226,23 +227,32 @@ class YawConfig:
             if raw_path.lower() == "latest":
                 candidates = sorted(
                     base_dir.glob("yaw_optimize_*.db"),
-                    key=lambda p: p.stat().st_size,
+                    # Run creation time is encoded in the name. Writes to an older
+                    # run must not make it newer than a subsequently created run.
+                    key=lambda p: p.name,
                     reverse=True,
                 )
-                opt_db = (
-                    candidates[0]
-                    if candidates
-                    else base_dir / f"yaw_optimize_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}.db"
-                )
+                candidates = [
+                    p for p in candidates
+                    if p.is_file() and re.fullmatch(r"yaw_optimize_\d{8}_\d{6}\.db", p.name)
+                ]
+                if not candidates:
+                    raise YawRuntimeError("INVALID_INPUT", "No optimization run exists to resume.")
+                opt_db = candidates[0]
             else:
-                opt_db = Path(raw_path).resolve()
+                opt_db = _resolve_path(self.workspace_root, raw_path, raw_path)
+                if not opt_db.is_file():
+                    raise YawRuntimeError(
+                        "INVALID_INPUT", f"Optimization database does not exist: {opt_db}"
+                    )
+            base_dir = opt_db.parent
             ds_match = re.search(r"yaw_optimize_(\d{8}_\d{6})", opt_db.name)
-            ds = ds_match.group(1) if ds_match else datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+            ds = ds_match.group(1) if ds_match else opt_db.stem
         else:
             ds = datestamp or datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
             opt_db = base_dir / f"yaw_optimize_{ds}.db"
 
-        opt_lock = base_dir / f"yaw_optimize_{ds}.db.lock"
+        opt_lock = Path(str(opt_db) + ".lock")
         opt_status = base_dir / f"status_optimize_{ds}.json"
         opt_state = base_dir / f"coco_state_optimize_{ds}"
         opt_program = base_dir / f"compiled_program_optimize_{ds}.json"
@@ -336,6 +346,7 @@ _FIELD_TO_SECTION: dict[str, str] = {
     "synonymy_threshold": "graph",
     "synonymy_top_k": "graph",
     "embed_batch_size": "graph",
+    "embed_batch_chars": "graph",
     "max_context_chars": "graph",
     "max_ast_expansion_hops": "graph",
     "queue_maxsize": "runtime",

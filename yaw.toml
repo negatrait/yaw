@@ -12,10 +12,10 @@ compiled_program_path = ".yaw/compiled_program.json"
 [ingestion]
 included_patterns = ["*.md", "*.txt"]
 excluded_patterns = [".*", "*/.*", "__pycache__/*"]
-chunk_size = 1200
-chunk_overlap = 100
-min_chunk_size = 50
-poll_interval_seconds = 5.0
+chunk_size = 1500
+chunk_overlap = 120
+min_chunk_size = 100
+poll_interval_seconds = 10.0
 
 [inference]
 base_url = "http://localhost:13305/api/v1"
@@ -23,8 +23,8 @@ api_key = "lemonade"
 provider = "openai"
 embedding_model = "embeddinggemma-300m-GGUF"
 embedding_task_mode = "distinct-titled"
-extraction_model = "Qwen3-4B-Instruct-2507-GGUF"
-qa_model = "Qwen3-4B-Instruct-2507-GGUF"
+extraction_model = "Gemma-4-E4B-it-GGUF"
+qa_model = "Gemma-4-E4B-it-GGUF"
 enable_gbnf = true
 gbnf_max_facts = 4
 
@@ -36,6 +36,8 @@ damping = 0.5
 synonymy_threshold = 0.8
 synonymy_top_k = 100
 embed_batch_size = 64
+# Aggregate formatted-input budget per embedding request; tune for the provider.
+embed_batch_chars = 3500
 
 [runtime]
 queue_maxsize = 32
@@ -46,8 +48,8 @@ http_path = "/mcp"
 [optimization]
 datasets = ["enterprise_rag_bench"]
 mode = "gepa"
-max_queries = 40
-train_queries = 30
+max_queries = 250
+train_queries = 150
 query_offset = 0
 auto = "light"
 sleep_seconds = 0.0
