@@ -649,12 +649,23 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             set(obj_scores.keys()),
             {
                 "recall_at_5",
-                "pareto_raw",
                 "efficiency",
-                "gm_good",
-                "gm_bad",
                 "shacl_conforms",
             },
+        )
+        # Every GEPA objective is higher-is-better (no cost-as-good keys like gm_bad).
+        self.assertNotIn("gm_bad", obj_scores)
+        self.assertNotIn("pareto_raw", obj_scores)
+
+        # Default 30k-token budget: quality, not token count, dominates the score.
+        base_q = dict(
+            recall_at_1=0.5, recall_at_2=0.7, recall_at_10=0.95, recall_at_20=1.0, em=0.05
+        )
+        f1_gain = compute_sizecoding_pareto_score(0.87, f1=0.45, tokens=22_000, **base_q)
+        f1_base = compute_sizecoding_pareto_score(0.87, f1=0.35, tokens=22_000, **base_q)
+        half_tokens = compute_sizecoding_pareto_score(0.87, f1=0.35, tokens=11_000, **base_q)
+        self.assertGreater(
+            f1_gain.score / f1_base.score, half_tokens.score / f1_base.score
         )
         self.assertAlmostEqual(obj_scores["recall_at_5"], 0.80)
         self.assertAlmostEqual(obj_scores["shacl_conforms"], 1.0)

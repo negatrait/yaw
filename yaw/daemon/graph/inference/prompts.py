@@ -27,7 +27,8 @@ class FactList(BaseModel):
 
 
 class ExtractEntities(dspy.Signature):
-    """Your task is to extract named entities and their concise contextual definitions from the given paragraph.
+    """You are a critical component in a high-stakes SKOS/RDF/OWL based ontology graph system.
+    Your task is to extract and named entities as `skos:Concept`, and their concise contextual definitions as `skos:definition` from the given paragraph.
     Respond with a JSON object in the format: {"named_entities": [["entity1", "concise contextual definition of entity1"], ["entity2", "concise contextual definition of entity2"], ...]}"""
 
     passage: str = dspy.InputField(desc="Source passage text")
@@ -37,14 +38,15 @@ class ExtractEntities(dspy.Signature):
 
 
 class ExtractTriples(dspy.Signature):
-    """Your task is to construct an RDF (Resource Description Framework) graph from the given passages and named entity lists.
+    """Your are a critical component in a high-stakes SKOS/RDF/OWL based ontology graph system.
+    Your task is to construct an RDF (Resource Description Framework) `rdf:Statement` graph from the given passages and named entity lists.
     Respond with a JSON object in the format:
-    {"triples": [{"sub": "known_entity" or ["new_entity", "contextual definition"], "pred": "predicate", "obj": "known_entity" or ["new_entity", "contextual definition"], "def": "concise contextual definition of the statement"}, ...]}
+    {"triples": [{"sub": "known_entity" or ["new_entity", "contextual definition"], "pred": "predicate", "obj": "known_entity" or ["new_entity", "contextual definition"], "def": "concise contextual definition of the statement fact"}, ...]}
     Pay attention to the following requirements:
     - Each triple should contain at least one, but preferably two, of the named entities in the list for each passage.
     - Clearly resolve pronouns to their specific names to maintain clarity.
-    - If a "sub" or "obj" entity is already in named_entities with a definition, emit its exact string name (e.g., "Cinderella") without repeating its definition.
-    - If a "sub" or "obj" entity is a new entity not present in named_entities, emit a 2-element list [entity_name, contextual_definition] (e.g., ["glass slipper", "Delicate footwear lost by Cinderella at the ball"]), and always provide a concise statement definition in "def"."""
+    - If a "sub" or "obj" entity is already in named_entities with a definition, you must emit its exact string name (e.g., "Cinderella") without repeating its definition.
+    - If a "sub" or "obj" entity is a new entity not present in named_entities, you must emit a 2-element list [entity_name, contextual_definition] (e.g., ["glass slipper", "Delicate footwear lost by Cinderella at the ball"]), and always provide a concise statement definition in "def"."""
 
     passage: str = dspy.InputField(desc="Source passage text")
     named_entities: list[Any] = dspy.InputField(
@@ -56,7 +58,8 @@ class ExtractTriples(dspy.Signature):
 
 
 class DefineMissingEntities(dspy.Signature):
-    """Your task is to provide concise contextual definitions grounded in the passage and extracted triples for any triple entities that were emitted without definitions.
+    """You are a critical component in a high-stakes SKOS/RDF/OWL based ontology graph system.
+    Your task is to provide concise contextual definitions grounded in the passage and extracted triples for any triple entities that were emitted without definitions.
     Respond with a JSON object in the format:
     {"entity_definitions": [["entity_name", "concise contextual definition grounded in the passage and triples"], ...]}"""
 
@@ -74,11 +77,12 @@ class DefineMissingEntities(dspy.Signature):
 
 
 class JudgeSynonyms(dspy.Signature):
-    """Judge candidate pairs of entities that look similar semantically and in writing/spelling (including typos, acronyms, lookalikes like "Cindy Real" vs "Cinderella", or homonyms/homographs with the same name like "a ball" vs "a ball"):
+    """You are a critical component in a high-stakes SKOS/RDF/OWL based ontology graph system. Your task is to disambiguate entities.
+    Judge candidate pairs of entities that look similar semantically and in writing/spelling (including typos, acronyms, lookalikes like "Cindy Real" vs "Cinderella", or homonyms/homographs with the same name like "a ball" vs "a ball"):
     - 'skos:altLabel': True synonym or coreferent alias referring to the exact same entity/concept (merge into canonical entity).
     - 'skos:hiddenLabel': Typo, misspelling, transcription error, acronym, or surface spelling variant referring to the exact same entity/concept (merge into canonical entity).
     - 'owl:differentFrom': Confusable homonym, homograph (e.g., "a ball" [formal dance] vs "a ball" [spherical toy]), or false-friend lookalike (e.g., "Cindy Real" vs "Cinderella") that is easy to mix up due to similar/identical surface form or context, but actually refers to a genuinely different entity/concept (keep separate, add repulsive owl:differentFrom edge).
-    - 'skos:related': Distinct concepts that are associatively related in the domain without being coreferent synonyms or confusable homonyms/lookalikes (keep separate, add symmetric skos:related edge).
+    - 'skos:related': Distinct, different `skos:concept` entities that are associatively related in the domain without being coreferent synonyms or confusable homonyms/lookalikes (keep separate, add symmetric skos:related edge).
     Respond with JSON: {"decisions": [{"pair_id": "id_a|id_b", "relation": "skos:altLabel|skos:hiddenLabel|skos:related|owl:differentFrom", "canonical": "id_a_or_id_b"}, ...]}"""
 
     candidate_pairs: str = dspy.InputField(
@@ -90,7 +94,8 @@ class JudgeSynonyms(dspy.Signature):
 
 
 class ProposeSHACLRepairs(dspy.Signature):
-    """Propose closed-world SKOS/RDF/OWL repairs for SHACL validation report violations.
+    """You are a critical component in a high-stakes SKOS/RDF/OWL based ontology graph system. Your task is to heal SHACL violations.
+    Propose closed-world SKOS/RDF/OWL repairs for SHACL validation report violations.
     Supported actions: 'set_definition', 'set_pref_label', 'demote_to_alt_label', 'add_different_from', 'delete_dangling'.
     Respond with JSON: {"repairs": [{"focus_node": "...", "action": "...", "value": "..."}, ...]}"""
 
@@ -105,7 +110,9 @@ class ProposeSHACLRepairs(dspy.Signature):
 
 
 class FilterTriples(dspy.Signature):
-    """You are a critical component of a high-stakes question-answering system used by top researchers and decision-makers worldwide. Your task is to filter facts based on their relevance to a given query, ensuring that the most crucial information is presented to these stakeholders. The query requires careful analysis and possibly multi-hop reasoning to connect different pieces of information. You must select up to 4 relevant facts from the provided candidate list that have a strong connection to the query, aiding in reasoning and providing an accurate answer. The output should be in JSON format, e.g., {"fact": [["s1", "p1", "o1"], ["s2", "p2", "o2"]]}, and if no facts are relevant, return an empty list, {"fact\": []}. The accuracy of your response is paramount, as it will directly impact the decisions made by these high-level stakeholders. You must only use facts from the candidate list and not generate new facts. The future of critical decision-making relies on your ability to accurately filter and present relevant information."""
+    """You are a critical component of a high-stakes question-answering system used by top researchers and decision-makers worldwide. Your task is to filter facts based on their relevance to a given query, ensuring that the most crucial information is presented to these stakeholders.
+    The facts are presented to you in the form of `rdf:Statement` triples, they assert a text corpus bound fact.
+    The query requires careful analysis and possibly multi-hop reasoning to connect different pieces of information. You must select up to 4 relevant facts from the provided candidate list that have a strong connection to the query, aiding in reasoning and providing an accurate answer. The output should be in JSON format, e.g., {"fact": [["s1", "p1", "o1"], ["s2", "p2", "o2"]]}, and if no facts are relevant, return an empty list, {"fact\": []}. The accuracy of your response is paramount, as it will directly impact the decisions made by these high-level stakeholders. You must only use facts from the candidate list and not generate new facts. The future of critical decision-making relies on your ability to accurately filter and present relevant information."""
 
     question: str = dspy.InputField(desc="Query for retrieval")
     fact_before_filter: str = dspy.InputField(desc="Candidate triples to be filtered")
@@ -115,7 +122,11 @@ class FilterTriples(dspy.Signature):
 
 
 class AnswerQuestion(dspy.Signature):
-    """As an advanced reading comprehension assistant, your task is to analyze text passages and corresponding questions meticulously. Break down the reasoning process methodically, illustrating how you arrive at conclusions, and present a concise, definitive final answer devoid of additional elaborations. For 'Who', 'What', 'When', or 'Where' questions, state only the exact bare entity, name, or number without conversational phrases or articles. For 'How' or 'Why' questions, state both the key condition/means and the resulting outcome from the passages. If the provided context lacks sufficient information to answer the question, state: "Insufficient references in corpus to answer properly, consider ingesting more supporting documents." or "Insufficient information"."""
+    """As an advanced reading comprehension assistant, your task is to analyze text passages and corresponding questions meticulously.
+    Break down the reasoning process methodically, illustrating how you arrive at conclusions, and present a concise, definitive final answer devoid of additional elaborations.
+    - For 'Who', 'What', 'When', or 'Where' questions, state only the exact bare entity, name, or number without conversational phrases or articles.
+    - For 'How' or 'Why' questions, state both the key condition/means and the resulting outcome from the passages.
+    - If the provided context lacks sufficient information to answer the question, state: "Insufficient references in corpus", "Insufficient information", or similar."""
 
     context: str = dspy.InputField(desc="Retrieved evidence passages")
     question: str = dspy.InputField(desc="Question to answer")
@@ -135,7 +146,8 @@ class ExtractQueryIntent(dspy.Signature):
 
 
 class HealSHACLViolations(dspy.Signature):
-    """Recursive RLM orchestrator for closed-world SHACL graph repair using inspect_node and hydrate_chunk sandbox tools."""
+    """As a Recursive RLM orchestrator for closed-world SHACL graph repair,
+    you orchestrate the healing of SHACL violations using inspect_node and hydrate_chunk sandbox tools."""
 
     violations: str = dspy.InputField(desc="JSON list of SHACLViolation report items")
     repairs: list[dict[str, Any]] = dspy.OutputField(
@@ -149,7 +161,7 @@ class HealSHACLViolations(dspy.Signature):
 
 
 class ReflectiveInnerDistillerSignature(dspy.Signature):
-    """Single-level RLM distiller signature (Qwen GPU) for reflective GEPA trace analysis.
+    """You are a Single-level RLM distiller signature for reflective GEPA trace analysis.
     Distill universal failure patterns, structural schema gaps, and generalizable reasoning strategies from examples_with_feedback in Python (never copying specific entity names, dates, or sample facts) and delegate synthesis to synthesize_instruction."""
 
     current_instruction: str = dspy.InputField(
@@ -162,14 +174,18 @@ class ReflectiveInnerDistillerSignature(dspy.Signature):
 
 
 class ProposeInstructionSignature(dspy.Signature):
-    """I provided an assistant with instructions to perform a task for me. You are given those instructions, along with up to 5 diagnostic examples (task inputs, assistant responses, and evaluation feedback).
+    """You are a meta-reasoning instruction-refinement engine. Your job is to improve the instructions given to another AI model based on its observed failures.
 
+    **CONTEXT:**
+    I provided an assistant with instructions to perform a task for me. You are given those instructions, along with diagnostic examples (task inputs, assistant responses, and evaluation feedback).
+
+    **YOUR MISSION:**
     Your task is to write an improved, generalizable instruction for the assistant.
 
-    CRITICAL ANTI-LEAKAGE & GENERALIZATION RULES:
-    - Focus strictly on universal task strategies, structural extraction/reasoning rules, and schema invariants.
-    - NEVER include specific entity names, proper nouns, locations, dates, numbers, or question-specific facts from the examples in the new instruction.
-    - Preserve the exact required JSON output schema and structural contract for the component.
+    **CRITICAL ANTI-LEAKAGE & GENERALIZATION RULES:**
+    - Allways focus strictly on universal task strategies, structural extraction/reasoning rules, and schema invariants.
+    - Never include specific entity names, proper nouns, locations, dates, numbers, or question-specific facts from the examples in the new instruction.
+    - Allways preserve the exact required JSON output schema and structural contract for the component.
     - Your instruction must generalize cleanly across completely unseen domains, documents, and questions."""
 
     current_instruction: str = dspy.InputField(desc="The instructions I provided to the assistant.")
@@ -180,9 +196,11 @@ class ProposeInstructionSignature(dspy.Signature):
 
 
 class CompressInstructionSignature(dspy.Signature):
-    """Shorten the instruction to fit within the stated limit. Preserve every
-    strategy, rule, and constraint; cut redundancy and verbosity. Do not add
-    new content. Output only the shortened instruction."""
+    """You are a critical component in an advanced meta-reasoning instruction-refinement engine. Your task is to shorten the given inputs to conserve tokens while preserving intent and functionality of the instructions.
+    - Preserve every strategy, rule, and constraint; cut redundancy and verbosity.
+    - Shorten the instruction to fit within the stated limit.
+    - Never add new content.
+    - Output only the shortened instruction."""
 
     instruction: str = dspy.InputField()
     length_limit: str = dspy.InputField()

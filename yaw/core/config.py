@@ -226,23 +226,32 @@ class YawConfig:
             if raw_path.lower() == "latest":
                 candidates = sorted(
                     base_dir.glob("yaw_optimize_*.db"),
-                    key=lambda p: p.stat().st_size,
+                    # Run creation time is encoded in the name. Writes to an older
+                    # run must not make it newer than a subsequently created run.
+                    key=lambda p: p.name,
                     reverse=True,
                 )
-                opt_db = (
-                    candidates[0]
-                    if candidates
-                    else base_dir / f"yaw_optimize_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}.db"
-                )
+                candidates = [
+                    p for p in candidates
+                    if p.is_file() and re.fullmatch(r"yaw_optimize_\d{8}_\d{6}\.db", p.name)
+                ]
+                if not candidates:
+                    raise YawRuntimeError("INVALID_INPUT", "No optimization run exists to resume.")
+                opt_db = candidates[0]
             else:
-                opt_db = Path(raw_path).resolve()
+                opt_db = _resolve_path(self.workspace_root, raw_path, raw_path)
+                if not opt_db.is_file():
+                    raise YawRuntimeError(
+                        "INVALID_INPUT", f"Optimization database does not exist: {opt_db}"
+                    )
+            base_dir = opt_db.parent
             ds_match = re.search(r"yaw_optimize_(\d{8}_\d{6})", opt_db.name)
-            ds = ds_match.group(1) if ds_match else datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+            ds = ds_match.group(1) if ds_match else opt_db.stem
         else:
             ds = datestamp or datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
             opt_db = base_dir / f"yaw_optimize_{ds}.db"
 
-        opt_lock = base_dir / f"yaw_optimize_{ds}.db.lock"
+        opt_lock = Path(str(opt_db) + ".lock")
         opt_status = base_dir / f"status_optimize_{ds}.json"
         opt_state = base_dir / f"coco_state_optimize_{ds}"
         opt_program = base_dir / f"compiled_program_optimize_{ds}.json"

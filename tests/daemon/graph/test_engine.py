@@ -207,6 +207,62 @@ def test_engine_index_and_caching(test_engine: YawGraphEngine, tmp_path: Path) -
     assert reindexed == 0
 
 
+def test_openie_resume_reuses_matching_prompts_and_invalidates_mutations(tmp_path: Path) -> None:
+    from yaw.daemon.graph.storage import get_chunk_pointers
+
+    class CountingProgram(HippoRAGProgram):
+        def __init__(self) -> None:
+            super().__init__(enable_gbnf=False)
+            self.openie_calls = 0
+
+        def extract_openie(self, chunk_id: str, passage: str) -> Any:
+            self.openie_calls += 1
+            return super().extract_openie(chunk_id, passage)
+
+    dspy.settings.configure(lm=DeterministicMockLM())
+    doc = "Alan Turing was an English mathematician and computer scientist."
+    database = tmp_path / "resume.db"
+    first = CountingProgram()
+    engine = YawGraphEngine(
+        db_path=database, workspace_root=tmp_path, program=first,
+        embedder=DeterministicMockEmbedder(dim=64),
+    )
+    try:
+        engine.index([doc])
+        assert first.openie_calls == 1
+        ids = [str(row[0]) for row in engine.conn.execute("SELECT chunk_id FROM chunks")]
+        pointers = get_chunk_pointers(engine.conn, ids)
+        chunks = [(pointers[cid], doc) for cid in ids]
+        provenance = engine.conn.execute(
+            "SELECT value FROM meta WHERE key GLOB 'indexed_fp:*'"
+        ).fetchall()
+    finally:
+        engine.close()
+
+    # Recreate all Python objects: no in-memory stage cache can survive.
+    second = CountingProgram()
+    engine = YawGraphEngine(
+        db_path=database, workspace_root=tmp_path, program=second,
+        embedder=DeterministicMockEmbedder(dim=64),
+    )
+    try:
+        engine.index_chunks(chunks)
+        assert second.openie_calls == 0
+        assert engine.conn.execute(
+            "SELECT value FROM meta WHERE key GLOB 'indexed_fp:*'"
+        ).fetchall() == provenance
+        second.ner.signature = second.ner.signature.with_instructions(
+            second.ner.signature.instructions + " Include all explicitly named people."
+        )
+        engine.index_chunks(chunks, program=second)
+        assert second.openie_calls == 1
+        assert engine.conn.execute(
+            "SELECT value FROM meta WHERE key GLOB 'indexed_fp:*'"
+        ).fetchall() != provenance
+    finally:
+        engine.close()
+
+
 def test_engine_retrieve_and_rag_qa(test_engine: YawGraphEngine) -> None:
     docs = [
         "Alan Turing was an English mathematician and computer scientist.\nHe formulated the Turing machine.",

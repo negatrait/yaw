@@ -383,6 +383,8 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
         caching: bool = False,
     ) -> None:
         self.task_mode = task_mode
+        self.base_url = base_url
+        self.provider = provider
         self.profile = profile or resolve_embedding_profile(MODEL, task_mode)
         base_embedder = embedder or create_dspy_embedder(
             self.profile,

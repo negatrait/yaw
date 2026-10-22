@@ -1,6 +1,7 @@
 import logging
 import os
 import time
+from collections.abc import Mapping
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,85 @@ if hasattr(dspy, "disable_litellm_logging"):
     dspy.disable_litellm_logging()
 
 _YAW_SLEEP_SECONDS: ContextVar[float] = ContextVar("yaw_sleep_seconds", default=0.0)
+
+
+class _UsageAccountingCache:
+    """Delegate storage/keys to DSPy while replaying logical inference cost.
+
+    DSPy intentionally records zero physical usage on hits. YAW's optimization
+    metric needs the original cost instead, so cached candidates do not get an
+    artificial advantage. LM history retains DSPy's zero physical usage.
+    """
+
+    def __init__(self, backend: Any) -> None:
+        self.backend = backend
+        self.cache_hits = 0
+        self.cached_tokens = 0
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.backend, name)
+
+    @staticmethod
+    def _is_lm_request(request: dict[str, Any]) -> bool:
+        return str(request.get("_fn_identifier", "")).startswith(
+            ("dspy.clients.lm.", "dspy.clients.lm15.")
+        )
+
+    @staticmethod
+    def _ignored(ignored: list[str] | None) -> list[str]:
+        # DSPy excludes endpoints by default; local servers may serve different
+        # weights under the same model name. Retain endpoints in YAW cache keys.
+        return [key for key in (ignored or ()) if key not in {"api_base", "base_url"}]
+
+    def _usage_key(self, request: dict[str, Any], ignored: list[str] | None) -> dict[str, str]:
+        return {"yaw_logical_usage_v1": self.backend.cache_key(request, ignored)}
+
+    def get(
+        self, request: dict[str, Any], ignored_args_for_cache_key: list[str] | None = None,
+    ) -> Any:
+        ignored_args_for_cache_key = self._ignored(ignored_args_for_cache_key)
+        record = self.backend.get(request, ignored_args_for_cache_key)
+        if record is None or not self._is_lm_request(request):
+            return record
+        if isinstance(record, dict) and "_dspy_format" in record:
+            usage = record.get("usage")
+        else:
+            # Legacy SDK responses have their usage cleared by DSPy's get().
+            # New writes retain a small usage companion in the same disk cache.
+            metadata = self.backend.get(self._usage_key(request, ignored_args_for_cache_key))
+            if metadata is None:
+                return None  # Unverifiable old usage: recompute instead of scoring it as zero.
+            usage = metadata.get("usage")
+        model = request.get("model") or request.get("request", {}).get("model")
+        if not isinstance(usage, Mapping) or not isinstance(model, str):
+            return None
+        tracker = dspy.settings.usage_tracker
+        if tracker is not None:
+            tracker.add_usage(model, dict(usage))
+        self.cache_hits += 1
+        self.cached_tokens += int(usage.get("total_tokens") or (
+            (usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+            + (usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+        ))
+        return record
+
+    def put(
+        self, request: dict[str, Any], value: Any,
+        ignored_args_for_cache_key: list[str] | None = None,
+        enable_memory_cache: bool = True,
+    ) -> None:
+        ignored_args_for_cache_key = self._ignored(ignored_args_for_cache_key)
+        self.backend.put(request, value, ignored_args_for_cache_key, enable_memory_cache)
+        if not self._is_lm_request(request):
+            return
+        if not (isinstance(value, dict) and "_dspy_format" in value):
+            usage = getattr(value, "usage", None)
+            if usage is None and isinstance(value, Mapping):
+                usage = value.get("usage")
+            self.backend.put(
+                self._usage_key(request, ignored_args_for_cache_key),
+                {"usage": dict(usage or {})}, enable_memory_cache=enable_memory_cache,
+            )
 
 
 def get_yaw_sleep_seconds() -> float:
@@ -83,6 +163,7 @@ def configure_yaw_dspy_cache(
     memory_max_entries: int = 100_000,
     restrict_pickle: bool = True,
     safe_types: list[type[Any]] | None = None,
+    account_cached_usage: bool = False,
 ) -> None:
     """Configure workspace-isolated DSPy cache via dspy.configure_cache with restrict_pickle=True by default."""
     resolved_dir: str | None = None
@@ -107,6 +188,8 @@ def configure_yaw_dspy_cache(
     if callable(close_fn):
         close_fn()
     dspy.configure_cache(**kwargs)
+    if account_cached_usage:
+        dspy.cache = _UsageAccountingCache(dspy.cache)
 
 
 def create_dspy_lm(

@@ -591,6 +591,22 @@ class _PredictorBoundLM(dspy.BaseLM):
     def dump_state(self) -> dict[str, Any]:
         return {}
 
+    def cache_identity(self) -> dict[str, Any]:
+        """Expose effective inference settings for persistent stage-cache keys."""
+        identities = {}
+        for role, target in (
+            ("effective", self._resolve_target_lm()), ("bound", self._base_lm_getter())
+        ):
+            identities[role] = {
+                "model": getattr(target, "model", self._fallback_model),
+                "model_type": getattr(target, "model_type", None),
+                "kwargs": {
+                    k: v for k, v in (getattr(target, "kwargs", {}) or {}).items()
+                    if k not in {"api_key", "api_token"}
+                },
+            }
+        return identities
+
     def copy(self, **kwargs: Any) -> _PredictorBoundLM:
         cloned = _PredictorBoundLM(
             self.predictor_name,
