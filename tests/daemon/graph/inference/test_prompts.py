@@ -5,6 +5,8 @@ import json
 import unittest
 from typing import Any
 
+import pytest
+
 from yaw.daemon.graph.inference.parsers import (
     compute_mdhash_id,
     extract_named_entities,
@@ -109,8 +111,12 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         """Verify text_processing normalizes alphanumeric lowercase tokens."""
         self.assertEqual(text_processing("Apple Inc."), "apple inc")
         self.assertEqual(text_processing("Radio-City (FM Station) #1!"), "radio city fm station 1")
-        self.assertEqual(text_processing("   Multiple   Spaces   and   Tabs\t\n"), "multiple spaces and tabs")
-        self.assertEqual(text_processing("123 numbers & Symbols_underscore"), "123 numbers symbols underscore")
+        self.assertEqual(
+            text_processing("   Multiple   Spaces   and   Tabs\t\n"), "multiple spaces and tabs"
+        )
+        self.assertEqual(
+            text_processing("123 numbers & Symbols_underscore"), "123 numbers symbols underscore"
+        )
         self.assertEqual(
             text_processing(["Apple Inc.", "Google LLC", "DeepMind (UK)"]),
             ["apple inc", "google llc", "deepmind uk"],
@@ -158,14 +164,16 @@ class PromptsAndParsersParityTests(unittest.TestCase):
 
     def test_extract_triples_parity(self):
         """Verify extract_triples parses and filters triples."""
-        resp = json.dumps({
-            "triples": [
-                ["Alan Turing", "born in", "London"],
-                ["London", "located in", "United Kingdom"],
-                ["invalid", "pair"],
-                ["Alan Turing", "born in", "London"],  # duplicate
-            ]
-        })
+        resp = json.dumps(
+            {
+                "triples": [
+                    ["Alan Turing", "born in", "London"],
+                    ["London", "located in", "United Kingdom"],
+                    ["invalid", "pair"],
+                    ["Alan Turing", "born in", "London"],  # duplicate
+                ]
+            }
+        )
         triples = extract_triples(resp)
         self.assertEqual(
             triples,
@@ -239,7 +247,9 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         self.assertEqual(list(ExtractEntities.output_fields.keys()), ["named_entities"])
         self.assertEqual(list(ExtractTriples.input_fields.keys()), ["passage", "named_entities"])
         self.assertEqual(list(ExtractTriples.output_fields.keys()), ["triples"])
-        self.assertEqual(list(FilterTriples.input_fields.keys()), ["question", "fact_before_filter"])
+        self.assertEqual(
+            list(FilterTriples.input_fields.keys()), ["question", "fact_before_filter"]
+        )
         self.assertEqual(list(FilterTriples.output_fields.keys()), ["fact"])
         self.assertEqual(list(AnswerQuestion.input_fields.keys()), ["context", "question"])
         self.assertEqual(list(AnswerQuestion.output_fields.keys()), ["answer"])
@@ -312,9 +322,7 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             lm=lm,
         )
         self.assertEqual(record.chunk_id, "chunk-1")
-        self.assertEqual(
-            record.entities, ("Alan Turing", "London", "United Kingdom")
-        )
+        self.assertEqual(record.entities, ("Alan Turing", "London", "United Kingdom"))
         self.assertEqual(
             record.entity_definitions,
             (
@@ -372,17 +380,19 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         from yaw.daemon.graph.inference.grammars import DSPY_SHACL_REPAIR_GBNF_GRAMMAR
         from yaw.daemon.graph.inference.program import HippoRAGProgram
 
-        orch_lm = DummyLM([
-            {
-                "reasoning": "Propose SHACL repairs via GBNF tool using keyword argument violations=violations.",
-                "code": (
-                    "reps = qwen_propose_shacl_repairs(violations=violations)\n"
-                    "SUBMIT(repairs=reps)"
-                ),
-            }
-        ])
-        setattr(orch_lm, "_yaw_recipe", "llamacpp")
-        setattr(orch_lm, "_yaw_supports_gbnf", False)
+        orch_lm = DummyLM(
+            [
+                {
+                    "reasoning": "Propose SHACL repairs via GBNF tool using keyword argument violations=violations.",
+                    "code": (
+                        "reps = qwen_propose_shacl_repairs(violations=violations)\n"
+                        "SUBMIT(repairs=reps)"
+                    ),
+                }
+            ]
+        )
+        orch_lm._yaw_recipe = "llamacpp"
+        orch_lm._yaw_supports_gbnf = False
 
         sub_lm = DummyLM(
             [
@@ -398,8 +408,8 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             ],
             adapter=dspy.JSONAdapter(),
         )
-        setattr(sub_lm, "_yaw_recipe", "llamacpp")
-        setattr(sub_lm, "_yaw_supports_gbnf", True)
+        sub_lm._yaw_recipe = "llamacpp"
+        sub_lm._yaw_supports_gbnf = True
 
         program = HippoRAGProgram(
             enable_gbnf=True,
@@ -445,9 +455,7 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             state_path = Path(tmp_dir) / "gepa_compiled.json"
             prog1 = HippoRAGProgram()
             sig1: Any = prog1.ner.signature
-            prog1.ner.signature = sig1.with_instructions(
-                "GEPA optimized NER instruction."
-            )
+            prog1.ner.signature = sig1.with_instructions("GEPA optimized NER instruction.")
             prog1.ner.demos = [
                 dspy.Example(
                     passage="Custom GEPA demo passage.",
@@ -643,13 +651,22 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             set(obj_scores.keys()),
             {
                 "recall_at_5",
-                "pareto_raw",
                 "efficiency",
-                "gm_good",
-                "gm_bad",
                 "shacl_conforms",
             },
         )
+        # Every GEPA objective is higher-is-better (no cost-as-good keys like gm_bad).
+        self.assertNotIn("gm_bad", obj_scores)
+        self.assertNotIn("pareto_raw", obj_scores)
+
+        # Default 30k-token budget: quality, not token count, dominates the score.
+        base_q = dict(
+            recall_at_1=0.5, recall_at_2=0.7, recall_at_10=0.95, recall_at_20=1.0, em=0.05
+        )
+        f1_gain = compute_sizecoding_pareto_score(0.87, f1=0.45, tokens=22_000, **base_q)
+        f1_base = compute_sizecoding_pareto_score(0.87, f1=0.35, tokens=22_000, **base_q)
+        half_tokens = compute_sizecoding_pareto_score(0.87, f1=0.35, tokens=11_000, **base_q)
+        self.assertGreater(f1_gain.score / f1_base.score, half_tokens.score / f1_base.score)
         self.assertAlmostEqual(obj_scores["recall_at_5"], 0.80)
         self.assertAlmostEqual(obj_scores["shacl_conforms"], 1.0)
 
@@ -705,7 +722,9 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         import urllib.request
 
         try:
-            with urllib.request.urlopen("http://localhost:13305/api/v1/health", timeout=2.0) as resp:
+            with urllib.request.urlopen(
+                "http://localhost:13305/api/v1/health", timeout=2.0
+            ) as resp:
                 if resp.status != 200:
                     return set()
                 payload = json.loads(resp.read().decode("utf-8"))
@@ -718,6 +737,7 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         except Exception:
             return set()
 
+    @pytest.mark.live
     def test_live_silicon_direct_qwen_gbnf_and_shacl_healer_rlm(self):
         """Run un-mocked end-to-end HippoRAGProgram against live Lemonade Server (Qwen GPU GBNF + SHACL Healer RLM)."""
         loaded_models = self._probe_live_lemonade_models()
@@ -847,111 +867,21 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         self.assertTrue(getattr(worker_ref, "_yaw_supports_gbnf", False))
 
     def test_rlm_instruction_proposer_contract_and_boundary_envelope(self):
-        """TDD Contract: RLMInstructionProposer executes single-level RLM trace distillation -> Qwen GBNF synthesis."""
-        import dspy
-        from dspy.utils.dummies import DummyLM
+        from yaw.daemon.graph.inference import RLMInstructionProposer
+        from yaw.daemon.graph.inference.reflection import ReflectionBudgetError
 
-        from yaw.daemon.graph.inference import (
-            DSPY_INSTRUCTION_PROPOSAL_GBNF_GRAMMAR,
-            RLMInstructionProposer,
-        )
-
-        # Negative boundary envelope: invalid max_instruction_chars raises ValueError
         with self.assertRaises(ValueError):
             RLMInstructionProposer(max_instruction_chars=0)
+        proposer = RLMInstructionProposer()
+        self.assertEqual(proposer({}, {}, []), {})
+        with self.assertRaises(ReflectionBudgetError):
+            proposer(component_name="qa.predict", current_instruction="Use evidence.")
 
-        orch_lm = DummyLM([
-            {
-                "reasoning": "Distill examples_with_feedback in Python and call GBNF synthesize_instruction with keyword args.",
-                "code": (
-                    "digest = [{'Inputs': {'passage': ex['Inputs']['passage'][:200]}, "
-                    "'Generated Outputs': ex['Generated Outputs'], 'Feedback': ex['Feedback']} "
-                    "for ex in examples_with_feedback]\n"
-                    "res = synthesize_instruction(current_instruction=current_instruction, examples_with_feedback=digest)\n"
-                    "SUBMIT(new_instruction=res)"
-                ),
-            }
-        ])
-        setattr(orch_lm, "_yaw_recipe", "llamacpp")
-        setattr(orch_lm, "_yaw_supports_gbnf", False)
-
-        qwen_lm = DummyLM(
-            [
-                {"new_instruction": "Extract all bridge named entities concisely without redundant titles."},
-            ]
-        )
-        setattr(qwen_lm, "_yaw_recipe", "llamacpp")
-        setattr(qwen_lm, "_yaw_supports_gbnf", True)
-
-        proposer = RLMInstructionProposer(
-            orchestrator_lm=orch_lm,
-            worker_lm=qwen_lm,
-            enable_gbnf=True,
-            max_instruction_chars=900,
-        )
-        self.assertFalse(isinstance(proposer, dspy.Module))
-
-        candidate = {
-            "ner": "Extract named entities from the passage.",
-            "qa": "Answer the question concisely.",
-        }
-        reflective_dataset = {
-            "ner": [
-                {
-                    "Inputs": {"passage": "A" * 1200},
-                    "Generated Outputs": {"named_entities": ["Radio City"]},
-                    "Feedback": "Missed gold items: ['Bangalore', 'Abraham Thomas'].",
-                }
-            ]
-        }
-
-        # Boundary: empty or missing component updates make zero LM calls
-        self.assertEqual(proposer(candidate, reflective_dataset, []), {})
-        self.assertEqual(proposer(candidate, reflective_dataset, ["missing_comp"]), {})
-        self.assertEqual(len(orch_lm.history), 0)
-        self.assertEqual(len(qwen_lm.history), 0)
-
-        # Happy path: updates 'ner' via single-level RLM trace distillation -> Qwen GBNF synthesis
-        with dspy.context(track_usage=True):
-            updated = proposer(candidate, reflective_dataset, ["ner"])
-        self.assertEqual(
-            updated,
-            {"ner": "Extract all bridge named entities concisely without redundant titles."},
-        )
-        self.assertEqual(len(orch_lm.history), 1)
-        self.assertEqual(len(qwen_lm.history), 1)
-
-        # Verify RLM orchestrator got instruction proposal prompt (not SPO/QA tools) and zero GBNF
-        rlm_call = orch_lm.history[0]
-        self.assertIsNone(rlm_call["kwargs"].get("extra_body"))
-        self.assertEqual(rlm_call["kwargs"].get("temperature"), 0.8)
-        rlm_prompt_text = str(rlm_call.get("messages") or rlm_call.get("prompt"))
-        self.assertIn("synthesize_instruction", rlm_prompt_text)
-        self.assertIn("new_instruction", rlm_prompt_text)
-        self.assertNotIn("qwen_extract_triples", rlm_prompt_text)
-        self.assertNotIn("qwen_propose_instruction", rlm_prompt_text)
-
-        # Verify Qwen worker call was GBNF ProposeInstruction synthesis
-        qwen_synth_call = qwen_lm.history[0]
-        self.assertEqual(qwen_synth_call["kwargs"].get("temperature"), 0.7)
-        self.assertEqual(
-            (qwen_synth_call["kwargs"].get("extra_body") or {}).get("grammar"),
-            DSPY_INSTRUCTION_PROPOSAL_GBNF_GRAMMAR,
-        )
-
-        # Verify telemetry was recorded on the proposer
-        self.assertEqual(len(proposer.telemetry), 1)
-        self.assertEqual(proposer.telemetry[0]["component_name"], "ner")
-        self.assertEqual(proposer.telemetry[0]["predictor"], "inner_rlm")
-        self.assertEqual(
-            proposer.telemetry[0]["new_instruction"],
-            "Extract all bridge named entities concisely without redundant titles.",
-        )
-
+    @pytest.mark.live
     def test_live_silicon_rlm_instruction_proposer(self):
         """Run un-mocked single-level RLMInstructionProposer against live Lemonade Server."""
         loaded_models = self._probe_live_lemonade_models()
-        required = {"Qwen3-4B-Instruct-2507-GGUF"}
+        required = {"Gemma-4-E4B-it-GGUF"}
         if not required.issubset(loaded_models):
             self.skipTest(
                 f"Live Lemonade Server models {sorted(required)} not loaded (found {sorted(loaded_models)})"
@@ -960,6 +890,7 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         from yaw.daemon.graph.inference import (
             DSPY_INSTRUCTION_PROPOSAL_GBNF_GRAMMAR,
             RLMInstructionProposer,
+            ServingTokenCounter,
             create_dspy_rlm_pair,
         )
 
@@ -974,6 +905,7 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             enable_gbnf=True,
             max_instruction_chars=800,
             rlm_max_iters=3,
+            token_counter=ServingTokenCounter("http://localhost:13305/api/v1", worker_lm.model),
         )
         candidate = {
             "qa": "Read the retrieved Wikipedia passages and answer the multi-hop question."
@@ -1031,8 +963,8 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         self.assertIn("query_intent", DSPY_QUERY_INTENT_GBNF_GRAMMAR)
 
         qwen_lm = DummyLM([{"query_intent": "Erik Hort birthplace village town county"}])
-        setattr(qwen_lm, "_yaw_recipe", "llamacpp")
-        setattr(qwen_lm, "_yaw_supports_gbnf", True)
+        qwen_lm._yaw_recipe = "llamacpp"
+        qwen_lm._yaw_supports_gbnf = True
 
         prog = HippoRAGProgram(
             enable_gbnf=True,
@@ -1051,9 +983,11 @@ class PromptsAndParsersParityTests(unittest.TestCase):
 
         # Boundary: non-GBNF LM omits extra_body.grammar
         non_gbnf_lm = DummyLM([{"query_intent": "Erik Hort birthplace county"}])
-        setattr(non_gbnf_lm, "_yaw_recipe", "flm")
-        setattr(non_gbnf_lm, "_yaw_supports_gbnf", False)
-        intent_non_gbnf = prog.extract_query_intent("What county is Erik Hort's birthplace a part of?", lm=non_gbnf_lm)
+        non_gbnf_lm._yaw_recipe = "flm"
+        non_gbnf_lm._yaw_supports_gbnf = False
+        intent_non_gbnf = prog.extract_query_intent(
+            "What county is Erik Hort's birthplace a part of?", lm=non_gbnf_lm
+        )
         self.assertEqual(intent_non_gbnf, "Erik Hort birthplace county")
         self.assertIsNone(non_gbnf_lm.history[0]["kwargs"].get("extra_body"))
 
@@ -1101,8 +1035,8 @@ class PromptsAndParsersParityTests(unittest.TestCase):
                 },
             ]
         )
-        setattr(sub_lm, "_yaw_recipe", "llamacpp")
-        setattr(sub_lm, "_yaw_supports_gbnf", True)
+        sub_lm._yaw_recipe = "llamacpp"
+        sub_lm._yaw_supports_gbnf = True
 
         dspy.settings.configure(lm=primary_lm)
         prog = HippoRAGProgram(
@@ -1178,7 +1112,9 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         self.assertEqual(structured[0].spo_def, "Ada Lovelace wrote the Note G algorithm.")
 
         decisions = prog.judge_synonyms('[{"pair_id": "ent-1|ent-2"}]')
-        self.assertEqual(decisions, [{"pair_id": "ent-1|ent-2", "relation": "skos:altLabel", "canonical": "A"}])
+        self.assertEqual(
+            decisions, [{"pair_id": "ent-1|ent-2", "relation": "skos:altLabel", "canonical": "A"}]
+        )
 
         repairs = prog.propose_shacl_repairs(
             '[{"focus_node": "ent-1"}]',
@@ -1187,7 +1123,13 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         )
         self.assertEqual(
             repairs,
-            [{"focus_node": "ent-1", "action": "set_definition", "value": "Valid non-empty definition"}],
+            [
+                {
+                    "focus_node": "ent-1",
+                    "action": "set_definition",
+                    "value": "Valid non-empty definition",
+                }
+            ],
         )
 
         # Verify GBNF grammars and parser edge cases
@@ -1218,7 +1160,7 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             max_triples=3,
             known_entities=[["Radio City", "FM station"], ["Bangalore", "City"]],
         )
-        self.assertIn("known-entity ::= \"\\\"Radio City\\\"\" | \"\\\"Bangalore\\\"\"", g_known)
+        self.assertIn('known-entity ::= "\\"Radio City\\"" | "\\"Bangalore\\""', g_known)
         self.assertIn("entity-slot ::= known-entity | new-entity-pair", g_known)
         self.assertIn('triple-list ::= (triple (", " triple (", " triple)?)?)?', g_known)
 
@@ -1274,8 +1216,8 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             ],
             adapter=dspy.JSONAdapter(),
         )
-        setattr(direct_lm, "_yaw_recipe", "llamacpp")
-        setattr(direct_lm, "_yaw_supports_gbnf", True)
+        direct_lm._yaw_recipe = "llamacpp"
+        direct_lm._yaw_supports_gbnf = True
 
         prog_direct = HippoRAGProgram(
             enable_gbnf=True,
@@ -1289,7 +1231,9 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             )
         self.assertEqual(len(direct_lm.history), 3)
         # Call 1 (ExtractTriples) received [[name, def]] in named_entities
-        triples_prompt_str = str(direct_lm.history[1].get("messages") or direct_lm.history[1].get("prompt"))
+        triples_prompt_str = str(
+            direct_lm.history[1].get("messages") or direct_lm.history[1].get("prompt")
+        )
         self.assertIn("English mathematician and writer", triples_prompt_str)
         # Call 2 (DefineMissingEntities) received dynamic GBNF locked to ["Charles Babbage"]
         self.assertEqual(
@@ -1341,8 +1285,8 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             ],
             adapter=dspy.JSONAdapter(),
         )
-        setattr(chunk2_lm, "_yaw_recipe", "llamacpp")
-        setattr(chunk2_lm, "_yaw_supports_gbnf", True)
+        chunk2_lm._yaw_recipe = "llamacpp"
+        chunk2_lm._yaw_supports_gbnf = True
         rec_chunk2 = prog_direct.extract_openie(
             "chunk-2",
             "Charles Babbage designed the Difference Engine.",
@@ -1360,7 +1304,10 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             [
                 {
                     "named_entities": [
-                        ["Cinderella", "Young woman mistreated by her stepmother who attends the royal ball"],
+                        [
+                            "Cinderella",
+                            "Young woman mistreated by her stepmother who attends the royal ball",
+                        ],
                         ["a ball", "Royal dance hosted by the prince"],
                     ]
                 },
@@ -1392,8 +1339,8 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             ],
             adapter=dspy.JSONAdapter(),
         )
-        setattr(cinderella_lm, "_yaw_recipe", "llamacpp")
-        setattr(cinderella_lm, "_yaw_supports_gbnf", True)
+        cinderella_lm._yaw_recipe = "llamacpp"
+        cinderella_lm._yaw_supports_gbnf = True
         prog_cinderella = HippoRAGProgram(
             enable_gbnf=True,
             rlm_sub_lm=cinderella_lm,
@@ -1419,7 +1366,10 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         self.assertEqual(
             rec_cin.entity_definitions,
             (
-                ("Cinderella", "Young woman mistreated by her stepmother who attends the royal ball"),
+                (
+                    "Cinderella",
+                    "Young woman mistreated by her stepmother who attends the royal ball",
+                ),
                 ("a ball", "Royal dance hosted by the prince"),
                 ("glass slipper", "Delicate footwear lost by Cinderella at the ball"),
             ),
@@ -1450,259 +1400,29 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             repair_pareto.feedback,
         )
 
-    def test_rlm_instruction_proposer_top5_failing_selection_anonymization_and_schema_contract(
-        self,
-    ):
-        """TDD Contract: RLMInstructionProposer enforces anti-leakage rules, selects top-5 failing examples, anonymizes gold literals, and preserves stage JSON schema contracts."""
-        import dspy
-        from dspy.utils.dummies import DummyLM
-
-        from yaw.daemon.graph.inference.program import RLMInstructionProposer
-        from yaw.daemon.graph.inference.prompts import (
-            ProposeInstructionSignature,
-            ReflectiveInnerDistillerSignature,
+    def test_reflection_preserves_expected_training_answers(self):
+        from yaw.daemon.graph.inference.reflection import (
+            deterministic_evidence,
+            reflection_examples,
+            resolve_evidence,
         )
 
-        # 1. Anti-leakage meta-instruction contract on ProposeInstructionSignature & ReflectiveInnerDistillerSignature
-        propose_doc = ProposeInstructionSignature.__doc__ or ""
-        distill_doc = ReflectiveInnerDistillerSignature.__doc__ or ""
-        self.assertNotIn("Identify all niche and domain specific factual information", propose_doc)
-        self.assertIn("NEVER include specific", propose_doc)
-        self.assertIn("never copying specific", distill_doc.lower())
-
-        # 2. Top-5 failing example selection & gold entity anonymization in _prepare_examples
-        raw_examples = [
-            {
-                "Inputs": {"question": "Pass Q1"},
-                "Generated Outputs": {"answer": "OK1"},
-                "Feedback": "[qa] Gate-free GM_good/GM_bad=0.9500 (Recall@5=1.0000, EM=1.0000, F1=1.0000) | Stage[qa]: trace_calls=1 | gold_answers=['Pass1'] | all_retrieved",
-            },
-            {
-                "Inputs": {"question": "Pass Q2"},
-                "Generated Outputs": {"answer": "OK2"},
-                "Feedback": "[qa] Gate-free GM_good/GM_bad=0.9200 (Recall@5=1.0000, EM=1.0000, F1=1.0000) | Stage[qa]: trace_calls=1 | gold_answers=['Pass2'] | all_retrieved",
-            },
-            {
-                "Inputs": {"question": "Fail Q1"},
-                "Generated Outputs": {"answer": "Wrong1"},
-                "Feedback": "[qa] Below reference floor (0.0000 < 0.7500). Gate-free GM_good/GM_bad=0.1200 (Recall@5=0.0000, EM=0.0000, F1=0.0000). Missed items: [\"Missed passage: 'Stanford University Professor Thomas C. Sudhof'\", \"Predicted='Wrong1' != Expected=['Port of Spain', '20 March 851']\"] | Stage[qa]: trace_calls=1 | gold_answers=['Port of Spain'] | missed=2",
-            },
-            {
-                "Inputs": {"question": "Fail Q2"},
-                "Generated Outputs": {"answer": "Wrong2"},
-                "Feedback": "[qa] Below reference floor (0.2000 < 0.7500). Gate-free GM_good/GM_bad=0.1800 (Recall@5=0.2000, EM=0.0000, F1=0.1000). Missed items: [\"Predicted='Wrong2' != Expected=['Rockland County']\"] | Stage[qa]: trace_calls=1 | gold_answers=['Rockland County'] | missed=1",
-            },
-            {
-                "Inputs": {"question": "Fail Q3"},
-                "Generated Outputs": {"answer": "Wrong3"},
-                "Feedback": "[qa] Below reference floor (0.4000 < 0.7500). Gate-free GM_good/GM_bad=0.2200 (Recall@5=0.4000, EM=0.0000, F1=0.2000). Missed items: [\"Missed passage: 'Alpha Corp Q3 Earnings'\"]",
-            },
-            {
-                "Inputs": {"question": "Fail Q4"},
-                "Generated Outputs": {"answer": "Wrong4"},
-                "Feedback": "[qa] Below reference floor (0.5000 < 0.7500). Gate-free GM_good/GM_bad=0.2500 (Recall@5=0.5000, EM=0.0000, F1=0.2500). Missed items: [\"Predicted='Wrong4' != Expected=['Bletchley Park']\"]",
-            },
-            {
-                "Inputs": {"question": "Fail Q5"},
-                "Generated Outputs": {"answer": "Wrong5"},
-                "Feedback": "[qa] Below reference floor (0.6000 < 0.7500). Gate-free GM_good/GM_bad=0.3000 (Recall@5=0.6000, EM=0.0000, F1=0.3000). Missed items: [\"Predicted='Wrong5' != Expected=['Alan Turing']\"]",
-            },
-            {
-                "Inputs": {"question": "Fail Q6 (mild)"},
-                "Generated Outputs": {"answer": "Partial6"},
-                "Feedback": "[qa] Gate-free GM_good/GM_bad=0.6500 (Recall@5=1.0000, EM=0.0000, F1=0.7500). Missed items: [\"Predicted='Partial6' != Expected=['Enigma Machine']\"]",
-            },
-        ]
-
-        prepared = RLMInstructionProposer._prepare_examples(raw_examples, max_examples=5)
-        self.assertEqual(len(prepared), 5)
-        selected_questions = [ex["Inputs"]["question"] for ex in prepared]
-        # Top-5 worst failing examples selected; passing examples and mildest 6th failure excluded
-        self.assertEqual(
-            selected_questions,
-            ["Fail Q1", "Fail Q2", "Fail Q3", "Fail Q4", "Fail Q5"],
+        examples = reflection_examples(
+            [{"score": i, "Feedback": f"Expected=['answer-{i}']"} for i in range(8)]
         )
+        evidence = resolve_evidence(examples, deterministic_evidence(examples))
+        self.assertEqual(len(evidence), 5)
+        self.assertEqual([row["evidence"]["score"] for row in evidence], [0, 1, 2, 7, 6])
+        self.assertIn("answer-0", evidence[0]["evidence"]["Feedback"])
 
-        # Verify gold entity/passage literals are anonymized in Feedback while structural metrics remain
-        fb1 = prepared[0]["Feedback"]
-        self.assertNotIn("Port of Spain", fb1)
-        self.assertNotIn("20 March 851", fb1)
-        self.assertNotIn("Thomas C. Sudhof", fb1)
-        self.assertIn("<Target", fb1)
-        self.assertIn("GM_good/GM_bad=0.1200", fb1)
+    def test_rlm_instruction_proposer_requires_task_reward_for_simba(self):
+        from yaw.daemon.graph.inference import RLMInstructionProposer
 
-        # 3. Stage schema contract preservation when proposer omits required JSON schema keys
-        orch_lm = DummyLM(
-            [
-                {
-                    "reasoning": "Synthesize instruction via synthesize_instruction.",
-                    "code": (
-                        "res = synthesize_instruction(current_instruction=current_instruction, examples_with_feedback=examples_with_feedback)\n"
-                        "SUBMIT(new_instruction=res)"
-                    ),
-                }
-            ]
-        )
-        qwen_lm = DummyLM(
-            [
-                {
-                    "new_instruction": "Extract all coreferent and domain-relevant entities with concise definitions."
-                }
-            ]
-        )
-        proposer = RLMInstructionProposer(
-            orchestrator_lm=orch_lm,
-            worker_lm=qwen_lm,
-            enable_gbnf=True,
-            max_instruction_chars=600,
-        )
-        with dspy.context(track_usage=True):
-            updated = proposer(
-                {"ner": "Extract named entities."},
-                {"ner": raw_examples},
-                ["ner"],
-            )
-        self.assertIn("named_entities", updated["ner"])
-        self.assertLessEqual(len(updated["ner"]), 600)
-        self.assertEqual(proposer.telemetry[0]["num_feedback_examples"], 5)
-
-    def test_rlm_instruction_proposer_dspy_module_and_always_on_simba(self):
-        """TDD Contract: RLMInstructionProposer is a dspy.Module with an always-on dspy.SIMBA meta-optimizer."""
-        import dspy
-        from dspy.utils.dummies import DummyLM
-
-        from yaw.daemon.graph.inference.program import RLMInstructionProposer
-
-        orch_lm = DummyLM(
-            [
-                {
-                    "reasoning": "Distill NER failures.",
-                    "code": (
-                        "res = synthesize_instruction(current_instruction=current_instruction, examples_with_feedback=examples_with_feedback)\n"
-                        "SUBMIT(new_instruction=res)"
-                    ),
-                },
-                {
-                    "reasoning": "Distill QA failures.",
-                    "code": (
-                        "res = synthesize_instruction(current_instruction=current_instruction, examples_with_feedback=examples_with_feedback)\n"
-                        "SUBMIT(new_instruction=res)"
-                    ),
-                },
-            ]
-        )
-        # Responses for:
-        # 1-8+: SIMBA rollout sampling, OfferFeedback rule generation, candidate eval, and validation,
-        # plus direct qwen_proposer calls during propose_for_component.
-        qwen_lm = DummyLM(
-            [
-                # Rollout 1 (good, schema-compliant, no leakage)
-                {
-                    "new_instruction": "Extract all coreferent and domain-specific entities from the passage. Return a JSON object with key `named_entities`."
-                },
-                # Rollout 2 (bad, leaks literal entity and omits schema key)
-                {
-                    "new_instruction": "Always extract Port of Spain and 20 March 851."
-                },
-                # Rollout 3 (good QA instruction)
-                {
-                    "new_instruction": "Synthesize multi-hop facts concisely into the final answer without explanatory prefixes."
-                },
-                # Rollout 4 (bad QA instruction - empty/trivial)
-                {
-                    "new_instruction": "Answer."
-                },
-                # OfferFeedback response from SIMBA append_a_rule
-                {
-                    "discussion": "The better trajectory preserved JSON schema contracts and avoided entity leakage.",
-                    "module_advice": {
-                        "qwen_proposer": "If the module receives stage feedback, then it should preserve the stage JSON output key and never copy literal entities."
-                    },
-                },
-                # OfferFeedback response 2 (if second bucket triggers append_a_rule)
-                {
-                    "discussion": "Preserve concise schema instructions.",
-                    "module_advice": {
-                        "qwen_proposer": "Ensure concise generalizable rules."
-                    },
-                },
-            ]
-            + [
-                {
-                    "new_instruction": "Extract all coreferent and bridge entities from the passage. Return a JSON object with key `named_entities`."
-                }
-                for _ in range(16)
-            ]
-        )
-
-        proposer = RLMInstructionProposer(
-            orchestrator_lm=orch_lm,
-            worker_lm=qwen_lm,
-            enable_gbnf=True,
-            enable_simba=True,
-            simba_bsize=2,
-            simba_num_candidates=2,
-            simba_max_steps=1,
-            simba_max_demos=2,
-        )
-
-        # 1. Inner worker must be a first-class dspy.Module exposing its predictors to SIMBA
-        self.assertIsInstance(proposer.worker_module, dspy.Module)
+        proposer = RLMInstructionProposer()
         self.assertTrue(proposer.enable_simba)
-        pred_names = dict(proposer.worker_module.named_predictors())
-        self.assertIn("qwen_proposer", pred_names)
-        self.assertIn("qwen_compressor", pred_names)
-
-
-        # 2. Direct dspy.Module forward(component_name=..., current_instruction=..., examples_with_feedback=...)
-        # must return a dspy.Prediction(new_instruction=...) and record trace for SIMBA
-        with dspy.context(trace=[], track_usage=True):
-            direct_pred = proposer(
-                component_name="ner",
-                current_instruction='Extract entities. Return JSON key `named_entities`.',
-                examples_with_feedback=[
-                    {
-                        "Inputs": {"passage": "Stanford University was founded in 1885."},
-                        "Generated Outputs": {"named_entities": []},
-                        "Feedback": "[ner] Gate-free GM_good/GM_bad=0.1500 (Recall@5=0.0000, EM=0.0000, F1=0.0000) | Stage[ner]: trace_calls=1 | missed=1",
-                    }
-                ],
-            )
-            captured_trace = list(dspy.settings.trace)
-        self.assertIsInstance(direct_pred, dspy.Prediction)
-        self.assertTrue(str(getattr(direct_pred, "new_instruction", "")).strip())
-        self.assertGreaterEqual(len(captured_trace), 1)
-
-        # 3. Calling GEPA ProposalFn across 2 components reaches simba_bsize=2 and triggers SIMBA compilation
-        reflective_dataset = {
-            "ner": [
-                {
-                    "Inputs": {"passage": "Port of Spain is the capital of Trinidad and Tobago."},
-                    "Generated Outputs": {"named_entities": ["Trinidad"]},
-                    "Feedback": "[ner] Gate-free GM_good/GM_bad=0.1400 (Recall@5=0.0000, EM=0.0000, F1=0.0000) | Stage[ner]: trace_calls=1 | missed=1",
-                }
-            ],
-            "qa": [
-                {
-                    "Inputs": {"question": "What is the capital?", "context": "Port of Spain is the capital."},
-                    "Generated Outputs": {"answer": "Unknown"},
-                    "Feedback": "[qa] Gate-free GM_good/GM_bad=0.1800 (Recall@5=1.0000, EM=0.0000, F1=0.0000) | Stage[qa]: trace_calls=1 | missed=1",
-                }
-            ],
-        }
-        candidate = {
-            "ner": "Extract named entities. Return a JSON object with key `named_entities`.",
-            "qa": "Answer the question concisely from context.",
-        }
-        with dspy.context(track_usage=True):
-            updated = proposer(candidate, reflective_dataset, ["ner", "qa"])
-
-        self.assertIn("ner", updated)
-        self.assertIn("qa", updated)
-        self.assertGreaterEqual(len(proposer.simba_telemetry), 1)
-        simba_entry = proposer.simba_telemetry[-1]
-        self.assertEqual(simba_entry["optimizer"], "dspy.SIMBA")
-        self.assertGreaterEqual(simba_entry["trainset_size"], 2)
+        self.assertFalse(proposer.step_simba())
+        self.assertEqual(proposer.dump_simba_state()["version"], 2)
+        self.assertIn("shortened_instruction", proposer.qwen_compressor.signature.output_fields)
 
     def test_sprint1_configure_yaw_dspy_cache_and_zero_deprecation_warning(self) -> None:
         import tempfile
@@ -1750,9 +1470,7 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             warnings.simplefilter("always", DeprecationWarning)
             copied = lm.copy(temperature=0.35)
             self.assertIsInstance(copied, YawDSPyLM)
-            legacy_warnings = [
-                w for w in caught if "BaseLM.forward()" in str(w.message)
-            ]
+            legacy_warnings = [w for w in caught if "BaseLM.forward()" in str(w.message)]
             self.assertEqual(len(legacy_warnings), 0)
 
     def test_sprint1_yaw_gbnf_adapter_contract(self) -> None:
@@ -1800,7 +1518,9 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             CompressInstructionSignature,
         ):
             grammar = adapter.resolve_grammar(direct_sig)
-            self.assertIsInstance(grammar, str, f"Expected grammar string for {direct_sig.__name__}")
+            self.assertIsInstance(
+                grammar, str, f"Expected grammar string for {direct_sig.__name__}"
+            )
             self.assertIn("root ::=", str(grammar))
 
         for rlm_sig in (HealSHACLViolations, ReflectiveInnerDistillerSignature):
@@ -1852,7 +1572,9 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             return out
 
         embedder = dspy.Embedder(fake_embed_fn, batch_size=2, caching=False)
-        adapter = DSPyEmbeddingAdapter(profile=profile, embedder=embedder, batch_size=2, caching=False)
+        adapter = DSPyEmbeddingAdapter(
+            profile=profile, embedder=embedder, batch_size=2, caching=False
+        )
         self.assertTrue(issubclass(DSPyEmbeddingAdapter, dspy.Embedder))
         self.assertIsInstance(adapter, dspy.Embedder)
 
@@ -1870,9 +1592,7 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             async_vecs = anyio.run(
                 lambda: adapter.abatch_encode(texts, batch_size=2, stage="entity_embed")
             )
-            acall_vecs = anyio.run(
-                lambda: adapter.acall(texts, batch_size=2, stage="entity_embed")
-            )
+            acall_vecs = anyio.run(lambda: adapter.acall(texts, batch_size=2, stage="entity_embed"))
             async_fn = adapter.as_async()
             asyncified_vecs = anyio.run(
                 lambda: async_fn(texts, instruction=FACT_INSTRUCTION, batch_size=2)
@@ -1903,7 +1623,9 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         for sym in ("YawPassage", "YawRM", "YawRetriever"):
             self.assertIn(sym, inf_pkg.__all__)
 
-        psg = YawPassage(long_text="Erik Hort was born in Montebello.", pid="chunk-0", score=0.91, rank=1)
+        psg = YawPassage(
+            long_text="Erik Hort was born in Montebello.", pid="chunk-0", score=0.91, rank=1
+        )
         self.assertEqual(psg.long_text, "Erik Hort was born in Montebello.")
         self.assertEqual(psg.pid, "chunk-0")
         self.assertAlmostEqual(psg.score, 0.91)
@@ -1948,7 +1670,9 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             )
 
         self.assertTrue(issubclass(YawRetriever, dspy.Retrieve))
-        qa_lm = DummyLM([{"reasoning": "Montebello is in Rockland County.", "answer": "Rockland County"}])
+        qa_lm = DummyLM(
+            [{"reasoning": "Montebello is in Rockland County.", "answer": "Rockland County"}]
+        )
         prog = HippoRAGProgram(orchestrator_lm=qa_lm, rlm_sub_lm=qa_lm)
         self.assertIsInstance(prog.rm, YawRM)
         self.assertIsInstance(prog.retriever, YawRetriever)
@@ -2034,12 +1758,26 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             dspy.Prediction(
                 named_entities=[
                     ["New York", "State in Northeastern US"],
-                    ["new york", "US state"],
+                    ["new york", "State in Northeastern US"],
                 ]
             ),
         )
         self.assertLess(ner_dup_score, 1.0)
         self.assertIn("ConceptShape/prefLabel", ner_dup_fb)
+
+        # Same label with distinct definitions remains a provisional sense split;
+        # semantic adjudication belongs to the synonym stage.
+        homograph_score, _ = validate_stage_invariants(
+            "ner",
+            {"passage": "Mercury can refer to a planet or a chemical element."},
+            dspy.Prediction(
+                named_entities=[
+                    ["Mercury", "Planet nearest the Sun"],
+                    ["mercury", "Chemical element with symbol Hg"],
+                ]
+            ),
+        )
+        self.assertEqual(homograph_score, 1.0)
 
         # 2. Stage 2: triples (StatementShape/closedWorld & Connected Nodes)
         stage1_ents = [
@@ -2065,7 +1803,10 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         # Novel entity WITHOUT inline [name, def] violates StatementShape/closedWorld
         triples_cw_score, triples_cw_fb = validate_stage_invariants(
             "triples",
-            {"passage": "Ada Lovelace collaborated with Charles Babbage.", "named_entities": stage1_ents},
+            {
+                "passage": "Ada Lovelace collaborated with Charles Babbage.",
+                "named_entities": stage1_ents,
+            },
             dspy.Prediction(
                 triples=[
                     {
@@ -2083,7 +1824,10 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         # Novel entity WITH inline [name, def] satisfies StatementShape/closedWorld
         triples_inline_score, _ = validate_stage_invariants(
             "triples",
-            {"passage": "Ada Lovelace collaborated with Charles Babbage.", "named_entities": [["Ada Lovelace", "English mathematician"]]},
+            {
+                "passage": "Ada Lovelace collaborated with Charles Babbage.",
+                "named_entities": [["Ada Lovelace", "English mathematician"]],
+            },
             dspy.Prediction(
                 triples=[
                     {
@@ -2112,7 +1856,12 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             dspy.Prediction(
                 triples=[
                     {"sub": "Alpha", "pred": "links", "obj": "Beta", "def": "Alpha links to Beta."},
-                    {"sub": "Gamma", "pred": "links", "obj": "Delta", "def": "Gamma links to Delta."},
+                    {
+                        "sub": "Gamma",
+                        "pred": "links",
+                        "obj": "Delta",
+                        "def": "Gamma links to Delta.",
+                    },
                 ]
             ),
         )
@@ -2131,9 +1880,7 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         ed_bad, ed_bad_fb = validate_stage_invariants(
             "entity_definer",
             {"missing_entities": ["Charles Babbage", "Analytical Engine"]},
-            dspy.Prediction(
-                entity_definitions=[["Charles Babbage", "Charles Babbage"]]
-            ),
+            dspy.Prediction(entity_definitions=[["Charles Babbage", "Charles Babbage"]]),
         )
         self.assertLess(ed_bad, 1.0)
         self.assertIn("ConceptShape/definition", ed_bad_fb)
@@ -2143,7 +1890,9 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             "synonym_judge",
             {"candidate_pairs": '[{"pair_id": "ent-1|ent-2"}]'},
             dspy.Prediction(
-                decisions=[{"pair_id": "ent-1|ent-2", "relation": "skos:altLabel", "canonical": "A"}]
+                decisions=[
+                    {"pair_id": "ent-1|ent-2", "relation": "skos:altLabel", "canonical": "A"}
+                ]
             ),
         )
         self.assertEqual(syn_ok, 1.0)
@@ -2164,7 +1913,13 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             "shacl_repair",
             {"violations": '[{"focus_node": "ent-1", "source_shape": "ConceptShape/definition"}]'},
             dspy.Prediction(
-                repairs=[{"focus_node": "ent-1", "action": "set_definition", "value": "Valid contextual definition"}]
+                repairs=[
+                    {
+                        "focus_node": "ent-1",
+                        "action": "set_definition",
+                        "value": "Valid contextual definition",
+                    }
+                ]
             ),
             shacl_linter=lambda: [],
         )
@@ -2175,7 +1930,9 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             dspy.Prediction(
                 repairs=[{"focus_node": "ent-999", "action": "set_definition", "value": ""}]
             ),
-            shacl_linter=lambda: [{"focus_node": "ent-1", "source_shape": "ConceptShape/definition"}],
+            shacl_linter=lambda: [
+                {"focus_node": "ent-1", "source_shape": "ConceptShape/definition"}
+            ],
         )
         self.assertLess(shacl_bad, 1.0)
         self.assertIn("ConceptShape/definition", shacl_bad_fb)
@@ -2221,7 +1978,9 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         qa_ok, _ = validate_stage_invariants(
             "qa",
             {"context": "Montebello is in Rockland County.", "question": "What county?"},
-            dspy.Prediction(reasoning="Montebello is in Rockland County.", answer="Rockland County"),
+            dspy.Prediction(
+                reasoning="Montebello is in Rockland County.", answer="Rockland County"
+            ),
         )
         self.assertEqual(qa_ok, 1.0)
         qa_abstain, _ = validate_stage_invariants(
@@ -2236,7 +1995,7 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             "qwen_proposer",
             {
                 "component_name": "ner",
-                "current_instruction": 'Return JSON with key `named_entities`.',
+                "current_instruction": "Return JSON with key `named_entities`.",
             },
             dspy.Prediction(
                 new_instruction="Extract all salient entities with definitions. Return JSON with key `named_entities`."
@@ -2247,11 +2006,9 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             "qwen_proposer",
             {
                 "component_name": "ner",
-                "current_instruction": 'Return JSON with key `named_entities`.',
+                "current_instruction": "Return JSON with key `named_entities`.",
             },
-            dspy.Prediction(
-                new_instruction="Extract <TargetEntity> from the passage."
-            ),
+            dspy.Prediction(new_instruction="Extract <TargetEntity> from the passage."),
         )
         self.assertLess(prop_leak, 1.0)
         self.assertIn("named_entities", prop_leak_fb)
@@ -2264,7 +2021,9 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             ]
         )
         prog = HippoRAGProgram(orchestrator_lm=retry_lm, rlm_sub_lm=retry_lm)
-        defs = prog.extract_entity_definitions("Ada Lovelace was an English mathematician and writer.")
+        defs = prog.extract_entity_definitions(
+            "Ada Lovelace was an English mathematician and writer."
+        )
         self.assertEqual(defs, (("Ada Lovelace", "English mathematician and writer"),))
         self.assertEqual(prog.telemetry[-1].get("invariant_retries"), 1)
         self.assertEqual(prog.telemetry[-1].get("invariant_score"), 1.0)
@@ -2297,8 +2056,14 @@ class PromptsAndParsersParityTests(unittest.TestCase):
                         }
                     ]
                 },
-                {"reasoning": "Erik Hort was born in Montebello, Rockland County.", "answer": "Rockland County"},
-                {"reasoning": "Erik Hort was born in Montebello, Rockland County.", "answer": "Rockland County"},
+                {
+                    "reasoning": "Erik Hort was born in Montebello, Rockland County.",
+                    "answer": "Rockland County",
+                },
+                {
+                    "reasoning": "Erik Hort was born in Montebello, Rockland County.",
+                    "answer": "Rockland County",
+                },
             ]
         )
         lm2 = DummyLM(

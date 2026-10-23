@@ -103,7 +103,9 @@ def test_run_ppr_mass_conservation_and_multi_hop() -> None:
 
     # Seed entity-A only
     reset = {"entity-A": 1.0}
-    p = run_ppr(graph, reset, damping=0.5, max_iter=100, tol=1e-6, activation="linear", dual_weight=None)
+    p = run_ppr(
+        graph, reset, damping=0.5, max_iter=100, tol=1e-6, activation="linear", dual_weight=None
+    )
 
     # Probability mass conserved in linear mode
     assert np.isclose(np.sum(p), 1.0, atol=1e-5)
@@ -172,7 +174,9 @@ def test_apply_graph_activation_invariants() -> None:
         # Lipschitz condition: |f(x) - f(y)| <= |x - y|
         diffs_f = np.abs(f_grid[1:] - f_grid[:-1])
         diffs_x = np.abs(grid[1:] - grid[:-1])
-        assert np.all(diffs_f <= diffs_x + 1e-9), f"Activation {act} violates 1-Lipschitz contraction"
+        assert np.all(diffs_f <= diffs_x + 1e-9), (
+            f"Activation {act} violates 1-Lipschitz contraction"
+        )
 
     # 2. Hub suppression: scaled_tanh and hard_tanh compress large values
     large_x = np.array([0.5, 1.0, 2.0])
@@ -274,7 +278,7 @@ def test_build_transition_matrix_beta_normalization() -> None:
     # 4. Arbitrary beta (e.g. 0.7): entry is d_i^-0.7 * d_j^-0.3
     g_arb = build_transition_matrix(chunks, entities, edges, beta=0.7)
     w_arb = g_arb.transition_t.toarray()
-    expected_arb = (3.0 ** -0.7) * (1.0 ** -0.3)
+    expected_arb = (3.0**-0.7) * (1.0**-0.3)
     assert np.isclose(w_arb[idx_hub, idx_l1], expected_arb)
 
 
@@ -308,5 +312,3 @@ def test_run_ppr_dual_weight_combination() -> None:
     assert len(ranked) == 2
     assert ranked[0][0] == "c-1"
     assert ranked[1][0] == "c-2"
-
-

@@ -22,7 +22,9 @@ from yaw.daemon.graph.inference.embedding import (
 
 
 class EmbeddingTests(unittest.TestCase):
-    def test_titled_and_distinct_titled_modes_format_multiline_passages_and_preserve_single_line_inputs(self):
+    def test_titled_and_distinct_titled_modes_format_multiline_passages_and_preserve_single_line_inputs(
+        self,
+    ):
         base_profile = resolve_embedding_profile(MODEL, "search")
         titled_profile = resolve_embedding_profile(MODEL, "titled")
         distinct_titled_profile = resolve_embedding_profile(MODEL, "distinct-titled")
@@ -33,7 +35,13 @@ class EmbeddingTests(unittest.TestCase):
         self.assertEqual(titled_profile.query_instruction_mode, "shared")
         self.assertEqual(distinct_titled_profile.query_instruction_mode, "distinct")
         self.assertEqual(
-            len({base_profile.index_identity, titled_profile.index_identity, distinct_titled_profile.index_identity}),
+            len(
+                {
+                    base_profile.index_identity,
+                    titled_profile.index_identity,
+                    distinct_titled_profile.index_identity,
+                }
+            ),
             3,
         )
 
@@ -75,12 +83,18 @@ class EmbeddingTests(unittest.TestCase):
 
     def test_dspy_embedder_and_adapter_preserve_prefixes_and_l2_normalization(self):
         # Verify Lemonade (openai/...) and Ollama (ollama/...) dspy.Embedder initialization
-        lemonade_emb = create_dspy_embedder(MODEL, base_url="http://localhost:13305/api/v1", provider="openai")
+        lemonade_emb = create_dspy_embedder(
+            MODEL, base_url="http://localhost:13305/api/v1", provider="openai"
+        )
         self.assertEqual(lemonade_emb.model, f"openai/{MODEL}")
         self.assertEqual(lemonade_emb.default_kwargs.get("encoding_format"), "float")
-        self.assertEqual(lemonade_emb.default_kwargs.get("api_base"), "http://localhost:13305/api/v1")
+        self.assertEqual(
+            lemonade_emb.default_kwargs.get("api_base"), "http://localhost:13305/api/v1"
+        )
 
-        ollama_emb = create_dspy_embedder("nomic-embed-text", base_url="http://localhost:11434", provider="ollama")
+        ollama_emb = create_dspy_embedder(
+            "nomic-embed-text", base_url="http://localhost:11434", provider="ollama"
+        )
         self.assertEqual(ollama_emb.model, "ollama/nomic-embed-text")
         self.assertEqual(ollama_emb.default_kwargs.get("api_base"), "http://localhost:11434")
 
@@ -165,6 +179,7 @@ class EmbeddingTests(unittest.TestCase):
 
     def test_adaptive_batch_splitting_on_physical_batch_overflow(self):
         """Verify DSPyEmbeddingAdapter gracefully splits without truncation on physical batch overflow."""
+
         def overflow_embed_fn(texts: list[str]) -> np.ndarray:
             if len(texts) > 1 or any(len(x) > 4000 for x in texts):
                 raise RuntimeError(

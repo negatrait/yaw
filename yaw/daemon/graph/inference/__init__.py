@@ -5,6 +5,11 @@ from typing import Any
 
 # Single source of truth: only these symbols are exposed as the public package contract.
 _PUBLIC_API: dict[str, str] = {
+    "ActiveReflectionCheckpoint": ".reflection",
+    "checkpoint_object": ".reflection",
+    "validate_active_checkpoint": ".reflection",
+    "validate_request_checkpoint": ".reflection",
+    "validate_simba_state": ".reflection",
     # Native DSPy LM & Heterogeneous RLM
     "create_dspy_lm": ".chat",
     "create_dspy_rlm_pair": ".chat",
@@ -34,6 +39,7 @@ _PUBLIC_API: dict[str, str] = {
     # Native DSPy Program & 12 Canonical Signatures
     "HippoRAGProgram": ".program",
     "RLMInstructionProposer": ".program",
+    "ServingTokenCounter": ".reflection",
     "YawGBNFAdapter": ".program",
     "YawPassage": ".program",
     "YawRM": ".program",

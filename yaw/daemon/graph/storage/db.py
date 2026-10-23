@@ -20,11 +20,50 @@ _SQL_BATCH_SIZE = 500
 _MAX_FTS_TERMS = 24
 _FTS_STOPWORDS = frozenset(
     {
-        "a", "an", "and", "are", "as", "at", "be", "by", "did", "do", "does",
-        "for", "from", "had", "has", "have", "how", "in", "into", "is", "it",
-        "its", "of", "on", "or", "that", "the", "their", "then", "there",
-        "these", "they", "this", "to", "was", "were", "what", "when", "where",
-        "which", "who", "whom", "why", "with",
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "by",
+        "did",
+        "do",
+        "does",
+        "for",
+        "from",
+        "had",
+        "has",
+        "have",
+        "how",
+        "in",
+        "into",
+        "is",
+        "it",
+        "its",
+        "of",
+        "on",
+        "or",
+        "that",
+        "the",
+        "their",
+        "then",
+        "there",
+        "these",
+        "they",
+        "this",
+        "to",
+        "was",
+        "were",
+        "what",
+        "when",
+        "where",
+        "which",
+        "who",
+        "whom",
+        "why",
+        "with",
     }
 )
 
@@ -238,12 +277,16 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
         if "content_hash" in chunk_cols:
             conn.execute("ALTER TABLE chunks DROP COLUMN content_hash")
         if "ast_island_start" not in chunk_cols:
-            conn.execute("ALTER TABLE chunks ADD COLUMN ast_island_start INTEGER NOT NULL DEFAULT 0")
+            conn.execute(
+                "ALTER TABLE chunks ADD COLUMN ast_island_start INTEGER NOT NULL DEFAULT 0"
+            )
         if "ast_island_end" not in chunk_cols:
             conn.execute("ALTER TABLE chunks ADD COLUMN ast_island_end INTEGER NOT NULL DEFAULT 0")
 
         # Auto-migrate openie_chunks.structured_triples_json
-        openie_cols = {row[1] for row in conn.execute("PRAGMA table_info(openie_chunks)").fetchall()}
+        openie_cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(openie_chunks)").fetchall()
+        }
         if "structured_triples_json" not in openie_cols:
             conn.execute(
                 "ALTER TABLE openie_chunks ADD COLUMN structured_triples_json TEXT NOT NULL DEFAULT '[]'"
@@ -346,7 +389,9 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
                     except Exception:
                         fts_items.append((fid, pred))
                 if fts_items:
-                    conn.executemany("INSERT INTO fact_fts (fact_id, text) VALUES (?, ?)", fts_items)
+                    conn.executemany(
+                        "INSERT INTO fact_fts (fact_id, text) VALUES (?, ?)", fts_items
+                    )
 
 
 def serialize_f32_vector(vector: np.ndarray | Sequence[float]) -> bytes:
@@ -500,7 +545,9 @@ def _is_acronym_match(name_a: str, name_b: str) -> bool:
     initials = "".join(w[0].lower() for w in words if w)
     if short == initials:
         return True
-    non_stop_initials = "".join(w[0].lower() for w in words if w and w.lower() not in _FTS_STOPWORDS)
+    non_stop_initials = "".join(
+        w[0].lower() for w in words if w and w.lower() not in _FTS_STOPWORDS
+    )
     return len(non_stop_initials) >= 2 and short == non_stop_initials
 
 
@@ -643,6 +690,8 @@ def find_entity_disambiguation_candidates(
             if _is_acronym_match(name_a, name_b):
                 lexical_pairs[key] = max(lexical_threshold, 0.85)
                 continue
+            if norm_a.isdigit() and norm_b.isdigit():
+                continue
             len_b = len(norm_b)
             if min(len_a, len_b) / max(len_a, len_b) < 0.4:
                 continue
@@ -650,13 +699,23 @@ def find_entity_disambiguation_candidates(
                 matcher.set_seq2(norm_a)
                 matcher_seq2_set = True
             matcher.set_seq1(norm_b)
-            if matcher.real_quick_ratio() < lexical_threshold:
-                continue
-            if matcher.quick_ratio() < lexical_threshold:
-                continue
-            ratio = matcher.ratio()
-            if ratio >= lexical_threshold:
-                lexical_pairs[key] = ratio
+            best_ratio = 0.0
+            if (
+                matcher.real_quick_ratio() >= lexical_threshold
+                and matcher.quick_ratio() >= lexical_threshold
+            ):
+                best_ratio = matcher.ratio()
+            if best_ratio < lexical_threshold and (" " in norm_a or " " in norm_b):
+                alnum_a = re.sub(r"[^a-z0-9]", "", norm_a)
+                alnum_b = re.sub(r"[^a-z0-9]", "", norm_b)
+                if alnum_a and alnum_b and not (alnum_a.isdigit() and alnum_b.isdigit()):
+                    alnum_ratio = difflib.SequenceMatcher(
+                        None, alnum_b, alnum_a, autojunk=False
+                    ).ratio()
+                    if alnum_ratio > best_ratio:
+                        best_ratio = alnum_ratio
+            if best_ratio >= lexical_threshold:
+                lexical_pairs[key] = best_ratio
 
     for row in conn.execute(
         """
@@ -732,7 +791,15 @@ def upsert_chunk_pointers(
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                (p.chunk_id, p.rel_posix_path, p.start_line, p.end_line, p.title, p.ast_island_start, p.ast_island_end)
+                (
+                    p.chunk_id,
+                    p.rel_posix_path,
+                    p.start_line,
+                    p.end_line,
+                    p.title,
+                    p.ast_island_start,
+                    p.ast_island_end,
+                )
                 for p, _ in chunks
             ),
         )
@@ -993,9 +1060,7 @@ def save_openie_checkpoints(
 
 def _normalize_label(text: str) -> str:
     """Normalize an entity label or name to lowercase alphanumeric tokens (matching text_processing)."""
-    normalized = "".join(
-        ch if ch.isalnum() or ch.isspace() else " " for ch in str(text).casefold()
-    )
+    normalized = "".join(ch if ch.isalnum() or ch.isspace() else " " for ch in str(text).casefold())
     return " ".join(normalized.split())
 
 
@@ -1236,9 +1301,7 @@ def resolve_entity_labels(
     if query_vec is None:
         return by_norm
 
-    ambiguous_eids: list[str] = [
-        eid for eids in by_norm.values() if len(eids) > 1 for eid in eids
-    ]
+    ambiguous_eids: list[str] = [eid for eids in by_norm.values() if len(eids) > 1 for eid in eids]
     if not ambiguous_eids:
         return by_norm
 
@@ -1277,7 +1340,9 @@ def merge_entities(
     if src_id == dst_id:
         return
     if label_kind not in ("skos:altLabel", "skos:hiddenLabel"):
-        raise ValueError(f"merge_entities label_kind must be skos:altLabel or skos:hiddenLabel, got {label_kind!r}")
+        raise ValueError(
+            f"merge_entities label_kind must be skos:altLabel or skos:hiddenLabel, got {label_kind!r}"
+        )
 
     with _write_tx(conn):
         src_row = conn.execute(
@@ -1309,8 +1374,10 @@ def merge_entities(
         if src_labels:
             for l_norm, l_kind, raw_lbl, cid in src_labels:
                 norm_str = str(l_norm)
-                new_kind = "skos:prefLabel" if norm_str == dst_pref_norm else (
-                    label_kind if str(l_kind) == "skos:prefLabel" else str(l_kind)
+                new_kind = (
+                    "skos:prefLabel"
+                    if norm_str == dst_pref_norm
+                    else (label_kind if str(l_kind) == "skos:prefLabel" else str(l_kind))
                 )
                 labels_to_upsert.append((norm_str, dst_id, new_kind, str(raw_lbl), str(cid)))
         else:
@@ -1476,9 +1543,7 @@ def upsert_edges_with_sources(
             """,
             ((src, dst, kind, weight) for src, dst, kind, weight, _ in edges_with_sources),
         )
-        fact_pairs = {
-            (src, dst) for src, dst, kind, _, _ in edges_with_sources if kind == "fact"
-        }
+        fact_pairs = {(src, dst) for src, dst, kind, _, _ in edges_with_sources if kind == "fact"}
         if fact_pairs:
             conn.executemany(
                 """
@@ -1655,7 +1720,11 @@ def inspect_focus_node(
         )
     ]
 
-    chunk_ids_set: set[str] = {item["chunk_id"] for item in labels if item["chunk_id"] and not item["chunk_id"].startswith("__")}
+    chunk_ids_set: set[str] = {
+        item["chunk_id"]
+        for item in labels
+        if item["chunk_id"] and not item["chunk_id"].startswith("__")
+    }
     for r in conn.execute(
         "SELECT DISTINCT chunk_id FROM edge_sources WHERE src_id IN (?, ?) OR dst_id IN (?, ?)",
         (focus_node, eid, focus_node, eid),
@@ -1773,11 +1842,34 @@ def load_graph_topology(
     return chunk_ids, entity_ids, edges
 
 
+def _are_same_label_homographs(conn: sqlite3.Connection, ent1: str, ent2: str) -> bool:
+    """Return True if ent1 and ent2 share a skos:prefLabel norm or normalized entity name (e.g. 'a ball' vs 'a ball')."""
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM entities a
+        INNER JOIN entities b ON a.entity_id = ? AND b.entity_id = ?
+        WHERE LOWER(TRIM(a.name)) != '' AND LOWER(TRIM(a.name)) = LOWER(TRIM(b.name))
+        UNION ALL
+        SELECT 1
+        FROM entity_labels la
+        INNER JOIN entity_labels lb
+          ON la.label_norm = lb.label_norm
+         AND la.label_kind = 'skos:prefLabel'
+         AND lb.label_kind = 'skos:prefLabel'
+        WHERE la.entity_id = ? AND lb.entity_id = ?
+        LIMIT 1
+        """,
+        (ent1, ent2, ent1, ent2),
+    ).fetchone()
+    return row is not None
+
+
 def upsert_semantic_edges(
     conn: sqlite3.Connection,
     edges: Sequence[tuple[str, str, str, float]],
 ) -> None:
-    """Bulk upsert symmetric skos:related and owl:differentFrom edges with owl:differentFrom dominance."""
+    """Bulk upsert symmetric skos:related and owl:differentFrom edges (allowing both on same-label homographs like 'a ball' vs 'a ball')."""
     if not edges:
         return
     with _write_tx(conn):
@@ -1786,15 +1878,17 @@ def upsert_semantic_edges(
                 continue
             if kind not in ("skos:related", "owl:differentFrom"):
                 raise ValueError(f"Unsupported semantic edge kind: {kind!r}")
+            is_homograph = _are_same_label_homographs(conn, ent1, ent2)
             if kind == "owl:differentFrom":
-                conn.execute(
-                    """
-                    DELETE FROM edges
-                    WHERE kind = 'skos:related'
-                      AND ((src_id = ? AND dst_id = ?) OR (src_id = ? AND dst_id = ?))
-                    """,
-                    (ent1, ent2, ent2, ent1),
-                )
+                if not is_homograph:
+                    conn.execute(
+                        """
+                        DELETE FROM edges
+                        WHERE kind = 'skos:related'
+                          AND ((src_id = ? AND dst_id = ?) OR (src_id = ? AND dst_id = ?))
+                        """,
+                        (ent1, ent2, ent2, ent1),
+                    )
                 for s, d in ((ent1, ent2), (ent2, ent1)):
                     conn.execute(
                         """
@@ -1805,15 +1899,19 @@ def upsert_semantic_edges(
                         (s, d),
                     )
             else:
-                has_diff = conn.execute(
-                    """
-                    SELECT 1 FROM edges
-                    WHERE kind = 'owl:differentFrom'
-                      AND ((src_id = ? AND dst_id = ?) OR (src_id = ? AND dst_id = ?))
-                    LIMIT 1
-                    """,
-                    (ent1, ent2, ent2, ent1),
-                ).fetchone()
+                has_diff = (
+                    None
+                    if is_homograph
+                    else conn.execute(
+                        """
+                        SELECT 1 FROM edges
+                        WHERE kind = 'owl:differentFrom'
+                          AND ((src_id = ? AND dst_id = ?) OR (src_id = ? AND dst_id = ?))
+                        LIMIT 1
+                        """,
+                        (ent1, ent2, ent2, ent1),
+                    ).fetchone()
+                )
                 if has_diff is None:
                     rel_weight = max(float(weight), 1e-6)
                     for s, d in ((ent1, ent2), (ent2, ent1)):
@@ -1825,6 +1923,16 @@ def upsert_semantic_edges(
                             """,
                             (s, d, rel_weight),
                         )
+                    if is_homograph:
+                        for s, d in ((ent1, ent2), (ent2, ent1)):
+                            conn.execute(
+                                """
+                                INSERT INTO edges (src_id, dst_id, kind, weight)
+                                VALUES (?, ?, 'owl:differentFrom', 0.0)
+                                ON CONFLICT(src_id, dst_id, kind) DO UPDATE SET weight = 0.0
+                                """,
+                                (s, d),
+                            )
 
 
 def upsert_synonymy_edges(
@@ -2063,6 +2171,19 @@ def _scan_shacl_violations(conn: sqlite3.Connection) -> list[SHACLViolation]:
          AND a.kind = 'skos:related'
          AND b.kind = 'owl:differentFrom'
         WHERE a.src_id < a.dst_id
+          AND NOT EXISTS (
+              SELECT 1 FROM entities ea
+              INNER JOIN entities eb ON ea.entity_id = a.src_id AND eb.entity_id = a.dst_id
+              WHERE LOWER(TRIM(ea.name)) != '' AND LOWER(TRIM(ea.name)) = LOWER(TRIM(eb.name))
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM entity_labels la
+              INNER JOIN entity_labels lb
+                ON la.label_norm = lb.label_norm
+               AND la.label_kind = 'skos:prefLabel'
+               AND lb.label_kind = 'skos:prefLabel'
+              WHERE la.entity_id = a.src_id AND lb.entity_id = a.dst_id
+          )
         ORDER BY a.src_id ASC, a.dst_id ASC
         """
     ):
@@ -2276,8 +2397,12 @@ def lint_graph_shacl(
         if dangling_fids:
             for batch in _batched(dangling_fids):
                 placeholders = ",".join("?" for _ in batch)
-                conn.execute(f"DELETE FROM fact_vec WHERE fact_id IN ({placeholders})", tuple(batch))
-                conn.execute(f"DELETE FROM fact_fts WHERE fact_id IN ({placeholders})", tuple(batch))
+                conn.execute(
+                    f"DELETE FROM fact_vec WHERE fact_id IN ({placeholders})", tuple(batch)
+                )
+                conn.execute(
+                    f"DELETE FROM fact_fts WHERE fact_id IN ({placeholders})", tuple(batch)
+                )
                 conn.execute(f"DELETE FROM facts WHERE fact_id IN ({placeholders})", tuple(batch))
 
         empty_fact_defs = conn.execute(
@@ -2331,6 +2456,19 @@ def lint_graph_shacl(
                     AND b.dst_id = edges.dst_id
                     AND b.kind = 'owl:differentFrom'
               )
+              AND NOT EXISTS (
+                  SELECT 1 FROM entities ea
+                  INNER JOIN entities eb ON ea.entity_id = edges.src_id AND eb.entity_id = edges.dst_id
+                  WHERE LOWER(TRIM(ea.name)) != '' AND LOWER(TRIM(ea.name)) = LOWER(TRIM(eb.name))
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM entity_labels la
+                  INNER JOIN entity_labels lb
+                    ON la.label_norm = lb.label_norm
+                   AND la.label_kind = 'skos:prefLabel'
+                   AND lb.label_kind = 'skos:prefLabel'
+                  WHERE la.entity_id = edges.src_id AND lb.entity_id = edges.dst_id
+              )
             """
         )
         asym_rows = conn.execute(
@@ -2355,10 +2493,7 @@ def lint_graph_shacl(
 
 def _escape_turtle_literal(value: str) -> str:
     escaped = (
-        value.replace("\\", "\\\\")
-        .replace('"', '\\"')
-        .replace("\r", "\\r")
-        .replace("\n", "\\n")
+        value.replace("\\", "\\\\").replace('"', '\\"').replace("\r", "\\r").replace("\n", "\\n")
     )
     return f'"{escaped}"'
 
@@ -2555,11 +2690,19 @@ def delete_chunks(conn: sqlite3.Connection, chunk_ids: Sequence[str]) -> None:
             "DELETE FROM chunk_fts WHERE chunk_id = ?",
             ((cid,) for cid in chunk_ids),
         )
-        conn.execute("DELETE FROM chunk_vec WHERE chunk_id IN (SELECT chunk_id FROM temp._del_chunks)")
-        conn.execute("DELETE FROM openie_chunks WHERE chunk_id IN (SELECT chunk_id FROM temp._del_chunks)")
+        conn.execute(
+            "DELETE FROM chunk_vec WHERE chunk_id IN (SELECT chunk_id FROM temp._del_chunks)"
+        )
+        conn.execute(
+            "DELETE FROM openie_chunks WHERE chunk_id IN (SELECT chunk_id FROM temp._del_chunks)"
+        )
         conn.execute("DELETE FROM chunks WHERE chunk_id IN (SELECT chunk_id FROM temp._del_chunks)")
-        conn.execute("DELETE FROM edge_sources WHERE chunk_id IN (SELECT chunk_id FROM temp._del_chunks)")
-        conn.execute("DELETE FROM entity_labels WHERE chunk_id IN (SELECT chunk_id FROM temp._del_chunks)")
+        conn.execute(
+            "DELETE FROM edge_sources WHERE chunk_id IN (SELECT chunk_id FROM temp._del_chunks)"
+        )
+        conn.execute(
+            "DELETE FROM entity_labels WHERE chunk_id IN (SELECT chunk_id FROM temp._del_chunks)"
+        )
 
         # 3. Prune affected passage/fact edges with zero remaining provenance and update surviving fact weights
         conn.execute(
@@ -2602,8 +2745,12 @@ def delete_chunks(conn: sqlite3.Connection, chunk_ids: Sequence[str]) -> None:
             )
             """
         )
-        conn.execute("DELETE FROM fact_vec WHERE fact_id IN (SELECT fact_id FROM temp._orphan_facts)")
-        conn.execute("DELETE FROM fact_fts WHERE fact_id IN (SELECT fact_id FROM temp._orphan_facts)")
+        conn.execute(
+            "DELETE FROM fact_vec WHERE fact_id IN (SELECT fact_id FROM temp._orphan_facts)"
+        )
+        conn.execute(
+            "DELETE FROM fact_fts WHERE fact_id IN (SELECT fact_id FROM temp._orphan_facts)"
+        )
         conn.execute("DELETE FROM facts WHERE fact_id IN (SELECT fact_id FROM temp._orphan_facts)")
 
         # 5. Prune orphaned entities and entity_vec strictly among candidate entities using index seeks
@@ -2622,9 +2769,15 @@ def delete_chunks(conn: sqlite3.Connection, chunk_ids: Sequence[str]) -> None:
             )
             """
         )
-        conn.execute("DELETE FROM entity_labels WHERE entity_id IN (SELECT entity_id FROM temp._orphan_entities)")
-        conn.execute("DELETE FROM entity_vec WHERE entity_id IN (SELECT entity_id FROM temp._orphan_entities)")
-        conn.execute("DELETE FROM entities WHERE entity_id IN (SELECT entity_id FROM temp._orphan_entities)")
+        conn.execute(
+            "DELETE FROM entity_labels WHERE entity_id IN (SELECT entity_id FROM temp._orphan_entities)"
+        )
+        conn.execute(
+            "DELETE FROM entity_vec WHERE entity_id IN (SELECT entity_id FROM temp._orphan_entities)"
+        )
+        conn.execute(
+            "DELETE FROM entities WHERE entity_id IN (SELECT entity_id FROM temp._orphan_entities)"
+        )
 
         # 6. Prune semantic edges incident to deleted entities
         conn.execute(

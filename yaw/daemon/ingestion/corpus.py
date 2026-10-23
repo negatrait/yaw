@@ -1,6 +1,7 @@
 """Textbook CocoIndex v1 incremental line-pointer and native Tree-sitter AST ingestion pipeline."""
 
 import bisect
+import hashlib
 import json
 import re
 from collections.abc import Callable, Collection, Sequence
@@ -248,7 +249,9 @@ def _extract_markdown_ast_headings(source: str | CodeSource) -> list[tuple[int, 
                     m_atx = _ATX_HEADING_RE.match(first_line)
                     if m_atx is not None:
                         headings_by_line[seg.start_line] = (m_atx.group(1) or "").strip()
-                    elif len(seg_lines) >= 2 and _SETEXT_UNDERLINE_RE.match(seg_lines[1]) is not None:
+                    elif (
+                        len(seg_lines) >= 2 and _SETEXT_UNDERLINE_RE.match(seg_lines[1]) is not None
+                    ):
                         headings_by_line[seg.start_line] = first_line
 
         if not in_ast_code_fence:
@@ -366,7 +369,11 @@ def extract_ast_headings(
         if content_len > 0:
             view = _coco_core.render_ranges(code_src._src, [(pos, pos + content_len)])
             for seg in view.segments:
-                if seg.kind == "frame" and seg.summary is None and seg.start_line not in headings_by_line:
+                if (
+                    seg.kind == "frame"
+                    and seg.summary is None
+                    and seg.start_line not in headings_by_line
+                ):
                     seg_text = src_text[seg.start_char_offset : seg.end_char_offset].strip()
                     first_sig = seg_text.splitlines()[0].strip() if seg_text else ""
                     first_sig = first_sig.rstrip("{:").strip()
@@ -455,7 +462,10 @@ def project_json_records(
             src = CodeSource(clean_text, language="json")
 
     obj_spans = sorted(
-        ((m.chunks[0].start.byte_offset, m.chunks[0].end.byte_offset) for m in _JSON_OBJ_PATTERN.match_source(src)),
+        (
+            (m.chunks[0].start.byte_offset, m.chunks[0].end.byte_offset)
+            for m in _JSON_OBJ_PATTERN.match_source(src)
+        ),
         key=lambda x: (x[0], -x[1]),
     )
     if not obj_spans:
@@ -559,9 +569,7 @@ def project_json_records(
 
             stack.append((key, p_e))
             is_wl = not whitelist or any(
-                fnmatchcase(dotted, pat)
-                or fnmatchcase(key, pat)
-                or pat.startswith(f"{dotted}.")
+                fnmatchcase(dotted, pat) or fnmatchcase(key, pat) or pat.startswith(f"{dotted}.")
                 for pat in whitelist
             )
             if is_wl:
@@ -607,9 +615,7 @@ def project_json_records(
         # 2. 2-Tuple passages [title, [sents...]] under surviving "context"
         if not extracted and obj_tuples:
             ctx_spans = [
-                (v_s, v_e)
-                for k, _d, _ps, _pe, v_s, v_e, _vr in kept_pairs
-                if k == "context"
+                (v_s, v_e) for k, _d, _ps, _pe, v_s, v_e, _vr in kept_pairs if k == "context"
             ]
             sep = "" if is_hotpot else " "
             seen_tuple_spans: set[tuple[int, int]] = set()
@@ -619,8 +625,10 @@ def project_json_records(
                     te = tm.chunks[0].end.byte_offset
                     if (ts, te) in seen_tuple_spans:
                         continue
-                    if c_vs <= ts and te <= c_ve and not any(
-                        b_s <= ts and te <= b_e for b_s, b_e in blacklisted_spans
+                    if (
+                        c_vs <= ts
+                        and te <= c_ve
+                        and not any(b_s <= ts and te <= b_e for b_s, b_e in blacklisted_spans)
                     ):
                         seen_tuple_spans.add((ts, te))
                         try:
@@ -764,7 +772,8 @@ def chunk_json_text(
         clean_body = body_i.replace("\r\n", "\n").rstrip("\n")
         passage_text = (
             f"{clean_title}\n{clean_body}"
-            if clean_title and not (clean_body.startswith(f"{clean_title}\n") or clean_body == clean_title)
+            if clean_title
+            and not (clean_body.startswith(f"{clean_title}\n") or clean_body == clean_title)
             else clean_body
         )
 
@@ -816,7 +825,10 @@ def chunk_json_text(
             ):
                 sc_text = f"{clean_title}\n{sc_text.lstrip()}"
             sub_s = max(rec_start, rec_start + sc.start.line - 1)
-            sub_e = min(rec_end, rec_start + inclusive_end_line(sc.start.line, sc.end.line, sc.end.column) - 1)
+            sub_e = min(
+                rec_end,
+                rec_start + inclusive_end_line(sc.start.line, sc.end.line, sc.end.column) - 1,
+            )
             if sub_e < sub_s:
                 sub_e = sub_s
             cid = compute_chunk_id(rel_posix_path, sub_s, sub_e, sc_text)
@@ -979,7 +991,13 @@ def chunk_markdown_text(
     )
 
 
-@coco.fn(memo=True)
+@coco.fn(
+    memo=True,
+    version=2,
+    # Plain helpers and projection constants are in this module. Track their
+    # source too; adopting a new dependency must invalidate older memo entries.
+    deps={"parser_source": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()},
+)
 async def process_corpus_file(
     file: FileLike,
     corpus_root_str: str,
@@ -1109,7 +1127,7 @@ class CorpusIngestor:
         """Close the underlying CocoIndex environment and release LMDB resources."""
         self._env.close()
 
-    def __enter__(self) -> "CorpusIngestor":
+    def __enter__(self) -> CorpusIngestor:
         return self
 
     def __exit__(self, *args: Any) -> None:

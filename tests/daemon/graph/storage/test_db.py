@@ -156,7 +156,10 @@ def test_contentless_fts5_indexing_and_l1_normalized_lexical_search(tmp_path: Pa
         upsert_chunk_pointers(
             conn,
             [
-                (p1, "Alan Turing was an English mathematician and computer scientist at Bletchley Park."),
+                (
+                    p1,
+                    "Alan Turing was an English mathematician and computer scientist at Bletchley Park.",
+                ),
                 (p2, "Radio City 91.1 is an Indian radio station broadcasting in Bangalore."),
                 (p3, "Bletchley Park was the principal centre of Allied code-breaking in WWII."),
             ],
@@ -244,23 +247,29 @@ def test_graph_upserts_and_atomic_cascading_deletion(tmp_path: Path) -> None:
         upsert_entity_vectors(conn, [("e1", [1.0, 0.0]), ("e2", [0.0, 1.0]), ("e3", [1.0, 1.0])])
 
         # Facts: F1 (exclusive to c1), F2 (exclusive to c2)
-        upsert_facts(conn, [
-            ("f1", "e1", "born in", "e2", '["Alan Turing", "born in", "London"]'),
-            ("f2", "e2", "capital of", "e3", '["London", "capital of", "UK"]'),
-        ])
+        upsert_facts(
+            conn,
+            [
+                ("f1", "e1", "born in", "e2", '["Alan Turing", "born in", "London"]'),
+                ("f2", "e2", "capital of", "e3", '["London", "capital of", "UK"]'),
+            ],
+        )
         upsert_fact_vectors(conn, [("f1", [1.0, 0.0]), ("f2", [0.0, 1.0])])
 
         # Edges and provenance
         # Passage edges: c1 <-> e1, c1 <-> e2; c2 <-> e2, c2 <-> e3
-        upsert_edges_with_sources(conn, [
-            ("c1", "e1", "passage", 1.0, "c1"),
-            ("c1", "e2", "passage", 1.0, "c1"),
-            ("c2", "e2", "passage", 1.0, "c2"),
-            ("c2", "e3", "passage", 1.0, "c2"),
-            # Fact edges: e1 <-> e2 supported by c1, e2 <-> e3 supported by c2
-            ("e1", "e2", "fact", 1.0, "c1"),
-            ("e2", "e3", "fact", 1.0, "c2"),
-        ])
+        upsert_edges_with_sources(
+            conn,
+            [
+                ("c1", "e1", "passage", 1.0, "c1"),
+                ("c1", "e2", "passage", 1.0, "c1"),
+                ("c2", "e2", "passage", 1.0, "c2"),
+                ("c2", "e3", "passage", 1.0, "c2"),
+                # Fact edges: e1 <-> e2 supported by c1, e2 <-> e3 supported by c2
+                ("e1", "e2", "fact", 1.0, "c1"),
+                ("e2", "e3", "fact", 1.0, "c2"),
+            ],
+        )
 
         # Synonymy edge between e1 and an alias e1_alias
         upsert_entities(conn, [("e1_alias", "A. Turing")])
@@ -276,22 +285,38 @@ def test_graph_upserts_and_atomic_cascading_deletion(tmp_path: Path) -> None:
         # 1. c1 metadata and vectors removed
         assert get_chunk_pointer(conn, "c1") is None
         assert get_chunk_pointer(conn, "c2") is not None
-        assert conn.execute("SELECT COUNT(*) FROM chunk_vec WHERE chunk_id = 'c1';").fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM chunk_vec WHERE chunk_id = 'c2';").fetchone()[0] == 1
+        assert (
+            conn.execute("SELECT COUNT(*) FROM chunk_vec WHERE chunk_id = 'c1';").fetchone()[0] == 0
+        )
+        assert (
+            conn.execute("SELECT COUNT(*) FROM chunk_vec WHERE chunk_id = 'c2';").fetchone()[0] == 1
+        )
 
         # 2. Fact F1 (exclusive to c1) is deleted, F2 (supported by c2) remains
         remaining_facts = conn.execute("SELECT fact_id FROM facts;").fetchall()
         assert [r[0] for r in remaining_facts] == ["f2"]
-        assert conn.execute("SELECT COUNT(*) FROM fact_vec WHERE fact_id = 'f1';").fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM fact_vec WHERE fact_id = 'f2';").fetchone()[0] == 1
+        assert (
+            conn.execute("SELECT COUNT(*) FROM fact_vec WHERE fact_id = 'f1';").fetchone()[0] == 0
+        )
+        assert (
+            conn.execute("SELECT COUNT(*) FROM fact_vec WHERE fact_id = 'f2';").fetchone()[0] == 1
+        )
 
         # 3. Entity E1 (exclusive to c1) is deleted, E2 and E3 remain
-        remaining_entities = {r[0] for r in conn.execute("SELECT entity_id FROM entities;").fetchall()}
+        remaining_entities = {
+            r[0] for r in conn.execute("SELECT entity_id FROM entities;").fetchall()
+        }
         assert "e1" not in remaining_entities
         assert "e2" in remaining_entities
         assert "e3" in remaining_entities
-        assert conn.execute("SELECT COUNT(*) FROM entity_vec WHERE entity_id = 'e1';").fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM entity_vec WHERE entity_id = 'e2';").fetchone()[0] == 1
+        assert (
+            conn.execute("SELECT COUNT(*) FROM entity_vec WHERE entity_id = 'e1';").fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute("SELECT COUNT(*) FROM entity_vec WHERE entity_id = 'e2';").fetchone()[0]
+            == 1
+        )
 
         # 4. Synonymy edge incident to deleted e1 is pruned
         syn_edges = conn.execute("SELECT * FROM edges WHERE kind = 'synonymy';").fetchall()
@@ -353,8 +378,14 @@ def test_fts5_real_bm25_proportional_scores_and_long_query_cap(tmp_path: Path) -
         upsert_chunk_pointers(
             conn,
             [
-                (p_dense, "Enigma rotor cipher machine. Enigma rotors and enigma plugboard broke enigma codes."),
-                (p_sparse, "The history of the modern world includes many machines and one enigma."),
+                (
+                    p_dense,
+                    "Enigma rotor cipher machine. Enigma rotors and enigma plugboard broke enigma codes.",
+                ),
+                (
+                    p_sparse,
+                    "The history of the modern world includes many machines and one enigma.",
+                ),
                 (p_bg1, "Sunny skies and warm temperatures across the coastal region today."),
                 (p_bg2, "Fresh basil and olive oil make a classic pasta sauce."),
                 (p_bg3, "Planting perennial flowers in early spring improves root growth."),
@@ -370,7 +401,9 @@ def test_fts5_real_bm25_proportional_scores_and_long_query_cap(tmp_path: Path) -
         assert scores_by_id["c_dense"] > 0.70
 
         # Adversarial 200-word query with punctuation should be capped safely without FTS5 syntax error
-        long_query = " ".join(["enigma", "cipher"] + [f"token_{i}" for i in range(180)] + ["?!@#$%^&*()"])
+        long_query = " ".join(
+            ["enigma", "cipher"] + [f"token_{i}" for i in range(180)] + ["?!@#$%^&*()"]
+        )
         long_hits = search_chunks_fts(conn, long_query, top_k=5)
         assert len(long_hits) >= 1
         assert sum(s for _, s in long_hits) == pytest.approx(1.0, abs=1e-5)
@@ -393,7 +426,9 @@ def test_high_load_batch_operations_exceeding_sqlite_variable_limits(tmp_path: P
         upsert_chunk_vectors(conn, [(cid, [1.0, float(i + 1)]) for i, cid in enumerate(chunk_ids)])
 
         upsert_entities(conn, [(eid, f"Entity {i}") for i, eid in enumerate(entity_ids)])
-        upsert_entity_vectors(conn, [(eid, [1.0, float(i + 1)]) for i, eid in enumerate(entity_ids)])
+        upsert_entity_vectors(
+            conn, [(eid, [1.0, float(i + 1)]) for i, eid in enumerate(entity_ids)]
+        )
 
         records = [
             OpenIERecord(cid, (f"Entity {i}",), ((f"Entity {i}", "rel", f"Entity {i}"),))
@@ -412,7 +447,18 @@ def test_high_load_batch_operations_exceeding_sqlite_variable_limits(tmp_path: P
         assert len(loaded_ckpts) == n_items
 
         # Shared fact edge supported by chunk-0 and chunk-1199
-        upsert_facts(conn, [("f_shared", "ent-0", "linked_to", "ent-1199", '["Entity 0", "linked_to", "Entity 1199"]')])
+        upsert_facts(
+            conn,
+            [
+                (
+                    "f_shared",
+                    "ent-0",
+                    "linked_to",
+                    "ent-1199",
+                    '["Entity 0", "linked_to", "Entity 1199"]',
+                )
+            ],
+        )
         upsert_edges_with_sources(
             conn,
             [
@@ -440,9 +486,27 @@ def test_fact_fts_indexing_search_and_backfill(tmp_path: Path) -> None:
     try:
         # 1. Upsert facts with triples
         facts = [
-            ("fact-1", "ent-curie", "discovered", "ent-radium", '["Marie Curie", "discovered", "radium"]'),
-            ("fact-2", "ent-einstein", "developed", "ent-relativity", '["Albert Einstein", "developed", "general relativity"]'),
-            ("fact-3", "ent-turing", "broke", "ent-enigma", '["Alan Turing", "broke", "Enigma code at Bletchley"]'),
+            (
+                "fact-1",
+                "ent-curie",
+                "discovered",
+                "ent-radium",
+                '["Marie Curie", "discovered", "radium"]',
+            ),
+            (
+                "fact-2",
+                "ent-einstein",
+                "developed",
+                "ent-relativity",
+                '["Albert Einstein", "developed", "general relativity"]',
+            ),
+            (
+                "fact-3",
+                "ent-turing",
+                "broke",
+                "ent-enigma",
+                '["Alan Turing", "broke", "Enigma code at Bletchley"]',
+            ),
         ]
         upsert_facts(conn, facts)
 
@@ -482,7 +546,9 @@ def test_fact_fts_indexing_search_and_backfill(tmp_path: Path) -> None:
         )
         delete_chunks(conn, ["c1"])
         # fact-1 should now be deleted from facts and fact_fts
-        assert conn.execute("SELECT COUNT(*) FROM facts WHERE fact_id = 'fact-1';").fetchone()[0] == 0
+        assert (
+            conn.execute("SELECT COUNT(*) FROM facts WHERE fact_id = 'fact-1';").fetchone()[0] == 0
+        )
         assert search_facts_fts(conn, "radium", top_k=5) == []
         # fact-2 should still be intact
         assert len(search_facts_fts(conn, "relativity", top_k=5)) == 1
@@ -564,7 +630,9 @@ def test_skos_labels_s13_disjointness_and_homograph_resolution(tmp_path: Path) -
         assert resolved_fruit["apple"] == ["ent-apple-fruit"]
 
         # 2-channel candidate generation finds lexical cousins even when cosine = 0.0
-        upsert_entities(conn, [("ent-apple-corp", "Apple Corp.", "Record label founded by The Beatles")])
+        upsert_entities(
+            conn, [("ent-apple-corp", "Apple Corp.", "Record label founded by The Beatles")]
+        )
         upsert_entity_vectors(conn, [("ent-apple-corp", v_fruit)])
         candidates = find_entity_disambiguation_candidates(
             conn, ["ent-apple-inc"], dense_threshold=0.95, dense_top_k=5, lexical_threshold=0.6
@@ -619,7 +687,9 @@ def test_merge_entities_and_semantic_edge_dominance(tmp_path: Path) -> None:
 
         # Alias entity row is gone, its prefLabel "NYC" is now a skos:altLabel on ent-nyc-canon
         assert (
-            conn.execute("SELECT COUNT(*) FROM entities WHERE entity_id = 'ent-nyc-alias';").fetchone()[0]
+            conn.execute(
+                "SELECT COUNT(*) FROM entities WHERE entity_id = 'ent-nyc-alias';"
+            ).fetchone()[0]
             == 0
         )
         alt_rows = conn.execute(
@@ -655,9 +725,7 @@ def test_merge_entities_and_semantic_edge_dominance(tmp_path: Path) -> None:
         conn.execute("DELETE FROM edges WHERE kind = 'fact';")
         conn.commit()
         _, _, topo_edges_after = load_graph_topology(conn)
-        assert not any(
-            {s, d} == {"ent-nyc-canon", "ent-usa"} for s, d, _ in topo_edges_after
-        )
+        assert not any({s, d} == {"ent-nyc-canon", "ent-usa"} for s, d, _ in topo_edges_after)
     finally:
         conn.close()
 
@@ -698,7 +766,10 @@ def test_closed_world_shacl_lint_auto_heal_and_turtle_export(tmp_path: Path) -> 
         # Inspect focus node neighbourhood
         info = inspect_focus_node(conn, "ent-a")
         assert info["entity"] is not None
-        assert info["entity"]["definition"] == "Entity A participates in relation: Entity A relates to Entity B."
+        assert (
+            info["entity"]["definition"]
+            == "Entity A participates in relation: Entity A relates to Entity B."
+        )
 
         # Export W3C Turtle with SHACL report
         ttl = serialize_graph_turtle(conn, violations=violations_after)

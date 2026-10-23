@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,45 +7,52 @@ name = "yaw"
 version = "0.1.0"
 description = "HippoRAG 2 evaluation workspace"
 readme = "README.md"
-requires-python = ">=3.14.7"
+requires-python = ">=3.14"
 dependencies = [
-    "cocoindex>=1.0.25",
-    "dspy[deno]>=3.0.0",
-    "filelock>=3.18.0",
+    "cocoindex>=1.0.26",
+    "dspy[deno]>=3.4.1",
+    "filelock>=3.32.7",
+    "matplotlib>=3.11.2",
     "numpy>=2.5.4",
-    "optuna>=4.0.0",
-    "scipy>=1.15.0",
-    "sqlite-vec>=0.1.6",
+    "optuna>=5.0.0",
+    "psutil>=7.2.2",
+    "scipy>=1.18.1",
+    "sqlite-vec>=0.1.9",
 ]
 
 [project.scripts]
 yaw = "yaw.daemon.cli:cli_entrypoint"
+watchdog = "scripts.watchdog:main"
+preflight = "yaw.core.preflight:main"
+typecheck = "yaw.core.preflight:typecheck"
 
 [dependency-groups]
 dev = [
-    "pytest>=9.0.3",
-    "ruff>=0.11.0",
-    "ty>=0.0.1a0",
+    "pytest>=9.1.1",
+    "pytest-testmon>=2.2.0",
+    "ruff>=0.17.1",
+    "coverage>=7.17.0",
+    "pytest-cov>=7.0.0",
+    "ty>=0.0.89",
 ]
 
 [tool.uv]
 package = true
+preview-features = ["content-addressed-cache"]
 
 [tool.setuptools.packages.find]
 include = ["yaw*"]
 
 [tool.ruff]
-line-length = 100
-target-version = "py312"
+fix = true
+line-length = 120
+target-version = "py314"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
-ignore = ["E501", "B010", "B009"]
 
 [tool.pytest.ini_options]
+addopts = ["--testmon"]
 testpaths = ["tests"]
 pythonpath = ["."]
-filterwarnings = [
-    "ignore::pydantic.warnings.PydanticDeprecatedSince20:litellm.*",
-    "ignore:.*Pydantic serializer warnings.*:UserWarning:pydantic.main",
-]
+markers = ["live: explicitly enabled tests against a resident inference service"]

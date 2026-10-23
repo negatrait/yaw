@@ -1,12 +1,15 @@
 """Single-owner persistent daemon runtime with FileLock, 32-slot bounded queue, and crash-resilient CocoIndex sync."""
 
 import contextlib
+import hashlib
+import importlib.metadata
 import json
 import logging
 import os
 import queue
 import shutil
 import sqlite3
+import tempfile
 import threading
 import time
 import uuid
@@ -64,8 +67,7 @@ def _serialize_sync_delta(delta: SyncDelta) -> str:
 def _deserialize_sync_delta(raw: str) -> SyncDelta:
     data = json.loads(raw)
     added = tuple(
-        (ChunkPointer(**ptr_dict), str(text))
-        for ptr_dict, text in data.get("added_chunks", ())
+        (ChunkPointer(**ptr_dict), str(text)) for ptr_dict, text in data.get("added_chunks", ())
     )
     deleted = tuple(str(cid) for cid in data.get("deleted_chunk_ids", ()))
     return SyncDelta(added_chunks=added, deleted_chunk_ids=deleted)
@@ -87,7 +89,7 @@ class YawRuntime:
     """Single-owner persistent daemon runtime managing yaw.db, CocoIndex, and bounded worker execution."""
 
     _active_lock: ClassVar[threading.Lock] = threading.Lock()
-    _active_instances: ClassVar[dict[Path, "YawRuntime"]] = {}
+    _active_instances: ClassVar[dict[Path, YawRuntime]] = {}
 
     def __init__(
         self,
@@ -171,6 +173,7 @@ class YawRuntime:
             else DSPyEmbeddingAdapter.from_config(self.config)
         )
 
+        assert self.config.max_context_chars is not None
         self.engine = YawGraphEngine(
             db_path=self.config.db_path,
             workspace_root=self.config.corpus_root,
@@ -182,7 +185,10 @@ class YawRuntime:
             synonymy_threshold=self.config.synonymy_threshold,
             synonymy_top_k=self.config.synonymy_top_k,
             embed_batch_size=self.config.embed_batch_size,
+            max_context_chars=self.config.max_context_chars,
+            max_ast_expansion_hops=self.config.max_ast_expansion_hops,
         )
+        self.engine.config = self.config
         self.ingestor = CorpusIngestor(
             corpus_root=self.config.corpus_root,
             state_dir=self.config.state_dir,
@@ -360,7 +366,7 @@ class YawRuntime:
         """Alias for stop()."""
         self.stop()
 
-    def __enter__(self) -> "YawRuntime":
+    def __enter__(self) -> YawRuntime:
         self.start()
         return self
 
@@ -479,7 +485,9 @@ class YawRuntime:
                 self._update_state()
                 continue
 
-            sync_state = "syncing" if item.op_name in ("sync", "rebuild") else self._status.sync_state
+            sync_state = (
+                "syncing" if item.op_name in ("sync", "rebuild") else self._status.sync_state
+            )
             self._update_state(active_op=item.op_name, sync_state=sync_state)
             if item.progress_callback is not None:
                 item.progress_callback("started")
@@ -501,9 +509,7 @@ class YawRuntime:
             except Exception as exc:
                 msg = f"{type(exc).__name__}: {exc}"
                 err_code: Literal["CONSISTENCY_ERROR", "MODEL_ERROR"] = (
-                    "CONSISTENCY_ERROR"
-                    if isinstance(exc, sqlite3.DatabaseError)
-                    else "MODEL_ERROR"
+                    "CONSISTENCY_ERROR" if isinstance(exc, sqlite3.DatabaseError) else "MODEL_ERROR"
                 )
                 wrapped = YawRuntimeError(err_code, msg)
                 self._update_state(
@@ -517,7 +523,11 @@ class YawRuntime:
             else:
                 if item.progress_callback is not None:
                     item.progress_callback("ready")
-                now_ts = time.time() if item.op_name in ("sync", "rebuild") else self._status.last_sync_at
+                now_ts = (
+                    time.time()
+                    if item.op_name in ("sync", "rebuild")
+                    else self._status.last_sync_at
+                )
                 self._update_state(
                     lifecycle="ready",
                     provider_ready=True,
@@ -541,6 +551,7 @@ class YawRuntime:
             return
         cb = progress_callback
         if cb is None:
+
             def _default_sync_progress(msg: str) -> None:
                 self._update_state(active_op=msg, sync_state="syncing")
 
@@ -655,9 +666,7 @@ class YawRuntime:
         progress_callback: Callable[[str], None] | None = None,
     ) -> list[HydratedPassage]:
         """Synchronously retrieve top-k hydrated passages via the bounded worker queue."""
-        return self.retrieve_async(
-            query, top_k=top_k, progress_callback=progress_callback
-        ).result()
+        return self.retrieve_async(query, top_k=top_k, progress_callback=progress_callback).result()
 
     def rag_qa_async(
         self,
@@ -668,9 +677,7 @@ class YawRuntime:
         """Validate question and enqueue multi-hop HippoRAG 2 QA on the worker queue."""
         cleaned = validate_query_input(question)
         if self.stats().chunks == 0:
-            raise YawRuntimeError(
-                "EMPTY_INDEX", "Cannot execute rag_qa on an empty graph index."
-            )
+            raise YawRuntimeError("EMPTY_INDEX", "Cannot execute rag_qa on an empty graph index.")
 
         def _run_qa() -> dict[str, Any]:
             if self.engine is None:
@@ -760,8 +767,12 @@ class YawRuntime:
         auto: Literal["light", "medium", "heavy"] | None = None,
         num_candidates: int | None = None,
         num_trials: int | None = None,
+        sleep_seconds: float | None = None,
+        max_bootstrapped_demos: int | None = None,
+        max_labeled_demos: int | None = None,
         corpus_docs: Sequence[str] | None = None,
         progress_callback: Callable[[str], None] | None = None,
+        run_options: dict[str, Any] | None = None,
     ) -> Path:
         """Compile DSPy prompts and surface bounds on the worker thread and save artifact."""
         target_path = Path(
@@ -772,6 +783,10 @@ class YawRuntime:
         def _run_optimize() -> Path:
             if self.engine is None:
                 raise YawRuntimeError("NOT_READY", "Graph engine is not initialized.")
+
+            self.validate_optimization_run(
+                target_path, trainset, valset, corpus_docs, mode, run_options
+            )
 
             def _progress(msg: str) -> None:
                 self._update_state(active_op=msg)
@@ -797,22 +812,25 @@ class YawRuntime:
                     json.dumps(records_payload, ensure_ascii=False, indent=2),
                     encoding="utf-8",
                 )
-                delta = sync_corpus_once(
-                    corpus_root=self.config.corpus_root,
-                    state_dir=Path(self.config.state_dir) / "opt_slice_state",
-                    included_patterns=(opt_json_rel,),
-                    excluded_patterns=(),
-                    json_keys_whitelist=self.config.json_keys_whitelist,
-                    json_keys_blacklist=self.config.json_keys_blacklist,
-                    chunk_size=self.config.chunk_size,
-                    chunk_overlap=self.config.chunk_overlap,
-                    min_chunk_size=self.config.min_chunk_size,
-                )
-                opt_chunks = list(delta.added_chunks)
-                if opt_chunks and len(opt_chunks) <= 64:
-                    self.engine.index_chunks(
-                        opt_chunks, progress_callback=_progress
+                # Reconstruct the complete pointer pool on restart. A memoized
+                # incremental scan returns only changes, losing unchanged passages
+                # from the optimizer's in-memory candidate pool.
+                Path(self.config.state_dir).mkdir(parents=True, exist_ok=True)
+                with tempfile.TemporaryDirectory(
+                    prefix="opt_slice_", dir=self.config.state_dir
+                ) as scan_state:
+                    delta = sync_corpus_once(
+                        corpus_root=self.config.corpus_root,
+                        state_dir=scan_state,
+                        included_patterns=(opt_json_rel,),
+                        excluded_patterns=(),
+                        json_keys_whitelist=self.config.json_keys_whitelist,
+                        json_keys_blacklist=self.config.json_keys_blacklist,
+                        chunk_size=self.config.chunk_size,
+                        chunk_overlap=self.config.chunk_overlap,
+                        min_chunk_size=self.config.min_chunk_size,
                     )
+                opt_chunks = list(delta.added_chunks)
                 new_stats = self.engine.get_stats(self.config.config_fingerprint())
                 with self._state_lock:
                     self._stats = new_stats
@@ -828,9 +846,16 @@ class YawRuntime:
                     api_key=self.config.api_key,
                     provider=self.config.provider,
                     reflection=True,
+                    context_window_tokens=self.config.context_window_tokens,
+                    max_tokens=self.config.max_output_tokens,
                 )
 
             _progress(f"optimizing: starting {mode} (auto={resolved_auto}) evolution")
+            eff_sleep = (
+                sleep_seconds
+                if sleep_seconds is not None
+                else getattr(self.config, "optimize_sleep_seconds", 0.0)
+            )
             self.engine.evolve_prompts(
                 trainset=trainset,
                 valset=valset,
@@ -843,6 +868,9 @@ class YawRuntime:
                 num_trials=num_trials,
                 progress_callback=_progress,
                 opt_chunks=opt_chunks,
+                sleep_seconds=eff_sleep,
+                max_bootstrapped_demos=max_bootstrapped_demos,
+                max_labeled_demos=max_labeled_demos,
             )
             final_stats = self.engine.get_stats(self.config.config_fingerprint())
             with self._state_lock:
@@ -850,6 +878,103 @@ class YawRuntime:
             return target_path
 
         return self.submit("optimize", _run_optimize, progress_callback=progress_callback).result()
+
+    def validate_optimization_run(
+        self,
+        target_path: Path,
+        trainset: Sequence[Any],
+        valset: Sequence[Any] | None,
+        corpus_docs: Sequence[str] | None,
+        mode: str,
+        run_options: dict[str, Any] | None = None,
+    ) -> None:
+        """Bind checkpoints to their ordered data, inference settings and scoring code.
+
+        Called on the writer thread, before replacing corpus sources or indexing.
+        Budgets may be increased when continuing an existing search.
+        """
+        assert self.engine is not None
+        settings = {
+            k: v
+            for k, v in asdict(self.config).items()
+            if not k.endswith(("_path", "_dir", "_root"))
+            and not k.startswith(("optimize_", "http_"))
+            and k not in {"api_key", "poll_interval_seconds", "queue_maxsize"}
+        }
+        settings.update(
+            max_bootstrapped_demos=self.config.optimize_max_bootstrapped_demos,
+            max_labeled_demos=self.config.optimize_max_labeled_demos,
+        )
+        daemon_dir = Path(__file__).parent
+        source_paths = sorted((daemon_dir / "graph").rglob("*.py"))
+        source_paths.append(daemon_dir / "ingestion" / "corpus.py")
+        identity = {
+            "version": 1,
+            "mode": mode,
+            "settings": settings,
+            "data_sha256": hashlib.sha256(
+                json.dumps(
+                    {
+                        "train": [ex.toDict() for ex in trainset],
+                        "val": [ex.toDict() for ex in (valset or trainset)],
+                        "corpus": list(corpus_docs or ()),
+                    },
+                    sort_keys=True,
+                    ensure_ascii=False,
+                ).encode("utf-8")
+            ).hexdigest(),
+            "code_sha256": hashlib.sha256(
+                b"".join(
+                    p.relative_to(daemon_dir).as_posix().encode("utf-8") + b"\0" + p.read_bytes()
+                    for p in source_paths
+                )
+            ).hexdigest(),
+            "packages": {
+                name: importlib.metadata.version(name)
+                for name in ("dspy", "gepa", "cocoindex", "sqlite-vec", "scipy")
+            },
+        }
+        # TOML tuples become JSON lists on disk; compare the canonical form.
+        identity = json.loads(json.dumps(identity))
+        conn = self.engine.conn
+        row = conn.execute("SELECT value FROM meta WHERE key = 'optimization_run'").fetchone()
+        if row is not None:
+            saved = json.loads(row[0])
+            if saved["identity"] != identity or saved["output_path"] != str(target_path):
+                raise YawRuntimeError(
+                    "INVALID_INPUT",
+                    "Cannot resume: optimization data, settings, code, packages or output path "
+                    "changed. Start a fresh run without --resume/--db-path; "
+                    "old state is preserved.",
+                )
+            if run_options is not None:
+                saved["cli_options"] = run_options
+                with self.engine.managed_conn.transaction() as tx:
+                    tx.execute(
+                        "UPDATE meta SET value = ? WHERE key = 'optimization_run'",
+                        (json.dumps(saved),),
+                    )
+            return
+        checkpoint = target_path.parent / f"{target_path.stem}_telemetry" / "gepa_state.bin"
+        if checkpoint.exists():
+            raise YawRuntimeError(
+                "INVALID_INPUT",
+                "Cannot verify this legacy GEPA checkpoint: no run identity was recorded. "
+                "Start a fresh run; the existing checkpoint is preserved.",
+            )
+        with self.engine.managed_conn.transaction() as tx:
+            tx.execute(
+                "INSERT INTO meta(key, value) VALUES ('optimization_run', ?)",
+                (
+                    json.dumps(
+                        {
+                            "output_path": str(target_path),
+                            "identity": identity,
+                            "cli_options": run_options or {},
+                        }
+                    ),
+                ),
+            )
 
     def reload_program(self, program_path: Path | str) -> dict[str, Any]:
         """Hot-reload a compiled DSPy program into the running engine in-memory."""

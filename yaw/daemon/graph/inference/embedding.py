@@ -10,7 +10,9 @@ from typing import Any, cast
 import dspy
 import numpy as np
 
-from yaw.core.config import YawConfig
+from yaw.core.config import DEFAULT_EMBEDDING_MODEL, YawConfig
+
+from .diagnostics import DiagnosticHistory, trim_diagnostics
 
 FACT_INSTRUCTION = "Given a question, retrieve relevant triplet facts that matches this question."
 PASSAGE_INSTRUCTION = "Given a question, retrieve relevant documents that best answer the question."
@@ -45,9 +47,10 @@ class EmbeddingProfile:
         if not self.parse_document_title:
             payload.pop("parse_document_title", None)
         contract = {"adapter": "retrieval-prompts-v3", "normalization": "l2", **payload}
-        return "yaw-embedding-v2:" + hashlib.sha256(
-            json.dumps(contract, sort_keys=True).encode("utf-8")
-        ).hexdigest()
+        return (
+            "yaw-embedding-v2:"
+            + hashlib.sha256(json.dumps(contract, sort_keys=True).encode("utf-8")).hexdigest()
+        )
 
     def format(self, text, *, query, instruction=None, title: str | None = None):
         if not isinstance(text, str):
@@ -92,22 +95,32 @@ PROFILES = {
     "embeddinggemma-300m-GGUF": EmbeddingProfile(
         "embeddinggemma-300m-GGUF",
         "ggml-org/embeddinggemma-300M-GGUF:embeddinggemma-300M-Q8_0.gguf",
-        768, 2048, "mean", QUERY_PREFIX, DOCUMENT_PREFIX,
+        768,
+        2048,
+        "mean",
+        QUERY_PREFIX,
+        DOCUMENT_PREFIX,
     ),
     "embeddinggemma-300m-qat-q8_0-GGUF-Q8_0": EmbeddingProfile(
         "embeddinggemma-300m-qat-q8_0-GGUF-Q8_0",
         "ggml-org/embeddinggemma-300m-qat-q8_0-GGUF:Q8_0",
-        768, 2048, "mean", QUERY_PREFIX, DOCUMENT_PREFIX,
+        768,
+        2048,
+        "mean",
+        QUERY_PREFIX,
+        DOCUMENT_PREFIX,
     ),
     "Qwen3-Embedding-0.6B-GGUF": EmbeddingProfile(
         "Qwen3-Embedding-0.6B-GGUF",
         "Qwen/Qwen3-Embedding-0.6B-GGUF:Qwen3-Embedding-0.6B-Q8_0.gguf",
-        1024, 32768, "last",
+        1024,
+        32768,
+        "last",
         "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:",
         "",
     ),
 }
-MODEL = "embeddinggemma-300m-GGUF"
+MODEL = DEFAULT_EMBEDDING_MODEL
 
 
 def resolve_embedding_profile(model=MODEL, task_mode="search"):
@@ -370,8 +383,14 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
         provider: str = "openai",
         batch_size: int = 32,
         caching: bool = False,
+        max_batch_chars: int = 3500,
     ) -> None:
+        if batch_size < 1 or max_batch_chars < 1:
+            raise ValueError("Embedding batch size and character budget must be positive.")
+        self.max_batch_chars = max_batch_chars
         self.task_mode = task_mode
+        self.base_url = base_url
+        self.provider = provider
         self.profile = profile or resolve_embedding_profile(MODEL, task_mode)
         base_embedder = embedder or create_dspy_embedder(
             self.profile,
@@ -396,12 +415,10 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
                 caching=caching,
             )
             self.embedder = base_embedder
-        self.telemetry: list[dict[str, Any]] = []
+        self.telemetry: list[dict[str, Any]] = DiagnosticHistory()
         self._telemetry_hook: Callable[[dict[str, Any]], None] | None = None
 
-    def bind_telemetry_hook(
-        self, hook: Callable[[dict[str, Any]], None] | None
-    ) -> None:
+    def bind_telemetry_hook(self, hook: Callable[[dict[str, Any]], None] | None) -> None:
         """Bind a callback invoked with each structured embedding telemetry entry."""
         self._telemetry_hook = hook
 
@@ -410,7 +427,7 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
         self.telemetry.clear()
 
     @classmethod
-    def from_config(cls, config: YawConfig) -> "DSPyEmbeddingAdapter":
+    def from_config(cls, config: YawConfig) -> DSPyEmbeddingAdapter:
         """Construct a profile-aware DSPyEmbeddingAdapter from a YawConfig."""
         profile = resolve_embedding_profile(config.embedding_model, config.embedding_task_mode)
         return cls(
@@ -420,6 +437,7 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
             api_key=config.api_key,
             provider=config.provider,
             batch_size=config.embed_batch_size,
+            max_batch_chars=config.embed_batch_chars,
         )
 
     def _encode_prepared(
@@ -435,6 +453,13 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
             vectors = np.asarray(raw, dtype=np.float32)
             if vectors.ndim == 1:
                 vectors = vectors.reshape(1, -1)
+            from .chat import get_yaw_sleep_seconds
+
+            sleep_sec = get_yaw_sleep_seconds()
+            if sleep_sec > 0:
+                import time
+
+                time.sleep(sleep_sec)
             return vectors
         except Exception as exc:
             if not is_batch_overflow_error(exc):
@@ -442,7 +467,9 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
             if len(prepared) > 1:
                 mid = len(prepared) // 2
                 left = self._encode_prepared(prepared[:mid], {**call_kwargs, "batch_size": mid})
-                right = self._encode_prepared(prepared[mid:], {**call_kwargs, "batch_size": len(prepared) - mid})
+                right = self._encode_prepared(
+                    prepared[mid:], {**call_kwargs, "batch_size": len(prepared) - mid}
+                )
                 return np.concatenate([left, right], axis=0)
 
             # Single item overflow: divide gracefully into 2+ sub-chunks and pool without truncation
@@ -479,6 +506,13 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
             vectors = np.asarray(raw, dtype=np.float32)
             if vectors.ndim == 1:
                 vectors = vectors.reshape(1, -1)
+            from .chat import get_yaw_sleep_seconds
+
+            sleep_sec = get_yaw_sleep_seconds()
+            if sleep_sec > 0:
+                import time
+
+                time.sleep(sleep_sec)
             return vectors
         except Exception as exc:
             if not is_batch_overflow_error(exc):
@@ -519,9 +553,9 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
             raise ValueError("Embedding input cannot be empty.")
 
         max_chunk_chars = 3000
-        max_batch_chars = 3500
+        max_batch_chars = self.max_batch_chars
         effective_max_batch_size = (
-            batch_size if (isinstance(batch_size, int) and batch_size >= 1) else 16
+            batch_size if (isinstance(batch_size, int) and batch_size >= 1) else self.batch_size
         )
 
         text_piece_map: list[list[int]] = []
@@ -643,6 +677,7 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
             ),
         }
         self.telemetry.append(entry)
+        trim_diagnostics(self)
         if self._telemetry_hook is not None:
             self._telemetry_hook(entry)
 
@@ -664,9 +699,7 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
             flat_pieces,
             piece_weights,
             micro_batches,
-        ) = self._prepare_pieces_and_batches(
-            texts, instruction=instruction, batch_size=batch_size
-        )
+        ) = self._prepare_pieces_and_batches(texts, instruction=instruction, batch_size=batch_size)
 
         flat_vectors: list[np.ndarray | None] = [None] * len(flat_pieces)
         for mb in micro_batches:
@@ -708,9 +741,7 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
             flat_pieces,
             piece_weights,
             micro_batches,
-        ) = self._prepare_pieces_and_batches(
-            texts, instruction=instruction, batch_size=batch_size
-        )
+        ) = self._prepare_pieces_and_batches(texts, instruction=instruction, batch_size=batch_size)
 
         flat_vectors: list[np.ndarray | None] = [None] * len(flat_pieces)
 

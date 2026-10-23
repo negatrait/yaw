@@ -11,6 +11,20 @@ from typing import Any, Literal
 
 from .types import YawRuntimeError
 
+DEFAULT_EMBEDDING_MODEL = "embeddinggemma-300m-qat-q8_0-GGUF-Q8_0"
+
+
+def context_char_limit(base_chars: int, context_tokens: int, output_tokens: int) -> int:
+    """Scale conservative character safeguards by available input capacity.
+
+    Preserve the established 32K-context/4K-output limits. This is a character
+    heuristic, not a tokenizer or a guarantee that an entire prompt will fit.
+    """
+    if not 0 < output_tokens < context_tokens:
+        raise ValueError("Require 0 < output_tokens < context_tokens")
+    return max(1, base_chars * (context_tokens - output_tokens) // (32768 - 4096))
+
+
 _DEFAULT_RELATIVE_PATHS: dict[str, str] = {
     "corpus_root": "corpus",
     "db_path": ".yaw/yaw.db",
@@ -100,19 +114,26 @@ class YawConfig:
     excluded_patterns: tuple[str, ...] = (".*", "*/.*", "__pycache__/*")
     json_keys_whitelist: tuple[str, ...] = ("*",)
     json_keys_blacklist: tuple[str, ...] = ()
-    chunk_size: int = 1200
-    chunk_overlap: int = 100
-    min_chunk_size: int = 50
-    poll_interval_seconds: float = 5.0
+    chunk_size: int = 1500
+    chunk_overlap: int = 120
+    min_chunk_size: int = 100
+    poll_interval_seconds: float = 10.0
 
     # Inference settings
     base_url: str = "http://localhost:13305/api/v1"
     api_key: str = "lemonade"
     provider: str = "openai"
-    embedding_model: str = "embeddinggemma-300m-GGUF"
+    embedding_model: str = DEFAULT_EMBEDDING_MODEL
     embedding_task_mode: str = "distinct-titled"
-    extraction_model: str = "Qwen3-4B-Instruct-2507-GGUF"
-    qa_model: str = "Qwen3-4B-Instruct-2507-GGUF"
+    extraction_model: str = "Gemma-4-E4B-it-GGUF"
+    qa_model: str = "Gemma-4-E4B-it-GGUF"
+    context_window_tokens: int = 32768
+    max_output_tokens: int = 4096
+    rlm_max_iters: int = 10
+    rlm_max_llm_calls: int = 20
+    rlm_max_output_chars: int = 10000
+    reflection_input_tokens: int = 16384
+    reflection_tokenizer_url: str = ""
     enable_gbnf: bool = True
     gbnf_max_entities: int | None = None
     gbnf_max_triples: int | None = None
@@ -127,7 +148,8 @@ class YawConfig:
     synonymy_threshold: float = 0.8
     synonymy_top_k: int = 100
     embed_batch_size: int = 64
-    max_context_chars: int = 24000
+    embed_batch_chars: int = 3500
+    max_context_chars: int | None = None
     max_ast_expansion_hops: int = 1
 
     # Runtime & HTTP transport settings
@@ -143,6 +165,9 @@ class YawConfig:
     optimize_train_queries: int = 7
     optimize_query_offset: int = 0
     optimize_auto: Literal["light", "medium", "heavy"] = "light"
+    optimize_sleep_seconds: float = 0.0
+    optimize_max_bootstrapped_demos: int = 0
+    optimize_max_labeled_demos: int = 0
 
     def __post_init__(self) -> None:
         ws = Path(self.workspace_root).resolve()
@@ -157,6 +182,26 @@ class YawConfig:
             raise YawRuntimeError("INVALID_INPUT", "queue_maxsize must be >= 1")
         if self.chunk_size < 1:
             raise YawRuntimeError("INVALID_INPUT", "chunk_size must be >= 1")
+        if not 0 < self.max_output_tokens < self.context_window_tokens:
+            raise YawRuntimeError(
+                "INVALID_INPUT", "Require 0 < max_output_tokens < context_window_tokens"
+            )
+        for name in (
+            "rlm_max_iters",
+            "rlm_max_llm_calls",
+            "rlm_max_output_chars",
+            "reflection_input_tokens",
+        ):
+            if getattr(self, name) < 1:
+                raise YawRuntimeError("INVALID_INPUT", f"{name} must be positive")
+        context_chars = self.max_context_chars
+        if context_chars is None:
+            context_chars = context_char_limit(
+                24000, self.context_window_tokens, self.max_output_tokens
+            )
+            object.__setattr__(self, "max_context_chars", context_chars)
+        if context_chars < 1:
+            raise YawRuntimeError("INVALID_INPUT", "max_context_chars must be positive")
         if self.optimize_mode not in ("miprov2", "gepa", "hybrid"):
             raise YawRuntimeError(
                 "INVALID_INPUT", f"Unsupported optimize_mode: {self.optimize_mode!r}"
@@ -165,6 +210,21 @@ class YawConfig:
             raise YawRuntimeError(
                 "INVALID_INPUT", f"Unsupported optimize_auto: {self.optimize_auto!r}"
             )
+        object.__setattr__(
+            self,
+            "optimize_sleep_seconds",
+            max(0.0, float(self.optimize_sleep_seconds or 0.0)),
+        )
+        object.__setattr__(
+            self,
+            "optimize_max_bootstrapped_demos",
+            max(0, int(self.optimize_max_bootstrapped_demos or 0)),
+        )
+        object.__setattr__(
+            self,
+            "optimize_max_labeled_demos",
+            max(0, int(self.optimize_max_labeled_demos or 0)),
+        )
         raw_ds = self.optimize_datasets
         if isinstance(raw_ds, str):
             ds_tuple = tuple(p.strip() for p in raw_ds.split(",") if p.strip())
@@ -191,16 +251,50 @@ class YawConfig:
                 j_tuple if j_attr == "json_keys_blacklist" else (j_tuple or j_default),
             )
 
-    def for_optimization(self, datestamp: str | None = None) -> "YawConfig":
+    def for_optimization(
+        self,
+        datestamp: str | None = None,
+        db_override: Path | str | None = None,
+    ) -> YawConfig:
         """Derive an isolated configuration for prompt optimization using *_optimize_<datestamp>.* paths."""
+        import re
         from datetime import UTC, datetime
 
-        ds = datestamp or datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
         base_db = Path(self.db_path) if self.db_path else Path(".yaw/yaw.db")
         base_dir = base_db.parent
 
-        opt_db = base_dir / f"yaw_optimize_{ds}.db"
-        opt_lock = base_dir / f"yaw_optimize_{ds}.db.lock"
+        if db_override is not None:
+            raw_path = str(db_override).strip()
+            if raw_path.lower() == "latest":
+                candidates = sorted(
+                    base_dir.glob("yaw_optimize_*.db"),
+                    # Run creation time is encoded in the name. Writes to an older
+                    # run must not make it newer than a subsequently created run.
+                    key=lambda p: p.name,
+                    reverse=True,
+                )
+                candidates = [
+                    p
+                    for p in candidates
+                    if p.is_file() and re.fullmatch(r"yaw_optimize_\d{8}_\d{6}\.db", p.name)
+                ]
+                if not candidates:
+                    raise YawRuntimeError("INVALID_INPUT", "No optimization run exists to resume.")
+                opt_db = candidates[0]
+            else:
+                opt_db = _resolve_path(self.workspace_root, raw_path, raw_path)
+                if not opt_db.is_file():
+                    raise YawRuntimeError(
+                        "INVALID_INPUT", f"Optimization database does not exist: {opt_db}"
+                    )
+            base_dir = opt_db.parent
+            ds_match = re.search(r"yaw_optimize_(\d{8}_\d{6})", opt_db.name)
+            ds = ds_match.group(1) if ds_match else opt_db.stem
+        else:
+            ds = datestamp or datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+            opt_db = base_dir / f"yaw_optimize_{ds}.db"
+
+        opt_lock = Path(str(opt_db) + ".lock")
         opt_status = base_dir / f"status_optimize_{ds}.json"
         opt_state = base_dir / f"coco_state_optimize_{ds}"
         opt_program = base_dir / f"compiled_program_optimize_{ds}.json"
@@ -208,7 +302,8 @@ class YawConfig:
         cfg_dict: dict[str, Any] = {
             f.name: getattr(self, f.name)
             for f in fields(self)
-            if f.name not in (
+            if f.name
+            not in (
                 "db_path",
                 "lock_path",
                 "status_path",
@@ -239,6 +334,14 @@ class YawConfig:
             "embedding_task_mode": self.embedding_task_mode,
             "extraction_model": self.extraction_model,
             "qa_model": self.qa_model,
+            "context_window_tokens": self.context_window_tokens,
+            "max_output_tokens": self.max_output_tokens,
+            "rlm_max_iters": self.rlm_max_iters,
+            "rlm_max_llm_calls": self.rlm_max_llm_calls,
+            "rlm_max_output_chars": self.rlm_max_output_chars,
+            "reflection_input_tokens": self.reflection_input_tokens,
+            "reflection_tokenizer_url": self.reflection_tokenizer_url,
+            "max_context_chars": self.max_context_chars,
             "synonymy_threshold": self.synonymy_threshold,
             "damping": self.damping,
         }
@@ -253,6 +356,10 @@ _OPTIMIZATION_KEY_ALIASES: dict[str, str] = {
     "train_queries": "optimize_train_queries",
     "query_offset": "optimize_query_offset",
     "auto": "optimize_auto",
+    "sleep_seconds": "optimize_sleep_seconds",
+    "sleep": "optimize_sleep_seconds",
+    "max_bootstrapped_demos": "optimize_max_bootstrapped_demos",
+    "max_labeled_demos": "optimize_max_labeled_demos",
 }
 
 _FIELD_TO_SECTION: dict[str, str] = {
@@ -278,6 +385,13 @@ _FIELD_TO_SECTION: dict[str, str] = {
     "embedding_task_mode": "inference",
     "extraction_model": "inference",
     "qa_model": "inference",
+    "context_window_tokens": "inference",
+    "max_output_tokens": "inference",
+    "rlm_max_iters": "inference",
+    "rlm_max_llm_calls": "inference",
+    "rlm_max_output_chars": "inference",
+    "reflection_input_tokens": "inference",
+    "reflection_tokenizer_url": "inference",
     "enable_gbnf": "inference",
     "gbnf_max_entities": "inference",
     "gbnf_max_triples": "inference",
@@ -289,6 +403,7 @@ _FIELD_TO_SECTION: dict[str, str] = {
     "synonymy_threshold": "graph",
     "synonymy_top_k": "graph",
     "embed_batch_size": "graph",
+    "embed_batch_chars": "graph",
     "max_context_chars": "graph",
     "max_ast_expansion_hops": "graph",
     "queue_maxsize": "runtime",
@@ -301,6 +416,9 @@ _FIELD_TO_SECTION: dict[str, str] = {
     "optimize_train_queries": "optimization",
     "optimize_query_offset": "optimization",
     "optimize_auto": "optimization",
+    "optimize_sleep_seconds": "optimization",
+    "optimize_max_bootstrapped_demos": "optimization",
+    "optimize_max_labeled_demos": "optimization",
 }
 
 
@@ -366,11 +484,7 @@ def load_config(
         section = data.get(sec_name)
         if isinstance(section, dict):
             for k, v in section.items():
-                mapped_k = (
-                    _OPTIMIZATION_KEY_ALIASES.get(k, k)
-                    if sec_name == "optimization"
-                    else k
-                )
+                mapped_k = _OPTIMIZATION_KEY_ALIASES.get(k, k) if sec_name == "optimization" else k
                 if mapped_k in valid_fields:
                     if mapped_k == "optimize_datasets":
                         if isinstance(v, str):

@@ -4,30 +4,130 @@ YAW is a native HippoRAG 2 graph & storage engine backed by a single SQLite data
 
 ## Available now
 
-Use Python `>=3.14.7` (`.python-version` `3.14.7`) and `uv`:
+Use Python `>=3.14` (`.python-version` `3.14.9`) and `uv`:
 
 ```powershell
-uv sync --locked
-uv run --locked pytest -v
-uv run --locked python scripts/download-datasets.py --dataset enterprise_rag_bench
-uv run --locked yaw daemon status
-uv run --locked yaw daemon run
-uv run --locked yaw daemon start
-uv run --locked yaw daemon stop
-uv run --locked yaw graph build
-uv run --locked yaw graph rebuild
-uv run --locked yaw graph lint
-uv run --locked yaw graph lint --turtle
-uv run --locked yaw optimize
-uv run --locked yaw load-program .yaw/compiled_program_optimize_<datestamp>.json
-uv run --locked yaw config get optimization.auto
-uv run --locked yaw config set optimization.auto heavy
-uv run --locked python benchmark.py --dataset sample --mode all
-uv run --locked python benchmark.py --dataset 2wikimultihopqa --max-queries 25
-uv run --locked python benchmark.py --dataset hotpotqa --max-queries 25 --mode retrieval
-uv run --locked python benchmark.py --dataset musique --max-queries 25 --mode retrieval
-uv run --locked python scripts/verify_paper_parity_gate.py
+uv sync
+uv run preflight
+uv run preflight --full
+uv run typecheck
+uv run pytest -v
+uv run python scripts/download-datasets.py --dataset enterprise_rag_bench
+uv run yaw daemon status
+uv run yaw daemon run
+uv run yaw daemon start
+uv run yaw daemon stop
+uv run yaw graph build
+uv run yaw graph rebuild
+uv run yaw graph lint
+uv run yaw graph lint --turtle
+uv run yaw optimize
+uv run --locked yaw dspy optimize --resume
+uv run --locked yaw dspy optimize --db-path latest
+uv run yaw load-program .yaw/compiled_program_optimize_<datestamp>.json
+uv run yaw config get optimization.auto
+uv run yaw config set optimization.auto heavy
+uv run python benchmark.py --dataset sample --mode all
+uv run python benchmark.py --dataset 2wikimultihopqa --max-queries 25
+uv run python benchmark.py --dataset hotpotqa --max-queries 25 --mode retrieval
+uv run python benchmark.py --dataset musique --max-queries 25 --mode retrieval
+uv run python scripts/verify_paper_parity_gate.py
 ```
+
+`preflight` formats with Ruff, applies safe Ruff and ty fixes, then runs pytest
+with testmon and coverage.py through pytest-cov. It continues after failures and
+returns a failing exit status if any check fails. Full UTF-8 logs, JUnit XML,
+coverage JSON and a combined report are saved under `outputs/preflight/`;
+`latest.json` points to the newest report. Add `--verbose` to stream diagnostics.
+Default tests are incremental; `--full` runs the whole suite. Coverage describes
+the tests executed in that invocation. Resident-model tests require `--live`.
+Ruff fixes and pytest `--testmon` are project defaults. ty's `--fix` has no
+persistent configuration setting; `uv run typecheck` supplies it automatically.
+See the [preflight audit](docs/preflight-audit.md) for remaining cleanup work.
+
+Optimization starts a fresh timestamped sandbox unless `--resume` or `--db-path`
+(`--db` alias) selects an existing run. `--resume` and `--db-path latest` select
+the newest run by its filename timestamp, regardless of database size or later
+writes to older runs. They restore the saved dataset slice, optimization options,
+custom output path, seed program, and GEPA checkpoint. A specific existing database
+can be selected with `--resume --db-path .yaw/yaw_optimize_<datestamp>.db`.
+Missing runs fail instead of silently starting over; an active run retains its
+writer lock.
+
+Resume validates ordered training/validation data and corpus contents, inference
+and indexing settings, implementation files, and package versions. Changed inputs
+require a fresh run. Legacy GEPA checkpoints without recorded identity are preserved
+and rejected because their scores cannot be verified. Legacy database entries
+without prompt provenance are recomputed; newly recorded matching extraction and
+graph results survive restarts. Hybrid runs retain the completed MIPRO seed before
+entering GEPA. Recovery uses the last saved checkpoint; unfinished work can repeat.
+GEPA 0.1.4 also reevaluates the seed validation set on startup; identical model
+requests can reuse DSPy's disk response cache. `--num-trials` is the
+total GEPA metric-call budget, including calls already recorded; increase it to
+continue an exhausted run.
+
+Candidate-stage results (embedding vectors, OpenIE records, synonym decisions,
+and SHACL repairs) are cached in `yaw.db`, shared across candidates and process
+restarts. These caches retain no resident result dictionaries and share a
+256 MiB compressed-payload budget with FIFO eviction. Keys cover stage inputs,
+prompt/schema/demos, model and sampling settings, embedding profile/endpoint,
+implementation and DSPy/NumPy versions; SHACL also keys the tool-visible graph
+and source content. Traces and their original OpenIE/synonym/SHACL token statistics
+are replayed on hits. Source passages in trace inputs/history are stored as
+content references and hydrated from the current source pool. Evicted,
+incompatible, corrupt, or unavailable-source entries are recomputed. This is
+application-level stage caching around native DSPy/GEPA.
+
+DSPy's native request/response disk cache is also enabled during evolution, with
+its memory cache disabled. A small public-interface adapter replays original
+token usage into YAW's tracker so GEPA scores reflect logical inference cost;
+When inspection history is enabled, DSPy records zero physical usage for cache hits. Request keys
+retain inference endpoints as well as model, messages, sampling and grammar
+settings. `cache=False` remains an explicit bypass. Legacy SDK cache entries with
+no recoverable usage are recomputed once rather than scored as free. No changes
+to GEPA's optimizer or program signatures are required.
+
+GEPA reflection uses sandbox evidence selection followed by DSPy's native instruction
+writer. `inference.reflection_input_tokens` defaults to **16,384**; the complete
+rendered request is checked with the resident model's serving tokenizer. Evidence,
+proposals and SIMBA state checkpoint in `yaw.db`, including a pinned active request.
+See [reflection repair and restart behavior](docs/gepa-reflection-repair.md).
+
+During optimization, full DSPy LM/module inspection histories are disabled;
+GEPA traces and logical token accounting remain active. YAW keeps recent
+diagnostics (250 telemetry/embedding/definition records and 100 synonym/SHACL
+records), and candidate copies start without prior diagnostics. Reflection
+training keeps the same recent-example window that SIMBA consumes. This bounds
+diagnostic retention; the corpus and GEPA's own candidate/frontier state still
+require memory.
+
+Embedding request limits are explicit under `[graph]`: `embed_batch_size` bounds
+items, and `embed_batch_chars` bounds aggregate formatted characters (default
+3500). Both apply; the adapter no longer silently substitutes a 16-item limit.
+Larger character budgets need testing against the inference server; overflow
+splitting remains enabled. Query-prefix evolution preserves document-stage
+caches, while query vectors use the effective query prefix in their own keys.
+Persistent CocoIndex parsing also invalidates when parsing helpers change.
+
+Inference capacity is explicit under `[inference]`: `context_window_tokens`
+declares the server's actual serving window (65,536 in `yaw.toml`), while
+`max_output_tokens` caps each completion. These settings do not resize or reload
+the external server. Extraction, QA, reflection-field and validation-input
+character safeguards scale with available input capacity; they are heuristics,
+not exact token counts. `[graph].max_context_chars` defaults to a scaled context
+budget unless explicitly set. Embedding input limits remain profile-specific.
+`rlm_max_iters`, `rlm_max_llm_calls` and `rlm_max_output_chars` independently bound
+SHACL and reflection loops. More context does not automatically mean more turns.
+Changed model/budget settings require a compatible fresh run/index; an already
+running optimizer retains its original settings.
+
+The dashboard's `scripts/watchdog.py --layout-iterations 1000` controls graph
+relaxation rounds (default 1,000). Fig. 2 shows only the largest connected
+one-hop neighborhood seeded by `skos:related` and `owl:differentFrom`, with
+labels on ten recent disambiguation pairs. Both assertion lists follow Fig. 2;
+the related list shows up to ten active canonical pairs by newest insertion
+rowid, since reassertion timestamps are not stored. Full-validation progress
+uses GEPA's validation score; candidate F1/recall means include minibatches.
 
 `benchmark.py` and `scripts/verify_paper_parity_gate.py` evaluate the native `yaw` engine (`YawGraphEngine` + `yaw.db` + `HippoRAGProgram`) against Standard DPR (`retrieve_dpr`) and two consolidated reference targets across the 7 HippoRAG 2 paper datasets (`popqa`, `lveval`, `narrativeqa`, `2wikimultihopqa`, `hotpotqa`, `nq`, `musique`):
 - **Target 1 (`MONKEYPATCHED_HIPPORAG_BASELINES`):** Consolidated historical runs of upstream HippoRAG 2 on the exact same `Qwen3-4B-Instruct-2507-GGUF` + `embeddinggemma-300m-GGUF` local stack (archived in [`outputs/benchmarks/consolidated_historical_baselines.json`](outputs/benchmarks/consolidated_historical_baselines.json)).
@@ -37,37 +137,10 @@ Upstream `hipporag` and `optuna` are permanently retired from `pyproject.toml`, 
 
 The unified local model stack (`http://localhost:13305/api/v1`) uses:
 - **Embeddings (`--embedding-model`):** `embeddinggemma-300m-GGUF` on GPU `llamacpp` (`--embedding-task-mode` defaults to `distinct-titled` under `retrieval-prompts-v3`).
-- **Unified Chat, GBNF Worker, QA Reader & RLM Orchestrator (`--extraction-model`, `--qa-model`):** `Qwen3-4B-Instruct-2507-GGUF` on GPU `llamacpp` (`--parallel 1 --cache-ram 0`) with pure-JSON GBNF grammar enforcement (`_yaw_supports_gbnf=True`) for direct/worker predictors and unconstrained Python REPL execution (`_yaw_supports_gbnf=False`) inside DSPy's managed Deno/Pyodide WASM sandbox (`dspy[deno]`, `dspy.PythonInterpreter`) for `shacl_healer_rlm` and `RLMInstructionProposer.inner_rlm`.
+- **Unified Chat, GBNF Worker, QA Reader & RLM Orchestrator (`--extraction-model`, `--qa-model`):** `Gemma-4-E4B-it-GGUF` (`Q4_K_M`, 32,768 context) on GPU `llamacpp` (`--parallel 1 --cache-ram 0`) with pure-JSON GBNF grammar enforcement (`_yaw_supports_gbnf=True`) for direct/worker predictors and unconstrained Python REPL execution (`_yaw_supports_gbnf=False`) inside DSPy's managed Deno/Pyodide WASM sandbox (`dspy[deno]`, `dspy.PythonInterpreter`) for `shacl_healer_rlm` and `RLMInstructionProposer.inner_rlm`. Historical Qwen benchmark targets remain unchanged.
 - **OOD Enterprise Prompt Evolution (`uv run yaw optimize`):** Configured by default in [`yaw.toml`](yaw.toml) to train on the stratified 250-query (`150` train + `100` val) **EnterpriseRAG-Bench** (`enterprise_rag_bench`, `onyx-dot-app/EnterpriseRAG-Bench`) dataset across all 10 reasoning categories (`Basic`, `Semantic`, `Intra-Document Reasoning`, `Project Related`, `Constrained`, `Conflicting Info`, `Completeness`, `Miscellaneous`, `Info Not Found`, `High Level`) with $2.0\times$ same-tool hard distractors (`mode = "gepa"`, `auto = "heavy"`).
 
-On this machine the models and settings are already installed. For a fresh Lemonade installation, register/download the embedding checkpoint and save both `llamacpp` model settings explicitly before running benchmarks (`--batch-size 2048 --ubatch-size 2048` on EmbeddingGemma prevents `llama-server`'s default 512-token physical microbatch cutoff on 512–2048 token passages, and `--cache-ram 0` without `-dio` on `Qwen3-4B-Instruct-2507-GGUF` prevents Windows Direct-IO and host-RAM prompt-cache growth):
-
-```powershell
-$api = 'http://localhost:13305/api/v1'
-$pull = @{
-    model_name = 'user.embeddinggemma-300m-GGUF'
-    checkpoint = 'ggml-org/embeddinggemma-300M-GGUF:embeddinggemma-300M-Q8_0.gguf'
-    recipe = 'llamacpp'
-    embedding = $true
-} | ConvertTo-Json
-Invoke-RestMethod -Method Post -Uri "$api/pull" -ContentType 'application/json' -Body $pull
-$loadEmbed = @{
-    model_name = 'user.embeddinggemma-300m-GGUF'
-    ctx_size = 2048
-    llamacpp_backend = 'cuda'
-    llamacpp_args = '--pooling mean --parallel 1 --batch-size 2048 --ubatch-size 2048'
-    save_options = $true
-} | ConvertTo-Json
-Invoke-RestMethod -Method Post -Uri "$api/load" -ContentType 'application/json' -Body $loadEmbed
-$loadChat = @{
-    model_name = 'Qwen3-4B-Instruct-2507-GGUF'
-    ctx_size = 16384
-    llamacpp_backend = 'cuda'
-    llamacpp_args = '--parallel 1 --cache-ram 0'
-    save_options = $true
-} | ConvertTo-Json
-Invoke-RestMethod -Method Post -Uri "$api/load" -ContentType 'application/json' -Body $loadChat
-```
+On this machine the models and settings are already installed. For a fresh Lemonade installation, register/download the embedding checkpoint and save both `llamacpp` models and settings explicitly before running benchmarks. 
 
 ## Measured versus planned
 

@@ -75,13 +75,69 @@ In [`benchmark.py`](../benchmark.py) and [`scripts/verify_paper_parity_gate.py`]
 
 ```python
 MONKEYPATCHED_HIPPORAG_BASELINES: dict[str, dict[str, Any]] = {
-    "popqa": {"queries": 25, "docs": 70, "Recall@1": 0.500, "Recall@2": 0.580, "Recall@5": 0.720, "ExactMatch": 0.360, "F1": 0.5956},
-    "2wikimultihopqa": {"queries": 25, "docs": 307, "Recall@1": 0.450, "Recall@2": 0.780, "Recall@5": 0.960, "ExactMatch": 0.360, "F1": 0.4923},
-    "hotpotqa": {"queries": 25, "docs": 344, "Recall@1": 0.400, "Recall@2": 0.740, "Recall@5": 0.960, "ExactMatch": 0.200, "F1": 0.3964},
-    "musique": {"queries": 10, "docs": 197, "Recall@1": 0.183, "Recall@2": 0.317, "Recall@5": 0.542, "ExactMatch": 0.200, "F1": 0.3000},
-    "lveval": {"queries": 25, "docs": 70, "Recall@1": 0.440, "Recall@2": 0.640, "Recall@5": 0.740, "ExactMatch": 0.240, "F1": 0.3401},
-    "narrativeqa": {"queries": 25, "docs": 70, "Recall@1": 0.100, "Recall@2": 0.160, "Recall@5": 0.280, "ExactMatch": 0.080, "F1": 0.1384},
-    "nq": {"queries": 1, "docs": 20, "Recall@1": 0.000, "Recall@2": 0.000, "Recall@5": 1.000, "ExactMatch": 0.000, "F1": 0.0000},
+    "popqa": {
+        "queries": 25,
+        "docs": 70,
+        "Recall@1": 0.500,
+        "Recall@2": 0.580,
+        "Recall@5": 0.720,
+        "ExactMatch": 0.360,
+        "F1": 0.5956,
+    },
+    "2wikimultihopqa": {
+        "queries": 25,
+        "docs": 307,
+        "Recall@1": 0.450,
+        "Recall@2": 0.780,
+        "Recall@5": 0.960,
+        "ExactMatch": 0.360,
+        "F1": 0.4923,
+    },
+    "hotpotqa": {
+        "queries": 25,
+        "docs": 344,
+        "Recall@1": 0.400,
+        "Recall@2": 0.740,
+        "Recall@5": 0.960,
+        "ExactMatch": 0.200,
+        "F1": 0.3964,
+    },
+    "musique": {
+        "queries": 10,
+        "docs": 197,
+        "Recall@1": 0.183,
+        "Recall@2": 0.317,
+        "Recall@5": 0.542,
+        "ExactMatch": 0.200,
+        "F1": 0.3000,
+    },
+    "lveval": {
+        "queries": 25,
+        "docs": 70,
+        "Recall@1": 0.440,
+        "Recall@2": 0.640,
+        "Recall@5": 0.740,
+        "ExactMatch": 0.240,
+        "F1": 0.3401,
+    },
+    "narrativeqa": {
+        "queries": 25,
+        "docs": 70,
+        "Recall@1": 0.100,
+        "Recall@2": 0.160,
+        "Recall@5": 0.280,
+        "ExactMatch": 0.080,
+        "F1": 0.1384,
+    },
+    "nq": {
+        "queries": 1,
+        "docs": 20,
+        "Recall@1": 0.000,
+        "Recall@2": 0.000,
+        "Recall@5": 1.000,
+        "ExactMatch": 0.000,
+        "F1": 0.0000,
+    },
 }
 ```
 
@@ -106,6 +162,7 @@ ENTERPRISE_CATEGORY_QUOTAS: dict[str, tuple[int, int]] = {
     "Info Not Found": (9, 6),
     "High Level": (6, 4),
 }
+
 
 def download_enterprise_rag_bench(
     dest_dir: Path,

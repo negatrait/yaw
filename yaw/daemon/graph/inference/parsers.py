@@ -17,9 +17,7 @@ def text_processing(text: str | list[Any]) -> str | list[Any]:
         return [text_processing(t) for t in text]
     if not isinstance(text, str):
         text = str(text)
-    normalized = "".join(
-        ch if ch.isalnum() or ch.isspace() else " " for ch in text.casefold()
-    )
+    normalized = "".join(ch if ch.isalnum() or ch.isspace() else " " for ch in text.casefold())
     return " ".join(normalized.split())
 
 
@@ -41,9 +39,7 @@ def _coerce_structured_triple_item(
         if isinstance(raw_subj, (list, tuple)) and len(raw_subj) >= 1:
             subj = str(raw_subj[0]).strip()
             subj_def = (
-                str(raw_subj[1]).strip()
-                if len(raw_subj) >= 2 and raw_subj[1] is not None
-                else ""
+                str(raw_subj[1]).strip() if len(raw_subj) >= 2 and raw_subj[1] is not None else ""
             )
         elif isinstance(raw_subj, str):
             subj = raw_subj.strip()
@@ -54,9 +50,7 @@ def _coerce_structured_triple_item(
         if isinstance(raw_obj, (list, tuple)) and len(raw_obj) >= 1:
             obj = str(raw_obj[0]).strip()
             obj_def = (
-                str(raw_obj[1]).strip()
-                if len(raw_obj) >= 2 and raw_obj[1] is not None
-                else ""
+                str(raw_obj[1]).strip() if len(raw_obj) >= 2 and raw_obj[1] is not None else ""
             )
         elif isinstance(raw_obj, str):
             obj = raw_obj.strip()
@@ -83,25 +77,40 @@ def _coerce_structured_triple_item(
             spo_def=spo_def,
         )
 
+    if isinstance(item, (list, tuple)) and len(item) in (5, 6):
+        subj = str(item[0]).strip() if item[0] is not None else ""
+        subj_def = str(item[1]).strip() if item[1] is not None else ""
+        pred = str(item[2]).strip() if item[2] is not None else ""
+        obj = str(item[3]).strip() if item[3] is not None else ""
+        obj_def = str(item[4]).strip() if item[4] is not None else ""
+        if not subj or not pred or not obj:
+            return None
+        raw_spo = str(item[5]).strip() if len(item) == 6 and item[5] is not None else ""
+        spo_def = raw_spo or f"{subj} {pred} {obj}."
+        if not subj_def:
+            subj_def = lookup.get(subj) or lookup.get(str(text_processing(subj))) or ""
+        if not obj_def:
+            obj_def = lookup.get(obj) or lookup.get(str(text_processing(obj))) or ""
+        return StructuredTriple(
+            subj=subj,
+            subj_def=subj_def,
+            pred=pred,
+            obj=obj,
+            obj_def=obj_def,
+            spo_def=spo_def,
+        )
+
     if isinstance(item, (list, tuple)) and len(item) in (3, 4):
         raw_s, raw_p, raw_o = item[0], item[1], item[2]
         if isinstance(raw_s, (list, tuple)) and len(raw_s) >= 1:
             subj = str(raw_s[0]).strip()
-            subj_def = (
-                str(raw_s[1]).strip()
-                if len(raw_s) >= 2 and raw_s[1] is not None
-                else ""
-            )
+            subj_def = str(raw_s[1]).strip() if len(raw_s) >= 2 and raw_s[1] is not None else ""
         else:
             subj = str(raw_s).strip()
             subj_def = ""
         if isinstance(raw_o, (list, tuple)) and len(raw_o) >= 1:
             obj = str(raw_o[0]).strip()
-            obj_def = (
-                str(raw_o[1]).strip()
-                if len(raw_o) >= 2 and raw_o[1] is not None
-                else ""
-            )
+            obj_def = str(raw_o[1]).strip() if len(raw_o) >= 2 and raw_o[1] is not None else ""
         else:
             obj = str(raw_o).strip()
             obj_def = ""
@@ -123,7 +132,6 @@ def _coerce_structured_triple_item(
             spo_def=spo_def,
         )
     return None
-
 
 
 def filter_invalid_triples(triples: Sequence[Any]) -> list[list[str]]:
@@ -154,7 +162,7 @@ def repair_truncated_json(response: str, *, is_triples: bool = False) -> str:
     try:
         json.loads(response)
         return response
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         pass
 
     depth, in_str, esc, last_end = 0, False, False, -1
@@ -239,9 +247,7 @@ def extract_entity_definitions(raw_input: Any) -> tuple[tuple[str, str], ...]:
                         raw_list = _extract_json_list_field(repaired, "named_entities")
                     except ValueError:
                         try:
-                            raw_list = _extract_json_list_field(
-                                repaired, "entity_definitions"
-                            )
+                            raw_list = _extract_json_list_field(repaired, "entity_definitions")
                         except ValueError:
                             bare_repaired = _parse_bare_json_list(repaired)
                             raw_list = bare_repaired if bare_repaired is not None else ()
@@ -259,9 +265,8 @@ def extract_entity_definitions(raw_input: Any) -> tuple[tuple[str, str], ...]:
     else:
         raw_list = ()
 
-
-    ordered_names: list[str] = []
-    defs_by_name: dict[str, str] = {}
+    ordered_pairs: list[tuple[str, str]] = []
+    indices_by_name: dict[str, list[int]] = {}
     for item in raw_list:
         name = ""
         defn = ""
@@ -278,18 +283,41 @@ def extract_entity_definitions(raw_input: Any) -> tuple[tuple[str, str], ...]:
             defn = str(raw_def).strip()
         if not name:
             continue
-        if name not in defs_by_name:
-            ordered_names.append(name)
-            defs_by_name[name] = defn
-        elif len(defn) > len(defs_by_name[name]):
-            defs_by_name[name] = defn
+        existing_idxs = indices_by_name.get(name)
+        if not existing_idxs:
+            indices_by_name[name] = [len(ordered_pairs)]
+            ordered_pairs.append((name, defn))
+        elif not defn:
+            continue
+        else:
+            matched = False
+            for idx in existing_idxs:
+                prev_def = ordered_pairs[idx][1]
+                if not prev_def:
+                    ordered_pairs[idx] = (name, defn)
+                    matched = True
+                    break
+                if prev_def.lower() == defn.lower():
+                    if len(defn) > len(prev_def):
+                        ordered_pairs[idx] = (name, defn)
+                    matched = True
+                    break
+            if not matched:
+                existing_idxs.append(len(ordered_pairs))
+                ordered_pairs.append((name, defn))
 
-    return tuple((n, defs_by_name[n]) for n in ordered_names)
+    return tuple(ordered_pairs)
 
 
 def extract_named_entities(response: Any) -> tuple[str, ...]:
     """Extract and deduplicate unique named entities from LLM response (supporting [name, def] pairs and 1D strings)."""
-    return tuple(name for name, _ in extract_entity_definitions(response))
+    seen: set[str] = set()
+    names: list[str] = []
+    for name, _ in extract_entity_definitions(response):
+        if name not in seen:
+            seen.add(name)
+            names.append(name)
+    return tuple(names)
 
 
 def extract_structured_triples(
@@ -299,6 +327,7 @@ def extract_structured_triples(
 ) -> tuple[StructuredTriple, ...]:
     """Extract, validate, and deduplicate StructuredTriple records from raw list, dict, or JSON string."""
     def_lookup: dict[str, str] = {}
+    multi_defs: dict[str, list[str]] = {}
     if isinstance(entity_definitions, dict):
         for k, v in entity_definitions.items():
             clean_k = str(k).strip()
@@ -312,8 +341,15 @@ def extract_structured_triples(
                 clean_k = str(pair[0]).strip()
                 clean_v = str(pair[1]).strip()
                 if clean_k and clean_v:
-                    def_lookup[clean_k] = clean_v
-                    def_lookup[str(text_processing(clean_k))] = clean_v
+                    norm_k = str(text_processing(clean_k))
+                    def_lookup.setdefault(clean_k, clean_v)
+                    if norm_k:
+                        def_lookup.setdefault(norm_k, clean_v)
+                    for key_str in (clean_k, norm_k):
+                        if key_str:
+                            lst = multi_defs.setdefault(key_str, [])
+                            if all(d.lower() != clean_v.lower() for d in lst):
+                                lst.append(clean_v)
 
     raw_list: Sequence[Any]
     if isinstance(raw_input, str):
@@ -329,20 +365,53 @@ def extract_structured_triples(
                     raw_list = loaded if isinstance(loaded, list) else []
                 except Exception:
                     raw_list = []
-    elif isinstance(raw_input, dict) and "triples" in raw_input and isinstance(raw_input["triples"], list):
+    elif (
+        isinstance(raw_input, dict)
+        and "triples" in raw_input
+        and isinstance(raw_input["triples"], list)
+    ):
         raw_list = raw_input["triples"]
     elif isinstance(raw_input, Sequence):
         raw_list = raw_input
     else:
         raw_list = []
 
-    seen: set[tuple[str, str, str]] = set()
+    seen: set[tuple[str, str, str, str, str]] = set()
     results: list[StructuredTriple] = []
     for item in raw_list:
         st = _coerce_structured_triple_item(item, def_lookup=def_lookup)
         if st is None:
             continue
-        key = (st.subj, st.pred, st.obj)
+        s_norm = str(text_processing(st.subj))
+        o_norm = str(text_processing(st.obj))
+        if (
+            s_norm
+            and s_norm == o_norm
+            and st.subj_def
+            and st.obj_def
+            and st.subj_def.lower() == st.obj_def.lower()
+        ):
+            senses = multi_defs.get(st.subj) or multi_defs.get(s_norm) or []
+            if len(senses) >= 2:
+                alt_sense = next(
+                    (d for d in senses if d.lower() != st.subj_def.lower()),
+                    st.obj_def,
+                )
+                st = StructuredTriple(
+                    subj=st.subj,
+                    subj_def=st.subj_def,
+                    pred=st.pred,
+                    obj=st.obj,
+                    obj_def=alt_sense,
+                    spo_def=st.spo_def,
+                )
+        key = (
+            st.subj,
+            st.subj_def.strip().lower(),
+            st.pred,
+            st.obj,
+            st.obj_def.strip().lower(),
+        )
         if key not in seen:
             seen.add(key)
             results.append(st)
@@ -384,10 +453,10 @@ def parse_filter_facts(response: str) -> list[list[str]]:
             parsed_value = None
             try:
                 parsed_value = json.loads(value)
-            except (json.JSONDecodeError, ValueError):
+            except json.JSONDecodeError, ValueError:
                 try:
                     parsed_value = ast.literal_eval(value)
-                except (ValueError, SyntaxError):
+                except ValueError, SyntaxError:
                     parsed_value = value
 
             if isinstance(parsed_value, dict) and "fact" in parsed_value:
@@ -428,26 +497,20 @@ def match_facts_to_candidate_indices(
     if not generated_facts or not candidate_facts:
         return []
 
-    candidate_str_list = [
-        str(list(f) if isinstance(f, tuple) else f) for f in candidate_facts
-    ]
-    candidate_list_of_lists = [
-        list(f) if isinstance(f, tuple) else f for f in candidate_facts
-    ]
+    candidate_str_list = [str(list(f) if isinstance(f, tuple) else f) for f in candidate_facts]
+    candidate_list_of_lists = [list(f) if isinstance(f, tuple) else f for f in candidate_facts]
 
     result_indices: list[int] = []
     for generated_fact in generated_facts:
         gen_str = str(list(generated_fact))
-        matches = difflib.get_close_matches(
-            gen_str, candidate_str_list, n=1, cutoff=0.0
-        )
+        matches = difflib.get_close_matches(gen_str, candidate_str_list, n=1, cutoff=0.0)
         if matches:
             closest_matched_fact = matches[0]
             try:
                 idx = candidate_list_of_lists.index(ast.literal_eval(closest_matched_fact))
                 if idx not in result_indices:
                     result_indices.append(idx)
-            except (ValueError, SyntaxError):
+            except ValueError, SyntaxError:
                 pass
 
     if max_facts is not None:
@@ -464,9 +527,7 @@ def filter_reranked_facts(
     generated_facts = parse_filter_facts(response)
     if not generated_facts:
         return []
-    return match_facts_to_candidate_indices(
-        candidate_facts, generated_facts, max_facts=max_facts
-    )
+    return match_facts_to_candidate_indices(candidate_facts, generated_facts, max_facts=max_facts)
 
 
 def strip_mistral_bracket_prefix(text: str) -> str:

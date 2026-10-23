@@ -165,7 +165,12 @@ def normalize_json_passage_text(raw_text: str, default_title: str = "") -> str:
         try:
             data = json.loads("{" + stripped.rstrip(",") + "}")
         except Exception:
-            return f"{default_title}\n{stripped}" if default_title and not (stripped.startswith(f"{default_title}\n") or stripped == default_title) else stripped
+            return (
+                f"{default_title}\n{stripped}"
+                if default_title
+                and not (stripped.startswith(f"{default_title}\n") or stripped == default_title)
+                else stripped
+            )
 
     if isinstance(data, list):
         if len(data) >= 2 and isinstance(data[0], str) and isinstance(data[1], list):
@@ -183,10 +188,18 @@ def normalize_json_passage_text(raw_text: str, default_title: str = "") -> str:
         body = data.get("text") or data.get("paragraph_text") or data.get("contents")
         if body is not None:
             body_str = str(body).strip()
-            return f"{title}\n{body_str}" if title and not (body_str.startswith(f"{title}\n") or body_str == title) else body_str
+            return (
+                f"{title}\n{body_str}"
+                if title and not (body_str.startswith(f"{title}\n") or body_str == title)
+                else body_str
+            )
         items = [f"{k}: {v}" for k, v in data.items() if v is not None]
         body_str = "\n".join(items)
-        return f"{title}\n{body_str}" if title and not (body_str.startswith(f"{title}\n") or body_str == title) else body_str
+        return (
+            f"{title}\n{body_str}"
+            if title and not (body_str.startswith(f"{title}\n") or body_str == title)
+            else body_str
+        )
 
     if isinstance(data, str):
         return data.strip()
@@ -261,9 +274,7 @@ def dehydrate_passage_ast(
                     break
             if last_valid_end_byte > 0:
                 best_body = (
-                    body_bytes[:last_valid_end_byte]
-                    .decode("utf-8", errors="replace")
-                    .rstrip()
+                    body_bytes[:last_valid_end_byte].decode("utf-8", errors="replace").rstrip()
                 )
                 break
 
@@ -324,7 +335,7 @@ def read_corpus_lines(
         if start_line < 1 or start_line - 1 >= len(lines):
             return None
         raw_text = "".join(lines[start_line - 1 : end_line])
-    except (OSError, UnicodeDecodeError):
+    except OSError, UnicodeDecodeError:
         return None
 
     if not raw_text:
@@ -383,9 +394,7 @@ def hydrate_passages(
     hydrated: list[HydratedPassage] = []
     used_chars = 0
     for ptr, score in pointers_with_scores:
-        hp = hydrate_chunk_pointer(
-            ptr, corpus_root, score, max_chars=max_island_chars
-        )
+        hp = hydrate_chunk_pointer(ptr, corpus_root, score, max_chars=max_island_chars)
         if hp.stale_on_disk or not hp.text:
             hydrated.append(hp)
             continue
@@ -436,8 +445,10 @@ def _hydrate_spans(
 ) -> list[HydratedPassage]:
     passages: list[HydratedPassage] = []
     for span in spans:
-        cid = span.hit_chunk_ids[0] if span.hit_chunk_ids else compute_chunk_id(
-            span.rel_posix_path, span.start_line, span.end_line, span.title
+        cid = (
+            span.hit_chunk_ids[0]
+            if span.hit_chunk_ids
+            else compute_chunk_id(span.rel_posix_path, span.start_line, span.end_line, span.title)
         )
         ptr = ChunkPointer(
             chunk_id=cid,
@@ -451,11 +462,15 @@ def _hydrate_spans(
         target_path = resolve_corpus_path(corpus_root, span.rel_posix_path)
         text = read_corpus_lines(target_path, span.start_line, span.end_line)
         if text is None:
-            passages.append(HydratedPassage(pointer=ptr, text="", score=span.max_score, stale_on_disk=True))
+            passages.append(
+                HydratedPassage(pointer=ptr, text="", score=span.max_score, stale_on_disk=True)
+            )
             continue
         if span.rel_posix_path.lower().endswith((".json", ".jsonl")):
             text = normalize_json_passage_text(text, default_title=span.title)
-        passages.append(HydratedPassage(pointer=ptr, text=text, score=span.max_score, stale_on_disk=False))
+        passages.append(
+            HydratedPassage(pointer=ptr, text=text, score=span.max_score, stale_on_disk=False)
+        )
     return passages
 
 

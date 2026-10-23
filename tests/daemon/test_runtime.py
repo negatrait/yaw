@@ -6,10 +6,12 @@ import hashlib
 import io
 import json
 import os
+import sqlite3
 import threading
 import time
 from collections.abc import Sequence
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import closing, redirect_stderr, redirect_stdout
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +25,7 @@ from yaw.core import (
     YawRuntimeError,
     load_config,
 )
-from yaw.daemon.cli import inspect_status, main
+from yaw.daemon.cli import build_parser, inspect_status, main
 from yaw.daemon.graph.inference import (
     HippoRAGProgram,
     compute_sizecoding_pareto_score,
@@ -47,7 +49,9 @@ class DeterministicTestLM(dspy.LM):
         **kwargs: Any,
     ) -> list[str]:
         if self.fail_online:
-            raise ConnectionError("Inference server at http://localhost:13305/api/v1 is unreachable")
+            raise ConnectionError(
+                "Inference server at http://localhost:13305/api/v1 is unreachable"
+            )
         req_str = str(prompt or messages or kwargs)
         if dspy.settings.usage_tracker is not None:
             dspy.settings.usage_tracker.add_usage(
@@ -206,7 +210,9 @@ http_port = 13306
     return cfg, toml_path
 
 
-def _make_program_and_embedder() -> tuple[HippoRAGProgram, Any, DeterministicTestLM, DeterministicTestEmbedder]:
+def _make_program_and_embedder() -> tuple[
+    HippoRAGProgram, Any, DeterministicTestLM, DeterministicTestEmbedder
+]:
     lm = DeterministicTestLM()
     dspy.settings.configure(lm=lm)
     prog = HippoRAGProgram(
@@ -222,9 +228,10 @@ def test_load_config_and_fingerprint(tmp_path: Path) -> None:
     """Verify stdlib tomllib loader, relative path resolution, and deterministic config fingerprinting."""
     repo_cfg = load_config(Path(__file__).resolve().parents[2] / "yaw.toml")
     assert repo_cfg.queue_maxsize == 32
-    assert repo_cfg.embedding_model == "embeddinggemma-300m-GGUF"
-    assert repo_cfg.extraction_model == "Qwen3-4B-Instruct-2507-GGUF"
-    assert repo_cfg.qa_model == "Qwen3-4B-Instruct-2507-GGUF"
+    assert repo_cfg.embedding_model == "embeddinggemma-300m-qat-q8_0-GGUF-Q8_0"
+    assert repo_cfg.context_window_tokens == 65536
+    assert repo_cfg.extraction_model == "Gemma-4-E4B-it-GGUF"
+    assert repo_cfg.qa_model == "Gemma-4-E4B-it-GGUF"
     assert repo_cfg.config_fingerprint().startswith("yaw-cfg-v1:")
 
     cfg1, toml_path = _make_test_config(tmp_path)
@@ -236,6 +243,169 @@ def test_load_config_and_fingerprint(tmp_path: Path) -> None:
     with pytest.raises(YawRuntimeError) as exc_info:
         load_config(tmp_path / "nonexistent.toml")
     assert exc_info.value.code == "INVALID_INPUT"
+
+
+def test_runtime_applies_configured_hydration_capacity(tmp_path: Path) -> None:
+    config, _ = _make_test_config(tmp_path)
+    config = replace(
+        config,
+        context_window_tokens=65536,
+        max_output_tokens=8192,
+        max_context_chars=None,
+        max_ast_expansion_hops=2,
+    )
+    program, embedder, _, _ = _make_program_and_embedder()
+    runtime = YawRuntime(config, program=program, embedder=embedder)
+    try:
+        runtime.start(sync_on_start=False)
+        assert runtime.engine is not None
+        assert runtime.engine.max_context_chars == 48000
+        assert runtime.engine.max_ast_expansion_hops == 2
+        assert runtime.engine.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 0
+    finally:
+        runtime.stop()
+
+
+def test_optimize_resume_parser_aliases() -> None:
+    parser = build_parser()
+    for command in (["dspy", "optimize"], ["optimize"]):
+        assert parser.parse_args([*command, "--resume"]).resume
+        for flag in ("--db", "--db-path"):
+            args = parser.parse_args([*command, flag, "latest"])
+            assert args.db_path == "latest"
+
+
+def test_cli_resume_without_a_run_fails_before_dataset_or_provider_access(tmp_path: Path) -> None:
+    cfg, toml_path = _make_test_config(tmp_path)
+    errors = io.StringIO()
+    with redirect_stderr(errors):
+        code = main(["dspy", "optimize", "--config", str(toml_path), "--resume"])
+    assert code == 1
+    assert "No optimization run exists" in errors.getvalue()
+    assert cfg.db_path is not None and not cfg.db_path.exists()
+
+
+def test_cli_resume_real_gepa_checkpoint_and_custom_output(tmp_path: Path) -> None:
+    """Real GEPA/DSPy + SQLite + CocoIndex; deterministic LM tests orchestration only."""
+    from gepa.core.state import GEPAState, ValsetEvaluation
+
+    cfg, toml_path = _make_test_config(tmp_path)
+    dataset = tmp_path / "resume_dataset.json"
+    records = [
+        {
+            "id": f"q{i}",
+            "question": f"Where did Alan Turing work ({i})?",
+            "answer": ["Bletchley Park"],
+            "paragraphs": [
+                {
+                    "title": "Alan Turing",
+                    "text": "Alan Turing worked at Bletchley Park as a wartime codebreaker.",
+                    "is_supporting": True,
+                }
+            ],
+        }
+        for i in range(2)
+    ]
+    dataset.write_text(json.dumps(records), encoding="utf-8")
+    custom_output = tmp_path / "my_compiled.json"
+    common = [
+        "dspy",
+        "optimize",
+        "--config",
+        str(toml_path),
+        "--dataset",
+        str(dataset),
+        "--mode",
+        "gepa",
+        "--max-queries",
+        "2",
+        "--train-queries",
+        "1",
+        "--num-trials",
+        "1",
+    ]
+
+    def run_cli(extra: list[str], *, bare: bool = False) -> tuple[int, str, str]:
+        prog, emb, _, _ = _make_program_and_embedder()
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            invocation = ["dspy", "optimize", "--config", str(toml_path)] if bare else common
+            code = main([*invocation, *extra], program=prog, embedder=emb)
+        return code, out.getvalue(), err.getvalue()
+
+    rc, output, errors = run_cli(["--output", str(custom_output)])
+    assert rc == 0, errors
+    original = json.loads(output)
+    db_path = Path(original["sandbox_db_path"])
+    telemetry = tmp_path / "my_compiled_telemetry"
+    checkpoint = telemetry / "gepa_state.bin"
+    assert checkpoint.is_file()
+    state = GEPAState.load(str(telemetry))
+    # Persist a superior candidate using GEPA's real state API. A restart must
+    # return it, rather than deleting the checkpoint and returning the seed.
+    candidate = dict(state.program_candidates[0])
+    candidate["qa.predict"] += "\nRESUMED_WINNER: ground every answer in evidence."
+    state.update_state_with_new_program(
+        [0],
+        candidate,
+        ValsetEvaluation(
+            outputs_by_val_id={0: dspy.Prediction(answer="Bletchley Park")},
+            scores_by_val_id={0: 1.0},
+            objective_scores_by_val_id={0: {"f1": 1.0}},
+        ),
+        str(telemetry),
+        1,
+    )
+    state.save(str(telemetry), use_cloudpickle=True)
+    custom_output.unlink()  # unfinished run need not have a final program
+    with closing(sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True)) as conn:
+        initial_openie = conn.execute("SELECT * FROM openie_chunks").fetchall()
+    for selection in (["--resume"], ["--db-path", "latest"]):
+        rc, output, errors = run_cli(selection, bare=True)
+        assert rc == 0, errors
+        resumed = json.loads(output)
+        assert resumed["sandbox_db_path"] == original["sandbox_db_path"]
+        assert custom_output.is_file()
+        assert "RESUMED_WINNER" in custom_output.read_text(encoding="utf-8")
+        loaded = GEPAState.load(str(telemetry))
+        assert loaded.program_candidates == state.program_candidates
+        assert loaded.total_num_evals == state.total_num_evals
+        pools = json.loads((tmp_path / "my_compiled_pools.json").read_text())
+        assert pools["corpus_chunk_ids"]
+        with closing(sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True)) as conn:
+            assert conn.execute("SELECT * FROM openie_chunks").fetchall() == initial_openie
+
+    # Same length, different questions: reject before replacing the corpus or
+    # touching the checkpoint, preserving both for inspection or recovery.
+    original_checkpoint = checkpoint.read_bytes()
+    assert cfg.corpus_root is not None
+    corpus_path = cfg.corpus_root / ".yaw_optimize_slice.json"
+    original_corpus = corpus_path.read_bytes()
+    records[0]["question"] = "A changed training question"
+    dataset.write_text(json.dumps(records), encoding="utf-8")
+    rc, _, errors = run_cli(["--resume"], bare=True)
+    assert rc == 1
+    assert "Cannot resume" in errors
+    assert checkpoint.read_bytes() == original_checkpoint
+    assert corpus_path.read_bytes() == original_corpus
+
+
+def test_resume_preserves_unverifiable_legacy_checkpoint(tmp_path: Path) -> None:
+    cfg, _ = _make_test_config(tmp_path)
+    prog, emb, _, _ = _make_program_and_embedder()
+    target = tmp_path / "legacy.json"
+    checkpoint = tmp_path / "legacy_telemetry" / "gepa_state.bin"
+    checkpoint.parent.mkdir()
+    checkpoint.write_bytes(b"legacy checkpoint must survive")
+    runtime = YawRuntime(cfg, program=prog, embedder=emb)
+    runtime.start(sync_on_start=False)
+    try:
+        examples = [dspy.Example(question="Test?").with_inputs("question")]
+        with pytest.raises(YawRuntimeError, match="legacy GEPA checkpoint"):
+            runtime.optimize(examples, mode="gepa", save_path=target, num_trials=1)
+        assert checkpoint.read_bytes() == b"legacy checkpoint must survive"
+    finally:
+        runtime.stop()
 
 
 def test_second_runtime_fails_fast_on_lock(tmp_path: Path) -> None:
@@ -341,7 +511,7 @@ def test_stage1_crash_resume_does_not_reextract_completed_chunks(tmp_path: Path)
             raise RuntimeError("Simulated mid-batch Stage 1 OpenIE crash on chunk 2")
         return orig_extract1(chunk_id, passage, **kw)
 
-    setattr(prog1, "extract_openie", _InstrumentedExtract)
+    prog1.extract_openie = _InstrumentedExtract
 
     rt1 = YawRuntime(cfg, program=prog1, embedder=emb1)
     rt1.start(sync_on_start=False)
@@ -372,7 +542,7 @@ def test_stage1_crash_resume_does_not_reextract_completed_chunks(tmp_path: Path)
         extracted_counts[chunk_id] = extracted_counts.get(chunk_id, 0) + 1
         return orig_extract2(chunk_id, passage, **kw)
 
-    setattr(prog2, "extract_openie", _InstrumentedExtract2)
+    prog2.extract_openie = _InstrumentedExtract2
 
     rt2 = YawRuntime(cfg, program=prog2, embedder=emb2)
     rt2.start(sync_on_start=True)
@@ -506,7 +676,7 @@ def test_optimize_and_reload_compiled_program_with_composite_fitness(tmp_path: P
             return student
 
     orig_gepa = getattr(dspy, "GEPA", None)
-    setattr(dspy, "GEPA", StubGEPA)
+    dspy.GEPA = StubGEPA
     try:
         rt1 = YawRuntime(cfg, program=prog, embedder=emb)
         rt1.start(sync_on_start=True)
@@ -524,7 +694,7 @@ def test_optimize_and_reload_compiled_program_with_composite_fitness(tmp_path: P
             rt1.stop()
     finally:
         if orig_gepa is not None:
-            setattr(dspy, "GEPA", orig_gepa)
+            dspy.GEPA = orig_gepa
 
     # 3. Start a brand-new YawRuntime and verify compiled_program.json restores all 5 surfaces
     fresh_prog, fresh_emb, _, _ = _make_program_and_embedder()
@@ -539,7 +709,9 @@ def test_optimize_and_reload_compiled_program_with_composite_fitness(tmp_path: P
         assert loaded_p.gbnf_max_facts == 3
         assert loaded_p.gbnf_max_reasoning_chars == 160
         assert rt2.engine.embedder.profile.query_prefix == "task: custom optimized query | query: "
-        assert rt2.engine.embedder.profile.fact_query_prefix == "task: custom optimized fact | query: "
+        assert (
+            rt2.engine.embedder.profile.fact_query_prefix == "task: custom optimized fact | query: "
+        )
         assert rt2.engine.embedder.profile.document_prefix == "title: custom | text: "
     finally:
         rt2.stop()
@@ -901,7 +1073,9 @@ def test_cli_config_get_and_set(tmp_path: Path) -> None:
     # 3. Setting invalid value fails with INVALID_INPUT and preserves yaw.toml integrity
     err_buf = io.StringIO()
     with redirect_stderr(err_buf):
-        rc_err = main(["config", "set", "optimization.auto", "super_heavy", "--config", str(toml_path)])
+        rc_err = main(
+            ["config", "set", "optimization.auto", "super_heavy", "--config", str(toml_path)]
+        )
     assert rc_err == 1
     err_payload = json.loads(err_buf.getvalue())
     assert err_payload["error"] == "INVALID_INPUT"
@@ -981,20 +1155,25 @@ def test_cli_dspy_optimize_sandbox_isolation_and_status(
         # Write small synthetic dataset
         bench_ds = tmp_path / "bench.json"
         bench_ds.write_text(
-            json.dumps([
-                {
-                    "id": "q1",
-                    "question": "Question 1?",
-                    "answer": ["Answer 1"],
-                    "paragraphs": [{"title": "Doc 1", "text": "Content 1.", "is_supporting": True}],
-                }
-            ]),
+            json.dumps(
+                [
+                    {
+                        "id": "q1",
+                        "question": "Question 1?",
+                        "answer": ["Answer 1"],
+                        "paragraphs": [
+                            {"title": "Doc 1", "text": "Content 1.", "is_supporting": True}
+                        ],
+                    }
+                ]
+            ),
             encoding="utf-8",
         )
 
         class FastGEPA:
             def __init__(self, *args: Any, **kwargs: Any) -> None:
                 pass
+
             def compile(self, student: Any, *args: Any, **kwargs: Any) -> Any:
                 return student
 
