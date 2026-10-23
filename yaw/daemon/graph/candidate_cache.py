@@ -20,10 +20,21 @@ logger = logging.getLogger(__name__)
 
 
 def _encode_string(value: str, sources: dict[str, str]) -> Any:
+    if len(value) >= 16:
+        for digest, source in sources.items():
+            start = source.find(value)
+            if start >= 0:
+                return {
+                    "type": "source_span",
+                    "value": digest,
+                    "start": start,
+                    "end": start + len(value),
+                }
     parts: list[Any] = [value]
     for digest, source in sources.items():
         for spelling, escaped, ascii_only in (
-            (source, False, False), (json.dumps(source)[1:-1], True, True),
+            (source, False, False),
+            (json.dumps(source)[1:-1], True, True),
             (json.dumps(source, ensure_ascii=False)[1:-1], True, False),
         ):
             if not spelling or (len(spelling) < 16 and spelling != value):
@@ -36,43 +47,67 @@ def _encode_string(value: str, sources: dict[str, str]) -> Any:
                 fragments = part.split(spelling)
                 for i, fragment in enumerate(fragments):
                     if i:
-                        replaced.append({
-                            "type": "source", "value": digest,
-                            "escaped": escaped, "ascii_only": ascii_only,
-                        })
+                        replaced.append(
+                            {
+                                "type": "source",
+                                "value": digest,
+                                "escaped": escaped,
+                                "ascii_only": ascii_only,
+                            }
+                        )
                     if fragment:
                         replaced.append(fragment)
             parts = replaced
     return value if parts == [value] else {"type": "source_parts", "value": parts}
 
 
-def _encode(value: Any, sources: dict[str, str]) -> Any:
+def _encode(value: Any, sources: dict[str, str], *, source_passages: bool = False) -> Any:
+    def encode(item: Any) -> Any:
+        return _encode(item, sources, source_passages=source_passages)
+
     if isinstance(value, str):
         return _encode_string(value, sources)
     if value is None or isinstance(value, (int, float, bool)):
         return value
     if isinstance(value, dict):
-        return {"type": "dict", "value": [
-            [key, {"type": "passage"} if key == "passage" and isinstance(item, str)
-             else _encode(item, sources)] for key, item in value.items()
-        ]}
+        return {
+            "type": "dict",
+            "value": [
+                [
+                    key,
+                    {"type": "passage"}
+                    if key == "passage" and isinstance(item, str) and not source_passages
+                    else encode(item),
+                ]
+                for key, item in value.items()
+            ],
+        }
     if isinstance(value, (OpenIERecord, StructuredTriple)):
-        return {"type": type(value).__name__, "value": _encode({
-            f.name: getattr(value, f.name) for f in fields(value)
-        }, sources)}
+        return {
+            "type": type(value).__name__,
+            "value": encode({f.name: getattr(value, f.name) for f in fields(value)}),
+        }
     if isinstance(value, dspy.Prediction):
-        return {"type": "prediction", "value": _encode(value.toDict(), sources)}
+        return {"type": "prediction", "value": encode(value.toDict())}
     if isinstance(value, REPLHistory):
-        return {"type": "repl_history", "value": _encode({
-            "entries": [entry.model_dump() for entry in value.entries],
-            "max_output_chars": value.max_output_chars,
-        }, sources)}
+        return {
+            "type": "repl_history",
+            "value": encode(
+                {
+                    "entries": [entry.model_dump() for entry in value.entries],
+                    "max_output_chars": value.max_output_chars,
+                }
+            ),
+        }
     if isinstance(value, np.ndarray):
         vector = np.asarray(value, dtype=np.float32)
-        return {"type": "array", "shape": list(vector.shape),
-                "value": base64.b64encode(vector.tobytes()).decode("ascii")}
+        return {
+            "type": "array",
+            "shape": list(vector.shape),
+            "value": base64.b64encode(vector.tobytes()).decode("ascii"),
+        }
     if isinstance(value, (tuple, list, set)):
-        return {"type": type(value).__name__, "value": [_encode(item, sources) for item in value]}
+        return {"type": type(value).__name__, "value": [encode(item) for item in value]}
     raise TypeError(f"Unsupported candidate-cache value: {type(value).__name__}")
 
 
@@ -80,11 +115,14 @@ def _decode(value: Any, passage: str | None, sources: dict[str, str]) -> Any:
     if not isinstance(value, dict):
         return value
     tag = value["type"]
+    if tag == "source_span":
+        return sources[value["value"]][value["start"] : value["end"]]
     if tag == "source":
         source = sources[value["value"]]
         return (
             json.dumps(source, ensure_ascii=value["ascii_only"])[1:-1]
-            if value["escaped"] else source
+            if value["escaped"]
+            else source
         )
     if tag == "source_parts":
         return "".join(_decode(part, passage, sources) for part in value["value"])
@@ -93,9 +131,11 @@ def _decode(value: Any, passage: str | None, sources: dict[str, str]) -> Any:
             raise ValueError("OpenIE trace replay requires the current hydrated passage.")
         return passage
     if tag == "array":
-        return np.frombuffer(base64.b64decode(value["value"]), dtype=np.float32).reshape(
-            value["shape"]
-        ).copy()
+        return (
+            np.frombuffer(base64.b64decode(value["value"]), dtype=np.float32)
+            .reshape(value["shape"])
+            .copy()
+        )
     if tag == "dict":
         return {k: _decode(v, passage, sources) for k, v in value["value"]}
     if tag in {"list", "tuple", "set"}:
@@ -111,6 +151,27 @@ def _decode(value: Any, passage: str | None, sources: dict[str, str]) -> Any:
     if tag == "repl_history":
         return REPLHistory.model_validate(decoded)
     raise ValueError(f"Unknown candidate-cache type: {tag}")
+
+
+class CandidatePayloadCodec:
+    """JSON snapshots with corpus excerpts hydrated by source identity and span."""
+
+    def __init__(self, sources: Callable[[], dict[str, str]]) -> None:
+        self.sources = sources
+
+    def encode(self, value: Any) -> str:
+        return json.dumps(
+            {"reflection_codec": 1, "value": _encode(value, self.sources(), source_passages=True)},
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+
+    def decode(self, value: str) -> Any:
+        parsed = json.loads(value)
+        if parsed.get("reflection_codec") == 1:
+            return _decode(parsed["value"], None, self.sources())
+        return parsed  # Legacy snapshots still reach explicit state/context validation.
 
 
 class CandidateStageCache:
@@ -174,10 +235,14 @@ class CandidateStageCache:
         return value
 
     def __setitem__(self, key: tuple[str, ...], value: Any) -> None:
-        payload = zlib.compress(json.dumps(
-            _encode(value, self.sources()),
-            ensure_ascii=False, allow_nan=False, separators=(",", ":")
-        ).encode("utf-8"))
+        payload = zlib.compress(
+            json.dumps(
+                _encode(value, self.sources()),
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
         if self.store.conn.in_transaction:
             self.store.put(self.stage, self._key(key), payload, max_bytes=self.max_bytes)
         else:

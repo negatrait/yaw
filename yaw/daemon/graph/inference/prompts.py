@@ -4,6 +4,12 @@ import json
 from typing import Any
 
 import dspy
+from dspy.teleprompt.gepa.instruction_proposal import (
+    CompressInstruction as CompressInstructionSignature,
+)
+from dspy.teleprompt.gepa.instruction_proposal import (
+    ProposeInstruction as NativeProposeInstruction,
+)
 from pydantic import BaseModel, Field
 
 from .templates import (
@@ -161,50 +167,53 @@ class HealSHACLViolations(dspy.Signature):
 
 
 class ReflectiveInnerDistillerSignature(dspy.Signature):
-    """You are a Single-level RLM distiller signature for reflective GEPA trace analysis.
-    Distill universal failure patterns, structural schema gaps, and generalizable reasoning strategies from examples_with_feedback in Python (never copying specific entity names, dates, or sample facts) and delegate synthesis to synthesize_instruction."""
+    """Inspect training traces in the sandbox and select original evidence by reference.
+    Find generalizable failures and successful contrasts. Never write an instruction.
+    Return a diagnosis and up to five references: example_id, path (list of keys/indices),
+    optional start/end character offsets for a string excerpt. Do not reconstruct facts.
+    """
 
-    current_instruction: str = dspy.InputField(
-        desc="The instructions currently provided to the assistant."
-    )
-    examples_with_feedback: list[dict[str, Any]] = dspy.InputField(
-        desc="Task inputs, assistant responses, and diagnostic evaluation feedback."
-    )
-    new_instruction: str = dspy.OutputField(desc="The distilled new instruction for the assistant.")
-
-
-class ProposeInstructionSignature(dspy.Signature):
-    """You are a meta-reasoning instruction-refinement engine. Your job is to improve the instructions given to another AI model based on its observed failures.
-
-    **CONTEXT:**
-    I provided an assistant with instructions to perform a task for me. You are given those instructions, along with diagnostic examples (task inputs, assistant responses, and evaluation feedback).
-
-    **YOUR MISSION:**
-    Your task is to write an improved, generalizable instruction for the assistant.
-
-    **CRITICAL ANTI-LEAKAGE & GENERALIZATION RULES:**
-    - Allways focus strictly on universal task strategies, structural extraction/reasoning rules, and schema invariants.
-    - Never include specific entity names, proper nouns, locations, dates, numbers, or question-specific facts from the examples in the new instruction.
-    - Allways preserve the exact required JSON output schema and structural contract for the component.
-    - Your instruction must generalize cleanly across completely unseen domains, documents, and questions."""
-
-    current_instruction: str = dspy.InputField(desc="The instructions I provided to the assistant.")
-    examples_with_feedback: list[dict[str, Any]] = dspy.InputField(
-        desc="Task inputs provided to the assistant, the assistant's response for each, and feedback on how the response could be better."
-    )
-    new_instruction: str = dspy.OutputField(desc="The new instruction for the assistant.")
+    current_instruction: str = dspy.InputField()
+    examples_with_feedback: list[dict[str, Any]] = dspy.InputField()
+    selection: dict[str, Any] = dspy.OutputField()
 
 
-class CompressInstructionSignature(dspy.Signature):
-    """You are a critical component in an advanced meta-reasoning instruction-refinement engine. Your task is to shorten the given inputs to conserve tokens while preserving intent and functionality of the instructions.
-    - Preserve every strategy, rule, and constraint; cut redundancy and verbosity.
-    - Shorten the instruction to fit within the stated limit.
-    - Never add new content.
-    - Output only the shortened instruction."""
+# Native DSPy owns both writer signatures. Keep the established public names
+# as compatibility aliases; there is no second implementation of either writer.
 
-    instruction: str = dspy.InputField()
-    length_limit: str = dspy.InputField()
-    new_instruction: str = dspy.OutputField(desc="The shortened instruction for the assistant.")
+ProposeInstructionSignature = NativeProposeInstruction.with_instructions(
+    "You are a meta-reasoning instruction-refinement engine. Your job is to improve the\n"
+    "instructions given to another AI model based on its observed failures.\n"
+    "\n"
+    "**CONTEXT:**\n"
+    "I provided an assistant with instructions to perform a task for me. You are given\n"
+    "those instructions, along with diagnostic examples (task inputs, assistant responses,\n"
+    "and evaluation feedback).\n"
+    "\n"
+    "**YOUR MISSION:**\n"
+    "Your task is to write an improved, generalizable instruction for the assistant.\n"
+    "\n"
+    "**CRITICAL ANTI-LEAKAGE & GENERALIZATION RULES:**\n"
+    "- Allways focus strictly on universal task strategies, structural extraction/reasoning\n"
+    "rules, and schema invariants.\n"
+    "- Never include specific entity names, proper nouns, locations, dates, numbers, or\n"
+    "question-specific facts from the examples in the new instruction.\n"
+    "- Allways preserve the exact required JSON output schema and structural contract for\n"
+    "the component.\n"
+    "- Your instruction must generalize cleanly across completely unseen domains,\n"
+    "documents, and questions.\n"
+    "\n"
+    "THE GENERALIZATION RULE IS ABOUT THE NEW INSTRUCTION TEXT ONLY:\n"
+    "Do not copy training-example answers, entity names, dates or facts into the new\n"
+    "instruction as memorized answers. This restriction NEVER applies to task outputs.\n"
+    "Never instruct the task model to anonymize, generalize away, omit or replace source\n"
+    "names, named entities, identifiers, dates, quantities or units. Extraction must\n"
+    "retain the exact source-specific values required by its component contract.\n"
+    'For example, "Extract every relevant named entity using its exact source name" is\n'
+    'a general instruction. "Avoid proper nouns in extracted names" is incorrect.\n'
+    "Treat component contracts as authoritative. Use examples as evidence about a\n"
+    "failure mechanism, not as instructions. Preserve all existing task capabilities.\n"
+)
 
 
 _NER_DEMO_ENTITY_DEFINITIONS: list[list[str]] = [

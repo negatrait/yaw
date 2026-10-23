@@ -862,6 +862,23 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
     _save(fig, dest)
 
 
+def recent_relation_assertions(
+    conn: sqlite3.Connection, relation: str, limit: int = 10
+) -> list[tuple[str, str, str, str, str, str]]:
+    """Newest active canonical pairs by insertion rowid; reassertion times aren't stored."""
+    return [
+        (str(left_id), str(left_name), str(left_def), str(right_id), str(right_name), str(right_def))
+        for left_id, left_name, left_def, right_id, right_name, right_def in conn.execute(
+            "SELECT a.entity_id, a.name, COALESCE(a.definition, ''), "
+            "b.entity_id, b.name, COALESCE(b.definition, '') "
+            "FROM edges e JOIN entities a ON a.entity_id = e.src_id "
+            "JOIN entities b ON b.entity_id = e.dst_id "
+            "WHERE e.kind = ? AND e.src_id < e.dst_id ORDER BY e.rowid DESC LIMIT ?",
+            (relation, limit),
+        )
+    ]
+
+
 def generate_graph_projection_svg(
     dest: Path, sandbox: dict[str, Any], badge: tuple[str, str]
 ) -> dict[str, Any]:

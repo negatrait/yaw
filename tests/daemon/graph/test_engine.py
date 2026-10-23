@@ -9,9 +9,31 @@ import dspy
 import numpy as np
 import pytest
 
+from daemon.graph.inference.test_reflection import provider as provider
 from yaw.core import ChunkPointer
 from yaw.daemon.graph.engine import YawGraphEngine
 from yaw.daemon.graph.inference import HippoRAGProgram
+
+
+def protocol_token_counter(url):
+    from yaw.daemon.graph.inference import ServingTokenCounter
+
+    serving = ServingTokenCounter(url, "reflection-model")
+
+    def count(messages, **kwargs):
+        return serving(messages, **kwargs)
+
+    # Synthetic task LMs have no resident serving identity. The loopback
+    # tokenizer still exercises exact request budgeting for orchestration.
+    count.identity = serving.identity
+    count.context_tokens = serving.context_tokens
+    return count
+
+
+@pytest.fixture
+def reflection_token_counter(provider):
+    url, _calls = provider
+    return protocol_token_counter(url)
 
 
 class DeterministicMockLM(dspy.LM):
@@ -224,7 +246,9 @@ def test_openie_resume_reuses_matching_prompts_and_invalidates_mutations(tmp_pat
     database = tmp_path / "resume.db"
     first = CountingProgram()
     engine = YawGraphEngine(
-        db_path=database, workspace_root=tmp_path, program=first,
+        db_path=database,
+        workspace_root=tmp_path,
+        program=first,
         embedder=DeterministicMockEmbedder(dim=64),
     )
     try:
@@ -242,23 +266,27 @@ def test_openie_resume_reuses_matching_prompts_and_invalidates_mutations(tmp_pat
     # Recreate all Python objects: no in-memory stage cache can survive.
     second = CountingProgram()
     engine = YawGraphEngine(
-        db_path=database, workspace_root=tmp_path, program=second,
+        db_path=database,
+        workspace_root=tmp_path,
+        program=second,
         embedder=DeterministicMockEmbedder(dim=64),
     )
     try:
         engine.index_chunks(chunks)
         assert second.openie_calls == 0
-        assert engine.conn.execute(
-            "SELECT value FROM meta WHERE key GLOB 'indexed_fp:*'"
-        ).fetchall() == provenance
+        assert (
+            engine.conn.execute("SELECT value FROM meta WHERE key GLOB 'indexed_fp:*'").fetchall()
+            == provenance
+        )
         second.ner.signature = second.ner.signature.with_instructions(
             second.ner.signature.instructions + " Include all explicitly named people."
         )
         engine.index_chunks(chunks, program=second)
         assert second.openie_calls == 1
-        assert engine.conn.execute(
-            "SELECT value FROM meta WHERE key GLOB 'indexed_fp:*'"
-        ).fetchall() != provenance
+        assert (
+            engine.conn.execute("SELECT value FROM meta WHERE key GLOB 'indexed_fp:*'").fetchall()
+            != provenance
+        )
     finally:
         engine.close()
 
@@ -301,11 +329,11 @@ def test_engine_end_to_end_trace_hook(test_engine: YawGraphEngine) -> None:
     pred = test_engine.program(question="Who designed the ACE?")
 
     assert hasattr(pred, "answer")
-    assert getattr(pred, "answer") == "Alan Turing"
+    assert pred.answer == "Alan Turing"
     assert hasattr(pred, "context")
-    assert "Alan Turing" in getattr(pred, "context")
+    assert "Alan Turing" in pred.context
     assert hasattr(pred, "retrieved_passages")
-    assert len(getattr(pred, "retrieved_passages")) > 0
+    assert len(pred.retrieved_passages) > 0
 
 
 def test_engine_delete_chunks_cascades_and_invalidates_csr(test_engine: YawGraphEngine) -> None:
@@ -461,6 +489,7 @@ def test_engine_fact_score_weighting_and_thread_safe_retrieval(tmp_path: Path) -
 
 
 def test_engine_evolve_prompts_miprov2_and_gepa_metric_contracts(
+    reflection_token_counter,
     test_engine: YawGraphEngine,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -539,7 +568,9 @@ def test_engine_evolve_prompts_miprov2_and_gepa_metric_contracts(
     monkeypatch.setattr(dspy, "MIPROv2", FakeMIPROv2, raising=False)
     monkeypatch.setattr(dspy, "GEPA", FakeGEPA, raising=False)
 
-    test_engine.evolve_prompts(trainset, mode="hybrid")
+    test_engine.evolve_prompts(
+        trainset, mode="hybrid", reflection_token_counter=reflection_token_counter
+    )
     assert len(mipro_scores) == 1
     assert len(gepa_scores) == 1
 
@@ -1342,6 +1373,7 @@ def test_engine_define_missing_entities_telemetry_and_no_heuristic_fallbacks(
 
 
 def test_engine_evolve_prompts_reindexes_on_extraction_mutation_and_captures_all_stage_traces(
+    reflection_token_counter,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1544,7 +1576,9 @@ def test_engine_evolve_prompts_reindexes_on_extraction_mutation_and_captures_all
                 return cand_ner
 
         monkeypatch.setattr(dspy, "GEPA", InspectingGEPA, raising=False)
-        compiled = engine.evolve_prompts(trainset, mode="gepa")
+        compiled = engine.evolve_prompts(
+            trainset, mode="gepa", reflection_token_counter=reflection_token_counter
+        )
         assert "MUTATED_NER_MARKER" in compiled.ner.signature.instructions
         assert len(observed_traces) >= 3
         assert "[ner]" in feedback_by_stage["ner"]
@@ -1943,6 +1977,7 @@ def test_canonical_retrieval_hook_and_rag_qa_forward_unification(
 
 
 def test_hybrid_e2e_per_query_isolation_stage_caching_and_reflective_stats(
+    reflection_token_counter,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2074,17 +2109,22 @@ def test_hybrid_e2e_per_query_isolation_stage_caching_and_reflective_stats(
                 return cand_syn
 
         monkeypatch.setattr(dspy, "GEPA", VerifyingGEPA, raising=False)
-        _ = engine.evolve_prompts([ex1, ex2], mode="gepa")
+        _ = engine.evolve_prompts(
+            [ex1, ex2], mode="gepa", reflection_token_counter=reflection_token_counter
+        )
     finally:
         engine.close()
 
 
 def test_evolve_prompts_real_unmocked_gepa_and_miprov2_with_context_limit_guard(
     tmp_path: Path,
+    provider,
 ) -> None:
     """Run real un-mocked dspy.MIPROv2 and dspy.GEPA end-to-end with a strict context-size guard and RLM proposer."""
     import json
 
+    tokenizer_url, _tokenizer_calls = provider
+    counter = protocol_token_counter(tokenizer_url)
     max_observed_prompt_chars = 0
 
     class ContextGuardedRealOptLM(DeterministicMockLM):
@@ -2109,12 +2149,11 @@ def test_evolve_prompts_real_unmocked_gepa_and_miprov2_with_context_limit_guard(
             if "variables_info" in req_str and "repl_history" in req_str:
                 return [
                     "[[ ## reasoning ## ]]\n"
-                    "Distill examples_with_feedback in the Python REPL and call synthesize_instruction.\n\n"
+                    "Select original evidence by reference.\n\n"
                     "[[ ## code ## ]]\n"
                     "```python\n"
-                    "digest = [{'Inputs': {k: (v[:300] if isinstance(v, str) else v) for k, v in ex.get('Inputs', {}).items()}, 'Generated Outputs': ex.get('Generated Outputs', {}), 'Feedback': ex.get('Feedback', '')} for ex in examples_with_feedback[:3]]\n"
-                    "res = synthesize_instruction(current_instruction=current_instruction, examples_with_feedback=digest)\n"
-                    "SUBMIT(new_instruction=res)\n"
+                    "SUBMIT(selection={'diagnosis': 'Use original evidence', 'references': "
+                    "[{'example_id': examples_with_feedback[0]['evidence_id'], 'path': []}]})\n"
                     "```\n"
                     "[[ ## completed ## ]]"
                 ]
@@ -2198,22 +2237,31 @@ def test_evolve_prompts_real_unmocked_gepa_and_miprov2_with_context_limit_guard(
         save_path = tmp_path / "real_compiled.json"
         compiled = engine.evolve_prompts(
             trainset,
+            reflection_token_counter=counter,
             valset=valset,
             mode="hybrid",
             num_candidates=2,
             num_trials=5,
             save_path=save_path,
+            max_bootstrapped_demos=0,
+            max_labeled_demos=0,
         )
         assert isinstance(compiled, HippoRAGProgram)
         assert max_observed_prompt_chars < 32000
         assert save_path.exists()
         assert getattr(compiled, "detailed_results", None) is not None
-        assert len(compiled.shacl_healer_rlm.generate_action.demos) >= 1
+        # Zero-shot optimization must remove seeded task demos, including SHACL's.
+        # Verify the saved artifact preserves that contract as well.
+        restored = HippoRAGProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
+        restored.load(str(save_path))
+        for task_program in (compiled, restored):
+            for name, predictor in task_program.named_predictors():
+                assert not predictor.demos, f"Zero-shot task predictor {name} retained demos"
         telemetry_path = tmp_path / "real_compiled_proposer_telemetry.json"
         assert telemetry_path.exists()
         telemetry_data = json.loads(telemetry_path.read_text(encoding="utf-8"))
         assert len(telemetry_data) >= 1
-        assert all(entry.get("mode") == "rlm" for entry in telemetry_data)
+        assert all(entry.get("mode") == "evidence_native" for entry in telemetry_data)
     finally:
         engine.close()
 
@@ -2392,7 +2440,9 @@ def test_engine_homographs_paronyms_and_same_label_triple_permutations(
         ).fetchone()
         assert cinderella_row is not None
         assert (
-            engine.conn.execute("SELECT entity_id FROM entities WHERE name = 'cindarella'").fetchone()
+            engine.conn.execute(
+                "SELECT entity_id FROM entities WHERE name = 'cindarella'"
+            ).fetchone()
             is None
         )
         hidden_labels = [
@@ -2464,7 +2514,9 @@ def test_engine_homographs_paronyms_and_same_label_triple_permutations(
         ).fetchall()
         assert len(ball_facts) == 2
         for fid, sid, pred, oid in ball_facts:
-            assert str(sid) != str(oid), f"Homograph triple collapsed into self-loop on {fid} ({pred})"
+            assert str(sid) != str(oid), (
+                f"Homograph triple collapsed into self-loop on {fid} ({pred})"
+            )
             assert str(sid) in ball_ids and str(oid) in ball_ids
 
         # Verify the two permutations have reversed (subject_id, object_id) poles

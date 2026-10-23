@@ -4,20 +4,22 @@ import functools
 import inspect
 import json
 import logging
+import math
 import re
+import sys
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal
 
 import dspy
+from dspy.utils.exceptions import AdapterParseError, LMError
 
-from yaw.core.config import YawConfig
+from yaw.core.config import YawConfig, context_char_limit
 from yaw.core.types import OpenIERecord, StructuredTriple
 
 from .chat import create_dspy_lm
 from .diagnostics import DiagnosticHistory, diagnostic_boundary, trim_diagnostics
 from .grammars import (
-    DSPY_INSTRUCTION_PROPOSAL_GBNF_GRAMMAR,
     DSPY_RERANK_GBNF_GRAMMAR,
     build_dspy_instruction_proposal_grammar,
     build_dspy_missing_entity_defs_grammar,
@@ -60,6 +62,17 @@ from .prompts import (
     ProposeSHACLRepairs,
     ReflectiveInnerDistillerSignature,
 )
+from .reflection import (
+    ReflectionBudgetError,
+    ReflectionLM,
+    checkpoint_object,
+    deterministic_evidence,
+    reflection_digest,
+    reflection_examples,
+    resolve_evidence,
+    validate_request_checkpoint,
+    validate_simba_state,
+)
 
 _STAGE_RLM_DELEGATION_RULES: dict[str, str] = {
     "shacl_repair": (
@@ -72,14 +85,11 @@ _STAGE_RLM_DELEGATION_RULES: dict[str, str] = {
         "```"
     ),
     "instruction_proposer_inner": (
-        "CRITICAL RLM SANDBOX RULE:\n"
-        "Prioritize aggressive 1-step or 2-step resolution: do NOT import `synthesize_instruction` (`synthesize_instruction` and `SUBMIT` are already in global scope).\n"
-        "Never make redundant exploratory tool calls or iterative loops. Immediately distill `examples_with_feedback` in Python, call `synthesize_instruction`, and immediately call `SUBMIT`:\n"
-        "```python\n"
-        "digest = [{'Inputs': {k: (v[:400] if isinstance(v, str) else v) for k, v in ex.get('Inputs', {}).items()}, 'Generated Outputs': ex.get('Generated Outputs', {}), 'Feedback': ex.get('Feedback', '')} for ex in examples_with_feedback]\n"
-        "res = synthesize_instruction(current_instruction=current_instruction, examples_with_feedback=digest)\n"
-        "SUBMIT(new_instruction=res)\n"
-        "```"
+        "Inspect examples_with_feedback in Python. Select evidence by evidence_id and field path; "
+        "use start/end character offsets for string excerpts. Include failures and successes. "
+        "contrasts. Never write instructions or reconstruct facts. "
+        "SUBMIT(selection={'diagnosis': 'brief generalizable diagnosis', "
+        "'references': [{'example_id': examples_with_feedback[0]['evidence_id'], 'path': []}]})"
     ),
 }
 
@@ -98,24 +108,7 @@ def _build_rlm_action_demos() -> dict[str, list[dspy.Example]]:
                 code="```python\nrepairs = qwen_propose_shacl_repairs(violations=violations)\nSUBMIT(repairs=repairs)\n```",
             ).with_inputs("variables_info", "repl_history", "iteration")
         ],
-        "instruction_proposer_inner": [
-            dspy.Example(
-                variables_info=(
-                    "Variable: `current_instruction` (type: str): The instructions currently provided to the assistant.\n"
-                    "Variable: `examples_with_feedback` (type: list): Task inputs, assistant responses, and diagnostic evaluation feedback."
-                ),
-                repl_history=empty_history,
-                iteration="1/10",
-                reasoning="Distill the examples and feedback in Python and immediately call synthesize_instruction and SUBMIT.",
-                code=(
-                    "```python\n"
-                    "digest = [{'Inputs': {k: (v[:400] if isinstance(v, str) else v) for k, v in ex.get('Inputs', {}).items()}, 'Generated Outputs': ex.get('Generated Outputs', {}), 'Feedback': ex.get('Feedback', '')} for ex in examples_with_feedback]\n"
-                    "res = synthesize_instruction(current_instruction=current_instruction, examples_with_feedback=digest)\n"
-                    "SUBMIT(new_instruction=res)\n"
-                    "```"
-                ),
-            ).with_inputs("variables_info", "repl_history", "iteration")
-        ],
+        "instruction_proposer_inner": [],
     }
 
 
@@ -139,7 +132,7 @@ def _normalize_rlm_field(name: str, val: Any, annotation: Any) -> Any:
         if isinstance(val, str):
             try:
                 loaded = json.loads(val)
-            except (json.JSONDecodeError, TypeError, ValueError):
+            except json.JSONDecodeError, TypeError, ValueError:
                 loaded = None
             if isinstance(loaded, list):
                 return loaded
@@ -251,7 +244,9 @@ class _PositionalSafeRLM(_RLM_Base):
                 return tool(**bound.arguments)
 
         functools.update_wrapper(invoke, tool.func)
-        setattr(invoke, "__signature__", sig)
+        # inspect.signature's documented callable protocol; retain coroutine
+        # identity rather than replacing the function with a callable object.
+        vars(invoke)["__signature__"] = sig
         return invoke
 
     def _process_final_output(
@@ -495,6 +490,12 @@ class YawGBNFAdapter(YawJSONAdapter):
                 return build_dspy_synonym_judge_grammar(self.max_entities)
             if out_keys == ("repairs",) and "focus_context" in in_keys:
                 return build_dspy_shacl_repair_grammar(self.max_entities)
+            if out_keys == ("new_instruction",):
+                return build_dspy_instruction_proposal_grammar(self.max_instruction_chars)
+            if out_keys == ("shortened_instruction",):
+                return build_dspy_instruction_proposal_grammar(self.max_instruction_chars).replace(
+                    "new_instruction", "shortened_instruction"
+                )
             if out_keys == ("query_intent",):
                 return build_dspy_query_intent_grammar()
             if out_keys == ("fact",):
@@ -596,13 +597,16 @@ class _PredictorBoundLM(dspy.BaseLM):
         """Expose effective inference settings for persistent stage-cache keys."""
         identities = {}
         for role, target in (
-            ("effective", self._resolve_target_lm()), ("bound", self._base_lm_getter())
+            ("effective", self._resolve_target_lm()),
+            ("bound", self._base_lm_getter()),
         ):
             identities[role] = {
                 "model": getattr(target, "model", self._fallback_model),
                 "model_type": getattr(target, "model_type", None),
+                "context_window_tokens": getattr(target, "_yaw_context_window_tokens", None),
                 "kwargs": {
-                    k: v for k, v in (getattr(target, "kwargs", {}) or {}).items()
+                    k: v
+                    for k, v in (getattr(target, "kwargs", {}) or {}).items()
                     if k not in {"api_key", "api_token"}
                 },
             }
@@ -747,7 +751,7 @@ class YawRM:
             accepts_prog = len(param_names) >= 2 or has_var_pos
             accepts_item_docs = "item_docs" in sig.parameters or len(param_names) >= 3 or has_var_kw
             accepts_k = "k" in sig.parameters or has_var_kw
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             accepts_prog = False
             accepts_item_docs = False
             accepts_k = False
@@ -1076,7 +1080,11 @@ def validate_stage_invariants(
             norm = str(text_processing(ename)) or ename.lower()
             def_key = edef.lower()
             if norm in seen_defs_by_norm:
-                if not def_key or def_key in seen_defs_by_norm[norm] or "" in seen_defs_by_norm[norm]:
+                if (
+                    not def_key
+                    or def_key in seen_defs_by_norm[norm]
+                    or "" in seen_defs_by_norm[norm]
+                ):
                     dup_labels.append(ename)
                 else:
                     seen_defs_by_norm[norm].add(def_key)
@@ -1245,7 +1253,7 @@ def validate_stage_invariants(
             for v in viol_list:
                 if isinstance(v, Mapping) and v.get("focus_node"):
                     allowed_nodes.add(str(v["focus_node"]).strip())
-        except (json.JSONDecodeError, TypeError, ValueError):
+        except json.JSONDecodeError, TypeError, ValueError:
             viol_list = []
 
         issues = []
@@ -1308,7 +1316,7 @@ def validate_stage_invariants(
                             str(text_processing(str(item[2]))),
                         )
                     )
-        except (json.JSONDecodeError, TypeError, ValueError):
+        except json.JSONDecodeError, TypeError, ValueError:
             cand_norms = set()
         issues = []
         if len(generated) > max_facts:
@@ -1456,6 +1464,37 @@ def _should_retry_stage_invariants(
     return True
 
 
+class NativeQA(dspy.ChainOfThought):
+    """Expose stage accessors backed exclusively by DSPy's native predictor."""
+
+    @property
+    def signature(self) -> type[dspy.Signature]:
+        signature = self.predict.signature
+        if signature is None:
+            raise ValueError("QA predictor has no signature")
+        return signature
+
+    @signature.setter
+    def signature(self, value: type[dspy.Signature]) -> None:
+        self.predict.signature = value
+
+    @property
+    def lm(self) -> dspy.BaseLM | None:
+        return self.predict.lm
+
+    @lm.setter
+    def lm(self, value: dspy.BaseLM | None) -> None:
+        self.predict.lm = value
+
+    @property
+    def demos(self) -> list[dspy.Example | dict[str, Any]]:
+        return self.predict.demos
+
+    @demos.setter
+    def demos(self, value: Sequence[dspy.Example | dict[str, Any]]) -> None:
+        self.predict.demos = list(value)
+
+
 class HippoRAGProgram(dspy.Module):
     """Unified DSPy Module for HippoRAG 2 OpenIE, EDC/SKOS Schema Canon, SHACL Repair, Recognition Memory, and Multi-Hop QA.
 
@@ -1501,8 +1540,13 @@ class HippoRAGProgram(dspy.Module):
         rlm_interpreter_factory: Callable[[], Any] = dspy.PythonInterpreter,
         compiled_path: str | Path | None = None,
         enable_react_fallback: bool = False,
+        context_window_tokens: int = 32768,
+        max_output_tokens: int = 4096,
     ) -> None:
         super().__init__()
+        context_char_limit(1, context_window_tokens, max_output_tokens)
+        self.context_window_tokens = context_window_tokens
+        self.max_output_tokens = max_output_tokens
         self.enable_gbnf: bool = enable_gbnf
         self.gbnf_max_entities: int | None = gbnf_max_entities
         self.gbnf_max_triples: int | None = gbnf_max_triples
@@ -1556,7 +1600,7 @@ class HippoRAGProgram(dspy.Module):
         self.shacl_repair = dspy.Predict(ProposeSHACLRepairs)
         self.triple_filter = dspy.Predict(FilterTriples)
         self.query_intent = dspy.Predict(ExtractQueryIntent)
-        self.qa = dspy.ChainOfThought(AnswerQuestion)
+        self.qa = NativeQA(AnswerQuestion)
 
         shacl_tools = list(self._build_shacl_repl_tools())
         if rlm_tools:
@@ -1582,18 +1626,12 @@ class HippoRAGProgram(dspy.Module):
         self._bind_predictor_lms()
 
         if include_demos:
-            setattr(self.ner, "demos", list(NER_DEMOS))
-            setattr(self.triples, "demos", list(TRIPLE_DEMOS))
-            setattr(self.triple_filter, "demos", list(TRIPLE_FILTER_DEMOS))
-            setattr(self.qa, "demos", list(QA_DEMOS))
-            if hasattr(self.qa, "predict"):
-                setattr(self.qa.predict, "demos", list(QA_DEMOS))
+            self.ner.demos = list(NER_DEMOS)
+            self.triples.demos = list(TRIPLE_DEMOS)
+            self.triple_filter.demos = list(TRIPLE_FILTER_DEMOS)
+            self.qa.demos = list(QA_DEMOS)
             rlm_demos = _build_rlm_action_demos()
-            setattr(
-                self.shacl_healer_rlm.generate_action,
-                "demos",
-                list(rlm_demos["shacl_repair"]),
-            )
+            self.shacl_healer_rlm.generate_action.demos = list(rlm_demos["shacl_repair"])
 
         if compiled_path is not None:
             path = Path(compiled_path)
@@ -1635,9 +1673,7 @@ class HippoRAGProgram(dspy.Module):
             pred.lm = _PredictorBoundLM(name, "worker", worker_getter)
 
         qa_lm = _PredictorBoundLM("qa", "orchestrator", orch_getter)
-        self.qa.predict.lm = qa_lm
-        setattr(self.qa, "lm", qa_lm)
-        setattr(self.qa, "signature", self.qa.predict.signature)
+        self.qa.lm = qa_lm
 
         action_lm = _PredictorBoundLM(
             "shacl_healer_rlm.generate_action", "orchestrator", orch_getter
@@ -1645,7 +1681,7 @@ class HippoRAGProgram(dspy.Module):
         extract_lm = _PredictorBoundLM("shacl_healer_rlm.extract", "orchestrator", orch_getter)
         self.shacl_healer_rlm.generate_action.lm = action_lm
         self.shacl_healer_rlm.extract.lm = extract_lm
-        setattr(self.shacl_healer_rlm, "lm", action_lm)
+        self.shacl_healer_rlm.lm = action_lm
 
     def all_stage_predictors(self) -> list[tuple[str, Any]]:
         """Return all 9 canonical stage predictors (8 direct GBNF + 1 SHACL RLM healer)."""
@@ -1691,6 +1727,8 @@ class HippoRAGProgram(dspy.Module):
             api_key=config.api_key,
             provider=config.provider,
             role="qa",
+            context_window_tokens=config.context_window_tokens,
+            max_tokens=config.max_output_tokens,
         )
         sub_lm = create_dspy_lm(
             config.extraction_model,
@@ -1698,8 +1736,10 @@ class HippoRAGProgram(dspy.Module):
             api_key=config.api_key,
             provider=config.provider,
             role="extraction",
+            context_window_tokens=config.context_window_tokens,
+            max_tokens=config.max_output_tokens,
         )
-        return cls(
+        program = cls(
             enable_gbnf=config.enable_gbnf,
             gbnf_max_entities=config.gbnf_max_entities,
             gbnf_max_triples=config.gbnf_max_triples,
@@ -1708,7 +1748,26 @@ class HippoRAGProgram(dspy.Module):
             orchestrator_lm=orch_lm,
             rlm_sub_lm=sub_lm,
             compiled_path=config.compiled_program_path,
+            context_window_tokens=config.context_window_tokens,
+            max_output_tokens=config.max_output_tokens,
+            rlm_max_iters=config.rlm_max_iters,
+            rlm_max_llm_calls=config.rlm_max_llm_calls,
+            rlm_max_output_chars=config.rlm_max_output_chars,
         )
+        # Compiled prompts must not override the configured serving capacity.
+        members = list(program.pareto_ensemble.programs) if program.pareto_ensemble else []
+        for target in [program, *members]:
+            target.context_window_tokens = config.context_window_tokens
+            target.max_output_tokens = config.max_output_tokens
+            target.shacl_healer_rlm.max_iters = config.rlm_max_iters
+            target.shacl_healer_rlm.max_llm_calls = config.rlm_max_llm_calls
+            target.shacl_healer_rlm.max_output_chars = config.rlm_max_output_chars
+        if members:
+            program.pareto_frontier_states = [member.dump_state() for member in members]
+        return program
+
+    def _context_char_limit(self, base_chars: int) -> int:
+        return context_char_limit(base_chars, self.context_window_tokens, self.max_output_tokens)
 
     def dump_state(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         """Serialize all DSPy predictors/RLMs plus EmbeddingGemma prefixes, GBNF structural bounds, and Pareto frontier."""
@@ -1721,6 +1780,8 @@ class HippoRAGProgram(dspy.Module):
             "embedding_query_prefix": self.embedding_query_prefix,
             "embedding_fact_prefix": self.embedding_fact_prefix,
             "embedding_document_prefix": self.embedding_document_prefix,
+            "context_window_tokens": self.context_window_tokens,
+            "max_output_tokens": self.max_output_tokens,
         }
         if self.pareto_frontier_states:
             yaw_surface["pareto_frontier_states"] = list(self.pareto_frontier_states)
@@ -1732,6 +1793,8 @@ class HippoRAGProgram(dspy.Module):
         state_copy = dict(state)
         state_copy.setdefault("retriever", {"k": getattr(self.retriever, "k", 10)})
         yaw_surface = state_copy.pop("yaw_surface", None)
+        # Missing legacy predictors retain constructor defaults. Explicitly
+        # saved empty demo lists must survive loading without reseeding.
         for p_name, param in self.named_parameters():
             if p_name not in state_copy and hasattr(param, "dump_state"):
                 state_copy[p_name] = param.dump_state()
@@ -1744,6 +1807,8 @@ class HippoRAGProgram(dspy.Module):
                 "embedding_query_prefix",
                 "embedding_fact_prefix",
                 "embedding_document_prefix",
+                "context_window_tokens",
+                "max_output_tokens",
             ):
                 if attr in yaw_surface:
                     setattr(self, attr, yaw_surface[attr])
@@ -1762,8 +1827,6 @@ class HippoRAGProgram(dspy.Module):
             self.json_adapter.max_facts = self.gbnf_max_facts
             self.json_adapter.max_reasoning_chars = self.gbnf_max_reasoning_chars
         self._bind_predictor_lms()
-        if hasattr(self.qa, "predict") and not getattr(self.qa.predict, "demos", None):
-            self.qa.predict.demos = list(QA_DEMOS)
         return res
 
     def __deepcopy__(self, memo: dict[int, Any]) -> HippoRAGProgram:
@@ -1948,16 +2011,16 @@ class HippoRAGProgram(dspy.Module):
                     else:
                         effective_lm = self.rlm_sub_lm or self.orchestrator_lm
                 direct_inputs = dict(inputs)
-                if (
-                    isinstance(direct_inputs.get("passage"), str)
-                    and len(direct_inputs["passage"]) > 24000
-                ):
-                    direct_inputs["passage"] = direct_inputs["passage"][:24000]
-                if (
-                    isinstance(direct_inputs.get("context"), str)
-                    and len(direct_inputs["context"]) > 40000
-                ):
-                    direct_inputs["context"] = direct_inputs["context"][:40000]
+                if isinstance(direct_inputs.get("passage"), str) and len(
+                    direct_inputs["passage"]
+                ) > self._context_char_limit(24000):
+                    limit = self._context_char_limit(24000)
+                    direct_inputs["passage"] = direct_inputs["passage"][:limit]
+                if isinstance(direct_inputs.get("context"), str) and len(
+                    direct_inputs["context"]
+                ) > self._context_char_limit(40000):
+                    limit = self._context_char_limit(40000)
+                    direct_inputs["context"] = direct_inputs["context"][:limit]
                 call_kwargs: dict[str, Any] = {}
                 if self._should_use_gbnf(use_gbnf, effective_lm):
                     call_kwargs["config"] = {"extra_body": {"grammar": grammar_fn()}}
@@ -2427,13 +2490,13 @@ class HippoRAGProgram(dspy.Module):
             pairs_json = candidate_pairs.strip()
             if not pairs_json or pairs_json == "[]":
                 return []
-            if len(pairs_json) > 12000:
+            if len(pairs_json) > self._context_char_limit(12000):
                 try:
                     parsed_pairs = json.loads(pairs_json)
                     if isinstance(parsed_pairs, list):
                         pairs_json = json.dumps(parsed_pairs[:16], ensure_ascii=False)
-                except (json.JSONDecodeError, TypeError):
-                    pairs_json = pairs_json[:12000]
+                except json.JSONDecodeError, TypeError:
+                    pairs_json = pairs_json[: self._context_char_limit(12000)]
         else:
             pairs_list = [dict(p) for p in candidate_pairs if isinstance(p, Mapping)]
             if not pairs_list:
@@ -2495,13 +2558,13 @@ class HippoRAGProgram(dspy.Module):
             violations_json = violations.strip()
             if not violations_json or violations_json == "[]":
                 return []
-            if not is_rlm and len(violations_json) > 12000:
+            if not is_rlm and len(violations_json) > self._context_char_limit(12000):
                 try:
                     parsed_v = json.loads(violations_json)
                     if isinstance(parsed_v, list):
                         violations_json = json.dumps(parsed_v[:16], ensure_ascii=False)
-                except (json.JSONDecodeError, TypeError):
-                    violations_json = violations_json[:12000]
+                except json.JSONDecodeError, TypeError:
+                    violations_json = violations_json[: self._context_char_limit(12000)]
         else:
             serialized: list[dict[str, str]] = []
             for v in violations:
@@ -3194,137 +3257,6 @@ _STAGE_SCHEMA_CONTRACTS: dict[str, tuple[str, tuple[str, ...], str]] = {
 }
 
 
-def _anonymize_feedback_literals(feedback: str) -> str:
-    """Replace specific gold passage and answer literals in diagnostic feedback with abstract placeholders."""
-    if not feedback:
-        return feedback
-    out = re.sub(
-        r"Missed passage:\s*(?:'[^']*'|\"[^\"]*\")",
-        "Missed passage: '<TargetPassage>'",
-        feedback,
-    )
-    out = re.sub(
-        r"Expected=\[[^\]]*\]",
-        "Expected=['<TargetAnswer>']",
-        out,
-    )
-    out = re.sub(
-        r"gold_answers=\[[^\]]*\]",
-        "gold_answers=['<TargetAnswer>']",
-        out,
-    )
-    out = re.sub(
-        r"Missed gold items:\s*\[[^\]]*\]",
-        "Missed gold items: ['<TargetEntity>']",
-        out,
-    )
-    return out
-
-
-def _example_failure_priority(ex: Mapping[str, Any], index: int) -> tuple[int, float, int]:
-    """Rank reflective examples so the worst-scoring failing examples come strictly before passing ones."""
-    fb = str(ex.get("Feedback", "") or "")
-    score_match = re.search(r"GM_good/GM_bad=([0-9]+(?:\.[0-9]+)?)", fb)
-    score_val = float(score_match.group(1)) if score_match else 0.5
-    is_fail = any(
-        marker in fb
-        for marker in (
-            "Below reference floor",
-            "Missed",
-            "!=",
-            "EM=0.0000",
-            "violations_remaining",
-            "repaired ",
-        )
-    ) or ("missed=" in fb and "all_retrieved" not in fb)
-    if not is_fail and "all_retrieved" in fb and "EM=1.0000" in fb:
-        return (1, score_val, index)
-    return (0 if is_fail else 1, score_val if is_fail else 1.0 + score_val, index)
-
-
-def _bound_nested_strings(value: Any, max_chars: int, *, _depth: int = 0) -> Any:
-    """Bound oversized leaf strings and nested list lengths inside reflective examples while keeping structure intact."""
-    if isinstance(value, str):
-        if len(value) > max_chars:
-            cut = len(value) - max_chars
-            return f"{value[:max_chars]} [{cut:,} chars omitted]"
-        return value
-    if isinstance(value, Mapping):
-        return {
-            str(k): _bound_nested_strings(v, max_chars, _depth=_depth + 1) for k, v in value.items()
-        }
-    if isinstance(value, (list, tuple)):
-        if _depth >= 1 and len(value) > 6:
-            bounded_head = [
-                _bound_nested_strings(v, max_chars, _depth=_depth + 1) for v in value[:6]
-            ]
-            bounded_head.append(f"[{len(value) - 6} items omitted]")
-            return bounded_head
-        return [_bound_nested_strings(v, max_chars, _depth=_depth + 1) for v in value]
-    return value
-
-
-def _extract_example_literal_phrases(examples: Any, current_instruction: str) -> list[str]:
-    """Extract specific input/output literal phrases from reflection examples to detect instance leakage."""
-    cur_lower = current_instruction.lower()
-    phrases: list[str] = []
-    items = examples if isinstance(examples, Sequence) and not isinstance(examples, str) else []
-    for ex in items:
-        if not isinstance(ex, Mapping):
-            continue
-        for section_key in ("Inputs", "Generated Outputs"):
-            sec = ex.get(section_key)
-            if not isinstance(sec, Mapping):
-                continue
-            for val in sec.values():
-                text = str(val)
-                for match in re.findall(
-                    r"\b[A-Z][A-Za-z0-9]+(?:\s+(?:of|the|and|[A-Z0-9][A-Za-z0-9]*)){1,3}\b", text
-                ):
-                    cand = match.strip()
-                    if len(cand) >= 8 and cand.lower() not in cur_lower:
-                        phrases.append(cand)
-                for match in re.findall(r"\b\d{1,2}\s+[A-Z][a-z]+\s+\d{3,4}\b", text):
-                    cand = match.strip()
-                    if cand.lower() not in cur_lower:
-                        phrases.append(cand)
-    return phrases
-
-
-def _score_proposer_prediction(example: dspy.Example, prediction: Any) -> float:
-    """Meta-metric for `dspy.SIMBA` evaluating the RLM inner worker (`qwen_proposer`) instruction proposals."""
-    comp_name = str(getattr(example, "component_name", "") or "")
-    cur_inst = str(getattr(example, "current_instruction", "") or "")
-    ex_fb = getattr(example, "examples_with_feedback", ())
-    new_inst = str(getattr(prediction, "new_instruction", "") or "").strip()
-
-    if not new_inst:
-        return 0.0
-
-    schema_ok = True
-    if comp_name in _STAGE_SCHEMA_CONTRACTS:
-        strict_key, alt_markers, _ = _STAGE_SCHEMA_CONTRACTS[comp_name]
-        had_strict = strict_key in cur_inst
-        has_strict = strict_key in new_inst
-        has_any = any(m.lower() in new_inst.lower() for m in alt_markers)
-        schema_ok = bool(has_strict or (not had_strict and has_any))
-
-    leaked_phrases = _extract_example_literal_phrases(ex_fb, cur_inst)
-    new_lower = new_inst.lower()
-    no_leakage = not any(p.lower() in new_lower for p in leaked_phrases)
-
-    concise_ok = (
-        len(new_inst) >= 35 and len(new_inst) <= 1500 and new_inst.strip() != cur_inst.strip()
-    )
-
-    score = (
-        (0.35 if schema_ok else 0.05)
-        + (0.35 if no_leakage else 0.0)
-        + (0.30 if concise_ok else 0.05)
-    )
-    return round(float(score), 4)
-
-
 class _InstructionSynthesizerWorker(dspy.Module):
     """Inner GBNF instruction-synthesis worker module of `RLMInstructionProposer`, optimized by `dspy.SIMBA`."""
 
@@ -3357,9 +3289,9 @@ class _InstructionSynthesizerWorker(dspy.Module):
     def get_lm(self) -> Any:
         return (
             self._rollout_lm
-            or getattr(self.qwen_proposer, "lm", None)
             or self.worker_lm
             or self.orchestrator_lm
+            or getattr(self.qwen_proposer, "lm", None)
         )
 
     def set_lm(self, lm: Any) -> None:
@@ -3384,124 +3316,71 @@ class _InstructionSynthesizerWorker(dspy.Module):
         examples_with_feedback: Any = None,
         component_name: str = "",
     ) -> dspy.Prediction:
-        from dspy.utils.usage_tracker import track_usage
+        from dspy.teleprompt.gepa.instruction_proposal import InstructionProposer
 
-        _ = component_name
-        eff_worker = self.worker_lm or self.orchestrator_lm or getattr(dspy.settings, "lm", None)
-        parsed_examples: list[dict[str, Any]]
-        if isinstance(examples_with_feedback, str):
-            try:
-                loaded = json.loads(examples_with_feedback)
-                parsed_examples = (
-                    [dict(x) for x in loaded if isinstance(x, Mapping)]
-                    if isinstance(loaded, list)
-                    else [{"Feedback": examples_with_feedback}]
-                )
-            except (json.JSONDecodeError, TypeError, ValueError):
-                parsed_examples = [{"Feedback": examples_with_feedback}]
-        elif isinstance(examples_with_feedback, Sequence):
-            parsed_examples = [
-                dict(x) if isinstance(x, Mapping) else {"Feedback": str(x)}
-                for x in examples_with_feedback
-            ]
-        else:
-            parsed_examples = [{"Feedback": str(examples_with_feedback)}]
-
-        bounded_examples = _bound_nested_strings(parsed_examples, self.max_field_chars)
-
-        rollout_kwargs = (
-            getattr(self._rollout_lm, "kwargs", {}) if self._rollout_lm is not None else {}
+        native = InstructionProposer(
+            base_instructions=ProposeInstructionSignature.__doc__,
+            max_chars=self.max_instruction_chars,
+            adapter=self.json_adapter,
         )
-        temp = float(rollout_kwargs.get("temperature", self.worker_temperature))
-        call_config: dict[str, Any] = {"temperature": temp}
-        if "rollout_id" in rollout_kwargs:
-            call_config["rollout_id"] = rollout_kwargs["rollout_id"]
-        if self.enable_gbnf and lm_supports_gbnf(eff_worker):
-            call_config["extra_body"] = {"grammar": DSPY_INSTRUCTION_PROPOSAL_GBNF_GRAMMAR}
-        ctx_kwargs: dict[str, Any] = {"adapter": self.json_adapter}
-        if eff_worker is not None:
-            ctx_kwargs["lm"] = eff_worker
-        with dspy.context(**ctx_kwargs):
-            with track_usage() as prop_tracker:
-                pred = self.qwen_proposer(
-                    current_instruction=str(current_instruction),
-                    examples_with_feedback=bounded_examples,
-                    config=call_config,
-                )
-            prop_usage = prop_tracker.get_total_tokens()
-            draft = strip_mistral_bracket_prefix(
-                str(getattr(pred, "new_instruction", "") or "")
-            ).strip()
-            self.sub_telemetry.append(
-                {
-                    "predictor": "qwen_proposer",
-                    "signature": ProposeInstructionSignature.__name__,
-                    "mode": "direct",
-                    "tokens_used": _sum_usage_tokens(prop_usage),
-                    "usage": dict(prop_usage or {}),
-                    "inputs_summary": str(current_instruction)[:120],
-                    "outputs_summary": draft[:120],
-                }
+        native.propose = self.qwen_proposer
+        native.compress = self.qwen_compressor if self.max_instruction_chars else None
+        examples = self.fit_evidence(current_instruction, examples_with_feedback, component_name)
+        stage = component_name.removesuffix(".predict")
+        contract = _STAGE_SCHEMA_CONTRACTS.get(
+            stage, ("", (), "Preserve the existing output schema.")
+        )[2]
+        inputs = {
+            "examples_with_feedback": [
+                {"component": component_name, "contract": contract},
+                *examples,
+            ]
+        }
+        lm = self._rollout_lm or self.worker_lm or self.orchestrator_lm or dspy.settings.lm
+        with dspy.context(lm=lm, adapter=self.json_adapter):
+            result = native(
+                {component_name: current_instruction},
+                {component_name: inputs["examples_with_feedback"]},
+                [component_name],
+            )[component_name]
+        return dspy.Prediction(new_instruction=result)
+
+    def fit_evidence(
+        self, current_instruction: str, examples_with_feedback: Any, component_name: str
+    ) -> list[dict[str, Any]]:
+        examples = list(examples_with_feedback or [])
+        stage = component_name.removesuffix(".predict")
+        contract = _STAGE_SCHEMA_CONTRACTS.get(
+            stage, ("", (), "Preserve the existing output schema.")
+        )[2]
+        mandatory = {"component": component_name, "contract": contract}
+        lm = self._rollout_lm or self.worker_lm or self.orchestrator_lm or dspy.settings.lm
+        inputs = {
+            "current_instruction": current_instruction,
+            "examples_with_feedback": [mandatory, *examples],
+        }
+        if self.max_instruction_chars is not None:
+            inputs["length_limit"] = (
+                f"The new instruction must be at most {self.max_instruction_chars} characters."
             )
-            if (
-                draft
-                and self.max_instruction_chars is not None
-                and len(draft) > self.max_instruction_chars
-            ):
-                compress_config: dict[str, Any] = {"temperature": self.worker_temperature}
-                if self.enable_gbnf and lm_supports_gbnf(eff_worker):
-                    compress_config["extra_body"] = {
-                        "grammar": build_dspy_instruction_proposal_grammar(
-                            self.max_instruction_chars
-                        )
-                    }
-                with track_usage() as comp_tracker:
-                    comp_pred = self.qwen_compressor(
-                        instruction=draft,
-                        length_limit=(
-                            f"The new instruction must be at most {self.max_instruction_chars} characters."
-                        ),
-                        config=compress_config,
+        while isinstance(lm, ReflectionLM):
+            try:
+                lm.count(
+                    self.json_adapter.format(
+                        self.qwen_proposer.signature, self.qwen_proposer.demos, inputs
                     )
-                comp_usage = comp_tracker.get_total_tokens()
-                compressed = strip_mistral_bracket_prefix(
-                    str(getattr(comp_pred, "new_instruction", "") or "")
-                ).strip()
-                self.sub_telemetry.append(
-                    {
-                        "predictor": "qwen_compressor",
-                        "signature": CompressInstructionSignature.__name__,
-                        "mode": "direct",
-                        "tokens_used": _sum_usage_tokens(comp_usage),
-                        "usage": dict(comp_usage or {}),
-                        "inputs_summary": draft[:120],
-                        "outputs_summary": compressed[:120],
-                    }
                 )
-                if compressed:
-                    draft = compressed
-
-        active_trace = getattr(dspy.settings, "trace", None)
-        if isinstance(active_trace, list) and not any(
-            t[0] is self.qwen_proposer for t in active_trace
-        ):
-            active_trace.append(
-                (
-                    self.qwen_proposer,
-                    {
-                        "current_instruction": str(current_instruction),
-                        "examples_with_feedback": bounded_examples,
-                    },
-                    pred,
-                )
-            )
-
-        result_inst = draft if draft else str(current_instruction).strip()
-        return dspy.Prediction(new_instruction=result_inst)
+                break
+            except ReflectionBudgetError:
+                if not examples:
+                    raise
+                examples.pop()
+                inputs["examples_with_feedback"] = [mandatory, *examples]
+        return examples
 
 
 class RLMInstructionProposer:
-    """Single-level RLM + SIMBA-optimized GBNF worker on the configured reflection model.
+    """RLM evidence selection followed by a SIMBA-optimized native DSPy proposer.
 
     Conforms to `gepa.core.adapter.ProposalFn` and stock DSPy `InstructionProposer`:
     `(candidate, reflective_dataset, components_to_update) -> dict[str, str]`, while its
@@ -3532,12 +3411,24 @@ class RLMInstructionProposer:
         include_demos: bool = True,
         adapter: dspy.Adapter | None = None,
         rlm_interpreter_factory: Callable[[], Any] = dspy.PythonInterpreter,
+        task_scorer: Callable[[Mapping[str, str]], float] | None = None,
+        save_simba_state: Callable[[dict[str, Any]], None] | None = None,
+        reflection_input_tokens: int = 16384,
+        token_counter: Any = None,
+        checkpoint_get: Callable[[str], Any] | None = None,
+        checkpoint_put: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
         if max_instruction_chars is not None and max_instruction_chars <= 0:
             raise ValueError(
                 f"max_instruction_chars must be > 0 or None, got {max_instruction_chars!r}."
             )
 
+        if reflection_input_tokens < 1:
+            raise ValueError("reflection_input_tokens must be positive")
+        self.reflection_input_tokens = reflection_input_tokens
+        self.token_counter = token_counter
+        self.checkpoint_get = checkpoint_get
+        self.checkpoint_put = checkpoint_put
         self.orchestrator_lm = orchestrator_lm
         self.worker_lm = worker_lm
         self.enable_gbnf = bool(enable_gbnf)
@@ -3550,7 +3441,7 @@ class RLMInstructionProposer:
             int(max_instruction_chars) if max_instruction_chars is not None else None
         )
         self.max_field_chars = max(120, int(max_field_chars))
-        self.max_feedback_examples = max(1, int(max_feedback_examples))
+        self.max_feedback_examples = min(5, max(1, int(max_feedback_examples)))
         self.reflection_temperature = float(reflection_temperature)
         self.worker_temperature = float(worker_temperature)
         self.json_adapter: dspy.Adapter = adapter or YawGBNFAdapter(
@@ -3560,12 +3451,21 @@ class RLMInstructionProposer:
         self.telemetry: list[dict[str, Any]] = DiagnosticHistory()
         self.simba_telemetry: list[dict[str, Any]] = DiagnosticHistory()
         self._simba_steps = 0
+        self.task_scorer = task_scorer
+        self.save_simba_state = save_simba_state
+        self._simba_reward_errors = 0
         self._simba_examples: list[dspy.Example] = []
         self._sub_telemetry: list[dict[str, Any]] = []
-        self._synthesized_proposals: list[str] = []
 
-        self.qwen_proposer = dspy.Predict(ProposeInstructionSignature)
-        self.qwen_compressor = dspy.Predict(CompressInstructionSignature)
+        from dspy.teleprompt.gepa.instruction_proposal import InstructionProposer
+
+        native = InstructionProposer(
+            base_instructions=ProposeInstructionSignature.__doc__,
+            max_chars=self.max_instruction_chars,
+        )
+        self.qwen_proposer = native.propose
+        # Keep both native predictors visible to SIMBA and state serialization.
+        self.qwen_compressor = native.compress or dspy.Predict(CompressInstructionSignature)
         self.worker_module = _InstructionSynthesizerWorker(
             qwen_proposer=self.qwen_proposer,
             qwen_compressor=self.qwen_compressor,
@@ -3578,31 +3478,13 @@ class RLMInstructionProposer:
             json_adapter=self.json_adapter,
         )
 
-        def synthesize_instruction(
-            current_instruction: str,
-            examples_with_feedback: Any,
-        ) -> str:
-            """Synthesize an improved instruction using the SIMBA-optimized inner worker on Qwen GPU."""
-            self.worker_module.sub_telemetry.clear()
-            pred = self.worker_module(
-                current_instruction=current_instruction,
-                examples_with_feedback=examples_with_feedback,
-            )
-            self._sub_telemetry.extend(self.worker_module.sub_telemetry)
-            result_inst = str(getattr(pred, "new_instruction", "") or "").strip()
-            if not result_inst:
-                result_inst = str(current_instruction).strip()
-            self._synthesized_proposals.append(result_inst)
-            return result_inst
-
-        self._synthesize_tool = synthesize_instruction
         self.inner_rlm = _PositionalSafeRLM(
             ReflectiveInnerDistillerSignature,
             stage_rule=_STAGE_RLM_DELEGATION_RULES["instruction_proposer_inner"],
             max_iters=rlm_max_iters,
             max_llm_calls=rlm_max_llm_calls,
             max_output_chars=rlm_max_output_chars,
-            tools=[synthesize_instruction],
+            tools=[],
             sub_lm=worker_lm or orchestrator_lm,
             interpreter_factory=rlm_interpreter_factory,
         )
@@ -3614,11 +3496,7 @@ class RLMInstructionProposer:
 
         if include_demos:
             rlm_demos = _build_rlm_action_demos()
-            setattr(
-                self.inner_rlm.generate_action,
-                "demos",
-                list(rlm_demos["instruction_proposer_inner"]),
-            )
+            self.inner_rlm.generate_action.demos = list(rlm_demos["instruction_proposer_inner"])
 
     def _bind_predictor_lms(self) -> None:
         """Bind dedicated `_PredictorBoundLM` instances to all 3 reflection predictors."""
@@ -3644,7 +3522,7 @@ class RLMInstructionProposer:
         inner_extract_lm = _PredictorBoundLM("inner_rlm.extract", "orchestrator", orch_getter)
         self.inner_rlm.generate_action.lm = inner_action_lm
         self.inner_rlm.extract.lm = inner_extract_lm
-        setattr(self.inner_rlm, "lm", inner_action_lm)
+        self.inner_rlm.lm = inner_action_lm
 
     def get_lm(self) -> Any:
         return self.worker_module.get_lm()
@@ -3652,37 +3530,46 @@ class RLMInstructionProposer:
     def set_lm(self, lm: Any) -> None:
         self.worker_module.set_lm(lm)
 
-    def __deepcopy__(self, memo: dict[int, Any]) -> RLMInstructionProposer:
+    def __deepcopy__(self, memo: dict[int, Any]) -> Any:
         import copy
 
-        cls = self.__class__
-        new_prop = cls.__new__(cls)
-        memo[id(self)] = new_prop
-        for k, v in self.__dict__.items():
-            if k in ("orchestrator_lm", "worker_lm", "json_adapter", "_synthesize_tool"):
-                setattr(new_prop, k, v)
-            else:
-                setattr(new_prop, k, copy.deepcopy(v, memo))
+        new = type(self).__new__(type(self))
+        memo[id(self)] = new
+        callbacks = {
+            "orchestrator_lm",
+            "worker_lm",
+            "json_adapter",
+            "token_counter",
+            "task_scorer",
+            "save_simba_state",
+            "checkpoint_get",
+            "checkpoint_put",
+        }
+        for key, value in self.__dict__.items():
+            setattr(new, key, value if key in callbacks else copy.deepcopy(value, memo))
+        new._bind_predictor_lms()
+        return new
 
-        def synthesize_instruction(
-            current_instruction: str,
-            examples_with_feedback: Any,
-        ) -> str:
-            new_prop.worker_module.sub_telemetry.clear()
-            pred = new_prop.worker_module(
-                current_instruction=current_instruction,
-                examples_with_feedback=examples_with_feedback,
-            )
-            new_prop._sub_telemetry.extend(new_prop.worker_module.sub_telemetry)
-            result_inst = str(getattr(pred, "new_instruction", "") or "").strip()
-            if not result_inst:
-                result_inst = str(current_instruction).strip()
-            new_prop._synthesized_proposals.append(result_inst)
-            return result_inst
-
-        new_prop._synthesize_tool = synthesize_instruction
-        new_prop._bind_predictor_lms()
-        return new_prop
+    def preflight(self) -> None:
+        """Require an exact tokenizer before any reflection or meta-learning call."""
+        if self.token_counter is None:
+            raise ReflectionBudgetError("Reflection requires a verified serving tokenizer")
+        for name in ("worker_lm", "orchestrator_lm"):
+            lm = getattr(self, name)
+            if lm is not None and not isinstance(lm, ReflectionLM):
+                setattr(
+                    self,
+                    name,
+                    ReflectionLM(
+                        lm,
+                        self.token_counter,
+                        self.reflection_input_tokens,
+                        getattr(lm, "_yaw_context_window_tokens", None) or 65536,
+                        int(lm.kwargs.get("max_tokens") or 4096),
+                    ),
+                )
+        self.inner_rlm.sub_lm = self.worker_lm or self.orchestrator_lm
+        self._bind_predictor_lms()
 
     def all_reflection_predictors(self) -> list[tuple[str, Any]]:
         """Return all 3 active reflection predictors (`inner_rlm`, `qwen_proposer`, `qwen_compressor`)."""
@@ -3692,13 +3579,85 @@ class RLMInstructionProposer:
             ("qwen_compressor", self.qwen_compressor),
         ]
 
+    def dump_simba_state(self) -> dict[str, Any]:
+        """JSON-safe DSPy predictor state; exclude clients, traces and optimizer archives."""
+        predictors = {}
+        for name in ("qwen_proposer", "qwen_compressor"):
+            state = getattr(self, name).dump_state()
+            state.update(lm=None, traces=[], train=[])
+            predictors[name] = state
+        return {
+            "version": 2,
+            "steps": self._simba_steps,
+            "examples": [ex.toDict() for ex in self._simba_examples[-max(self.simba_bsize, 8) :]],
+            "predictors": predictors,
+        }
+
+    def load_simba_state(self, state: object) -> None:
+        """Restore learned parameters into fresh predictors, then bind current clients."""
+        state = validate_simba_state(state)
+        restored = {}
+        for name in ("qwen_proposer", "qwen_compressor"):
+            predictor = dspy.Predict(getattr(self, name).signature)
+            saved = dict(state["predictors"][name])
+            saved.update(lm=None, traces=[], train=[])
+            signature = predictor.signature
+            if signature is None or len(saved["signature"]["fields"]) != len(signature.fields):
+                raise ValueError(f"SIMBA predictor {name} has an incompatible field schema")
+            try:
+                predictor.load_state(saved)
+            except (KeyError, TypeError, IndexError) as exc:
+                raise ValueError(f"Malformed SIMBA predictor {name}") from exc
+            restored[name] = predictor
+        examples = [
+            dspy.Example(**ex).with_inputs(
+                "component_name", "current_instruction", "examples_with_feedback"
+            )
+            for ex in state["examples"][-max(self.simba_bsize, 8) :]
+        ]
+        for name, predictor in restored.items():
+            # Preserve the identities also held by the synthesis tool and worker.
+            getattr(self, name).load_state(predictor.dump_state())
+        self._simba_examples = examples
+        self._simba_steps = int(state["steps"])
+        self._bind_predictor_lms()
+
+    def _score_task_improvement(self, example: Any, prediction: Any) -> float:
+        """Reward a counterfactual task-score gain, never instruction formatting."""
+        try:
+            if self.task_scorer is None:
+                raise RuntimeError("SIMBA requires a task scorer")
+            candidate = dict(example.task_candidate)
+            component = str(example.component_name)
+            instruction = self._ensure_stage_schema_contract(
+                component,
+                str(example.current_instruction),
+                str(getattr(prediction, "new_instruction", "") or "").strip(),
+            )
+            baseline = float(self.task_scorer(candidate))
+            candidate[component] = instruction
+            improvement = float(self.task_scorer(candidate)) - baseline
+            if not math.isfinite(improvement):
+                raise ValueError("Non-finite SIMBA task improvement")
+            return 0.5 + 0.5 * improvement / (1.0 + abs(improvement))
+        except Exception:
+            # DSPy can swallow metric exceptions as zero scores. Refuse to adopt
+            # a worker selected from incomplete/failed task measurements.
+            self._simba_reward_errors += 1
+            raise
+
     def step_simba(self) -> bool:
         """Run `dspy.SIMBA` on the inner worker (`self.worker_module`) over buffered reflection examples."""
-        if not self.enable_simba or len(self._simba_examples) < self.simba_bsize:
+        if (
+            not self.enable_simba
+            or self.task_scorer is None
+            or len(self._simba_examples) < self.simba_bsize
+        ):
             return False
         if not hasattr(dspy, "SIMBA"):
             return False
 
+        self.preflight()
         eff_worker = self.worker_lm or self.orchestrator_lm or getattr(dspy.settings, "lm", None)
         if eff_worker is None:
             return False
@@ -3709,31 +3668,37 @@ class RLMInstructionProposer:
         prev_demos = len(getattr(self.qwen_proposer, "demos", ()) or ())
 
         try:
+            self._simba_reward_errors = 0
             simba = dspy.SIMBA(
-                metric=_score_proposer_prediction,
+                metric=self._score_task_improvement,
                 bsize=bsize,
                 num_candidates=self.simba_num_candidates,
                 max_steps=self.simba_max_steps,
                 max_demos=self.simba_max_demos,
-                demo_input_field_maxlen=self.max_field_chars * 2,
+                demo_input_field_maxlen=sys.maxsize,
                 prompt_model=eff_worker,
                 num_threads=1,
             )
-            with dspy.context(lm=eff_worker, adapter=self.json_adapter):
+            with dspy.context(lm=eff_worker, adapter=self.json_adapter, trace=[]):
                 compiled_worker = simba.compile(
                     self.worker_module,
                     trainset=trainset,
                     seed=self._simba_steps,
                 )
-            new_inst = str(compiled_worker.qwen_proposer.signature.instructions).strip()
-            if (
-                self.max_instruction_chars is not None
-                and len(new_inst) > self.max_instruction_chars
-            ):
-                new_inst = new_inst[: self.max_instruction_chars].rstrip()
-                compiled_worker.qwen_proposer.signature = (
-                    compiled_worker.qwen_proposer.signature.with_instructions(new_inst)
+            if self._simba_reward_errors:
+                raise RuntimeError("SIMBA task evaluations failed; retaining previous worker")
+            if not isinstance(compiled_worker, _InstructionSynthesizerWorker):
+                raise TypeError("SIMBA returned an incompatible instruction worker")
+            # Learned instructions/demos are also part of the next rendered prompt.
+            # Reject an oversized worker before adopting or checkpointing its state.
+            compiled_worker._rollout_lm = None
+            for example in trainset:
+                compiled_worker.fit_evidence(
+                    example.current_instruction,
+                    example.examples_with_feedback,
+                    example.component_name,
                 )
+            new_inst = str(compiled_worker.qwen_proposer.signature.instructions).strip()
             self.qwen_proposer.signature = compiled_worker.qwen_proposer.signature
             self.qwen_proposer.demos = list(
                 getattr(compiled_worker.qwen_proposer, "demos", ()) or ()
@@ -3759,8 +3724,10 @@ class RLMInstructionProposer:
             self.simba_telemetry.append(entry)
             self._simba_steps += 1
             trim_diagnostics(self)
-            return True
         except (
+            AdapterParseError,
+            LMError,
+            OSError,
             RuntimeError,
             ValueError,
             TypeError,
@@ -3769,12 +3736,17 @@ class RLMInstructionProposer:
             IndexError,
             AssertionError,
         ) as exc:
-            logging.getLogger(__name__).debug(
+            logging.getLogger(__name__).warning(
                 "SIMBA inner-worker step skipped (%s: %s)",
                 type(exc).__name__,
                 exc,
             )
             return False
+        # Persistence failures must reach the caller, rather than look like a
+        # successful durable step. SQLite keeps the previous complete snapshot.
+        if self.save_simba_state is not None:
+            self.save_simba_state(self.dump_simba_state())
+        return True
 
     @staticmethod
     def _prepare_examples(
@@ -3783,51 +3755,11 @@ class RLMInstructionProposer:
         max_examples: int = 5,
     ) -> list[dict[str, Any]]:
         """Prepare reflective examples, prioritizing top-5 failing examples and anonymizing gold literals."""
-        from dspy.adapters.types import History
-        from dspy.primitives.repl_types import REPLHistory
-        from dspy.teleprompt.gepa.instruction_proposal import (
-            compact_history,
-            compact_repl_history,
-        )
-
-        def prepare(value: Any, *, is_feedback: bool = False) -> Any:
-            if isinstance(value, History):
-                return compact_history(value)
-            if isinstance(value, REPLHistory):
-                return compact_repl_history(value)
-            if isinstance(value, Mapping):
-                return {
-                    str(k): prepare(v, is_feedback=(str(k) == "Feedback")) for k, v in value.items()
-                }
-            if isinstance(value, (list, tuple)):
-                return [prepare(v, is_feedback=is_feedback) for v in value]
-            if is_feedback and isinstance(value, str):
-                return _anonymize_feedback_literals(value)
-            return value
-
-        raw_list: list[dict[str, Any]] = []
         if isinstance(examples, str):
-            try:
-                loaded = json.loads(examples)
-                if isinstance(loaded, list):
-                    raw_list = [dict(x) for x in loaded if isinstance(x, Mapping)]
-                else:
-                    raw_list = [{"Feedback": examples}]
-            except (json.JSONDecodeError, TypeError, ValueError):
-                raw_list = [{"Feedback": examples}]
-        elif isinstance(examples, Sequence):
-            raw_list = [
-                dict(ex) if isinstance(ex, Mapping) else {"Feedback": str(ex)} for ex in examples
-            ]
-
-        if not raw_list:
+            examples = json.loads(examples)
+        if not examples:
             return []
-
-        indexed = list(enumerate(raw_list))
-        indexed.sort(key=lambda pair: _example_failure_priority(pair[1], pair[0]))
-        limit = max(1, int(max_examples))
-        selected = [ex for _, ex in indexed[:limit]]
-        return [prepare(ex) for ex in selected]
+        return reflection_examples(examples)[:max_examples]
 
     def _ensure_stage_schema_contract(
         self,
@@ -3835,22 +3767,120 @@ class RLMInstructionProposer:
         current_instruction: str,
         draft: str,
     ) -> str:
-        """Preserve the component's JSON schema contract when omitted by the proposer."""
-        if not draft or component_name not in _STAGE_SCHEMA_CONTRACTS:
-            return draft
-        strict_key, alt_markers, schema_clause = _STAGE_SCHEMA_CONTRACTS[component_name]
-        draft_lower = draft.lower()
-        had_strict = strict_key in current_instruction
-        has_strict = strict_key in draft
-        has_any_marker = any(m.lower() in draft_lower for m in alt_markers)
-        if has_strict or (not had_strict and has_any_marker):
-            return draft
+        """Validate the instruction; the immutable DSPy Signature owns the output schema."""
+        if not draft.strip():
+            raise ValueError("Empty instruction")
+        if self.max_instruction_chars is not None and len(draft) > self.max_instruction_chars:
+            raise ValueError("Instruction exceeds the native writer length limit")
+        return draft
 
-        combined = f"{draft.rstrip()} {schema_clause}"
-        if self.max_instruction_chars is not None and len(combined) > self.max_instruction_chars:
-            budget = max(32, self.max_instruction_chars - len(schema_clause) - 1)
-            combined = f"{draft[:budget].rstrip()} {schema_clause}"
-        return combined
+    def cache_identity(self) -> dict[str, Any]:
+        """All deployment/policy settings that affect reflection stage results."""
+        models = []
+        for lm in (self.orchestrator_lm, self.worker_lm):
+            models.append(
+                {
+                    "model": getattr(lm, "model", None),
+                    "kwargs": {
+                        key: value
+                        for key, value in getattr(lm, "kwargs", {}).items()
+                        if key not in {"api_key", "api_token"}
+                    },
+                    "context": getattr(lm, "_yaw_context_window_tokens", None),
+                    "tokenizer": getattr(getattr(lm, "counter", None), "identity", None),
+                }
+            )
+        return {
+            "version": 2,
+            "models": models,
+            "tokenizer": getattr(self.token_counter, "identity", None),
+            "input_tokens": self.reflection_input_tokens,
+            "settings": [
+                self.max_instruction_chars,
+                self.max_feedback_examples,
+                self.worker_temperature,
+                self.reflection_temperature,
+                self.enable_gbnf,
+            ],
+            "selector": [
+                self.inner_rlm.max_iters,
+                self.inner_rlm.max_llm_calls,
+                self.inner_rlm.max_output_chars,
+            ],
+            "adapter": type(self.json_adapter).__qualname__,
+        }
+
+    def select_evidence(
+        self,
+        component_name: str,
+        current_instruction: str,
+        component_examples: Sequence[Mapping[str, Any]],
+    ) -> tuple[str, list[dict[str, Any]], Any]:
+        """Checkpoint validated references, retaining exact training evidence."""
+        self.preflight()
+        originals = reflection_examples(component_examples)
+        evidence_key = reflection_digest(
+            {
+                "version": 2,
+                "deployment": self.cache_identity(),
+                "component": component_name,
+                "instruction": current_instruction,
+                "examples": originals,
+                "input_tokens": self.reflection_input_tokens,
+                "writer_settings": [
+                    self.max_instruction_chars,
+                    self.max_feedback_examples,
+                    self.worker_temperature,
+                    self.reflection_temperature,
+                    self.enable_gbnf,
+                ],
+                "selector": self.inner_rlm.generate_action.signature.instructions,
+                "selector_limits": [
+                    self.inner_rlm.max_iters,
+                    self.inner_rlm.max_llm_calls,
+                    self.inner_rlm.max_output_chars,
+                ],
+                "model": self.orchestrator_lm.model if self.orchestrator_lm else None,
+                "tokenizer": getattr(self.token_counter, "identity", str(self.token_counter)),
+            }
+        )
+        get = self.checkpoint_get or (lambda key: None)
+        put = self.checkpoint_put or (lambda key, value: None)
+        saved = get("evidence:" + evidence_key)
+        if saved is None:
+            fallback = None
+            try:
+                with dspy.context(lm=self.orchestrator_lm or self.worker_lm, trace=[]):
+                    result = self.inner_rlm(
+                        current_instruction=current_instruction, examples_with_feedback=originals
+                    )
+                selection = checkpoint_object(result.selection, "evidence selection")
+                resolve_evidence(originals, selection, self.max_feedback_examples)
+            except (
+                ValueError,
+                KeyError,
+                TypeError,
+                RuntimeError,
+                IndexError,
+                AdapterParseError,
+                LMError,
+                OSError,
+            ) as exc:
+                fallback = type(exc).__name__
+                selection = deterministic_evidence(originals, self.max_feedback_examples)
+            saved = {"selection": selection, "fallback": fallback}
+            put("evidence:" + evidence_key, saved)
+        saved = checkpoint_object(saved, "evidence checkpoint")
+        selection = checkpoint_object(saved.get("selection"), "evidence selection")
+        fallback = saved.get("fallback")
+        if fallback is not None and not isinstance(fallback, str):
+            raise ValueError("Malformed evidence checkpoint fallback")
+        packet = resolve_evidence(originals, selection, self.max_feedback_examples)
+        diagnosis = selection.get("diagnosis", "")
+        if not isinstance(diagnosis, str):
+            raise ValueError("Malformed evidence diagnosis")
+        packet.insert(0, {"diagnosis": diagnosis[:2000]})
+        return evidence_key, packet, fallback
 
     @diagnostic_boundary
     def propose_for_component(
@@ -3859,75 +3889,56 @@ class RLMInstructionProposer:
         current_instruction: str,
         component_examples: Sequence[Mapping[str, Any]],
     ) -> str:
-        """Run single-level RLM trace distillation -> SIMBA-evolved Qwen GBNF synthesis for a predictor component."""
+        evidence_key, packet, fallback = self.select_evidence(
+            component_name, current_instruction, component_examples
+        )
+        get = self.checkpoint_get or (lambda key: None)
+        put = self.checkpoint_put or (lambda key, value: None)
+        key = "proposal:" + reflection_digest(
+            {
+                "evidence": evidence_key,
+                "state": self.dump_simba_state(),
+                "worker": self.worker_lm.model if self.worker_lm else None,
+            }
+        )
+        completed = get(key)
+        if completed is not None:
+            completed = checkpoint_object(completed, "proposal checkpoint")
+            instruction = completed.get("instruction")
+            if not isinstance(instruction, str):
+                raise ValueError("Malformed proposal checkpoint instruction")
+            return self._ensure_stage_schema_contract(
+                component_name.removesuffix(".predict"), current_instruction, instruction
+            )
         from dspy.utils.usage_tracker import track_usage
 
-        prepared_examples = self._prepare_examples(
-            component_examples,
-            max_examples=self.max_feedback_examples,
-        )
-        eff_orch = self.orchestrator_lm or self.worker_lm or getattr(dspy.settings, "lm", None)
-        self._synthesized_proposals.clear()
-        self._sub_telemetry.clear()
-
-        with track_usage() as usage_tracker:
-            if eff_orch is not None:
-                with dspy.context(lm=eff_orch), track_usage() as rlm_tracker:
-                    rlm_pred = self.inner_rlm(
-                        current_instruction=current_instruction,
-                        examples_with_feedback=prepared_examples,
-                    )
-                rlm_usage = rlm_tracker.get_total_tokens()
-                rlm_inst = strip_mistral_bracket_prefix(
-                    str(getattr(rlm_pred, "new_instruction", "") or "")
-                ).strip()
-                self._sub_telemetry.append(
-                    {
-                        "predictor": "inner_rlm",
-                        "signature": ReflectiveInnerDistillerSignature.__name__,
-                        "mode": "rlm",
-                        "tokens_used": _sum_usage_tokens(rlm_usage),
-                        "usage": dict(rlm_usage or {}),
-                        "inputs_summary": current_instruction[:120],
-                        "outputs_summary": rlm_inst[:120],
-                    }
-                )
-                if self._synthesized_proposals:
-                    proposed = self._synthesized_proposals[-1]
-                else:
-                    proposed = self._synthesize_tool(
-                        current_instruction,
-                        prepared_examples,
-                    )
-            else:
-                proposed = self._synthesize_tool(
-                    current_instruction,
-                    prepared_examples,
-                )
-        usage = usage_tracker.get_total_tokens()
-
-        final_instruction = proposed.strip() if proposed else current_instruction
-        final_instruction = self._ensure_stage_schema_contract(
-            component_name,
+        self.worker_module.sub_telemetry.clear()
+        with dspy.context(trace=[]), track_usage() as tracker:
+            prediction = self.worker_module(
+                current_instruction=current_instruction,
+                examples_with_feedback=packet,
+                component_name=component_name,
+            )
+        usage = tracker.get_total_tokens()
+        instruction = self._ensure_stage_schema_contract(
+            component_name.removesuffix(".predict"),
             current_instruction,
-            final_instruction,
+            str(prediction.new_instruction),
         )
+        put(key, {"instruction": instruction})
         self.telemetry.append(
             {
                 "component_name": component_name,
-                "predictor": "inner_rlm",
-                "signature": ReflectiveInnerDistillerSignature.__name__,
-                "mode": "rlm",
+                "mode": "evidence_native",
+                "fallback": fallback,
+                "evidence_key": evidence_key,
+                "usage": usage,
                 "tokens_used": _sum_usage_tokens(usage),
-                "previous_instruction": current_instruction,
-                "new_instruction": final_instruction,
-                "num_feedback_examples": len(prepared_examples),
-                "usage": dict(usage or {}),
-                "sub_telemetry": list(self._sub_telemetry),
+                "new_instruction": instruction,
                 "simba_steps": self._simba_steps,
             }
         )
-        return final_instruction
+        return instruction
 
     def forward(
         self,
@@ -3941,15 +3952,17 @@ class RLMInstructionProposer:
     ) -> Any:
         """Dual entrypoint: GEPA `ProposalFn` `(candidate, reflective_dataset, components_to_update)` or `dspy.Module` `(component_name=..., current_instruction=..., examples_with_feedback=...)`."""
         if candidate is None or not isinstance(candidate, Mapping):
+            self.preflight()
             prepared = self._prepare_examples(
                 examples_with_feedback,
                 max_examples=self.max_feedback_examples,
             )
-            pred = self.worker_module(
-                current_instruction=current_instruction,
-                examples_with_feedback=prepared,
-                component_name=component_name,
-            )
+            with dspy.context(trace=[]):
+                pred = self.worker_module(
+                    current_instruction=current_instruction,
+                    examples_with_feedback=prepared,
+                    component_name=component_name,
+                )
             inst = self._ensure_stage_schema_contract(
                 component_name,
                 current_instruction,
@@ -3960,47 +3973,95 @@ class RLMInstructionProposer:
         if not components_to_update or reflective_dataset is None:
             return {}
 
-        for comp_name in components_to_update:
-            if comp_name not in candidate:
-                continue
-            comp_examples = reflective_dataset.get(comp_name)
-            if not comp_examples:
-                continue
-            prepared = self._prepare_examples(
-                comp_examples,
-                max_examples=self.max_feedback_examples,
-            )
-            if prepared:
+        self.preflight()
+        get = self.checkpoint_get or (lambda key: None)
+        put = self.checkpoint_put or (lambda key, value: None)
+        request = reflection_digest(
+            {
+                "version": 2,
+                "deployment": self.cache_identity(),
+                "candidate": candidate,
+                "input_tokens": self.reflection_input_tokens,
+                "tokenizer": getattr(self.token_counter, "identity", None),
+                "writer_settings": [
+                    self.max_instruction_chars,
+                    self.max_feedback_examples,
+                    self.worker_temperature,
+                    self.reflection_temperature,
+                    self.enable_gbnf,
+                ],
+                "data": reflection_examples(
+                    [{"component": k, "examples": v} for k, v in reflective_dataset.items()]
+                ),
+                "components": list(components_to_update),
+            }
+        )
+        checkpoint_key = "request:" + request
+
+        def snapshot(phase: str, **extra: Any) -> dict[str, Any]:
+            state = self.dump_simba_state()
+            return {
+                "phase": phase,
+                "state": state,
+                "writer": reflection_digest(state["predictors"]),
+                **extra,
+            }
+
+        record = get(checkpoint_key)
+        if record is not None:
+            record = validate_request_checkpoint(record)
+        current_writer = reflection_digest(self.dump_simba_state()["predictors"])
+        if record is not None and record["phase"] == "complete":
+            saved_writer = record.get("writer", reflection_digest(record["state"]["predictors"]))
+            if saved_writer != current_writer:
+                record = None
+        if record is not None:
+            if record["phase"] != "complete" or record["state"]["steps"] > self._simba_steps:
+                self.load_simba_state(record["state"])
+            if record["phase"] == "complete":
+                allowed = set(components_to_update) & set(candidate)
+                if set(record["proposals"]) - allowed:
+                    raise ValueError("Completed proposal has an unknown component")
+                for name, instruction in record["proposals"].items():
+                    self._ensure_stage_schema_contract(name, candidate[name], instruction)
+                return record["proposals"]
+        else:
+            record = snapshot("collecting")
+            put(checkpoint_key, record)
+        if record["phase"] == "collecting":
+            for name in components_to_update:
+                if name not in candidate or not reflective_dataset.get(name):
+                    continue
+                _, packet, _ = self.select_evidence(name, candidate[name], reflective_dataset[name])
+                prepared = self.worker_module.fit_evidence(candidate[name], packet, name)
                 self._simba_examples.append(
                     dspy.Example(
-                        component_name=comp_name,
-                        current_instruction=candidate[comp_name],
-                        examples_with_feedback=_bound_nested_strings(
-                            prepared, self.max_field_chars
-                        ),
-                    ).with_inputs(
-                        "component_name",
-                        "current_instruction",
-                        "examples_with_feedback",
-                    )
+                        task_candidate=dict(candidate),
+                        component_name=name,
+                        current_instruction=candidate[name],
+                        examples_with_feedback=prepared,
+                    ).with_inputs("component_name", "current_instruction", "examples_with_feedback")
                 )
-
-        del self._simba_examples[:-max(self.simba_bsize, 8)]
-        if self.enable_simba and len(self._simba_examples) >= self.simba_bsize:
+            del self._simba_examples[: -max(self.simba_bsize, 8)]
+            # The request-local state is authoritative on restart, so an incomplete
+            # SIMBA call is retried from its input snapshot, never applied twice.
+            record = snapshot("learning")
+            put(checkpoint_key, record)
+        if record["phase"] == "learning":
             self.step_simba()
-
-        updated: dict[str, str] = {}
-        for comp_name in components_to_update:
-            if comp_name not in candidate:
-                continue
-            comp_examples = reflective_dataset.get(comp_name)
-            if not comp_examples:
-                continue
-            updated[comp_name] = self.propose_for_component(
-                component_name=comp_name,
-                current_instruction=candidate[comp_name],
-                component_examples=comp_examples,
-            )
+            record = snapshot("learned")
+            put(checkpoint_key, record)
+        updated = {
+            name: self.propose_for_component(name, candidate[name], reflective_dataset[name])
+            for name in components_to_update
+            if name in candidate and reflective_dataset.get(name)
+        }
+        put(
+            checkpoint_key,
+            snapshot("complete", proposals=updated),
+        )
+        if self.save_simba_state is not None:
+            self.save_simba_state(self.dump_simba_state())
         return updated
 
     def propose_mipro_instructions(

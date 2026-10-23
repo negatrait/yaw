@@ -1,6 +1,7 @@
 """AST-enforced architecture containment and zero-cross-domain import boundary tests."""
 
 import ast
+import sys
 import unittest
 from pathlib import Path
 
@@ -255,21 +256,21 @@ class ArchitectureTests(unittest.TestCase):
         self.assertTrue(hasattr(ingestion, "extract_chunk_title"))
 
         with self.assertRaises(AttributeError):
-            _ = getattr(ingestion, "_CHUNK_HANDLER")
+            _ = ingestion._CHUNK_HANDLER
         with self.assertRaises(AttributeError):
-            _ = getattr(ingestion, "_ChunkSpec")
+            _ = ingestion._ChunkSpec
 
         # Verify facade is strictly constricted: internal helpers cannot leak through
         with self.assertRaises(AttributeError):
-            _ = getattr(inference, "_strip_mistral_bracket_prefix")
+            _ = inference._strip_mistral_bracket_prefix
         with self.assertRaises(AttributeError):
-            _ = getattr(inference, "_build_default_ner_demos")
+            _ = inference._build_default_ner_demos
         with self.assertRaises(AttributeError):
-            _ = getattr(inference, "_extract_json_list_field")
+            _ = inference._extract_json_list_field
         with self.assertRaises(AttributeError):
-            _ = getattr(inference, "_PositionalSafeRLM")
+            _ = inference._PositionalSafeRLM
         with self.assertRaises(AttributeError):
-            _ = getattr(inference, "_LLMConfig")
+            _ = inference._LLMConfig
 
     def test_domain_containment_and_zero_cross_domain_imports(self):
         """Rule 2 & 3: Package P imports only P.* and yaw.core.* (zero horizontal cross-domain edges)."""
@@ -301,40 +302,8 @@ class ArchitectureTests(unittest.TestCase):
         core_files = list((YAW_DIR / "core").glob("*.py"))
         self.assertGreater(len(core_files), 0)
 
-        # Common known stdlib top-level modules
-        stdlib_whitelist = {
-            "ast",
-            "collections",
-            "contextlib",
-            "dataclasses",
-            "datetime",
-            "functools",
-            "hashlib",
-            "itertools",
-            "json",
-            "logging",
-            "math",
-            "os",
-            "pathlib",
-            "queue",
-            "re",
-            "shutil",
-            "stat",
-            "string",
-            "sys",
-            "tempfile",
-            "threading",
-            "time",
-            "tomllib",
-            "types",
-            "typing",
-            "unittest",
-            "urllib",
-            "uuid",
-            "weakref",
-            "enum",
-            "abc",
-        }
+        # Python supplies the authoritative set, including platform-specific modules.
+        stdlib_whitelist = sys.stdlib_module_names
 
         violations = []
         for py_file in core_files:

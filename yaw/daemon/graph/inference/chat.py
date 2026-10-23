@@ -51,7 +51,9 @@ class _UsageAccountingCache:
         return {"yaw_logical_usage_v1": self.backend.cache_key(request, ignored)}
 
     def get(
-        self, request: dict[str, Any], ignored_args_for_cache_key: list[str] | None = None,
+        self,
+        request: dict[str, Any],
+        ignored_args_for_cache_key: list[str] | None = None,
     ) -> Any:
         ignored_args_for_cache_key = self._ignored(ignored_args_for_cache_key)
         record = self.backend.get(request, ignored_args_for_cache_key)
@@ -73,14 +75,19 @@ class _UsageAccountingCache:
         if tracker is not None:
             tracker.add_usage(model, dict(usage))
         self.cache_hits += 1
-        self.cached_tokens += int(usage.get("total_tokens") or (
-            (usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
-            + (usage.get("completion_tokens") or usage.get("output_tokens") or 0)
-        ))
+        self.cached_tokens += int(
+            usage.get("total_tokens")
+            or (
+                (usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+                + (usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+            )
+        )
         return record
 
     def put(
-        self, request: dict[str, Any], value: Any,
+        self,
+        request: dict[str, Any],
+        value: Any,
         ignored_args_for_cache_key: list[str] | None = None,
         enable_memory_cache: bool = True,
     ) -> None:
@@ -94,7 +101,8 @@ class _UsageAccountingCache:
                 usage = value.get("usage")
             self.backend.put(
                 self._usage_key(request, ignored_args_for_cache_key),
-                {"usage": dict(usage or {})}, enable_memory_cache=enable_memory_cache,
+                {"usage": dict(usage or {})},
+                enable_memory_cache=enable_memory_cache,
             )
 
 
@@ -122,6 +130,10 @@ __all__ = [
 class YawDSPyLM(dspy.LM):
     """Native dspy.LM wrapper preserving recipe metadata across copies without overriding BaseLM.forward."""
 
+    _yaw_recipe: str | None = None
+    _yaw_context_window_tokens: int | None = None
+    _yaw_supports_gbnf: bool = False
+
     def __call__(self, prompt: Any = None, *, messages: Any = None, **kwargs: Any) -> Any:
         if (
             getattr(self, "_yaw_recipe", None) == "ryzenai-llm"
@@ -147,10 +159,13 @@ class YawDSPyLM(dspy.LM):
             time.sleep(sleep_sec)
         return res
 
-    def copy(self, **kwargs: Any) -> Any:
+    def copy(self, **kwargs: Any) -> YawDSPyLM:
         copied = super().copy(**kwargs)
-        setattr(copied, "_yaw_recipe", getattr(self, "_yaw_recipe", None))
-        setattr(copied, "_yaw_supports_gbnf", getattr(self, "_yaw_supports_gbnf", False))
+        if not isinstance(copied, YawDSPyLM):
+            raise TypeError("DSPy returned an incompatible LM copy")
+        copied._yaw_context_window_tokens = getattr(self, "_yaw_context_window_tokens", None)
+        copied._yaw_recipe = getattr(self, "_yaw_recipe", None)
+        copied._yaw_supports_gbnf = getattr(self, "_yaw_supports_gbnf", False)
         return copied
 
 
@@ -201,15 +216,16 @@ def create_dspy_lm(
     role: str = "extraction",
     temperature: float | None = None,
     max_tokens: int | None = None,
+    context_window_tokens: int | None = None,
     cache: bool = True,
     num_retries: int = 1,
     timeout: float = 240.0,
     **kwargs: Any,
-) -> dspy.LM:
+) -> YawDSPyLM:
     """Create a native dspy.LM configured for Lemonade (openai/...) or Ollama (ollama_chat/...).
 
     Applies recipe-aware and role-aware defaults for our local hardware stack:
-    - Gemma-4-E4B-it-GGUF (llamacpp GPU, 32768 ctx): default chat/reflection model;
+    - Gemma-4-E4B-it-GGUF (llamacpp GPU): default chat/reflection model;
       direct/worker roles support GBNF, while RLM orchestrators generate plain code.
     - Qwen3-4B-Instruct-2507-GGUF (llamacpp on Vulkan GPU, 16384 ctx): supports GBNF for direct/worker
       roles (`extraction`, `qa`, `reflection_worker`) with temp=0.2, freq_penalty=0.5, and runs
@@ -241,6 +257,15 @@ def create_dspy_lm(
     if max_tokens is None:
         # Per-completion output cap; model context is a separate server setting.
         max_tokens = 4096
+    context_tokens = (
+        context_window_tokens
+        if context_window_tokens is not None
+        else profile.expected_context
+        if profile
+        else None
+    )
+    if context_tokens is not None and not 0 < max_tokens < context_tokens:
+        raise ValueError("Require 0 < max_tokens < context_window_tokens")
 
     lm_kwargs: dict[str, Any] = dict(kwargs)
     if role == "extraction" and profile is not None and profile.frequency_penalty > 0:
@@ -284,10 +309,9 @@ def create_dspy_lm(
             **lm_kwargs,
         )
 
-    setattr(lm, "_yaw_recipe", recipe)
-    setattr(
-        lm, "_yaw_supports_gbnf", (recipe == "llamacpp") and (role not in ("rlm", "reflection"))
-    )
+    lm._yaw_recipe = recipe
+    lm._yaw_context_window_tokens = context_tokens
+    lm._yaw_supports_gbnf = recipe == "llamacpp" and role not in ("rlm", "reflection")
     return lm
 
 
@@ -301,7 +325,9 @@ def create_dspy_rlm_pair(
     reflection: bool = False,
     cache: bool = True,
     num_retries: int = 0,
-) -> tuple[dspy.LM, dspy.LM]:
+    context_window_tokens: int | None = None,
+    max_tokens: int | None = None,
+) -> tuple[YawDSPyLM, YawDSPyLM]:
     """Create the `(orchestrator_lm, sub_lm)` DSPy pair on the configured chat models.
 
     - `orchestrator_lm` (`role="rlm"` or `"reflection"`): runs `dspy.RLM` Python REPL code
@@ -319,6 +345,8 @@ def create_dspy_rlm_pair(
         role="reflection" if reflection else "rlm",
         cache=cache,
         num_retries=num_retries,
+        context_window_tokens=context_window_tokens,
+        max_tokens=max_tokens,
     )
     sub_lm = create_dspy_lm(
         sub_model,
@@ -328,5 +356,7 @@ def create_dspy_rlm_pair(
         role="reflection_worker" if reflection else "extraction",
         cache=cache,
         num_retries=num_retries,
+        context_window_tokens=context_window_tokens,
+        max_tokens=max_tokens,
     )
     return orchestrator_lm, sub_lm

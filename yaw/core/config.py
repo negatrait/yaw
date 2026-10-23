@@ -11,6 +11,20 @@ from typing import Any, Literal
 
 from .types import YawRuntimeError
 
+DEFAULT_EMBEDDING_MODEL = "embeddinggemma-300m-qat-q8_0-GGUF-Q8_0"
+
+
+def context_char_limit(base_chars: int, context_tokens: int, output_tokens: int) -> int:
+    """Scale conservative character safeguards by available input capacity.
+
+    Preserve the established 32K-context/4K-output limits. This is a character
+    heuristic, not a tokenizer or a guarantee that an entire prompt will fit.
+    """
+    if not 0 < output_tokens < context_tokens:
+        raise ValueError("Require 0 < output_tokens < context_tokens")
+    return max(1, base_chars * (context_tokens - output_tokens) // (32768 - 4096))
+
+
 _DEFAULT_RELATIVE_PATHS: dict[str, str] = {
     "corpus_root": "corpus",
     "db_path": ".yaw/yaw.db",
@@ -109,10 +123,17 @@ class YawConfig:
     base_url: str = "http://localhost:13305/api/v1"
     api_key: str = "lemonade"
     provider: str = "openai"
-    embedding_model: str = "embeddinggemma-300m-qat-q8_0-GGUF-Q8_0"
+    embedding_model: str = DEFAULT_EMBEDDING_MODEL
     embedding_task_mode: str = "distinct-titled"
     extraction_model: str = "Gemma-4-E4B-it-GGUF"
     qa_model: str = "Gemma-4-E4B-it-GGUF"
+    context_window_tokens: int = 32768
+    max_output_tokens: int = 4096
+    rlm_max_iters: int = 10
+    rlm_max_llm_calls: int = 20
+    rlm_max_output_chars: int = 10000
+    reflection_input_tokens: int = 16384
+    reflection_tokenizer_url: str = ""
     enable_gbnf: bool = True
     gbnf_max_entities: int | None = None
     gbnf_max_triples: int | None = None
@@ -128,7 +149,7 @@ class YawConfig:
     synonymy_top_k: int = 100
     embed_batch_size: int = 64
     embed_batch_chars: int = 3500
-    max_context_chars: int = 24000
+    max_context_chars: int | None = None
     max_ast_expansion_hops: int = 1
 
     # Runtime & HTTP transport settings
@@ -161,6 +182,26 @@ class YawConfig:
             raise YawRuntimeError("INVALID_INPUT", "queue_maxsize must be >= 1")
         if self.chunk_size < 1:
             raise YawRuntimeError("INVALID_INPUT", "chunk_size must be >= 1")
+        if not 0 < self.max_output_tokens < self.context_window_tokens:
+            raise YawRuntimeError(
+                "INVALID_INPUT", "Require 0 < max_output_tokens < context_window_tokens"
+            )
+        for name in (
+            "rlm_max_iters",
+            "rlm_max_llm_calls",
+            "rlm_max_output_chars",
+            "reflection_input_tokens",
+        ):
+            if getattr(self, name) < 1:
+                raise YawRuntimeError("INVALID_INPUT", f"{name} must be positive")
+        context_chars = self.max_context_chars
+        if context_chars is None:
+            context_chars = context_char_limit(
+                24000, self.context_window_tokens, self.max_output_tokens
+            )
+            object.__setattr__(self, "max_context_chars", context_chars)
+        if context_chars < 1:
+            raise YawRuntimeError("INVALID_INPUT", "max_context_chars must be positive")
         if self.optimize_mode not in ("miprov2", "gepa", "hybrid"):
             raise YawRuntimeError(
                 "INVALID_INPUT", f"Unsupported optimize_mode: {self.optimize_mode!r}"
@@ -233,7 +274,8 @@ class YawConfig:
                     reverse=True,
                 )
                 candidates = [
-                    p for p in candidates
+                    p
+                    for p in candidates
                     if p.is_file() and re.fullmatch(r"yaw_optimize_\d{8}_\d{6}\.db", p.name)
                 ]
                 if not candidates:
@@ -292,6 +334,14 @@ class YawConfig:
             "embedding_task_mode": self.embedding_task_mode,
             "extraction_model": self.extraction_model,
             "qa_model": self.qa_model,
+            "context_window_tokens": self.context_window_tokens,
+            "max_output_tokens": self.max_output_tokens,
+            "rlm_max_iters": self.rlm_max_iters,
+            "rlm_max_llm_calls": self.rlm_max_llm_calls,
+            "rlm_max_output_chars": self.rlm_max_output_chars,
+            "reflection_input_tokens": self.reflection_input_tokens,
+            "reflection_tokenizer_url": self.reflection_tokenizer_url,
+            "max_context_chars": self.max_context_chars,
             "synonymy_threshold": self.synonymy_threshold,
             "damping": self.damping,
         }
@@ -335,6 +385,13 @@ _FIELD_TO_SECTION: dict[str, str] = {
     "embedding_task_mode": "inference",
     "extraction_model": "inference",
     "qa_model": "inference",
+    "context_window_tokens": "inference",
+    "max_output_tokens": "inference",
+    "rlm_max_iters": "inference",
+    "rlm_max_llm_calls": "inference",
+    "rlm_max_output_chars": "inference",
+    "reflection_input_tokens": "inference",
+    "reflection_tokenizer_url": "inference",
     "enable_gbnf": "inference",
     "gbnf_max_entities": "inference",
     "gbnf_max_triples": "inference",

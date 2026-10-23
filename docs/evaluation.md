@@ -1149,3 +1149,154 @@ Offline test suite: `uv run --locked python -m unittest discover -s tests -v` �
   not GEPA convergence, benchmark parity, sustained memory use, or performance
   relative to Qwen. Model changes intentionally use distinct cache/run identities;
   this does not migrate Qwen optimization checkpoints into Gemma runs.
+
+## 34. Evidence-driven native GEPA reflection replacement (2026-10-23)
+
+Implemented the accepted replacement: original training traces stay in the RLM
+sandbox; the selector returns validated example/field/span references and a short
+diagnosis; DSPy's native `InstructionProposer` is the sole instruction writer.
+Invalid selections and provider failures use deterministic evidence selection.
+Task signatures retain their output schemas. The native compressor uses its real
+`shortened_instruction` output field. Existing user task prompts/demos remain.
+
+- `reflection_input_tokens=16384` by default. Final rendered messages, including
+  learned demos/schema, use the resident llama.cpp model's chat template/tokenizer.
+  Requests reserve their actual output allowance plus 512 context tokens. Optional
+  evidence is removed whole; mandatory instructions/contracts are never sliced.
+  Each reflection role verifies its own resident model/tokenizer. Serving weights,
+  templates and generation defaults participate in reflection response/stage keys.
+- Evidence, proposals and request phases use existing SQLite storage. The active
+  request is pinned separately from FIFO cache eviction and committed atomically
+  with learned state. Corpus text/excerpts hydrate by source identity/span.
+  Completed stages replay without generation; interrupted in-flight work may run
+  again. SIMBA uses task-improvement rewards and version-2 learned state, with
+  request-local restoration preventing repeated application of a completed update.
+  Legacy worker snapshots are incompatible and rejected; they are not migrated.
+- LM histories are disabled, reflection traces are isolated, learning examples and
+  diagnostic histories are bounded, and sandbox lifetimes end with each attempt.
+  SIMBA native resampling temperatures now reach the worker; already compacted
+  evidence is not silently clipped by SIMBA's demonstration-field default.
+
+### Verification
+
+- Focused suite: **41 passed**, 16 warnings, 245.23 s, covering reflection,
+  SIMBA, candidate caches, architecture, inference budgets and program state.
+  Actual native DSPy classes, Deno/Pyodide sandbox, SQLite, loopback HTTP and fresh
+  processes are used. Loopback tokenizer counts validate the protocol/guard,
+  not the accuracy or task quality of a real model.
+- Fresh-process tests verify zero additional generation for completed proposals,
+  including interruption immediately after a proposal becomes durable. Real
+  cache eviction preserves the pinned active request and learned worker state;
+  failed SQLite writes preserve the preceding snapshot. Changed training labels
+  invalidate restoration. Native SIMBA restores learned predictions/task rewards.
+- Four affected engine optimizer tests passed earlier (78.14 s), including native
+  MIPROv2/GEPA orchestration. This does not change MIPRO warmup/search policy.
+- After the final tokenizer-role and retention changes, reflection/SIMBA checks
+  passed **23 tests** (103.09 s), and all **4 affected engine optimizer tests**
+  passed again (73.27 s). Repeated native proposals release original input
+  containers, leave outer traces empty and retain no LM/predictor histories.
+  Missing selector-model tokenizer access fails before generation.
+- The final reflection suite passed **17 tests** (74.32 s), including real SQLite
+  replay invalidation: changing learned writer instructions runs the new writer
+  exactly once while reusing evidence; subsequent identical requests reuse it.
+  Default LM chat-template options also count toward the complete request budget.
+- Final baseline-relative lint comparison found **no new diagnostics**;
+  `git diff --check` passed. Existing unrelated lint debt remains. The last lint
+  comparison used the already tested installed environment because concurrent
+  dependency edits left the manifest and lock out of sync: `uv run --locked`
+  reported that `uv.lock` needs updating. The manifest now requests
+  `cocoindex>=1.0.26`, while the tested environment used 1.0.25. Those dependency
+  edits and the lock were preserved. Locked launch/new-dependency compatibility
+  remains to be reconciled by the dependency work; no packages were changed by
+  this reflection replacement.
+- A broader prompts/budget/state run exposed the existing unrelated
+  `test_sprint2_validate_stage_invariants_and_refine_retry` assertion: differently
+  defined `New York` / `new york` entries score 1.0 while that assertion expects
+  less than 1.0. That run had 53 passes, one failure and two deselections. It is
+  outside the reflection replacement; the full test suite is not claimed green.
+- One verification invocation used an incorrect architecture-test path and
+  collected no tests; the corrected invocation is the 41-pass run above. An
+  intermediate fresh-process run overlapped source edits and failed compatibility;
+  with source frozen, the isolated recovery test passed (34.66 s). Final recovery
+  checks also run with source frozen.
+
+### Bounded live pilot
+
+A serial EnterpriseRAG pilot used Gemma-4-E4B-it-GGUF, its actual serving tokenizer
+and a verified 65,536-token context on native Windows / Python 3.14.7, with DSPy
+3.4.1. Two training queries (dataset indices 0–1) supplied reflection and SIMBA
+calibration; twelve disjoint held-out queries (indices 2–13) were reserved for
+comparison. No held-out answers entered learning. All three components (NER,
+synonym judging and QA) produced proposals; two SIMBA updates completed. Synonym
+selection used the deterministic fallback after an invalid RLM selection.
+
+The first attempt was stopped after discovering an ambiguous generalization rule:
+the model interpreted “do not copy instance facts into new instructions” as a ban
+on names in extraction outputs. The native writer policy now explicitly requires
+exact source names/identifiers in task outputs while keeping instruction text
+general. The first attempt's report is preserved separately.
+
+The corrected attempt stopped at its **60-minute deadline** (3,601.16 s), with
+**6 of 12 paired comparisons completed**. The unpaired seventh baseline is excluded.
+It recorded 524 logical LM invocations and 93 DSPy cache hits; these are not exact
+physical inference-server request counts. Peak observed Python working set was
+**423.64 MiB**; model-server, Deno and total system memory/VRAM were not measured.
+
+| Completed-pair mean | Starting program | Proposed program |
+| --- | ---: | ---: |
+| Primary-reference F1 used during pilot | 0.3304 | 0.3349 |
+| Full-reference F1, rescored identically after pilot | 0.4211 | 0.4305 |
+| EM, either answer policy | 0 | 0 |
+| Recall@1 / @2 / @5, 5 applicable queries | 0.6622 / 0.7244 / 0.9111 | 0.6622 / 0.7244 / 0.9111 |
+| Logical task tokens per query | 21,975.5 | 22,806.2 |
+| Task score under original pilot metric | 0.4460 | 0.4475 |
+| Seconds per query | 211.08 | 182.23 |
+
+Full-reference rescoring adds the dataset's `answer_aliases` and `answer_facts`,
+as production answer extraction does. The original pilot/calibration used only
+the primary answer; rescoring does not retroactively change learning. Recall
+excludes the query without supporting contexts. Candidate runs followed baselines,
+so cache/order effects confound latency. Identical starting task demos were retained
+in both arms; this is not a complete GEPA zero-demo corpus run.
+
+Per-query full-reference F1 (dataset index): 2, 0.4348→0.4348; 3, 0→0;
+4, **0.8298→0.8172 regression**; 5, 0.5000→0.5000;
+6, **0.2621→0.3312 improvement**; 7, 0.5000→0.5000.
+Raw answers, component instructions and call diagnostics remain in
+`outputs/gepa_reflection_pilot_v2/report.json`; paired rescoring is in
+`outputs/gepa_reflection_pilot_v2/summary.json`, and the process observations are
+in `outputs/gepa_reflection_pilot_v2/peak-memory.json`.
+
+The live pilot exercised an in-progress replacement before the final SIMBA
+resampling, trace isolation and deployment-key fixes. It therefore establishes
+neither quality gain for the final source nor unattended stability. The small
+partial score increase is inconclusive; both improvement and regression are
+reported. The twelve-query target was not achieved within the authorized deadline.
+No further live pilot, model loading/unloading or unattended optimizer was launched.
+
+
+## 36. Runtime contract reliability repair (2026-10-23)
+
+The first preflight repair packet validates persisted reflection/SIMBA objects
+before adoption and SQLite writes, delegates QA aliases to the native predictor,
+declares LM capabilities, preserves callable signatures and checks optimizer
+configuration before corpus mutation. See `runtime-contracts.md` for scope.
+
+Verification on Python 3.14.9 / DSPy 3.4.1 / CocoIndex 1.0.26:
+
+- The 15 runtime diagnostics in the audit packet are cleared: targeted
+  `ty check --fix` passes over engine, chat, program, reflection, watchdog and
+  the new runtime regression file.
+- Native DSPy, real SQLite, loopback inference, fresh-process recovery and
+  architecture checks: **61 passed**, 20 warnings, 144.58 s. An isolated export
+  of the staged commit also passed **61 tests**, 145.15 s, without the pending
+  preflight, ingestion or dashboard presentation changes.
+- Affected optimizer/hybrid engine checks: **4 passed**, 75.09 s; the isolated
+  staged export also passed all four, 73.23 s. The final
+  signature-metadata adjustment passed its two sync/async tool regressions.
+- New reflection/runtime regression files pass Ruff. The repair adds no lint
+  diagnostics relative to its starting snapshot under the current workspace
+  policy; existing lint debt is not reported as repaired.
+- No live-model optimization or corpus quality benchmark was launched. Existing
+  DSPy temperature/cache notices and normalized-message API deprecations remain.
+  The other audited full-suite fixture/type/lint failures remain separate work.
