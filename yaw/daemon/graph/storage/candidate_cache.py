@@ -50,10 +50,13 @@ class CandidateCacheStore:
         return bytes(row[0]) if row is not None else None
 
     def contains(self, stage: str, key: str) -> bool:
-        return self.conn.execute(
-            "SELECT 1 FROM candidate_stage_cache WHERE stage = ? AND cache_key = ?",
-            (stage, key),
-        ).fetchone() is not None
+        return (
+            self.conn.execute(
+                "SELECT 1 FROM candidate_stage_cache WHERE stage = ? AND cache_key = ?",
+                (stage, key),
+            ).fetchone()
+            is not None
+        )
 
     def delete(self, stage: str, key: str) -> None:
         self.conn.execute(
@@ -68,11 +71,15 @@ class CandidateCacheStore:
             return
         self.conn.execute(
             "INSERT INTO candidate_stage_cache(stage, cache_key, payload, size_bytes) "
-            "VALUES (?, ?, ?, ?)", (stage, key, payload, len(payload)),
+            "VALUES (?, ?, ?, ?)",
+            (stage, key, payload, len(payload)),
         )
-        while self.conn.execute(
-            "SELECT total_bytes FROM candidate_cache_size WHERE singleton = 1"
-        ).fetchone()[0] > max_bytes:
+        while (
+            self.conn.execute(
+                "SELECT total_bytes FROM candidate_cache_size WHERE singleton = 1"
+            ).fetchone()[0]
+            > max_bytes
+        ):
             self.conn.execute(
                 "DELETE FROM candidate_stage_cache WHERE seq = "
                 "(SELECT MIN(seq) FROM candidate_stage_cache)"

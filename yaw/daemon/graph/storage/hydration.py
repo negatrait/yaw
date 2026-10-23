@@ -335,7 +335,7 @@ def read_corpus_lines(
         if start_line < 1 or start_line - 1 >= len(lines):
             return None
         raw_text = "".join(lines[start_line - 1 : end_line])
-    except (OSError, UnicodeDecodeError):
+    except OSError, UnicodeDecodeError:
         return None
 
     if not raw_text:

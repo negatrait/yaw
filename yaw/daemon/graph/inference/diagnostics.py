@@ -21,9 +21,12 @@ class DiagnosticHistory(list):
 def trim_diagnostics(owner: Any) -> None:
     """Retain recent diagnostics after their current operation has consumed them."""
     for name, limit in (
-        ("telemetry", 250), ("embedding_audit_trail", 250),
-        ("entity_def_audit_trail", 250), ("synonym_audit_trail", 100),
-        ("shacl_audit_trail", 100), ("simba_telemetry", 100),
+        ("telemetry", 250),
+        ("embedding_audit_trail", 250),
+        ("entity_def_audit_trail", 250),
+        ("synonym_audit_trail", 100),
+        ("shacl_audit_trail", 100),
+        ("simba_telemetry", 100),
     ):
         records = getattr(owner, name, None)
         if isinstance(records, list):
@@ -32,10 +35,12 @@ def trim_diagnostics(owner: Any) -> None:
 
 def diagnostic_boundary(fn: Callable) -> Callable:
     """Release old diagnostics after success or failure, outside accounting slices."""
+
     @functools.wraps(fn)
     def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
         try:
             return fn(self, *args, **kwargs)
         finally:
             trim_diagnostics(self)
+
     return wrapped

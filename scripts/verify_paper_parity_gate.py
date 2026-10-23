@@ -1029,7 +1029,7 @@ def run_parity_gate(
             loaded = json.loads(output_json.read_text(encoding="utf-8"))
             if isinstance(loaded, dict) and isinstance(loaded.get("datasets"), dict):
                 existing_datasets = loaded["datasets"]
-        except (json.JSONDecodeError, OSError):
+        except json.JSONDecodeError, OSError:
             existing_datasets = {}
 
     gate_payload: dict[str, Any] = {

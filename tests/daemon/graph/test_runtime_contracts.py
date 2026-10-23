@@ -18,30 +18,31 @@ from yaw.daemon.graph.inference import HippoRAGProgram, RLMInstructionProposer
 from yaw.daemon.graph.inference.chat import YawDSPyLM, create_dspy_lm
 
 
-def test_native_qa_aliases_follow_predictor_mutation_and_json_restore(tmp_path):
+def test_native_qa_predictor_state_survives_json_restore_and_deepcopy(tmp_path):
     program = HippoRAGProgram(enable_gbnf=False)
+    assert type(program.qa) is dspy.ChainOfThought
+    predictor = dict(program.named_predictors())["qa.predict"]
+    assert dict(program.all_stage_predictors())["qa"] is predictor
     lm = create_dspy_lm("Gemma-4-E4B-it-GGUF", cache=False)
-    program.qa.predict.lm = lm
-    program.qa.predict.signature = program.qa.predict.signature.with_instructions("Use source names.")
-    program.qa.predict.demos = []
-    assert program.qa.lm is lm
-    assert program.qa.signature is program.qa.predict.signature
-    assert program.qa.demos is program.qa.predict.demos
-    program.qa.demos = [dspy.Example(context="A", question="Q", answer="A")]
-    assert program.qa.predict.demos == program.qa.demos
-    program.qa.lm = None
-    assert program.qa.predict.lm is None
+    program.qa.set_lm(lm)
+    assert predictor.lm is lm
+    predictor.signature = predictor.signature.with_instructions("Use source names.")
+    predictor.demos = [dspy.Example(context="A", question="Q", answer="A")]
+    assert not {"signature", "lm", "demos"}.intersection(vars(program.qa))
+    # State-only saves must not require loading a custom LM class.
+    program.qa.set_lm(None)
     saved = tmp_path / "qa.json"
     program.save(str(saved))
     restored = HippoRAGProgram(enable_gbnf=False)
     restored.load(str(saved))
-    assert restored.qa.signature.instructions == "Use source names."
-    assert restored.qa.demos == restored.qa.predict.demos
-    assert len(restored.qa.demos) == 1
-    assert isinstance(restored.qa.demos[0], dict)
+    assert type(restored.qa) is dspy.ChainOfThought
+    assert restored.qa.predict.signature.instructions == "Use source names."
+    assert restored.qa.predict.demos == [{"context": "A", "question": "Q", "answer": "A"}]
     clone = restored.deepcopy()
-    clone.qa.signature = clone.qa.signature.with_instructions("Other instructions.")
-    assert restored.qa.signature.instructions == "Use source names."
+    clone.qa.predict.signature = clone.qa.predict.signature.with_instructions("Other instructions.")
+    clone.qa.predict.demos.clear()
+    assert restored.qa.predict.signature.instructions == "Use source names."
+    assert len(restored.qa.predict.demos) == 1
 
 
 def test_native_lm_capability_defaults_and_copy():

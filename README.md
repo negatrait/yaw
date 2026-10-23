@@ -4,10 +4,13 @@ YAW is a native HippoRAG 2 graph & storage engine backed by a single SQLite data
 
 ## Available now
 
-Use Python `>=3.14.7` (`.python-version` `3.14.7`) and `uv`:
+Use Python `>=3.14` (`.python-version` `3.14.9`) and `uv`:
 
 ```powershell
 uv sync
+uv run preflight
+uv run preflight --full
+uv run typecheck
 uv run pytest -v
 uv run python scripts/download-datasets.py --dataset enterprise_rag_bench
 uv run yaw daemon status
@@ -30,6 +33,17 @@ uv run python benchmark.py --dataset hotpotqa --max-queries 25 --mode retrieval
 uv run python benchmark.py --dataset musique --max-queries 25 --mode retrieval
 uv run python scripts/verify_paper_parity_gate.py
 ```
+
+`preflight` formats with Ruff, applies safe Ruff and ty fixes, then runs pytest
+with testmon and coverage.py through pytest-cov. It continues after failures and
+returns a failing exit status if any check fails. Full UTF-8 logs, JUnit XML,
+coverage JSON and a combined report are saved under `outputs/preflight/`;
+`latest.json` points to the newest report. Add `--verbose` to stream diagnostics.
+Default tests are incremental; `--full` runs the whole suite. Coverage describes
+the tests executed in that invocation. Resident-model tests require `--live`.
+Ruff fixes and pytest `--testmon` are project defaults. ty's `--fix` has no
+persistent configuration setting; `uv run typecheck` supplies it automatically.
+See the [preflight audit](docs/preflight-audit.md) for remaining cleanup work.
 
 Optimization starts a fresh timestamped sandbox unless `--resume` or `--db-path`
 (`--db` alias) selects an existing run. `--resume` and `--db-path latest` select
@@ -73,6 +87,12 @@ settings. `cache=False` remains an explicit bypass. Legacy SDK cache entries wit
 no recoverable usage are recomputed once rather than scored as free. No changes
 to GEPA's optimizer or program signatures are required.
 
+GEPA reflection uses sandbox evidence selection followed by DSPy's native instruction
+writer. `inference.reflection_input_tokens` defaults to **16,384**; the complete
+rendered request is checked with the resident model's serving tokenizer. Evidence,
+proposals and SIMBA state checkpoint in `yaw.db`, including a pinned active request.
+See [reflection repair and restart behavior](docs/gepa-reflection-repair.md).
+
 During optimization, full DSPy LM/module inspection histories are disabled;
 GEPA traces and logical token accounting remain active. YAW keeps recent
 diagnostics (250 telemetry/embedding/definition records and 100 synonym/SHACL
@@ -88,6 +108,26 @@ Larger character budgets need testing against the inference server; overflow
 splitting remains enabled. Query-prefix evolution preserves document-stage
 caches, while query vectors use the effective query prefix in their own keys.
 Persistent CocoIndex parsing also invalidates when parsing helpers change.
+
+Inference capacity is explicit under `[inference]`: `context_window_tokens`
+declares the server's actual serving window (65,536 in `yaw.toml`), while
+`max_output_tokens` caps each completion. These settings do not resize or reload
+the external server. Extraction, QA, reflection-field and validation-input
+character safeguards scale with available input capacity; they are heuristics,
+not exact token counts. `[graph].max_context_chars` defaults to a scaled context
+budget unless explicitly set. Embedding input limits remain profile-specific.
+`rlm_max_iters`, `rlm_max_llm_calls` and `rlm_max_output_chars` independently bound
+SHACL and reflection loops. More context does not automatically mean more turns.
+Changed model/budget settings require a compatible fresh run/index; an already
+running optimizer retains its original settings.
+
+The dashboard's `scripts/watchdog.py --layout-iterations 1000` controls graph
+relaxation rounds (default 1,000). Fig. 2 shows only the largest connected
+one-hop neighborhood seeded by `skos:related` and `owl:differentFrom`, with
+labels on ten recent disambiguation pairs. Both assertion lists follow Fig. 2;
+the related list shows up to ten active canonical pairs by newest insertion
+rowid, since reassertion timestamps are not stored. Full-validation progress
+uses GEPA's validation score; candidate F1/recall means include minibatches.
 
 `benchmark.py` and `scripts/verify_paper_parity_gate.py` evaluate the native `yaw` engine (`YawGraphEngine` + `yaw.db` + `HippoRAGProgram`) against Standard DPR (`retrieve_dpr`) and two consolidated reference targets across the 7 HippoRAG 2 paper datasets (`popqa`, `lveval`, `narrativeqa`, `2wikimultihopqa`, `hotpotqa`, `nq`, `musique`):
 - **Target 1 (`MONKEYPATCHED_HIPPORAG_BASELINES`):** Consolidated historical runs of upstream HippoRAG 2 on the exact same `Qwen3-4B-Instruct-2507-GGUF` + `embeddinggemma-300m-GGUF` local stack (archived in [`outputs/benchmarks/consolidated_historical_baselines.json`](outputs/benchmarks/consolidated_historical_baselines.json)).

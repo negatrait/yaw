@@ -124,6 +124,7 @@ class MutableSpan:
 @dataclass(frozen=True)
 class CoalescedSpan:
     """A deduplicated, contiguous line span covering one or more hit chunks and their AST expansion."""
+
     rel_posix_path: str
     start_line: int
     end_line: int
@@ -298,7 +299,7 @@ In production RAG and sensible benchmark evaluation:
   ```
   or matches on document identity:
   ```python
-  is_hit = (retrieved_pointer.rel_posix_path == gold_doc_path)
+  is_hit = retrieved_pointer.rel_posix_path == gold_doc_path
   ```
 - This allows native YAW retrieval to return clean, focused $\approx 300$-token AST chunks, achieving 100% recall credit on academic datasets without corrupting the production engine.
 

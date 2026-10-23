@@ -435,6 +435,7 @@ def get_active_sandbox_info() -> dict[str, Any]:
                 counts[tbl] = (conn.execute(f"SELECT count(*) FROM {tbl}").fetchone() or [0])[0]
         diff_from_rows: list[tuple[str, str, str, str, str, str]] = []
         related_rows: list[tuple[str, str]] = []
+        related_assertions: list[tuple[str, str, str, str, str, str]] = []
         alt_label_cnt = 0
         with contextlib.suppress(sqlite3.Error):
             diff_from_rows = [
@@ -447,6 +448,7 @@ def get_active_sandbox_info() -> dict[str, Any]:
                     JOIN entities a ON a.entity_id = e.src_id
                     JOIN entities b ON b.entity_id = e.dst_id
                     WHERE e.kind = 'owl:differentFrom' AND e.src_id < e.dst_id
+                    ORDER BY e.rowid DESC
                     """
                 ).fetchall()
             ]
@@ -495,6 +497,7 @@ def get_active_sandbox_info() -> dict[str, Any]:
                     """
                 ).fetchall()
             ]
+            related_assertions = recent_relation_assertions(conn, "skos:related")
         rows = conn.execute(
             "SELECT chunk_id, entities_json, triples_json, structured_triples_json "
             "FROM openie_chunks ORDER BY rowid ASC"
@@ -560,6 +563,7 @@ def get_active_sandbox_info() -> dict[str, Any]:
             "edges": graph_edges,
             "diff_from_rows": diff_from_rows,
             "related_rows": related_rows,
+            "related_assertion_rows": related_assertions,
         }
         info["timeseries_samples"] = get_empirical_telemetry_timeseries(
             start_dt, info["elapsed_seconds"], len(rows), cum_e, cum_t, latest_db.stem
@@ -862,6 +866,38 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
     _save(fig, dest)
 
 
+def largest_one_hop_neighborhood(edges: list[tuple[str, str, str]]) -> set[str]:
+    """Largest induced component one hop from related/differentFrom endpoints."""
+    adjacency: dict[str, set[str]] = defaultdict(set)
+    seeds: set[str] = set()
+    for u, v, kind in edges:
+        if kind not in {"fact", "skos:related", "owl:differentFrom"} or u == v:
+            continue
+        adjacency[u].add(v)
+        adjacency[v].add(u)
+        if kind in {"skos:related", "owl:differentFrom"}:
+            seeds.update((u, v))
+    selected = seeds | {node for seed in seeds for node in adjacency[seed]}
+    remaining = set(selected)
+    largest: set[str] = set()
+    # Sorted starts give deterministic tie-breaking for equally large components.
+    for start in sorted(selected):
+        if start not in remaining:
+            continue
+        component: set[str] = set()
+        pending = [start]
+        remaining.remove(start)
+        while pending:
+            node = pending.pop()
+            component.add(node)
+            neighbors = adjacency[node] & remaining
+            remaining.difference_update(neighbors)
+            pending.extend(neighbors)
+        if len(component) > len(largest):
+            largest = component
+    return largest
+
+
 def recent_relation_assertions(
     conn: sqlite3.Connection, relation: str, limit: int = 10
 ) -> list[tuple[str, str, str, str, str, str]]:
@@ -880,8 +916,10 @@ def recent_relation_assertions(
 
 
 def generate_graph_projection_svg(
-    dest: Path, sandbox: dict[str, Any], badge: tuple[str, str]
+    dest: Path, sandbox: dict[str, Any], badge: tuple[str, str], *, layout_iterations: int = 1000
 ) -> dict[str, Any]:
+    if layout_iterations < 1:
+        raise ValueError("layout_iterations must be positive")
     kg_g = sandbox.get("kg_graph")
     if not kg_g:
         _placeholder_svg(
@@ -905,7 +943,9 @@ def generate_graph_projection_svg(
         )
         return {}
 
-    # Identify all owl:differentFrom and skos:related entities
+    selected = largest_one_hop_neighborhood(all_edges)
+    # Counts and colors describe only the connected neighborhood actually shown.
+    all_edges = [(u, v, k) for u, v, k in all_edges if u in selected and v in selected]
     diff_nodes: set[str] = {u for u, v, k in all_edges if k == "owl:differentFrom"} | {
         v for u, v, k in all_edges if k == "owl:differentFrom"
     }
@@ -922,10 +962,6 @@ def generate_graph_projection_svg(
                 inc_fact[u].add(v)
             if v in base_nodes:
                 inc_fact[v].add(u)
-
-    selected: set[str] = set(base_nodes)
-    for nbrs in inc_fact.values():
-        selected.update(nbrs)
 
     nodes = sorted(
         selected,
@@ -950,15 +986,9 @@ def generate_graph_projection_svg(
         if k == "owl:differentFrom" and u in idx and v in idx
     ]
     rel_segs = [
-        [idx[u], idx[v]]
-        for u, v, k in all_edges
-        if k == "skos:related" and u in idx and v in idx
+        [idx[u], idx[v]] for u, v, k in all_edges if k == "skos:related" and u in idx and v in idx
     ]
-    fact_segs = [
-        [idx[u], idx[v]]
-        for u, v, k in all_edges
-        if k == "fact" and u in idx and v in idx
-    ]
+    fact_segs = [[idx[u], idx[v]] for u, v, k in all_edges if k == "fact" and u in idx and v in idx]
     active_edge_arr = (
         np.array(diff_segs + rel_segs + fact_segs, dtype=int)
         if (diff_segs or rel_segs or fact_segs)
@@ -973,7 +1003,7 @@ def generate_graph_projection_svg(
         rad = 220.0 + rng.standard_normal(n_cnt) * 30.0
         pos = np.column_stack([np.cos(ang) * rad, np.sin(ang) * rad])
         vel = np.zeros((n_cnt, 2))
-        for _ in range(80):
+        for _ in range(layout_iterations):
             diff = pos[:, None, :] - pos[None, :, :]
             d2 = np.sum(diff**2, axis=-1) + 25.0
             f_rep = 8500.0 / (d2 * np.sqrt(d2))
@@ -1031,7 +1061,7 @@ def generate_graph_projection_svg(
                 )
 
         deg_arr = np.maximum(np.bincount(active_edge_arr.ravel(), minlength=n_cnt), 1)[:, None]
-        for _ in range(40):
+        for _ in range(layout_iterations):
             if len(active_edge_arr):
                 de = pos[active_edge_arr[:, 1]] - pos[active_edge_arr[:, 0]]
                 dl = np.linalg.norm(de, axis=1, keepdims=True) + 1e-2
@@ -1059,11 +1089,13 @@ def generate_graph_projection_svg(
     )
     fig.text(
         0.04,
-        0.915,
-        f"{n_cnt} Entities ({len(diff_nodes)} owl:differentFrom, {len(rel_nodes)} skos:related, "
-        f"{n_cnt - len(base_nodes)} 1-Hop rdf:Statement) • {len(fact_segs)} Fact Edges • "
-        f"{len(rel_segs)} skos:related • {len(diff_segs)} owl:differentFrom (\u2260)",
-        fontsize=9.5,
+        0.91,
+        f"{n_cnt} entities • Largest 1-hop component • "
+        f"{len(diff_nodes)} ≠ endpoints • {n_cnt - len(base_nodes)} neighboring entities\n"
+        f"Edges: {len(fact_segs)} fact • {len(rel_segs)} skos:related • "
+        f"{len(diff_segs)} owl:differentFrom • Labels: 10 newest ≠ pairs in view",
+        fontsize=9,
+        va="top",
         color="#38bdf8",
         fontweight="bold",
     )
@@ -1144,21 +1176,29 @@ def generate_graph_projection_svg(
         diff_peer_map[ea].append((eb, nb, db))
         diff_peer_map[eb].append((ea, na, da))
 
-    for eid in diff_nodes:
+    label_nodes: set[str] = set()
+    label_pairs = 0
+    for ea, _na, _da, eb, _nb, _db in diff_from_rows:
+        if ea in idx and eb in idx:
+            label_nodes.update((ea, eb))
+            label_pairs += 1
+            if label_pairs == 10:
+                break
+    for eid in sorted(label_nodes):
         if eid not in idx:
             continue
         i = idx[eid]
         name, defn, _ = entities.get(eid, (eid, "", 1))
         # Could well be possible to just show the name to save space
-#        peers = diff_peer_map.get(eid, [])
-#        has_homograph = any(
-#            p_name.strip().lower() == name.strip().lower() for _, p_name, _ in peers
-#        )
-#        if has_homograph:
-#            words = [w for w in defn.replace(";", " ").replace(".", " ").split() if len(w) > 2]
-#            hint = " ".join(words[:2]) if words else eid[-4:]
-#            disp_label = f"{name} [{hint}]"
-#        else:
+        #        peers = diff_peer_map.get(eid, [])
+        #        has_homograph = any(
+        #            p_name.strip().lower() == name.strip().lower() for _, p_name, _ in peers
+        #        )
+        #        if has_homograph:
+        #            words = [w for w in defn.replace(";", " ").replace(".", " ").split() if len(w) > 2]
+        #            hint = " ".join(words[:2]) if words else eid[-4:]
+        #            disp_label = f"{name} [{hint}]"
+        #        else:
         disp_label = name
 
         ax.text(
@@ -1198,7 +1238,7 @@ def generate_graph_projection_svg(
             color="#475569",
             lw=1.0,
             ls="-",
-            label=f"rdf:Statement ({len(fact_segs)} edges)",
+            label=f"Fact relationships ({len(fact_segs)} edges)",
         ),
         Line2D(
             [0],
@@ -1241,6 +1281,7 @@ def generate_graph_projection_svg(
         "diff_edges": len(diff_segs),
         "related_edges": len(rel_segs),
         "fact_edges": len(fact_segs),
+        "layout_iterations": layout_iterations,
     }
 
 
@@ -1560,15 +1601,14 @@ def generate_report_markdown(
         full = [c for c in cands if c.get("val_score") is not None]
         if full:
             seed = full[0]
-            best_f1 = max(full, key=lambda c: c["f1"])
-            best_r5 = max(full, key=lambda c: c["r5"])
+            best = max(full, key=lambda c: c["val_score"])
             rows.append(
                 (
-                    "Full-Valset Front",
-                    f"`{len(full)}` fully scored • Best F1 **`#{best_f1['cand']}` "
-                    f"`{best_f1['f1'] * 100:.1f}%`** ({(best_f1['f1'] - seed['f1']) * 100:+.1f}pt "
-                    f"vs seed) • Best R@5 **`#{best_r5['cand']}` `{best_r5['r5'] * 100:.0f}%`** "
-                    f"({(best_r5['r5'] - seed['r5']) * 100:+.0f}pt vs seed)",
+                    "Full Validation",
+                    f"`{len(full)}` fully scored • Best composite score **`#{best['cand']}` "
+                    f"`{best['val_score']:.4f}`** "
+                    f"({best['val_score'] - seed['val_score']:+.4f} vs seed). "
+                    "Candidate F1/recall averages also include minibatch evaluations.",
                 )
             )
     rows += [
@@ -1598,6 +1638,7 @@ def generate_report_markdown(
 
     kg_g = sandbox.get("kg_graph", {})
     diff_from_rows = kg_g.get("diff_from_rows", [])
+    related_assertions = kg_g.get("related_assertion_rows", [])
     assertions_md = ""
     if diff_from_rows:
         # Mobile-friendly: a narrow bullet list instead of a wide multi-column table.
@@ -1617,6 +1658,21 @@ def generate_report_markdown(
             "*If an `owl:differentFrom` assertion below is false, it is an intervention "
             "candidate in `yaw.db`.*\n\n" + "\n".join(items) + f"\n{trunc}\n"
         )
+    if related_assertions:
+        related_items = []
+        for _ea, na, da, _eb, nb, db in related_assertions:
+            related_items.append(
+                f"- **`{na}`** ↔ **`{nb}`**\n"
+                f"  - A: *{da.strip()[:110] or 'n/a'}*\n"
+                f"  - B: *{db.strip()[:110] or 'n/a'}*"
+            )
+        assertions_md += (
+            "### Most Recent `skos:related` Assertions\n\n"
+            "*Up to 10 active pairs, newest insertion first. Reassertion times are not stored. "
+            "Lists cover the sandbox; Fig. 2 shows its largest seeded neighborhood.*\n\n"
+            + "\n".join(related_items)
+            + "\n\n"
+        )
 
     # Small image files referenced by path (no inline base64: that made the report multi-MB and
     # unrenderable on mobile). Fig. 2 is a compact PNG; the others are small SVGs.
@@ -1627,15 +1683,17 @@ def generate_report_markdown(
         "Fig. 4: Retrieval Quality",
         "Fig. 5: Pareto Frontier",
     ]
-    figs = "\n\n".join(
-        f"![{t}](/{art}/{name})" for t, name in zip(fig_titles, FIG_FILES, strict=True)
-    )
+    figures = []
+    for index, (title, name) in enumerate(zip(fig_titles, FIG_FILES, strict=True)):
+        figures.append(f"![{title}](/{art}/{name})")
+        if index == 1 and assertions_md:
+            figures.append(assertions_md)
+    figs = "\n\n".join(figures)
     md = (
         f"# Live Optimization Telemetry (`{sandbox.get('db_name', 'no sandbox')}`)\n\n"
         f"*Updated*: `{datetime.now(UTC):%Y-%m-%d %H:%M:%S UTC}` • *State*: **`{badge[0]}`**\n\n"
         "| Metric | Live Value |\n| :--- | :--- |\n"
         f"{table}\n\n"
-        f"{assertions_md}"
         f"{figs}\n"
     )
     _atomic_write(dest, lambda p: p.write_text(md, encoding="utf-8"))
@@ -1685,7 +1743,10 @@ def cool_inference_servers(cool_seconds: int) -> None:
             time.sleep(cool_seconds)
 
 
-def run_once() -> tuple[dict[str, Any], list[dict[str, Any]], int, tuple[str, str]]:
+def run_once(
+    *,
+    layout_iterations: int = 1000,
+) -> tuple[dict[str, Any], list[dict[str, Any]], int, tuple[str, str]]:
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
     sb = get_active_sandbox_info()
     cfg = read_config_info()
@@ -1695,7 +1756,12 @@ def run_once() -> tuple[dict[str, Any], list[dict[str, Any]], int, tuple[str, st
     )
     jobs = (
         (FIG_FILES[0], lambda d: generate_kg_dashboard_svg(d, sb, cfg)),
-        (FIG_FILES[1], lambda d: generate_graph_projection_svg(d, sb, badge)),
+        (
+            FIG_FILES[1],
+            lambda d: generate_graph_projection_svg(
+                d, sb, badge, layout_iterations=layout_iterations
+            ),
+        ),
         (FIG_FILES[2], lambda d: generate_candidate_score_svg(d, cands, legacy, badge, sb)),
         (FIG_FILES[3], lambda d: generate_candidate_quality_svg(d, cands, legacy, badge, sb)),
         (FIG_FILES[4], lambda d: generate_pareto_svg(d, cands, legacy, badge, sb)),
@@ -1719,11 +1785,19 @@ def run_once() -> tuple[dict[str, Any], list[dict[str, Any]], int, tuple[str, st
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--watch", type=int, default=None)
+    ap.add_argument(
+        "--layout-iterations",
+        type=int,
+        default=1000,
+        help="Force-layout relaxation rounds for Fig. 2 (default: 1000)",
+    )
     ap.add_argument("--cool-seconds", type=int, default=0)
     ap.add_argument("--thermal-guard", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--crisis-temp", type=float, default=82.0)
     ap.add_argument("--target-temp", type=float, default=72.0)
     args = ap.parse_args()
+    if args.layout_iterations < 1:
+        ap.error("--layout-iterations must be positive")
 
     for name in LEGACY_FIG_FILES:
         with contextlib.suppress(OSError):
@@ -1731,7 +1805,7 @@ def main() -> int:
 
     while True:
         try:
-            sb, cands, n_evals, badge = run_once()
+            sb, cands, n_evals, badge = run_once(layout_iterations=args.layout_iterations)
             pt = PoolTelemetry.from_sandbox(sb)
             cand_info = ""
             if cands:
@@ -1739,8 +1813,8 @@ def main() -> int:
                 last = cands[-1]
                 best_txt = ""
                 if full:
-                    best = max(full, key=lambda c: c["f1"])
-                    best_txt = f", best full-val F1 #{best['cand']} {best['f1'] * 100:.1f}%"
+                    best = max(full, key=lambda c: c["val_score"])
+                    best_txt = f", best full-val score #{best['cand']} {best['val_score']:.4f}"
                 cand_info = (
                     f" | Candidates: {len(cands)} ({n_evals} evals){best_txt}, latest "
                     f"#{last['cand']} R@5 {last['r5'] * 100:.0f}% F1 {last['f1'] * 100:.0f}%"

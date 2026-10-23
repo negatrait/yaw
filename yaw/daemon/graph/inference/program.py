@@ -1464,37 +1464,6 @@ def _should_retry_stage_invariants(
     return True
 
 
-class NativeQA(dspy.ChainOfThought):
-    """Expose stage accessors backed exclusively by DSPy's native predictor."""
-
-    @property
-    def signature(self) -> type[dspy.Signature]:
-        signature = self.predict.signature
-        if signature is None:
-            raise ValueError("QA predictor has no signature")
-        return signature
-
-    @signature.setter
-    def signature(self, value: type[dspy.Signature]) -> None:
-        self.predict.signature = value
-
-    @property
-    def lm(self) -> dspy.BaseLM | None:
-        return self.predict.lm
-
-    @lm.setter
-    def lm(self, value: dspy.BaseLM | None) -> None:
-        self.predict.lm = value
-
-    @property
-    def demos(self) -> list[dspy.Example | dict[str, Any]]:
-        return self.predict.demos
-
-    @demos.setter
-    def demos(self, value: Sequence[dspy.Example | dict[str, Any]]) -> None:
-        self.predict.demos = list(value)
-
-
 class HippoRAGProgram(dspy.Module):
     """Unified DSPy Module for HippoRAG 2 OpenIE, EDC/SKOS Schema Canon, SHACL Repair, Recognition Memory, and Multi-Hop QA.
 
@@ -1600,7 +1569,7 @@ class HippoRAGProgram(dspy.Module):
         self.shacl_repair = dspy.Predict(ProposeSHACLRepairs)
         self.triple_filter = dspy.Predict(FilterTriples)
         self.query_intent = dspy.Predict(ExtractQueryIntent)
-        self.qa = NativeQA(AnswerQuestion)
+        self.qa = dspy.ChainOfThought(AnswerQuestion)
 
         shacl_tools = list(self._build_shacl_repl_tools())
         if rlm_tools:
@@ -1629,7 +1598,7 @@ class HippoRAGProgram(dspy.Module):
             self.ner.demos = list(NER_DEMOS)
             self.triples.demos = list(TRIPLE_DEMOS)
             self.triple_filter.demos = list(TRIPLE_FILTER_DEMOS)
-            self.qa.demos = list(QA_DEMOS)
+            self.qa.predict.demos = list(QA_DEMOS)
             rlm_demos = _build_rlm_action_demos()
             self.shacl_healer_rlm.generate_action.demos = list(rlm_demos["shacl_repair"])
 
@@ -1673,7 +1642,7 @@ class HippoRAGProgram(dspy.Module):
             pred.lm = _PredictorBoundLM(name, "worker", worker_getter)
 
         qa_lm = _PredictorBoundLM("qa", "orchestrator", orch_getter)
-        self.qa.lm = qa_lm
+        self.qa.predict.lm = qa_lm
 
         action_lm = _PredictorBoundLM(
             "shacl_healer_rlm.generate_action", "orchestrator", orch_getter
@@ -1694,7 +1663,7 @@ class HippoRAGProgram(dspy.Module):
             ("shacl_healer_rlm", self.shacl_healer_rlm),
             ("triple_filter", self.triple_filter),
             ("query_intent", self.query_intent),
-            ("qa", self.qa),
+            ("qa", self.qa.predict),
         ]
 
     def set_graph_tools(
@@ -2767,7 +2736,7 @@ class HippoRAGProgram(dspy.Module):
                 return str(self._chunk_hydrator(str(chunk_id)))
             return ""
 
-        sig = getattr(self.qa, "predict", self.qa).signature
+        sig = self.qa.predict.signature
         eff_lm = self.orchestrator_lm or self.rlm_sub_lm
         try:
             agent = react_cls(

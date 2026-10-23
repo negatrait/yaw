@@ -18,6 +18,7 @@ Equivalent reproduction from the project environment:
 
 ```python
 import logging, runpy, tempfile
+
 logging.basicConfig(level=logging.INFO)
 script = runpy.run_path("live_smoke.py", run_name="diagnostic")
 script["main"].__globals__["save_dir"] = tempfile.mkdtemp(prefix="yaw-live-smoke-")
@@ -1150,6 +1151,194 @@ Offline test suite: `uv run --locked python -m unittest discover -s tests -v` â€
   relative to Qwen. Model changes intentionally use distinct cache/run identities;
   this does not migrate Qwen optimization checkpoints into Gemma runs.
 
+## 30. SIMBA task reward and durable worker recovery (2026-10-23)
+
+- **Implemented:** replaced instruction-form scoring with a paired task-score
+  improvement reward. Each proposal is applied to its complete GEPA candidate
+  and evaluated against that candidate on the same first two training queries
+  (one for a single-query trainset). This uses the existing GEPA composite
+  retrieval/EM/F1/token/graph metric without adding validation-history records.
+  Meta-example candidate snapshots are labels, excluded from worker inputs.
+- **Persistence:** native DSPy predictor state for proposer and compressor,
+  demos, bounded training examples, and step/seed counter are atomically stored
+  in `yaw.db` metadata before compilation and immediately after each completed
+  step. The GEPA seed-resume path restores the worker with current LM bindings.
+  Incompatible model/task/data/retrieval/code identities reject restoration;
+  task-evaluation failures retain the previous worker and warn; storage errors
+  propagate. Task scores use the bounded SQLite candidate cache.
+- **Final focused verification:**
+  `uv run --locked pytest tests/daemon/graph/test_simba_learning.py -q`
+  -> **7 passed in 40.23 s**, with two native DSPy warnings that rollout IDs do
+  not change sampling at temperature zero. Real native SIMBA, real loopback
+  HTTP, and real SQLite verify helpful versus harmful task rewards, correct
+  task-model routing, two-query bounds, worker learning, fresh-process state
+  restoration and continued proposal generation, zero extra task requests on
+  cached rescoring after restart, incompatible-label rejection, task failure
+  non-adoption, and preservation of the previous snapshot on a read-only write
+  failure. The HTTP provider is scripted: this establishes orchestration and
+  metric discrimination, not genuine model quality or benchmark parity.
+- The updated standalone-proposer contract plus the initial six SIMBA tests
+  passed together: **7 passed, 32 deselected in 44.56 s**. Architecture and
+  bounded-diagnostic checks passed with the strengthened restart test:
+  **17 passed in 42.56 s** (six SIMBA tests plus eleven architecture/diagnostic
+  tests; the additional SQLite-write-failure case was then verified above).
+- **Broader integration limitation:** the existing native MIPROv2/GEPA hybrid
+  test completed optimization and saved its program, then failed its existing
+  `len(compiled.shacl_healer_rlm.generate_action.demos) >= 1` assertion under
+  zero-demo settings, as previously recorded in sections 22/24. Combined run:
+  **11 passed, 1 failed, 21 deselected in 64.44 s**. Scripted provider parse
+  errors also occurred during that test's MIPRO search. This is not reported
+  as a passing end-to-end optimization acceptance run.
+- New test-file Ruff check and `git diff --check` pass. Comparison of runtime
+  source diagnostics against HEAD reports **zero new lint diagnostics**;
+  the broad touched-file Ruff check still finds existing lint debt.
+- **Limits:** no live-server training, full-corpus reindex, convergence study,
+  or long-running memory soak was performed. Inner task evaluation costs are
+  additional to GEPA's metric-call budget on cache misses. The small fixed
+  calibration slice can overfit; outer GEPA validation still decides candidate
+  acceptance. Recovery resumes completed SIMBA steps and their training window,
+  not an in-flight native SIMBA compile's temporary candidates/trial logs.
+  Legacy checkpoints without SIMBA state start a fresh worker.
+
+## 31. Hybrid zero-demo assertion and saved-program regression (2026-10-23)
+
+- Corrected the hybrid integration test's contradictory requirement for at
+  least one SHACL demo. It now explicitly requests zero bootstrapped/labeled
+  task demos and verifies every task predictor is demo-free both immediately
+  after optimization and after reloading the saved program.
+- The stronger check exposed a real loader defect: `HippoRAGProgram.load_state`
+  reinserted `QA_DEMOS` whenever the restored QA demo list was empty. Removed
+  that reseeding. Explicitly saved empty/default/custom demo lists now survive
+  JSON round trips. Missing legacy predictor state still inherits the chosen
+  constructor defaults through the existing missing-state handling.
+- First corrected-test run failed on restored `qa.predict` retaining built-in
+  demos (**1 failed in 61.00 s**). After fixing the loader,
+  `uv run --locked pytest tests/daemon/graph/test_engine.py::test_evolve_prompts_real_unmocked_gepa_and_miprov2_with_context_limit_guard -q --tb=short`
+  -> **1 passed in 69.71 s**. This supersedes the failed assertion reported in
+  section 30; it also corrects the initial assessment that only the test needed
+  changing.
+- `uv run --locked pytest tests/daemon/graph/inference/test_program_state.py -q --tb=short`
+  -> **5 passed in 13.94 s**. Cases cover saved empty/default/custom QA demos
+  and missing legacy QA state with constructor demos enabled and disabled.
+  The new file passes Ruff; baseline comparisons for changed runtime code and
+  the existing integration-test file report zero new diagnostics.
+  `git diff --check` passes.
+- Existing retriever/program-state and Pareto-ensemble contracts plus the
+  standalone proposer and SIMBA recovery tests:
+  `uv run --locked pytest tests/daemon/graph/inference/test_prompts.py tests/daemon/graph/test_simba_learning.py -k 'yaw_rm_and_yaw_retriever_contract or pareto_program_ensemble or simba or task_reward' -q --tb=short`
+  -> **10 passed, 30 deselected in 58.30 s**, with the same two native DSPy
+  temperature-zero rollout warnings documented in section 30.
+- These checks use real native DSPy optimizers and JSON persistence with a
+  scripted inference provider. They verify orchestration/state behavior, not
+  live-model quality, benchmark parity, or corpus-level gains.
+
+## 32. Active GEPA model/context and watchdog audit (2026-10-23)
+
+- Findings and implementation details:
+  [gepa-live-run-audit.md](gepa-live-run-audit.md). `yaw.toml` overrode the QAT
+  core default with the standard embedding model, and all 250 sampled recent
+  embedding audit entries named that model. TOML and adapter defaults now
+  share the exact QAT alias; explicit standard selection remains supported.
+  The active optimizer was not switched between embedding identities.
+- Read-only Lemonade health confirmed Gemma's launched serving context is
+  **65,536**, distinct from its advertised architectural maximum of 131,072.
+  Added explicit context/output/RLM budgets, scaled character safeguards,
+  runtime forwarding of graph context capacity, current deployment overrides
+  for saved ensembles, and compatible cache identities. Character safeguards
+  are heuristics, not token-exact prompt fitting. Existing process settings are
+  not hot-reloaded; changed inference/index identities require a fresh run.
+- Dashboard: both relation types seed one hop; only the largest induced
+  component is rendered. The two assertion lists follow Fig. 2, including ten
+  recent active related pairs ordered by insertion rowid. Relaxation increases
+  from 40/80 rounds to **1,000**, configurable with `--layout-iterations`.
+  Labels cover ten recent disambiguation pairs in view. Actual full-validation
+  scores replace misleading comparisons of mixed candidate F1 averages.
+- **Focused checks:**
+  `uv run --locked pytest tests/scripts/test_watchdog.py tests/daemon/graph/inference/test_inference_budgets.py tests/core/test_config.py tests/daemon/graph/inference/test_chat.py tests/daemon/graph/inference/test_embedding.py tests/daemon/graph/inference/test_program_state.py tests/core/test_architecture.py -q --tb=short`
+  -> **37 passed in 27.86 s**. Real loopback HTTP verifies exact standard/QAT
+  embedding requests and a long passage tail retained at 64K but truncated at
+  32K. SQLite tests verify newest ten active canonical assertions, and rendered
+  file tests verify component selection/report order. Other cases cover input
+  budgeting, saved deployment overrides, validation, persistence and boundaries.
+- Final context/ensemble/dashboard selection:
+  `uv run --locked pytest tests/daemon/graph/inference/test_inference_budgets.py tests/scripts/test_watchdog.py tests/daemon/graph/inference/test_prompts.py -k 'inference_budgets or watchdog or pareto_program_ensemble' -q --tb=short`
+  -> **9 passed, 32 deselected in 19.47 s**. One upstream Pydantic warning
+  concerns a TypedDict ReadOnly qualifier, not a failed assertion.
+- Dashboard/runtime selection -> **7 passed, 15 deselected in 28.19 s**.
+  Native SIMBA recovery and bounded diagnostics -> **9 passed in 43.42 s**,
+  with the previously documented two DSPy temperature-zero rollout warnings.
+  Initial new embedding test used the nonexistent `embed_texts` interface
+  (**1 failed, 22 passed**); corrected to the actual `batch_encode` API.
+  Initial runtime selection expected the old repository embedding default
+  (**1 failed, 2 passed**); updated that expectation to the selected QAT alias.
+- New tests and watchdog pass Ruff. Baseline comparison reports **zero new
+  runtime lint diagnostics**; `git diff --check` passes. Existing lint debt in
+  touched runtime files remains.
+- A read-only workspace preview generated all five figures/report in **60.47 s**
+  with 1,000 layout rounds and 2,228 selected nodes. Reloaded only the verified
+  watchdog process tree using the existing 200-second watch interval. The
+  optimizer and all three model-server identities were verified unchanged
+  across that reload. Inspected the published PNG (2,238 selected entities)
+  and report: caption is readable, both lists follow Fig. 2, and validation
+  comparison uses the seed score **0.4759** versus candidate 4 **0.4525**.
+- **Later observed shutdown:** at 06:45:36 UTC the watchdog reported the
+  optimizer stopped with 309 recorded evaluations. PID 82496 was absent;
+  its status file retained `stopping`, `last_error=null`. Tests inspected for
+  shutdown interaction use isolated temporary configs/databases and local
+  runtime cleanup. The available evidence does not identify why the original
+  process exited. It was not restarted, and its checkpoint was preserved.
+- No new live-model generation, model loading/unloading, corpus rebuild or
+  GEPA restart was performed. These results validate routing, budgets,
+  persistence and dashboard behavior, not 64K live-model capacity under load
+  or new corpus-level benchmark gains.
+
+## 33. GEPA reflection signal inspection (2026-10-23)
+
+- Read-only follow-up on the user's observation that MIPRO produces useful
+  early candidates faster than recent GEPA runs. No optimizer/prompt changes
+  or live inference were performed for this inspection.
+- Both optimizers use YAW's `RLMInstructionProposer`: MIPRO's instruction
+  proposer is replaced with `propose_mipro_instructions`, which calls the same
+  per-component reflection method. The inputs differ: MIPRO builds candidate
+  banks from successful demos or dataset labels; GEPA supplies failure traces
+  and diagnostic feedback. This is not a comparison of wholly separate
+  generation models/templates.
+- GEPA feedback preparation replaces expected answers and gold answers with
+  `<TargetAnswer>` before reflection. A local no-inference probe confirmed
+  `Predicted=North != Expected=['South']` becomes
+  `Predicted=North != Expected=['<TargetAnswer>']`. This removes a concrete
+  training-label contrast as well as discouraging instance copying. Whether
+  that transformation reduces real task quality needs controlled comparison.
+- The reflection worker accepts but ignores `component_name`; the signatures
+  expose only current instruction and examples. Per-component task contracts
+  are therefore implicit in the current instruction/trace. After any synthesis
+  tool call, the outer proposer selects the last worker draft rather than the
+  RLM's returned text. That worker-authoritative design can be intentional;
+  its effect depends on whether the tool receives useful distilled diagnoses.
+  No saved trace evidence establishes it as the cause of the stalled scores.
+- A representative synthetic metric feedback plus stage diagnostic measured
+  **556 characters**, with the stage hint at character **464**; its stage hint
+  survived the old 600-character worker cap. This does not support claiming
+  all stage diagnostics were truncated. Longer traces remain bounded by the
+  configured character policy.
+- Saved native `candidates.json` contained two accepted programs; the second
+  changed `synonym_judge` relative to the seed. The six engine candidate records
+  include scored/rejected proposals, not six accepted native candidates.
+  Full-validation scores remain the previously recorded 0.4759 versus 0.4525.
+  Exact rejected reflection inputs/tool trajectories are not recoverable from
+  these summary JSON artifacts, so model-prompt quality is not established.
+- A useful next comparison is a bounded, paired replay using identical training
+  examples, task-demo policy, task metric and generation budget: native DSPy
+  GEPA proposer versus the custom direct worker versus RLM distillation. Preserve
+  expected training outputs for diagnosis while checking generated instructions
+  for instance copying. Compare actual downstream scores and inference cost,
+  not instruction wording alone. MIPRO's observed early gains remain a reason
+  to retain a reliable warmup, subject to the handoff/stability fixes already
+  documented in the MIPRO audit.
+- `git diff --check` passes. This is diagnostic evidence and an experiment
+  design, not a new convergence or benchmark result.
+
+
 ## 34. Evidence-driven native GEPA reflection replacement (2026-10-23)
 
 Implemented the accepted replacement: original training traces stay in the RLM
@@ -1275,6 +1464,88 @@ reported. The twelve-query target was not achieved within the authorized deadlin
 No further live pilot, model loading/unloading or unattended optimizer was launched.
 
 
+## 35. Python 3.14.9 preflight and full developer-check audit (2026-10-23)
+
+- User-requested toolchain update: `.python-version`, `requires-python`, the
+  project guidance and the recreated `.venv` now use **Python 3.14.9**. Global uv
+  0.13.0 lacked that release in its catalogue; an isolated current uv installed
+  the managed interpreter. Global uv was not replaced. The lock and environment
+  were synchronized deliberately. The initial offline lock attempt lacked cached
+  pytest-cov; normal online resolution succeeded.
+- Added **`uv run preflight`** and **`uv run typecheck`**. Preflight runs Ruff
+  formatting, safe Ruff fixes, ty fixes and serial pytest/testmon/coverage checks.
+  It continues after ordinary failures, returns nonzero for failures and stores
+  full UTF-8 logs, commands, tool versions, timings, JUnit, coverage JSON and
+  Markdown/JSON summaries under ignored `outputs/preflight/`. `latest.json`
+  points to the latest completed report. `--full` disables testmon deselection;
+  `--verbose` streams details; the default console includes periodic progress.
+- Ruff `fix=true` and pytest `addopts=["--testmon"]` are project defaults.
+  The installed ty has `--fix` but rejects a persistent `fix=true` setting;
+  `uv run typecheck` provides the default flag without shadowing the ty binary.
+  No diagnostic rules were disabled and no suppression comments were added.
+- Per the user's correction, **SlipCover was removed**. Coverage uses
+  **coverage.py 7.17.0 / pytest-cov 7.1.0**, integrated with testmon 2.2.0.
+  Its C tracer preserves the per-test contexts that Python 3.14's default sysmon
+  core cannot provide. Reports label incremental coverage as current-run coverage,
+  never a full-suite or stale merged result. Child-process coverage/dependencies
+  are not automatically observed; use a full run before an unattended optimizer.
+- Added explicit `--live` opt-in for the two resident-model tests. Existing
+  offline tests retain real SQLite/files/loopback HTTP; no live LLM generation,
+  corpus rebuild or unattended optimization was launched. The earlier incomplete
+  SlipCover audit was stopped during the user-requested tool/interpreter change;
+  only this task's verified process trees were terminated.
+- Corrected the architecture test's incomplete stdlib whitelist using
+  `sys.stdlib_module_names`. Corrected the NER duplicate fixture to repeat its
+  definition and added a separate same-label/distinct-sense Mercury assertion.
+  These repaired assertions do not weaken containment or semantic-sense rules.
+
+### Measured full offline run
+
+`uv run --locked preflight --full` completed with **230 passed, 7 failed,
+2 skipped**, 53 warnings, **624.29 s** pytest time (630.74 s process time).
+Coverage.py recorded **7,916 / 9,882 executable lines = 80.11%**. The failed
+paths contribute coverage; this is not an all-passing acceptance result.
+
+Available safe fixes left **602 Ruff findings** (599 E501, two B007, one SIM118)
+and **67 ty diagnostics**, with zero ty automatic fixes for this inventory.
+The seven failures are one engine optimization setup without config/token counter,
+five CLI/runtime optimization fixtures whose in-process LM lacks a verified
+resident tokenizer, and one benchmark MinimalProgram missing inference-capacity
+fields. They fail before establishing an optimizer-quality or retrieval regression.
+The concrete repair packets and full test names are in `docs/preflight-audit.md`.
+Production config validation also needs a deliberate error rather than the observed
+`None.base_url` AttributeError; the verified-tokenizer requirement must remain.
+
+Full artifacts: `outputs/preflight/20261023T114056Z-53964/`. Its raw JUnit suite
+header counted 242, but its 239 unique test-case records match pytest's terminal
+result. The runner now counts those records. That full report was postprocessed
+from preserved logs/XML to correct counts and add diagnostic groups; checks were
+not rerun during that report correction. Raw artifacts remain unchanged.
+
+The slowest full-run tests were candidate-stage process-restart reuse (136.83 s),
+response-cache process restart/invalidation (105.91 s), and native optimizer
+orchestration (53.78 s). Keep these physical recovery checks; use incremental
+selection for development and a complete run for the final gate.
+
+### Runner verification and remaining limits
+
+- A real disposable-project integration test invokes the actual tools, verifies
+  that static failures do not prevent pytest/reporting, repairs the real files,
+  reruns incrementally, checks executed source coverage, and verifies a third
+  unchanged run selects zero tests. The initial runner/architecture run passed
+  **10 tests** (52.15 s); the final extended runner regression passed again
+  (**1 passed**, 21.98 s). New runner/test/conftest pass both Ruff and ty.
+- Final command smoke: `uv run --locked preflight -- --lf` completed with
+  **4 passed, 7 failed, 1 skipped**, 112.6 s pytest-process time; static counts
+  remained 602 / 67. This demonstrates reporting and conservative incremental
+  selection, not repair of the seven audited failures. Its coverage is partial.
+  Latest artifacts: `outputs/preflight/20261023T115835Z-48344/`.
+- The suite reports unclosed SQLite connection ResourceWarnings and DSPy's
+  upcoming normalized-LM API migration. Allocation ownership and migration are
+  follow-up work, not suppressed warnings or proven production failures.
+- `git diff --check` passes. No Tier 1/Tier 2 benchmark parity, live inference
+  quality gain, or unattended stability result is claimed by this developer audit.
+
 ## 36. Runtime contract reliability repair (2026-10-23)
 
 The first preflight repair packet validates persisted reflection/SIMBA objects
@@ -1314,3 +1585,17 @@ fresh-process parser-helper invalidation and loopback embedding routing. Three
 configuration/runtime/crash-resume tests passed (27.28 s), including a new real
 runtime/SQLite check for hydration capacity. Runtime and embedding modules pass
 ty. These checks do not establish corpus quality or live-model convergence.
+
+## 38. Preflight command delivery (2026-10-23)
+
+Committed the pending serial preflight runner, Python 3.14.9 environment pin,
+coverage.py/pytest-cov and testmon integration, safe-fix defaults and reports.
+The user-selected 120-character Ruff limit and current Python compatibility
+range (`>=3.14`) are preserved; audit counts at 100 characters remain historical.
+
+The actual-tool disposable-project test passed (19.43 s): it verifies reporting
+through static failures, measured coverage, successful incremental reruns and
+zero selected tests when unchanged. Runner, test and conftest pass Ruff and ty;
+`uv run --locked preflight --help` succeeds. Existing formatting-only edits were
+checked for equivalent Python ASTs before inclusion. No full-repository green
+claim is made: other audited fixture/type/lint failures remain to be repaired.

@@ -13,7 +13,7 @@ import pytest
 
 from yaw.daemon.graph.inference import configure_yaw_dspy_cache
 
-_WORKER = r'''
+_WORKER = r"""
 import json, os, sys
 from pathlib import Path
 import dspy
@@ -56,7 +56,7 @@ report.update(hits=dspy.cache.cache_hits, cached_tokens=dspy.cache.cached_tokens
     disk=dspy.cache.enable_disk_cache, memory=dspy.cache.enable_memory_cache)
 print(json.dumps(report))
 dspy.cache.disk_cache.close()
-'''
+"""
 
 
 @pytest.fixture
@@ -69,13 +69,21 @@ def inference_server():
             requests.append(request)
             content = (
                 '{"answer":"cached","reasoning":"Grounded in the supplied passage."}'
-                if request["model"] == "retention-test" else '{"answer":"cached"}'
+                if request["model"] == "retention-test"
+                else '{"answer":"cached"}'
             )
             response = {
-                "id": "cache-test", "object": "chat.completion", "created": 0,
-                "model": request["model"], "choices": [{"index": 0,
-                    "message": {"role": "assistant", "content": content},
-                    "finish_reason": "stop"}],
+                "id": "cache-test",
+                "object": "chat.completion",
+                "created": 0,
+                "model": request["model"],
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": content},
+                        "finish_reason": "stop",
+                    }
+                ],
                 "usage": {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30},
             }
             body = json.dumps(response).encode()
@@ -101,7 +109,9 @@ def inference_server():
 def _run_worker(root: Path, url: str, case: str = "normal") -> dict[str, Any]:
     result = subprocess.run(
         [sys.executable, "-c", _WORKER, str(root), url, case],
-        capture_output=True, text=True, timeout=60,
+        capture_output=True,
+        text=True,
+        timeout=60,
         env=dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[4])),
     )
     assert result.returncode == 0, result.stdout + result.stderr
@@ -109,7 +119,8 @@ def _run_worker(root: Path, url: str, case: str = "normal") -> dict[str, Any]:
 
 
 def test_long_qa_run_bounds_diagnostics_preserves_cost_and_avoids_history(
-    tmp_path: Path, inference_server,
+    tmp_path: Path,
+    inference_server,
 ) -> None:
     import gc
     import tracemalloc
@@ -121,7 +132,9 @@ def test_long_qa_run_bounds_diagnostics_preserves_cost_and_avoids_history(
 
     url, requests = inference_server
     configure_yaw_dspy_cache(
-        tmp_path / "retention", enable_memory_cache=False, account_cached_usage=True,
+        tmp_path / "retention",
+        enable_memory_cache=False,
+        account_cached_usage=True,
     )
     lm = create_dspy_lm("retention-test", base_url=url, api_key="test", max_tokens=200)
     program = HippoRAGProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
@@ -151,15 +164,22 @@ def test_long_qa_run_bounds_diagnostics_preserves_cost_and_avoids_history(
     assert total_tokens == 600 * 30
     assert len(requests) == 1
     assert len(program.telemetry) == 250
-    assert not lm.history and not program.history and not program.qa.lm.history
+    assert not lm.history and not program.history and not program.qa.predict.lm.history
     assert len(GLOBAL_HISTORY) == before_global
     assert retained_at_end - retained_after_warmup < 1_000_000
-    print({"calls": 600, "provider_requests": len(requests), "logical_tokens": total_tokens,
-           "retained_growth_bytes": retained_at_end - retained_after_warmup})
+    print(
+        {
+            "calls": 600,
+            "provider_requests": len(requests),
+            "logical_tokens": total_tokens,
+            "retained_growth_bytes": retained_at_end - retained_after_warmup,
+        }
+    )
 
 
 def test_response_disk_cache_across_processes_and_request_invalidation(
-    tmp_path: Path, inference_server,
+    tmp_path: Path,
+    inference_server,
 ) -> None:
     url, requests = inference_server
     first = _run_worker(tmp_path, url)
@@ -184,7 +204,8 @@ def test_response_disk_cache_across_processes_and_request_invalidation(
 
 
 def test_native_gepa_scores_match_after_request_cache_restart(
-    tmp_path: Path, inference_server,
+    tmp_path: Path,
+    inference_server,
 ) -> None:
     url, requests = inference_server
     first = _run_worker(tmp_path, url, "gepa")
@@ -198,7 +219,8 @@ def test_native_gepa_scores_match_after_request_cache_restart(
 
 
 def test_legacy_sdk_response_cache_preserves_logical_usage(
-    tmp_path: Path, inference_server,
+    tmp_path: Path,
+    inference_server,
 ) -> None:
     url, requests = inference_server
     first = _run_worker(tmp_path, url, "legacy")
@@ -209,7 +231,8 @@ def test_legacy_sdk_response_cache_preserves_logical_usage(
 
 
 def test_response_cache_does_not_cross_inference_endpoints(
-    tmp_path: Path, inference_server,
+    tmp_path: Path,
+    inference_server,
 ) -> None:
     url, requests = inference_server
     _run_worker(tmp_path, url)
@@ -222,7 +245,9 @@ def test_response_cache_passthrough_and_unreported_usage(tmp_path: Path) -> None
     import dspy
 
     configure_yaw_dspy_cache(
-        tmp_path, enable_memory_cache=False, account_cached_usage=True,
+        tmp_path,
+        enable_memory_cache=False,
+        account_cached_usage=True,
     )
     try:
         unrelated = {"_fn_identifier": "application.pure_function", "input": "data"}
@@ -230,9 +255,14 @@ def test_response_cache_passthrough_and_unreported_usage(tmp_path: Path) -> None
         assert dspy.cache.get(unrelated) == {"answer": "unchanged"}
         assert dspy.cache.cache_hits == 0
         request = {"_fn_identifier": "dspy.clients.lm.litellm_completion", "model": "test"}
-        record = {"_dspy_format": "counter-test", "usage": {
-            "prompt_tokens": None, "completion_tokens": None, "total_tokens": None,
-        }}
+        record = {
+            "_dspy_format": "counter-test",
+            "usage": {
+                "prompt_tokens": None,
+                "completion_tokens": None,
+                "total_tokens": None,
+            },
+        }
         dspy.cache.put(request, record)
         with dspy.context(usage_tracker=None):
             assert dspy.cache.get(request) == record

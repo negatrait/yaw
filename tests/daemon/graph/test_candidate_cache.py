@@ -31,14 +31,24 @@ def test_stage_cache_roundtrips_typed_traces_without_storing_passage(tmp_path: P
         cache = CandidateStageCache(store, managed, "openie", lambda: "version-one")
         text = "Lähdeteksti: a source passage that must be hydrated.\nKeep the second line."
         record = OpenIERecord(
-            "chunk", ("Ada",), (("Ada", "wrote", "Notes"),),
-            (StructuredTriple(
-                "Ada", "Author", "wrote", "Notes", "Publication", "Ada wrote Notes"
-            ),),
+            "chunk",
+            ("Ada",),
+            (("Ada", "wrote", "Notes"),),
+            (
+                StructuredTriple(
+                    "Ada", "Author", "wrote", "Notes", "Publication", "Ada wrote Notes"
+                ),
+            ),
             (("Ada", "Author"),),
         )
-        value = (record, [("ner", {"passage": text}, dspy.Prediction(named_entities=["Ada"]))],
-                 {"ada"}, 1, 7, 30)
+        value = (
+            record,
+            [("ner", {"passage": text}, dspy.Prediction(named_entities=["Ada"]))],
+            {"ada"},
+            1,
+            7,
+            30,
+        )
         cache[("prompt", "source")] = value
         row = conn.execute("SELECT payload FROM candidate_stage_cache").fetchone()
         assert text not in zlib.decompress(row[0]).decode()
@@ -48,15 +58,27 @@ def test_stage_cache_roundtrips_typed_traces_without_storing_passage(tmp_path: P
         assert loaded[1][0][2].named_entities == ["Ada"]
         assert loaded[2:] == value[2:]
         history = REPLHistory(max_output_chars=500).append(
-            code="print(source)", output="Source text: " + text,
+            code="print(source)",
+            output="Source text: " + text,
         )
         sources = {hashlib.sha256(text.encode()).hexdigest(): text}
         replay = CandidateStageCache(
-            store, managed, "shacl", lambda: "version-one", sources=lambda: sources,
+            store,
+            managed,
+            "shacl",
+            lambda: "version-one",
+            sources=lambda: sources,
         )
-        replay[("trace",)] = [("shacl_healer_rlm.generate_action", {
-            "repl_history": history, "focus_context": json.dumps({"text": text}),
-        }, dspy.Prediction(code="SUBMIT(repairs=[])"))]
+        replay[("trace",)] = [
+            (
+                "shacl_healer_rlm.generate_action",
+                {
+                    "repl_history": history,
+                    "focus_context": json.dumps({"text": text}),
+                },
+                dspy.Prediction(code="SUBMIT(repairs=[])"),
+            )
+        ]
         row = conn.execute(
             "SELECT payload FROM candidate_stage_cache WHERE stage = 'shacl'"
         ).fetchone()
@@ -83,7 +105,8 @@ def test_candidate_stages_make_zero_requests_after_process_restart(tmp_path: Pat
     # developer edits the checkout while this relatively expensive test runs.
     source_root = tmp_path / "implementation"
     shutil.copytree(
-        Path(__file__).resolve().parents[3] / "yaw", source_root / "yaw",
+        Path(__file__).resolve().parents[3] / "yaw",
+        source_root / "yaw",
         ignore=shutil.ignore_patterns("__pycache__"),
     )
 
@@ -93,11 +116,21 @@ def test_candidate_stages_make_zero_requests_after_process_restart(tmp_path: Pat
             if self.path.endswith("/embeddings"):
                 requests.append("embedding")
                 texts = data["input"] if isinstance(data["input"], list) else [data["input"]]
-                payload = {"object": "list", "model": data["model"], "data": [
-                    {"object": "embedding", "index": i, "embedding": [
-                        (b + 1) / 256 for b in hashlib.sha256(t.encode()).digest() * 24
-                    ]} for i, t in enumerate(texts)
-                ], "usage": {"prompt_tokens": 20, "total_tokens": 20}}
+                payload = {
+                    "object": "list",
+                    "model": data["model"],
+                    "data": [
+                        {
+                            "object": "embedding",
+                            "index": i,
+                            "embedding": [
+                                (b + 1) / 256 for b in hashlib.sha256(t.encode()).digest() * 24
+                            ],
+                        }
+                        for i, t in enumerate(texts)
+                    ],
+                    "usage": {"prompt_tokens": 20, "total_tokens": 20},
+                }
             else:
                 messages = data["messages"]
                 prompt = str(messages)
@@ -115,37 +148,64 @@ def test_candidate_stages_make_zero_requests_after_process_restart(tmp_path: Pat
                 elif "[[ ## violations ## ]]" in user:
                     requests.append("shacl")
                     ids = sorted(set(re.findall(r"entity-[0-9a-f]+", user)))
-                    content = json.dumps({"repairs": [{
-                        "focus_node": eid, "action": "set_definition",
-                        "value": "A grounded definition restored by the SHACL worker.",
-                    } for eid in ids]})
+                    content = json.dumps(
+                        {
+                            "repairs": [
+                                {
+                                    "focus_node": eid,
+                                    "action": "set_definition",
+                                    "value": "A grounded definition restored by the SHACL worker.",
+                                }
+                                for eid in ids
+                            ]
+                        }
+                    )
                 elif "[[ ## candidate_pairs ## ]]" in user:
                     requests.append("synonym")
                     content = json.dumps({"decisions": []})
                 elif "[[ ## named_entities ## ]]" in user:
                     requests.append("triples")
                     if "Bletchley Park" in user:
-                        triple = {"sub": "Alan M. Turing", "pred": "worked at",
-                                  "obj": "Bletchley Park", "def": "A wartime cryptanalyst."}
+                        triple = {
+                            "sub": "Alan M. Turing",
+                            "pred": "worked at",
+                            "obj": "Bletchley Park",
+                            "def": "A wartime cryptanalyst.",
+                        }
                     else:
-                        triple = {"sub": "Alan Turing", "pred": "formulated",
-                                  "obj": "Turing machine", "def": "A model of computation."}
+                        triple = {
+                            "sub": "Alan Turing",
+                            "pred": "formulated",
+                            "obj": "Turing machine",
+                            "def": "A model of computation.",
+                        }
                     content = json.dumps({"triples": [triple]})
                 else:
                     requests.append("ner")
                     entities = (
-                        [["Alan M. Turing", "British cryptanalyst"],
-                         ["Bletchley Park", "Wartime codebreaking center"]]
-                        if "Bletchley Park" in user else
-                        [["Alan Turing", "English mathematician"],
-                         ["Turing machine", "A model of computation"]]
+                        [
+                            ["Alan M. Turing", "British cryptanalyst"],
+                            ["Bletchley Park", "Wartime codebreaking center"],
+                        ]
+                        if "Bletchley Park" in user
+                        else [
+                            ["Alan Turing", "English mathematician"],
+                            ["Turing machine", "A model of computation"],
+                        ]
                     )
                     content = json.dumps({"named_entities": entities})
                 payload = {
-                    "id": "cache-test", "object": "chat.completion", "created": 0,
-                    "model": data["model"], "choices": [{"index": 0,
-                        "message": {"role": "assistant", "content": content},
-                        "finish_reason": "stop"}],
+                    "id": "cache-test",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": data["model"],
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": content},
+                            "finish_reason": "stop",
+                        }
+                    ],
                     "usage": {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30},
                 }
             raw = json.dumps(payload).encode()
@@ -161,9 +221,18 @@ def test_candidate_stages_make_zero_requests_after_process_restart(tmp_path: Pat
     def run_worker(url: str, mutation: str = "none") -> dict[str, Any]:
         env = dict(os.environ, PYTHONPATH=str(source_root))
         result = subprocess.run(
-            [sys.executable, str(Path(__file__).with_name("candidate_cache_worker.py")),
-             str(tmp_path), url, "--mutation", mutation],
-            env=env, capture_output=True, text=True, timeout=90,
+            [
+                sys.executable,
+                str(Path(__file__).with_name("candidate_cache_worker.py")),
+                str(tmp_path),
+                url,
+                "--mutation",
+                mutation,
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=90,
         )
         assert result.returncode == 0, result.stdout + result.stderr
         report = json.loads(result.stdout.strip().splitlines()[-1])
@@ -180,18 +249,31 @@ def test_candidate_stages_make_zero_requests_after_process_restart(tmp_path: Pat
             before = len(requests)
             second = run_worker(url)
             if len(requests) != before:
-                raise AssertionError(json.dumps({
-                    "requests": requests[before:], "first": first, "second": second,
-                }, indent=2))
+                raise AssertionError(
+                    json.dumps(
+                        {
+                            "requests": requests[before:],
+                            "first": first,
+                            "second": second,
+                        },
+                        indent=2,
+                    )
+                )
             assert second["tokens"] == first["tokens"]
             assert second["openie_tokens"] == first["openie_tokens"]
             assert second["trace_names"] == first["trace_names"]
             assert all(hits > 0 for hits in second["hits"].values())
-            print(json.dumps({
-                "initial_requests": before, "replay_requests": len(requests) - before,
-                "replay_cache_hits": second["hits"], "preserved_tokens": second["tokens"],
-                "preserved_openie_tokens": second["openie_tokens"],
-            }))
+            print(
+                json.dumps(
+                    {
+                        "initial_requests": before,
+                        "replay_requests": len(requests) - before,
+                        "replay_cache_hits": second["hits"],
+                        "preserved_tokens": second["tokens"],
+                        "preserved_openie_tokens": second["openie_tokens"],
+                    }
+                )
+            )
             query_only = run_worker(url, "query")
             assert requests[before:] == ["embedding", "embedding"]
             assert all(hits > 0 for hits in query_only["hits"].values())

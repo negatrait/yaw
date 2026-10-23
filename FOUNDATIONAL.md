@@ -1,5 +1,28 @@
 # FOUNDATIONAL
 
+Accepted development-tool update (2026-10-23): Python is pinned to 3.14.9.
+`uv run preflight` applies Ruff formatting/safe fixes and ty fixes, then runs
+pytest with testmon and coverage.py through pytest-cov. SlipCover is removed.
+Ruff fixes and pytest testmon are project defaults. `uv run typecheck` supplies
+ty's CLI-only `--fix` default. Resident-model tests explicitly require `--live`.
+Reports distinguish incremental test coverage from complete-suite coverage.
+
+Accepted GEPA reflection repair (2026-10-23): RLM selects original training evidence
+by stable reference; DSPy's native InstructionProposer is the sole instruction
+writer/compressor. SIMBA remains enabled with task-improvement rewards. Full
+rendered reflection requests use the serving tokenizer, a 16,384-token input
+budget, configured output allowance and 512-token context margin. Completed
+stages and version-2 worker state persist in yaw.db; the active request is pinned
+outside candidate-cache eviction. Legacy worker states require a compatible new
+run. Reflection never consumes held-out answers. See docs/gepa-reflection-repair.md.
+
+Accepted capacity/profile update (2026-10-23): use the exact embedding alias
+`embeddinggemma-300m-qat-q8_0-GGUF-Q8_0` by default. The observed Gemma server
+serving window is 65,536 tokens; `yaw.toml` declares that capacity explicitly.
+Context/output capacities and independent RLM execution budgets are deployment
+settings, and changing them or embedding identity requires a compatible new
+optimization/index run. Existing running processes keep their original settings.
+
 Accepted runtime update (2026-10-22): the configured/default chat, extraction,
 QA and reflection model is now `Gemma-4-E4B-it-GGUF`, checkpoint
 `unsloth/gemma-4-E4B-it-GGUF:Q4_K_M`, on the existing external llama.cpp GPU
@@ -33,12 +56,12 @@ Baseline: 2026-10-19. YAW is a native HippoRAG 2 graph & storage engine (`yaw/da
    - Mount `fastmcp` Streamable HTTP (`127.0.0.1:13306/mcp` + `/healthz` + `/readyz`) onto the single daemon runtime.
 6. **Native DSPy Inference, Canonical 12 Signatures, First-Class Embedding Trail & Gate-Free $\text{GM}_{\text{good}} / \text{GM}_{\text{bad}}$ Pareto Evolution:**
    - Drive all inference through `dspy` (`yaw/daemon/graph/inference/`): `dspy.LM` (`chat.py`) and `dspy.Embedder` (`embedding.py`) against Lemonade (`openai/...`) or Ollama (`ollama_chat/...`, `ollama/...`) with zero `hipporag` runtime imports and zero mode-toggle bloat (`execution_mode` and `qa_mode` are retired).
-   - **Canonical 12 DSPy Signatures & First-Class Embedding Trail:** Only the **12 canonical `dspy.Signature` classes** exist:
+   - **Canonical 12 DSPy Signatures & First-Class Embedding Trail:** The **12 canonical predictor roles** use distinct signatures; DSPy owns its internal generated signatures:
      1. **7 Core Direct GBNF Signatures (`dspy.Predict` / `dspy.ChainOfThought`):** `ExtractEntities` (`ner`), polymorphic `ExtractTriples` (`triples`), `DefineMissingEntities` (`entity_definer`), `JudgeSynonyms` (`synonym_judge`), `ExtractQueryIntent` (`query_intent`), `FilterTriples` (`triple_filter`), and `AnswerQuestion` (`qa`).
      2. **2 SHACL Integrity Healing Signatures:** `HealSHACLViolations` (`shacl_healer_rlm` — single-level `dspy.RLM` Python REPL loop with 5 graph inspection/lint/repair tools) and `ProposeSHACLRepairs` (`shacl_repair` — inner direct GBNF tool).
-     3. **3 GEPA Reflection Optimizer Signatures (`RLMInstructionProposer`):** `ReflectiveInnerDistillerSignature` (`inner_rlm` / `rlm` — single-level `dspy.RLM` Python REPL trace distiller), `ProposeInstructionSignature` (`qwen_proposer`), and `CompressInstructionSignature` (`qwen_compressor`).
+     3. **3 GEPA Reflection Optimizer Signatures (`RLMInstructionProposer`):** `ReflectiveInnerDistillerSignature` (`inner_rlm` / `rlm` — sandbox evidence selector), native DSPy `ProposeInstruction` (`qwen_proposer`), and native `CompressInstruction` (`qwen_compressor`). The established public proposal/compression signature names are compatibility aliases; no second writer exists.
      Every predictor has its own dedicated `_PredictorBoundLM` (`.lm`) clone and records per-invocation `track_usage()` telemetry (`self.telemetry`, `self.entity_def_audit_trail`, `self.synonym_audit_trail`, `self.shacl_audit_trail`), with all 9 runtime `HippoRAGProgram` predictors exposed in `named_predictors()`. Furthermore, `DSPyEmbeddingAdapter` (`dspy.Embedder`) is wired into `HippoRAGProgram.telemetry` and `HippoRAGProgram.embedding_audit_trail` via `bind_telemetry_hook`, recording every embedding invocation (`chunk_embed`, `entity_embed`, `fact_embed`, `query_fact_embed`, `query_passage_embed`), active task prefix (`query_prefix`, `fact_query_prefix`, `document_prefix`), sub-chunk splits, micro-batches, and token counts into `*_graph_rlm_audit.json`.
-   - **Strict `/dspy-rlm-module` Discipline + Managed Deno WASM Sandbox (`dspy[deno]`, `dspy.PythonInterpreter`) + Unified `Qwen3-4B-Instruct-2507-GGUF` GBNF Execution:** All chat, extraction, QA, RLM orchestration, and reflection roles run on `Qwen3-4B-Instruct-2507-GGUF` (`llamacpp` on Vulkan GPU; `Mistral-7B-Instruct-v0.3-Hybrid` on Ryzen AI NPU is retired). Following `/dspy-rlm-module`, `dspy.RLM` is strictly reserved for multi-step data-exploration or large-context Python REPL loops (`shacl_healer_rlm` and `RLMInstructionProposer.inner_rlm`) backed by DSPy's managed Deno/Pyodide WASM runtime (`dspy[deno]>=3.0.0`, `dspy.PythonInterpreter`); single-pass extraction, reranking, and QA never wrap `dspy.RLM`. Direct/worker roles (`extraction`, `qa`, `reflection_worker`) set `_yaw_supports_gbnf=True` (`extra_body={"grammar": ...}` with pure-JSON GBNF grammars), while RLM orchestrator roles (`rlm`, `reflection`) set `_yaw_supports_gbnf=False` so `dspy.RLM` emits unconstrained Python REPL code inside `dspy.PythonInterpreter`, invokes sandbox tools strictly with explicit keyword arguments (`current_instruction=..., examples_with_feedback=...`), and delegates `llm_query` / `llm_query_batched` to an explicit `sub_lm` (`create_dspy_rlm_pair`).
+   - **Strict `/dspy-rlm-module` Discipline + Managed Deno WASM Sandbox (`dspy[deno]`, `dspy.PythonInterpreter`) + Configured Gemma GBNF Execution:** Chat, extraction, QA, RLM orchestration, and reflection roles use the configured model, currently `Gemma-4-E4B-it-GGUF` (`llamacpp` on Vulkan GPU; `Mistral-7B-Instruct-v0.3-Hybrid` on Ryzen AI NPU is retired). Following `/dspy-rlm-module`, `dspy.RLM` is strictly reserved for multi-step data-exploration or large-context Python REPL loops (`shacl_healer_rlm` and `RLMInstructionProposer.inner_rlm`) backed by DSPy's managed Deno/Pyodide WASM runtime (`dspy[deno]>=3.0.0`, `dspy.PythonInterpreter`); single-pass extraction, reranking, and QA never wrap `dspy.RLM`. Direct/worker roles (`extraction`, `qa`, `reflection_worker`) set `_yaw_supports_gbnf=True` (`extra_body={"grammar": ...}` with pure-JSON GBNF grammars), while RLM orchestrator roles (`rlm`, `reflection`) set `_yaw_supports_gbnf=False` so `dspy.RLM` emits unconstrained Python REPL code inside `dspy.PythonInterpreter`, invokes sandbox tools strictly with explicit keyword arguments (`current_instruction=..., examples_with_feedback=...`), and delegates `llm_query` / `llm_query_batched` to an explicit `sub_lm` (`create_dspy_rlm_pair`).
    - **Gate-Free $\text{GM}_{\text{good}} / \text{GM}_{\text{bad}}$ Sizecoding Pareto Evolution:** Never evolve prompts on full Tier 2 benchmark corpora. Evolve one universal `compiled_program.json` via `dspy.GEPA` using `compute_sizecoding_pareto_score` ($\text{score} = \text{GM}_{\text{good}} / \text{GM}_{\text{bad}}$, combining floor-smoothed `Recall@1..20`, optional `EM`/`F1`, and `shacl_conforms` in $\text{GM}_{\text{good}}$ against normalized token, initial/remaining SHACL violation, missing entity definition count/tokens, and canonicalization/repair token factors in $\text{GM}_{\text{bad}}$ with zero hard-gate cliffs) strictly on the stratified 250-query (`150` train + `100` val) **EnterpriseRAG-Bench** (`enterprise_rag_bench`, `uv run yaw optimize`) OOD dataset, then evaluate zero-shot on unseen Tier 2 holdouts.
 
 ## Domain Containment Tree & Architectural Law (Zero Cross-Domain / Sibling Edges)

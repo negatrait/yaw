@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,9 +7,9 @@ name = "yaw"
 version = "0.1.0"
 description = "HippoRAG 2 evaluation workspace"
 readme = "README.md"
-requires-python = ">=3.14.7"
+requires-python = ">=3.14"
 dependencies = [
-    "cocoindex>=1.0.25",
+    "cocoindex>=1.0.26",
     "dspy[deno]>=3.4.1",
     "filelock>=3.32.7",
     "matplotlib>=3.11.2",
@@ -22,27 +22,37 @@ dependencies = [
 
 [project.scripts]
 yaw = "yaw.daemon.cli:cli_entrypoint"
+watchdog = "scripts.watchdog:main"
+preflight = "yaw.core.preflight:main"
+typecheck = "yaw.core.preflight:typecheck"
 
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+    "pytest-testmon>=2.2.0",
     "ruff>=0.17.1",
+    "coverage>=7.17.0",
+    "pytest-cov>=7.0.0",
     "ty>=0.0.89",
 ]
 
 [tool.uv]
 package = true
+preview-features = ["content-addressed-cache"]
 
 [tool.setuptools.packages.find]
 include = ["yaw*"]
 
 [tool.ruff]
-line-length = 100
+fix = true
+line-length = 120
 target-version = "py314"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.pytest.ini_options]
+addopts = ["--testmon"]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = ["live: explicitly enabled tests against a resident inference service"]

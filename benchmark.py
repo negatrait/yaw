@@ -650,7 +650,7 @@ def get_gold_answers(samples: list[dict]) -> list[list[str]]:
                             gold_answer.extend(parsed)
                         elif parsed:
                             gold_answer.append(parsed)
-                    except (json.JSONDecodeError, TypeError):
+                    except json.JSONDecodeError, TypeError:
                         gold_answer.append(value)
                 elif isinstance(value, list):
                     gold_answer.extend(value)

@@ -833,12 +833,10 @@ def handle_dspy_optimize(
         # Read metadata before loading datasets, so bare --resume can recover
         # the original slice and budget even when they were CLI overrides.
         assert opt_config.db_path is not None
-        with contextlib.closing(sqlite3.connect(
-            opt_config.db_path.as_uri() + "?mode=ro", uri=True
-        )) as conn:
-            row = conn.execute(
-                "SELECT value FROM meta WHERE key = 'optimization_run'"
-            ).fetchone()
+        with contextlib.closing(
+            sqlite3.connect(opt_config.db_path.as_uri() + "?mode=ro", uri=True)
+        ) as conn:
+            row = conn.execute("SELECT value FROM meta WHERE key = 'optimization_run'").fetchone()
         if row is not None:
             saved_run = json.loads(row[0])
             saved_output = Path(saved_run["output_path"])
@@ -853,7 +851,8 @@ def handle_dspy_optimize(
         print(
             f"[yaw optimize] Resuming {opt_config.db_path}; "
             f"output={out_override or opt_config.compiled_program_path}",
-            file=sys.stderr, flush=True,
+            file=sys.stderr,
+            flush=True,
         )
     raw_dataset = getattr(args, "dataset", None)
     if raw_dataset is not None:
@@ -947,10 +946,15 @@ def handle_dspy_optimize(
             corpus_docs=corpus_docs,
             progress_callback=_cli_progress,
             run_options={
-                "dataset": dataset_args, "max_queries": max_queries,
-                "train_queries": train_queries, "query_offset": query_offset,
-                "mode": mode, "auto": auto, "num_trials": num_trials,
-                "num_candidates": num_candidates, "sleep_seconds": sleep_seconds,
+                "dataset": dataset_args,
+                "max_queries": max_queries,
+                "train_queries": train_queries,
+                "query_offset": query_offset,
+                "mode": mode,
+                "auto": auto,
+                "num_trials": num_trials,
+                "num_candidates": num_candidates,
+                "sleep_seconds": sleep_seconds,
                 "max_bootstrapped_demos": max_bootstrapped_demos,
                 "max_labeled_demos": max_labeled_demos,
             },

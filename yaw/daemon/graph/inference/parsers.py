@@ -162,7 +162,7 @@ def repair_truncated_json(response: str, *, is_triples: bool = False) -> str:
     try:
         json.loads(response)
         return response
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         pass
 
     depth, in_str, esc, last_end = 0, False, False, -1
@@ -453,10 +453,10 @@ def parse_filter_facts(response: str) -> list[list[str]]:
             parsed_value = None
             try:
                 parsed_value = json.loads(value)
-            except (json.JSONDecodeError, ValueError):
+            except json.JSONDecodeError, ValueError:
                 try:
                     parsed_value = ast.literal_eval(value)
-                except (ValueError, SyntaxError):
+                except ValueError, SyntaxError:
                     parsed_value = value
 
             if isinstance(parsed_value, dict) and "fact" in parsed_value:
@@ -510,7 +510,7 @@ def match_facts_to_candidate_indices(
                 idx = candidate_list_of_lists.index(ast.literal_eval(closest_matched_fact))
                 if idx not in result_indices:
                     result_indices.append(idx)
-            except (ValueError, SyntaxError):
+            except ValueError, SyntaxError:
                 pass
 
     if max_facts is not None:

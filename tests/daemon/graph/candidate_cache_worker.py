@@ -20,12 +20,18 @@ def main() -> None:
     args = parser.parse_args()
     lm = dspy.LM(
         "openai/cache-test-v2" if args.mutation == "model" else "openai/cache-test",
-        api_base=args.url, api_key="test", cache=False,
-        temperature=0.3 if args.mutation == "sampling" else 0.0, max_tokens=1000,
+        api_base=args.url,
+        api_key="test",
+        cache=False,
+        temperature=0.3 if args.mutation == "sampling" else 0.0,
+        max_tokens=1000,
     )
     dspy.configure(lm=lm)
     program = HippoRAGProgram(
-        enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm, rlm_max_iters=2,
+        enable_gbnf=False,
+        orchestrator_lm=lm,
+        rlm_sub_lm=lm,
+        rlm_max_iters=2,
     )
     if args.mutation == "prompt":
         program.ner.signature = program.ner.signature.with_instructions(
@@ -33,25 +39,31 @@ def main() -> None:
         )
     embedder = DSPyEmbeddingAdapter(base_url=args.url, api_key="test", caching=False)
     engine = YawGraphEngine(
-        db_path=args.root / "yaw.db", workspace_root=args.root,
-        program=program, embedder=embedder, synonymy_threshold=-1.0,
+        db_path=args.root / "yaw.db",
+        workspace_root=args.root,
+        program=program,
+        embedder=embedder,
+        synonymy_threshold=-1.0,
     )
     try:
         if args.mutation == "query":
             old_vector = engine._encode_texts(
-                ["Where did Turing work?"], instruction=PASSAGE_INSTRUCTION,
+                ["Where did Turing work?"],
+                instruction=PASSAGE_INSTRUCTION,
             )[0]
             program.embedding_query_prefix += "A different query-only task. "
             program.embedding_fact_prefix += "A different fact-query task. "
             engine._apply_program_embedding_prefixes(program)
             new_vector = engine._encode_texts(
-                ["Where did Turing work?"], instruction=PASSAGE_INSTRUCTION,
+                ["Where did Turing work?"],
+                instruction=PASSAGE_INSTRUCTION,
             )[0]
             assert not np.array_equal(old_vector, new_vector)
             np.testing.assert_array_equal(
                 new_vector,
                 engine._encode_texts(
-                    ["Where did Turing work?"], instruction=PASSAGE_INSTRUCTION,
+                    ["Where did Turing work?"],
+                    instruction=PASSAGE_INSTRUCTION,
                 )[0],
             )
         # Force materialization from scratch while retaining only the disk stage
@@ -69,28 +81,43 @@ def main() -> None:
         assert not engine.lint_graph()["conforms"]
         engine.index(["Alan M. Turing worked on cryptanalysis at Bletchley Park."])
         assert engine.lint_graph()["conforms"]
-        print(json.dumps({
-            "tokens": {key: engine._graph_rlm_stats[key] for key in (
-                "synonym_judge_tokens", "shacl_healer_tokens", "missing_entity_defs_tokens",
-            )},
-            "openie_tokens": [
-                stats["openie_tokens"] for _, stats in sorted(engine._chunk_rlm_stats.items())
-            ],
-            "hits": {cache.stage: cache.hits for cache in (
-                engine._text_vec_cache, engine._openie_fp_cache,
-                engine._synonym_fp_cache, engine._shacl_fp_cache,
-            )},
-            "cache_rows": engine.conn.execute(
-                "SELECT COUNT(*) FROM candidate_stage_cache"
-            ).fetchone()[0],
-            "trace_names": sorted({name for name, _, _ in engine._captured_graph_traces}),
-            "namespace": engine._candidate_cache_namespace(),
-            "code_fp": engine._candidate_cache_code_fp,
-            "embedding_kwargs": embedder.default_kwargs,
-            "implementation_root": str(
-                Path(sys.modules[YawGraphEngine.__module__].__file__).parent
-            ),
-        }))
+        print(
+            json.dumps(
+                {
+                    "tokens": {
+                        key: engine._graph_rlm_stats[key]
+                        for key in (
+                            "synonym_judge_tokens",
+                            "shacl_healer_tokens",
+                            "missing_entity_defs_tokens",
+                        )
+                    },
+                    "openie_tokens": [
+                        stats["openie_tokens"]
+                        for _, stats in sorted(engine._chunk_rlm_stats.items())
+                    ],
+                    "hits": {
+                        cache.stage: cache.hits
+                        for cache in (
+                            engine._text_vec_cache,
+                            engine._openie_fp_cache,
+                            engine._synonym_fp_cache,
+                            engine._shacl_fp_cache,
+                        )
+                    },
+                    "cache_rows": engine.conn.execute(
+                        "SELECT COUNT(*) FROM candidate_stage_cache"
+                    ).fetchone()[0],
+                    "trace_names": sorted({name for name, _, _ in engine._captured_graph_traces}),
+                    "namespace": engine._candidate_cache_namespace(),
+                    "code_fp": engine._candidate_cache_code_fp,
+                    "embedding_kwargs": embedder.default_kwargs,
+                    "implementation_root": str(
+                        Path(sys.modules[YawGraphEngine.__module__].__file__).parent
+                    ),
+                }
+            )
+        )
     finally:
         engine.close()
 

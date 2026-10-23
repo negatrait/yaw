@@ -4016,18 +4016,10 @@ class YawGraphEngine:
                 if eff_bootstrapped_demos == 0 and eff_labeled_demos == 0:
                     for name, pred in compiled.named_predictors():
                         pred.demos = []
-                    if hasattr(compiled, "qa"):
-                        compiled.qa.demos = []
-                        if hasattr(compiled.qa, "predict"):
-                            compiled.qa.predict.demos = []
                 else:
                     for name, pred in compiled.named_predictors():
                         if not getattr(pred, "demos", None) and baseline_demos.get(name):
                             pred.demos = list(baseline_demos[name])
-                    if hasattr(compiled.qa, "predict") and getattr(
-                        compiled.qa.predict, "demos", None
-                    ):
-                        compiled.qa.demos = list(compiled.qa.predict.demos)
 
             if mode in ("gepa", "hybrid") and hasattr(dspy, "GEPA"):
                 if gepa_seed_path is not None and not resumed_seed:

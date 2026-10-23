@@ -1,5 +1,50 @@
 # SIMBA wiring verification
 
+## Implemented follow-up — 2026-10-23
+
+The two primary findings below are now remedied. Native DSPy SIMBA scores each
+worker-generated instruction by executing the complete task candidate before
+and after replacing the selected component. Both use the same first two
+training queries (or one when only one is available), current task LMs, and
+GEPA's existing retrieval/EM/F1/token/graph-quality metric. Validation labels
+are not selected for this inner reward. Candidate instructions are labels on
+the meta-training examples, not inputs to the worker or its demonstrations.
+
+For task-score difference `delta`, the reward is
+`0.5 + 0.5 * delta / (1 + abs(delta))`: improvement scores above 0.5,
+no change scores 0.5, and regression scores below 0.5. Schema completion is
+applied before task execution, as it is for actual proposals. The old format
+heuristic has been removed. Standalone proposers without a task scorer skip
+SIMBA rather than substitute a format reward. Task evaluation failures prevent
+adoption and produce a warning; checkpoint-write failures propagate.
+
+Each completed step immediately stores native DSPy predictor state for both
+worker predictors, their demos, the bounded recent training window (normally
+eight examples), and the step/seed counter as one atomic JSON snapshot in
+`yaw.db` metadata. Buffer updates are also persisted before compilation. The
+existing GEPA seed-resume path restores this snapshot before compilation;
+current LM clients are rebound rather than deserialized. A run/model/task/data/
+retrieval-settings/implementation mismatch rejects restoration and preserves
+the snapshot. Older runs without a worker snapshot start the worker fresh.
+An interrupted inner compile restarts from its last completed step; native
+SIMBA's transient candidate/trial archives are not stored.
+
+Counterfactual task scores use the existing bounded disk-backed candidate cache
+in `yaw.db`, keyed by candidate instructions and the full evaluation context.
+They do not accumulate in RAM or increment GEPA's validation counters/history.
+Real task scoring adds inference on cache misses, outside GEPA's metric-call
+budget. The two-query calibration is deliberately small and can overfit; outer
+GEPA validation still decides acceptance. No corpus-quality lift is claimed.
+
+Verification now lives in `tests/daemon/graph/test_simba_learning.py`: real native
+SIMBA and loopback HTTP, harmful versus helpful task instructions, SQLite
+snapshots, independent-process restore and continued worker use, persisted
+task-score cache reuse, failed task evaluation, and failed SQLite writes.
+See [evaluation.md](evaluation.md) for executed checks and limitations.
+This follows DSPy's [metric-based SIMBA and state persistence API](https://dspy.ai/current/api/optimizers/SIMBA/).
+
+## Original read-only audit (historical)
+
 2026-10-22, DSPy 3.4.1. Scope: verify the existing reflection-worker optimizer,
 not change its architecture or measure downstream benchmark lift.
 

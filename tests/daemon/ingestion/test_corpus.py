@@ -284,7 +284,8 @@ def test_parser_helper_edit_invalidates_persistent_memo_across_processes(tmp_pat
 
     snapshot = tmp_path / "implementation"
     shutil.copytree(
-        Path(__file__).resolve().parents[3] / "yaw", snapshot / "yaw",
+        Path(__file__).resolve().parents[3] / "yaw",
+        snapshot / "yaw",
         ignore=shutil.ignore_patterns("__pycache__"),
     )
     corpus = tmp_path / "corpus"
@@ -302,7 +303,10 @@ print(json.dumps([p.title for p, text in delta.added_chunks]))
     def scan() -> list[str]:
         result = subprocess.run(
             [sys.executable, "-c", worker, str(snapshot), str(corpus), str(tmp_path / "state")],
-            capture_output=True, text=True, check=True, timeout=60,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=60,
             env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
         )
         return json.loads(result.stdout.strip().splitlines()[-1])
