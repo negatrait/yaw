@@ -10,7 +10,7 @@ from typing import Any, cast
 import dspy
 import numpy as np
 
-from yaw.core.config import YawConfig
+from yaw.core.config import DEFAULT_EMBEDDING_MODEL, YawConfig
 
 from .diagnostics import DiagnosticHistory, trim_diagnostics
 
@@ -120,7 +120,7 @@ PROFILES = {
         "",
     ),
 }
-MODEL = "embeddinggemma-300m-GGUF"
+MODEL = DEFAULT_EMBEDDING_MODEL
 
 
 def resolve_embedding_profile(model=MODEL, task_mode="search"):

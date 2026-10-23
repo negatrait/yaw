@@ -11,6 +11,7 @@ import threading
 import time
 from collections.abc import Sequence
 from contextlib import closing, redirect_stderr, redirect_stdout
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -227,7 +228,8 @@ def test_load_config_and_fingerprint(tmp_path: Path) -> None:
     """Verify stdlib tomllib loader, relative path resolution, and deterministic config fingerprinting."""
     repo_cfg = load_config(Path(__file__).resolve().parents[2] / "yaw.toml")
     assert repo_cfg.queue_maxsize == 32
-    assert repo_cfg.embedding_model == "embeddinggemma-300m-GGUF"
+    assert repo_cfg.embedding_model == "embeddinggemma-300m-qat-q8_0-GGUF-Q8_0"
+    assert repo_cfg.context_window_tokens == 65536
     assert repo_cfg.extraction_model == "Gemma-4-E4B-it-GGUF"
     assert repo_cfg.qa_model == "Gemma-4-E4B-it-GGUF"
     assert repo_cfg.config_fingerprint().startswith("yaw-cfg-v1:")
@@ -241,6 +243,27 @@ def test_load_config_and_fingerprint(tmp_path: Path) -> None:
     with pytest.raises(YawRuntimeError) as exc_info:
         load_config(tmp_path / "nonexistent.toml")
     assert exc_info.value.code == "INVALID_INPUT"
+
+
+def test_runtime_applies_configured_hydration_capacity(tmp_path: Path) -> None:
+    config, _ = _make_test_config(tmp_path)
+    config = replace(
+        config,
+        context_window_tokens=65536,
+        max_output_tokens=8192,
+        max_context_chars=None,
+        max_ast_expansion_hops=2,
+    )
+    program, embedder, _, _ = _make_program_and_embedder()
+    runtime = YawRuntime(config, program=program, embedder=embedder)
+    try:
+        runtime.start(sync_on_start=False)
+        assert runtime.engine is not None
+        assert runtime.engine.max_context_chars == 48000
+        assert runtime.engine.max_ast_expansion_hops == 2
+        assert runtime.engine.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 0
+    finally:
+        runtime.stop()
 
 
 def test_optimize_resume_parser_aliases() -> None:
@@ -270,22 +293,36 @@ def test_cli_resume_real_gepa_checkpoint_and_custom_output(tmp_path: Path) -> No
     dataset = tmp_path / "resume_dataset.json"
     records = [
         {
-            "id": f"q{i}", "question": f"Where did Alan Turing work ({i})?",
+            "id": f"q{i}",
+            "question": f"Where did Alan Turing work ({i})?",
             "answer": ["Bletchley Park"],
-            "paragraphs": [{
-                "title": "Alan Turing",
-                "text": "Alan Turing worked at Bletchley Park as a wartime codebreaker.",
-                "is_supporting": True,
-            }],
+            "paragraphs": [
+                {
+                    "title": "Alan Turing",
+                    "text": "Alan Turing worked at Bletchley Park as a wartime codebreaker.",
+                    "is_supporting": True,
+                }
+            ],
         }
         for i in range(2)
     ]
     dataset.write_text(json.dumps(records), encoding="utf-8")
     custom_output = tmp_path / "my_compiled.json"
     common = [
-        "dspy", "optimize", "--config", str(toml_path), "--dataset", str(dataset),
-        "--mode", "gepa", "--max-queries", "2", "--train-queries", "1",
-        "--num-trials", "1",
+        "dspy",
+        "optimize",
+        "--config",
+        str(toml_path),
+        "--dataset",
+        str(dataset),
+        "--mode",
+        "gepa",
+        "--max-queries",
+        "2",
+        "--train-queries",
+        "1",
+        "--num-trials",
+        "1",
     ]
 
     def run_cli(extra: list[str], *, bare: bool = False) -> tuple[int, str, str]:
@@ -309,13 +346,15 @@ def test_cli_resume_real_gepa_checkpoint_and_custom_output(tmp_path: Path) -> No
     candidate = dict(state.program_candidates[0])
     candidate["qa.predict"] += "\nRESUMED_WINNER: ground every answer in evidence."
     state.update_state_with_new_program(
-        [0], candidate,
+        [0],
+        candidate,
         ValsetEvaluation(
             outputs_by_val_id={0: dspy.Prediction(answer="Bletchley Park")},
             scores_by_val_id={0: 1.0},
             objective_scores_by_val_id={0: {"f1": 1.0}},
         ),
-        str(telemetry), 1,
+        str(telemetry),
+        1,
     )
     state.save(str(telemetry), use_cloudpickle=True)
     custom_output.unlink()  # unfinished run need not have a final program
@@ -472,7 +511,7 @@ def test_stage1_crash_resume_does_not_reextract_completed_chunks(tmp_path: Path)
             raise RuntimeError("Simulated mid-batch Stage 1 OpenIE crash on chunk 2")
         return orig_extract1(chunk_id, passage, **kw)
 
-    setattr(prog1, "extract_openie", _InstrumentedExtract)
+    prog1.extract_openie = _InstrumentedExtract
 
     rt1 = YawRuntime(cfg, program=prog1, embedder=emb1)
     rt1.start(sync_on_start=False)
@@ -503,7 +542,7 @@ def test_stage1_crash_resume_does_not_reextract_completed_chunks(tmp_path: Path)
         extracted_counts[chunk_id] = extracted_counts.get(chunk_id, 0) + 1
         return orig_extract2(chunk_id, passage, **kw)
 
-    setattr(prog2, "extract_openie", _InstrumentedExtract2)
+    prog2.extract_openie = _InstrumentedExtract2
 
     rt2 = YawRuntime(cfg, program=prog2, embedder=emb2)
     rt2.start(sync_on_start=True)
@@ -637,7 +676,7 @@ def test_optimize_and_reload_compiled_program_with_composite_fitness(tmp_path: P
             return student
 
     orig_gepa = getattr(dspy, "GEPA", None)
-    setattr(dspy, "GEPA", StubGEPA)
+    dspy.GEPA = StubGEPA
     try:
         rt1 = YawRuntime(cfg, program=prog, embedder=emb)
         rt1.start(sync_on_start=True)
@@ -655,7 +694,7 @@ def test_optimize_and_reload_compiled_program_with_composite_fitness(tmp_path: P
             rt1.stop()
     finally:
         if orig_gepa is not None:
-            setattr(dspy, "GEPA", orig_gepa)
+            dspy.GEPA = orig_gepa
 
     # 3. Start a brand-new YawRuntime and verify compiled_program.json restores all 5 surfaces
     fresh_prog, fresh_emb, _, _ = _make_program_and_embedder()

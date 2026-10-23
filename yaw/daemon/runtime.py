@@ -173,6 +173,7 @@ class YawRuntime:
             else DSPyEmbeddingAdapter.from_config(self.config)
         )
 
+        assert self.config.max_context_chars is not None
         self.engine = YawGraphEngine(
             db_path=self.config.db_path,
             workspace_root=self.config.corpus_root,
@@ -184,6 +185,8 @@ class YawRuntime:
             synonymy_threshold=self.config.synonymy_threshold,
             synonymy_top_k=self.config.synonymy_top_k,
             embed_batch_size=self.config.embed_batch_size,
+            max_context_chars=self.config.max_context_chars,
+            max_ast_expansion_hops=self.config.max_ast_expansion_hops,
         )
         self.engine.config = self.config
         self.ingestor = CorpusIngestor(
@@ -843,6 +846,8 @@ class YawRuntime:
                     api_key=self.config.api_key,
                     provider=self.config.provider,
                     reflection=True,
+                    context_window_tokens=self.config.context_window_tokens,
+                    max_tokens=self.config.max_output_tokens,
                 )
 
             _progress(f"optimizing: starting {mode} (auto={resolved_auto}) evolution")
@@ -890,7 +895,8 @@ class YawRuntime:
         """
         assert self.engine is not None
         settings = {
-            k: v for k, v in asdict(self.config).items()
+            k: v
+            for k, v in asdict(self.config).items()
             if not k.endswith(("_path", "_dir", "_root"))
             and not k.startswith(("optimize_", "http_"))
             and k not in {"api_key", "poll_interval_seconds", "queue_maxsize"}
@@ -906,17 +912,23 @@ class YawRuntime:
             "version": 1,
             "mode": mode,
             "settings": settings,
-            "data_sha256": hashlib.sha256(json.dumps(
-                {
-                    "train": [ex.toDict() for ex in trainset],
-                    "val": [ex.toDict() for ex in (valset or trainset)],
-                    "corpus": list(corpus_docs or ()),
-                }, sort_keys=True, ensure_ascii=False,
-            ).encode("utf-8")).hexdigest(),
-            "code_sha256": hashlib.sha256(b"".join(
-                p.relative_to(daemon_dir).as_posix().encode("utf-8") + b"\0" + p.read_bytes()
-                for p in source_paths
-            )).hexdigest(),
+            "data_sha256": hashlib.sha256(
+                json.dumps(
+                    {
+                        "train": [ex.toDict() for ex in trainset],
+                        "val": [ex.toDict() for ex in (valset or trainset)],
+                        "corpus": list(corpus_docs or ()),
+                    },
+                    sort_keys=True,
+                    ensure_ascii=False,
+                ).encode("utf-8")
+            ).hexdigest(),
+            "code_sha256": hashlib.sha256(
+                b"".join(
+                    p.relative_to(daemon_dir).as_posix().encode("utf-8") + b"\0" + p.read_bytes()
+                    for p in source_paths
+                )
+            ).hexdigest(),
             "packages": {
                 name: importlib.metadata.version(name)
                 for name in ("dspy", "gepa", "cocoindex", "sqlite-vec", "scipy")
@@ -925,9 +937,7 @@ class YawRuntime:
         # TOML tuples become JSON lists on disk; compare the canonical form.
         identity = json.loads(json.dumps(identity))
         conn = self.engine.conn
-        row = conn.execute(
-            "SELECT value FROM meta WHERE key = 'optimization_run'"
-        ).fetchone()
+        row = conn.execute("SELECT value FROM meta WHERE key = 'optimization_run'").fetchone()
         if row is not None:
             saved = json.loads(row[0])
             if saved["identity"] != identity or saved["output_path"] != str(target_path):
@@ -955,10 +965,15 @@ class YawRuntime:
         with self.engine.managed_conn.transaction() as tx:
             tx.execute(
                 "INSERT INTO meta(key, value) VALUES ('optimization_run', ?)",
-                (json.dumps({
-                    "output_path": str(target_path), "identity": identity,
-                    "cli_options": run_options or {},
-                }),),
+                (
+                    json.dumps(
+                        {
+                            "output_path": str(target_path),
+                            "identity": identity,
+                            "cli_options": run_options or {},
+                        }
+                    ),
+                ),
             )
 
     def reload_program(self, program_path: Path | str) -> dict[str, Any]:

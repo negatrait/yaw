@@ -1300,3 +1300,17 @@ Verification on Python 3.14.9 / DSPy 3.4.1 / CocoIndex 1.0.26:
 - No live-model optimization or corpus quality benchmark was launched. Existing
   DSPy temperature/cache notices and normalized-message API deprecations remain.
   The other audited full-suite fixture/type/lint failures remain separate work.
+
+## 37. Ingestion model and runtime-capacity wiring (2026-10-23)
+
+Committed the pending exact embedding alias and runtime capacity wiring.
+`embedding.MODEL` shares the configured default; explicit embedding choices
+remain independent of chat models. The runtime passes hydration context and AST
+expansion limits into the engine and context/output limits into reflection LMs.
+The repository profile declares the external server's 65,536-token context.
+
+Verification: 17 ingestion/inference-budget tests passed (42.11 s), including
+fresh-process parser-helper invalidation and loopback embedding routing. Three
+configuration/runtime/crash-resume tests passed (27.28 s), including a new real
+runtime/SQLite check for hydration capacity. Runtime and embedding modules pass
+ty. These checks do not establish corpus quality or live-model convergence.
