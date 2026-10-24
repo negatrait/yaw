@@ -4,9 +4,11 @@ import ast
 import difflib
 import json
 import re
-from collections import Counter
 from collections.abc import Sequence
 from typing import Any
+
+import dspy
+from dspy.evaluate.metrics import F1
 
 from yaw.core import StructuredTriple, compute_mdhash_id
 
@@ -19,6 +21,11 @@ def text_processing(text: str | list[Any]) -> str | list[Any]:
         text = str(text)
     normalized = "".join(ch if ch.isalnum() or ch.isspace() else " " for ch in text.casefold())
     return " ".join(normalized.split())
+
+
+def _nullable_text(value: Any) -> str:
+    """Model null is missing text, never an entity or definition named 'None'."""
+    return "" if value is None else str(value).strip()
 
 
 def _coerce_structured_triple_item(
@@ -37,24 +44,20 @@ def _coerce_structured_triple_item(
         if raw_pred is None or raw_subj is None or raw_obj is None:
             return None
         if isinstance(raw_subj, (list, tuple)) and len(raw_subj) >= 1:
-            subj = str(raw_subj[0]).strip()
-            subj_def = (
-                str(raw_subj[1]).strip() if len(raw_subj) >= 2 and raw_subj[1] is not None else ""
-            )
+            subj = _nullable_text(raw_subj[0])
+            subj_def = str(raw_subj[1]).strip() if len(raw_subj) >= 2 and raw_subj[1] is not None else ""
         elif isinstance(raw_subj, str):
             subj = raw_subj.strip()
-            subj_def = str(item.get("subjDef", item.get("subj_def", ""))).strip()
+            subj_def = _nullable_text(item.get("subjDef", item.get("subj_def", "")))
         else:
             return None
 
         if isinstance(raw_obj, (list, tuple)) and len(raw_obj) >= 1:
-            obj = str(raw_obj[0]).strip()
-            obj_def = (
-                str(raw_obj[1]).strip() if len(raw_obj) >= 2 and raw_obj[1] is not None else ""
-            )
+            obj = _nullable_text(raw_obj[0])
+            obj_def = str(raw_obj[1]).strip() if len(raw_obj) >= 2 and raw_obj[1] is not None else ""
         elif isinstance(raw_obj, str):
             obj = raw_obj.strip()
-            obj_def = str(item.get("objDef", item.get("obj_def", ""))).strip()
+            obj_def = _nullable_text(item.get("objDef", item.get("obj_def", "")))
         else:
             return None
 
@@ -102,14 +105,16 @@ def _coerce_structured_triple_item(
 
     if isinstance(item, (list, tuple)) and len(item) in (3, 4):
         raw_s, raw_p, raw_o = item[0], item[1], item[2]
+        if raw_s is None or raw_p is None or raw_o is None:
+            return None
         if isinstance(raw_s, (list, tuple)) and len(raw_s) >= 1:
-            subj = str(raw_s[0]).strip()
+            subj = _nullable_text(raw_s[0])
             subj_def = str(raw_s[1]).strip() if len(raw_s) >= 2 and raw_s[1] is not None else ""
         else:
             subj = str(raw_s).strip()
             subj_def = ""
         if isinstance(raw_o, (list, tuple)) and len(raw_o) >= 1:
-            obj = str(raw_o[0]).strip()
+            obj = _nullable_text(raw_o[0])
             obj_def = str(raw_o[1]).strip() if len(raw_o) >= 2 and raw_o[1] is not None else ""
         else:
             obj = str(raw_o).strip()
@@ -221,15 +226,14 @@ def _parse_bare_json_list(response: str) -> list[Any] | None:
         payload = json.loads(text)
     except json.JSONDecodeError:
         return None
-    if not isinstance(payload, list) or not all(
-        isinstance(item, (str, list, tuple, dict)) for item in payload
-    ):
+    if not isinstance(payload, list) or not all(isinstance(item, (str, list, tuple, dict)) for item in payload):
         return None
     return payload
 
 
 def extract_entity_definitions(raw_input: Any) -> tuple[tuple[str, str], ...]:
-    """Extract and deduplicate (entity_name, contextual_definition) pairs from Stage 1 NER or DefineMissingEntities output."""
+    """Extract and deduplicate (entity_name, contextual_definition) pairs from Stage 1 NER or \
+DefineMissingEntities output."""
     raw_list: Sequence[Any]
     if isinstance(raw_input, str):
         try:
@@ -254,9 +258,7 @@ def extract_entity_definitions(raw_input: Any) -> tuple[tuple[str, str], ...]:
     elif isinstance(raw_input, dict):
         if "named_entities" in raw_input and isinstance(raw_input["named_entities"], list):
             raw_list = raw_input["named_entities"]
-        elif "entity_definitions" in raw_input and isinstance(
-            raw_input["entity_definitions"], list
-        ):
+        elif "entity_definitions" in raw_input and isinstance(raw_input["entity_definitions"], list):
             raw_list = raw_input["entity_definitions"]
         else:
             raw_list = ()
@@ -279,8 +281,8 @@ def extract_entity_definitions(raw_input: Any) -> tuple[tuple[str, str], ...]:
         elif isinstance(item, dict):
             raw_name = item.get("name", item.get("entity", item.get("label", "")))
             raw_def = item.get("definition", item.get("def", item.get("skos:definition", "")))
-            name = str(raw_name).strip()
-            defn = str(raw_def).strip()
+            name = _nullable_text(raw_name)
+            defn = _nullable_text(raw_def)
         if not name:
             continue
         existing_idxs = indices_by_name.get(name)
@@ -365,11 +367,7 @@ def extract_structured_triples(
                     raw_list = loaded if isinstance(loaded, list) else []
                 except Exception:
                     raw_list = []
-    elif (
-        isinstance(raw_input, dict)
-        and "triples" in raw_input
-        and isinstance(raw_input["triples"], list)
-    ):
+    elif isinstance(raw_input, dict) and "triples" in raw_input and isinstance(raw_input["triples"], list):
         raw_list = raw_input["triples"]
     elif isinstance(raw_input, Sequence):
         raw_list = raw_input
@@ -384,14 +382,8 @@ def extract_structured_triples(
             continue
         s_norm = str(text_processing(st.subj))
         o_norm = str(text_processing(st.obj))
-        if (
-            s_norm
-            and s_norm == o_norm
-            and st.subj_def
-            and st.obj_def
-            and st.subj_def.lower() == st.obj_def.lower()
-        ):
-            senses = multi_defs.get(st.subj) or multi_defs.get(s_norm) or []
+        if s_norm and s_norm == o_norm and st.subj_def and st.obj_def and st.subj_def.lower() == st.obj_def.lower():
+            senses = multi_defs.get(s_norm) or multi_defs.get(st.subj) or []
             if len(senses) >= 2:
                 alt_sense = next(
                     (d for d in senses if d.lower() != st.subj_def.lower()),
@@ -497,21 +489,18 @@ def match_facts_to_candidate_indices(
     if not generated_facts or not candidate_facts:
         return []
 
-    candidate_str_list = [str(list(f) if isinstance(f, tuple) else f) for f in candidate_facts]
-    candidate_list_of_lists = [list(f) if isinstance(f, tuple) else f for f in candidate_facts]
+    # Compare textual coordinates, not representation tags such as np.str_(...).
+    candidate_values = [[str(value) for value in fact] for fact in candidate_facts]
+    candidate_str_list = [str(fact) for fact in candidate_values]
 
     result_indices: list[int] = []
     for generated_fact in generated_facts:
-        gen_str = str(list(generated_fact))
+        gen_str = str([str(value) for value in generated_fact])
         matches = difflib.get_close_matches(gen_str, candidate_str_list, n=1, cutoff=0.0)
         if matches:
-            closest_matched_fact = matches[0]
-            try:
-                idx = candidate_list_of_lists.index(ast.literal_eval(closest_matched_fact))
-                if idx not in result_indices:
-                    result_indices.append(idx)
-            except ValueError, SyntaxError:
-                pass
+            idx = candidate_str_list.index(matches[0])
+            if idx not in result_indices:
+                result_indices.append(idx)
 
     if max_facts is not None:
         return result_indices[:max_facts]
@@ -601,24 +590,17 @@ def flatten_facts(
 
 
 def compute_qa_em_f1(pred_str: str, gold_answers: Sequence[str]) -> tuple[float, float]:
-    """Compute exact match (EM) and token-level F1 score against gold answers."""
-    norm_p = str(text_processing(pred_str))
-    p_tokens = norm_p.split()
-    p_counts = Counter(p_tokens)
-    best_em = 0.0
-    best_f1 = 0.0
-    for gold in gold_answers:
-        norm_g = str(text_processing(gold))
-        if norm_p == norm_g or (norm_p and norm_g and norm_g in norm_p):
-            best_em = 1.0
-        g_tokens = norm_g.split()
-        if not p_tokens and not g_tokens:
-            best_f1 = 1.0
-            continue
-        common = sum((p_counts & Counter(g_tokens)).values())
-        if common > 0:
-            best_f1 = max(best_f1, (2.0 * common) / (len(p_tokens) + len(g_tokens)))
-    return best_em, max(best_f1, best_em)
+    """Use DSPy's normalized exact match and continuous best-reference token F1.
+
+    ``answer_exact_match(frac < 1)`` thresholds F1 into a boolean; it does not
+    return the continuous score needed by the optimization objective.
+    """
+    if not gold_answers:
+        return 0.0, 0.0
+    answers = list(gold_answers)
+    example = dspy.Example(answer=answers)
+    prediction = dspy.Prediction(answer=pred_str)
+    return float(dspy.evaluate.answer_exact_match(example, prediction)), float(F1(pred_str, answers))
 
 
 _SYNONYM_RELATION_ALIASES: dict[str, str] = {
@@ -632,9 +614,7 @@ _SYNONYM_RELATION_ALIASES: dict[str, str] = {
     "owl:differentFrom": "owl:differentFrom",
     "differentFrom": "owl:differentFrom",
 }
-_VALID_SYNONYM_RELATIONS = frozenset(
-    {"skos:altLabel", "skos:hiddenLabel", "skos:related", "owl:differentFrom"}
-)
+_VALID_SYNONYM_RELATIONS = frozenset({"skos:altLabel", "skos:hiddenLabel", "skos:related", "owl:differentFrom"})
 _VALID_SHACL_ACTIONS = frozenset(
     {
         "set_definition",

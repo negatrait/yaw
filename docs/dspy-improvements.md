@@ -6,8 +6,9 @@ Practical design patterns, lessons learned, and future architecture investigatio
 
 ## 1. Zero-Shot Optimization on Local Silicon (Active Epic 1 Rule)
 
-- **The Issue**: Bootstrapping few-shot demonstrations on local 4B models (`Qwen3-4B-Instruct`) causes prompt bloat ($3,500+$ tokens), generation timeouts, repetition loops, and severe Pareto penalties ($b_{\text{tokens}} = 1 + \text{tokens}/100$).
+- **The Issue**: Bootstrapping few-shot demonstrations on local 4B models (`Qwen3-4B-Instruct`) causes prompt bloat ($3,500+$ tokens), generation timeouts and repetition loops. Historical token penalties were removed on 2026-10-24: GEPA now rewards only the geometric mean of labeled retrieval recall and QA EM/F1. See [the reward contract](gepa-reflection-repair.md#task-reward-2026-10-24).
 - **The Rule**: Always set `max_bootstrapped_demos = 0` and `max_labeled_demos = 0` in `yaw.toml`. Optimize pure instructions zero-shot.
+- **Fresh program policy (2026-10-24)**: Task and reflection constructors default to `include_demos=False`, so a fresh GEPA-only run also starts without fixed examples. Existing example sets require explicit opt-in; loaded compiled demonstrations are preserved. Their generalization has not been established by a paired benchmark.
 
 ---
 

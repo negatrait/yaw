@@ -1,10 +1,13 @@
 """Native DSPy disk-cache reuse and logical-cost parity over actual loopback HTTP."""
 
+import gc
 import json
 import os
 import subprocess
 import sys
 import threading
+import warnings
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -164,7 +167,8 @@ def test_long_qa_run_bounds_diagnostics_preserves_cost_and_avoids_history(
     assert total_tokens == 600 * 30
     assert len(requests) == 1
     assert len(program.telemetry) == 250
-    assert not lm.history and not program.history and not program.qa.predict.lm.history
+    assert not lm.history and not program.history
+    assert program.qa.predict.lm is lm  # Native explicit binding needs no proxy.
     assert len(GLOBAL_HISTORY) == before_global
     assert retained_at_end - retained_after_warmup < 1_000_000
     print(
@@ -267,5 +271,37 @@ def test_response_cache_passthrough_and_unreported_usage(tmp_path: Path) -> None
         with dspy.context(usage_tracker=None):
             assert dspy.cache.get(request) == record
         assert dspy.cache.cached_tokens == 0
+    finally:
+        configure_yaw_dspy_cache(enable_disk_cache=False, enable_memory_cache=False)
+
+
+@pytest.mark.parametrize("account_usage", [False, True])
+def test_worker_cache_handles_close_without_losing_persisted_entries(tmp_path: Path, account_usage: bool) -> None:
+    import dspy
+
+    barrier = threading.Barrier(2)
+
+    def configure() -> None:
+        configure_yaw_dspy_cache(tmp_path, enable_memory_cache=False, account_cached_usage=account_usage)
+
+    def worker(index: int) -> None:
+        barrier.wait(timeout=10)
+        request = {"_fn_identifier": "application.worker", "index": index}
+        dspy.cache.put(request, {"answer": index})
+        assert dspy.cache.get(request) == {"answer": index}
+
+    try:
+        # Capture and assert these warnings, rather than hiding resource failures.
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always", ResourceWarning)
+            configure()
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                list(pool.map(worker, range(2)))
+            gc.collect()
+            assert not [warning for warning in captured if isinstance(warning.message, ResourceWarning)]
+        configure()
+        for index in range(2):
+            request = {"_fn_identifier": "application.worker", "index": index}
+            assert dspy.cache.get(request) == {"answer": index}
     finally:
         configure_yaw_dspy_cache(enable_disk_cache=False, enable_memory_cache=False)

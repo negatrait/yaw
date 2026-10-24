@@ -119,11 +119,7 @@ def _decode(value: Any, passage: str | None, sources: dict[str, str]) -> Any:
         return sources[value["value"]][value["start"] : value["end"]]
     if tag == "source":
         source = sources[value["value"]]
-        return (
-            json.dumps(source, ensure_ascii=value["ascii_only"])[1:-1]
-            if value["escaped"]
-            else source
-        )
+        return json.dumps(source, ensure_ascii=value["ascii_only"])[1:-1] if value["escaped"] else source
     if tag == "source_parts":
         return "".join(_decode(part, passage, sources) for part in value["value"])
     if tag == "passage":
@@ -131,11 +127,7 @@ def _decode(value: Any, passage: str | None, sources: dict[str, str]) -> Any:
             raise ValueError("OpenIE trace replay requires the current hydrated passage.")
         return passage
     if tag == "array":
-        return (
-            np.frombuffer(base64.b64decode(value["value"]), dtype=np.float32)
-            .reshape(value["shape"])
-            .copy()
-        )
+        return np.frombuffer(base64.b64decode(value["value"]), dtype=np.float32).reshape(value["shape"]).copy()
     if tag == "dict":
         return {k: _decode(v, passage, sources) for k, v in value["value"]}
     if tag in {"list", "tuple", "set"}:

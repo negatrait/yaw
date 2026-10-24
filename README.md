@@ -40,7 +40,8 @@ returns a failing exit status if any check fails. Full UTF-8 logs, JUnit XML,
 coverage JSON and a combined report are saved under `outputs/preflight/`;
 `latest.json` points to the newest report. Add `--verbose` to stream diagnostics.
 Default tests are incremental; `--full` runs the whole suite. Coverage describes
-the tests executed in that invocation. Resident-model tests require `--live`.
+the tests executed in that invocation. Every collected test runs, including live inference checks; configured models
+must already be resident.
 Ruff fixes and pytest `--testmon` are project defaults. ty's `--fix` has no
 persistent configuration setting; `uv run typecheck` supplies it automatically.
 See the [preflight audit](docs/preflight-audit.md) for remaining cleanup work.
@@ -110,14 +111,18 @@ caches, while query vectors use the effective query prefix in their own keys.
 Persistent CocoIndex parsing also invalidates when parsing helpers change.
 
 Inference capacity is explicit under `[inference]`: `context_window_tokens`
-declares the server's actual serving window (65,536 in `yaw.toml`), while
-`max_output_tokens` caps each completion. These settings do not resize or reload
+declares the server's actual serving window (131,072 by default). Unset
+`max_output_tokens`, `reflection_input_tokens` and `rlm_max_output_chars` derive
+from capacity: 8,192 tokens, 32,768 tokens and 20,000 characters at 128K. Explicit
+values pin those limits. These settings do not resize or reload
 the external server. Extraction, QA, reflection-field and validation-input
 character safeguards scale with available input capacity; they are heuristics,
 not exact token counts. `[graph].max_context_chars` defaults to a scaled context
 budget unless explicitly set. Embedding input limits remain profile-specific.
-`rlm_max_iters`, `rlm_max_llm_calls` and `rlm_max_output_chars` independently bound
-SHACL and reflection loops. More context does not automatically mean more turns.
+Synonym/SHACL prompt batches and proposal/diagnosis length limits also scale.
+`rlm_max_iters` and `rlm_max_llm_calls` independently bound SHACL and reflection
+loops. More context does not automatically mean more turns. The deployed Gemma
+profile is 128K without flash attention; the user reports approximately 65 TPS.
 Changed model/budget settings require a compatible fresh run/index; an already
 running optimizer retains its original settings.
 

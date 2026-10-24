@@ -4,9 +4,36 @@ The reflection path is now **training traces → sandbox evidence selection → 
 DSPy InstructionProposer → downstream task scoring**. The previous synthesis
 tool, prefix clipping and competing outer instruction output are removed.
 
+## Task reward (2026-10-24)
+
+GEPA and its SIMBA task scorer use the unweighted geometric mean of available
+`Recall@1`, `Recall@2`, `Recall@5`, `Recall@10`, `Recall@20`, `EM` and token `F1`.
+With all seven labels, the reward is `(R1 * R2 * R5 * R10 * R20 * EM * F1) ** (1/7)`.
+Retrieval-only and QA-only examples contribute only their labeled metrics.
+There is no cost denominator, repeated weighting or smoothing floor: a zero
+component makes the composite zero. The individual quality metrics remain GEPA
+Pareto objectives so their improvements remain observable.
+
+Tokens and graph repairs remain diagnostics. They neither penalize the scalar
+reward nor create extra Pareto objectives. Missing token usage cannot invalidate
+a quality evaluation. DSPy's normalized `answer_exact_match` supplies EM and
+`dspy.evaluate.metrics.F1` supplies continuous best-reference token F1;
+`answer_exact_match(frac < 1)` would return a thresholded boolean. LM-judged
+`SemanticF1` remains an optional evaluation diagnostic via `include_semantic_metrics`.
+
+The run and SIMBA cache identities identify `task-quality-geometric-mean-v1`.
+Old optimization state contains incomparable scores and requires a fresh run;
+the existing compatibility checks preserve and reject it rather than mixing scores.
+An already running process keeps its previously loaded reward implementation.
+
 ## Behavior and configuration
 
-`[inference].reflection_input_tokens` defaults to **16384**. Each final reflection
+`[inference].reflection_input_tokens` defaults to one quarter of the configured
+serving window: **32768** at the **131072**-token Gemma default. An explicit
+value pins the input cap. Automatic output allowance is one sixteenth of context
+(8192 at 128K); RLM output characters and default proposal/diagnosis limits also
+scale from their 64K deployment budgets. RLM turn/call limits remain independent.
+Each final reflection
 request is measured with the resident model's llama.cpp chat template/tokenizer,
 including schema, demonstrations, instructions and evidence. Output tokens and a
 512-token context margin are reserved independently. The external service must

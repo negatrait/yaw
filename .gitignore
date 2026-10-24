@@ -15,6 +15,7 @@ data/
 .pytest_cache/
 .ruff_cache/
 .coverage*
+!.coveragerc
 .testmondata*
 scratch/
 *.db

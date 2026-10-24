@@ -27,9 +27,7 @@ from typing import Any
 
 HF_BASE_URL = "https://huggingface.co/datasets/osunlp/HippoRAG_2/resolve/main"
 ENTERPRISE_RAG_BENCH_HF_REPO = "onyx-dot-app/EnterpriseRAG-Bench"
-ENTERPRISE_RAG_BENCH_HF_URL = (
-    f"https://huggingface.co/datasets/{ENTERPRISE_RAG_BENCH_HF_REPO}/resolve/main"
-)
+ENTERPRISE_RAG_BENCH_HF_URL = f"https://huggingface.co/datasets/{ENTERPRISE_RAG_BENCH_HF_REPO}/resolve/main"
 GITHUB_PINNED_COMMIT = "d5c8329422e0a0b834a15874545cb6a74b4f9b26"
 GITHUB_BASE_URL = f"https://raw.githubusercontent.com/OSU-NLP-Group/HippoRAG/{GITHUB_PINNED_COMMIT}/reproduce/dataset"
 
@@ -263,9 +261,7 @@ with open(out_path, "w", encoding="utf-8") as out_f:
             json.dumps(ENTERPRISE_CATEGORY_QUOTAS),
             json.dumps(_CATEGORY_NORMALIZATION),
         ]
-        print(
-            f"  Fetching stratified EnterpriseRAG-Bench slice from {ENTERPRISE_RAG_BENCH_HF_REPO}..."
-        )
+        print(f"  Fetching stratified EnterpriseRAG-Bench slice from {ENTERPRISE_RAG_BENCH_HF_REPO}...")
         t0 = time.perf_counter()
         subprocess.run(cmd, check=True)
         dt = time.perf_counter() - t0
@@ -286,7 +282,7 @@ def download_enterprise_rag_bench(
     questions_rows: list[dict[str, Any]] | None = None,
     documents_rows: list[dict[str, Any]] | None = None,
 ) -> tuple[Path, Path]:
-    """Build stratified 250-query EnterpriseRAG-Bench dataset (150 train + 100 val) and 2.0x same-tool distractor corpus."""
+    "Build stratified 250-query EnterpriseRAG-Bench dataset (150 train + 100 val) and 2.0x same-tool distractor corpus."
     q_file, c_file, _ = DATASET_REGISTRY["enterprise_rag_bench"]
     q_target = dest_dir / q_file
     c_target = dest_dir / c_file
@@ -330,9 +326,7 @@ def download_enterprise_rag_bench(
             key=lambda r: str(r.get("question_id") or r.get("id") or r.get("question") or ""),
         )
         if len(pool) < n_train + n_val:
-            raise ValueError(
-                f"Category '{cat}' has only {len(pool)} questions, need {n_train + n_val}"
-            )
+            raise ValueError(f"Category '{cat}' has only {len(pool)} questions, need {n_train + n_val}")
         rng.shuffle(pool)
         for item in pool[:n_train]:
             train_raw.append((cat, item))
@@ -341,15 +335,11 @@ def download_enterprise_rag_bench(
 
     rng.shuffle(train_raw)
     rng.shuffle(val_raw)
-    ordered_split = [("train", cat, item) for cat, item in train_raw] + [
-        ("val", cat, item) for cat, item in val_raw
-    ]
+    ordered_split = [("train", cat, item) for cat, item in train_raw] + [("val", cat, item) for cat, item in val_raw]
 
     docs_by_id: dict[str, dict[str, Any]] = {}
     non_gold_by_tool: dict[str, list[dict[str, Any]]] = {}
-    all_gold_ids: set[str] = {
-        str(did) for _, _, q in ordered_split for did in (q.get("expected_doc_ids") or ())
-    }
+    all_gold_ids: set[str] = {str(did) for _, _, q in ordered_split for did in (q.get("expected_doc_ids") or ())}
 
     for d in documents_rows:
         did = str(d.get("doc_id") or d.get("id") or "")
@@ -365,9 +355,7 @@ def download_enterprise_rag_bench(
         rng.shuffle(non_gold_by_tool[st])
 
     tool_cursors: dict[str, int] = {st: 0 for st in non_gold_by_tool}
-    all_non_gold_docs = [
-        d for d in documents_rows if str(d.get("doc_id") or d.get("id") or "") not in all_gold_ids
-    ]
+    all_non_gold_docs = [d for d in documents_rows if str(d.get("doc_id") or d.get("id") or "") not in all_gold_ids]
     all_non_gold_docs.sort(key=lambda x: str(x.get("doc_id") or x.get("id") or ""))
     rng.shuffle(all_non_gold_docs)
     fallback_cursor = 0
@@ -378,9 +366,7 @@ def download_enterprise_rag_bench(
         raw_title = str(doc_obj.get("title") or did).strip() or did
         prefix = f"[{st}] "
         title = raw_title if raw_title.startswith("[") else f"{prefix}{raw_title}"
-        text = str(
-            doc_obj.get("content") if "content" in doc_obj else doc_obj.get("text") or ""
-        ).strip()
+        text = str(doc_obj.get("content") if "content" in doc_obj else doc_obj.get("text") or "").strip()
         return did, st, title, text
 
     formatted_queries: list[dict[str, Any]] = []
@@ -389,9 +375,7 @@ def download_enterprise_rag_bench(
     for split_name, canonical_cat, q in ordered_split:
         qid = str(q.get("question_id") or q.get("id") or "")
         question_text = str(q.get("question") or "").strip()
-        gold_ans = str(
-            q.get("gold_answer") if "gold_answer" in q else q.get("answer") or ""
-        ).strip()
+        gold_ans = str(q.get("gold_answer") if "gold_answer" in q else q.get("answer") or "").strip()
         raw_facts = q.get("answer_facts") or q.get("answer_aliases") or []
         aliases = [str(f).strip() for f in raw_facts if str(f).strip()]
         if canonical_cat == "Info Not Found":
@@ -500,8 +484,7 @@ def download_enterprise_rag_bench(
         encoding="utf-8",
     )
     print(
-        f"  -> Wrote {len(formatted_queries)} stratified queries to {q_file} "
-        f"and {len(corpus_map)} passages to {c_file}"
+        f"  -> Wrote {len(formatted_queries)} stratified queries to {q_file} and {len(corpus_map)} passages to {c_file}"
     )
     return q_target, c_target
 
@@ -527,9 +510,7 @@ def download_file(filename: str, dest_dir: Path, force: bool = False) -> Path:
         try:
             print(f"  Downloading {filename} from {url}...")
             t0 = time.perf_counter()
-            req = urllib.request.Request(
-                url, headers={"User-Agent": "YAW-HippoRAG-DatasetDownloader/1.0"}
-            )
+            req = urllib.request.Request(url, headers={"User-Agent": "YAW-HippoRAG-DatasetDownloader/1.0"})
             with urllib.request.urlopen(req) as resp, open(tmp_target, "wb") as out_f:
                 while True:
                     chunk = resp.read(1024 * 1024)
@@ -575,9 +556,7 @@ def verify_dataset(name: str, dest_dir: Path) -> dict:
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "--dataset",
         choices=["all", *tuple(DATASET_REGISTRY), *tuple(ALIASES)],
@@ -611,7 +590,9 @@ def main():
             st = verify_dataset(name, dest_dir)
             if st["ready"]:
                 print(
-                    f"  [OK] {name:22s}: {st['queries']:5d} queries, {st['corpus_passages']:6d} passages ({st['query_size_mb'] + st['corpus_size_mb']:.1f} MB)"
+                    f"  [OK] {name:22s}: {st['queries']:5d} queries, "
+                    f"{st['corpus_passages']:6d} passages "
+                    f"({st['query_size_mb'] + st['corpus_size_mb']:.1f} MB)"
                 )
             else:
                 print(f"  [MISSING] {name:22s}: {st.get('error', 'not found')}")

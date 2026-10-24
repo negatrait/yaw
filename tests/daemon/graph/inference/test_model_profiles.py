@@ -54,9 +54,7 @@ class ProfileTests(unittest.TestCase):
             patch(
                 "yaw.daemon.graph.inference.models.get_json",
                 return_value={
-                    "all_models_loaded": [
-                        {**base_entry, "launch_command": ["llama-server.exe", "--parallel", "1"]}
-                    ]
+                    "all_models_loaded": [{**base_entry, "launch_command": ["llama-server.exe", "--parallel", "1"]}]
                 },
             ),
             self.assertRaisesRegex(ValueError, "--cache-ram 0"),
@@ -103,9 +101,7 @@ class ProfileTests(unittest.TestCase):
 
                 adapter = DSPyEmbeddingAdapter(
                     profile=profile,
-                    embedder=create_dspy_embedder(
-                        make_embed_fn(profile.dimensions), batch_size=2, caching=False
-                    ),
+                    embedder=create_dspy_embedder(make_embed_fn(profile.dimensions), batch_size=2, caching=False),
                 )
                 adapter.batch_encode(["a document"])
                 self.assertEqual(recorded_inputs[-1], [profile.document_prefix + "a document"])
@@ -118,9 +114,7 @@ class ProfileTests(unittest.TestCase):
                     self.assertIn("\nQuery:", recorded_inputs[-1][0])
                     bad_adapter = DSPyEmbeddingAdapter(
                         profile=profile,
-                        embedder=create_dspy_embedder(
-                            make_embed_fn(768), batch_size=2, caching=False
-                        ),
+                        embedder=create_dspy_embedder(make_embed_fn(768), batch_size=2, caching=False),
                     )
                     with self.assertRaises(ValueError):
                         bad_adapter.batch_encode(["wrong dimensions"])
@@ -134,9 +128,7 @@ class ProfileTests(unittest.TestCase):
             replace(profile, pooling="last"),
         ):
             self.assertNotEqual(profile.index_identity, changed.index_identity)
-        mode_identities = {
-            resolve_embedding_profile(MODEL, mode).index_identity for mode in GEMMA_TASK_MODES
-        }
+        mode_identities = {resolve_embedding_profile(MODEL, mode).index_identity for mode in GEMMA_TASK_MODES}
         self.assertEqual(len(mode_identities), len(GEMMA_TASK_MODES))
         with self.assertRaises(ValueError):
             resolve_embedding_profile("Qwen3-Embedding-0.6B-GGUF", "qa")

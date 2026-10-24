@@ -92,11 +92,7 @@ def coalesce_spans(spans: Sequence[MutableSpan]) -> list[CoalescedSpan]:
 
         for nxt in sorted_spans[1:]:
             same_title = not cur_title or not nxt.title or cur_title == nxt.title
-            same_ast_island = (
-                cur_ast_s > 0
-                and cur_ast_s == nxt.ast_island_start
-                and cur_ast_e == nxt.ast_island_end
-            )
+            same_ast_island = cur_ast_s > 0 and cur_ast_s == nxt.ast_island_start and cur_ast_e == nxt.ast_island_end
             in_same_island = (
                 (cur_ast_s == 0 or nxt.ast_island_start == 0 or cur_ast_s == nxt.ast_island_start)
                 and (cur_ast_e == 0 or nxt.start_line <= cur_ast_e)
@@ -167,8 +163,7 @@ def normalize_json_passage_text(raw_text: str, default_title: str = "") -> str:
         except Exception:
             return (
                 f"{default_title}\n{stripped}"
-                if default_title
-                and not (stripped.startswith(f"{default_title}\n") or stripped == default_title)
+                if default_title and not (stripped.startswith(f"{default_title}\n") or stripped == default_title)
                 else stripped
             )
 
@@ -273,9 +268,7 @@ def dehydrate_passage_ast(
                 else:
                     break
             if last_valid_end_byte > 0:
-                best_body = (
-                    body_bytes[:last_valid_end_byte].decode("utf-8", errors="replace").rstrip()
-                )
+                best_body = body_bytes[:last_valid_end_byte].decode("utf-8", errors="replace").rstrip()
                 break
 
     if not best_body:
@@ -352,14 +345,10 @@ def hydrate_chunk_pointer(
 ) -> HydratedPassage:
     """Hydrate a 1-indexed [start_line, end_line] AST island from disk, gracefully dehydrating if oversized."""
     if pointer.start_line < 1 or pointer.end_line < pointer.start_line:
-        raise ValueError(
-            f"Invalid line span [{pointer.start_line}, {pointer.end_line}] for chunk {pointer.chunk_id}"
-        )
+        raise ValueError(f"Invalid line span [{pointer.start_line}, {pointer.end_line}] for chunk {pointer.chunk_id}")
     line_count = pointer.end_line - pointer.start_line + 1
     if line_count > _MAX_CHUNK_LINE_SPAN:
-        raise ValueError(
-            f"Line span {line_count} exceeds maximum {_MAX_CHUNK_LINE_SPAN} for chunk {pointer.chunk_id}"
-        )
+        raise ValueError(f"Line span {line_count} exceeds maximum {_MAX_CHUNK_LINE_SPAN} for chunk {pointer.chunk_id}")
 
     target_path = resolve_corpus_path(corpus_root, pointer.rel_posix_path)
     text = read_corpus_lines(target_path, pointer.start_line, pointer.end_line)
@@ -462,15 +451,11 @@ def _hydrate_spans(
         target_path = resolve_corpus_path(corpus_root, span.rel_posix_path)
         text = read_corpus_lines(target_path, span.start_line, span.end_line)
         if text is None:
-            passages.append(
-                HydratedPassage(pointer=ptr, text="", score=span.max_score, stale_on_disk=True)
-            )
+            passages.append(HydratedPassage(pointer=ptr, text="", score=span.max_score, stale_on_disk=True))
             continue
         if span.rel_posix_path.lower().endswith((".json", ".jsonl")):
             text = normalize_json_passage_text(text, default_title=span.title)
-        passages.append(
-            HydratedPassage(pointer=ptr, text=text, score=span.max_score, stale_on_disk=False)
-        )
+        passages.append(HydratedPassage(pointer=ptr, text=text, score=span.max_score, stale_on_disk=False))
     return passages
 
 
@@ -484,10 +469,11 @@ def hydrate_budgeted_passages(
     """Hydrate retrieved chunks via greedy priority AST-expansion:
     1. Sort chunks by relevance descending (FIFO queue).
     2. Pick the most relevant remaining chunk.
-    3. Expand ONCE to immediate neighbors (max_expansion_hops=1, non-recursive) respecting AST boundaries if headroom permits.
+    3. Expand ONCE to immediate neighbors (max_expansion_hops=1, non-recursive) respecting AST boundaries \
+if headroom permits.
     4. Deduplicate / coalesce contiguous spans (MaxP score inheritance).
     5. Inviolate Hit Invariant: retrieved hit chunks are never dropped.
-    """
+"""
     if not pointers_with_scores:
         return []
 

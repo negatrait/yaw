@@ -19,6 +19,7 @@ import dspy
 import numpy as np
 import pytest
 
+from daemon.graph.inference.test_reflection import provider as provider
 from yaw.core import (
     OpenIERecord,
     YawConfig,
@@ -49,42 +50,31 @@ class DeterministicTestLM(dspy.LM):
         **kwargs: Any,
     ) -> list[str]:
         if self.fail_online:
-            raise ConnectionError(
-                "Inference server at http://localhost:13305/api/v1 is unreachable"
-            )
+            raise ConnectionError("Inference server at http://localhost:13305/api/v1 is unreachable")
         req_str = str(prompt or messages or kwargs)
         if dspy.settings.usage_tracker is not None:
             dspy.settings.usage_tracker.add_usage(
                 self.model,
                 {"prompt_tokens": 32, "completion_tokens": 16, "total_tokens": 48},
             )
-        if (
-            "JudgeSynonyms" in req_str
-            or "candidate_pairs_json" in req_str
-            or "candidate_pairs" in req_str
-        ):
+        if "JudgeSynonyms" in req_str or "candidate_pairs_json" in req_str or "candidate_pairs" in req_str:
             return ['{"decisions": []}']
-        if (
-            "ProposeSHACLRepairs" in req_str
-            or "HealSHACLViolations" in req_str
-            or "violations_json" in req_str
-        ):
+        if "ProposeSHACLRepairs" in req_str or "HealSHACLViolations" in req_str or "violations_json" in req_str:
             return ['{"repairs": []}']
-        if (
-            "DefineMissingEntities" in req_str
-            or "missing_entities" in req_str
-            or "entity_definitions" in req_str
-        ):
+        if "DefineMissingEntities" in req_str or "missing_entities" in req_str or "entity_definitions" in req_str:
             if "Turing" in req_str:
                 return [
-                    '{"entity_definitions": [["Alan Turing", "English mathematician and cryptanalyst"], ["Bletchley Park", "British wartime codebreaking center"]]}'
+                    '{"entity_definitions": [["Alan Turing", "English mathematician and cryptanalyst"], '
+                    '["Bletchley Park", "British wartime codebreaking center"]]}'
                 ]
             if "Lovelace" in req_str:
                 return [
-                    '{"entity_definitions": [["Ada Lovelace", "English mathematician"], ["Analytical Engine", "Early mechanical general-purpose computer"]]}'
+                    '{"entity_definitions": [["Ada Lovelace", "English mathematician"], ["Analytical Engine", '
+                    '"Early mechanical general-purpose computer"]]}'
                 ]
             return [
-                '{"entity_definitions": [["University of Southampton", "Public research university in Southampton"], ["1862", "Founding year of the Hartley Institution"]]}'
+                '{"entity_definitions": [["University of Southampton", "Public research university in '
+                'Southampton"], ["1862", "Founding year of the Hartley Institution"]]}'
             ]
         if "FilterTriples" in req_str or "fact_before_filter" in req_str:
             if "Turing" in req_str:
@@ -95,26 +85,32 @@ class DeterministicTestLM(dspy.LM):
         if "ExtractTriples" in req_str or '"triples"' in req_str or "`triples`" in req_str:
             if "Turing" in req_str:
                 return [
-                    '{"triples": [{"sub": "Alan Turing", "pred": "worked at", "obj": "Bletchley Park", "def": "Alan Turing worked at Bletchley Park."}]}'
+                    '{"triples": [{"sub": "Alan Turing", "pred": "worked at", "obj": "Bletchley Park", "def": '
+                    '"Alan Turing worked at Bletchley Park."}]}'
                 ]
             if "Lovelace" in req_str:
                 return [
-                    '{"triples": [{"sub": "Ada Lovelace", "pred": "programmed", "obj": "Analytical Engine", "def": "Ada Lovelace programmed the Analytical Engine."}]}'
+                    '{"triples": [{"sub": "Ada Lovelace", "pred": "programmed", "obj": "Analytical Engine", '
+                    '"def": "Ada Lovelace programmed the Analytical Engine."}]}'
                 ]
             return [
-                '{"triples": [{"sub": "University of Southampton", "pred": "founded in", "obj": "1862", "def": "University of Southampton was founded in 1862."}]}'
+                '{"triples": [{"sub": "University of Southampton", "pred": "founded in", "obj": "1862", '
+                '"def": "University of Southampton was founded in 1862."}]}'
             ]
         if "ExtractEntities" in req_str or "named_entities" in req_str:
             if "Turing" in req_str:
                 return [
-                    '{"named_entities": [["Alan Turing", "English mathematician and cryptanalyst"], ["Bletchley Park", "British wartime codebreaking center"]]}'
+                    '{"named_entities": [["Alan Turing", "English mathematician and cryptanalyst"], '
+                    '["Bletchley Park", "British wartime codebreaking center"]]}'
                 ]
             if "Lovelace" in req_str:
                 return [
-                    '{"named_entities": [["Ada Lovelace", "English mathematician"], ["Analytical Engine", "Early mechanical general-purpose computer"]]}'
+                    '{"named_entities": [["Ada Lovelace", "English mathematician"], ["Analytical Engine", '
+                    '"Early mechanical general-purpose computer"]]}'
                 ]
             return [
-                '{"named_entities": [["University of Southampton", "Public research university in Southampton"], ["1862", "Founding year of the Hartley Institution"]]}'
+                '{"named_entities": [["University of Southampton", "Public research university in '
+                'Southampton"], ["1862", "Founding year of the Hartley Institution"]]}'
             ]
         if "ExtractQueryIntent" in req_str or "query_intent" in req_str:
             return ['{"query_intent": "Alan Turing worked at Bletchley Park"}']
@@ -170,7 +166,9 @@ class DeterministicTestEmbedder:
         return vecs
 
 
-def _make_test_config(tmp_path: Path, *, queue_maxsize: int = 32) -> tuple[YawConfig, Path]:
+def _make_test_config(
+    tmp_path: Path, *, queue_maxsize: int = 32, base_url: str = "http://localhost:13305/api/v1"
+) -> tuple[YawConfig, Path]:
     toml_path = tmp_path / "yaw.toml"
     toml_content = f"""
 [paths]
@@ -191,7 +189,7 @@ min_chunk_size = 20
 poll_interval_seconds = 0.2
 
 [inference]
-base_url = "http://localhost:13305/api/v1"
+base_url = "{base_url}"
 enable_gbnf = false
 
 [graph]
@@ -210,9 +208,7 @@ http_port = 13306
     return cfg, toml_path
 
 
-def _make_program_and_embedder() -> tuple[
-    HippoRAGProgram, Any, DeterministicTestLM, DeterministicTestEmbedder
-]:
+def _make_program_and_embedder() -> tuple[HippoRAGProgram, Any, DeterministicTestLM, DeterministicTestEmbedder]:
     lm = DeterministicTestLM()
     dspy.settings.configure(lm=lm)
     prog = HippoRAGProgram(
@@ -285,11 +281,11 @@ def test_cli_resume_without_a_run_fails_before_dataset_or_provider_access(tmp_pa
     assert cfg.db_path is not None and not cfg.db_path.exists()
 
 
-def test_cli_resume_real_gepa_checkpoint_and_custom_output(tmp_path: Path) -> None:
+def test_cli_resume_real_gepa_checkpoint_and_custom_output(tmp_path: Path, provider) -> None:
     """Real GEPA/DSPy + SQLite + CocoIndex; deterministic LM tests orchestration only."""
     from gepa.core.state import GEPAState, ValsetEvaluation
 
-    cfg, toml_path = _make_test_config(tmp_path)
+    cfg, toml_path = _make_test_config(tmp_path, base_url=provider[0])
     dataset = tmp_path / "resume_dataset.json"
     records = [
         {
@@ -486,7 +482,8 @@ def test_bounded_32_slot_queue_overflow_and_non_blocking_status(tmp_path: Path) 
 
 
 def test_stage1_crash_resume_does_not_reextract_completed_chunks(tmp_path: Path) -> None:
-    """D1-A3 & D1-A5: Crash mid-OpenIE persists completed chunks and pending_sync_delta; restart resumes without re-extracting."""
+    """D1-A3 & D1-A5: Crash mid-OpenIE persists completed chunks and pending_sync_delta; restart resumes without \
+re-extracting."""
     cfg, _ = _make_test_config(tmp_path)
     assert cfg.corpus_root is not None
     assert cfg.db_path is not None
@@ -561,7 +558,8 @@ def test_stage1_crash_resume_does_not_reextract_completed_chunks(tmp_path: Path)
 
 
 def test_inference_outage_degradation_and_recovery(tmp_path: Path) -> None:
-    """D1-A5: Inference outage sets provider_ready=False and lifecycle='degraded' without crashing; recovery restores ready."""
+    """D1-A5: Inference outage sets provider_ready=False and lifecycle='degraded' without crashing; recovery \
+restores ready."""
     cfg, _ = _make_test_config(tmp_path)
     assert cfg.corpus_root is not None
     (cfg.corpus_root / "turing.md").write_text(
@@ -603,8 +601,9 @@ def test_inference_outage_degradation_and_recovery(tmp_path: Path) -> None:
         rt.stop()
 
 
-def test_optimize_and_reload_compiled_program_with_composite_fitness(tmp_path: Path) -> None:
-    """D1-A4: Verify composite fitness formula (Recall@1..20 * EM * F1) / tokens and full-surface persistence."""
+@pytest.mark.parametrize("labels", ["combined", "qa", "retrieval"])
+def test_optimize_and_reload_compiled_program_with_composite_fitness(tmp_path: Path, provider, labels: str) -> None:
+    """D1-A4: Verify geometric task quality and full-surface persistence."""
     # 1. Verify exact composite fitness calculation in compute_sizecoding_pareto_score
     pred_metric = compute_sizecoding_pareto_score(
         0.8,
@@ -617,16 +616,14 @@ def test_optimize_and_reload_compiled_program_with_composite_fitness(tmp_path: P
         tokens=50,
     )
     expected_quality = 0.5 * 0.6 * 0.8 * 1.0 * 1.0 * 1.0 * 0.9
-    expected_pareto_raw = expected_quality / 50
-    assert pytest.approx(pred_metric.quality_numerator) == expected_quality
-    assert pytest.approx(pred_metric.pareto_raw) == expected_pareto_raw
+    assert pred_metric.score == pytest.approx(expected_quality ** (1 / 7))
     assert "em" in pred_metric.objective_scores
     assert "f1" in pred_metric.objective_scores
     assert "recall_at_1" in pred_metric.objective_scores
     assert "recall_at_20" in pred_metric.objective_scores
 
     # 2. Verify full-surface optimization and persistence via YawRuntime.optimize()
-    cfg, _ = _make_test_config(tmp_path)
+    cfg, _ = _make_test_config(tmp_path, base_url=provider[0])
     assert cfg.corpus_root is not None
     (cfg.corpus_root / "turing.md").write_text(
         "# Alan Turing\nAlan Turing worked at Bletchley Park.\n",
@@ -644,57 +641,29 @@ def test_optimize_and_reload_compiled_program_with_composite_fitness(tmp_path: P
     prog.gbnf_max_reasoning_chars = 160
     prog.ner.signature = prog.ner.signature.with_instructions("Optimized NER surface instruction.")
 
-    class StubGEPA:
-        def __init__(
-            self,
-            metric: Any,
-            reflection_lm: Any = None,
-            instruction_proposer: Any = None,
-            auto: str = "light",
-            track_stats: bool = False,
-            track_best_outputs: bool = False,
-            log_dir: str | None = None,
-            **kwargs: Any,
-        ) -> None:
-            self.metric = metric
-            self.reflection_lm = reflection_lm
-            self.instruction_proposer = instruction_proposer
-            self.auto = auto
-            self.track_stats = track_stats
-            self.track_best_outputs = track_best_outputs
-            self.log_dir = log_dir
-
-        def compile(self, student: Any, trainset: list[Any], valset: Any = None) -> Any:
-            assert self.reflection_lm is not None
-            assert self.instruction_proposer is not None
-            assert callable(self.instruction_proposer)
-            assert self.track_stats is True
-            assert self.track_best_outputs is True
-            pred = student(question=trainset[0].question)
-            score_pred = self.metric(trainset[0], pred, pred_name="qa")
-            assert score_pred.score > 0.0
-            return student
-
-    orig_gepa = getattr(dspy, "GEPA", None)
-    dspy.GEPA = StubGEPA
+    rt1 = YawRuntime(cfg, program=prog, embedder=emb)
+    rt1.start(sync_on_start=True)
     try:
-        rt1 = YawRuntime(cfg, program=prog, embedder=emb)
-        rt1.start(sync_on_start=True)
-        try:
-            trainset = [
-                dspy.Example(
-                    question="Where did Alan Turing work?",
-                    gold_answers=["Bletchley Park"],
-                    gold_docs=["Alan Turing worked at Bletchley Park."],
-                ).with_inputs("question")
-            ]
-            saved_path = rt1.optimize(trainset, mode="gepa")
-            assert saved_path.exists()
-        finally:
-            rt1.stop()
+        example_data: dict[str, Any] = {"question": "Where did Alan Turing work?"}
+        if labels in ("combined", "qa"):
+            example_data["gold_answers"] = ["Bletchley Park"]
+        if labels in ("combined", "retrieval"):
+            example_data["gold_docs"] = ["Alan Turing worked at Bletchley Park."]
+        trainset = [dspy.Example(**example_data).with_inputs("question")]
+        # Use GEPA itself with a one-evaluation budget, not an optimizer replacement.
+        saved_path = rt1.optimize(trainset, mode="gepa", num_trials=1)
+        assert saved_path.exists()
+        audit = json.loads(saved_path.with_name(f"{saved_path.stem}_graph_rlm_audit.json").read_text(encoding="utf-8"))
+        assert audit["eval_records"]
+        for row in audit["eval_records"]:
+            keys = ["r1", "r2", "r5", "r10", "r20"] if labels != "qa" else []
+            keys += ["em", "f1"] if labels != "retrieval" else []
+            product = 1.0
+            for key in keys:
+                product *= row[key]
+            assert row["score"] == pytest.approx(product ** (1 / len(keys)), abs=0.0001)
     finally:
-        if orig_gepa is not None:
-            dspy.GEPA = orig_gepa
+        rt1.stop()
 
     # 3. Start a brand-new YawRuntime and verify compiled_program.json restores all 5 surfaces
     fresh_prog, fresh_emb, _, _ = _make_program_and_embedder()
@@ -709,9 +678,7 @@ def test_optimize_and_reload_compiled_program_with_composite_fitness(tmp_path: P
         assert loaded_p.gbnf_max_facts == 3
         assert loaded_p.gbnf_max_reasoning_chars == 160
         assert rt2.engine.embedder.profile.query_prefix == "task: custom optimized query | query: "
-        assert (
-            rt2.engine.embedder.profile.fact_query_prefix == "task: custom optimized fact | query: "
-        )
+        assert rt2.engine.embedder.profile.fact_query_prefix == "task: custom optimized fact | query: "
         assert rt2.engine.embedder.profile.document_prefix == "title: custom | text: "
     finally:
         rt2.stop()
@@ -757,9 +724,7 @@ def test_cli_subcommands_sync_status_rebuild_and_stop(tmp_path: Path) -> None:
 
     # 4. Foreground daemon run + CLI stop from another thread
     run_thread = threading.Thread(
-        target=lambda: main(
-            ["daemon", "run", "--config", str(toml_path)], program=prog, embedder=emb
-        ),
+        target=lambda: main(["daemon", "run", "--config", str(toml_path)], program=prog, embedder=emb),
         daemon=True,
     )
     run_thread.start()
@@ -785,10 +750,12 @@ def test_cli_subcommands_sync_status_rebuild_and_stop(tmp_path: Path) -> None:
 
 def test_cli_optimize_ergonomics_and_anti_overfitting_gate(
     tmp_path: Path,
+    provider,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify `yaw dspy optimize` CLI ergonomics: benchmark slice parsing, train/val split, telemetry paths, and Tier 2 anti-overfitting guard."""
-    cfg, toml_path = _make_test_config(tmp_path)
+    """Verify `yaw dspy optimize` CLI ergonomics: benchmark slice parsing, train/val split, telemetry paths, and \
+Tier 2 anti-overfitting guard."""
+    cfg, toml_path = _make_test_config(tmp_path, base_url=provider[0])
     assert cfg.corpus_root is not None
     prog, emb, _, _ = _make_program_and_embedder()
 
@@ -911,10 +878,11 @@ def test_cli_optimize_ergonomics_and_anti_overfitting_gate(
 
 def test_cli_optimize_multi_dataset_interleaved_splits(
     tmp_path: Path,
+    provider,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Verify multi-dataset optimization: array of datasets, interleaved train/val splits, and budget allocation."""
-    _, toml_path = _make_test_config(tmp_path)
+    _, toml_path = _make_test_config(tmp_path, base_url=provider[0])
     prog, emb, _, _ = _make_program_and_embedder()
 
     # Create 3 synthetic datasets (each with 10 questions)
@@ -1015,10 +983,7 @@ def test_cli_status_reports_active_indexing_progress(tmp_path: Path) -> None:
     conn = open_yaw_db(cfg.db_path)
     try:
         # Seed 3 dummy openie records
-        records = [
-            OpenIERecord(chunk_id=f"chunk-{i}", entities=("E",), triples=(("A", "r", "B"),))
-            for i in range(3)
-        ]
+        records = [OpenIERecord(chunk_id=f"chunk-{i}", entities=("E",), triples=(("A", "r", "B"),)) for i in range(3)]
         save_openie_checkpoints(conn, records)
     finally:
         conn.close()
@@ -1073,9 +1038,7 @@ def test_cli_config_get_and_set(tmp_path: Path) -> None:
     # 3. Setting invalid value fails with INVALID_INPUT and preserves yaw.toml integrity
     err_buf = io.StringIO()
     with redirect_stderr(err_buf):
-        rc_err = main(
-            ["config", "set", "optimization.auto", "super_heavy", "--config", str(toml_path)]
-        )
+        rc_err = main(["config", "set", "optimization.auto", "super_heavy", "--config", str(toml_path)])
     assert rc_err == 1
     err_payload = json.loads(err_buf.getvalue())
     assert err_payload["error"] == "INVALID_INPUT"
@@ -1138,12 +1101,13 @@ def test_cli_dspy_load_program_hot_reload_live_and_staged(tmp_path: Path) -> Non
 
 def test_cli_dspy_optimize_sandbox_isolation_and_status(
     tmp_path: Path,
+    provider,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Verify `yaw dspy optimize` runs in an isolated sandbox concurrently with production daemon."""
     from yaw.daemon.cli import is_daemon_locked
 
-    cfg, toml_path = _make_test_config(tmp_path)
+    cfg, toml_path = _make_test_config(tmp_path, base_url=provider[0])
     prog, emb, _, _ = _make_program_and_embedder()
 
     # Start persistent production daemon holding yaw.db.lock
@@ -1161,9 +1125,7 @@ def test_cli_dspy_optimize_sandbox_isolation_and_status(
                         "id": "q1",
                         "question": "Question 1?",
                         "answer": ["Answer 1"],
-                        "paragraphs": [
-                            {"title": "Doc 1", "text": "Content 1.", "is_supporting": True}
-                        ],
+                        "paragraphs": [{"title": "Doc 1", "text": "Content 1.", "is_supporting": True}],
                     }
                 ]
             ),

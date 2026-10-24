@@ -68,13 +68,9 @@ def run_check(
                         print(f"[{name}] Running ({time.monotonic() - started:.0f}s)", flush=True)
                 result["status"] = "passed" if result["exit_code"] == 0 else "failed"
             except (subprocess.TimeoutExpired, KeyboardInterrupt) as exc:
-                result["status"] = (
-                    "interrupted" if isinstance(exc, KeyboardInterrupt) else "timeout"
-                )
+                result["status"] = "interrupted" if isinstance(exc, KeyboardInterrupt) else "timeout"
                 if process.poll() is None:
-                    process.send_signal(
-                        signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGINT
-                    )
+                    process.send_signal(signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGINT)
                     try:
                         process.wait(timeout=5)
                     except subprocess.TimeoutExpired:
@@ -101,10 +97,7 @@ def write_report(output: Path, report: dict) -> None:
         "| --- | --- | ---: | ---: |",
     ]
     for result in report["checks"]:
-        lines.append(
-            f"| {result['name']} | {result['status']} | "
-            f"{result.get('exit_code')} | {result['seconds']:.1f} |"
-        )
+        lines.append(f"| {result['name']} | {result['status']} | {result.get('exit_code')} | {result['seconds']:.1f} |")
     for name, diagnostics in report.get("diagnostics", {}).items():
         lines += [
             "",
@@ -114,8 +107,8 @@ def write_report(output: Path, report: dict) -> None:
     lines += [
         "",
         "Coverage describes only tests executed in this invocation. Incremental",
-        "coverage is not a full-suite coverage result. Fresh-process children are",
-        "not automatically included. Use --full for a fresh complete test pass.",
+        "coverage is not a full-suite coverage result. Python subprocess coverage",
+        "is enabled by the project .coveragerc. Use --full for a fresh complete test pass.",
         "",
     ]
     if "tests" in report:
@@ -141,9 +134,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--full", action="store_true", help="Run all tests, updating testmon data")
     parser.add_argument("--verbose", action="store_true", help="Stream complete tool diagnostics")
-    parser.add_argument(
-        "--live", action="store_true", help="Include resident-model inference tests"
-    )
+    parser.add_argument("--live", action="store_true", help="Compatibility option; resident-model tests always run")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/preflight"))
     parser.add_argument("--timeout", type=float, default=1800, help="Seconds per check; 0 disables")
     parser.add_argument("pytest_args", nargs=argparse.REMAINDER, help="Pytest arguments after --")
@@ -171,12 +162,11 @@ def main(argv: list[str] | None = None) -> int:
     mode = "full" if args.full else "incremental"
     report = {
         "mode": mode,
-        "live": args.live,
+        "live": True,
         "checks": [],
         "python": sys.version,
         "versions": {
-            name: version(name)
-            for name in ("ty", "ruff", "pytest", "pytest-testmon", "coverage", "pytest-cov")
+            name: version(name) for name in ("ty", "ruff", "pytest", "pytest-testmon", "coverage", "pytest-cov")
         },
         "lock_identity": identity,
     }
@@ -188,9 +178,11 @@ def main(argv: list[str] | None = None) -> int:
         "pytest",
         "--testmon",
         "--cov=yaw",
+        "--cov=benchmark",
+        "--cov=scripts",
         "--cov-report=term",
         f"--cov-report=json:{output / 'coverage.json'}",
-        f"--testmon-env=preflight-{identity}-live={args.live}",
+        f"--testmon-env=preflight-{identity}-all-tests",
         "-ra",
         "--tb=short",
         "--durations=10",
@@ -260,8 +252,7 @@ def main(argv: list[str] | None = None) -> int:
         report["report_errors"].append(f"Cannot read test/coverage report: {exc}")
     write_report(output, report)
     (base / "latest.json").write_text(
-        json.dumps({"report": str(output / "report.md"), "summary": str(output / "summary.json")})
-        + "\n",
+        json.dumps({"report": str(output / "report.md"), "summary": str(output / "summary.json")}) + "\n",
         encoding="utf-8",
     )
     print(f"\nReport: {output / 'report.md'}", flush=True)

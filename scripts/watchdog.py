@@ -29,9 +29,7 @@ from matplotlib.collections import LineCollection
 from matplotlib.lines import Line2D
 
 WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
-ARTIFACT_DIR = Path(
-    r"C:\Users\Harri.Ahokas\.gemini\antigravity\brain\3061c87c-9ec6-4ff5-b756-80b05e1c4342"
-)
+ARTIFACT_DIR = Path(r"C:\Users\Harri.Ahokas\.gemini\antigravity\brain\3061c87c-9ec6-4ff5-b756-80b05e1c4342")
 # Report figure order (Fig 1..5). Figs 3-5 are indexed by optimizer candidate, not wall-clock.
 FIG_FILES = (
     "knowledge_graph_extraction_dashboard.svg",
@@ -176,9 +174,7 @@ class PoolTelemetry:
             return "n/a"
         return f"{int(minutes // 60)}h {int(minutes % 60)}m"
 
-    def badge(
-        self, n_cands: int, n_evals: int, active: bool, active_op: str = ""
-    ) -> tuple[str, str]:
+    def badge(self, n_cands: int, n_evals: int, active: bool, active_op: str = "") -> tuple[str, str]:
         op_suffix = f" • {active_op}" if active_op and active else ""
         if n_cands:
             state = "OPTIMIZER RUNNING" if active else "OPTIMIZER STOPPED"
@@ -194,20 +190,12 @@ def _pareto_2d(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return []
     s = sorted(records, key=lambda r: (float(r["s_per_it"]), -float(r["gm_good"])))
     q = np.array([float(r["gm_good"]) for r in s])
-    return [
-        r
-        for r, k in zip(
-            s, np.concatenate(([True], q[1:] > np.maximum.accumulate(q)[:-1])), strict=True
-        )
-        if k
-    ]
+    return [r for r, k in zip(s, np.concatenate(([True], q[1:] > np.maximum.accumulate(q)[:-1])), strict=True) if k]
 
 
 def get_lemonade_server_metrics() -> dict[str, Any]:
     try:
-        req = urllib.request.Request(
-            "http://localhost:13305/metrics", headers={"Authorization": "Bearer lemonade"}
-        )
+        req = urllib.request.Request("http://localhost:13305/metrics", headers={"Authorization": "Bearer lemonade"})
         with urllib.request.urlopen(req, timeout=1.0) as resp:
             m = {
                 p[0]: float(p[1])
@@ -349,9 +337,7 @@ def get_empirical_telemetry_timeseries(
     return samples
 
 
-def _open_ro_sqlite(
-    db_path: Path, backoff: tuple[float, ...] = (1.0, 2.0, 3.0)
-) -> sqlite3.Connection | None:
+def _open_ro_sqlite(db_path: Path, backoff: tuple[float, ...] = (1.0, 2.0, 3.0)) -> sqlite3.Connection | None:
     # Never use `immutable=1`: the optimizer writes this DB concurrently (rollback journal), and
     # immutable readers skip locking/journal checks and serve stale or torn pages.
     for i in range(len(backoff) + 1):
@@ -476,15 +462,12 @@ def get_active_sandbox_info() -> dict[str, Any]:
             )
             lbl_counts = dict(
                 conn.execute(
-                    "SELECT entity_id, COUNT(DISTINCT label_norm) "
-                    "FROM entity_labels GROUP BY entity_id"
+                    "SELECT entity_id, COUNT(DISTINCT label_norm) FROM entity_labels GROUP BY entity_id"
                 ).fetchall()
             )
             entity_details = {
                 str(r[0]): (str(r[1]), str(r[2]), max(1, int(lbl_counts.get(r[0], 1))))
-                for r in conn.execute(
-                    "SELECT entity_id, name, COALESCE(definition, '') FROM entities"
-                ).fetchall()
+                for r in conn.execute("SELECT entity_id, name, COALESCE(definition, '') FROM entities").fetchall()
             }
             graph_edges = [
                 (str(r[0]), str(r[1]), str(r[2]))
@@ -537,9 +520,7 @@ def get_active_sandbox_info() -> dict[str, Any]:
                         raw_counts[s] += 1
                         raw_counts[o] += 1
             if idx >= len(rows) - 4:
-                recent.append(
-                    {"chunk_id": cid, "entity_count": len(ents), "triple_count": len(trips)}
-                )
+                recent.append({"chunk_id": cid, "entity_count": len(ents), "triple_count": len(trips)})
 
         info["counts"] = counts
         info["indexed_chunk_ids"] = {str(r[0]) for r in rows}
@@ -675,9 +656,7 @@ def read_config_info() -> dict[str, Any]:
     with contextlib.suppress(Exception):
         import tomllib
 
-        return tomllib.loads((WORKSPACE_ROOT / "yaw.toml").read_text("utf-8")).get(
-            "optimization", {}
-        )
+        return tomllib.loads((WORKSPACE_ROOT / "yaw.toml").read_text("utf-8")).get("optimization", {})
     return {
         "mode": "hybrid",
         "datasets": ["enterprise_rag_bench"],
@@ -980,14 +959,8 @@ def generate_graph_projection_svg(
     idx = {eid: i for i, eid in enumerate(nodes)}
 
     # Segment lists
-    diff_segs = [
-        [idx[u], idx[v]]
-        for u, v, k in all_edges
-        if k == "owl:differentFrom" and u in idx and v in idx
-    ]
-    rel_segs = [
-        [idx[u], idx[v]] for u, v, k in all_edges if k == "skos:related" and u in idx and v in idx
-    ]
+    diff_segs = [[idx[u], idx[v]] for u, v, k in all_edges if k == "owl:differentFrom" and u in idx and v in idx]
+    rel_segs = [[idx[u], idx[v]] for u, v, k in all_edges if k == "skos:related" and u in idx and v in idx]
     fact_segs = [[idx[u], idx[v]] for u, v, k in all_edges if k == "fact" and u in idx and v in idx]
     active_edge_arr = (
         np.array(diff_segs + rel_segs + fact_segs, dtype=int)
@@ -1164,9 +1137,7 @@ def generate_graph_projection_svg(
             edgecolors.append("#1e293b")
             lws.append(0.5)
 
-    ax.scatter(
-        pos[:, 0], pos[:, 1], s=sizes, c=colors, edgecolors=edgecolors, linewidths=lws, zorder=4
-    )
+    ax.scatter(pos[:, 0], pos[:, 1], s=sizes, c=colors, edgecolors=edgecolors, linewidths=lws, zorder=4)
 
     # Entity Name Labels:
     # Show entity names exclusively for both ends of owl:differentFrom disambiguation;
@@ -1406,9 +1377,7 @@ def generate_candidate_score_svg(
     ax2.set_ylim(0.0, max(1.0, float(lat.max()) * 1.3))
     if len(cands) <= 40:
         for c, li in zip(cands, lat, strict=True):
-            ax2.text(
-                c["cand"], li, f"n={c['n']}", ha="center", va="bottom", fontsize=7, color="#cbd5e1"
-            )
+            ax2.text(c["cand"], li, f"n={c['n']}", ha="center", va="bottom", fontsize=7, color="#cbd5e1")
     ax2.set_ylabel("Latency (s / eval)", color="#f43f5e", fontweight="bold")
     ax2.legend(loc="upper left", fontsize=8)
     _candidate_xaxis(ax2, cands, legacy)
@@ -1475,9 +1444,7 @@ def generate_candidate_quality_svg(
         ms=ms,
         label="QA F1",
     )
-    ax2.plot(
-        x, [c["em"] * 100.0 for c in cands], color="#fbbf24", lw=1.0, marker="s", ms=ms, label="EM"
-    )
+    ax2.plot(x, [c["em"] * 100.0 for c in cands], color="#fbbf24", lw=1.0, marker="s", ms=ms, label="EM")
     ax2.set_ylabel("Mean QA Score", color="#f43f5e", fontweight="bold")
     ax2.legend(loc="lower right", bbox_to_anchor=(1.0, 1.0), ncol=2, fontsize=8)
     _candidate_xaxis(ax2, cands, legacy)
@@ -1648,11 +1615,7 @@ def generate_report_markdown(
             db_s = db.strip()[:110] or "n/a"
             items.append(f"- **`{na}`** ≠ **`{nb}`**\n  - A: *{da_s}*\n  - B: *{db_s}*")
         total_pairs = len(diff_from_rows)
-        trunc = (
-            f"\n*(Showing 10 of {total_pairs} active disambiguation pairs)*\n"
-            if total_pairs > 10
-            else "\n"
-        )
+        trunc = f"\n*(Showing 10 of {total_pairs} active disambiguation pairs)*\n" if total_pairs > 10 else "\n"
         assertions_md = (
             "### Graph Assertions for Intervention\n"
             "*If an `owl:differentFrom` assertion below is false, it is an intervention "
@@ -1662,9 +1625,7 @@ def generate_report_markdown(
         related_items = []
         for _ea, na, da, _eb, nb, db in related_assertions:
             related_items.append(
-                f"- **`{na}`** ↔ **`{nb}`**\n"
-                f"  - A: *{da.strip()[:110] or 'n/a'}*\n"
-                f"  - B: *{db.strip()[:110] or 'n/a'}*"
+                f"- **`{na}`** ↔ **`{nb}`**\n  - A: *{da.strip()[:110] or 'n/a'}*\n  - B: *{db.strip()[:110] or 'n/a'}*"
             )
         assertions_md += (
             "### Most Recent `skos:related` Assertions\n\n"
@@ -1701,11 +1662,7 @@ def generate_report_markdown(
 
 @contextlib.contextmanager
 def _suspended_llama(reason: str):
-    targets = [
-        p
-        for p in psutil.process_iter(["pid", "name"])
-        if "llama-server" in (p.info.get("name") or "").lower()
-    ]
+    targets = [p for p in psutil.process_iter(["pid", "name"]) if "llama-server" in (p.info.get("name") or "").lower()]
     if targets:
         ts = f"{datetime.now(UTC):%H:%M:%S}"
         print(
@@ -1723,9 +1680,7 @@ def _suspended_llama(reason: str):
                 p.resume()
 
 
-def check_thermal_guard(
-    crisis_temp: float = 82.0, target_temp: float = 72.0, max_pause_sec: int = 300
-) -> bool:
+def check_thermal_guard(crisis_temp: float = 82.0, target_temp: float = 72.0, max_pause_sec: int = 300) -> bool:
     if (temp := get_gpu_temperature()) is None or temp < crisis_temp:
         return False
     with _suspended_llama(f"GPU {temp:.1f}°C >= {crisis_temp:.1f}°C") as active:
@@ -1758,9 +1713,7 @@ def run_once(
         (FIG_FILES[0], lambda d: generate_kg_dashboard_svg(d, sb, cfg)),
         (
             FIG_FILES[1],
-            lambda d: generate_graph_projection_svg(
-                d, sb, badge, layout_iterations=layout_iterations
-            ),
+            lambda d: generate_graph_projection_svg(d, sb, badge, layout_iterations=layout_iterations),
         ),
         (FIG_FILES[2], lambda d: generate_candidate_score_svg(d, cands, legacy, badge, sb)),
         (FIG_FILES[3], lambda d: generate_candidate_quality_svg(d, cands, legacy, badge, sb)),
@@ -1776,9 +1729,7 @@ def run_once(
                 f"[{datetime.now(UTC):%H:%M:%S}] {name} failed: {type(exc).__name__}: {exc}",
                 flush=True,
             )
-    generate_report_markdown(
-        ARTIFACT_DIR / "benchmark_mobile_report.md", sb, cands, n_evals, legacy, badge
-    )
+    generate_report_markdown(ARTIFACT_DIR / "benchmark_mobile_report.md", sb, cands, n_evals, legacy, badge)
     return sb, cands, n_evals, badge
 
 

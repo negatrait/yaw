@@ -467,9 +467,7 @@ def test_benchmark_json_air_gapping_and_exact_passage_hydration(tmp_path: Path) 
                 ],
                 [
                     "Rockland County",
-                    [
-                        "Rockland County is the southernmost county on the west side of the Hudson River."
-                    ],
+                    ["Rockland County is the southernmost county on the west side of the Hudson River."],
                 ],
             ],
         }
@@ -496,12 +494,7 @@ def test_benchmark_json_air_gapping_and_exact_passage_hydration(tmp_path: Path) 
         hydrated_texts.append(hp.text)
 
     expected_p1 = (
-        "Montebello\n"
-        "Montebello is an incorporated village in the town of Ramapo."
-        "It is in Rockland County, New York."
+        "Montebello\nMontebello is an incorporated village in the town of Ramapo.It is in Rockland County, New York."
     )
-    expected_p2 = (
-        "Rockland County\n"
-        "Rockland County is the southernmost county on the west side of the Hudson River."
-    )
+    expected_p2 = "Rockland County\nRockland County is the southernmost county on the west side of the Hudson River."
     assert hydrated_texts == [expected_p1, expected_p2]

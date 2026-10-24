@@ -94,9 +94,7 @@ def build_parser() -> argparse.ArgumentParser:
     # -------------------------------------------------------------------------
     # 2. yaw graph {build|rebuild|lint}
     # -------------------------------------------------------------------------
-    p_graph = domain_subparsers.add_parser(
-        "graph", help="Standalone graph and corpus index commands"
-    )
+    p_graph = domain_subparsers.add_parser("graph", help="Standalone graph and corpus index commands")
     graph_subs = p_graph.add_subparsers(dest="action", help="Graph action")
 
     graph_subs.add_parser(
@@ -190,21 +188,24 @@ def build_parser() -> argparse.ArgumentParser:
         dest="sleep_seconds",
         type=float,
         default=None,
-        help="Sleep pause in seconds between LLM/embedding calls to manage thermal duty cycles (defaults to yaw.toml [optimization].sleep_seconds, default 0.0)",
+        help="Sleep pause in seconds between LLM/embedding calls to manage thermal duty cycles "
+        "(defaults to yaw.toml [optimization].sleep_seconds, default 0.0)",
     )
     p_opt_common.add_argument(
         "--max-bootstrapped-demos",
         dest="max_bootstrapped_demos",
         type=int,
         default=None,
-        help="Maximum bootstrapped demonstrations for MIPROv2 (defaults to yaw.toml [optimization].max_bootstrapped_demos, 0 to disable)",
+        help="Maximum bootstrapped demonstrations for MIPROv2 (defaults to yaw.toml "
+        "[optimization].max_bootstrapped_demos, 0 to disable)",
     )
     p_opt_common.add_argument(
         "--max-labeled-demos",
         dest="max_labeled_demos",
         type=int,
         default=None,
-        help="Maximum labeled demonstrations for MIPROv2 (defaults to yaw.toml [optimization].max_labeled_demos, 0 to disable)",
+        help="Maximum labeled demonstrations for MIPROv2 (defaults to yaw.toml "
+        "[optimization].max_labeled_demos, 0 to disable)",
     )
     p_opt_common.add_argument(
         "--db",
@@ -220,9 +221,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Resume the newest optimization run (or the run selected by --db-path)",
     )
 
-    p_dspy = domain_subparsers.add_parser(
-        "dspy", help="DSPy prompt optimization and program management"
-    )
+    p_dspy = domain_subparsers.add_parser("dspy", help="DSPy prompt optimization and program management")
     dspy_subs = p_dspy.add_subparsers(dest="action", help="DSPy action")
 
     dspy_subs.add_parser(
@@ -299,6 +298,10 @@ def is_daemon_locked(config: YawConfig) -> bool:
         return False
 
 
+def _nonnegative_status_count(value: Any, fallback: int = 0) -> int:
+    return value if type(value) is int and value >= 0 else fallback
+
+
 def _inspect_active_optimization(config: YawConfig) -> dict[str, Any] | None:
     """Detect if any sandbox yaw_optimize_*.db.lock is currently locked and read its live progress."""
     if not config.lock_path:
@@ -337,17 +340,27 @@ def _inspect_active_optimization(config: YawConfig) -> dict[str, Any] | None:
             snap: dict[str, Any] = {}
             if status_file.exists():
                 with contextlib.suppress(Exception):
-                    snap = json.loads(status_file.read_text(encoding="utf-8"))
+                    parsed = json.loads(status_file.read_text(encoding="utf-8"))
+                    if isinstance(parsed, dict):
+                        snap = parsed
+
+            stats = snap.get("stats", {})
+            if not isinstance(stats, dict):
+                stats = {}
+            status = snap.get("status", {})
+            if not isinstance(status, dict):
+                status = {}
+            active_op = status.get("active_op")
+            if not isinstance(active_op, str) or not active_op:
+                active_op = "optimizing"
 
             return {
                 "active": True,
                 "datestamp": ds,
                 "sandbox_db": str(opt_db),
-                "openie_checkpoints": max(
-                    openie, snap.get("stats", {}).get("openie_checkpoints", 0)
-                ),
-                "active_op": snap.get("status", {}).get("active_op", "optimizing"),
-                "status": snap.get("status", {}),
+                "openie_checkpoints": max(openie, _nonnegative_status_count(stats.get("openie_checkpoints"))),
+                "active_op": active_op,
+                "status": status,
             }
     return None
 
@@ -375,10 +388,18 @@ def inspect_status(config: YawConfig) -> dict[str, Any]:
     if running and config.status_path and Path(config.status_path).exists():
         with contextlib.suppress(OSError, json.JSONDecodeError):
             data = json.loads(Path(config.status_path).read_text(encoding="utf-8"))
-            if isinstance(data, dict) and "status" in data and "stats" in data:
+            if (
+                isinstance(data, dict)
+                and isinstance(data.get("status"), dict)
+                and isinstance(data.get("stats"), dict)
+                and data["status"].get("lifecycle") in ("stopped", "starting", "ready", "degraded", "stopping")
+            ):
                 data["stats"]["openie_checkpoints"] = max(
-                    openie, data["stats"].get("openie_checkpoints", 0)
+                    openie, _nonnegative_status_count(data["stats"].get("openie_checkpoints"))
                 )
+                data["stats"]["chunks"] = _nonnegative_status_count(data["stats"].get("chunks"), chunks)
+                if not isinstance(data["status"].get("active_op"), (str, type(None))):
+                    data["status"]["active_op"] = None
                 data["stats"].setdefault("entity_labels", entity_labels)
                 data["stats"].setdefault("shacl_conforms", shacl_conforms)
                 if not data["status"].get("active_op") and openie > data["stats"].get("chunks", 0):
@@ -455,12 +476,7 @@ def _extract_item_docs_and_gold(
     item: dict[str, Any],
     dataset_name: str = "",
 ) -> tuple[list[str], list[str]]:
-    if (
-        "gold_docs" in item
-        and "paragraphs" not in item
-        and "context" not in item
-        and "contexts" not in item
-    ):
+    if "gold_docs" in item and "paragraphs" not in item and "context" not in item and "contexts" not in item:
         g_docs = [str(d) for d in item.get("gold_docs", ())]
         return g_docs, g_docs
 
@@ -504,7 +520,8 @@ def _load_single_dataset_examples(
     if (ds_clean in _TIER2_CORPORA or ds_lower in _TIER2_CORPORA) and max_queries > 50:
         raise YawRuntimeError(
             "INVALID_INPUT",
-            f"Anti-overfitting policy forbids prompt evolution on >50 queries of Tier 2 dataset '{ds_clean}' (got max_queries={max_queries}).",
+            f"Anti-overfitting policy forbids prompt evolution on >50 queries "
+            f"of Tier 2 dataset '{ds_clean}' (got max_queries={max_queries}).",
         )
 
     candidate_path = Path(ds_clean)
@@ -833,24 +850,19 @@ def handle_dspy_optimize(
         # Read metadata before loading datasets, so bare --resume can recover
         # the original slice and budget even when they were CLI overrides.
         assert opt_config.db_path is not None
-        with contextlib.closing(
-            sqlite3.connect(opt_config.db_path.as_uri() + "?mode=ro", uri=True)
-        ) as conn:
+        with contextlib.closing(sqlite3.connect(opt_config.db_path.as_uri() + "?mode=ro", uri=True)) as conn:
             row = conn.execute("SELECT value FROM meta WHERE key = 'optimization_run'").fetchone()
         if row is not None:
             saved_run = json.loads(row[0])
             saved_output = Path(saved_run["output_path"])
             if out_override and Path(out_override).resolve() != saved_output:
-                raise YawRuntimeError(
-                    "INVALID_INPUT", f"Resume must use the original output path: {saved_output}"
-                )
+                raise YawRuntimeError("INVALID_INPUT", f"Resume must use the original output path: {saved_output}")
             out_override = str(saved_output)
             for key, value in saved_run.get("cli_options", {}).items():
                 if getattr(args, key, None) is None:
                     setattr(args, key, value)
         print(
-            f"[yaw optimize] Resuming {opt_config.db_path}; "
-            f"output={out_override or opt_config.compiled_program_path}",
+            f"[yaw optimize] Resuming {opt_config.db_path}; output={out_override or opt_config.compiled_program_path}",
             file=sys.stderr,
             flush=True,
         )
@@ -875,14 +887,10 @@ def handle_dspy_optimize(
     max_queries = int(raw_max_q if raw_max_q is not None else (config.optimize_max_queries or 20))
 
     raw_offset = getattr(args, "query_offset", None)
-    query_offset = int(
-        raw_offset if raw_offset is not None else (config.optimize_query_offset or 0)
-    )
+    query_offset = int(raw_offset if raw_offset is not None else (config.optimize_query_offset or 0))
 
     raw_train_q = getattr(args, "train_queries", None)
-    train_queries = int(
-        raw_train_q if raw_train_q is not None else (config.optimize_train_queries or 7)
-    )
+    train_queries = int(raw_train_q if raw_train_q is not None else (config.optimize_train_queries or 7))
 
     raw_auto = getattr(args, "auto", None)
     auto = raw_auto or config.optimize_auto or "light"
@@ -907,21 +915,15 @@ def handle_dspy_optimize(
     # Resolution order for sandbox: always isolate prompt compilation
     dspy.settings.configure(provide_traceback=True)
     raw_sleep = getattr(args, "sleep_seconds", None)
-    sleep_seconds = (
-        float(raw_sleep) if raw_sleep is not None else float(config.optimize_sleep_seconds or 0.0)
-    )
+    sleep_seconds = float(raw_sleep) if raw_sleep is not None else float(config.optimize_sleep_seconds or 0.0)
     object.__setattr__(opt_config, "optimize_sleep_seconds", sleep_seconds)
 
     raw_bootstrapped = getattr(args, "max_bootstrapped_demos", None)
     max_bootstrapped_demos = (
-        int(raw_bootstrapped)
-        if raw_bootstrapped is not None
-        else int(config.optimize_max_bootstrapped_demos or 0)
+        int(raw_bootstrapped) if raw_bootstrapped is not None else int(config.optimize_max_bootstrapped_demos or 0)
     )
     raw_labeled = getattr(args, "max_labeled_demos", None)
-    max_labeled_demos = (
-        int(raw_labeled) if raw_labeled is not None else int(config.optimize_max_labeled_demos or 0)
-    )
+    max_labeled_demos = int(raw_labeled) if raw_labeled is not None else int(config.optimize_max_labeled_demos or 0)
     object.__setattr__(opt_config, "optimize_max_bootstrapped_demos", max_bootstrapped_demos)
     object.__setattr__(opt_config, "optimize_max_labeled_demos", max_labeled_demos)
 
@@ -969,26 +971,14 @@ def handle_dspy_optimize(
             with contextlib.suppress(Exception):
                 raw_eval = json.loads(val_eval_file.read_text(encoding="utf-8"))
                 if isinstance(raw_eval, list) and raw_eval:
-                    f1_scores = [
-                        float(it.get("f1", it.get("score", 0.0)))
-                        for it in raw_eval
-                        if isinstance(it, dict)
-                    ]
-                    em_scores = [
-                        float(it.get("em", 0.0)) for it in raw_eval if isinstance(it, dict)
-                    ]
-                    apm_scores = [
-                        float(it.get("answer_passage_match", 0.0))
-                        for it in raw_eval
-                        if isinstance(it, dict)
-                    ]
+                    f1_scores = [float(it.get("f1", it.get("score", 0.0))) for it in raw_eval if isinstance(it, dict)]
+                    em_scores = [float(it.get("em", 0.0)) for it in raw_eval if isinstance(it, dict)]
+                    apm_scores = [float(it.get("answer_passage_match", 0.0)) for it in raw_eval if isinstance(it, dict)]
                     eval_summary = {
                         "num_evaluated": len(raw_eval),
                         "mean_f1": (sum(f1_scores) / len(f1_scores) if f1_scores else 0.0),
                         "mean_em": (sum(em_scores) / len(em_scores) if em_scores else 0.0),
-                        "answer_passage_match_rate": (
-                            sum(apm_scores) / len(apm_scores) if apm_scores else 0.0
-                        ),
+                        "answer_passage_match_rate": (sum(apm_scores) / len(apm_scores) if apm_scores else 0.0),
                     }
         payload: dict[str, Any] = {
             "optimized": True,
@@ -1002,13 +992,9 @@ def handle_dspy_optimize(
             "val_eval_path": str(val_eval_file) if val_eval_file.exists() else None,
             "eval_summary": eval_summary,
             "sandbox_db_path": str(opt_config.db_path),
-            "proposer_telemetry_path": (
-                str(proposer_telemetry) if proposer_telemetry.exists() else None
-            ),
+            "proposer_telemetry_path": (str(proposer_telemetry) if proposer_telemetry.exists() else None),
             "graph_rlm_audit_path": (str(graph_rlm_audit) if graph_rlm_audit.exists() else None),
-            "gepa_telemetry_dir": (
-                str(gepa_telemetry_dir) if gepa_telemetry_dir.exists() else None
-            ),
+            "gepa_telemetry_dir": (str(gepa_telemetry_dir) if gepa_telemetry_dir.exists() else None),
             "stats": runtime.stats().to_dict(),
         }
         sys.stdout.write(json.dumps(payload, indent=2) + "\n")
@@ -1031,9 +1017,7 @@ def handle_dspy_load_program(
         if not isinstance(content, dict):
             raise ValueError("Root JSON must be a dictionary object")
     except Exception as exc:
-        raise YawRuntimeError(
-            "INVALID_INPUT", f"Invalid compiled program JSON in {src}: {exc}"
-        ) from exc
+        raise YawRuntimeError("INVALID_INPUT", f"Invalid compiled program JSON in {src}: {exc}") from exc
 
     target_path = (
         Path(config.compiled_program_path).resolve()
@@ -1091,7 +1075,8 @@ def handle_dspy_load_program(
                     "staged": True,
                     "program_path": str(target_path),
                     "source_path": str(src),
-                    "message": "Signal written; daemon did not acknowledge before timeout. Program staged for next startup.",
+                    "message": "Signal written; daemon did not acknowledge before timeout. Program staged for next "
+                    "startup.",
                 },
                 indent=2,
             )
@@ -1106,7 +1091,8 @@ def handle_dspy_load_program(
                 "staged": True,
                 "compiled_program_path": str(target_path),
                 "source_path": str(src),
-                "message": "Daemon is not running. Program promoted to compiled_program_path and will load on next daemon start.",
+                "message": "Daemon is not running. Program promoted to compiled_program_path and will load on next "
+                "daemon start.",
             },
             indent=2,
         )
@@ -1213,9 +1199,7 @@ def main(
             if action == "get":
                 return handle_config_get(config, key=args.key, config_path=cfg_path)
             if action == "set":
-                return handle_config_set(
-                    config, key=args.key, value_raw=args.value, config_path=cfg_path
-                )
+                return handle_config_set(config, key=args.key, value_raw=args.value, config_path=cfg_path)
 
         parser.print_help(sys.stderr)
         return 2

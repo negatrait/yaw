@@ -79,9 +79,7 @@ def test_optimization_custom_database_has_stable_paths(tmp_path: Path) -> None:
     second = cfg.for_optimization("20300101_000000", db_override=database)
     assert first == second
     assert first.lock_path == database.with_suffix(".db.lock")
-    assert first.compiled_program_path == (
-        database.parent / "compiled_program_optimize_experiment.json"
-    )
+    assert first.compiled_program_path == (database.parent / "compiled_program_optimize_experiment.json")
 
 
 def test_config_get_and_set_values(tmp_path: Path) -> None:
@@ -98,9 +96,7 @@ qa_model = "Qwen3-4B-Instruct-2507-GGUF"
     )
 
     # 1. get specific keys
-    auto_val = get_config_value(
-        path=toml_file, key="optimization.auto", workspace_override=tmp_path
-    )
+    auto_val = get_config_value(path=toml_file, key="optimization.auto", workspace_override=tmp_path)
     assert auto_val == "light"
 
     # Alias check
@@ -118,10 +114,7 @@ qa_model = "Qwen3-4B-Instruct-2507-GGUF"
     assert val == "heavy"
 
     # Verify updated
-    assert (
-        get_config_value(path=toml_file, key="optimization.auto", workspace_override=tmp_path)
-        == "heavy"
-    )
+    assert get_config_value(path=toml_file, key="optimization.auto", workspace_override=tmp_path) == "heavy"
 
     # 3. get all keys
     all_cfg = get_config_value(path=toml_file, workspace_override=tmp_path)

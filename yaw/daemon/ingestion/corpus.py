@@ -117,9 +117,7 @@ class _ChunkTargetHandler(coco.TargetHandler[_ChunkValue, bytes]):
     def __init__(self) -> None:
         self._sink = coco.TargetActionSink.from_fn(self._apply_actions)
 
-    def _apply_actions(
-        self, context_provider: coco.ContextProvider, actions: Sequence[_ChunkAction]
-    ) -> None:
+    def _apply_actions(self, context_provider: coco.ContextProvider, actions: Sequence[_ChunkAction]) -> None:
         compiler = context_provider.get(_COMPILER_KEY)
         if compiler is not None and actions:
             added_chunks: list[tuple[ChunkPointer, str]] = []
@@ -249,9 +247,7 @@ def _extract_markdown_ast_headings(source: str | CodeSource) -> list[tuple[int, 
                     m_atx = _ATX_HEADING_RE.match(first_line)
                     if m_atx is not None:
                         headings_by_line[seg.start_line] = (m_atx.group(1) or "").strip()
-                    elif (
-                        len(seg_lines) >= 2 and _SETEXT_UNDERLINE_RE.match(seg_lines[1]) is not None
-                    ):
+                    elif len(seg_lines) >= 2 and _SETEXT_UNDERLINE_RE.match(seg_lines[1]) is not None:
                         headings_by_line[seg.start_line] = first_line
 
         if not in_ast_code_fence:
@@ -369,11 +365,7 @@ def extract_ast_headings(
         if content_len > 0:
             view = _coco_core.render_ranges(code_src._src, [(pos, pos + content_len)])
             for seg in view.segments:
-                if (
-                    seg.kind == "frame"
-                    and seg.summary is None
-                    and seg.start_line not in headings_by_line
-                ):
+                if seg.kind == "frame" and seg.summary is None and seg.start_line not in headings_by_line:
                     seg_text = src_text[seg.start_char_offset : seg.end_char_offset].strip()
                     first_sig = seg_text.splitlines()[0].strip() if seg_text else ""
                     first_sig = first_sig.rstrip("{:").strip()
@@ -442,7 +434,7 @@ def project_json_records(
     whitelist: Sequence[str] = ("*",),
     blacklist: Sequence[str] = (),
 ) -> list[tuple[str, str, int, int]]:
-    """Project JSON/JSONL records via CocoIndex Tree-sitter AST key filtering into (title, body, s_line, e_line) tuples."""
+    "Project JSON/JSONL records via CocoIndex Tree-sitter AST key filtering into (title, body, s_line, e_line) tuples."
     if isinstance(content, CodeSource):
         clean_text = content.text
         src = content
@@ -462,10 +454,7 @@ def project_json_records(
             src = CodeSource(clean_text, language="json")
 
     obj_spans = sorted(
-        (
-            (m.chunks[0].start.byte_offset, m.chunks[0].end.byte_offset)
-            for m in _JSON_OBJ_PATTERN.match_source(src)
-        ),
+        ((m.chunks[0].start.byte_offset, m.chunks[0].end.byte_offset) for m in _JSON_OBJ_PATTERN.match_source(src)),
         key=lambda x: (x[0], -x[1]),
     )
     if not obj_spans:
@@ -552,13 +541,7 @@ def project_json_records(
             v_raw = val_chunk.text.strip()
 
             is_bl = any(fnmatchcase(dotted, pat) or fnmatchcase(key, pat) for pat in blacklist)
-            if (
-                not is_bl
-                and blacklist
-                and len(v_raw) >= 2
-                and v_raw.startswith('"')
-                and v_raw.endswith('"')
-            ):
+            if not is_bl and blacklist and len(v_raw) >= 2 and v_raw.startswith('"') and v_raw.endswith('"'):
                 v_unesc = _unescape_json_str(v_raw[1:-1])
                 if any(fnmatchcase(v_unesc, pat) for pat in blacklist):
                     is_bl = True
@@ -569,8 +552,7 @@ def project_json_records(
 
             stack.append((key, p_e))
             is_wl = not whitelist or any(
-                fnmatchcase(dotted, pat) or fnmatchcase(key, pat) or pat.startswith(f"{dotted}.")
-                for pat in whitelist
+                fnmatchcase(dotted, pat) or fnmatchcase(key, pat) or pat.startswith(f"{dotted}.") for pat in whitelist
             )
             if is_wl:
                 kept_pairs.append((key, dotted, p_s, p_e, v_s, v_e, v_raw))
@@ -590,10 +572,7 @@ def project_json_records(
             parent_dotted = ""
             for k, d, p_s, p_e, _vs, _ve, v_raw in kept_pairs:
                 if sub_s < p_s and p_e < sub_e:
-                    if any(
-                        sub_s < in_s and in_e < sub_e and in_s < p_s and p_e < in_e
-                        for in_s, in_e in nested_objs
-                    ):
+                    if any(sub_s < in_s and in_e < sub_e and in_s < p_s and p_e < in_e for in_s, in_e in nested_objs):
                         continue
                     if len(v_raw) >= 2 and v_raw.startswith('"') and v_raw.endswith('"'):
                         direct_str[k] = _unescape_json_str(v_raw[1:-1])
@@ -601,11 +580,7 @@ def project_json_records(
                             parent_dotted = d.rsplit(".", 1)[0]
             if parent_dotted == "document.summary":
                 continue
-            sub_body = (
-                direct_str.get("text")
-                or direct_str.get("paragraph_text")
-                or direct_str.get("contents")
-            )
+            sub_body = direct_str.get("text") or direct_str.get("paragraph_text") or direct_str.get("contents")
             if sub_body is not None:
                 sub_title = direct_str.get("title", "")
                 s_line = line_of_byte(sub_s)
@@ -614,9 +589,7 @@ def project_json_records(
 
         # 2. 2-Tuple passages [title, [sents...]] under surviving "context"
         if not extracted and obj_tuples:
-            ctx_spans = [
-                (v_s, v_e) for k, _d, _ps, _pe, v_s, v_e, _vr in kept_pairs if k == "context"
-            ]
+            ctx_spans = [(v_s, v_e) for k, _d, _ps, _pe, v_s, v_e, _vr in kept_pairs if k == "context"]
             sep = "" if is_hotpot else " "
             seen_tuple_spans: set[tuple[int, int]] = set()
             for c_vs, c_ve in ctx_spans:
@@ -625,11 +598,7 @@ def project_json_records(
                     te = tm.chunks[0].end.byte_offset
                     if (ts, te) in seen_tuple_spans:
                         continue
-                    if (
-                        c_vs <= ts
-                        and te <= c_ve
-                        and not any(b_s <= ts and te <= b_e for b_s, b_e in blacklisted_spans)
-                    ):
+                    if c_vs <= ts and te <= c_ve and not any(b_s <= ts and te <= b_e for b_s, b_e in blacklisted_spans):
                         seen_tuple_spans.add((ts, te))
                         try:
                             parsed_tuple = json.loads(tm.chunks[0].text)
@@ -663,24 +632,12 @@ def project_json_records(
             s_line = line_of_byte(o_s)
             e_line = line_of_byte(o_e)
             if "context" in dotted_str_map and "### Passage" in dotted_str_map["context"]:
-                parts = [
-                    p.strip()
-                    for p in _LVEVAL_SPLIT_RE.split(dotted_str_map["context"])
-                    if p.strip()
-                ]
+                parts = [p.strip() for p in _LVEVAL_SPLIT_RE.split(dotted_str_map["context"]) if p.strip()]
                 for p in parts:
                     extracted.append(("", p, s_line, e_line))
             elif "document.summary.text" in dotted_str_map or "document.text" in dotted_str_map:
-                doc_title = (
-                    dotted_str_map.get("document.summary.title")
-                    or dotted_str_map.get("document.title")
-                    or ""
-                )
-                doc_body = (
-                    dotted_str_map.get("document.summary.text")
-                    or dotted_str_map.get("document.text")
-                    or ""
-                )
+                doc_title = dotted_str_map.get("document.summary.title") or dotted_str_map.get("document.title") or ""
+                doc_body = dotted_str_map.get("document.summary.text") or dotted_str_map.get("document.text") or ""
                 if doc_body:
                     extracted.append((doc_title, doc_body, s_line, e_line))
 
@@ -772,8 +729,7 @@ def chunk_json_text(
         clean_body = body_i.replace("\r\n", "\n").rstrip("\n")
         passage_text = (
             f"{clean_title}\n{clean_body}"
-            if clean_title
-            and not (clean_body.startswith(f"{clean_title}\n") or clean_body == clean_title)
+            if clean_title and not (clean_body.startswith(f"{clean_title}\n") or clean_body == clean_title)
             else clean_body
         )
 
@@ -818,11 +774,7 @@ def chunk_json_text(
 
         for sc in sub_chunks:
             sc_text = sc.text
-            if (
-                clean_title
-                and not sc_text.startswith(f"{clean_title}\n")
-                and sc_text.strip() != clean_title
-            ):
+            if clean_title and not sc_text.startswith(f"{clean_title}\n") and sc_text.strip() != clean_title:
                 sc_text = f"{clean_title}\n{sc_text.lstrip()}"
             sub_s = max(rec_start, rec_start + sc.start.line - 1)
             sub_e = min(
@@ -861,10 +813,7 @@ def resolve_ast_island_bounds(
     for i, (h_line, _) in enumerate(headings):
         if h_line <= line:
             ast_start = h_line
-            if i + 1 < len(headings):
-                ast_end = max(ast_start, headings[i + 1][0] - 1)
-            else:
-                ast_end = total_lines
+            ast_end = max(ast_start, headings[i + 1][0] - 1) if i + 1 < len(headings) else total_lines
         else:
             break
     return ast_start, ast_end
@@ -1009,9 +958,7 @@ async def process_corpus_file(
 ) -> None:
     """Memoized per-file processing component declaring chunks as target state."""
     if file.file_path.path.is_absolute():
-        raise ValueError(
-            f"Expected relative FilePath from localfs.walk_dir, got absolute path: {file.file_path.path}"
-        )
+        raise ValueError(f"Expected relative FilePath from localfs.walk_dir, got absolute path: {file.file_path.path}")
     rel_posix_path = file.file_path.path.as_posix()
     text = await file.read_text()
 

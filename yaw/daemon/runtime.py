@@ -66,9 +66,7 @@ def _serialize_sync_delta(delta: SyncDelta) -> str:
 
 def _deserialize_sync_delta(raw: str) -> SyncDelta:
     data = json.loads(raw)
-    added = tuple(
-        (ChunkPointer(**ptr_dict), str(text)) for ptr_dict, text in data.get("added_chunks", ())
-    )
+    added = tuple((ChunkPointer(**ptr_dict), str(text)) for ptr_dict, text in data.get("added_chunks", ()))
     deleted = tuple(str(cid) for cid in data.get("deleted_chunk_ids", ()))
     return SyncDelta(added_chunks=added, deleted_chunk_ids=deleted)
 
@@ -159,10 +157,7 @@ class YawRuntime:
 
         if self._custom_program is not None:
             program = self._custom_program
-            if (
-                self.config.compiled_program_path
-                and Path(self.config.compiled_program_path).exists()
-            ):
+            if self.config.compiled_program_path and Path(self.config.compiled_program_path).exists():
                 program.load(str(self.config.compiled_program_path))
         else:
             program = HippoRAGProgram.from_config(self.config)
@@ -282,10 +277,7 @@ class YawRuntime:
             self._worker_thread.start()
             self._update_state(lifecycle="ready")
 
-            has_pending = (
-                self.engine is not None
-                and self.engine.get_meta(_PENDING_DELTA_META_KEY) is not None
-            )
+            has_pending = self.engine is not None and self.engine.get_meta(_PENDING_DELTA_META_KEY) is not None
             if sync_on_start or has_pending:
                 self.sync_now()
 
@@ -453,9 +445,7 @@ class YawRuntime:
                                 "error": str(exc),
                                 "pid": os.getpid(),
                             }
-                            result_file.write_text(
-                                json.dumps(err_payload, indent=2), encoding="utf-8"
-                            )
+                            result_file.write_text(json.dumps(err_payload, indent=2), encoding="utf-8")
                         finally:
                             with contextlib.suppress(OSError):
                                 signal_file.unlink(missing_ok=True)
@@ -485,9 +475,7 @@ class YawRuntime:
                 self._update_state()
                 continue
 
-            sync_state = (
-                "syncing" if item.op_name in ("sync", "rebuild") else self._status.sync_state
-            )
+            sync_state = "syncing" if item.op_name in ("sync", "rebuild") else self._status.sync_state
             self._update_state(active_op=item.op_name, sync_state=sync_state)
             if item.progress_callback is not None:
                 item.progress_callback("started")
@@ -523,11 +511,7 @@ class YawRuntime:
             else:
                 if item.progress_callback is not None:
                     item.progress_callback("ready")
-                now_ts = (
-                    time.time()
-                    if item.op_name in ("sync", "rebuild")
-                    else self._status.last_sync_at
-                )
+                now_ts = time.time() if item.op_name in ("sync", "rebuild") else self._status.last_sync_at
                 self._update_state(
                     lifecycle="ready",
                     provider_ready=True,
@@ -652,8 +636,7 @@ class YawRuntime:
                 raise YawRuntimeError("NOT_READY", "Graph engine is not initialized.")
             hits = self.engine.retrieve(cleaned, top_k=top_k)
             return [
-                HydratedPassage(pointer=ptr, text=text, score=score, stale_on_disk=False)
-                for ptr, score, text in hits
+                HydratedPassage(pointer=ptr, text=text, score=score, stale_on_disk=False) for ptr, score, text in hits
             ]
 
         return self.submit("retrieve", _run_retrieve, progress_callback=progress_callback)
@@ -683,9 +666,7 @@ class YawRuntime:
             if self.engine is None:
                 raise YawRuntimeError("NOT_READY", "Graph engine is not initialized.")
             if self.engine.get_stats().chunks == 0:
-                raise YawRuntimeError(
-                    "EMPTY_INDEX", "Cannot execute rag_qa on an empty graph index."
-                )
+                raise YawRuntimeError("EMPTY_INDEX", "Cannot execute rag_qa on an empty graph index.")
             pred = self.engine.program(question=cleaned)
             ans = str(getattr(pred, "answer", "")).strip()
             reasoning = str(getattr(pred, "reasoning", "")).strip()
@@ -775,18 +756,14 @@ class YawRuntime:
         run_options: dict[str, Any] | None = None,
     ) -> Path:
         """Compile DSPy prompts and surface bounds on the worker thread and save artifact."""
-        target_path = Path(
-            save_path or self.config.compiled_program_path or "compiled_program.json"
-        ).resolve()
+        target_path = Path(save_path or self.config.compiled_program_path or "compiled_program.json").resolve()
         resolved_auto = auto or self.config.optimize_auto or "light"
 
         def _run_optimize() -> Path:
             if self.engine is None:
                 raise YawRuntimeError("NOT_READY", "Graph engine is not initialized.")
 
-            self.validate_optimization_run(
-                target_path, trainset, valset, corpus_docs, mode, run_options
-            )
+            self.validate_optimization_run(target_path, trainset, valset, corpus_docs, mode, run_options)
 
             def _progress(msg: str) -> None:
                 self._update_state(active_op=msg)
@@ -816,9 +793,7 @@ class YawRuntime:
                 # incremental scan returns only changes, losing unchanged passages
                 # from the optimizer's in-memory candidate pool.
                 Path(self.config.state_dir).mkdir(parents=True, exist_ok=True)
-                with tempfile.TemporaryDirectory(
-                    prefix="opt_slice_", dir=self.config.state_dir
-                ) as scan_state:
+                with tempfile.TemporaryDirectory(prefix="opt_slice_", dir=self.config.state_dir) as scan_state:
                     delta = sync_corpus_once(
                         corpus_root=self.config.corpus_root,
                         state_dir=scan_state,
@@ -852,9 +827,7 @@ class YawRuntime:
 
             _progress(f"optimizing: starting {mode} (auto={resolved_auto}) evolution")
             eff_sleep = (
-                sleep_seconds
-                if sleep_seconds is not None
-                else getattr(self.config, "optimize_sleep_seconds", 0.0)
+                sleep_seconds if sleep_seconds is not None else getattr(self.config, "optimize_sleep_seconds", 0.0)
             )
             self.engine.evolve_prompts(
                 trainset=trainset,
@@ -910,6 +883,7 @@ class YawRuntime:
         source_paths.append(daemon_dir / "ingestion" / "corpus.py")
         identity = {
             "version": 1,
+            "metric": "task-quality-geometric-mean-v1",
             "mode": mode,
             "settings": settings,
             "data_sha256": hashlib.sha256(
@@ -925,13 +899,11 @@ class YawRuntime:
             ).hexdigest(),
             "code_sha256": hashlib.sha256(
                 b"".join(
-                    p.relative_to(daemon_dir).as_posix().encode("utf-8") + b"\0" + p.read_bytes()
-                    for p in source_paths
+                    p.relative_to(daemon_dir).as_posix().encode("utf-8") + b"\0" + p.read_bytes() for p in source_paths
                 )
             ).hexdigest(),
             "packages": {
-                name: importlib.metadata.version(name)
-                for name in ("dspy", "gepa", "cocoindex", "sqlite-vec", "scipy")
+                name: importlib.metadata.version(name) for name in ("dspy", "gepa", "cocoindex", "sqlite-vec", "scipy")
             },
         }
         # TOML tuples become JSON lists on disk; compare the canonical form.

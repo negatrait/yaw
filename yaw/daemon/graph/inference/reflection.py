@@ -11,6 +11,8 @@ from urllib.request import Request, urlopen
 
 import dspy
 
+from yaw.core.config import DEFAULT_CONTEXT_WINDOW_TOKENS, scale_context_budget
+
 
 def reflection_digest(value: Any) -> str:
     return hashlib.sha256(
@@ -199,18 +201,24 @@ class ReflectionLM(dspy.BaseLM):
         self,
         target: Any,
         counter: Any,
-        input_tokens: int = 16384,
-        context_tokens: int = 65536,
-        output_tokens: int = 4096,
+        input_tokens: int | None = None,
+        context_tokens: int = DEFAULT_CONTEXT_WINDOW_TOKENS,
+        output_tokens: int | None = None,
     ) -> None:
         super().__init__(model=target.model, **target.kwargs)
-        self.kwargs["max_tokens"] = self.kwargs.get("max_tokens") or output_tokens
         self.target = target
         counter = counter.for_model(target.model) if isinstance(counter, ServingTokenCounter) else counter
         self.counter = counter
-        self.input_tokens = input_tokens
         self.context_tokens = min(context_tokens, getattr(counter, "context_tokens", 0) or context_tokens)
-        self.output_tokens = output_tokens
+        self.input_tokens = (
+            input_tokens if input_tokens is not None else scale_context_budget(16384, self.context_tokens)
+        )
+        self.output_tokens = (
+            output_tokens
+            if output_tokens is not None
+            else self.kwargs.get("max_tokens") or scale_context_budget(4096, self.context_tokens)
+        )
+        self.kwargs["max_tokens"] = self.kwargs.get("max_tokens") or self.output_tokens
         self._yaw_context_window_tokens = self.context_tokens
         self._yaw_supports_gbnf = getattr(target, "_yaw_supports_gbnf", False)
 
@@ -298,7 +306,9 @@ def deterministic_evidence(examples: Sequence[Mapping[str, Any]], limit: int = 5
         if value is None and isinstance(feedback, Mapping):
             value = feedback.get("score")
         if value is None:
-            match = re.search(r"(?:GM_good/GM_bad|score)\s*=\s*([0-9.eE+-]+)", str(feedback))
+            match = re.search(
+                r"(?:Task quality geometric mean|GM_good/GM_bad|score)\s*=\s*([0-9.eE+-]+)", str(feedback)
+            )
             value = match.group(1) if match else 0
         try:
             result = float(value)

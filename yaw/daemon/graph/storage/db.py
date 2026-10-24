@@ -277,20 +277,14 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
         if "content_hash" in chunk_cols:
             conn.execute("ALTER TABLE chunks DROP COLUMN content_hash")
         if "ast_island_start" not in chunk_cols:
-            conn.execute(
-                "ALTER TABLE chunks ADD COLUMN ast_island_start INTEGER NOT NULL DEFAULT 0"
-            )
+            conn.execute("ALTER TABLE chunks ADD COLUMN ast_island_start INTEGER NOT NULL DEFAULT 0")
         if "ast_island_end" not in chunk_cols:
             conn.execute("ALTER TABLE chunks ADD COLUMN ast_island_end INTEGER NOT NULL DEFAULT 0")
 
         # Auto-migrate openie_chunks.structured_triples_json
-        openie_cols = {
-            row[1] for row in conn.execute("PRAGMA table_info(openie_chunks)").fetchall()
-        }
+        openie_cols = {row[1] for row in conn.execute("PRAGMA table_info(openie_chunks)").fetchall()}
         if "structured_triples_json" not in openie_cols:
-            conn.execute(
-                "ALTER TABLE openie_chunks ADD COLUMN structured_triples_json TEXT NOT NULL DEFAULT '[]'"
-            )
+            conn.execute("ALTER TABLE openie_chunks ADD COLUMN structured_triples_json TEXT NOT NULL DEFAULT '[]'")
 
         # Auto-migrate entities.definition and drop legacy UNIQUE constraint on entities.name
         entity_cols = {row[1] for row in conn.execute("PRAGMA table_info(entities)").fetchall()}
@@ -310,7 +304,8 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
                 """
             )
             conn.execute(
-                "INSERT INTO _entities_migrated (entity_id, name, definition) SELECT entity_id, name, definition FROM entities"
+                "INSERT INTO _entities_migrated (entity_id, name, definition) SELECT entity_id, name, "
+                "definition FROM entities"
             )
             conn.execute("DROP TABLE entities")
             conn.execute("ALTER TABLE _entities_migrated RENAME TO entities")
@@ -322,9 +317,7 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
             conn.execute("ALTER TABLE facts ADD COLUMN definition TEXT NOT NULL DEFAULT ''")
 
         # Auto-migrate edges CHECK constraint and legacy 'synonymy' kind -> 'skos:related'
-        edges_ddl_row = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'edges'"
-        ).fetchone()
+        edges_ddl_row = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'edges'").fetchone()
         if edges_ddl_row is not None and "skos:related" not in str(edges_ddl_row[0]):
             conn.execute(
                 """
@@ -389,9 +382,7 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
                     except Exception:
                         fts_items.append((fid, pred))
                 if fts_items:
-                    conn.executemany(
-                        "INSERT INTO fact_fts (fact_id, text) VALUES (?, ?)", fts_items
-                    )
+                    conn.executemany("INSERT INTO fact_fts (fact_id, text) VALUES (?, ?)", fts_items)
 
 
 def serialize_f32_vector(vector: np.ndarray | Sequence[float]) -> bytes:
@@ -545,9 +536,7 @@ def _is_acronym_match(name_a: str, name_b: str) -> bool:
     initials = "".join(w[0].lower() for w in words if w)
     if short == initials:
         return True
-    non_stop_initials = "".join(
-        w[0].lower() for w in words if w and w.lower() not in _FTS_STOPWORDS
-    )
+    non_stop_initials = "".join(w[0].lower() for w in words if w and w.lower() not in _FTS_STOPWORDS)
     return len(non_stop_initials) >= 2 and short == non_stop_initials
 
 
@@ -591,9 +580,7 @@ def find_entity_synonym_candidates(
 
     adjudicated: set[tuple[str, str]] = {
         (str(r[0]), str(r[1])) if str(r[0]) < str(r[1]) else (str(r[1]), str(r[0]))
-        for r in conn.execute(
-            "SELECT src_id, dst_id FROM edges WHERE kind IN ('skos:related', 'owl:differentFrom')"
-        )
+        for r in conn.execute("SELECT src_id, dst_id FROM edges WHERE kind IN ('skos:related', 'owl:differentFrom')")
     }
 
     def _scan_entity_rows(rows_iter: Iterator[sqlite3.Row]) -> None:
@@ -647,9 +634,7 @@ def find_entity_disambiguation_candidates(
     """Two-channel candidate generation combining sqlite-vec dense kNN and 3-stage SequenceMatcher cascade."""
     adjudicated: set[tuple[str, str]] = {
         (str(r[0]), str(r[1])) if str(r[0]) < str(r[1]) else (str(r[1]), str(r[0]))
-        for r in conn.execute(
-            "SELECT src_id, dst_id FROM edges WHERE kind IN ('skos:related', 'owl:differentFrom')"
-        )
+        for r in conn.execute("SELECT src_id, dst_id FROM edges WHERE kind IN ('skos:related', 'owl:differentFrom')")
     }
 
     dense_pairs: dict[tuple[str, str], float] = {}
@@ -700,18 +685,13 @@ def find_entity_disambiguation_candidates(
                 matcher_seq2_set = True
             matcher.set_seq1(norm_b)
             best_ratio = 0.0
-            if (
-                matcher.real_quick_ratio() >= lexical_threshold
-                and matcher.quick_ratio() >= lexical_threshold
-            ):
+            if matcher.real_quick_ratio() >= lexical_threshold and matcher.quick_ratio() >= lexical_threshold:
                 best_ratio = matcher.ratio()
             if best_ratio < lexical_threshold and (" " in norm_a or " " in norm_b):
                 alnum_a = re.sub(r"[^a-z0-9]", "", norm_a)
                 alnum_b = re.sub(r"[^a-z0-9]", "", norm_b)
                 if alnum_a and alnum_b and not (alnum_a.isdigit() and alnum_b.isdigit()):
-                    alnum_ratio = difflib.SequenceMatcher(
-                        None, alnum_b, alnum_a, autojunk=False
-                    ).ratio()
+                    alnum_ratio = difflib.SequenceMatcher(None, alnum_b, alnum_a, autojunk=False).ratio()
                     if alnum_ratio > best_ratio:
                         best_ratio = alnum_ratio
             if best_ratio >= lexical_threshold:
@@ -786,10 +766,11 @@ def upsert_chunk_pointers(
         return
     with _write_tx(conn):
         conn.executemany(
-            """
-            INSERT OR REPLACE INTO chunks (chunk_id, rel_posix_path, start_line, end_line, title, ast_island_start, ast_island_end)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
+            "\n"
+            "            INSERT OR REPLACE INTO chunks (chunk_id, rel_posix_path, start_line, "
+            "end_line, title, ast_island_start, ast_island_end)\n"
+            "            VALUES (?, ?, ?, ?, ?, ?, ?)\n"
+            "            ",
             (
                 (
                     p.chunk_id,
@@ -831,7 +812,8 @@ def _row_to_chunk_pointer(row: sqlite3.Row) -> ChunkPointer:
 def get_chunk_pointer(conn: sqlite3.Connection, chunk_id: str) -> ChunkPointer | None:
     """Retrieve ChunkPointer metadata for a single chunk_id."""
     row = conn.execute(
-        "SELECT chunk_id, rel_posix_path, start_line, end_line, title, ast_island_start, ast_island_end FROM chunks WHERE chunk_id = ?",
+        "SELECT chunk_id, rel_posix_path, start_line, end_line, title, ast_island_start, "
+        "ast_island_end FROM chunks WHERE chunk_id = ?",
         (chunk_id,),
     ).fetchone()
     return _row_to_chunk_pointer(row) if row is not None else None
@@ -907,7 +889,8 @@ def search_facts_fts(
     query: str,
     top_k: int = 50,
 ) -> list[tuple[str, float]]:
-    """Execute contentless FTS5 lexical match over fact triples returning (fact_id, score) with L1-normalized BM25 weights."""
+    """Execute contentless FTS5 lexical match over fact triples returning (fact_id, score) with L1-normalized \
+BM25 weights."""
     if top_k <= 0:
         return []
     terms = _extract_fts_terms(query)
@@ -1104,9 +1087,7 @@ def upsert_entities(
                 continue
             existing_norms = {str(r[0]) for r in existing_rows}
             pref_norm = (
-                raw_norm
-                if raw_norm in existing_norms
-                else (tok_norm if tok_norm in existing_norms else raw_norm)
+                raw_norm if raw_norm in existing_norms else (tok_norm if tok_norm in existing_norms else raw_norm)
             )
             if pref_norm:
                 conn.execute(
@@ -1180,15 +1161,10 @@ def upsert_entity_labels(
             if ename is not None:
                 raw_ename_norm = ename.lower()
                 tok_ename_norm = _normalize_label(ename)
-                matches_entity_name = (
-                    norm == raw_ename_norm or _normalize_label(norm) == tok_ename_norm
-                )
+                matches_entity_name = norm == raw_ename_norm or _normalize_label(norm) == tok_ename_norm
                 if matches_entity_name:
                     if curr_pref is not None and curr_pref != norm:
-                        curr_matches_name = (
-                            curr_pref == raw_ename_norm
-                            or _normalize_label(curr_pref) == tok_ename_norm
-                        )
+                        curr_matches_name = curr_pref == raw_ename_norm or _normalize_label(curr_pref) == tok_ename_norm
                         if curr_matches_name:
                             # Entity already has a canonical prefLabel norm; demote variant punctuation norm to altLabel
                             best_kind = "skos:altLabel"
@@ -1212,9 +1188,7 @@ def upsert_entity_labels(
                     # Strictly normalize across all chunk_ids to skos:altLabel or skos:hiddenLabel
                     # with skos:altLabel taking precedence over skos:hiddenLabel.
                     candidate_kind = (
-                        "skos:altLabel"
-                        if label_kind in ("skos:prefLabel", "skos:altLabel")
-                        else "skos:hiddenLabel"
+                        "skos:altLabel" if label_kind in ("skos:prefLabel", "skos:altLabel") else "skos:hiddenLabel"
                     )
                     if candidate_kind == "skos:altLabel" or any(
                         ek in ("skos:prefLabel", "skos:altLabel") for ek in existing_kinds
@@ -1237,13 +1211,15 @@ def upsert_entity_labels(
                         best_kind = ek
 
             conn.execute(
-                """
-                INSERT INTO entity_labels (label_norm, entity_id, label_kind, raw_label, chunk_id)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(label_norm, entity_id, chunk_id) DO UPDATE SET
-                    label_kind = excluded.label_kind,
-                    raw_label = CASE WHEN excluded.raw_label != '' THEN excluded.raw_label ELSE entity_labels.raw_label END
-                """,
+                "\n"
+                "                INSERT INTO entity_labels (label_norm, entity_id, label_kind, raw_label, "
+                "chunk_id)\n"
+                "                VALUES (?, ?, ?, ?, ?)\n"
+                "                ON CONFLICT(label_norm, entity_id, chunk_id) DO UPDATE SET\n"
+                "                    label_kind = excluded.label_kind,\n"
+                "                    raw_label = CASE WHEN excluded.raw_label != '' THEN "
+                "excluded.raw_label ELSE entity_labels.raw_label END\n"
+                "                ",
                 (norm, entity_id, best_kind, raw_label or label_norm, chunk_id),
             )
             if existing_kinds and any(k != best_kind for k in existing_kinds):
@@ -1336,21 +1312,15 @@ def merge_entities(
     dst_id: str,
     label_kind: str = "skos:altLabel",
 ) -> None:
-    """Atomically collapse src_id into dst_id, demoting src_id's prefLabel to label_kind and re-pointing all edges/facts."""
+    "Atomically collapse src_id into dst_id, demoting src_id's prefLabel to label_kind and re-pointing all edges/facts."
     if src_id == dst_id:
         return
     if label_kind not in ("skos:altLabel", "skos:hiddenLabel"):
-        raise ValueError(
-            f"merge_entities label_kind must be skos:altLabel or skos:hiddenLabel, got {label_kind!r}"
-        )
+        raise ValueError(f"merge_entities label_kind must be skos:altLabel or skos:hiddenLabel, got {label_kind!r}")
 
     with _write_tx(conn):
-        src_row = conn.execute(
-            "SELECT name, definition FROM entities WHERE entity_id = ?", (src_id,)
-        ).fetchone()
-        dst_row = conn.execute(
-            "SELECT name, definition FROM entities WHERE entity_id = ?", (dst_id,)
-        ).fetchone()
+        src_row = conn.execute("SELECT name, definition FROM entities WHERE entity_id = ?", (src_id,)).fetchone()
+        dst_row = conn.execute("SELECT name, definition FROM entities WHERE entity_id = ?", (dst_id,)).fetchone()
         if src_row is None or dst_row is None:
             return
 
@@ -1476,7 +1446,8 @@ def upsert_facts(
     conn: sqlite3.Connection,
     facts: Sequence[tuple[str, str, str, str, str] | tuple[str, str, str, str, str, str]],
 ) -> None:
-    """Upsert fact nodes (fact_id, subj_id, pred, obj_id, raw_triple_json[, definition]) into facts and index in fact_fts."""
+    """Upsert fact nodes (fact_id, subj_id, pred, obj_id, raw_triple_json[, definition]) into facts and index in \
+fact_fts."""
     if not facts:
         return
     normalized_facts: list[tuple[str, str, str, str, str, str]] = []
@@ -1578,9 +1549,7 @@ def get_existing_ids(
     if not candidate_ids:
         return set()
     if table_kind not in _EXISTING_ID_TABLES:
-        raise ValueError(
-            f"Unknown table kind: {table_kind!r}. Expected one of {list(_EXISTING_ID_TABLES.keys())}"
-        )
+        raise ValueError(f"Unknown table kind: {table_kind!r}. Expected one of {list(_EXISTING_ID_TABLES.keys())}")
     table, col = _EXISTING_ID_TABLES[table_kind]
     existing: set[str] = set()
     for batch in _batched(candidate_ids):
@@ -1721,9 +1690,7 @@ def inspect_focus_node(
     ]
 
     chunk_ids_set: set[str] = {
-        item["chunk_id"]
-        for item in labels
-        if item["chunk_id"] and not item["chunk_id"].startswith("__")
+        item["chunk_id"] for item in labels if item["chunk_id"] and not item["chunk_id"].startswith("__")
     }
     for r in conn.execute(
         "SELECT DISTINCT chunk_id FROM edge_sources WHERE src_id IN (?, ?) OR dst_id IN (?, ?)",
@@ -1843,7 +1810,7 @@ def load_graph_topology(
 
 
 def _are_same_label_homographs(conn: sqlite3.Connection, ent1: str, ent2: str) -> bool:
-    """Return True if ent1 and ent2 share a skos:prefLabel norm or normalized entity name (e.g. 'a ball' vs 'a ball')."""
+    "Return True if ent1 and ent2 share a skos:prefLabel norm or normalized entity name (e.g. 'a ball' vs 'a ball')."
     row = conn.execute(
         """
         SELECT 1
@@ -1869,7 +1836,8 @@ def upsert_semantic_edges(
     conn: sqlite3.Connection,
     edges: Sequence[tuple[str, str, str, float]],
 ) -> None:
-    """Bulk upsert symmetric skos:related and owl:differentFrom edges (allowing both on same-label homographs like 'a ball' vs 'a ball')."""
+    """Bulk upsert symmetric skos:related and owl:differentFrom edges (allowing both on same-label homographs \
+like 'a ball' vs 'a ball')."""
     if not edges:
         return
     with _write_tx(conn):
@@ -2049,7 +2017,8 @@ def _scan_shacl_violations(conn: sqlite3.Connection) -> list[SHACLViolation]:
                 )
             )
 
-    # 4. ConceptShape/homographDifferentFrom: Distinct entities sharing a skos:prefLabel norm must have owl:differentFrom
+    # 4. ConceptShape/homographDifferentFrom: Distinct entities sharing a skos:prefLabel norm must have
+    # owl:differentFrom
     for row in conn.execute(
         """
         SELECT a.entity_id, b.entity_id, a.label_norm
@@ -2357,9 +2326,7 @@ def lint_graph_shacl(
             )
 
         # Heal 4: ConceptShape/definition
-        empty_ent_defs = conn.execute(
-            "SELECT entity_id, name FROM entities WHERE TRIM(definition) = ''"
-        ).fetchall()
+        empty_ent_defs = conn.execute("SELECT entity_id, name FROM entities WHERE TRIM(definition) = ''").fetchall()
         for r in empty_ent_defs:
             eid, ename = str(r[0]), str(r[1])
             fact_row = conn.execute(
@@ -2397,12 +2364,8 @@ def lint_graph_shacl(
         if dangling_fids:
             for batch in _batched(dangling_fids):
                 placeholders = ",".join("?" for _ in batch)
-                conn.execute(
-                    f"DELETE FROM fact_vec WHERE fact_id IN ({placeholders})", tuple(batch)
-                )
-                conn.execute(
-                    f"DELETE FROM fact_fts WHERE fact_id IN ({placeholders})", tuple(batch)
-                )
+                conn.execute(f"DELETE FROM fact_vec WHERE fact_id IN ({placeholders})", tuple(batch))
+                conn.execute(f"DELETE FROM fact_fts WHERE fact_id IN ({placeholders})", tuple(batch))
                 conn.execute(f"DELETE FROM facts WHERE fact_id IN ({placeholders})", tuple(batch))
 
         empty_fact_defs = conn.execute(
@@ -2492,9 +2455,7 @@ def lint_graph_shacl(
 
 
 def _escape_turtle_literal(value: str) -> str:
-    escaped = (
-        value.replace("\\", "\\\\").replace('"', '\\"').replace("\r", "\\r").replace("\n", "\\n")
-    )
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("\r", "\\r").replace("\n", "\\n")
     return f'"{escaped}"'
 
 
@@ -2542,9 +2503,7 @@ def serialize_graph_turtle(
     ):
         sem_edges_by_eid.setdefault(str(row[0]), []).append((str(row[1]), str(row[2])))
 
-    for row in conn.execute(
-        "SELECT entity_id, name, definition FROM entities ORDER BY entity_id ASC"
-    ):
+    for row in conn.execute("SELECT entity_id, name, definition FROM entities ORDER BY entity_id ASC"):
         eid, ename, edef = str(row[0]), str(row[1]), str(row[2])
         pred_objs: list[str] = ["a skos:Concept"]
         seen_labels: set[tuple[str, str]] = set()
@@ -2567,9 +2526,7 @@ def serialize_graph_turtle(
         lines.append(f"yaw:{eid} " + " ;\n    ".join(pred_objs) + " .")
         lines.append("")
 
-    for row in conn.execute(
-        "SELECT fact_id, subj_id, pred, obj_id, definition FROM facts ORDER BY fact_id ASC"
-    ):
+    for row in conn.execute("SELECT fact_id, subj_id, pred, obj_id, definition FROM facts ORDER BY fact_id ASC"):
         fid, sid, pred, oid, fdef = (
             str(row[0]),
             str(row[1]),
@@ -2690,19 +2647,11 @@ def delete_chunks(conn: sqlite3.Connection, chunk_ids: Sequence[str]) -> None:
             "DELETE FROM chunk_fts WHERE chunk_id = ?",
             ((cid,) for cid in chunk_ids),
         )
-        conn.execute(
-            "DELETE FROM chunk_vec WHERE chunk_id IN (SELECT chunk_id FROM temp._del_chunks)"
-        )
-        conn.execute(
-            "DELETE FROM openie_chunks WHERE chunk_id IN (SELECT chunk_id FROM temp._del_chunks)"
-        )
+        conn.execute("DELETE FROM chunk_vec WHERE chunk_id IN (SELECT chunk_id FROM temp._del_chunks)")
+        conn.execute("DELETE FROM openie_chunks WHERE chunk_id IN (SELECT chunk_id FROM temp._del_chunks)")
         conn.execute("DELETE FROM chunks WHERE chunk_id IN (SELECT chunk_id FROM temp._del_chunks)")
-        conn.execute(
-            "DELETE FROM edge_sources WHERE chunk_id IN (SELECT chunk_id FROM temp._del_chunks)"
-        )
-        conn.execute(
-            "DELETE FROM entity_labels WHERE chunk_id IN (SELECT chunk_id FROM temp._del_chunks)"
-        )
+        conn.execute("DELETE FROM edge_sources WHERE chunk_id IN (SELECT chunk_id FROM temp._del_chunks)")
+        conn.execute("DELETE FROM entity_labels WHERE chunk_id IN (SELECT chunk_id FROM temp._del_chunks)")
 
         # 3. Prune affected passage/fact edges with zero remaining provenance and update surviving fact weights
         conn.execute(
@@ -2745,12 +2694,8 @@ def delete_chunks(conn: sqlite3.Connection, chunk_ids: Sequence[str]) -> None:
             )
             """
         )
-        conn.execute(
-            "DELETE FROM fact_vec WHERE fact_id IN (SELECT fact_id FROM temp._orphan_facts)"
-        )
-        conn.execute(
-            "DELETE FROM fact_fts WHERE fact_id IN (SELECT fact_id FROM temp._orphan_facts)"
-        )
+        conn.execute("DELETE FROM fact_vec WHERE fact_id IN (SELECT fact_id FROM temp._orphan_facts)")
+        conn.execute("DELETE FROM fact_fts WHERE fact_id IN (SELECT fact_id FROM temp._orphan_facts)")
         conn.execute("DELETE FROM facts WHERE fact_id IN (SELECT fact_id FROM temp._orphan_facts)")
 
         # 5. Prune orphaned entities and entity_vec strictly among candidate entities using index seeks
@@ -2769,15 +2714,9 @@ def delete_chunks(conn: sqlite3.Connection, chunk_ids: Sequence[str]) -> None:
             )
             """
         )
-        conn.execute(
-            "DELETE FROM entity_labels WHERE entity_id IN (SELECT entity_id FROM temp._orphan_entities)"
-        )
-        conn.execute(
-            "DELETE FROM entity_vec WHERE entity_id IN (SELECT entity_id FROM temp._orphan_entities)"
-        )
-        conn.execute(
-            "DELETE FROM entities WHERE entity_id IN (SELECT entity_id FROM temp._orphan_entities)"
-        )
+        conn.execute("DELETE FROM entity_labels WHERE entity_id IN (SELECT entity_id FROM temp._orphan_entities)")
+        conn.execute("DELETE FROM entity_vec WHERE entity_id IN (SELECT entity_id FROM temp._orphan_entities)")
+        conn.execute("DELETE FROM entities WHERE entity_id IN (SELECT entity_id FROM temp._orphan_entities)")
 
         # 6. Prune semantic edges incident to deleted entities
         conn.execute(

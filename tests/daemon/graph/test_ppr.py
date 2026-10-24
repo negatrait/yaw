@@ -103,9 +103,7 @@ def test_run_ppr_mass_conservation_and_multi_hop() -> None:
 
     # Seed entity-A only
     reset = {"entity-A": 1.0}
-    p = run_ppr(
-        graph, reset, damping=0.5, max_iter=100, tol=1e-6, activation="linear", dual_weight=None
-    )
+    p = run_ppr(graph, reset, damping=0.5, max_iter=100, tol=1e-6, activation="linear", dual_weight=None)
 
     # Probability mass conserved in linear mode
     assert np.isclose(np.sum(p), 1.0, atol=1e-5)
@@ -174,9 +172,7 @@ def test_apply_graph_activation_invariants() -> None:
         # Lipschitz condition: |f(x) - f(y)| <= |x - y|
         diffs_f = np.abs(f_grid[1:] - f_grid[:-1])
         diffs_x = np.abs(grid[1:] - grid[:-1])
-        assert np.all(diffs_f <= diffs_x + 1e-9), (
-            f"Activation {act} violates 1-Lipschitz contraction"
-        )
+        assert np.all(diffs_f <= diffs_x + 1e-9), f"Activation {act} violates 1-Lipschitz contraction"
 
     # 2. Hub suppression: scaled_tanh and hard_tanh compress large values
     large_x = np.array([0.5, 1.0, 2.0])

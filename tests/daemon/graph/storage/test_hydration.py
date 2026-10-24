@@ -113,9 +113,7 @@ def test_make_chunk_hydrator_tool(tmp_path: Path) -> None:
     try:
         f = tmp_path / "corpus" / "story.txt"
         f.parent.mkdir(parents=True)
-        f.write_text(
-            "Once upon a time in a faraway land.\nThere lived a wise queen.\n", encoding="utf-8"
-        )
+        f.write_text("Once upon a time in a faraway land.\nThere lived a wise queen.\n", encoding="utf-8")
 
         p = ChunkPointer("c_story", "corpus/story.txt", 1, 2, "Story")
         upsert_chunk_pointers(conn, [(p, f.read_text(encoding="utf-8"))])
@@ -221,9 +219,7 @@ def test_hydrate_budgeted_passages_1hop_ast_expansion(tmp_path: Path) -> None:
     lines = [f"Line {i:02d}: Context statement for testing.\n" for i in range(1, 41)]
     f.write_text("".join(lines), encoding="utf-8")
 
-    p1 = ChunkPointer(
-        "c_hit", "article.txt", 15, 18, "Article", ast_island_start=10, ast_island_end=25
-    )
+    p1 = ChunkPointer("c_hit", "article.txt", 15, 18, "Article", ast_island_start=10, ast_island_end=25)
 
     # Large budget: expands to ±10 lines bounded by [ast_island_start, ast_island_end] = [10, 25]
     passages = hydrate_budgeted_passages(

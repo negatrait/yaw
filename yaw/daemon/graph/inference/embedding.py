@@ -47,21 +47,14 @@ class EmbeddingProfile:
         if not self.parse_document_title:
             payload.pop("parse_document_title", None)
         contract = {"adapter": "retrieval-prompts-v3", "normalization": "l2", **payload}
-        return (
-            "yaw-embedding-v2:"
-            + hashlib.sha256(json.dumps(contract, sort_keys=True).encode("utf-8")).hexdigest()
-        )
+        return "yaw-embedding-v2:" + hashlib.sha256(json.dumps(contract, sort_keys=True).encode("utf-8")).hexdigest()
 
     def format(self, text, *, query, instruction=None, title: str | None = None):
         if not isinstance(text, str):
             raise TypeError("Embedding inputs must all be strings.")
-        prefixes = tuple(
-            p for p in (self.query_prefix, self.fact_query_prefix, self.document_prefix) if p
-        )
+        prefixes = tuple(p for p in (self.query_prefix, self.fact_query_prefix, self.document_prefix) if p)
         if text.startswith(prefixes) or (
-            (self.document_prefix or self.parse_document_title)
-            and text.startswith("title: ")
-            and " | text: " in text
+            (self.document_prefix or self.parse_document_title) and text.startswith("title: ") and " | text: " in text
         ):
             raise ValueError("Pass raw text, not an already prefixed embedding input.")
         if not query:
@@ -73,10 +66,7 @@ class EmbeddingProfile:
                         return f"title: {match.group(1).strip()} | text: {body.strip()}"
                 if title and title.strip():
                     clean_title = title.strip()
-                    if text.startswith(f"{clean_title}\n"):
-                        body = text[len(clean_title) + 1 :].strip()
-                    else:
-                        body = text.strip()
+                    body = text[len(clean_title) + 1 :].strip() if text.startswith(f"{clean_title}\n") else text.strip()
                     if body:
                         return f"title: {clean_title} | text: {body}"
             return self.document_prefix + text
@@ -161,11 +151,7 @@ def create_dspy_embedder(
     if callable(model_or_profile):
         return dspy.Embedder(model_or_profile, batch_size=batch_size, caching=caching, **kwargs)
 
-    model_name = (
-        model_or_profile.model
-        if isinstance(model_or_profile, EmbeddingProfile)
-        else str(model_or_profile)
-    )
+    model_name = model_or_profile.model if isinstance(model_or_profile, EmbeddingProfile) else str(model_or_profile)
     embedder_cls: Any = dspy.Embedder
     if provider == "ollama" or model_name.startswith("ollama/"):
         litellm_model = model_name if model_name.startswith("ollama/") else f"ollama/{model_name}"
@@ -264,11 +250,7 @@ def split_text_gracefully(
         if chunk.strip():
             chunks.append(chunk)
 
-        advance = (
-            max(1, split_pos - overlap_chars)
-            if overlap_chars > 0 and split_pos < total_len
-            else split_pos
-        )
+        advance = max(1, split_pos - overlap_chars) if overlap_chars > 0 and split_pos < total_len else split_pos
         start = max(start + 1, advance)
 
     return chunks if chunks else [text]
@@ -317,9 +299,7 @@ def batch_texts_by_budget(
 
     for idx, t in enumerate(texts):
         t_len = len(t)
-        if current_batch and (
-            current_chars + t_len > max_batch_chars or len(current_batch) >= max_batch_size
-        ):
+        if current_batch and (current_chars + t_len > max_batch_chars or len(current_batch) >= max_batch_size):
             micro_batches.append(current_batch)
             current_batch = [idx]
             current_chars = t_len
@@ -467,9 +447,7 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
             if len(prepared) > 1:
                 mid = len(prepared) // 2
                 left = self._encode_prepared(prepared[:mid], {**call_kwargs, "batch_size": mid})
-                right = self._encode_prepared(
-                    prepared[mid:], {**call_kwargs, "batch_size": len(prepared) - mid}
-                )
+                right = self._encode_prepared(prepared[mid:], {**call_kwargs, "batch_size": len(prepared) - mid})
                 return np.concatenate([left, right], axis=0)
 
             # Single item overflow: divide gracefully into 2+ sub-chunks and pool without truncation
@@ -477,9 +455,7 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
             sub_chunks = split_text_gracefully(single, max_chars=max(256, len(single) // 2))
             if len(sub_chunks) <= 1:
                 raise
-            sub_vecs = self._encode_prepared(
-                sub_chunks, {**call_kwargs, "batch_size": len(sub_chunks)}
-            )
+            sub_vecs = self._encode_prepared(sub_chunks, {**call_kwargs, "batch_size": len(sub_chunks)})
             weights = [max(1, len(s)) for s in sub_chunks]
             pooled = pool_subchunk_embeddings(sub_vecs, weights, norm=True)
             return pooled.reshape(1, -1)
@@ -519,21 +495,15 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
                 raise
             if len(prepared) > 1:
                 mid = len(prepared) // 2
-                left = await self._aencode_prepared(
-                    prepared[:mid], {**call_kwargs, "batch_size": mid}
-                )
-                right = await self._aencode_prepared(
-                    prepared[mid:], {**call_kwargs, "batch_size": len(prepared) - mid}
-                )
+                left = await self._aencode_prepared(prepared[:mid], {**call_kwargs, "batch_size": mid})
+                right = await self._aencode_prepared(prepared[mid:], {**call_kwargs, "batch_size": len(prepared) - mid})
                 return np.concatenate([left, right], axis=0)
 
             single = prepared[0]
             sub_chunks = split_text_gracefully(single, max_chars=max(256, len(single) // 2))
             if len(sub_chunks) <= 1:
                 raise
-            sub_vecs = await self._aencode_prepared(
-                sub_chunks, {**call_kwargs, "batch_size": len(sub_chunks)}
-            )
+            sub_vecs = await self._aencode_prepared(sub_chunks, {**call_kwargs, "batch_size": len(sub_chunks)})
             weights = [max(1, len(s)) for s in sub_chunks]
             pooled = pool_subchunk_embeddings(sub_vecs, weights, norm=True)
             return pooled.reshape(1, -1)
@@ -554,9 +524,7 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
 
         max_chunk_chars = 3000
         max_batch_chars = self.max_batch_chars
-        effective_max_batch_size = (
-            batch_size if (isinstance(batch_size, int) and batch_size >= 1) else self.batch_size
-        )
+        effective_max_batch_size = batch_size if (isinstance(batch_size, int) and batch_size >= 1) else self.batch_size
 
         text_piece_map: list[list[int]] = []
         flat_pieces: list[str] = []
@@ -630,9 +598,7 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
             or not np.isfinite(vectors).all()
             or np.any(np.linalg.norm(vectors, axis=1) == 0)
         ):
-            raise ValueError(
-                f"Expected finite, nonzero {self.profile.dimensions}-dimensional vectors."
-            )
+            raise ValueError(f"Expected finite, nonzero {self.profile.dimensions}-dimensional vectors.")
 
         if is_query:
             active_prefix = (
@@ -640,9 +606,7 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
                 if (instruction == FACT_INSTRUCTION and self.profile.fact_query_prefix)
                 else self.profile.query_prefix
             )
-            resolved_stage = stage or (
-                "query_fact_embed" if instruction == FACT_INSTRUCTION else "query_passage_embed"
-            )
+            resolved_stage = stage or ("query_fact_embed" if instruction == FACT_INSTRUCTION else "query_passage_embed")
         else:
             active_prefix = self.profile.document_prefix
             resolved_stage = stage or "document_embed"

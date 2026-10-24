@@ -1,6 +1,7 @@
 """Graph selection and assertion trails over real SQLite and report files."""
 
 import sqlite3
+from contextlib import closing
 
 from scripts.watchdog import (
     generate_graph_projection_svg,
@@ -46,7 +47,7 @@ def test_component_ties_are_deterministic_and_unknown_edges_do_not_expand():
 
 
 def test_recent_related_assertions_are_active_canonical_pairs(tmp_path):
-    with sqlite3.connect(tmp_path / "assertions.db") as conn:
+    with closing(sqlite3.connect(tmp_path / "assertions.db")) as conn:
         conn.executescript(
             "CREATE TABLE entities(entity_id TEXT PRIMARY KEY, name TEXT, definition TEXT);"
             "CREATE TABLE edges(src_id TEXT, dst_id TEXT, kind TEXT, "
@@ -75,9 +76,7 @@ def test_recent_related_assertions_are_active_canonical_pairs(tmp_path):
         {"cand": 1, "n": 100, "val_score": 0.4, "f1": 0.8, "r5": 0.9},
         {"cand": 2, "n": 110, "val_score": 0.5, "f1": 0.1, "r5": 0.8},
     ]
-    generate_report_markdown(
-        report, {"kg_graph": graph}, candidates, 210, False, ("TEST", "#38bdf8")
-    )
+    generate_report_markdown(report, {"kg_graph": graph}, candidates, 210, False, ("TEST", "#38bdf8"))
     text = report.read_text(encoding="utf-8")
     assert text.index("![Fig. 2:") < text.index("### Graph Assertions")
     assert text.index("### Graph Assertions") < text.index("### Most Recent `skos:related`")
@@ -92,9 +91,7 @@ def test_projection_renders_only_largest_seeded_component(tmp_path):
     edges = [("a", "b", "owl:differentFrom"), ("b", "c", "fact"), ("x", "y", "skos:related")]
     sandbox = {"kg_graph": {"edges": edges, "entities": {n: (n, "Definition", 1) for n in "abcxy"}}}
     output = tmp_path / "graph.svg"
-    result = generate_graph_projection_svg(
-        output, sandbox, ("TEST", "#38bdf8"), layout_iterations=200
-    )
+    result = generate_graph_projection_svg(output, sandbox, ("TEST", "#38bdf8"), layout_iterations=200)
     assert result["nodes_rendered"] == 3
     assert result["diff_edges"] == 1
     assert result["related_edges"] == 0

@@ -59,9 +59,7 @@ class CandidateCacheStore:
         )
 
     def delete(self, stage: str, key: str) -> None:
-        self.conn.execute(
-            "DELETE FROM candidate_stage_cache WHERE stage = ? AND cache_key = ?", (stage, key)
-        )
+        self.conn.execute("DELETE FROM candidate_stage_cache WHERE stage = ? AND cache_key = ?", (stage, key))
 
     def put(self, stage: str, key: str, payload: bytes, *, max_bytes: int) -> None:
         if max_bytes < 0:
@@ -70,17 +68,13 @@ class CandidateCacheStore:
         if len(payload) > max_bytes or max_bytes == 0:
             return
         self.conn.execute(
-            "INSERT INTO candidate_stage_cache(stage, cache_key, payload, size_bytes) "
-            "VALUES (?, ?, ?, ?)",
+            "INSERT INTO candidate_stage_cache(stage, cache_key, payload, size_bytes) VALUES (?, ?, ?, ?)",
             (stage, key, payload, len(payload)),
         )
         while (
-            self.conn.execute(
-                "SELECT total_bytes FROM candidate_cache_size WHERE singleton = 1"
-            ).fetchone()[0]
+            self.conn.execute("SELECT total_bytes FROM candidate_cache_size WHERE singleton = 1").fetchone()[0]
             > max_bytes
         ):
             self.conn.execute(
-                "DELETE FROM candidate_stage_cache WHERE seq = "
-                "(SELECT MIN(seq) FROM candidate_stage_cache)"
+                "DELETE FROM candidate_stage_cache WHERE seq = (SELECT MIN(seq) FROM candidate_stage_cache)"
             )

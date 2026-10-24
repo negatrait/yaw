@@ -466,9 +466,7 @@ def recycle_lemonade_model(model_name: str) -> bool:
         logging.info("Recycling Lemonade model '%s'...", model_name)
         is_ryzen = "ryzenai" in model_name.lower() or "mistral" in model_name.lower()
         if is_ryzen:
-            subprocess.run(
-                ["taskkill", "/F", "/IM", "ryzenai-server.exe"], capture_output=True, timeout=5
-            )
+            subprocess.run(["taskkill", "/F", "/IM", "ryzenai-server.exe"], capture_output=True, timeout=5)
             time.sleep(1.0)
         else:
             subprocess.run([lemonade_bin, "unload", model_name], capture_output=True, timeout=15)
@@ -502,24 +500,17 @@ def get_gold_docs(
             gold_doc = [f"{item[0]}\n{separator.join(item[1])}" for item in supporting_contexts]
         elif "contexts" in sample:
             gold_doc = [
-                f"{item['title']}\n{item['text']}"
-                for item in sample["contexts"]
-                if item.get("is_supporting", False)
+                f"{item['title']}\n{item['text']}" for item in sample["contexts"] if item.get("is_supporting", False)
             ]
         elif "paragraphs" in sample:
             paragraphs = [item for item in sample["paragraphs"] if item.get("is_supporting", True)]
             gold_doc = [
-                f"{item['title']}\n{item['text'] if 'text' in item else item['paragraph_text']}"
-                for item in paragraphs
+                f"{item['title']}\n{item['text'] if 'text' in item else item['paragraph_text']}" for item in paragraphs
             ]
         elif "context" in sample and isinstance(sample["context"], list):
             gold_doc = [f"{item[0]}\n{separator.join(item[1])}" for item in sample["context"]]
         elif isinstance(sample.get("context"), str):
-            passages = [
-                p.strip()
-                for p in re.split(r"\n*### Passage \d+\n*", sample["context"])
-                if p.strip()
-            ]
+            passages = [p.strip() for p in re.split(r"\n*### Passage \d+\n*", sample["context"]) if p.strip()]
             ans_set: set[str] = set()
             if sample.get("gold_ans"):
                 ans_set.add(str(sample["gold_ans"]).strip())
@@ -533,16 +524,9 @@ def get_gold_docs(
                     ans_set.add(str(sample["answer"]).strip())
 
             question = sample.get("question", "")
-            q_keywords = {
-                w
-                for w in re.findall(r"\w+", question.lower())
-                if len(w) >= 3 and w not in TEXT_STOPWORDS
-            }
+            q_keywords = {w for w in re.findall(r"\w+", question.lower()) if len(w) >= 3 and w not in TEXT_STOPWORDS}
             a_keywords = {
-                w
-                for a in ans_set
-                for w in re.findall(r"\w+", a.lower())
-                if len(w) >= 3 and w not in TEXT_STOPWORDS
+                w for a in ans_set for w in re.findall(r"\w+", a.lower()) if len(w) >= 3 and w not in TEXT_STOPWORDS
             }
             ans_lower = [a.lower() for a in ans_set if a]
 
@@ -555,9 +539,7 @@ def get_gold_docs(
                 q_kw_matches = len(q_keywords & p_words)
 
                 if exact_ans_matches > 0 or ans_kw_matches > 0:
-                    scored_passages.append(
-                        ((exact_ans_matches, ans_kw_matches, q_kw_matches, -idx), p)
-                    )
+                    scored_passages.append(((exact_ans_matches, ans_kw_matches, q_kw_matches, -idx), p))
 
             if scored_passages:
                 scored_passages.sort(key=lambda x: x[0], reverse=True)
@@ -577,16 +559,11 @@ def get_gold_docs(
                 answers = get_gold_answers([sample])[0]
                 ans_lower = [a.lower().strip() for a in answers if a.strip()]
                 a_keywords = {
-                    w
-                    for a in answers
-                    for w in re.findall(r"\w+", a.lower())
-                    if len(w) >= 3 and w not in TEXT_STOPWORDS
+                    w for a in answers for w in re.findall(r"\w+", a.lower()) if len(w) >= 3 and w not in TEXT_STOPWORDS
                 }
                 question = sample.get("question", "")
                 q_keywords = {
-                    w
-                    for w in re.findall(r"\w+", question.lower())
-                    if len(w) >= 3 and w not in TEXT_STOPWORDS
+                    w for w in re.findall(r"\w+", question.lower()) if len(w) >= 3 and w not in TEXT_STOPWORDS
                 }
 
                 scored_chunks: list[tuple[tuple[int, int, int, int], str]] = []
@@ -600,9 +577,7 @@ def get_gold_docs(
 
                     if exact_ans_matches > 0 or ans_kw_matches > 0:
                         formatted = f"{c['title']}\n{c_text}"
-                        scored_chunks.append(
-                            ((exact_ans_matches, ans_kw_matches, q_kw_matches, -idx), formatted)
-                        )
+                        scored_chunks.append(((exact_ans_matches, ans_kw_matches, q_kw_matches, -idx), formatted))
 
                 if scored_chunks:
                     scored_chunks.sort(key=lambda x: x[0], reverse=True)
@@ -621,7 +596,8 @@ def get_gold_docs(
                     gold_doc = []
         else:
             raise ValueError(
-                "Each sample needs supporting_facts, contexts, paragraphs, context, or document for retrieval evaluation"
+                "Each sample needs supporting_facts, contexts, paragraphs, context, or document for "
+                "retrieval evaluation"
             )
         gold_docs.append(list(dict.fromkeys(gold_doc)))
     return gold_docs
@@ -662,7 +638,7 @@ def get_gold_answers(samples: list[dict]) -> list[list[str]]:
             raise ValueError("Answer fields must not be null")
         answers = [gold_answer] if isinstance(gold_answer, str) else list(gold_answer)
         answers.extend(sample.get("answer_aliases", []))
-        gold_answers.append(list(dict.fromkeys(answers)))
+        gold_answers.append(list(dict.fromkeys(str(answer) for answer in answers)))
     return gold_answers
 
 
@@ -718,9 +694,7 @@ def build_benchmark_slice(
                 for sample in pooled_samples:
                     if isinstance(sample.get("context"), str):
                         passages = [
-                            p.strip()
-                            for p in re.split(r"\n*### Passage \d+\n*", sample["context"])
-                            if p.strip()
+                            p.strip() for p in re.split(r"\n*### Passage \d+\n*", sample["context"]) if p.strip()
                         ]
                         for p in passages:
                             candidate_pool.append(f"\n{p}")
@@ -737,9 +711,7 @@ def build_benchmark_slice(
                                 candidate_pool.append(f"{c['title']}\n{c['text']}")
                     summary = doc.get("summary") if isinstance(doc, dict) else None
                     if isinstance(summary, dict) and summary.get("text"):
-                        candidate_pool.append(
-                            f"{summary.get('title', '')}\n{summary['text']}".strip()
-                        )
+                        candidate_pool.append(f"{summary.get('title', '')}\n{summary['text']}".strip())
                 if corpus and len(candidate_pool) < target_pool_size:
                     for c in corpus:
                         candidate_pool.append(f"{c['title']}\n{c['text']}")
@@ -758,9 +730,7 @@ def build_benchmark_slice(
                             docs.append(f"{title}\n{separator.join(sents)}")
                     elif isinstance(sample["context"], str):
                         passages = [
-                            p.strip()
-                            for p in re.split(r"\n*### Passage \d+\n*", sample["context"])
-                            if p.strip()
+                            p.strip() for p in re.split(r"\n*### Passage \d+\n*", sample["context"]) if p.strip()
                         ]
                         for p in passages:
                             docs.append(f"\n{p}")
@@ -836,9 +806,7 @@ def load_dataset_files(
             for url in urls:
                 try:
                     logging.info("Downloading %s to %s", url, target)
-                    req = urllib.request.Request(
-                        url, headers={"User-Agent": "YAW-HippoRAG-DatasetDownloader/1.0"}
-                    )
+                    req = urllib.request.Request(url, headers={"User-Agent": "YAW-HippoRAG-DatasetDownloader/1.0"})
                     with urllib.request.urlopen(req) as resp:
                         target.write_bytes(resp.read())
                     downloaded = True
@@ -862,9 +830,7 @@ def load_dataset_files(
     return samples, corpus
 
 
-def verify_embeddings(
-    embedding: DSPyEmbeddingAdapter, queries: list[str], docs: list[str]
-) -> list[dict[str, Any]]:
+def verify_embeddings(embedding: DSPyEmbeddingAdapter, queries: list[str], docs: list[str]) -> list[dict[str, Any]]:
     """Five repeats of batch, individual and reversed inputs across all active roles."""
     probe_queries = queries[:3]
     probe_docs = docs[:3]
@@ -884,9 +850,7 @@ def verify_embeddings(
             observations.extend(
                 [
                     embedding.batch_encode(texts, norm=True, **options),
-                    np.concatenate(
-                        [embedding.batch_encode([text], norm=True, **options) for text in texts]
-                    ),
+                    np.concatenate([embedding.batch_encode([text], norm=True, **options) for text in texts]),
                     embedding.batch_encode(texts[::-1], norm=True, **options)[::-1],
                 ]
             )
@@ -897,9 +861,7 @@ def verify_embeddings(
             {
                 "role": role,
                 "inputs": [
-                    embedding.profile.format(
-                        text, query=bool(options), instruction=options.get("instruction", "")
-                    )
+                    embedding.profile.format(text, query=bool(options), instruction=options.get("instruction", ""))
                     for text in texts
                 ],
                 "repeats": 5,
@@ -927,9 +889,7 @@ def check_benchmark_integrity(
     if include_qa and qa_errors:
         errors.extend(f"qa_llm: {err}" for err in qa_errors)
     if graph_info.get("num_passage_nodes") != expected_doc_count:
-        errors.append(
-            f"Index passage count mismatch: {graph_info.get('num_passage_nodes')} != {expected_doc_count}"
-        )
+        errors.append(f"Index passage count mismatch: {graph_info.get('num_passage_nodes')} != {expected_doc_count}")
     if not (graph_info.get("num_extracted_triples") or graph_info.get("num_fact_nodes")):
         errors.append("No triples extracted during OpenIE indexing")
     if include_qa:
@@ -944,9 +904,7 @@ def check_benchmark_integrity(
             ):
                 errors.append(f"Question {idx + 1}: empty StandardRAG (DPR) answer")
     if len(records) > 1 and not any(record.get("graph_seeds") for record in records):
-        errors.append(
-            "All queries had empty graph_seeds (recognition memory / PPR never activated)"
-        )
+        errors.append("All queries had empty graph_seeds (recognition memory / PPR never activated)")
     return errors
 
 
@@ -957,9 +915,7 @@ def print_benchmark_summary(
     metrics: dict,
 ) -> None:
     print(f"\n{'=' * 72}")
-    print(
-        f"=== Benchmark Summary [NATIVE YAW ENGINE]: {dataset} ({len(records)} queries, {num_docs} passages) ==="
-    )
+    print(f"=== Benchmark Summary [NATIVE YAW ENGINE]: {dataset} ({len(records)} queries, {num_docs} passages) ===")
     print(f"{'=' * 72}")
     print("Native YAW Retrieval:   ", metrics["hipporag"]["retrieval"])
     print("Standard DPR Retrieval: ", metrics["standard_dpr"]["retrieval"])
@@ -972,10 +928,7 @@ def print_benchmark_summary(
             "Target 1 (Monkeypatched HippoRAG 2 Local Baseline):",
             metrics["monkeypatched_hipporag_baseline"],
         )
-    if (
-        "paper_baselines" in metrics
-        and "hipporag2_llama3.3_70b_nvembed_v2" in metrics["paper_baselines"]
-    ):
+    if "paper_baselines" in metrics and "hipporag2_llama3.3_70b_nvembed_v2" in metrics["paper_baselines"]:
         print(
             "Target 2 (Paper Reference arXiv:2502.14802):       ",
             metrics["paper_baselines"]["hipporag2_llama3.3_70b_nvembed_v2"],
@@ -1114,12 +1067,8 @@ def run_yaw_benchmark(
         report["indexing_seconds"] = round(perf_counter() - index_start, 2)
         num_facts = int(yaw_engine.conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0])
         report["graph"] = {
-            "num_passage_nodes": int(
-                yaw_engine.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-            ),
-            "num_entity_nodes": int(
-                yaw_engine.conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
-            ),
+            "num_passage_nodes": int(yaw_engine.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]),
+            "num_entity_nodes": int(yaw_engine.conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]),
             "num_fact_nodes": num_facts,
             "num_extracted_triples": num_facts,
             "num_edges": int(yaw_engine.conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]),
@@ -1144,9 +1093,7 @@ def run_yaw_benchmark(
             valset: list[Any] | None = None
             train_q_set = {s["question"] for s in train_samples}
             disjoint_val = [
-                (q, gold_answers[idx], gold_docs[idx])
-                for idx, q in enumerate(queries)
-                if q not in train_q_set
+                (q, gold_answers[idx], gold_docs[idx]) for idx, q in enumerate(queries) if q not in train_q_set
             ]
             if disjoint_val:
                 valset = [
@@ -1237,7 +1184,8 @@ def run_yaw_benchmark(
             timing_records.append((retrieval_elapsed, qa_elapsed))
             if q_idx % 5 == 0 or q_idx == total_queries:
                 print(
-                    f"[Native YAW] [{dataset}] Query {q_idx}/{total_queries} completed (retrieval={retrieval_elapsed:.2f}s, qa={qa_elapsed:.2f}s)",
+                    f"[Native YAW] [{dataset}] Query {q_idx}/{total_queries} completed "
+                    f"(retrieval={retrieval_elapsed:.2f}s, qa={qa_elapsed:.2f}s)",
                     flush=True,
                 )
 
@@ -1268,12 +1216,8 @@ def run_yaw_benchmark(
         em_list: list[float] = []
         f1_list: list[float] = []
         if include_qa:
-            em_overall, per_query_em_raw = ScriptQAExactMatch().calculate_metric_scores(
-                gold_answers, qa_answers
-            )
-            f1_overall, per_query_f1_raw = ScriptQAF1Score().calculate_metric_scores(
-                gold_answers, qa_answers
-            )
+            em_overall, per_query_em_raw = ScriptQAExactMatch().calculate_metric_scores(gold_answers, qa_answers)
+            f1_overall, per_query_f1_raw = ScriptQAF1Score().calculate_metric_scores(gold_answers, qa_answers)
             em_list = [float(item["ExactMatch"]) for item in per_query_em_raw]
             f1_list = [float(item["F1"]) for item in per_query_f1_raw]
             qa_metrics = {
@@ -1318,9 +1262,7 @@ def run_yaw_benchmark(
         seeds_active = sum(1 for seeds in kept_facts_per_query if seeds)
         fallback_count = len(records) - seeds_active
         avg_facts_kept = (
-            round(float(np.mean([len(s) for s in kept_facts_per_query])), 4)
-            if kept_facts_per_query
-            else 0.0
+            round(float(np.mean([len(s) for s in kept_facts_per_query])), 4) if kept_facts_per_query else 0.0
         )
         hipporag_ret = {
             "Recall@1": round(float(np.mean(recalls_1)), 4) if recalls_1 else 0.0,
@@ -1440,9 +1382,7 @@ def main(
         qa_model = chat_model
     include_qa = mode not in ("embeddings", "retrieval")
     profile = resolve_embedding_profile(embedding_model, embedding_task_mode)
-    include_corpus = bool(
-        full_corpus or max_queries is None or dataset in ("sample", "narrativeqa", "lveval")
-    )
+    include_corpus = bool(full_corpus or max_queries is None or dataset in ("sample", "narrativeqa", "lveval"))
 
     total_needed = None
     if max_queries is not None:
@@ -1490,13 +1430,8 @@ def main(
     run_dir = Path(tempfile.mkdtemp(prefix=f"run-{dataset}-", dir=root))
 
     slice_hash = hashlib.sha256("\n".join(docs).encode("utf-8")).hexdigest()[:10]
-    id_hash = hashlib.sha256(
-        f"yaw|{profile.index_identity}|{extraction_model}".encode()
-    ).hexdigest()[:10]
-    if fresh_index:
-        index_dir = run_dir / "index"
-    else:
-        index_dir = root / "indexes" / f"{dataset}_d{num_docs}_{slice_hash}_{id_hash}"
+    id_hash = hashlib.sha256(f"yaw|{profile.index_identity}|{extraction_model}".encode()).hexdigest()[:10]
+    index_dir = run_dir / "index" if fresh_index else root / "indexes" / f"{dataset}_d{num_docs}_{slice_hash}_{id_hash}"
 
     configure_logging(log_file=run_dir / "run.log", max_lines=500)
     for name in (
@@ -1531,9 +1466,7 @@ def main(
         "extraction_model": extraction_model,
         "qa_model": qa_model if include_qa else None,
         "chat_model": (
-            extraction_model
-            if not include_qa or extraction_model == qa_model
-            else f"{extraction_model} -> {qa_model}"
+            extraction_model if not include_qa or extraction_model == qa_model else f"{extraction_model} -> {qa_model}"
         ),
         "base_url": BASE_URL,
         "index_identity": profile.index_identity,
@@ -1639,7 +1572,8 @@ if __name__ == "__main__":
         "--index-queries",
         type=int,
         default=None,
-        help="Number of queries from which to pool candidate passages for indexing (defaults to int(max_queries * 1.4)).",
+        help="Number of queries from which to pool candidate passages for indexing (defaults to "
+        "int(max_queries * 1.4)).",
     )
     parser.add_argument(
         "--full-corpus",
@@ -1658,14 +1592,10 @@ if __name__ == "__main__":
         default=None,
         help="Override both extraction and QA chat models with a single model.",
     )
-    parser.add_argument(
-        "--extraction-model", choices=tuple(CHAT_MODELS), default=DEFAULT_EXTRACTION_CHAT
-    )
+    parser.add_argument("--extraction-model", choices=tuple(CHAT_MODELS), default=DEFAULT_EXTRACTION_CHAT)
     parser.add_argument("--qa-model", choices=tuple(CHAT_MODELS), default=DEFAULT_QA_CHAT)
     parser.add_argument("--embedding-model", choices=tuple(PROFILES), default=MODEL)
-    parser.add_argument(
-        "--embedding-task-mode", choices=GEMMA_TASK_MODES, default="distinct-titled"
-    )
+    parser.add_argument("--embedding-task-mode", choices=GEMMA_TASK_MODES, default="distinct-titled")
     parser.add_argument(
         "--fresh-index",
         action="store_true",
@@ -1783,7 +1713,8 @@ if __name__ == "__main__":
         "--graph-activation-param",
         type=float,
         default=5.0,
-        help="Optional parameter for graph activation (scale for scaled_tanh, cap for hard_tanh, threshold for relu, default: 5.0).",
+        help="Optional parameter for graph activation (scale for scaled_tanh, cap for hard_tanh, "
+        "threshold for relu, default: 5.0).",
     )
     parser.add_argument(
         "--graph-activation-renormalize",
@@ -1794,7 +1725,8 @@ if __name__ == "__main__":
         "--graph-beta",
         type=float,
         default=0.5,
-        help="Normalization exponent beta for W = D^-beta A D^-(1-beta) (arXiv:2609.32929v1: 0.0=random walk, 0.5=symmetric GCN, default: 0.5).",
+        help="Normalization exponent beta for W = D^-beta A D^-(1-beta) (arXiv:2609.32929v1: 0.0=random "
+        "walk, 0.5=symmetric GCN, default: 0.5).",
     )
     parser.add_argument(
         "--graph-dual-weight",

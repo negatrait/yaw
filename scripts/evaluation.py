@@ -102,19 +102,13 @@ class RetrievalRecall:
         example_eval_results: list[dict[str, float]] = []
         pooled_eval_results: dict[str, float] = {f"Recall@{k}": 0.0 for k in sorted_k}
 
-        for example_gold_docs, example_retrieved_docs in zip(
-            gold_docs, retrieved_docs, strict=False
-        ):
+        for example_gold_docs, example_retrieved_docs in zip(gold_docs, retrieved_docs, strict=False):
             example_eval_result = {f"Recall@{k}": 0.0 for k in sorted_k}
             unique_gold = list(dict.fromkeys(example_gold_docs))
             for k in sorted_k:
                 top_k_docs = example_retrieved_docs[:k]
                 if unique_gold:
-                    matched_gold = sum(
-                        1
-                        for g in unique_gold
-                        if any(self._doc_matches_gold(r, g) for r in top_k_docs)
-                    )
+                    matched_gold = sum(1 for g in unique_gold if any(self._doc_matches_gold(r, g) for r in top_k_docs))
                     example_eval_result[f"Recall@{k}"] = matched_gold / len(unique_gold)
                 else:
                     example_eval_result[f"Recall@{k}"] = 0.0
@@ -218,9 +212,7 @@ QUERY_INSTRUCTIONS: dict[str, str] = {
     "query_to_passage": "Given a question, retrieve relevant documents that best answer the question.",
 }
 
-DEFAULT_QUERY_INSTRUCTION = (
-    "Given a question, retrieve relevant documents that best answer the question."
-)
+DEFAULT_QUERY_INSTRUCTION = "Given a question, retrieve relevant documents that best answer the question."
 
 
 def get_query_instruction(linking_method: str) -> str:

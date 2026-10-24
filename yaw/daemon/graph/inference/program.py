@@ -5,7 +5,6 @@ import inspect
 import json
 import logging
 import math
-import re
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -14,7 +13,7 @@ from typing import Any, Literal
 import dspy
 from dspy.utils.exceptions import AdapterParseError, LMError
 
-from yaw.core.config import YawConfig, context_char_limit
+from yaw.core.config import DEFAULT_CONTEXT_WINDOW_TOKENS, YawConfig, context_char_limit, scale_context_budget
 from yaw.core.types import OpenIERecord, StructuredTriple
 
 from .chat import create_dspy_lm
@@ -77,8 +76,10 @@ from .reflection import (
 _STAGE_RLM_DELEGATION_RULES: dict[str, str] = {
     "shacl_repair": (
         "CRITICAL RLM SANDBOX RULE:\n"
-        "Prioritize aggressive 2-step resolution: do NOT perform exploratory node inspections unless strictly necessary.\n"
-        "Immediately delegate to `qwen_propose_shacl_repairs(violations=violations)` on Step 1, verify if needed, and call `SUBMIT(repairs=repairs)` by Step 2 without wandering:\n"
+        "Prioritize aggressive 2-step resolution: do NOT perform exploratory node inspections "
+        "unless strictly necessary.\n"
+        "Immediately delegate to `qwen_propose_shacl_repairs(violations=violations)` on Step 1, "
+        "verify if needed, and call `SUBMIT(repairs=repairs)` by Step 2 without wandering:\n"
         "```python\n"
         "repairs = qwen_propose_shacl_repairs(violations=violations)\n"
         "SUBMIT(repairs=repairs)\n"
@@ -105,7 +106,10 @@ def _build_rlm_action_demos() -> dict[str, list[dspy.Example]]:
                 repl_history=empty_history,
                 iteration="1/10",
                 reasoning="Immediately delegate to Qwen worker and submit in step 1 without wandering.",
-                code="```python\nrepairs = qwen_propose_shacl_repairs(violations=violations)\nSUBMIT(repairs=repairs)\n```",
+                code="```python\n"
+                "repairs = qwen_propose_shacl_repairs(violations=violations)\n"
+                "SUBMIT(repairs=repairs)\n"
+                "```",
             ).with_inputs("variables_info", "repl_history", "iteration")
         ],
         "instruction_proposer_inner": [],
@@ -152,7 +156,8 @@ def _normalize_rlm_field(name: str, val: Any, annotation: Any) -> Any:
 
 
 def _sanitize_repl_code(code: str) -> str:
-    """Strip hallucinated imports of pre-bound sandbox tools (`qwen_*`, `inspect_focus_node`, `hydrate_chunk`, `apply_shacl_repairs`, `lint_shacl`, `synthesize_instruction`, `SUBMIT`, `llm_query`)."""
+    """Strip hallucinated imports of pre-bound sandbox tools (`qwen_*`, `inspect_focus_node`, `hydrate_chunk`, \
+`apply_shacl_repairs`, `lint_shacl`, `synthesize_instruction`, `SUBMIT`, `llm_query`)."""
     cleaned_lines: list[str] = []
     for line in code.splitlines():
         stripped = line.strip()
@@ -177,7 +182,8 @@ _RLM_Base: Any = getattr(dspy, "RLM", dspy.Module)
 
 
 class _PositionalSafeRLM(_RLM_Base):
-    """RLM subclass that binds positional tool arguments, enforces 1-step Qwen delegation, and normalizes SUBMIT payloads."""
+    """RLM subclass that binds positional tool arguments, enforces 1-step Qwen delegation, and normalizes SUBMIT \
+payloads."""
 
     def __init__(self, *args: Any, stage_rule: str = "", **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -204,16 +210,12 @@ class _PositionalSafeRLM(_RLM_Base):
     ) -> Any:
         variables_info = [variable.format() for variable in variables]
         action = self.generate_action(
-            signature=self._action_signature_for_current_factory(
-                interpreter_factory, sub_agent_rules
-            ),
+            signature=self._action_signature_for_current_factory(interpreter_factory, sub_agent_rules),
             variables_info=variables_info,
             repl_history=history,
             iteration=f"{iteration + 1}/{self.max_iters}",
         )
-        self.last_reasoning = strip_mistral_bracket_prefix(
-            str(getattr(action, "reasoning", "") or "")
-        ).strip()
+        self.last_reasoning = strip_mistral_bracket_prefix(str(getattr(action, "reasoning", "") or "")).strip()
         from dspy.predict.rlm import _strip_code_fences, format_error_for_lm
 
         try:
@@ -256,11 +258,7 @@ class _PositionalSafeRLM(_RLM_Base):
     ) -> tuple[dict[str, Any] | None, str | None]:
         raw_output = getattr(result, "output", None)
         if isinstance(raw_output, dict):
-            if (
-                len(output_field_names) == 1
-                and output_field_names[0] not in raw_output
-                and len(raw_output) == 1
-            ):
+            if len(output_field_names) == 1 and output_field_names[0] not in raw_output and len(raw_output) == 1:
                 raw_output[output_field_names[0]] = next(iter(raw_output.values()))
             for name in output_field_names:
                 if name in raw_output:
@@ -316,117 +314,8 @@ class _PositionalSafeRLM(_RLM_Base):
         return pred
 
 
-def _parse_react_v2_payload(fields: Mapping[str, Any]) -> dict[str, Any] | None:
-    """Coerce ReActV2 tool-call payloads (`next_thought`/`tool_calls` or `thought`/`tool_name`/`tool_args`)."""
-    from dspy.adapters.types.reasoning import Reasoning
-    from dspy.adapters.types.tool import ToolCalls
-
-    if "tool_calls" in fields:
-        thought_val = fields.get("next_thought", fields.get("thought", ""))
-        tc_raw = fields["tool_calls"]
-        if isinstance(tc_raw, str):
-            import json_repair
-
-            tc_raw = json_repair.loads(tc_raw)
-        return {
-            "next_thought": (
-                thought_val
-                if isinstance(thought_val, Reasoning)
-                else Reasoning(content=str(thought_val or ""))
-            ),
-            "tool_calls": (
-                tc_raw if isinstance(tc_raw, ToolCalls) else ToolCalls.model_validate(tc_raw)
-            ),
-        }
-    if "tool_name" in fields:
-        raw_name = str(fields.get("tool_name", "") or "").strip()
-        tool_name = "submit" if raw_name in ("finish", "submit") else raw_name
-        raw_args = fields.get("tool_args", {})
-        if isinstance(raw_args, str):
-            import json_repair
-
-            loaded_args = json_repair.loads(raw_args)
-            raw_args = loaded_args if isinstance(loaded_args, dict) else {}
-        elif not isinstance(raw_args, Mapping):
-            raw_args = {}
-        thought_str = str(fields.get("next_thought") or fields.get("thought") or "")
-        return {
-            "next_thought": Reasoning(content=thought_str),
-            "tool_calls": ToolCalls.model_validate(
-                {"tool_calls": [{"name": tool_name, "args": dict(raw_args)}]}
-            ),
-        }
-    return None
-
-
-class YawJSONAdapter(dspy.JSONAdapter):
-    """Robust JSON adapter that recovers from top-level arrays or mismatched single fields."""
-
-    def parse(self, signature: type[dspy.Signature], completion: str) -> dict[str, Any]:
-        out_fields = list(signature.output_fields.keys())
-        try:
-            return super().parse(signature, completion)
-        except Exception:
-            if "[[ ##" in completion:
-                try:
-                    return dspy.ChatAdapter().parse(signature, completion)
-                except Exception:
-                    if set(out_fields) == {"next_thought", "tool_calls"}:
-                        sections: dict[str, str] = {}
-                        current_key: str | None = None
-                        buf: list[str] = []
-                        for line in completion.splitlines():
-                            m = re.match(r"^\[\[\s*##\s*([^#]+?)\s*##\s*\]\]$", line.strip())
-                            if m:
-                                if current_key is not None:
-                                    sections[current_key] = "\n".join(buf).strip()
-                                current_key = m.group(1).strip()
-                                buf = []
-                            else:
-                                buf.append(line)
-                        if current_key is not None:
-                            sections[current_key] = "\n".join(buf).strip()
-                        coerced = _parse_react_v2_payload(sections)
-                        if coerced is not None:
-                            return coerced
-                    raise
-            import json_repair
-            from dspy.adapters.utils import parse_value
-
-            fields = json_repair.loads(completion)
-            if isinstance(fields, list) and len(out_fields) == 1:
-                target_field = out_fields[0]
-                annotation = getattr(signature.output_fields[target_field], "annotation", Any)
-                if annotation is not str:
-                    try:
-                        cast_val = parse_value(fields, annotation)
-                    except Exception:
-                        cast_val = fields
-                    return {target_field: cast_val}
-            if isinstance(fields, dict):
-                if set(out_fields) == {"next_thought", "tool_calls"}:
-                    coerced = _parse_react_v2_payload(fields)
-                    if coerced is not None:
-                        return coerced
-                for out_f in out_fields:
-                    if out_f in fields:
-                        ann = getattr(signature.output_fields[out_f], "annotation", Any)
-                        return {out_f: parse_value(fields[out_f], ann)}
-                if len(out_fields) == 1:
-                    target_field = out_fields[0]
-                    ann = getattr(signature.output_fields[target_field], "annotation", Any)
-                    if target_field in ("decisions", "repairs") and target_field not in fields:
-                        return {target_field: []}
-                    if len(fields) == 1:
-                        v = next(iter(fields.values()))
-                        return {target_field: parse_value(v, ann)}
-                    if "answer" in fields:
-                        return {target_field: parse_value(fields["answer"], ann)}
-            raise
-
-
-class YawGBNFAdapter(YawJSONAdapter):
-    """Unified `dspy.JSONAdapter` subclass with automatic per-signature GBNF grammar injection and fallback parsing."""
+class YawGBNFAdapter(dspy.JSONAdapter):
+    """Supply per-signature GBNF grammars; DSPy owns all formatting and parsing."""
 
     def __init__(
         self,
@@ -545,133 +434,6 @@ class YawGBNFAdapter(YawJSONAdapter):
         return await super().acall(lm, lm_kwargs, signature, demos, inputs)
 
 
-class _PredictorBoundLM(dspy.BaseLM):
-    """Per-predictor isolated `dspy.BaseLM` proxy with dedicated `.history` and telemetry."""
-
-    def __init__(
-        self,
-        predictor_name: str,
-        role: Literal["orchestrator", "worker"],
-        base_lm_getter: Callable[[], Any],
-    ) -> None:
-        self._fallback_model = f"yaw-predictor/{predictor_name}"
-        self.predictor_name = predictor_name
-        self.role: Literal["orchestrator", "worker"] = role
-        self._base_lm_getter = base_lm_getter
-        super().__init__(model=self._fallback_model)
-
-    def _resolve_target_lm(self) -> Any:
-        ctx_lm = getattr(dspy.settings, "lm", None)
-        if ctx_lm is not None and not isinstance(ctx_lm, _PredictorBoundLM):
-            return ctx_lm
-        base = self._base_lm_getter()
-        if base is not None and not isinstance(base, _PredictorBoundLM):
-            return base
-        return None
-
-    @property
-    def model(self) -> str:
-        target = self._resolve_target_lm()
-        if target is not None:
-            return str(getattr(target, "model", self._fallback_model))
-        return self._fallback_model
-
-    @model.setter
-    def model(self, value: str) -> None:
-        self._fallback_model = str(value)
-
-    @property
-    def _yaw_supports_gbnf(self) -> bool | None:
-        target = self._resolve_target_lm()
-        return getattr(target, "_yaw_supports_gbnf", None) if target is not None else None
-
-    @property
-    def _yaw_recipe(self) -> str | None:
-        target = self._resolve_target_lm()
-        return getattr(target, "_yaw_recipe", None) if target is not None else None
-
-    def dump_state(self) -> dict[str, Any]:
-        return {}
-
-    def cache_identity(self) -> dict[str, Any]:
-        """Expose effective inference settings for persistent stage-cache keys."""
-        identities = {}
-        for role, target in (
-            ("effective", self._resolve_target_lm()),
-            ("bound", self._base_lm_getter()),
-        ):
-            identities[role] = {
-                "model": getattr(target, "model", self._fallback_model),
-                "model_type": getattr(target, "model_type", None),
-                "context_window_tokens": getattr(target, "_yaw_context_window_tokens", None),
-                "kwargs": {
-                    k: v
-                    for k, v in (getattr(target, "kwargs", {}) or {}).items()
-                    if k not in {"api_key", "api_token"}
-                },
-            }
-        return identities
-
-    def copy(self, **kwargs: Any) -> _PredictorBoundLM:
-        cloned = _PredictorBoundLM(
-            self.predictor_name,
-            self.role,
-            self._base_lm_getter,
-        )
-        if kwargs:
-            cloned.kwargs = {**self.kwargs, **kwargs}
-        return cloned
-
-    def __deepcopy__(self, memo: dict[int, Any]) -> _PredictorBoundLM:
-        cloned = _PredictorBoundLM(
-            self.predictor_name,
-            self.role,
-            self._base_lm_getter,
-        )
-        memo[id(self)] = cloned
-        return cloned
-
-    def __call__(self, prompt: Any = None, *, messages: Any = None, **kwargs: Any) -> Any:
-        import warnings
-
-        target = self._resolve_target_lm()
-        if target is None:
-            raise ValueError(
-                f"No LM is configured for predictor {self.predictor_name!r} (role={self.role!r})."
-            )
-        target_hist = getattr(target, "history", ())
-        previous_entry = target_hist[-1] if target_hist else None
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message=".*messages=.*",
-                category=DeprecationWarning,
-            )
-            warnings.filterwarnings(
-                "ignore",
-                message=".*Pydantic serializer warnings.*",
-                category=UserWarning,
-            )
-            if prompt is not None:
-                result = target(prompt, messages=messages, **kwargs)
-            else:
-                result = target(messages=messages, **kwargs)
-        target_hist = getattr(target, "history", None)
-        if isinstance(target_hist, list):
-            new_entries = (
-                target_hist[-1:] if target_hist and target_hist[-1] is not previous_entry else ()
-            )
-            for entry in new_entries:
-                if isinstance(entry, Mapping):
-                    rec = dict(entry)
-                    rec["predictor"] = self.predictor_name
-                    self.history.append(rec)
-                else:
-                    self.history.append({"predictor": self.predictor_name, "entry": entry})
-            del self.history[:-100]
-        return result
-
-
 def _sum_usage_tokens(usage: Mapping[str, Any] | None) -> int:
     if not usage:
         return 0
@@ -742,12 +504,8 @@ class YawRM:
         try:
             sig = inspect.signature(self.hook)
             param_names = list(sig.parameters.keys())
-            has_var_kw = any(
-                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-            )
-            has_var_pos = any(
-                p.kind == inspect.Parameter.VAR_POSITIONAL for p in sig.parameters.values()
-            )
+            has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+            has_var_pos = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in sig.parameters.values())
             accepts_prog = len(param_names) >= 2 or has_var_pos
             accepts_item_docs = "item_docs" in sig.parameters or len(param_names) >= 3 or has_var_kw
             accepts_k = "k" in sig.parameters or has_var_kw
@@ -768,9 +526,7 @@ class YawRM:
             ctx, passages, scores, pids = raw
             return str(ctx), tuple(passages), tuple(scores), tuple(pids)
         ctx, passages, scores = raw
-        pids = tuple(
-            str(p) if str(p).startswith("chunk-") else f"chunk-{i}" for i, p in enumerate(passages)
-        )
+        pids = tuple(str(p) if str(p).startswith("chunk-") else f"chunk-{i}" for i, p in enumerate(passages))
         return str(ctx), tuple(passages), tuple(scores), pids
 
     def _invoke_hook(
@@ -790,16 +546,10 @@ class YawRM:
     ) -> list[YawPassage]:
         effective_k = self.default_k if k is None else int(k)
         item_docs = kwargs.get("item_docs")
-        queries = (
-            [query_or_queries]
-            if isinstance(query_or_queries, str)
-            else [str(q) for q in query_or_queries]
-        )
+        queries = [query_or_queries] if isinstance(query_or_queries, str) else [str(q) for q in query_or_queries]
         results: list[YawPassage] = []
         for q in queries:
-            _, passages, scores, pids = self._invoke_hook_with_pids(
-                q, k=effective_k, item_docs=item_docs
-            )
+            _, passages, scores, pids = self._invoke_hook_with_pids(q, k=effective_k, item_docs=item_docs)
             for idx, text in enumerate(passages[:effective_k]):
                 sc = float(scores[idx]) if idx < len(scores) else 0.0
                 pid = str(pids[idx]) if idx < len(pids) else f"chunk-{idx}"
@@ -1080,11 +830,7 @@ def validate_stage_invariants(
             norm = str(text_processing(ename)) or ename.lower()
             def_key = edef.lower()
             if norm in seen_defs_by_norm:
-                if (
-                    not def_key
-                    or def_key in seen_defs_by_norm[norm]
-                    or "" in seen_defs_by_norm[norm]
-                ):
+                if not def_key or def_key in seen_defs_by_norm[norm] or "" in seen_defs_by_norm[norm]:
                     dup_labels.append(ename)
                 else:
                     seen_defs_by_norm[norm].add(def_key)
@@ -1099,9 +845,7 @@ def validate_stage_invariants(
         if dup_labels:
             issues.append(f"ConceptShape/prefLabel duplicate normalized labels: {dup_labels}")
         if bad_defs:
-            issues.append(
-                f"ConceptShape/definition missing or tautological definitions: {bad_defs}"
-            )
+            issues.append(f"ConceptShape/definition missing or tautological definitions: {bad_defs}")
         if not issues:
             return 1.0, "PASS [ner]"
         ratio = valid_count / max(1, len(items))
@@ -1119,11 +863,7 @@ def validate_stage_invariants(
         stage1_norms: set[str] = set()
         if isinstance(stage1_raw, Sequence) and not isinstance(stage1_raw, str):
             for ent in stage1_raw:
-                ename = (
-                    str(ent[0]).strip()
-                    if isinstance(ent, (list, tuple)) and len(ent) >= 1
-                    else str(ent).strip()
-                )
+                ename = str(ent[0]).strip() if isinstance(ent, (list, tuple)) and len(ent) >= 1 else str(ent).strip()
                 if ename:
                     stage1_norms.add(str(text_processing(ename)) or ename.lower())
 
@@ -1167,7 +907,8 @@ def validate_stage_invariants(
         components = _count_connected_components(structured)
         if len(structured) >= 2 and len(stage1_norms) >= 2 and components > 1:
             issues.append(
-                f"Disconnected subgraph ({components} components across {len(structured)} triples; missing bridge predicates)"
+                f"Disconnected subgraph ({components} components across "
+                f"{len(structured)} triples; missing bridge predicates)"
             )
 
         if not issues:
@@ -1176,9 +917,7 @@ def validate_stage_invariants(
         return score, f"[triples] {'; '.join(issues)}"
 
     if stage == "entity_definer":
-        missing_in = [
-            str(x).strip() for x in (inputs.get("missing_entities") or ()) if str(x).strip()
-        ]
+        missing_in = [str(x).strip() for x in (inputs.get("missing_entities") or ()) if str(x).strip()]
         raw_defs = getattr(
             prediction,
             "entity_definitions",
@@ -1195,9 +934,7 @@ def validate_stage_invariants(
                 if def_by_norm
                 else (0.0, "[entity_definer] ConceptShape/definition empty.")
             )
-        unrepaired = [
-            m for m in missing_in if (str(text_processing(m)) or m.lower()) not in def_by_norm
-        ]
+        unrepaired = [m for m in missing_in if (str(text_processing(m)) or m.lower()) not in def_by_norm]
         if not unrepaired:
             return 1.0, "PASS [entity_definer]"
         cov = (len(missing_in) - len(unrepaired)) / max(1, len(missing_in))
@@ -1231,9 +968,7 @@ def validate_stage_invariants(
             if canon not in ("A", "B", id_a, id_b):
                 issues.append(f"EdgeShape/closedWorld invalid canonical={canon!r} for {pair_id!r}")
             if pair_id in seen_pairs and seen_pairs[pair_id] != (rel, canon):
-                issues.append(
-                    f"ConceptShape/homographDifferentFrom conflicting decisions for {pair_id!r}"
-                )
+                issues.append(f"ConceptShape/homographDifferentFrom conflicting decisions for {pair_id!r}")
             seen_pairs[pair_id] = (rel, canon)
         if not issues:
             return 1.0, "PASS [synonym_judge]"
@@ -1241,11 +976,7 @@ def validate_stage_invariants(
 
     if stage in ("shacl_repair", "shacl_healer_rlm"):
         raw_repairs = getattr(prediction, "repairs", None)
-        repairs = (
-            list(raw_repairs)
-            if isinstance(raw_repairs, (list, tuple))
-            else parse_shacl_repairs(raw_repairs)
-        )
+        repairs = list(raw_repairs) if isinstance(raw_repairs, (list, tuple)) else parse_shacl_repairs(raw_repairs)
         allowed_nodes: set[str] = set()
         raw_viol = inputs.get("violations", "")
         try:
@@ -1302,11 +1033,7 @@ def validate_stage_invariants(
         raw_before = inputs.get("fact_before_filter", "")
         try:
             parsed_before = json.loads(raw_before) if isinstance(raw_before, str) else raw_before
-            fact_list = (
-                parsed_before.get("fact", [])
-                if isinstance(parsed_before, Mapping)
-                else parsed_before
-            )
+            fact_list = parsed_before.get("fact", []) if isinstance(parsed_before, Mapping) else parsed_before
             for item in fact_list or ():
                 if isinstance(item, (list, tuple)) and len(item) >= 3:
                     cand_norms.add(
@@ -1333,9 +1060,7 @@ def validate_stage_invariants(
                 not in cand_norms
             ]
             if hallucinated:
-                issues.append(
-                    f"Hallucinated facts outside closed-world candidate subset: {hallucinated}"
-                )
+                issues.append(f"Hallucinated facts outside closed-world candidate subset: {hallucinated}")
         if not issues:
             return 1.0, "PASS [triple_filter]"
         return max(0.0, round(1.0 - 0.5 * len(issues), 4)), f"[triple_filter] {'; '.join(issues)}"
@@ -1433,11 +1158,7 @@ def _should_retry_stage_invariants(
         ):
             return False
 
-    target_lm = (
-        effective_lm._resolve_target_lm()
-        if isinstance(effective_lm, _PredictorBoundLM)
-        else effective_lm
-    )
+    target_lm = effective_lm
     if target_lm is None:
         return False
     answers_it = getattr(target_lm, "answers", None)
@@ -1464,8 +1185,20 @@ def _should_retry_stage_invariants(
     return True
 
 
+def _bounded_prompt_json(items: Sequence[Any], max_items: int, max_chars: int) -> str:
+    """Fit whole structured input items; never split a JSON item to fit a prompt."""
+    selected = list(items[:max_items])
+    while selected:
+        rendered = json.dumps(selected, ensure_ascii=False)
+        if len(rendered) <= max_chars:
+            return rendered
+        selected.pop()
+    return "[]"
+
+
 class HippoRAGProgram(dspy.Module):
-    """Unified DSPy Module for HippoRAG 2 OpenIE, EDC/SKOS Schema Canon, SHACL Repair, Recognition Memory, and Multi-Hop QA.
+    """Unified DSPy Module for HippoRAG 2 OpenIE, EDC/SKOS Schema Canon, SHACL Repair, Recognition Memory, and \
+Multi-Hop QA.
 
     Exposes the 9 canonical runtime stage predictors (out of the 12 total DSPy signatures in YAW):
     1. **8 Direct GBNF Predictors (configured chat model on `llama.cpp` GPU):**
@@ -1478,19 +1211,20 @@ class HippoRAGProgram(dspy.Module):
        - `query_intent` (`ExtractQueryIntent`)
        - `qa` (`AnswerQuestion`)
     2. **1 Single-Level RLM Python REPL Orchestrator (`shacl_healer_rlm`):**
-       - `shacl_healer_rlm` (`HealSHACLViolations`) running inside `dspy.PythonInterpreter` (managed Deno/Pyodide WASM) with
+       - `shacl_healer_rlm` (`HealSHACLViolations`) running inside `dspy.PythonInterpreter` (managed \
+Deno/Pyodide WASM) with
          bound graph inspection, hydration, repair, and SQL SHACL linting tools (`inspect_focus_node`,
          `hydrate_chunk`, `qwen_propose_shacl_repairs`, `apply_shacl_repairs`, `lint_shacl`).
     3. **First-Class Embedding Trail (`record_embedding_telemetry` / `embedding_audit_trail`):**
        - Tracks every `DSPyEmbeddingAdapter` (`dspy.Embedder`) invocation and the 3 optimizable
          task prefixes (`embedding_query_prefix`, `embedding_fact_prefix`, `embedding_document_prefix`)
          in `self.telemetry` and `self.embedding_audit_trail`.
-    """
+"""
 
     def __init__(
         self,
         *,
-        include_demos: bool = True,
+        include_demos: bool = False,
         enable_gbnf: bool = False,
         gbnf_max_entities: int | None = None,
         gbnf_max_triples: int | None = None,
@@ -1503,16 +1237,28 @@ class HippoRAGProgram(dspy.Module):
         orchestrator_lm: Any = None,
         rlm_max_iters: int = 10,
         rlm_max_llm_calls: int = 20,
-        rlm_max_output_chars: int = 10000,
+        rlm_max_output_chars: int | None = None,
         rlm_sub_lm: Any = None,
         rlm_tools: list[Callable[..., Any]] | None = None,
         rlm_interpreter_factory: Callable[[], Any] = dspy.PythonInterpreter,
         compiled_path: str | Path | None = None,
         enable_react_fallback: bool = False,
-        context_window_tokens: int = 32768,
-        max_output_tokens: int = 4096,
+        context_window_tokens: int | None = None,
+        max_output_tokens: int | None = None,
     ) -> None:
         super().__init__()
+        if context_window_tokens is None:
+            context_window_tokens = (
+                getattr(orchestrator_lm, "_yaw_context_window_tokens", None)
+                or getattr(rlm_sub_lm, "_yaw_context_window_tokens", None)
+                or DEFAULT_CONTEXT_WINDOW_TOKENS
+            )
+        if max_output_tokens is None:
+            max_output_tokens = max(
+                int((getattr(lm, "kwargs", {}) or {}).get("max_tokens") or 0) for lm in (orchestrator_lm, rlm_sub_lm)
+            ) or scale_context_budget(4096, context_window_tokens)
+        if rlm_max_output_chars is None:
+            rlm_max_output_chars = scale_context_budget(10000, context_window_tokens)
         context_char_limit(1, context_window_tokens, max_output_tokens)
         self.context_window_tokens = context_window_tokens
         self.max_output_tokens = max_output_tokens
@@ -1622,35 +1368,23 @@ class HippoRAGProgram(dspy.Module):
         self.telemetry.append(record)
 
     def _bind_predictor_lms(self) -> None:
-        """Bind a dedicated `_PredictorBoundLM` instance with isolated `.history` to all 9 stage predictors."""
-
-        def worker_getter() -> Any:
-            return self.rlm_sub_lm or self.orchestrator_lm
-
-        def orch_getter() -> Any:
-            return self.orchestrator_lm or self.rlm_sub_lm
-
-        for name, pred in (
-            ("ner", self.ner),
-            ("triples", self.triples),
-            ("entity_definer", self.entity_definer),
-            ("synonym_judge", self.synonym_judge),
-            ("shacl_repair", self.shacl_repair),
-            ("triple_filter", self.triple_filter),
-            ("query_intent", self.query_intent),
-        ):
-            pred.lm = _PredictorBoundLM(name, "worker", worker_getter)
-
-        qa_lm = _PredictorBoundLM("qa", "orchestrator", orch_getter)
-        self.qa.predict.lm = qa_lm
-
-        action_lm = _PredictorBoundLM(
-            "shacl_healer_rlm.generate_action", "orchestrator", orch_getter
-        )
-        extract_lm = _PredictorBoundLM("shacl_healer_rlm.extract", "orchestrator", orch_getter)
-        self.shacl_healer_rlm.generate_action.lm = action_lm
-        self.shacl_healer_rlm.extract.lm = extract_lm
-        self.shacl_healer_rlm.lm = action_lm
+        """Bind native LMs by role; unbound predictors use DSPy's current context."""
+        worker = self.rlm_sub_lm or self.orchestrator_lm
+        orchestrator = self.orchestrator_lm or self.rlm_sub_lm
+        if worker is not None:
+            for predictor in (
+                self.ner,
+                self.triples,
+                self.entity_definer,
+                self.synonym_judge,
+                self.shacl_repair,
+                self.triple_filter,
+                self.query_intent,
+            ):
+                predictor.set_lm(worker)
+        if orchestrator is not None:
+            self.qa.set_lm(orchestrator)
+            self.shacl_healer_rlm.set_lm(orchestrator)
 
     def all_stage_predictors(self) -> list[tuple[str, Any]]:
         """Return all 9 canonical stage predictors (8 direct GBNF + 1 SHACL RLM healer)."""
@@ -1674,7 +1408,8 @@ class HippoRAGProgram(dspy.Module):
         shacl_repair_applier: Callable[[Sequence[Mapping[str, Any]]], int] | None = None,
         shacl_linter: Callable[[], list[dict[str, str]]] | None = None,
     ) -> None:
-        """Bind storage tools (`inspect_focus_node`, `hydrate_chunk`, `apply_shacl_repairs`, `lint_shacl`) for the SHACL RLM sandbox."""
+        """Bind storage tools (`inspect_focus_node`, `hydrate_chunk`, `apply_shacl_repairs`, `lint_shacl`) for the \
+SHACL RLM sandbox."""
         self._node_inspector = node_inspector
         self._chunk_hydrator = chunk_hydrator
         self._shacl_repair_applier = shacl_repair_applier
@@ -1690,6 +1425,7 @@ class HippoRAGProgram(dspy.Module):
     @classmethod
     def from_config(cls, config: YawConfig) -> HippoRAGProgram:
         """Construct a HippoRAGProgram from a YawConfig."""
+        assert config.max_output_tokens is not None and config.rlm_max_output_chars is not None
         orch_lm = create_dspy_lm(
             config.qa_model,
             base_url=config.base_url,
@@ -1739,7 +1475,7 @@ class HippoRAGProgram(dspy.Module):
         return context_char_limit(base_chars, self.context_window_tokens, self.max_output_tokens)
 
     def dump_state(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        """Serialize all DSPy predictors/RLMs plus EmbeddingGemma prefixes, GBNF structural bounds, and Pareto frontier."""
+        "Serialize all DSPy predictors/RLMs plus EmbeddingGemma prefixes, GBNF structural bounds, and Pareto frontier."
         state: dict[str, Any] = super().dump_state(*args, **kwargs)
         yaw_surface: dict[str, Any] = {
             "gbnf_max_entities": self.gbnf_max_entities,
@@ -1758,17 +1494,29 @@ class HippoRAGProgram(dspy.Module):
         return state
 
     def load_state(self, state: dict[str, Any], *args: Any, **kwargs: Any) -> Any:
-        """Restore DSPy predictor/RLM state plus EmbeddingGemma prefixes, GBNF structural bounds, and Pareto frontier."""
+        "Restore DSPy predictor/RLM state plus EmbeddingGemma prefixes, GBNF structural bounds, and Pareto frontier."
         state_copy = dict(state)
         state_copy.setdefault("retriever", {"k": getattr(self.retriever, "k", 10)})
         yaw_surface = state_copy.pop("yaw_surface", None)
+        deployment_lms = {name: predictor.lm for name, predictor in self.named_predictors() if predictor.lm is not None}
         # Missing legacy predictors retain constructor defaults. Explicitly
         # saved empty demo lists must survive loading without reseeding.
         for p_name, param in self.named_parameters():
             if p_name not in state_copy and hasattr(param, "dump_state"):
                 state_copy[p_name] = param.dump_state()
+        for name in deployment_lms:
+            if name in state_copy:
+                # Instructions/demos are portable; explicit deployment LMs own
+                # endpoints and credentials. Do not reconstruct clients from a
+                # compiled prompt file when the caller already supplied them.
+                state_copy[name] = {**state_copy[name], "lm": None}
         res = super().load_state(state_copy, *args, **kwargs)
+        for name, predictor in self.named_predictors():
+            if name in deployment_lms:
+                predictor.set_lm(deployment_lms[name])
         if isinstance(yaw_surface, dict):
+            # Serving capacity belongs to this deployment, not a compiled prompt
+            # or old Pareto member. Preserve it on hot reload as well as startup.
             for attr in (
                 "gbnf_max_entities",
                 "gbnf_max_triples",
@@ -1776,8 +1524,6 @@ class HippoRAGProgram(dspy.Module):
                 "embedding_query_prefix",
                 "embedding_fact_prefix",
                 "embedding_document_prefix",
-                "context_window_tokens",
-                "max_output_tokens",
             ):
                 if attr in yaw_surface:
                     setattr(self, attr, yaw_surface[attr])
@@ -1786,16 +1532,13 @@ class HippoRAGProgram(dspy.Module):
             frontier_states = yaw_surface.get("pareto_frontier_states")
             if isinstance(frontier_states, list) and frontier_states:
                 self.pareto_frontier_states = list(frontier_states)
-                self.pareto_ensemble = ParetoProgramEnsemble.from_frontier_states(
-                    self, self.pareto_frontier_states
-                )
+                self.pareto_ensemble = ParetoProgramEnsemble.from_frontier_states(self, self.pareto_frontier_states)
         if isinstance(self.json_adapter, YawGBNFAdapter):
             self.json_adapter.enable_gbnf = self.enable_gbnf
             self.json_adapter.max_entities = self.gbnf_max_entities
             self.json_adapter.max_triples = self.gbnf_max_triples
             self.json_adapter.max_facts = self.gbnf_max_facts
             self.json_adapter.max_reasoning_chars = self.gbnf_max_reasoning_chars
-        self._bind_predictor_lms()
         return res
 
     def __deepcopy__(self, memo: dict[int, Any]) -> HippoRAGProgram:
@@ -1832,7 +1575,6 @@ class HippoRAGProgram(dspy.Module):
             k=getattr(self.retriever, "k", 10),
             rm=new_prog.rm,
         )
-        new_prog._bind_predictor_lms()
         return new_prog
 
     def _resolve_worker_lm(self, fallback_lm: dspy.LM | None = None) -> dspy.LM | None:
@@ -1898,7 +1640,7 @@ class HippoRAGProgram(dspy.Module):
             lint_shacl,
         ]
 
-    def _dspy_ctx(self, lm: dspy.LM | None, *, use_json_adapter: bool = True):
+    def _dspy_ctx(self, lm: dspy.BaseLM | None, *, use_json_adapter: bool = True):
         ctx_kwargs: dict[str, Any] = {}
         if lm is not None:
             ctx_kwargs["lm"] = lm
@@ -1906,7 +1648,7 @@ class HippoRAGProgram(dspy.Module):
             ctx_kwargs["adapter"] = self.json_adapter
         return dspy.context(**ctx_kwargs)
 
-    def _should_use_gbnf(self, use_gbnf: bool | None, lm: dspy.LM | None) -> bool:
+    def _should_use_gbnf(self, use_gbnf: bool | None, lm: dspy.BaseLM | None) -> bool:
         requested = self.enable_gbnf if use_gbnf is None else use_gbnf
         return bool(requested and lm_supports_gbnf(lm))
 
@@ -1961,6 +1703,9 @@ class HippoRAGProgram(dspy.Module):
         inv_feedback = ""
         with track_usage() as usage_tracker:
             if is_rlm and rlm_mod is not None:
+                if lm is not None:
+                    rlm_mod = rlm_mod.deepcopy()
+                    rlm_mod.set_lm(lm)
                 orch_lm = self._resolve_orchestrator_lm(lm)
                 with self._dspy_ctx(orch_lm, use_json_adapter=False):
                     pred = rlm_mod(**inputs)
@@ -1973,12 +1718,8 @@ class HippoRAGProgram(dspy.Module):
                     shacl_linter=self._shacl_linter,
                 )
             else:
-                effective_lm = lm
-                if effective_lm is None:
-                    if direct_mod is self.qa:
-                        effective_lm = self.orchestrator_lm or self.rlm_sub_lm
-                    else:
-                        effective_lm = self.rlm_sub_lm or self.orchestrator_lm
+                predictor = direct_mod.predict if isinstance(direct_mod, dspy.ChainOfThought) else direct_mod
+                effective_lm = lm or predictor.lm or dspy.settings.lm
                 direct_inputs = dict(inputs)
                 if isinstance(direct_inputs.get("passage"), str) and len(
                     direct_inputs["passage"]
@@ -1991,6 +1732,8 @@ class HippoRAGProgram(dspy.Module):
                     limit = self._context_char_limit(40000)
                     direct_inputs["context"] = direct_inputs["context"][:limit]
                 call_kwargs: dict[str, Any] = {}
+                if lm is not None:
+                    call_kwargs["lm"] = lm
                 if self._should_use_gbnf(use_gbnf, effective_lm):
                     call_kwargs["config"] = {"extra_body": {"grammar": grammar_fn()}}
                 with self._dspy_ctx(effective_lm, use_json_adapter=True):
@@ -2066,8 +1809,7 @@ class HippoRAGProgram(dspy.Module):
         raw_entities = getattr(pred, "named_entities", [])
         parsed_defs = extract_entity_definitions(raw_entities)
         enriched_defs: list[tuple[str, str]] = [
-            (ename, edef or self._last_ner_definitions.get(ename, ""))
-            for ename, edef in parsed_defs
+            (ename, edef or self._last_ner_definitions.get(ename, "")) for ename, edef in parsed_defs
         ]
         entities = tuple(ename for ename, _ in enriched_defs)
         return entities, tuple(enriched_defs)
@@ -2159,11 +1901,7 @@ class HippoRAGProgram(dspy.Module):
                 if not _record_audit:
                     self._last_ner_definitions[ename] = edef
 
-        stage_tokens = (
-            int(self.telemetry[-1].get("tokens_used", 0))
-            if len(self.telemetry) > prev_telem_len
-            else 0
-        )
+        stage_tokens = int(self.telemetry[-1].get("tokens_used", 0)) if len(self.telemetry) > prev_telem_len else 0
         if _record_audit:
             self.entity_def_audit_trail.append(
                 {
@@ -2234,11 +1972,7 @@ class HippoRAGProgram(dspy.Module):
         known_entities_for_grammar: list[str] = defined_entity_names or [
             (str(x[0]).strip() if isinstance(x, (list, tuple)) and len(x) >= 1 else str(x).strip())
             for x in named_entities
-            if (
-                str(x[0]).strip()
-                if isinstance(x, (list, tuple)) and len(x) >= 1
-                else str(x).strip()
-            )
+            if (str(x[0]).strip() if isinstance(x, (list, tuple)) and len(x) >= 1 else str(x).strip())
         ]
 
         pred = self._invoke_stage(
@@ -2256,9 +1990,7 @@ class HippoRAGProgram(dspy.Module):
         )
 
         raw_triples = getattr(pred, "triples", [])
-        structured = list(
-            extract_structured_triples(raw_triples, entity_definitions=all_def_pairs or merged_defs)
-        )
+        structured = list(extract_structured_triples(raw_triples, entity_definitions=all_def_pairs or merged_defs))
 
         # Propagate any inline [name, def] pairs across all triples in the same chunk first
         for st in structured:
@@ -2271,16 +2003,8 @@ class HippoRAGProgram(dspy.Module):
 
         missing_names: list[str] = []
         for idx, st in enumerate(structured):
-            s_def = (
-                st.subj_def
-                or merged_defs.get(st.subj, "")
-                or merged_defs.get(str(text_processing(st.subj)), "")
-            )
-            o_def = (
-                st.obj_def
-                or merged_defs.get(st.obj, "")
-                or merged_defs.get(str(text_processing(st.obj)), "")
-            )
+            s_def = st.subj_def or merged_defs.get(st.subj, "") or merged_defs.get(str(text_processing(st.subj)), "")
+            o_def = st.obj_def or merged_defs.get(st.obj, "") or merged_defs.get(str(text_processing(st.obj)), "")
             if s_def != st.subj_def or o_def != st.obj_def:
                 structured[idx] = StructuredTriple(
                     subj=st.subj,
@@ -2309,15 +2033,9 @@ class HippoRAGProgram(dspy.Module):
                     merged_defs[str(text_processing(ename))] = edef
             for idx, st in enumerate(structured):
                 s_def = (
-                    st.subj_def
-                    or merged_defs.get(st.subj, "")
-                    or merged_defs.get(str(text_processing(st.subj)), "")
+                    st.subj_def or merged_defs.get(st.subj, "") or merged_defs.get(str(text_processing(st.subj)), "")
                 )
-                o_def = (
-                    st.obj_def
-                    or merged_defs.get(st.obj, "")
-                    or merged_defs.get(str(text_processing(st.obj)), "")
-                )
+                o_def = st.obj_def or merged_defs.get(st.obj, "") or merged_defs.get(str(text_processing(st.obj)), "")
                 if s_def != st.subj_def or o_def != st.obj_def:
                     structured[idx] = StructuredTriple(
                         subj=st.subj,
@@ -2355,13 +2073,11 @@ class HippoRAGProgram(dspy.Module):
         lm: Any = None,
         use_gbnf: bool | None = None,
     ) -> OpenIERecord:
-        """Execute OpenIE (NER w/ definitions -> Structured Triples -> Missing Entity Definitions) for a passage chunk."""
+        "Execute OpenIE (NER w/ definitions -> Structured Triples -> Missing Entity Definitions) for a passage chunk."
         entities, entity_definitions = self._run_ner_stage(passage, lm=lm, use_gbnf=use_gbnf)
         has_nonempty_defs = any(defn for _, defn in entity_definitions)
         stage2_entities_input: list[Any] = (
-            [[name, defn] for name, defn in entity_definitions]
-            if has_nonempty_defs
-            else list(entities)
+            [[name, defn] for name, defn in entity_definitions] if has_nonempty_defs else list(entities)
         )
         structured_triples = self.extract_structured_triples(
             passage,
@@ -2406,9 +2122,7 @@ class HippoRAGProgram(dspy.Module):
                 if not ent_name:
                     continue
                 ent_norm = str(text_processing(ent_name))
-                if ent_name not in seen_entity_names and (
-                    not ent_norm or ent_norm not in seen_entity_norms
-                ):
+                if ent_name not in seen_entity_names and (not ent_norm or ent_norm not in seen_entity_norms):
                     merged_entities.append(ent_name)
                     seen_entity_names.add(ent_name)
                     if ent_norm:
@@ -2452,7 +2166,8 @@ class HippoRAGProgram(dspy.Module):
         lm: Any = None,
         use_gbnf: bool | None = None,
     ) -> list[dict[str, str]]:
-        """Classify candidate entity pairs into SKOS/OWL relations (`skos:altLabel`, `skos:hiddenLabel`, `skos:related`, `owl:differentFrom`)."""
+        """Classify candidate entity pairs into SKOS/OWL relations (`skos:altLabel`, `skos:hiddenLabel`, \
+`skos:related`, `owl:differentFrom`)."""
         if not candidate_pairs:
             return []
         if isinstance(candidate_pairs, str):
@@ -2463,16 +2178,22 @@ class HippoRAGProgram(dspy.Module):
                 try:
                     parsed_pairs = json.loads(pairs_json)
                     if isinstance(parsed_pairs, list):
-                        pairs_json = json.dumps(parsed_pairs[:16], ensure_ascii=False)
+                        pairs_json = _bounded_prompt_json(
+                            parsed_pairs,
+                            scale_context_budget(16, self.context_window_tokens),
+                            self._context_char_limit(12000),
+                        )
                 except json.JSONDecodeError, TypeError:
                     pairs_json = pairs_json[: self._context_char_limit(12000)]
         else:
             pairs_list = [dict(p) for p in candidate_pairs if isinstance(p, Mapping)]
             if not pairs_list:
                 return []
-            if len(pairs_list) > 16:
-                pairs_list = pairs_list[:16]
-            pairs_json = json.dumps(pairs_list, ensure_ascii=False)
+            pairs_json = _bounded_prompt_json(
+                pairs_list, scale_context_budget(16, self.context_window_tokens), self._context_char_limit(12000)
+            )
+        if pairs_json == "[]":
+            return []
 
         prev_telem_len = len(self.telemetry)
         pred = self._invoke_stage(
@@ -2486,11 +2207,7 @@ class HippoRAGProgram(dspy.Module):
         )
         raw_decisions = getattr(pred, "decisions", [])
         decisions = parse_synonym_decisions(raw_decisions)
-        stage_tokens = (
-            int(self.telemetry[-1].get("tokens_used", 0))
-            if len(self.telemetry) > prev_telem_len
-            else 0
-        )
+        stage_tokens = int(self.telemetry[-1].get("tokens_used", 0)) if len(self.telemetry) > prev_telem_len else 0
         self.synonym_audit_trail.append(
             {
                 "mode": "direct",
@@ -2531,7 +2248,11 @@ class HippoRAGProgram(dspy.Module):
                 try:
                     parsed_v = json.loads(violations_json)
                     if isinstance(parsed_v, list):
-                        violations_json = json.dumps(parsed_v[:16], ensure_ascii=False)
+                        violations_json = _bounded_prompt_json(
+                            parsed_v,
+                            scale_context_budget(16, self.context_window_tokens),
+                            self._context_char_limit(12000),
+                        )
                 except json.JSONDecodeError, TypeError:
                     violations_json = violations_json[: self._context_char_limit(12000)]
         else:
@@ -2551,9 +2272,7 @@ class HippoRAGProgram(dspy.Module):
                     serialized.append(
                         {
                             "focus_node": str(getattr(v, "focus_node", "")),
-                            "source_shape": str(
-                                getattr(v, "source_shape", getattr(v, "shape", ""))
-                            ),
+                            "source_shape": str(getattr(v, "source_shape", getattr(v, "shape", ""))),
                             "result_path": str(getattr(v, "result_path", "")),
                             "value": str(getattr(v, "value", "")),
                             "message": str(getattr(v, "message", "")),
@@ -2561,15 +2280,19 @@ class HippoRAGProgram(dspy.Module):
                     )
             if not serialized:
                 return []
-            if not is_rlm and len(serialized) > 16:
-                serialized = serialized[:16]
-            violations_json = json.dumps(serialized, ensure_ascii=False)
+            violations_json = (
+                json.dumps(serialized, ensure_ascii=False)
+                if is_rlm
+                else _bounded_prompt_json(
+                    serialized, scale_context_budget(16, self.context_window_tokens), self._context_char_limit(12000)
+                )
+            )
+        if violations_json == "[]":
+            return []
 
         stage_inputs: dict[str, Any] = {"violations": violations_json}
         if not is_rlm:
-            stage_inputs["focus_context"] = (
-                focus_context[:12000] if len(focus_context) > 12000 else focus_context
-            )
+            stage_inputs["focus_context"] = focus_context[: self._context_char_limit(12000)]
         prev_telem_len = len(self.telemetry)
         pred = self._invoke_stage(
             self.shacl_repair,
@@ -2583,18 +2306,12 @@ class HippoRAGProgram(dspy.Module):
         )
         raw_repairs = getattr(pred, "repairs", [])
         repairs = parse_shacl_repairs(raw_repairs)
-        stage_tokens = (
-            int(self.telemetry[-1].get("tokens_used", 0))
-            if len(self.telemetry) > prev_telem_len
-            else 0
-        )
+        stage_tokens = int(self.telemetry[-1].get("tokens_used", 0)) if len(self.telemetry) > prev_telem_len else 0
         self.shacl_audit_trail.append(
             {
                 "mode": "rlm" if is_rlm else "direct",
                 "predictor": "shacl_healer_rlm" if is_rlm else "shacl_repair",
-                "signature": (
-                    HealSHACLViolations.__name__ if is_rlm else ProposeSHACLRepairs.__name__
-                ),
+                "signature": (HealSHACLViolations.__name__ if is_rlm else ProposeSHACLRepairs.__name__),
                 "tokens_used": stage_tokens,
                 "violations": violations_json,
                 "focus_context": focus_context,
@@ -2626,17 +2343,13 @@ class HippoRAGProgram(dspy.Module):
             is_rlm=False,
             lm=lm,
             use_gbnf=use_gbnf,
-            grammar_fn=lambda: build_dspy_rerank_grammar(
-                candidate_facts, max_facts=effective_max_facts
-            ),
+            grammar_fn=lambda: build_dspy_rerank_grammar(candidate_facts, max_facts=effective_max_facts),
             question=question,
             fact_before_filter=fact_before_filter,
         )
         raw_after = getattr(pred, "fact", getattr(pred, "fact_after_filter", None))
         generated = coerce_generated_facts(raw_after)
-        return match_facts_to_candidate_indices(
-            candidate_facts, generated, max_facts=effective_max_facts
-        )
+        return match_facts_to_candidate_indices(candidate_facts, generated, max_facts=effective_max_facts)
 
     def extract_query_intent(
         self,
@@ -2648,7 +2361,7 @@ class HippoRAGProgram(dspy.Module):
         """Rewrite question into a declarative query_intent string (GBNF on Qwen GPU, temp=0.4, freq_penalty=0.2)."""
         from dspy.utils.usage_tracker import track_usage
 
-        effective_lm = lm or self.rlm_sub_lm or self.orchestrator_lm
+        effective_lm = lm or self.query_intent.lm or dspy.settings.lm
         call_cfg: dict[str, Any] = {
             "temperature": 0.4,
             "frequency_penalty": 0.2,
@@ -2656,7 +2369,7 @@ class HippoRAGProgram(dspy.Module):
         if self._should_use_gbnf(use_gbnf, effective_lm):
             call_cfg["extra_body"] = {"grammar": build_dspy_query_intent_grammar()}
         with track_usage() as usage_tracker, self._dspy_ctx(effective_lm, use_json_adapter=True):
-            pred = self.query_intent(question=question, config=call_cfg)
+            pred = self.query_intent(question=question, config=call_cfg, **({"lm": lm} if lm is not None else {}))
         tokens = usage_tracker.get_total_tokens()
         out_intent = str(getattr(pred, "query_intent", "") or "").strip() or question
         self._record_stage_telemetry(
@@ -2710,7 +2423,8 @@ class HippoRAGProgram(dspy.Module):
         question: str,
         initial_context: str,
     ) -> dspy.Prediction | None:
-        """Run bounded `dspy.ReActV2` multi-hop graph exploration when single-shot PPR/QA abstains or retrieval confidence < 0.15."""
+        """Run bounded `dspy.ReActV2` multi-hop graph exploration when single-shot PPR/QA abstains or retrieval \
+confidence < 0.15."""
         react_cls = getattr(dspy, "ReActV2", None)
         if react_cls is None:
             return None
@@ -2751,9 +2465,7 @@ class HippoRAGProgram(dspy.Module):
             with self._dspy_ctx(eff_lm, use_json_adapter=True):
                 return agent(context=initial_context, question=question)
         except Exception as exc:
-            logging.getLogger(__name__).debug(
-                "ReActV2 fallback skipped (%s: %s)", type(exc).__name__, exc
-            )
+            logging.getLogger(__name__).debug("ReActV2 fallback skipped (%s: %s)", type(exc).__name__, exc)
             return None
 
     @diagnostic_boundary
@@ -2770,9 +2482,7 @@ class HippoRAGProgram(dspy.Module):
 
         if context is not None and question is not None:
             if self.pareto_ensemble is not None and not self._in_ensemble:
-                return self.pareto_ensemble.answer_question(
-                    context=context, question=question, use_gbnf=use_gbnf
-                )
+                return self.pareto_ensemble.answer_question(context=context, question=question, use_gbnf=use_gbnf)
             return self.answer_question(context=context, question=question, use_gbnf=use_gbnf)
         if context is not None and question is None:
             return self.forward(
@@ -2797,13 +2507,10 @@ class HippoRAGProgram(dspy.Module):
                             context=hydrated_ctx, question=question, use_gbnf=use_gbnf
                         )
                     else:
-                        pred = self.answer_question(
-                            context=hydrated_ctx, question=question, use_gbnf=use_gbnf
-                        )
+                        pred = self.answer_question(context=hydrated_ctx, question=question, use_gbnf=use_gbnf)
                     top_score = max(scores) if len(scores) > 0 else 1.0
                     if self.enable_react_fallback and (
-                        is_abstaining_answer(str(getattr(pred, "answer", "") or ""))
-                        or top_score < 0.15
+                        is_abstaining_answer(str(getattr(pred, "answer", "") or "")) or top_score < 0.15
                     ):
                         react_pred = self._run_react_qa_fallback(question, hydrated_ctx)
                         if react_pred is not None and not is_abstaining_answer(
@@ -2822,20 +2529,12 @@ class HippoRAGProgram(dspy.Module):
                 if tokens and hasattr(res, "set_lm_usage"):
                     res.set_lm_usage(tokens)
                 return res
-            raise ValueError(
-                "context must be provided when no retrieval_hook is registered on HippoRAGProgram."
-            )
-        raise ValueError(
-            "Either (context, question) or question must be provided to HippoRAGProgram."
-        )
+            raise ValueError("context must be provided when no retrieval_hook is registered on HippoRAGProgram.")
+        raise ValueError("Either (context, question) or question must be provided to HippoRAGProgram.")
 
     def as_async(self) -> Any:
         """Return a `dspy.asyncify`-wrapped async callable for this `HippoRAGProgram`."""
         return dspy.asyncify(self)
-
-    def named_predictors(self) -> list[tuple[str, Any]]:
-        """Return all 9 canonical stage predictors so `dspy.GEPA` inspects the full program surface."""
-        return list(super().named_predictors())
 
 
 class ParetoProgramEnsemble(dspy.Module):
@@ -2850,9 +2549,7 @@ class ParetoProgramEnsemble(dspy.Module):
         if not programs:
             raise ValueError("ParetoProgramEnsemble requires at least 1 HippoRAGProgram candidate.")
         self.programs: list[HippoRAGProgram] = list(programs)
-        self.qa_ensemble = dspy.Ensemble(reduce_fn=self.reduce_qa_predictions).compile(
-            self.programs
-        )
+        self.qa_ensemble = dspy.Ensemble(reduce_fn=self.reduce_qa_predictions).compile(self.programs)
         # Freeze as compiled so attaching onto HippoRAGProgram.pareto_ensemble never duplicates named_predictors()
         self._compiled = True
 
@@ -2880,7 +2577,7 @@ class ParetoProgramEnsemble(dspy.Module):
 
     @staticmethod
     def reduce_ner_predictions(predictions: Sequence[Any]) -> dspy.Prediction:
-        """Union extracted entities across Pareto candidates, preserving the richest non-tautological `skos:definition`."""
+        "Union extracted entities across Pareto candidates, preserving the richest non-tautological `skos:definition`."
         ordered_norms: list[str] = []
         canonical_name_by_norm: dict[str, str] = {}
         best_def_by_norm: dict[str, str] = {}
@@ -2901,9 +2598,7 @@ class ParetoProgramEnsemble(dspy.Module):
                 if clean_def and not is_taut and len(clean_def) > len(existing_def):
                     best_def_by_norm[norm] = clean_def
 
-        merged_pairs = [
-            [canonical_name_by_norm[n], best_def_by_norm.get(n, "")] for n in ordered_norms
-        ]
+        merged_pairs = [[canonical_name_by_norm[n], best_def_by_norm.get(n, "")] for n in ordered_norms]
         return dspy.Prediction(named_entities=merged_pairs)
 
     @staticmethod
@@ -2912,7 +2607,8 @@ class ParetoProgramEnsemble(dspy.Module):
         *,
         valid_entities: Sequence[tuple[str, str]] | Mapping[str, str] | None = None,
     ) -> dspy.Prediction:
-        """Union and rank relation triples by vote count across Pareto candidates while enforcing closed-world entity linkage."""
+        """Union and rank relation triples by vote count across Pareto candidates while enforcing closed-world \
+entity linkage."""
         def_map: dict[str, str] = {}
         if isinstance(valid_entities, Mapping):
             for k, v in valid_entities.items():
@@ -2934,8 +2630,7 @@ class ParetoProgramEnsemble(dspy.Module):
             raw_triples = getattr(pred, "triples", pred)
             structured_list = (
                 list(raw_triples)
-                if isinstance(raw_triples, (list, tuple))
-                and all(isinstance(x, StructuredTriple) for x in raw_triples)
+                if isinstance(raw_triples, (list, tuple)) and all(isinstance(x, StructuredTriple) for x in raw_triples)
                 else list(extract_structured_triples(raw_triples, entity_definitions=def_map))
             )
             seen_in_cand: set[tuple[str, str, str]] = set()
@@ -2962,14 +2657,9 @@ class ParetoProgramEnsemble(dspy.Module):
                     or def_map.get(s_norm, "")
                 )
                 o_def = (
-                    st.obj_def
-                    or (prev.obj_def if prev else "")
-                    or def_map.get(st.obj, "")
-                    or def_map.get(o_norm, "")
+                    st.obj_def or (prev.obj_def if prev else "") or def_map.get(st.obj, "") or def_map.get(o_norm, "")
                 )
-                spo_def = (
-                    st.spo_def if not prev or len(st.spo_def) >= len(prev.spo_def) else prev.spo_def
-                )
+                spo_def = st.spo_def if not prev or len(st.spo_def) >= len(prev.spo_def) else prev.spo_def
                 best_triple_by_key[key] = StructuredTriple(
                     subj=prev.subj if prev else st.subj,
                     subj_def=s_def,
@@ -2995,9 +2685,7 @@ class ParetoProgramEnsemble(dspy.Module):
         if not predictions:
             return dspy.Prediction(reasoning="", answer="")
 
-        non_abstaining = [
-            p for p in predictions if not is_abstaining_answer(str(getattr(p, "answer", "") or ""))
-        ]
+        non_abstaining = [p for p in predictions if not is_abstaining_answer(str(getattr(p, "answer", "") or ""))]
         pool = non_abstaining if non_abstaining else list(predictions)
         votes: dict[str, int] = {}
         best_pred_by_norm: dict[str, Any] = {}
@@ -3011,9 +2699,7 @@ class ParetoProgramEnsemble(dspy.Module):
             if norm not in first_idx:
                 first_idx[norm] = idx
             prev = best_pred_by_norm.get(norm)
-            prev_reas = (
-                str(getattr(prev, "reasoning", "") or "").strip() if prev is not None else ""
-            )
+            prev_reas = str(getattr(prev, "reasoning", "") or "").strip() if prev is not None else ""
             if prev is None or len(reas) > len(prev_reas):
                 best_pred_by_norm[norm] = p
 
@@ -3049,9 +2735,7 @@ class ParetoProgramEnsemble(dspy.Module):
         merged_ner = self.reduce_ner_predictions(ner_preds)
         merged_defs = list(extract_entity_definitions(merged_ner.named_entities))
         stage2_input: list[Any] = (
-            [[k, v] for k, v in merged_defs]
-            if any(v for _, v in merged_defs)
-            else [k for k, _ in merged_defs]
+            [[k, v] for k, v in merged_defs] if any(v for _, v in merged_defs) else [k for k, _ in merged_defs]
         )
 
         triple_preds: list[dspy.Prediction] = []
@@ -3074,15 +2758,11 @@ class ParetoProgramEnsemble(dspy.Module):
             triple_preds,
             valid_entities=merged_defs,
         )
-        structured_triples: tuple[StructuredTriple, ...] = tuple(
-            merged_triples_pred.structured_triples
-        )
+        structured_triples: tuple[StructuredTriple, ...] = tuple(merged_triples_pred.structured_triples)
 
         ordered_entities: list[str] = [k for k, _ in merged_defs]
         seen_norms: set[str] = {str(text_processing(k)) or k.lower() for k in ordered_entities}
-        def_by_norm: dict[str, str] = {
-            (str(text_processing(k)) or k.lower()): v for k, v in merged_defs if v
-        }
+        def_by_norm: dict[str, str] = {(str(text_processing(k)) or k.lower()): v for k, v in merged_defs if v}
         for st in structured_triples:
             for ename, edef in ((st.subj, st.subj_def), (st.obj, st.obj_def)):
                 if not ename:
@@ -3095,8 +2775,7 @@ class ParetoProgramEnsemble(dspy.Module):
                     def_by_norm[enorm] = edef
 
         final_defs = tuple(
-            (ename, def_by_norm.get(str(text_processing(ename)) or ename.lower(), ""))
-            for ename in ordered_entities
+            (ename, def_by_norm.get(str(text_processing(ename)) or ename.lower(), "")) for ename in ordered_entities
         )
         return OpenIERecord(
             chunk_id=chunk_id,
@@ -3206,7 +2885,9 @@ _STAGE_SCHEMA_CONTRACTS: dict[str, tuple[str, tuple[str, ...], str]] = {
     "synonym_judge": (
         "decisions",
         ("decisions",),
-        'Respond with JSON: {"decisions": [{"pair_id": "id_a|id_b", "relation": "skos:altLabel|skos:hiddenLabel|skos:related|owl:differentFrom", "canonical": "id_a_or_id_b"}, ...]}.',
+        'Respond with JSON: {"decisions": [{"pair_id": "id_a|id_b", "relation": '
+        '"skos:altLabel|skos:hiddenLabel|skos:related|owl:differentFrom", "canonical": '
+        '"id_a_or_id_b"}, ...]}.',
     ),
     "shacl_repair": (
         "repairs",
@@ -3251,17 +2932,12 @@ class _InstructionSynthesizerWorker(dspy.Module):
         self.max_instruction_chars = max_instruction_chars
         self.max_field_chars = max_field_chars
         self.worker_temperature = float(worker_temperature)
-        self.json_adapter: dspy.Adapter = json_adapter or YawJSONAdapter()
+        self.json_adapter: dspy.Adapter = json_adapter or dspy.JSONAdapter()
         self._rollout_lm: Any = None
         self.sub_telemetry: list[dict[str, Any]] = []
 
     def get_lm(self) -> Any:
-        return (
-            self._rollout_lm
-            or self.worker_lm
-            or self.orchestrator_lm
-            or getattr(self.qwen_proposer, "lm", None)
-        )
+        return self._rollout_lm or self.worker_lm or self.orchestrator_lm or getattr(self.qwen_proposer, "lm", None)
 
     def set_lm(self, lm: Any) -> None:
         self._rollout_lm = lm
@@ -3296,9 +2972,7 @@ class _InstructionSynthesizerWorker(dspy.Module):
         native.compress = self.qwen_compressor if self.max_instruction_chars else None
         examples = self.fit_evidence(current_instruction, examples_with_feedback, component_name)
         stage = component_name.removesuffix(".predict")
-        contract = _STAGE_SCHEMA_CONTRACTS.get(
-            stage, ("", (), "Preserve the existing output schema.")
-        )[2]
+        contract = _STAGE_SCHEMA_CONTRACTS.get(stage, ("", (), "Preserve the existing output schema."))[2]
         inputs = {
             "examples_with_feedback": [
                 {"component": component_name, "contract": contract},
@@ -3319,9 +2993,7 @@ class _InstructionSynthesizerWorker(dspy.Module):
     ) -> list[dict[str, Any]]:
         examples = list(examples_with_feedback or [])
         stage = component_name.removesuffix(".predict")
-        contract = _STAGE_SCHEMA_CONTRACTS.get(
-            stage, ("", (), "Preserve the existing output schema.")
-        )[2]
+        contract = _STAGE_SCHEMA_CONTRACTS.get(stage, ("", (), "Preserve the existing output schema."))[2]
         mandatory = {"component": component_name, "contract": contract}
         lm = self._rollout_lm or self.worker_lm or self.orchestrator_lm or dspy.settings.lm
         inputs = {
@@ -3329,16 +3001,10 @@ class _InstructionSynthesizerWorker(dspy.Module):
             "examples_with_feedback": [mandatory, *examples],
         }
         if self.max_instruction_chars is not None:
-            inputs["length_limit"] = (
-                f"The new instruction must be at most {self.max_instruction_chars} characters."
-            )
+            inputs["length_limit"] = f"The new instruction must be at most {self.max_instruction_chars} characters."
         while isinstance(lm, ReflectionLM):
             try:
-                lm.count(
-                    self.json_adapter.format(
-                        self.qwen_proposer.signature, self.qwen_proposer.demos, inputs
-                    )
-                )
+                lm.count(self.json_adapter.format(self.qwen_proposer.signature, self.qwen_proposer.demos, inputs))
                 break
             except ReflectionBudgetError:
                 if not examples:
@@ -3369,28 +3035,40 @@ class RLMInstructionProposer:
         simba_num_candidates: int = 2,
         simba_max_steps: int = 1,
         simba_max_demos: int = 2,
-        max_instruction_chars: int | None = 1500,
-        max_field_chars: int = 600,
+        max_instruction_chars: int | Literal["auto"] | None = "auto",
+        max_field_chars: int | None = None,
         max_feedback_examples: int = 5,
         reflection_temperature: float = 0.8,
         worker_temperature: float = 0.7,
         rlm_max_iters: int = 10,
         rlm_max_llm_calls: int = 20,
-        rlm_max_output_chars: int = 10000,
-        include_demos: bool = True,
+        rlm_max_output_chars: int | None = None,
+        include_demos: bool = False,
         adapter: dspy.Adapter | None = None,
         rlm_interpreter_factory: Callable[[], Any] = dspy.PythonInterpreter,
         task_scorer: Callable[[Mapping[str, str]], float] | None = None,
         save_simba_state: Callable[[dict[str, Any]], None] | None = None,
-        reflection_input_tokens: int = 16384,
+        reflection_input_tokens: int | None = None,
         token_counter: Any = None,
         checkpoint_get: Callable[[str], Any] | None = None,
         checkpoint_put: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
+        self.context_window_tokens = (
+            getattr(orchestrator_lm, "_yaw_context_window_tokens", None)
+            or getattr(worker_lm, "_yaw_context_window_tokens", None)
+            or getattr(token_counter, "context_tokens", None)
+            or DEFAULT_CONTEXT_WINDOW_TOKENS
+        )
+        if max_instruction_chars == "auto":
+            max_instruction_chars = scale_context_budget(1500, self.context_window_tokens)
+        if max_field_chars is None:
+            max_field_chars = scale_context_budget(600, self.context_window_tokens)
+        if rlm_max_output_chars is None:
+            rlm_max_output_chars = scale_context_budget(10000, self.context_window_tokens)
+        if reflection_input_tokens is None:
+            reflection_input_tokens = scale_context_budget(16384, self.context_window_tokens)
         if max_instruction_chars is not None and max_instruction_chars <= 0:
-            raise ValueError(
-                f"max_instruction_chars must be > 0 or None, got {max_instruction_chars!r}."
-            )
+            raise ValueError(f"max_instruction_chars must be > 0 or None, got {max_instruction_chars!r}.")
 
         if reflection_input_tokens < 1:
             raise ValueError("reflection_input_tokens must be positive")
@@ -3406,16 +3084,14 @@ class RLMInstructionProposer:
         self.simba_num_candidates = max(1, int(simba_num_candidates))
         self.simba_max_steps = max(1, int(simba_max_steps))
         self.simba_max_demos = max(0, int(simba_max_demos))
-        self.max_instruction_chars = (
-            int(max_instruction_chars) if max_instruction_chars is not None else None
-        )
+        self.max_instruction_chars = int(max_instruction_chars) if max_instruction_chars is not None else None
         self.max_field_chars = max(120, int(max_field_chars))
         self.max_feedback_examples = min(5, max(1, int(max_feedback_examples)))
         self.reflection_temperature = float(reflection_temperature)
         self.worker_temperature = float(worker_temperature)
         self.json_adapter: dspy.Adapter = adapter or YawGBNFAdapter(
             enable_gbnf=self.enable_gbnf,
-            max_instruction_chars=self.max_instruction_chars or 1500,
+            max_instruction_chars=self.max_instruction_chars,
         )
         self.telemetry: list[dict[str, Any]] = DiagnosticHistory()
         self.simba_telemetry: list[dict[str, Any]] = DiagnosticHistory()
@@ -3468,30 +3144,18 @@ class RLMInstructionProposer:
             self.inner_rlm.generate_action.demos = list(rlm_demos["instruction_proposer_inner"])
 
     def _bind_predictor_lms(self) -> None:
-        """Bind dedicated `_PredictorBoundLM` instances to all 3 reflection predictors."""
-
-        def worker_getter() -> Any:
-            return self.worker_lm or self.orchestrator_lm
-
-        def orch_getter() -> Any:
-            return self.orchestrator_lm or self.worker_lm
-
-        worker_bound = _PredictorBoundLM("qwen_proposer", "worker", worker_getter)
-        comp_bound = _PredictorBoundLM("qwen_compressor", "worker", worker_getter)
-        self.qwen_proposer.lm = worker_bound
-        self.qwen_compressor.lm = comp_bound
+        """Use native contextual writer LMs and a role-bound evidence selector."""
+        # The native proposer runs under the worker's selected rollout context.
+        # Leaving its predictors unbound makes DSPy's normal context precedence
+        # apply, including the verified ReflectionLM token-budget guard.
+        self.qwen_proposer.set_lm(None)
+        self.qwen_compressor.set_lm(None)
         self.worker_module.qwen_proposer = self.qwen_proposer
         self.worker_module.qwen_compressor = self.qwen_compressor
         self.worker_module.worker_lm = self.worker_lm
         self.worker_module.orchestrator_lm = self.orchestrator_lm
 
-        inner_action_lm = _PredictorBoundLM(
-            "inner_rlm.generate_action", "orchestrator", orch_getter
-        )
-        inner_extract_lm = _PredictorBoundLM("inner_rlm.extract", "orchestrator", orch_getter)
-        self.inner_rlm.generate_action.lm = inner_action_lm
-        self.inner_rlm.extract.lm = inner_extract_lm
-        self.inner_rlm.lm = inner_action_lm
+        self.inner_rlm.set_lm(self.orchestrator_lm or self.worker_lm)
 
     def get_lm(self) -> Any:
         return self.worker_module.get_lm()
@@ -3516,7 +3180,6 @@ class RLMInstructionProposer:
         }
         for key, value in self.__dict__.items():
             setattr(new, key, value if key in callbacks else copy.deepcopy(value, memo))
-        new._bind_predictor_lms()
         return new
 
     def preflight(self) -> None:
@@ -3533,8 +3196,8 @@ class RLMInstructionProposer:
                         lm,
                         self.token_counter,
                         self.reflection_input_tokens,
-                        getattr(lm, "_yaw_context_window_tokens", None) or 65536,
-                        int(lm.kwargs.get("max_tokens") or 4096),
+                        getattr(lm, "_yaw_context_window_tokens", None) or self.context_window_tokens,
+                        int(lm.kwargs.get("max_tokens") or scale_context_budget(4096, self.context_window_tokens)),
                     ),
                 )
         self.inner_rlm.sub_lm = self.worker_lm or self.orchestrator_lm
@@ -3579,9 +3242,7 @@ class RLMInstructionProposer:
                 raise ValueError(f"Malformed SIMBA predictor {name}") from exc
             restored[name] = predictor
         examples = [
-            dspy.Example(**ex).with_inputs(
-                "component_name", "current_instruction", "examples_with_feedback"
-            )
+            dspy.Example(**ex).with_inputs("component_name", "current_instruction", "examples_with_feedback")
             for ex in state["examples"][-max(self.simba_bsize, 8) :]
         ]
         for name, predictor in restored.items():
@@ -3617,11 +3278,7 @@ class RLMInstructionProposer:
 
     def step_simba(self) -> bool:
         """Run `dspy.SIMBA` on the inner worker (`self.worker_module`) over buffered reflection examples."""
-        if (
-            not self.enable_simba
-            or self.task_scorer is None
-            or len(self._simba_examples) < self.simba_bsize
-        ):
+        if not self.enable_simba or self.task_scorer is None or len(self._simba_examples) < self.simba_bsize:
             return False
         if not hasattr(dspy, "SIMBA"):
             return False
@@ -3669,13 +3326,9 @@ class RLMInstructionProposer:
                 )
             new_inst = str(compiled_worker.qwen_proposer.signature.instructions).strip()
             self.qwen_proposer.signature = compiled_worker.qwen_proposer.signature
-            self.qwen_proposer.demos = list(
-                getattr(compiled_worker.qwen_proposer, "demos", ()) or ()
-            )
+            self.qwen_proposer.demos = list(getattr(compiled_worker.qwen_proposer, "demos", ()) or ())
             self.qwen_compressor.signature = compiled_worker.qwen_compressor.signature
-            self.qwen_compressor.demos = list(
-                getattr(compiled_worker.qwen_compressor, "demos", ()) or ()
-            )
+            self.qwen_compressor.demos = list(getattr(compiled_worker.qwen_compressor, "demos", ()) or ())
             self._bind_predictor_lms()
 
             entry = {
@@ -3820,9 +3473,7 @@ class RLMInstructionProposer:
             fallback = None
             try:
                 with dspy.context(lm=self.orchestrator_lm or self.worker_lm, trace=[]):
-                    result = self.inner_rlm(
-                        current_instruction=current_instruction, examples_with_feedback=originals
-                    )
+                    result = self.inner_rlm(current_instruction=current_instruction, examples_with_feedback=originals)
                 selection = checkpoint_object(result.selection, "evidence selection")
                 resolve_evidence(originals, selection, self.max_feedback_examples)
             except (
@@ -3848,7 +3499,7 @@ class RLMInstructionProposer:
         diagnosis = selection.get("diagnosis", "")
         if not isinstance(diagnosis, str):
             raise ValueError("Malformed evidence diagnosis")
-        packet.insert(0, {"diagnosis": diagnosis[:2000]})
+        packet.insert(0, {"diagnosis": diagnosis[: scale_context_budget(2000, self.context_window_tokens)]})
         return evidence_key, packet, fallback
 
     @diagnostic_boundary
@@ -3858,9 +3509,7 @@ class RLMInstructionProposer:
         current_instruction: str,
         component_examples: Sequence[Mapping[str, Any]],
     ) -> str:
-        evidence_key, packet, fallback = self.select_evidence(
-            component_name, current_instruction, component_examples
-        )
+        evidence_key, packet, fallback = self.select_evidence(component_name, current_instruction, component_examples)
         get = self.checkpoint_get or (lambda key: None)
         put = self.checkpoint_put or (lambda key, value: None)
         key = "proposal:" + reflection_digest(
@@ -3919,7 +3568,8 @@ class RLMInstructionProposer:
         current_instruction: str = "",
         examples_with_feedback: Any = None,
     ) -> Any:
-        """Dual entrypoint: GEPA `ProposalFn` `(candidate, reflective_dataset, components_to_update)` or `dspy.Module` `(component_name=..., current_instruction=..., examples_with_feedback=...)`."""
+        """Dual entrypoint: GEPA `ProposalFn` `(candidate, reflective_dataset, components_to_update)` or \
+`dspy.Module` `(component_name=..., current_instruction=..., examples_with_feedback=...)`."""
         if candidate is None or not isinstance(candidate, Mapping):
             self.preflight()
             prepared = self._prepare_examples(
@@ -3959,9 +3609,7 @@ class RLMInstructionProposer:
                     self.reflection_temperature,
                     self.enable_gbnf,
                 ],
-                "data": reflection_examples(
-                    [{"component": k, "examples": v} for k, v in reflective_dataset.items()]
-                ),
+                "data": reflection_examples([{"component": k, "examples": v} for k, v in reflective_dataset.items()]),
                 "components": list(components_to_update),
             }
         )
@@ -4046,7 +3694,8 @@ class RLMInstructionProposer:
         *,
         num_instruct_candidates: int = 1,
     ) -> dict[int, list[str]]:
-        """Propose MIPROv2 instruction candidates per predictor using `self.inner_rlm` (`dspy.RLM`) instead of stock `GroundedProposer`."""
+        """Propose MIPROv2 instruction candidates per predictor using `self.inner_rlm` (`dspy.RLM`) instead of stock \
+`GroundedProposer`."""
         named_preds = list(program.named_predictors())
         program_summary = (
             ", ".join(
@@ -4111,14 +3760,8 @@ class RLMInstructionProposer:
                     }
                     for d_ex in list(chosen_set)[: self.max_feedback_examples]:
                         if isinstance(d_ex, Mapping):
-                            d_in = {
-                                k: v for k, v in d_ex.items() if k in in_keys and k != "augmented"
-                            }
-                            d_out = {
-                                k: v
-                                for k, v in d_ex.items()
-                                if k not in in_keys and k != "augmented"
-                            }
+                            d_in = {k: v for k, v in d_ex.items() if k in in_keys and k != "augmented"}
+                            d_out = {k: v for k, v in d_ex.items() if k not in in_keys and k != "augmented"}
                             comp_examples.append(
                                 {
                                     "Inputs": d_in,

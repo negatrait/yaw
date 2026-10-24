@@ -81,14 +81,12 @@ class SuppressThirdPartyInfoFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         if record.levelno < logging.WARNING and any(
-            record.name == prefix or record.name.startswith(f"{prefix}.")
-            for prefix in self._SUPPRESSED_PREFIXES
+            record.name == prefix or record.name.startswith(f"{prefix}.") for prefix in self._SUPPRESSED_PREFIXES
         ):
             return False
         # Suppress repetitive benign warnings from upstream hipporag
         return not (
-            record.name.startswith("hipporag")
-            and "does not have a customized prompt template" in record.getMessage()
+            record.name.startswith("hipporag") and "does not have a customized prompt template" in record.getMessage()
         )
 
 

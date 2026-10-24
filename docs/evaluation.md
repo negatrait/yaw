@@ -1599,3 +1599,442 @@ zero selected tests when unchanged. Runner, test and conftest pass Ruff and ty;
 `uv run --locked preflight --help` succeeds. Existing formatting-only edits were
 checked for equivalent Python ASTs before inclusion. No full-repository green
 claim is made: other audited fixture/type/lint failures remain to be repaired.
+
+## 39. Complete Ruff, ty and pytest repair (2026-10-23)
+
+Started from clean commit `2e9eded`. The baseline was 52 ty diagnostics and
+218 Ruff findings at the existing 120-character limit. Typed native-DSPy
+fixtures, exact tokenizer callables and HTTP handlers now declare their actual
+contracts. Runtime optimizer tests use loopback tokenizer endpoints, one
+persistence test now uses native GEPA instead of replacing its class, and the
+retrieval-only fixture declares inference capacities. No static rules or test
+assertions were disabled. Prompt/template/grammar/SQL literal values were
+checked against the original source ASTs; only non-signature docstring trailing
+whitespace required normalized comparison.
+
+Automatic/conditional live-test skipping has been removed. Tests use the
+configured resident Gemma model and native DSPy callbacks instead of requiring
+Qwen or unbounded inspection histories. `--live` is retained only for command
+compatibility. Full verification disables testmon deselection; incremental
+preflight remains available for development.
+
+The first full preflight ran all 259 cases: **257 passed, 2 failed, 0 skipped**,
+731.95 s, with 81.37% line coverage. Both failures were in a new typed DummyLM
+fixture whose capability default incorrectly said GBNF unsupported. Restoring
+the original unspecified default fixed the unchanged assertions. Both actual
+resident-model tests passed in this full run. Initial artifacts:
+`outputs/preflight/20261023T162322Z-54704/`.
+
+The run also exposed unclosed native diskcache SQLite connections. An allocation
+trace located them in diskcache/core.py, rather than graph storage. YAW closes
+constructor handles on their creating thread and per-operation handles on the
+using thread, retaining persistent entries and native key/serialization logic.
+An unmanaged two-worker control reproduced two ResourceWarnings. New real-cache
+regressions cover both usage-accounting modes, thread teardown and persisted
+reconfiguration reuse; **3 passed** with ResourceWarnings escalated to errors
+(15.23 s). CLI resume and the two corrected grammar cases also passed under that
+strict warning setting (**3 passed**, 24.18 s). Three transaction-only SQLite
+test contexts now explicitly close their connections.
+
+Final `uv run --locked preflight --full` passed all four gates. Ruff and ty
+report **0 diagnostics**. Pytest executed **261 collected / 261 unique cases:
+261 passed, 0 failures, 0 errors, 0 skipped**, with testmon selection deactivated.
+Pytest took 721.85 s (728.5 s process time). Coverage.py measured **8,168 / 9,992
+lines = 81.75%**, with zero excluded lines. Both configured-resident-model tests
+and all native/SQLite/fresh-process recovery checks executed successfully.
+
+The final run emitted **0 ResourceWarnings**. Its 23 remaining notices are one
+Pydantic ReadOnly qualifier warning, four DSPy legacy message-API deprecations,
+and 18 DSPy temperature-zero/rollout notices. None were suppressed. These API
+migration/metadata notices do not represent skipped tests or failed assertions.
+
+Artifacts: `outputs/preflight/20261023T164646Z-31068/`, including the actual logs,
+JUnit XML, coverage JSON and `completion-audit.json`. The completion audit
+independently reconciles collected, executed and unique case counts, confirms
+required live/recovery cases, and rejects any failed/errored/skipped case. Tracked
+Python source timestamps were checked to ensure no source changed during this
+final run. `git diff --check` passes. This establishes developer-gate correctness,
+not new corpus quality or Tier 2 benchmark parity.
+
+## 40. Complete production coverage work in progress (2026-10-23)
+
+The user confirmed that 100% coverage includes all production Python: yaw/,
+benchmark.py and the four executable/support modules in scripts/. This goal is
+not achieved. Development measurements below are accumulated focused-test
+coverage, not a fresh full-suite acceptance result.
+
+New tests exercise actual subprocess output/timeout/interruption cleanup,
+durable reports, configuration writes, native DSPy objects, evidence provenance,
+real sparse matrices, SQLite payload corruption, loopback model identity and
+async embeddings, and CocoIndex AST/disk hydration. No production lines were
+excluded. Configuration rejects unknown field writes before touching the file.
+Parser fixes reject null coordinates/definitions, preserve case-variant
+homograph senses and normalize NumPy string triples before fuzzy matching.
+
+Coverage.py's native subprocess patch is enabled in the tracked .coveragerc;
+the .gitignore exception retains that configuration. Actual Python children now
+contribute coverage of the real source tree. Copied fixture implementations do
+not count as production execution. Preflight's reporting text was reconciled
+and its coverage command now includes benchmark and scripts. A disposable
+project test checks all three source locations in the actual coverage JSON.
+
+Verified focused runs: 82 parser/preflight edge cases passed in 134.71 seconds;
+9 real sparse/cache cases passed in 11.73 seconds; the combined inference,
+registry, evidence, graph and hydration edge suite passed 80 cases in 33.83
+seconds. A subsequent real async HTTP embedding/registry run passed 15 cases in
+35.75 seconds. All 15 preflight cases passed after the reporting-text update
+(162.36 seconds). The expanded-scope command, actual three-source coverage
+report and newest prefix-update case subsequently passed in a 33-case run
+(177.76 seconds). Repository-wide Ruff and ty currently report zero
+diagnostics. Earlier new-test failures were corrected fixtures: JSON-valid
+nonfinite score text and explicit optional-value/type narrowing.
+
+Before the expanded-scope command change, accumulated yaw-only coverage was
+8,743 / 9,994 executable lines (87.48%); core, parsers, model registry, graph
+candidate cache and PPR measured 100%. Hydration measured 95%, reflection 93%,
+and embeddings 89%. The separate first benchmark/script measurement passed
+28 tests in 25.80 seconds, covering 907 / 2,206 lines (41.12%). These separate
+percentages must not be presented as complete production coverage.
+
+An additional 15 benchmark metric cases passed in 2.28 seconds. They establish
+exact recall denominators, rank ordering, title/crop/whitespace matching,
+empty/malformed inputs, answer aliases and configurable EM/F1 aggregation.
+scripts/evaluation.py now measures 126 / 126 lines (100%) in the development
+data; the aggregate script scope is 983 / 2,206 lines (44.56%). One unsuppressed
+coverage notice reports that benchmark was not imported in this narrowly
+selected metric run; benchmark data was retained from the preceding run.
+
+The runtime and script databases were then combined with coverage.py's native
+combine operation: **9,735 / 12,200 lines = 79.7951%, 2,465 missing, 0 excluded**
+across all 36 production files. The lower percentage reflects the expanded
+denominator, not a regression. See all-production-coverage.json. This combined
+database is now the append baseline; future focused runs must keep all three
+source flags (`--cov=yaw --cov=benchmark --cov=scripts`). Production source
+identity was verified after combination. No source file changed during merging.
+
+Artifacts are under outputs/coverage-work/: coverage.json, scripts-coverage.json,
+separate coverage databases and the production source-hash manifest. Changed
+production files are purged before development append runs; a fresh complete
+suite with exact zero missing/excluded lines remains required for acceptance.
+Large remaining gaps include engine/program/storage/runtime/CLI, executable
+scripts, and genuine platform/error paths. No unattended optimization was
+started by this coverage work; the user's existing optimizer/watchdog processes
+were inspected and left running.
+
+## 41. SQLite, downloader and report coverage packet (2026-10-23)
+
+New real SQLite cases migrate an actual legacy database with old entity name
+uniqueness, chunk hashes, missing AST/definition columns, synonymy edges and
+malformed historical fact JSON. They verify row preservation, SKOS backfill,
+FTS reconstruction and migration idempotence. Transaction cases distinguish
+owned rollback from an active outer transaction. Additional cases verify
+global cross-source label priority, missing/zero vector sense resolution and
+independent dense/lexical candidate scores. Fourteen new storage cases pass;
+db.py now measures 855 / 965 lines (88.60%).
+
+Downloader tests stream more than 1 MiB through real loopback HTTP, exercise
+fallback and forced replacement, and verify failed requests preserve the prior
+target and remove the temporary file. Actual CLI processes check valid/invalid
+cached datasets and aliases without external network. Eight cases pass;
+download-datasets.py measures 229 / 261 lines (87.74%).
+
+Ten dashboard cases render actual Matplotlib SVGs and read audit JSON from disk.
+They verify candidate ordering, validation-score precedence, cumulative best
+scores, last-good snapshots after malformed writes, observed throughput,
+placeholders and configuration fallback. watchdog.py measures 514 / 825 lines
+(62.30%). No live dashboard output was overwritten by these tests.
+
+Parity rendering tests exposed two source defects: latency SVG groups were
+unclosed and baseline bars were missing, while the quality chart could report
+PASS despite an ExactMatch failure in the actual gate. The latency chart now
+closes groups, advances rows and renders both engines; the quality chart uses
+the recorded gate decision and includes ExactMatch when deriving legacy status.
+XML parsing tests verify real outputs, escaping, zero-duration comparisons and
+agreement with gate decisions. The source coverage for this edited module was
+purged before remeasurement. Native benchmark comparison regressions still pass.
+
+Final focused packet: **60 passed in 43.39 seconds**, with testmon deselection
+disabled. Repository-wide Ruff and ty report zero diagnostics; git diff --check
+passes. Production source hashes match all 36 measured files. The accumulated
+all-production report is **10,255 / 12,211 lines = 83.9817%, 1,956 missing and
+0 excluded**. The additional executable lines implement the verified SVG fixes.
+Earlier focused runs emitted coverage-only notices about benchmark not being
+imported or no new parent-process data; no warnings were suppressed. The final
+60-case run includes benchmark execution and reports no warnings.
+
+This packet makes progress toward the full 100% goal; it does not complete it.
+Remaining gaps and the final fresh complete-suite acceptance remain open.
+
+## 42. Native engine recovery and reflection boundaries (2026-10-23)
+
+The new engine cases use native dspy.LM, HippoRAGProgram and dspy.Embedder,
+actual loopback HTTP chat responses, real source files and yaw.db. They first
+index a source, delete the bounded candidate-stage cache in a transaction,
+close the engine and recreate its objects. Structured, legacy triples-only,
+structured-only and partially invalid statement checkpoints make no new NER
+or triple requests. A legacy checkpoint lacking definitions makes exactly one
+definition-repair request and still reuses its committed NER/triples. Persisted
+OpenIE JSON, prompt fingerprints and the single fact survive replay. Empty
+index/retrieval/context/deletion operations leave graph rows empty and make no
+inference calls. These are orchestration guarantees for the exercised cases,
+not a quality measurement or an unattended-run stability guarantee.
+
+Reflection tests execute the native async wrapper with the verified serving
+tokenizer, check output allowance, disabled history, deepcopy and serialized
+state, and reject incompatible checkpoint context. Real HTTP-served JSON tests
+reject missing tokenizer discovery, zero serving context, different weights,
+malformed JSON, nonresident models and missing backend routes. Completed
+proposal state rejects blank or nontext instructions. The installed DSPy
+OpenAI adapter uses max_completion_tokens on the wire; the test checks the
+actual 128-token allowance instead of assuming the legacy max_tokens name.
+
+Final focused packet: **29 passed in 42.40 seconds**, including the prior native
+engine cache/resume and prompt-mutation invalidation regressions. Ruff and ty
+pass repository-wide, git diff --check passes, and all 36 production hashes
+match. No production code changed in this packet. reflection.py measures
+**220 / 220 executable lines (100%)** in accumulated development data. Engine
+coverage rose to 2,053 / 2,351 lines; additional genuine definition-repair paths
+also execute in program.py.
+
+The complete production development report is **10,325 / 12,211 lines =
+84.5549%, 1,886 missing, 0 excluded**. Remaining notices are DSPy's existing
+legacy-message API deprecation and the focused-run notice that benchmark was
+not imported; neither is suppressed. The overall goal remains incomplete and
+requires the remaining cases plus a fresh complete-suite acceptance run.
+
+## 43. Benchmark input, persistence and end-to-end coverage (2026-10-23)
+
+New benchmark cases exercise answer cleanup, ordered aliases, null/missing
+answer rejection, document fallbacks, source-document matching, four dataset
+padding formats, local-cache reuse and actual HTTP dataset fallback/failure.
+Native dspy.Embedder callables verify repeatability under batching, individual
+calls and reversed inputs across the active embedding roles; an intentionally
+changing mathematical embedding function is rejected. Integrity checks retain
+provider errors and distinguish QA checks from retrieval-only validation.
+
+The numeric-alias case exposed a real runtime type-contract mismatch:
+get_gold_answers was declared to return strings but could return numeric
+aliases. Values are now normalized to strings before ordered deduplication;
+the new regression verifies that numeric 3 and string "3" collapse to one
+answer. The benchmark module's old measurements were purged before running
+its tests against the changed implementation. User prompt edits are preserved.
+
+Two complete run_yaw_benchmark cases use real CocoIndex ingestion, SQLite,
+native DSPy HTTP chat/embedding calls and sparse retrieval. Retrieval-only and
+QA reports contain the expected source and fixture scores; repeated invocation
+reuses the committed index and cached LM responses without new LM requests.
+These oracle-provider scores verify orchestration, not local-model quality.
+Any retry executable lookup is confined to the disposable test environment.
+
+Actual benchmark.main tests persist success and registry-rejection reports,
+verify the serialized report against the returned data, and keep training
+queries out of evaluation embedding probes. Real model-identity functions are
+bound to loopback HTTP endpoints. Each test restores the previous DSPy LM
+binding, preventing a stopped fixture server from leaking into later tests.
+
+Verification: **63 passed in 51.44 seconds** across benchmark, new edge cases,
+native engine recovery and parity rendering. After adding LM-binding isolation,
+the full benchmark edge file passed **29 cases in 43.74 seconds**. Four final
+gold-retention/distractor-padding variants passed in **26.33 seconds**. Ruff,
+ty and git diff --check pass. The remaining three notices in the full packet
+are existing Pydantic ReadOnly metadata and DSPy temperature/rollout warnings;
+none were suppressed. All 36 production source hashes match the final data.
+
+benchmark.py now measures **538 / 627 lines (85.81%)**. Complete production
+development coverage is **10,589 / 12,211 lines = 86.7169%, 1,622 missing and
+0 excluded**. The 100% goal and fresh complete-suite acceptance remain open.
+
+## 44. GEPA quality-only geometric reward (2026-10-24)
+
+Accepted reward change: the scalar objective is the unweighted geometric mean
+of labeled R@1, R@2, R@5, R@10, R@20, EM and token F1. Token, repair, latency
+and SHACL penalties are removed, together with efficiency/integrity Pareto
+objectives. Tokens and integrity remain diagnostics. There is no smoothing or
+extra weighting; a zero component yields zero. QA-only examples no longer
+substitute EM for unmeasured recall. Unlabeled examples fail explicitly.
+Missing token telemetry no longer prevents quality evaluation.
+
+QA now uses native DSPy normalized exact match and continuous best-reference
+token F1. The previous substring-as-exact-match rule and F1 promotion are
+removed. Installed `answer_exact_match(frac < 1)` was inspected: it thresholds
+F1 to a boolean, so continuous F1 comes from `dspy.evaluate.metrics.F1`.
+`SemanticF1` is an LM judge and remains an optional evaluation diagnostic.
+Reflection's deterministic fallback recognizes the new feedback score format.
+Run and SIMBA task-cache identities record `task-quality-geometric-mean-v1`;
+old scored optimization state must not resume into this objective. Existing
+processes keep their loaded implementation until restarted with fresh state.
+
+Verification used actual DSPy metric/GEPA classes, real SQLite checkpoints and
+loopback task providers. **126 passed in 122.54 seconds** in the focused metric,
+grammar, parser and prompt packet. The broader reflection/SIMBA/engine/benchmark
+packet initially had **104 passed and 1 failed in 160.34 seconds**: an old
+cache-isolation test expected positive smoothed reward for a missed answer.
+It now asserts zero composite, zero F1 and preserved R@20=1 diagnostics.
+The corrected case plus real GEPA resume, legacy checkpoint rejection and
+architecture checks passed **12 cases in 43.13 seconds**. SIMBA's partial-answer
+baseline assertion was also updated for zero EM, retaining a real correct-to-wrong
+regression check and zero repeated task calls for cached evaluations; the full
+SIMBA packet passed in the broader run. Real GEPA runtime/persistence cases for
+combined, QA-only and retrieval-only labels passed **3 cases in 28.74 seconds**,
+verifying the serialized scores against the formula. Ruff, ty and
+`git diff --check` pass. Existing DSPy message-API deprecation, temperature/rollout
+and Pydantic metadata warnings remain visible.
+
+These tests establish metric and orchestration behavior. They do not establish
+better held-out model quality. No unattended optimization run was launched.
+This packet does not update or complete the separate all-production coverage goal.
+
+## 45. DSPy Signature, History and predictor construction audit (2026-10-24)
+
+Read-only source audit and runtime probes against installed DSPy **3.4.1**.
+Signatures are wrapped in native Predict/ChainOfThought modules; demonstrations
+are native Example objects attached through predictor.demos. QA's generated
+reasoning/answer signature and RLM's generated REPLHistory inputs are expected
+DSPy behavior. DiagnosticHistory and LM.history are observational records, not
+conversation inputs. Current QA signatures and forward APIs do not accept a
+conversation history. A native History field rendered through YawGBNFAdapter
+correctly produced system/user/assistant/user messages, including the prior answer.
+Settings are read at call time; constructing predictors before configure/context
+does not by itself invalidate them.
+
+Confirmed defects in disposable probes, with no resident inference calls:
+
+- A real loopback HTTP request through ner.lm.copy(temperature=0.9,
+  max_tokens=123) sent temperature **0.1** and max_completion_tokens **77**,
+  the original target settings. _PredictorBoundLM.copy stores overrides on the
+  proxy, but its __call__ forwards neither those kwargs nor a copied target.
+- Native program.ner.acall raised **NotImplementedError: Subclasses must
+  implement this method** before sending an HTTP request. The proxy inherits
+  BaseLM.acall without implementing its async execution contract. The separate
+  program.as_async helper uses asyncify over synchronous execution.
+- YawJSONAdapter.parse accepted {"reasoning": "Only reasoning"} for the
+  ChainOfThought QA signature, returning no answer. Native JSONAdapter rejected
+  the same payload with AdapterParseError. The repair fallback returns the
+  first matching output field without validating all required outputs.
+
+Additional integration risks: the LM proxy prefers ambient settings.lm over
+its bound target, unlike native Predict's explicit-binding precedence. A context
+probe resolved a bound predictor to the ambient model. Dedicated proxy identities
+also make HippoRAGProgram.get_lm report multiple LMs even when all roles use one
+underlying LM. These behaviors need explicit design decisions when replacing the
+proxy. DSPy 3.4 emits legacy LM/message deprecations; its documented 3.5 cutoff
+requires migrating custom integration to the native engine/request contract.
+OpenIE output annotations remain list[Any], leaving structural guarantees to
+GBNF and host parsing rather than the signature type itself.
+
+A fresh default program contains 1 NER, 1 triples, 10 triple-filter and 2 QA
+demonstrations. GEPA-only optimization retains seed demos; the zero-demo clearing
+currently occurs inside the MIPRO branch. This is distinct from conversation
+history and should be made explicit in any intended zero-shot policy.
+
+Verification: **4 passed in 22.29 seconds** for the existing signature/demo,
+canonical predictor, adapter and asyncify/embedding checks. Additional construction,
+message rendering, parser and isolated HTTP probes produced the results above;
+git diff --check passed. Those passing tests do not cover the confirmed defects.
+No production source was changed and no optimization run was launched.
+
+## 46. Native DSPy predictor binding and parsing repair (2026-10-24)
+
+The custom per-predictor BaseLM proxy is removed. Task predictors now bind
+native LMs by role; an unbound predictor follows DSPy's context. Explicit
+per-call LM overrides are forwarded to Predict, including query-intent calls.
+Native LM copies preserve their generation settings through candidate copies.
+RLM explicit overrides operate on a copied module instead of mutating shared
+predictors. The native instruction writer and compressor remain unbound so
+their selected worker/SIMBA rollout context and verified token guard apply.
+Predictor enumeration is inherited directly from DSPy.
+
+The additional YAW JSON recovery adapter and legacy ReAct field-renaming helper
+are removed. YawGBNFAdapter supplies grammar only and inherits native formatting
+and parsing. DSPy's JSONAdapter already repairs JSON syntax and validates
+declared output fields; YAW no longer guesses field names, accepts partial QA
+objects or fabricates empty success results. This was legacy response-format
+compatibility, not a GBNF parser. No reproduced server-side GBNF defect justified
+that extra layer. Invalid signatures now expose invalid scripted fixtures too:
+some fixtures answered query-intent requests with QA fields or confused an
+extraction input field with the required output. Those fixtures now produce the
+actual native schemas, including ReAct tool calls.
+
+Fresh task and reflection programs have zero demonstrations by default. The
+existing user-edited examples are retained unchanged for explicit opt-in, with
+no claim of measured generalization. Native compiled demos remain intact on
+load, including deliberately empty lists. Explicit deployment LMs are retained
+before rebuilding Pareto members; missing legacy predictors get configured
+defaults without importing serialized custom clients. Native LM identities
+remain in candidate-cache keys while credentials are excluded. No implicit
+conversational memory was added; History remains an explicit signature input.
+
+Regression tests use native DSPy classes, real HTTP requests and JSON state files
+for sync/async execution, copied parameters, role/context/explicit-call
+precedence, candidate cloning, state restoration, zero-shot defaults and history
+formatting. Malformed output cases exercise DSPy's own validator. Initial
+targeted checks passed **16 cases in 22.51 seconds**; the complete prompt suite,
+including resident-model GBNF and RLM smoke checks, passed **33 cases in 111.05
+seconds**. A broader run passed **145 cases and failed 13 in 576.09 seconds**;
+the failures identified legacy engine fixture schemas and an obsolete proxy
+identity assertion in the cache-retention test, plus fixtures attempting to
+reconstruct their custom test clients instead of supplying deployment LMs.
+
+The corrected serial engine/native-binding/cache packet passed **43 cases and
+failed 1 in 314.22 seconds**; the last failure was the custom test-LM restoration
+case, corrected by explicitly supplying its deployment client. The final packet
+passed **36 cases in 66.47 seconds**: all new native binding/parser/history
+regressions, that corrected frontier export/load case, real GEPA runtime
+optimization/persistence for QA-only, retrieval-only and combined labels, native
+SIMBA learning/process restart and architecture checks. All failures encountered
+in the affected packets were corrected and reverified. This is targeted
+verification, not a fresh complete repository suite or a model-quality benchmark.
+
+The 600-query disk-cache retention test passed with **one physical provider
+request**, **18,000 logically accounted tokens**, no retained LM/global histories
+and less than **1,000,000 bytes** of retained allocation growth after warmup.
+Ruff, ty and git diff --check pass. Existing DSPy 3.4 message-API and
+temperature/rollout warnings remain visible. No user processes were stopped and
+no unattended optimization run was launched. The separate all-production
+coverage goal is unchanged.
+
+## 47. Gemma 128K capacity and automatic budgets (2026-10-24)
+
+The configured and Python/model-profile Gemma default is **131,072 tokens**.
+The user reports approximately **65 TPS without flash attention**; this packet
+records that deployment evidence and does not remeasure throughput or modify
+the external inference service. Embedding model limits remain independent.
+
+Unpinned completion, reflection-input and RLM-output budgets scale from the
+64K deployment baseline. At 128K they resolve to **8,192 output tokens**,
+**32,768 reflection input tokens** and **20,000 RLM output characters**. The
+repository TOML no longer pins those budgets at their old 64K values. Explicit
+overrides remain authoritative; changing the context in TOML recomputes omitted
+budgets on load. Standalone programs infer capacity from supplied LM metadata
+or use the same 128K default. Existing smaller model profiles retain their
+previous completion default unless an explicit deployment context is supplied.
+
+Extraction, QA and graph hydration use available-input-scaled character limits;
+the default graph context budget is **102,857 characters** at 128K/8K output.
+SHACL focus context and metric hydration no longer have separate fixed small
+caps. Synonym/SHACL prompt-size batch caps scale from 16 items at 64K to 32 at
+128K; structured lists are fitted as whole JSON input items, never split mid-item.
+Default native proposal and diagnosis length limits also scale. Explicit
+unbounded proposal length is passed through to its grammar without a hidden
+1,500-character fallback. These are input-budget changes, not a revival of the
+removed custom response recovery parser.
+
+The verified serving tokenizer still measures complete reflection requests and
+reserves output plus a fixed **512-token safety margin**. RLM iteration/call
+counts, retry limits, retrieval parameters and diagnostic retention stay
+independent. Prompt-state loading, including hot reload and Pareto restoration,
+cannot replace the deployment's serving context/output caps with stale values.
+Changed settings/code retain the existing optimization-resume compatibility
+checks; a running process retains its startup settings.
+
+Verification: **73 passed in 93.18 seconds** across initial budget, native
+binding, tokenizer/reflection and configuration tests. Extended real-HTTP and
+SQLite graph/tokenizer/architecture checks passed **93 cases in 182.44 seconds**.
+Native GEPA/SIMBA learning and persistence plus capacity checks passed **27 cases
+in 68.12 seconds**. The final hot-reload/legacy-Pareto/real-GEPA and architecture
+packet passed **28 cases in 41.09 seconds**. Tests show source text beyond the
+old 64K safeguards reaching 128K requests, automatic and pinned settings,
+context-sized structured batches, exact loopback tokenizer rejection before
+generation, and preserved configured capacity on prompt reload. Ruff, ty and
+git diff --check pass. Existing DSPy/Pydantic warnings remain visible. No
+unattended optimization or resident-model performance benchmark was launched.

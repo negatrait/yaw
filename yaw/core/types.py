@@ -176,9 +176,7 @@ def resolve_corpus_path(corpus_root: Path, rel_posix_path: str) -> Path:
     root_resolved = corpus_root.resolve()
     target_path = (root_resolved / rel_posix_path).resolve()
     if not target_path.is_relative_to(root_resolved):
-        raise ValueError(
-            f"Path traversal detected: {rel_posix_path!r} resolves outside corpus root {corpus_root}"
-        )
+        raise ValueError(f"Path traversal detected: {rel_posix_path!r} resolves outside corpus root {corpus_root}")
     return target_path
 
 

@@ -1,6 +1,7 @@
 """Unmocked integration and invariant tests for YawGraphEngine with real SQLite and disk files."""
 
 import hashlib
+import json
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
@@ -15,19 +16,22 @@ from yaw.daemon.graph.engine import YawGraphEngine
 from yaw.daemon.graph.inference import HippoRAGProgram
 
 
+class ProtocolTokenCounter:
+    """Exact loopback tokenizer with an independent synthetic task LM identity."""
+
+    def __init__(self, url):
+        from yaw.daemon.graph.inference import ServingTokenCounter
+
+        self.serving = ServingTokenCounter(url, "reflection-model")
+        self.identity = self.serving.identity
+        self.context_tokens = self.serving.context_tokens
+
+    def __call__(self, messages, **kwargs):
+        return self.serving(messages, **kwargs)
+
+
 def protocol_token_counter(url):
-    from yaw.daemon.graph.inference import ServingTokenCounter
-
-    serving = ServingTokenCounter(url, "reflection-model")
-
-    def count(messages, **kwargs):
-        return serving(messages, **kwargs)
-
-    # Synthetic task LMs have no resident serving identity. The loopback
-    # tokenizer still exercises exact request budgeting for orchestration.
-    count.identity = serving.identity
-    count.context_tokens = serving.context_tokens
-    return count
+    return ProtocolTokenCounter(url)
 
 
 @pytest.fixture
@@ -51,6 +55,8 @@ class DeterministicMockLM(dspy.LM):
                 {"prompt_tokens": 32, "completion_tokens": 16, "total_tokens": 48},
             )
         req_str = str(prompt or messages or kwargs)
+        if "ExtractQueryIntent" in req_str or "query_intent" in req_str:
+            return [json.dumps({"query_intent": "Ada Lovelace" if "Lovelace" in req_str else "Alan Turing"})]
         if (
             "JudgeSynonyms" in req_str
             or "OrchestrateSynonymJudgment" in req_str
@@ -58,11 +64,7 @@ class DeterministicMockLM(dspy.LM):
             or "candidate_pairs" in req_str
         ):
             return ['{"decisions": []}']
-        if (
-            "ProposeSHACLRepairs" in req_str
-            or "HealSHACLViolations" in req_str
-            or "violations_json" in req_str
-        ):
+        if "ProposeSHACLRepairs" in req_str or "HealSHACLViolations" in req_str or "violations_json" in req_str:
             return ['{"repairs": []}']
         if (
             "DefineMissingEntities" in req_str
@@ -72,10 +74,12 @@ class DeterministicMockLM(dspy.LM):
         ):
             if "Lovelace" in req_str:
                 return [
-                    '{"entity_definitions": [["Ada Lovelace", "English mathematician"], ["Analytical Engine", "Mechanical general-purpose computer"]]}'
+                    '{"entity_definitions": [["Ada Lovelace", "English mathematician"], ["Analytical Engine", '
+                    '"Mechanical general-purpose computer"]]}'
                 ]
             return [
-                '{"entity_definitions": [["Alan Turing", "English mathematician and computer scientist"], ["computer science", "Study of computation and information"]]}'
+                '{"entity_definitions": [["Alan Turing", "English mathematician and computer scientist"], '
+                '["computer science", "Study of computation and information"]]}'
             ]
         # Filter triples stage
         if "FilterTriples" in req_str or "fact_before_filter" in req_str:
@@ -86,37 +90,31 @@ class DeterministicMockLM(dspy.LM):
         if "ExtractTriples" in req_str or '"triples"' in req_str or "`triples`" in req_str:
             if "Lovelace" in req_str:
                 return [
-                    '{"triples": [{"sub": "Ada Lovelace", "pred": "worked on", "obj": "Analytical Engine", "def": "Ada Lovelace worked on the Analytical Engine."}]}'
+                    '{"triples": [{"sub": "Ada Lovelace", "pred": "worked on", "obj": "Analytical Engine", '
+                    '"def": "Ada Lovelace worked on the Analytical Engine."}]}'
                 ]
             return [
-                '{"triples": [{"sub": "Alan Turing", "pred": "father of", "obj": "computer science", "def": "Alan Turing is the father of computer science."}]}'
+                '{"triples": [{"sub": "Alan Turing", "pred": "father of", "obj": "computer science", '
+                '"def": "Alan Turing is the father of computer science."}]}'
             ]
         # NER stage
         if "ExtractEntities" in req_str or "named_entities" in req_str:
             if "Lovelace" in req_str:
                 return [
-                    '{"named_entities": [["Ada Lovelace", "English mathematician"], ["Analytical Engine", "Mechanical general-purpose computer"]]}'
+                    '{"named_entities": [["Ada Lovelace", "English mathematician"], ["Analytical Engine", '
+                    '"Mechanical general-purpose computer"]]}'
                 ]
             return [
-                '{"named_entities": [["Alan Turing", "English mathematician and computer scientist"], ["computer science", "Study of computation and information"]]}'
+                '{"named_entities": [["Alan Turing", "English mathematician and computer scientist"], '
+                '["computer science", "Study of computation and information"]]}'
             ]
         # QA stage
-        if (
-            "AnswerQuestion" in req_str
-            or "Retrieved evidence passages" in req_str
-            or "context" in req_str
-        ):
+        if "AnswerQuestion" in req_str or "Retrieved evidence passages" in req_str or "context" in req_str:
             if "Turing" in req_str:
-                return [
-                    '{"reasoning": "Alan Turing founded computer science.", "answer": "Alan Turing"}'
-                ]
+                return ['{"reasoning": "Alan Turing founded computer science.", "answer": "Alan Turing"}']
             if "Lovelace" in req_str:
-                return [
-                    '{"reasoning": "Ada Lovelace worked on the Analytical Engine.", "answer": "Ada Lovelace"}'
-                ]
-            return [
-                '{"reasoning": "Alan Turing founded computer science.", "answer": "Alan Turing"}'
-            ]
+                return ['{"reasoning": "Ada Lovelace worked on the Analytical Engine.", "answer": "Ada Lovelace"}']
+            return ['{"reasoning": "Alan Turing founded computer science.", "answer": "Alan Turing"}']
         return ['{"reasoning": "Alan Turing founded computer science.", "answer": "Alan Turing"}']
 
 
@@ -205,15 +203,11 @@ def test_engine_index_and_caching(test_engine: YawGraphEngine, tmp_path: Path) -
     assert "Radio City" in content
 
     # Verify SQLite tables populated
-    chunks = test_engine.conn.execute(
-        "SELECT chunk_id, start_line, end_line FROM chunks"
-    ).fetchall()
+    chunks = test_engine.conn.execute("SELECT chunk_id, start_line, end_line FROM chunks").fetchall()
     assert len(chunks) == 2
 
     # Check FTS5 populated
-    fts_hits = test_engine.conn.execute(
-        "SELECT chunk_id FROM chunk_fts WHERE chunk_fts MATCH 'Turing'"
-    ).fetchall()
+    fts_hits = test_engine.conn.execute("SELECT chunk_id FROM chunk_fts WHERE chunk_fts MATCH 'Turing'").fetchall()
     assert len(fts_hits) == 1
 
     # Check openie_chunks populated
@@ -257,9 +251,7 @@ def test_openie_resume_reuses_matching_prompts_and_invalidates_mutations(tmp_pat
         ids = [str(row[0]) for row in engine.conn.execute("SELECT chunk_id FROM chunks")]
         pointers = get_chunk_pointers(engine.conn, ids)
         chunks = [(pointers[cid], doc) for cid in ids]
-        provenance = engine.conn.execute(
-            "SELECT value FROM meta WHERE key GLOB 'indexed_fp:*'"
-        ).fetchall()
+        provenance = engine.conn.execute("SELECT value FROM meta WHERE key GLOB 'indexed_fp:*'").fetchall()
     finally:
         engine.close()
 
@@ -274,19 +266,13 @@ def test_openie_resume_reuses_matching_prompts_and_invalidates_mutations(tmp_pat
     try:
         engine.index_chunks(chunks)
         assert second.openie_calls == 0
-        assert (
-            engine.conn.execute("SELECT value FROM meta WHERE key GLOB 'indexed_fp:*'").fetchall()
-            == provenance
-        )
+        assert engine.conn.execute("SELECT value FROM meta WHERE key GLOB 'indexed_fp:*'").fetchall() == provenance
         second.ner.signature = second.ner.signature.with_instructions(
             second.ner.signature.instructions + " Include all explicitly named people."
         )
         engine.index_chunks(chunks, program=second)
         assert second.openie_calls == 1
-        assert (
-            engine.conn.execute("SELECT value FROM meta WHERE key GLOB 'indexed_fp:*'").fetchall()
-            != provenance
-        )
+        assert engine.conn.execute("SELECT value FROM meta WHERE key GLOB 'indexed_fp:*'").fetchall() != provenance
     finally:
         engine.close()
 
@@ -568,9 +554,7 @@ def test_engine_evolve_prompts_miprov2_and_gepa_metric_contracts(
     monkeypatch.setattr(dspy, "MIPROv2", FakeMIPROv2, raising=False)
     monkeypatch.setattr(dspy, "GEPA", FakeGEPA, raising=False)
 
-    test_engine.evolve_prompts(
-        trainset, mode="hybrid", reflection_token_counter=reflection_token_counter
-    )
+    test_engine.evolve_prompts(trainset, mode="hybrid", reflection_token_counter=reflection_token_counter)
     assert len(mipro_scores) == 1
     assert len(gepa_scores) == 1
 
@@ -730,9 +714,7 @@ def test_engine_homograph_gate_edc_and_shacl_conformance(tmp_path: Path) -> None
                 )
             req_str = str(prompt or messages or kwargs)
             if "JudgeSynonyms" in req_str or "candidate_pairs" in req_str:
-                pair_ids = list(
-                    dict.fromkeys(re.findall(r"entity-[0-9a-f]+\|entity-[0-9a-f]+", req_str))
-                )
+                pair_ids = list(dict.fromkeys(re.findall(r"entity-[0-9a-f]+\|entity-[0-9a-f]+", req_str)))
                 decisions = [
                     {
                         "pair_id": pid,
@@ -742,7 +724,9 @@ def test_engine_homograph_gate_edc_and_shacl_conformance(tmp_path: Path) -> None
                     for pid in pair_ids
                 ]
                 return [json.dumps({"decisions": decisions})]
-            if "ExtractTriples" in req_str or "triples" in req_str:
+            if "ExtractTriples" in req_str or (
+                "triples" in req_str and "missing_entities" not in req_str and "fact_before_filter" not in req_str
+            ):
                 if "Cupertino" in req_str:
                     return [
                         json.dumps(
@@ -777,7 +761,7 @@ def test_engine_homograph_gate_edc_and_shacl_conformance(tmp_path: Path) -> None
                             }
                         )
                     ]
-            if "ExtractEntities" in req_str or "named_entities" in req_str:
+            if "ExtractEntities" in req_str or ("named_entities" in req_str and "triples" not in req_str):
                 if "Cupertino" in req_str:
                     return [
                         json.dumps(
@@ -819,9 +803,7 @@ def test_engine_homograph_gate_edc_and_shacl_conformance(tmp_path: Path) -> None
         assert n1 == 1
 
         # Index second passage: "Apple" with different inline definition triggers provisional sense split
-        n2 = engine.index(
-            ["The apple is an edible pome fruit harvested in orchard trees during Autumn."]
-        )
+        n2 = engine.index(["The apple is an edible pome fruit harvested in orchard trees during Autumn."])
         assert n2 == 1
 
         # Verify two distinct Apple entities exist, linked by owl:differentFrom and sharing prefLabel "apple"
@@ -830,9 +812,7 @@ def test_engine_homograph_gate_edc_and_shacl_conformance(tmp_path: Path) -> None
         ).fetchall()
         assert len(apple_entities) == 2
 
-        diff_edges = engine.conn.execute(
-            "SELECT COUNT(*) FROM edges WHERE kind = 'owl:differentFrom';"
-        ).fetchone()[0]
+        diff_edges = engine.conn.execute("SELECT COUNT(*) FROM edges WHERE kind = 'owl:differentFrom';").fetchone()[0]
         assert diff_edges >= 2
 
         report = engine.lint_graph(as_turtle=True)
@@ -848,7 +828,8 @@ def test_engine_homograph_gate_edc_and_shacl_conformance(tmp_path: Path) -> None
 def test_engine_same_label_provisional_split_merged_by_judge_synonyms_and_stage1_standalone_ner(
     tmp_path: Path,
 ) -> None:
-    """Verify Hazard 2 (same-label cos < 0.85 merged back when JudgeSynonyms returns skos:altLabel) and Hazard 3 Option A (standalone Stage 1 NER entities preserved with definitions)."""
+    """Verify Hazard 2 (same-label cos < 0.85 merged back when JudgeSynonyms returns skos:altLabel) and Hazard 3 \
+Option A (standalone Stage 1 NER entities preserved with definitions)."""
     import json
     import re
 
@@ -866,9 +847,7 @@ def test_engine_same_label_provisional_split_merged_by_judge_synonyms_and_stage1
                 )
             req_str = str(prompt or messages or kwargs)
             if "JudgeSynonyms" in req_str or "candidate_pairs" in req_str:
-                pair_ids = list(
-                    dict.fromkeys(re.findall(r"entity-[0-9a-f]+\|entity-[0-9a-f]+", req_str))
-                )
+                pair_ids = list(dict.fromkeys(re.findall(r"entity-[0-9a-f]+\|entity-[0-9a-f]+", req_str)))
                 decisions = []
                 for pid in pair_ids:
                     ea, eb = pid.split("|", 1)
@@ -881,7 +860,9 @@ def test_engine_same_label_provisional_split_merged_by_judge_synonyms_and_stage1
                         }
                     )
                 return [json.dumps({"decisions": decisions})]
-            if "ExtractTriples" in req_str or "triples" in req_str:
+            if "ExtractTriples" in req_str or (
+                "triples" in req_str and "missing_entities" not in req_str and "fact_before_filter" not in req_str
+            ):
                 if "iPhone" in req_str:
                     return [
                         json.dumps(
@@ -902,7 +883,7 @@ def test_engine_same_label_provisional_split_merged_by_judge_synonyms_and_stage1
                             }
                         )
                     ]
-            if "ExtractEntities" in req_str or "named_entities" in req_str:
+            if "ExtractEntities" in req_str or ("named_entities" in req_str and "triples" not in req_str):
                 if "iPhone" in req_str:
                     return [
                         json.dumps(
@@ -954,9 +935,7 @@ def test_engine_same_label_provisional_split_merged_by_judge_synonyms_and_stage1
             "SELECT entity_id, name, definition FROM entities WHERE name = 'apple'"
         ).fetchall()
         assert len(apple_rows) == 1
-        diff_edges = engine.conn.execute(
-            "SELECT COUNT(*) FROM edges WHERE kind = 'owl:differentFrom'"
-        ).fetchone()[0]
+        diff_edges = engine.conn.execute("SELECT COUNT(*) FROM edges WHERE kind = 'owl:differentFrom'").fetchone()[0]
         assert diff_edges == 0
 
         # Hazard 3 Option A: Standalone Stage 1 NER entities ("2007" and "m3 max") that did NOT appear in any triple
@@ -996,7 +975,8 @@ def test_engine_same_label_provisional_split_merged_by_judge_synonyms_and_stage1
 def test_engine_step7_heal_shacl_violations_rlm_repl_tools_and_token_stats(
     tmp_path: Path,
 ) -> None:
-    """Verify Step 6 direct GBNF synonym_judge_tokens and Step 7 heal_shacl_violations via shacl_healer_rlm using all 5 bound REPL tools."""
+    """Verify Step 6 direct GBNF synonym_judge_tokens and Step 7 heal_shacl_violations via shacl_healer_rlm \
+using all 5 bound REPL tools."""
     import json
     import re
 
@@ -1064,10 +1044,7 @@ def test_engine_step7_heal_shacl_violations_rlm_repl_tools_and_token_stats(
                     {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30},
                 )
             req_str = str(prompt or messages or kwargs)
-            if (
-                "[[ ## violations ## ]]" in req_str
-                or "bounded closed-world SHACL repair" in req_str
-            ):
+            if "[[ ## violations ## ]]" in req_str or "bounded closed-world SHACL repair" in req_str:
                 focus_matches = list(dict.fromkeys(re.findall(r"entity-[0-9a-f]+", req_str)))
                 for fn in focus_matches:
                     repl_tool_events.append(f"qwen_propose_shacl_repairs:{fn}")
@@ -1078,7 +1055,8 @@ def test_engine_step7_heal_shacl_violations_rlm_repl_tools_and_token_stats(
                                 {
                                     "focus_node": fn,
                                     "action": "set_definition",
-                                    "value": "Healed concept definition from Alan Turing formulated the Turing machine in 1936.",
+                                    "value": "Healed concept definition from Alan Turing formulated t"
+                                    "he Turing machine in 1936.",
                                 }
                                 for fn in focus_matches
                             ]
@@ -1086,9 +1064,7 @@ def test_engine_step7_heal_shacl_violations_rlm_repl_tools_and_token_stats(
                     )
                 ]
             if "[[ ## candidate_pairs ## ]]" in req_str or "candidate_pairs" in req_str:
-                pair_ids = list(
-                    dict.fromkeys(re.findall(r"entity-[0-9a-f]+\|entity-[0-9a-f]+", req_str))
-                )
+                pair_ids = list(dict.fromkeys(re.findall(r"entity-[0-9a-f]+\|entity-[0-9a-f]+", req_str)))
                 decisions = [
                     {
                         "pair_id": pid,
@@ -1098,10 +1074,7 @@ def test_engine_step7_heal_shacl_violations_rlm_repl_tools_and_token_stats(
                     for pid in pair_ids
                 ]
                 return [json.dumps({"decisions": decisions})]
-            if (
-                "[[ ## named_entities ## ]]" in req_str
-                or "Resource Description Framework" in req_str
-            ):
+            if "[[ ## named_entities ## ]]" in req_str or "Resource Description Framework" in req_str:
                 if "Bletchley" in req_str:
                     return [
                         json.dumps(
@@ -1204,9 +1177,7 @@ def test_engine_step7_heal_shacl_violations_rlm_repl_tools_and_token_stats(
             assert orphan_lbls == 0
 
             # Inject 2 ConceptShape/definition SHACL violations on "alan turing" and "turing machine"
-            conn.execute(
-                "UPDATE entities SET definition = '' WHERE name IN ('alan turing', 'turing machine')"
-            )
+            conn.execute("UPDATE entities SET definition = '' WHERE name IN ('alan turing', 'turing machine')")
 
         pre_lint = engine.lint_graph()
         assert pre_lint["conforms"] is False
@@ -1215,7 +1186,8 @@ def test_engine_step7_heal_shacl_violations_rlm_repl_tools_and_token_stats(
 
         # 2. Index second document:
         #    - Step 6 runs direct GBNF synonym_judge on candidate pairs (30 tokens)
-        #    - Step 7 runs shacl_healer_rlm using all 5 bound REPL tools (applying repair[0] in REPL + repair[1] post-RLM)
+        # - Step 7 runs shacl_healer_rlm using all 5 bound REPL tools (applying repair[0] in REPL + repair[1] post-
+        # RLM)
         program.telemetry.clear()
         program.synonym_audit_trail.clear()
         program.shacl_audit_trail.clear()
@@ -1224,9 +1196,7 @@ def test_engine_step7_heal_shacl_violations_rlm_repl_tools_and_token_stats(
 
         # Verify all 5 REPL tools ran inside shacl_healer_rlm and healed both violations
         assert "shacl_healer_rlm_invoked" in repl_tool_events
-        assert (
-            sum(1 for ev in repl_tool_events if ev.startswith("qwen_propose_shacl_repairs:")) == 2
-        )
+        assert sum(1 for ev in repl_tool_events if ev.startswith("qwen_propose_shacl_repairs:")) == 2
 
         # Verify exact non-double-counted token accounting:
         # Step 6 (direct GBNF synonym_judge) = 30 tokens on doc 2 (total 30 + 30 = 60 across doc 1 + doc 2)
@@ -1271,7 +1241,8 @@ def test_engine_step7_heal_shacl_violations_rlm_repl_tools_and_token_stats(
 def test_engine_define_missing_entities_telemetry_and_no_heuristic_fallbacks(
     tmp_path: Path,
 ) -> None:
-    """Verify index_chunks repairs missing entity definitions via DefineMissingEntities, tracks stats, and never uses heuristic fallbacks."""
+    """Verify index_chunks repairs missing entity definitions via DefineMissingEntities, tracks stats, and never \
+uses heuristic fallbacks."""
     import json
 
     class MissingEntityRepairLM(DeterministicMockLM):
@@ -1287,11 +1258,7 @@ def test_engine_define_missing_entities_telemetry_and_no_heuristic_fallbacks(
                     {"prompt_tokens": 30, "completion_tokens": 15, "total_tokens": 45},
                 )
             req_str = str(prompt or messages or kwargs)
-            if (
-                "DefineMissingEntities" in req_str
-                or "missing_entities" in req_str
-                or "entity_definitions" in req_str
-            ):
+            if "DefineMissingEntities" in req_str or "missing_entities" in req_str or "entity_definitions" in req_str:
                 return [
                     json.dumps(
                         {
@@ -1304,7 +1271,9 @@ def test_engine_define_missing_entities_telemetry_and_no_heuristic_fallbacks(
                         }
                     )
                 ]
-            if "ExtractTriples" in req_str or "triples" in req_str:
+            if "ExtractTriples" in req_str or (
+                "triples" in req_str and "missing_entities" not in req_str and "fact_before_filter" not in req_str
+            ):
                 return [
                     json.dumps(
                         {
@@ -1319,7 +1288,7 @@ def test_engine_define_missing_entities_telemetry_and_no_heuristic_fallbacks(
                         }
                     )
                 ]
-            if "ExtractEntities" in req_str or "named_entities" in req_str:
+            if "ExtractEntities" in req_str or ("named_entities" in req_str and "triples" not in req_str):
                 return [
                     json.dumps(
                         {
@@ -1352,14 +1321,9 @@ def test_engine_define_missing_entities_telemetry_and_no_heuristic_fallbacks(
         assert program.entity_def_audit_trail[0]["missing_count"] == 1
         assert program.entity_def_audit_trail[0]["tokens"] == 45
 
-        rows = {
-            str(r[0]): str(r[1])
-            for r in engine.conn.execute("SELECT name, definition FROM entities").fetchall()
-        }
+        rows = {str(r[0]): str(r[1]) for r in engine.conn.execute("SELECT name, definition FROM entities").fetchall()}
         assert rows["ada lovelace"] == "English mathematician and writer"
-        assert (
-            rows["charles babbage"] == "English polymath who originated the programmable computer"
-        )
+        assert rows["charles babbage"] == "English polymath who originated the programmable computer"
         for defn in rows.values():
             assert "(in statement:" not in defn
             assert "(in passage:" not in defn
@@ -1377,7 +1341,8 @@ def test_engine_evolve_prompts_reindexes_on_extraction_mutation_and_captures_all
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify mutating extraction/graph predictors in GEPA triggers candidate re-indexing, injects all stage traces into dspy.settings.trace, and emits per-predictor feedback."""
+    """Verify mutating extraction/graph predictors in GEPA triggers candidate re-indexing, injects all stage \
+traces into dspy.settings.trace, and emits per-predictor feedback."""
     import json
 
     ner_calls: list[str] = []
@@ -1395,7 +1360,7 @@ def test_engine_evolve_prompts_reindexes_on_extraction_mutation_and_captures_all
                     {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30},
                 )
             req_str = str(prompt or messages or kwargs)
-            if "ExtractEntities" in req_str or "named_entities" in req_str:
+            if "ExtractEntities" in req_str or ("named_entities" in req_str and "triples" not in req_str):
                 ner_calls.append(req_str)
                 if "MUTATED_NER_MARKER" in req_str:
                     return [
@@ -1420,7 +1385,9 @@ def test_engine_evolve_prompts_reindexes_on_extraction_mutation_and_captures_all
                         }
                     )
                 ]
-            if "ExtractTriples" in req_str or "triples" in req_str:
+            if "ExtractTriples" in req_str or (
+                "triples" in req_str and "missing_entities" not in req_str and "fact_before_filter" not in req_str
+            ):
                 if "Alan Turing" in req_str:
                     return [
                         json.dumps(
@@ -1450,11 +1417,7 @@ def test_engine_evolve_prompts_reindexes_on_extraction_mutation_and_captures_all
                         }
                     )
                 ]
-            if (
-                "DefineMissingEntities" in req_str
-                or "missing_entities" in req_str
-                or "entity_definitions" in req_str
-            ):
+            if "DefineMissingEntities" in req_str or "missing_entities" in req_str or "entity_definitions" in req_str:
                 return [
                     json.dumps(
                         {
@@ -1499,9 +1462,7 @@ def test_engine_evolve_prompts_reindexes_on_extraction_mutation_and_captures_all
         # 1. Verify _extraction_fingerprint sensitivity
         fp_base = engine._extraction_fingerprint(program)
         qa_mutated = program.deepcopy()
-        qa_mutated.qa.predict.signature = qa_mutated.qa.predict.signature.with_instructions(
-            "QA-only mutation"
-        )
+        qa_mutated.qa.predict.signature = qa_mutated.qa.predict.signature.with_instructions("QA-only mutation")
         assert engine._extraction_fingerprint(qa_mutated) == fp_base
 
         ner_mutated = program.deepcopy()
@@ -1526,17 +1487,13 @@ def test_engine_evolve_prompts_reindexes_on_extraction_mutation_and_captures_all
                 trace_base: list[Any] = []
                 with dspy.context(trace=trace_base, track_usage=True):
                     _ = student(**ex.inputs())
-                entities_before = {
-                    str(r[0]) for r in engine.conn.execute("SELECT name FROM entities").fetchall()
-                }
+                entities_before = {str(r[0]) for r in engine.conn.execute("SELECT name FROM entities").fetchall()}
                 assert "unknown person" in entities_before
 
                 # Evaluate QA-only mutated candidate: must NOT re-run NER extraction
                 ner_count_after_base = len(ner_calls)
                 cand_qa = student.deepcopy()
-                cand_qa.qa.predict.signature = cand_qa.qa.predict.signature.with_instructions(
-                    "Answer concisely."
-                )
+                cand_qa.qa.predict.signature = cand_qa.qa.predict.signature.with_instructions("Answer concisely.")
                 with dspy.context(trace=[], track_usage=True):
                     _ = cand_qa(**ex.inputs())
                 assert len(ner_calls) == ner_count_after_base
@@ -1551,9 +1508,7 @@ def test_engine_evolve_prompts_reindexes_on_extraction_mutation_and_captures_all
                     pred_mut = cand_ner(**ex.inputs())
                 assert len(ner_calls) > ner_count_after_base
 
-                entities_after = {
-                    str(r[0]) for r in engine.conn.execute("SELECT name FROM entities").fetchall()
-                }
+                entities_after = {str(r[0]) for r in engine.conn.execute("SELECT name FROM entities").fetchall()}
                 assert "alan turing" in entities_after
                 assert "bletchley park" in entities_after
 
@@ -1576,9 +1531,7 @@ def test_engine_evolve_prompts_reindexes_on_extraction_mutation_and_captures_all
                 return cand_ner
 
         monkeypatch.setattr(dspy, "GEPA", InspectingGEPA, raising=False)
-        compiled = engine.evolve_prompts(
-            trainset, mode="gepa", reflection_token_counter=reflection_token_counter
-        )
+        compiled = engine.evolve_prompts(trainset, mode="gepa", reflection_token_counter=reflection_token_counter)
         assert "MUTATED_NER_MARKER" in compiled.ner.signature.instructions
         assert len(observed_traces) >= 3
         assert "[ner]" in feedback_by_stage["ner"]
@@ -1593,7 +1546,8 @@ def test_engine_evolve_prompts_reindexes_on_extraction_mutation_and_captures_all
 def test_sprint3_engine_as_rm_and_as_retriever_and_dspy_retrieve_compatibility(
     tmp_path: Path,
 ) -> None:
-    """Verify YawGraphEngine.as_rm, as_retriever, workspace DSPy cache isolation, and stock dspy.Retrieve(k=...) compatibility."""
+    """Verify YawGraphEngine.as_rm, as_retriever, workspace DSPy cache isolation, and stock dspy.Retrieve(k=...) \
+compatibility."""
     from yaw.daemon.graph.inference import YawPassage, YawRetriever, YawRM
 
     dspy.settings.configure(lm=DeterministicMockLM())
@@ -1612,9 +1566,7 @@ def test_sprint3_engine_as_rm_and_as_retriever_and_dspy_retrieve_compatibility(
         assert getattr(dspy, "cache", None) is not None
 
         doc_turing = "Alan Turing designed the Automatic Computing Engine (ACE) at the National Physical Laboratory."
-        doc_lovelace = (
-            "Ada Lovelace wrote the first algorithm for Charles Babbage's Analytical Engine."
-        )
+        doc_lovelace = "Ada Lovelace wrote the first algorithm for Charles Babbage's Analytical Engine."
         engine.index([doc_turing, doc_lovelace])
 
         rm = engine.as_rm(k=2, configure_dspy=True)
@@ -1648,7 +1600,8 @@ def test_sprint3_engine_as_rm_and_as_retriever_and_dspy_retrieve_compatibility(
 def test_sprint3_engine_search_graph_for_react_and_react_v2_fallback_integration(
     tmp_path: Path,
 ) -> None:
-    """Verify _search_graph_for_react queries real SQLite yaw.db facts and passages and powers dspy.ReActV2 multi-hop fallback."""
+    """Verify _search_graph_for_react queries real SQLite yaw.db facts and passages and powers dspy.ReActV2 \
+multi-hop fallback."""
     import json
 
     class ReActEngineMockLM(DeterministicMockLM):
@@ -1669,11 +1622,19 @@ def test_sprint3_engine_search_graph_for_react_and_react_v2_fallback_integration
                     return [
                         json.dumps(
                             {
-                                "thought": "Found the year in the graph facts.",
-                                "tool_name": "finish",
-                                "tool_args": {
-                                    "reasoning": "Alan Turing received the Presidential Medal of Freedom in 1969 according to the graph search.",
-                                    "answer": "1969",
+                                "next_thought": {"content": "Found the year in the graph facts."},
+                                "tool_calls": {
+                                    "tool_calls": [
+                                        {
+                                            "name": "submit",
+                                            "args": {
+                                                "reasoning": "Alan Turing received the Presidential Medal of Freedom "
+                                                "in 1969 according to the graph "
+                                                "search.",
+                                                "answer": "1969",
+                                            },
+                                        }
+                                    ]
                                 },
                             }
                         )
@@ -1681,9 +1642,10 @@ def test_sprint3_engine_search_graph_for_react_and_react_v2_fallback_integration
                 return [
                     json.dumps(
                         {
-                            "thought": "Search graph facts for Alan Turing.",
-                            "tool_name": "search_graph_facts",
-                            "tool_args": {"query": "Alan Turing"},
+                            "next_thought": {"content": "Search graph facts for Alan Turing."},
+                            "tool_calls": {
+                                "tool_calls": [{"name": "search_graph_facts", "args": {"query": "Alan Turing"}}]
+                            },
                         }
                     )
                 ]
@@ -1730,9 +1692,7 @@ def test_sprint3_engine_search_graph_for_react_and_react_v2_fallback_integration
         assert "Alan Turing" in graph_search_text
         assert "computer science" in graph_search_text
 
-        pred = engine.program(
-            question="When did Alan Turing receive the Presidential Medal of Freedom?"
-        )
+        pred = engine.program(question="When did Alan Turing receive the Presidential Medal of Freedom?")
         assert pred.answer == "1969"
     finally:
         engine.close()
@@ -1740,9 +1700,11 @@ def test_sprint3_engine_search_graph_for_react_and_react_v2_fallback_integration
 
 def test_sprint3_engine_evaluate_and_pareto_frontier_export(
     tmp_path: Path,
+    reflection_token_counter,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify YawGraphEngine.evaluate (dspy.Evaluate + answer_passage_match) and top-3 Pareto frontier export in optimize()."""
+    """Verify YawGraphEngine.evaluate (dspy.Evaluate + answer_passage_match) and top-3 Pareto frontier export in \
+optimize()."""
     import json
     from types import SimpleNamespace
 
@@ -1832,6 +1794,7 @@ def test_sprint3_engine_evaluate_and_pareto_frontier_export(
             valset=devset,
             mode="gepa",
             save_path=save_path,
+            reflection_token_counter=reflection_token_counter,
         )
         assert len(observed_feedbacks) == 1
         assert "AnswerPassageMatch=1" in observed_feedbacks[0]
@@ -1841,7 +1804,7 @@ def test_sprint3_engine_evaluate_and_pareto_frontier_export(
         assert save_path.exists()
         assert (tmp_path / "compiled_sprint3_eval.json").exists()
 
-        reloaded = HippoRAGProgram(enable_gbnf=False, compiled_path=save_path)
+        reloaded = HippoRAGProgram(enable_gbnf=False, compiled_path=save_path, orchestrator_lm=lm, rlm_sub_lm=lm)
         assert len(reloaded.pareto_frontier_states) == 3
         assert isinstance(reloaded.pareto_ensemble, ParetoProgramEnsemble)
     finally:
@@ -1851,7 +1814,8 @@ def test_sprint3_engine_evaluate_and_pareto_frontier_export(
 def test_canonical_retrieval_hook_and_rag_qa_forward_unification(
     tmp_path: Path,
 ) -> None:
-    """Verify _canonical_retrieval_hook unifies YawRM, YawRetriever, HippoRAGProgram.forward, and rag_qa with GEPA trace replay and ReActV2/Pareto support."""
+    """Verify _canonical_retrieval_hook unifies YawRM, YawRetriever, HippoRAGProgram.forward, and rag_qa with \
+GEPA trace replay and ReActV2/Pareto support."""
     import json
 
     class UnifiedHookMockLM(DeterministicMockLM):
@@ -1872,11 +1836,17 @@ def test_canonical_retrieval_hook_and_rag_qa_forward_unification(
                     return [
                         json.dumps(
                             {
-                                "thought": "Found the answer in graph facts.",
-                                "tool_name": "finish",
-                                "tool_args": {
-                                    "reasoning": "Recovered via ReActV2 graph exploration.",
-                                    "answer": "Alan Turing",
+                                "next_thought": {"content": "Found the answer in graph facts."},
+                                "tool_calls": {
+                                    "tool_calls": [
+                                        {
+                                            "name": "submit",
+                                            "args": {
+                                                "reasoning": "Recovered via ReActV2 graph exploration.",
+                                                "answer": "Alan Turing",
+                                            },
+                                        }
+                                    ]
                                 },
                             }
                         )
@@ -1884,9 +1854,10 @@ def test_canonical_retrieval_hook_and_rag_qa_forward_unification(
                 return [
                     json.dumps(
                         {
-                            "thought": "Search graph facts for Alan Turing.",
-                            "tool_name": "search_graph_facts",
-                            "tool_args": {"query": "Alan Turing"},
+                            "next_thought": {"content": "Search graph facts for Alan Turing."},
+                            "tool_calls": {
+                                "tool_calls": [{"name": "search_graph_facts", "args": {"query": "Alan Turing"}}]
+                            },
                         }
                     )
                 ]
@@ -1924,9 +1895,7 @@ def test_canonical_retrieval_hook_and_rag_qa_forward_unification(
     )
     try:
         # 1. Oblivion verification: legacy dual hooks demolished, only _canonical_retrieval_hook bound
-        assert [m for m in dir(engine) if m.endswith("_retrieval_hook")] == [
-            "_canonical_retrieval_hook"
-        ]
+        assert [m for m in dir(engine) if m.endswith("_retrieval_hook")] == ["_canonical_retrieval_hook"]
         assert engine.program._retrieval_hook == engine._canonical_retrieval_hook
 
         doc_turing = "Alan Turing\nAlan Turing was an English mathematician and computer scientist."
@@ -1950,9 +1919,7 @@ def test_canonical_retrieval_hook_and_rag_qa_forward_unification(
             rm_hits = rm(q, k=2, item_docs=[doc_turing, doc_lovelace])
         assert len(rm_hits) == 2
         assert [h.pid for h in rm_hits] == list(pids[:2])
-        assert (
-            len(ext_trace) >= 2
-        )  # Captured NER and triples traces replayed into dspy.settings.trace!
+        assert len(ext_trace) >= 2  # Captured NER and triples traces replayed into dspy.settings.trace!
 
         fwd_pred = engine.program(question=q)
         assert tuple(getattr(fwd_pred, "retrieved_chunk_ids", ()))[:2] == pids[:2]
@@ -1981,7 +1948,8 @@ def test_hybrid_e2e_per_query_isolation_stage_caching_and_reflective_stats(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify per-query sandbox isolation, 4-tier stage caching, component selector mutation resilience, and minibatch q_stats lookup."""
+    """Verify per-query sandbox isolation, 4-tier stage caching, component selector mutation resilience, and \
+minibatch q_stats lookup."""
     import json
     from types import SimpleNamespace
 
@@ -2000,7 +1968,7 @@ def test_hybrid_e2e_per_query_isolation_stage_caching_and_reflective_stats(
                     {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30},
                 )
             req_str = str(prompt or messages or kwargs)
-            if "ExtractEntities" in req_str or "named_entities" in req_str:
+            if "ExtractEntities" in req_str or ("named_entities" in req_str and "triples" not in req_str):
                 stage_call_counts["ner"] += 1
             elif "JudgeSynonyms" in req_str or "candidate_pairs" in req_str:
                 stage_call_counts["synonym_judge"] += 1
@@ -2078,15 +2046,17 @@ def test_hybrid_e2e_per_query_isolation_stage_caching_and_reflective_stats(
                 score1_live = self.metric(ex1, pred1_live)
                 score2_live = self.metric(ex2, pred2_live)
                 assert score1_live.score > 0.0
-                assert score2_live.score > 0.0
+                # This query misses its answer and early retrieval ranks. A true
+                # geometric mean must preserve those zeros instead of smoothing.
+                assert score2_live.score == 0.0
+                assert score2_live.objective_scores["f1"] == 0.0
+                assert score2_live.objective_scores["recall_at_20"] == 1.0
 
                 # 2. Mutate QA only: OpenIE and SynonymJudge must hit stage caches (0 extra LLM calls)
                 ner_before = stage_call_counts["ner"]
                 syn_before = stage_call_counts["synonym_judge"]
                 cand_qa = student.deepcopy()
-                cand_qa.qa.predict.signature = cand_qa.qa.predict.signature.with_instructions(
-                    "Mutated QA instruction"
-                )
+                cand_qa.qa.predict.signature = cand_qa.qa.predict.signature.with_instructions("Mutated QA instruction")
                 with dspy.context(trace=[], track_usage=True):
                     pred1_cached = cand_qa(**ex1.inputs())
                 assert stage_call_counts["ner"] == ner_before
@@ -2097,10 +2067,8 @@ def test_hybrid_e2e_per_query_isolation_stage_caching_and_reflective_stats(
 
                 # 3. Mutate SynonymJudge only: OpenIE hits cache (0 extra NER calls), SynonymJudge runs live!
                 cand_syn = student.deepcopy()
-                cand_syn.synonym_judge.signature = (
-                    cand_syn.synonym_judge.signature.with_instructions(
-                        "Mutated SynonymJudge instruction"
-                    )
+                cand_syn.synonym_judge.signature = cand_syn.synonym_judge.signature.with_instructions(
+                    "Mutated SynonymJudge instruction"
                 )
                 with dspy.context(trace=[], track_usage=True):
                     _ = cand_syn(**ex2.inputs())
@@ -2109,9 +2077,7 @@ def test_hybrid_e2e_per_query_isolation_stage_caching_and_reflective_stats(
                 return cand_syn
 
         monkeypatch.setattr(dspy, "GEPA", VerifyingGEPA, raising=False)
-        _ = engine.evolve_prompts(
-            [ex1, ex2], mode="gepa", reflection_token_counter=reflection_token_counter
-        )
+        _ = engine.evolve_prompts([ex1, ex2], mode="gepa", reflection_token_counter=reflection_token_counter)
     finally:
         engine.close()
 
@@ -2143,9 +2109,7 @@ def test_evolve_prompts_real_unmocked_gepa_and_miprov2_with_context_limit_guard(
             req_str = str(prompt or messages or kwargs)
             max_observed_prompt_chars = max(max_observed_prompt_chars, len(req_str))
             if len(req_str) > 32000:
-                raise RuntimeError(
-                    f"Request ({len(req_str)} chars) exceeds available context size (32000 chars)"
-                )
+                raise RuntimeError(f"Request ({len(req_str)} chars) exceeds available context size (32000 chars)")
             if "variables_info" in req_str and "repl_history" in req_str:
                 return [
                     "[[ ## reasoning ## ]]\n"
@@ -2157,15 +2121,19 @@ def test_evolve_prompts_real_unmocked_gepa_and_miprov2_with_context_limit_guard(
                     "```\n"
                     "[[ ## completed ## ]]"
                 ]
-            if "new_instruction" in req_str and (
-                "examples_with_feedback" in req_str or "length_limit" in req_str
-            ):
+            if "new_instruction" in req_str and ("examples_with_feedback" in req_str or "length_limit" in req_str):
                 return [
                     json.dumps(
                         {
                             "new_instruction": (
-                                "Extract accurate entities, triples, and answers strictly grounded in the passage context. "
-                                'Respond with JSON: {"named_entities": [["Entity", "Definition"]], "triples": [["s", "s_def", "p", "o", "o_def", "spo_def"]], "entity_definitions": [["E", "D"]], "decisions": [], "repairs": [], "fact": [["s", "p", "o"]], "query_intent": "...", "reasoning": "...", "answer": "..."}.'
+                                "Extract accurate entities, triples, and answers strictl"
+                                "y grounded in the passage context. "
+                                'Respond with JSON: {"named_entities": [["Entity", "Definition"]], "triples": [["s", '
+                                '"s_def", "p", "o", "o_def", "spo_def"]], "entity_defini'
+                                'tions": [["E", "D"]], "decisions": '
+                                '[], "repairs": [], "fact": [["s", "p", "o"]], "query_in'
+                                'tent": "...", "reasoning": "...", '
+                                '"answer": "..."}.'
                             )
                         }
                     )
@@ -2214,8 +2182,7 @@ def test_evolve_prompts_real_unmocked_gepa_and_miprov2_with_context_limit_guard(
         doc_lovelace = "Ada Lovelace\nAda Lovelace wrote the first computer algorithm."
         # Pad item_docs with large distractor strings so 10 raw examples would exceed 60,000 chars if un-distilled
         filler_docs = [
-            f"Distractor {i}\n" + ("Historical archive notes on mechanical calculators. " * 25)
-            for i in range(6)
+            f"Distractor {i}\n" + ("Historical archive notes on mechanical calculators. " * 25) for i in range(6)
         ]
 
         trainset = [
@@ -2269,7 +2236,8 @@ def test_evolve_prompts_real_unmocked_gepa_and_miprov2_with_context_limit_guard(
 def test_engine_homographs_paronyms_and_same_label_triple_permutations(
     tmp_path: Path,
 ) -> None:
-    """Verify paronyms ('Cindy Real' vs 'Cinderella'), typos ('Cindarella'), and homograph permutations ('a ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a ball')."""
+    """Verify paronyms ('Cindy Real' vs 'Cinderella'), typos ('Cindarella'), and homograph permutations ('a \
+ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a ball')."""
     import json
     import re
 
@@ -2324,10 +2292,7 @@ def test_engine_homographs_paronyms_and_same_label_triple_permutations(
                         )
                 return [json.dumps({"decisions": decisions})]
 
-            if (
-                "[[ ## named_entities ## ]]" in req_str
-                or "Resource Description Framework" in req_str
-            ):
+            if "[[ ## named_entities ## ]]" in req_str or "Resource Description Framework" in req_str:
                 if "Cindy Real" in req_str:
                     return [
                         json.dumps(
@@ -2428,23 +2393,17 @@ def test_engine_homographs_paronyms_and_same_label_triple_permutations(
     try:
         n = engine.index(
             [
-                "Cinderella (sometimes misspelled Cindarella) attended a ball at the palace, while journalist Cindy Real wrote about a ball.",
+                "Cinderella (sometimes misspelled Cindarella) attended a ball at the palace, while "
+                "journalist Cindy Real wrote about a ball.",
                 "During the ceremony, a ball was handled in a ball, and a ball featured a ball.",
             ]
         )
         assert n == 2
 
         # 1. Verify 'Cindarella' merged into 'cinderella' as skos:hiddenLabel
-        cinderella_row = engine.conn.execute(
-            "SELECT entity_id FROM entities WHERE name = 'cinderella'"
-        ).fetchone()
+        cinderella_row = engine.conn.execute("SELECT entity_id FROM entities WHERE name = 'cinderella'").fetchone()
         assert cinderella_row is not None
-        assert (
-            engine.conn.execute(
-                "SELECT entity_id FROM entities WHERE name = 'cindarella'"
-            ).fetchone()
-            is None
-        )
+        assert engine.conn.execute("SELECT entity_id FROM entities WHERE name = 'cindarella'").fetchone() is None
         hidden_labels = [
             str(r[0])
             for r in engine.conn.execute(
@@ -2455,9 +2414,7 @@ def test_engine_homographs_paronyms_and_same_label_triple_permutations(
         assert "cindarella" in hidden_labels
 
         # 2. Verify 'Cindy Real' remained distinct from 'Cinderella' with an owl:differentFrom edge
-        cindy_real_row = engine.conn.execute(
-            "SELECT entity_id FROM entities WHERE name = 'cindy real'"
-        ).fetchone()
+        cindy_real_row = engine.conn.execute("SELECT entity_id FROM entities WHERE name = 'cindy real'").fetchone()
         assert cindy_real_row is not None
         diff_cindy = engine.conn.execute(
             """
@@ -2475,9 +2432,7 @@ def test_engine_homographs_paronyms_and_same_label_triple_permutations(
         assert int(diff_cindy) == 2
 
         # 3. Verify homograph 'a ball' entities exist as distinct sense nodes
-        ball_rows = engine.conn.execute(
-            "SELECT entity_id, definition FROM entities WHERE name = 'a ball'"
-        ).fetchall()
+        ball_rows = engine.conn.execute("SELECT entity_id, definition FROM entities WHERE name = 'a ball'").fetchall()
         assert len(ball_rows) >= 2
         ball_ids = {str(r[0]) for r in ball_rows}
 
@@ -2514,9 +2469,7 @@ def test_engine_homographs_paronyms_and_same_label_triple_permutations(
         ).fetchall()
         assert len(ball_facts) == 2
         for fid, sid, pred, oid in ball_facts:
-            assert str(sid) != str(oid), (
-                f"Homograph triple collapsed into self-loop on {fid} ({pred})"
-            )
+            assert str(sid) != str(oid), f"Homograph triple collapsed into self-loop on {fid} ({pred})"
             assert str(sid) in ball_ids and str(oid) in ball_ids
 
         # Verify the two permutations have reversed (subject_id, object_id) poles

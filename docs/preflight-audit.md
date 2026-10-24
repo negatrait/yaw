@@ -4,6 +4,14 @@ Scope: the designated Windows checkout, its upgraded dependencies, Python
 3.14.9, and the complete offline test suite. This is a developer verification
 audit, not a new corpus benchmark or proof of unattended optimizer stability.
 
+## Completed repair
+
+The complete gate now passes: Ruff 0 findings, ty 0 diagnostics, **261 passed,
+0 skipped**, with testmon selection disabled. ResourceWarnings are eliminated;
+23 Pydantic/DSPy API/metadata notices remain unsuppressed. The baseline counts
+and failures below are historical. See [quality repair](quality-repair.md) and
+[evaluation section 39](evaluation.md#39-complete-ruff-ty-and-pytest-repair-2026-10-23).
+
 ## Available commands
 
 ```powershell
@@ -40,14 +48,17 @@ The default per-check timeout is 1,800 seconds; `--timeout 0` disables it.
 
 Incremental coverage measures only this invocation's selected tests, including
 zero selected tests when everything is unchanged. It is never presented as
-full-suite coverage or merged with stale results. Fresh-process child coverage
-is not automatically included. `--full` disables testmon deselection while
+full-suite coverage or merged with stale results. Python subprocess execution
+is measured through coverage.py's native subprocess patch in `.coveragerc`.
+Coverage includes `yaw/`, `benchmark.py` and all production Python in `scripts/`.
+`--full` disables testmon deselection while
 updating its database. A lock-file hash separates dependency environments.
 Testmon tracks in-process dependencies; code used only in child workers and
 external input files can escape that dependency graph. Use `--full` as the
 final gate before unattended optimization, especially after worker changes.
-Resident-model tests now explicitly require `--live`; normal pytest/preflight
-does not infer permission to generate merely because an LLM is resident.
+The initial audit required `--live`. The subsequent complete-gate repair
+supersedes that policy: every collected test runs, including live inference, and
+unavailable prerequisites fail explicitly. `--live` remains a compatibility flag.
 
 ## Initial findings and repair order
 
@@ -79,7 +90,7 @@ The five runtime test names are
 `test_cli_optimize_ergonomics_and_anti_overfitting_gate`,
 `test_cli_optimize_multi_dataset_interleaved_splits`, and
 `test_cli_dspy_optimize_sandbox_isolation_and_status`.
-These seven repairs are audited recommendations, not completed fixes.
+All seven repairs are now verified by the complete gate recorded in section 39.
 
 The suite also emitted 53 warnings. ResourceWarnings include unclosed SQLite
 connections: trace their allocations and fix fixture/runtime ownership before
@@ -92,9 +103,9 @@ look clean. The current lock retains the measured DSPy 3.4.1.
 | Order | Work packet | Observed scope and exit condition |
 | --- | --- | --- |
 | 1 | Real runtime type contracts (completed in `cd167ae`) | 14 diagnostics in graph engine/inference, plus one watchdog return annotation. Declare LM capability fields, use native `qa.predict` attributes, narrow SIMBA's compiled module, validate checkpoint/evidence mappings and missing LMs, and type mixed fingerprint payloads. Verified: runtime ty passes and 65 focused native/SQLite/recovery checks pass; see `runtime-contracts.md`. |
-| 2 | Typed test fixtures and metric arguments | 52 diagnostics in tests; 43 are in `test_prompts.py`. Its dynamic DummyLM attributes and three untyped metric-kwargs expansions cause most of these. Use a capability-declaring native DummyLM subclass and explicit or precisely typed metric arguments. Match HTTP-handler override signatures, use a declared callable counter object, narrow optional paths, and replace incompatible optimizer assignment with a supported test seam. Exit: tests pass ty without hiding diagnostics. |
-| 3 | Three semantic lint findings | Two unused loop bindings (`B007`) and one unnecessary `.keys()` membership (`SIM118`), all in `engine.py`. Rename/remove unused bindings and use direct dictionary membership; retain behavior. Exit: these three findings disappear. |
-| 4 | Long-line cleanup | 599 `E501` findings across 34 files. Highest counts: engine tests 71, parity-gate script 68, storage DB 68, inference program 55, graph engine 43, templates 42. Wrap comments, signatures and SQL/prompt literals using adjacent strings. Compare parsed string values before/after so user prompt edits and SQL semantics survive. Exit: full Ruff pass at the current 120-character limit, followed by affected tests. |
+| 2 | Typed test fixtures and metric arguments (completed) | 52 diagnostics in tests; 43 are in `test_prompts.py`. Its dynamic DummyLM attributes and three untyped metric-kwargs expansions cause most of these. Use a capability-declaring native DummyLM subclass and explicit or precisely typed metric arguments. Match HTTP-handler override signatures, use a declared callable counter object, narrow optional paths, and replace incompatible optimizer assignment with a supported test seam. Exit: tests pass ty without hiding diagnostics. |
+| 3 | Three semantic lint findings (completed) | Two unused loop bindings (`B007`) and one unnecessary `.keys()` membership (`SIM118`), all in `engine.py`. Rename/remove unused bindings and use direct dictionary membership; retain behavior. Exit: these three findings disappear. |
+| 4 | Long-line cleanup (completed at 120 characters) | 599 `E501` findings across 34 files. Highest counts: engine tests 71, parity-gate script 68, storage DB 68, inference program 55, graph engine 43, templates 42. Wrap comments, signatures and SQL/prompt literals using adjacent strings. Compare parsed string values before/after so user prompt edits and SQL semantics survive. Exit: full Ruff pass at the current 120-character limit, followed by affected tests. |
 
 Do runtime contracts before broad literal wrapping so compatibility problems do
 not get buried in a large formatting diff. Keep the user-selected 120-character policy and enabled rules; do not disable
@@ -108,9 +119,9 @@ rules to conceal remaining findings.
   expecting the exact-duplicate guard to reject them. The duplicate fixture now
   repeats the definition; a separate Mercury homograph case verifies that
   distinct provisional senses remain permitted pending synonym adjudication.
-- Routine tests explicitly skip resident-model inference unless `--live` is
-  provided. Live model quality and its legacy inspection-history assertions are
-  separate from the offline acceptance result.
+- The initial run skipped resident-model tests without `--live`. The subsequent
+  complete-gate repair removes that skipping and replaces obsolete history
+  assertions with observations through native DSPy callbacks.
 - A Windows redirected-output encoding bug found during runner development was
   fixed; diagnostics and logs use UTF-8. Only this task's verified audit process
   trees were stopped during the coverage-tool/interpreter migration.
