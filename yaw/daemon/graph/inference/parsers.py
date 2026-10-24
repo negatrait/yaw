@@ -277,9 +277,7 @@ DefineMissingEntities output, or {name: definition} mappings."""
                 raw_list = ()
         else:
             raw_list = [
-                (k, v)
-                for k, v in raw_input.items()
-                if isinstance(k, str) and (v is None or isinstance(v, str))
+                (k, v) for k, v in raw_input.items() if isinstance(k, str) and (v is None or isinstance(v, str))
             ]
     elif isinstance(raw_input, Sequence):
         raw_list = raw_input
@@ -996,9 +994,7 @@ def evaluate_benchmark_gate(
         optional_qa_values["delta_yaw_vs_hipporag"]["ExactMatch"].append(
             delta_vs_hippo["ExactMatch"] if eval_em_enforced else None
         )
-        optional_qa_values["delta_yaw_vs_hipporag"]["F1"].append(
-            delta_vs_hippo["F1"] if eval_f1_enforced else None
-        )
+        optional_qa_values["delta_yaw_vs_hipporag"]["F1"].append(delta_vs_hippo["F1"] if eval_f1_enforced else None)
 
         failures: list[str] = []
         integrity = rep.get("integrity", {})

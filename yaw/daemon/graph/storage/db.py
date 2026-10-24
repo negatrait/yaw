@@ -263,7 +263,6 @@ def open_readonly_yaw_db(
     raise sqlite3.OperationalError(f"Failed to open read-only SQLite database: {resolved}")
 
 
-
 def initialize_schema(conn: sqlite3.Connection) -> None:
     """Initialize all unified schema tables and indices in yaw.db with in-place migrations."""
     with write_tx(conn):

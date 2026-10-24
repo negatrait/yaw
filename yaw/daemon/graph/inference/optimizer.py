@@ -8,6 +8,8 @@ import functools
 import hashlib
 import inspect
 import json
+import os
+import shutil
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -27,7 +29,6 @@ from .parsers import (
     compute_retrieval_recalls,
     compute_task_quality_score,
     doc_matches_gold,
-    normalize_answer,
 )
 from .program import HippoRAGProgram
 from .proposer import RLMInstructionProposer
@@ -382,9 +383,7 @@ def query_retrieval_fingerprint(program: HippoRAGProgram) -> str:
     """Compute SHA-256 fingerprint for query-time retrieval predictor surfaces (`query_intent`, `triple_filter`)."""
     named = dict(program.named_predictors()) if hasattr(program, "named_predictors") else {}
     payload = {
-        "stages": {
-            k: serialize_predictor_surface(named[k]) for k in ("query_intent", "triple_filter") if k in named
-        },
+        "stages": {k: serialize_predictor_surface(named[k]) for k in ("query_intent", "triple_filter") if k in named},
         "embedding_query_prefix": getattr(program, "embedding_query_prefix", None),
         "embedding_fact_prefix": getattr(program, "embedding_fact_prefix", None),
         "context_budget": [program.context_window_tokens, program.max_output_tokens],
@@ -459,7 +458,9 @@ def select_pareto_frontier_programs(
             return all_ge and any_gt
 
         non_dominated = [
-            i for i in eligible_indices if i != best_idx and not any(_dominates(j, i) for j in eligible_indices if j != i)
+            i
+            for i in eligible_indices
+            if i != best_idx and not any(_dominates(j, i) for j in eligible_indices if j != i)
         ]
 
         # Deduplicate by query-time + QA predictor surface while preserving highest scalar score per surface
@@ -539,8 +540,61 @@ def select_pareto_frontier_programs(
     return selected
 
 
+def rrf_fuse_passage_lists(
+    ranked_lists: Sequence[Sequence[tuple[Any, float, str]]],
+    *,
+    top_k: int = 20,
+    rrf_k: float = 60.0,
+) -> list[tuple[Any, float, str]]:
+    """Fuse ranked `(chunk_id_or_pointer, score, text)` lists via RRF (`1 / (60 + r)`) + normalized PPR scores."""
+    if not ranked_lists or top_k <= 0:
+        return []
+
+    fused_scores: dict[str, float] = {}
+    meta_by_cid: dict[str, Any] = {}
+    text_by_cid: dict[str, str] = {}
+    first_seen_order: dict[str, int] = {}
+
+    for member_list in ranked_lists:
+        if not member_list:
+            continue
+        raw_scores = [float(item[1]) for item in member_list]
+        max_s = max(raw_scores) if raw_scores else 0.0
+        min_s = min(raw_scores) if raw_scores else 0.0
+        span_s = max_s - min_s
+        for idx, (meta, raw_s_val, text_val) in enumerate(member_list):
+            cid = str(getattr(meta, "chunk_id", meta) or "")
+            txt = str(text_val or "")
+            if not cid and txt:
+                cid = compute_mdhash_id(txt, prefix="chunk-")
+                meta = cid
+            if not cid:
+                continue
+            rank_1 = idx + 1
+            raw_s = float(raw_s_val)
+            if span_s > 1e-12:
+                norm_s = (raw_s - min_s) / span_s
+            elif max_s > 0.0:
+                norm_s = raw_s / max_s
+            else:
+                norm_s = 0.0
+            fused_scores[cid] = fused_scores.get(cid, 0.0) + (1.0 / (rrf_k + rank_1)) + norm_s
+            if cid not in first_seen_order:
+                first_seen_order[cid] = len(first_seen_order)
+            if cid not in meta_by_cid:
+                meta_by_cid[cid] = meta
+            if cid not in text_by_cid and txt:
+                text_by_cid[cid] = txt
+
+    ranked_cids = sorted(
+        fused_scores.keys(),
+        key=lambda c: (-fused_scores[c], first_seen_order.get(c, 0)),
+    )[:top_k]
+    return [(meta_by_cid[c], round(float(fused_scores[c]), 6), text_by_cid.get(c, "")) for c in ranked_cids]
+
+
 def reduce_pareto_predictions(predictions: Sequence[dspy.Prediction]) -> dspy.Prediction:
-    """Fuse `recall@N` rankings via RRF + normalized PPR scores and resolve `QA (F1, EM)` via majority EM + F1 medoid."""
+    """Use `dspy.majority` when answers have non-empty content; otherwise fuse retrieval rankings via RRF."""
     if not predictions:
         return dspy.Prediction(
             context="",
@@ -553,10 +607,11 @@ def reduce_pareto_predictions(predictions: Sequence[dspy.Prediction]) -> dspy.Pr
     if len(predictions) == 1:
         return predictions[0]
 
-    # 1. recall@N Perspective: Reciprocal Rank Fusion (1 / (60 + r)) + min-max normalized PPR score
-    fused_scores: dict[str, float] = {}
-    passage_by_cid: dict[str, str] = {}
-    first_seen_order: dict[str, int] = {}
+    if any(str(getattr(p, "answer", "") or "").strip() for p in predictions):
+        return dspy.majority(list(predictions))
+
+    # RRF fusion for retrieval-only predictions (answer == "")
+    member_lists: list[list[tuple[str, float, str]]] = []
     max_k = 0
     for pred in predictions:
         raw_pids = tuple(str(x) for x in (getattr(pred, "retrieved_chunk_ids", None) or ()))
@@ -567,31 +622,17 @@ def reduce_pareto_predictions(predictions: Sequence[dspy.Prediction]) -> dspy.Pr
         max_k = max(max_k, len(raw_pids))
         if not raw_pids:
             continue
-        max_s = max(raw_scores) if raw_scores else 0.0
-        min_s = min(raw_scores) if raw_scores else 0.0
-        span_s = max_s - min_s
+        m_items: list[tuple[str, float, str]] = []
         for idx, cid in enumerate(raw_pids):
-            rank_1 = idx + 1
-            raw_s = raw_scores[idx] if idx < len(raw_scores) else 0.0
-            if span_s > 1e-12:
-                norm_s = (raw_s - min_s) / span_s
-            elif max_s > 0.0:
-                norm_s = raw_s / max_s
-            else:
-                norm_s = 0.0
-            fused_scores[cid] = fused_scores.get(cid, 0.0) + (1.0 / (60.0 + rank_1)) + norm_s
-            if cid not in first_seen_order:
-                first_seen_order[cid] = len(first_seen_order)
-            if cid not in passage_by_cid and idx < len(raw_passages) and raw_passages[idx]:
-                passage_by_cid[cid] = raw_passages[idx]
+            s_val = raw_scores[idx] if idx < len(raw_scores) else 0.0
+            p_val = raw_passages[idx] if idx < len(raw_passages) else ""
+            m_items.append((cid, s_val, p_val))
+        member_lists.append(m_items)
 
-    ranked_cids = sorted(
-        fused_scores.keys(),
-        key=lambda c: (-fused_scores[c], first_seen_order.get(c, 0)),
-    )[: max(20, max_k)]
-    fused_pids = tuple(ranked_cids)
-    fused_passages = tuple(passage_by_cid.get(c, "") for c in fused_pids)
-    fused_score_tuple = tuple(round(float(fused_scores[c]), 6) for c in fused_pids)
+    fused_items = rrf_fuse_passage_lists(member_lists, top_k=max(20, max_k))
+    fused_pids = tuple(str(cid) for cid, _, _ in fused_items)
+    fused_score_tuple = tuple(float(sc) for _, sc, _ in fused_items)
+    fused_passages = tuple(str(txt) for _, _, txt in fused_items)
 
     primary_pids = tuple(str(x) for x in (getattr(predictions[0], "retrieved_chunk_ids", None) or ()))
     if fused_pids == primary_pids and getattr(predictions[0], "context", ""):
@@ -599,70 +640,69 @@ def reduce_pareto_predictions(predictions: Sequence[dspy.Prediction]) -> dspy.Pr
     else:
         non_empty_psgs = [p for p in fused_passages[:10] if p]
         fused_context = (
-            "\n\n".join(non_empty_psgs)
-            if non_empty_psgs
-            else str(getattr(predictions[0], "context", "") or "")
+            "\n\n".join(non_empty_psgs) if non_empty_psgs else str(getattr(predictions[0], "context", "") or "")
         )
 
-    # 2. QA (F1, EM) Perspective: dspy.majority EM vote when max count >= 2, else token-F1 medoid tie-break
-    non_empty_members: list[tuple[int, dspy.Prediction, str, str]] = []
-    norm_counts: dict[str, int] = {}
-    for idx, pred in enumerate(predictions):
-        raw_ans = str(getattr(pred, "answer", "") or "").strip()
-        norm_ans = normalize_answer(raw_ans) if raw_ans else ""
-        if norm_ans:
-            non_empty_members.append((idx, pred, raw_ans, norm_ans))
-            norm_counts[norm_ans] = norm_counts.get(norm_ans, 0) + 1
-
-    if not non_empty_members:
-        winner = predictions[0]
-    elif max(norm_counts.values()) >= 2:
-        winner = dspy.majority( [p for _, p, _, _ in non_empty_members], field="answer")
-    elif len(non_empty_members) == 1:
-        winner = non_empty_members[0][1]
-    else:
-        best_medoid_score = -1.0
-        winner = non_empty_members[0][1]
-        for i_pos, (_orig_i, pred_i, ans_i, _norm_i) in enumerate(non_empty_members):
-            pairwise_f1s = [
-                compute_qa_em_f1(ans_i, [ans_j])[1]
-                for j_pos, (_orig_j, _pred_j, ans_j, _norm_j) in enumerate(non_empty_members)
-                if j_pos != i_pos
-            ]
-            mean_f1 = sum(pairwise_f1s) / len(pairwise_f1s) if pairwise_f1s else 0.0
-            if mean_f1 > best_medoid_score + 1e-9:
-                best_medoid_score = mean_f1
-                winner = pred_i
-
-    winning_answer = str(getattr(winner, "answer", "") or "")
-    winning_reasoning = str(getattr(winner, "reasoning", "") or "")
-    if not winning_reasoning:
-        for _, p_cand, _, n_cand in non_empty_members:
-            if n_cand == normalize_answer(winning_answer) and getattr(p_cand, "reasoning", ""):
-                winning_reasoning = str(getattr(p_cand, "reasoning", ""))
-                break
-
-    res = dspy.Prediction(
+    return dspy.Prediction(
         context=fused_context,
-        reasoning=winning_reasoning,
+        reasoning="",
         retrieved_passages=fused_passages,
         retrieved_scores=fused_score_tuple,
         retrieved_chunk_ids=fused_pids,
-        answer=winning_answer,
+        answer="",
     )
-    total_usage: dict[str, dict[str, int]] = {}
-    for pred in predictions:
-        u = pred.get_lm_usage() if hasattr(pred, "get_lm_usage") else None
-        if isinstance(u, Mapping):
-            for model_k, counts in u.items():
-                if isinstance(counts, Mapping):
-                    dest = total_usage.setdefault(str(model_k), {})
-                    for ck, cv in counts.items():
-                        if isinstance(cv, (int, float)):
-                            dest[str(ck)] = dest.get(str(ck), 0) + int(cv)
-    if total_usage and hasattr(res, "set_lm_usage"):
-        res.set_lm_usage(total_usage)
-    return res
+
+
+def sync_pareto_telemetry_siblings(
+    src_path: Path | str,
+    dst_path: Path | str,
+) -> list[Path]:
+    """Sync `<src_stem>_telemetry/pareto_member_*.json` and manifest into `<dst_stem>_telemetry/`."""
+    src = Path(src_path).resolve()
+    dst = Path(dst_path).resolve()
+    if src == dst:
+        src_tel = src.parent / f"{src.stem}_telemetry"
+        return sorted(src_tel.glob("pareto_member_*.json")) if src_tel.exists() else []
+
+    src_tel_dir = src.parent / f"{src.stem}_telemetry"
+    dst_tel_dir = dst.parent / f"{dst.stem}_telemetry"
+    if dst_tel_dir.exists():
+        for old_file in [
+            *dst_tel_dir.glob("pareto_member_*.json"),
+            dst_tel_dir / "pareto_frontier_manifest.json",
+        ]:
+            with contextlib.suppress(OSError):
+                old_file.unlink(missing_ok=True)
+
+    copied: list[Path] = []
+    if src_tel_dir.exists() and src_tel_dir.is_dir():
+        sib_files = sorted(src_tel_dir.glob("pareto_member_*.json"))
+        manifest_file = src_tel_dir / "pareto_frontier_manifest.json"
+        if sib_files or manifest_file.exists():
+            dst_tel_dir.mkdir(parents=True, exist_ok=True)
+            for sib in sib_files:
+                dst_sib = dst_tel_dir / sib.name
+                shutil.copy2(sib, dst_sib)
+                copied.append(dst_sib)
+            if manifest_file.exists() and manifest_file.is_file():
+                shutil.copy2(manifest_file, dst_tel_dir / manifest_file.name)
+    return copied
+
+
+def promote_compiled_program(
+    src_path: Path | str,
+    dst_path: Path | str,
+) -> Path:
+    """Atomically promote a compiled program JSON to `dst_path` and sync its Pareto telemetry siblings."""
+    src = Path(src_path).resolve()
+    dst = Path(dst_path).resolve()
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if src != dst:
+        tmp_target = dst.with_suffix(f".tmp.{os.getpid()}")
+        shutil.copy2(src, tmp_target)
+        tmp_target.replace(dst)
+        sync_pareto_telemetry_siblings(src, dst)
+    return dst
 
 
 def compile_pareto_ensemble(
@@ -671,14 +711,12 @@ def compile_pareto_ensemble(
     max_programs: int = 3,
     program_path: Path | str | None = None,
 ) -> dspy.Module:
-    """Compile an external `dspy.Ensemble(reduce_fn=reduce_pareto_predictions)` over up to 3 non-dominated Pareto programs."""
+    """Compile an external `dspy.Ensemble(reduce_fn=reduce_pareto_predictions)` over Pareto programs."""
     programs = select_pareto_frontier_programs(
         compiled,
         max_programs=max_programs,
         program_path=program_path,
     )
-    if len(programs) <= 1:
-        return compiled
     return dspy.Ensemble(reduce_fn=reduce_pareto_predictions).compile(programs)
 
 
@@ -1664,13 +1702,30 @@ def evolve_program_prompts(
         pareto_programs = select_pareto_frontier_programs(compiled, max_programs=3)
         telem_dir = p.parent / f"{p.stem}_telemetry"
         if telem_dir.exists():
-            for stale_member in telem_dir.glob("pareto_member_*.json"):
+            for stale_member in [
+                *telem_dir.glob("pareto_member_*.json"),
+                telem_dir / "pareto_frontier_manifest.json",
+            ]:
                 with contextlib.suppress(OSError):
                     stale_member.unlink(missing_ok=True)
         if len(pareto_programs) > 1:
             telem_dir.mkdir(parents=True, exist_ok=True)
+            member_names: list[str] = []
             for idx, sibling in enumerate(pareto_programs[1:], start=1):
-                sibling.save(str(telem_dir / f"pareto_member_{idx}.json"), save_program=False)
+                m_name = f"pareto_member_{idx}.json"
+                sibling.save(str(telem_dir / m_name), save_program=False)
+                member_names.append(m_name)
+            write_text_atomic(
+                telem_dir / "pareto_frontier_manifest.json",
+                json.dumps(
+                    {
+                        "primary_program": p.name,
+                        "member_files": member_names,
+                        "ensemble_size": len(pareto_programs),
+                    },
+                    indent=2,
+                ),
+            )
 
     hooks.finalize_compiled_program(compiled)
     hooks.rehydrate_sandbox_after_optimization(compiled)
@@ -1714,11 +1769,14 @@ __all__ = [
     "extract_named_trace_entries",
     "extraction_fingerprint",
     "openie_fingerprint",
+    "promote_compiled_program",
     "prune_mismatching_demos",
     "query_retrieval_fingerprint",
     "reduce_pareto_predictions",
+    "rrf_fuse_passage_lists",
     "select_pareto_frontier_programs",
     "serialize_predictor_surface",
     "shacl_fingerprint",
+    "sync_pareto_telemetry_siblings",
     "synonym_fingerprint",
 ]

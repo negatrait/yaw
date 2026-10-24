@@ -109,10 +109,7 @@ def build_transition_matrix(
         directed
         or (
             policy is not None
-            and (
-                pol.fact_forward != pol.fact_reverse
-                or pol.skos_broader_up != pol.skos_broader_down
-            )
+            and (pol.fact_forward != pol.fact_reverse or pol.skos_broader_up != pol.skos_broader_down)
         )
     )
 

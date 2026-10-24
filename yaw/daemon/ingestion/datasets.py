@@ -477,8 +477,7 @@ def resolve_dataset_name(name: str) -> str:
     resolved = DATASET_ALIASES.get(cleaned, cleaned)
     if resolved not in DATASET_REGISTRY:
         raise ValueError(
-            f"Unknown dataset '{name}'. Valid datasets: {', '.join(DATASETS)} "
-            f"(aliases: {', '.join(DATASET_ALIASES)})"
+            f"Unknown dataset '{name}'. Valid datasets: {', '.join(DATASETS)} (aliases: {', '.join(DATASET_ALIASES)})"
         )
     return resolved
 
@@ -629,7 +628,7 @@ def extract_gold_answers(sample: Mapping[str, Any], *, strict: bool = False) -> 
                         gold_answer.extend(parsed)
                     elif parsed:
                         gold_answer.append(parsed)
-                except (json.JSONDecodeError, TypeError):
+                except json.JSONDecodeError, TypeError:
                     gold_answer.append(value)
             elif isinstance(value, list):
                 gold_answer.extend(value)
@@ -780,8 +779,7 @@ def extract_sample_docs_and_gold(
     """Extract `(all_docs, gold_docs)` from a single dataset item."""
     if "gold_docs" in sample and "paragraphs" not in sample and "context" not in sample and "contexts" not in sample:
         g_docs = [
-            f"{d['title']}\n{d['text']}" if isinstance(d, Mapping) else str(d)
-            for d in sample.get("gold_docs", ())
+            f"{d['title']}\n{d['text']}" if isinstance(d, Mapping) else str(d) for d in sample.get("gold_docs", ())
         ]
         return g_docs, g_docs
 
@@ -1214,9 +1212,7 @@ def sync_source_files_for_docs(
         if len(covered_docs) == len(dedup_allowed) and matched_chunks:
             return matched_chunks
 
-    dedup_docs = [
-        d for d in dict.fromkeys(allowed_docs or ()) if d and d.strip() and d not in covered_docs
-    ]
+    dedup_docs = [d for d in dict.fromkeys(allowed_docs or ()) if d and d.strip() and d not in covered_docs]
     if not dedup_docs:
         return matched_chunks
 

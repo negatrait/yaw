@@ -772,14 +772,10 @@ class YawRuntime:
         def _run_retrieve() -> list[HydratedPassage]:
             if self.engine is None:
                 raise YawRuntimeError("NOT_READY", "Graph engine is not initialized.")
-            ens = getattr(self.engine, "ensemble", None)
-            if ens is not None and len(getattr(ens, "programs", ())) > 1:
-                pred = ens(question=cleaned, retrieve_only=True, k=top_k)
-                cids = tuple(str(c) for c in getattr(pred, "retrieved_chunk_ids", ()))
-                scores = tuple(float(s) for s in getattr(pred, "retrieved_scores", ()))
-                hits = self.engine.hydrate_ranked_chunks(list(zip(cids, scores, strict=False)), top_k)
-            else:
-                hits = self.engine.retrieve(cleaned, top_k=top_k)
+            pred = self.engine.ensemble(question=cleaned, retrieve_only=True, k=top_k)
+            cids = tuple(str(c) for c in getattr(pred, "retrieved_chunk_ids", ()))
+            scores = tuple(float(s) for s in getattr(pred, "retrieved_scores", ()))
+            hits = self.engine.hydrate_ranked_chunks(list(zip(cids, scores, strict=False)), top_k)
             return [
                 HydratedPassage(pointer=ptr, text=text, score=score, stale_on_disk=False) for ptr, score, text in hits
             ]
@@ -812,8 +808,7 @@ class YawRuntime:
                 raise YawRuntimeError("NOT_READY", "Graph engine is not initialized.")
             if self.engine.get_stats().chunks == 0:
                 raise YawRuntimeError("EMPTY_INDEX", "Cannot execute rag_qa on an empty graph index.")
-            active_module = getattr(self.engine, "ensemble", None) or self.engine.program
-            pred = active_module(question=cleaned)
+            pred = self.engine.ensemble(question=cleaned)
             ans = str(getattr(pred, "answer", "")).strip()
             reasoning = str(getattr(pred, "reasoning", "")).strip()
             top_n = min(5, self.config.retrieval_top_k)
@@ -1194,18 +1189,12 @@ class YawRuntime:
             if cand_path.exists() and cand_path.is_file():
                 resolved_file = cand_path.resolve()
                 raw_data = json.loads(resolved_file.read_text(encoding="utf-8"))
-                samples = (
-                    raw_data
-                    if isinstance(raw_data, list)
-                    else raw_data.get("data", raw_data.get("samples", []))
-                )
+                samples = raw_data if isinstance(raw_data, list) else raw_data.get("data", raw_data.get("samples", []))
                 corpus: list[dict[str, Any]] = []
                 stem = resolved_file.stem.lower()
                 canonical_ds = DATASET_ALIASES.get(stem, stem)
                 include_corpus = bool(
-                    full_corpus
-                    or eff_max_q is None
-                    or canonical_ds in ("sample", "narrativeqa", "lveval")
+                    full_corpus or eff_max_q is None or canonical_ds in ("sample", "narrativeqa", "lveval")
                 )
                 if include_corpus and canonical_ds in DATASET_REGISTRY:
                     _, corpus_filename = DATASET_REGISTRY[canonical_ds]
@@ -1218,9 +1207,7 @@ class YawRuntime:
             else:
                 canonical_ds = resolve_dataset_name(ds_arg)
                 include_corpus = bool(
-                    full_corpus
-                    or eff_max_q is None
-                    or canonical_ds in ("sample", "narrativeqa", "lveval")
+                    full_corpus or eff_max_q is None or canonical_ds in ("sample", "narrativeqa", "lveval")
                 )
                 if eff_max_q is not None and eff_idx_q is not None:
                     total_needed: int | None = max(
@@ -1284,11 +1271,7 @@ class YawRuntime:
                 min_chunk_size=1,
             )
 
-            prog = (
-                self._custom_program
-                if self._custom_program is not None
-                else HippoRAGProgram.from_config(bench_cfg)
-            )
+            prog = self._custom_program if self._custom_program is not None else HippoRAGProgram.from_config(bench_cfg)
             comp_p = compiled_program or compiled_program_path or bench_cfg.compiled_program_path
             if comp_p and Path(comp_p).exists() and hasattr(prog, "load"):
                 prog.load(str(comp_p))
@@ -1314,9 +1297,7 @@ class YawRuntime:
                 max_ast_expansion_hops=bench_cfg.max_ast_expansion_hops,
             )
             try:
-                existing_cids = {
-                    str(r[0]) for r in bench_engine.conn.execute("SELECT chunk_id FROM chunks").fetchall()
-                }
+                existing_cids = {str(r[0]) for r in bench_engine.conn.execute("SELECT chunk_id FROM chunks").fetchall()}
                 unindexed = [(ptr, txt) for ptr, txt in chunks if ptr.chunk_id not in existing_cids]
                 index_batches = (
                     bench_engine.index_chunks(unindexed)
@@ -1335,25 +1316,21 @@ class YawRuntime:
                 seeds_count = 0
                 bench_records: list[dict[str, Any]] = []
 
-                has_ensemble = len(getattr(bench_engine.ensemble, "programs", ())) > 1
                 for q_idx, q in enumerate(queries):
                     g_docs = gold_docs[q_idx] if q_idx < len(gold_docs) else []
                     g_ans = gold_answers[q_idx] if q_idx < len(gold_answers) else []
-                    hits, seeds = bench_engine.retrieve_with_seeds(q, top_k=top_k)
-                    ens_pred: Any = None
-                    if has_ensemble:
-                        ens_pred = bench_engine.ensemble(
-                            question=q,
-                            retrieve_only=(effective_mode != "eval"),
-                            k=top_k,
-                        )
-                        ens_cids = tuple(str(c) for c in getattr(ens_pred, "retrieved_chunk_ids", ()))
-                        ens_scores = tuple(float(s) for s in getattr(ens_pred, "retrieved_scores", ()))
-                        if ens_cids:
-                            hits = bench_engine.hydrate_ranked_chunks(
-                                list(zip(ens_cids, ens_scores, strict=False)),
-                                top_k,
-                            )
+                    ens_pred = bench_engine.ensemble(
+                        question=q,
+                        retrieve_only=(effective_mode != "eval"),
+                        k=top_k,
+                    )
+                    ens_cids = tuple(str(c) for c in getattr(ens_pred, "retrieved_chunk_ids", ()))
+                    ens_scores = tuple(float(s) for s in getattr(ens_pred, "retrieved_scores", ()))
+                    hits = bench_engine.hydrate_ranked_chunks(
+                        list(zip(ens_cids, ens_scores, strict=False)),
+                        top_k,
+                    )
+                    seeds = list(getattr(bench_engine, "_last_query_seeds", ()))
                     dpr_hits = bench_engine.retrieve_dpr(q, top_k=top_k)
                     if seeds:
                         seeds_count += 1
@@ -1373,16 +1350,7 @@ class YawRuntime:
                     dpr_ans: str | None = None
                     dpr_qa_metrics: dict[str, float] | None = None
                     if effective_mode == "eval":
-                        if ens_pred is not None:
-                            pred_ans = str(getattr(ens_pred, "answer", "") or "").strip()
-                        else:
-                            ctx_str = bench_engine.format_qa_context(hits[:5])
-                            pred = (
-                                prog.answer_question(context=ctx_str, question=q)
-                                if hasattr(prog, "answer_question")
-                                else prog(question=q)
-                            )
-                            pred_ans = str(getattr(pred, "answer", pred) or "").strip()
+                        pred_ans = str(getattr(ens_pred, "answer", "") or "").strip()
                         em_val, f1_val = compute_qa_em_f1(pred_ans, g_ans)
                         hippo_em += em_val
                         hippo_f1 += f1_val

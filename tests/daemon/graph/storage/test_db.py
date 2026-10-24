@@ -854,7 +854,7 @@ def test_multi_chunk_entity_labels_enforces_skos_s13_and_s14_disjointness(tmp_pa
 def test_step11_literal_facts_check_constraints_fact_sources_and_merge_collision(
     tmp_path: Path,
 ) -> None:
-    """Verify H2: facts mutual-exclusion CHECK constraint, fact_sources provenance, delete_chunks orphan pruning, and merge_entities collision deduplication."""
+    """Verify H2: facts CHECK constraint, fact_sources provenance, orphan pruning, and merge collision dedup."""
     import sqlite3
 
     from yaw.daemon.graph.storage import get_facts_with_meta_by_ids, upsert_fact_sources
@@ -886,17 +886,20 @@ def test_step11_literal_facts_check_constraints_fact_sources_and_merge_collision
         # 1. Verify SQL CHECK constraints reject hybrid/invalid entity vs literal rows
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute(
-                "INSERT INTO facts (fact_id, subj_id, pred, obj_id, raw_triple_json, definition, obj_kind, obj_literal_lex) "
+                "INSERT INTO facts "
+                "(fact_id, subj_id, pred, obj_id, raw_triple_json, definition, obj_kind, obj_literal_lex) "
                 "VALUES ('bad-1', 'ent-turing', 'born on', NULL, '[]', 'def', 'entity', NULL)"
             )
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute(
-                "INSERT INTO facts (fact_id, subj_id, pred, obj_id, raw_triple_json, definition, obj_kind, obj_literal_lex) "
+                "INSERT INTO facts "
+                "(fact_id, subj_id, pred, obj_id, raw_triple_json, definition, obj_kind, obj_literal_lex) "
                 "VALUES ('bad-2', 'ent-turing', 'born on', 'ent-turing', '[]', 'def', 'literal', '1912-06-23')"
             )
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute(
-                "INSERT INTO facts (fact_id, subj_id, pred, obj_id, raw_triple_json, definition, obj_kind, obj_literal_lex) "
+                "INSERT INTO facts "
+                "(fact_id, subj_id, pred, obj_id, raw_triple_json, definition, obj_kind, obj_literal_lex) "
                 "VALUES ('bad-3', 'ent-turing', 'born on', NULL, '[]', 'def', 'literal', '   ')"
             )
 
@@ -972,7 +975,7 @@ def test_step11_literal_facts_check_constraints_fact_sources_and_merge_collision
 
 
 def test_step11_skos_broader_cycle_safe_cte_and_s27_disjointness(tmp_path: Path) -> None:
-    """Verify H3: directed skos:broader edges, cycle-safe recursive CTE cycle detection, and SKOS S27 disjointness healing."""
+    """Verify H3: directed skos:broader edges, cycle-safe CTE cycle detection, and SKOS S27 disjointness."""
     conn = open_yaw_db(tmp_path / "test_step11_h3.db")
     try:
         upsert_entities(
@@ -1032,4 +1035,3 @@ def test_step11_skos_broader_cycle_safe_cte_and_s27_disjointness(tmp_path: Path)
         assert conn.execute("SELECT COUNT(*) FROM edges WHERE kind = 'skos:related'").fetchone()[0] == 0
     finally:
         conn.close()
-

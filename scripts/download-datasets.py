@@ -93,8 +93,7 @@ _CATEGORY_NORMALIZATION: dict[str, str] = {
 
 # Registry of dataset keys to (query_filename, corpus_filename, description)
 DATASET_REGISTRY = {
-    name: (*files, DATASET_DESCRIPTIONS.get(name, ""))
-    for name, files in _INGESTION_DATASET_REGISTRY.items()
+    name: (*files, DATASET_DESCRIPTIONS.get(name, "")) for name, files in _INGESTION_DATASET_REGISTRY.items()
 }
 
 

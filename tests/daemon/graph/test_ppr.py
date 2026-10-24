@@ -311,7 +311,7 @@ def test_run_ppr_dual_weight_combination() -> None:
 
 
 def test_step11_relation_traversal_policy_broader_asymmetry_and_zero_diff_parity() -> None:
-    """Verify H4: RelationTraversalPolicy zero-diff identity on symmetric graphs, parallel-edge aggregation modes, and asymmetric skos:broader column-stochastic transitions."""
+    """Verify H4: RelationTraversalPolicy zero-diff parity, parallel aggregation, and skos:broader asymmetry."""
     from yaw.core import RelationTraversalPolicy
 
     chunks = ["c-child", "c-parent", "c-other"]
@@ -374,8 +374,7 @@ def test_step11_relation_traversal_policy_broader_asymmetry_and_zero_diff_parity
         if not g_b0.dangling_mask[col_idx]:
             assert np.isclose(np.sum(pt_b0[:, col_idx]), 1.0), f"Column {col_idx} sum != 1.0"
 
-    # Transition from child -> parent (upward = 1.0 / (1.0 + 1.0) = 0.5) > parent -> child (downward = 0.25 / 1.25 = 0.2)
+    # Transition child -> parent (upward = 1.0 / 2.0 = 0.5) > parent -> child (downward = 0.25 / 1.25 = 0.2)
     assert np.isclose(pt_b0[idx_ep, idx_ec], 0.5)
     assert np.isclose(pt_b0[idx_ec, idx_ep], 0.2)
     assert pt_b0[idx_ep, idx_ec] > pt_b0[idx_ec, idx_ep]
-

@@ -61,7 +61,7 @@ STAGE_SCHEMA_CONTRACTS: dict[str, tuple[str, tuple[str, ...], str]] = {
         "decisions",
         ("decisions",),
         'Respond with JSON: {"decisions": [{"pair_id": "id_a|id_b", "relation": '
-        '"skos:altLabel|skos:hiddenLabel|skos:related|owl:differentFrom", "canonical": '
+        '"skos:altLabel|skos:hiddenLabel|skos:related|skos:broader|owl:differentFrom", "canonical": '
         '"id_a_or_id_b"}, ...]}.',
     ),
     "shacl_repair": (
@@ -195,7 +195,12 @@ def validate_stage_invariants(
         for st in structured:
             if st.subj and st.subj_def and st.subj_def.strip().lower() != st.subj.strip().lower():
                 closed_world_norms.add(str(text_processing(st.subj)) or st.subj.lower())
-            if st.obj and st.obj_def and st.obj_def.strip().lower() != st.obj.strip().lower():
+            if (
+                st.obj_kind != "literal"
+                and st.obj
+                and st.obj_def
+                and st.obj_def.strip().lower() != st.obj.strip().lower()
+            ):
                 closed_world_norms.add(str(text_processing(st.obj)) or st.obj.lower())
 
         unregistered: list[str] = []
@@ -207,7 +212,7 @@ def validate_stage_invariants(
                 continue
             s_norm = str(text_processing(st.subj)) or st.subj.lower()
             o_norm = str(text_processing(st.obj)) or st.obj.lower()
-            if s_norm == o_norm:
+            if st.obj_kind != "literal" and s_norm == o_norm:
                 s_def_clean = st.subj_def.strip().lower()
                 o_def_clean = st.obj_def.strip().lower()
                 if not s_def_clean or not o_def_clean or s_def_clean == o_def_clean:
@@ -215,7 +220,7 @@ def validate_stage_invariants(
             if stage1_norms:
                 if s_norm not in closed_world_norms:
                     unregistered.append(st.subj)
-                if o_norm not in closed_world_norms:
+                if st.obj_kind != "literal" and o_norm not in closed_world_norms:
                     unregistered.append(st.obj)
 
         issues = []

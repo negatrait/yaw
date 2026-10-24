@@ -2007,8 +2007,8 @@ repair, and Pareto penalty."""
         )
 
         # 1. Verify all VALID_SHACL_ACTIONS from parsers.py pass invariants
-        self.assertEqual(len(VALID_SHACL_ACTIONS), 11)
-        self.assertTrue(
+        self.assertEqual(len(VALID_SHACL_ACTIONS), 14)
+        self.assertEqual(
             {
                 "set_definition",
                 "rewrite_definition",
@@ -2019,12 +2019,15 @@ repair, and Pareto penalty."""
                 "add_different_from",
                 "assert_differentFrom",
                 "assert_related",
+                "assert_broader",
+                "remove_hierarchy_cycle",
+                "remove_conflicting_related",
                 "delete_dangling",
                 "delete_invalid_fact",
-            }
-            == set(VALID_SHACL_ACTIONS)
+            },
+            set(VALID_SHACL_ACTIONS),
         )
-        self.assertEqual(len(VALID_SYNONYM_RELATIONS), 4)
+        self.assertEqual(len(VALID_SYNONYM_RELATIONS), 5)
         self.assertEqual(
             VALUE_BEARING_SHACL_ACTIONS,
             {"set_definition", "rewrite_definition", "set_pref_label"},
@@ -2204,7 +2207,7 @@ repair, and Pareto penalty."""
             self.assertEqual(len(unbounded_trails[key]), len(getattr(prog, key)))
 
     def test_step10_pareto_ensemble_and_dual_perspective_contracts(self):
-        """Verify Step 10 contracts: dspy.majority field order, retrieve_only, select_pareto_frontier_programs, and reduce_pareto_predictions."""
+        """Verify Step 10 contracts: dspy.majority field order, retrieve_only, and Pareto ensemble."""
         import copy
         import tempfile
         from types import SimpleNamespace
@@ -2277,22 +2280,22 @@ repair, and Pareto penalty."""
         maj_out = maj_ens(question="Where is Montebello?")
         self.assertEqual(maj_out.answer, "Rockland County")
 
-        # 3. Verify reduce_pareto_predictions fuses recall@N (RRF + normalized PPR) & resolves 1-1-1 EM tie via token-F1 medoid
-        prog3_distinct = copy.deepcopy(prog3)
-        prog3_distinct.answer_question = lambda context, question, **_kw: dspy.Prediction(  # type: ignore[method-assign]
-            reasoning="R3-distinct", answer="Westchester County"
-        )
-        pareto_ens = dspy.Ensemble(reduce_fn=reduce_pareto_predictions).compile([prog1, prog2, prog3_distinct])
-        fused_out = pareto_ens(question="Where is Montebello?")
-        # chunk-b is ranked #2 in prog1 and #1 in prog2 and #1 in prog3 -> must rank #1 in fused output
-        self.assertEqual(fused_out.retrieved_chunk_ids[0], "chunk-b")
-        self.assertEqual(set(fused_out.retrieved_chunk_ids), {"chunk-a", "chunk-b", "chunk-c"})
-        # In 1-1-1 EM tie ("Rockland County, New York", "Rockland County", "Westchester County"),
-        # "Rockland County" has highest mean token-F1 overlap with the other two answers
-        self.assertIn("Rockland County", fused_out.answer)
-        self.assertEqual(list(fused_out.keys())[-1], "answer")
+        # 3. Verify reduce_pareto_predictions delegates to dspy.majority when answers are non-empty,
+        #    and fuses recall@N via RRF when answer == "" (retrieve_only=True)
+        pareto_ens = dspy.Ensemble(reduce_fn=reduce_pareto_predictions).compile([prog1, prog2, prog3])
+        qa_out = pareto_ens(question="Where is Montebello?")
+        self.assertEqual(qa_out.answer, "Rockland County")
+        self.assertEqual(list(qa_out.keys())[-1], "answer")
 
-        # 4. Verify select_pareto_frontier_programs excludes dominated candidates & covers both recall@N and QA(F1, EM)
+        ret_fused_out = pareto_ens(question="Where is Montebello?", retrieve_only=True)
+        # chunk-b is ranked #2 in prog1 and #1 in prog2 and #1 in prog3 -> must rank #1 in RRF-fused output
+        self.assertEqual(ret_fused_out.retrieved_chunk_ids[0], "chunk-b")
+        self.assertEqual(set(ret_fused_out.retrieved_chunk_ids), {"chunk-a", "chunk-b", "chunk-c"})
+        self.assertEqual(ret_fused_out.answer, "")
+        self.assertEqual(list(ret_fused_out.keys())[-1], "answer")
+
+        # 4. Verify select_pareto_frontier_programs excludes dominated candidates
+        #    and covers both recall@N and QA(F1, EM)
         cand0 = copy.deepcopy(prog1)
         cand1 = copy.deepcopy(prog1)
         cand1.query_intent.signature = cand1.query_intent.signature.with_instructions("Intent 1 (Retrieval leader)")
@@ -2318,6 +2321,10 @@ repair, and Pareto penalty."""
         only_best = select_pareto_frontier_programs(cand0, max_programs=3)
         self.assertEqual(len(only_best), 1)
         self.assertIs(only_best[0], cand0)
+        single_ens = compile_pareto_ensemble(cand0)
+        self.assertTrue(hasattr(single_ens, "programs"))
+        self.assertEqual(len(single_ens.programs), 1)
+        self.assertEqual(type(single_ens).__name__, "EnsembledProgram")
 
         # Multi-specialist frontier where cand1 and cand2 have higher scalar scores (due to 5 retrieval metrics)
         # while cand3 is the non-dominated QA (F1, EM) specialist
@@ -2379,15 +2386,35 @@ repair, and Pareto penalty."""
         self.assertIs(selected[1], cand1)  # Slot 1: recall@N Pareto leader
         self.assertIs(selected[2], cand3)  # Slot 2: QA (F1, EM) Pareto leader (NOT cand2!)
 
-        # 5. Verify standalone pareto_member_*.json persistence and reload + evaluate_program recall_at_k attachment
+        # 5. Verify standalone pareto_member_*.json persistence, promote_compiled_program sibling sync,
+        #    and evaluate_program recall_at_k attachment
+        from yaw.daemon.graph.inference import promote_compiled_program
+
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_p = Path(tmpdir)
-            prog_file = tmp_p / "compiled_program.json"
-            telem_dir = tmp_p / "compiled_program_telemetry"
-            telem_dir.mkdir(parents=True, exist_ok=True)
-            cand0.save(str(prog_file), save_program=False)
+            src_prog_file = tmp_p / "compiled_program_optimize_run.json"
+            src_telem_dir = tmp_p / "compiled_program_optimize_run_telemetry"
+            src_telem_dir.mkdir(parents=True, exist_ok=True)
+            cand0.save(str(src_prog_file), save_program=False)
             for idx, sib in enumerate(selected[1:], start=1):
-                sib.save(str(telem_dir / f"pareto_member_{idx}.json"), save_program=False)
+                sib.save(str(src_telem_dir / f"pareto_member_{idx}.json"), save_program=False)
+            (src_telem_dir / "pareto_frontier_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "primary_program": src_prog_file.name,
+                        "member_files": ["pareto_member_1.json", "pareto_member_2.json"],
+                        "ensemble_size": 3,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            prog_file = tmp_p / "compiled_program.json"
+            promote_compiled_program(src_prog_file, prog_file)
+            dst_telem_dir = tmp_p / "compiled_program_telemetry"
+            self.assertTrue((dst_telem_dir / "pareto_member_1.json").exists())
+            self.assertTrue((dst_telem_dir / "pareto_member_2.json").exists())
+            self.assertTrue((dst_telem_dir / "pareto_frontier_manifest.json").exists())
 
             fresh_prog = HippoRAGProgram(compiled_path=prog_file)
             fresh_prog.set_retrieval_hook(prog1._retrieval_hook)
@@ -2413,4 +2440,3 @@ repair, and Pareto penalty."""
 
 if __name__ == "__main__":
     unittest.main()
-

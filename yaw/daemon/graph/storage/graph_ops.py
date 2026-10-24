@@ -824,7 +824,10 @@ def merge_entities(
                 obj_lang
             FROM facts
             WHERE subj_id = ? OR obj_id = ?
-            GROUP BY subj_id, pred, obj_kind, COALESCE(obj_id, ''), COALESCE(obj_literal_lex, ''), obj_datatype, obj_lang
+            GROUP BY
+                subj_id, pred, obj_kind,
+                COALESCE(obj_id, ''), COALESCE(obj_literal_lex, ''),
+                obj_datatype, obj_lang
             HAVING COUNT(*) > 1
             """,
             (dst_id, dst_id),
@@ -1006,9 +1009,7 @@ def upsert_facts(
             obj_dt = ""
             obj_lang = ""
 
-        normalized_facts.append(
-            (fid, sid, pred, obj_kind, oid_val, obj_lit, obj_dt, obj_lang, raw_json, fdef)
-        )
+        normalized_facts.append((fid, sid, pred, obj_kind, oid_val, obj_lit, obj_dt, obj_lang, raw_json, fdef))
 
     with write_tx(conn):
         conn.executemany(
@@ -1174,7 +1175,7 @@ def get_facts_with_meta_by_ids(
         for row in cursor:
             fid = str(row[0])
             raw_list = json.loads(row[4])
-            results[fid] = {
+            item: dict[str, Any] = {
                 "fact_id": fid,
                 "subj_id": str(row[1]),
                 "pred": str(row[2]),
@@ -1183,11 +1184,14 @@ def get_facts_with_meta_by_ids(
                 "definition": str(row[5]),
                 "subj_def": str(row[6]),
                 "obj_def": str(row[7]),
-                "obj_kind": str(row[8] or "entity"),
-                "obj_literal_lex": str(row[9]) if row[9] is not None else None,
-                "obj_datatype": str(row[10] or ""),
-                "obj_lang": str(row[11] or ""),
             }
+            obj_kind = str(row[8] or "entity")
+            if obj_kind != "entity" or row[9] is not None or row[10] or row[11]:
+                item["obj_kind"] = obj_kind
+                item["obj_literal_lex"] = str(row[9]) if row[9] is not None else None
+                item["obj_datatype"] = str(row[10] or "")
+                item["obj_lang"] = str(row[11] or "")
+            results[fid] = item
     return results
 
 

@@ -2107,3 +2107,38 @@ Completed full-codebase SSOT/DRY canonicalization and legacy symbol retirement a
 - **Runtime & CLI canonicalization**: Prevented duplicate `_apply_delta` execution in `YawRuntime._execute_sync_worker` when `ingestor.on_delta` is bound, preserved pre-startup `stop()` signals across `start()`, drained queued `_WorkItem` futures on worker exit, renamed `handle_dspy_benchmark`, inlined single-use subparser parents, and enforced canonical CLI grammar (`yaw {daemon|graph|dspy|config} <action>`, `--db-path`, `--gate`) with `allow_abbrev=False` across all subparsers.
 
 Verification: All 17 Oblivion Demolition Table `Test-Path` and repository-wide `git grep -w` checks returned **0 matches**. Offline real-substrate pytest suite (`uv run --locked pytest -o addopts="" -k "not live_silicon" tests/core/ tests/daemon/ tests/scripts/ tests/test_benchmark.py tests/test_benchmark_edges.py tests/test_download_datasets.py`) passed **610 cases with 0 failures** (`88%` total line coverage across `yaw/`). Repository-wide `ruff check`, `ty check`, and `git diff --check` passed with zero diagnostics. Live `:13305` model-server tests were intentionally not executed while an external optimization process held the local endpoint.
+
+## 48. Step 10 & Step 11: External Pareto `dspy.Ensemble`, Dual-Perspective Reporting, and SKOS/RDF/OWL/PPR Hardening (2026-10-25)
+
+### Step 10: Canonical External `dspy.Ensemble` & Dual-Perspective (`recall@N` + `QA (F1, EM)`) Reporting
+- **Prediction final-field invariant & `retrieve_only` mode (`yaw/daemon/graph/inference/program.py`)**: Enforced `answer` as the final keyword argument on `HippoRAGProgram.forward` predictions (`signature=None`) so `dspy.majority` resolves `field = "answer"` by default, and added `retrieve_only: bool = False` to execute `self.retriever(question, k=k)` while skipping `self.answer_question` (`answer=""`).
+- **Dual-perspective Pareto frontier selection & reduction (`yaw/daemon/graph/inference/optimizer.py`)**:
+  - `select_pareto_frontier_programs` filters strictly non-dominated candidates from `compiled.detailed_results`, deduplicates by query-time predictors (`query_intent`, `triple_filter`, `qa.predict`), and assigns Slot 0 (`best_candidate`), Slot 1 (`recall@N` Pareto leader), and Slot 2 (`QA (F1, EM)` Pareto leader), falling back to `<stem>_telemetry/pareto_member_*.json` when loaded from disk.
+  - `reduce_pareto_predictions` delegates directly to `dspy.majority(list(predictions))` when any prediction has a non-empty `answer`, and fuses retrieval rankings via `rrf_fuse_passage_lists` (`1 / (60 + r)` + min-max normalized PPR scores) when all predictions have `answer == ""` (`retrieve_only=True`).
+  - `compile_pareto_ensemble` unconditionally returns `dspy.Ensemble(reduce_fn=reduce_pareto_predictions).compile(programs)`.
+  - `promote_compiled_program` and `sync_pareto_telemetry_siblings` atomically synchronize `<stem>_telemetry/pareto_member_*.json` and `pareto_frontier_manifest.json` across `evolve_prompts` and `yaw dspy load-program`.
+  - `evaluate_program` evaluates `compile_pareto_ensemble(program)` and attaches `recall_at_k` (`1, 2, 5, 10, 20`) alongside `em`, `f1`, and `score`.
+- **Read-only graph index & retrieval memoization (`yaw/daemon/graph/engine.py`, `yaw/daemon/runtime.py`)**: `YawGraphEngine._canonical_retrieval_hook` memoizes post-optimization query retrievals by `(question, k, query_retrieval_fingerprint(active_program))` while replaying extraction traces when `_in_optimization` or `item_docs` is active. `YawRuntime._run_retrieve`, `YawRuntime._run_qa`, and `YawRuntime.benchmark` route unconditionally through `engine.ensemble`.
+
+### Step 11: SKOS / RDF / OWL / SHACL & Relation-Aware PPR Hardening (`H1`–`H4`)
+- **`H1` Baseline Diagnostics Measured (Pre-Purge)**:
+  | Database | Entities | Facts | Edges | Literal-Like Entity Rate | Singleton Entity Rate | Duplicate Directed Fact-Pair Rate | Semantic Edge Share | SHACL Violations (Pre-Heal) |
+  | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+  | `.yaw/yaw.db` | 8,659 | 11,086 | 56,116 | 3.48% | 62.78% | 11.96% | 14.74% | 19,745 (legacy pre-`fact_sources` rows) |
+  | `.yaw/yaw_optimize_20261024_053147.db` | 4,838 | 5,112 | 25,444 | 0.10% | 89.25% | 5.34% | 14.31% | 5 |
+  - All `.yaw/*optimize*` remnants were subsequently purged, leaving only `coco_state`, `corpus`, `dspy_cache`, and `yaw.db`.
+- **`H2` Literal-Aware Facts & `fact_sources` Provenance (`schema.py`, `graph_ops.py`, `shacl.py`, `parsers.py`, `engine.py`)**:
+  - Extended `facts` with mutual-exclusion `CHECK` constraint (`obj_kind = 'entity'` vs `obj_kind = 'literal'`) and added `fact_sources(fact_id, chunk_id)` provenance table with automatic migration/backfill from `edges`.
+  - Added deterministic literal object classifier (`xsd:dateTime`, `xsd:date`, `xsd:gYear`, `xsd:integer`, `xsd:decimal`, `xsd:boolean`, `xsd:anyURI`, `xsd:string`); literal objects skip `entities`, `entity_labels`, `entity_vec`, and synonym mining, and seed PPR via `subj_id` plus `fact_sources` chunks.
+  - Updated `delete_chunks` to prune orphaned facts via `fact_sources` and `merge_entities` to deduplicate colliding entity/literal facts while merging their `fact_sources`.
+  - Updated `lint_graph_shacl` (`FactTripleShape` + `FactProvenanceShape`) and `serialize_graph_turtle` to validate and emit typed/language-tagged RDF literals.
+- **`H3` Directed `skos:broader` Hierarchy & Cycle-Safe SHACL Validation (`shacl.py`, `graph_ops.py`, `engine.py`, `signatures.py`, `invariants.py`)**:
+  - Added directed `skos:broader` (`src_id = narrower`, `dst_id = broader`) to `edges`, `VALID_SYNONYM_RELATIONS` (5 relations), and `VALID_SHACL_ACTIONS` (14 actions including `assert_broader`, `remove_hierarchy_cycle`, `remove_conflicting_related`).
+  - Added cycle-safe recursive CTE cycle detection (`ConceptHierarchyCycleShape`, SKOS S19/S23) and disjointness validation against `skos:related` (`ConceptDisjointRelationShape`, SKOS S27) and `owl:differentFrom` (`ConceptDisjointDifferentFromBroaderShape`) in `lint_graph_shacl`.
+- **`H4` Relation-Aware Directed PPR (`yaw/core/types.py`, `yaw/daemon/graph/ppr.py`, `engine.py`)**:
+  - Added `RelationTraversalPolicy` (`passage`, `fact_forward`, `fact_reverse`, `skos_related`, `skos_broader_up`, `skos_broader_down`, `parallel_aggregation`, `parallel_cap`) and updated `build_transition_matrix` with asymmetric `skos:broader` transitions (`up = 1.0`, `down = 0.5` default) while preserving exact `0.0` matrix diff on symmetric graphs when `policy=None` or default `RelationTraversalPolicy()`.
+
+### Verification
+- Full offline pytest suite (`uv run --locked pytest -m "not live_llm" -q`): **652 passed, 0 failed** (648 passed in initial batch + all 4 edge/contract regressions resolved and verified in `task-687` and `task-700`).
+- Focused Step 10 & Step 11 suite (`test_step10_*` and `test_step11_*` across `test_prompts.py`, `test_db.py`, `test_ppr.py`, `test_engine.py`): **6 passed in 19.71s**.
+- Static analysis & formatting (`uv run --locked ruff check`, `uv run --locked ty check`, `git diff --check`): **All checks passed (0 diagnostics)**.

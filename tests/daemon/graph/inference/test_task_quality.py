@@ -136,10 +136,7 @@ def test_partial_answer_is_not_promoted_to_exact_match():
 
 def test_reflection_fallback_reads_quality_feedback_to_select_failures_and_contrasts():
     examples = reflection_examples(
-        [
-            {"Feedback": compute_task_quality_score(value, tokens=0).feedback}
-            for value in (0.9, 0.2, 0.8, 0.4, 0.1, 0.6)
-        ]
+        [{"Feedback": compute_task_quality_score(value, tokens=0).feedback} for value in (0.9, 0.2, 0.8, 0.4, 0.1, 0.6)]
     )
     resolved = resolve_evidence(examples, deterministic_evidence(examples))
     feedbacks = [item["evidence"]["Feedback"] for item in resolved]

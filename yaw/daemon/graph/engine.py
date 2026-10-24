@@ -203,6 +203,8 @@ class YawGraphEngine:
         self._captured_graph_traces: list[tuple[str, dict[str, Any], Any]] = []
         self._in_optimization: bool = False
         self._last_memo_question: str | None = None
+        self._last_seed_query: str | None = None
+        self._last_query_seeds: list[tuple[str, str, str]] = []
         self._query_retrieval_memo: dict[
             tuple[str, int, str],
             tuple[str, tuple[str, ...], tuple[float, ...], tuple[str, ...]],
@@ -569,6 +571,9 @@ class YawGraphEngine:
         if target is self.program:
             loaded_path = getattr(self.program, "loaded_from_path", None)
             self.ensemble = compile_pareto_ensemble(self.program, program_path=loaded_path)
+            for ep in getattr(self.ensemble, "programs", ()):
+                if ep is not self.program:
+                    self._bind_program_hooks(ep)
 
     def refresh_program_bindings(self) -> None:
         """Re-bind runtime hooks, Pareto ensemble siblings, and embedding prefixes after program load."""
@@ -589,8 +594,9 @@ class YawGraphEngine:
         self._last_hook_program = active_program
         qa_top_k = max(1, int(k if k is not None else self.retrieval_top_k))
         q_str = str(question or "")
+        memo_key = (q_str, qa_top_k, query_retrieval_fingerprint(active_program))
 
-        if self._in_optimization:
+        if self._in_optimization or bool(item_docs):
             target_cids = self._ensure_candidate_chunks_indexed(active_program, item_docs=item_docs)
             active_trace = getattr(dspy.settings, "trace", None)
             if isinstance(active_trace, list):
@@ -607,12 +613,11 @@ class YawGraphEngine:
         else:
             if not self._opt_indexed_cids:
                 self._hydrate_indexed_cids_from_db(self.program)
-            if not self._opt_indexed_cids and (bool(self._opt_chunks_pool) or bool(item_docs)):
+            if not self._opt_indexed_cids and bool(self._opt_chunks_pool):
                 self._ensure_candidate_chunks_indexed(self.program, item_docs=item_docs)
-            if active_program is self.program and q_str != self._last_memo_question:
+            if q_str != self._last_memo_question:
                 self._query_retrieval_memo.clear()
                 self._last_memo_question = q_str
-            memo_key = (q_str, qa_top_k, query_retrieval_fingerprint(active_program))
             cached_ret = self._query_retrieval_memo.get(memo_key)
             if cached_ret is not None:
                 return cached_ret
@@ -628,16 +633,16 @@ class YawGraphEngine:
         )
         if not hits:
             empty_res: tuple[str, tuple[str, ...], tuple[float, ...], tuple[str, ...]] = ("", (), (), ())
-            if not self._in_optimization:
-                self._query_retrieval_memo[(q_str, qa_top_k, query_retrieval_fingerprint(active_program))] = empty_res
+            if not self._in_optimization and not bool(item_docs):
+                self._query_retrieval_memo[memo_key] = empty_res
             return empty_res
         texts = tuple(self._format_hydrated_passage(p, text) for p, _, text in hits)
         scores = tuple(float(s) for _, s, _ in hits)
         pids = tuple(p.chunk_id for p, _, _ in hits)
         formatted_context = self.format_qa_context(hits[:qa_top_k])
         res = (formatted_context, texts, scores, pids)
-        if not self._in_optimization:
-            self._query_retrieval_memo[(q_str, qa_top_k, query_retrieval_fingerprint(active_program))] = res
+        if not self._in_optimization and not bool(item_docs):
+            self._query_retrieval_memo[memo_key] = res
         return res
 
     def as_rm(
@@ -813,8 +818,7 @@ class YawGraphEngine:
         with self._lock:
             if self._csr_graph is None:
                 has_broader = (
-                    self.conn.execute("SELECT 1 FROM edges WHERE kind = 'skos:broader' LIMIT 1").fetchone()
-                    is not None
+                    self.conn.execute("SELECT 1 FROM edges WHERE kind = 'skos:broader' LIMIT 1").fetchone() is not None
                 )
                 use_policy = self.traversal_policy is not None or has_broader
                 chunk_ids, entity_ids, edges = load_graph_topology(self.conn, include_kinds=use_policy)
@@ -1526,11 +1530,7 @@ class YawGraphEngine:
                             obj=st.obj,
                             spo_def=st.spo_def,
                             subj_def=st.subj_def or stage1_defs.get(st.subj, ""),
-                            obj_def=(
-                                ""
-                                if st.obj_kind == "literal"
-                                else (st.obj_def or stage1_defs.get(st.obj, ""))
-                            ),
+                            obj_def=("" if st.obj_kind == "literal" else (st.obj_def or stage1_defs.get(st.obj, ""))),
                             obj_kind=st.obj_kind,
                             obj_datatype=st.obj_datatype,
                             obj_lang=st.obj_lang,
@@ -2066,6 +2066,8 @@ class YawGraphEngine:
                         if not raw_src or not raw_tgt:
                             continue
                         pkey = (min(raw_src, raw_tgt), max(raw_src, raw_tgt))
+                        if pkey not in cand_by_pair:
+                            continue
                         adjudicated_pairs.add(pkey)
                         src = _resolve_active_eid(raw_src)
                         tgt = _resolve_active_eid(raw_tgt)
@@ -2354,6 +2356,9 @@ class YawGraphEngine:
         """Retrieve top-k chunks and return both hydrated hits and kept recognition-memory facts."""
         active_program = program if program is not None else self.program
         with self._lock:
+            if allow_intent_path and str(query or "") != self._last_seed_query:
+                self._last_query_seeds = []
+                self._last_seed_query = str(query or "")
             graph = self._ensure_csr_graph()
             if len(graph.chunk_indices) == 0 or top_k <= 0:
                 return [], []
@@ -2489,14 +2494,18 @@ class YawGraphEngine:
                 resolved_map = resolve_entity_labels(self.conn, surface_mentions, query_vec=query_fact_vec)
 
                 seed_entities: dict[str, list[float]] = {}
+                literal_chunk_seeds: dict[str, list[float]] = {}
                 for fid, (s, _, o), score in kept_facts_with_scores:
                     s_norm = str(text_processing(s))
                     s_ids = resolved_map.get(s_norm) or [compute_mdhash_id(s_norm, prefix="entity-")]
                     for s_id in s_ids:
                         seed_entities.setdefault(s_id, []).append(score)
                     if fact_kind_by_fid.get(fid, "entity") == "literal":
-                        for src_cid in fact_sources_by_fid.get(fid, ()):
-                            passage_weights[src_cid] = max(passage_weights.get(src_cid, 0.0), score)
+                        src_cids = fact_sources_by_fid.get(fid, ())
+                        if src_cids:
+                            share = score / float(len(src_cids))
+                            for src_cid in src_cids:
+                                literal_chunk_seeds.setdefault(src_cid, []).append(share)
                     else:
                         o_norm = str(text_processing(o))
                         o_ids = resolved_map.get(o_norm) or [compute_mdhash_id(o_norm, prefix="entity-")]
@@ -2522,6 +2531,9 @@ class YawGraphEngine:
                 for cid, w in passage_weights.items():
                     reset_distribution[cid] = self.passage_node_weight * w
 
+                for cid, l_scores in literal_chunk_seeds.items():
+                    reset_distribution[cid] = reset_distribution.get(cid, 0.0) + (sum(l_scores) / len(l_scores))
+
                 ppr_scores = run_ppr(
                     graph,
                     reset_distribution,
@@ -2534,6 +2546,9 @@ class YawGraphEngine:
                 ranked_chunks = rank_passages_by_ppr(graph, ppr_scores, top_k=pool_k)
 
             kept_facts_triples = [t for _, t, _ in kept_facts_with_scores]
+            for seed_t in kept_facts_triples:
+                if seed_t not in self._last_query_seeds:
+                    self._last_query_seeds.append(seed_t)
             if not ranked_chunks:
                 return [], kept_facts_triples
 

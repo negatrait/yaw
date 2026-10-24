@@ -78,7 +78,19 @@ class StructuredTriple:
         return (self.subj, self.pred, self.obj)
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        d: dict[str, Any] = {
+            "subj": self.subj,
+            "subj_def": self.subj_def,
+            "pred": self.pred,
+            "obj": self.obj,
+            "obj_def": self.obj_def,
+            "spo_def": self.spo_def,
+        }
+        if self.obj_kind != "entity" or self.obj_datatype or self.obj_lang:
+            d["obj_kind"] = self.obj_kind
+            d["obj_datatype"] = self.obj_datatype
+            d["obj_lang"] = self.obj_lang
+        return d
 
 
 @dataclass(slots=True, frozen=True)

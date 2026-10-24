@@ -541,9 +541,7 @@ def format_gate_markdown(gate_payload: dict[str, Any]) -> str:
 
     for r in rows["paper"]:
         lines.append(
-            f"| `{r['dataset']}` | {r['r2']} | {r['r5']} "
-            f"| {r['em']} | {r['f1']} "
-            f"| {r['std_r5']} | {r['std_f1']} |"
+            f"| `{r['dataset']}` | {r['r2']} | {r['r5']} | {r['em']} | {r['f1']} | {r['std_r5']} | {r['std_f1']} |"
         )
 
     lines.append("")
@@ -668,11 +666,7 @@ def generate_quality_svg(gate_payload: dict[str, Any]) -> str:
         gate_passed = entry.get("gate_passed")
         if gate_passed is None:
             delta_em = d.get("ExactMatch")
-            gate_passed = (
-                delta_r5 >= 0.0
-                and delta_f1 >= 0.0
-                and (delta_em is None or float(delta_em) >= 0.0)
-            )
+            gate_passed = delta_r5 >= 0.0 and delta_f1 >= 0.0 and (delta_em is None or float(delta_em) >= 0.0)
         status_text = "PASS" if gate_passed else "FAIL"
         badge_color = "#10b981" if status_text == "PASS" else "#ef4444"
 

@@ -73,12 +73,13 @@ def _merge_openie_definitions(
     """Merge NER entities, NER definitions, and structured-triple inline definitions without duplicates."""
     merged_entities: list[str] = list(entities)
     seen_entity_names: set[str] = set(merged_entities)
-    seen_entity_norms: set[str] = {
-        str(text_processing(name)) for name in merged_entities if str(text_processing(name))
-    }
+    seen_entity_norms: set[str] = {str(text_processing(name)) for name in merged_entities if str(text_processing(name))}
     raw_pairs: list[tuple[str, str]] = list(entity_definitions)
     for st in structured_triples:
-        for ent_name, ent_def in ((st.subj, st.subj_def), (st.obj, st.obj_def)):
+        mention_pairs = (
+            ((st.subj, st.subj_def),) if st.obj_kind == "literal" else ((st.subj, st.subj_def), (st.obj, st.obj_def))
+        )
+        for ent_name, ent_def in mention_pairs:
             if not ent_name:
                 continue
             ent_norm = str(text_processing(ent_name))
@@ -914,14 +915,18 @@ SHACL RLM sandbox."""
             if st.subj and st.subj_def:
                 merged_defs[st.subj] = st.subj_def
                 merged_defs[str(text_processing(st.subj))] = st.subj_def
-            if st.obj and st.obj_def:
+            if st.obj_kind != "literal" and st.obj and st.obj_def:
                 merged_defs[st.obj] = st.obj_def
                 merged_defs[str(text_processing(st.obj))] = st.obj_def
 
         missing_names: list[str] = []
         for idx, st in enumerate(structured):
             s_def = st.subj_def or merged_defs.get(st.subj, "") or merged_defs.get(str(text_processing(st.subj)), "")
-            o_def = st.obj_def or merged_defs.get(st.obj, "") or merged_defs.get(str(text_processing(st.obj)), "")
+            o_def = (
+                ""
+                if st.obj_kind == "literal"
+                else (st.obj_def or merged_defs.get(st.obj, "") or merged_defs.get(str(text_processing(st.obj)), ""))
+            )
             if s_def != st.subj_def or o_def != st.obj_def:
                 structured[idx] = StructuredTriple(
                     subj=st.subj,
@@ -930,10 +935,13 @@ SHACL RLM sandbox."""
                     obj=st.obj,
                     obj_def=o_def,
                     spo_def=st.spo_def,
+                    obj_kind=st.obj_kind,
+                    obj_datatype=st.obj_datatype,
+                    obj_lang=st.obj_lang,
                 )
             if st.subj and not s_def and st.subj not in missing_names:
                 missing_names.append(st.subj)
-            if st.obj and not o_def and st.obj not in missing_names:
+            if st.obj_kind != "literal" and st.obj and not o_def and st.obj not in missing_names:
                 missing_names.append(st.obj)
 
         if _repair_missing_defs and missing_names:
@@ -952,7 +960,13 @@ SHACL RLM sandbox."""
                 s_def = (
                     st.subj_def or merged_defs.get(st.subj, "") or merged_defs.get(str(text_processing(st.subj)), "")
                 )
-                o_def = st.obj_def or merged_defs.get(st.obj, "") or merged_defs.get(str(text_processing(st.obj)), "")
+                o_def = (
+                    ""
+                    if st.obj_kind == "literal"
+                    else (
+                        st.obj_def or merged_defs.get(st.obj, "") or merged_defs.get(str(text_processing(st.obj)), "")
+                    )
+                )
                 if s_def != st.subj_def or o_def != st.obj_def:
                     structured[idx] = StructuredTriple(
                         subj=st.subj,
@@ -961,6 +975,9 @@ SHACL RLM sandbox."""
                         obj=st.obj,
                         obj_def=o_def,
                         spo_def=st.spo_def,
+                        obj_kind=st.obj_kind,
+                        obj_datatype=st.obj_datatype,
+                        obj_lang=st.obj_lang,
                     )
 
         return tuple(structured)

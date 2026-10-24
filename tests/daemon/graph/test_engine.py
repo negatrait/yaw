@@ -2486,8 +2486,7 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
 def test_step10_engine_pareto_ensemble_readonly_graph_and_memoization(
     tmp_path: Path,
 ) -> None:
-    """Verify post-optimization Pareto dspy.Ensemble runs read-only against yaw.db without re-indexing and memoizes identical query-side retrievals."""
-    import json
+    """Verify Pareto dspy.Ensemble runs read-only against yaw.db and memoizes identical query retrievals."""
 
     ner_calls: list[str] = []
 
@@ -2549,12 +2548,14 @@ def test_step10_engine_pareto_ensemble_readonly_graph_and_memoization(
         retrieve_calls = 0
         orig_retrieve = engine.retrieve
 
-        def _counting_retrieve(*args: Any, **kwargs: Any) -> Any:
+        def _counting_retrieve(
+            query: str, top_k: int = 10, *, program: Any | None = None
+        ) -> list[tuple[Any, float, str]]:
             nonlocal retrieve_calls
             retrieve_calls += 1
-            return orig_retrieve(*args, **kwargs)
+            return orig_retrieve(query, top_k=top_k, program=program)
 
-        engine.retrieve = _counting_retrieve  # type: ignore[method-assign]
+        object.__setattr__(engine, "retrieve", _counting_retrieve)
 
         qa_out = engine.rag_qa(["Where did Alan Turing work?"])
         assert len(qa_out) == 1
@@ -2562,12 +2563,14 @@ def test_step10_engine_pareto_ensemble_readonly_graph_and_memoization(
         assert len(qa_out[0]["retrieved_chunk_ids"]) >= 1
         # Must NOT have wiped or re-indexed yaw.db despite sib_1 having a different extraction_fingerprint!
         assert len(ner_calls) == ner_calls_after_index
-        # 3 ensemble members, but sib_0 and sib_1 share identical query_retrieval_fingerprint -> only 2 retrieve() calls!
+        # 3 ensemble members, but sib_0 & sib_1 share query_retrieval_fingerprint -> only 2 retrieve() calls!
         assert retrieve_calls == 2
 
-        # Retrieve-only ensemble mode must also reuse memoized query retrieval for the same question
+        # Retrieve-only ensemble mode (answer == "") must fuse via RRF and reuse memoized query retrieval
         ret_pred = engine.ensemble(question="Where did Alan Turing work?", retrieve_only=True, k=2)
+        assert getattr(ret_pred, "answer", None) == ""
         assert len(getattr(ret_pred, "retrieved_chunk_ids", ())) >= 1
+        assert len(getattr(engine, "_last_query_seeds", ())) >= 1
         assert len(ner_calls) == ner_calls_after_index
     finally:
         engine.close()
@@ -2576,7 +2579,7 @@ def test_step10_engine_pareto_ensemble_readonly_graph_and_memoization(
 def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
     tmp_path: Path,
 ) -> None:
-    """Verify Step 11 (H1-H4) end-to-end: literal-object triples skip entity creation/synonym mining, conform to SHACL, and seed PPR via subject + fact_sources alongside skos:broader hierarchy."""
+    """Verify Step 11 (H1-H4) end-to-end: literal-object triples, SHACL, PPR seeding, and skos:broader."""
     import json
     import re
 
@@ -2600,6 +2603,8 @@ def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
                     pid = str(p.get("pair_id", ""))
                     na = str(p.get("name_a", "")).lower()
                     nb = str(p.get("name_b", "")).lower()
+                    if not na or not nb:
+                        continue
                     if {na, nb} == {"cryptanalysis", "mathematics"}:
                         decisions.append(
                             {
@@ -2729,14 +2734,12 @@ def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
         assert int(src_cnt) == 1
 
         # 3. Directed skos:broader edge exists from cryptanalysis -> mathematics
-        broader_cnt = engine.conn.execute(
-            "SELECT COUNT(*) FROM edges WHERE kind = 'skos:broader'"
-        ).fetchone()[0]
+        broader_cnt = engine.conn.execute("SELECT COUNT(*) FROM edges WHERE kind = 'skos:broader'").fetchone()[0]
         assert int(broader_cnt) == 1
 
         # 4. Graph conforms to SHACL
         lint = engine.lint_graph(as_turtle=True)
-        assert lint["conforms"] is True, lint["results"]
+        assert lint["conforms"] is True, lint["violations"]
         assert 'rdf:object "1912-06-23"^^<xsd:date>' in lint["turtle"]
         assert "skos:broader yaw:entity-" in lint["turtle"]
 
@@ -2747,5 +2750,3 @@ def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
         assert any(o == "1912-06-23" for _, _, o in kept_facts)
     finally:
         engine.close()
-
-

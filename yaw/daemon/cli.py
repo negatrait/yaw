@@ -11,7 +11,6 @@ import argparse
 import contextlib
 import json
 import os
-import shutil
 import signal
 import sqlite3
 import subprocess
@@ -34,7 +33,7 @@ from yaw.core import (
     set_config_value,
     write_text_atomic,
 )
-from yaw.daemon.graph.inference import DSPyEmbeddingAdapter, HippoRAGProgram
+from yaw.daemon.graph.inference import DSPyEmbeddingAdapter, HippoRAGProgram, promote_compiled_program
 from yaw.daemon.graph.storage import (
     get_graph_counts,
     lint_graph_shacl,
@@ -396,9 +395,10 @@ def _inspect_active_optimization(config: YawConfig) -> dict[str, Any] | None:
 
             openie = 0
             if opt_db.exists():
-                with contextlib.suppress(sqlite3.Error), contextlib.closing(
-                    open_readonly_yaw_db(opt_db, timeout=1.0)
-                ) as conn:
+                with (
+                    contextlib.suppress(sqlite3.Error),
+                    contextlib.closing(open_readonly_yaw_db(opt_db, timeout=1.0)) as conn,
+                ):
                     _, _, _, _, openie = get_graph_counts(conn)
 
             snap: dict[str, Any] = {}
@@ -435,9 +435,10 @@ def inspect_status(config: YawConfig) -> dict[str, Any]:
     chunks = entities = facts = edges = openie = entity_labels = 0
     shacl_conforms = True
     if config.db_path and Path(config.db_path).exists():
-        with contextlib.suppress(sqlite3.Error), contextlib.closing(
-            open_readonly_yaw_db(config.db_path, timeout=1.0)
-        ) as conn:
+        with (
+            contextlib.suppress(sqlite3.Error),
+            contextlib.closing(open_readonly_yaw_db(config.db_path, timeout=1.0)) as conn,
+        ):
             chunks, entities, facts, edges, openie = get_graph_counts(conn)
             with contextlib.suppress(sqlite3.Error):
                 row = conn.execute("SELECT COUNT(*) FROM entity_labels").fetchone()
@@ -967,23 +968,7 @@ def handle_dspy_load_program(
         if config.compiled_program_path
         else (config.workspace_root / ".yaw" / "compiled_program.json").resolve()
     )
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    if src != target_path:
-        tmp_target = target_path.with_suffix(f".tmp.{os.getpid()}")
-        shutil.copy2(src, tmp_target)
-        tmp_target.replace(target_path)
-        src_tel_dir = src.parent / f"{src.stem}_telemetry"
-        dst_tel_dir = target_path.parent / f"{target_path.stem}_telemetry"
-        if dst_tel_dir.exists():
-            for old_sib in dst_tel_dir.glob("pareto_member_*.json"):
-                with contextlib.suppress(OSError):
-                    old_sib.unlink(missing_ok=True)
-        if src_tel_dir.exists() and src_tel_dir.is_dir():
-            sib_files = sorted(src_tel_dir.glob("pareto_member_*.json"))
-            if sib_files:
-                dst_tel_dir.mkdir(parents=True, exist_ok=True)
-                for sib in sib_files:
-                    shutil.copy2(sib, dst_tel_dir / sib.name)
+    promote_compiled_program(src, target_path)
 
     if is_daemon_locked(config):
         assert config.lock_path is not None
