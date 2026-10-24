@@ -33,13 +33,15 @@ string ::= "\"" char+ "\""
 char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
 """
 
-DSPY_SYNONYM_JUDGE_GBNF_GRAMMAR = r"""root ::= "{\"decisions\": " decision-list "}"
-decision-list ::= "[]" | "[" decision (", " decision)* "]"
-decision ::= "{\"pair_id\": " string ", \"relation\": " relation-kind ", \"canonical\": " string "}"
-relation-kind ::= "\"skos:altLabel\"" | "\"skos:hiddenLabel\"" | "\"skos:related\"" | "\"owl:differentFrom\""
-string ::= "\"" char+ "\""
-char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
-"""
+DSPY_SYNONYM_JUDGE_GBNF_GRAMMAR = (
+    'root ::= "{\\"decisions\\": " decision-list "}"\n'
+    'decision-list ::= "[]" | "[" decision (", " decision)* "]"\n'
+    'decision ::= "{\\"pair_id\\": " string ", \\"relation\\": " relation-kind ", \\"canonical\\": " string "}"\n'
+    'relation-kind ::= "\\"skos:altLabel\\"" | "\\"skos:hiddenLabel\\"" | "\\"skos:related\\"" | '
+    '"\\"skos:broader\\"" | "\\"owl:differentFrom\\""\n'
+    'string ::= "\\"" char+ "\\""\n'
+    'char ::= [^"\\\\\\x7F\\x00-\\x1F] | "\\\\" (["\\\\bfnrt] | "u" [0-9a-fA-F]{4})\n'
+)
 
 DSPY_SHACL_REPAIR_GBNF_GRAMMAR = (
     'root ::= "{\\"repairs\\": " repair-list "}"\n'
@@ -49,6 +51,7 @@ DSPY_SHACL_REPAIR_GBNF_GRAMMAR = (
     'action-kind ::= "\\"set_definition\\"" | "\\"rewrite_definition\\"" | "\\"set_pref_label\\"" | '
     '"\\"demote_to_alt_label\\"" | "\\"merge_altLabel\\"" | "\\"merge_hiddenLabel\\"" | '
     '"\\"add_different_from\\"" | "\\"assert_differentFrom\\"" | "\\"assert_related\\"" | '
+    '"\\"assert_broader\\"" | "\\"remove_hierarchy_cycle\\"" | "\\"remove_conflicting_related\\"" | '
     '"\\"delete_dangling\\"" | "\\"delete_invalid_fact\\""\n'
     'string ::= "\\"" char+ "\\""\n'
     'char ::= [^"\\\\\\x7F\\x00-\\x1F] | "\\\\" (["\\\\bfnrt] | "u" [0-9a-fA-F]{4})\n'
@@ -192,7 +195,7 @@ def build_dspy_synonym_judge_grammar(max_decisions: int | None = None) -> str:
         f"decision-list ::= ({seq})?\n"
         'decision ::= "{\\"pair_id\\": " string ", \\"relation\\": " relation-kind ", \\"canonical\\": " string "}"\n'
         'relation-kind ::= "\\"skos:altLabel\\"" | "\\"skos:hiddenLabel\\"" | "\\"skos:related\\"" | '
-        '"\\"owl:differentFrom\\""\n'
+        '"\\"skos:broader\\"" | "\\"owl:differentFrom\\""\n'
         'string ::= "\\"" char+ "\\""\n'
         'char ::= [^"\\\\\\x7F\\x00-\\x1F] | "\\\\" (["\\\\bfnrt] | "u" [0-9a-fA-F]{4})\n'
     )
@@ -212,6 +215,7 @@ def build_dspy_shacl_repair_grammar(max_repairs: int | None = None) -> str:
         'action-kind ::= "\\"set_definition\\"" | "\\"rewrite_definition\\"" | "\\"set_pref_label\\"" | '
         '"\\"demote_to_alt_label\\"" | "\\"merge_altLabel\\"" | "\\"merge_hiddenLabel\\"" | '
         '"\\"add_different_from\\"" | "\\"assert_differentFrom\\"" | "\\"assert_related\\"" | '
+        '"\\"assert_broader\\"" | "\\"remove_hierarchy_cycle\\"" | "\\"remove_conflicting_related\\"" | '
         '"\\"delete_dangling\\"" | "\\"delete_invalid_fact\\""\n'
         'string ::= "\\"" char+ "\\""\n'
         'char ::= [^"\\\\\\x7F\\x00-\\x1F] | "\\\\" (["\\\\bfnrt] | "u" [0-9a-fA-F]{4})\n'

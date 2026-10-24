@@ -1389,8 +1389,8 @@ confidence < 0.15."""
                                 str(getattr(react_pred, "answer", "") or "")
                             ):
                                 pred = react_pred
-                        ans_str = getattr(pred, "answer", "")
-                        reas_str = getattr(pred, "reasoning", "")
+                        ans_str = str(getattr(pred, "answer", "") or "")
+                        reas_str = str(getattr(pred, "reasoning", "") or "")
                 tokens = usage_tracker.get_total_tokens()
                 res = dspy.Prediction(
                     context=hydrated_ctx,

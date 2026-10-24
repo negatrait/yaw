@@ -1269,9 +1269,50 @@ def load_graph_topology(
     if include_kinds:
         edge_cursor = conn.execute(
             """
-            SELECT src_id, dst_id, kind, weight
-            FROM edges
-            WHERE src_id != dst_id AND weight > 0.0 AND kind != 'owl:differentFrom'
+            SELECT
+                f.subj_id AS src_id,
+                f.obj_id AS dst_id,
+                'fact' AS kind,
+                CAST(MAX(1, COUNT(DISTINCT fs.chunk_id)) AS REAL) AS weight
+            FROM facts f
+            LEFT JOIN fact_sources fs ON fs.fact_id = f.fact_id
+            WHERE COALESCE(f.obj_kind, 'entity') = 'entity'
+              AND f.obj_id IS NOT NULL
+              AND f.obj_id != ''
+              AND f.subj_id != f.obj_id
+            GROUP BY f.fact_id, f.subj_id, f.obj_id
+            UNION ALL
+            SELECT
+                e.src_id AS src_id,
+                e.dst_id AS dst_id,
+                e.kind AS kind,
+                e.weight AS weight
+            FROM edges e
+            WHERE e.src_id != e.dst_id
+              AND e.weight > 0.0
+              AND e.kind != 'owl:differentFrom'
+              AND (
+                  e.kind != 'fact'
+                  OR NOT EXISTS (
+                      SELECT 1 FROM facts f
+                      WHERE COALESCE(f.obj_kind, 'entity') = 'entity'
+                        AND f.obj_id IS NOT NULL
+                        AND f.obj_id != ''
+                        AND ((f.subj_id = e.src_id AND f.obj_id = e.dst_id)
+                             OR (f.subj_id = e.dst_id AND f.obj_id = e.src_id))
+                  )
+              )
+              AND (
+                  e.kind NOT IN ('passage', 'skos:related', 'synonym')
+                  OR e.src_id < e.dst_id
+                  OR NOT EXISTS (
+                      SELECT 1 FROM edges rev
+                      WHERE rev.src_id = e.dst_id
+                        AND rev.dst_id = e.src_id
+                        AND rev.kind = e.kind
+                        AND rev.weight > 0.0
+                  )
+              )
             ORDER BY src_id ASC, dst_id ASC, kind ASC
             """
         )

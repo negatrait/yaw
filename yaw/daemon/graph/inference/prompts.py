@@ -269,8 +269,10 @@ entity/concept (keep separate, add repulsive owl:differentFrom edge).
     - 'skos:related': Distinct, different `skos:concept` entities that are associatively related in the \
 domain without being coreferent synonyms or confusable homonyms/lookalikes (keep separate, add symmetric \
 skos:related edge).
+    - 'skos:broader': Hierarchical broader-concept relation where the narrower concept points to `canonical` \
+as its broader parent concept (keep separate, add directed skos:broader edge).
     Respond with JSON: {"decisions": [{"pair_id": "id_a|id_b", "relation": \
-"skos:altLabel|skos:hiddenLabel|skos:related|owl:differentFrom", "canonical": "id_a_or_id_b"}, ...]}"""
+"skos:altLabel|skos:hiddenLabel|skos:related|skos:broader|owl:differentFrom", "canonical": "id_a_or_id_b"}, ...]}"""
 
     candidate_pairs: str = dspy.InputField(
         desc="JSON list of candidate entity pairs with names, definitions, and similarity scores"
@@ -286,6 +288,7 @@ heal SHACL violations.
     Propose closed-world SKOS/RDF/OWL repairs for SHACL validation report violations.
     Supported actions: 'set_definition', 'rewrite_definition', 'set_pref_label', 'demote_to_alt_label', \
 'merge_altLabel', 'merge_hiddenLabel', 'add_different_from', 'assert_differentFrom', 'assert_related', \
+'assert_broader', 'remove_hierarchy_cycle', 'remove_conflicting_related', \
 'delete_dangling', 'delete_invalid_fact'.
     Respond with JSON: {"repairs": [{"focus_node": "...", "action": "...", "value": "..."}, ...]}"""
 

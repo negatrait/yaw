@@ -2649,6 +2649,15 @@ def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
                                         "obj_kind": "entity",
                                         "def": "Alan Turing worked on cryptanalysis during World War II.",
                                     },
+                                    {
+                                        "sub": "Alan Turing",
+                                        "sub_def": "English mathematician and logician",
+                                        "pred": "pioneered",
+                                        "obj": "Cryptanalysis",
+                                        "obj_def": "Study of analyzing information systems to decipher ciphertexts",
+                                        "obj_kind": "entity",
+                                        "def": "Alan Turing pioneered modern cryptanalysis.",
+                                    },
                                 ]
                             }
                         )
@@ -2713,11 +2722,16 @@ def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
         engine.index([doc_turing, doc_math])
 
         # 1. Literal "1912-06-23" is NOT materialized in entities, entity_labels, or entity_vec
-        ent_names = {str(r[0]) for r in engine.conn.execute("SELECT name FROM entities").fetchall()}
+        ent_rows = {
+            str(r[0]): str(r[1]) for r in engine.conn.execute("SELECT name, entity_id FROM entities").fetchall()
+        }
+        ent_names = set(ent_rows.keys())
         assert "1912-06-23" not in ent_names
         assert "alan turing" in ent_names
         assert "cryptanalysis" in ent_names
         assert "mathematics" in ent_names
+        turing_id = ent_rows["alan turing"]
+        crypt_id = ent_rows["cryptanalysis"]
 
         # 2. Literal fact is stored in facts with obj_kind='literal', obj_id IS NULL, and recorded in fact_sources
         lit_row = engine.conn.execute(
@@ -2736,6 +2750,47 @@ def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
         # 3. Directed skos:broader edge exists from cryptanalysis -> mathematics
         broader_cnt = engine.conn.execute("SELECT COUNT(*) FROM edges WHERE kind = 'skos:broader'").fetchone()[0]
         assert int(broader_cnt) == 1
+
+        # 3b. H4: load_graph_topology(include_kinds=True) preserves asserted fact direction (turing -> cryptanalysis)
+        #     without synthetic reverse rows and preserves both parallel predicates from the same chunk.
+        from yaw.daemon.graph.ppr import build_transition_matrix
+        from yaw.daemon.graph.storage import load_graph_topology
+
+        c_ids, e_ids, kind_edges = load_graph_topology(engine.conn, include_kinds=True)
+        turing_to_crypt_facts = [
+            w for s, d, k, w in kind_edges if s == turing_id and d == crypt_id and k == "fact"
+        ]
+        crypt_to_turing_facts = [
+            w for s, d, k, w in kind_edges if s == crypt_id and d == turing_id and k == "fact"
+        ]
+        assert len(turing_to_crypt_facts) == 2
+        assert len(crypt_to_turing_facts) == 0
+
+        csr_dir = build_transition_matrix(
+            c_ids,
+            e_ids,
+            kind_edges,
+            policy=RelationTraversalPolicy(fact_forward=1.0, fact_reverse=0.1, skos_related=0.0),
+        )
+        u_tur = csr_dir.node_to_idx[turing_id]
+        v_cry = csr_dir.node_to_idx[crypt_id]
+        # Asymmetric policy gives higher transition weight in asserted direction (turing -> crypt)
+        assert float(csr_dir.transition_t[v_cry, u_tur]) > float(csr_dir.transition_t[u_tur, v_cry])
+
+        csr_max = build_transition_matrix(
+            c_ids,
+            e_ids,
+            kind_edges,
+            policy=RelationTraversalPolicy(parallel_aggregation="max", skos_related=0.0),
+        )
+        csr_sum = build_transition_matrix(
+            c_ids,
+            e_ids,
+            kind_edges,
+            policy=RelationTraversalPolicy(parallel_aggregation="sum", skos_related=0.0),
+        )
+        # Parallel predicates ("worked on" + "pioneered") in the same chunk increase transition share under "sum"
+        assert float(csr_sum.transition_t[v_cry, u_tur]) > float(csr_max.transition_t[v_cry, u_tur])
 
         # 4. Graph conforms to SHACL
         lint = engine.lint_graph(as_turtle=True)

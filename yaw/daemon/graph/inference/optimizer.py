@@ -607,8 +607,9 @@ def reduce_pareto_predictions(predictions: Sequence[dspy.Prediction]) -> dspy.Pr
     if len(predictions) == 1:
         return predictions[0]
 
-    if any(str(getattr(p, "answer", "") or "").strip() for p in predictions):
-        return dspy.majority(list(predictions))
+    non_empty = [p for p in predictions if str(getattr(p, "answer", "") or "").strip()]
+    if non_empty:
+        return dspy.majority(non_empty)
 
     # RRF fusion for retrieval-only predictions (answer == "")
     member_lists: list[list[tuple[str, float, str]]] = []

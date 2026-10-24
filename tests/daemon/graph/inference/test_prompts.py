@@ -2032,8 +2032,25 @@ repair, and Pareto penalty."""
             VALUE_BEARING_SHACL_ACTIONS,
             {"set_definition", "rewrite_definition", "set_pref_label"},
         )
+        from yaw.daemon.graph.inference import (
+            DSPY_SHACL_REPAIR_GBNF_GRAMMAR,
+            DSPY_SYNONYM_JUDGE_GBNF_GRAMMAR,
+            JudgeSynonyms,
+            ProposeSHACLRepairs,
+            build_dspy_shacl_repair_grammar,
+            build_dspy_synonym_judge_grammar,
+        )
+
+        for rel in VALID_SYNONYM_RELATIONS:
+            self.assertIn(rel, DSPY_SYNONYM_JUDGE_GBNF_GRAMMAR)
+            self.assertIn(rel, build_dspy_synonym_judge_grammar(max_decisions=2))
+            self.assertIn(rel, JudgeSynonyms.instructions)
+
         violations_in = {"violations": [{"focus_node": "entity-a"}, {"focus_node": "entity-b"}]}
         for action in VALID_SHACL_ACTIONS:
+            self.assertIn(action, DSPY_SHACL_REPAIR_GBNF_GRAMMAR)
+            self.assertIn(action, build_dspy_shacl_repair_grammar(max_repairs=2))
+            self.assertIn(action, ProposeSHACLRepairs.instructions)
             val = "Non-empty value" if action in VALUE_BEARING_SHACL_ACTIONS else "entity-b"
             if action in ("delete_dangling", "delete_invalid_fact"):
                 val = ""
@@ -2293,6 +2310,24 @@ repair, and Pareto penalty."""
         self.assertEqual(set(ret_fused_out.retrieved_chunk_ids), {"chunk-a", "chunk-b", "chunk-c"})
         self.assertEqual(ret_fused_out.answer, "")
         self.assertEqual(list(ret_fused_out.keys())[-1], "answer")
+
+        # Verify None/empty answer handling in HippoRAGProgram.forward and reduce_pareto_predictions:
+        # Two abstaining members returning None or "" must not crash dspy.majority or outvote a valid answer.
+        prog_none = copy.deepcopy(prog1)
+        prog_none.answer_question = lambda context, question, **_kw: dspy.Prediction(  # type: ignore[method-assign]
+            reasoning=None, answer=None
+        )
+        none_pred = prog_none(question="Where is Montebello?")
+        self.assertEqual(none_pred.answer, "")
+        self.assertEqual(none_pred.reasoning, "")
+        mixed_reduced = reduce_pareto_predictions(
+            [
+                dspy.Prediction(retrieved_chunk_ids=("chunk-a",), answer=None),
+                dspy.Prediction(retrieved_chunk_ids=("chunk-b",), answer=""),
+                dspy.Prediction(retrieved_chunk_ids=("chunk-c",), answer="Rockland County"),
+            ]
+        )
+        self.assertEqual(mixed_reduced.answer, "Rockland County")
 
         # 4. Verify select_pareto_frontier_programs excludes dominated candidates
         #    and covers both recall@N and QA(F1, EM)
