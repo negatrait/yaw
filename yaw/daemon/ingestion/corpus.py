@@ -19,69 +19,13 @@ from cocoindex.ops.text import RecursiveSplitter, detect_code_language
 from cocoindex.resources.file import FileLike, PatternFilePathMatcher
 
 from yaw.core import (
+    DEFAULT_EXCLUDED_PATTERNS,
+    DEFAULT_INCLUDED_PATTERNS,
     ChunkPointer,
     SyncDelta,
     compute_chunk_id,
     inclusive_end_line,
 )
-
-_DEFAULT_INCLUDED_PATTERNS: tuple[str, ...] = (
-    "*.md",
-    "*.mdx",
-    "*.txt",
-    "*.rst",
-    "*.adoc",
-    "*.org",
-    "*.py",
-    "*.pyi",
-    "*.rs",
-    "*.ts",
-    "*.tsx",
-    "*.js",
-    "*.jsx",
-    "*.mjs",
-    "*.cjs",
-    "*.go",
-    "*.java",
-    "*.kt",
-    "*.kts",
-    "*.c",
-    "*.h",
-    "*.cpp",
-    "*.hpp",
-    "*.cc",
-    "*.cs",
-    "*.rb",
-    "*.php",
-    "*.swift",
-    "*.scala",
-    "*.lua",
-    "*.r",
-    "*.R",
-    "*.sh",
-    "*.bash",
-    "*.zsh",
-    "*.sql",
-    "*.graphql",
-    "*.proto",
-    "*.yaml",
-    "*.yml",
-    "*.toml",
-    "*.json",
-    "*.jsonl",
-    "*.xml",
-    "*.html",
-    "*.css",
-    "*.scss",
-    "*.tex",
-    "*.bib",
-    "*.pas",
-    "*.dpr",
-    "*.f90",
-    "*.sol",
-    "*.dtd",
-)
-_DEFAULT_EXCLUDED_PATTERNS: tuple[str, ...] = (".*", "*/.*", "__pycache__/*")
 
 _SPLITTER = RecursiveSplitter()
 _ATX_HEADING_RE = re.compile(r"^ {0,3}#{1,6}(?:\s+(.*?))?(?:\s+#+\s*)?$")
@@ -1016,8 +960,8 @@ class CorpusIngestor:
         corpus_root: Path | str,
         state_dir: Path | str,
         *,
-        included_patterns: Sequence[str] = _DEFAULT_INCLUDED_PATTERNS,
-        excluded_patterns: Sequence[str] = _DEFAULT_EXCLUDED_PATTERNS,
+        included_patterns: Sequence[str] = DEFAULT_INCLUDED_PATTERNS,
+        excluded_patterns: Sequence[str] = DEFAULT_EXCLUDED_PATTERNS,
         json_keys_whitelist: Sequence[str] = ("*",),
         json_keys_blacklist: Sequence[str] = (),
         chunk_size: int = 1200,
@@ -1065,10 +1009,10 @@ class CorpusIngestor:
             json_keys_blacklist=self.json_keys_blacklist,
         )
 
-    def set_delta_compiler(self, compiler: Callable[[SyncDelta], None] | None) -> None:
-        """Bind or update the target sink delta compiler callback."""
-        self._on_delta = compiler
-        self._cp.provide(_COMPILER_KEY, compiler)
+    @property
+    def on_delta(self) -> Callable[[SyncDelta], None] | None:
+        """Return the configured target sink delta compiler callback."""
+        return self._on_delta
 
     def close(self) -> None:
         """Close the underlying CocoIndex environment and release LMDB resources."""

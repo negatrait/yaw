@@ -235,7 +235,7 @@ Offline test suite: `uv run --locked python -m unittest discover -s tests -v` â€
 
 1. **Pure-JSON `dspy.JSONAdapter` + GBNF Grammars & Sizecoding Pareto Metric (`yaw/daemon/graph/inference/prompts.py`):**
    - Eliminated `[[ ## field ## ]]` output markers on `Qwen3-4B-Instruct-2507-GGUF` (`llamacpp`) by routing direct `dspy.Predict` / `dspy.ChainOfThought` calls through `dspy.JSONAdapter()` and pure-JSON GBNF grammars (`DSPY_NER_GBNF_GRAMMAR`, `DSPY_TRIPLES_GBNF_GRAMMAR`, `build_dspy_rerank_grammar`, `DSPY_QA_COT_GBNF_GRAMMAR`) with optional sizecoding caps (`gbnf_max_entities`, `gbnf_max_triples`, `gbnf_max_facts`, `gbnf_max_reasoning_chars`).
-   - Added `compute_sizecoding_pareto_score` (`pareto = recall@5 / (tokens * elapsed_seconds)`) with a hard Tier 1 baseline gate (`clamped_recall < min_baseline_recall` clamped below `0.05` with zero `pareto_raw`/`efficiency` objective scores) for `dspy.GEPA` multi-objective optimization.
+   - Added `compute_task_quality_score` (`pareto = recall@5 / (tokens * elapsed_seconds)`) with a hard Tier 1 baseline gate (`clamped_recall < min_baseline_recall` clamped below `0.05` with zero `pareto_raw`/`efficiency` objective scores) for `dspy.GEPA` multi-objective optimization.
    - Added `lm_supports_gbnf(lm)` and `create_dspy_rlm_pair()` (`yaw/daemon/graph/inference/chat.py`) so GBNF grammars are **only** attached to `llamacpp` GPU calls (`Qwen3-4B-Instruct-2507-GGUF`) and **never** sent to Ryzen AI NPU/OGA (`Mistral-7B-Instruct-v0.3-Hybrid`, `recipe == "ryzenai-llm"`).
 2. **Real-Silicon Failure Modes Caught on Live Lemonade Server (`http://localhost:13305/api/v1`) and Fixes (`_PositionalSafeRLM`):**
    - **Failure 1 â€” Positional tool arguments inside `dspy.LocalInterpreter`:** Upstream `dspy.RLM._make_interpreter_tool` wraps tools as `def invoke(**kwargs): return tool(**kwargs)`. On live silicon, `Mistral-7B-Instruct-v0.3-Hybrid` invoked `qwen_extract_entities(passage)` positionally, raising `TypeError: invoke() takes 0 positional arguments`. Fixed in `_PositionalSafeRLM._make_interpreter_tool` by binding `*args, **kwargs` via `inspect.signature(tool.func).bind(*args, **kwargs)`.
@@ -290,11 +290,11 @@ Offline test suite: `uv run --locked python -m unittest discover -s tests -v` â€
 
 3. **Native HippoRAG 2 Graph & Retrieval Engine (`yaw/daemon/graph/engine.py`, `yaw/daemon/graph/storage/db.py`):**
    - Ported graph construction, indexing, and retrieval onto single `yaw.db` (`sqlite-vec` + FTS5) + `inference` (`HippoRAGProgram`, `DSPyEmbeddingAdapter`).
-   - Raw passages appended to `workspace_root / corpus / passages.txt` with $O(1)$ B-tree indexed line-offset resolution (`idx_chunks_path_end`, `get_max_end_line`) and 1-indexed `(start_line, end_line)` spans. 1-indexed line hydration streams directly from disk with SHA-256 staleness checking and trailing newline normalization.
+   - Raw passages appended to `workspace_root / corpus / passages.txt` with $O(1)$ B-tree indexed line-offset resolution (`idx_chunks_path_end`) and 1-indexed `(start_line, end_line)` spans. 1-indexed line hydration streams directly from disk with SHA-256 staleness checking and trailing newline normalization.
    - Self-healing crash-resilient checkpointing (`openie_chunks`, `chunk_vec`), bounded embedding micro-batches (`_encode_in_batches`, `embed_batch_size=64`), single-evaluation `vec_distance_cosine` synonymy mining, pre-aggregated SQL `GROUP BY src_id, dst_id` topology loading, and atomic cascading deletion (`delete_chunks`).
    - Real min-max normalized fact-score entity seeding ($w(e) = \text{mean\_fact\_score}(e) / \max(1, \text{doc\_freq}(e))$), `retrieve_with_seeds` returning `(hydrated_hits, kept_facts)`, and `retrieve_dpr` providing the Standard DPR dense KNN baseline.
    - Implemented `YawJSONAdapter(dspy.JSONAdapter)` to transparently handle bare JSON lists/arrays emitted by local quantized models during OpenIE extraction without `AdapterParseError`.
-   - Separate `_mipro_metric` (scalar `float`) and `_gepa_metric` (`dspy.Prediction(score=..., feedback=...)` via `compute_sizecoding_pareto_score`) in `evolve_prompts`, plus `check_same_thread=False` and `threading.RLock()` thread safety across `YawGraphEngine`.
+   - Separate `_mipro_metric` (scalar `float`) and `_gepa_metric` (`dspy.Prediction(score=..., feedback=...)` via `compute_task_quality_score`) in `evolve_prompts`, plus `check_same_thread=False` and `threading.RLock()` thread safety across `YawGraphEngine`.
 
 4. **Benchmark Suite Disjoint Slicing, DPR Baseline & Telemetry (`benchmark.py`):**
    - Added CLI flags: `--engine {hipporag, yaw}`, `--execution-mode {direct, rlm}`, `--qa-mode {cot, rlm}`, `--enable-gbnf`, `--query-offset`, `--evolve {none, miprov2, gepa, hybrid}`, `--train-queries`, `--compiled-program`.
@@ -515,7 +515,7 @@ Offline test suite: `uv run --locked python -m unittest discover -s tests -v` â€
   - **CLI Entrypoint (`yaw/daemon/cli.py`, `yaw/__main__.py`):**
     - Implemented `python -m yaw {run|start|status|sync|stop|rebuild|optimize} --config yaw.toml`.
   - **Composite Fitness Objective & Full Optimizable Surface (`yaw/daemon/graph/inference/{grammars.py,embedding.py,program.py}`, `yaw/daemon/graph/engine.py`):**
-    - Upgraded `compute_sizecoding_pareto_score` and `YawGraphEngine.evolve_prompts` to compute the full multiplicative quality curve $\prod_{k \in \{1,2,5,10,20\}} \text{Recall@}k \times \text{EM} \times \text{F1} / (\text{tokens} \times \text{wall\_clock\_seconds})$.
+    - Upgraded `compute_task_quality_score` and `YawGraphEngine.evolve_prompts` to compute the full multiplicative quality curve $\prod_{k \in \{1,2,5,10,20\}} \text{Recall@}k \times \text{EM} \times \text{F1} / (\text{tokens} \times \text{wall\_clock\_seconds})$.
     - Exposed and persisted all 5 optimizable surfaces (`EmbeddingGemma` prefixes, OpenIE Extraction RLM, `FilterFacts`/`ExtractQueryIntent`, Multi-Hop QA RLM, and parametric GBNF bounds) via `HippoRAGProgram.dump_state()` / `load_state()` and `DSPyEmbeddingAdapter.update_prefixes()`.
 
 - **Verification Status:**
@@ -622,15 +622,15 @@ Offline test suite: `uv run --locked python -m unittest discover -s tests -v` â€
   - `git diff --check` $\to$ **Clean**.
   - `git grep -n "def forward" yaw/daemon/graph/inference/chat.py` $\to$ **0 matches**.
 
-17. **Sprint 2 â€” First-Class `YawRM` / `YawRetriever(dspy.Retrieve)`, Stage Invariants (`yaw_assert` / `yaw_suggest` / `dspy.Refine`), GEPA Pareto Frontier Ensemble (`dspy.Ensemble`) & `dspy.ReActV2` (2026-10-19):**
+17. **Sprint 2 â€” First-Class `YawRM` / `YawRetriever(dspy.Retrieve)`, Stage Invariants (`validate_stage_invariants`), GEPA Pareto Frontier Ensemble (`dspy.Ensemble`) & `dspy.ReActV2` (2026-10-19):**
 
 - **Architecture & Implementation:**
   - **First-Class `dspy.Retrieve` / `dspy.RM` Adapter (`yaw/daemon/graph/inference/program.py`, `yaw/daemon/graph/inference/__init__.py`):**
     - Implemented `YawPassage(dspy.Prediction)` exposing `.long_text` (required by `dspy.Retrieve.forward`), `.pid`, `.score`, and `.rank`.
     - Implemented `YawRM` (`__call__(query_or_queries, k=None, **kwargs) -> list[YawPassage]`) compatible with `dspy.configure(rm=...)` / `dspy.context(rm=...)` so stock `dspy.Retrieve(k=...)` modules query YAW's hybrid PPR graph engine natively.
     - Implemented `YawRetriever(dspy.Retrieve)` with backward-compatible `dump_state` / `load_state` (`state_copy.setdefault("retriever", {"k": ...})`) and wired `self.rm` and `self.retriever` onto `HippoRAGProgram` while preserving the 9-predictor `named_predictors()` invariant.
-  - **Exhaustive Stage & Closed-World SHACL/SKOS/Connected-Node Invariants (`yaw/daemon/graph/inference/program.py`):**
-    - Implemented `YawAssertionError`, `yaw_assert(condition, message, *, target_module=None)`, `yaw_suggest(condition, message, *, target_module=None)`, `validate_stage_invariants(...)`, and `wrap_stage_with_refine(module, stage_name, *, N=2, threshold=1.0, use_refine=True)` (`dspy.Refine` / `dspy.BestOfN`).
+  - **Exhaustive Stage & Closed-World SHACL/SKOS/Connected-Node Invariants (`yaw/daemon/graph/inference/invariants.py`):**
+    - Implemented `validate_stage_invariants(...)` and `is_abstaining_answer(...)`.
     - Enforces all 9 stage contracts (`ner`, `triples`, `entity_definer`, `synonym_judge`, `shacl_repair` / `shacl_healer_rlm`, `query_intent`, `triple_filter`, `qa`, `qwen_proposer` / `qwen_compressor`) and all 6 closed-world SHACL shapes (`ConceptShape/prefLabel`, `ConceptShape/definition`, `ConceptShape/S13-disjointLabels`, `ConceptShape/homographDifferentFrom`, `StatementShape/closedWorld`, `EdgeShape/closedWorld`), plus connected-node subgraph topology (`_count_connected_components`), closed-world candidate fact subset closure, and anti-leakage instruction validation.
     - Wired feedback-guided self-correction retry (`max_invariant_retries = 1`) into `HippoRAGProgram._invoke_stage`, recording `invariant_score`, `invariant_feedback`, and `invariant_retries` in `self.telemetry`.
   - **GEPA Pareto Frontier Ensembling (`yaw/daemon/graph/inference/program.py`):**
@@ -707,7 +707,7 @@ Offline test suite: `uv run --locked python -m unittest discover -s tests -v` â€
 ## 21. GEPA Metric Fix: Quality-Led Score, 10-Example Minibatch, Clean Objective Score Card (2026-10-22)
 
 - **Observed failure (run `yaw_optimize_20261021_174008`, 150 train / 100 val, Qwen3-4B):** after 10 candidates (401 evals) the seed stayed "best" (val score `0.0573`) while candidate #5 had higher full-valset R@5 (`0.90` vs `0.87`) and F1 (`0.359` vs `0.350`). Six of ten candidates were judged on 3-example minibatches only.
-- **Root causes (`compute_sizecoding_pareto_score`, `yaw/daemon/graph/inference/grammars.py`):**
+- **Root causes (`compute_task_quality_score`, `yaw/daemon/graph/inference/parsers.py`):**
   - `target_tokens=100` against ~20k tokens/query made the token cost term ~228; a 50% token cut moved the score ~20% while a +10pt F1 gain moved it ~3%. The score tracked cost, not quality.
   - `objective_scores` (GEPA per-objective frontier -> `ParetoProgramEnsemble` / `dspy.Ensemble`) included `gm_bad` (lower-is-better), so the frontier kept the most expensive candidate, plus redundant composites (`gm_good`, `pareto_raw`, `quality_numerator`).
   - `reflection_minibatch_size=3` (`yaw/daemon/graph/engine.py`) let a single answer accept/reject a proposal.
@@ -1298,11 +1298,10 @@ Offline test suite: `uv run --locked python -m unittest discover -s tests -v` â€
   early candidates faster than recent GEPA runs. No optimizer/prompt changes
   or live inference were performed for this inspection.
 - Both optimizers use YAW's `RLMInstructionProposer`: MIPRO's instruction
-  proposer is replaced with `propose_mipro_instructions`, which calls the same
-  per-component reflection method. The inputs differ: MIPRO builds candidate
-  banks from successful demos or dataset labels; GEPA supplies failure traces
-  and diagnostic feedback. This is not a comparison of wholly separate
-  generation models/templates.
+  proposer delegates to the same per-component reflection method. The inputs
+  differ: MIPRO builds candidate banks from successful demos or dataset labels;
+  GEPA supplies failure traces and diagnostic feedback. This is not a
+  comparison of wholly separate generation models/templates.
 - GEPA feedback preparation replaces expected answers and gold answers with
   `<TargetAnswer>` before reflection. A local no-inference probe confirmed
   `Predicted=North != Expected=['South']` becomes
@@ -2038,3 +2037,73 @@ context-sized structured batches, exact loopback tokenizer rejection before
 generation, and preserved configured capacity on prompt reload. Ruff, ty and
 git diff --check pass. Existing DSPy/Pydantic warnings remain visible. No
 unattended optimization or resident-model performance benchmark was launched.
+
+### Watchdog individual evaluation scores (2026-10-24)
+
+Fig. 3 now plots individual evaluation scores in evaluation order, with the
+current all-evaluation mean for each candidate overlaid. The latest evaluation
+number, candidate, score and mean appear above the panel. Existing candidate
+mean/min/max, validation/best-program and mean-latency panels remain available.
+Individual points use the optimizer's existing bounded 500-record audit tail;
+candidate aggregates still cover all recorded evaluations. Audits without
+individual scores show an explicit unavailable message. The optimizer already
+writes the audit after each completed evaluation, so a dashboard refresh can
+show progress within a candidate without optimizer changes. An existing
+watchdog process must restart to load the new renderer.
+
+Verification: all **15 focused watchdog tests passed in 10.57 seconds**, including
+real audit-file updates and SVG rendering as another evaluation completes on
+the same candidate. Ruff checks/formatting, focused ty checks and
+`git diff --check` passed. A three-candidate PNG preview was visually inspected.
+Initial sandbox checks could not access uv's cache/Python environment; the
+authorized rerun succeeded. No inference or optimization run was needed.
+
+### Native GEPA progress in watchdog Fig. 5 (2026-10-24)
+
+Replaced the dashboard-derived quality/latency frontier and its misleading
+archive-size trend. Fig. 5 now uses a versioned `gepa_progress` snapshot in the
+existing optimization audit. GEPA callbacks publish validation scores, scored
+example counts and validation-set sizes, exact native frontier membership,
+bounded addition/displacement history, iteration and execution phase. Audit
+publication happens on callbacks as well as individual metric evaluations, so
+reflection and validation completion are visible without waiting for another
+candidate evaluation. GEPA's native CompositeCallback wraps optional observers.
+
+Full-validation scores have a seed baseline and best-so-far line. Partial
+validation results are marked separately and excluded from that line. Scores
+have no smoothing floor. Native candidate indices start at zero and differ
+from the dashboard's first-seen fingerprint numbering. Frontier membership
+comes from `on_pareto_front_updated` and `get_pareto_front_mapping()`, including
+the configured hybrid frontier. A restored native checkpoint supplies all
+known candidate score/count summaries and current membership without requiring
+new inference. The first frontier observation is a baseline, not an addition;
+the latest 250 observations in the current process are retained. Programs,
+outputs and traces are never held by this observer. Completed validation
+coverage includes cached results; in-flight counters explicitly report metric
+calls observed during the phase, which cache reuse may bypass.
+
+Older audits explicitly report native telemetry unavailable. Restarting the
+watchdog loads the renderer; restarting/resuming the optimizer with this code
+enables native publication. No running optimizer was stopped or relaunched.
+
+Verification: the final focused packet passed **30 tests in 37.57 seconds**,
+covering a real deterministic GEPA optimization loop, native hybrid frontier
+displacement, real checkpoint save/load, YAW CLI resume with unchanged native
+evaluation counts and exact published frontier, real audit/SVG updates,
+partial-validation rendering, legacy placeholders, architectural containment
+and hybrid metric integration. Earlier test-adapter/interface failures were
+corrected before the final run. Ruff and focused ty checks passed; a PNG preview
+was visually inspected and `git diff --check` passed. The native GEPA test is an
+offline arithmetic task: it verifies monitoring/orchestration, not model quality.
+
+### SSOT/DRY canonicalization and legacy purge (2026-10-24)
+
+Completed full-codebase SSOT/DRY canonicalization and legacy symbol retirement across `yaw/`, `benchmark.py`, `scripts/`, `tests/`, and `docs/`:
+
+- **Retired legacy symbols, dead wrappers, and duplicate helpers**: Removed legacy GBNF synonym-judgment grammar helpers, dead assertion/refine wrappers, unused entity-node/fact-flattening helpers, batch-overflow repackers, mutable delta-compiler setter (replaced with read-only `CorpusIngestor.on_delta` property), candidate-list partitioning and the residual `16`-candidate cap in `YawGraphEngine` synonym discovery/adjudication (so all unadjudicated candidate pairs with `dense_sim >= synonymy_threshold` emit `skos:related` fallback edges), dead model-recycling helper, unused `--index-batch-size` / `--qa-batch-size` flags in `benchmark.py`, 11 private staticmethod bindings on `YawGraphEngine`, duplicate `corpus/{cid}.md` materialization (consolidated into `YawGraphEngine._materialize_doc_chunk`), dead `HippoRAGProgram` repair aliases, duplicate `DEFAULT_CHAT` / `DEFAULT_BASE_URL` constants in `models.py` and `embedding.py`, and hardcoded user paths (`YAW_ARTIFACT_DIR` env var or workspace default used instead).
+- **Task quality & benchmark integrity**: Consolidated `compute_task_quality_score` in `parsers.py`. Added `check_benchmark_integrity(records, *, k_values=...)` in `parsers.py` and wired it into `benchmark.py` and `YawRuntime.benchmark` (`report["integrity"] = {"passed": ..., "errors": ...}`).
+- **Entity definition canonicalization**: Unified `extract_entity_definitions(raw_input, *, normalize_keys=False)` in `parsers.py` as the single parser for list/dict/tuple inputs and delegated `HippoRAGProgram._merge_openie_definitions` to `extract_entity_definitions(..., normalize_keys=True)`.
+- **SHACL action SSOT**: Synchronized `ProposeSHACLRepairs` docstring with `VALID_SHACL_ACTIONS` and `HealSHACLViolations` (all 11 canonical actions).
+- **Runtime & CLI canonicalization**: Prevented duplicate `_apply_delta` execution in `YawRuntime._execute_sync_worker` when `ingestor.on_delta` is bound, preserved pre-startup `stop()` signals across `start()`, drained queued `_WorkItem` futures on worker exit, renamed `handle_dspy_benchmark`, inlined single-use subparser parents, and enforced canonical CLI grammar (`yaw {daemon|graph|dspy|config} <action>`, `--db-path`, `--gate`) with `allow_abbrev=False` across all subparsers.
+
+Verification: All 17 Oblivion Demolition Table `Test-Path` and repository-wide `git grep -w` checks returned **0 matches**. Offline real-substrate pytest suite (`uv run --locked pytest -o addopts="" -k "not live_silicon" tests/core/ tests/daemon/ tests/scripts/ tests/test_benchmark.py tests/test_benchmark_edges.py tests/test_download_datasets.py`) passed **610 cases with 0 failures** (`88%` total line coverage across `yaw/`). Repository-wide `ruff check`, `ty check`, and `git diff --check` passed with zero diagnostics. Live `:13305` model-server tests were intentionally not executed while an external optimization process held the local endpoint.

@@ -38,7 +38,7 @@ def test_preflight_reports_all_failures_and_reuses_testmon(tmp_path: Path):
             [
                 sys.executable,
                 "-c",
-                "from yaw.core.preflight import main; raise SystemExit(main())",
+                "from scripts.preflight import main; raise SystemExit(main())",
                 "--output-dir",
                 str(output),
                 *args,

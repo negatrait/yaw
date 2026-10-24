@@ -3,15 +3,14 @@
 import json
 
 import dspy
-import pytest
 
 from yaw.daemon.graph.inference.grammars import (
     DSPY_RERANK_GBNF_GRAMMAR,
     build_dspy_rerank_grammar,
     build_dspy_triples_grammar,
-    compute_sizecoding_pareto_score,
     lm_supports_gbnf,
 )
+from yaw.daemon.graph.inference.parsers import compute_task_quality_score
 
 
 def test_dynamic_grammar_rejects_malformed_candidates_and_ignores_invalid_known_names():
@@ -23,11 +22,11 @@ def test_dynamic_grammar_rejects_malformed_candidates_and_ignores_invalid_known_
 
 
 def test_multirank_retrieval_score_does_not_invent_qa_objectives():
-    base = compute_sizecoding_pareto_score(0.8, tokens=100, recall_at_1=0.5)
+    base = compute_task_quality_score(0.8, tokens=100, recall_at_1=0.5)
     assert base.em is None and base.f1 is None
     assert "em" not in base.objective_scores and "f1" not in base.objective_scores
     assert base.objective_scores["recall_at_1"] == 0.5
-    costly = compute_sizecoding_pareto_score(
+    costly = compute_task_quality_score(
         0.8,
         tokens=100,
         recall_at_1=0.5,
@@ -44,11 +43,10 @@ def test_absent_default_lm_keeps_grammar_supported():
         assert lm_supports_gbnf() is True
 
 
-@pytest.mark.parametrize("recipe", ["flm", "ryzenai-llm"])
-def test_native_lm_recipe_metadata_disables_unsupported_grammar(recipe):
+def test_native_lm_recipe_metadata_disables_unsupported_grammar():
     class RecipeLM(dspy.LM):
         _yaw_recipe: str
 
     lm = RecipeLM("openai/test-model", cache=False)
-    lm._yaw_recipe = recipe
+    lm._yaw_recipe = "flm"
     assert lm_supports_gbnf(lm) is False

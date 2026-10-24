@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from yaw.core import ChunkPointer
-from yaw.daemon.graph.storage.db import open_yaw_db, upsert_chunk_pointers
+from yaw.daemon.graph.storage import open_yaw_db, upsert_chunk_pointers
 from yaw.daemon.graph.storage.hydration import (
     hydrate_chunk_pointer,
     hydrate_passages,

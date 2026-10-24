@@ -12,10 +12,10 @@ import pytest
 from daemon.graph.inference.test_reflection import proposer
 from daemon.graph.inference.test_reflection import provider as provider
 from yaw.core import ChunkPointer, YawRuntimeError
-from yaw.daemon.graph.candidate_cache import CandidatePayloadCodec
 from yaw.daemon.graph.engine import YawGraphEngine
 from yaw.daemon.graph.inference import HippoRAGProgram, RLMInstructionProposer
 from yaw.daemon.graph.inference.chat import YawDSPyLM, create_dspy_lm
+from yaw.daemon.graph.storage import CandidatePayloadCodec
 
 
 def test_native_qa_predictor_state_survives_json_restore_and_deepcopy(tmp_path):

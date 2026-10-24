@@ -213,3 +213,26 @@ def test_empty_engine_operations_do_not_call_inference_or_create_graph_rows(tmp_
         assert engine.conn.execute("SELECT count(*) FROM chunks").fetchone()[0] == 0
     finally:
         engine.close()
+
+
+def test_unadjudicated_synonym_candidates_below_16_emit_skos_related_fallback(tmp_path, indexing_provider):
+    url, calls = indexing_provider
+    engine = make_engine(tmp_path, url)
+    engine.synonymy_threshold = 0.1
+    try:
+        assert engine.index(["Ada wrote Notes."]) == 1
+        assert "synonyms" in calls
+        relations = [
+            tuple(row)
+            for row in engine.conn.execute(
+                "SELECT src_id, dst_id, kind FROM edges WHERE kind = 'skos:related' ORDER BY src_id"
+            )
+        ]
+        assert len(relations) == 2
+        assert all(rel == "skos:related" for _, _, rel in relations)
+        resolved = engine._resolve_chunks_for_docs(["Ada wrote Notes."])
+        assert len(resolved) == 1
+        pointer, _ = resolved[0]
+        assert (tmp_path / pointer.rel_posix_path).exists()
+    finally:
+        engine.close()

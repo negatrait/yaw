@@ -164,24 +164,6 @@ class YawDSPyLM(dspy.LM):
     _yaw_supports_gbnf: bool = False
 
     def __call__(self, prompt: Any = None, *, messages: Any = None, **kwargs: Any) -> Any:
-        if (
-            getattr(self, "_yaw_recipe", None) == "ryzenai-llm"
-            and isinstance(messages, list)
-            and len(messages) >= 2
-            and isinstance(messages[0], dict)
-            and messages[0].get("role") == "system"
-            and isinstance(messages[1], dict)
-            and messages[1].get("role") == "user"
-        ):
-            messages = [
-                {
-                    "role": "user",
-                    "content": str(messages[0].get("content", "")).strip()
-                    + "\n\n"
-                    + str(messages[1].get("content", "")),
-                },
-                *messages[2:],
-            ]
         res = super().__call__(prompt=prompt, messages=messages, **kwargs)
         sleep_sec = get_yaw_sleep_seconds()
         if sleep_sec > 0:

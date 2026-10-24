@@ -4,13 +4,16 @@ import numpy as np
 import pytest
 
 from scripts.evaluation import (
-    DEFAULT_QUERY_INSTRUCTION,
-    QUERY_INSTRUCTIONS,
     QAExactMatch,
     QAF1Score,
     RetrievalRecall,
-    get_query_instruction,
     normalize_answer,
+)
+from yaw.daemon.graph.inference import (
+    FACT_INSTRUCTION,
+    GEMMA_TASK_MODES,
+    PASSAGE_INSTRUCTION,
+    resolve_embedding_profile,
 )
 
 
@@ -77,5 +80,11 @@ def test_qa_aliases_aggregation_and_empty_examples_have_exact_scores():
 
 
 def test_embedding_query_instruction_modes_and_fallback_are_explicit():
-    assert all(get_query_instruction(key) == value for key, value in QUERY_INSTRUCTIONS.items())
-    assert get_query_instruction("unknown-mode") == DEFAULT_QUERY_INSTRUCTION
+    assert all(resolve_embedding_profile(task_mode=mode) is not None for mode in GEMMA_TASK_MODES)
+    distinct_profile = resolve_embedding_profile(task_mode="distinct")
+    assert distinct_profile.format("q", query=True, instruction=FACT_INSTRUCTION) != distinct_profile.format(
+        "q", query=True, instruction=PASSAGE_INSTRUCTION
+    )
+    assert distinct_profile.format("q", query=True, instruction="unknown-mode") == distinct_profile.format(
+        "q", query=True, instruction=PASSAGE_INSTRUCTION
+    )

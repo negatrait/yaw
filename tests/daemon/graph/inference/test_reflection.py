@@ -11,9 +11,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import dspy
 import pytest
 
-from yaw.daemon.graph.candidate_cache import CandidatePayloadCodec, CandidateStageCache
 from yaw.daemon.graph.inference.chat import create_dspy_lm
-from yaw.daemon.graph.inference.program import RLMInstructionProposer
+from yaw.daemon.graph.inference.proposer import RLMInstructionProposer
 from yaw.daemon.graph.inference.reflection import (
     ReflectionBudgetError,
     ReflectionLM,
@@ -22,7 +21,12 @@ from yaw.daemon.graph.inference.reflection import (
     reflection_examples,
     resolve_evidence,
 )
-from yaw.daemon.graph.storage import CandidateCacheStore, open_managed_yaw_db
+from yaw.daemon.graph.storage import (
+    CandidateCacheStore,
+    CandidatePayloadCodec,
+    CandidateStageCache,
+    open_managed_yaw_db,
+)
 
 
 @pytest.fixture

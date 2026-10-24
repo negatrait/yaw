@@ -7,16 +7,21 @@ from contextlib import closing
 import numpy as np
 import pytest
 
-from yaw.daemon.graph.storage.db import (
+from yaw.daemon.graph.storage import (
+    apply_shacl_repairs,
     deserialize_f32_vector,
     find_entity_disambiguation_candidates,
     get_entities_by_label_norm,
+    get_entity_metadata_batch,
     get_facts_with_meta_by_ids,
     initialize_schema,
+    open_readonly_yaw_db,
     open_yaw_db,
     resolve_entity_labels,
     search_chunks_fts,
+    search_entity_vectors_knn,
     search_facts_fts,
+    set_meta,
     upsert_entities,
     upsert_entity_labels,
     upsert_entity_vectors,
@@ -205,3 +210,89 @@ def test_disambiguation_keeps_dense_and_lexical_channels_independent(tmp_path, n
         assert pairs[0][:2] == ("a", "b")
         assert pairs[0][2] == pytest.approx(1.0)
         assert pairs[0][3] == pytest.approx(lexical)
+
+
+def test_open_readonly_yaw_db_enforces_ro_uri_and_busy_timeout(tmp_path):
+    db_file = tmp_path / "readonly.db"
+    with closing(open_yaw_db(db_file)) as rw_conn:
+        set_meta(rw_conn, "version", "1")
+        upsert_entity_vectors(rw_conn, [("entity-1", [1.0, 0.0])])
+    with closing(open_readonly_yaw_db(db_file, timeout=2.5)) as ro_conn:
+        assert ro_conn.row_factory is sqlite3.Row
+        assert ro_conn.execute("PRAGMA busy_timeout").fetchone()[0] == 2500
+        assert ro_conn.execute("SELECT value FROM meta WHERE key = 'version'").fetchone()["value"] == "1"
+        knn_hits = search_entity_vectors_knn(ro_conn, [1.0, 0.0], top_k=1)
+        assert knn_hits == [("entity-1", pytest.approx(1.0))]
+        with pytest.raises(sqlite3.OperationalError):
+            ro_conn.execute("INSERT INTO meta (key, value) VALUES ('x', 'y')")
+
+
+def test_get_entity_metadata_batch_handles_empty_and_multi_batch_queries(tmp_path):
+    with closing(open_yaw_db(tmp_path / "batch_meta.db")) as conn:
+        assert get_entity_metadata_batch(conn, []) == {}
+        rows = [(f"entity-{i:04d}", f"Name {i}", f"Def {i}" if i % 2 == 0 else "") for i in range(950)]
+        upsert_entities(conn, rows)
+        requested = [r[0] for r in rows] + ["entity-missing"]
+        fetched = get_entity_metadata_batch(conn, requested)
+        assert len(fetched) == 950
+        assert fetched["entity-0000"] == ("Name 0", "Def 0")
+        assert fetched["entity-0949"] == ("Name 949", "")
+        assert "entity-missing" not in fetched
+
+
+def test_apply_shacl_repairs_executes_closed_world_actions_and_custom_merge_callback(tmp_path):
+    with closing(open_yaw_db(tmp_path / "repairs.db")) as conn:
+        assert apply_shacl_repairs(conn, []) == 0
+        upsert_entities(
+            conn,
+            [
+                ("entity-1", "Alpha", ""),
+                ("entity-2", "Alpha Alias", "Alias def"),
+                ("entity-3", "Beta", "Beta def"),
+                ("entity-orphan", "Orphan", ""),
+            ],
+        )
+        upsert_facts(conn, [("fact-1", "entity-1", "relates", "entity-3", '["Alpha","relates","Beta"]', "")])
+
+        def failing_merge(src: str, dst: str, lkind: str) -> bool:
+            raise RuntimeError("Mid-batch repair failure must roll back owned transaction")
+
+        with pytest.raises(RuntimeError, match="Mid-batch repair failure"):
+            apply_shacl_repairs(
+                conn,
+                [
+                    {"focus_node": "entity-1", "action": "set_definition", "value": "Should Roll Back"},
+                    {"focus_node": "entity-2|entity-1", "action": "merge_altLabel", "target_node": "entity-1"},
+                ],
+                merge_entities_fn=failing_merge,
+            )
+        assert not conn.in_transaction
+        assert get_entity_metadata_batch(conn, ["entity-1"])["entity-1"] == ("Alpha", "")
+
+        merged_calls: list[tuple[str, str, str]] = []
+
+        def custom_merge(src: str, dst: str, lkind: str) -> bool:
+            merged_calls.append((src, dst, lkind))
+            return True
+
+        applied = apply_shacl_repairs(
+            conn,
+            [
+                {"focus_node": "", "action": "set_definition", "value": "ignored"},
+                {"focus_node": "entity-1", "action": "set_definition", "value": "Alpha definition"},
+                {"focus_node": "fact-1", "action": "rewrite_definition", "value": "Fact definition"},
+                {"focus_node": "entity-1", "action": "set_pref_label", "value": "Alpha Canonical"},
+                {"focus_node": "entity-2|entity-1", "action": "merge_altLabel", "target_node": "entity-1"},
+                {"focus_node": "entity-1|entity-3", "action": "assert_differentFrom"},
+                {"focus_node": "entity-orphan", "action": "delete_orphan"},
+            ],
+            merge_entities_fn=custom_merge,
+        )
+        assert applied == 6
+        assert merged_calls == [("entity-2", "entity-1", "skos:altLabel")]
+        assert get_entity_metadata_batch(conn, ["entity-1", "entity-orphan"]) == {
+            "entity-1": ("Alpha Canonical", "Alpha definition")
+        }
+        assert conn.execute("SELECT definition FROM facts WHERE fact_id = 'fact-1'").fetchone()[0] == "Fact definition"
+        diff_edges = conn.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'owl:differentFrom'").fetchall()
+        assert len(diff_edges) == 2

@@ -20,16 +20,39 @@ import subprocess
 import sys
 import tempfile
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any
 
-HF_BASE_URL = "https://huggingface.co/datasets/osunlp/HippoRAG_2/resolve/main"
+try:
+    from yaw.daemon.ingestion import (
+        ALIASES,
+        DATASET_DESCRIPTIONS,
+        HF_BASE_URL,
+        download_dataset_file,
+    )
+    from yaw.daemon.ingestion import (
+        DATASET_REGISTRY as _INGESTION_DATASET_REGISTRY,
+    )
+    from yaw.daemon.ingestion import (
+        UPSTREAM_DATASET_BASE_URL as GITHUB_BASE_URL,
+    )
+except ModuleNotFoundError:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from yaw.daemon.ingestion import (
+        ALIASES,
+        DATASET_DESCRIPTIONS,
+        HF_BASE_URL,
+        download_dataset_file,
+    )
+    from yaw.daemon.ingestion import (
+        DATASET_REGISTRY as _INGESTION_DATASET_REGISTRY,
+    )
+    from yaw.daemon.ingestion import (
+        UPSTREAM_DATASET_BASE_URL as GITHUB_BASE_URL,
+    )
+
 ENTERPRISE_RAG_BENCH_HF_REPO = "onyx-dot-app/EnterpriseRAG-Bench"
 ENTERPRISE_RAG_BENCH_HF_URL = f"https://huggingface.co/datasets/{ENTERPRISE_RAG_BENCH_HF_REPO}/resolve/main"
-GITHUB_PINNED_COMMIT = "d5c8329422e0a0b834a15874545cb6a74b4f9b26"
-GITHUB_BASE_URL = f"https://raw.githubusercontent.com/OSU-NLP-Group/HippoRAG/{GITHUB_PINNED_COMMIT}/reproduce/dataset"
 
 # Stratified 250-query quotas (150 train, 100 val) across all 10 EnterpriseRAG-Bench categories
 ENTERPRISE_CATEGORY_QUOTAS: dict[str, tuple[int, int]] = {
@@ -70,66 +93,8 @@ _CATEGORY_NORMALIZATION: dict[str, str] = {
 
 # Registry of dataset keys to (query_filename, corpus_filename, description)
 DATASET_REGISTRY = {
-    "sample": (
-        "sample.json",
-        "sample_corpus.json",
-        "Tier 0 validation fixture (1 query, 3 passages)",
-    ),
-    "2wikimultihopqa": (
-        "2wikimultihopqa.json",
-        "2wikimultihopqa_corpus.json",
-        "Multi-hop QA from Wikipedia (1,000 queries, 6,119 passages)",
-    ),
-    "hotpotqa": (
-        "hotpotqa.json",
-        "hotpotqa_corpus.json",
-        "Multi-hop QA with diverse reasoning (1,000 queries, 9,811 passages)",
-    ),
-    "musique": (
-        "musique.json",
-        "musique_corpus.json",
-        "Complex multi-hop QA with 2-4 hops (1,000 queries, 11,656 passages)",
-    ),
-    "nq": (
-        "nq_rear.json",
-        "nq_rear_corpus.json",
-        "NaturalQuestions single-hop QA (1,000 queries, 9,633 passages)",
-    ),
-    "popqa": (
-        "popqa.json",
-        "popqa_corpus.json",
-        "PopQA entity-centric long-tail QA (1,000 queries, 8,676 passages)",
-    ),
-    "lveval": (
-        "lveval.json",
-        "lveval_corpus.json",
-        "LV-Eval hotpotwikiqa-mixup 256k long-context QA (124 queries, 22,849 passages)",
-    ),
-    "narrativeqa": (
-        "narrativeqa_dev_10_doc.json",
-        "narrativeqa_dev_10_doc_corpus.json",
-        "NarrativeQA discourse understanding on novels (293 queries, 4,111 passages)",
-    ),
-    "case_study_university": (
-        "case_study_university.json",
-        "case_study_university_corpus.json",
-        "University Case Study graph reasoning demo",
-    ),
-    "enterprise_rag_bench": (
-        "enterprise_rag_bench.json",
-        "enterprise_rag_bench_corpus.json",
-        "EnterpriseRAG-Bench stratified 10-category multi-tool dataset (250 queries: 150 train + 100 val)",
-    ),
-}
-
-# Aliases for convenience
-ALIASES = {
-    "2wiki": "2wikimultihopqa",
-    "hotpot": "hotpotqa",
-    "naturalquestions": "nq",
-    "nq_rear": "nq",
-    "narrative": "narrativeqa",
-    "enterprise": "enterprise_rag_bench",
+    name: (*files, DATASET_DESCRIPTIONS.get(name, ""))
+    for name, files in _INGESTION_DATASET_REGISTRY.items()
 }
 
 
@@ -491,44 +456,14 @@ def download_enterprise_rag_bench(
 
 def download_file(filename: str, dest_dir: Path, force: bool = False) -> Path:
     """Download a dataset file from Hugging Face (or GitHub fallback) to dest_dir."""
-    target = dest_dir / filename
-    if target.exists() and not force and target.stat().st_size > 0:
-        size_mb = target.stat().st_size / (1024 * 1024)
-        print(f"  [cached] {filename} ({size_mb:.2f} MB)")
-        return target
-
-    urls = [f"{HF_BASE_URL}/{filename}"]
-    # GitHub hosts sample, 2wiki, hotpot, and musique files
-    if any(k in filename for k in ("sample", "2wiki", "hotpot", "musique")):
-        urls.append(f"{GITHUB_BASE_URL}/{filename}")
-
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    tmp_target = dest_dir / f"{filename}.tmp"
-
-    last_error = None
-    for url in urls:
-        try:
-            print(f"  Downloading {filename} from {url}...")
-            t0 = time.perf_counter()
-            req = urllib.request.Request(url, headers={"User-Agent": "YAW-HippoRAG-DatasetDownloader/1.0"})
-            with urllib.request.urlopen(req) as resp, open(tmp_target, "wb") as out_f:
-                while True:
-                    chunk = resp.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    out_f.write(chunk)
-            tmp_target.replace(target)
-            dt = time.perf_counter() - t0
-            size_mb = target.stat().st_size / (1024 * 1024)
-            print(f"  -> Saved {filename} ({size_mb:.2f} MB in {dt:.2f}s)")
-            return target
-        except urllib.error.URLError as exc:
-            last_error = exc
-            if tmp_target.exists():
-                tmp_target.unlink()
-            print(f"  Failed from {url}: {exc}")
-
-    raise RuntimeError(f"Could not download {filename} from any source: {last_error}")
+    return download_dataset_file(
+        filename,
+        dest_dir,
+        force=force,
+        hf_base_url=HF_BASE_URL,
+        upstream_base_url=GITHUB_BASE_URL,
+        verbose=True,
+    )
 
 
 def verify_dataset(name: str, dest_dir: Path) -> dict:

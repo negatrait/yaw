@@ -11,14 +11,14 @@ import dspy
 import numpy as np
 
 from yaw.core.config import DEFAULT_EMBEDDING_MODEL, YawConfig
+from yaw.core.types import ChunkPointer
 
 from .diagnostics import DiagnosticHistory, trim_diagnostics
+from .models import BASE_URL
 
 FACT_INSTRUCTION = "Given a question, retrieve relevant triplet facts that matches this question."
 PASSAGE_INSTRUCTION = "Given a question, retrieve relevant documents that best answer the question."
-QUERY_INSTRUCTIONS = {FACT_INSTRUCTION, PASSAGE_INSTRUCTION}
 TITLE_LINE_RE = re.compile(r"^(?:#{1,6}\s+|(?:wikipedia\s+)?title:\s*)(.+)$", re.IGNORECASE)
-DEFAULT_BASE_URL = "http://localhost:13305/api/v1"
 
 
 @dataclass(frozen=True)
@@ -140,7 +140,7 @@ def resolve_embedding_profile(model=MODEL, task_mode="search"):
 def create_dspy_embedder(
     model_or_profile: EmbeddingProfile | str | Callable = MODEL,
     *,
-    base_url: str = DEFAULT_BASE_URL,
+    base_url: str = BASE_URL,
     api_key: str = "lemonade",
     provider: str = "openai",
     batch_size: int = 32,
@@ -188,9 +188,6 @@ def is_batch_overflow_error(exc: Exception) -> bool:
         or "too many tokens" in msg
         or ("exceeds" in msg and "tokens" in msg)
     )
-
-
-_is_batch_overflow_error = is_batch_overflow_error
 
 
 def split_text_gracefully(
@@ -312,43 +309,6 @@ def batch_texts_by_budget(
     return micro_batches
 
 
-def _repack_overflow_batch(texts: list[str], context_tokens: int) -> list[list[str]]:
-    """Gracefully split texts without truncation after embedding server rejection."""
-    char_budget = max(512, int(context_tokens * 1.5))
-    if len(texts) == 1:
-        sub_chunks = split_text_gracefully(texts[0], max_chars=max(256, char_budget // 2))
-        return [[sc] for sc in sub_chunks]
-
-    packed: list[list[str]] = []
-    current: list[str] = []
-    current_chars = 0
-    for t in texts:
-        if len(t) > char_budget:
-            if current:
-                packed.append(current)
-                current = []
-                current_chars = 0
-            for sc in split_text_gracefully(t, max_chars=char_budget):
-                packed.append([sc])
-            continue
-
-        if current and current_chars + len(t) > char_budget:
-            packed.append(current)
-            current = [t]
-            current_chars = len(t)
-        else:
-            current.append(t)
-            current_chars += len(t)
-    if current:
-        packed.append(current)
-
-    if len(packed) > 1:
-        return packed
-
-    mid = len(texts) // 2
-    return [texts[:mid], texts[mid:]]
-
-
 class DSPyEmbeddingAdapter(dspy.Embedder):
     """Profile-aware retrieval embedding adapter subclassing native `dspy.Embedder`."""
 
@@ -358,7 +318,7 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
         embedder: dspy.Embedder | Any = None,
         *,
         task_mode: str = "distinct-titled",
-        base_url: str = DEFAULT_BASE_URL,
+        base_url: str = BASE_URL,
         api_key: str = "lemonade",
         provider: str = "openai",
         batch_size: int = 32,
@@ -515,7 +475,7 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
         instruction: str | None = None,
         batch_size: int | None = None,
     ) -> tuple[list[str], bool, list[list[int]], list[str], list[int], list[list[int]]]:
-        if instruction not in (None, "") and instruction not in QUERY_INSTRUCTIONS:
+        if instruction not in (None, "") and instruction not in (FACT_INSTRUCTION, PASSAGE_INSTRUCTION):
             raise ValueError(f"Unsupported retrieval instruction: {instruction!r}")
         if isinstance(texts, str):
             texts = [texts]
@@ -840,11 +800,48 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
         if updates:
             self.profile = replace(self.profile, **updates)
 
+    def format_chunk_for_embedding(self, ptr: ChunkPointer, text: str) -> str:
+        """Ensure AST-resolved ChunkPointer.title is passed as a Title: line for title-aware embedders."""
+        parse_title = bool(getattr(getattr(self, "profile", None), "parse_document_title", False))
+        if not parse_title or not ptr.title or not ptr.title.strip():
+            return text
+        clean_title = ptr.title.strip()
+        first_line = text.split("\n", 1)[0].strip() if "\n" in text else text.strip()
+        if first_line.startswith("#") or first_line.lower().startswith(("title:", "wikipedia title:")):
+            return text
+        if text.startswith(f"{clean_title}\n"):
+            body = text[len(clean_title) + 1 :]
+            return f"Title: {clean_title}\n{body}" if body.strip() else text
+        return f"Title: {clean_title}\n{text}"
+
+    @staticmethod
+    def format_entity_for_embedding(name: str, definition: str) -> str:
+        """Format an entity name and contextual definition for embedding."""
+        clean_def = definition.strip()
+        if clean_def:
+            return f"# {name}\n{clean_def}"
+        return name
+
+    @staticmethod
+    def format_fact_for_embedding(
+        subj: str,
+        pred: str,
+        obj: str,
+        definition: str = "",
+        subj_def: str = "",
+        obj_def: str = "",
+    ) -> str:
+        """Format a subject-predicate-object fact and contextual statement definition for embedding."""
+        _ = (subj_def, obj_def)
+        s_d = definition.strip()
+        if s_d and s_d.lower().rstrip(".") != f"{subj} {pred} {obj}".lower().rstrip("."):
+            return f"{subj} {pred} {obj}. {s_d}"
+        return f"{subj} {pred} {obj}"
+
 
 __all__ = [
     "FACT_INSTRUCTION",
     "PASSAGE_INSTRUCTION",
-    "QUERY_INSTRUCTIONS",
     "EmbeddingProfile",
     "PROFILES",
     "MODEL",

@@ -859,7 +859,7 @@ class PaperParityGateTests(unittest.TestCase):
                     ],
                 }
             ]
-            (corpus_dir / "musique_slice.json").write_text(
+            (corpus_dir / "musique.json").write_text(
                 json.dumps(dataset_payload, indent=2),
                 encoding="utf-8",
             )

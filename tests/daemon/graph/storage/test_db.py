@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from yaw.core import ChunkPointer, OpenIERecord
-from yaw.daemon.graph.storage.db import (
+from yaw.daemon.graph.storage import (
     delete_chunks,
     deserialize_f32_vector,
     find_entity_disambiguation_candidates,
@@ -849,3 +849,187 @@ def test_multi_chunk_entity_labels_enforces_skos_s13_and_s14_disjointness(tmp_pa
         assert lint_graph_shacl(conn, auto_heal=False) == []
     finally:
         conn.close()
+
+
+def test_step11_literal_facts_check_constraints_fact_sources_and_merge_collision(
+    tmp_path: Path,
+) -> None:
+    """Verify H2: facts mutual-exclusion CHECK constraint, fact_sources provenance, delete_chunks orphan pruning, and merge_entities collision deduplication."""
+    import sqlite3
+
+    from yaw.daemon.graph.storage import get_facts_with_meta_by_ids, upsert_fact_sources
+
+    conn = open_yaw_db(tmp_path / "test_step11_h2.db")
+    try:
+        upsert_chunk_pointers(
+            conn,
+            [
+                (ChunkPointer("c1", "doc.md", 1, 5, "Doc 1"), "Alan Turing was born on 1912-06-23."),
+                (ChunkPointer("c2", "doc.md", 6, 10, "Doc 2"), "Turing was born on 1912-06-23."),
+            ],
+        )
+        upsert_entities(
+            conn,
+            [
+                ("ent-turing", "Alan Turing", "English mathematician and computer scientist"),
+                ("ent-turing-alias", "Turing", "Surname alias for Alan Turing"),
+            ],
+        )
+        upsert_entity_labels(
+            conn,
+            [
+                ("alan turing", "ent-turing", "skos:prefLabel", "Alan Turing", "c1"),
+                ("turing", "ent-turing-alias", "skos:prefLabel", "Turing", "c2"),
+            ],
+        )
+
+        # 1. Verify SQL CHECK constraints reject hybrid/invalid entity vs literal rows
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO facts (fact_id, subj_id, pred, obj_id, raw_triple_json, definition, obj_kind, obj_literal_lex) "
+                "VALUES ('bad-1', 'ent-turing', 'born on', NULL, '[]', 'def', 'entity', NULL)"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO facts (fact_id, subj_id, pred, obj_id, raw_triple_json, definition, obj_kind, obj_literal_lex) "
+                "VALUES ('bad-2', 'ent-turing', 'born on', 'ent-turing', '[]', 'def', 'literal', '1912-06-23')"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO facts (fact_id, subj_id, pred, obj_id, raw_triple_json, definition, obj_kind, obj_literal_lex) "
+                "VALUES ('bad-3', 'ent-turing', 'born on', NULL, '[]', 'def', 'literal', '   ')"
+            )
+
+        # 2. Upsert valid literal-object facts + fact_sources provenance
+        upsert_facts(
+            conn,
+            [
+                (
+                    "fact-lit-1",
+                    "ent-turing",
+                    "born on",
+                    None,
+                    '["Alan Turing", "born on", "1912-06-23"]',
+                    "Alan Turing was born on 23 June 1912.",
+                    "literal",
+                    "1912-06-23",
+                    "xsd:date",
+                    "",
+                ),
+                (
+                    "fact-lit-2",
+                    "ent-turing-alias",
+                    "born on",
+                    None,
+                    '["Turing", "born on", "1912-06-23"]',
+                    "Turing was born on 23 June 1912.",
+                    "literal",
+                    "1912-06-23",
+                    "xsd:date",
+                    "",
+                ),
+            ],
+        )
+        upsert_fact_sources(conn, [("fact-lit-1", "c1"), ("fact-lit-2", "c2")])
+        upsert_edges_with_sources(
+            conn,
+            [
+                ("c1", "ent-turing", "passage", 1.0, "c1"),
+                ("c2", "ent-turing-alias", "passage", 1.0, "c2"),
+            ],
+        )
+
+        meta = get_facts_with_meta_by_ids(conn, ["fact-lit-1"])
+        assert meta["fact-lit-1"]["obj_kind"] == "literal"
+        assert meta["fact-lit-1"]["obj_id"] is None
+        assert meta["fact-lit-1"]["obj_literal_lex"] == "1912-06-23"
+        assert meta["fact-lit-1"]["obj_datatype"] == "xsd:date"
+
+        # SHACL closed-world validation conforms for literal-object facts (obj_id IS NULL)
+        assert lint_graph_shacl(conn, auto_heal=False) == []
+        ttl = serialize_graph_turtle(conn)
+        assert 'rdf:object "1912-06-23"^^<xsd:date>' in ttl
+
+        # 3. Merge ent-turing-alias into ent-turing -> colliding literal fact is deduplicated and fact_sources merged
+        merge_entities(conn, "ent-turing-alias", "ent-turing")
+        surviving_facts = conn.execute("SELECT fact_id, subj_id, obj_id, obj_kind FROM facts").fetchall()
+        assert len(surviving_facts) == 1
+        surviving_fid = str(surviving_facts[0][0])
+        src_chunks = {
+            str(r[0])
+            for r in conn.execute("SELECT chunk_id FROM fact_sources WHERE fact_id = ?", (surviving_fid,)).fetchall()
+        }
+        assert src_chunks == {"c1", "c2"}
+
+        # 4. Deleting c1 keeps the fact alive (still supported by c2); deleting c2 prunes the orphaned literal fact
+        delete_chunks(conn, ["c1"])
+        assert conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 1
+        delete_chunks(conn, ["c2"])
+        assert conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM fact_sources").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_step11_skos_broader_cycle_safe_cte_and_s27_disjointness(tmp_path: Path) -> None:
+    """Verify H3: directed skos:broader edges, cycle-safe recursive CTE cycle detection, and SKOS S27 disjointness healing."""
+    conn = open_yaw_db(tmp_path / "test_step11_h3.db")
+    try:
+        upsert_entities(
+            conn,
+            [
+                ("ent-dog", "Dog", "Domesticated canine"),
+                ("ent-mammal", "Mammal", "Warm-blooded vertebrate"),
+                ("ent-animal", "Animal", "Multicellular eukaryotic organism"),
+            ],
+        )
+        upsert_entity_labels(
+            conn,
+            [
+                ("dog", "ent-dog", "skos:prefLabel", "Dog", "c1"),
+                ("mammal", "ent-mammal", "skos:prefLabel", "Mammal", "c1"),
+                ("animal", "ent-animal", "skos:prefLabel", "Animal", "c1"),
+            ],
+        )
+
+        # 1. Directed skos:broader hierarchy: dog -> mammal -> animal
+        upsert_semantic_edges(
+            conn,
+            [
+                ("ent-dog", "ent-mammal", "skos:broader", 0.9),
+                ("ent-mammal", "ent-animal", "skos:broader", 0.9),
+            ],
+        )
+        broader_rows = conn.execute(
+            "SELECT src_id, dst_id FROM edges WHERE kind = 'skos:broader' ORDER BY src_id"
+        ).fetchall()
+        assert [(str(r[0]), str(r[1])) for r in broader_rows] == [
+            ("ent-dog", "ent-mammal"),
+            ("ent-mammal", "ent-animal"),
+        ]
+        assert lint_graph_shacl(conn, auto_heal=False) == []
+
+        # 2. Inject a transitive S27 conflict (skos:related between dog and animal) and a 3-hop cycle (animal -> dog)
+        conn.execute(
+            "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-dog', 'ent-animal', 'skos:related', 0.7)"
+        )
+        conn.execute(
+            "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-animal', 'ent-dog', 'skos:related', 0.7)"
+        )
+        conn.execute(
+            "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-animal', 'ent-dog', 'skos:broader', 0.8)"
+        )
+        conn.commit()
+
+        violations = lint_graph_shacl(conn, auto_heal=False)
+        shapes = {v.shape for v in violations}
+        assert "ConceptShape/broaderCycle" in shapes
+        assert "ConceptShape/S27-disjointBroaderRelated" in shapes
+
+        # 3. Auto-heal breaks the hierarchy cycle and removes the conflicting skos:related edges
+        remaining = lint_graph_shacl(conn, auto_heal=True)
+        assert remaining == []
+        assert conn.execute("SELECT COUNT(*) FROM edges WHERE kind = 'skos:related'").fetchone()[0] == 0
+    finally:
+        conn.close()
+

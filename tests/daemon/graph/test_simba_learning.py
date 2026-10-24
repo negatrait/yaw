@@ -17,7 +17,7 @@ from yaw.daemon.graph.inference import (
     RLMInstructionProposer,
     ServingTokenCounter,
     compute_qa_em_f1,
-    compute_sizecoding_pareto_score,
+    compute_task_quality_score,
     create_dspy_lm,
 )
 
@@ -125,7 +125,7 @@ def provider():
 
 def task_metric(gold, pred):
     em, f1 = compute_qa_em_f1(pred.answer, gold.gold_answers)
-    return float(compute_sizecoding_pareto_score(em, em=em, f1=f1, tokens=25).score)
+    return float(compute_task_quality_score(em, em=em, f1=f1, tokens=25).score)
 
 
 def make_learning(root, url, *, resume=False, answer="Alan Turing"):
@@ -178,8 +178,8 @@ def test_task_reward_disk_cache_and_isolated_training_queries(tmp_path, provider
         good = proposer._score_task_improvement(ex, dspy.Prediction(new_instruction=GOOD))
         bad = proposer._score_task_improvement(ex, dspy.Prediction(new_instruction=BAD))
         same = proposer._score_task_improvement(ex, dspy.Prediction(new_instruction=BASE))
-        # Both incomplete and wrong answers have EM=0, hence geometric quality=0.
-        assert good > same == bad == 0.5
+        # Partial answer (BASE: surname only, F1>0) scores higher than wrong answer (BAD: F1=0).
+        assert good > same == 0.5 > bad
         assert len(calls) == 8  # paired task evaluations; subsequent repeats must reuse the cache
         assert all("task-model" in call["model"] for call in calls)
         assert all("Who designed ACE? 2" not in str(call) for call in calls)

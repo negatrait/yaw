@@ -11,7 +11,13 @@ import pytest
 from yaw.core.config import YawConfig, context_char_limit, load_config, scale_context_budget
 from yaw.core.types import YawRuntimeError
 from yaw.daemon.graph.engine import YawGraphEngine
-from yaw.daemon.graph.inference import DSPyEmbeddingAdapter, HippoRAGProgram, RLMInstructionProposer, create_dspy_lm
+from yaw.daemon.graph.inference import (
+    DSPyEmbeddingAdapter,
+    HippoRAGProgram,
+    RLMInstructionProposer,
+    create_dspy_lm,
+    openie_fingerprint,
+)
 from yaw.daemon.graph.inference.embedding import MODEL, resolve_embedding_profile
 from yaw.daemon.graph.inference.models import CHAT_MODELS
 
@@ -109,7 +115,7 @@ def test_serving_context_changes_real_extraction_truncation(provider):
         prompt = str(requests[-1]["messages"])
         assert ("TAIL_RETAINED_AT_64K" in prompt) == (context_tokens == 65536)
         assert "context_window_tokens" not in requests[-1]  # local budget, not an API parameter
-        fingerprints.append(YawGraphEngine._openie_fingerprint(task))
+        fingerprints.append(openie_fingerprint(task))
     assert fingerprints[0] != fingerprints[1]
     assert context_char_limit(24000, 32768, 4096) == 24000
     assert context_char_limit(24000, 65536, 8192) == 48000
@@ -118,7 +124,6 @@ def test_serving_context_changes_real_extraction_truncation(provider):
 @pytest.mark.parametrize("context_tokens", [65536, 131072])
 def test_configured_limits_override_old_compiled_deployment_settings(tmp_path, context_tokens):
     old = HippoRAGProgram(enable_gbnf=False, context_window_tokens=32768, max_output_tokens=4096)
-    old.pareto_frontier_states = [old.dump_state()]
     saved = tmp_path / "compiled.json"
     old.save(str(saved))
     config = YawConfig(
@@ -139,8 +144,6 @@ def test_configured_limits_override_old_compiled_deployment_settings(tmp_path, c
     assert program.shacl_healer_rlm.max_llm_calls == 25
     assert program.shacl_healer_rlm.max_output_chars == 18000
     assert config.max_context_chars == context_char_limit(24000, context_tokens, 8192)
-    assert program.pareto_ensemble.programs[0].context_window_tokens == context_tokens
-    assert program.pareto_frontier_states[0]["yaw_surface"]["context_window_tokens"] == context_tokens
     assert config.for_optimization().context_window_tokens == context_tokens
     assert config.config_fingerprint() != YawConfig(workspace_root=tmp_path).config_fingerprint()
 

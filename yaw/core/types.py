@@ -3,7 +3,7 @@
 import hashlib
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, overload
 
 ErrorCode = Literal[
     "INVALID_INPUT",
@@ -58,6 +58,9 @@ class StructuredTriple:
     obj: str = ""
     obj_def: str = ""
     spo_def: str = ""
+    obj_kind: Literal["entity", "literal"] = "entity"
+    obj_datatype: str = ""
+    obj_lang: str = ""
 
     @property
     def subject(self) -> str:
@@ -73,6 +76,23 @@ class StructuredTriple:
 
     def as_tuple(self) -> tuple[str, str, str]:
         return (self.subj, self.pred, self.obj)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True, frozen=True)
+class RelationTraversalPolicy:
+    """Versioned relation-aware directed traversal policy for Personalized PageRank."""
+
+    passage: float = 1.0
+    fact_forward: float = 1.0
+    fact_reverse: float = 1.0
+    skos_related: float = 1.0
+    skos_broader_up: float = 1.0
+    skos_broader_down: float = 0.5
+    parallel_aggregation: Literal["max", "sum", "capped_sum"] = "max"
+    parallel_cap: float = 2.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -156,6 +176,24 @@ class DaemonStatus:
 def compute_mdhash_id(content: str, prefix: str = "") -> str:
     """Compute the MD5 hash of the given content string and optionally prepend a prefix."""
     return prefix + hashlib.md5(content.encode("utf-8")).hexdigest()
+
+
+@overload
+def text_processing(text: list[Any]) -> list[Any]: ...
+
+
+@overload
+def text_processing(text: Any) -> str: ...
+
+
+def text_processing(text: Any) -> str | list[Any]:
+    """Normalize entity/fact text to lowercase alphanumeric tokens separated by single spaces."""
+    if isinstance(text, list):
+        return [text_processing(t) for t in text]
+    if not isinstance(text, str):
+        text = str(text)
+    normalized = "".join(ch if ch.isalnum() or ch.isspace() else " " for ch in text.casefold())
+    return " ".join(normalized.split())
 
 
 def compute_chunk_id(rel_posix_path: str, start_line: int, end_line: int, text: str) -> str:

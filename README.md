@@ -21,10 +21,11 @@ uv run yaw graph build
 uv run yaw graph rebuild
 uv run yaw graph lint
 uv run yaw graph lint --turtle
-uv run yaw optimize
+uv run yaw dspy optimize
 uv run --locked yaw dspy optimize --resume
 uv run --locked yaw dspy optimize --db-path latest
-uv run yaw load-program .yaw/compiled_program_optimize_<datestamp>.json
+uv run yaw dspy load-program .yaw/compiled_program_optimize_<datestamp>.json
+uv run yaw dspy benchmark --gate benchmark_gate.json
 uv run yaw config get optimization.auto
 uv run yaw config set optimization.auto heavy
 uv run python benchmark.py --dataset sample --mode all
@@ -47,7 +48,7 @@ persistent configuration setting; `uv run typecheck` supplies it automatically.
 See the [preflight audit](docs/preflight-audit.md) for remaining cleanup work.
 
 Optimization starts a fresh timestamped sandbox unless `--resume` or `--db-path`
-(`--db` alias) selects an existing run. `--resume` and `--db-path latest` select
+selects an existing run. `--resume` and `--db-path latest` select
 the newest run by its filename timestamp, regardless of database size or later
 writes to older runs. They restore the saved dataset slice, optimization options,
 custom output path, seed program, and GEPA checkpoint. A specific existing database
@@ -143,7 +144,7 @@ Upstream `hipporag` and `optuna` are permanently retired from `pyproject.toml`, 
 The unified local model stack (`http://localhost:13305/api/v1`) uses:
 - **Embeddings (`--embedding-model`):** `embeddinggemma-300m-GGUF` on GPU `llamacpp` (`--embedding-task-mode` defaults to `distinct-titled` under `retrieval-prompts-v3`).
 - **Unified Chat, GBNF Worker, QA Reader & RLM Orchestrator (`--extraction-model`, `--qa-model`):** `Gemma-4-E4B-it-GGUF` (`Q4_K_M`, 32,768 context) on GPU `llamacpp` (`--parallel 1 --cache-ram 0`) with pure-JSON GBNF grammar enforcement (`_yaw_supports_gbnf=True`) for direct/worker predictors and unconstrained Python REPL execution (`_yaw_supports_gbnf=False`) inside DSPy's managed Deno/Pyodide WASM sandbox (`dspy[deno]`, `dspy.PythonInterpreter`) for `shacl_healer_rlm` and `RLMInstructionProposer.inner_rlm`. Historical Qwen benchmark targets remain unchanged.
-- **OOD Enterprise Prompt Evolution (`uv run yaw optimize`):** Configured by default in [`yaw.toml`](yaw.toml) to train on the stratified 250-query (`150` train + `100` val) **EnterpriseRAG-Bench** (`enterprise_rag_bench`, `onyx-dot-app/EnterpriseRAG-Bench`) dataset across all 10 reasoning categories (`Basic`, `Semantic`, `Intra-Document Reasoning`, `Project Related`, `Constrained`, `Conflicting Info`, `Completeness`, `Miscellaneous`, `Info Not Found`, `High Level`) with $2.0\times$ same-tool hard distractors (`mode = "gepa"`, `auto = "heavy"`).
+- **OOD Enterprise Prompt Evolution (`uv run yaw dspy optimize`):** Configured by default in [`yaw.toml`](yaw.toml) to train on the stratified 250-query (`150` train + `100` val) **EnterpriseRAG-Bench** (`enterprise_rag_bench`, `onyx-dot-app/EnterpriseRAG-Bench`) dataset across all 10 reasoning categories (`Basic`, `Semantic`, `Intra-Document Reasoning`, `Project Related`, `Constrained`, `Conflicting Info`, `Completeness`, `Miscellaneous`, `Info Not Found`, `High Level`) with $2.0\times$ same-tool hard distractors via canonical `"hybrid"` optimization (`dspy.MIPROv2` warm-up + `dspy.GEPA` handoff with `candidate_selection_strategy="pareto"` and `use_merge=True` + always-on `dspy.SIMBA`, `auto = "heavy"`) and `compute_task_quality_score` (`yaw/daemon/graph/inference/parsers.py`, unweighted arithmetic mean $\text{score} = \frac{1}{|M|}\sum_{m \in M} m$ over available `Recall@1/2/5/10/20`, `EM`, and `F1`, preserving all 7 raw metrics in `objective_scores`).
 
 On this machine the models and settings are already installed. For a fresh Lemonade installation, register/download the embedding checkpoint and save both `llamacpp` models and settings explicitly before running benchmarks. 
 
@@ -222,7 +223,7 @@ YAW is engineered directly from principles and algorithms established in the fol
    - *Key Foundations:* Declarative Signatures, Modules, and programmatic prompt compilation against objective metric evaluators with strict separation of concerns.
 7. **MIPROv2 & GEPA: Optimizing Instructions and Demonstrations for Multi-Stage Language Model Programs**
    - *Opsahl-Ong, et al. (2024)* — [arXiv:2406.11695](https://arxiv.org/abs/2406.11695)
-   - *Key Foundations:* Multi-stage instruction proposal and few-shot demonstration search with reflective, evolutionary Pareto optimization ($\text{GM}_{\text{good}} / \text{GM}_{\text{bad}}$).
+   - *Key Foundations:* Multi-stage instruction proposal and few-shot demonstration search with reflective, evolutionary Pareto optimization (`candidate_selection_strategy="pareto"`, compile-time system-aware `use_merge=True`) over unweighted arithmetic mean task quality (`compute_task_quality_score`: $\text{score} = \frac{1}{|M|}\sum_{m \in M} m$ across available `Recall@1/2/5/10/20`, `EM`, and `F1`, preserving all 7 raw metrics in `objective_scores`).
 8. **Recursive Language Modeling for Long Context Reasoning (RLM)**
    - *Zhang, et al. (2025)* — [arXiv:2502.06733](https://arxiv.org/abs/2502.06733)
    - *Key Foundations:* Decomposing complex multi-step reasoning, self-healing graph validation, and synonym adjudication into programmatic REPL tool loops with sandboxed Python evaluation.

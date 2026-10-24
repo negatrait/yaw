@@ -85,20 +85,22 @@ def test_fifo_reports_unformattable_records_without_dropping_existing_lines(tmp_
         handler.close()
 
 
-def test_noisy_legacy_template_warning_is_filtered_but_real_warnings_remain():
+def test_third_party_info_is_filtered_but_warnings_and_yaw_logs_remain():
     filtering = SuppressThirdPartyInfoFilter()
-    benign = logging.LogRecord(
-        "hipporag.reader", logging.WARNING, __file__, 1, "reader does not have a customized prompt template", (), None
-    )
-    real = logging.LogRecord("hipporag.reader", logging.ERROR, __file__, 2, "Provider disconnected", (), None)
-    assert not filtering.filter(benign)
-    assert filtering.filter(real)
-    informational = logging.LogRecord("httpx.transport", logging.INFO, __file__, 3, "HTTP trace", (), None)
+    informational = logging.LogRecord("httpx.transport", logging.INFO, __file__, 1, "HTTP trace", (), None)
+    litellm_info = logging.LogRecord("litellm.router", logging.INFO, __file__, 2, "Router trace", (), None)
+    real_warning = logging.LogRecord("litellm.router", logging.WARNING, __file__, 3, "Provider warning", (), None)
+    real_error = logging.LogRecord("httpx.transport", logging.ERROR, __file__, 4, "Provider disconnected", (), None)
+    yaw_info = logging.LogRecord("yaw.daemon", logging.INFO, __file__, 5, "Daemon started", (), None)
     assert not filtering.filter(informational)
+    assert not filtering.filter(litellm_info)
+    assert filtering.filter(real_warning)
+    assert filtering.filter(real_error)
+    assert filtering.filter(yaw_info)
 
 
 def test_all_leaf_facades_advertise_and_resolve_their_public_exports():
-    for name in ("yaw.daemon.graph.inference", "yaw.daemon.graph.storage", "yaw.daemon.ingestion"):
+    for name in ("yaw.core", "yaw.daemon.graph.inference", "yaw.daemon.graph.storage", "yaw.daemon.ingestion"):
         module = importlib.import_module(name)
         names = dir(module)
         assert names

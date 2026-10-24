@@ -4,6 +4,7 @@ import contextlib
 import hashlib
 import json
 import os
+import time
 import tomllib
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -13,6 +14,85 @@ from .types import YawRuntimeError
 
 DEFAULT_EMBEDDING_MODEL = "embeddinggemma-300m-qat-q8_0-GGUF-Q8_0"
 DEFAULT_CONTEXT_WINDOW_TOKENS = 131072
+DEFAULT_INCLUDED_PATTERNS: tuple[str, ...] = (
+    "*.md",
+    "*.mdx",
+    "*.txt",
+    "*.rst",
+    "*.adoc",
+    "*.org",
+    "*.py",
+    "*.pyi",
+    "*.rs",
+    "*.ts",
+    "*.tsx",
+    "*.js",
+    "*.jsx",
+    "*.mjs",
+    "*.cjs",
+    "*.go",
+    "*.java",
+    "*.kt",
+    "*.kts",
+    "*.c",
+    "*.h",
+    "*.cpp",
+    "*.hpp",
+    "*.cc",
+    "*.cs",
+    "*.rb",
+    "*.php",
+    "*.swift",
+    "*.scala",
+    "*.lua",
+    "*.r",
+    "*.R",
+    "*.sh",
+    "*.bash",
+    "*.zsh",
+    "*.sql",
+    "*.graphql",
+    "*.proto",
+    "*.yaml",
+    "*.yml",
+    "*.toml",
+    "*.json",
+    "*.jsonl",
+    "*.xml",
+    "*.html",
+    "*.css",
+    "*.scss",
+    "*.tex",
+    "*.bib",
+    "*.pas",
+    "*.dpr",
+    "*.f90",
+    "*.sol",
+    "*.dtd",
+)
+DEFAULT_EXCLUDED_PATTERNS: tuple[str, ...] = (".*", "*/.*", "__pycache__/*")
+
+
+def write_text_atomic(path: Path | str, content: str, *, retries: int = 6) -> None:
+    """Atomically write UTF-8 text via a sibling temporary file with Windows PermissionError backoff."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(f".{target.name}.{os.getpid()}_{time.time_ns()}.tmp")
+    max_attempts = max(1, int(retries))
+    try:
+        tmp.write_text(content, encoding="utf-8")
+        for attempt in range(max_attempts):
+            try:
+                os.replace(tmp, target)
+                return
+            except PermissionError:
+                if attempt == max_attempts - 1:
+                    target.write_text(content, encoding="utf-8")
+                    return
+                time.sleep(0.01 * (2**attempt))
+    finally:
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
 
 
 def scale_context_budget(base_budget: int, context_tokens: int) -> int:
@@ -63,63 +143,8 @@ class YawConfig:
     compiled_program_path: Path | None = None
 
     # Ingestion settings
-    included_patterns: tuple[str, ...] = (
-        "*.md",
-        "*.mdx",
-        "*.txt",
-        "*.rst",
-        "*.adoc",
-        "*.org",
-        "*.py",
-        "*.pyi",
-        "*.rs",
-        "*.ts",
-        "*.tsx",
-        "*.js",
-        "*.jsx",
-        "*.mjs",
-        "*.cjs",
-        "*.go",
-        "*.java",
-        "*.kt",
-        "*.kts",
-        "*.c",
-        "*.h",
-        "*.cpp",
-        "*.hpp",
-        "*.cc",
-        "*.cs",
-        "*.rb",
-        "*.php",
-        "*.swift",
-        "*.scala",
-        "*.lua",
-        "*.r",
-        "*.R",
-        "*.sh",
-        "*.bash",
-        "*.zsh",
-        "*.sql",
-        "*.graphql",
-        "*.proto",
-        "*.yaml",
-        "*.yml",
-        "*.toml",
-        "*.json",
-        "*.jsonl",
-        "*.xml",
-        "*.html",
-        "*.css",
-        "*.scss",
-        "*.tex",
-        "*.bib",
-        "*.pas",
-        "*.dpr",
-        "*.f90",
-        "*.sol",
-        "*.dtd",
-    )
-    excluded_patterns: tuple[str, ...] = (".*", "*/.*", "__pycache__/*")
+    included_patterns: tuple[str, ...] = DEFAULT_INCLUDED_PATTERNS
+    excluded_patterns: tuple[str, ...] = DEFAULT_EXCLUDED_PATTERNS
     json_keys_whitelist: tuple[str, ...] = ("*",)
     json_keys_blacklist: tuple[str, ...] = ()
     chunk_size: int = 1500
@@ -325,6 +350,109 @@ class YawConfig:
         cfg_dict["state_dir"] = opt_state
         cfg_dict["compiled_program_path"] = opt_program
         cfg_dict["poll_interval_seconds"] = 0.0
+        return YawConfig(**cfg_dict)
+
+    def for_benchmark(
+        self,
+        dataset: str,
+        slice_hash: str,
+        *,
+        index_root: Path | None = None,
+        fresh: bool = False,
+    ) -> YawConfig:
+        """Derive an isolated sandbox configuration for per-dataset benchmark runs."""
+        import re
+        import shutil
+
+        safe_ds = re.sub(r"[^a-zA-Z0-9_.-]+", "_", dataset.strip().lower()).strip("_") or "dataset"
+        safe_hash = re.sub(r"[^a-zA-Z0-9_.-]+", "_", slice_hash.strip().lower()).strip("_") or "default"
+        ws = Path(self.workspace_root).resolve() if self.workspace_root else Path.cwd().resolve()
+        root_dir = Path(index_root).resolve() if index_root is not None else (ws / "outputs" / "benchmarks" / "indexes")
+        sandbox_dir = root_dir / f"{safe_ds}_{safe_hash}"
+
+        if fresh and sandbox_dir.exists():
+            shutil.rmtree(sandbox_dir, ignore_errors=True)
+        sandbox_dir.mkdir(parents=True, exist_ok=True)
+
+        bench_db = sandbox_dir / "yaw.db"
+        bench_lock = sandbox_dir / "yaw.db.lock"
+        bench_status = sandbox_dir / "status.json"
+        bench_state = sandbox_dir / "coco_state"
+        bench_log = sandbox_dir / "yaw.log"
+
+        cfg_dict: dict[str, Any] = {
+            f.name: getattr(self, f.name)
+            for f in fields(self)
+            if f.name
+            not in (
+                "workspace_root",
+                "corpus_root",
+                "db_path",
+                "lock_path",
+                "status_path",
+                "state_dir",
+                "log_path",
+            )
+        }
+        cfg_dict["workspace_root"] = sandbox_dir
+        cfg_dict["corpus_root"] = sandbox_dir
+        cfg_dict["db_path"] = bench_db
+        cfg_dict["lock_path"] = bench_lock
+        cfg_dict["status_path"] = bench_status
+        cfg_dict["state_dir"] = bench_state
+        cfg_dict["log_path"] = bench_log
+        cfg_dict["poll_interval_seconds"] = 0.0
+        if self.json_keys_whitelist == ("*",):
+            cfg_dict["json_keys_whitelist"] = (
+                "title",
+                "text",
+                "paragraph_text",
+                "contents",
+                "context",
+                "context.*",
+                "contexts",
+                "contexts.*",
+                "paragraphs",
+                "paragraphs.*",
+                "document",
+                "document.title",
+                "document.text",
+                "document.summary",
+                "document.summary.*",
+            )
+            cfg_dict["json_keys_blacklist"] = tuple(
+                dict.fromkeys(
+                    (
+                        *self.json_keys_blacklist,
+                        "question*",
+                        "answer*",
+                        "answers*",
+                        "gold*",
+                        "reference*",
+                        "supporting_facts*",
+                        "is_supporting*",
+                        "evidences*",
+                        "obj*",
+                        "subj*",
+                        "prop*",
+                        "*_id",
+                        "id",
+                        "idx",
+                        "type",
+                        "level",
+                        "all_classes",
+                        "distractor",
+                        "length",
+                        "language",
+                        "dataset",
+                        "possible_answers*",
+                        "s_*",
+                        "o_*",
+                        "question_decomposition*",
+                        "answerable*",
+                    )
+                )
+            )
         return YawConfig(**cfg_dict)
 
     def config_fingerprint(self) -> str:
@@ -630,8 +758,11 @@ def set_config_value(
 
 
 __all__ = [
+    "DEFAULT_EXCLUDED_PATTERNS",
+    "DEFAULT_INCLUDED_PATTERNS",
     "YawConfig",
     "get_config_value",
     "load_config",
     "set_config_value",
+    "write_text_atomic",
 ]

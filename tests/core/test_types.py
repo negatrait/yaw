@@ -15,6 +15,7 @@ from yaw.core.types import (
     compute_mdhash_id,
     inclusive_end_line,
     resolve_corpus_path,
+    text_processing,
     to_rel_posix_path,
 )
 
@@ -156,3 +157,15 @@ class TypesTests(unittest.TestCase):
                 resolve_corpus_path(root, "../outside.txt")
             with self.assertRaises(ValueError):
                 to_rel_posix_path(root, root.parent / "outside.txt")
+
+    def test_text_processing(self):
+        self.assertEqual(text_processing("Apple Inc."), "apple inc")
+        self.assertEqual(text_processing("Radio-City (FM Station) #1!"), "radio city fm station 1")
+        self.assertEqual(text_processing("   Multiple   Spaces   and   Tabs\t\n"), "multiple spaces and tabs")
+        self.assertEqual(text_processing("123 numbers & Symbols_underscore"), "123 numbers symbols underscore")
+        self.assertEqual(text_processing(""), "")
+        self.assertEqual(text_processing(42), "42")
+        self.assertEqual(
+            text_processing(["Apple Inc.", "Google LLC"]),
+            ["apple inc", "google llc"],
+        )

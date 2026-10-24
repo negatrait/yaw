@@ -12,11 +12,169 @@ from dspy.teleprompt.gepa.instruction_proposal import (
 )
 from pydantic import BaseModel, Field
 
-from .templates import (
-    NER_ONE_SHOT_PARAGRAPH,
-    RAG_QA_DOCS,
-    best_dspy_prompt,
+NER_ONE_SHOT_PARAGRAPH = (
+    "Radio City\n"
+    "Radio City is India's first private FM radio station and was started on 3 July 2001.\n"
+    "It plays Hindi, English and regional songs.\n"
+    "Radio City recently forayed into New Media in May 2008 with the launch of a music portal "
+    "- PlanetRadiocity.com that offers music related news, videos, songs, and other "
+    "music-related features."
 )
+
+RAG_QA_DOCS = (
+    "Wikipedia Title: The Last Horse\n"
+    "The Last Horse (Spanish:El último caballo) is a 1950 Spanish comedy film directed by "
+    "Edgar Neville starring Fernando Fernán Gómez.\n"
+    "Wikipedia Title: Southampton\n"
+    "The University of Southampton, which was founded in 1862 and received its Royal Charter "
+    "as a university in 1952, has over 22,000 students. The university is ranked in the top "
+    "100 research universities in the world in the Academic Ranking of World Universities "
+    "2010. In 2010, the THES - QS World University Rankings positioned the University of "
+    "Southampton in the top 80 universities in the world. The university considers itself one "
+    "of the top 5 research universities in the UK. The university has a global reputation for "
+    "research into engineering sciences, oceanography, chemistry, cancer sciences, sound and "
+    "vibration research, computer science and electronics, optoelectronics and textile "
+    "conservation at the Textile Conservation Centre (which is due to close in October 2009.) "
+    "It is also home to the National Oceanography Centre, Southampton (NOCS), the focus of "
+    "Natural Environment Research Council-funded marine research.\n"
+    "Wikipedia Title: Stanton Township, Champaign County, Illinois\n"
+    "Stanton Township is a township in Champaign County, Illinois, USA. As of the 2010 census, "
+    "its population was 505 and it contained 202 housing units.\n"
+    "Wikipedia Title: Neville A. Stanton\n"
+    "Neville A. Stanton is a British Professor of Human Factors and Ergonomics at the "
+    "University of Southampton. Prof Stanton is a Chartered Engineer (C.Eng), Chartered "
+    "Psychologist (C.Psychol) and Chartered Ergonomist (C.ErgHF). He has written and edited "
+    "over a forty books and over three hundered peer-reviewed journal papers on applications "
+    "of the subject. Stanton is a Fellow of the British Psychological Society, a Fellow of The "
+    "Institute of Ergonomics and Human Factors and a member of the Institution of Engineering "
+    'and Technology. He has been published in academic journals including "Nature". He has '
+    "also helped organisations design new human-machine interfaces, such as the Adaptive "
+    "Cruise Control system for Jaguar Cars.\n"
+    "Wikipedia Title: Finding Nemo\n"
+    "Finding Nemo Theatrical release poster Directed by Andrew Stanton Produced by Graham "
+    "Walters Screenplay by Andrew Stanton Bob Peterson David Reynolds Story by Andrew Stanton "
+    "Starring Albert Brooks Ellen DeGeneres Alexander Gould Willem Dafoe Music by Thomas "
+    "Newman Cinematography Sharon Calahan Jeremy Lasky Edited by David Ian Salter Production "
+    "company Walt Disney Pictures Pixar Animation Studios Distributed by Buena Vista Pictures "
+    "Distribution Release date May 30, 2003 (2003 - 05 - 30) Running time 100 minutes Country "
+    "United States Language English Budget $94 million Box office $940.3 million"
+)
+
+best_dspy_prompt: dict[str, Any] = {
+    "prog": {
+        "demos": [
+            {
+                "augmented": True,
+                "question": "Are Imperial River (Florida) and Amaradia (Dolj) both located in the same country?",
+                "fact_before_filter": '{"fact": [["imperial river", "is located in", "florida"'
+                '], ["imperial river", "is a river '
+                'in", "united states"], ["imperial river", "may refer to", "south america"], ["amaradia", '
+                '"flows through", "ro ia de amaradia"], ["imperial river", "may refer to", "united '
+                'states"]]}',
+                "fact_after_filter": '{"fact":[["imperial river","is located in","florida"],['
+                '"imperial river","is a river '
+                'in","united states"],["amaradia","flows through","ro ia de amaradia"]]}',
+            },
+            {
+                "augmented": True,
+                "question": "When is the director of film The Ancestor 's birthday?",
+                "fact_before_filter": '{"fact": [["jean jacques annaud", "born on", "1 october'
+                ' 1943"], ["tsui hark", "born on", '
+                '"15 february 1950"], ["pablo trapero", "born on", "4 october 1971"], ["the ancestor", '
+                '"directed by", "guido brignone"], ["benh zeitlin", "born on", "october 14  1982"]]}',
+                "fact_after_filter": '{"fact":[["the ancestor","directed by","guido brignone"]]}',
+            },
+            {
+                "augmented": True,
+                "question": "In what geographic region is the country where Teafuone is located?",
+                "fact_before_filter": '{"fact": [["teafuaniua", "is on the", "east"], ["motulo'
+                'a", "lies between", "teafuaniua"], '
+                '["motuloa", "lies between", "teafuanonu"], ["teafuone", "is", "islet"], ["teafuone", '
+                '"located in", "nukufetau"]]}',
+                "fact_after_filter": '{"fact":[["teafuone","is","islet"],["teafuone","located in","nukufetau"]]}',
+            },
+            {
+                "augmented": True,
+                "question": "When did the director of film S.O.B. (Film) die?",
+                "fact_before_filter": '{"fact": [["allan dwan", "died on", "28 december 1981"]'
+                ', ["s o b", "written and directed '
+                'by", "blake edwards"], ["robert aldrich", "died on", "december 5  1983"], ["robert '
+                'siodmak", "died on", "10 march 1973"], ["bernardo bertolucci", "died on", "26 november '
+                '2018"]]}',
+                "fact_after_filter": '{"fact":[["s o b","written and directed by","blake edwards"]]}',
+            },
+            {
+                "augmented": True,
+                "question": "Do both films: Gloria (1980 Film) and A New Life (Film) have the directors from the same "
+                "country?",
+                "fact_before_filter": '{"fact": [["sebasti n lelio watt", "received acclaim for directing", "gloria"], '
+                '["gloria", "is", "1980 american thriller crime drama film"], ["a brand new life", "is '
+                'directed by", "ounie lecomte"], ["gloria", "written and directed by", "john cassavetes"], '
+                '["a new life", "directed by", "alan alda"]]}',
+                "fact_after_filter": '{"fact":[["gloria","is","1980 american thriller crime d'
+                'rama film"],["gloria","written and '
+                'directed by","john cassavetes"],["a new life","directed by","alan alda"]]}',
+            },
+            {
+                "augmented": True,
+                "question": "What is the date of death of the director of film The Old Guard (1960 Film)?",
+                "fact_before_filter": '{"fact": [["the old guard", "is", "1960 french comedy f'
+                'ilm"], ["gilles grangier", '
+                '"directed", "the old guard"], ["the old guard", "directed by", "gilles grangier"], ["the '
+                'old fritz", "directed by", "gerhard lamprecht"], ["oswald albert mitchell", "directed", '
+                '"old mother riley series of films"]]}',
+                "fact_after_filter": '{"fact":[["the old guard","is","1960 french comedy film"],["gilles '
+                'grangier","directed","the old guard"],["the old guard","directed by","gilles grangier"]]}',
+            },
+            {
+                "augmented": True,
+                "question": "When is the composer of film Aulad (1968 Film) 's birthday?",
+                "fact_before_filter": '{"fact": [["aulad", "has music composed by", "chitragup'
+                'ta shrivastava"], ["aadmi sadak '
+                'ka", "has music by", "ravi"], ["ravi shankar sharma", "composed music for", "hindi '
+                'films"], ["gulzar", "was born on", "18 august 1934"], ["aulad", "is a", "1968 hindi '
+                'language drama film"]]}',
+                "fact_after_filter": '{"fact":[["aulad","has music composed by","chitragupta '
+                'shrivastava"],["aulad","is '
+                'a","1968 hindi language drama film"]]}',
+            },
+            {
+                "question": "How many households were in the city where Angelical Tears located?",
+                "fact_before_filter": '{"fact": [["dow city", "had", "219 households"], ["tucs'
+                'on", "had", "229 762 households"], '
+                '["atlantic city", "has", "15 504 households"], ["angelical tears", "located in", '
+                '"oklahoma city"], ["atlantic city", "had", "15 848 households"]]}',
+                "fact_after_filter": '{"fact": [["angelical tears", "located in", "oklahoma city"]]}',
+            },
+            {
+                "question": "Did the movies In The Pope'S Eye and Virgin Mountain, originate from the same country?",
+                "fact_before_filter": '{"fact": [["virgin mountain", "released in", "icelandic'
+                ' cinemas"], ["virgin mountain", '
+                '"directed by", "dagur k ri"], ["virgin mountain", "icelandic title is", "f si"], ["virgin '
+                'mountain", "won", "2015 nordic council film prize"], ["virgin mountain", "is a", "2015 '
+                'icelandic drama film"]]}',
+                "fact_after_filter": '{"fact": [["virgin mountain", "released in", "icelandic'
+                ' cinemas"], ["virgin mountain", '
+                '"directed by", "dagur k ri"], ["virgin mountain", "icelandic title is", "f si"], ["virgin '
+                'mountain", "won", "2015 nordic council film prize"], ["virgin mountain", "is a", "2015 '
+                'icelandic drama film"]]}',
+            },
+            {
+                "question": "Which film has the director who died earlier, The Virtuous Model or Bulldog Drummond'S "
+                "Peril?",
+                "fact_before_filter": '{"fact": [["the virtuous model", "is", "1919 american s'
+                'ilent drama film"], ["bulldog '
+                'drummond s peril", "directed by", "james p  hogan"], ["the virtuous model", "directed '
+                'by", "albert capellani"], ["bulldog drummond s revenge", "directed by", "louis king"], '
+                '["bulldog drummond s peril", "is", "american film"]]}',
+                "fact_after_filter": '{"fact": [["the virtuous model", "is", "1919 american s'
+                'ilent drama film"], ["bulldog '
+                'drummond s peril", "directed by", "james p  hogan"], ["the virtuous model", "directed '
+                'by", "albert capellani"], ["bulldog drummond s peril", "is", "american film"]]}',
+            },
+        ]
+    }
+}
 
 # ---------------------------------------------------------------------------
 # Native DSPy Signatures and Few-Shot Demos
@@ -126,8 +284,9 @@ class ProposeSHACLRepairs(dspy.Signature):
     """You are a critical component in a high-stakes SKOS/RDF/OWL based ontology graph system. Your task is to \
 heal SHACL violations.
     Propose closed-world SKOS/RDF/OWL repairs for SHACL validation report violations.
-    Supported actions: 'set_definition', 'set_pref_label', 'demote_to_alt_label', 'add_different_from', \
-'delete_dangling'.
+    Supported actions: 'set_definition', 'rewrite_definition', 'set_pref_label', 'demote_to_alt_label', \
+'merge_altLabel', 'merge_hiddenLabel', 'add_different_from', 'assert_differentFrom', 'assert_related', \
+'delete_dangling', 'delete_invalid_fact'.
     Respond with JSON: {"repairs": [{"focus_node": "...", "action": "...", "value": "..."}, ...]}"""
 
     violations: str = dspy.InputField(desc="JSON list of SHACLViolation report items")
@@ -441,10 +600,13 @@ __all__ = [
     "HealSHACLViolations",
     "JudgeSynonyms",
     "NER_DEMOS",
+    "NER_ONE_SHOT_PARAGRAPH",
     "ProposeInstructionSignature",
     "ProposeSHACLRepairs",
     "QA_DEMOS",
+    "RAG_QA_DOCS",
     "ReflectiveInnerDistillerSignature",
     "TRIPLE_DEMOS",
     "TRIPLE_FILTER_DEMOS",
+    "best_dspy_prompt",
 ]

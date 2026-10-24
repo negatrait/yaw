@@ -215,11 +215,22 @@ class ArchitectureTests(unittest.TestCase):
         self.assertTrue(hasattr(inference, "create_dspy_lm"))
         self.assertTrue(hasattr(inference, "HippoRAGProgram"))
         self.assertTrue(hasattr(inference, "DSPyEmbeddingAdapter"))
-        self.assertTrue(hasattr(inference, "compute_sizecoding_pareto_score"))
+        self.assertTrue(hasattr(inference, "compute_task_quality_score"))
+        self.assertTrue(hasattr(inference, "check_benchmark_integrity"))
+        self.assertTrue(hasattr(inference, "GepaProgress"))
+        self.assertTrue(hasattr(inference, "GraphOptimizationHooks"))
+        self.assertTrue(hasattr(inference, "ActiveTraceComponentSelector"))
+        self.assertTrue(hasattr(inference, "configure_simba_task_learning"))
+        self.assertTrue(hasattr(inference, "evolve_program_prompts"))
+        self.assertTrue(hasattr(inference, "evaluate_program"))
         self.assertFalse(hasattr(inference, "RetrievalEmbedding"))
         self.assertFalse(hasattr(inference, "LocalChat"))
         self.assertFalse(hasattr(inference, "CacheOpenAI"))
         self.assertFalse(hasattr(inference, "chat_identity"))
+
+        # Verify yaw/daemon/graph top-level files are strictly __init__.py, engine.py, and ppr.py
+        graph_files = {f.name for f in (YAW_DIR / "daemon" / "graph").glob("*.py")}
+        self.assertEqual(graph_files, {"__init__.py", "engine.py", "ppr.py"})
 
         # Verify storage public facade
         import yaw.daemon.graph.storage as storage
@@ -251,7 +262,7 @@ class ArchitectureTests(unittest.TestCase):
 
         # Verify facade is strictly constricted: internal helpers cannot leak through
         with self.assertRaises(AttributeError):
-            _ = inference._strip_mistral_bracket_prefix
+            _ = inference._nullable_text
         with self.assertRaises(AttributeError):
             _ = inference._build_default_ner_demos
         with self.assertRaises(AttributeError):
@@ -289,7 +300,10 @@ class ArchitectureTests(unittest.TestCase):
     def test_core_imports_stdlib_only(self):
         """Rule: yaw/core/* must strictly import standard library only (zero third-party, zero daemon)."""
         core_files = list((YAW_DIR / "core").glob("*.py"))
-        self.assertGreater(len(core_files), 0)
+        self.assertEqual(
+            {f.name for f in core_files},
+            {"__init__.py", "config.py", "logger.py", "types.py"},
+        )
 
         # Python supplies the authoritative set, including platform-specific modules.
         stdlib_whitelist = sys.stdlib_module_names

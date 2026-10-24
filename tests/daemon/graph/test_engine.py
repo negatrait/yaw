@@ -13,7 +13,11 @@ import pytest
 from daemon.graph.inference.test_reflection import provider as provider
 from yaw.core import ChunkPointer
 from yaw.daemon.graph.engine import YawGraphEngine
-from yaw.daemon.graph.inference import HippoRAGProgram
+from yaw.daemon.graph.inference import (
+    ActiveTraceComponentSelector,
+    HippoRAGProgram,
+    extraction_fingerprint,
+)
 
 
 class ProtocolTokenCounter:
@@ -195,10 +199,10 @@ def test_engine_index_and_caching(test_engine: YawGraphEngine, tmp_path: Path) -
     indexed_count = test_engine.index(docs)
     assert indexed_count == 2
 
-    # Verify passages.txt written on disk
-    passages_file = tmp_path / "corpus" / "passages.txt"
-    assert passages_file.exists()
-    content = passages_file.read_text(encoding="utf-8")
+    # Verify per-chunk corpus files written on disk
+    corpus_files = sorted((tmp_path / "corpus").glob("chunk-*.md"))
+    assert len(corpus_files) == 2
+    content = "\n".join(p.read_text(encoding="utf-8") for p in corpus_files)
     assert "Alan Turing" in content
     assert "Radio City" in content
 
@@ -389,9 +393,12 @@ def test_engine_multi_batch_indexing_and_bounded_embedding_batches(tmp_path: Pat
         # Every embedder call must respect embed_batch_size=2
         assert all(sz <= 2 for sz in batch_sizes_seen)
 
-        # Verify line numbers in SQLite match exact lines in passages.txt (2 + 3 + 1 + 2 + 1 = 9 lines)
-        max_end = engine.conn.execute("SELECT MAX(end_line) FROM chunks").fetchone()[0]
-        assert max_end == 9
+        # Verify line numbers in SQLite match exact per-document 1-indexed spans
+        spans = [
+            tuple(r)
+            for r in engine.conn.execute("SELECT start_line, end_line FROM chunks ORDER BY end_line").fetchall()
+        ]
+        assert spans == [(1, 1), (1, 1), (1, 2), (1, 2), (1, 3)]
 
         # Verify DPR retrieval hydrates chunks from both batches accurately
         dpr_hits = engine.retrieve_dpr("Doc 4 line 1", top_k=5)
@@ -1459,17 +1466,17 @@ traces into dspy.settings.trace, and emits per-predictor feedback."""
             ).with_inputs("question", "item_docs")
         ]
 
-        # 1. Verify _extraction_fingerprint sensitivity
-        fp_base = engine._extraction_fingerprint(program)
+        # 1. Verify extraction_fingerprint sensitivity
+        fp_base = extraction_fingerprint(program)
         qa_mutated = program.deepcopy()
         qa_mutated.qa.predict.signature = qa_mutated.qa.predict.signature.with_instructions("QA-only mutation")
-        assert engine._extraction_fingerprint(qa_mutated) == fp_base
+        assert extraction_fingerprint(qa_mutated) == fp_base
 
         ner_mutated = program.deepcopy()
         ner_mutated.ner.signature = ner_mutated.ner.signature.with_instructions(
             "MUTATED_NER_MARKER: Extract all entities with definitions."
         )
-        assert engine._extraction_fingerprint(ner_mutated) != fp_base
+        assert extraction_fingerprint(ner_mutated) != fp_base
 
         # 2. Verify GEPA compile loop triggers re-indexing on NER mutation, reuses cache on QA-only mutation,
         #    captures extraction + QA traces in dspy.settings.trace, and provides stage-specific feedback.
@@ -1703,12 +1710,8 @@ def test_sprint3_engine_evaluate_and_pareto_frontier_export(
     reflection_token_counter,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify YawGraphEngine.evaluate (dspy.Evaluate + answer_passage_match) and top-3 Pareto frontier export in \
-optimize()."""
+    """Verify YawGraphEngine.evaluate (dspy.Evaluate + answer_passage_match) and compiled candidate persistence."""
     import json
-    from types import SimpleNamespace
-
-    from yaw.daemon.graph.inference import ParetoProgramEnsemble
 
     lm = DeterministicMockLM()
     dspy.settings.configure(lm=lm)
@@ -1765,26 +1768,6 @@ optimize()."""
                 cand_0.qa.predict.signature = cand_0.qa.predict.signature.with_instructions(
                     "Pareto candidate 0 instruction."
                 )
-                cand_1 = student.deepcopy()
-                cand_1.qa.predict.signature = cand_1.qa.predict.signature.with_instructions(
-                    "Pareto candidate 1 instruction."
-                )
-                cand_2 = student.deepcopy()
-                cand_2.qa.predict.signature = cand_2.qa.predict.signature.with_instructions(
-                    "Pareto candidate 2 instruction."
-                )
-                cand_dup = student.deepcopy()
-                cand_dup.qa.predict.signature = cand_dup.qa.predict.signature.with_instructions(
-                    "Pareto candidate 0 instruction."
-                )
-
-                cand_0.detailed_results = SimpleNamespace(
-                    candidates=[cand_0, cand_1, cand_2, cand_dup],
-                    val_aggregate_scores=[0.92, 0.89, 0.87, 0.92],
-                    per_val_instance_best_candidates={0: [0, 1], 1: [2]},
-                    per_objective_best_candidates=None,
-                    best_idx=0,
-                )
                 return cand_0
 
         monkeypatch.setattr(dspy, "GEPA", FrontierMockGEPA, raising=False)
@@ -1798,15 +1781,15 @@ optimize()."""
         )
         assert len(observed_feedbacks) == 1
         assert "AnswerPassageMatch=1" in observed_feedbacks[0]
-        assert len(compiled.pareto_frontier_states) == 3
-        assert isinstance(compiled.pareto_ensemble, ParetoProgramEnsemble)
-        assert len(compiled.pareto_ensemble.programs) == 3
+        assert compiled.qa.predict.signature.instructions == "Pareto candidate 0 instruction."
         assert save_path.exists()
         assert (tmp_path / "compiled_sprint3_eval.json").exists()
 
         reloaded = HippoRAGProgram(enable_gbnf=False, compiled_path=save_path, orchestrator_lm=lm, rlm_sub_lm=lm)
-        assert len(reloaded.pareto_frontier_states) == 3
-        assert isinstance(reloaded.pareto_ensemble, ParetoProgramEnsemble)
+        assert reloaded.qa.predict.signature.instructions == "Pareto candidate 0 instruction."
+        ensemble = dspy.Ensemble(reduce_fn=dspy.majority).compile([compiled, reloaded])
+        ens_pred = ensemble(context=doc, question="Who designed the ACE?")
+        assert ens_pred.answer == "Alan Turing"
     finally:
         engine.close()
 
@@ -2006,8 +1989,8 @@ minibatch q_stats lookup."""
             item_docs=[doc_q2_a, doc_q2_b],
         ).with_inputs("question", "item_docs")
 
-        # Verify _ActiveTraceComponentSelector continues matching after candidate instructions mutate
-        selector = YawGraphEngine._ActiveTraceComponentSelector(program)
+        # Verify ActiveTraceComponentSelector continues matching after candidate instructions mutate
+        selector = ActiveTraceComponentSelector(program)
         mut_ner_sig = program.ner.signature.with_instructions("Mutated NER instruction v2")
         fake_pred_obj = SimpleNamespace(signature=mut_ner_sig)
         fake_state = SimpleNamespace(
@@ -2046,9 +2029,12 @@ minibatch q_stats lookup."""
                 score1_live = self.metric(ex1, pred1_live)
                 score2_live = self.metric(ex2, pred2_live)
                 assert score1_live.score > 0.0
-                # This query misses its answer and early retrieval ranks. A true
-                # geometric mean must preserve those zeros instead of smoothing.
-                assert score2_live.score == 0.0
+                # This query misses its answer and early retrieval ranks, but hits later
+                # retrieval ranks; unweighted arithmetic mean preserves positive signal (> 0.0).
+                assert score2_live.score == pytest.approx(
+                    sum(score2_live.objective_scores.values()) / len(score2_live.objective_scores)
+                )
+                assert score2_live.score > 0.0
                 assert score2_live.objective_scores["f1"] == 0.0
                 assert score2_live.objective_scores["recall_at_20"] == 1.0
 
@@ -2241,7 +2227,7 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
     import json
     import re
 
-    from yaw.daemon.graph.storage.db import load_graph_topology
+    from yaw.daemon.graph.storage import load_graph_topology
 
     class HomographAndParonymLM(DeterministicMockLM):
         def __call__(
@@ -2495,3 +2481,271 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
         assert lint["conforms"] is True, f"Unexpected SHACL violations: {lint['violations']}"
     finally:
         engine.close()
+
+
+def test_step10_engine_pareto_ensemble_readonly_graph_and_memoization(
+    tmp_path: Path,
+) -> None:
+    """Verify post-optimization Pareto dspy.Ensemble runs read-only against yaw.db without re-indexing and memoizes identical query-side retrievals."""
+    import json
+
+    ner_calls: list[str] = []
+
+    class TrackingEnsembleLM(DeterministicMockLM):
+        def __call__(
+            self,
+            prompt: str | None = None,
+            messages: list[dict[str, Any]] | None = None,
+            **kwargs: Any,
+        ) -> list[str]:
+            req_str = str(prompt or messages or kwargs)
+            if "ExtractEntities" in req_str or ("named_entities" in req_str and "triples" not in req_str):
+                ner_calls.append(req_str)
+            return super().__call__(prompt=prompt, messages=messages, **kwargs)
+
+    lm = TrackingEnsembleLM()
+    dspy.settings.configure(lm=lm)
+    prog = HippoRAGProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
+    embedder: Any = DeterministicMockEmbedder(dim=64)
+    engine = YawGraphEngine(
+        db_path=tmp_path / "yaw_step10_ens.db",
+        workspace_root=tmp_path,
+        program=prog,
+        embedder=embedder,
+        retrieval_top_k=2,
+    )
+    try:
+        doc_a = "Alan Turing\nAlan Turing worked at Bletchley Park during World War II."
+        doc_b = "Grace Hopper\nGrace Hopper pioneered compiler design for COBOL."
+        engine.index([doc_a, doc_b])
+        ner_calls_after_index = len(ner_calls)
+        assert ner_calls_after_index >= 1
+
+        # Save primary program and 2 Pareto siblings where sibling 1 has a DIFFERENT extraction_fingerprint
+        # (mutated NER instruction) but IDENTICAL query_retrieval_fingerprint, and sibling 2 has a different
+        # query_retrieval_fingerprint (mutated query_intent instruction).
+        prog_path = tmp_path / "compiled_program.json"
+        tel_dir = tmp_path / "compiled_program_telemetry"
+        tel_dir.mkdir(parents=True, exist_ok=True)
+        prog.save(str(prog_path))
+
+        sib_0 = prog.deepcopy()
+        sib_1 = prog.deepcopy()
+        sib_1.ner.signature = sib_1.ner.signature.with_instructions("SIBLING_1_MUTATED_NER_INSTRUCTION")
+        sib_1.qa.predict.signature = sib_1.qa.predict.signature.with_instructions("SIBLING_1_QA")
+        sib_2 = prog.deepcopy()
+        sib_2.query_intent.signature = sib_2.query_intent.signature.with_instructions("SIBLING_2_QUERY_INTENT")
+        sib_2.qa.predict.signature = sib_2.qa.predict.signature.with_instructions("SIBLING_2_QA")
+
+        sib_0.save(str(tel_dir / "pareto_member_0.json"))
+        sib_1.save(str(tel_dir / "pareto_member_1.json"))
+        sib_2.save(str(tel_dir / "pareto_member_2.json"))
+
+        engine.program.load(str(prog_path))
+        engine.refresh_program_bindings()
+        assert len(getattr(engine.ensemble, "programs", ())) == 3
+
+        # Spy on engine.retrieve to count how many times full retrieval executes across the 3 ensemble members
+        retrieve_calls = 0
+        orig_retrieve = engine.retrieve
+
+        def _counting_retrieve(*args: Any, **kwargs: Any) -> Any:
+            nonlocal retrieve_calls
+            retrieve_calls += 1
+            return orig_retrieve(*args, **kwargs)
+
+        engine.retrieve = _counting_retrieve  # type: ignore[method-assign]
+
+        qa_out = engine.rag_qa(["Where did Alan Turing work?"])
+        assert len(qa_out) == 1
+        assert qa_out[0]["answer"]
+        assert len(qa_out[0]["retrieved_chunk_ids"]) >= 1
+        # Must NOT have wiped or re-indexed yaw.db despite sib_1 having a different extraction_fingerprint!
+        assert len(ner_calls) == ner_calls_after_index
+        # 3 ensemble members, but sib_0 and sib_1 share identical query_retrieval_fingerprint -> only 2 retrieve() calls!
+        assert retrieve_calls == 2
+
+        # Retrieve-only ensemble mode must also reuse memoized query retrieval for the same question
+        ret_pred = engine.ensemble(question="Where did Alan Turing work?", retrieve_only=True, k=2)
+        assert len(getattr(ret_pred, "retrieved_chunk_ids", ())) >= 1
+        assert len(ner_calls) == ner_calls_after_index
+    finally:
+        engine.close()
+
+
+def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
+    tmp_path: Path,
+) -> None:
+    """Verify Step 11 (H1-H4) end-to-end: literal-object triples skip entity creation/synonym mining, conform to SHACL, and seed PPR via subject + fact_sources alongside skos:broader hierarchy."""
+    import json
+    import re
+
+    from yaw.core import RelationTraversalPolicy
+
+    class Step11MockLM(DeterministicMockLM):
+        def __call__(
+            self,
+            prompt: str | None = None,
+            messages: list[dict[str, Any]] | None = None,
+            **kwargs: Any,
+        ) -> list[str]:
+            req_str = str(prompt or messages or kwargs)
+            if "[[ ## candidate_pairs ## ]]" in req_str or "candidate_pairs" in req_str:
+                decisions = []
+                for match in re.finditer(r"\{[^{}]*\"pair_id\"[^{}]*\}", req_str):
+                    try:
+                        p = json.loads(match.group(0))
+                    except Exception:
+                        continue
+                    pid = str(p.get("pair_id", ""))
+                    na = str(p.get("name_a", "")).lower()
+                    nb = str(p.get("name_b", "")).lower()
+                    if {na, nb} == {"cryptanalysis", "mathematics"}:
+                        decisions.append(
+                            {
+                                "pair_id": pid,
+                                "relation": "skos:broader",
+                                "canonical": "A" if na == "mathematics" else "B",
+                            }
+                        )
+                    else:
+                        decisions.append(
+                            {
+                                "pair_id": pid,
+                                "relation": "skos:related",
+                                "canonical": "A",
+                            }
+                        )
+                return [json.dumps({"decisions": decisions})]
+            if "FilterTriples" in req_str or "fact_before_filter" in req_str:
+                return [json.dumps({"fact": [["alan turing", "was born on", "1912-06-23"]]})]
+            if "ExtractTriples" in req_str or '"triples"' in req_str or "`triples`" in req_str:
+                if "1912-06-23" in req_str:
+                    return [
+                        json.dumps(
+                            {
+                                "triples": [
+                                    {
+                                        "sub": "Alan Turing",
+                                        "sub_def": "English mathematician and logician",
+                                        "pred": "was born on",
+                                        "obj": "1912-06-23",
+                                        "obj_def": "",
+                                        "obj_kind": "literal",
+                                        "obj_datatype": "xsd:date",
+                                        "def": "Alan Turing was born on 1912-06-23.",
+                                    },
+                                    {
+                                        "sub": "Alan Turing",
+                                        "sub_def": "English mathematician and logician",
+                                        "pred": "worked on",
+                                        "obj": "Cryptanalysis",
+                                        "obj_def": "Study of analyzing information systems to decipher ciphertexts",
+                                        "obj_kind": "entity",
+                                        "def": "Alan Turing worked on cryptanalysis during World War II.",
+                                    },
+                                ]
+                            }
+                        )
+                    ]
+                return [
+                    json.dumps(
+                        {
+                            "triples": [
+                                {
+                                    "sub": "Cryptanalysis",
+                                    "sub_def": "Study of analyzing information systems to decipher ciphertexts",
+                                    "pred": "is a subfield of",
+                                    "obj": "Mathematics",
+                                    "obj_def": "Formal science of numbers, structure, and logic",
+                                    "obj_kind": "entity",
+                                    "def": "Cryptanalysis is a subfield of mathematics.",
+                                }
+                            ]
+                        }
+                    )
+                ]
+            if "ExtractEntities" in req_str or "named_entities" in req_str:
+                if "1912-06-23" in req_str:
+                    return [
+                        json.dumps(
+                            {
+                                "named_entities": [
+                                    ["Alan Turing", "English mathematician and logician"],
+                                    ["Cryptanalysis", "Study of analyzing information systems to decipher ciphertexts"],
+                                ]
+                            }
+                        )
+                    ]
+                return [
+                    json.dumps(
+                        {
+                            "named_entities": [
+                                ["Cryptanalysis", "Study of analyzing information systems to decipher ciphertexts"],
+                                ["Mathematics", "Formal science of numbers, structure, and logic"],
+                            ]
+                        }
+                    )
+                ]
+            return super().__call__(prompt=prompt, messages=messages, **kwargs)
+
+    lm = Step11MockLM()
+    dspy.settings.configure(lm=lm)
+    prog = HippoRAGProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
+    embedder: Any = DeterministicMockEmbedder(dim=64)
+    engine = YawGraphEngine(
+        db_path=tmp_path / "yaw_step11_e2e.db",
+        workspace_root=tmp_path,
+        program=prog,
+        embedder=embedder,
+        retrieval_top_k=2,
+        synonymy_threshold=-1.0,
+        traversal_policy=RelationTraversalPolicy(skos_broader_up=1.0, skos_broader_down=0.25),
+    )
+    try:
+        doc_turing = "Alan Turing\nAlan Turing was born on 1912-06-23 and worked on cryptanalysis."
+        doc_math = "Mathematics\nCryptanalysis is a subfield of mathematics."
+        engine.index([doc_turing, doc_math])
+
+        # 1. Literal "1912-06-23" is NOT materialized in entities, entity_labels, or entity_vec
+        ent_names = {str(r[0]) for r in engine.conn.execute("SELECT name FROM entities").fetchall()}
+        assert "1912-06-23" not in ent_names
+        assert "alan turing" in ent_names
+        assert "cryptanalysis" in ent_names
+        assert "mathematics" in ent_names
+
+        # 2. Literal fact is stored in facts with obj_kind='literal', obj_id IS NULL, and recorded in fact_sources
+        lit_row = engine.conn.execute(
+            "SELECT fact_id, obj_id, obj_kind, obj_literal_lex, obj_datatype FROM facts WHERE obj_kind = 'literal'"
+        ).fetchone()
+        assert lit_row is not None
+        assert lit_row[1] is None
+        assert str(lit_row[2]) == "literal"
+        assert str(lit_row[3]) == "1912-06-23"
+        assert str(lit_row[4]) == "xsd:date"
+        src_cnt = engine.conn.execute(
+            "SELECT COUNT(*) FROM fact_sources WHERE fact_id = ?", (str(lit_row[0]),)
+        ).fetchone()[0]
+        assert int(src_cnt) == 1
+
+        # 3. Directed skos:broader edge exists from cryptanalysis -> mathematics
+        broader_cnt = engine.conn.execute(
+            "SELECT COUNT(*) FROM edges WHERE kind = 'skos:broader'"
+        ).fetchone()[0]
+        assert int(broader_cnt) == 1
+
+        # 4. Graph conforms to SHACL
+        lint = engine.lint_graph(as_turtle=True)
+        assert lint["conforms"] is True, lint["results"]
+        assert 'rdf:object "1912-06-23"^^<xsd:date>' in lint["turtle"]
+        assert "skos:broader yaw:entity-" in lint["turtle"]
+
+        # 5. Retrieving for the literal fact seeds the subject + fact_sources chunk and retrieves doc_turing
+        hits, kept_facts = engine.retrieve_with_seeds("When was Alan Turing born on 1912-06-23?", top_k=2)
+        assert len(hits) >= 1
+        assert "1912-06-23" in hits[0][2]
+        assert any(o == "1912-06-23" for _, _, o in kept_facts)
+    finally:
+        engine.close()
+
+

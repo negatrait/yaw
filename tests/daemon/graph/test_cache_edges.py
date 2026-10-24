@@ -5,8 +5,12 @@ import zlib
 
 import pytest
 
-from yaw.daemon.graph.candidate_cache import CandidatePayloadCodec, CandidateStageCache
-from yaw.daemon.graph.storage import CandidateCacheStore, open_managed_yaw_db
+from yaw.daemon.graph.storage import (
+    CandidateCacheStore,
+    CandidatePayloadCodec,
+    CandidateStageCache,
+    open_managed_yaw_db,
+)
 
 
 def test_payload_codec_preserves_legacy_snapshots_and_short_source_literals():

@@ -13,19 +13,14 @@ from dspy.utils.dummies import DummyLM as NativeDummyLM
 
 from yaw.core import load_config
 from yaw.daemon.graph.inference.parsers import (
+    coerce_generated_facts,
     compute_mdhash_id,
     extract_named_entities,
     extract_triples,
     filter_invalid_triples,
-    filter_reranked_facts,
+    match_facts_to_candidate_indices,
     repair_truncated_json,
     text_processing,
-)
-from yaw.daemon.graph.inference.templates import (
-    render_fact_filter_messages,
-    render_ner_messages,
-    render_rag_qa_messages,
-    render_triple_messages,
 )
 
 
@@ -59,76 +54,6 @@ class RecallInputs(TypedDict):
 
 
 class PromptsAndParsersParityTests(unittest.TestCase):
-    def test_ner_messages_byte_for_byte_parity(self):
-        """Verify render_ner_messages produces the canonical 4-turn NER chat message structure."""
-        test_passages = [
-            "Alan Turing was an English mathematician and computer scientist.",
-            "Radio City is an FM radio station in India.\nIt operates in English and Hindi.",
-            "Special characters: 'quotes', \"double quotes\", $dollar signs, and \\backslashes.",
-        ]
-        for passage in test_passages:
-            our_msgs = render_ner_messages(passage)
-            self.assertEqual(len(our_msgs), 4)
-            self.assertEqual([m["role"] for m in our_msgs], ["system", "user", "assistant", "user"])
-            self.assertEqual(our_msgs[-1]["content"], passage)
-
-    def test_triple_messages_byte_for_byte_parity(self):
-        """Verify render_triple_messages produces the canonical 4-turn OpenIE triple extraction structure."""
-        test_cases = [
-            (
-                "Alan Turing was born in Maida Vale, London.",
-                ["Alan Turing", "Maida Vale", "London"],
-            ),
-            (
-                "DeepMind is based in London and was acquired by Google in 2014.",
-                ["DeepMind", "London", "Google", "2014"],
-            ),
-        ]
-        for passage, entities in test_cases:
-            named_entity_json = json.dumps({"named_entities": entities})
-            our_msgs = render_triple_messages(passage, entities)
-            self.assertEqual(len(our_msgs), 4)
-            self.assertEqual([m["role"] for m in our_msgs], ["system", "user", "assistant", "user"])
-            self.assertIn(passage, our_msgs[-1]["content"])
-            self.assertIn(named_entity_json, our_msgs[-1]["content"])
-
-    def test_rag_qa_messages_byte_for_byte_parity(self):
-        """Verify render_rag_qa_messages produces the canonical 4-turn MuSiQue QA message structure."""
-        test_prompts = [
-            (
-                "Wikipedia Title: Southampton\nSouthampton is a port city.\n\n"
-                "Question: Where is Southampton located?\nThought: "
-            ),
-            (
-                "Wikipedia Title: Neville A. Stanton\nNeville Stanton works at University of Southampton.\n\n"
-                "Question: Who employs Neville Stanton?\nThought: "
-            ),
-        ]
-        for prompt_user in test_prompts:
-            our_msgs = render_rag_qa_messages(prompt_user)
-            self.assertEqual(len(our_msgs), 4)
-            self.assertEqual(
-                [m["role"] for m in our_msgs],
-                ["system", "user", "assistant", "user"],
-            )
-            self.assertEqual(our_msgs[-1]["content"], prompt_user)
-
-    def test_fact_filter_messages_byte_for_byte_parity(self):
-        """Verify render_fact_filter_messages produces the canonical 10-demo fact filter structure."""
-        candidate_facts = [
-            ("apple", "founded in", "california"),
-            ("apple", "created", "iphone"),
-            ("steve jobs", "co-founded", "apple"),
-        ]
-        query = "Where was Apple founded?"
-
-        fact_before_filter = {"fact": [list(item) for item in candidate_facts]}
-        our_messages = render_fact_filter_messages(query, candidate_facts)
-        self.assertEqual(our_messages[0]["role"], "system")
-        self.assertEqual(our_messages[-1]["role"], "user")
-        self.assertIn(query, our_messages[-1]["content"])
-        self.assertIn(json.dumps(fact_before_filter), our_messages[-1]["content"])
-
     def test_compute_mdhash_id_parity(self):
         """Verify compute_mdhash_id matches MD5 hex digest with prefix."""
         test_strings = [
@@ -213,8 +138,8 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             ),
         )
 
-    def test_filter_reranked_facts_parity(self):
-        """Verify filter_reranked_facts selects matching candidate indices."""
+    def test_match_facts_to_candidate_indices_parity(self):
+        """Verify coerce_generated_facts and match_facts_to_candidate_indices select matching candidate indices."""
         candidates = [
             ("imperial river", "is located in", "florida"),
             ("imperial river", "is a river in", "united states"),
@@ -230,9 +155,10 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             "[[ ## completed ## ]]"
         )
 
-        matched_indices = filter_reranked_facts(candidates, llm_response)
+        generated = coerce_generated_facts(llm_response)
+        matched_indices = match_facts_to_candidate_indices(candidates, generated)
         self.assertEqual(matched_indices, [0, 2])
-        self.assertEqual(filter_reranked_facts(candidates, llm_response, max_facts=1), [0])
+        self.assertEqual(match_facts_to_candidate_indices(candidates, generated, max_facts=1), [0])
 
     def test_repair_truncated_json_handles_openie_boundaries(self):
         """Verify repair_truncated_json fixes max_tokens truncations without losing valid elements."""
@@ -569,7 +495,7 @@ tools."""
         )
 
     def test_sizecoding_gbnf_caps_and_gepa_pareto_metric(self):
-        """Verify sizecoding GBNF caps on forward() and compute_sizecoding_pareto_score for dspy.GEPA."""
+        """Verify sizecoding GBNF caps on forward() and compute_task_quality_score for dspy.GEPA."""
         import dspy
         from dspy.teleprompt.gepa.gepa_utils import _extract_score_and_objective_scores
 
@@ -577,8 +503,8 @@ tools."""
             build_dspy_ner_grammar,
             build_dspy_qa_grammar,
             build_dspy_triples_grammar,
-            compute_sizecoding_pareto_score,
         )
+        from yaw.daemon.graph.inference.parsers import compute_task_quality_score
         from yaw.daemon.graph.inference.program import HippoRAGProgram
 
         program = HippoRAGProgram(
@@ -630,7 +556,7 @@ tools."""
         )
 
         # 1. Task quality has no reference gate or cost denominator.
-        violated = compute_sizecoding_pareto_score(
+        violated = compute_task_quality_score(
             0.60,
             tokens=20,
             pred_name="triples",
@@ -638,18 +564,18 @@ tools."""
         )
         self.assertGreater(violated.score, 0.0)
         self.assertAlmostEqual(violated.score, 0.60)
-        self.assertIn("Task quality geometric mean", violated.feedback)
+        self.assertIn("Task quality arithmetic mean", violated.feedback)
 
         # 2. Identical quality receives the same score at any token count.
-        bloated = compute_sizecoding_pareto_score(
+        bloated = compute_task_quality_score(
             0.80,
             tokens=400,
         )
-        sizecoded = compute_sizecoding_pareto_score(
+        sizecoded = compute_task_quality_score(
             0.80,
             tokens=80,
         )
-        higher_recall_same_tokens = compute_sizecoding_pareto_score(
+        higher_recall_same_tokens = compute_task_quality_score(
             0.80,
             tokens=20,
         )
@@ -672,37 +598,39 @@ tools."""
 
         # F1 improvements change quality; token count has no effect.
         base_q: RecallInputs = dict(recall_at_1=0.5, recall_at_2=0.7, recall_at_10=0.95, recall_at_20=1.0, em=0.05)
-        f1_gain = compute_sizecoding_pareto_score(0.87, f1=0.45, tokens=22_000, **base_q)
-        f1_base = compute_sizecoding_pareto_score(0.87, f1=0.35, tokens=22_000, **base_q)
-        half_tokens = compute_sizecoding_pareto_score(0.87, f1=0.35, tokens=11_000, **base_q)
+        f1_gain = compute_task_quality_score(0.87, f1=0.45, tokens=22_000, **base_q)
+        f1_base = compute_task_quality_score(0.87, f1=0.35, tokens=22_000, **base_q)
+        half_tokens = compute_task_quality_score(0.87, f1=0.35, tokens=11_000, **base_q)
         self.assertGreater(f1_gain.score / f1_base.score, half_tokens.score / f1_base.score)
         self.assertAlmostEqual(obj_scores["recall_at_5"], 0.80)
         self.assertNotIn("shacl_conforms", obj_scores)
         self.assertEqual(half_tokens.score, f1_base.score)
 
-        # 3. A true geometric mean preserves zero; individual objectives still improve.
-        em_zero_low_recall = compute_sizecoding_pareto_score(
+        # 3. Unweighted arithmetic mean avoids zero-cliff when EM=0 and F1=0; retrieval gains increase score.
+        em_zero_low_recall = compute_task_quality_score(
             0.50,
             recall_at_1=0.0,
             recall_at_2=0.50,
             recall_at_10=0.50,
             recall_at_20=1.0,
             em=0.0,
-            f1=0.40,
+            f1=0.0,
             tokens=100,
         )
-        em_zero_high_recall = compute_sizecoding_pareto_score(
+        em_zero_high_recall = compute_task_quality_score(
             1.0,
             recall_at_1=0.50,
             recall_at_2=1.0,
             recall_at_10=1.0,
             recall_at_20=1.0,
             em=0.0,
-            f1=0.40,
+            f1=0.0,
             tokens=100,
         )
-        self.assertEqual(em_zero_low_recall.score, 0.0)
-        self.assertEqual(em_zero_high_recall.score, 0.0)
+        self.assertGreater(em_zero_low_recall.score, 0.0)
+        self.assertAlmostEqual(em_zero_low_recall.score, (0.0 + 0.50 + 0.50 + 0.50 + 1.0 + 0.0 + 0.0) / 7)
+        self.assertAlmostEqual(em_zero_high_recall.score, (0.50 + 1.0 + 1.0 + 1.0 + 1.0 + 0.0 + 0.0) / 7)
+        self.assertGreater(em_zero_high_recall.score, em_zero_low_recall.score)
         self.assertGreater(
             em_zero_high_recall.objective_scores["recall_at_5"],
             em_zero_low_recall.objective_scores["recall_at_5"],
@@ -781,7 +709,7 @@ tools."""
         self.assertEqual(direct_lm.history, [])
 
     def test_leaf_modularization_and_inference_facade_integrity(self):
-        """Verify program, grammars, and prompts are cleanly modularized and accessible via facade."""
+        """Verify program, grammars, parsers, and prompts are cleanly modularized and accessible via facade."""
         import yaw.daemon.graph.inference.prompts as prompts_module
         from yaw.daemon.graph.inference import (
             HippoRAGProgram as FacadeHippoRAGProgram,
@@ -790,24 +718,24 @@ tools."""
             build_dspy_ner_grammar as FacadeBuildNer,
         )
         from yaw.daemon.graph.inference import (
-            compute_sizecoding_pareto_score as FacadePareto,
+            compute_task_quality_score as FacadeTaskQuality,
         )
         from yaw.daemon.graph.inference.grammars import (
             build_dspy_ner_grammar as GrammarBuildNer,
         )
-        from yaw.daemon.graph.inference.grammars import (
-            compute_sizecoding_pareto_score as GrammarPareto,
+        from yaw.daemon.graph.inference.parsers import (
+            compute_task_quality_score as ParserTaskQuality,
         )
         from yaw.daemon.graph.inference.program import HippoRAGProgram as ProgramHippoRAGProgram
 
         self.assertIs(ProgramHippoRAGProgram, FacadeHippoRAGProgram)
         self.assertIs(GrammarBuildNer, FacadeBuildNer)
-        self.assertIs(GrammarPareto, FacadePareto)
+        self.assertIs(ParserTaskQuality, FacadeTaskQuality)
 
-        # Comfort cushions off: prompts.py does NOT re-export program or grammars
+        # Comfort cushions off: prompts.py does NOT re-export program, grammars, or parsers
         self.assertFalse(hasattr(prompts_module, "HippoRAGProgram"))
         self.assertFalse(hasattr(prompts_module, "build_dspy_ner_grammar"))
-        self.assertFalse(hasattr(prompts_module, "compute_sizecoding_pareto_score"))
+        self.assertFalse(hasattr(prompts_module, "compute_task_quality_score"))
 
     def test_instruction_proposal_gbnf_grammar_and_reflection_lm_contract(self):
         """TDD Contract: instruction proposal GBNF grammar and reflection RLM temperatures."""
@@ -1138,7 +1066,7 @@ repair, and Pareto penalty."""
             HippoRAGProgram,
             build_dspy_missing_entity_defs_grammar,
             build_dspy_triples_grammar,
-            compute_sizecoding_pareto_score,
+            compute_task_quality_score,
         )
         from yaw.daemon.graph.inference.parsers import extract_structured_triples
 
@@ -1377,8 +1305,8 @@ repair, and Pareto penalty."""
         )
 
         # 4. Repairs are diagnostic and do not penalize task quality.
-        clean_pareto = compute_sizecoding_pareto_score(0.80, tokens=100)
-        repair_pareto = compute_sizecoding_pareto_score(
+        clean_pareto = compute_task_quality_score(0.80, tokens=100)
+        repair_pareto = compute_task_quality_score(
             0.80,
             tokens=100,
             missing_entity_defs_count=2,
@@ -1678,28 +1606,15 @@ repair, and Pareto penalty."""
         import yaw.daemon.graph.inference as inf_pkg
         from yaw.daemon.graph.inference import (
             HippoRAGProgram,
-            YawAssertionError,
             is_abstaining_answer,
             validate_stage_invariants,
-            wrap_stage_with_refine,
-            yaw_assert,
-            yaw_suggest,
         )
 
         for sym in (
-            "YawAssertionError",
-            "yaw_assert",
-            "yaw_suggest",
             "validate_stage_invariants",
-            "wrap_stage_with_refine",
             "is_abstaining_answer",
         ):
             self.assertIn(sym, inf_pkg.__all__)
-
-        with self.assertRaises(YawAssertionError):
-            yaw_assert(False, "closed-world violation")
-        self.assertFalse(yaw_suggest(False, "soft suggestion"))
-        self.assertTrue(yaw_suggest(True, "ok"))
 
         self.assertTrue(is_abstaining_answer("I don't know"))
         self.assertTrue(is_abstaining_answer("Not enough information provided in the context."))
@@ -1976,7 +1891,7 @@ repair, and Pareto penalty."""
         self.assertLess(prop_leak, 1.0)
         self.assertIn("named_entities", prop_leak_fb)
 
-        # Verify wrap_stage_with_refine and feedback-guided _invoke_stage retry
+        # Verify feedback-guided _invoke_stage retry
         retry_lm = CapabilityDummyLM(
             [
                 {"named_entities": [["Ada Lovelace", "Ada Lovelace"]]},
@@ -1989,37 +1904,14 @@ repair, and Pareto penalty."""
         self.assertEqual(prog.telemetry[-1].get("invariant_retries"), 1)
         self.assertEqual(prog.telemetry[-1].get("invariant_score"), 1.0)
 
-        refined_mod = wrap_stage_with_refine(prog.ner, "ner", N=2, threshold=1.0, use_refine=False)
-        self.assertIsInstance(refined_mod, dspy.BestOfN)
-
-    def test_sprint2_pareto_program_ensemble_and_react_v2_fallback(self) -> None:
+    def test_sprint2_textbook_dspy_ensemble_and_react_v2_fallback(self) -> None:
         import anyio
+        import dspy
 
-        import yaw.daemon.graph.inference as inf_pkg
-        from yaw.daemon.graph.inference import (
-            HippoRAGProgram,
-            ParetoProgramEnsemble,
-        )
-
-        self.assertIn("ParetoProgramEnsemble", inf_pkg.__all__)
+        from yaw.daemon.graph.inference import HippoRAGProgram
 
         lm1 = CapabilityDummyLM(
             [
-                {"named_entities": [["Erik Hort", "American soccer player"]]},
-                {
-                    "triples": [
-                        {
-                            "sub": "Erik Hort",
-                            "pred": "born in",
-                            "obj": ["Montebello", "Village in Rockland County, New York"],
-                            "def": "Erik Hort was born in Montebello.",
-                        }
-                    ]
-                },
-                {
-                    "reasoning": "Erik Hort was born in Montebello, Rockland County.",
-                    "answer": "Rockland County",
-                },
                 {
                     "reasoning": "Erik Hort was born in Montebello, Rockland County.",
                     "answer": "Rockland County",
@@ -2028,79 +1920,21 @@ repair, and Pareto penalty."""
         )
         lm2 = CapabilityDummyLM(
             [
-                {
-                    "named_entities": [
-                        ["Erik Hort", "American professional soccer defender born in Montebello"],
-                        ["Rockland County", "County in the state of New York"],
-                    ]
-                },
-                {
-                    "triples": [
-                        {
-                            "sub": "Erik Hort",
-                            "pred": "born in",
-                            "obj": ["Montebello", "Village in Rockland County, New York"],
-                            "def": "Erik Hort was born in Montebello, New York.",
-                        },
-                        {
-                            "sub": "Montebello",
-                            "pred": "located in",
-                            "obj": "Rockland County",
-                            "def": "Montebello is located in Rockland County.",
-                        },
-                    ]
-                },
-                {"reasoning": "Not sure.", "answer": "I don't know"},
                 {"reasoning": "Montebello is in Rockland County.", "answer": "Rockland County"},
             ]
         )
 
-        cand1 = HippoRAGProgram(orchestrator_lm=lm1, rlm_sub_lm=lm1)
-        cand2 = HippoRAGProgram(orchestrator_lm=lm2, rlm_sub_lm=lm2)
-        ensemble = ParetoProgramEnsemble([cand1, cand2])
-        self.assertTrue(getattr(ensemble, "_compiled", False))
+        prog1 = HippoRAGProgram(orchestrator_lm=lm1, rlm_sub_lm=lm1)
+        prog2 = HippoRAGProgram(orchestrator_lm=lm2, rlm_sub_lm=lm2)
+        ensemble = dspy.Ensemble(reduce_fn=dspy.majority).compile([prog1, prog2])
 
-        openie_rec = ensemble.extract_openie(
-            "chunk-ens",
-            "Erik Hort was born in Montebello, a village located in Rockland County.",
-        )
-        self.assertIn("Erik Hort", openie_rec.entities)
-        self.assertIn("Montebello", openie_rec.entities)
-        self.assertIn("Rockland County", openie_rec.entities)
-        # Richest non-tautological definition preserved for Erik Hort
-        def_map = dict(openie_rec.entity_definitions)
-        self.assertIn("defender", def_map["Erik Hort"])
-        # Shared triple ranked first
-        self.assertEqual(openie_rec.triples[0], ("Erik Hort", "born in", "Montebello"))
-
-        # QA ensemble selects non-abstaining consensus answer
-        qa_ens_pred = ensemble.answer_question(
-            "Erik Hort was born in Montebello, Rockland County.",
-            "What county is Erik Hort's birthplace a part of?",
+        qa_ens_pred = ensemble(
+            context="Erik Hort was born in Montebello, Rockland County.",
+            question="What county is Erik Hort's birthplace a part of?",
         )
         self.assertEqual(qa_ens_pred.answer, "Rockland County")
-
-        async_qa_pred = anyio.run(
-            lambda: ensemble.aanswer_question(
-                "Erik Hort was born in Montebello, Rockland County.",
-                "What county is Erik Hort's birthplace a part of?",
-            )
-        )
-        self.assertEqual(async_qa_pred.answer, "Rockland County")
-
-        # Verify Pareto frontier persistence in HippoRAGProgram.dump_state / load_state without polluting
-        # named_predictors
-        cand1.pareto_frontier_states = [cand1.dump_state(), cand2.dump_state()]
-        cand1.pareto_ensemble = ensemble
-        self.assertEqual(len(cand1.named_predictors()), 10)
-        dumped_with_frontier = cand1.dump_state()
-        self.assertEqual(len(dumped_with_frontier["yaw_surface"]["pareto_frontier_states"]), 2)
-
-        restored_prog = HippoRAGProgram(orchestrator_lm=lm1, rlm_sub_lm=lm1)
-        restored_prog.load_state(dumped_with_frontier)
-        self.assertEqual(len(restored_prog.pareto_frontier_states), 2)
-        self.assertIsInstance(restored_prog.pareto_ensemble, ParetoProgramEnsemble)
-        self.assertEqual(len(restored_prog.named_predictors()), 10)
+        self.assertEqual(len(prog1.named_predictors()), 10)
+        self.assertEqual(len(prog2.named_predictors()), 10)
 
         # Verify dspy.ReActV2 multi-hop fallback when single-shot QA abstains or retrieval confidence < 0.15
         react_lm = CapabilityDummyLM(
@@ -2158,6 +1992,425 @@ repair, and Pareto penalty."""
         )
         self.assertEqual(async_res.answer, "Rockland County")
 
+    def test_step03_decomposed_modules_unified_metrics_and_embedding_formatters(self) -> None:
+        from yaw.core.types import ChunkPointer
+        from yaw.daemon.graph.inference import (
+            VALID_SHACL_ACTIONS,
+            VALID_SYNONYM_RELATIONS,
+            VALUE_BEARING_SHACL_ACTIONS,
+            DSPyEmbeddingAdapter,
+            HippoRAGProgram,
+            compute_answer_passage_match,
+            compute_retrieval_recalls,
+            doc_matches_gold,
+            validate_stage_invariants,
+        )
+
+        # 1. Verify all VALID_SHACL_ACTIONS from parsers.py pass invariants
+        self.assertEqual(len(VALID_SHACL_ACTIONS), 11)
+        self.assertTrue(
+            {
+                "set_definition",
+                "rewrite_definition",
+                "set_pref_label",
+                "demote_to_alt_label",
+                "merge_altLabel",
+                "merge_hiddenLabel",
+                "add_different_from",
+                "assert_differentFrom",
+                "assert_related",
+                "delete_dangling",
+                "delete_invalid_fact",
+            }
+            == set(VALID_SHACL_ACTIONS)
+        )
+        self.assertEqual(len(VALID_SYNONYM_RELATIONS), 4)
+        self.assertEqual(
+            VALUE_BEARING_SHACL_ACTIONS,
+            {"set_definition", "rewrite_definition", "set_pref_label"},
+        )
+        violations_in = {"violations": [{"focus_node": "entity-a"}, {"focus_node": "entity-b"}]}
+        for action in VALID_SHACL_ACTIONS:
+            val = "Non-empty value" if action in VALUE_BEARING_SHACL_ACTIONS else "entity-b"
+            if action in ("delete_dangling", "delete_invalid_fact"):
+                val = ""
+            score, fb = validate_stage_invariants(
+                "shacl_repair",
+                violations_in,
+                dspy.Prediction(repairs=[{"focus_node": "entity-a", "action": action, "value": val}]),
+            )
+            self.assertEqual(score, 1.0, msg=f"Action {action} failed invariants: {fb}")
+
+        # Value-bearing action with empty value should still fail
+        bad_score, bad_fb = validate_stage_invariants(
+            "shacl_repair",
+            violations_in,
+            dspy.Prediction(repairs=[{"focus_node": "entity-a", "action": "set_definition", "value": ""}]),
+        )
+        self.assertLess(bad_score, 1.0)
+        self.assertIn("empty value", bad_fb)
+
+        # 2. Verify doc_matches_gold, compute_retrieval_recalls, and compute_answer_passage_match
+        from yaw.daemon.graph.inference import compute_mdhash_id, parse_shacl_repairs
+
+        self.assertFalse(doc_matches_gold("", "Erik Hort was born in Montebello"))
+        self.assertFalse(doc_matches_gold("Erik Hort was born in Montebello", ""))
+        self.assertTrue(doc_matches_gold("chunk-abc123", "chunk-abc123"))
+        self.assertFalse(doc_matches_gold("chunk-abc123", "chunk-def456"))
+        self.assertFalse(doc_matches_gold("chunk-abc", "chunk-abcdef"))
+        gold_sample = "Erik Hort\nErik Hort was born in Montebello, New York."
+        gold_cid = compute_mdhash_id(gold_sample, prefix="chunk-")
+        self.assertTrue(doc_matches_gold(gold_cid, gold_sample))
+        self.assertTrue(doc_matches_gold(gold_sample, gold_cid))
+        self.assertTrue(
+            doc_matches_gold(
+                "Title: Erik Hort\nErik Hort was born in Montebello, New York.",
+                "Erik Hort was born in Montebello, New York.",
+            )
+        )
+        # Multi-segment omitted lines with Wikipedia Title / Title prefix and body-only gold doc
+        omitted_passage = (
+            "Wikipedia Title: Ada Lovelace\n"
+            "Ada Lovelace was an English mathematician and writer.\n"
+            "[... lines 5-10 omitted ...]\n"
+            "She worked on Charles Babbage's mechanical computer, the Analytical Engine.\n"
+            "[... AST section cropped due to context window limitations ...]"
+        )
+        full_gold_with_title = (
+            "Ada Lovelace\n"
+            "Ada Lovelace was an English mathematician and writer. "
+            "In 1842, she translated Luigi Menabrea's article on the engine. "
+            "She worked on Charles Babbage's mechanical computer, the Analytical Engine."
+        )
+        full_gold_body_only = (
+            "Ada Lovelace was an English mathematician and writer. "
+            "In 1842, she translated Luigi Menabrea's article on the engine. "
+            "She worked on Charles Babbage's mechanical computer, the Analytical Engine."
+        )
+        self.assertTrue(doc_matches_gold(omitted_passage, full_gold_with_title))
+        self.assertTrue(doc_matches_gold(omitted_passage, full_gold_body_only))
+
+        parsed_target_node = parse_shacl_repairs(
+            [{"focus_node": "entity-a", "action": "merge_altLabel", "target_node": "entity-b"}]
+        )
+        self.assertEqual(
+            parsed_target_node,
+            [{"focus_node": "entity-a", "action": "merge_altLabel", "value": "entity-b"}],
+        )
+
+        recalls_empty = compute_retrieval_recalls([], ["doc1"])
+        self.assertEqual(recalls_empty[5], 0.0)
+
+        recalls = compute_retrieval_recalls(
+            ["chunk-1", "chunk-3", "chunk-missing"],
+            ["chunk-1", "chunk-2", "chunk-3"],
+            k_list=(1, 2, 5),
+        )
+        self.assertAlmostEqual(recalls[1], 1 / 3)
+        self.assertAlmostEqual(recalls[2], 1 / 3)
+        self.assertAlmostEqual(recalls[5], 2 / 3)
+
+        # Bare string arguments must not iterate character-by-character
+        recalls_str = compute_retrieval_recalls("chunk-1", "chunk-1", k_list=(1,))
+        self.assertEqual(recalls_str[1], 1.0)
+        self.assertFalse(compute_answer_passage_match("Westchester", "Montebello is in Rockland County."))
+        self.assertTrue(compute_answer_passage_match("Rockland County", "Montebello is in Rockland County."))
+
+        self.assertFalse(compute_answer_passage_match([], "Montebello is in Rockland County."))
+        self.assertFalse(compute_answer_passage_match(["Rockland County"], ""))
+        self.assertTrue(
+            compute_answer_passage_match(
+                ["Rockland County"],
+                "Erik Hort was born in Montebello.\n\nMontebello is in Rockland County.",
+            )
+        )
+        self.assertFalse(
+            compute_answer_passage_match(
+                ["Westchester County"],
+                ["Erik Hort was born in Montebello.", "Montebello is in Rockland County."],
+            )
+        )
+
+        # 3. Verify DSPyEmbeddingAdapter formatting helpers
+
+        adapter = DSPyEmbeddingAdapter(
+            embedder=lambda texts, **_kw: [[1.0, 0.0] for _ in texts],
+        )
+        ptr = ChunkPointer(
+            chunk_id="chunk-1",
+            rel_posix_path="doc.md",
+            start_line=1,
+            end_line=2,
+            title="Erik Hort",
+        )
+        self.assertEqual(
+            adapter.format_chunk_for_embedding(ptr, "Born in Montebello."),
+            "Title: Erik Hort\nBorn in Montebello.",
+        )
+        self.assertEqual(
+            adapter.format_entity_for_embedding("Erik Hort", "American soccer player"),
+            "# Erik Hort\nAmerican soccer player",
+        )
+        self.assertEqual(
+            adapter.format_entity_for_embedding("Erik Hort", ""),
+            "Erik Hort",
+        )
+        self.assertEqual(
+            adapter.format_fact_for_embedding(
+                "Erik Hort",
+                "born in",
+                "Montebello",
+                "Erik Hort was born in Montebello.",
+            ),
+            "Erik Hort born in Montebello. Erik Hort was born in Montebello.",
+        )
+        self.assertEqual(
+            adapter.format_fact_for_embedding("Erik Hort", "born in", "Montebello"),
+            "Erik Hort born in Montebello",
+        )
+
+        # 4. Verify HippoRAGProgram.dump_audit_trails bounded vs unbounded & custom telemetry_key
+        import yaw.daemon.graph.inference.program as prog_mod
+
+        self.assertEqual(prog_mod.__all__, ["HippoRAGProgram"])
+        prog = HippoRAGProgram()
+        for i in range(260):
+            prog.telemetry.append({"idx": i})
+            prog.embedding_audit_trail.append({"idx": i})
+            prog.entity_def_audit_trail.append({"idx": i})
+            prog.synonym_audit_trail.append({"idx": i})
+            prog.shacl_audit_trail.append({"idx": i})
+        bounded_trails = prog.dump_audit_trails(bounded=True)
+        self.assertEqual(
+            set(bounded_trails.keys()),
+            {
+                "telemetry",
+                "embedding_audit_trail",
+                "entity_def_audit_trail",
+                "synonym_audit_trail",
+                "shacl_audit_trail",
+            },
+        )
+        self.assertEqual(len(bounded_trails["telemetry"]), 250)
+        self.assertEqual(len(bounded_trails["embedding_audit_trail"]), 250)
+        self.assertEqual(len(bounded_trails["entity_def_audit_trail"]), 250)
+        self.assertEqual(len(bounded_trails["synonym_audit_trail"]), 100)
+        self.assertEqual(len(bounded_trails["shacl_audit_trail"]), 100)
+        aliased_trails = prog.dump_audit_trails(bounded=True, telemetry_key="program_telemetry")
+        self.assertIn("program_telemetry", aliased_trails)
+        self.assertNotIn("telemetry", aliased_trails)
+        unbounded_trails = prog.dump_audit_trails(bounded=False)
+        for key in unbounded_trails:
+            self.assertEqual(len(unbounded_trails[key]), len(getattr(prog, key)))
+
+    def test_step10_pareto_ensemble_and_dual_perspective_contracts(self):
+        """Verify Step 10 contracts: dspy.majority field order, retrieve_only, select_pareto_frontier_programs, and reduce_pareto_predictions."""
+        import copy
+        import tempfile
+        from types import SimpleNamespace
+
+        from yaw.daemon.graph.inference import (
+            HippoRAGProgram,
+            compile_pareto_ensemble,
+            evaluate_program,
+            query_retrieval_fingerprint,
+            reduce_pareto_predictions,
+            select_pareto_frontier_programs,
+        )
+
+        # 1. Verify HippoRAGProgram.forward places 'answer' last & supports retrieve_only=True
+        prog1 = HippoRAGProgram()
+        qa_calls: list[str] = []
+        prog1.set_retrieval_hook(
+            lambda q, _p=None, **_kw: (
+                "Ctx 1",
+                ("Passage A", "Passage B"),
+                (0.9, 0.4),
+                ("chunk-a", "chunk-b"),
+            )
+        )
+        prog1.answer_question = lambda context, question, **_kw: (  # type: ignore[method-assign]
+            qa_calls.append(question) or dspy.Prediction(reasoning="R1", answer="Rockland County, New York")
+        )
+
+        ret_only_pred = prog1(question="Where is Montebello?", retrieve_only=True, k=2)
+        self.assertEqual(len(qa_calls), 0)
+        self.assertEqual(ret_only_pred.answer, "")
+        self.assertEqual(ret_only_pred.retrieved_chunk_ids, ("chunk-a", "chunk-b"))
+        self.assertEqual(list(ret_only_pred.keys())[-1], "answer")
+
+        full_pred = prog1(question="Where is Montebello?")
+        self.assertEqual(len(qa_calls), 1)
+        self.assertEqual(list(full_pred.keys())[-1], "answer")
+        self.assertEqual(full_pred.answer, "Rockland County, New York")
+
+        # 2. Verify bare dspy.Ensemble(reduce_fn=dspy.majority) works without AttributeError on tuple chunk IDs
+        prog2 = copy.deepcopy(prog1)
+        prog2.qa.predict.signature = prog2.qa.predict.signature.with_instructions("QA variant 2")
+        prog2.set_retrieval_hook(
+            lambda q, _p=None, **_kw: (
+                "Ctx 2",
+                ("Passage B", "Passage C"),
+                (0.95, 0.8),
+                ("chunk-b", "chunk-c"),
+            )
+        )
+        prog2.answer_question = lambda context, question, **_kw: dspy.Prediction(  # type: ignore[method-assign]
+            reasoning="R2", answer="Rockland County"
+        )
+
+        prog3 = copy.deepcopy(prog1)
+        prog3.qa.predict.signature = prog3.qa.predict.signature.with_instructions("QA variant 3")
+        prog3.set_retrieval_hook(
+            lambda q, _p=None, **_kw: (
+                "Ctx 3",
+                ("Passage B", "Passage A"),
+                (0.85, 0.7),
+                ("chunk-b", "chunk-a"),
+            )
+        )
+        prog3.answer_question = lambda context, question, **_kw: dspy.Prediction(  # type: ignore[method-assign]
+            reasoning="R3", answer="Rockland County"
+        )
+
+        maj_ens = dspy.Ensemble(reduce_fn=dspy.majority).compile([prog1, prog2, prog3])
+        maj_out = maj_ens(question="Where is Montebello?")
+        self.assertEqual(maj_out.answer, "Rockland County")
+
+        # 3. Verify reduce_pareto_predictions fuses recall@N (RRF + normalized PPR) & resolves 1-1-1 EM tie via token-F1 medoid
+        prog3_distinct = copy.deepcopy(prog3)
+        prog3_distinct.answer_question = lambda context, question, **_kw: dspy.Prediction(  # type: ignore[method-assign]
+            reasoning="R3-distinct", answer="Westchester County"
+        )
+        pareto_ens = dspy.Ensemble(reduce_fn=reduce_pareto_predictions).compile([prog1, prog2, prog3_distinct])
+        fused_out = pareto_ens(question="Where is Montebello?")
+        # chunk-b is ranked #2 in prog1 and #1 in prog2 and #1 in prog3 -> must rank #1 in fused output
+        self.assertEqual(fused_out.retrieved_chunk_ids[0], "chunk-b")
+        self.assertEqual(set(fused_out.retrieved_chunk_ids), {"chunk-a", "chunk-b", "chunk-c"})
+        # In 1-1-1 EM tie ("Rockland County, New York", "Rockland County", "Westchester County"),
+        # "Rockland County" has highest mean token-F1 overlap with the other two answers
+        self.assertIn("Rockland County", fused_out.answer)
+        self.assertEqual(list(fused_out.keys())[-1], "answer")
+
+        # 4. Verify select_pareto_frontier_programs excludes dominated candidates & covers both recall@N and QA(F1, EM)
+        cand0 = copy.deepcopy(prog1)
+        cand1 = copy.deepcopy(prog1)
+        cand1.query_intent.signature = cand1.query_intent.signature.with_instructions("Intent 1 (Retrieval leader)")
+        cand2 = copy.deepcopy(prog1)
+        cand2.triple_filter.signature = cand2.triple_filter.signature.with_instructions("Filter 2 (Retrieval #2)")
+        cand3 = copy.deepcopy(prog1)
+        cand3.qa.predict.signature = cand3.qa.predict.signature.with_instructions("QA 3 (QA F1/EM leader)")
+        cand4_dominated = copy.deepcopy(prog1)
+        cand4_dominated.qa.predict.signature = cand4_dominated.qa.predict.signature.with_instructions("Dominated")
+
+        self.assertNotEqual(query_retrieval_fingerprint(cand0), query_retrieval_fingerprint(cand1))
+
+        # Dominated-only case: cand0 dominates cand4_dominated -> returns [cand0] (length 1)
+        cand0.detailed_results = SimpleNamespace(
+            candidates=[cand0, cand4_dominated],
+            val_aggregate_scores=[0.80, 0.50],
+            val_aggregate_subscores=[
+                {"recall_at_1": 0.8, "recall_at_2": 0.9, "recall_at_5": 1.0, "em": 0.7, "f1": 0.8},
+                {"recall_at_1": 0.5, "recall_at_2": 0.6, "recall_at_5": 0.7, "em": 0.4, "f1": 0.5},
+            ],
+            best_idx=0,
+        )
+        only_best = select_pareto_frontier_programs(cand0, max_programs=3)
+        self.assertEqual(len(only_best), 1)
+        self.assertIs(only_best[0], cand0)
+
+        # Multi-specialist frontier where cand1 and cand2 have higher scalar scores (due to 5 retrieval metrics)
+        # while cand3 is the non-dominated QA (F1, EM) specialist
+        cand0.detailed_results = SimpleNamespace(
+            candidates=[cand0, cand1, cand2, cand3, cand4_dominated],
+            val_aggregate_scores=[0.82, 0.81, 0.80, 0.72, 0.40],
+            val_aggregate_subscores=[
+                {
+                    "recall_at_1": 0.80,
+                    "recall_at_2": 0.85,
+                    "recall_at_5": 0.90,
+                    "recall_at_10": 0.92,
+                    "recall_at_20": 0.95,
+                    "em": 0.65,
+                    "f1": 0.67,
+                },
+                {
+                    "recall_at_1": 0.90,
+                    "recall_at_2": 0.95,
+                    "recall_at_5": 0.98,
+                    "recall_at_10": 0.99,
+                    "recall_at_20": 1.00,
+                    "em": 0.40,
+                    "f1": 0.45,
+                },
+                {
+                    "recall_at_1": 0.88,
+                    "recall_at_2": 0.92,
+                    "recall_at_5": 0.96,
+                    "recall_at_10": 0.97,
+                    "recall_at_20": 1.00,
+                    "em": 0.42,
+                    "f1": 0.45,
+                },
+                {
+                    "recall_at_1": 0.60,
+                    "recall_at_2": 0.65,
+                    "recall_at_5": 0.70,
+                    "recall_at_10": 0.75,
+                    "recall_at_20": 0.80,
+                    "em": 0.75,
+                    "f1": 0.85,
+                },
+                {
+                    "recall_at_1": 0.40,
+                    "recall_at_2": 0.40,
+                    "recall_at_5": 0.40,
+                    "recall_at_10": 0.40,
+                    "recall_at_20": 0.40,
+                    "em": 0.40,
+                    "f1": 0.40,
+                },
+            ],
+            best_idx=0,
+        )
+        selected = select_pareto_frontier_programs(cand0, max_programs=3)
+        self.assertEqual(len(selected), 3)
+        self.assertIs(selected[0], cand0)  # Slot 0: best_candidate
+        self.assertIs(selected[1], cand1)  # Slot 1: recall@N Pareto leader
+        self.assertIs(selected[2], cand3)  # Slot 2: QA (F1, EM) Pareto leader (NOT cand2!)
+
+        # 5. Verify standalone pareto_member_*.json persistence and reload + evaluate_program recall_at_k attachment
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_p = Path(tmpdir)
+            prog_file = tmp_p / "compiled_program.json"
+            telem_dir = tmp_p / "compiled_program_telemetry"
+            telem_dir.mkdir(parents=True, exist_ok=True)
+            cand0.save(str(prog_file), save_program=False)
+            for idx, sib in enumerate(selected[1:], start=1):
+                sib.save(str(telem_dir / f"pareto_member_{idx}.json"), save_program=False)
+
+            fresh_prog = HippoRAGProgram(compiled_path=prog_file)
+            fresh_prog.set_retrieval_hook(prog1._retrieval_hook)
+            fresh_prog.answer_question = prog1.answer_question  # type: ignore[method-assign]
+            reloaded_ens = compile_pareto_ensemble(fresh_prog, program_path=prog_file)
+            self.assertTrue(hasattr(reloaded_ens, "programs"))
+            self.assertEqual(len(reloaded_ens.programs), 3)
+
+            devset = [
+                dspy.Example(
+                    question="Where is Montebello?",
+                    gold_answers=["Rockland County, New York"],
+                    gold_docs=["Passage A"],
+                ).with_inputs("question")
+            ]
+            eval_json = tmp_p / "eval_out.json"
+            evaluate_program(reloaded_ens, devset, save_as_json=eval_json)
+            saved_eval = json.loads(eval_json.read_text(encoding="utf-8"))
+            self.assertEqual(len(saved_eval), 1)
+            self.assertEqual(saved_eval[0]["recall_at_1"], 1.0)
+            self.assertEqual(saved_eval[0]["recall_at_5"], 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()
+

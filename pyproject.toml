@@ -23,8 +23,8 @@ dependencies = [
 [project.scripts]
 yaw = "yaw.daemon.cli:cli_entrypoint"
 watchdog = "scripts.watchdog:main"
-preflight = "yaw.core.preflight:main"
-typecheck = "yaw.core.preflight:typecheck"
+preflight = "scripts.preflight:main"
+typecheck = "scripts.preflight:typecheck"
 
 [dependency-groups]
 dev = [
@@ -41,7 +41,7 @@ package = true
 preview-features = ["content-addressed-cache"]
 
 [tool.setuptools.packages.find]
-include = ["yaw*"]
+include = ["yaw*", "scripts*"]
 
 [tool.ruff]
 fix = true

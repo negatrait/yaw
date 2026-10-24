@@ -11,17 +11,12 @@ from yaw.daemon.graph.inference.parsers import (
     coerce_generated_facts,
     compute_qa_em_f1,
     extract_entity_definitions,
-    extract_entity_nodes,
     extract_structured_triples,
     extract_triples,
     filter_invalid_triples,
-    filter_reranked_facts,
-    flatten_facts,
     match_facts_to_candidate_indices,
-    parse_filter_facts,
     parse_shacl_repairs,
     parse_synonym_decisions,
-    strip_mistral_bracket_prefix,
     text_processing,
 )
 
@@ -187,7 +182,7 @@ def test_plain_triple_parser_rejects_invalid_response_shapes(payload):
     ],
 )
 def test_recognition_memory_accepts_only_three_coordinate_facts(payload, expected):
-    assert parse_filter_facts(payload) == expected
+    assert coerce_generated_facts(payload) == expected
 
 
 @pytest.mark.parametrize("envelope", ["prediction", "dictionary", "list", "json"])
@@ -204,16 +199,15 @@ def test_fact_envelopes_preserve_actual_candidates(envelope):
     assert coerce_generated_facts({"fact": "wrong type"}) == []
 
 
-def test_graph_coordinate_extraction_deduplicates_and_rejects_empty_or_self_edges():
-    triples = [(" A! ", "links to", "B"), ("A", "links to", "B"), ("A", "p", "A"), ("", "p", "B"), ("short",)]
-    nodes = extract_entity_nodes(triples)
-    assert [name for _, name in nodes] == ["a", "b"]
-    facts = flatten_facts(triples)
-    assert len(facts) == 1
-    _, subject_id, predicate, object_id, raw = facts[0]
-    assert (subject_id, object_id) == (nodes[0][0], nodes[1][0])
-    assert predicate == "links to"
-    assert json.loads(raw) == ["a", "links to", "b"]
+def test_entity_definitions_mapping_and_normalize_keys():
+    assert extract_entity_definitions({"Ada Lovelace": "English mathematician", "Engine": None}) == (
+        ("Ada Lovelace", "English mathematician"),
+        ("Engine", ""),
+    )
+    assert extract_entity_definitions(
+        [("Ada Lovelace", ""), ("ada lovelace", "English mathematician")],
+        normalize_keys=True,
+    ) == (("Ada Lovelace", "English mathematician"),)
 
 
 def test_candidate_matching_retains_original_order_indices_with_numpy_string_values():
@@ -223,11 +217,10 @@ def test_candidate_matching_retains_original_order_indices_with_numpy_string_val
     assert match_facts_to_candidate_indices([], [["A", "p", "B"]]) == []
 
 
-def test_empty_answer_metrics_and_legacy_bracket_cleanup():
+def test_empty_answer_metrics_and_triple_filtering():
     assert compute_qa_em_f1("", [""]) == (1.0, 0.0)
     assert compute_qa_em_f1("A", []) == (0.0, 0.0)
     assert compute_qa_em_f1("A B", ["B C"]) == (0.0, pytest.approx(2 / 3))
-    assert strip_mistral_bracket_prefix("]\n\nAnswer") == "Answer"
     assert text_processing(json.loads("12")) == "12"
     assert filter_invalid_triples([{}, ["short"], StructuredTriple("A", pred="p", obj="B")]) == [["A", "p", "B"]]
 
@@ -241,7 +234,7 @@ def test_truncation_repair_preserves_escaped_characters_in_completed_names(name)
 def test_wrong_nested_response_envelopes_and_missing_filter_output_are_not_facts():
     assert extract_structured_triples('{"other":[["A"]], "unfinished') == ()
     assert extract_structured_triples({"triples": [["A", "p", "B"]]})[0].as_tuple() == ("A", "p", "B")
-    assert filter_reranked_facts([("A", "p", "B")], "No structured response") == []
+    assert match_facts_to_candidate_indices([("A", "p", "B")], coerce_generated_facts("No structured response")) == []
 
 
 def test_invalid_synonym_items_cannot_displace_a_later_valid_decision():

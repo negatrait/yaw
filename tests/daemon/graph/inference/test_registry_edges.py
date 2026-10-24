@@ -169,17 +169,13 @@ def test_chat_identity_uses_http_health_and_rejects_unready_backend(registry_ser
 
 
 @pytest.mark.parametrize(
-    ("device", "context", "message"),
-    [("npu", 8192, None), ("gpu", 8192, "requires device"), ("npu", 1024, "requires ctx_size")],
+    ("device", "message"),
+    [("npu", None), ("gpu", "expected device npu")],
 )
-def test_registered_ryzen_profile_checks_device_and_recipe_context(
-    registry_server, monkeypatch, device, context, message
-):
+def test_registered_npu_profile_checks_expected_device(registry_server, monkeypatch, device, message):
     state, base_url = registry_server
-    # Register a native profile to exercise the supported recipe independently
-    # of the currently selected production model pool.
-    name = "test-ryzen-profile"
-    profile = ChatProfile("test-weights", "ryzenai-llm", expected_context=8192)
+    name = "test-flm-npu-profile"
+    profile = ChatProfile("test-weights", "flm", expected_device="npu")
     monkeypatch.setitem(CHAT_MODELS, name, profile)
     entry = {
         "id": name,
@@ -187,7 +183,6 @@ def test_registered_ryzen_profile_checks_device_and_recipe_context(
         "recipe": profile.recipe,
         "backend_health": "ready",
         "device": device,
-        "recipe_options": {"ctx_size": context},
     }
     state["loaded"] = [entry]
     if message:

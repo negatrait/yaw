@@ -9,7 +9,6 @@ import os
 import queue
 import shutil
 import sqlite3
-import tempfile
 import threading
 import time
 import uuid
@@ -30,20 +29,77 @@ from yaw.core import (
     YawConfig,
     YawRuntimeError,
     configure_logging,
+    write_text_atomic,
 )
 from yaw.daemon.graph.engine import YawGraphEngine
 from yaw.daemon.graph.inference import (
     DSPyEmbeddingAdapter,
     HippoRAGProgram,
+    check_benchmark_integrity,
+    compute_qa_em_f1,
+    compute_retrieval_recalls,
     create_dspy_rlm_pair,
+    evaluate_benchmark_gate,
 )
-from yaw.daemon.ingestion import CorpusIngestor, sync_corpus_once
+from yaw.daemon.ingestion import (
+    BENCHMARK_JSON_BLACKLIST,
+    BENCHMARK_JSON_WHITELIST,
+    DATASET_ALIASES,
+    DATASET_REGISTRY,
+    DEFAULT_PARITY_DATASETS,
+    MONKEYPATCHED_HIPPORAG_BASELINES,
+    PAPER_BASELINES,
+    CorpusIngestor,
+    build_benchmark_slice,
+    load_dataset_files,
+    resolve_dataset_name,
+    sync_source_files_for_docs,
+)
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 _PENDING_DELTA_META_KEY = "pending_sync_delta"
 _CONFIG_FP_META_KEY = "config_fingerprint"
+
+if os.name == "nt":
+    import ctypes
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _kernel32.CreateEventW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_wchar_p]
+    _kernel32.CreateEventW.restype = ctypes.c_void_p
+    _kernel32.OpenEventW.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_wchar_p]
+    _kernel32.OpenEventW.restype = ctypes.c_void_p
+    _kernel32.SetEvent.argtypes = [ctypes.c_void_p]
+    _kernel32.SetEvent.restype = ctypes.c_int
+    _kernel32.ResetEvent.argtypes = [ctypes.c_void_p]
+    _kernel32.ResetEvent.restype = ctypes.c_int
+    _kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    _kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+    _kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    _kernel32.CloseHandle.restype = ctypes.c_int
+
+
+def _win32_stop_event_name(lock_path: Path | str) -> str:
+    resolved = str(Path(lock_path).resolve()).replace("\\", "/").lower()
+    digest = hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:16]
+    return f"Local\\yaw-stop-{digest}"
+
+
+def is_file_locked(lock_path: Path | str | None) -> bool:
+    """Return True if `lock_path` exists and is currently held by a FileLock owner."""
+    if lock_path is None:
+        return False
+    lock_p = Path(lock_path)
+    if not lock_p.exists():
+        return False
+    lock = filelock.FileLock(str(lock_p), timeout=0)
+    try:
+        lock.acquire(timeout=0)
+        lock.release()
+        return False
+    except filelock.Timeout:
+        return True
 
 
 @dataclass(slots=True)
@@ -109,8 +165,11 @@ class YawRuntime:
         self._state_lock = threading.Lock()
         self._queue: queue.Queue[_WorkItem | None] = queue.Queue(maxsize=self.config.queue_maxsize)
         self._stop_event = threading.Event()
+        self._has_started = False
         self._worker_thread: threading.Thread | None = None
         self._poller_thread: threading.Thread | None = None
+        self._win32_stop_handle: int | None = None
+        self._win32_waiter_thread: threading.Thread | None = None
 
         self._pending_sync_future: Future[SyncDelta] | None = None
         self._pending_scan_id: str | None = None
@@ -132,17 +191,30 @@ class YawRuntime:
 
     @classmethod
     def signal_local_stop(cls, lock_path: Path) -> bool:
-        """Signal an in-process YawRuntime holding lock_path to stop gracefully."""
+        """Signal an in-process YawRuntime or Windows Named Kernel Event holding lock_path to stop gracefully."""
+        signaled = False
         with cls._active_lock:
             rt = cls._active_instances.get(lock_path.resolve())
         if rt is not None:
             rt.request_stop()
-            return True
-        return False
+            signaled = True
+        if os.name == "nt":
+            event_name = _win32_stop_event_name(lock_path)
+            handle = _kernel32.OpenEventW(0x0002, 0, event_name)
+            if handle:
+                try:
+                    if _kernel32.SetEvent(handle):
+                        signaled = True
+                finally:
+                    _kernel32.CloseHandle(handle)
+        return signaled
 
     def request_stop(self) -> None:
         """Signal the runtime stop event and wake the worker loop."""
         self._stop_event.set()
+        if os.name == "nt" and self._win32_stop_handle:
+            with contextlib.suppress(OSError):
+                _kernel32.SetEvent(self._win32_stop_handle)
         with contextlib.suppress(queue.Full):
             self._queue.put_nowait(None)
 
@@ -228,15 +300,54 @@ class YawRuntime:
         if self.config.status_path is None:
             return
         status_path = Path(self.config.status_path)
-        status_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = status_path.with_suffix(f".json.{os.getpid()}.tmp")
         for _ in range(5):
             try:
-                tmp_path.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
-                tmp_path.replace(status_path)
+                write_text_atomic(status_path, json.dumps(snapshot, indent=2))
                 break
             except OSError:
                 time.sleep(0.01)
+
+    def _start_win32_stop_event(self) -> None:
+        if os.name != "nt" or self.config.lock_path is None:
+            return
+        event_name = _win32_stop_event_name(self.config.lock_path)
+        handle = _kernel32.CreateEventW(None, 1, 0, event_name)
+        if not handle:
+            return
+        _kernel32.ResetEvent(handle)
+        self._win32_stop_handle = int(handle)
+
+        def _wait_kernel_event(ev_handle: int) -> None:
+            res = _kernel32.WaitForSingleObject(ev_handle, 0xFFFFFFFF)
+            if res == 0 and not self._stop_event.is_set():
+                self.request_stop()
+
+        self._win32_waiter_thread = threading.Thread(
+            target=_wait_kernel_event,
+            args=(int(handle),),
+            name="yaw-win32-stop-waiter",
+            daemon=True,
+        )
+        self._win32_waiter_thread.start()
+
+    def _close_win32_stop_event(self) -> None:
+        if os.name != "nt":
+            return
+        handle = self._win32_stop_handle
+        self._win32_stop_handle = None
+        if handle:
+            with contextlib.suppress(OSError):
+                _kernel32.SetEvent(handle)
+        if (
+            self._win32_waiter_thread is not None
+            and self._win32_waiter_thread.is_alive()
+            and self._win32_waiter_thread is not threading.current_thread()
+        ):
+            self._win32_waiter_thread.join(timeout=1.0)
+        self._win32_waiter_thread = None
+        if handle:
+            with contextlib.suppress(OSError):
+                _kernel32.CloseHandle(handle)
 
     def start(self, *, sync_on_start: bool = True) -> None:
         """Acquire exclusive yaw.db.lock, open CocoIndex + YawGraphEngine, and start worker thread."""
@@ -245,7 +356,7 @@ class YawRuntime:
                 return
 
         try:
-            self._file_lock.acquire(timeout=0)
+            self._file_lock.acquire(timeout=0.2)
         except filelock.Timeout as exc:
             raise YawRuntimeError(
                 "BUSY",
@@ -257,9 +368,12 @@ class YawRuntime:
             self._active_instances[self.config.lock_path.resolve()] = self
 
         try:
+            if self._has_started:
+                self._stop_event.clear()
+            self._has_started = True
+            self._start_win32_stop_event()
             if self.config.log_path is not None:
                 configure_logging(self.config.log_path)
-            self._stop_event.clear()
             self._update_state(
                 lifecycle="starting",
                 provider_ready=True,
@@ -275,13 +389,22 @@ class YawRuntime:
                 daemon=True,
             )
             self._worker_thread.start()
-            self._update_state(lifecycle="ready")
 
             has_pending = self.engine is not None and self.engine.get_meta(_PENDING_DELTA_META_KEY) is not None
-            if sync_on_start or has_pending:
-                self.sync_now()
+            if (sync_on_start or has_pending) and not self._stop_event.is_set():
+                try:
+                    self.sync_now()
+                except YawRuntimeError as err:
+                    if err.code != "SHUTTING_DOWN" or not self._stop_event.is_set():
+                        raise
+            elif not self._stop_event.is_set():
+                self._update_state(lifecycle="ready")
 
-            if self.auto_poll and self.config.poll_interval_seconds > 0:
+            if self._stop_event.is_set():
+                self.stop()
+                return
+
+            if self.auto_poll and self.config.poll_interval_seconds > 0 and not self._stop_event.is_set():
                 self._poller_thread = threading.Thread(
                     target=self._poll_loop,
                     name="yaw-runtime-poller",
@@ -289,6 +412,7 @@ class YawRuntime:
                 )
                 self._poller_thread.start()
         except Exception:
+            self._close_win32_stop_event()
             if self.config.lock_path is not None:
                 with self._active_lock:
                     self._active_instances.pop(self.config.lock_path.resolve(), None)
@@ -299,12 +423,14 @@ class YawRuntime:
 
     def stop(self) -> None:
         """Gracefully stop poller and worker threads, close databases, and release yaw.db.lock."""
+        self._stop_event.set()
         if self.config.lock_path is not None:
             with self._active_lock:
                 self._active_instances.pop(self.config.lock_path.resolve(), None)
 
         with self._state_lock:
             if self._status.lifecycle == "stopped":
+                self._close_win32_stop_event()
                 if self._file_lock.is_locked:
                     self._file_lock.release()
                 return
@@ -320,6 +446,7 @@ class YawRuntime:
             )
 
         self._stop_event.set()
+        self._close_win32_stop_event()
 
         if self._poller_thread is not None and self._poller_thread.is_alive():
             self._poller_thread.join(timeout=2.0)
@@ -395,7 +522,7 @@ class YawRuntime:
         with self._state_lock:
             if self._status.lifecycle in ("stopping", "stopped"):
                 raise YawRuntimeError("SHUTTING_DOWN", "Daemon runtime is not running.")
-            if self._status.lifecycle == "starting":
+            if self._status.lifecycle == "starting" and op_name != "sync":
                 raise YawRuntimeError("NOT_READY", "Daemon runtime is still starting.")
 
         fut: Future[T] = Future()
@@ -524,6 +651,17 @@ class YawRuntime:
             finally:
                 self._queue.task_done()
 
+        while True:
+            try:
+                queued_item = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if queued_item is not None and not queued_item.future.done():
+                queued_item.future.set_exception(
+                    YawRuntimeError("SHUTTING_DOWN", "Daemon is shutting down before queued operation could start.")
+                )
+            self._queue.task_done()
+
     def _apply_delta(
         self,
         delta: SyncDelta,
@@ -565,7 +703,7 @@ class YawRuntime:
         # 2. Poll CocoIndex for subsequent corpus changes (compiled inside target sink before LMDB commit)
         _sync_progress("polling CocoIndex for corpus changes")
         polled_delta = self.ingestor.poll()
-        if getattr(self.ingestor, "on_delta", None) is None:
+        if getattr(self.ingestor, "on_delta", getattr(self.ingestor, "_on_delta", None)) is None:
             self._apply_delta(polled_delta, progress_callback=_sync_progress)
 
         new_stats = self.engine.get_stats(self.config.config_fingerprint())
@@ -634,7 +772,14 @@ class YawRuntime:
         def _run_retrieve() -> list[HydratedPassage]:
             if self.engine is None:
                 raise YawRuntimeError("NOT_READY", "Graph engine is not initialized.")
-            hits = self.engine.retrieve(cleaned, top_k=top_k)
+            ens = getattr(self.engine, "ensemble", None)
+            if ens is not None and len(getattr(ens, "programs", ())) > 1:
+                pred = ens(question=cleaned, retrieve_only=True, k=top_k)
+                cids = tuple(str(c) for c in getattr(pred, "retrieved_chunk_ids", ()))
+                scores = tuple(float(s) for s in getattr(pred, "retrieved_scores", ()))
+                hits = self.engine.hydrate_ranked_chunks(list(zip(cids, scores, strict=False)), top_k)
+            else:
+                hits = self.engine.retrieve(cleaned, top_k=top_k)
             return [
                 HydratedPassage(pointer=ptr, text=text, score=score, stale_on_disk=False) for ptr, score, text in hits
             ]
@@ -667,7 +812,8 @@ class YawRuntime:
                 raise YawRuntimeError("NOT_READY", "Graph engine is not initialized.")
             if self.engine.get_stats().chunks == 0:
                 raise YawRuntimeError("EMPTY_INDEX", "Cannot execute rag_qa on an empty graph index.")
-            pred = self.engine.program(question=cleaned)
+            active_module = getattr(self.engine, "ensemble", None) or self.engine.program
+            pred = active_module(question=cleaned)
             ans = str(getattr(pred, "answer", "")).strip()
             reasoning = str(getattr(pred, "reasoning", "")).strip()
             top_n = min(5, self.config.retrieval_top_k)
@@ -775,37 +921,26 @@ class YawRuntime:
                 _progress(f"indexing: preparing {len(corpus_docs)} corpus passages")
                 assert self.config.corpus_root is not None
                 assert self.config.state_dir is not None
-                opt_json_rel = ".yaw_optimize_slice.json"
-                opt_json_path = Path(self.config.corpus_root) / opt_json_rel
-                records_payload = [
-                    {
-                        "title": d.split("\n", 1)[0] if "\n" in d else "",
-                        "text": d.split("\n", 1)[1] if "\n" in d else d,
-                    }
-                    for d in corpus_docs
-                ]
-                opt_json_path.parent.mkdir(parents=True, exist_ok=True)
-                opt_json_path.write_text(
-                    json.dumps(records_payload, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
+                eff_whitelist = (
+                    BENCHMARK_JSON_WHITELIST
+                    if self.config.json_keys_whitelist == ("*",)
+                    else self.config.json_keys_whitelist
                 )
-                # Reconstruct the complete pointer pool on restart. A memoized
-                # incremental scan returns only changes, losing unchanged passages
-                # from the optimizer's in-memory candidate pool.
-                Path(self.config.state_dir).mkdir(parents=True, exist_ok=True)
-                with tempfile.TemporaryDirectory(prefix="opt_slice_", dir=self.config.state_dir) as scan_state:
-                    delta = sync_corpus_once(
-                        corpus_root=self.config.corpus_root,
-                        state_dir=scan_state,
-                        included_patterns=(opt_json_rel,),
-                        excluded_patterns=(),
-                        json_keys_whitelist=self.config.json_keys_whitelist,
-                        json_keys_blacklist=self.config.json_keys_blacklist,
-                        chunk_size=self.config.chunk_size,
-                        chunk_overlap=self.config.chunk_overlap,
-                        min_chunk_size=self.config.min_chunk_size,
-                    )
-                opt_chunks = list(delta.added_chunks)
+                eff_blacklist = (
+                    tuple(dict.fromkeys((*self.config.json_keys_blacklist, *BENCHMARK_JSON_BLACKLIST)))
+                    if self.config.json_keys_whitelist == ("*",)
+                    else self.config.json_keys_blacklist
+                )
+                opt_chunks = sync_source_files_for_docs(
+                    corpus_root=self.config.corpus_root,
+                    state_dir=Path(self.config.state_dir) / "optimize_coco",
+                    allowed_docs=corpus_docs,
+                    json_keys_whitelist=eff_whitelist,
+                    json_keys_blacklist=eff_blacklist,
+                    chunk_size=self.config.chunk_size,
+                    chunk_overlap=self.config.chunk_overlap,
+                    min_chunk_size=self.config.min_chunk_size,
+                )
                 new_stats = self.engine.get_stats(self.config.config_fingerprint())
                 with self._state_lock:
                     self._stats = new_stats
@@ -883,7 +1018,7 @@ class YawRuntime:
         source_paths.append(daemon_dir / "ingestion" / "corpus.py")
         identity = {
             "version": 1,
-            "metric": "task-quality-geometric-mean-v1",
+            "metric": "task-quality-arithmetic-mean-v2",
             "mode": mode,
             "settings": settings,
             "data_sha256": hashlib.sha256(
@@ -912,16 +1047,33 @@ class YawRuntime:
         row = conn.execute("SELECT value FROM meta WHERE key = 'optimization_run'").fetchone()
         if row is not None:
             saved = json.loads(row[0])
-            if saved["identity"] != identity or saved["output_path"] != str(target_path):
+            saved_id = saved.get("identity")
+            invariant_keys = ("version", "mode", "settings", "data_sha256", "packages")
+            if (
+                saved.get("output_path") != str(target_path)
+                or not isinstance(saved_id, dict)
+                or any(saved_id.get(k) != identity[k] for k in invariant_keys)
+            ):
                 raise YawRuntimeError(
                     "INVALID_INPUT",
                     "Cannot resume: optimization data, settings, code, packages or output path "
                     "changed. Start a fresh run without --resume/--db-path; "
                     "old state is preserved.",
                 )
-            if run_options is not None:
-                saved["cli_options"] = run_options
+            metric_upgraded = saved_id.get("metric") != identity["metric"]
+            code_upgraded = saved_id.get("code_sha256") != identity["code_sha256"]
+            if metric_upgraded:
+                checkpoint = target_path.parent / f"{target_path.stem}_telemetry" / "gepa_state.bin"
+                checkpoint.unlink(missing_ok=True)
+            if metric_upgraded or code_upgraded or run_options is not None:
+                saved["identity"] = identity
+                if run_options is not None:
+                    saved["cli_options"] = run_options
                 with self.engine.managed_conn.transaction() as tx:
+                    if metric_upgraded or code_upgraded:
+                        tx.execute("DELETE FROM meta WHERE key LIKE 'simba_worker:%'")
+                    if metric_upgraded:
+                        tx.execute("DELETE FROM candidate_stage_cache WHERE stage = 'simba_task_score'")
                     tx.execute(
                         "UPDATE meta SET value = ? WHERE key = 'optimization_run'",
                         (json.dumps(saved),),
@@ -958,8 +1110,7 @@ class YawRuntime:
             if self.engine is None:
                 raise YawRuntimeError("NOT_READY", "Graph engine is not initialized.")
             self.engine.program.load(str(p))
-            self.engine._bind_program_hooks()
-            self.engine._apply_program_embedding_prefixes()
+            self.engine.refresh_program_bindings()
             self._update_state()
             return {
                 "reloaded": True,
@@ -970,8 +1121,402 @@ class YawRuntime:
 
         return self.submit("reload_program", _run_reload).result()
 
+    def benchmark(
+        self,
+        datasets: Sequence[str] | str | None = None,
+        *,
+        gate_path: Path | str | None = None,
+        max_queries: int | None = None,
+        index_queries: int | None = None,
+        query_offset: int = 0,
+        full_corpus: bool = False,
+        mode: Literal["eval", "retrieval"] = "eval",
+        compiled_program: Path | str | None = None,
+        compiled_program_path: Path | str | None = None,
+        output_path: Path | str | None = None,
+        fresh: bool = False,
+        index_root: Path | str | None = None,
+        target: str | None = None,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        """Run isolated per-dataset HippoRAG 2 + DPR benchmark evaluation and optional gate verification."""
+        gate_spec: dict[str, Any] | None = None
+        if gate_path is not None:
+            gp = Path(gate_path).resolve()
+            if not gp.exists() or not gp.is_file():
+                raise YawRuntimeError("INVALID_INPUT", f"Benchmark gate file not found: {gp}")
+            loaded_gate = json.loads(gp.read_text(encoding="utf-8"))
+            if not isinstance(loaded_gate, dict):
+                raise YawRuntimeError("INVALID_INPUT", f"Invalid benchmark gate JSON in {gp}")
+            gate_spec = loaded_gate
+
+        effective_mode: Literal["eval", "retrieval"] = (
+            "retrieval"
+            if str(mode or (gate_spec.get("mode", "eval") if gate_spec else "eval")).lower() == "retrieval"
+            else "eval"
+        )
+
+        raw_datasets: list[str] = []
+        if datasets is not None:
+            if isinstance(datasets, str):
+                raw_datasets = [p.strip() for p in datasets.split(",") if p.strip()]
+            else:
+                for item in datasets:
+                    raw_datasets.extend(p.strip() for p in str(item).split(",") if p.strip())
+        if not raw_datasets:
+            if gate_spec and isinstance(gate_spec.get("datasets"), dict) and gate_spec["datasets"]:
+                raw_datasets = list(gate_spec["datasets"].keys())
+            else:
+                raw_datasets = list(DEFAULT_PARITY_DATASETS)
+
+        if full_corpus:
+            eff_max_q: int | None = None
+            eff_idx_q: int | None = None
+        else:
+            eff_max_q = (
+                max_queries
+                if max_queries is not None
+                else (int(gate_spec["queries_per_dataset"]) if gate_spec and "queries_per_dataset" in gate_spec else 25)
+            )
+            eff_idx_q = (
+                index_queries
+                if index_queries is not None
+                else (
+                    int(gate_spec["index_queries"])
+                    if gate_spec and "index_queries" in gate_spec
+                    else max(eff_max_q, 35)
+                )
+            )
+
+        dataset_reports: dict[str, dict[str, Any]] = {}
+        for ds_arg in raw_datasets:
+            cand_path = Path(ds_arg)
+            if cand_path.exists() and cand_path.is_file():
+                resolved_file = cand_path.resolve()
+                raw_data = json.loads(resolved_file.read_text(encoding="utf-8"))
+                samples = (
+                    raw_data
+                    if isinstance(raw_data, list)
+                    else raw_data.get("data", raw_data.get("samples", []))
+                )
+                corpus: list[dict[str, Any]] = []
+                stem = resolved_file.stem.lower()
+                canonical_ds = DATASET_ALIASES.get(stem, stem)
+                include_corpus = bool(
+                    full_corpus
+                    or eff_max_q is None
+                    or canonical_ds in ("sample", "narrativeqa", "lveval")
+                )
+                if include_corpus and canonical_ds in DATASET_REGISTRY:
+                    _, corpus_filename = DATASET_REGISTRY[canonical_ds]
+                    if corpus_filename:
+                        sibling_corpus = resolved_file.parent / corpus_filename
+                        if sibling_corpus.exists() and sibling_corpus.is_file():
+                            raw_corpus = json.loads(sibling_corpus.read_text(encoding="utf-8"))
+                            if isinstance(raw_corpus, list):
+                                corpus = raw_corpus
+            else:
+                canonical_ds = resolve_dataset_name(ds_arg)
+                include_corpus = bool(
+                    full_corpus
+                    or eff_max_q is None
+                    or canonical_ds in ("sample", "narrativeqa", "lveval")
+                )
+                if eff_max_q is not None and eff_idx_q is not None:
+                    total_needed: int | None = max(
+                        eff_max_q,
+                        eff_idx_q * 2 if canonical_ds == "popqa" else eff_idx_q,
+                    ) + max(0, query_offset)
+                else:
+                    total_needed = None
+                samples, corpus = load_dataset_files(
+                    canonical_ds,
+                    max_queries=total_needed,
+                    include_corpus=include_corpus,
+                )
+
+            docs, queries, gold_docs, gold_answers = build_benchmark_slice(
+                canonical_ds,
+                samples,
+                corpus,
+                max_queries=eff_max_q,
+                query_offset=query_offset,
+                full_corpus=full_corpus,
+                index_queries=eff_idx_q,
+            )
+
+            slice_hash = hashlib.sha256(
+                json.dumps(
+                    {
+                        "dataset": canonical_ds,
+                        "docs": len(docs),
+                        "first_doc": docs[0][:64] if docs else "",
+                        "queries": len(queries),
+                        "offset": query_offset,
+                        "full_corpus": full_corpus,
+                    },
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()[:8]
+
+            bench_cfg = self.config.for_benchmark(
+                canonical_ds,
+                slice_hash,
+                index_root=Path(index_root) if index_root else None,
+                fresh=fresh,
+            )
+            assert bench_cfg.corpus_root is not None
+            assert bench_cfg.state_dir is not None
+            assert bench_cfg.db_path is not None
+            assert bench_cfg.max_context_chars is not None
+
+            if progress_callback is not None:
+                progress_callback(f"benchmarking {canonical_ds}: indexing {len(docs)} docs")
+
+            chunks = sync_source_files_for_docs(
+                bench_cfg.corpus_root,
+                bench_cfg.state_dir,
+                allowed_docs=docs,
+                json_keys_whitelist=bench_cfg.json_keys_whitelist,
+                json_keys_blacklist=bench_cfg.json_keys_blacklist,
+                chunk_size=bench_cfg.chunk_size,
+                chunk_overlap=bench_cfg.chunk_overlap,
+                min_chunk_size=1,
+            )
+
+            prog = (
+                self._custom_program
+                if self._custom_program is not None
+                else HippoRAGProgram.from_config(bench_cfg)
+            )
+            comp_p = compiled_program or compiled_program_path or bench_cfg.compiled_program_path
+            if comp_p and Path(comp_p).exists() and hasattr(prog, "load"):
+                prog.load(str(comp_p))
+
+            emb = (
+                self._custom_embedder
+                if self._custom_embedder is not None
+                else DSPyEmbeddingAdapter.from_config(bench_cfg)
+            )
+
+            bench_engine = YawGraphEngine(
+                db_path=bench_cfg.db_path,
+                workspace_root=bench_cfg.corpus_root,
+                program=prog,
+                embedder=emb,
+                linking_top_k=bench_cfg.linking_top_k,
+                retrieval_top_k=bench_cfg.retrieval_top_k,
+                damping=bench_cfg.damping,
+                synonymy_threshold=bench_cfg.synonymy_threshold,
+                synonymy_top_k=bench_cfg.synonymy_top_k,
+                embed_batch_size=bench_cfg.embed_batch_size,
+                max_context_chars=bench_cfg.max_context_chars,
+                max_ast_expansion_hops=bench_cfg.max_ast_expansion_hops,
+            )
+            try:
+                existing_cids = {
+                    str(r[0]) for r in bench_engine.conn.execute("SELECT chunk_id FROM chunks").fetchall()
+                }
+                unindexed = [(ptr, txt) for ptr, txt in chunks if ptr.chunk_id not in existing_cids]
+                index_batches = (
+                    bench_engine.index_chunks(unindexed)
+                    if unindexed
+                    else int(bench_engine.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
+                )
+
+                if progress_callback is not None:
+                    progress_callback(f"benchmarking {canonical_ds}: evaluating {len(queries)} queries")
+
+                top_k = max(bench_cfg.retrieval_top_k, 5)
+                hippo_r1, hippo_r2, hippo_r5 = 0.0, 0.0, 0.0
+                dpr_r1, dpr_r2, dpr_r5 = 0.0, 0.0, 0.0
+                hippo_em, hippo_f1 = 0.0, 0.0
+                dpr_em, dpr_f1 = 0.0, 0.0
+                seeds_count = 0
+                bench_records: list[dict[str, Any]] = []
+
+                has_ensemble = len(getattr(bench_engine.ensemble, "programs", ())) > 1
+                for q_idx, q in enumerate(queries):
+                    g_docs = gold_docs[q_idx] if q_idx < len(gold_docs) else []
+                    g_ans = gold_answers[q_idx] if q_idx < len(gold_answers) else []
+                    hits, seeds = bench_engine.retrieve_with_seeds(q, top_k=top_k)
+                    ens_pred: Any = None
+                    if has_ensemble:
+                        ens_pred = bench_engine.ensemble(
+                            question=q,
+                            retrieve_only=(effective_mode != "eval"),
+                            k=top_k,
+                        )
+                        ens_cids = tuple(str(c) for c in getattr(ens_pred, "retrieved_chunk_ids", ()))
+                        ens_scores = tuple(float(s) for s in getattr(ens_pred, "retrieved_scores", ()))
+                        if ens_cids:
+                            hits = bench_engine.hydrate_ranked_chunks(
+                                list(zip(ens_cids, ens_scores, strict=False)),
+                                top_k,
+                            )
+                    dpr_hits = bench_engine.retrieve_dpr(q, top_k=top_k)
+                    if seeds:
+                        seeds_count += 1
+                    ret_texts = [t for _, _, t in hits]
+                    dpr_texts = [t for _, _, t in dpr_hits]
+
+                    h_rec = compute_retrieval_recalls(g_docs, ret_texts, k_list=(1, 2, 5))
+                    d_rec = compute_retrieval_recalls(g_docs, dpr_texts, k_list=(1, 2, 5))
+                    hippo_r1 += h_rec.get(1, 0.0)
+                    hippo_r2 += h_rec.get(2, 0.0)
+                    hippo_r5 += h_rec.get(5, 0.0)
+                    dpr_r1 += d_rec.get(1, 0.0)
+                    dpr_r2 += d_rec.get(2, 0.0)
+                    dpr_r5 += d_rec.get(5, 0.0)
+
+                    pred_ans = ""
+                    dpr_ans: str | None = None
+                    dpr_qa_metrics: dict[str, float] | None = None
+                    if effective_mode == "eval":
+                        if ens_pred is not None:
+                            pred_ans = str(getattr(ens_pred, "answer", "") or "").strip()
+                        else:
+                            ctx_str = bench_engine.format_qa_context(hits[:5])
+                            pred = (
+                                prog.answer_question(context=ctx_str, question=q)
+                                if hasattr(prog, "answer_question")
+                                else prog(question=q)
+                            )
+                            pred_ans = str(getattr(pred, "answer", pred) or "").strip()
+                        em_val, f1_val = compute_qa_em_f1(pred_ans, g_ans)
+                        hippo_em += em_val
+                        hippo_f1 += f1_val
+
+                        dpr_ctx_str = bench_engine.format_qa_context(dpr_hits[:5])
+                        dpr_pred = (
+                            prog.answer_question(context=dpr_ctx_str, question=q)
+                            if hasattr(prog, "answer_question")
+                            else prog(question=q)
+                        )
+                        dpr_ans = str(getattr(dpr_pred, "answer", dpr_pred) or "").strip()
+                        d_em_val, d_f1_val = compute_qa_em_f1(dpr_ans, g_ans)
+                        dpr_em += d_em_val
+                        dpr_f1 += d_f1_val
+                        dpr_qa_metrics = {"ExactMatch": d_em_val, "F1": d_f1_val}
+
+                    bench_records.append(
+                        {
+                            "question": q,
+                            "graph_seeds": seeds,
+                            "answer": pred_ans,
+                            "dpr_answer": dpr_ans,
+                            "dpr_qa_metrics": dpr_qa_metrics,
+                        }
+                    )
+
+                n_q = max(len(queries), 1)
+                fallback_count = len(queries) - seeds_count
+                num_facts = int(bench_engine.conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0])
+                graph_info = {
+                    "num_passage_nodes": int(bench_engine.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]),
+                    "num_entity_nodes": int(bench_engine.conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]),
+                    "num_fact_nodes": num_facts,
+                    "num_extracted_triples": num_facts,
+                    "num_edges": int(bench_engine.conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]),
+                }
+                expected_doc_count = (
+                    int(graph_info["num_passage_nodes"])
+                    if int(graph_info["num_passage_nodes"]) >= len(docs) and len(docs) > 0
+                    else len(docs)
+                )
+                integrity_errors = check_benchmark_integrity(
+                    bench_records,
+                    graph_info,
+                    expected_doc_count=expected_doc_count,
+                    include_qa=(effective_mode == "eval"),
+                )
+
+                dataset_reports[canonical_ds] = {
+                    "dataset": canonical_ds,
+                    "mode": effective_mode,
+                    "queries": len(queries),
+                    "docs": len(docs),
+                    "index_dir": str(bench_cfg.workspace_root),
+                    "index_batches": index_batches,
+                    "graph": graph_info,
+                    "integrity": {"passed": len(integrity_errors) == 0, "errors": integrity_errors},
+                    "evaluation_metrics": {
+                        "hipporag": {
+                            "retrieval": {
+                                "Recall@1": round(hippo_r1 / n_q, 4),
+                                "Recall@2": round(hippo_r2 / n_q, 4),
+                                "Recall@5": round(hippo_r5 / n_q, 4),
+                            },
+                            "qa": (
+                                {
+                                    "ExactMatch": round(hippo_em / n_q, 4),
+                                    "F1": round(hippo_f1 / n_q, 4),
+                                }
+                                if effective_mode == "eval"
+                                else {}
+                            ),
+                        },
+                        "standard_dpr": {
+                            "retrieval": {
+                                "Recall@1": round(dpr_r1 / n_q, 4),
+                                "Recall@2": round(dpr_r2 / n_q, 4),
+                                "Recall@5": round(dpr_r5 / n_q, 4),
+                            },
+                            "qa": (
+                                {
+                                    "ExactMatch": round(dpr_em / n_q, 4),
+                                    "F1": round(dpr_f1 / n_q, 4),
+                                }
+                                if effective_mode == "eval"
+                                else {}
+                            ),
+                        },
+                        "recognition_memory": {
+                            "queries_with_graph_seeds": seeds_count,
+                            "dpr_fallback_count": fallback_count,
+                            "dpr_fallback_rate": round(fallback_count / n_q, 4),
+                        },
+                    },
+                }
+            finally:
+                bench_engine.close()
+
+        effective_gate_spec = gate_spec or {
+            "mode": effective_mode,
+            "per_dataset_tolerance": 0.0,
+            "require_mean_recall5_parity": True,
+            "require_mean_f1_parity": effective_mode == "eval",
+            "require_mean_em_parity": effective_mode == "eval",
+            "datasets": {
+                ds_key: {
+                    "monkeypatched_hipporag": MONKEYPATCHED_HIPPORAG_BASELINES.get(ds_key, {}),
+                    "paper_70b": PAPER_BASELINES.get(ds_key, {}),
+                }
+                for ds_key in dataset_reports
+            },
+        }
+        gate_eval = evaluate_benchmark_gate(
+            dataset_reports,
+            effective_gate_spec,
+            mode=effective_mode,
+            target=target,
+        )
+
+        result_payload: dict[str, Any] = {
+            "status": "passed" if gate_eval["overall_gate_passed"] else "failed",
+            "mode": effective_mode,
+            "overall_gate_passed": gate_eval["overall_gate_passed"],
+            "overall_gate_status": gate_eval["overall_gate_status"],
+            "datasets": dataset_reports,
+            "gate": gate_eval,
+        }
+        if output_path is not None:
+            write_text_atomic(Path(output_path).resolve(), json.dumps(result_payload, indent=2))
+        return result_payload
+
 
 __all__ = [
     "YawRuntime",
+    "is_file_locked",
     "validate_query_input",
 ]

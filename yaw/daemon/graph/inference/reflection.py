@@ -307,7 +307,8 @@ def deterministic_evidence(examples: Sequence[Mapping[str, Any]], limit: int = 5
             value = feedback.get("score")
         if value is None:
             match = re.search(
-                r"(?:Task quality geometric mean|GM_good/GM_bad|score)\s*=\s*([0-9.eE+-]+)", str(feedback)
+                r"(?:Task quality (?:arithmetic|geometric) mean|GM_good/GM_bad|score)\s*=\s*([0-9.eE+-]+)",
+                str(feedback),
             )
             value = match.group(1) if match else 0
         try:

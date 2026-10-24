@@ -18,8 +18,7 @@ import numpy as np
 from dspy.primitives.repl_types import REPLHistory
 
 from yaw.core import OpenIERecord, StructuredTriple
-from yaw.daemon.graph.candidate_cache import CandidateStageCache
-from yaw.daemon.graph.storage import CandidateCacheStore, open_managed_yaw_db
+from yaw.daemon.graph.storage import CandidateCacheStore, CandidateStageCache, open_managed_yaw_db
 
 
 def test_stage_cache_roundtrips_typed_traces_without_storing_passage(tmp_path: Path) -> None:

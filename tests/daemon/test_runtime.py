@@ -29,7 +29,7 @@ from yaw.core import (
 from yaw.daemon.cli import build_parser, inspect_status, main
 from yaw.daemon.graph.inference import (
     HippoRAGProgram,
-    compute_sizecoding_pareto_score,
+    compute_task_quality_score,
     resolve_embedding_profile,
 )
 from yaw.daemon.graph.storage import get_meta, get_openie_checkpoints, open_yaw_db
@@ -225,7 +225,7 @@ def test_load_config_and_fingerprint(tmp_path: Path) -> None:
     repo_cfg = load_config(Path(__file__).resolve().parents[2] / "yaw.toml")
     assert repo_cfg.queue_maxsize == 32
     assert repo_cfg.embedding_model == "embeddinggemma-300m-qat-q8_0-GGUF-Q8_0"
-    assert repo_cfg.context_window_tokens == 65536
+    assert repo_cfg.context_window_tokens == 131072
     assert repo_cfg.extraction_model == "Gemma-4-E4B-it-GGUF"
     assert repo_cfg.qa_model == "Gemma-4-E4B-it-GGUF"
     assert repo_cfg.config_fingerprint().startswith("yaw-cfg-v1:")
@@ -264,11 +264,13 @@ def test_runtime_applies_configured_hydration_capacity(tmp_path: Path) -> None:
 
 def test_optimize_resume_parser_aliases() -> None:
     parser = build_parser()
-    for command in (["dspy", "optimize"], ["optimize"]):
-        assert parser.parse_args([*command, "--resume"]).resume
-        for flag in ("--db", "--db-path"):
-            args = parser.parse_args([*command, flag, "latest"])
-            assert args.db_path == "latest"
+    assert parser.parse_args(["dspy", "optimize", "--resume"]).resume
+    args = parser.parse_args(["dspy", "optimize", "--db-path", "latest"])
+    assert args.db_path == "latest"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["optimize", "--resume"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["dspy", "optimize", "--db", "latest"])
 
 
 def test_cli_resume_without_a_run_fails_before_dataset_or_provider_access(tmp_path: Path) -> None:
@@ -291,7 +293,7 @@ def test_cli_resume_real_gepa_checkpoint_and_custom_output(tmp_path: Path, provi
         {
             "id": f"q{i}",
             "question": f"Where did Alan Turing work ({i})?",
-            "answer": ["Bletchley Park"],
+            "answer": ["Alan Turing at Bletchley Park"],
             "paragraphs": [
                 {
                     "title": "Alan Turing",
@@ -366,24 +368,59 @@ def test_cli_resume_real_gepa_checkpoint_and_custom_output(tmp_path: Path, provi
         loaded = GEPAState.load(str(telemetry))
         assert loaded.program_candidates == state.program_candidates
         assert loaded.total_num_evals == state.total_num_evals
+        audit = json.loads((tmp_path / "my_compiled_graph_rlm_audit.json").read_text(encoding="utf-8"))
+        native = audit["gepa_progress"]
+        expected_front = sorted({idx for group in loaded.get_pareto_front_mapping().values() for idx in group})
+        assert native["frontier"] == expected_front
+        assert native["validation"][1]["score"] == 1.0
+        assert native["phase"] == "optimization complete"
         pools = json.loads((tmp_path / "my_compiled_pools.json").read_text())
         assert pools["corpus_chunk_ids"]
         with closing(sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True)) as conn:
             assert conn.execute("SELECT * FROM openie_chunks").fetchall() == initial_openie
 
+    # Metric/code upgrade with identical data, settings, mode, packages, and output path:
+    # preserves openie_chunks while invalidating stale pre-upgrade gepa_state.bin and simba scores.
+    with closing(sqlite3.connect(db_path)) as conn, conn:
+        saved_meta = json.loads(conn.execute("SELECT value FROM meta WHERE key = 'optimization_run'").fetchone()[0])
+        saved_meta["identity"]["metric"] = "task-quality-legacy-v1"
+        saved_meta["identity"]["code_sha256"] = "0" * 64
+        conn.execute(
+            "UPDATE meta SET value = ? WHERE key = 'optimization_run'",
+            (json.dumps(saved_meta),),
+        )
+        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('simba_worker:stale', '{}')")
+        conn.execute(
+            "INSERT OR REPLACE INTO candidate_stage_cache(stage, cache_key, payload, size_bytes) "
+            "VALUES ('simba_task_score', 'stale-key', X'00', 1)"
+        )
+    rc, output, errors = run_cli(["--resume"], bare=True)
+    assert rc == 0, errors
+    assert "RESUMED_WINNER" not in custom_output.read_text(encoding="utf-8")
+    with closing(sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True)) as conn:
+        assert conn.execute("SELECT * FROM openie_chunks").fetchall() == initial_openie
+        upgraded_meta = json.loads(conn.execute("SELECT value FROM meta WHERE key = 'optimization_run'").fetchone()[0])
+        assert upgraded_meta["identity"]["metric"] == "task-quality-arithmetic-mean-v2"
+        assert conn.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'simba_worker:%'").fetchone()[0] == 0
+        assert (
+            conn.execute("SELECT COUNT(*) FROM candidate_stage_cache WHERE stage = 'simba_task_score'").fetchone()[0]
+            == 0
+        )
+
     # Same length, different questions: reject before replacing the corpus or
     # touching the checkpoint, preserving both for inspection or recovery.
     original_checkpoint = checkpoint.read_bytes()
     assert cfg.corpus_root is not None
-    corpus_path = cfg.corpus_root / ".yaw_optimize_slice.json"
-    original_corpus = corpus_path.read_bytes()
+    corpus_md_files = sorted((cfg.corpus_root / "corpus").glob("*.md"))
+    assert corpus_md_files
+    original_corpus = {p.name: p.read_bytes() for p in corpus_md_files}
     records[0]["question"] = "A changed training question"
     dataset.write_text(json.dumps(records), encoding="utf-8")
     rc, _, errors = run_cli(["--resume"], bare=True)
     assert rc == 1
     assert "Cannot resume" in errors
     assert checkpoint.read_bytes() == original_checkpoint
-    assert corpus_path.read_bytes() == original_corpus
+    assert {p.name: p.read_bytes() for p in sorted((cfg.corpus_root / "corpus").glob("*.md"))} == original_corpus
 
 
 def test_resume_preserves_unverifiable_legacy_checkpoint(tmp_path: Path) -> None:
@@ -603,9 +640,9 @@ restores ready."""
 
 @pytest.mark.parametrize("labels", ["combined", "qa", "retrieval"])
 def test_optimize_and_reload_compiled_program_with_composite_fitness(tmp_path: Path, provider, labels: str) -> None:
-    """D1-A4: Verify geometric task quality and full-surface persistence."""
-    # 1. Verify exact composite fitness calculation in compute_sizecoding_pareto_score
-    pred_metric = compute_sizecoding_pareto_score(
+    """D1-A4: Verify unweighted arithmetic mean task quality and full-surface persistence."""
+    # 1. Verify exact composite fitness calculation in compute_task_quality_score
+    pred_metric = compute_task_quality_score(
         0.8,
         recall_at_1=0.5,
         recall_at_2=0.6,
@@ -615,8 +652,8 @@ def test_optimize_and_reload_compiled_program_with_composite_fitness(tmp_path: P
         f1=0.9,
         tokens=50,
     )
-    expected_quality = 0.5 * 0.6 * 0.8 * 1.0 * 1.0 * 1.0 * 0.9
-    assert pred_metric.score == pytest.approx(expected_quality ** (1 / 7))
+    expected_quality = (0.5 + 0.6 + 0.8 + 1.0 + 1.0 + 1.0 + 0.9) / 7
+    assert pred_metric.score == pytest.approx(expected_quality)
     assert "em" in pred_metric.objective_scores
     assert "f1" in pred_metric.objective_scores
     assert "recall_at_1" in pred_metric.objective_scores
@@ -658,10 +695,8 @@ def test_optimize_and_reload_compiled_program_with_composite_fitness(tmp_path: P
         for row in audit["eval_records"]:
             keys = ["r1", "r2", "r5", "r10", "r20"] if labels != "qa" else []
             keys += ["em", "f1"] if labels != "retrieval" else []
-            product = 1.0
-            for key in keys:
-                product *= row[key]
-            assert row["score"] == pytest.approx(product ** (1 / len(keys)), abs=0.0001)
+            expected_mean = sum(row[key] for key in keys) / len(keys)
+            assert row["score"] == pytest.approx(expected_mean, abs=0.0001)
     finally:
         rt1.stop()
 
@@ -760,7 +795,7 @@ Tier 2 anti-overfitting guard."""
     prog, emb, _, _ = _make_program_and_embedder()
 
     # Write a 6-query benchmark-format dataset JSON (with paragraphs + is_supporting)
-    bench_dataset_path = tmp_path / "tier1_slice.json"
+    bench_dataset_path = tmp_path / "tier1_samples.json"
     bench_samples = [
         {
             "id": f"q-{i}",
@@ -784,7 +819,7 @@ Tier 2 anti-overfitting guard."""
     bench_dataset_path.write_text(json.dumps(bench_samples), encoding="utf-8")
 
     captured_gepa: dict[str, Any] = {}
-    opt_slice_file = cfg.corpus_root / ".yaw_optimize_slice.json"
+    corpus_md_dir = cfg.corpus_root / "corpus"
 
     class CaptureGEPA:
         def __init__(self, metric: Any, **kwargs: Any) -> None:
@@ -794,10 +829,9 @@ Tier 2 anti-overfitting guard."""
         def compile(self, student: Any, trainset: list[Any], valset: Any = None) -> Any:
             captured_gepa["trainset_len"] = len(trainset)
             captured_gepa["valset_len"] = len(valset) if valset is not None else 0
-            # Verify .yaw_optimize_slice.json stays on disk with indent=2 during GEPA evolution
-            assert opt_slice_file.exists()
-            raw_slice_text = opt_slice_file.read_text(encoding="utf-8")
-            assert "\n  {\n" in raw_slice_text
+            # Verify CocoIndex synced markdown passages exist during GEPA evolution for 1-indexed line hydration
+            md_files = list(corpus_md_dir.glob("*.md"))
+            assert len(md_files) >= 6
             pred = student(question=trainset[0].question)
             assert pred.context.strip() != ""
             proposer = captured_gepa.get("instruction_proposer")
@@ -840,7 +874,7 @@ Tier 2 anti-overfitting guard."""
             embedder=emb,
         )
     assert rc == 0
-    assert opt_slice_file.exists()
+    assert list(corpus_md_dir.glob("*.md"))
     opt_out = json.loads(buf.getvalue())
     assert opt_out["optimized"] is True
     assert opt_out["mode"] == "gepa"
@@ -1212,3 +1246,235 @@ def test_cli_graph_lint_and_turtle_over_read_only_snapshot_while_daemon_locked(
         assert "sh:conforms true" in ttl_out
     finally:
         prod_rt.stop()
+
+
+def test_cli_benchmark_and_gate_evaluation(tmp_path: Path, provider) -> None:
+    """Verify `yaw benchmark [--gate]` isolates state via YawConfig.for_benchmark and evaluates benchmark_gate.json."""
+    cfg, toml_path = _make_test_config(tmp_path, base_url=provider[0])
+    prog, emb, _, _ = _make_program_and_embedder()
+
+    dataset_path = tmp_path / "2wikimultihopqa.json"
+    dataset_samples = [
+        {
+            "id": "q-1",
+            "question": "Where did Alan Turing work?",
+            "answer": ["Bletchley Park"],
+            "paragraphs": [
+                {
+                    "title": "Alan Turing",
+                    "text": "Alan Turing worked at Bletchley Park during World War II.",
+                    "is_supporting": True,
+                }
+            ],
+        }
+    ]
+    dataset_path.write_text(json.dumps(dataset_samples), encoding="utf-8")
+
+    # 1. Passing gate (thresholds <= 1.0)
+    passing_gate = tmp_path / "passing_gate.json"
+    passing_gate.write_text(
+        json.dumps(
+            {
+                "tolerance": 0.0,
+                "targets": {
+                    "monkeypatched_hipporag": {
+                        "datasets": {
+                            "2wikimultihopqa": {"Recall@5": 0.5, "F1": 0.5},
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    buf_pass = io.StringIO()
+    with redirect_stdout(buf_pass):
+        rc_pass = main(
+            [
+                "dspy",
+                "benchmark",
+                "--config",
+                str(toml_path),
+                "--dataset",
+                str(dataset_path),
+                "--max-queries",
+                "1",
+                "--gate",
+                str(passing_gate),
+                "--target",
+                "monkeypatched_hipporag",
+            ],
+            program=prog,
+            embedder=emb,
+        )
+    assert rc_pass == 0
+    report_pass = json.loads(buf_pass.getvalue())
+    assert report_pass["status"] == "passed"
+    assert report_pass["gate"]["passed"] is True
+    assert report_pass["datasets"]["2wikimultihopqa"]["integrity"]["passed"] is True
+    assert not Path(cfg.db_path).exists()
+
+    # 2. Failing gate (impossible threshold > 1.0 returns exit code 1)
+    failing_gate = tmp_path / "failing_gate.json"
+    failing_gate.write_text(
+        json.dumps(
+            {
+                "tolerance": 0.0,
+                "targets": {
+                    "monkeypatched_hipporag": {
+                        "datasets": {
+                            "2wikimultihopqa": {"Recall@5": 1.5},
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    buf_fail = io.StringIO()
+    with redirect_stdout(buf_fail):
+        rc_fail = main(
+            [
+                "dspy",
+                "benchmark",
+                "--config",
+                str(toml_path),
+                "--dataset",
+                str(dataset_path),
+                "--max-queries",
+                "1",
+                "--gate",
+                str(failing_gate),
+                "--target",
+                "monkeypatched_hipporag",
+            ],
+            program=prog,
+            embedder=emb,
+        )
+    assert rc_fail == 1
+    report_fail = json.loads(buf_fail.getvalue())
+    assert report_fail["gate"]["passed"] is False
+    assert report_fail["gate"]["failures"]
+
+    # 3. Verify ExactMatch tolerance enforcement and positional runtime.benchmark call
+    em_failing_gate = tmp_path / "em_failing_gate.json"
+    em_failing_gate.write_text(
+        json.dumps(
+            {
+                "tolerance": 0.0,
+                "targets": {
+                    "monkeypatched_hipporag": {
+                        "datasets": {
+                            "2wikimultihopqa": {"Recall@5": 0.0, "F1": 0.0, "ExactMatch": 1.5},
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    rt = YawRuntime(cfg, program=prog, embedder=emb, auto_poll=False)
+    progress_msgs: list[str] = []
+    pos_report = rt.benchmark(
+        [str(dataset_path)],
+        gate_path=em_failing_gate,
+        max_queries=1,
+        target="monkeypatched_hipporag",
+        progress_callback=progress_msgs.append,
+    )
+    assert pos_report["overall_gate_passed"] is False
+    assert any("ExactMatch" in f for f in pos_report["gate"]["failures"])
+    assert len(progress_msgs) >= 2
+
+
+def test_canonical_benchmark_gate_json_and_dataset_ingestion_invariants(tmp_path: Path) -> None:
+    """Verify benchmark_gate.json matches consolidated baselines and sync_source_files_for_docs preserves user files."""
+    from yaw.daemon.ingestion import (
+        MONKEYPATCHED_HIPPORAG_BASELINES,
+        PAPER_BASELINES,
+        load_dataset_splits,
+        sync_source_files_for_docs,
+    )
+
+    gate_file = Path(__file__).resolve().parents[2] / "benchmark_gate.json"
+    gate_data = json.loads(gate_file.read_text(encoding="utf-8"))
+    assert set(gate_data["datasets"].keys()) == set(MONKEYPATCHED_HIPPORAG_BASELINES.keys())
+    for ds in MONKEYPATCHED_HIPPORAG_BASELINES:
+        assert gate_data["datasets"][ds]["monkeypatched_hipporag"] == MONKEYPATCHED_HIPPORAG_BASELINES[ds]
+        paper_ref = PAPER_BASELINES[ds]["hipporag2_llama3.3_70b_nvembed_v2"]
+        for metric_key in ("Recall@2", "Recall@5", "ExactMatch", "F1"):
+            if metric_key in paper_ref:
+                assert gate_data["datasets"][ds]["paper_70b"][metric_key] == paper_ref[metric_key]
+
+    # Anti-overfitting alias check on load_dataset_splits
+    with pytest.raises(YawRuntimeError) as exc_info:
+        load_dataset_splits(["2wiki"], workspace_root=tmp_path, max_queries=100)
+    assert exc_info.value.code == "INVALID_INPUT"
+
+    # sync_source_files_for_docs preserves user corpus/*.md files and is idempotent across repeated calls
+    corpus_root = tmp_path / "ws"
+    user_md_dir = corpus_root / "corpus"
+    user_md_dir.mkdir(parents=True, exist_ok=True)
+    user_md = user_md_dir / "architecture.md"
+    user_md.write_text("# Architecture\nImportant user documentation.\n", encoding="utf-8")
+
+    state_dir = tmp_path / "coco_state"
+    docs = ["Doc Title\nDoc body text for testing."]
+    chunks1 = sync_source_files_for_docs(corpus_root, state_dir, allowed_docs=docs, min_chunk_size=1)
+    assert user_md.exists()
+    assert len(chunks1) == 1
+
+    # Repeated call with allowed_docs=None returns chunks idempotently
+    chunks2 = sync_source_files_for_docs(corpus_root, state_dir, allowed_docs=None, min_chunk_size=1)
+    assert len(chunks2) >= 2
+    chunks3 = sync_source_files_for_docs(corpus_root, state_dir, allowed_docs=None, min_chunk_size=1)
+    assert len(chunks3) == len(chunks2)
+
+
+def test_sync_now_executes_single_index_chunks_and_pre_start_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify sync_now invokes engine.index_chunks once per sync (no double _apply_delta) and pre-start stop works."""
+    cfg, _ = _make_test_config(tmp_path)
+    assert cfg.corpus_root is not None
+    (cfg.corpus_root / "turing.md").write_text(
+        "# Alan Turing\nAlan Turing worked at Bletchley Park.\n",
+        encoding="utf-8",
+    )
+    prog, emb, _, _ = _make_program_and_embedder()
+
+    # 1. Pre-start stop() sets stop event; subsequent first start() honors it immediately
+    rt_pre = YawRuntime(cfg, program=prog, embedder=emb, auto_poll=False)
+    rt_pre.stop()
+    rt_pre.start(sync_on_start=False)
+    assert rt_pre.status().lifecycle == "stopped"
+
+    # 2. Normal start and verify engine.index_chunks is called exactly once during sync_now()
+    rt = YawRuntime(cfg, program=prog, embedder=emb, auto_poll=False)
+    rt.start(sync_on_start=False)
+    try:
+        assert rt.ingestor is not None
+        assert rt.ingestor.on_delta is not None
+        assert rt.engine is not None
+
+        index_calls = 0
+        orig_index_chunks = rt.engine.index_chunks
+
+        def counted_index_chunks(
+            chunks: Sequence[tuple[Any, str]],
+            *,
+            progress_callback: Any | None = None,
+            program: Any | None = None,
+        ) -> int:
+            nonlocal index_calls
+            index_calls += 1
+            return orig_index_chunks(chunks, progress_callback=progress_callback, program=program)
+
+        monkeypatch.setattr(rt.engine, "index_chunks", counted_index_chunks)
+        summary = rt.sync_now()
+        assert len(summary.added_chunks) == 1
+        assert index_calls == 1
+    finally:
+        rt.stop()

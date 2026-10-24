@@ -414,7 +414,7 @@ def make_chunk_hydrator(
     corpus_root: Path,
 ) -> Callable[[str], str]:
     """Create a callable `hydrate_chunk(chunk_id: str) -> str` tool for dspy.RLM passage inspection."""
-    from yaw.daemon.graph.storage.db import get_chunk_pointer
+    from .graph_ops import get_chunk_pointer
 
     def hydrate_chunk(chunk_id: str) -> str:
         pointer = get_chunk_pointer(conn, chunk_id)

@@ -29,8 +29,14 @@ from matplotlib.collections import LineCollection
 from matplotlib.lines import Line2D
 
 WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
-ARTIFACT_DIR = Path(r"C:\Users\Harri.Ahokas\.gemini\antigravity\brain\3061c87c-9ec6-4ff5-b756-80b05e1c4342")
-# Report figure order (Fig 1..5). Figs 3-5 are indexed by optimizer candidate, not wall-clock.
+if str(WORKSPACE_ROOT) not in sys.path:
+    sys.path.insert(0, str(WORKSPACE_ROOT))
+
+from yaw.core import write_text_atomic  # noqa: E402
+from yaw.daemon.graph.storage import get_graph_counts, open_readonly_yaw_db  # noqa: E402
+
+ARTIFACT_DIR = Path(os.environ.get("YAW_ARTIFACT_DIR") or (WORKSPACE_ROOT / "outputs" / "dashboard"))
+# Report figure order (Fig 1..5). Fig. 3 includes evaluation and candidate axes.
 FIG_FILES = (
     "knowledge_graph_extraction_dashboard.svg",
     "knowledge_graph_2d_projection.png",
@@ -185,14 +191,6 @@ class PoolTelemetry:
         return f"OPTIMIZER STOPPED • {self.openie_cnt} CHUNKS INDEXED", "#f59e0b"
 
 
-def _pareto_2d(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    if not records:
-        return []
-    s = sorted(records, key=lambda r: (float(r["s_per_it"]), -float(r["gm_good"])))
-    q = np.array([float(r["gm_good"]) for r in s])
-    return [r for r, k in zip(s, np.concatenate(([True], q[1:] > np.maximum.accumulate(q)[:-1])), strict=True) if k]
-
-
 def get_lemonade_server_metrics() -> dict[str, Any]:
     try:
         req = urllib.request.Request("http://localhost:13305/metrics", headers={"Authorization": "Bearer lemonade"})
@@ -204,7 +202,11 @@ def get_lemonade_server_metrics() -> dict[str, Any]:
             }
 
         def pick(sub: str) -> float:
-            return next((v for k, v in m.items() if "Qwen3-4B" in k and sub in k), 0.0)
+            for pref in ("Gemma", "Qwen3-4B"):
+                for k, v in m.items():
+                    if pref in k and sub in k:
+                        return v
+            return next((v for k, v in m.items() if sub in k), 0.0)
 
         return {
             "server_up": True,
@@ -309,7 +311,7 @@ def get_empirical_telemetry_timeseries(
             deduped.append(cp)
 
     with contextlib.suppress(Exception):
-        t_file.write_text(json.dumps(deduped, indent=2), encoding="utf-8")
+        write_text_atomic(t_file, json.dumps(deduped, indent=2))
 
     # Interval rate/latency between consecutive real samples only; no seeded defaults.
     samples: list[dict[str, Any]] = []
@@ -338,18 +340,8 @@ def get_empirical_telemetry_timeseries(
 
 
 def _open_ro_sqlite(db_path: Path, backoff: tuple[float, ...] = (1.0, 2.0, 3.0)) -> sqlite3.Connection | None:
-    # Never use `immutable=1`: the optimizer writes this DB concurrently (rollback journal), and
-    # immutable readers skip locking/journal checks and serve stale or torn pages.
-    for i in range(len(backoff) + 1):
-        try:
-            conn = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True, timeout=30.0)
-            conn.execute("PRAGMA busy_timeout = 30000;")
-            conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
-            return conn
-        except sqlite3.Error:
-            pass
-        if i < len(backoff):
-            time.sleep(backoff[i])
+    with contextlib.suppress(sqlite3.Error):
+        return open_readonly_yaw_db(db_path, backoff=backoff)
     return None
 
 
@@ -415,13 +407,20 @@ def get_active_sandbox_info() -> dict[str, Any]:
         return info
 
     try:
-        counts = {}
-        for tbl in ("chunks", "entities", "facts", "edges", "openie_chunks"):
-            with contextlib.suppress(sqlite3.Error):
-                counts[tbl] = (conn.execute(f"SELECT count(*) FROM {tbl}").fetchone() or [0])[0]
+        counts: dict[str, int] = {}
+        with contextlib.suppress(sqlite3.Error):
+            counts = dict(
+                zip(
+                    ("chunks", "entities", "facts", "edges", "openie_chunks"),
+                    get_graph_counts(conn),
+                    strict=True,
+                )
+            )
         diff_from_rows: list[tuple[str, str, str, str, str, str]] = []
         related_rows: list[tuple[str, str]] = []
         related_assertions: list[tuple[str, str, str, str, str, str]] = []
+        entity_details: dict[str, tuple[str, str, int]] = {}
+        graph_edges: list[tuple[str, str, str]] = []
         alt_label_cnt = 0
         with contextlib.suppress(sqlite3.Error):
             diff_from_rows = [
@@ -485,7 +484,6 @@ def get_active_sandbox_info() -> dict[str, Any]:
             "SELECT chunk_id, entities_json, triples_json, structured_triples_json "
             "FROM openie_chunks ORDER BY rowid ASC"
         ).fetchall()
-        conn.close()
 
         cum_e = cum_t = 0
         uniq_e, uniq_edges, preds, recent, raw_counts, triples_raw = (
@@ -563,6 +561,9 @@ def get_active_sandbox_info() -> dict[str, Any]:
         }
     except Exception as exc:
         info["error"] = str(exc)
+    finally:
+        with contextlib.suppress(sqlite3.Error):
+            conn.close()
     return info
 
 
@@ -599,11 +600,6 @@ def _read_audit(path: Path) -> dict[str, Any]:
     return obj
 
 
-def _geo_quality(row: dict[str, Any]) -> float:
-    vals = np.array([max(0.05, float(row.get(k, 0.0))) for k in _CAND_METRICS])
-    return round(float(np.exp(np.log(vals).mean())), 4)
-
-
 def load_candidate_records(sandbox: dict[str, Any]) -> tuple[list[dict[str, Any]], int, bool]:
     """Return (per-candidate rows, total evals, legacy) for the ACTIVE run only.
 
@@ -622,6 +618,17 @@ def load_candidate_records(sandbox: dict[str, Any]) -> tuple[list[dict[str, Any]
     if legacy:
         raw = [dict(r, cand=i + 1, n=1) for i, r in enumerate(evals)]
     n_evals = sum(int(r.get("n", 1)) for r in raw)
+    evaluations_by_candidate: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for i, evaluation in enumerate(evals):
+        candidate = i + 1 if legacy else evaluation.get("cand")
+        if candidate is None:
+            continue
+        evaluations_by_candidate[int(candidate)].append(
+            {
+                "eval": int(evaluation.get("eval", i + 1)),
+                "score": float(evaluation.get("score", 0.0)),
+            }
+        )
 
     rows: list[dict[str, Any]] = []
     for r in sorted(raw, key=lambda x: int(x.get("cand", 0))):
@@ -639,11 +646,11 @@ def load_candidate_records(sandbox: dict[str, Any]) -> tuple[list[dict[str, Any]
             "optimizer": str(r.get("optimizer", "")),
             "s_per_it": float(r.get("s_per_it", 0.0)),
             "tokens": float(r.get("tokens", 0.0)),
+            "evaluations": evaluations_by_candidate[int(r.get("cand", len(rows) + 1))],
             **{k: float(r.get(k, 0.0)) for k in _CAND_METRICS},
         }
         # Valset score (when GEPA ran one) is the comparable number; minibatch means are noisy.
         row["eff_score"] = row["val_score"] if row["val_score"] is not None else sc
-        row["gm_good"] = _geo_quality(row)
         rows.append(row)
     best = 0.0
     for row in rows:
@@ -895,7 +902,7 @@ def recent_relation_assertions(
 
 
 def generate_graph_projection_svg(
-    dest: Path, sandbox: dict[str, Any], badge: tuple[str, str], *, layout_iterations: int = 1000
+    dest: Path, sandbox: dict[str, Any], badge: tuple[str, str], *, layout_iterations: int = 500
 ) -> dict[str, Any]:
     if layout_iterations < 1:
         raise ValueError("layout_iterations must be positive")
@@ -922,20 +929,22 @@ def generate_graph_projection_svg(
         )
         return {}
 
-    selected = largest_one_hop_neighborhood(all_edges)
+    # Slice to 1000 edges to limit graph size
+    all_edges_tail = all_edges[-1000:]
+    selected = largest_one_hop_neighborhood(all_edges_tail)
     # Counts and colors describe only the connected neighborhood actually shown.
-    all_edges = [(u, v, k) for u, v, k in all_edges if u in selected and v in selected]
-    diff_nodes: set[str] = {u for u, v, k in all_edges if k == "owl:differentFrom"} | {
-        v for u, v, k in all_edges if k == "owl:differentFrom"
+    all_edges_tail = [(u, v, k) for u, v, k in all_edges_tail if u in selected and v in selected]
+    diff_nodes: set[str] = {u for u, v, k in all_edges_tail if k == "owl:differentFrom"} | {
+        v for u, v, k in all_edges_tail if k == "owl:differentFrom"
     }
-    rel_nodes: set[str] = {u for u, v, k in all_edges if k == "skos:related"} | {
-        v for u, v, k in all_edges if k == "skos:related"
+    rel_nodes: set[str] = {u for u, v, k in all_edges_tail if k == "skos:related"} | {
+        v for u, v, k in all_edges_tail if k == "skos:related"
     }
     base_nodes = diff_nodes | rel_nodes
 
     # Include all 1-hop connected rdf:Statement (fact) entities
     inc_fact: dict[str, set[str]] = defaultdict(set)
-    for u, v, k in all_edges:
+    for u, v, k in all_edges_tail:
         if k == "fact":
             if u in base_nodes:
                 inc_fact[u].add(v)
@@ -959,9 +968,9 @@ def generate_graph_projection_svg(
     idx = {eid: i for i, eid in enumerate(nodes)}
 
     # Segment lists
-    diff_segs = [[idx[u], idx[v]] for u, v, k in all_edges if k == "owl:differentFrom" and u in idx and v in idx]
-    rel_segs = [[idx[u], idx[v]] for u, v, k in all_edges if k == "skos:related" and u in idx and v in idx]
-    fact_segs = [[idx[u], idx[v]] for u, v, k in all_edges if k == "fact" and u in idx and v in idx]
+    diff_segs = [[idx[u], idx[v]] for u, v, k in all_edges_tail if k == "owl:differentFrom" and u in idx and v in idx]
+    rel_segs = [[idx[u], idx[v]] for u, v, k in all_edges_tail if k == "skos:related" and u in idx and v in idx]
+    fact_segs = [[idx[u], idx[v]] for u, v, k in all_edges_tail if k == "fact" and u in idx and v in idx]
     active_edge_arr = (
         np.array(diff_segs + rel_segs + fact_segs, dtype=int)
         if (diff_segs or rel_segs or fact_segs)
@@ -1118,7 +1127,7 @@ def generate_graph_projection_svg(
     for eid in nodes:
         name, defn, skos_cnt = entities.get(eid, (eid, "", 1))
         # Base size scaled with skos:*Label count (synonyms & lexical variants)
-        s = min(300.0, base_sz + 9.9 * (skos_cnt - 1))
+        s = min(300.0, base_sz + 12.0 * (skos_cnt - 1))
         sizes.append(s)
         if eid in diff_nodes:
             colors.append("#f43f5e")  # rose/crimson for disambiguation endpoints
@@ -1278,6 +1287,30 @@ def _header(fig: plt.Figure, title: str, badge: tuple[str, str], y: float = 0.96
     )
 
 
+def _create_dark_figure(
+    figsize: tuple[float, float],
+    title: str,
+    badge: tuple[str, str],
+    *,
+    nrows: int = 2,
+    sharex: bool = False,
+    gridspec_kw: dict[str, Any] | None = None,
+    adjust_kw: dict[str, float] | None = None,
+    header_y: float = 0.96,
+) -> tuple[plt.Figure, Any]:
+    fig, axes = plt.subplots(
+        nrows,
+        1,
+        figsize=figsize,
+        sharex=sharex,
+        gridspec_kw=gridspec_kw,
+    )
+    if adjust_kw:
+        fig.subplots_adjust(**adjust_kw)
+    _header(fig, title, badge, y=header_y)
+    return fig, axes
+
+
 def _candidate_xaxis(ax: plt.Axes, cands: list[dict[str, Any]], legacy: bool) -> None:
     """Integer candidate axis with fixed padding so 1..N candidates never autoscale oddly."""
     hi = max(int(c["cand"]) for c in cands)
@@ -1310,19 +1343,65 @@ def generate_candidate_score_svg(
     badge: tuple[str, str],
     sandbox: dict[str, Any],
 ) -> None:
-    title = "Fig. 3: Candidate Score & Evaluation Cost per Candidate"
+    title = "Fig. 3: Individual Evaluations, Candidate Means & Cost"
     if not cands:
         _placeholder_svg(dest, title, badge, _no_candidates_message(sandbox))
         return
-    fig, (ax1, ax2) = plt.subplots(
-        2,
-        1,
-        figsize=(9.4, 6.4),
-        sharex=True,
-        gridspec_kw={"height_ratios": [1.45, 1.0], "hspace": 0.14},
+    fig, (ax_eval, ax1, ax2) = _create_dark_figure(
+        (9.4, 9.4),
+        title,
+        badge,
+        nrows=3,
+        gridspec_kw={"height_ratios": [1.35, 1.45, 1.0], "hspace": 0.48},
+        adjust_kw={"top": 0.88, "bottom": 0.08, "left": 0.09, "right": 0.97},
     )
-    fig.subplots_adjust(top=0.84, bottom=0.10, left=0.09, right=0.97)
-    _header(fig, title, badge)
+
+    evaluations = sorted(
+        [(e["eval"], e["score"], c["cand"], c["score"]) for c in cands for e in c.get("evaluations", [])],
+        key=lambda e: e[0],
+    )
+    if evaluations:
+        eval_x = [e[0] for e in evaluations]
+        eval_scores = [e[1] * 100.0 for e in evaluations]
+        ax_eval.plot(
+            eval_x, eval_scores, "o-", color="#a78bfa", ms=3, lw=0.6, alpha=0.75, label="Individual evaluation score"
+        )
+        # Disconnected segments keep distinct candidates' means visually separate.
+        for candidate in cands:
+            candidate_evals = sorted(candidate.get("evaluations", []), key=lambda e: e["eval"])
+            if candidate_evals:
+                ax_eval.plot(
+                    [e["eval"] for e in candidate_evals],
+                    [candidate["score"] * 100.0] * len(candidate_evals),
+                    "_--",
+                    color="#38bdf8",
+                    lw=1.2,
+                    ms=5,
+                    label="Current candidate mean (all its evals)" if not ax_eval.lines[1:] else None,
+                )
+        latest = evaluations[-1]
+        ax_eval.set_title(
+            f"Latest: eval #{latest[0]} · candidate #{latest[2]} · score {latest[1]:.1%} · mean {latest[3]:.1%}",
+            fontsize=9,
+            color="#cbd5e1",
+        )
+        ax_eval.set_xlim(min(eval_x) - 0.5, max(eval_x) + 0.5)
+        ax_eval.legend(loc="upper left", fontsize=8)
+        ax_eval.set_xlabel(f"Evaluation # → (recent {len(evaluations)} recorded; older points may be evicted)")
+    else:
+        ax_eval.text(
+            0.5,
+            0.5,
+            "Individual evaluation scores unavailable in this audit",
+            transform=ax_eval.transAxes,
+            ha="center",
+            color="#cbd5e1",
+        )
+        ax_eval.set_xlabel("Evaluation # →")
+    ax_eval.set_ylim(-3, 105)
+    ax_eval.xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
+    ax_eval.yaxis.set_major_formatter(ticker.PercentFormatter(decimals=0))
+    ax_eval.set_ylabel("Score (%)")
 
     x = np.array([c["cand"] for c in cands], dtype=float)
     sc = np.array([c["score"] for c in cands]) * 100.0
@@ -1371,6 +1450,7 @@ def generate_candidate_score_svg(
     ax1.yaxis.set_major_formatter(ticker.PercentFormatter(decimals=0))
     ax1.set_ylabel("Score (%)", color="#10b981", fontweight="bold")
     ax1.legend(loc="upper left", ncol=2, fontsize=8)
+    _candidate_xaxis(ax1, cands, legacy)
 
     lat = np.array([c["s_per_it"] for c in cands])
     ax2.bar(x, lat, width=0.6, color="#f43f5e", alpha=0.75, label="Mean latency per eval")
@@ -1395,15 +1475,15 @@ def generate_candidate_quality_svg(
     if not cands:
         _placeholder_svg(dest, title, badge, _no_candidates_message(sandbox))
         return
-    fig, (ax1, ax2) = plt.subplots(
-        2,
-        1,
-        figsize=(9.4, 6.4),
+    fig, (ax1, ax2) = _create_dark_figure(
+        (9.4, 6.4),
+        title,
+        badge,
+        nrows=2,
         sharex=True,
         gridspec_kw={"height_ratios": [1.25, 1.0], "hspace": 0.22},
+        adjust_kw={"top": 0.84, "bottom": 0.10, "left": 0.09, "right": 0.97},
     )
-    fig.subplots_adjust(top=0.84, bottom=0.10, left=0.09, right=0.97)
-    _header(fig, title, badge)
     x = [c["cand"] for c in cands]
     ms = 4 if len(cands) <= 60 else 0
     for k, col in (
@@ -1458,59 +1538,117 @@ def generate_pareto_svg(
     badge: tuple[str, str],
     sandbox: dict[str, Any],
 ) -> None:
-    title = "Fig. 5: Quality–Latency Pareto Frontier across Candidates"
-    if not cands:
+    title = "Fig. 5: GEPA Validation & Native Frontier Progress"
+    if not sandbox:
         _placeholder_svg(dest, title, badge, _no_candidates_message(sandbox))
         return
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(9.4, 5.6), gridspec_kw={"wspace": 0.32})
-    fig.subplots_adjust(top=0.82, bottom=0.12, left=0.08, right=0.97)
-    _header(fig, title, badge, y=0.95)
-    nd = _pareto_2d(cands)
-    lat = np.array([c["s_per_it"] for c in cands])
-    gm = np.array([c["gm_good"] for c in cands])
-    sc = ax1.scatter(
-        lat,
-        gm,
-        c=[c["cand"] for c in cands],
-        cmap="viridis",
-        vmin=1,
-        vmax=max(2, len(cands)),
-        s=30,
-        alpha=0.85,
-        zorder=3,
+    ds = sandbox.get("datestamp")
+    progress = _read_audit(_audit_path(str(ds))).get("gepa_progress") if ds else None
+    if not isinstance(progress, dict) or progress.get("version") != 1:
+        _placeholder_svg(
+            dest,
+            title,
+            badge,
+            "Native GEPA telemetry unavailable in this audit.\n"
+            "Requires an optimizer started with progress telemetry.\n"
+            "Candidate averages cannot reconstruct GEPA's frontier.",
+        )
+        return
+    fig, (ax1, ax2) = _create_dark_figure(
+        (9.4, 8.4),
+        title,
+        badge,
+        nrows=2,
+        gridspec_kw={"hspace": 0.5},
+        adjust_kw={"top": 0.77, "bottom": 0.12, "left": 0.09, "right": 0.97},
+        header_y=0.95,
     )
-    ax1.plot(
-        [r["s_per_it"] for r in nd],
-        [r["gm_good"] for r in nd],
-        color="#10b981",
-        lw=1.0,
-        marker="o",
-        zorder=4,
-        label=f"Pareto front ({len(nd)})",
+    observed = int(progress.get("phase_evaluations", 0))
+    expected = progress.get("phase_expected")
+    count = f"{observed}/{expected}" if expected is not None else str(observed)
+    activity = "RUNNING" if sandbox.get("optimizer_alive") else "STOPPED / last recorded phase"
+    fig.text(
+        0.09,
+        0.84,
+        f"{activity}: {progress.get('phase', 'unknown')} · iteration {progress.get('iteration', '?')}\n"
+        f"Metric evaluations since phase began: {count} (cache hits may bypass metrics)",
+        fontsize=9,
+        color="#cbd5e1",
     )
-    cb = fig.colorbar(sc, ax=ax1, pad=0.02, fraction=0.05)
-    cb.set_label("Evaluation #" if legacy else "Candidate #", color="#e2e8f0")
-    cb.ax.yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
-    ax1.set_xlim(0.0, max(1.0, float(lat.max()) * 1.15))
-    ax1.set_ylim(0.0, 1.05)
-    ax1.set_xlabel("Latency τ (s / eval) →")
-    ax1.set_ylabel("GM quality (R@k, EM, F1) ↑", color="#38bdf8", fontweight="bold")
-    ax1.legend(loc="lower right", fontsize=8)
+    rows = sorted(progress.get("validation", []), key=lambda r: r["candidate_idx"])
+    full = [r for r in rows if r["total"] > 0 and r["evaluated"] == r["total"]]
+    partial = [r for r in rows if r not in full]
+    if full:
+        x = [r["candidate_idx"] for r in full]
+        y = [r["score"] * 100 for r in full]
+        ax1.plot(x, y, "o", ms=5, color="#38bdf8", label="Full validation score")
+        ax1.step(
+            x,
+            np.maximum.accumulate(y),
+            where="post",
+            color="#10b981",
+            label=f"Best full-validation score ({max(y):.1f}%)",
+        )
+        seed = next((r for r in full if r["candidate_idx"] == 0), None)
+        if seed is not None:
+            ax1.axhline(seed["score"] * 100, color="#fbbf24", ls=":", label=f"Seed baseline ({seed['score']:.1%})")
+    if partial:
+        ax1.scatter(
+            [r["candidate_idx"] for r in partial],
+            [r["score"] * 100 for r in partial],
+            marker="x",
+            color="#f59e0b",
+            label="Partial validation (not comparable)",
+        )
+    for row in rows[-20:]:
+        ax1.annotate(
+            f"{row['evaluated']}/{row['total']}",
+            (row["candidate_idx"], row["score"] * 100),
+            xytext=(0, 7),
+            textcoords="offset points",
+            ha="center",
+            fontsize=7,
+            color="#cbd5e1",
+        )
+    if rows:
+        ax1.legend(loc="upper left", fontsize=8)
+    else:
+        ax1.text(0.5, 0.5, "Awaiting native validation results", transform=ax1.transAxes, ha="center", color="#cbd5e1")
+    ax1.set_ylim(-3, 110)
+    ax1.set_ylabel("GEPA validation score (%)")
+    ax1.yaxis.set_major_formatter(ticker.PercentFormatter(decimals=0))
+    ax1.set_xlabel("Native GEPA candidate index (seed = 0); labels = validation coverage")
+    ax1.xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
 
-    arch = [len(_pareto_2d(cands[: k + 1])) for k in range(len(cands))]
-    ax2.step(
-        [c["cand"] for c in cands],
-        arch,
-        where="post",
-        color="#10b981",
-        lw=1.0,
-        label=f"Frontier size ({arch[-1]})",
-    )
-    ax2.set_ylim(0.0, max(arch) + 1.0)
+    history = progress.get("frontier_history", [])
+    front = progress.get("frontier")
+    if front is None:
+        ax2.text(
+            0.5,
+            0.5,
+            "Native frontier membership not yet available",
+            transform=ax2.transAxes,
+            ha="center",
+            color="#cbd5e1",
+        )
+    else:
+        for key, marker, color, label in (
+            ("members", "s", "#38bdf8", "Retained"),
+            ("added", "o", "#10b981", "Added"),
+            ("removed", "x", "#f43f5e", "Displaced"),
+        ):
+            points = [(h["event"], idx) for h in history for idx in h[key]]
+            if points:
+                ax2.scatter(*zip(*points, strict=True), marker=marker, color=color, s=22, label=label)
+        if ax2.collections:
+            ax2.legend(loc="upper left", fontsize=8, ncol=3)
+        shown = ", ".join(str(i) for i in front[:20]) or "empty"
+        suffix = f" … ({len(front)} total)" if len(front) > 20 else ""
+        ax2.set_title(f"Current native frontier: {shown}{suffix}", fontsize=9, color="#cbd5e1")
     ax2.yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
-    ax2.set_ylabel("Archive size ↑", color="#10b981", fontweight="bold")
-    ax2.legend(loc="upper left", fontsize=8)
-    _candidate_xaxis(ax2, cands, legacy)
+    ax2.xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
+    ax2.set_ylabel("Native GEPA candidate index")
+    ax2.set_xlabel("Native frontier observation # (latest 250 since process start; first = baseline)")
     _save(fig, dest)
 
 
@@ -1642,7 +1780,7 @@ def generate_report_markdown(
         "Fig. 2: Knowledge Graph & Disambiguation",
         "Fig. 3: Candidate Score",
         "Fig. 4: Retrieval Quality",
-        "Fig. 5: Pareto Frontier",
+        "Fig. 5: GEPA Validation & Frontier",
     ]
     figures = []
     for index, (title, name) in enumerate(zip(fig_titles, FIG_FILES, strict=True)):
@@ -1657,7 +1795,7 @@ def generate_report_markdown(
         f"{table}\n\n"
         f"{figs}\n"
     )
-    _atomic_write(dest, lambda p: p.write_text(md, encoding="utf-8"))
+    write_text_atomic(dest, md)
 
 
 @contextlib.contextmanager
@@ -1700,7 +1838,7 @@ def cool_inference_servers(cool_seconds: int) -> None:
 
 def run_once(
     *,
-    layout_iterations: int = 1000,
+    layout_iterations: int = 500,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], int, tuple[str, str]]:
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
     sb = get_active_sandbox_info()
@@ -1739,8 +1877,8 @@ def main() -> int:
     ap.add_argument(
         "--layout-iterations",
         type=int,
-        default=1000,
-        help="Force-layout relaxation rounds for Fig. 2 (default: 1000)",
+        default=500,
+        help="Force-layout relaxation rounds for Fig. 2 (default: 500)",
     )
     ap.add_argument("--cool-seconds", type=int, default=0)
     ap.add_argument("--thermal-guard", action=argparse.BooleanOptionalAction, default=True)

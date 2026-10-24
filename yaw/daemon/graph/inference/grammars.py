@@ -1,7 +1,6 @@
-"""Pure-JSON Context-Free Grammars (GBNF) and task quality metric for DSPy."""
+"""Pure-JSON Context-Free Grammars (GBNF) for DSPy."""
 
 import json
-import math
 from collections.abc import Sequence
 from typing import Any
 
@@ -41,7 +40,6 @@ relation-kind ::= "\"skos:altLabel\"" | "\"skos:hiddenLabel\"" | "\"skos:related
 string ::= "\"" char+ "\""
 char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
 """
-DSPY_SYNONYM_JUDGMENT_GBNF_GRAMMAR = DSPY_SYNONYM_JUDGE_GBNF_GRAMMAR
 
 DSPY_SHACL_REPAIR_GBNF_GRAMMAR = (
     'root ::= "{\\"repairs\\": " repair-list "}"\n'
@@ -200,9 +198,6 @@ def build_dspy_synonym_judge_grammar(max_decisions: int | None = None) -> str:
     )
 
 
-build_dspy_synonym_judgment_grammar = build_dspy_synonym_judge_grammar
-
-
 def build_dspy_shacl_repair_grammar(max_repairs: int | None = None) -> str:
     """Build pure-JSON GBNF grammar for ProposeSHACLRepairs (`{"repairs": [...]}`)."""
     if max_repairs is None or max_repairs <= 0:
@@ -275,115 +270,8 @@ def build_dspy_rerank_grammar(
     return f'root ::= "{{\\"fact\\": [" fact-list "]}}"\nfact-list ::= ({seq})?\ntriple ::= {triple_rule}\n'
 
 
-def _clamp_unit(val: float) -> float:
-    return max(0.0, min(1.0, float(val)))
-
-
-def _geometric_mean(values: Sequence[float]) -> float:
-    if not values:
-        raise ValueError("Task quality requires at least one labeled metric")
-    if any(v == 0.0 for v in values):
-        return 0.0
-    return math.exp(math.fsum(math.log(v) for v in values) / len(values))
-
-
-def compute_sizecoding_pareto_score(
-    recall_at_5: float | None,
-    *,
-    tokens: int,
-    recall_at_1: float | None = None,
-    recall_at_2: float | None = None,
-    recall_at_10: float | None = None,
-    recall_at_20: float | None = None,
-    em: float | None = None,
-    f1: float | None = None,
-    shacl_conformance: float | None = None,
-    shacl_violations: int | None = None,
-    shacl_violations_initial: int = 0,
-    shacl_violations_remaining: int = 0,
-    synonym_judge_tokens: int = 0,
-    shacl_healer_tokens: int = 0,
-    missing_entity_defs_count: int = 0,
-    missing_entity_defs_tokens: int = 0,
-    pred_name: str | None = None,
-    missed_items: Sequence[str] = (),
-) -> dspy.Prediction:
-    """Return the unweighted geometric mean of available recall, EM and F1.
-
-    The historical function name is retained for callers. There is no cost
-    denominator, smoothing floor or repeated weight. Zero quality stays zero.
-    Absent labels contribute no objectives. Tokens and graph integrity remain
-    diagnostics only, including in GEPA's per-objective Pareto frontier.
-    """
-    clamped_recall = _clamp_unit(recall_at_5) if recall_at_5 is not None else None
-    safe_tokens = max(int(tokens), 0)
-    stage_prefix = f"[{pred_name}] " if pred_name else ""
-    raw_metrics = {
-        "recall_at_1": recall_at_1,
-        "recall_at_2": recall_at_2,
-        "recall_at_5": clamped_recall,
-        "recall_at_10": recall_at_10,
-        "recall_at_20": recall_at_20,
-        "em": em,
-        "f1": f1,
-    }
-    obj_scores = {name: _clamp_unit(value) for name, value in raw_metrics.items() if value is not None}
-    score = _geometric_mean(list(obj_scores.values()))
-
-    eff_v_rem = max(
-        0,
-        int(shacl_violations) if shacl_violations is not None else int(shacl_violations_remaining),
-    )
-    eff_v_init = max(0, int(shacl_violations_initial))
-    eff_missing_defs = max(0, int(missing_entity_defs_count))
-    eff_missing_def_tokens = max(0, int(missing_entity_defs_tokens))
-    g_shacl = _clamp_unit(shacl_conformance) if shacl_conformance is not None else 1.0 / (1.0 + float(eff_v_rem))
-
-    missed_str = f" Missed gold items: {list(missed_items)}." if missed_items else ""
-    missing_defs_str = (
-        f" [entity_definer] repaired {eff_missing_defs} missing Stage-2 entity definition(s) "
-        f"({eff_missing_def_tokens} aux tokens); emit inline [name, def] pairs in Stage 2 or extract in Stage 1."
-        if eff_missing_defs > 0
-        else ""
-    )
-    quality_details = ", ".join(f"{name}={value:.4f}" for name, value in obj_scores.items())
-    feedback = (
-        f"{stage_prefix}Task quality geometric mean={score:.6f} ({quality_details}). "
-        "Improve retrieval and answer correctness; tokens and graph repairs do not affect reward. "
-        f"Diagnostics: {safe_tokens} tokens, SHACL={g_shacl:.4f}."
-        f"{missed_str}{missing_defs_str}"
-    )
-
-    return dspy.Prediction(
-        score=score,
-        feedback=feedback,
-        gm_good=score,
-        shacl_conforms=g_shacl,
-        recall_at_1=obj_scores.get("recall_at_1"),
-        recall_at_2=obj_scores.get("recall_at_2"),
-        recall_at_5=clamped_recall,
-        recall_at_10=obj_scores.get("recall_at_10"),
-        recall_at_20=obj_scores.get("recall_at_20"),
-        em=obj_scores.get("em"),
-        f1=obj_scores.get("f1"),
-        tokens=safe_tokens,
-        synonym_judge_tokens=max(0, int(synonym_judge_tokens)),
-        shacl_healer_tokens=max(0, int(shacl_healer_tokens)),
-        shacl_violations_initial=eff_v_init,
-        shacl_violations_remaining=eff_v_rem,
-        missing_entity_defs_count=eff_missing_defs,
-        missing_entity_defs_tokens=eff_missing_def_tokens,
-        objective_scores=obj_scores,
-    )
-
-
 def lm_supports_gbnf(lm: Any = None) -> bool:
-    """Return True if `lm` runs on a `llama.cpp` backend that supports GBNF grammars.
-
-    Ryzen AI NPU/OGA (`ryzenai-llm`, e.g. `Mistral-7B-Instruct-v0.3-Hybrid`) and FLM
-    do NOT support GBNF (`extra_body={"grammar": ...}`). Only `llamacpp` GPU models
-    (e.g. `Qwen3-4B-Instruct-2507-GGUF`) support GBNF constrained decoding.
-    """
+    """Return True if `lm` runs on a `llama.cpp` backend that supports GBNF grammars."""
     target_lm = lm if lm is not None else getattr(dspy.settings, "lm", None)
     if target_lm is None:
         return True
@@ -391,10 +279,10 @@ def lm_supports_gbnf(lm: Any = None) -> bool:
     if isinstance(explicit, bool):
         return explicit
     recipe = getattr(target_lm, "_yaw_recipe", None)
-    if recipe in ("ryzenai-llm", "flm"):
+    if recipe == "flm":
         return False
     model_name = str(getattr(target_lm, "model", "")).lower()
-    return not ("mistral" in model_name or "ryzenai" in model_name or "flm" in model_name)
+    return "flm" not in model_name
 
 
 __all__ = [
@@ -402,7 +290,6 @@ __all__ = [
     "DSPY_TRIPLES_GBNF_GRAMMAR",
     "DSPY_MISSING_ENTITY_DEFS_GBNF_GRAMMAR",
     "DSPY_SYNONYM_JUDGE_GBNF_GRAMMAR",
-    "DSPY_SYNONYM_JUDGMENT_GBNF_GRAMMAR",
     "DSPY_SHACL_REPAIR_GBNF_GRAMMAR",
     "DSPY_RERANK_GBNF_GRAMMAR",
     "DSPY_QA_GBNF_GRAMMAR",
@@ -413,12 +300,10 @@ __all__ = [
     "build_dspy_triples_grammar",
     "build_dspy_missing_entity_defs_grammar",
     "build_dspy_synonym_judge_grammar",
-    "build_dspy_synonym_judgment_grammar",
     "build_dspy_shacl_repair_grammar",
     "build_dspy_qa_grammar",
     "build_dspy_instruction_proposal_grammar",
     "build_dspy_query_intent_grammar",
     "build_dspy_rerank_grammar",
-    "compute_sizecoding_pareto_score",
     "lm_supports_gbnf",
 ]

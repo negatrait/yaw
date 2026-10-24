@@ -1,11 +1,9 @@
 """Native DSPy HippoRAG 2 Graph and Retrieval Engine backed by yaw.db and disk line hydration."""
 
 import contextlib
-import functools
 import hashlib
 import importlib.metadata
 import json
-import os
 import re
 import sqlite3
 import threading
@@ -18,31 +16,34 @@ from typing import Any, Literal
 import dspy
 import numpy as np
 
-from yaw.core import ChunkPointer, IndexStats, StructuredTriple, YawRuntimeError
+from yaw.core import ChunkPointer, IndexStats, RelationTraversalPolicy, StructuredTriple, write_text_atomic
 from yaw.core.config import context_char_limit, scale_context_budget
-from yaw.daemon.graph.candidate_cache import CandidatePayloadCodec, CandidateStageCache
 from yaw.daemon.graph.inference import (
     FACT_INSTRUCTION,
     PASSAGE_INSTRUCTION,
     DSPyEmbeddingAdapter,
+    GraphOptimizationHooks,
     HippoRAGProgram,
-    ParetoProgramEnsemble,
     RLMInstructionProposer,
-    ServingTokenCounter,
     YawRetriever,
     YawRM,
-    checkpoint_object,
+    compile_pareto_ensemble,
     compute_mdhash_id,
-    compute_qa_em_f1,
-    compute_sizecoding_pareto_score,
+    configure_simba_task_learning,
     configure_yaw_dspy_cache,
+    embed_fingerprint,
+    evaluate_program,
+    evolve_program_prompts,
+    extract_named_trace_entries,
+    extraction_fingerprint,
+    openie_fingerprint,
+    query_retrieval_fingerprint,
+    set_yaw_sleep_seconds,
+    shacl_fingerprint,
+    synonym_fingerprint,
     text_processing,
-    validate_active_checkpoint,
-    validate_request_checkpoint,
-    validate_simba_state,
+    trim_diagnostics,
 )
-from yaw.daemon.graph.inference.diagnostics import trim_diagnostics
-from yaw.daemon.graph.inference.reflection import ActiveReflectionCheckpoint
 from yaw.daemon.graph.ppr import (
     CSRGraph,
     build_transition_matrix,
@@ -52,17 +53,20 @@ from yaw.daemon.graph.ppr import (
 )
 from yaw.daemon.graph.storage import (
     CandidateCacheStore,
+    CandidatePayloadCodec,
+    CandidateStageCache,
     ManagedConnection,
+    apply_shacl_repairs,
     delete_chunks,
     find_entity_disambiguation_candidates,
     get_chunk_pointers,
     get_entities_by_label_norm,
     get_entity_doc_frequencies,
+    get_entity_metadata_batch,
     get_entity_vectors,
     get_existing_ids,
     get_facts_by_ids,
     get_graph_counts,
-    get_max_end_line,
     get_meta,
     get_openie_checkpoints,
     hydrate_budgeted_passages,
@@ -87,35 +91,13 @@ from yaw.daemon.graph.storage import (
     upsert_entities,
     upsert_entity_labels,
     upsert_entity_vectors,
+    upsert_fact_sources,
     upsert_fact_vectors,
     upsert_facts,
     upsert_semantic_edges,
 )
 
 _SAME_SENSE_COSINE_GATE = 0.85
-
-
-def _write_text_atomic(path: Path, text: str) -> None:
-    """Write via sibling temp file + os.replace so concurrent readers never observe partial JSON."""
-    tmp = path.with_name(f"{path.name}.tmp")
-    tmp.write_text(text, encoding="utf-8")
-    try:
-        os.replace(tmp, path)
-    except PermissionError:
-        # Windows: a reader holding the target open blocks replace; fall back to in-place write.
-        path.write_text(text, encoding="utf-8")
-        tmp.unlink(missing_ok=True)
-
-
-def _optimization_history_scope(fn: Callable) -> Callable:
-    @functools.wraps(fn)
-    def wrapped(*args: Any, **kwargs: Any) -> Any:
-        # GEPA consumes DSPy traces and usage, not inspection histories containing
-        # full prompts/responses on every LM, caller module and GLOBAL_HISTORY.
-        with dspy.context(disable_history=True, max_history_size=0):
-            return fn(*args, **kwargs)
-
-    return wrapped
 
 
 class YawGraphEngine:
@@ -151,6 +133,7 @@ class YawGraphEngine:
         homograph_cosine_gate: float | None = None,
         max_context_chars: int | None = None,
         max_ast_expansion_hops: int = 1,
+        traversal_policy: RelationTraversalPolicy | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.db_path = db_path
@@ -196,6 +179,7 @@ class YawGraphEngine:
             homograph_cosine_gate if homograph_cosine_gate is not None else same_sense_cosine_gate
         )
         self.homograph_cosine_gate = self.same_sense_cosine_gate
+        self.traversal_policy: RelationTraversalPolicy | None = traversal_policy
 
         self._csr_graph: CSRGraph | None = None
         self._active_repl_repair_keys: set[tuple[str, str, str, str]] | None = None
@@ -217,6 +201,13 @@ class YawGraphEngine:
         self._resolved_docs_cache: dict[tuple[int, str], list[tuple[ChunkPointer, str]]] = {}
         self._captured_chunk_traces: dict[str, list[tuple[str, dict[str, Any], Any]]] = {}
         self._captured_graph_traces: list[tuple[str, dict[str, Any], Any]] = []
+        self._in_optimization: bool = False
+        self._last_memo_question: str | None = None
+        self._query_retrieval_memo: dict[
+            tuple[str, int, str],
+            tuple[str, tuple[str, ...], tuple[float, ...], tuple[str, ...]],
+        ] = {}
+        self.ensemble: dspy.Module = self.program
         # One versioned, bounded disk cache in yaw.db. Candidate histories must
         # not accumulate vectors, extraction records and RLM traces in RAM.
         graph_dir = Path(__file__).parent
@@ -304,6 +295,7 @@ class YawGraphEngine:
         for table, order in (
             ("entities", "entity_id"),
             ("facts", "fact_id"),
+            ("fact_sources", "fact_id, chunk_id"),
             ("edges", "src_id, dst_id, kind"),
             ("entity_labels", "label_norm, entity_id, label_kind, chunk_id"),
             ("edge_sources", "src_id, dst_id, kind, chunk_id"),
@@ -405,11 +397,7 @@ class YawGraphEngine:
             payload = {
                 "graph_rlm_stats": dict(self._graph_rlm_stats),
                 "chunk_rlm_stats": dict(self._chunk_rlm_stats),
-                "telemetry": list(getattr(active_prog, "telemetry", ()))[-250:],
-                "embedding_audit_trail": list(getattr(active_prog, "embedding_audit_trail", ()))[-250:],
-                "synonym_audit_trail": list(getattr(active_prog, "synonym_audit_trail", ()))[-100:],
-                "shacl_audit_trail": list(getattr(active_prog, "shacl_audit_trail", ()))[-100:],
-                "entity_def_audit_trail": list(getattr(active_prog, "entity_def_audit_trail", ()))[-250:],
+                **active_prog.dump_audit_trails(bounded=True),
             }
             set_meta(self.conn, "dspy_trails_state", json.dumps(payload, ensure_ascii=False))
         except Exception:
@@ -496,6 +484,7 @@ class YawGraphEngine:
             "candidate_pairs": 0,
             "merged_entities": 0,
             "related_edges": 0,
+            "broader_edges": 0,
             "different_from_edges": 0,
             "shacl_violations_before": 0,
             "shacl_violations_after": 0,
@@ -510,197 +499,6 @@ class YawGraphEngine:
             "embedding_calls": 0,
             "embedding_tokens": 0,
         }
-
-    @staticmethod
-    def _serialize_predictor_surface(pred: Any) -> dict[str, Any]:
-        sig = getattr(pred, "signature", None)
-        instructions = str(getattr(sig, "instructions", "") or "")
-        in_fields = set(getattr(sig, "input_fields", {}) or {})
-        out_fields = set(getattr(sig, "output_fields", {}) or {})
-        demos_raw = getattr(pred, "demos", None) or ()
-        demos_repr: list[str] = []
-        for d in demos_raw:
-            d_dict = d.toDict() if hasattr(d, "toDict") else (dict(d) if isinstance(d, Mapping) else None)
-            if isinstance(d_dict, dict) and in_fields and out_fields:
-                if not (in_fields.issubset(d_dict.keys()) and out_fields.issubset(d_dict.keys())):
-                    continue
-                filtered = {k: d_dict[k] for k in sorted(in_fields | out_fields)}
-                demos_repr.append(json.dumps(filtered, sort_keys=True, ensure_ascii=False, default=str))
-            else:
-                demos_repr.append(str(d_dict) if d_dict is not None else str(d))
-        lm = getattr(pred, "lm", None) or dspy.settings.lm
-        identity = getattr(lm, "cache_identity", None)
-        return {
-            "instructions": instructions,
-            "demos": demos_repr,
-            "fields": {name: str(f.annotation) for name, f in sig.fields.items()} if sig else {},
-            "config": getattr(pred, "config", {}),
-            "lm": identity()
-            if callable(identity)
-            else {
-                "model": getattr(lm, "model", None),
-                "model_type": getattr(lm, "model_type", None),
-                "context_window_tokens": getattr(lm, "_yaw_context_window_tokens", None),
-                "kwargs": {
-                    key: value
-                    for key, value in (getattr(lm, "kwargs", {}) or {}).items()
-                    if key not in {"api_key", "api_token"}
-                },
-            },
-        }
-
-    @staticmethod
-    def _prune_mismatching_demos(program: HippoRAGProgram) -> None:
-        if not hasattr(program, "named_predictors"):
-            return
-        for _, pred in program.named_predictors():
-            demos_raw = getattr(pred, "demos", None)
-            if not demos_raw:
-                continue
-            sig = getattr(pred, "signature", None)
-            in_fields = set(getattr(sig, "input_fields", {}) or {})
-            out_fields = set(getattr(sig, "output_fields", {}) or {})
-            if not (in_fields and out_fields):
-                continue
-            valid_demos: list[Any] = []
-            for d in demos_raw:
-                d_dict = d.toDict() if hasattr(d, "toDict") else (dict(d) if isinstance(d, Mapping) else None)
-                if (
-                    isinstance(d_dict, dict)
-                    and in_fields.issubset(d_dict.keys())
-                    and out_fields.issubset(d_dict.keys())
-                ):
-                    valid_demos.append(d)
-            pred.demos = valid_demos
-
-    @classmethod
-    def _embed_fingerprint(cls, program: Any, instruction: str = "") -> str:
-        query_prefix = getattr(program, "query_prefix", getattr(program, "embedding_query_prefix", None))
-        fact_prefix = getattr(program, "fact_query_prefix", getattr(program, "embedding_fact_prefix", None))
-        if not instruction:
-            prefix = getattr(program, "document_prefix", getattr(program, "embedding_document_prefix", None))
-        elif instruction == FACT_INSTRUCTION:
-            prefix = fact_prefix or query_prefix
-        else:
-            prefix = query_prefix
-        payload = {"prefix": prefix}
-        raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
-        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-    @classmethod
-    def _synonym_fingerprint(cls, program: HippoRAGProgram) -> str:
-        named = dict(program.named_predictors()) if hasattr(program, "named_predictors") else {}
-        payload = cls._serialize_predictor_surface(named["synonym_judge"]) if "synonym_judge" in named else {}
-        payload["context_budget"] = [program.context_window_tokens, program.max_output_tokens]
-        raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
-        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-    @classmethod
-    def _shacl_fingerprint(cls, program: HippoRAGProgram) -> str:
-        named = dict(program.named_predictors()) if hasattr(program, "named_predictors") else {}
-        shacl_keys = (
-            "shacl_repair",
-            "shacl_healer_rlm.generate_action",
-            "shacl_healer_rlm.extract",
-        )
-        payload: dict[str, object] = {k: cls._serialize_predictor_surface(named[k]) for k in shacl_keys if k in named}
-        healer = getattr(program, "shacl_healer_rlm", None)
-        payload["rlm_limits"] = {
-            name: getattr(healer, name, None) for name in ("max_iters", "max_llm_calls", "max_output_chars")
-        }
-        payload["context_budget"] = [program.context_window_tokens, program.max_output_tokens]
-        raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
-        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-    @classmethod
-    def _openie_fingerprint(cls, program: HippoRAGProgram) -> str:
-        named = dict(program.named_predictors()) if hasattr(program, "named_predictors") else {}
-        payload = {
-            "stages": {
-                k: cls._serialize_predictor_surface(named[k])
-                for k in ("ner", "triples", "entity_definer")
-                if k in named
-            },
-            "gbnf_max_entities": getattr(program, "gbnf_max_entities", None),
-            "gbnf_max_triples": getattr(program, "gbnf_max_triples", None),
-            "context_budget": [program.context_window_tokens, program.max_output_tokens],
-        }
-        raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
-        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-    @classmethod
-    def _extraction_fingerprint(cls, program: HippoRAGProgram) -> str:
-        named = dict(program.named_predictors()) if hasattr(program, "named_predictors") else {}
-        graph_stage_keys = (
-            "ner",
-            "triples",
-            "entity_definer",
-            "synonym_judge",
-            "shacl_repair",
-            "shacl_healer_rlm.generate_action",
-            "shacl_healer_rlm.extract",
-        )
-        payload = {
-            "stages": {k: cls._serialize_predictor_surface(named[k]) for k in graph_stage_keys if k in named},
-            "gbnf_max_entities": getattr(program, "gbnf_max_entities", None),
-            "gbnf_max_triples": getattr(program, "gbnf_max_triples", None),
-            "embedding_document_prefix": getattr(program, "embedding_document_prefix", None),
-            "context_budget": [program.context_window_tokens, program.max_output_tokens],
-        }
-        raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
-        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-    @classmethod
-    def _candidate_fingerprint(cls, program: HippoRAGProgram) -> str:
-        """Identify an optimizer candidate by hashing every predictor surface and embedding prefix."""
-        named = dict(program.named_predictors()) if hasattr(program, "named_predictors") else {}
-        payload = {
-            "stages": {k: cls._serialize_predictor_surface(v) for k, v in sorted(named.items())},
-            "embedding_query_prefix": getattr(program, "embedding_query_prefix", None),
-            "embedding_fact_prefix": getattr(program, "embedding_fact_prefix", None),
-            "embedding_document_prefix": getattr(program, "embedding_document_prefix", None),
-            "context_budget": [program.context_window_tokens, program.max_output_tokens],
-        }
-        raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
-        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
-
-    @staticmethod
-    def _extract_named_trace_entries(
-        program: HippoRAGProgram,
-        raw_trace: Sequence[Any],
-        *,
-        allowed_names: set[str] | None = None,
-    ) -> list[tuple[str, dict[str, Any], Any]]:
-        named_preds = list(program.named_predictors()) if hasattr(program, "named_predictors") else []
-        captured: list[tuple[str, dict[str, Any], Any]] = []
-        for item in raw_trace:
-            if not isinstance(item, (list, tuple)) or len(item) < 3:
-                continue
-            pred_inst, inp, out = item[0], item[1], item[2]
-            matched_name: str | None = None
-            pred_sig = getattr(pred_inst, "signature", None)
-            for name, cand_pred in named_preds:
-                if pred_inst is cand_pred:
-                    matched_name = name
-                    break
-            if matched_name is None and pred_sig is not None:
-                pred_fields = tuple(getattr(pred_sig, "fields", {}).keys())
-                for name, cand_pred in named_preds:
-                    cand_sig = getattr(cand_pred, "signature", None)
-                    if cand_sig is not None:
-                        is_eq = cand_sig.equals(pred_sig) if hasattr(cand_sig, "equals") else cand_sig == pred_sig
-                        cand_fields = tuple(getattr(cand_sig, "fields", {}).keys())
-                        if is_eq or (pred_fields and pred_fields == cand_fields):
-                            matched_name = name
-                            break
-            if matched_name is not None:
-                if allowed_names is not None and not (
-                    matched_name in allowed_names or any(matched_name.startswith(f"{a}.") for a in allowed_names)
-                ):
-                    continue
-                inp_dict = dict(inp) if isinstance(inp, Mapping) else {"input": inp}
-                captured.append((matched_name, inp_dict, out))
-        return captured
 
     def _hydrate_single_chunk(self, chunk_id: str) -> str:
         hydrator = make_chunk_hydrator(self.conn, self.workspace_root)
@@ -766,22 +564,17 @@ class YawGraphEngine:
             )
         if hasattr(target, "set_graph_search_tool"):
             target.set_graph_search_tool(self._search_graph_for_react)
-        ensemble = getattr(target, "pareto_ensemble", None)
-        if ensemble is not None and hasattr(ensemble, "programs"):
-            for sub_prog in ensemble.programs:
-                if sub_prog is not target:
-                    sub_rm = getattr(sub_prog, "rm", None)
-                    if sub_rm is not None:
-                        sub_rm.default_k = self.retrieval_top_k
-                    sub_ret = getattr(sub_prog, "retriever", None)
-                    if sub_ret is not None:
-                        sub_ret.k = self.retrieval_top_k
-                    if hasattr(sub_prog, "set_retrieval_hook"):
-                        sub_prog.set_retrieval_hook(self._canonical_retrieval_hook)
-                    if hasattr(sub_prog, "set_graph_search_tool"):
-                        sub_prog.set_graph_search_tool(self._search_graph_for_react)
         if hasattr(self.embedder, "bind_telemetry_hook"):
             self.embedder.bind_telemetry_hook(self._on_embedding_telemetry)
+        if target is self.program:
+            loaded_path = getattr(self.program, "loaded_from_path", None)
+            self.ensemble = compile_pareto_ensemble(self.program, program_path=loaded_path)
+
+    def refresh_program_bindings(self) -> None:
+        """Re-bind runtime hooks, Pareto ensemble siblings, and embedding prefixes after program load."""
+        self._query_retrieval_memo.clear()
+        self._bind_program_hooks()
+        self._apply_program_embedding_prefixes()
 
     def _canonical_retrieval_hook(
         self,
@@ -794,24 +587,39 @@ class YawGraphEngine:
         """Canonical engine retrieval hook returning (formatted_context, hydrated_texts, scores, chunk_ids)."""
         active_program = program if program is not None else self.program
         self._last_hook_program = active_program
-        target_cids = self._ensure_candidate_chunks_indexed(active_program, item_docs=item_docs)
-        active_trace = getattr(dspy.settings, "trace", None)
-        if isinstance(active_trace, list):
-            named_map = dict(active_program.named_predictors())
-            for cid in target_cids:
-                for pred_name, inp_dict, out_obj in self._captured_chunk_traces.get(cid, ()):
+        qa_top_k = max(1, int(k if k is not None else self.retrieval_top_k))
+        q_str = str(question or "")
+
+        if self._in_optimization:
+            target_cids = self._ensure_candidate_chunks_indexed(active_program, item_docs=item_docs)
+            active_trace = getattr(dspy.settings, "trace", None)
+            if isinstance(active_trace, list):
+                named_map = dict(active_program.named_predictors())
+                for cid in target_cids:
+                    for pred_name, inp_dict, out_obj in self._captured_chunk_traces.get(cid, ()):
+                        pred_inst = named_map.get(pred_name)
+                        if pred_inst is not None:
+                            active_trace.append((pred_inst, dict(inp_dict), out_obj))
+                for pred_name, inp_dict, out_obj in self._captured_graph_traces:
                     pred_inst = named_map.get(pred_name)
                     if pred_inst is not None:
                         active_trace.append((pred_inst, dict(inp_dict), out_obj))
-            for pred_name, inp_dict, out_obj in self._captured_graph_traces:
-                pred_inst = named_map.get(pred_name)
-                if pred_inst is not None:
-                    active_trace.append((pred_inst, dict(inp_dict), out_obj))
+        else:
+            if not self._opt_indexed_cids:
+                self._hydrate_indexed_cids_from_db(self.program)
+            if not self._opt_indexed_cids and (bool(self._opt_chunks_pool) or bool(item_docs)):
+                self._ensure_candidate_chunks_indexed(self.program, item_docs=item_docs)
+            if active_program is self.program and q_str != self._last_memo_question:
+                self._query_retrieval_memo.clear()
+                self._last_memo_question = q_str
+            memo_key = (q_str, qa_top_k, query_retrieval_fingerprint(active_program))
+            cached_ret = self._query_retrieval_memo.get(memo_key)
+            if cached_ret is not None:
+                return cached_ret
 
-        qa_top_k = max(1, int(k if k is not None else self.retrieval_top_k))
         fetch_top_k = max(20, qa_top_k)
         if self._active_progress_callback is not None:
-            q_preview = str(question or "").strip().replace("\n", " ")[:48]
+            q_preview = q_str.strip().replace("\n", " ")[:48]
             self._active_progress_callback(f"retrieving + QA: {q_preview!r}...")
         hits = self.retrieve(
             question,
@@ -819,12 +627,18 @@ class YawGraphEngine:
             program=active_program,
         )
         if not hits:
-            return "", (), (), ()
+            empty_res: tuple[str, tuple[str, ...], tuple[float, ...], tuple[str, ...]] = ("", (), (), ())
+            if not self._in_optimization:
+                self._query_retrieval_memo[(q_str, qa_top_k, query_retrieval_fingerprint(active_program))] = empty_res
+            return empty_res
         texts = tuple(self._format_hydrated_passage(p, text) for p, _, text in hits)
         scores = tuple(float(s) for _, s, _ in hits)
         pids = tuple(p.chunk_id for p, _, _ in hits)
         formatted_context = self.format_qa_context(hits[:qa_top_k])
-        return formatted_context, texts, scores, pids
+        res = (formatted_context, texts, scores, pids)
+        if not self._in_optimization:
+            self._query_retrieval_memo[(q_str, qa_top_k, query_retrieval_fingerprint(active_program))] = res
+        return res
 
     def as_rm(
         self,
@@ -998,8 +812,19 @@ class YawGraphEngine:
     def _ensure_csr_graph(self) -> CSRGraph:
         with self._lock:
             if self._csr_graph is None:
-                chunk_ids, entity_ids, edges = load_graph_topology(self.conn)
-                self._csr_graph = build_transition_matrix(chunk_ids, entity_ids, edges, beta=self.beta)
+                has_broader = (
+                    self.conn.execute("SELECT 1 FROM edges WHERE kind = 'skos:broader' LIMIT 1").fetchone()
+                    is not None
+                )
+                use_policy = self.traversal_policy is not None or has_broader
+                chunk_ids, entity_ids, edges = load_graph_topology(self.conn, include_kinds=use_policy)
+                self._csr_graph = build_transition_matrix(
+                    chunk_ids,
+                    entity_ids,
+                    edges,
+                    beta=self.beta,
+                    policy=(self.traversal_policy or RelationTraversalPolicy()) if use_policy else None,
+                )
             return self._csr_graph
 
     def _encode_texts(
@@ -1012,7 +837,7 @@ class YawGraphEngine:
         if not texts:
             return []
         if hasattr(self.embedder, "bind_telemetry_hook"):
-            embed_fp = self._embed_fingerprint(getattr(self.embedder, "profile", None) or self.program, instruction)
+            embed_fp = embed_fingerprint(getattr(self.embedder, "profile", None) or self.program, instruction)
             missing_texts: list[str] = []
             missing_keys: set[str] = set()
             vectors: dict[str, np.ndarray] = {}
@@ -1088,167 +913,7 @@ class YawGraphEngine:
                 blocks.append(formatted)
         return "\n\n".join(blocks)
 
-    @staticmethod
-    def _format_entity_embedding_text(name: str, definition: str) -> str:
-        clean_def = definition.strip()
-        if clean_def:
-            return f"# {name}\n{clean_def}"
-        return name
-
-    @staticmethod
-    def _format_fact_embedding_text(
-        s: str,
-        p: str,
-        o: str,
-        spo_def: str = "",
-        subj_def: str = "",
-        obj_def: str = "",
-    ) -> str:
-        s_d = spo_def.strip()
-        if s_d and s_d.lower().rstrip(".") != f"{s} {p} {o}".lower().rstrip("."):
-            return f"{s} {p} {o}. {s_d}"
-        return f"{s} {p} {o}"
-
-    @staticmethod
-    def _apply_shacl_repairs(
-        conn: sqlite3.Connection,
-        repairs: Sequence[dict[str, str]],
-    ) -> int:
-        applied = 0
-        for rep in repairs:
-            focus = str(rep.get("focus_node", "")).strip()
-            action = str(rep.get("action", "")).strip()
-            val = str(rep.get("value", "")).strip()
-            target = str(rep.get("target_node", "")).strip() or val
-            if not focus or not action:
-                continue
-            if action in ("set_definition", "rewrite_definition") and val:
-                if focus.startswith("entity-"):
-                    cur = conn.execute(
-                        "UPDATE entities SET definition = ? WHERE entity_id = ?",
-                        (val, focus),
-                    )
-                    if cur.rowcount > 0:
-                        applied += 1
-                elif focus.startswith("fact-"):
-                    cur = conn.execute(
-                        "UPDATE facts SET definition = ? WHERE fact_id = ?",
-                        (val, focus),
-                    )
-                    if cur.rowcount > 0:
-                        applied += 1
-            elif action == "set_pref_label" and val and focus.startswith("entity-"):
-                cur = conn.execute(
-                    "UPDATE entities SET name = ? WHERE entity_id = ?",
-                    (val, focus),
-                )
-                if cur.rowcount > 0:
-                    upsert_entity_labels(conn, [(val.strip().lower(), focus, "skos:prefLabel", val, "__healed__")])
-                    applied += 1
-            elif action in ("demote_to_alt_label", "demote_label") and focus.startswith("entity-"):
-                rows = conn.execute(
-                    "SELECT label_norm FROM entity_labels WHERE entity_id = ? AND label_kind = "
-                    "'skos:prefLabel' ORDER BY label_norm ASC",
-                    (focus,),
-                ).fetchall()
-                if len(rows) > 1:
-                    for extra in rows[1:]:
-                        conn.execute(
-                            "UPDATE entity_labels SET label_kind = 'skos:altLabel' WHERE entity_id = ? AND label_norm "
-                            "= ? AND label_kind = 'skos:prefLabel'",
-                            (focus, str(extra[0])),
-                        )
-                    applied += 1
-                else:
-                    s13_rows = conn.execute(
-                        """
-                        SELECT label_norm
-                        FROM entity_labels
-                        WHERE entity_id = ?
-                        GROUP BY label_norm
-                        HAVING COUNT(DISTINCT label_kind) > 1
-                        """,
-                        (focus,),
-                    ).fetchall()
-                    for r in s13_rows:
-                        conn.execute(
-                            "UPDATE entity_labels SET label_kind = 'skos:altLabel' WHERE entity_id = ? AND label_norm "
-                            "= ?",
-                            (focus, str(r[0])),
-                        )
-                        applied += 1
-            elif action in ("merge_altLabel", "merge_hiddenLabel") and (target or "|" in focus):
-                if "|" in focus:
-                    ea, eb = (x.strip() for x in focus.split("|", 1))
-                    if target == ea:
-                        src_node, dst_node = eb, ea
-                    else:
-                        src_node, dst_node = ea, eb
-                else:
-                    src_node, dst_node = focus, target
-                lkind = "skos:hiddenLabel" if action == "merge_hiddenLabel" else "skos:altLabel"
-                if src_node and dst_node and src_node != dst_node:
-                    existing_pair = get_existing_ids(conn, "entity", [src_node, dst_node])
-                    if src_node in existing_pair and dst_node in existing_pair:
-                        merge_entities(conn, src_node, dst_node, label_kind=lkind)
-                        applied += 1
-            elif action in ("add_different_from", "assert_differentFrom"):
-                if "|" in focus:
-                    ea, eb = (x.strip() for x in focus.split("|", 1))
-                else:
-                    ea, eb = focus, target
-                if ea and eb and ea != eb:
-                    existing_pair = get_existing_ids(conn, "entity", [ea, eb])
-                    if ea in existing_pair and eb in existing_pair:
-                        upsert_semantic_edges(conn, [(ea, eb, "owl:differentFrom", 0.0)])
-                        applied += 1
-            elif action == "assert_related":
-                if "|" in focus:
-                    ea, eb = (x.strip() for x in focus.split("|", 1))
-                else:
-                    ea, eb = focus, target
-                if ea and eb and ea != eb:
-                    existing_pair = get_existing_ids(conn, "entity", [ea, eb])
-                    if ea in existing_pair and eb in existing_pair:
-                        upsert_semantic_edges(conn, [(ea, eb, "skos:related", 0.5)])
-                        applied += 1
-            elif action in ("delete_dangling", "delete_orphan", "delete_invalid_fact"):
-                if "->" in focus:
-                    src_node, dst_node = (x.strip() for x in focus.split("->", 1))
-                    conn.execute(
-                        "DELETE FROM edges WHERE src_id = ? AND dst_id = ?",
-                        (src_node, dst_node),
-                    )
-                    conn.execute(
-                        "DELETE FROM edge_sources WHERE src_id = ? AND dst_id = ?",
-                        (src_node, dst_node),
-                    )
-                    applied += 1
-                else:
-                    affected_fids = [
-                        str(r[0])
-                        for r in conn.execute(
-                            "SELECT fact_id FROM facts WHERE fact_id = ? OR subj_id = ? OR obj_id = ?",
-                            (focus, focus, focus),
-                        ).fetchall()
-                    ]
-                    for fid in affected_fids:
-                        conn.execute("DELETE FROM fact_vec WHERE fact_id = ?", (fid,))
-                        conn.execute("DELETE FROM fact_fts WHERE fact_id = ?", (fid,))
-                        conn.execute("DELETE FROM facts WHERE fact_id = ?", (fid,))
-                    conn.execute(
-                        "DELETE FROM edges WHERE src_id = ? OR dst_id = ?",
-                        (focus, focus),
-                    )
-                    conn.execute(
-                        "DELETE FROM edge_sources WHERE src_id = ? OR dst_id = ?",
-                        (focus, focus),
-                    )
-                    conn.execute("DELETE FROM entity_labels WHERE entity_id = ?", (focus,))
-                    conn.execute("DELETE FROM entity_vec WHERE entity_id = ?", (focus,))
-                    conn.execute("DELETE FROM entities WHERE entity_id = ?", (focus,))
-                    applied += 1
-        return applied
+    _apply_shacl_repairs = staticmethod(apply_shacl_repairs)
 
     def _reset_sandbox_graph(self, *, clear_openie: bool = True) -> None:
         """Clear graph tables in the sandbox DB when a candidate mutates extraction/graph prompts or query scope."""
@@ -1257,6 +922,7 @@ class YawGraphEngine:
             conn.execute("DELETE FROM chunk_vec")
             conn.execute("DELETE FROM chunk_fts")
             conn.execute("DELETE FROM chunks")
+            conn.execute("DELETE FROM fact_sources")
             conn.execute("DELETE FROM fact_vec")
             conn.execute("DELETE FROM fact_fts")
             conn.execute("DELETE FROM facts")
@@ -1274,44 +940,39 @@ class YawGraphEngine:
         self._chunk_indexed_ext_fp.clear()
         self._attempted_shacl_keys.clear()
         self._chunk_rlm_stats.clear()
+        self._query_retrieval_memo.clear()
+        self._last_memo_question = None
         self._active_query_rlm_stats = None
         self._csr_graph = None
         self._graph_rlm_stats = self._empty_graph_rlm_stats()
 
-    def _materialize_raw_doc_to_pool(self, doc: str) -> tuple[ChunkPointer, str] | None:
-        "Materialize a raw document string into corpus/passages.txt and _opt_chunks_pool without running LLM indexing."
+    def _materialize_doc_chunk(
+        self,
+        doc: str,
+        *,
+        cid: str | None = None,
+    ) -> tuple[ChunkPointer, str] | None:
         lines = doc.splitlines(keepends=True)
         n_lines = len(lines)
         if n_lines == 0:
             return None
+        chunk_id = cid or compute_mdhash_id(doc, prefix="chunk-")
         corpus_dir = self.workspace_root / "corpus"
         corpus_dir.mkdir(parents=True, exist_ok=True)
-        passages_path = corpus_dir / "passages.txt"
-        pool_max_line = max(
-            (p.end_line for p, _ in self._opt_chunks_pool if p.rel_posix_path == "corpus/passages.txt"),
-            default=0,
-        )
-        current_lines = max(get_max_end_line(self.conn, "corpus/passages.txt"), pool_max_line)
-        open_mode = "w" if current_lines == 0 else "a"
-        with passages_path.open(open_mode, encoding="utf-8") as f:
-            start_line = current_lines + 1
-            end_line = current_lines + n_lines
-            for line in lines:
-                f.write(line if line.endswith("\n") else line + "\n")
-        cid = compute_mdhash_id(doc, prefix="chunk-")
+        normalized_doc = "".join(line if line.endswith("\n") else line + "\n" for line in lines)
+        rel_posix_path = f"corpus/{chunk_id}.md"
+        write_text_atomic(self.workspace_root / rel_posix_path, normalized_doc)
         first_line = doc.split("\n", 1)[0].strip()
         title = first_line if len(first_line) < 100 else ""
         ptr = ChunkPointer(
-            chunk_id=cid,
-            rel_posix_path="corpus/passages.txt",
-            start_line=start_line,
-            end_line=end_line,
+            chunk_id=chunk_id,
+            rel_posix_path=rel_posix_path,
+            start_line=1,
+            end_line=n_lines,
             title=title,
-            ast_island_start=start_line,
-            ast_island_end=end_line,
+            ast_island_start=1,
+            ast_island_end=n_lines,
         )
-        if cid not in {p.chunk_id for p, _ in self._opt_chunks_pool}:
-            self._opt_chunks_pool.append((ptr, doc))
         return (ptr, doc)
 
     def _resolve_chunks_for_docs(
@@ -1355,10 +1016,12 @@ class YawGraphEngine:
                     if body_match:
                         doc_matches.append((ptr, c_text))
                 if not doc_matches:
-                    mat = self._materialize_raw_doc_to_pool(d)
+                    mat = self._materialize_doc_chunk(d, cid=direct_cid)
                     if mat is not None:
-                        pool_by_cid[mat[0].chunk_id] = mat
-                        pool_len = len(self._opt_chunks_pool)
+                        if direct_cid not in pool_by_cid:
+                            self._opt_chunks_pool.append(mat)
+                            pool_by_cid[direct_cid] = mat
+                            pool_len = len(self._opt_chunks_pool)
                         doc_matches.append(mat)
             self._resolved_docs_cache[(pool_len, d)] = doc_matches
             for ptr, c_text in doc_matches:
@@ -1374,7 +1037,7 @@ class YawGraphEngine:
     ) -> list[str]:
         with self._lock:
             self._hydrate_indexed_cids_from_db(program)
-            ext_fp = self._extraction_fingerprint(program)
+            ext_fp = extraction_fingerprint(program)
             req_chunks = self._resolve_chunks_for_docs(item_docs)
             pool_chunks = (
                 list(self._opt_val_chunks_pool)
@@ -1500,58 +1163,12 @@ class YawGraphEngine:
                         chunks_to_index.append((existing_ptrs[cid], doc_by_cid[cid]))
 
             if new_docs:
-                corpus_dir = self.workspace_root / "corpus"
-                corpus_dir.mkdir(parents=True, exist_ok=True)
-                passages_path = corpus_dir / "passages.txt"
-
-                pool_max_line = max(
-                    (p.end_line for p, _ in self._opt_chunks_pool if p.rel_posix_path == "corpus/passages.txt"),
-                    default=0,
-                )
-                current_lines = max(get_max_end_line(self.conn, "corpus/passages.txt"), pool_max_line)
-                open_mode = "w" if current_lines == 0 else "a"
-
-                with passages_path.open(open_mode, encoding="utf-8") as f:
-                    for doc in new_docs:
-                        cid = compute_mdhash_id(doc, prefix="chunk-")
-                        first_line = doc.split("\n", 1)[0].strip()
-                        title = first_line if len(first_line) < 100 else ""
-                        lines = doc.splitlines(keepends=True)
-                        n_lines = len(lines)
-                        if n_lines == 0:
-                            continue
-                        start_line = current_lines + 1
-                        end_line = current_lines + n_lines
-                        for line in lines:
-                            f.write(line if line.endswith("\n") else line + "\n")
-                        current_lines += n_lines
-
-                        ptr = ChunkPointer(
-                            chunk_id=cid,
-                            rel_posix_path="corpus/passages.txt",
-                            start_line=start_line,
-                            end_line=end_line,
-                            title=title,
-                            ast_island_start=start_line,
-                            ast_island_end=end_line,
-                        )
-                        chunks_to_index.append((ptr, doc))
+                for doc in new_docs:
+                    mat = self._materialize_doc_chunk(doc)
+                    if mat is not None:
+                        chunks_to_index.append(mat)
 
             return self.index_chunks(chunks_to_index, progress_callback=progress_callback)
-
-    def _format_chunk_for_embedding(self, ptr: ChunkPointer, text: str) -> str:
-        """Ensure AST-resolved ChunkPointer.title is passed as a Title: line for title-aware embedders."""
-        parse_title = bool(getattr(getattr(self.embedder, "profile", None), "parse_document_title", False))
-        if not parse_title or not ptr.title or not ptr.title.strip():
-            return text
-        clean_title = ptr.title.strip()
-        first_line = text.split("\n", 1)[0].strip() if "\n" in text else text.strip()
-        if first_line.startswith("#") or first_line.lower().startswith(("title:", "wikipedia title:")):
-            return text
-        if text.startswith(f"{clean_title}\n"):
-            body = text[len(clean_title) + 1 :]
-            return f"Title: {clean_title}\n{body}" if body.strip() else text
-        return f"Title: {clean_title}\n{text}"
 
     def index_chunks(
         self,
@@ -1566,8 +1183,6 @@ class YawGraphEngine:
 
         opt_sleep = getattr(getattr(self, "config", None), "optimize_sleep_seconds", 0.0)
         if opt_sleep > 0:
-            from .inference.chat import set_yaw_sleep_seconds
-
             set_yaw_sleep_seconds(opt_sleep)
 
         active_program = program if program is not None else self.program
@@ -1575,8 +1190,8 @@ class YawGraphEngine:
             trim_diagnostics(active_program)
             self._bind_program_hooks(active_program)
             self._apply_program_embedding_prefixes(active_program)
-            openie_fp = self._openie_fingerprint(active_program)
-            ext_fp = self._extraction_fingerprint(active_program)
+            openie_fp = openie_fingerprint(active_program)
+            ext_fp = extraction_fingerprint(active_program)
 
             existing_pool_cids = {p.chunk_id for p, _ in self._opt_chunks_pool}
             for ptr, text in chunks:
@@ -1589,6 +1204,22 @@ class YawGraphEngine:
             self._captured_graph_traces.clear()
             pre_batch_stats = dict(self._graph_rlm_stats)
 
+            fmt_chunk = getattr(
+                self.embedder,
+                "format_chunk_for_embedding",
+                lambda p, t: DSPyEmbeddingAdapter.format_chunk_for_embedding(self.embedder, p, t),
+            )
+            fmt_entity = getattr(
+                self.embedder,
+                "format_entity_for_embedding",
+                DSPyEmbeddingAdapter.format_entity_for_embedding,
+            )
+            fmt_fact = getattr(
+                self.embedder,
+                "format_fact_for_embedding",
+                DSPyEmbeddingAdapter.format_fact_for_embedding,
+            )
+
             # 1. Chunk vector embeddings in bounded batches
             existing_chunk_vecs = get_existing_ids(self.conn, "chunk_vec", chunk_ids)
             missing_chunks = [(p, t) for p, t in chunks if p.chunk_id not in existing_chunk_vecs]
@@ -1596,7 +1227,7 @@ class YawGraphEngine:
             if missing_chunks:
                 if progress_callback is not None:
                     progress_callback(f"indexing: embedding {len(missing_chunks)} chunk vectors")
-                texts_to_embed = [self._format_chunk_for_embedding(p, t) for p, t in missing_chunks]
+                texts_to_embed = [fmt_chunk(p, t) for p, t in missing_chunks]
                 vecs = self._encode_in_batches(texts_to_embed, instruction="", stage="chunk_embed")
                 chunk_vec_pairs = [(p.chunk_id, v) for (p, _), v in zip(missing_chunks, vecs, strict=False)]
 
@@ -1633,10 +1264,13 @@ class YawGraphEngine:
                             if en:
                                 cached_norms.add(en)
                         for st_item in getattr(rec, "structured_triples", ()) or ():
-                            for side in (getattr(st_item, "subj", ""), getattr(st_item, "obj", "")):
-                                sn = str(text_processing(str(side)))
-                                if sn:
-                                    cached_norms.add(sn)
+                            sn = str(text_processing(str(getattr(st_item, "subj", ""))))
+                            if sn:
+                                cached_norms.add(sn)
+                            if getattr(st_item, "obj_kind", "entity") != "literal":
+                                on = str(text_processing(str(getattr(st_item, "obj", ""))))
+                                if on:
+                                    cached_norms.add(on)
                         for t_item in getattr(rec, "triples", ()) or ():
                             if len(t_item) >= 3:
                                 for side in (t_item[0], t_item[2]):
@@ -1653,7 +1287,7 @@ class YawGraphEngine:
                     chunk_raw_trace: list[Any] = []
                     with dspy.context(trace=chunk_raw_trace, usage_tracker=None):
                         rec = active_program.extract_openie(ptr.chunk_id, text)
-                    chunk_traces = self._extract_named_trace_entries(active_program, chunk_raw_trace)
+                    chunk_traces = extract_named_trace_entries(active_program, chunk_raw_trace)
                     self._captured_chunk_traces[ptr.chunk_id] = chunk_traces
                     new_telem_entries = list(getattr(active_program, "telemetry", ())[prev_telem_len:])
                     raw_openie_tok = sum(
@@ -1779,12 +1413,14 @@ class YawGraphEngine:
                 for st in st_list:
                     s_norm = str(text_processing(st.subj))
                     p_norm = str(text_processing(st.pred))
-                    o_norm = str(text_processing(st.obj))
-                    if not s_norm or not p_norm or not o_norm:
+                    is_literal_obj = getattr(st, "obj_kind", "entity") == "literal"
+                    o_val = str(st.obj).strip() if is_literal_obj else str(text_processing(st.obj))
+                    if not s_norm or not p_norm or not o_val:
                         continue
                     all_norm_labels.add(s_norm)
-                    all_norm_labels.add(o_norm)
-                    spo_d = st.spo_def.strip() or f"{s_norm} {p_norm} {o_norm}."
+                    if not is_literal_obj:
+                        all_norm_labels.add(o_val)
+                    spo_d = st.spo_def.strip() or f"{s_norm} {p_norm} {o_val}."
                     raw_subj_d = st.subj_def.strip()
                     subj_d = raw_subj_d or stage1_defs.get(s_norm, "")
                     if subj_d:
@@ -1794,34 +1430,40 @@ class YawGraphEngine:
                         if all(d.lower() != subj_d.lower() for d in senses_lst):
                             senses_lst.append(subj_d)
 
-                    raw_obj_d = st.obj_def.strip()
-                    obj_d = raw_obj_d or stage1_defs.get(o_norm, "")
-                    if (
-                        s_norm == o_norm
-                        and subj_d
-                        and obj_d
-                        and subj_d.lower() == obj_d.lower()
-                        and len(stage1_senses.get(o_norm, ())) >= 2
-                    ):
-                        obj_d = next(
-                            (d for d in stage1_senses[o_norm] if d.lower() != subj_d.lower()),
-                            obj_d,
-                        )
-                    if obj_d:
-                        if o_norm not in stage1_defs:
-                            stage1_defs[o_norm] = obj_d
-                        senses_lst = stage1_senses.setdefault(o_norm, [])
-                        if all(d.lower() != obj_d.lower() for d in senses_lst):
-                            senses_lst.append(obj_d)
+                    if is_literal_obj:
+                        obj_d = ""
+                    else:
+                        raw_obj_d = st.obj_def.strip()
+                        obj_d = raw_obj_d or stage1_defs.get(o_val, "")
+                        if (
+                            s_norm == o_val
+                            and subj_d
+                            and obj_d
+                            and subj_d.lower() == obj_d.lower()
+                            and len(stage1_senses.get(o_val, ())) >= 2
+                        ):
+                            obj_d = next(
+                                (d for d in stage1_senses[o_val] if d.lower() != subj_d.lower()),
+                                obj_d,
+                            )
+                        if obj_d:
+                            if o_val not in stage1_defs:
+                                stage1_defs[o_val] = obj_d
+                            senses_lst = stage1_senses.setdefault(o_val, [])
+                            if all(d.lower() != obj_d.lower() for d in senses_lst):
+                                senses_lst.append(obj_d)
 
                     normalized_sts.append(
                         StructuredTriple(
                             subj=s_norm,
                             pred=p_norm,
-                            obj=o_norm,
+                            obj=o_val,
                             spo_def=spo_d,
                             subj_def=subj_d,
                             obj_def=obj_d,
+                            obj_kind="literal" if is_literal_obj else "entity",
+                            obj_datatype=str(getattr(st, "obj_datatype", "") or ""),
+                            obj_lang=str(getattr(st, "obj_lang", "") or ""),
                         )
                     )
 
@@ -1832,7 +1474,12 @@ class YawGraphEngine:
                     if not st.subj_def and not stage1_defs.get(st.subj) and st.subj not in seen_missing:
                         seen_missing.add(st.subj)
                         missing_norms.append(st.subj)
-                    if not st.obj_def and not stage1_defs.get(st.obj) and st.obj not in seen_missing:
+                    if (
+                        st.obj_kind != "literal"
+                        and not st.obj_def
+                        and not stage1_defs.get(st.obj)
+                        and st.obj not in seen_missing
+                    ):
                         seen_missing.add(st.obj)
                         missing_norms.append(st.obj)
                 for e_norm, e_def in ner_entities:
@@ -1858,7 +1505,7 @@ class YawGraphEngine:
                             ],
                         )
                     self._captured_chunk_traces.setdefault(cid, []).extend(
-                        self._extract_named_trace_entries(active_program, def_raw_trace)
+                        extract_named_trace_entries(active_program, def_raw_trace)
                     )
                     new_def_entries = list(getattr(active_program, "entity_def_audit_trail", ())[prev_def_audit_len:])
                     for entry in new_def_entries:
@@ -1879,7 +1526,14 @@ class YawGraphEngine:
                             obj=st.obj,
                             spo_def=st.spo_def,
                             subj_def=st.subj_def or stage1_defs.get(st.subj, ""),
-                            obj_def=st.obj_def or stage1_defs.get(st.obj, ""),
+                            obj_def=(
+                                ""
+                                if st.obj_kind == "literal"
+                                else (st.obj_def or stage1_defs.get(st.obj, ""))
+                            ),
+                            obj_kind=st.obj_kind,
+                            obj_datatype=st.obj_datatype,
+                            obj_lang=st.obj_lang,
                         )
                         for st in normalized_sts
                     ]
@@ -1892,15 +1546,7 @@ class YawGraphEngine:
             entity_info_by_id: dict[str, tuple[str, str]] = {}
             existing_vecs_by_id: dict[str, np.ndarray] = {}
             if all_existing_eids:
-                for i in range(0, len(all_existing_eids), 900):
-                    batch_eids = all_existing_eids[i : i + 900]
-                    placeholders = ",".join("?" for _ in batch_eids)
-                    for row in self.conn.execute(
-                        f"SELECT entity_id, name, COALESCE(definition, '') FROM entities "
-                        f"WHERE entity_id IN ({placeholders})",
-                        batch_eids,
-                    ).fetchall():
-                        entity_info_by_id[str(row[0])] = (str(row[1]), str(row[2]))
+                entity_info_by_id = get_entity_metadata_batch(self.conn, all_existing_eids)
                 raw_vecs = get_entity_vectors(self.conn, all_existing_eids)
                 for eid_v, vec_v in raw_vecs.items():
                     v_norm = float(np.linalg.norm(vec_v))
@@ -1971,7 +1617,12 @@ class YawGraphEngine:
             cand_pairs_by_label: dict[str, list[tuple[str, str]]] = {}
             for _cid, st_list, ner_entities in record_structured:
                 for st in st_list:
-                    for m_lbl, m_def in ((st.subj, st.subj_def), (st.obj, st.obj_def)):
+                    mention_items = (
+                        ((st.subj, st.subj_def),)
+                        if st.obj_kind == "literal"
+                        else ((st.subj, st.subj_def), (st.obj, st.obj_def))
+                    )
+                    for m_lbl, m_def in mention_items:
                         c_def = m_def.strip()
                         if c_def:
                             defs_by_label.setdefault(m_lbl, set()).add(c_def.lower())
@@ -1989,13 +1640,13 @@ class YawGraphEngine:
                         sense_cand_id = compute_mdhash_id(f"{m_lbl}::{c_def.lower()}", prefix="entity-")
                         if sense_cand_id in existing_vecs_by_id:
                             continue
-                        ct = self._format_entity_embedding_text(m_lbl, c_def)
+                        ct = fmt_entity(m_lbl, c_def)
                         if ct not in seen_prebatch:
                             seen_prebatch.add(ct)
                             prebatch_texts.append(ct)
                     for _, name_s, prev_def_s, prev_vec_s in senses_by_label.get(lbl, ()):
                         if prev_vec_s is None and prev_def_s:
-                            pt = self._format_entity_embedding_text(name_s, prev_def_s)
+                            pt = fmt_entity(name_s, prev_def_s)
                             if pt not in seen_prebatch:
                                 seen_prebatch.add(pt)
                                 prebatch_texts.append(pt)
@@ -2085,7 +1736,7 @@ class YawGraphEngine:
                 if cached_sense_vec is not None:
                     cand_vec = cached_sense_vec
                 else:
-                    cand_text = self._format_entity_embedding_text(label_norm, clean_def)
+                    cand_text = fmt_entity(label_norm, clean_def)
                     cand_vec = self._encode_in_batches([cand_text], instruction="", stage="entity_embed")[0]
                     c_norm = float(np.linalg.norm(cand_vec))
                     if c_norm > 0:
@@ -2095,7 +1746,7 @@ class YawGraphEngine:
                     if exclude_eid is not None and eid == exclude_eid:
                         continue
                     if prev_vec is None:
-                        p_text = self._format_entity_embedding_text(name, prev_def)
+                        p_text = fmt_entity(name, prev_def)
                         prev_vec = self._encode_in_batches([p_text], instruction="", stage="entity_embed")[0]
                         p_norm = float(np.linalg.norm(prev_vec))
                         if p_norm > 0:
@@ -2129,7 +1780,11 @@ class YawGraphEngine:
                 return sense_id
 
             chunk_to_entities: dict[str, set[str]] = {}
-            fact_nodes_map: dict[str, tuple[str, str, str, str, str, str, str, str]] = {}
+            fact_nodes_map: dict[
+                str,
+                tuple[str, str, str, str | None, str, str, str, str, str, str | None, str, str],
+            ] = {}
+            fact_sources_batch: list[tuple[str, str]] = []
             edges_with_sources: list[tuple[str, str, str, float, str]] = []
             fact_linked_pairs: set[tuple[str, str]] = set()
 
@@ -2138,47 +1793,78 @@ class YawGraphEngine:
                 resolved_in_chunk: set[tuple[str, str]] = set()
                 for st in st_list:
                     s_id = _resolve_mention_entity_id(st.subj, st.subj_def, cid)
-                    distinct_homograph_pole = (
-                        st.subj == st.obj
-                        and bool(st.subj_def.strip())
-                        and bool(st.obj_def.strip())
-                        and st.subj_def.strip().lower() != st.obj_def.strip().lower()
-                    )
-                    o_id = _resolve_mention_entity_id(
-                        st.obj,
-                        st.obj_def,
-                        cid,
-                        exclude_eid=s_id if distinct_homograph_pole else None,
-                    )
                     resolved_in_chunk.add((st.subj, st.subj_def.strip().lower()))
-                    resolved_in_chunk.add((st.obj, st.obj_def.strip().lower()))
                     chunk_to_entities[cid].add(s_id)
-                    chunk_to_entities[cid].add(o_id)
 
-                    base_s_id = compute_mdhash_id(st.subj, prefix="entity-")
-                    base_o_id = compute_mdhash_id(st.obj, prefix="entity-")
-                    if st.subj == st.obj or s_id != base_s_id or o_id != base_o_id:
-                        fid = compute_mdhash_id(str((s_id, st.pred, o_id)), prefix="fact-")
-                    else:
-                        raw_triple_str = str((st.subj, st.pred, st.obj))
-                        fid = compute_mdhash_id(raw_triple_str, prefix="fact-")
-                    raw_json = json.dumps([st.subj, st.pred, st.obj])
-                    prev_fact = fact_nodes_map.get(fid)
-                    if prev_fact is None or (not prev_fact[5] and st.spo_def):
-                        fact_nodes_map[fid] = (
-                            fid,
-                            s_id,
-                            st.pred,
-                            o_id,
-                            raw_json,
-                            st.spo_def,
-                            st.subj_def,
-                            st.obj_def,
+                    if st.obj_kind == "literal":
+                        o_id: str | None = None
+                        fid = compute_mdhash_id(
+                            str((s_id, st.pred, f"literal:{st.obj}:{st.obj_datatype}:{st.obj_lang}")),
+                            prefix="fact-",
                         )
-                    if s_id != o_id:
-                        fact_linked_pairs.add((min(s_id, o_id), max(s_id, o_id)))
-                        edges_with_sources.append((s_id, o_id, "fact", 1.0, cid))
-                        edges_with_sources.append((o_id, s_id, "fact", 1.0, cid))
+                        raw_json = json.dumps([st.subj, st.pred, st.obj])
+                        prev_fact = fact_nodes_map.get(fid)
+                        if prev_fact is None or (not prev_fact[5] and st.spo_def):
+                            fact_nodes_map[fid] = (
+                                fid,
+                                s_id,
+                                st.pred,
+                                None,
+                                raw_json,
+                                st.spo_def,
+                                st.subj_def,
+                                "",
+                                "literal",
+                                st.obj,
+                                st.obj_datatype,
+                                st.obj_lang,
+                            )
+                        fact_sources_batch.append((fid, cid))
+                    else:
+                        distinct_homograph_pole = (
+                            st.subj == st.obj
+                            and bool(st.subj_def.strip())
+                            and bool(st.obj_def.strip())
+                            and st.subj_def.strip().lower() != st.obj_def.strip().lower()
+                        )
+                        o_id = _resolve_mention_entity_id(
+                            st.obj,
+                            st.obj_def,
+                            cid,
+                            exclude_eid=s_id if distinct_homograph_pole else None,
+                        )
+                        resolved_in_chunk.add((st.obj, st.obj_def.strip().lower()))
+                        chunk_to_entities[cid].add(o_id)
+
+                        base_s_id = compute_mdhash_id(st.subj, prefix="entity-")
+                        base_o_id = compute_mdhash_id(st.obj, prefix="entity-")
+                        if st.subj == st.obj or s_id != base_s_id or o_id != base_o_id:
+                            fid = compute_mdhash_id(str((s_id, st.pred, o_id)), prefix="fact-")
+                        else:
+                            raw_triple_str = str((st.subj, st.pred, st.obj))
+                            fid = compute_mdhash_id(raw_triple_str, prefix="fact-")
+                        raw_json = json.dumps([st.subj, st.pred, st.obj])
+                        prev_fact = fact_nodes_map.get(fid)
+                        if prev_fact is None or (not prev_fact[5] and st.spo_def):
+                            fact_nodes_map[fid] = (
+                                fid,
+                                s_id,
+                                st.pred,
+                                o_id,
+                                raw_json,
+                                st.spo_def,
+                                st.subj_def,
+                                st.obj_def,
+                                "entity",
+                                None,
+                                "",
+                                "",
+                            )
+                        fact_sources_batch.append((fid, cid))
+                        if s_id != o_id:
+                            fact_linked_pairs.add((min(s_id, o_id), max(s_id, o_id)))
+                            edges_with_sources.append((s_id, o_id, "fact", 1.0, cid))
+                            edges_with_sources.append((o_id, s_id, "fact", 1.0, cid))
 
                 for e_norm, e_def in ner_entities:
                     e_key = (e_norm, e_def.strip().lower())
@@ -2212,12 +1898,12 @@ class YawGraphEngine:
             if missing_entities:
                 if progress_callback is not None:
                     progress_callback(f"indexing: embedding {len(missing_entities)} entity vectors")
-                e_texts = [self._format_entity_embedding_text(name, defn) for _, name, defn in missing_entities]
+                e_texts = [fmt_entity(name, defn) for _, name, defn in missing_entities]
                 e_vecs = self._encode_in_batches(e_texts, instruction="", stage="entity_embed")
                 entity_vec_pairs.extend((eid, v) for (eid, _, _), v in zip(missing_entities, e_vecs, strict=False))
 
             # Compute missing fact vectors using contextual `# {s} {p} {o}\n{spo_def} | {subj_def} | {obj_def}`
-            all_fact_ids = [fid for fid, _, _, _, _, _, _, _ in fact_nodes]
+            all_fact_ids = [f_row[0] for f_row in fact_nodes]
             existing_fact_vecs = get_existing_ids(self.conn, "fact_vec", all_fact_ids)
             missing_facts = [f_row for f_row in fact_nodes if f_row[0] not in existing_fact_vecs]
             fact_vec_pairs: list[tuple[str, np.ndarray]] = []
@@ -2225,9 +1911,10 @@ class YawGraphEngine:
                 if progress_callback is not None:
                     progress_callback(f"indexing: embedding {len(missing_facts)} fact vectors")
                 fact_texts: list[str] = []
-                for _, _s_id, pred, _o_id, raw_json, spo_d, subj_d, obj_d in missing_facts:
+                for f_row in missing_facts:
+                    _, _s_id, pred, _o_id, raw_json, spo_d, subj_d, obj_d = f_row[:8]
                     items = json.loads(raw_json)
-                    fact_texts.append(self._format_fact_embedding_text(items[0], pred, items[2], spo_d, subj_d, obj_d))
+                    fact_texts.append(fmt_fact(items[0], pred, items[2], spo_d, subj_d, obj_d))
                 f_vecs = self._encode_in_batches(fact_texts, instruction="", stage="fact_embed")
                 fact_vec_pairs = [(f_row[0], v) for f_row, v in zip(missing_facts, f_vecs, strict=False)]
 
@@ -2244,10 +1931,25 @@ class YawGraphEngine:
                 upsert_facts(
                     conn,
                     [
-                        (fid, s_id, pred, o_id, raw_json, spo_d)
-                        for fid, s_id, pred, o_id, raw_json, spo_d, _, _ in fact_nodes
+                        (fid, s_id, pred, o_id, raw_json, spo_d, okind, olex, odt, olang)
+                        for (
+                            fid,
+                            s_id,
+                            pred,
+                            o_id,
+                            raw_json,
+                            spo_d,
+                            _subj_d,
+                            _obj_d,
+                            okind,
+                            olex,
+                            odt,
+                            olang,
+                        ) in fact_nodes
                     ],
                 )
+                if fact_sources_batch:
+                    upsert_fact_sources(conn, fact_sources_batch)
                 if entity_vec_pairs:
                     upsert_entity_vectors(conn, entity_vec_pairs)
                 if fact_vec_pairs:
@@ -2265,16 +1967,7 @@ class YawGraphEngine:
                     self._graph_rlm_stats["candidate_pairs"] += len(raw_candidates)
 
                     cand_eids = list({eid for ea, eb, _, _ in raw_candidates for eid in (ea, eb)})
-                    cand_meta: dict[str, tuple[str, str]] = {}
-                    for i in range(0, len(cand_eids), 900):
-                        batch_eids = cand_eids[i : i + 900]
-                        placeholders = ",".join("?" for _ in batch_eids)
-                        for row in conn.execute(
-                            f"SELECT entity_id, name, COALESCE(definition, '') FROM entities "
-                            f"WHERE entity_id IN ({placeholders})",
-                            batch_eids,
-                        ).fetchall():
-                            cand_meta[str(row[0])] = (str(row[1]), str(row[2]))
+                    cand_meta = get_entity_metadata_batch(conn, cand_eids)
 
                     candidates: list[dict[str, Any]] = []
                     for ea, eb, d_sim, l_sim in raw_candidates:
@@ -2305,14 +1998,11 @@ class YawGraphEngine:
                         ),
                         reverse=True,
                     )
-                    llm_candidates = candidates[: scale_context_budget(16, active_program.context_window_tokens)]
-                    overflow_candidates = candidates[16:]
-
                     decisions: list[dict[str, str]] = []
-                    if llm_candidates:
-                        syn_fp = self._synonym_fingerprint(active_program)
+                    if candidates:
+                        syn_fp = synonym_fingerprint(active_program)
                         pairs_fp = hashlib.sha256(
-                            json.dumps(llm_candidates, sort_keys=True, ensure_ascii=False).encode("utf-8")
+                            json.dumps(candidates, sort_keys=True, ensure_ascii=False).encode("utf-8")
                         ).hexdigest()
                         cached_syn = self._synonym_fp_cache.get((syn_fp, pairs_fp))
                         if cached_syn is not None:
@@ -2327,8 +2017,8 @@ class YawGraphEngine:
                             prev_tel_len = len(tel)
                             local_syn_trace: list[Any] = []
                             with dspy.context(trace=local_syn_trace, usage_tracker=None):
-                                decisions = active_program.judge_synonyms(llm_candidates)
-                            syn_traces = self._extract_named_trace_entries(
+                                decisions = active_program.judge_synonyms(candidates)
+                            syn_traces = extract_named_trace_entries(
                                 active_program,
                                 local_syn_trace,
                                 allowed_names={"synonym_judge"},
@@ -2414,6 +2104,22 @@ class YawGraphEngine:
                         elif rel in ("owl:differentFrom", "different", "different_from"):
                             semantic_batch.append((src, tgt, "owl:differentFrom", 0.0))
                             self._graph_rlm_stats["different_from_edges"] += 1
+                        elif rel == "skos:broader":
+                            if canon and (
+                                canon.upper() == "A"
+                                or canon in (src, raw_src)
+                                or (
+                                    text_processing(canon) == text_processing(name_src)
+                                    and text_processing(canon) != text_processing(name_tgt)
+                                )
+                            ):
+                                child_id, parent_id = tgt, src
+                            else:
+                                child_id, parent_id = src, tgt
+                            semantic_batch.append((child_id, parent_id, "skos:broader", max(0.5, sim)))
+                            self._graph_rlm_stats["broader_edges"] = (
+                                int(self._graph_rlm_stats.get("broader_edges", 0)) + 1
+                            )
                         elif rel in ("skos:related", "related"):
                             if same_name:
                                 semantic_batch.append((src, tgt, "owl:differentFrom", 0.0))
@@ -2427,27 +2133,13 @@ class YawGraphEngine:
                             semantic_batch.append((src, tgt, "owl:differentFrom", 0.0))
                             self._graph_rlm_stats["different_from_edges"] += 1
 
-                    for c in llm_candidates:
+                    for c in candidates:
                         ea, eb = str(c["entity_a"]), str(c["entity_b"])
                         pkey = (min(ea, eb), max(ea, eb))
                         if pkey in adjudicated_pairs:
                             continue
-                        if text_processing(str(c["name_a"])) == text_processing(str(c["name_b"])):
-                            src = _resolve_active_eid(ea)
-                            tgt = _resolve_active_eid(eb)
-                            if src != tgt:
-                                active_pkey = (min(src, tgt), max(src, tgt))
-                                if float(c.get("dense_sim", 0.0)) >= 0.45 and active_pkey not in fact_linked_pairs:
-                                    merge_entities(conn, src, tgt, label_kind="skos:altLabel")
-                                    merged_into[src] = tgt
-                                    self._graph_rlm_stats["merged_entities"] += 1
-                                else:
-                                    semantic_batch.append((src, tgt, "owl:differentFrom", 0.0))
-                                    self._graph_rlm_stats["different_from_edges"] += 1
-
-                    for c in overflow_candidates:
-                        src = _resolve_active_eid(str(c["entity_a"]))
-                        tgt = _resolve_active_eid(str(c["entity_b"]))
+                        src = _resolve_active_eid(ea)
+                        tgt = _resolve_active_eid(eb)
                         if src == tgt:
                             continue
                         if text_processing(str(c["name_a"])) == text_processing(str(c["name_b"])):
@@ -2498,7 +2190,7 @@ class YawGraphEngine:
                         inspect_focus_node(conn, v.focus_node)
                         for v in violations[: scale_context_budget(16, active_program.context_window_tokens)]
                     ]
-                    shacl_fp = self._shacl_fingerprint(active_program)
+                    shacl_fp = shacl_fingerprint(active_program)
                     viol_fp = hashlib.sha256(
                         json.dumps(
                             {
@@ -2553,7 +2245,7 @@ class YawGraphEngine:
                             )
                             self._active_repl_repair_keys = None
                             self._active_repl_repairs_list = None
-                        shacl_traces = self._extract_named_trace_entries(
+                        shacl_traces = extract_named_trace_entries(
                             active_program,
                             local_shacl_trace,
                             allowed_names={"shacl_repair", "shacl_healer_rlm"},
@@ -2623,6 +2315,8 @@ class YawGraphEngine:
                 }
 
             self._csr_graph = None
+            self._query_retrieval_memo.clear()
+            self._last_memo_question = None
             self._active_extraction_fingerprint = ext_fp
             self._active_openie_fingerprint = openie_fp
             self._opt_indexed_cids.update(chunk_ids)
@@ -2646,6 +2340,8 @@ class YawGraphEngine:
                 self._opt_indexed_cids.discard(cid)
                 self._chunk_indexed_ext_fp.pop(cid, None)
             self._csr_graph = None
+            self._query_retrieval_memo.clear()
+            self._last_memo_question = None
 
     def retrieve_with_seeds(
         self,
@@ -2712,7 +2408,7 @@ class YawGraphEngine:
             )
             fts_norm_dict = {fid: float(fts_norm_all[i]) for i, (fid, _) in enumerate(fts_hits)}
 
-            kept_facts_with_scores: list[tuple[tuple[str, str, str], float]] = []
+            kept_facts_with_scores: list[tuple[str, tuple[str, str, str], float]] = []
             if top_candidates:
                 candidate_triples = [t for _, t, _ in top_candidates]
                 candidate_scores = [
@@ -2727,7 +2423,13 @@ class YawGraphEngine:
                 filter_indices = active_program.filter_triples(query, candidate_triples)
                 for idx in filter_indices:
                     if 0 <= idx < len(top_candidates):
-                        kept_facts_with_scores.append((candidate_triples[idx], float(candidate_scores[idx])))
+                        kept_facts_with_scores.append(
+                            (
+                                top_candidates[idx][0],
+                                candidate_triples[idx],
+                                float(candidate_scores[idx]),
+                            )
+                        )
 
             if not kept_facts_with_scores and allow_intent_path:
                 return self.retrieve_with_seeds(
@@ -2763,22 +2465,43 @@ class YawGraphEngine:
                 sorted_passages = sorted(passage_weights.items(), key=lambda kv: kv[1], reverse=True)
                 ranked_chunks = sorted_passages[:pool_k]
             else:
+                kept_fids = [fid for fid, _, _ in kept_facts_with_scores]
+                f_placeholders = ",".join("?" for _ in kept_fids)
+                fact_kind_by_fid: dict[str, str] = {
+                    str(r[0]): str(r[1])
+                    for r in self.conn.execute(
+                        f"SELECT fact_id, COALESCE(obj_kind, 'entity') FROM facts WHERE fact_id IN ({f_placeholders})",
+                        kept_fids,
+                    )
+                }
+                fact_sources_by_fid: dict[str, list[str]] = {}
+                for r in self.conn.execute(
+                    f"SELECT fact_id, chunk_id FROM fact_sources WHERE fact_id IN ({f_placeholders})",
+                    kept_fids,
+                ):
+                    fact_sources_by_fid.setdefault(str(r[0]), []).append(str(r[1]))
+
                 surface_mentions: list[str] = []
-                for (s, _, o), _ in kept_facts_with_scores:
+                for fid, (s, _, o), _ in kept_facts_with_scores:
                     surface_mentions.append(str(text_processing(s)))
-                    surface_mentions.append(str(text_processing(o)))
+                    if fact_kind_by_fid.get(fid, "entity") != "literal":
+                        surface_mentions.append(str(text_processing(o)))
                 resolved_map = resolve_entity_labels(self.conn, surface_mentions, query_vec=query_fact_vec)
 
                 seed_entities: dict[str, list[float]] = {}
-                for (s, _, o), score in kept_facts_with_scores:
+                for fid, (s, _, o), score in kept_facts_with_scores:
                     s_norm = str(text_processing(s))
-                    o_norm = str(text_processing(o))
                     s_ids = resolved_map.get(s_norm) or [compute_mdhash_id(s_norm, prefix="entity-")]
-                    o_ids = resolved_map.get(o_norm) or [compute_mdhash_id(o_norm, prefix="entity-")]
                     for s_id in s_ids:
                         seed_entities.setdefault(s_id, []).append(score)
-                    for o_id in o_ids:
-                        seed_entities.setdefault(o_id, []).append(score)
+                    if fact_kind_by_fid.get(fid, "entity") == "literal":
+                        for src_cid in fact_sources_by_fid.get(fid, ()):
+                            passage_weights[src_cid] = max(passage_weights.get(src_cid, 0.0), score)
+                    else:
+                        o_norm = str(text_processing(o))
+                        o_ids = resolved_map.get(o_norm) or [compute_mdhash_id(o_norm, prefix="entity-")]
+                        for o_id in o_ids:
+                            seed_entities.setdefault(o_id, []).append(score)
 
                 doc_freqs = get_entity_doc_frequencies(self.conn, list(seed_entities.keys()))
 
@@ -2810,13 +2533,22 @@ class YawGraphEngine:
                 )
                 ranked_chunks = rank_passages_by_ppr(graph, ppr_scores, top_k=pool_k)
 
-            kept_facts_triples = [t for t, _ in kept_facts_with_scores]
+            kept_facts_triples = [t for _, t, _ in kept_facts_with_scores]
             if not ranked_chunks:
                 return [], kept_facts_triples
 
             # 4. MaxP Passage Span Deduplication + 1-Indexed Line Hydration from Disk
             hydrated_hits = self._hydrate_maxp_passages(ranked_chunks, top_k)
             return hydrated_hits, kept_facts_triples
+
+    def hydrate_ranked_chunks(
+        self,
+        ranked_chunks: Sequence[tuple[str, float]],
+        top_k: int,
+    ) -> list[tuple[ChunkPointer, float, str]]:
+        """Public thread-safe MaxP hydration of ranked `(chunk_id, score)` pairs."""
+        with self._lock:
+            return self._hydrate_maxp_passages(ranked_chunks, top_k)
 
     def _hydrate_maxp_passages(
         self,
@@ -2911,8 +2643,9 @@ class YawGraphEngine:
     ) -> list[dict[str, Any]]:
         """Multi-hop QA retrieval and answer generation evaluated on task quality."""
         results: list[dict[str, Any]] = []
+        active_module = self.ensemble if self.ensemble is not None else self.program
         for i, q in enumerate(queries):
-            pred = self.program(question=q)
+            pred = active_module(question=q)
             ans = str(getattr(pred, "answer", "")).strip()
             reasoning = str(getattr(pred, "reasoning", "")).strip()
             formatted_context = str(getattr(pred, "context", ""))
@@ -2935,306 +2668,36 @@ class YawGraphEngine:
             results.append(item)
         return results
 
-    class _ActiveTraceComponentSelector:
-        """GEPA component selector that dynamically prioritizes predictors with active execution traces."""
-
-        def __init__(self, program: HippoRAGProgram) -> None:
-            self.program = program
-            self.cursor = 0
-
-        def __call__(
-            self,
-            state: Any,
-            trajectories: list[Any],
-            subsample_scores: list[float],
-            candidate_idx: int,
-            candidate: dict[str, str],
-        ) -> list[str]:
-            active_sigs = set()
-            for data in trajectories or []:
-                for t in data.get("trace", ()):
-                    sig = getattr(t[0], "signature", None)
-                    if sig is not None:
-                        active_sigs.add(sig)
-
-            active_names: list[str] = []
-            name_to_pred = dict(self.program.named_predictors())
-            for name in getattr(state, "list_of_named_predictors", list(candidate.keys())):
-                pred = name_to_pred.get(name)
-                pred_sig = getattr(pred, "signature", None)
-                if pred_sig is not None:
-                    cand_sig = (
-                        pred_sig.with_instructions(candidate[name])
-                        if name in candidate and hasattr(pred_sig, "with_instructions")
-                        else pred_sig
-                    )
-                    pred_fields = tuple(getattr(pred_sig, "fields", {}).keys())
-                    for a_sig in active_sigs:
-                        is_eq = cand_sig.equals(a_sig) if hasattr(cand_sig, "equals") else cand_sig == a_sig
-                        a_fields = tuple(getattr(a_sig, "fields", {}).keys())
-                        if is_eq or (pred_fields and pred_fields == a_fields):
-                            active_names.append(name)
-                            break
-
-            if not active_names:
-                pid = getattr(state, "named_predictor_id_to_update_next_for_program_candidate", [0])[candidate_idx]
-                num_preds = len(state.list_of_named_predictors)
-                state.named_predictor_id_to_update_next_for_program_candidate[candidate_idx] = (pid + 1) % num_preds
-                return [state.list_of_named_predictors[pid]]
-
-            selected = active_names[self.cursor % len(active_names)]
-            self.cursor += 1
-            return [selected]
-
-    def _configure_simba_task_learning(
+    def _commit_active_reflection_checkpoint(
         self,
-        proposer: RLMInstructionProposer,
-        template: HippoRAGProgram,
-        trainset: Sequence[Any],
-        metric: Callable[[Any, Any], float],
-        *,
-        save_path: Path | str | None,
-        resume: bool,
+        active_key: str,
+        encoded_active: str,
+        state_key: str | None,
+        encoded_state: str | None,
     ) -> None:
-        """Wire counterfactual training rewards and atomic worker snapshots in yaw.db."""
-        # Fixed paired calibration queries keep each inner step bounded. Labels
-        # never come from the GEPA validation set or enter the worker's inputs.
-        proposer.preflight()
-        calibration = list(trainset[:2])
-        if not calibration:
-            raise ValueError("SIMBA task learning requires training queries")
-        fallback_task_lm = getattr(dspy.settings, "lm", None)
-        template = template.deepcopy()
-        identity = {
-            "version": 1,
-            "metric": "task-quality-geometric-mean-v1",
-            "reflection_deployment": proposer.cache_identity(),
-            "namespace": self._candidate_cache_namespace(),
-            "retrieval": {
-                name: getattr(self, name)
-                for name in (
-                    "max_context_chars",
-                    "max_ast_expansion_hops",
-                    "linking_top_k",
-                    "fact_candidate_pool_k",
-                    "fact_fts_pool_k",
-                    "fact_rrf_k",
-                    "fact_fts_weight",
-                    "passage_seed_pool_k",
-                    "fts_seed_pool_k",
-                    "passage_node_weight",
-                    "fts_weight",
-                    "damping",
-                    "synonymy_threshold",
-                    "synonymy_top_k",
-                    "retrieval_top_k",
-                    "activation",
-                    "activation_param",
-                    "activation_renormalize",
-                    "beta",
-                    "dual_weight",
-                    "same_sense_cosine_gate",
-                )
-            },
-            "template": self._candidate_fingerprint(template),
-            "trainset": [{"data": ex.toDict(), "inputs": sorted(ex.inputs())} for ex in trainset],
-            "corpus": sorted(self._candidate_cache_sources()),
-            "worker": self._serialize_predictor_surface(proposer.qwen_proposer),
-            "orchestrator": self._serialize_predictor_surface(proposer.inner_rlm.generate_action),
-            "settings": [
-                proposer.simba_bsize,
-                proposer.simba_num_candidates,
-                proposer.simba_max_steps,
-                proposer.simba_max_demos,
-                proposer.max_instruction_chars,
-                proposer.max_field_chars,
-                proposer.max_feedback_examples,
-                proposer.enable_gbnf,
-                proposer.worker_temperature,
-                proposer.reflection_temperature,
-                proposer.reflection_input_tokens,
-                getattr(proposer.token_counter, "identity", None),
-            ],
-        }
-        context = hashlib.sha256(
-            json.dumps(identity, sort_keys=True, default=str, ensure_ascii=False).encode("utf-8")
-        ).hexdigest()
-        scores = CandidateStageCache(
-            self._openie_fp_cache.store, self.managed_conn, "simba_task_score", lambda: context
-        )
-
-        def score_candidate(instructions: Mapping[str, str]) -> float:
-            key = (json.dumps(dict(instructions), sort_keys=True, ensure_ascii=False),)
-            cached = scores.get(key)
-            if cached is not None:
-                return float(cached)
-            task = template.deepcopy()
-            named = dict(task.named_predictors())
-            for name, instruction in instructions.items():
-                named[name].signature = named[name].signature.with_instructions(instruction)
-            self._bind_program_hooks(task)
-            total = 0.0
-            # SIMBA's reflection LM and traces must not override task LMs or
-            # pollute its meta-training trajectory with downstream task calls.
-            task_lm = None if template.rlm_sub_lm or template.orchestrator_lm else fallback_task_lm
-            with dspy.context(lm=task_lm, trace=[], usage_tracker=None, track_usage=True):
-                for gold in calibration:
-                    prediction = task(**gold.inputs())
-                    total += float(metric(gold, prediction))
-            result = total / len(calibration)
-            scores[key] = result
-            return result
-
-        run = str(Path(save_path).resolve()) if save_path is not None else "default"
-        state_key = "simba_worker:" + hashlib.sha256(run.encode("utf-8")).hexdigest()
-
-        codec = CandidatePayloadCodec(self._candidate_cache_sources)
-
-        def save_state(state: dict[str, Any]) -> None:
-            self.set_meta(state_key, codec.encode({"context": context, "state": state}))
-
-        saved_state = None
-        if resume:
-            raw = self.get_meta(state_key)
-            if raw is not None:
-                saved = checkpoint_object(codec.decode(raw), "SIMBA checkpoint")
-                if saved.get("context") != context:
-                    raise ValueError("SIMBA checkpoint does not match this run's task/model/data")
-                saved_state = validate_simba_state(saved.get("state"))
-        checkpoints = CandidateStageCache(
-            self._openie_fp_cache.store,
-            self.managed_conn,
-            "reflection_checkpoint",
-            lambda: context,
-            sources=self._candidate_cache_sources,
-        )
-        active_key = state_key + ":active_reflection"
-        active_raw = self.get_meta(active_key) if resume else None
-        active: ActiveReflectionCheckpoint | None = (
-            validate_active_checkpoint(codec.decode(active_raw), context) if active_raw else None
-        )
-        if active is not None:
-            saved_state = validate_simba_state(active["records"][active["request"]].get("state"))
-        if saved_state is not None:
-            proposer.load_simba_state(saved_state)
-
-        def get_checkpoint(key: str) -> Any:
-            if active is not None and key in active["records"]:
-                return active["records"][key]
-            raw = checkpoints.get((key,))
-            return codec.decode(raw) if raw is not None else None
-
-        def put_checkpoint(key: str, value: dict[str, Any]) -> None:
-            nonlocal active
-            if key.startswith("request:"):
-                value = validate_request_checkpoint(value)
-            checkpoints[(key,)] = codec.encode(value)
-            next_active: ActiveReflectionCheckpoint
-            if key.startswith("request:") and value["phase"] == "collecting":
-                next_active = {"context": context, "request": key, "records": {key: value}}
-            elif active is not None:
-                next_active = {**active, "records": {**active["records"], key: value}}
-            else:
-                return
-            # Pin only the active request, outside FIFO candidate-cache eviction.
-            # Request state and the learned worker are committed in one transaction.
-            with self.managed_conn.transaction() as conn:
+        with self.managed_conn.transaction() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)",
+                (active_key, encoded_active),
+            )
+            if state_key is not None and encoded_state is not None:
                 conn.execute(
                     "INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)",
-                    (active_key, codec.encode(next_active)),
+                    (state_key, encoded_state),
                 )
-                if key.startswith("request:"):
-                    conn.execute(
-                        "INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)",
-                        (state_key, codec.encode({"context": context, "state": value["state"]})),
-                    )
-            active = next_active
 
-        proposer.checkpoint_get = get_checkpoint
-        proposer.checkpoint_put = put_checkpoint
-        proposer.task_scorer = score_candidate
-        proposer.save_simba_state = save_state
-
-    @_optimization_history_scope
-    def evolve_prompts(
+    def _prepare_optimization_pools(
         self,
         trainset: Sequence[Any],
-        valset: Sequence[Any] | None = None,
-        *,
-        mode: Literal["miprov2", "gepa", "hybrid"] = "hybrid",
-        save_path: Path | str | None = None,
-        reflection_lm: Any = None,
-        reflection_worker_lm: Any = None,
-        reflection_token_counter: Any = None,
-        auto: Literal["light", "medium", "heavy"] | None = "light",
-        num_candidates: int | None = None,
-        num_trials: int | None = None,
-        progress_callback: Callable[[str], None] | None = None,
-        opt_chunks: Sequence[tuple[ChunkPointer, str]] | None = None,
-        sleep_seconds: float = 0.0,
-        max_bootstrapped_demos: int | None = None,
-        max_labeled_demos: int | None = None,
-    ) -> HippoRAGProgram:
-        """Evolve DSPy prompts via MIPROv2, GEPA, or two-phase hybrid with composite Sizecoding feedback."""
-        if not trainset:
-            return self.program
-
-        gepa_seed_path = (
-            Path(save_path).parent / f"{Path(save_path).stem}_telemetry" / "seed_program.json"
-            if save_path is not None and mode in ("gepa", "hybrid")
-            else None
-        )
-        resumed_seed = gepa_seed_path is not None and gepa_seed_path.exists()
-        if resumed_seed:
-            self.program.load(str(gepa_seed_path))
-            self._bind_program_hooks()
-            self._apply_program_embedding_prefixes()
-
-        resolved_ref_lm = (
-            reflection_lm
-            or self.program.orchestrator_lm
-            or self.program.rlm_sub_lm
-            or getattr(dspy.settings, "lm", None)
-        )
-        resolved_worker_lm = (
-            reflection_worker_lm or self.program.rlm_sub_lm or self.program.orchestrator_lm or resolved_ref_lm
-        )
-        if resolved_worker_lm is None:
-            raise YawRuntimeError("MODEL_ERROR", "Optimization requires a reflection LM")
-        if reflection_token_counter is None:
-            if self.config is None:
-                raise YawRuntimeError(
-                    "INVALID_INPUT",
-                    "Optimization requires inference configuration or an explicit verified tokenizer",
-                )
-            reflection_token_counter = ServingTokenCounter(
-                self.config.base_url,
-                resolved_worker_lm.model,
-                self.config.reflection_tokenizer_url,
-            )
-        proposer = RLMInstructionProposer(
-            orchestrator_lm=resolved_ref_lm,
-            worker_lm=resolved_worker_lm,
-            enable_gbnf=True,
-            rlm_max_iters=getattr(self.config, "rlm_max_iters", 10),
-            rlm_max_llm_calls=getattr(self.config, "rlm_max_llm_calls", 20),
-            rlm_max_output_chars=getattr(self.config, "rlm_max_output_chars", None),
-            max_field_chars=self.program._context_char_limit(600),
-            reflection_input_tokens=getattr(self.config, "reflection_input_tokens", None),
-            token_counter=reflection_token_counter,
-        )
-
-        proposer.preflight()
-
-        eff_sleep = (
-            sleep_seconds
-            if sleep_seconds > 0
-            else getattr(getattr(self, "config", None), "optimize_sleep_seconds", 0.0)
-        )
-        from .inference.chat import set_yaw_sleep_seconds
-
-        set_yaw_sleep_seconds(eff_sleep)
-
+        valset: Sequence[Any] | None,
+        opt_chunks: Sequence[tuple[ChunkPointer, str]] | None,
+        mode: str,
+        save_path: Path | str | None,
+        progress_callback: Callable[[str], None] | None,
+    ) -> None:
+        self._in_optimization = True
+        self._query_retrieval_memo.clear()
+        self._last_memo_question = None
         if opt_chunks is not None:
             existing_cids = {p.chunk_id for p, _ in self._opt_chunks_pool}
             for ptr, text in opt_chunks:
@@ -3243,7 +2706,8 @@ class YawGraphEngine:
                     existing_cids.add(ptr.chunk_id)
 
         self._active_progress_callback = progress_callback
-        self._baseline_openie_fp = self._openie_fingerprint(self.program)
+        self._last_hook_program = None
+        self._baseline_openie_fp = openie_fingerprint(self.program)
         self._hydrate_indexed_cids_from_db(self.program)
         # Legacy rows have no durable prompt provenance. Never relabel them as
         # results of the current seed; only verified checkpoints can be reused.
@@ -3287,7 +2751,7 @@ class YawGraphEngine:
             with contextlib.suppress(OSError):
                 p_save = Path(save_path)
                 p_save.parent.mkdir(parents=True, exist_ok=True)
-                _write_text_atomic(
+                write_text_atomic(
                     p_save.parent / f"{p_save.stem}_pools.json",
                     json.dumps(
                         {
@@ -3319,685 +2783,212 @@ class YawGraphEngine:
                     progress_callback=progress_callback,
                 )
 
-        eval_count = 0
-        eval_history: list[dict[str, Any]] = []
-        last_eval_ts = time.time()
-        # Per-candidate aggregates keyed by full predictor-surface fingerprint (first-seen order = candidate #).
-        candidate_stats: dict[str, dict[str, Any]] = {}
-        opt_phase = "gepa" if mode == "gepa" else "miprov2"
-        last_eval_fp: str | None = None
-        last_event_eval_count = 0
-        self._last_hook_program = None
-        _metric_keys = ("score", "r1", "r2", "r5", "r10", "r20", "em", "f1", "s_per_it", "tokens")
+    def _hydrate_top_chunks_for_eval(
+        self,
+        top_20_cids: Sequence[str],
+        active_prog: HippoRAGProgram,
+    ) -> dict[str, str]:
+        hydrated_by_cid: dict[str, str] = {}
+        if top_20_cids:
+            with self._lock:
+                ptrs = get_chunk_pointers(self.conn, top_20_cids)
+            ptrs_scores = [(ptrs[c], 0.0) for c in top_20_cids if c in ptrs]
+            if ptrs_scores:
+                for hp in hydrate_passages(
+                    ptrs_scores,
+                    self.workspace_root,
+                    max_island_chars=active_prog._context_char_limit(4000),
+                    max_total_chars=self.max_context_chars,
+                ):
+                    if hp.text:
+                        hydrated_by_cid[hp.pointer.chunk_id] = hp.text.strip()
+        return hydrated_by_cid
 
-        def _record_candidate_eval(rec: dict[str, Any]) -> None:
-            cs = candidate_stats.get(rec["cand_fp"])
-            if cs is None:
-                cs = candidate_stats[rec["cand_fp"]] = {
-                    "cand": len(candidate_stats) + 1,
-                    "fp": rec["cand_fp"],
-                    "optimizer": rec["optimizer"],
-                    "n": 0,
-                    "first_eval": rec["eval"],
-                    "score_min": float(rec["score"]),
-                    "score_max": float(rec["score"]),
-                    **{f"{k}_sum": 0.0 for k in _metric_keys},
-                }
-            cs["n"] += 1
-            cs["last_eval"] = rec["eval"]
-            cs["score_min"] = min(cs["score_min"], float(rec["score"]))
-            cs["score_max"] = max(cs["score_max"], float(rec["score"]))
-            for k in _metric_keys:
-                cs[f"{k}_sum"] += float(rec[k])
-
-        def _candidate_records() -> list[dict[str, Any]]:
-            out: list[dict[str, Any]] = []
-            for cs in sorted(candidate_stats.values(), key=lambda c: int(c["cand"])):
-                n = max(1, int(cs["n"]))
-                row = {k: cs[k] for k in ("cand", "fp", "optimizer", "n", "first_eval", "last_eval") if k in cs}
-                row.update({k: round(cs[f"{k}_sum"] / n, 4) for k in _metric_keys})
-                row["score_min"] = round(cs["score_min"], 4)
-                row["score_max"] = round(cs["score_max"], 4)
-                for k in ("gepa_idx", "gepa_iteration", "val_score", "is_best"):
-                    if k in cs:
-                        row[k] = cs[k]
-                out.append(row)
-            return out
-
-        def _build_stage_diagnostic(
-            pred_name_str: str,
-            pred_trace: Any,
-            gold_answers: list[str],
-            missed: list[str],
-        ) -> str:
-            trace_entries = list(pred_trace) if isinstance(pred_trace, (list, tuple)) else []
-            out_summaries: list[str] = []
-            for entry in trace_entries[:3]:
-                if isinstance(entry, (list, tuple)) and len(entry) >= 3:
-                    outputs = entry[2]
-                    if isinstance(outputs, dict):
-                        out_summaries.append(", ".join(f"{k}={repr(v)[:80]}" for k, v in list(outputs.items())[:3]))
-                    else:
-                        attrs = [
-                            f"{k}={repr(getattr(outputs, k))[:80]}"
-                            for k in (
-                                "named_entities",
-                                "triples",
-                                "definitions",
-                                "decisions",
-                                "repairs",
-                                "intent_query",
-                                "selected_fact_indices",
-                                "answer",
-                            )
-                            if hasattr(outputs, k)
-                        ]
-                        if attrs:
-                            out_summaries.append(", ".join(attrs))
-            trace_summary = "; ".join(out_summaries) if out_summaries else "no_trace_outputs"
-            target_hint = f"gold_answers={gold_answers[:2]!r}" if gold_answers else "no_gold_answers"
-            miss_hint = f"missed={len(missed)}" if missed else "all_retrieved"
-            return (
-                f"Stage[{pred_name_str}]: trace_calls={len(trace_entries)} "
-                f"({trace_summary}) | {target_hint} | {miss_hint}"
+    def _query_rlm_stats_for_eval(self, gold_item_docs: Sequence[str] | None) -> dict[str, Any]:
+        q_stats: dict[str, Any] | None = None
+        if gold_item_docs is not None and len(gold_item_docs) > 0:
+            gold_cids = tuple(p.chunk_id for p, _ in self._resolve_chunks_for_docs(gold_item_docs))
+            q_stats = self._last_scope_by_cids.get(gold_cids)
+        if q_stats is None:
+            q_stats = (
+                self._active_query_rlm_stats if self._active_query_rlm_stats is not None else self._graph_rlm_stats
             )
+        return q_stats
 
-        def _evaluate_prediction(
-            gold: Any,
-            pred: Any,
-            pred_name: Any = None,
-            pred_trace: Any = None,
-            *,
-            record: bool = True,
-        ) -> dspy.Prediction:
-            nonlocal eval_count, last_eval_ts, last_eval_fp
-            if record and pred_name is None:
-                eval_count += 1
-            gold_answers_raw = getattr(gold, "gold_answers", getattr(gold, "answer", None))
-            if gold_answers_raw is None:
-                gold_answers = []
-            elif isinstance(gold_answers_raw, str):
-                gold_answers = [gold_answers_raw]
-            else:
-                gold_answers = [str(a) for a in gold_answers_raw]
-
-            pred_answer = str(getattr(pred, "answer", "")).strip()
-            context_str = str(getattr(pred, "context", ""))
-
-            gold_docs_raw = getattr(gold, "gold_docs", None)
-            retrieved_cids_raw = getattr(pred, "retrieved_chunk_ids", None)
-            retrieved_passages_raw = getattr(pred, "retrieved_passages", None)
-            if retrieved_cids_raw is not None and len(retrieved_cids_raw) > 0:
-                retrieved_seq = [str(x) for x in retrieved_cids_raw]
-            elif retrieved_passages_raw is not None and len(retrieved_passages_raw) > 0:
-                retrieved_seq = [str(x) for x in retrieved_passages_raw]
-            else:
-                retrieved_seq = []
-            retrieved_texts_seq = [str(x) for x in retrieved_passages_raw] if retrieved_passages_raw is not None else []
-
-            missed: list[str] = []
-            recalls_by_k: dict[int, float] = {1: 0.0, 2: 0.0, 5: 0.0, 10: 0.0, 20: 0.0}
-            has_retrieval_labels = gold_docs_raw is not None and len(gold_docs_raw) > 0
-            if gold_docs_raw is not None and len(gold_docs_raw) > 0:
-                total_gold = max(1, len(gold_docs_raw))
-                top_20_cids = [c for c in retrieved_seq[:20] if c.startswith("chunk-")]
-                hydrated_by_cid: dict[str, str] = {}
-                if top_20_cids:
-                    with self._lock:
-                        ptrs = get_chunk_pointers(self.conn, top_20_cids)
-                    ptrs_scores = [(ptrs[c], 0.0) for c in top_20_cids if c in ptrs]
-                    if ptrs_scores:
-                        for hp in hydrate_passages(
-                            ptrs_scores,
-                            self.workspace_root,
-                            max_island_chars=self.program._context_char_limit(4000),
-                            max_total_chars=self.max_context_chars,
-                        ):
-                            if hp.text:
-                                hydrated_by_cid[hp.pointer.chunk_id] = hp.text.strip()
-                for k in (1, 2, 5, 10, 20):
-                    top_k_cids = retrieved_seq[:k]
-                    top_k_set = set(top_k_cids) | set(retrieved_texts_seq[:k])
-                    top_k_texts = {hydrated_by_cid[c] for c in top_k_cids if c in hydrated_by_cid} | set(
-                        retrieved_texts_seq[:k]
-                    )
-                    hits_k = 0
-                    for gd in gold_docs_raw:
-                        gd_str = str(gd).strip()
-                        gd_cid = compute_mdhash_id(gd_str, prefix="chunk-")
-                        island_matched = False
-                        for ht in top_k_texts:
-                            clean_ht = ht.split("\n[... AST section cropped", 1)[0].strip()
-                            if len(clean_ht) >= 60 and clean_ht in gd_str:
-                                island_matched = True
-                                break
-                            if "\n" in clean_ht:
-                                body_ht = clean_ht.split("\n", 1)[1].strip()
-                                if len(body_ht) >= 60 and body_ht in gd_str:
-                                    island_matched = True
-                                    break
-                        if (
-                            gd_cid in top_k_set
-                            or gd_str in top_k_set
-                            or gd_str in top_k_texts
-                            or island_matched
-                            or (k >= 5 and gd_str and gd_str in context_str)
-                        ):
-                            hits_k += 1
-                        elif k == 5:
-                            first_line = gd_str.splitlines()[0].strip() if gd_str else ""
-                            snippet = first_line[:120] if first_line else gd_cid
-                            missed.append(f"Missed passage: {snippet!r}")
-                    recalls_by_k[k] = hits_k / total_gold
-
-            em_score: float | None = None
-            f1_score: float | None = None
-            if gold_answers is not None and len(gold_answers) > 0:
-                em_score, f1_score = compute_qa_em_f1(pred_answer, gold_answers)
-                if em_score < 1.0:
-                    missed.append(f"Predicted={pred_answer!r} != Expected={gold_answers!r}")
-
-            usage_tokens = 0
-            if hasattr(pred, "get_lm_usage") and callable(pred.get_lm_usage):
-                usage_map = pred.get_lm_usage() or {}
-                if isinstance(usage_map, (int, float)):
-                    usage_tokens = int(usage_map)
-                elif isinstance(usage_map, dict):
-                    for model_usage in usage_map.values():
-                        if isinstance(model_usage, dict):
-                            usage_tokens += int(
-                                model_usage.get("completion_tokens")
-                                or model_usage.get("output_tokens")
-                                or model_usage.get("total_tokens")
-                                or 0
-                            )
-                        elif isinstance(model_usage, (int, float)):
-                            usage_tokens += int(model_usage)
-            if usage_tokens <= 0 and hasattr(self.program, "telemetry") and self.program.telemetry:
-                usage_tokens = sum(
-                    int(entry.get("tokens_used", 0))
-                    for entry in self.program.telemetry[-20:]
-                    if isinstance(entry, dict)
-                )
-            apm_hit: bool | None = None
-            if gold_answers is not None and len(gold_answers) > 0:
-                passages_for_apm = [p for p in context_str.split("\n\n") if p.strip()] if context_str.strip() else []
-                if passages_for_apm and hasattr(dspy, "evaluate") and hasattr(dspy.evaluate, "answer_passage_match"):
-                    ex_apm = dspy.Example(answer=list(gold_answers))
-                    pred_apm = dspy.Prediction(context=passages_for_apm)
-                    apm_hit = bool(dspy.evaluate.answer_passage_match(ex_apm, pred_apm))
-                else:
-                    apm_hit = False
-
-            gold_item_docs = getattr(gold, "item_docs", None)
-            q_stats: dict[str, Any] | None = None
-            if gold_item_docs is not None and len(gold_item_docs) > 0:
-                gold_cids = tuple(p.chunk_id for p, _ in self._resolve_chunks_for_docs(gold_item_docs))
-                q_stats = self._last_scope_by_cids.get(gold_cids)
-            if q_stats is None:
-                q_stats = (
-                    self._active_query_rlm_stats if self._active_query_rlm_stats is not None else self._graph_rlm_stats
-                )
-            usage_tokens += int(q_stats.get("openie_tokens", q_stats.get("cached_openie_tokens", 0)))
-            score_pred = compute_sizecoding_pareto_score(
-                recalls_by_k[5] if has_retrieval_labels else None,
-                recall_at_1=recalls_by_k[1] if has_retrieval_labels else None,
-                recall_at_2=recalls_by_k[2] if has_retrieval_labels else None,
-                recall_at_10=recalls_by_k[10] if has_retrieval_labels else None,
-                recall_at_20=recalls_by_k[20] if has_retrieval_labels else None,
-                em=em_score,
-                f1=f1_score,
-                tokens=usage_tokens,
-                synonym_judge_tokens=int(q_stats.get("synonym_judge_tokens", 0)),
-                shacl_healer_tokens=int(q_stats.get("shacl_healer_tokens", 0)),
-                shacl_violations_initial=int(
-                    q_stats.get(
-                        "shacl_violations_initial",
-                        q_stats.get("shacl_violations_before", 0),
-                    )
-                ),
-                shacl_violations_remaining=int(
-                    q_stats.get(
-                        "shacl_violations_remaining",
-                        q_stats.get("shacl_violations_after", 0),
-                    )
-                ),
-                missing_entity_defs_count=int(q_stats.get("missing_entity_defs_count", 0)),
-                missing_entity_defs_tokens=int(q_stats.get("missing_entity_defs_tokens", 0)),
-                pred_name=str(pred_name) if pred_name else None,
-                missed_items=missed,
-            )
-            if apm_hit is not None:
-                score_pred.answer_passage_match = 1.0 if apm_hit else 0.0
-                score_pred.feedback = f"{score_pred.feedback} | AnswerPassageMatch={1 if apm_hit else 0}"
-            if pred_name:
-                stage_diag = _build_stage_diagnostic(
-                    str(pred_name),
-                    pred_trace,
-                    gold_answers,
-                    missed,
-                )
-                score_pred.feedback = f"{score_pred.feedback} | {stage_diag}"
-            if record and pred_name is None:
-                now_ts = time.time()
-                dt_eval = max(1.0, now_ts - last_eval_ts)
-                last_eval_ts = now_ts
-                sc_val = float(score_pred.score)
-                em_val = float(em_score or 0.0)
-                f1_val = float(f1_score or 0.0)
-                cand_prog = self._last_hook_program or self.program
-                cand_fp = self._candidate_fingerprint(cand_prog)
-                last_eval_fp = cand_fp
-                eval_rec: dict[str, Any] = {
-                    "eval": eval_count,
-                    "cand_fp": cand_fp,
-                    "optimizer": opt_phase,
-                    "score": round(sc_val, 4),
-                    "r1": round(recalls_by_k[1], 4),
-                    "r2": round(recalls_by_k[2], 4),
-                    "r5": round(recalls_by_k[5], 4),
-                    "r10": round(recalls_by_k[10], 4),
-                    "r20": round(recalls_by_k[20], 4),
-                    "em": round(em_val, 4),
-                    "f1": round(f1_val, 4),
-                    "tokens": int(usage_tokens),
-                    "s_per_it": round(dt_eval, 2),
-                    "ts": round(now_ts, 2),
-                }
-                _record_candidate_eval(eval_rec)
-                eval_rec["cand"] = candidate_stats[cand_fp]["cand"]
-                eval_history.append(eval_rec)
-                del eval_history[:-500]
-                if progress_callback is not None:
-                    progress_callback(
-                        f"optimizing ({mode}, auto={auto}): eval #{eval_count} "
-                        f"[cand #{eval_rec['cand']}] -> "
-                        f"score={sc_val:.3f}, R@5={recalls_by_k[5]:.2f}, "
-                        f"F1={f1_val:.2f}, EM={em_val:.2f}, dt={dt_eval:.1f}s, tok={usage_tokens}"
-                    )
-            if record and pred_name is None:
-                self._persist_dspy_trails_to_db(self.program)
-                if save_path is not None:
-                    with contextlib.suppress(Exception):
-                        p_inc = Path(save_path)
-                        p_inc.parent.mkdir(parents=True, exist_ok=True)
-                        inc_audit = p_inc.parent / f"{p_inc.stem}_graph_rlm_audit.json"
-                        inc_payload = {
-                            "graph_rlm_stats": dict(self._graph_rlm_stats),
-                            "candidate_records": _candidate_records(),
-                            "eval_records": eval_history[-500:],
-                            "program_telemetry": list(getattr(self.program, "telemetry", ()))[-250:],
-                            "embedding_audit_trail": list(getattr(self.program, "embedding_audit_trail", ()))[-250:],
-                            "synonym_audit_trail": list(getattr(self.program, "synonym_audit_trail", ()))[-100:],
-                            "shacl_audit_trail": list(getattr(self.program, "shacl_audit_trail", ()))[-100:],
-                            "entity_def_audit_trail": list(getattr(self.program, "entity_def_audit_trail", ()))[-250:],
-                        }
-                        _write_text_atomic(inc_audit, json.dumps(inc_payload, ensure_ascii=False, indent=2))
-            return score_pred
-
-        def _mipro_metric(gold: Any, pred: Any, trace: Any = None) -> float | bool:
-            res = _evaluate_prediction(gold, pred)
-            if trace is not None:
-                f1_val = float(getattr(res, "f1", 0.0) or 0.0)
-                apm_val = float(getattr(res, "answer_passage_match", 0.0) or 0.0)
-                r5_val = float(getattr(res, "recall_at_5", 0.0) or 0.0)
-                return bool(f1_val >= 0.25 or apm_val > 0.0 or (r5_val >= 1.0 and f1_val > 0.0))
-            return float(res.score)
-
-        def _gepa_metric(
-            gold: Any,
-            pred: Any,
-            trace: Any = None,
-            pred_name: Any = None,
-            pred_trace: Any = None,
-        ) -> Any:
-            return _evaluate_prediction(
-                gold,
-                pred,
-                pred_name=pred_name,
-                pred_trace=pred_trace,
-            )
-
-        compiled = self.program
-        # Let DSPy reuse identical requests on disk while keeping logical token
-        # cost comparable across live and cached candidates. Avoid a RAM cache
-        # during evolution; request keys and cache=False remain DSPy's own.
-        configure_yaw_dspy_cache(
-            self._dspy_cache_dir,
-            enable_disk_cache=True,
-            enable_memory_cache=False,
-            restrict_pickle=True,
-            account_cached_usage=True,
-        )
-
-        try:
-            if mode in ("miprov2", "hybrid") and not resumed_seed and hasattr(dspy, "MIPROv2"):
-                import inspect
-
-                auto_val = auto if auto not in ("none", None, "") else None
-                eff_bootstrapped_demos = (
-                    max_bootstrapped_demos
-                    if max_bootstrapped_demos is not None
-                    else getattr(
-                        getattr(self, "config", None),
-                        "optimize_max_bootstrapped_demos",
-                        0,
-                    )
-                )
-                eff_labeled_demos = (
-                    max_labeled_demos
-                    if max_labeled_demos is not None
-                    else getattr(
-                        getattr(self, "config", None),
-                        "optimize_max_labeled_demos",
-                        0,
-                    )
-                )
-                optimizer_kwargs: dict[str, Any] = {
-                    "metric": _mipro_metric,
-                    "prompt_model": resolved_ref_lm,
-                    "task_model": resolved_worker_lm,
-                    "max_bootstrapped_demos": eff_bootstrapped_demos,
-                    "max_labeled_demos": eff_labeled_demos,
-                    "num_threads": 1,
-                }
-                compile_kwargs: dict[str, Any] = {
-                    "trainset": list(trainset),
-                    "valset": list(valset) if valset else None,
-                }
-                if num_trials is not None or num_candidates is not None:
-                    optimizer_kwargs["auto"] = None
-                    optimizer_kwargs["num_candidates"] = num_candidates or 1
-                    compile_kwargs["num_trials"] = num_trials or 1
-                    compile_kwargs["minibatch"] = False
-                elif mode == "hybrid" and valset and len(valset) >= 25:
-                    optimizer_kwargs["auto"] = None
-                    optimizer_kwargs["num_candidates"] = 3
-                    compile_kwargs["num_trials"] = 4
-                    compile_kwargs["max_bootstrapped_demos"] = eff_bootstrapped_demos
-                    compile_kwargs["max_labeled_demos"] = eff_labeled_demos
-                    compile_kwargs["minibatch"] = True
-                    compile_kwargs["minibatch_size"] = min(25, len(valset))
-                    compile_kwargs["minibatch_full_eval_steps"] = 4
-                else:
-                    optimizer_kwargs["auto"] = auto_val or "light"
-                    if valset and len(valset) < 35:
-                        compile_kwargs["minibatch"] = False
-
-                baseline_demos = {
-                    name: list(getattr(pred, "demos", ()) or ()) for name, pred in compiled.named_predictors()
-                }
-                optimizer = dspy.MIPROv2(**optimizer_kwargs)
-                if hasattr(optimizer, "_propose_instructions"):
-                    optimizer._propose_instructions = proposer.propose_mipro_instructions
-                compile_sig = inspect.signature(optimizer.compile).parameters
-                if not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in compile_sig.values()):
-                    compile_kwargs = {k: v for k, v in compile_kwargs.items() if k in compile_sig}
-                with dspy.context(track_usage=True):
-                    compiled = optimizer.compile(
-                        compiled,
-                        **compile_kwargs,
-                    )
-                self._prune_mismatching_demos(compiled)
-                if eff_bootstrapped_demos == 0 and eff_labeled_demos == 0:
-                    for _, pred in compiled.named_predictors():
-                        pred.demos = []
-                else:
-                    for name, pred in compiled.named_predictors():
-                        if not getattr(pred, "demos", None) and baseline_demos.get(name):
-                            pred.demos = list(baseline_demos[name])
-
-            if mode in ("gepa", "hybrid") and hasattr(dspy, "GEPA"):
-                if gepa_seed_path is not None and not resumed_seed:
-                    gepa_seed_path.parent.mkdir(parents=True, exist_ok=True)
-                    seed_tmp = gepa_seed_path.with_name("seed_program.tmp.json")
-                    compiled.save(str(seed_tmp), save_program=False)
-                    seed_tmp.replace(gepa_seed_path)
-                gepa_log_dir = (
-                    str(Path(save_path).parent / f"{Path(save_path).stem}_telemetry") if save_path is not None else None
-                )
-                gepa_valset = list(valset) if valset else None
-                if gepa_log_dir is not None:
-                    state_bin = Path(gepa_log_dir) / "gepa_state.bin"
-                    if state_bin.exists():
-                        from gepa.core.state import GEPAState
-
-                        # Use GEPA's loader: its on-disk representation is a dict,
-                        # not the object the previous preflight expected. Never
-                        # delete a checkpoint to conceal an incompatibility.
-                        saved_state = GEPAState.load(gepa_log_dir)
-                        expected_val_len = len(gepa_valset or trainset)
-                        if len(saved_state.prog_candidate_val_subscores[0]) != expected_val_len:
-                            raise YawRuntimeError(
-                                "INVALID_INPUT",
-                                "GEPA checkpoint validation set changed; "
-                                "start a fresh run. The checkpoint was preserved.",
-                            )
-
-                class _GepaProgressCallback:
-                    def on_optimization_start(self, event: Any) -> None:
-                        if progress_callback is not None:
-                            progress_callback(
-                                f"GEPA started (train={event.get('trainset_size')}, val={event.get('valset_size')})"
-                            )
-
-                    def on_iteration_start(self, event: Any) -> None:
-                        if progress_callback is not None:
-                            progress_callback(f"GEPA iteration {event.get('iteration')}: selecting candidate...")
-
-                    def on_proposal_start(self, event: Any) -> None:
-                        if progress_callback is not None:
-                            comps = ",".join(str(c) for c in (event.get("components") or ()))
-                            progress_callback(
-                                f"GEPA iteration {event.get('iteration')}: RLM reflecting on [{comps}]..."
-                            )
-
-                    def on_proposal_end(self, event: Any) -> None:
-                        if progress_callback is not None:
-                            comps = ",".join(str(c) for c in (event.get("new_instructions") or {}))
-                            progress_callback(
-                                f"GEPA iteration {event.get('iteration')}: proposed new [{comps}], scoring subsample..."
-                            )
-
-                    def on_valset_evaluated(self, event: Any) -> None:
-                        nonlocal last_event_eval_count
-                        # The valset pass that triggered this event scored the candidate whose
-                        # fingerprint was seen last; skip attribution if no new evals ran (resumed state).
-                        if last_eval_fp is not None and eval_count > last_event_eval_count:
-                            cs = candidate_stats.get(last_eval_fp)
-                            if cs is not None:
-                                cs["gepa_idx"] = int(event.get("candidate_idx", -1))
-                                cs["gepa_iteration"] = int(event.get("iteration", 0))
-                                cs["val_score"] = round(float(event.get("average_score", 0.0)), 4)
-                                cs["is_best"] = bool(event.get("is_best_program"))
-                        last_event_eval_count = eval_count
-                        if progress_callback is not None:
-                            progress_callback(
-                                f"GEPA iteration {event.get('iteration')}: candidate #{event.get('candidate_idx')} "
-                                f"val_score={float(event.get('average_score', 0.0)):.4f} "
-                                f"(best={event.get('is_best_program')})"
-                            )
-
-                gepa_kwargs: dict[str, Any] = {
-                    "metric": _gepa_metric,
-                    "reflection_lm": proposer.orchestrator_lm or proposer.worker_lm,
-                    "instruction_proposer": proposer,
-                    # 3 examples let single lucky answers accept/reject candidates; 10 is the floor.
-                    "reflection_minibatch_size": 10,
-                    "candidate_selection_strategy": "pareto",
-                    "skip_perfect_score": True,
-                    "use_merge": True,
-                    "component_selector": self._ActiveTraceComponentSelector(compiled),
-                    "num_threads": 1,
-                    "track_stats": True,
-                    "track_best_outputs": True,
-                    "warn_on_score_mismatch": False,
-                    "log_dir": gepa_log_dir,
-                    "seed": 0,
-                    "gepa_kwargs": {
-                        "use_cloudpickle": True,
-                        "frontier_type": "hybrid",
-                        "callbacks": [_GepaProgressCallback()],
-                    },
-                }
-                if num_trials is not None:
-                    gepa_kwargs["max_metric_calls"] = num_trials
-                    gepa_kwargs["auto"] = None
-                else:
-                    gepa_kwargs["auto"] = auto if auto in ("light", "medium", "heavy") else "light"
-
-                self._configure_simba_task_learning(
-                    proposer,
-                    compiled,
-                    trainset,
-                    lambda gold, pred: float(_evaluate_prediction(gold, pred, record=False).score),
-                    save_path=save_path,
-                    resume=resumed_seed,
-                )
-                gepa = dspy.GEPA(**gepa_kwargs)
-                opt_phase = "gepa"
-                with dspy.context(track_usage=True):
-                    compiled = gepa.compile(
-                        compiled,
-                        trainset=list(trainset),
-                        valset=gepa_valset,
-                    )
-        finally:
-            self._active_progress_callback = None
-            configure_yaw_dspy_cache(
-                self._dspy_cache_dir,
-                enable_disk_cache=True,
-                enable_memory_cache=True,
-                restrict_pickle=True,
-                account_cached_usage=True,
-            )
-
-        assert isinstance(compiled, HippoRAGProgram)
-        frontier_states = self._extract_pareto_frontier_states(compiled, max_candidates=3)
-        if frontier_states:
-            compiled.pareto_frontier_states = frontier_states
-            if len(frontier_states) >= 2:
-                compiled.pareto_ensemble = ParetoProgramEnsemble.from_frontier_states(compiled, frontier_states)
-
+    def _finalize_compiled_program(self, compiled: HippoRAGProgram) -> None:
         self.program = compiled
         self._bind_program_hooks()
         self._apply_program_embedding_prefixes()
 
-        if save_path is not None:
-            p = Path(save_path)
-            p.parent.mkdir(parents=True, exist_ok=True)
-            self.program.save(str(p), save_program=False)
-            if proposer.telemetry:
-                telemetry_path = p.parent / f"{p.stem}_proposer_telemetry.json"
-                telemetry_path.write_text(
-                    json.dumps(proposer.telemetry, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-            audit_path = p.parent / f"{p.stem}_graph_rlm_audit.json"
-            audit_payload = {
-                "graph_rlm_stats": dict(self._graph_rlm_stats),
-                "candidate_records": _candidate_records(),
-                "eval_records": eval_history[-500:],
-                "program_telemetry": list(getattr(self.program, "telemetry", ())),
-                "embedding_audit_trail": list(getattr(self.program, "embedding_audit_trail", ())),
-                "synonym_audit_trail": list(getattr(self.program, "synonym_audit_trail", ())),
-                "shacl_audit_trail": list(getattr(self.program, "shacl_audit_trail", ())),
-                "entity_def_audit_trail": list(getattr(self.program, "entity_def_audit_trail", ())),
-                "proposer_simba_telemetry": list(getattr(proposer, "simba_telemetry", ())),
-            }
-            _write_text_atomic(audit_path, json.dumps(audit_payload, ensure_ascii=False, indent=2))
-            if valset:
-                eval_path = p.parent / f"{p.stem}_eval.json"
-                self.evaluate(valset, save_as_json=eval_path)
-
+    def _rehydrate_sandbox_after_optimization(self, compiled: HippoRAGProgram) -> None:
+        self._in_optimization = False
+        self._query_retrieval_memo.clear()
+        self._last_memo_question = None
         if self._opt_chunks_pool and (
             len(self._opt_indexed_cids) < len(self._opt_chunks_pool)
-            or self._active_extraction_fingerprint != self._extraction_fingerprint(self.program)
+            or self._active_extraction_fingerprint != extraction_fingerprint(compiled)
         ):
-            target_openie_fp = self._openie_fingerprint(self.program)
+            target_openie_fp = openie_fingerprint(compiled)
             clear_openie = self._active_openie_fingerprint != target_openie_fp
             self._reset_sandbox_graph(clear_openie=clear_openie)
             if len(self._opt_chunks_pool) <= 32:
                 rehydrate_pool = list(self._opt_chunks_pool)
             else:
+                val_cids = {p.chunk_id for p, _ in self._opt_val_chunks_pool}
                 cached_pool = [
                     cp
                     for cp in self._opt_chunks_pool
-                    if (
+                    if cp[0].chunk_id not in val_cids
+                    and (
                         target_openie_fp,
                         cp[0].chunk_id,
                         hashlib.sha256(cp[1].encode()).hexdigest(),
                     )
                     in self._openie_fp_cache
                 ]
-                rehydrate_pool = cached_pool[:64] if cached_pool else list(self._opt_chunks_pool[:16])
-            self.index_chunks(rehydrate_pool, program=self.program)
+                rehydrate_pool = list(self._opt_val_chunks_pool) + (
+                    cached_pool[: max(0, 64 - len(self._opt_val_chunks_pool))]
+                    if cached_pool
+                    else [cp for cp in self._opt_chunks_pool if cp[0].chunk_id not in val_cids][:16]
+                )
+            self.index_chunks(rehydrate_pool, program=compiled)
+        self._bind_program_hooks()
 
-        return self.program
-
-    optimize = evolve_prompts
-
-    @staticmethod
-    def _extract_pareto_frontier_states(
-        compiled: Any,
-        *,
-        max_candidates: int = 3,
-    ) -> list[dict[str, Any]]:
-        """Extract up to `max_candidates` distinct non-dominated Pareto candidate states from \
-`compiled.detailed_results`."""
-        detailed = getattr(compiled, "detailed_results", None)
-        if detailed is None:
-            return []
-        candidates = list(getattr(detailed, "candidates", None) or ())
-        if not candidates:
-            return []
-        scores = [float(s) for s in (getattr(detailed, "val_aggregate_scores", None) or ())]
-        pareto_indices: set[int] = set()
-        best_idx = getattr(detailed, "best_idx", None)
-        if isinstance(best_idx, int) and 0 <= best_idx < len(candidates):
-            pareto_indices.add(best_idx)
-        for mapping_attr in (
-            "per_val_instance_best_candidates",
-            "per_objective_best_candidates",
-        ):
-            mapping = getattr(detailed, mapping_attr, None)
-            if isinstance(mapping, Mapping):
-                for idx_group in mapping.values():
-                    if isinstance(idx_group, (list, tuple, set)):
-                        for idx in idx_group:
-                            if isinstance(idx, int) and 0 <= idx < len(candidates):
-                                pareto_indices.add(idx)
-                    elif isinstance(idx_group, int) and 0 <= idx_group < len(candidates):
-                        pareto_indices.add(idx_group)
-
-        ranked_indices = sorted(
-            range(len(candidates)),
-            key=lambda i: (
-                i == best_idx,
-                i in pareto_indices,
-                scores[i] if i < len(scores) else 0.0,
-                -i,
+    def _build_optimization_hooks(self) -> GraphOptimizationHooks:
+        codec = CandidatePayloadCodec(self._candidate_cache_sources)
+        return GraphOptimizationHooks(
+            ensure_candidate_indexed=lambda prog, cids=None: self._ensure_candidate_chunks_indexed(
+                prog, item_docs=cids
             ),
-            reverse=True,
+            reset_sandbox_graph=lambda clear_openie: self._reset_sandbox_graph(clear_openie=clear_openie),
+            index_chunks=lambda chunks, prog: self.index_chunks(chunks, program=prog),
+            persist_trails=self._persist_dspy_trails_to_db,
+            get_meta=self.get_meta,
+            set_meta=self.set_meta,
+            candidate_cache_namespace=self._candidate_cache_namespace,
+            candidate_cache_sources=self._candidate_cache_sources,
+            retrieval_settings={
+                name: getattr(self, name)
+                for name in (
+                    "max_context_chars",
+                    "max_ast_expansion_hops",
+                    "linking_top_k",
+                    "fact_candidate_pool_k",
+                    "fact_fts_pool_k",
+                    "fact_rrf_k",
+                    "fact_fts_weight",
+                    "passage_seed_pool_k",
+                    "fts_seed_pool_k",
+                    "passage_node_weight",
+                    "fts_weight",
+                    "damping",
+                    "synonymy_threshold",
+                    "synonymy_top_k",
+                    "retrieval_top_k",
+                    "activation",
+                    "activation_param",
+                    "activation_renormalize",
+                    "beta",
+                    "dual_weight",
+                    "same_sense_cosine_gate",
+                )
+            },
+            bind_program_hooks=self._bind_program_hooks,
+            open_score_cache=lambda ctx: CandidateStageCache(
+                self._openie_fp_cache.store,
+                self.managed_conn,
+                "simba_task_score",
+                lambda: ctx,
+            ),
+            open_checkpoint_cache=lambda ctx: CandidateStageCache(
+                self._openie_fp_cache.store,
+                self.managed_conn,
+                "reflection_checkpoint",
+                lambda: ctx,
+                sources=self._candidate_cache_sources,
+            ),
+            encode_payload=codec.encode,
+            decode_payload=codec.decode,
+            commit_active_checkpoint=self._commit_active_reflection_checkpoint,
+            prepare_optimization_pools=self._prepare_optimization_pools,
+            hydrate_top_chunks=self._hydrate_top_chunks_for_eval,
+            query_rlm_stats=self._query_rlm_stats_for_eval,
+            graph_rlm_stats=lambda: dict(self._graph_rlm_stats),
+            last_hook_program=lambda: self._last_hook_program,
+            clear_progress_callback=lambda: setattr(self, "_active_progress_callback", None),
+            finalize_compiled_program=self._finalize_compiled_program,
+            rehydrate_sandbox_after_optimization=self._rehydrate_sandbox_after_optimization,
+            dspy_cache_dir=self._dspy_cache_dir,
+            config=self.config,
         )
 
-        states: list[dict[str, Any]] = []
-        seen_hashes: set[str] = set()
-        for idx in ranked_indices:
-            cand = candidates[idx]
-            if not hasattr(cand, "dump_state"):
-                continue
-            cand_state = dict(cand.dump_state())
-            surface_free = dict(cand_state)
-            surface_free.pop("yaw_surface", None)
-            raw_hash = hashlib.sha256(json.dumps(surface_free, sort_keys=True, default=str).encode("utf-8")).hexdigest()
-            if raw_hash in seen_hashes:
-                continue
-            seen_hashes.add(raw_hash)
-            states.append(cand_state)
-            if len(states) >= max_candidates:
-                break
-        return states
+    def _configure_simba_task_learning(
+        self,
+        proposer: RLMInstructionProposer,
+        template: HippoRAGProgram,
+        trainset: Sequence[Any],
+        metric: Callable[[Any, Any], float],
+        *,
+        save_path: Path | str | None,
+        resume: bool,
+    ) -> None:
+        """Wire counterfactual training rewards and atomic worker snapshots in yaw.db."""
+        configure_simba_task_learning(
+            proposer,
+            template,
+            trainset,
+            metric,
+            self._build_optimization_hooks(),
+            save_path=save_path,
+            resume=resume,
+        )
+
+    def evolve_prompts(
+        self,
+        trainset: Sequence[Any],
+        valset: Sequence[Any] | None = None,
+        *,
+        mode: Literal["miprov2", "gepa", "hybrid"] = "hybrid",
+        save_path: Path | str | None = None,
+        reflection_lm: Any = None,
+        reflection_worker_lm: Any = None,
+        reflection_token_counter: Any = None,
+        auto: Literal["light", "medium", "heavy"] | None = "light",
+        num_candidates: int | None = None,
+        num_trials: int | None = None,
+        progress_callback: Callable[[str], None] | None = None,
+        opt_chunks: Sequence[tuple[ChunkPointer, str]] | None = None,
+        sleep_seconds: float = 0.0,
+        max_bootstrapped_demos: int | None = None,
+        max_labeled_demos: int | None = None,
+    ) -> HippoRAGProgram:
+        """Evolve DSPy prompts via MIPROv2, GEPA, or two-phase hybrid with composite Sizecoding feedback."""
+        self._in_optimization = True
+        try:
+            return evolve_program_prompts(
+                self.program,
+                trainset,
+                valset,
+                hooks=self._build_optimization_hooks(),
+                mode=mode,
+                save_path=save_path,
+                reflection_lm=reflection_lm,
+                reflection_worker_lm=reflection_worker_lm,
+                reflection_token_counter=reflection_token_counter,
+                auto=auto,
+                num_candidates=num_candidates,
+                num_trials=num_trials,
+                progress_callback=progress_callback,
+                opt_chunks=opt_chunks,
+                sleep_seconds=sleep_seconds,
+                max_bootstrapped_demos=max_bootstrapped_demos,
+                max_labeled_demos=max_labeled_demos,
+            )
+        finally:
+            self._in_optimization = False
+            self._bind_program_hooks()
+
+    optimize = evolve_prompts
 
     def evaluate(
         self,
@@ -4011,82 +3002,18 @@ class YawGraphEngine:
         save_as_csv: str | Path | None = None,
         include_semantic_metrics: bool = False,
     ) -> dspy.evaluate.EvaluationResult:
-        """Evaluate the bound `HippoRAGProgram` on `devset` using `dspy.Evaluate` and return `EvaluationResult`."""
-        semantic_f1_mod = (
-            dspy.evaluate.SemanticF1() if include_semantic_metrics and hasattr(dspy.evaluate, "SemanticF1") else None
-        )
-        grounded_mod = (
-            dspy.evaluate.CompleteAndGrounded()
-            if include_semantic_metrics and hasattr(dspy.evaluate, "CompleteAndGrounded")
-            else None
-        )
-
-        def _extract_gold_answers(example: Any) -> list[str]:
-            raw = getattr(example, "gold_answers", getattr(example, "answer", []))
-            if isinstance(raw, str):
-                return [raw] if raw.strip() else []
-            return [str(a) for a in (raw or ()) if str(a).strip()]
-
-        def _compute_apm(gold_answers: list[str], context_val: Any) -> bool:
-            if not gold_answers:
-                return False
-            if isinstance(context_val, str):
-                passages = [p for p in context_val.split("\n\n") if p.strip()]
-            elif isinstance(context_val, Sequence):
-                passages = [str(p) for p in context_val if str(p).strip()]
-            else:
-                passages = []
-            if not passages:
-                return False
-            ex_apm = dspy.Example(answer=list(gold_answers))
-            pred_apm = dspy.Prediction(context=passages)
-            return bool(dspy.evaluate.answer_passage_match(ex_apm, pred_apm))
-
-        def _wrapped_metric(example: Any, pred: Any, trace: Any = None) -> float:
-            _ = trace
-            gold_answers = _extract_gold_answers(example)
-            pred_answer = str(getattr(pred, "answer", "") or "").strip()
-            context_val = getattr(pred, "context", "")
-            apm_hit = _compute_apm(gold_answers, context_val)
-            em_score, f1_score = compute_qa_em_f1(pred_answer, gold_answers) if gold_answers else (0.0, 0.0)
-            if isinstance(pred, dspy.Prediction):
-                pred.answer_passage_match = 1.0 if apm_hit else 0.0
-                pred.em = float(em_score)
-                pred.f1 = float(f1_score)
-                if include_semantic_metrics and gold_answers:
-                    q_str = str(getattr(example, "question", "") or "")
-                    ctx_str = context_val if isinstance(context_val, str) else "\n\n".join(str(x) for x in context_val)
-                    sem_ex = dspy.Example(question=q_str, response=gold_answers[0])
-                    sem_pred = dspy.Prediction(response=pred_answer, context=ctx_str)
-                    if semantic_f1_mod is not None:
-                        sem_res = semantic_f1_mod(sem_ex, sem_pred)
-                        pred.semantic_f1 = float(getattr(sem_res, "score", sem_res))
-                    if grounded_mod is not None:
-                        grd_res = grounded_mod(sem_ex, sem_pred)
-                        pred.complete_and_grounded = float(getattr(grd_res, "score", grd_res))
-
-            if metric is not None:
-                if metric is dspy.evaluate.answer_passage_match:
-                    return 1.0 if apm_hit else 0.0
-                norm_ex = example
-                if not hasattr(example, "answer") and gold_answers:
-                    norm_ex = dspy.Example(**example.toDict(), answer=list(gold_answers))
-                raw_score = metric(norm_ex, pred)
-                if hasattr(raw_score, "score"):
-                    return float(raw_score.score)
-                return float(raw_score)
-            return float(f1_score)
-
-        evaluator = dspy.Evaluate(
-            devset=list(devset),
-            metric=_wrapped_metric,
+        """Evaluate the bound `HippoRAGProgram` (or Pareto `dspy.Ensemble`) on `devset` using `dspy.Evaluate`."""
+        return evaluate_program(
+            self.ensemble if self.ensemble is not None else self.program,
+            devset,
+            metric=metric,
             num_threads=num_threads,
             display_progress=display_progress,
             display_table=display_table,
-            save_as_json=str(save_as_json) if save_as_json is not None else None,
-            save_as_csv=str(save_as_csv) if save_as_csv is not None else None,
+            save_as_json=save_as_json,
+            save_as_csv=save_as_csv,
+            include_semantic_metrics=include_semantic_metrics,
         )
-        return evaluator(self.program)
 
 
 __all__ = [

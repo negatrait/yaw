@@ -82,6 +82,32 @@ def test_optimization_custom_database_has_stable_paths(tmp_path: Path) -> None:
     assert first.compiled_program_path == (database.parent / "compiled_program_optimize_experiment.json")
 
 
+def test_yaw_config_for_benchmark(tmp_path: Path) -> None:
+    cfg = YawConfig(workspace_root=tmp_path)
+    idx_root = tmp_path / "bench_idx"
+    bench = cfg.for_benchmark("2wikimultihopqa", "a1b2c3d4", index_root=idx_root, fresh=False)
+
+    assert bench.workspace_root == idx_root / "2wikimultihopqa_a1b2c3d4"
+    assert bench.corpus_root == bench.workspace_root
+    assert bench.db_path == bench.workspace_root / "yaw.db"
+    assert bench.lock_path == bench.workspace_root / "yaw.db.lock"
+    assert bench.status_path == bench.workspace_root / "status.json"
+    assert bench.state_dir == bench.workspace_root / "coco_state"
+    assert bench.log_path == bench.workspace_root / "yaw.log"
+    assert bench.poll_interval_seconds == 0.0
+    assert "title" in bench.json_keys_whitelist
+    assert "paragraphs.*" in bench.json_keys_whitelist
+    assert "question*" in bench.json_keys_blacklist
+    assert "answer*" in bench.json_keys_blacklist
+
+    # Verify fresh=True cleans existing sandbox dir
+    marker = bench.workspace_root / "stale.txt"
+    marker.write_text("stale", encoding="utf-8")
+    bench_fresh = cfg.for_benchmark("2wikimultihopqa", "a1b2c3d4", index_root=idx_root, fresh=True)
+    assert bench_fresh.workspace_root == bench.workspace_root
+    assert not marker.exists()
+
+
 def test_config_get_and_set_values(tmp_path: Path) -> None:
     toml_file = tmp_path / "yaw.toml"
     toml_file.write_text(
@@ -149,3 +175,49 @@ def test_yaw_config_json_keys_and_patterns(tmp_path: Path) -> None:
     assert cfg_filtered.json_keys_whitelist == ("title", "text", "paragraphs.*")
     assert cfg_filtered.json_keys_blacklist == ("question*", "answer*", "Bearer*")
     assert cfg_filtered.config_fingerprint() != fp_default
+
+
+def test_default_patterns_and_write_text_atomic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import os
+
+    from yaw.core import (
+        DEFAULT_EXCLUDED_PATTERNS,
+        DEFAULT_INCLUDED_PATTERNS,
+        write_text_atomic,
+    )
+
+    cfg = YawConfig(workspace_root=tmp_path)
+    assert cfg.included_patterns == DEFAULT_INCLUDED_PATTERNS
+    assert cfg.excluded_patterns == DEFAULT_EXCLUDED_PATTERNS
+    assert "*.md" in DEFAULT_INCLUDED_PATTERNS
+    assert "__pycache__/*" in DEFAULT_EXCLUDED_PATTERNS
+
+    target = tmp_path / "nested" / "atomic.json"
+    write_text_atomic(target, '{"status": "ok"}\n')
+    assert target.read_text(encoding="utf-8") == '{"status": "ok"}\n'
+    write_text_atomic(str(target), '{"status": "updated"}\n', retries=2)
+    assert target.read_text(encoding="utf-8") == '{"status": "updated"}\n'
+    assert not list(target.parent.glob("*.tmp"))
+
+    real_replace = os.replace
+    attempts = 0
+
+    def flaky_replace(src: Any, dst: Any) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise PermissionError("Simulated transient Windows file lock")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", flaky_replace)
+    write_text_atomic(target, '{"status": "recovered"}\n', retries=2)
+    assert attempts == 2
+    assert target.read_text(encoding="utf-8") == '{"status": "recovered"}\n'
+
+    def always_locked_replace(src: Any, dst: Any) -> None:
+        raise PermissionError("Simulated persistent Windows file lock")
+
+    monkeypatch.setattr(os, "replace", always_locked_replace)
+    write_text_atomic(target, '{"status": "fallback"}\n', retries=2)
+    assert target.read_text(encoding="utf-8") == '{"status": "fallback"}\n'
+    assert not list(target.parent.glob("*.tmp"))

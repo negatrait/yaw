@@ -6,8 +6,8 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 
-import pytest
 import psutil
+import pytest
 from filelock import FileLock
 
 from yaw.core import YawConfig, YawRuntimeError, load_config
@@ -193,10 +193,15 @@ def test_daemon_status_normalizes_bad_counters_against_sqlite(tmp_path, bad_coun
     config = configured_workspace(tmp_path)
     assert config.lock_path is not None and config.status_path is not None
     seed_openie(config.db_path, 2)
-    config.status_path.write_text(json.dumps({
-        "status": {"lifecycle": "ready", "active_op": 7},
-        "stats": {"chunks": bad_count, "openie_checkpoints": bad_count},
-    }), encoding="utf-8")
+    config.status_path.write_text(
+        json.dumps(
+            {
+                "status": {"lifecycle": "ready", "active_op": 7},
+                "stats": {"chunks": bad_count, "openie_checkpoints": bad_count},
+            }
+        ),
+        encoding="utf-8",
+    )
     with FileLock(str(config.lock_path)):
         result = inspect_status(config)
     assert result["stats"]["chunks"] == 0
@@ -225,7 +230,7 @@ def test_detached_empty_daemon_starts_and_stops_without_leaking_process_handles(
             while time.monotonic() < deadline:
                 try:
                     status = json.loads(config.status_path.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError):
+                except OSError, json.JSONDecodeError:
                     time.sleep(0.05)
                     continue
                 if status["status"]["lifecycle"] == "ready":
@@ -246,3 +251,13 @@ def test_detached_empty_daemon_starts_and_stops_without_leaking_process_handles(
                     process.wait(timeout=5)
             except psutil.NoSuchProcess:
                 continue
+
+
+def test_cli_canonical_dspy_benchmark_handler_and_config_set_no_abbrev():
+    from yaw.daemon import cli
+
+    assert callable(cli.handle_dspy_benchmark)
+    assert not hasattr(cli, "handle_benchmark")
+    parser = cli.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["config", "set", "--unknown-abbreviated-flag", "inference.enable_gbnf", "false"])

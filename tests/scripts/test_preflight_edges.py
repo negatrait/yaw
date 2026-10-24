@@ -9,7 +9,7 @@ from pathlib import Path
 import psutil
 import pytest
 
-from yaw.core.preflight import main, run_check, typecheck, write_report
+from scripts.preflight import main, run_check, typecheck, write_report
 
 
 def test_run_check_retains_unicode_output_and_nonzero_exit(tmp_path, capsys):
@@ -169,7 +169,7 @@ def test_interrupted_preflight_persists_a_partial_report_in_an_owned_process(tmp
     script = """
 import signal,sys,threading,time
 from pathlib import Path
-from yaw.core.preflight import main
+from scripts.preflight import main
 ready=Path(sys.argv[1])
 def interrupt_when_test_runs():
     deadline=time.monotonic()+20

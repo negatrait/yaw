@@ -97,3 +97,61 @@ def test_projection_renders_only_largest_seeded_component(tmp_path):
     assert result["related_edges"] == 0
     assert result["layout_iterations"] == 200
     assert "Largest 1-hop component" in output.read_text(encoding="utf-8")
+
+
+def test_open_ro_sqlite_backoff_and_dark_figure_candidate_svgs(tmp_path):
+    import threading
+    import time
+
+    from scripts.watchdog import (
+        _open_ro_sqlite,
+        generate_candidate_quality_svg,
+        generate_candidate_score_svg,
+    )
+    from yaw.daemon.graph.storage import get_graph_counts, open_readonly_yaw_db, open_yaw_db
+
+    missing_db = tmp_path / "delayed.db"
+    assert _open_ro_sqlite(missing_db, backoff=()) is None
+
+    def _create_delayed():
+        time.sleep(0.05)
+        with closing(open_yaw_db(missing_db)):
+            pass
+
+    writer = threading.Thread(target=_create_delayed)
+    writer.start()
+    ro_conn = open_readonly_yaw_db(missing_db, timeout=1.0, backoff=(0.04, 0.08, 0.12))
+    try:
+        assert get_graph_counts(ro_conn) == (0, 0, 0, 0, 0)
+    finally:
+        ro_conn.close()
+        writer.join(timeout=2.0)
+
+    cands = [
+        {
+            "cand": 1,
+            "n": 4,
+            "score": 0.65,
+            "score_min": 0.55,
+            "score_max": 0.75,
+            "val_score": 0.68,
+            "eff_score": 0.68,
+            "best_so_far": 0.68,
+            "is_best": True,
+            "s_per_it": 1.2,
+            "r1": 0.5,
+            "r2": 0.6,
+            "r5": 0.75,
+            "r10": 0.8,
+            "r20": 0.85,
+            "em": 0.6,
+            "f1": 0.7,
+            "evaluations": [{"eval": 1, "score": 0.65}],
+        }
+    ]
+    score_svg = tmp_path / "score.svg"
+    qual_svg = tmp_path / "qual.svg"
+    generate_candidate_score_svg(score_svg, cands, False, ("RUNNING", "#10b981"), {})
+    generate_candidate_quality_svg(qual_svg, cands, False, ("RUNNING", "#10b981"), {})
+    assert "<svg" in score_svg.read_text(encoding="utf-8")
+    assert "<svg" in qual_svg.read_text(encoding="utf-8")

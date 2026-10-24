@@ -101,9 +101,7 @@ CHAT_MODELS = {
 }
 DEFAULT_EXTRACTION_CHAT = "Gemma-4-E4B-it-GGUF"
 DEFAULT_QA_CHAT = "Gemma-4-E4B-it-GGUF"
-DEFAULT_CHAT = DEFAULT_QA_CHAT
 BASE_URL = "http://localhost:13305/api/v1"
-DEFAULT_BASE_URL = BASE_URL
 
 
 def get_json(base_url, route):
@@ -211,10 +209,4 @@ def chat_evidence(model_name, base_url=BASE_URL):
             raise ValueError(
                 f"{model_name} requires explicit --cache-ram 0 in Lemonade to prevent host RAM prompt-cache growth."
             )
-    elif recipe == "ryzenai-llm":
-        if model.get("device") != "npu":
-            raise ValueError(f"{model_name} requires device 'npu' in Lemonade.")
-        ctx_size = model.get("recipe_options", {}).get("ctx_size")
-        if profile.expected_context and ctx_size and ctx_size < profile.expected_context:
-            raise ValueError(f"{model_name} requires ctx_size >= {profile.expected_context}, got {ctx_size}.")
     return model

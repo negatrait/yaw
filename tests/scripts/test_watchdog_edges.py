@@ -73,6 +73,103 @@ def test_pool_telemetry_uses_observed_progress_and_labels_missing_values_honestl
     assert telemetry.val_eta_min == 2.0
 
 
+def test_individual_evaluations_update_within_the_same_candidate(tmp_path, monkeypatch):
+    payload = {
+        "candidate_records": [
+            {"cand": 1, "n": 20, "score": 0.45},
+            {"cand": 2, "n": 2, "score": 0.5},
+        ],
+        # A bounded audit tail need not start at evaluation 1 or contain every candidate.
+        "eval_records": [
+            {"eval": 21, "cand": 2, "score": 0.2},
+            {"eval": 22, "cand": 2, "score": 0.8},
+        ],
+    }
+    audit = audit_file(tmp_path, monkeypatch, payload)
+    rows, total, legacy = watchdog.load_candidate_records({"datestamp": "test"})
+    assert total == 22 and not legacy
+    assert rows[0]["evaluations"] == []
+    assert rows[1]["evaluations"] == [
+        {"eval": 21, "score": 0.2},
+        {"eval": 22, "score": 0.8},
+    ]
+    path = tmp_path / "scores.svg"
+    watchdog.generate_candidate_score_svg(path, rows, legacy, ("TEST", "#38bdf8"), {})
+    text = " ".join(ElementTree.parse(path).getroot().itertext())
+    assert "eval #22" in text and "candidate #2" in text
+    assert "score 80.0%" in text and "mean 50.0%" in text
+    assert "Individual evaluation score" in text
+    assert "Current candidate mean (all its evals)" in text
+    assert "recent 2 recorded" in text
+
+    payload["candidate_records"][1].update(n=3, score=0.4)
+    payload["eval_records"].append({"eval": 23, "cand": 2, "score": 0.2})
+    audit.write_text(json.dumps(payload), encoding="utf-8")
+    rows, total, legacy = watchdog.load_candidate_records({"datestamp": "test"})
+    assert len(rows) == 2 and total == 23
+    watchdog.generate_candidate_score_svg(path, rows, legacy, ("TEST", "#38bdf8"), {})
+    text = " ".join(ElementTree.parse(path).getroot().itertext())
+    assert "eval #23" in text and "score 20.0%" in text and "mean 40.0%" in text
+    assert "recent 3 recorded" in text
+    assert not watchdog.plt.get_fignums()
+
+
+def test_native_gepa_chart_uses_validation_coverage_and_exact_membership(tmp_path, monkeypatch):
+    payload = {
+        "gepa_progress": {
+            "version": 1,
+            "phase": "reflecting / generating instructions",
+            "iteration": 3,
+            "phase_evaluations": 0,
+            "phase_expected": None,
+            "validation": [
+                {"candidate_idx": 0, "score": 0.0, "evaluated": 10, "total": 10},
+                {"candidate_idx": 1, "score": 0.4, "evaluated": 10, "total": 10},
+                {"candidate_idx": 2, "score": 0.9, "evaluated": 2, "total": 10},
+            ],
+            "frontier": [1, 2],
+            "frontier_history": [
+                {"event": 1, "members": [0], "added": [0], "removed": []},
+                {"event": 2, "members": [1, 2], "added": [1, 2], "removed": [0]},
+            ],
+        }
+    }
+    audit = audit_file(tmp_path, monkeypatch, payload)
+    path = tmp_path / "native.svg"
+    sandbox = {"datestamp": "test", "optimizer_alive": True}
+    # No dashboard candidate aggregates are needed, including after checkpoint restoration.
+    watchdog.generate_pareto_svg(path, [], False, ("TEST", "#38bdf8"), sandbox)
+    text = " ".join(ElementTree.parse(path).getroot().itertext())
+    for expected in (
+        "Seed baseline (0.0%)",
+        "Best full-validation score (40.0%)",
+        "Partial validation (not comparable)",
+        "10/10",
+        "2/10",
+        "Current native frontier: 1, 2",
+        "Displaced",
+        "reflecting / generating instructions",
+        "iteration 3",
+    ):
+        assert expected in text
+    assert "Latency" not in text and "GM quality" not in text and "Archive size" not in text
+    payload["gepa_progress"].update(phase="minibatch evaluation", phase_evaluations=2, phase_expected=10)
+    audit.write_text(json.dumps(payload), encoding="utf-8")
+    watchdog.generate_pareto_svg(path, [], False, ("TEST", "#38bdf8"), sandbox)
+    text = " ".join(ElementTree.parse(path).getroot().itertext())
+    assert "Metric evaluations since phase began: 2/10" in text
+    assert not watchdog.plt.get_fignums()
+
+
+def test_gepa_chart_does_not_invent_native_frontier_for_older_audits(tmp_path, monkeypatch):
+    audit_file(tmp_path, monkeypatch, {"candidate_records": [{"cand": 1, "n": 10, "score": 0.9}]})
+    path = tmp_path / "old.svg"
+    watchdog.generate_pareto_svg(path, [], False, ("TEST", "#38bdf8"), {"datestamp": "test"})
+    text = " ".join(ElementTree.parse(path).getroot().itertext())
+    assert "Native GEPA telemetry unavailable" in text
+    assert "cannot reconstruct GEPA's frontier" in text
+
+
 @pytest.mark.parametrize("legacy", [False, True])
 def test_candidate_plots_render_real_audit_metrics_and_close_figures(tmp_path, monkeypatch, legacy):
     candidates = [
