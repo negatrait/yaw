@@ -915,18 +915,14 @@ SHACL RLM sandbox."""
             if st.subj and st.subj_def:
                 merged_defs[st.subj] = st.subj_def
                 merged_defs[str(text_processing(st.subj))] = st.subj_def
-            if st.obj_kind != "literal" and st.obj and st.obj_def:
+            if st.obj and st.obj_def:
                 merged_defs[st.obj] = st.obj_def
                 merged_defs[str(text_processing(st.obj))] = st.obj_def
 
         missing_names: list[str] = []
         for idx, st in enumerate(structured):
             s_def = st.subj_def or merged_defs.get(st.subj, "") or merged_defs.get(str(text_processing(st.subj)), "")
-            o_def = (
-                ""
-                if st.obj_kind == "literal"
-                else (st.obj_def or merged_defs.get(st.obj, "") or merged_defs.get(str(text_processing(st.obj)), ""))
-            )
+            o_def = st.obj_def or merged_defs.get(st.obj, "") or merged_defs.get(str(text_processing(st.obj)), "")
             if s_def != st.subj_def or o_def != st.obj_def:
                 structured[idx] = StructuredTriple(
                     subj=st.subj,
@@ -960,13 +956,7 @@ SHACL RLM sandbox."""
                 s_def = (
                     st.subj_def or merged_defs.get(st.subj, "") or merged_defs.get(str(text_processing(st.subj)), "")
                 )
-                o_def = (
-                    ""
-                    if st.obj_kind == "literal"
-                    else (
-                        st.obj_def or merged_defs.get(st.obj, "") or merged_defs.get(str(text_processing(st.obj)), "")
-                    )
-                )
+                o_def = st.obj_def or merged_defs.get(st.obj, "") or merged_defs.get(str(text_processing(st.obj)), "")
                 if s_def != st.subj_def or o_def != st.obj_def:
                     structured[idx] = StructuredTriple(
                         subj=st.subj,

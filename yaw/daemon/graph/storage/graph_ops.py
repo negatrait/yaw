@@ -9,7 +9,16 @@ from typing import Any
 
 import numpy as np
 
-from yaw.core import ChunkPointer, OpenIERecord, StructuredTriple, text_processing
+from yaw.core import (
+    ChunkPointer,
+    OpenIERecord,
+    StructuredTriple,
+    check_lexical_subsumption_inversion,
+    detect_scalar_literal,
+    is_acronym_pair,
+    is_version_or_ordinal_sibling,
+    text_processing,
+)
 
 from .db import YawConnection, batched, write_tx
 from .vectors import FTS_STOPWORDS, get_entity_vectors
@@ -53,8 +62,40 @@ _INIT_DEL_TEMP_TABLES: tuple[str, ...] = (
 )
 
 
+def _get_pure_literal_entity_ids(conn: sqlite3.Connection | YawConnection) -> set[str]:
+    """Return entity IDs that represent pure rdfs:Literal resources and must not participate in SKOS taxonomy."""
+    concept_participant_ids: set[str] = {
+        str(r[0])
+        for r in conn.execute(
+            """
+            SELECT subj_id FROM facts
+            UNION
+            SELECT obj_id FROM facts
+            WHERE COALESCE(obj_kind, 'entity') = 'entity' AND obj_id IS NOT NULL
+            """
+        )
+    }
+    pure_literal_ids: set[str] = {
+        str(r[0])
+        for r in conn.execute(
+            """
+            SELECT DISTINCT obj_id FROM facts
+            WHERE obj_kind = 'literal' AND obj_id IS NOT NULL
+            """
+        )
+        if str(r[0]) not in concept_participant_ids
+    }
+    for row in conn.execute("SELECT entity_id, name FROM entities"):
+        eid, name = str(row[0]), str(row[1])
+        if eid not in concept_participant_ids and detect_scalar_literal(name)[0]:
+            pure_literal_ids.add(eid)
+    return pure_literal_ids
+
+
 def _is_acronym_match(name_a: str, name_b: str) -> bool:
     """Return True if one label is an initialism/acronym of the other multi-token label."""
+    if is_acronym_pair(name_a, name_b):
+        return True
     clean_a = re.sub(r"[^a-zA-Z0-9\s]", "", name_a).strip()
     clean_b = re.sub(r"[^a-zA-Z0-9\s]", "", name_b).strip()
     if not clean_a or not clean_b:
@@ -90,8 +131,14 @@ def _lexical_similarity_cascade(
         return 0.0
     if norm_a == norm_b:
         return 1.0
+    tok_a = str(text_processing(name_a))
+    tok_b = str(text_processing(name_b))
+    if tok_a and tok_a == tok_b:
+        return 1.0
     if _is_acronym_match(name_a, name_b):
         return max(threshold, 0.85)
+    if is_version_or_ordinal_sibling(name_a, name_b):
+        return max(threshold, 0.80)
     if norm_a.isdigit() and norm_b.isdigit():
         return 0.0
 
@@ -127,6 +174,7 @@ def find_entity_synonym_candidates(
         return []
     max_dist = max(0.0, 1.0 - threshold + 1e-6)
     pair_scores: dict[tuple[str, str], float] = {}
+    pure_literals = _get_pure_literal_entity_ids(conn)
 
     adjudicated: set[tuple[str, str]] = {
         (str(r[0]), str(r[1])) if str(r[0]) < str(r[1]) else (str(r[1]), str(r[0]))
@@ -138,6 +186,8 @@ def find_entity_synonym_candidates(
     def _scan_entity_rows(rows_iter: Iterator[sqlite3.Row]) -> None:
         for row in rows_iter:
             src_id = str(row[0])
+            if src_id in pure_literals:
+                continue
             blob = row[1]
             knn_cursor = conn.execute(
                 """
@@ -155,6 +205,8 @@ def find_entity_synonym_candidates(
             )
             for hit in knn_cursor:
                 dst_id = str(hit[0])
+                if dst_id in pure_literals:
+                    continue
                 sim = float(hit[1])
                 if sim >= threshold:
                     key = (src_id, dst_id) if src_id < dst_id else (dst_id, src_id)
@@ -164,7 +216,8 @@ def find_entity_synonym_candidates(
     if entity_ids is None:
         _scan_entity_rows(conn.execute("SELECT entity_id, embedding FROM entity_vec"))
     elif entity_ids:
-        for batch in batched(entity_ids):
+        filtered_eids = [eid for eid in entity_ids if eid not in pure_literals]
+        for batch in batched(filtered_eids):
             placeholders = ",".join("?" for _ in batch)
             cursor = conn.execute(
                 f"SELECT entity_id, embedding FROM entity_vec WHERE entity_id IN ({placeholders})",
@@ -184,6 +237,7 @@ def find_entity_disambiguation_candidates(
     lexical_threshold: float = 0.72,
 ) -> list[tuple[str, str, float, float]]:
     """Two-channel candidate generation combining sqlite-vec dense kNN and 3-stage SequenceMatcher cascade."""
+    pure_literals = _get_pure_literal_entity_ids(conn)
     adjudicated: set[tuple[str, str]] = {
         (str(r[0]), str(r[1])) if str(r[0]) < str(r[1]) else (str(r[1]), str(r[0]))
         for r in conn.execute(
@@ -195,14 +249,16 @@ def find_entity_disambiguation_candidates(
     for a, b, sim in find_entity_synonym_candidates(
         conn, entity_ids=entity_ids, threshold=dense_threshold, top_k=dense_top_k
     ):
-        dense_pairs[(a, b)] = sim
+        if a not in pure_literals and b not in pure_literals:
+            dense_pairs[(a, b)] = sim
 
     all_entities = [
         (str(r[0]), str(r[1]), str(r[1]).strip().lower())
         for r in conn.execute("SELECT entity_id, name FROM entities ORDER BY entity_id ASC")
+        if str(r[0]) not in pure_literals
     ]
     entity_names = {eid: name for eid, name, _ in all_entities}
-    target_set = set(entity_ids) if entity_ids is not None else None
+    target_set = (set(entity_ids) - pure_literals) if entity_ids is not None else None
 
     lexical_pairs: dict[tuple[str, str], float] = {}
     n_ents = len(all_entities)
@@ -239,6 +295,8 @@ def find_entity_disambiguation_candidates(
         """
     ):
         ea, eb = str(row[0]), str(row[1])
+        if ea in pure_literals or eb in pure_literals:
+            continue
         if target_set is not None and ea not in target_set and eb not in target_set:
             continue
         key = (ea, eb)
@@ -518,7 +576,7 @@ def upsert_entities(
         )
         for eid, ename, _ in normalized_rows:
             raw_norm = ename.strip().lower()
-            tok_norm = text_processing(ename)
+            tok_norm = str(text_processing(ename))
             if not raw_norm and not tok_norm:
                 continue
             existing_rows = conn.execute(
@@ -529,7 +587,9 @@ def upsert_entities(
                 continue
             existing_norms = {str(r[0]) for r in existing_rows}
             pref_norm = (
-                raw_norm if raw_norm in existing_norms else (tok_norm if tok_norm in existing_norms else raw_norm)
+                tok_norm
+                if (tok_norm and tok_norm in existing_norms)
+                else (raw_norm if raw_norm in existing_norms else "")
             )
             if pref_norm:
                 conn.execute(
@@ -601,17 +661,22 @@ def upsert_entity_labels(
             ]
 
             if ename is not None:
-                raw_ename_norm = ename.lower()
-                tok_ename_norm = text_processing(ename)
-                matches_entity_name = norm == raw_ename_norm or text_processing(norm) == tok_ename_norm
+                raw_ename_norm = ename.strip().lower()
+                tok_ename_norm = str(text_processing(ename))
+                canon_ename_norm = tok_ename_norm or raw_ename_norm
+                matches_entity_name = norm in (canon_ename_norm, raw_ename_norm) or (
+                    bool(tok_ename_norm) and str(text_processing(norm)) == tok_ename_norm
+                )
                 if matches_entity_name:
                     if curr_pref is not None and curr_pref != norm:
-                        curr_matches_name = curr_pref == raw_ename_norm or text_processing(curr_pref) == tok_ename_norm
-                        if curr_matches_name:
-                            # Entity already has a canonical prefLabel norm; demote variant punctuation norm to altLabel
+                        curr_matches_name = curr_pref in (canon_ename_norm, raw_ename_norm) or (
+                            bool(tok_ename_norm) and str(text_processing(curr_pref)) == tok_ename_norm
+                        )
+                        if curr_pref == canon_ename_norm or (curr_matches_name and norm != canon_ename_norm):
+                            # Entity already has canonical prefLabel norm; demote variant punctuation norm to altLabel
                             best_kind = "skos:altLabel"
                         else:
-                            # Demote stale non-name prefLabel to altLabel and promote canonical name norm
+                            # Demote stale or punctuated prefLabel to altLabel and promote canonical name norm
                             conn.execute(
                                 """
                                 UPDATE entity_labels
@@ -765,7 +830,8 @@ def merge_entities(
 
         src_name, src_def = str(src_row[0]), str(src_row[1])
         dst_name, dst_def = str(dst_row[0]), str(dst_row[1])
-        dst_pref_norm = dst_name.strip().lower()
+        dst_raw_norm = dst_name.strip().lower()
+        dst_pref_norm = str(text_processing(dst_name)) or dst_raw_norm
 
         if not dst_def.strip() and src_def.strip():
             conn.execute(
@@ -785,19 +851,34 @@ def merge_entities(
                 norm_str = str(l_norm)
                 new_kind = (
                     "skos:prefLabel"
-                    if norm_str == dst_pref_norm
+                    if norm_str in (dst_pref_norm, dst_raw_norm)
                     else (label_kind if str(l_kind) == "skos:prefLabel" else str(l_kind))
                 )
                 labels_to_upsert.append((norm_str, dst_id, new_kind, str(raw_lbl), str(cid)))
         else:
-            norm_str = src_name.strip().lower()
-            new_kind = "skos:prefLabel" if norm_str == dst_pref_norm else label_kind
+            norm_str = str(text_processing(src_name)) or src_name.strip().lower()
+            new_kind = "skos:prefLabel" if norm_str in (dst_pref_norm, dst_raw_norm) else label_kind
             labels_to_upsert.append((norm_str, dst_id, new_kind, src_name, "__merged__"))
         upsert_entity_labels(conn, labels_to_upsert)
 
         # 2. Re-point facts (subj_id and obj_id), prune self-loop entity facts, and deduplicate colliding facts
-        conn.execute("UPDATE facts SET subj_id = ? WHERE subj_id = ?", (dst_id, src_id))
-        conn.execute("UPDATE facts SET obj_id = ? WHERE obj_id = ?", (dst_id, src_id))
+        conn.execute(
+            """
+            UPDATE facts
+            SET subj_id = ?,
+                obj_id = CASE WHEN obj_kind = 'literal' AND obj_id = ? THEN NULL ELSE obj_id END
+            WHERE subj_id = ?
+            """,
+            (dst_id, dst_id, src_id),
+        )
+        conn.execute(
+            """
+            UPDATE facts
+            SET obj_id = CASE WHEN obj_kind = 'literal' AND subj_id = ? THEN NULL ELSE ? END
+            WHERE obj_id = ?
+            """,
+            (dst_id, dst_id, src_id),
+        )
         self_loop_fids = [
             str(r[0])
             for r in conn.execute(
@@ -926,7 +1007,32 @@ def merge_entities(
                         (new_src, new_dst),
                     ).fetchone()[0]
                 )
-                eff_weight = float(prov_count) if prov_count > 0 else weight_val
+                has_ent_fact = (
+                    conn.execute(
+                        """
+                        SELECT 1 FROM facts
+                        WHERE ((subj_id = ? AND obj_id = ?) OR (subj_id = ? AND obj_id = ?))
+                          AND COALESCE(obj_kind, 'entity') = 'entity'
+                        LIMIT 1
+                        """,
+                        (new_src, new_dst, new_dst, new_src),
+                    ).fetchone()
+                    is not None
+                )
+                has_lit_fact = (
+                    conn.execute(
+                        """
+                        SELECT 1 FROM facts
+                        WHERE ((subj_id = ? AND obj_id = ?) OR (subj_id = ? AND obj_id = ?))
+                          AND obj_kind = 'literal'
+                        LIMIT 1
+                        """,
+                        (new_src, new_dst, new_dst, new_src),
+                    ).fetchone()
+                    is not None
+                )
+                base_mult = 0.5 if (has_lit_fact and not has_ent_fact) else 1.0
+                eff_weight = float(prov_count) * base_mult if prov_count > 0 else weight_val
                 conn.execute(
                     """
                     INSERT INTO edges (src_id, dst_id, kind, weight)
@@ -996,7 +1102,8 @@ def upsert_facts(
             obj_lang = ""
 
         if obj_kind == "literal":
-            oid_val: str | None = None
+            raw_oid_str = str(raw_oid).strip() if raw_oid is not None else ""
+            oid_val: str | None = raw_oid_str if (raw_oid_str and raw_oid_str != sid) else None
             if obj_lit is None:
                 try:
                     parsed_raw = json.loads(raw_json)
@@ -1081,18 +1188,34 @@ def upsert_edges_with_sources(
             """,
             ((src, dst, kind, weight) for src, dst, kind, weight, _ in edges_with_sources),
         )
-        fact_pairs = {(src, dst) for src, dst, kind, _, _ in edges_with_sources if kind == "fact"}
-        if fact_pairs:
+        fact_base_weights: dict[tuple[str, str], float] = {}
+        for src, dst, kind, weight, _ in edges_with_sources:
+            if kind == "fact":
+                pair = (src, dst)
+                fact_base_weights[pair] = max(fact_base_weights.get(pair, 0.0), float(weight))
+        if fact_base_weights:
             conn.executemany(
                 """
                 UPDATE edges
-                SET weight = (
+                SET weight = MAX(
+                    ?,
+                    CASE
+                        WHEN EXISTS (
+                            SELECT 1 FROM facts f
+                            WHERE f.subj_id = edges.src_id
+                              AND f.obj_id = edges.dst_id
+                              AND COALESCE(f.obj_kind, 'entity') = 'entity'
+                        )
+                        THEN 1.0
+                        ELSE 0.0
+                    END
+                ) * (
                     SELECT COUNT(*) FROM edge_sources es
                     WHERE es.src_id = edges.src_id AND es.dst_id = edges.dst_id AND es.kind = 'fact'
                 )
                 WHERE src_id = ? AND dst_id = ? AND kind = 'fact'
                 """,
-                fact_pairs,
+                ((base_w, src, dst) for (src, dst), base_w in fact_base_weights.items()),
             )
 
 
@@ -1273,11 +1396,11 @@ def load_graph_topology(
                 f.subj_id AS src_id,
                 f.obj_id AS dst_id,
                 'fact' AS kind,
-                CAST(MAX(1, COUNT(DISTINCT fs.chunk_id)) AS REAL) AS weight
+                (CASE WHEN COALESCE(f.obj_kind, 'entity') = 'literal' THEN 0.5 ELSE 1.0 END)
+                * CAST(MAX(1, COUNT(DISTINCT fs.chunk_id)) AS REAL) AS weight
             FROM facts f
             LEFT JOIN fact_sources fs ON fs.fact_id = f.fact_id
-            WHERE COALESCE(f.obj_kind, 'entity') = 'entity'
-              AND f.obj_id IS NOT NULL
+            WHERE f.obj_id IS NOT NULL
               AND f.obj_id != ''
               AND f.subj_id != f.obj_id
             GROUP BY f.fact_id, f.subj_id, f.obj_id
@@ -1295,8 +1418,7 @@ def load_graph_topology(
                   e.kind != 'fact'
                   OR NOT EXISTS (
                       SELECT 1 FROM facts f
-                      WHERE COALESCE(f.obj_kind, 'entity') = 'entity'
-                        AND f.obj_id IS NOT NULL
+                      WHERE f.obj_id IS NOT NULL
                         AND f.obj_id != ''
                         AND ((f.subj_id = e.src_id AND f.obj_id = e.dst_id)
                              OR (f.subj_id = e.dst_id AND f.obj_id = e.src_id))
@@ -1352,7 +1474,19 @@ def _are_same_label_homographs(conn: sqlite3.Connection | YawConnection, ent1: s
         """,
         (ent1, ent2, ent1, ent2),
     ).fetchone()
-    return row is not None
+    if row is not None:
+        return True
+    names = conn.execute(
+        "SELECT name FROM entities WHERE entity_id IN (?, ?)",
+        (ent1, ent2),
+    ).fetchall()
+    if len(names) == 2:
+        na, nb = str(names[0][0]).strip(), str(names[1][0]).strip()
+        if na and nb:
+            ta, tb = str(text_processing(na)), str(text_processing(nb))
+            if ta and ta == tb:
+                return True
+    return False
 
 
 def upsert_semantic_edges(
@@ -1363,11 +1497,24 @@ def upsert_semantic_edges(
     if not edges:
         return
     with write_tx(conn):
+        pure_literals = _get_pure_literal_entity_ids(conn)
         for ent1, ent2, kind, weight in edges:
             if ent1 == ent2:
                 continue
             if kind not in ("skos:related", "skos:broader", "owl:differentFrom"):
                 raise ValueError(f"Unsupported semantic edge kind: {kind!r}")
+            if kind in ("skos:related", "skos:broader") and (ent1 in pure_literals or ent2 in pure_literals):
+                continue
+            if kind == "skos:broader":
+                row_s = conn.execute("SELECT name FROM entities WHERE entity_id = ?", (ent1,)).fetchone()
+                row_d = conn.execute("SELECT name FROM entities WHERE entity_id = ?", (ent2,)).fetchone()
+                name_s = str(row_s[0]) if row_s is not None else ""
+                name_d = str(row_d[0]) if row_d is not None else ""
+                if name_s and name_d:
+                    if is_version_or_ordinal_sibling(name_s, name_d):
+                        kind = "skos:related"
+                    elif check_lexical_subsumption_inversion(name_s, name_d):
+                        ent1, ent2 = ent2, ent1
             is_homograph = _are_same_label_homographs(conn, ent1, ent2)
             if kind == "owl:differentFrom":
                 if not is_homograph:
@@ -1567,6 +1714,23 @@ def delete_chunks(conn: sqlite3.Connection | YawConnection, chunk_ids: Sequence[
             """
             UPDATE edges
             SET weight = (
+                CASE
+                    WHEN EXISTS (
+                        SELECT 1 FROM facts f
+                        WHERE ((f.subj_id = edges.src_id AND f.obj_id = edges.dst_id)
+                               OR (f.subj_id = edges.dst_id AND f.obj_id = edges.src_id))
+                          AND f.obj_kind = 'literal'
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM facts f
+                        WHERE ((f.subj_id = edges.src_id AND f.obj_id = edges.dst_id)
+                               OR (f.subj_id = edges.dst_id AND f.obj_id = edges.src_id))
+                          AND COALESCE(f.obj_kind, 'entity') = 'entity'
+                    )
+                    THEN 0.5
+                    ELSE 1.0
+                END
+            ) * (
                 SELECT COUNT(*) FROM edge_sources es
                 WHERE es.src_id = edges.src_id
                   AND es.dst_id = edges.dst_id
@@ -1600,6 +1764,17 @@ def delete_chunks(conn: sqlite3.Connection | YawConnection, chunk_ids: Sequence[
                   SELECT 1 FROM edges e
                   WHERE e.src_id = f.subj_id AND e.dst_id = f.obj_id AND e.kind = 'fact'
               )
+              AND NOT EXISTS (
+                  SELECT 1 FROM fact_sources fs WHERE fs.fact_id = f.fact_id
+              )
+            """
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO temp._orphan_facts (fact_id)
+            SELECT f.fact_id
+            FROM facts f
+            WHERE f.obj_kind = 'literal'
               AND NOT EXISTS (
                   SELECT 1 FROM fact_sources fs WHERE fs.fact_id = f.fact_id
               )

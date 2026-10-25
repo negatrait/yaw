@@ -2007,7 +2007,7 @@ repair, and Pareto penalty."""
         )
 
         # 1. Verify all VALID_SHACL_ACTIONS from parsers.py pass invariants
-        self.assertEqual(len(VALID_SHACL_ACTIONS), 14)
+        self.assertEqual(len(VALID_SHACL_ACTIONS), 16)
         self.assertEqual(
             {
                 "set_definition",
@@ -2020,6 +2020,8 @@ repair, and Pareto penalty."""
                 "assert_differentFrom",
                 "assert_related",
                 "assert_broader",
+                "invert_broader",
+                "demote_sibling_to_related",
                 "remove_hierarchy_cycle",
                 "remove_conflicting_related",
                 "delete_dangling",

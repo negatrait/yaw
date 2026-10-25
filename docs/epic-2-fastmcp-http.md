@@ -41,3 +41,63 @@ All query inputs trimmed, non-empty, $\le 1024$ UTF-8 bytes.
 - [ ] **E2-A1 (`E2-S1`):** FastMCP server mounts onto `Runtime` lifespan with zero direct `graph`/`storage`/`inference` imports; `/healthz` and `/readyz` reflect live `Runtime` state.
 - [ ] **E2-A2 (`E2-S2`):** FastMCP client connects over TCP to `127.0.0.1:13306/mcp`, lists 5 tools, receives progress events, and retrieves 1-indexed line-hydrated passages + QA answers.
 - [ ] **E2-A3 (`E2-S2`):** Two concurrent TCP clients share one `yaw.db` owner; `daemon_status` and `/healthz` respond in `<2s` during slow inference; 32-slot overflow returns `BUSY`; live CocoIndex edits update citations atomically.
+
+---
+
+## Next Epic: Epic 3 Proposal ("The Great Cleanup & Configurable Substrate")
+
+### 1. Motivation & Goals
+As YAW solidifies its native HippoRAG 2 engine, knowledge graph traversal, and FastMCP transport across Epics 1 and 2, historical scaffolding, compatibility shims, and hardcoded prompt/parameter surfaces must be systematically eliminated. Epic 3 will align the user-facing CLI with strict domain containment, introduce standalone Optuna hyperparameter optimization, and externalize all hyperparameters and seed prompts into declarative configuration.
+
+### 2. Core Pillars of Epic 3
+
+#### A. CLI Surface Reconsideration & Anti-Sprawl Cleanup
+- **Purge the `yaw dspy` Historical Misnomer:** The `dspy` command group was an early development shim. Benchmarking, optimization, and program promotion belong to native engine operations.
+- **Strict Domain-Aligned CLI Hierarchy:**
+  ```text
+  yaw daemon   {start|stop|status|run}
+  yaw graph    {build|rebuild|lint|tune}
+  yaw optimize {gepa|optuna|hybrid}
+  yaw evaluate {benchmark|gate}
+  yaw config   {get|set|show}
+  ```
+- **Deprecation of Legacy Shims:** Remove unused flags, dead parameter aliases, and obsolete compatibility wrappers across `cli.py` and `runtime.py`.
+
+#### B. Standalone Optuna Hyperparameter Optimization (`yaw graph tune` / `yaw optimize --mode optuna`)
+- **Fast, Non-LLM Graph Traversal Tuning:** Decouple continuous/discrete numerical hyperparameter tuning from slow LLM prompt reflection.
+- **Trial Velocity:** Optuna evaluates candidate traversal settings on pre-indexed graphs via fast SciPy CSR PPR runs (executing 100 validation queries in seconds).
+- **Comprehensive Traversal Parameter Search Space:**
+  - PPR Dynamics: `damping` ($\alpha$), `beta` ($\beta$), `activation` (`scaled_tanh`, `linear`, `sigmoid`), `activation_param`, `dual_weight`.
+  - Seeding & Disambiguation: `passage_seed_pool_k`, `fts_seed_pool_k`, `same_sense_cosine_gate`, `synonymy_threshold`.
+  - SKOS Traversal Policies: `skos_broader_up`, `skos_broader_down`, `skos_related`, `fact_forward`, `fact_reverse`, `parallel_aggregation` (`max`, `sum`, `capped_sum`), `parallel_cap`.
+- **Output:** Writes the best-performing `RelationTraversalPolicy` and retrieval parameters directly to `yaw.toml` or candidate presets.
+
+#### C. Fully Configurable Hyperparameter Architecture (`yaw.toml`)
+- Restructure `yaw.toml` with explicit domain sections so zero engine knobs are hardcoded in source:
+  ```toml
+  [graph.traversal]
+  damping = 0.5
+  beta = 0.5
+  activation = "scaled_tanh"
+  dual_weight = 0.5
+
+  [graph.policy]
+  skos_broader_up = 1.0
+  skos_broader_down = 0.5
+  skos_related = 1.0
+  fact_forward = 1.0
+  fact_reverse = 1.0
+  parallel_aggregation = "max"
+  parallel_cap = 2.0
+
+  [graph.seeding]
+  passage_seed_pool_k = 10
+  fts_seed_pool_k = 10
+  same_sense_cosine_gate = 0.85
+  ```
+
+#### D. Externalized Seed Prompts & Demonstrations
+- **Eliminate Hardcoded Strings in Source:** Move hardcoded prompt docstrings, signature instructions, and seed few-shot demonstrations out of `yaw/daemon/graph/inference/prompts.py` and `program.py`.
+- **Declarative Prompt Files (`prompts/*.toml` or `[inference.prompts]` in `yaw.toml`):**
+  - Allow manual inspection, version-controlled prompt tuning, and custom few-shot demo injection without python code modifications.
+  - DSPy signatures load instructions and demonstrations dynamically from config at startup while maintaining strict GBNF grammar validation.

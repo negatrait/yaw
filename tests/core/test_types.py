@@ -11,6 +11,7 @@ from yaw.core.types import (
     OpenIERecord,
     RetrievalResult,
     SyncDelta,
+    check_lexical_subsumption_inversion,
     compute_chunk_id,
     compute_mdhash_id,
     inclusive_end_line,
@@ -163,9 +164,29 @@ class TypesTests(unittest.TestCase):
         self.assertEqual(text_processing("Radio-City (FM Station) #1!"), "radio city fm station 1")
         self.assertEqual(text_processing("   Multiple   Spaces   and   Tabs\t\n"), "multiple spaces and tabs")
         self.assertEqual(text_processing("123 numbers & Symbols_underscore"), "123 numbers symbols underscore")
+        self.assertEqual(text_processing("C++"), "c++")
+        self.assertEqual(text_processing("C#"), "c#")
+        self.assertEqual(text_processing("F#"), "f#")
+        self.assertEqual(text_processing("#1!"), "1")
+        self.assertEqual(text_processing("Python 3.10"), "python 3.10")
+        self.assertEqual(text_processing("19.5.1995"), "19.5.1995")
+        self.assertEqual(text_processing("2026-10-25"), "2026-10-25")
+        self.assertEqual(text_processing("99.9%"), "99.9%")
+        self.assertEqual(text_processing("8080/tcp"), "8080/tcp")
+        self.assertEqual(text_processing("12:30:00"), "12:30:00")
+        self.assertEqual(text_processing("skos:broader"), "skos:broader")
+        self.assertEqual(text_processing("UTF-8"), "utf-8")
+        self.assertEqual(text_processing("ISO-8601"), "iso-8601")
+        self.assertEqual(text_processing("v1.2-beta"), "v1.2-beta")
+        self.assertEqual(text_processing("Node.js"), "node.js")
         self.assertEqual(text_processing(""), "")
         self.assertEqual(text_processing(42), "42")
         self.assertEqual(
-            text_processing(["Apple Inc.", "Google LLC"]),
-            ["apple inc", "google llc"],
+            text_processing(["Apple Inc.", "Google LLC", "C++", "C#"]),
+            ["apple inc", "google llc", "c++", "c#"],
         )
+
+    def test_check_lexical_subsumption_inversion_preserves_technical_tokens(self):
+        self.assertFalse(check_lexical_subsumption_inversion("C", "C++"))
+        self.assertFalse(check_lexical_subsumption_inversion("C++", "C#"))
+        self.assertTrue(check_lexical_subsumption_inversion("C++", "C++ Standard Library"))

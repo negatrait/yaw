@@ -948,7 +948,7 @@ Option A (standalone Stage 1 NER entities preserved with definitions)."""
         # Hazard 3 Option A: Standalone Stage 1 NER entities ("2007" and "m3 max") that did NOT appear in any triple
         # are preserved in entities with their Stage 1 definitions and linked via passage edges!
         standalone_rows = {
-            str(r[0]): str(r[1])
+            str(r[0]).lower(): str(r[1])
             for r in engine.conn.execute(
                 "SELECT name, definition FROM entities WHERE name IN ('2007', 'm3 max')"
             ).fetchall()
@@ -1328,7 +1328,10 @@ uses heuristic fallbacks."""
         assert program.entity_def_audit_trail[0]["missing_count"] == 1
         assert program.entity_def_audit_trail[0]["tokens"] == 45
 
-        rows = {str(r[0]): str(r[1]) for r in engine.conn.execute("SELECT name, definition FROM entities").fetchall()}
+        rows = {
+            str(r[0]).lower(): str(r[1])
+            for r in engine.conn.execute("SELECT name, definition FROM entities").fetchall()
+        }
         assert rows["ada lovelace"] == "English mathematician and writer"
         assert rows["charles babbage"] == "English polymath who originated the programmable computer"
         for defn in rows.values():
@@ -1494,7 +1497,9 @@ traces into dspy.settings.trace, and emits per-predictor feedback."""
                 trace_base: list[Any] = []
                 with dspy.context(trace=trace_base, track_usage=True):
                     _ = student(**ex.inputs())
-                entities_before = {str(r[0]) for r in engine.conn.execute("SELECT name FROM entities").fetchall()}
+                entities_before = {
+                    str(r[0]).lower() for r in engine.conn.execute("SELECT name FROM entities").fetchall()
+                }
                 assert "unknown person" in entities_before
 
                 # Evaluate QA-only mutated candidate: must NOT re-run NER extraction
@@ -1515,7 +1520,9 @@ traces into dspy.settings.trace, and emits per-predictor feedback."""
                     pred_mut = cand_ner(**ex.inputs())
                 assert len(ner_calls) > ner_count_after_base
 
-                entities_after = {str(r[0]) for r in engine.conn.execute("SELECT name FROM entities").fetchall()}
+                entities_after = {
+                    str(r[0]).lower() for r in engine.conn.execute("SELECT name FROM entities").fetchall()
+                }
                 assert "alan turing" in entities_after
                 assert "bletchley park" in entities_after
 
@@ -2723,7 +2730,7 @@ def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
 
         # 1. Literal "1912-06-23" is NOT materialized in entities, entity_labels, or entity_vec
         ent_rows = {
-            str(r[0]): str(r[1]) for r in engine.conn.execute("SELECT name, entity_id FROM entities").fetchall()
+            str(r[0]).lower(): str(r[1]) for r in engine.conn.execute("SELECT name, entity_id FROM entities").fetchall()
         }
         ent_names = set(ent_rows.keys())
         assert "1912-06-23" not in ent_names
@@ -2795,7 +2802,7 @@ def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
         # 4. Graph conforms to SHACL
         lint = engine.lint_graph(as_turtle=True)
         assert lint["conforms"] is True, lint["violations"]
-        assert 'rdf:object "1912-06-23"^^<xsd:date>' in lint["turtle"]
+        assert 'rdf:object "1912-06-23"^^xsd:date' in lint["turtle"]
         assert "skos:broader yaw:entity-" in lint["turtle"]
 
         # 5. Retrieving for the literal fact seeds the subject + fact_sources chunk and retrieves doc_turing

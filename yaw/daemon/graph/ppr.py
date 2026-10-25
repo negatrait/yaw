@@ -143,9 +143,15 @@ def build_transition_matrix(
                     row_list.append(u)
                     col_list.append(v)
                     w_list.append(w_down)
-            elif kind == "fact":
-                w_fwd = base_w * float(pol.fact_forward)
-                w_rev = base_w * float(pol.fact_reverse)
+            elif kind in ("fact", "datatype_property", "owl:DatatypeProperty"):
+                if kind in ("datatype_property", "owl:DatatypeProperty"):
+                    eff_w = base_w * float(pol.datatype_property)
+                elif abs((base_w % 1.0) - 0.5) < 1e-6:
+                    eff_w = (base_w / 0.5) * float(pol.datatype_property)
+                else:
+                    eff_w = base_w
+                w_fwd = eff_w * float(pol.fact_forward)
+                w_rev = eff_w * float(pol.fact_reverse)
                 if w_fwd > 0.0:
                     row_list.append(v)
                     col_list.append(u)

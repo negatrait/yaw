@@ -305,6 +305,7 @@ def synonym_fingerprint(program: HippoRAGProgram) -> str:
     named = dict(program.named_predictors()) if hasattr(program, "named_predictors") else {}
     payload = serialize_predictor_surface(named["synonym_judge"]) if "synonym_judge" in named else {}
     payload["context_budget"] = [program.context_window_tokens, program.max_output_tokens]
+    payload["schema_version"] = "skos-shacl-v3"
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -323,6 +324,7 @@ def shacl_fingerprint(program: HippoRAGProgram) -> str:
         name: getattr(healer, name, None) for name in ("max_iters", "max_llm_calls", "max_output_chars")
     }
     payload["context_budget"] = [program.context_window_tokens, program.max_output_tokens]
+    payload["schema_version"] = "skos-shacl-v3"
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -337,6 +339,7 @@ def openie_fingerprint(program: HippoRAGProgram) -> str:
         "gbnf_max_entities": getattr(program, "gbnf_max_entities", None),
         "gbnf_max_triples": getattr(program, "gbnf_max_triples", None),
         "context_budget": [program.context_window_tokens, program.max_output_tokens],
+        "schema_version": "skos-shacl-v3",
     }
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -360,6 +363,7 @@ def extraction_fingerprint(program: HippoRAGProgram) -> str:
         "gbnf_max_triples": getattr(program, "gbnf_max_triples", None),
         "embedding_document_prefix": getattr(program, "embedding_document_prefix", None),
         "context_budget": [program.context_window_tokens, program.max_output_tokens],
+        "schema_version": "skos-shacl-v3",
     }
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -374,6 +378,7 @@ def candidate_fingerprint(program: HippoRAGProgram) -> str:
         "embedding_fact_prefix": getattr(program, "embedding_fact_prefix", None),
         "embedding_document_prefix": getattr(program, "embedding_document_prefix", None),
         "context_budget": [program.context_window_tokens, program.max_output_tokens],
+        "schema_version": "skos-shacl-v3",
     }
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]

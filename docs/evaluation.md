@@ -2142,3 +2142,19 @@ Verification: All 17 Oblivion Demolition Table `Test-Path` and repository-wide `
 - Full offline pytest suite (`uv run --locked pytest -m "not live_llm" -q`): **652 passed, 0 failed** (648 passed in initial batch + all 4 edge/contract regressions resolved and verified in `task-687` and `task-700`).
 - Focused Step 10 & Step 11 suite (`test_step10_*` and `test_step11_*` across `test_prompts.py`, `test_db.py`, `test_ppr.py`, `test_engine.py`): **6 passed in 19.71s**.
 - Static analysis & formatting (`uv run --locked ruff check`, `uv run --locked ty check`, `git diff --check`): **All checks passed (0 diagnostics)**.
+
+## 49. Step 12: W3C SKOS/RDF/OWL/SHACL Build-Time Hardening, Typed-Predicate Disambiguation, Low-Weight (`0.5`) Literal Connectivity, and Structural `text_processing` (2026-10-25)
+
+- **Owner & Canonical Contract:** [`FOUNDATIONAL.md`](../FOUNDATIONAL.md) & [`docs/skos-rdf-owl-shacl-hardening.md`](skos-rdf-owl-shacl-hardening.md).
+- **Core Architecture & Achievements:**
+  - **Typed Predicate Disambiguation (`owl:ObjectProperty` vs `owl:DatatypeProperty`):** Rather than brittle regex guessing on stripped text, extraction stages (`ExtractTriples`, `prompts.py`, `grammars.py`, `parsers.py`) emit `["pred", "owl:ObjectProperty" | "owl:DatatypeProperty"]`. Untyped literals default to `rdfs:Literal` (in RDF 1.1, untyped literals are `xsd:string`), and `skos:definition` on literals is strictly preserved under `rdfs:Resource`.
+  - **Low-Weight (`0.5`) Literal Connectivity:** Instead of severing literal objects (`obj_id = NULL`), `rdfs:Literal` targets remain materialized in `entities`, connected to chunks via `passage` edges and to subjects via `0.5`-weighted `'fact'` edges (`RelationTraversalPolicy.datatype_property = 0.5`), while being excluded from `skos:broader`/`skos:related` taxonomies and `JudgeSynonyms`.
+  - **Taxonomy Hierarchy & Disambiguation Guards:** Enforced `is_acronym_pair` ($\to$ `skos:altLabel`), `is_version_or_ordinal_sibling` ($\to$ `skos:related`), and `check_lexical_subsumption_inversion` across `YawGraphEngine.index_chunks`, `upsert_semantic_edges`, and `JudgeSynonyms`.
+  - **Deterministic Pre-RLM Auto-Healing & Build-Time Gate:** In `engine.py`, `lint_graph_shacl(conn, auto_heal=True, heal_definitions=False)` runs before invoking `active_program.heal_shacl_violations`, repairing structural violations at zero token cost. `lint_graph_shacl` validates all 11 closed-world shapes, checks the 10,000 recursive CTE cap (`ConceptShape/broaderTransitiveCapExceeded`), prunes true orphan facts, and serializes clean declared CURIE syntax (`^^xsd:date`).
+  - **Structural `text_processing` & Surface Form Preservation:** `text_processing` preserves token-internal structural punctuation (`.`, `-`, `+`, `#`, `/`, `%`, `:`) attached to alphanumeric tokens (`"C++"`, `"C#"`, `"Python 3.10"`, `"19.5.1995"`, `"8080/tcp"`), while `entities.name` (`COLLATE NOCASE`) and `entity_labels.raw_label` store canonical surface forms, using `text_processing` strictly for `label_norm` and hash key matching. Bumped `"schema_version": "skos-shacl-v3"` in `optimizer.py`.
+- **Verification:**
+  - Full offline test suite (`uv run pytest --no-testmon tests/core/ tests/daemon/graph/`): **561 passed, 0 failed**.
+  - All 11 SHACL shapes, deterministic auto-healers, un-mocked pipeline build gates, and structural normalization verified with real SQLite and DSPy modules.
+  - `uv run ruff check` -> **All checks passed!**
+  - `uv run ty check` -> **All checks passed!**
+  - `git diff --check` -> **Clean (0 errors)**.

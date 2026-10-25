@@ -19,7 +19,8 @@ char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
 
 DSPY_TRIPLES_GBNF_GRAMMAR = r"""root ::= "{\"triples\": " triple-list "}"
 triple-list ::= "[]" | "[" triple (", " triple)* "]"
-triple ::= "{\"sub\": " entity-slot ", \"pred\": " string ", \"obj\": " entity-slot ", \"def\": " string "}"
+triple ::= "{\"sub\": " entity-slot ", \"pred\": " pred-slot ", \"obj\": " entity-slot ", \"def\": " string "}"
+pred-slot ::= string | "[" string ", " ("\"owl:ObjectProperty\"" | "\"owl:DatatypeProperty\"") "]"
 entity-slot ::= new-entity-pair | string
 new-entity-pair ::= "[" string ", " string "]"
 string ::= "\"" char+ "\""
@@ -51,7 +52,8 @@ DSPY_SHACL_REPAIR_GBNF_GRAMMAR = (
     'action-kind ::= "\\"set_definition\\"" | "\\"rewrite_definition\\"" | "\\"set_pref_label\\"" | '
     '"\\"demote_to_alt_label\\"" | "\\"merge_altLabel\\"" | "\\"merge_hiddenLabel\\"" | '
     '"\\"add_different_from\\"" | "\\"assert_differentFrom\\"" | "\\"assert_related\\"" | '
-    '"\\"assert_broader\\"" | "\\"remove_hierarchy_cycle\\"" | "\\"remove_conflicting_related\\"" | '
+    '"\\"assert_broader\\"" | "\\"invert_broader\\"" | "\\"demote_sibling_to_related\\"" | '
+    '"\\"remove_hierarchy_cycle\\"" | "\\"remove_conflicting_related\\"" | '
     '"\\"delete_dangling\\"" | "\\"delete_invalid_fact\\""\n'
     'string ::= "\\"" char+ "\\""\n'
     'char ::= [^"\\\\\\x7F\\x00-\\x1F] | "\\\\" (["\\\\bfnrt] | "u" [0-9a-fA-F]{4})\n'
@@ -135,8 +137,9 @@ novel entities as [name, def] pairs."""
         list_line = f"triple-list ::= ({seq})?\n"
 
     triple_line = (
-        'triple ::= "{\\"sub\\": " entity-slot ", \\"pred\\": " string '
+        'triple ::= "{\\"sub\\": " entity-slot ", \\"pred\\": " pred-slot '
         '", \\"obj\\": " entity-slot ", \\"def\\": " string "}"\n'
+        'pred-slot ::= string | "[" string ", " ("\\"owl:ObjectProperty\\"" | "\\"owl:DatatypeProperty\\"") "]"\n'
     )
     if deduped_known:
         known_rule = " | ".join(gbnf_escape_literal(json.dumps(e, ensure_ascii=False)) for e in deduped_known)
@@ -215,7 +218,8 @@ def build_dspy_shacl_repair_grammar(max_repairs: int | None = None) -> str:
         'action-kind ::= "\\"set_definition\\"" | "\\"rewrite_definition\\"" | "\\"set_pref_label\\"" | '
         '"\\"demote_to_alt_label\\"" | "\\"merge_altLabel\\"" | "\\"merge_hiddenLabel\\"" | '
         '"\\"add_different_from\\"" | "\\"assert_differentFrom\\"" | "\\"assert_related\\"" | '
-        '"\\"assert_broader\\"" | "\\"remove_hierarchy_cycle\\"" | "\\"remove_conflicting_related\\"" | '
+        '"\\"assert_broader\\"" | "\\"invert_broader\\"" | "\\"demote_sibling_to_related\\"" | '
+        '"\\"remove_hierarchy_cycle\\"" | "\\"remove_conflicting_related\\"" | '
         '"\\"delete_dangling\\"" | "\\"delete_invalid_fact\\""\n'
         'string ::= "\\"" char+ "\\""\n'
         'char ::= [^"\\\\\\x7F\\x00-\\x1F] | "\\\\" (["\\\\bfnrt] | "u" [0-9a-fA-F]{4})\n'

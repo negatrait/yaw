@@ -208,26 +208,30 @@ class ExtractTriples(dspy.Signature):
     Your task is to construct an RDF (Resource Description Framework) `rdf:Statement` graph from the \
 given passages and named entity lists.
     Respond with a JSON object in the format:
-    {"triples": [{"sub": "known_entity" or ["new_entity", "contextual definition"], "pred": "predicate", \
-"obj": "known_entity" or ["new_entity", "contextual definition"], "def": "concise contextual definition \
-of the statement fact"}, ...]}
+    {"triples": [{"sub": "known_entity" or ["new_entity", "contextual definition"], "pred": ["predicate phrase", \
+"owl:ObjectProperty" | "owl:DatatypeProperty"], "obj": "known_resource" or ["new_resource", "contextual definition"], \
+"def": "concise contextual definition of the statement fact"}, ...]}
     Pay attention to the following requirements:
     - Each triple should contain at least one, but preferably two, of the named entities in the list for \
 each passage.
     - Clearly resolve pronouns to their specific names to maintain clarity.
-    - If a "sub" or "obj" entity is already in named_entities with a definition, you must emit its exact \
-string name (e.g., "Cinderella") without repeating its definition.
-    - If a "sub" or "obj" entity is a new entity not present in named_entities, you must emit a 2-element \
-list [entity_name, contextual_definition] (e.g., ["glass slipper", "Delicate footwear lost by Cinderella \
-at the ball"]), and always provide a concise statement definition in "def"."""
+    - For "pred", emit a 2-element pair ["predicate phrase", "owl:ObjectProperty" | "owl:DatatypeProperty"]: \
+use "owl:ObjectProperty" when "obj" is a concept/entity (`skos:Concept` / `owl:NamedIndividual`), and \
+use "owl:DatatypeProperty" when "obj" is a data value or literal (`rdfs:Literal`, such as dates, \
+timestamps, numbers, ports, versions, or percentages).
+    - Because `skos:definition` has domain `rdfs:Resource` (which includes both `skos:Concept` and `rdfs:Literal`), \
+both "sub" and "obj" can provide `[name, contextual_definition]` when not already defined in `named_entities` \
+(or emit the exact string name if already in `named_entities`), and always provide a concise statement \
+definition in "def"."""
 
     passage: str = dspy.InputField(desc="Source passage text")
     named_entities: list[Any] = dspy.InputField(
         desc="Extracted [entity_name, contextual_definition] pairs (or entity names) from Stage 1"
     )
     triples: list[Any] = dspy.OutputField(
-        desc='List of relation triple objects {"sub", "pred", "obj", "def"} where known entities are '
-        "strings and new entities are [name, definition] pairs"
+        desc='List of relation triple objects {"sub", "pred", "obj", "def"} where "pred" is '
+        '["predicate phrase", "owl:ObjectProperty" | "owl:DatatypeProperty"], known resources are '
+        "strings, and new resources are [name, definition] pairs"
     )
 
 
@@ -258,19 +262,21 @@ disambiguate entities.
     Judge candidate pairs of entities that look similar semantically and in writing/spelling (including \
 typos, acronyms, lookalikes like "Cindy Real" vs "Cinderella", or homonyms/homographs with the same name \
 like "a ball" vs "a ball"):
-    - 'skos:altLabel': True synonym or coreferent alias referring to the exact same entity/concept (merge \
-into canonical entity).
-    - 'skos:hiddenLabel': Typo, misspelling, transcription error, acronym, or surface spelling variant \
+    - 'skos:altLabel': True synonym, acronym, initialism, or coreferent alias referring to the exact same \
+entity/concept (merge into canonical entity, where 'canonical' is the preferred entity name).
+    - 'skos:hiddenLabel': Typo, misspelling, transcription error, or surface spelling variant \
 referring to the exact same entity/concept (merge into canonical entity).
     - 'owl:differentFrom': Confusable homonym, homograph (e.g., "a ball" [formal dance] vs "a ball" \
 [spherical toy]), or false-friend lookalike (e.g., "Cindy Real" vs "Cinderella") that is easy to mix up \
 due to similar/identical surface form or context, but actually refers to a genuinely different \
 entity/concept (keep separate, add repulsive owl:differentFrom edge).
-    - 'skos:related': Distinct, different `skos:concept` entities that are associatively related in the \
-domain without being coreferent synonyms or confusable homonyms/lookalikes (keep separate, add symmetric \
-skos:related edge).
-    - 'skos:broader': Hierarchical broader-concept relation where the narrower concept points to `canonical` \
-as its broader parent concept (keep separate, add directed skos:broader edge).
+    - 'skos:related': Distinct, different `skos:Concept` entities that are associatively related in the \
+domain without being coreferent synonyms or confusable homonyms/lookalikes, including version or severity \
+siblings (e.g., "http 2" vs "http 3", "sev 1" vs "sev 2") (keep separate, add symmetric skos:related edge).
+    - 'skos:broader': Hierarchical broader-concept relation where the narrower child concept points to \
+`canonical` as its broader parent concept (e.g. "cryptanalysis" -> "mathematics", where 'canonical' is \
+"mathematics"; child has compound specialization tokens, parent has general category tokens) (keep separate, \
+add directed skos:broader edge).
     Respond with JSON: {"decisions": [{"pair_id": "id_a|id_b", "relation": \
 "skos:altLabel|skos:hiddenLabel|skos:related|skos:broader|owl:differentFrom", "canonical": "id_a_or_id_b"}, ...]}"""
 
@@ -288,8 +294,8 @@ heal SHACL violations.
     Propose closed-world SKOS/RDF/OWL repairs for SHACL validation report violations.
     Supported actions: 'set_definition', 'rewrite_definition', 'set_pref_label', 'demote_to_alt_label', \
 'merge_altLabel', 'merge_hiddenLabel', 'add_different_from', 'assert_differentFrom', 'assert_related', \
-'assert_broader', 'remove_hierarchy_cycle', 'remove_conflicting_related', \
-'delete_dangling', 'delete_invalid_fact'.
+'assert_broader', 'invert_broader', 'demote_sibling_to_related', 'remove_hierarchy_cycle', \
+'remove_conflicting_related', 'delete_dangling', 'delete_invalid_fact'.
     Respond with JSON: {"repairs": [{"focus_node": "...", "action": "...", "value": "..."}, ...]}"""
 
     violations: str = dspy.InputField(desc="JSON list of SHACLViolation report items")
@@ -440,13 +446,13 @@ _NER_DEMO_ENTITY_DEFINITIONS: list[list[str]] = [
 _TRIPLE_DEMO_TRIPLES: list[dict[str, Any]] = [
     {
         "sub": "Radio City",
-        "pred": "located in",
+        "pred": ["located in", "owl:ObjectProperty"],
         "obj": "India",
         "def": "Radio City is a private FM radio station located in India.",
     },
     {
         "sub": "Radio City",
-        "pred": "is",
+        "pred": ["is", "owl:ObjectProperty"],
         "obj": [
             "private FM radio station",
             "Category of commercial FM radio station in India represented by Radio City.",
@@ -455,25 +461,25 @@ _TRIPLE_DEMO_TRIPLES: list[dict[str, Any]] = [
     },
     {
         "sub": "Radio City",
-        "pred": "started on",
+        "pred": ["started on", "owl:DatatypeProperty"],
         "obj": "3 July 2001",
         "def": "Radio City started broadcasting on 3 July 2001.",
     },
     {
         "sub": "Radio City",
-        "pred": "plays songs in",
+        "pred": ["plays songs in", "owl:ObjectProperty"],
         "obj": "Hindi",
         "def": "Radio City plays songs in the Hindi language.",
     },
     {
         "sub": "Radio City",
-        "pred": "plays songs in",
+        "pred": ["plays songs in", "owl:ObjectProperty"],
         "obj": "English",
         "def": "Radio City plays songs in the English language.",
     },
     {
         "sub": "Radio City",
-        "pred": "forayed into",
+        "pred": ["forayed into", "owl:ObjectProperty"],
         "obj": [
             "New Media",
             "Digital media sector entered by Radio City in May 2008.",
@@ -482,19 +488,19 @@ _TRIPLE_DEMO_TRIPLES: list[dict[str, Any]] = [
     },
     {
         "sub": "Radio City",
-        "pred": "launched",
+        "pred": ["launched", "owl:ObjectProperty"],
         "obj": "PlanetRadiocity.com",
         "def": "Radio City launched the music portal PlanetRadiocity.com in May 2008.",
     },
     {
         "sub": "PlanetRadiocity.com",
-        "pred": "launched in",
+        "pred": ["launched in", "owl:DatatypeProperty"],
         "obj": "May 2008",
         "def": "PlanetRadiocity.com was launched in May 2008.",
     },
     {
         "sub": "PlanetRadiocity.com",
-        "pred": "is",
+        "pred": ["is", "owl:ObjectProperty"],
         "obj": [
             "music portal",
             "Web portal category offering music news, videos, and songs.",
@@ -503,7 +509,7 @@ _TRIPLE_DEMO_TRIPLES: list[dict[str, Any]] = [
     },
     {
         "sub": "PlanetRadiocity.com",
-        "pred": "offers",
+        "pred": ["offers", "owl:ObjectProperty"],
         "obj": [
             "news",
             "Music-related news content offered on PlanetRadiocity.com.",
@@ -512,7 +518,7 @@ _TRIPLE_DEMO_TRIPLES: list[dict[str, Any]] = [
     },
     {
         "sub": "PlanetRadiocity.com",
-        "pred": "offers",
+        "pred": ["offers", "owl:ObjectProperty"],
         "obj": [
             "videos",
             "Music video content offered on PlanetRadiocity.com.",
@@ -521,7 +527,7 @@ _TRIPLE_DEMO_TRIPLES: list[dict[str, Any]] = [
     },
     {
         "sub": "PlanetRadiocity.com",
-        "pred": "offers",
+        "pred": ["offers", "owl:ObjectProperty"],
         "obj": [
             "songs",
             "Musical song tracks offered on PlanetRadiocity.com.",

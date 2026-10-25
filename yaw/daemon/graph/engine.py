@@ -16,7 +16,18 @@ from typing import Any, Literal
 import dspy
 import numpy as np
 
-from yaw.core import ChunkPointer, IndexStats, RelationTraversalPolicy, StructuredTriple, write_text_atomic
+from yaw.core import (
+    ChunkPointer,
+    IndexStats,
+    RelationTraversalPolicy,
+    StructuredTriple,
+    YawRuntimeError,
+    check_lexical_subsumption_inversion,
+    detect_scalar_literal,
+    is_acronym_pair,
+    is_version_or_ordinal_sibling,
+    write_text_atomic,
+)
 from yaw.core.config import context_char_limit, scale_context_budget
 from yaw.daemon.graph.inference import (
     FACT_INSTRUCTION,
@@ -1334,13 +1345,48 @@ class YawGraphEngine:
             chunk_text_by_id = {ptr.chunk_id: text for ptr, text in chunks}
             record_structured: list[tuple[str, list[StructuredTriple], list[tuple[str, str]]]] = []
             all_norm_labels: set[str] = set()
+            surface_by_norm: dict[str, str] = {}
+            chunk_surface_by_norm: dict[tuple[str, str], str] = {}
+
+            def _record_surface(norm_key: str, raw_val: str, cid_key: str = "") -> None:
+                clean_raw = raw_val.strip()
+                if not norm_key or not clean_raw:
+                    return
+                prev = surface_by_norm.get(norm_key)
+                if prev is None or (prev == prev.lower() and clean_raw != clean_raw.lower()):
+                    surface_by_norm[norm_key] = clean_raw
+                if cid_key:
+                    prev_c = chunk_surface_by_norm.get((cid_key, norm_key))
+                    if prev_c is None or (prev_c == prev_c.lower() and clean_raw != clean_raw.lower()):
+                        chunk_surface_by_norm[(cid_key, norm_key)] = clean_raw
+
             for rec in all_records:
                 cid = rec.chunk_id
+                raw_st_items = list(getattr(rec, "structured_triples", ()) or ())
+                entity_role_raws: set[str] = set()
+                literal_only_raws: set[str] = set()
+                for st_item in raw_st_items:
+                    s_r = str(getattr(st_item, "subj", "")).strip()
+                    o_r = str(getattr(st_item, "obj", "")).strip()
+                    if s_r:
+                        entity_role_raws.add(s_r)
+                        entity_role_raws.add(str(text_processing(s_r)))
+                    if getattr(st_item, "obj_kind", "entity") == "literal":
+                        if o_r:
+                            literal_only_raws.add(o_r)
+                    elif o_r:
+                        entity_role_raws.add(o_r)
+                        entity_role_raws.add(str(text_processing(o_r)))
+                literal_only_raws -= entity_role_raws
+
                 stage1_defs: dict[str, str] = {}
                 stage1_senses: dict[str, list[str]] = {}
                 for raw_pair in getattr(rec, "entity_definitions", ()) or ():
                     if isinstance(raw_pair, (list, tuple)) and len(raw_pair) >= 2:
-                        enorm = str(text_processing(str(raw_pair[0])))
+                        raw_e0 = str(raw_pair[0]).strip()
+                        is_lit_norm = raw_e0 in literal_only_raws or detect_scalar_literal(raw_e0)[0]
+                        enorm = raw_e0 if is_lit_norm else str(text_processing(raw_e0))
+                        _record_surface(enorm, raw_e0, cid)
                         edef = str(raw_pair[1]).strip()
                         if enorm and edef:
                             if enorm not in stage1_defs:
@@ -1354,14 +1400,16 @@ class YawGraphEngine:
                 seen_ner_sense_keys: set[tuple[str, str]] = set()
                 for raw_ent in getattr(rec, "entities", ()) or ():
                     if isinstance(raw_ent, (list, tuple)) and len(raw_ent) >= 1:
-                        e_str = str(raw_ent[0])
+                        e_str = str(raw_ent[0]).strip()
                         e_inline_def = str(raw_ent[1]).strip() if len(raw_ent) >= 2 and raw_ent[1] is not None else ""
                     else:
-                        e_str = str(raw_ent)
+                        e_str = str(raw_ent).strip()
                         e_inline_def = ""
-                    e_norm = str(text_processing(e_str))
+                    is_lit_norm = e_str in literal_only_raws or detect_scalar_literal(e_str)[0]
+                    e_norm = e_str if is_lit_norm else str(text_processing(e_str))
                     if not e_norm:
                         continue
+                    _record_surface(e_norm, e_str, cid)
                     e_def = e_inline_def or stage1_defs.get(e_norm, "")
                     s_key = (e_norm, e_def.lower())
                     if s_key in seen_ner_sense_keys or (not e_def and e_norm in seen_ner_norms):
@@ -1386,7 +1434,7 @@ class YawGraphEngine:
                             all_norm_labels.add(enorm)
                             ner_entities.append((enorm, edef))
 
-                st_list: list[StructuredTriple] = list(getattr(rec, "structured_triples", ()) or ())
+                st_list: list[StructuredTriple] = list(raw_st_items)
                 if not st_list and getattr(rec, "triples", ()):
                     for t in rec.triples:
                         if len(t) >= 3:
@@ -1415,15 +1463,32 @@ class YawGraphEngine:
                             )
                 normalized_sts: list[StructuredTriple] = []
                 for st in st_list:
+                    s_raw_str = str(st.subj).strip()
+                    o_raw_str = str(st.obj).strip()
                     s_norm = str(text_processing(st.subj))
                     p_norm = str(text_processing(st.pred))
-                    is_literal_obj = getattr(st, "obj_kind", "entity") == "literal"
-                    o_val = str(st.obj).strip() if is_literal_obj else str(text_processing(st.obj))
+                    is_literal_obj = (
+                        getattr(st, "obj_kind", "entity") == "literal"
+                        or detect_scalar_literal(str(st.obj))[0]
+                    )
+                    o_val = o_raw_str if is_literal_obj else str(text_processing(st.obj))
                     if not s_norm or not p_norm or not o_val:
                         continue
+                    if detect_scalar_literal(s_norm)[0]:
+                        if not is_literal_obj:
+                            s_norm, o_val = o_val, s_norm
+                            s_raw_str, o_raw_str = o_raw_str, s_raw_str
+                            is_literal_obj = True
+                        else:
+                            continue
+                    _record_surface(s_norm, s_raw_str, cid)
+                    _record_surface(o_val, o_raw_str, cid)
                     all_norm_labels.add(s_norm)
-                    if not is_literal_obj:
-                        all_norm_labels.add(o_val)
+                    all_norm_labels.add(o_val)
+                    o_tok_norm = str(text_processing(o_val))
+                    if o_tok_norm:
+                        all_norm_labels.add(o_tok_norm)
+                        _record_surface(o_tok_norm, o_raw_str, cid)
                     spo_d = st.spo_def.strip() or f"{s_norm} {p_norm} {o_val}."
                     raw_subj_d = st.subj_def.strip()
                     subj_d = raw_subj_d or stage1_defs.get(s_norm, "")
@@ -1434,28 +1499,26 @@ class YawGraphEngine:
                         if all(d.lower() != subj_d.lower() for d in senses_lst):
                             senses_lst.append(subj_d)
 
-                    if is_literal_obj:
-                        obj_d = ""
-                    else:
-                        raw_obj_d = st.obj_def.strip()
-                        obj_d = raw_obj_d or stage1_defs.get(o_val, "")
-                        if (
-                            s_norm == o_val
-                            and subj_d
-                            and obj_d
-                            and subj_d.lower() == obj_d.lower()
-                            and len(stage1_senses.get(o_val, ())) >= 2
-                        ):
-                            obj_d = next(
-                                (d for d in stage1_senses[o_val] if d.lower() != subj_d.lower()),
-                                obj_d,
-                            )
-                        if obj_d:
-                            if o_val not in stage1_defs:
-                                stage1_defs[o_val] = obj_d
-                            senses_lst = stage1_senses.setdefault(o_val, [])
-                            if all(d.lower() != obj_d.lower() for d in senses_lst):
-                                senses_lst.append(obj_d)
+                    raw_obj_d = st.obj_def.strip()
+                    obj_d = raw_obj_d or stage1_defs.get(o_val, "") or stage1_defs.get(o_tok_norm, "")
+                    if (
+                        not is_literal_obj
+                        and s_norm == o_val
+                        and subj_d
+                        and obj_d
+                        and subj_d.lower() == obj_d.lower()
+                        and len(stage1_senses.get(o_val, ())) >= 2
+                    ):
+                        obj_d = next(
+                            (d for d in stage1_senses[o_val] if d.lower() != subj_d.lower()),
+                            obj_d,
+                        )
+                    if obj_d:
+                        if o_val not in stage1_defs:
+                            stage1_defs[o_val] = obj_d
+                        senses_lst = stage1_senses.setdefault(o_val, [])
+                        if all(d.lower() != obj_d.lower() for d in senses_lst):
+                            senses_lst.append(obj_d)
 
                     normalized_sts.append(
                         StructuredTriple(
@@ -1518,6 +1581,7 @@ class YawGraphEngine:
                             self._graph_rlm_stats["missing_entity_defs_tokens"] += int(entry.get("tokens", 0))
                     for r_name, r_def in repaired_pairs:
                         r_norm = str(text_processing(str(r_name)))
+                        _record_surface(r_norm, str(r_name), cid)
                         r_clean = str(r_def).strip()
                         if r_norm and r_clean:
                             stage1_defs[r_norm] = r_clean
@@ -1530,7 +1594,11 @@ class YawGraphEngine:
                             obj=st.obj,
                             spo_def=st.spo_def,
                             subj_def=st.subj_def or stage1_defs.get(st.subj, ""),
-                            obj_def=("" if st.obj_kind == "literal" else (st.obj_def or stage1_defs.get(st.obj, ""))),
+                            obj_def=(
+                                st.obj_def
+                                or stage1_defs.get(st.obj, "")
+                                or stage1_defs.get(str(text_processing(st.obj)), "")
+                            ),
                             obj_kind=st.obj_kind,
                             obj_datatype=st.obj_datatype,
                             obj_lang=st.obj_lang,
@@ -1563,6 +1631,7 @@ class YawGraphEngine:
                 for ptr, _ in chunks:
                     if ptr.title:
                         t_norm = str(text_processing(ptr.title))
+                        _record_surface(t_norm, ptr.title, ptr.chunk_id)
                         if 3 <= len(t_norm) <= 30 and not t_norm.isdigit():
                             known_concepts.add(t_norm)
                 for _cid, normalized_sts, ner_entities in record_structured:
@@ -1572,8 +1641,10 @@ class YawGraphEngine:
                     for e_norm, e_def in ner_entities[:2]:
                         if not e_def or len(e_norm) < 3:
                             continue
-                        first_clause = e_def.split(".", 1)[0].lower()
-                        clause_words = set(re.findall(r"[a-z0-9]+", first_clause))
+                        first_clause = re.split(r"\.(?:\s|$)", e_def, maxsplit=1)[0].lower()
+                        clause_words = set(str(text_processing(first_clause)).split()) | set(
+                            re.findall(r"[a-z0-9]+", first_clause)
+                        )
                         for c_norm in known_concepts:
                             if c_norm == e_norm or c_norm in e_norm or e_norm in c_norm:
                                 continue
@@ -1582,7 +1653,7 @@ class YawGraphEngine:
                                 continue
                             if (e_norm, c_norm) in existing_pairs:
                                 continue
-                            if re.search(rf"\b{re.escape(c_norm)}\b", first_clause):
+                            if re.search(rf"(?:^|(?<=\s)|(?<=\W)){re.escape(c_norm)}(?=$|\s|\W)", first_clause):
                                 existing_pairs.add((e_norm, c_norm))
                                 normalized_sts.append(
                                     StructuredTriple(
@@ -1601,8 +1672,8 @@ class YawGraphEngine:
                 senses_by_label[lbl] = [
                     (
                         eid,
-                        entity_info_by_id.get(eid, (lbl, ""))[0],
-                        entity_info_by_id.get(eid, (lbl, ""))[1],
+                        entity_info_by_id.get(eid, (surface_by_norm.get(lbl, lbl), ""))[0],
+                        entity_info_by_id.get(eid, (surface_by_norm.get(lbl, lbl), ""))[1],
                         existing_vecs_by_id.get(eid),
                     )
                     for eid in eids
@@ -1617,12 +1688,7 @@ class YawGraphEngine:
             cand_pairs_by_label: dict[str, list[tuple[str, str]]] = {}
             for _cid, st_list, ner_entities in record_structured:
                 for st in st_list:
-                    mention_items = (
-                        ((st.subj, st.subj_def),)
-                        if st.obj_kind == "literal"
-                        else ((st.subj, st.subj_def), (st.obj, st.obj_def))
-                    )
-                    for m_lbl, m_def in mention_items:
+                    for m_lbl, m_def in ((st.subj, st.subj_def), (st.obj, st.obj_def)):
                         c_def = m_def.strip()
                         if c_def:
                             defs_by_label.setdefault(m_lbl, set()).add(c_def.lower())
@@ -1640,7 +1706,7 @@ class YawGraphEngine:
                         sense_cand_id = compute_mdhash_id(f"{m_lbl}::{c_def.lower()}", prefix="entity-")
                         if sense_cand_id in existing_vecs_by_id:
                             continue
-                        ct = fmt_entity(m_lbl, c_def)
+                        ct = fmt_entity(surface_by_norm.get(m_lbl, m_lbl), c_def)
                         if ct not in seen_prebatch:
                             seen_prebatch.add(ct)
                             prebatch_texts.append(ct)
@@ -1658,7 +1724,15 @@ class YawGraphEngine:
             precomputed_entity_vecs: dict[str, np.ndarray] = {}
 
             def _label_kind_for(entity_name: str, lbl_norm: str) -> str:
-                return "skos:prefLabel" if lbl_norm == str(text_processing(entity_name)) else "skos:altLabel"
+                return (
+                    "skos:prefLabel"
+                    if (
+                        lbl_norm == entity_name
+                        or lbl_norm.lower() == entity_name.lower()
+                        or lbl_norm == str(text_processing(entity_name))
+                    )
+                    else "skos:altLabel"
+                )
 
             def _resolve_mention_entity_id(
                 label_norm: str,
@@ -1668,35 +1742,54 @@ class YawGraphEngine:
                 exclude_eid: str | None = None,
             ) -> str:
                 clean_def = defn.strip()
+                canon_surface = surface_by_norm.get(label_norm, label_norm)
+                mention_raw = chunk_surface_by_norm.get((chunk_id, label_norm), canon_surface)
                 existing_senses = senses_by_label.get(label_norm, [])
                 if not existing_senses:
                     eid = compute_mdhash_id(label_norm, prefix="entity-")
-                    senses_by_label[label_norm] = [(eid, label_norm, clean_def, existing_vecs_by_id.get(eid))]
-                    entity_map[eid] = (eid, label_norm, clean_def)
-                    entity_labels_to_upsert.append((label_norm, eid, "skos:prefLabel", label_norm, chunk_id))
+                    senses_by_label[label_norm] = [(eid, canon_surface, clean_def, existing_vecs_by_id.get(eid))]
+                    entity_map[eid] = (eid, canon_surface, clean_def)
+                    entity_labels_to_upsert.append((label_norm, eid, "skos:prefLabel", mention_raw, chunk_id))
                     return eid
 
+                def _best_surface(curr_name: str) -> str:
+                    if (
+                        curr_name == curr_name.lower()
+                        and canon_surface != canon_surface.lower()
+                        and str(text_processing(curr_name)) == label_norm
+                    ):
+                        return canon_surface
+                    return curr_name
+
                 if not clean_def:
-                    for eid, name, prev_def, _ in existing_senses:
+                    for idx_s, (eid, name, prev_def, prev_vec) in enumerate(existing_senses):
                         if exclude_eid is not None and eid == exclude_eid:
                             continue
-                        if eid not in entity_map:
-                            entity_map[eid] = (eid, name, prev_def)
+                        best_name = _best_surface(name)
+                        if best_name != name:
+                            existing_senses[idx_s] = (eid, best_name, prev_def, prev_vec)
+                            entity_map[eid] = (eid, best_name, prev_def)
+                        elif eid not in entity_map:
+                            entity_map[eid] = (eid, best_name, prev_def)
                         entity_labels_to_upsert.append(
                             (
                                 label_norm,
                                 eid,
-                                _label_kind_for(name, label_norm),
-                                label_norm,
+                                _label_kind_for(best_name, label_norm),
+                                mention_raw,
                                 chunk_id,
                             )
                         )
                         return eid
-                    eid, name, prev_def, _ = existing_senses[0]
-                    if eid not in entity_map:
-                        entity_map[eid] = (eid, name, prev_def)
+                    eid, name, prev_def, prev_vec = existing_senses[0]
+                    best_name = _best_surface(name)
+                    if best_name != name:
+                        existing_senses[0] = (eid, best_name, prev_def, prev_vec)
+                        entity_map[eid] = (eid, best_name, prev_def)
+                    elif eid not in entity_map:
+                        entity_map[eid] = (eid, best_name, prev_def)
                     entity_labels_to_upsert.append(
-                        (label_norm, eid, _label_kind_for(name, label_norm), label_norm, chunk_id)
+                        (label_norm, eid, _label_kind_for(best_name, label_norm), mention_raw, chunk_id)
                     )
                     return eid
 
@@ -1705,20 +1798,21 @@ class YawGraphEngine:
                     if exclude_eid is not None and eid == exclude_eid:
                         continue
                     if not prev_def or prev_def.lower() == clean_def.lower():
+                        best_name = _best_surface(name)
                         merged_def = clean_def if len(clean_def) > len(prev_def) else (prev_def or clean_def)
                         existing_senses[idx_s] = (
                             eid,
-                            name,
+                            best_name,
                             merged_def,
-                            prev_vec if (merged_def == prev_def) else None,
+                            prev_vec if (merged_def == prev_def and best_name == name) else None,
                         )
-                        entity_map[eid] = (eid, name, merged_def)
+                        entity_map[eid] = (eid, best_name, merged_def)
                         entity_labels_to_upsert.append(
                             (
                                 label_norm,
                                 eid,
-                                _label_kind_for(name, label_norm),
-                                label_norm,
+                                _label_kind_for(best_name, label_norm),
+                                mention_raw,
                                 chunk_id,
                             )
                         )
@@ -1736,7 +1830,7 @@ class YawGraphEngine:
                 if cached_sense_vec is not None:
                     cand_vec = cached_sense_vec
                 else:
-                    cand_text = fmt_entity(label_norm, clean_def)
+                    cand_text = fmt_entity(canon_surface, clean_def)
                     cand_vec = self._encode_in_batches([cand_text], instruction="", stage="entity_embed")[0]
                     c_norm = float(np.linalg.norm(cand_vec))
                     if c_norm > 0:
@@ -1755,17 +1849,18 @@ class YawGraphEngine:
                         precomputed_entity_vecs[eid] = prev_vec
                     cos_sim = float(np.dot(cand_vec, prev_vec))
                     if cos_sim >= self.same_sense_cosine_gate:
+                        best_name = _best_surface(name)
                         merged_def = clean_def if len(clean_def) > len(prev_def) else prev_def
-                        if merged_def != prev_def:
-                            existing_senses[idx_s] = (eid, name, merged_def, cand_vec)
+                        if merged_def != prev_def or best_name != name:
+                            existing_senses[idx_s] = (eid, best_name, merged_def, cand_vec)
                             precomputed_entity_vecs[eid] = cand_vec
-                        entity_map[eid] = (eid, name, merged_def)
+                        entity_map[eid] = (eid, best_name, merged_def)
                         entity_labels_to_upsert.append(
                             (
                                 label_norm,
                                 eid,
-                                _label_kind_for(name, label_norm),
-                                label_norm,
+                                _label_kind_for(best_name, label_norm),
+                                mention_raw,
                                 chunk_id,
                             )
                         )
@@ -1773,9 +1868,9 @@ class YawGraphEngine:
 
                 sense_id = compute_mdhash_id(f"{label_norm}::{clean_def.lower()}", prefix="entity-")
                 precomputed_entity_vecs[sense_id] = cand_vec
-                existing_senses.append((sense_id, label_norm, clean_def, cand_vec))
-                entity_map[sense_id] = (sense_id, label_norm, clean_def)
-                entity_labels_to_upsert.append((label_norm, sense_id, "skos:prefLabel", label_norm, chunk_id))
+                existing_senses.append((sense_id, canon_surface, clean_def, cand_vec))
+                entity_map[sense_id] = (sense_id, canon_surface, clean_def)
+                entity_labels_to_upsert.append((label_norm, sense_id, "skos:prefLabel", mention_raw, chunk_id))
                 self._graph_rlm_stats["homograph_splits"] += 1
                 return sense_id
 
@@ -1798,8 +1893,15 @@ class YawGraphEngine:
 
                     if st.obj_kind == "literal":
                         o_id: str | None = None
+                        if not (st.obj_datatype.startswith("xsd:") and not st.obj_def.strip()):
+                            eff_obj_def = st.obj_def.strip() or st.spo_def.strip() or f"Literal value {st.obj}."
+                            o_id = _resolve_mention_entity_id(st.obj, eff_obj_def, cid)
+                            resolved_in_chunk.add((st.obj, st.obj_def.strip().lower()))
+                            chunk_to_entities[cid].add(o_id)
+                        eff_obj_dt = st.obj_datatype or "rdfs:Literal"
+                        fact_oid = o_id if (o_id is not None and o_id != s_id) else None
                         fid = compute_mdhash_id(
-                            str((s_id, st.pred, f"literal:{st.obj}:{st.obj_datatype}:{st.obj_lang}")),
+                            str((s_id, st.pred, f"literal:{st.obj}:{eff_obj_dt}:{st.obj_lang}")),
                             prefix="fact-",
                         )
                         raw_json = json.dumps([st.subj, st.pred, st.obj])
@@ -1809,17 +1911,25 @@ class YawGraphEngine:
                                 fid,
                                 s_id,
                                 st.pred,
-                                None,
+                                fact_oid,
                                 raw_json,
                                 st.spo_def,
                                 st.subj_def,
-                                "",
+                                st.obj_def,
                                 "literal",
                                 st.obj,
-                                st.obj_datatype,
+                                eff_obj_dt,
                                 st.obj_lang,
                             )
                         fact_sources_batch.append((fid, cid))
+                        if fact_oid is not None:
+                            dt_weight = (
+                                float(self.traversal_policy.datatype_property)
+                                if self.traversal_policy is not None
+                                else 0.5
+                            )
+                            fact_linked_pairs.add((min(s_id, fact_oid), max(s_id, fact_oid)))
+                            edges_with_sources.append((s_id, fact_oid, "fact", dt_weight, cid))
                     else:
                         distinct_homograph_pole = (
                             st.subj == st.obj
@@ -1864,7 +1974,6 @@ class YawGraphEngine:
                         if s_id != o_id:
                             fact_linked_pairs.add((min(s_id, o_id), max(s_id, o_id)))
                             edges_with_sources.append((s_id, o_id, "fact", 1.0, cid))
-                            edges_with_sources.append((o_id, s_id, "fact", 1.0, cid))
 
                 for e_norm, e_def in ner_entities:
                     e_key = (e_norm, e_def.strip().lower())
@@ -1956,7 +2065,31 @@ class YawGraphEngine:
                     upsert_fact_vectors(conn, fact_vec_pairs)
                 upsert_edges_with_sources(conn, edges_with_sources)
 
-                valid_entity_ids = [eid for eid, name, _ in entity_nodes if len(re.sub(r"[^A-Za-z0-9]", "", name)) >= 1]
+                concept_eids = {
+                    str(r[0])
+                    for r in conn.execute(
+                        """
+                        SELECT subj_id FROM facts
+                        UNION
+                        SELECT obj_id FROM facts
+                        WHERE COALESCE(obj_kind, 'entity') = 'entity' AND obj_id IS NOT NULL
+                        """
+                    )
+                }
+                lit_only_eids = {
+                    str(r[0])
+                    for r in conn.execute(
+                        "SELECT DISTINCT obj_id FROM facts WHERE obj_kind = 'literal' AND obj_id IS NOT NULL"
+                    )
+                    if str(r[0]) not in concept_eids
+                }
+                valid_entity_ids = [
+                    eid
+                    for eid, name, _ in entity_nodes
+                    if len(re.sub(r"[^A-Za-z0-9]", "", name)) >= 1
+                    and not (detect_scalar_literal(name)[0] and eid not in concept_eids)
+                    and eid not in lit_only_eids
+                ]
                 if valid_entity_ids:
                     raw_candidates = find_entity_disambiguation_candidates(
                         conn,
@@ -2081,6 +2214,19 @@ class YawGraphEngine:
                         same_name = text_processing(name_src) == text_processing(name_tgt)
                         active_pkey = (min(src, tgt), max(src, tgt))
                         is_fact_pole_pair = active_pkey in fact_linked_pairs
+                        if (
+                            rel not in ("owl:differentFrom", "different", "different_from")
+                            and is_acronym_pair(name_src, name_tgt)
+                            and not (same_name and is_fact_pole_pair)
+                        ):
+                            if len(name_src) < len(name_tgt):
+                                merge_src, merge_dst = src, tgt
+                            else:
+                                merge_src, merge_dst = tgt, src
+                            merge_entities(conn, merge_src, merge_dst, label_kind="skos:altLabel")
+                            merged_into[merge_src] = merge_dst
+                            self._graph_rlm_stats["merged_entities"] += 1
+                            continue
                         if rel in ("skos:altLabel", "skos:hiddenLabel", "exact_match") and not (
                             same_name and is_fact_pole_pair
                         ):
@@ -2107,6 +2253,13 @@ class YawGraphEngine:
                             semantic_batch.append((src, tgt, "owl:differentFrom", 0.0))
                             self._graph_rlm_stats["different_from_edges"] += 1
                         elif rel == "skos:broader":
+                            # 1. Version/Ordinal Sibling Guard: If version/ordinal siblings, demote to skos:related
+                            if is_version_or_ordinal_sibling(name_src, name_tgt):
+                                semantic_batch.append((src, tgt, "skos:related", max(0.5, sim)))
+                                self._graph_rlm_stats["related_edges"] += 1
+                                continue
+
+                            # 2. Missing/Invalid Canonical Guard: If canonical is missing/empty, demote to skos:related
                             if canon and (
                                 canon.upper() == "A"
                                 or canon in (src, raw_src)
@@ -2116,8 +2269,26 @@ class YawGraphEngine:
                                 )
                             ):
                                 child_id, parent_id = tgt, src
-                            else:
+                                child_name, parent_name = name_tgt, name_src
+                            elif canon and (
+                                canon.upper() == "B"
+                                or canon in (tgt, raw_tgt)
+                                or (
+                                    text_processing(canon) == text_processing(name_tgt)
+                                    and text_processing(canon) != text_processing(name_src)
+                                )
+                            ):
                                 child_id, parent_id = src, tgt
+                                child_name, parent_name = name_src, name_tgt
+                            else:
+                                semantic_batch.append((src, tgt, "skos:related", max(0.5, sim)))
+                                self._graph_rlm_stats["related_edges"] += 1
+                                continue
+
+                            # 3. Lexical Subsumption Inversion Guard:
+                            if check_lexical_subsumption_inversion(child_name, parent_name):
+                                child_id, parent_id = parent_id, child_id
+
                             semantic_batch.append((child_id, parent_id, "skos:broader", max(0.5, sim)))
                             self._graph_rlm_stats["broader_edges"] = (
                                 int(self._graph_rlm_stats.get("broader_edges", 0)) + 1
@@ -2144,8 +2315,18 @@ class YawGraphEngine:
                         tgt = _resolve_active_eid(eb)
                         if src == tgt:
                             continue
-                        if text_processing(str(c["name_a"])) == text_processing(str(c["name_b"])):
-                            active_pkey = (min(src, tgt), max(src, tgt))
+                        name_src, _ = cand_meta.get(src, (str(c["name_a"]), ""))
+                        name_tgt, _ = cand_meta.get(tgt, (str(c["name_b"]), ""))
+                        same_name = text_processing(name_src) == text_processing(name_tgt)
+                        active_pkey = (min(src, tgt), max(src, tgt))
+                        if is_acronym_pair(name_src, name_tgt) and not (
+                            same_name and active_pkey in fact_linked_pairs
+                        ):
+                            merge_src, merge_dst = (src, tgt) if len(name_src) < len(name_tgt) else (tgt, src)
+                            merge_entities(conn, merge_src, merge_dst, label_kind="skos:altLabel")
+                            merged_into[merge_src] = merge_dst
+                            self._graph_rlm_stats["merged_entities"] += 1
+                        elif same_name:
                             if float(c.get("dense_sim", 0.0)) >= 0.45 and active_pkey not in fact_linked_pairs:
                                 merge_entities(conn, src, tgt, label_kind="skos:altLabel")
                                 merged_into[src] = tgt
@@ -2169,7 +2350,22 @@ class YawGraphEngine:
 
                 # In-transaction Closed-World SHACL Linting & Bounded Self-Healing via shacl_healer_rlm
                 batch_node_ids = set(chunk_ids) | set(all_entity_ids) | set(all_fact_ids)
-                all_violations = lint_graph_shacl(conn, auto_heal=False)
+                pre_heal_violations = lint_graph_shacl(conn, auto_heal=False)
+                pre_heal_batch_violations = [
+                    v
+                    for v in pre_heal_violations
+                    if (v.focus_node, v.shape) not in self._attempted_shacl_keys
+                    or v.focus_node in batch_node_ids
+                    or ("|" in v.focus_node and any(p.strip() in batch_node_ids for p in v.focus_node.split("|")))
+                    or ("->" in v.focus_node and any(p.strip() in batch_node_ids for p in v.focus_node.split("->")))
+                ]
+                batch_shacl_before = len(pre_heal_batch_violations)
+                self._graph_rlm_stats["shacl_violations_before"] += batch_shacl_before
+                self._graph_rlm_stats["shacl_violations_initial"] = self._graph_rlm_stats["shacl_violations_before"]
+                batch_attempted_keys: set[tuple[str, str]] = {
+                    (v.focus_node, v.shape) for v in pre_heal_batch_violations
+                }
+                all_violations = lint_graph_shacl(conn, auto_heal=True, heal_definitions=False)
                 violations = [
                     v
                     for v in all_violations
@@ -2178,10 +2374,6 @@ class YawGraphEngine:
                     or ("|" in v.focus_node and any(p.strip() in batch_node_ids for p in v.focus_node.split("|")))
                     or ("->" in v.focus_node and any(p.strip() in batch_node_ids for p in v.focus_node.split("->")))
                 ]
-                batch_shacl_before = len(violations)
-                self._graph_rlm_stats["shacl_violations_before"] += batch_shacl_before
-                self._graph_rlm_stats["shacl_violations_initial"] = self._graph_rlm_stats["shacl_violations_before"]
-                batch_attempted_keys: set[tuple[str, str]] = set()
                 if violations:
                     for v in violations:
                         v_key = (v.focus_node, v.shape)
@@ -2213,7 +2405,7 @@ class YawGraphEngine:
                         if cached_reps:
                             applied = self._apply_shacl_repairs(conn, cached_reps)
                             self._graph_rlm_stats["shacl_repairs_applied"] += applied
-                        all_violations = lint_graph_shacl(conn, auto_heal=False)
+                        all_violations = lint_graph_shacl(conn, auto_heal=True)
                     else:
                         shacl_audit: list[dict[str, Any]] = getattr(active_program, "shacl_audit_trail", [])
                         shacl_tel: list[dict[str, Any]] = getattr(active_program, "telemetry", [])
@@ -2274,13 +2466,23 @@ class YawGraphEngine:
                                 list(shacl_traces),
                                 shacl_tok,
                             )
-                        all_violations = lint_graph_shacl(conn, auto_heal=False)
+                        all_violations = lint_graph_shacl(conn, auto_heal=True)
+                elif all_violations:
+                    all_violations = lint_graph_shacl(conn, auto_heal=True)
+
+                # In-transaction Build-Time Gate: Enforce zero remaining SHACL violations
+                remaining_violations = lint_graph_shacl(conn, auto_heal=False)
+                if remaining_violations:
+                    raise YawRuntimeError(
+                        "CONSISTENCY_ERROR",
+                        f"Graph build left {len(remaining_violations)} SHACL violations: {remaining_violations[:3]}",
+                    )
                 batch_shacl_remaining = sum(
-                    1 for v in all_violations if (v.focus_node, v.shape) in batch_attempted_keys
+                    1 for v in remaining_violations if (v.focus_node, v.shape) in batch_attempted_keys
                 )
-                self._graph_rlm_stats["shacl_violations_after"] = len(all_violations)
-                self._graph_rlm_stats["shacl_violations_remaining"] = len(all_violations)
-                self._graph_rlm_stats["shacl_conforms"] = len(all_violations) == 0
+                self._graph_rlm_stats["shacl_violations_after"] = len(remaining_violations)
+                self._graph_rlm_stats["shacl_violations_remaining"] = len(remaining_violations)
+                self._graph_rlm_stats["shacl_conforms"] = len(remaining_violations) == 0
                 for cid in chunk_ids:
                     set_meta(conn, f"indexed_fp:{cid}", json.dumps([ext_fp, openie_fp]))
 

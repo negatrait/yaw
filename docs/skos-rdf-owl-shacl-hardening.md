@@ -35,10 +35,81 @@ conformance.
 
 ## Semantic and traversal contract
 
-RDF predicates express relations; their meaning does not prescribe numerical
-ranking weights. YAW must define and evaluate that retrieval policy explicitly.
-Keep semantic assertions, structural incidence edges and the derived retrieval
-operator distinct, with a documented mapping between them.
+### 1. The Core W3C Partition: Concepts (`skos:Concept` / `owl:Thing`) vs. Data Values (`rdfs:Literal` / `rdfs:Datatype`) Under `rdfs:Resource`
+
+In W3C RDFS, OWL 2 DL, and SKOS:
+- **Both `skos:Concept` (`owl:NamedIndividual`) and `rdfs:Literal` are subclasses of `rdfs:Resource`** (`rdfs:Literal rdfs:subClassOf rdfs:Resource`). Because W3C SKOS Reference (Section 7) defines documentation properties (`skos:definition`) with an unrestricted domain (`rdfs:Resource`), **even `rdfs:Literal` values may carry a contextual `skos:definition`** explaining their role in the passage.
+- Within `rdfs:Resource`, however, **`skos:Concept` (`owl:Thing`) and `rdfs:Literal` are disjoint**, and the predicate (`pred`) linking a subject to an object is strictly partitioned into two disjoint OWL 2 property classes:
+
+1. **`owl:ObjectProperty` $\implies$ Concept / Individual Target (`skos:Concept`, `owl:NamedIndividual`, `owl:Class`):**
+   - Domain (`sub`): `owl:Class | owl:NamedIndividual` (`skos:Concept`).
+   - Range (`obj`): `owl:Class | owl:NamedIndividual` (`skos:Concept`).
+   - Example in `ExtractTriples`:
+     ```json
+     {
+       "sub": ["The Program", "definition of the program"],
+       "pred": ["programmed by", "owl:ObjectProperty"],
+       "obj": ["Bob", "who is Bob the owl:NamedIndividual"],
+       "def": "the reification definition of this fact triplet"
+     }
+     ```
+   - Participates in `skos:broader` / `skos:narrower` hierarchies, associative `skos:related` networks, and Stage 3 `JudgeSynonyms` disambiguation, with full PPR traversal weight (`1.0`).
+2. **`owl:DatatypeProperty` $\implies$ Data Value Target (`rdfs:Literal`):**
+   - Domain (`sub`): `owl:Class | owl:NamedIndividual` (`skos:Concept`). A literal can **never** be the subject of an RDF statement.
+   - Range (`obj`): `rdfs:Literal` (in RDF 1.1, untyped literals default automatically to `xsd:string`, so `"rdfs:Literal"` serves as the universal MVP datatype without requiring brittle per-XSD regex guessing).
+   - Example in `ExtractTriples`:
+     ```json
+     {
+       "sub": ["The Program", "definition of the program"],
+       "pred": ["was released", "owl:DatatypeProperty"],
+       "obj": ["19.5.1995", "definition is allowed since rdfs:Literal is in the scope of rdfs:Resource"],
+       "def": "some definition"
+     }
+     ```
+   - **Graph Traversal & Disambiguation Contract for `rdfs:Literal`:**
+     - **Low-Priority PPR Edges (`datatype_property = 0.5`):** Rather than severing literals from the graph (which breaks multi-hop recall and prevents PPR from walking through a specific date, port, or version to its source chunks), `owl:DatatypeProperty` edges remain in the graph with a **moderated traversal weight (`0.5` default, since YAW's `beta=0.5` degree-normalized CSR operator and `1/df` seed damping already penalize high-degree hubs)**, analogous to how `owl:differentFrom` uses weight `0.0`.
+     - **Excluded from `skos:Concept` Taxonomy:** Because `rdfs:Literal` is disjoint from `skos:Concept`, pure `rdfs:Literal` targets (nodes only reached via `owl:DatatypeProperty`) are excluded from Stage 3 `JudgeSynonyms` disambiguation and forbidden from participating in `skos:broader` or `skos:related` edges.
+
+#### Concrete Modeling Classes in YAW
+
+- **Dates and Timestamps (`"2026-10-25"`, `"19.5.1995"`, `"2024"`, `"2026-10-25T05:53:00Z"`):**
+  - **Class/Datatype:** `rdfs:Literal` (with optional `xsd:date`, `xsd:dateTime`, `xsd:gYear` refinement).
+  - **Predicate:** `["was released", "owl:DatatypeProperty"]`.
+  - *Exception:* A named historical era, sprint, or freeze window (e.g., `:Q4_Freeze_Window`) linked by an `owl:ObjectProperty` is a `skos:Concept`; its calendar start/end dates are `rdfs:Literal` values attached via `owl:DatatypeProperty`.
+- **Port Numbers, Version Numbers, and Codes (`"8080"`, `"443"`, `"v2.1"`):**
+  - *Pattern A (Configuration Attribute on a Service):* `owl:DatatypeProperty` pointing to an `rdfs:Literal` (`"8080"`).
+  - *Pattern B (Identifier Attached to a Concept, W3C SKOS Rule S15):* For standard protocols, error codes, or classifications (`HTTPS` = `443`, `Not Found` = `404`), W3C SKOS defines **`skos:notation`** (`skos:notation a owl:DatatypeProperty`).
+- **Light-Verbs & Light-Verb Idioms (`"made a request to"`, `"took a dependency on"`, `"had a ball"`):**
+  - A light-verb phrase is **never** an `rdfs:Literal`, because it expresses a relation or an event/state concept rather than a scalar measurement.
+  - *Case A (Transitive Light-Verb Phrase):* Relational predicate. If target is an entity (`Service B`), `"pred"` is `["took a dependency on", "owl:ObjectProperty"]`. If target is a scalar (`"30s"`), `"pred"` is `["has a timeout of", "owl:DatatypeProperty"]`.
+  - *Case B (Intransitive Light-Verb Idiom — e.g. "Cinderella had a ball", "Node 3 went into split-brain"):*
+    - The state/eventuality itself is modeled as a **`skos:Concept`** (`owl:NamedIndividual`), possessing `skos:definition` and participating in `skos:broader` taxonomies (e.g. `having a ball` $\to$ `enjoyment`).
+    - The subject links to this state concept via `["experienced", "owl:ObjectProperty"]`.
+
+#### Lexical Normalization (`text_processing`) vs. Surface Label Preservation (`skos:prefLabel` / `raw_label`)
+
+- **Token-Internal Structural Punctuation Preserved in `text_processing` ([`yaw/core/types.py`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/core/types.py)):**
+  - `text_processing` normalizes strings for `label_norm` / hash key matching by casefolding (`casefold()`), collapsing whitespace, and stripping outer/prose punctuation (quotes, parentheses, brackets, commas, semicolons, exclamation/question marks, trailing periods), **while preserving token-internal structural punctuation** (`.`, `-`, `+`, `#`, `/`, `%`, `:`) attached to alphanumeric characters:
+    - Technical symbols and suffixes after alphanumerics (`"C++"` $\to$ `"c++"`, `"C#"` $\to$ `"c#"`, `"99.9%"` $\to$ `"99.9%"`) are preserved so `"C++"`, `"C#"`, and `"C"` never collide into `"c"`.
+    - Internal dots, slashes, colons, and numeric/identifier hyphens (`"Python 3.10"` $\to$ `"python 3.10"`, `"19.5.1995"` $\to$ `"19.5.1995"`, `"2026-10-25"` $\to$ `"2026-10-25"`, `"8080/tcp"` $\to$ `"8080/tcp"`, `"UTF-8"` $\to$ `"utf-8"`, `"Node.js"` $\to$ `"node.js"`) remain intact as single tokens.
+- **Strict Separation Between `skos:prefLabel` Surface Form and `label_norm` Key Matching:**
+  - `text_processing` is used **strictly** for `entity_labels.label_norm`, deterministic MD5 hash IDs (`compute_mdhash_id(label_norm, prefix="entity-")`), and normalized lookup keys.
+  - The canonical surface form (`skos:prefLabel`, e.g., `"Python 3.10"`, `"C++"`, `"Alan Turing"`) is preserved in `entity_labels.raw_label` (and exported by `serialize_graph_turtle`), rather than overwriting surface labels with stripped `label_norm` strings.
+
+#### Summary Mapping Table for YAW
+
+| Extracted Item | Domain in W3C | Idiomatic W3C Class | Predicate Tuple (`pred`) | Graph & PPR Behavior in YAW (`yaw.db`) |
+| :--- | :--- | :--- | :--- | :--- |
+| **Concept / Named Entity** (`"The Program"`, `"Bob"`) | `rdfs:Resource` $\supset$ `owl:Thing` | `skos:Concept`, `owl:NamedIndividual` | `["...", "owl:ObjectProperty"]` | Full PPR weight (`1.0`); included in `JudgeSynonyms`, `skos:broader`, `skos:related` |
+| **Date / Port / Metric / Version** (`"19.5.1995"`, `"8080"`, `"99.9%"`) | `rdfs:Resource` $\supset$ `rdfs:Literal` | `rdfs:Literal` (defaults to `xsd:string` in RDF 1.1) | `["...", "owl:DatatypeProperty"]` | Damped PPR weight (`0.5`) + `1/df` to reach chunks; excluded from `JudgeSynonyms` & `skos:broader` |
+| **Transitive Light-Verb** (`"made a call to"`, `"has timeout"`) | `rdf:Property` | `owl:ObjectProperty` or `owl:DatatypeProperty` | *Is* the typed `pred` in `facts` | Determines whether `obj` is `skos:Concept` (`1.0`) or `rdfs:Literal` (`0.5`) |
+| **Intransitive Light-Verb Idiom** (`"had a ball"`, `"took a dive"`) | `rdfs:Resource` $\supset$ `owl:Thing` | `skos:Concept` + `owl:NamedIndividual` | `["experienced", "owl:ObjectProperty"]` | `entities` (with `skos:definition` & `skos:broader`) + full `owl:ObjectProperty` weight |
+
+---
+
+### 2. Traversal Policy Contract
+
+RDF predicates express relations; their meaning does not prescribe numerical ranking weights. YAW must define and evaluate that retrieval policy explicitly. Keep semantic assertions, structural incidence edges and the derived retrieval operator distinct, with a documented mapping between them.
 
 `rdf:predicate` is a statement-reification property identifying a statement's
 predicate. It is not the generic name of every subject-to-object relation.
@@ -47,14 +118,14 @@ must not silently stand in for all their semantics.
 
 | Relation / structure | Planned traversal policy |
 | --- | --- |
-| Passage/entity incidence | Explicit structural policy, initially symmetric |
-| Extracted entity-object fact | Preserve predicate identity; initially use a shared fallback policy, with explicit inverse traversal settings |
-| skos:related | Symmetric relation; configurable retrieval strength |
-| skos:broader | Store child-to-parent assertion; configure upward and downward traversal strengths separately |
-| skos:narrower | Normalize to the inverse broader assertion; do not double-count |
-| owl:differentFrom | Identity constraint, excluded from positive traversal; no negative transition probabilities |
-| Literal object | Preserve typed value and fact/source retrieval; do not mint an entity or automatic shared-value bridge |
-| Labels, definitions and reification metadata | Available for matching/audit, not automatically traversable |
+| Passage/entity incidence (`passage`) | Explicit structural policy connecting chunks and `rdfs:Resource` nodes (`skos:Concept` and `rdfs:Literal`) |
+| `owl:ObjectProperty` fact (`obj_kind = 'entity'`) | Directed forward assertion (`1.0` default); configurable inverse traversal strength |
+| `owl:DatatypeProperty` fact (`obj_kind = 'literal'`) | Moderated traversal weight (`0.5` default) + `1/df` damping + `beta=0.5` degree normalization so literals aid chunk recall without becoming super-hubs; excluded from `skos:broader` / `skos:related` |
+| `skos:related` | Symmetric associative relation between `skos:Concept` nodes; configurable retrieval strength |
+| `skos:broader` | Directed child-to-parent assertion between `skos:Concept` nodes; configure upward and downward traversal strengths separately |
+| `skos:narrower` | Normalize to the inverse broader assertion; do not double-count |
+| `owl:differentFrom` | Repulsive identity constraint (`0.0` traversal weight), excluded from positive PPR walks |
+| Labels, definitions and reification metadata | Available on all `rdfs:Resource` nodes (`skos:Concept` and `rdfs:Literal`) for embedding/FTS matching and audit |
 
 Define a small, versioned policy keyed by relation or explicitly configured
 relation family, direction and structural role. Unknown OpenIE predicates use a
@@ -76,30 +147,40 @@ strength have separate meanings and must not share one undocumented score.
 Exit: reviewed contracts and reproducible baseline; no claimed savings from
 unmeasured prevalence. This is the first unfinished packet.
 
-### H2 — Typed literal extraction and durable storage
+### H2 — Typed predicate disambiguation (`owl:ObjectProperty` vs. `owl:DatatypeProperty`) and low-priority literal traversal
 
-- Add an explicit entity-or-literal object representation in core types, DSPy
-  signatures, GBNF, parsers and stage caches. Preserve original lexical form,
-  datatype and optional language; retain units/context without inventing values.
-  Do not use a definition sentinel. Do not classify solely by numeric regex.
-- Apply the distinction to Stage 1 as well as triples so literal values do not
-  continue through missing-definition, embedding or synonym stages as entities.
-- Migrate facts with mutually exclusive entity/value fields and SQL invariants.
-  Update identity keys, readers, FTS/vector text, serialization, merging,
-  deletion, source bookkeeping and endpoint validation together.
-- Keep fact-to-source/subject seeding usable when no object entity exists.
-  Test dates, versions, ports, amounts and numeric-looking product names.
-- Version extraction/cache identities. Re-extract ambiguous historical objects
-  into a new compatible index; do not guess their types during migration.
+- Disambiguate `skos:Concept` (`owl:NamedIndividual`) vs. `rdfs:Literal` objects at the extraction boundary by typing the predicate `"pred"` in `ExtractTriples` as `["<predicate phrase>", "owl:ObjectProperty" | "owl:DatatypeProperty"]` in core types, DSPy signatures, GBNF, parsers and stage caches.
+- Because `rdfs:Literal rdfs:subClassOf rdfs:Resource` and the domain of `skos:definition` in W3C SKOS is `rdfs:Resource`, preserve contextual definitions (`obj_def`) on both `owl:ObjectProperty` and `owl:DatatypeProperty` objects. Do not classify solely by brittle numeric regexes.
+- Keep `rdfs:Literal` nodes connected in the graph to their source chunks (`passage` edges) and subjects with a **moderated traversal weight (`datatype_property = 0.5` default)** + `1/df` damping so specific dates, versions, and port numbers contribute to PPR chunk recall without acting as un-damped super-hubs.
+- Exclude pure `rdfs:Literal` targets from Stage 3 `JudgeSynonyms` disambiguation so they never consume LLM disambiguation calls or enter `skos:broader` / `skos:related` taxonomies.
+- Version extraction/cache identities (`openie_fingerprint`, `extraction_fingerprint`, `shacl_fingerprint`, `candidate_fingerprint`).
 
-Exit: real SQLite round trips and retrieval work for both object kinds; restart
-reuse is verified; paired literal-only results are recorded.
+Exit: real SQLite round trips and retrieval work for both `owl:ObjectProperty` and `owl:DatatypeProperty` triples; restart reuse is verified; paired results are recorded.
 
 ### H3 — Directed hierarchy and deterministic validation
 
 - Extend the existing pair judgment with explicit child and parent identities,
   keeping identity decisions separate. Retain existing candidate generation
   initially and measure its coverage and hierarchy classification precision.
+- **Disambiguation Prompt & Direction Hardening (`JudgeSynonyms`):**
+  Clarify that for `skos:broader`, `canonical` strictly designates the `parent_broader_concept`
+  (root concept), not the surviving preferred label or the more specific instance.
+  Supply contrastive few-shot examples separating true taxonomic subsumption
+  (`cryptanalysis (narrower) -> mathematics (broader)`) from coordinate siblings
+  (`http 2 <-> http 3 (skos:related)`) and acronyms (`slos -> service level objectives (skos:altLabel)`).
+- **Deterministic Lexical Subsumption Guard & Auto-Healing (`ConceptShape/lexicalSubsumption`):**
+  Enforce that if concept $A$'s lexical tokens are a strict subset of concept $B$'s tokens
+  ($A \subsetneq B$, e.g. `"inference"` vs `"redwood hosted inference"`), $B$ (the specialized
+  compound) must be narrower than $A$ (the root). Any asserted edge $A \to B$ is a structural
+  inversion violation; SHACL validation must flag it, and auto-healing must invert the edge to $B \to A$.
+- **Coordinate Sibling & Ordinal Guard (`ConceptShape/siblingNotBroader`):**
+  Concepts differing solely by trailing version digits or ordinal tiers (`http 2` vs `http 3`,
+  `sev 1` vs `sev 2` vs `sev 3`) are coordinate peers/siblings. They belong in `skos:related`,
+  and are forbidden from forming `skos:broader` edges.
+- **Acronym & Coreferent Disjointness Guard:**
+  Acronyms, initialisms, and lexical normalization variants (`slos` vs `service level objectives`,
+  `sev1` vs `sev 1`) must merge as `skos:altLabel` on a single concept, physically prohibited
+  from existing as separate entities linked by `skos:broader`.
 - Add directed broader storage and provenance, migrations, serialization,
   merge/deletion handling, cache invalidation and bounded audit presentation.
 - Check S27: related must not overlap broaderTransitive. Treat acyclicity as a
@@ -114,8 +195,9 @@ reuse is verified; paired literal-only results are recorded.
   prp-fp infers equality; it is not a generic conflicting-literal validator.
 
 Exit: direction/provenance survives persistence and restart; cycles, deep paths,
-S27 conflicts and source deletion have deterministic tests. Classification and
-storage can be evaluated with hierarchy traversal disabled.
+S27 conflicts, lexical subsumption inversions, sibling misclassifications, and source
+deletion have deterministic tests. Classification and storage can be evaluated with
+hierarchy traversal disabled.
 
 ### H4 — Relation-aware sparse propagation
 
@@ -163,23 +245,16 @@ implemented contract. Unproven ranking variants remain experimental.
 
 Following the `storage/` module decomposition ([`db.py`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/storage/db.py), [`graph_ops.py`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/storage/graph_ops.py), [`shacl.py`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/storage/shacl.py), [`vectors.py`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/storage/vectors.py)), **H1–H4** execution must enforce the following four concrete contracts across [`yaw/core/types.py`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/core/types.py), `yaw/daemon/graph/storage/`, [`yaw/daemon/graph/engine.py`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/engine.py), and [`yaw/daemon/graph/ppr.py`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/ppr.py):
 
-### 1. H2 Watchout: `facts` Uniqueness, Nullable `obj_id`, Explicit `fact_sources` Provenance & SHACL Gating
-- **Current Schema & Upsert Contract:**
-  - In [`yaw/daemon/graph/storage/db.py`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/storage/db.py#L77-L85), `facts` is currently keyed by a deterministic MD5 primary key `fact_id TEXT PRIMARY KEY` (`subj_id TEXT NOT NULL, pred TEXT NOT NULL, obj_id TEXT NOT NULL`), and [`upsert_facts`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/storage/graph_ops.py#L872-L901) deduplicates via `ON CONFLICT(fact_id) DO UPDATE`.
-- **SQLite `NULL` Uniqueness & Mutual Exclusion Invariant:**
-  - In standard SQLite `UNIQUE` constraints, `NULL != NULL`. When `obj_id` becomes nullable for literal-object facts (`obj_kind IN ('entity', 'literal')`), `facts` must enforce:
-    ```sql
-    CHECK (
-        (obj_kind = 'entity' AND obj_id IS NOT NULL AND obj_literal_lex IS NULL)
-        OR (obj_kind = 'literal' AND obj_id IS NULL AND obj_literal_lex IS NOT NULL)
-    )
-    ```
-  - Compute `fact_id` deterministically from `(subj_id, pred, obj_kind, obj_id_or_literal_lex, obj_datatype, obj_lang)`, and if adding secondary unique indexes over `(subj_id, pred, ...)`, use either two partial unique indexes (`WHERE obj_id IS NOT NULL` vs. `WHERE obj_id IS NULL`) or a non-null `object_identity_key TEXT NOT NULL` column so re-indexing never inserts duplicate literal facts.
-- **Orphan Fact Garbage Collection (`fact_sources`) & Entity Merge Re-Keying:**
-  - Today, [`delete_chunks` (`graph_ops.py:1323-1339`)](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/storage/graph_ops.py#L1323-L1339) garbage-collects orphaned `facts` by joining `facts` against `edges WHERE kind = 'fact' AND src_id = f.subj_id AND dst_id = f.obj_id`. Literal-object facts (`obj_id IS NULL`) emit no entity-to-entity `'fact'` edge in `edges` and would become immortal orphans on chunk deletion unless `facts` tracks explicit chunk provenance.
-  - **H2 Requirement:** Add `fact_sources (fact_id TEXT NOT NULL, chunk_id TEXT NOT NULL, PRIMARY KEY (fact_id, chunk_id))` (indexed on `chunk_id`) so [`delete_chunks`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/storage/graph_ops.py#L1323-L1339) prunes any `fact_id` with zero remaining rows in `fact_sources`, and update [`merge_entities` (`graph_ops.py:786-800`)](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/storage/graph_ops.py#L786-L800) so re-pointing `subj_id` or `obj_id` reconciles `fact_sources` and deduplicates colliding `(subj_id, pred, object_identity)` rows.
-- **SHACL Closed-World Endpoint Validation (`shacl.py`):**
-  - Update `StatementShape/closedWorld` in [`_scan_shacl_violations` (`shacl.py:230-261`)](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/storage/shacl.py#L230-L261) and `Heal 5` in [`lint_graph_shacl` (`shacl.py:530-548`)](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/storage/shacl.py#L530-L548) so `eo.entity_id IS NULL` is only a violation when `f.obj_kind = 'entity'` (`f.obj_id IS NOT NULL`), while literal-object facts validate `TRIM(COALESCE(f.obj_literal_lex, '')) != ''`.
+### 1. H2 Watchout: Typed Predicate Disambiguation (`owl:ObjectProperty` vs. `owl:DatatypeProperty`), Low-Weight Literal Edges & `fact_sources` Provenance
+- **Typed Predicate Extraction Contract (`ExtractTriples`):**
+  - Instead of relying on brittle numeric regexes or wiping `obj_def`, `ExtractTriples` emits `"pred"` as `["<predicate phrase>", "owl:ObjectProperty" | "owl:DatatypeProperty"]`.
+  - When `"pred"` carries `"owl:ObjectProperty"`, the object is a `skos:Concept` (`obj_kind = 'entity'`) and emits a full-weight (`1.0`) directed forward fact edge.
+  - When `"pred"` carries `"owl:DatatypeProperty"`, the object is an `rdfs:Literal` (`obj_kind = 'literal'`, `obj_datatype = 'rdfs:Literal'`). Because `rdfs:Literal rdfs:subClassOf rdfs:Resource` and the domain of `skos:definition` is `rdfs:Resource`, its contextual `obj_def` is preserved.
+- **Low-Priority Literal Traversal & Taxonomy Exclusion:**
+  - `rdfs:Literal` targets stay connected to their source chunks (`passage` edges) and subjects with a **moderated traversal weight (`datatype_property = 0.5` default, since `beta=0.5` degree normalization and `1/df` damping already penalize high-degree hubs)** so PPR can traverse specific dates, versions, and ports to reach source chunks without common literals acting as un-damped super-hubs.
+  - Pure `rdfs:Literal` targets (nodes only reached via `owl:DatatypeProperty`) are excluded from Stage 3 `JudgeSynonyms` disambiguation and forbidden from participating in `skos:broader` or `skos:related` edges.
+- **Explicit Fact Provenance (`fact_sources`) & SHACL Gating (`shacl.py`):**
+  - `fact_sources (fact_id TEXT NOT NULL, chunk_id TEXT NOT NULL, PRIMARY KEY (fact_id, chunk_id))` tracks explicit chunk provenance for every fact so [`delete_chunks`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/storage/graph_ops.py#L1323-L1339) prunes any `fact_id` with zero remaining rows in `fact_sources`, and `ProvenanceShape/factSources` verifies that every fact references at least one valid chunk in `chunks` (never inserting fake `'__healed__'` chunk IDs).
 
 ### 2. H3 Watchout: Cycle-Safe Recursive CTE Termination Without `depth` in the `UNION` Key (`shacl.py`)
 - **The SQLite Recursive `UNION` Trap:**
@@ -203,7 +278,27 @@ Following the `storage/` module decomposition ([`db.py`](file:///c:/Users/Harri.
     ```
   - A hierarchy cycle is then any row in `broader_tc` where `narrower_id = broader_id`, and a **SKOS S27** conflict is any `(narrower_id, broader_id)` pair in `broader_tc` that overlaps `edges WHERE kind = 'skos:related'` (in either direction), with no arbitrary depth-8 cutoff.
 
-### 3. H4 Watchout: Four-Layer Parallel-Fact & Direction Collapse Upstream of `ppr.py`
+### 3. H3 Watchout: Semantic Inversion, Coordinate Sibling Leaks & SHACL Lexical Subsumption Validation
+- **Empirical Live Audit Findings (2026-10-25):**
+  - An inspection of 66 active `skos:broader` edges in `yaw_optimize_*.db` revealed that while graph-theoretic cycle prevention (`broaderCycle = 0`) and SKOS S27 disjointness (`S27-disjointBroaderRelated = 0`) passed with zero violations, the semantic taxonomy exhibited three severe linguistic breakdown modes:
+    1. **Direct Inversions (24% of All Edges):** In 16 of 66 cases, the root concept was asserted to point to the specialized compound concept as its "broader parent" (e.g. `engineering -> security engineering`, `inference -> redwood hosted inference`, `rollout -> full rollout`, `priority -> priority p0`).
+    2. **Coordinate Sibling Confusion:** Version identifiers and ordinal levels (`http 2 -> http 3`, `sev 3 -> sev 2 -> sev 1`) were misclassified as `skos:broader` rather than symmetric `skos:related`.
+    3. **Acronym / Synonym Leaks:** Lexical aliases (`slos -> service level objectives`, `sev1 -> sev 1`) were misclassified as `skos:broader` instead of being merged via `skos:altLabel`.
+- **Root Cause in `JudgeSynonyms` & Parsing:**
+  - In `JudgeSynonyms`, the LLM prompt used `canonical` as an overloaded key: for `skos:altLabel`, it meant the surviving prefLabel; for `skos:broader`, the model often picked the "more concrete / specialized instance", causing `engine.py:2118-2120` to assign `child_id = tgt, parent_id = src` backwards.
+- **Architectural & SHACL Mitigation:**
+  1. **Deterministic Lexical Subsumption Invariant (`ConceptShape/lexicalSubsumption`):**
+     - For any candidate pair $(A, B)$ where token set $T(A) \subsetneq T(B)$ (e.g. $A = \text{"inference"}$, $B = \text{"redwood hosted inference"}$), $B$ is linguistically a specialized sub-concept of root $A$.
+     - At ingestion time in `engine.py`, enforce that if `skos:broader` is asserted, $B$ must be the narrower concept pointing to $A$ as broader ($B \to A$). If the LLM asserted $A \to B$, automatically invert the edge before write.
+     - Add `ConceptShape/lexicalSubsumption` to `_scan_shacl_violations` and auto-heal in `lint_graph_shacl` by reversing any inverted edges.
+  2. **Ordinal & Version Sibling Guard (`ConceptShape/siblingNotBroader`):**
+     - Entities differing solely by trailing version tokens (`http 2` vs `http 3`, `v1` vs `v2`, `p0` vs `p1`) must be classified as `skos:related`. If asserted as `skos:broader`, SHACL flags the violation and demotes the edge to `skos:related`.
+  3. **Disjointness with Lexical Aliases:**
+     - Acronyms (e.g. all-caps letter sequences matching the initials of the compound target) must be routed to `skos:altLabel` entity merging, forbidden from forming `skos:broader` edges.
+  4. **Disambiguation Prompt Hardening (`JudgeSynonyms`):**
+     - Make `canonical` explicitly mean `parent_broader_concept` in the prompt signature, providing contrastive examples that explicitly demonstrate taxonomy direction (`cryptanalysis (narrower) -> mathematics (broader)`).
+
+### 4. H4 Watchout: Four-Layer Parallel-Fact & Direction Collapse Upstream of `ppr.py`
 - **All Four Collapse Points Must Be Reconciled Together:**
   1. **Write-Time Symmetrization in [`GraphEngine.index_chunks` (`engine.py:1745-1746`)](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/engine.py#L1745-L1746):** Stop writing synthetic reverse `(o_id, s_id, "fact", 1.0, cid)` rows as if they were asserted forward facts; preserve asserted `subj_id -> obj_id` direction in storage and let the versioned traversal policy emit forward (`fact:fwd`) and inverse (`fact:rev`) contributions at operator construction time.
   2. **Same-Chunk Predicate Collision in `edges` / `edge_sources` ([`db.py:99-117`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/storage/db.py#L99-L117), [`graph_ops.py:920-955`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/storage/graph_ops.py#L920-L955)):** Because `edge_sources` keys on `(src_id, dst_id, kind, chunk_id)` with `kind = 'fact'`, two distinct predicates `(u, p1, v)` and `(u, p2, v)` in the same `chunk_id` currently collapse into one row. Derive fact-level relation contributions from `facts` + `fact_sources` (where `obj_id IS NOT NULL`) so distinct predicates `(u, p1, v)` and `(u, p2, v)` survive into [`load_graph_topology`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/storage/graph_ops.py#L1105-L1125).
@@ -213,7 +308,7 @@ Following the `storage/` module decomposition ([`db.py`](file:///c:/Users/Harri.
      - Support configurable parallel-edge aggregation (`"max"`, `"sum"`, `"capped_sum"`) per ordered `(dst, src)` pair after deduplicating identical assertions.
      - Compute directed **out-degrees** from column sums `out_deg = np.asarray(adj.sum(axis=0)).ravel()` (`dangling_mask = out_deg == 0.0`) and **in-degrees** from row sums `in_deg = np.asarray(adj.sum(axis=1)).ravel()`, scaling `adj[dst, src]` by `in_deg[row_indices] ** (-beta) * out_deg[adj.indices] ** (-(1.0 - beta))`.
 
-### 4. H1 Baseline Audit Query Checklist Against Current `yaw.db` Schema
+### 5. H1 Baseline Audit Query Checklist Against Current `yaw.db` Schema
 Before mutating extraction or storage schemas in **H2–H4**, execute and record these four read-only baseline diagnostics against `yaw.db` using the exact table/column names in [`yaw/daemon/graph/storage/db.py`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/storage/db.py):
 1. **Value-Like Entity Prevalence & Hub Degree:**
    - Fraction of rows in `entities` (`name`) and `entity_labels` (`WHERE label_kind = 'skos:prefLabel'`) whose surface form is purely numeric, date, version, currency, port, or boolean; their row count in `entity_vec`; and their max/p95 degree in `edges WHERE kind IN ('passage', 'fact')`.

@@ -11,6 +11,8 @@ import sqlite_vec
 from cocoindex.connectors.sqlite import ManagedConnection
 from cocoindex.connectors.sqlite import connect as coco_sqlite_connect
 
+from yaw.core import text_processing
+
 SQL_BATCH_SIZE = 500
 type YawConnection = sqlite3.Connection
 
@@ -55,7 +57,7 @@ _CREATE_SCHEMA_STATEMENTS: tuple[str, ...] = (
     """
     CREATE TABLE IF NOT EXISTS entities (
         entity_id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
+        name TEXT NOT NULL COLLATE NOCASE,
         definition TEXT NOT NULL DEFAULT ''
     )
     """,
@@ -87,7 +89,12 @@ _CREATE_SCHEMA_STATEMENTS: tuple[str, ...] = (
         definition TEXT NOT NULL DEFAULT '',
         CHECK (
             (obj_kind = 'entity' AND obj_id IS NOT NULL AND TRIM(obj_id) != '' AND obj_literal_lex IS NULL)
-            OR (obj_kind = 'literal' AND obj_id IS NULL AND obj_literal_lex IS NOT NULL AND TRIM(obj_literal_lex) != '')
+            OR (
+                obj_kind = 'literal'
+                AND (obj_id IS NULL OR (TRIM(obj_id) != '' AND obj_id != subj_id))
+                AND obj_literal_lex IS NOT NULL
+                AND TRIM(obj_literal_lex) != ''
+            )
         )
     )
     """,
@@ -290,12 +297,14 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
         entity_ddl_row = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'entities'"
         ).fetchone()
-        if entity_ddl_row is not None and "UNIQUE" in str(entity_ddl_row[0]).upper():
+        if entity_ddl_row is not None and (
+            "UNIQUE" in str(entity_ddl_row[0]).upper() or "COLLATE NOCASE" not in str(entity_ddl_row[0]).upper()
+        ):
             conn.execute(
                 """
                 CREATE TABLE _entities_migrated (
                     entity_id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
+                    name TEXT NOT NULL COLLATE NOCASE,
                     definition TEXT NOT NULL DEFAULT ''
                 )
                 """
@@ -314,7 +323,9 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
             conn.execute("ALTER TABLE facts ADD COLUMN definition TEXT NOT NULL DEFAULT ''")
         facts_ddl_row = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'facts'").fetchone()
         if facts_ddl_row is not None and (
-            "obj_kind" not in fact_cols or "obj_literal_lex" not in str(facts_ddl_row[0])
+            "obj_kind" not in fact_cols
+            or "obj_literal_lex" not in str(facts_ddl_row[0])
+            or "obj_id != subj_id" not in str(facts_ddl_row[0])
         ):
             conn.execute(
                 """
@@ -333,7 +344,7 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
                         (obj_kind = 'entity' AND obj_id IS NOT NULL AND TRIM(obj_id) != '' AND obj_literal_lex IS NULL)
                         OR (
                             obj_kind = 'literal'
-                            AND obj_id IS NULL
+                            AND (obj_id IS NULL OR (TRIM(obj_id) != '' AND obj_id != subj_id))
                             AND obj_literal_lex IS NOT NULL
                             AND TRIM(obj_literal_lex) != ''
                         )
@@ -341,19 +352,33 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
                 )
                 """
             )
-            conn.execute(
-                """
-                INSERT INTO _facts_migrated (
-                    fact_id, subj_id, pred, obj_kind, obj_id, obj_literal_lex,
-                    obj_datatype, obj_lang, raw_triple_json, definition
+            if "obj_kind" in fact_cols and "obj_literal_lex" in fact_cols:
+                conn.execute(
+                    """
+                    INSERT INTO _facts_migrated (
+                        fact_id, subj_id, pred, obj_kind, obj_id, obj_literal_lex,
+                        obj_datatype, obj_lang, raw_triple_json, definition
+                    )
+                    SELECT
+                        fact_id, subj_id, pred, COALESCE(obj_kind, 'entity'), obj_id, obj_literal_lex,
+                        COALESCE(obj_datatype, ''), COALESCE(obj_lang, ''), raw_triple_json, COALESCE(definition, '')
+                    FROM facts
+                    """
                 )
-                SELECT
-                    fact_id, subj_id, pred, 'entity', obj_id, NULL,
-                    '', '', raw_triple_json, COALESCE(definition, '')
-                FROM facts
-                WHERE obj_id IS NOT NULL
-                """
-            )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO _facts_migrated (
+                        fact_id, subj_id, pred, obj_kind, obj_id, obj_literal_lex,
+                        obj_datatype, obj_lang, raw_triple_json, definition
+                    )
+                    SELECT
+                        fact_id, subj_id, pred, 'entity', obj_id, NULL,
+                        '', '', raw_triple_json, COALESCE(definition, '')
+                    FROM facts
+                    WHERE obj_id IS NOT NULL
+                    """
+                )
             conn.execute("DROP TABLE facts")
             conn.execute("ALTER TABLE _facts_migrated RENAME TO facts")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_facts_subj ON facts(subj_id)")
@@ -425,7 +450,10 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
                 INSERT OR IGNORE INTO entity_labels (label_norm, entity_id, label_kind, raw_label, chunk_id)
                 VALUES (?, ?, 'skos:prefLabel', ?, '__legacy__')
                 """,
-                ((str(r[1]).strip().lower(), str(r[0]), str(r[1])) for r in missing_label_rows),
+                (
+                    (str(text_processing(r[1])) or str(r[1]).strip().lower(), str(r[0]), str(r[1]))
+                    for r in missing_label_rows
+                ),
             )
 
         # Auto-backfill fact_fts if facts exist but fact_fts is empty

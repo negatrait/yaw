@@ -57,6 +57,7 @@ _PUBLIC_API: dict[str, str] = {
     "compute_mdhash_id": ".parsers",
     "compute_qa_em_f1": ".parsers",
     "compute_task_quality_score": ".parsers",
+    "detect_scalar_literal": ".parsers",
     "doc_matches_gold": ".parsers",
     "evaluate_benchmark_gate": ".parsers",
     "compute_retrieval_recalls": ".parsers",

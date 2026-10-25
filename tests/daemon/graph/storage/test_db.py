@@ -951,7 +951,7 @@ def test_step11_literal_facts_check_constraints_fact_sources_and_merge_collision
         # SHACL closed-world validation conforms for literal-object facts (obj_id IS NULL)
         assert lint_graph_shacl(conn, auto_heal=False) == []
         ttl = serialize_graph_turtle(conn)
-        assert 'rdf:object "1912-06-23"^^<xsd:date>' in ttl
+        assert 'rdf:object "1912-06-23"^^xsd:date' in ttl
 
         # 3. Merge ent-turing-alias into ent-turing -> colliding literal fact is deduplicated and fact_sources merged
         merge_entities(conn, "ent-turing-alias", "ent-turing")

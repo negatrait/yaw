@@ -11,12 +11,33 @@ from typing import Any, Literal
 import dspy
 from dspy.evaluate.metrics import F1, normalize_text
 
-from yaw.core import StructuredTriple, compute_mdhash_id, text_processing
+from yaw.core import StructuredTriple, compute_mdhash_id, detect_scalar_literal, text_processing
 
 
 def _nullable_text(value: Any) -> str:
     """Model null is missing text, never an entity or definition named 'None'."""
     return "" if value is None else str(value).strip()
+
+
+def _parse_predicate_slot(raw_pred: Any) -> tuple[str, Literal["entity", "literal"] | None] | None:
+    """Parse a predicate slot into (predicate_phrase, explicit_obj_kind_or_None)."""
+    if isinstance(raw_pred, str):
+        p = raw_pred.strip()
+        return (p, None) if p else None
+    if isinstance(raw_pred, (list, tuple)) and len(raw_pred) >= 1:
+        if raw_pred[0] is None:
+            return None
+        p = str(raw_pred[0]).strip()
+        if not p:
+            return None
+        if len(raw_pred) >= 2 and raw_pred[1] is not None:
+            kind_tag = str(raw_pred[1]).strip().lower()
+            if kind_tag in ("owl:datatypeproperty", "datatypeproperty", "rdfs:literal", "literal"):
+                return (p, "literal")
+            if kind_tag in ("owl:objectproperty", "objectproperty", "entity", "skos:concept", "owl:namedindividual"):
+                return (p, "entity")
+        return (p, None)
+    return None
 
 
 def _coerce_structured_triple_item(
@@ -25,15 +46,40 @@ def _coerce_structured_triple_item(
 ) -> StructuredTriple | None:
     """Coerce a structured triple dict or 3/4-element sequence into a StructuredTriple."""
     lookup = def_lookup or {}
+    subj: str = ""
+    subj_def: str = ""
+    pred: str = ""
+    obj: str = ""
+    obj_def: str = ""
+    spo_def: str = ""
+    obj_kind: Literal["entity", "literal"] = "entity"
+    obj_datatype: str = ""
+    obj_lang: str = ""
+    has_explicit_kind: bool = False
+
     if isinstance(item, StructuredTriple):
-        return item
-    if isinstance(item, dict):
+        subj = item.subj
+        subj_def = item.subj_def
+        pred = item.pred
+        obj = item.obj
+        obj_def = item.obj_def
+        spo_def = item.spo_def
+        obj_kind = item.obj_kind
+        obj_datatype = item.obj_datatype
+        obj_lang = item.obj_lang
+        has_explicit_kind = True
+    elif isinstance(item, dict):
         raw_subj = item.get("sub", item.get("subj", item.get("subject")))
         raw_pred = item.get("pred", item.get("predicate"))
         raw_obj = item.get("obj", item.get("object"))
         raw_spo_def = item.get("def", item.get("spoDef", item.get("spo_def", "")))
         if raw_pred is None or raw_subj is None or raw_obj is None:
             return None
+        parsed_pred = _parse_predicate_slot(raw_pred)
+        if parsed_pred is None:
+            return None
+        pred, explicit_pred_kind = parsed_pred
+
         if isinstance(raw_subj, (list, tuple)) and len(raw_subj) >= 1:
             subj = _nullable_text(raw_subj[0])
             subj_def = str(raw_subj[1]).strip() if len(raw_subj) >= 2 and raw_subj[1] is not None else ""
@@ -43,8 +89,13 @@ def _coerce_structured_triple_item(
         else:
             return None
 
-        raw_obj_kind = str(item.get("obj_kind", item.get("objKind", "entity")) or "entity").strip().lower()
-        obj_kind: Literal["entity", "literal"] = "literal" if raw_obj_kind == "literal" else "entity"
+        raw_obj_kind_val = item.get("obj_kind", item.get("objKind"))
+        if explicit_pred_kind is not None:
+            obj_kind = explicit_pred_kind
+            has_explicit_kind = True
+        elif raw_obj_kind_val is not None and str(raw_obj_kind_val).strip():
+            obj_kind = "literal" if str(raw_obj_kind_val).strip().lower() == "literal" else "entity"
+            has_explicit_kind = True
         obj_datatype = _nullable_text(item.get("obj_datatype", item.get("objDatatype", "")))
         obj_lang = _nullable_text(item.get("obj_lang", item.get("objLang", "")))
 
@@ -56,6 +107,7 @@ def _coerce_structured_triple_item(
             obj_def = _nullable_text(raw_obj.get("def", raw_obj.get("definition", "")))
             if str(raw_obj.get("kind", "")).strip().lower() == "literal" or "datatype" in raw_obj or "lang" in raw_obj:
                 obj_kind = "literal"
+                has_explicit_kind = True
                 obj_datatype = _nullable_text(raw_obj.get("datatype", obj_datatype))
                 obj_lang = _nullable_text(raw_obj.get("lang", obj_lang))
         elif isinstance(raw_obj, str):
@@ -64,57 +116,31 @@ def _coerce_structured_triple_item(
         else:
             return None
 
-        pred = str(raw_pred).strip()
-        if not subj or not pred or not obj:
-            return None
         spo_def = str(raw_spo_def).strip() if raw_spo_def is not None else ""
-        if not spo_def:
-            spo_def = f"{subj} {pred} {obj}."
-        if not subj_def:
-            subj_def = lookup.get(subj) or lookup.get(str(text_processing(subj))) or ""
-        if obj_kind == "literal":
-            obj_def = ""
-        elif not obj_def:
-            obj_def = lookup.get(obj) or lookup.get(str(text_processing(obj))) or ""
-        return StructuredTriple(
-            subj=subj,
-            subj_def=subj_def,
-            pred=pred,
-            obj=obj,
-            obj_def=obj_def,
-            spo_def=spo_def,
-            obj_kind=obj_kind,
-            obj_datatype=obj_datatype if obj_kind == "literal" else "",
-            obj_lang=obj_lang if obj_kind == "literal" else "",
-        )
-
-    if isinstance(item, (list, tuple)) and len(item) in (5, 6):
+    elif isinstance(item, (list, tuple)) and len(item) in (5, 6):
         subj = str(item[0]).strip() if item[0] is not None else ""
         subj_def = str(item[1]).strip() if item[1] is not None else ""
-        pred = str(item[2]).strip() if item[2] is not None else ""
+        parsed_pred = _parse_predicate_slot(item[2])
+        if parsed_pred is None:
+            return None
+        pred, explicit_pred_kind = parsed_pred
+        if explicit_pred_kind is not None:
+            obj_kind = explicit_pred_kind
+            has_explicit_kind = True
         obj = str(item[3]).strip() if item[3] is not None else ""
         obj_def = str(item[4]).strip() if item[4] is not None else ""
-        if not subj or not pred or not obj:
-            return None
-        raw_spo = str(item[5]).strip() if len(item) == 6 and item[5] is not None else ""
-        spo_def = raw_spo or f"{subj} {pred} {obj}."
-        if not subj_def:
-            subj_def = lookup.get(subj) or lookup.get(str(text_processing(subj))) or ""
-        if not obj_def:
-            obj_def = lookup.get(obj) or lookup.get(str(text_processing(obj))) or ""
-        return StructuredTriple(
-            subj=subj,
-            subj_def=subj_def,
-            pred=pred,
-            obj=obj,
-            obj_def=obj_def,
-            spo_def=spo_def,
-        )
-
-    if isinstance(item, (list, tuple)) and len(item) in (3, 4):
+        spo_def = str(item[5]).strip() if len(item) == 6 and item[5] is not None else ""
+    elif isinstance(item, (list, tuple)) and len(item) in (3, 4):
         raw_s, raw_p, raw_o = item[0], item[1], item[2]
         if raw_s is None or raw_p is None or raw_o is None:
             return None
+        parsed_pred = _parse_predicate_slot(raw_p)
+        if parsed_pred is None:
+            return None
+        pred, explicit_pred_kind = parsed_pred
+        if explicit_pred_kind is not None:
+            obj_kind = explicit_pred_kind
+            has_explicit_kind = True
         if isinstance(raw_s, (list, tuple)) and len(raw_s) >= 1:
             subj = _nullable_text(raw_s[0])
             subj_def = str(raw_s[1]).strip() if len(raw_s) >= 2 and raw_s[1] is not None else ""
@@ -127,24 +153,52 @@ def _coerce_structured_triple_item(
         else:
             obj = str(raw_o).strip()
             obj_def = ""
-        pred = str(raw_p).strip()
-        if not subj or not pred or not obj:
+        spo_def = str(item[3]).strip() if len(item) == 4 and item[3] is not None else ""
+    else:
+        return None
+
+    if not subj or not pred or not obj:
+        return None
+
+    # Check scalar literal constraints
+    s_is_lit, _ = detect_scalar_literal(subj)
+    o_is_lit, o_lit_dt = detect_scalar_literal(obj)
+
+    if s_is_lit:
+        if not o_is_lit and obj_kind != "literal":
+            # Literals cannot be RDF subjects: swap subj and obj
+            subj, obj = obj, subj
+            subj_def, obj_def = obj_def, subj_def
+            s_is_lit, o_is_lit = False, True
+            obj_kind = "literal"
+            o_lit_dt = "rdfs:Literal"
+        else:
+            # Both endpoints are scalar literals: invalid RDF statement
             return None
-        raw_spo = str(item[3]).strip() if len(item) == 4 and item[3] is not None else ""
-        spo_def = raw_spo or f"{subj} {pred} {obj}."
-        if not subj_def:
-            subj_def = lookup.get(subj) or lookup.get(str(text_processing(subj))) or ""
-        if not obj_def:
-            obj_def = lookup.get(obj) or lookup.get(str(text_processing(obj))) or ""
-        return StructuredTriple(
-            subj=subj,
-            subj_def=subj_def,
-            pred=pred,
-            obj=obj,
-            obj_def=obj_def,
-            spo_def=spo_def,
-        )
-    return None
+
+    if obj_kind == "literal" or (not has_explicit_kind and o_is_lit):
+        obj_kind = "literal"
+        if not obj_datatype:
+            obj_datatype = o_lit_dt or "rdfs:Literal"
+
+    if not spo_def:
+        spo_def = f"{subj} {pred} {obj}."
+    if not subj_def:
+        subj_def = lookup.get(subj) or lookup.get(str(text_processing(subj))) or ""
+    if not obj_def:
+        obj_def = lookup.get(obj) or lookup.get(str(text_processing(obj))) or ""
+
+    return StructuredTriple(
+        subj=subj,
+        subj_def=subj_def,
+        pred=pred,
+        obj=obj,
+        obj_def=obj_def,
+        spo_def=spo_def,
+        obj_kind=obj_kind,
+        obj_datatype=obj_datatype if obj_kind == "literal" else "",
+        obj_lang=obj_lang if obj_kind == "literal" else "",
+    )
 
 
 def filter_invalid_triples(triples: Sequence[Any]) -> list[list[str]]:
@@ -159,7 +213,13 @@ def filter_invalid_triples(triples: Sequence[Any]) -> list[list[str]]:
                 continue
             valid_triple = [st.subj, st.pred, st.obj]
         elif isinstance(triple, (list, tuple)) and len(triple) == 3:
-            valid_triple = [str(item) for item in triple]
+            if any(isinstance(x, (list, tuple, dict)) for x in triple):
+                st = _coerce_structured_triple_item(triple)
+                if st is None:
+                    continue
+                valid_triple = [st.subj, st.pred, st.obj]
+            else:
+                valid_triple = [str(item) for item in triple]
         else:
             continue
         key = (valid_triple[0], valid_triple[1], valid_triple[2])
@@ -243,6 +303,7 @@ def extract_entity_definitions(
     raw_input: Any,
     *,
     normalize_keys: bool = False,
+    exclude_scalars: bool = False,
 ) -> tuple[tuple[str, str], ...]:
     """Extract and deduplicate (entity_name, contextual_definition) pairs from Stage 1 NER, \
 DefineMissingEntities output, or {name: definition} mappings."""
@@ -300,7 +361,7 @@ DefineMissingEntities output, or {name: definition} mappings."""
             raw_def = item.get("definition", item.get("def", item.get("skos:definition", "")))
             name = _nullable_text(raw_name)
             defn = _nullable_text(raw_def)
-        if not name:
+        if not name or (exclude_scalars and detect_scalar_literal(name)[0]):
             continue
         key = (str(text_processing(name)) or name.lower()) if normalize_keys else name
         existing_idxs = indices_by_name.get(key)
@@ -329,11 +390,11 @@ DefineMissingEntities output, or {name: definition} mappings."""
     return tuple(ordered_pairs)
 
 
-def extract_named_entities(response: Any) -> tuple[str, ...]:
+def extract_named_entities(response: Any, *, exclude_scalars: bool = False) -> tuple[str, ...]:
     """Extract and deduplicate unique named entities from LLM response (supporting [name, def] pairs and 1D strings)."""
     seen: set[str] = set()
     names: list[str] = []
-    for name, _ in extract_entity_definitions(response):
+    for name, _ in extract_entity_definitions(response, exclude_scalars=exclude_scalars):
         if name not in seen:
             seen.add(name)
             names.append(name)
@@ -682,6 +743,8 @@ VALID_SHACL_ACTIONS: frozenset[str] = frozenset(
         "assert_differentFrom",
         "assert_related",
         "assert_broader",
+        "invert_broader",
+        "demote_sibling_to_related",
         "remove_hierarchy_cycle",
         "remove_conflicting_related",
         "delete_dangling",
@@ -736,7 +799,7 @@ def parse_synonym_decisions(
             {
                 "pair_id": pair_id,
                 "relation": relation,
-                "canonical": canonical or "A",
+                "canonical": canonical if relation == "skos:broader" else (canonical or "A"),
             }
         )
         if num_pairs is not None and num_pairs > 0 and len(decisions) >= num_pairs:
@@ -1322,6 +1385,7 @@ __all__ = [
     "compute_qa_em_f1",
     "compute_retrieval_recalls",
     "compute_task_quality_score",
+    "detect_scalar_literal",
     "doc_matches_gold",
     "evaluate_benchmark_gate",
     "extract_entity_definitions",

@@ -418,10 +418,13 @@ def get_active_sandbox_info() -> dict[str, Any]:
             )
         diff_from_rows: list[tuple[str, str, str, str, str, str]] = []
         related_rows: list[tuple[str, str]] = []
+        broader_rows: list[tuple[str, str]] = []
         related_assertions: list[tuple[str, str, str, str, str, str]] = []
+        broader_assertions: list[tuple[str, str, str, str, str, str]] = []
         entity_details: dict[str, tuple[str, str, int]] = {}
         graph_edges: list[tuple[str, str, str]] = []
         alt_label_cnt = 0
+        largest_label_info: dict[str, Any] = {}
         with contextlib.suppress(sqlite3.Error):
             diff_from_rows = [
                 (str(r[0]), str(r[1]), str(r[2]), str(r[3]), str(r[4]), str(r[5]))
@@ -449,6 +452,18 @@ def get_active_sandbox_info() -> dict[str, Any]:
                     """
                 ).fetchall()
             ]
+            broader_rows = [
+                (str(r[0]), str(r[1]))
+                for r in conn.execute(
+                    """
+                    SELECT a.name, b.name
+                    FROM edges e
+                    JOIN entities a ON a.entity_id = e.src_id
+                    JOIN entities b ON b.entity_id = e.dst_id
+                    WHERE e.kind = 'skos:broader'
+                    """
+                ).fetchall()
+            ]
             alt_label_cnt = int(
                 (
                     conn.execute(
@@ -468,18 +483,51 @@ def get_active_sandbox_info() -> dict[str, Any]:
                 str(r[0]): (str(r[1]), str(r[2]), max(1, int(lbl_counts.get(r[0], 1))))
                 for r in conn.execute("SELECT entity_id, name, COALESCE(definition, '') FROM entities").fetchall()
             }
+            largest_label_row = conn.execute(
+                """
+                SELECT e.entity_id, e.name, COUNT(DISTINCT el.label_norm) as lbl_cnt
+                FROM entities e
+                JOIN entity_labels el ON el.entity_id = e.entity_id
+                GROUP BY e.entity_id, e.name
+                ORDER BY lbl_cnt DESC, e.entity_id ASC
+                LIMIT 1
+                """
+            ).fetchone()
+            if largest_label_row:
+                top_eid = str(largest_label_row[0])
+                top_name = str(largest_label_row[1])
+                top_cnt = int(largest_label_row[2])
+                labels_for_node = [
+                    (str(r[0]), str(r[1]))
+                    for r in conn.execute(
+                        """
+                        SELECT label_kind, raw_label
+                        FROM entity_labels
+                        WHERE entity_id = ?
+                        ORDER BY label_kind ASC, raw_label ASC
+                        """,
+                        (top_eid,),
+                    ).fetchall()
+                ]
+                largest_label_info = {
+                    "entity_id": top_eid,
+                    "name": top_name,
+                    "count": top_cnt,
+                    "labels": labels_for_node,
+                }
             graph_edges = [
                 (str(r[0]), str(r[1]), str(r[2]))
                 for r in conn.execute(
                     """
                     SELECT src_id, dst_id, kind
                     FROM edges
-                    WHERE kind IN ('fact', 'skos:related', 'owl:differentFrom')
-                      AND src_id < dst_id
+                    WHERE kind IN ('fact', 'skos:related', 'skos:broader', 'owl:differentFrom')
+                      AND (kind = 'skos:broader' OR src_id < dst_id)
                     """
                 ).fetchall()
             ]
             related_assertions = recent_relation_assertions(conn, "skos:related")
+            broader_assertions = recent_relation_assertions(conn, "skos:broader", limit=5)
         rows = conn.execute(
             "SELECT chunk_id, entities_json, triples_json, structured_triples_json "
             "FROM openie_chunks ORDER BY rowid ASC"
@@ -534,15 +582,19 @@ def get_active_sandbox_info() -> dict[str, Any]:
             "recent_extractions": recent,
             "different_from_pairs": len(diff_from_rows),
             "related_pairs": len(related_rows),
+            "broader_pairs": len(broader_rows),
             "synonym_merges": alt_label_cnt,
         }
-        info["graph_cache"] = (raw_counts, triples_raw, diff_from_rows, related_rows)
+        info["graph_cache"] = (raw_counts, triples_raw, diff_from_rows, related_rows, broader_rows)
         info["kg_graph"] = {
             "entities": entity_details,
             "edges": graph_edges,
             "diff_from_rows": diff_from_rows,
             "related_rows": related_rows,
+            "broader_rows": broader_rows,
             "related_assertion_rows": related_assertions,
+            "broader_assertion_rows": broader_assertions,
+            "largest_label_node": largest_label_info,
         }
         info["timeseries_samples"] = get_empirical_telemetry_timeseries(
             start_dt, info["elapsed_seconds"], len(rows), cum_e, cum_t, latest_db.stem
@@ -888,6 +940,7 @@ def recent_relation_assertions(
     conn: sqlite3.Connection, relation: str, limit: int = 10
 ) -> list[tuple[str, str, str, str, str, str]]:
     """Newest active canonical pairs by insertion rowid; reassertion times aren't stored."""
+    order_filter = "AND e.src_id < e.dst_id" if relation != "skos:broader" else ""
     return [
         (str(left_id), str(left_name), str(left_def), str(right_id), str(right_name), str(right_def))
         for left_id, left_name, left_def, right_id, right_name, right_def in conn.execute(
@@ -895,7 +948,7 @@ def recent_relation_assertions(
             "b.entity_id, b.name, COALESCE(b.definition, '') "
             "FROM edges e JOIN entities a ON a.entity_id = e.src_id "
             "JOIN entities b ON b.entity_id = e.dst_id "
-            "WHERE e.kind = ? AND e.src_id < e.dst_id ORDER BY e.rowid DESC LIMIT ?",
+            f"WHERE e.kind = ? {order_filter} ORDER BY e.rowid DESC LIMIT ?",
             (relation, limit),
         )
     ]
@@ -940,7 +993,8 @@ def generate_graph_projection_svg(
     rel_nodes: set[str] = {u for u, v, k in all_edges_tail if k == "skos:related"} | {
         v for u, v, k in all_edges_tail if k == "skos:related"
     }
-    base_nodes = diff_nodes | rel_nodes
+    broader_nodes: set[str] = {v for u, v, k in all_edges_tail if k == "skos:broader"}
+    base_nodes = diff_nodes | rel_nodes | broader_nodes
 
     # Include all 1-hop connected rdf:Statement (fact) entities
     inc_fact: dict[str, set[str]] = defaultdict(set)
@@ -953,7 +1007,7 @@ def generate_graph_projection_svg(
 
     nodes = sorted(
         selected,
-        key=lambda x: (x in diff_nodes, x in rel_nodes, len(inc_fact[x])),
+        key=lambda x: (x in diff_nodes, x in broader_nodes, x in rel_nodes, len(inc_fact[x])),
         reverse=True,
     )
     if not nodes:
@@ -971,9 +1025,10 @@ def generate_graph_projection_svg(
     diff_segs = [[idx[u], idx[v]] for u, v, k in all_edges_tail if k == "owl:differentFrom" and u in idx and v in idx]
     rel_segs = [[idx[u], idx[v]] for u, v, k in all_edges_tail if k == "skos:related" and u in idx and v in idx]
     fact_segs = [[idx[u], idx[v]] for u, v, k in all_edges_tail if k == "fact" and u in idx and v in idx]
+    broader_segs = [[idx[u], idx[v]] for u, v, k in all_edges_tail if k == "skos:broader" and u in idx and v in idx]
     active_edge_arr = (
-        np.array(diff_segs + rel_segs + fact_segs, dtype=int)
-        if (diff_segs or rel_segs or fact_segs)
+        np.array(diff_segs + rel_segs + fact_segs + broader_segs, dtype=int)
+        if (diff_segs or rel_segs or fact_segs or broader_segs)
         else np.zeros((0, 2), dtype=int)
     )
 
@@ -1073,9 +1128,9 @@ def generate_graph_projection_svg(
         0.04,
         0.91,
         f"{n_cnt} entities • Largest 1-hop component • "
-        f"{len(diff_nodes)} ≠ endpoints • {n_cnt - len(base_nodes)} neighboring entities\n"
+        f"{len(diff_nodes)} ≠ endpoints • {len(broader_nodes)} broader concepts\n"
         f"Edges: {len(fact_segs)} fact • {len(rel_segs)} skos:related • "
-        f"{len(diff_segs)} owl:differentFrom • Labels: 10 newest ≠ pairs in view",
+        f"{len(broader_segs)} skos:broader • {len(diff_segs)} owl:differentFrom",
         fontsize=9,
         va="top",
         color="#38bdf8",
@@ -1108,7 +1163,20 @@ def generate_graph_projection_svg(
             )
         )
 
-    # 3. owl:differentFrom Edges (crimson)
+    # 3. skos:broader Edges (warm amber/yellow)
+    if broader_segs:
+        ax.add_collection(
+            LineCollection(
+                [[pos[u], pos[v]] for u, v in broader_segs],
+                colors="#eab308",
+                linewidths=1.2,
+                linestyles="solid",
+                alpha=0.85,
+                zorder=2,
+            )
+        )
+
+    # 4. owl:differentFrom Edges (crimson)
     if diff_segs:
         ax.add_collection(
             LineCollection(
@@ -1121,6 +1189,25 @@ def generate_graph_projection_svg(
             )
         )
 
+    # Compute node cardinality (degree of active edges in the view)
+    deg_map: dict[str, int] = defaultdict(int)
+    for u, v, _k in all_edges_tail:
+        if u in idx and v in idx:
+            deg_map[u] += 1
+            deg_map[v] += 1
+
+    deg_vals = [deg_map.get(eid, 1) for eid in nodes]
+    min_deg = min(deg_vals) if deg_vals else 1
+    max_deg = max(deg_vals) if deg_vals else 1
+    span_deg = max(1.0, float(max_deg - min_deg))
+
+    # Cardinality colormap: violet -> cyan -> lime (yellowish green)
+    cardinality_cmap = matplotlib.colors.LinearSegmentedColormap.from_list(
+        "cardinality_vcl",
+        ["#8b5cf6", "#06b6d4", "#84cc16", "#a3e635"],
+        N=256,
+    )
+
     # Node Sizing: strictly based on skos:*Label count
     sizes, colors, edgecolors, lws = [], [], [], []
     base_sz = 6.0 if n_cnt > 2000 else (8.0 if n_cnt > 500 else 10.0)
@@ -1129,21 +1216,23 @@ def generate_graph_projection_svg(
         # Base size scaled with skos:*Label count (synonyms & lexical variants)
         s = min(300.0, base_sz + 12.0 * (skos_cnt - 1))
         sizes.append(s)
+
+        deg = deg_map.get(eid, 1)
+        t_card = math.log1p(deg - min_deg) / math.log1p(span_deg) if span_deg > 0 else 0.0
+        card_rgba = cardinality_cmap(np.clip(t_card, 0.0, 1.0))
+        card_hex = matplotlib.colors.to_hex(card_rgba)
+
         if eid in diff_nodes:
             colors.append("#f43f5e")  # rose/crimson for disambiguation endpoints
             edgecolors.append("#ffffff")
-            lws.append(0.5)
-        elif eid in rel_nodes:
-            colors.append("#a855f7")  # violet for skos:related context nodes
-            edgecolors.append("#c084fc")
-            lws.append(0.5)
-        elif skos_cnt > 1:
-            colors.append("#38bdf8")  # sky blue for multi-label entities
-            edgecolors.append("#0ea5e9")
-            lws.append(0.5)
+            lws.append(0.6)
+        elif eid in broader_nodes:
+            colors.append("#fef08a")  # light warm shade of yellow for broader nodes
+            edgecolors.append("#eab308")  # warm golden amber edge
+            lws.append(0.8)
         else:
-            colors.append("#64748b")  # slate for standard single-label entities
-            edgecolors.append("#1e293b")
+            colors.append(card_hex)  # change in hue for change in cardinality (violet -> cyan -> lime)
+            edgecolors.append("#0f172a")
             lws.append(0.5)
 
     ax.scatter(pos[:, 0], pos[:, 1], s=sizes, c=colors, edgecolors=edgecolors, linewidths=lws, zorder=4)
@@ -1207,6 +1296,14 @@ def generate_graph_projection_svg(
         Line2D(
             [0],
             [0],
+            color="#eab308",
+            lw=1.2,
+            ls="-",
+            label=f"skos:broader ({len(broader_segs)} hierarchy)",
+        ),
+        Line2D(
+            [0],
+            [0],
             color="#c084fc",
             lw=1.0,
             ls="-",
@@ -1219,6 +1316,26 @@ def generate_graph_projection_svg(
             lw=1.0,
             ls="-",
             label=f"Fact relationships ({len(fact_segs)} edges)",
+        ),
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            color="w",
+            markerfacecolor="#fef08a",
+            markeredgecolor="#eab308",
+            markersize=7,
+            label=f"skos:broader concept ({len(broader_nodes)} warm yellow)",
+        ),
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            color="w",
+            markerfacecolor="#8b5cf6",
+            markeredgecolor="#a3e635",
+            markersize=6,
+            label="Cardinality: violet (low) \u2192 lime (high)",
         ),
         Line2D(
             [0],
@@ -1735,6 +1852,7 @@ def generate_report_markdown(
             f"**`{counts.get('entities', 0):,}` entities** • "
             f"**`{counts.get('facts', 0):,}` facts** • "
             f"`{kg.get('synonym_merges', 0)}` alt/hidden labels • "
+            f"`{kg.get('broader_pairs', 0)}` `skos:broader` • "
             f"`{kg.get('related_pairs', 0)}` `skos:related` • "
             f"`{kg.get('different_from_pairs', 0)}` `owl:differentFrom`",
         ),
@@ -1744,6 +1862,8 @@ def generate_report_markdown(
     kg_g = sandbox.get("kg_graph", {})
     diff_from_rows = kg_g.get("diff_from_rows", [])
     related_assertions = kg_g.get("related_assertion_rows", [])
+    broader_assertions = kg_g.get("broader_assertion_rows", [])
+    largest_label_node = kg_g.get("largest_label_node")
     assertions_md = ""
     if diff_from_rows:
         # Mobile-friendly: a narrow bullet list instead of a wide multi-column table.
@@ -1759,6 +1879,20 @@ def generate_report_markdown(
             "*If an `owl:differentFrom` assertion below is false, it is an intervention "
             "candidate in `yaw.db`.*\n\n" + "\n".join(items) + f"\n{trunc}\n"
         )
+    if broader_assertions:
+        broader_items = []
+        for _ea, na, da, _eb, nb, db in broader_assertions[:5]:
+            da_s = da.strip()[:110] or "n/a"
+            db_s = db.strip()[:110] or "n/a"
+            broader_items.append(
+                f"- **`{na}`** (narrower) → **`{nb}`** (broader)\n  - Narrower: *{da_s}*\n  - Broader: *{db_s}*"
+            )
+        assertions_md += (
+            "### Most Recent `skos:broader` Hierarchy Assertions\n\n"
+            "*Top 5 active taxonomy pairs (narrower concept → broader concept), newest insertion first.*\n\n"
+            + "\n".join(broader_items)
+            + "\n\n"
+        )
     if related_assertions:
         related_items = []
         for _ea, na, da, _eb, nb, db in related_assertions:
@@ -1770,6 +1904,28 @@ def generate_report_markdown(
             "*Up to 10 active pairs, newest insertion first. Reassertion times are not stored. "
             "Lists cover the sandbox; Fig. 2 shows its largest seeded neighborhood.*\n\n"
             + "\n".join(related_items)
+            + "\n\n"
+        )
+    if largest_label_node and largest_label_node.get("labels"):
+        top_name = largest_label_node["name"]
+        top_cnt = largest_label_node["count"]
+        labels_list = largest_label_node["labels"]
+        by_kind: dict[str, list[str]] = defaultdict(list)
+        for k_label, l_label in labels_list:
+            by_kind[k_label].append(l_label)
+        label_lines = []
+        for k_label in ("skos:prefLabel", "skos:altLabel", "skos:hiddenLabel"):
+            if k_label in by_kind:
+                uniq_labels = sorted(set(by_kind[k_label]))
+                label_lines.append(f"  - `{k_label}`: {', '.join(f'`{raw}`' for raw in uniq_labels)}")
+        for k_label, vals in by_kind.items():
+            if k_label not in ("skos:prefLabel", "skos:altLabel", "skos:hiddenLabel"):
+                uniq_labels = sorted(set(vals))
+                label_lines.append(f"  - `{k_label}`: {', '.join(f'`{raw}`' for raw in uniq_labels)}")
+        assertions_md += (
+            "### Audit Trail: Largest Concept by SKOS Labels\n\n"
+            f"**`{top_name}`** ({top_cnt} total unique labels):\n"
+            + "\n".join(label_lines)
             + "\n\n"
         )
 
