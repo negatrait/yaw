@@ -3,9 +3,11 @@
 import json
 import re
 import sqlite3
+from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from threading import RLock
 
 from cocoindex._internal import core as _coco_core
 from cocoindex.ops.code import CodeSource
@@ -260,9 +262,10 @@ def dehydrate_passage_ast(
     body_bytes = body_text.encode("utf-8")
 
     best_body = ""
+    # All splitter attempts share CocoIndex's lazy parsed AST.
+    src = CodeSource(body_text, language=lang)
     for step_size in (min(body_budget, 600), max(40, body_budget // 3), 80):
         try:
-            src = CodeSource(body_text, language=lang)
             ast_chunks = _HYDRATION_SPLITTER.split(
                 src,
                 chunk_size=max(20, step_size),
@@ -298,26 +301,42 @@ def dehydrate_passage_ast(
     return f"{header_prefix}{best_body}{notice}"
 
 
-_CODE_SOURCE_CACHE: dict[str, tuple[float, CodeSource, list[str]]] = {}
+_CODE_SOURCE_CACHE: OrderedDict[str, tuple[tuple[int, int, int], CodeSource, list[str]]] = OrderedDict()
+_HYDRATED_TEXT_CACHE: OrderedDict[tuple[object, ...], str] = OrderedDict()
+_HYDRATION_CACHE_LOCK = RLock()
+_HYDRATED_CACHE_CHARS = 1_000_000
+
+
+def _source_revision(target_path: Path) -> tuple[int, int, int]:
+    st = target_path.stat()
+    return st.st_mtime_ns, st.st_ctime_ns, st.st_size
 
 
 def get_cached_code_source(target_path: Path) -> tuple[CodeSource, list[str]] | None:
     """Retrieve or construct a cached CocoIndex CodeSource, invalidating on file mtime changes."""
     try:
-        mtime = target_path.stat().st_mtime
+        revision = _source_revision(target_path)
     except OSError:
         return None
-    path_key = str(target_path)
-    cached = _CODE_SOURCE_CACHE.get(path_key)
-    if cached is not None and cached[0] == mtime:
-        return cached[1], cached[2]
+    path_key = str(target_path.resolve())
+    with _HYDRATION_CACHE_LOCK:
+        cached = _CODE_SOURCE_CACHE.get(path_key)
+        if cached is not None and cached[0] == revision:
+            _CODE_SOURCE_CACHE.move_to_end(path_key)
+            return cached[1], cached[2]
+        _CODE_SOURCE_CACHE.pop(path_key, None)
     try:
         text = target_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
     src = CodeSource(text)
     lines = src.text.splitlines(keepends=True)
-    _CODE_SOURCE_CACHE[path_key] = (mtime, src, lines)
+    with _HYDRATION_CACHE_LOCK:
+        _CODE_SOURCE_CACHE[path_key] = (revision, src, lines)
+        # Bound retained source text as well as file count. Large single files
+        # are usable but not retained after the current hydration operation.
+        while len(_CODE_SOURCE_CACHE) > 4 or sum(v[0][2] for v in _CODE_SOURCE_CACHE.values()) > 32_000_000:
+            _CODE_SOURCE_CACHE.popitem(last=False)
     return src, lines
 
 
@@ -364,6 +383,16 @@ def hydrate_chunk_pointer(
         raise ValueError(f"Line span {line_count} exceeds maximum {_MAX_CHUNK_LINE_SPAN} for chunk {pointer.chunk_id}")
 
     target_path = resolve_corpus_path(corpus_root, pointer.rel_posix_path)
+    try:
+        revision = _source_revision(target_path)
+    except OSError:
+        return HydratedPassage(pointer=pointer, text="", score=score, stale_on_disk=True)
+    cache_key = (str(target_path.resolve()), revision, pointer.start_line, pointer.end_line, pointer.title, max_chars)
+    with _HYDRATION_CACHE_LOCK:
+        cached_text = _HYDRATED_TEXT_CACHE.get(cache_key)
+        if cached_text is not None:
+            _HYDRATED_TEXT_CACHE.move_to_end(cache_key)
+            return HydratedPassage(pointer=pointer, text=cached_text, score=score, stale_on_disk=False)
     text = read_corpus_lines(target_path, pointer.start_line, pointer.end_line)
     if text is None:
         return HydratedPassage(pointer=pointer, text="", score=score, stale_on_disk=True)
@@ -377,6 +406,21 @@ def hydrate_chunk_pointer(
             title=pointer.title,
             rel_posix_path=pointer.rel_posix_path,
         )
+    # Cache only bounded rendered text, never pointers, scores or entire ASTs.
+    # Re-check the revision to avoid storing content read during a source edit.
+    if len(text) <= _HYDRATED_CACHE_CHARS:
+        try:
+            unchanged = _source_revision(target_path) == revision
+        except OSError:
+            unchanged = False
+        if unchanged:
+            with _HYDRATION_CACHE_LOCK:
+                _HYDRATED_TEXT_CACHE[cache_key] = text
+                while (
+                    len(_HYDRATED_TEXT_CACHE) > 256
+                    or sum(map(len, _HYDRATED_TEXT_CACHE.values())) > _HYDRATED_CACHE_CHARS
+                ):
+                    _HYDRATED_TEXT_CACHE.popitem(last=False)
     return HydratedPassage(
         pointer=pointer,
         text=text,

@@ -2,7 +2,7 @@
 
 import json
 import sqlite3
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -227,6 +227,7 @@ def format_entity_skos_markdown(
     max_chunks: int = 2,
     max_chunk_chars: int = 900,
     info: dict[str, Any] | None = None,
+    shared_source_excerpts: dict[str, str] | None = None,
 ) -> str:
     """Format an entity or literal node's SKOS/RDF/OWL profile, reified facts, and source chunks."""
     node_info = info if info is not None else _inspect_single_entity_or_fact(conn, entity_id, corpus_root)
@@ -240,11 +241,7 @@ def format_entity_skos_markdown(
     chunks_meta: list[dict[str, Any]] = list(node_info.get("chunks_meta") or [])
 
     pref_labels = sorted(
-        {
-            f'"{it["raw_label"]}" (norm: "{it["label_norm"]}")'
-            for it in labels
-            if it["label_kind"] == "skos:prefLabel"
-        }
+        {f'"{it["raw_label"]}" (norm: "{it["label_norm"]}")' for it in labels if it["label_kind"] == "skos:prefLabel"}
     )
     alt_labels = sorted({f'"{it["raw_label"]}"' for it in labels if it["label_kind"] == "skos:altLabel"})
     hidden_labels = sorted({f'"{it["raw_label"]}"' for it in labels if it["label_kind"] == "skos:hiddenLabel"})
@@ -347,6 +344,9 @@ def format_entity_skos_markdown(
                 f"(Chunk Lines {cm['start_line']}–{cm['end_line']}, "
                 f"AST Island {cm['ast_island_start']}–{cm['ast_island_end']})** [`{cid}`]:"
             )
+            if shared_source_excerpts is not None and cid in shared_source_excerpts:
+                lines.append(f"  See shared source excerpt `{cid}`.")
+                continue
             ptr = ptrs_map.get(cid)
             hydrated_body = ""
             parent_header = ""
@@ -361,12 +361,22 @@ def format_entity_skos_markdown(
                 hp = hydrate_chunk_pointer(ptr, root_path, max_chars=max_chunk_chars)
                 if not hp.stale_on_disk and hp.text:
                     hydrated_body = hp.text.strip()
+            excerpt_lines: list[str] = []
             if parent_header:
                 indented_parent = "\n".join(f"  > [AST Parent Header] {ln}" for ln in parent_header.splitlines()[:6])
-                lines.append(indented_parent)
+                excerpt_lines.append(indented_parent)
             if hydrated_body:
                 indented_body = "\n".join(f"  > {ln}" for ln in hydrated_body.splitlines()[:14])
-                lines.append(indented_body)
+                excerpt_lines.append(indented_body)
+            if shared_source_excerpts is None:
+                lines.extend(excerpt_lines)
+            else:
+                shared_source_excerpts[cid] = (
+                    f"## Source `{cid}`\n" + "\n".join(excerpt_lines)
+                    if excerpt_lines
+                    else f"## Source `{cid}`\n*(Source text unavailable)*"
+                )
+                lines.append(f"  See shared source excerpt `{cid}`.")
     elif node_info.get("chunk_ids"):
         lines.append(f"- Chunk IDs: {', '.join(node_info['chunk_ids'][:max_chunks])}")
     else:
@@ -387,6 +397,7 @@ def format_pair_disambiguation_dossier(
     max_chunk_chars: int = 900,
     info_a: dict[str, Any] | None = None,
     info_b: dict[str, Any] | None = None,
+    include_entity_profiles: bool = True,
 ) -> str:
     """Build a structured Markdown + SKOS/RDF/OWL comparison dossier for a candidate entity/literal pair."""
     ia = info_a if info_a is not None else _inspect_single_entity_or_fact(conn, entity_a, corpus_root)
@@ -434,6 +445,9 @@ def format_pair_disambiguation_dossier(
         df_str = "; ".join(f"`{f.get('raw_triple')}`" for f in direct_facts[:2])
         header_lines.append(f"- **Direct Fact Link Between A and B**: `YES` ({df_str})")
 
+    if not include_entity_profiles:
+        return "\n".join(header_lines)
+
     sec_a = format_entity_skos_markdown(
         conn,
         entity_a,
@@ -453,6 +467,96 @@ def format_pair_disambiguation_dossier(
         info=ib,
     )
     return "\n".join(header_lines) + "\n\n" + sec_a + "\n\n" + sec_b
+
+
+def iter_disambiguation_dossiers(
+    conn: sqlite3.Connection | YawConnection,
+    candidates: Sequence[dict[str, Any]],
+    corpus_root: Path,
+    *,
+    ast_context_hops: int = 0,
+    batch_size: int = 16,
+    max_chars: int = 40000,
+) -> Iterator[tuple[list[dict[str, Any]], str]]:
+    """Pack complete pair evidence with each entity profile rendered once per request.
+
+    The caller must keep the graph snapshot stable while consuming this iterator.
+    Each yielded batch owns only its bounded set of entity inspections. Every
+    pair receives both profiles; a full batch flushes instead of dropping evidence.
+    """
+    batch: list[dict[str, Any]] = []
+    headers: list[str] = []
+    profiles: dict[str, str] = {}
+    infos: dict[str, dict[str, Any]] = {}
+    sources: dict[str, str] = {}
+
+    def render(
+        items: Sequence[dict[str, Any]],
+        pair_headers: Sequence[str],
+        entity_profiles: Mapping[str, str],
+        source_excerpts: Mapping[str, str],
+    ) -> str:
+        index = [{k: v for k, v in c.items() if k not in ("def_a", "def_b")} for c in items]
+        return (
+            "# Candidate Pairs Index\n```json\n"
+            + json.dumps(index, ensure_ascii=False)
+            + "\n```\n\n"
+            + "\n\n".join(pair_headers)
+            + "\n\n# Shared Entity Profiles\n\n"
+            + "\n\n".join(entity_profiles.values())
+            + "\n\n# Shared Source Excerpts\n\n"
+            + "\n\n".join(source_excerpts.values())
+        )
+
+    for candidate in candidates:
+        ea, eb = str(candidate["entity_a"]), str(candidate["entity_b"])
+        new_profiles = {}
+        trial_sources = dict(sources)
+        for eid in (ea, eb):
+            if eid not in infos:
+                infos[eid] = _inspect_single_entity_or_fact(conn, eid, corpus_root)
+            if eid not in profiles:
+                new_profiles[eid] = format_entity_skos_markdown(
+                    conn,
+                    eid,
+                    corpus_root,
+                    ast_context_hops=ast_context_hops,
+                    info=infos[eid],
+                    shared_source_excerpts=trial_sources,
+                )
+        header = format_pair_disambiguation_dossier(
+            conn,
+            ea,
+            eb,
+            corpus_root,
+            ast_context_hops=ast_context_hops,
+            dense_sim=float(candidate["dense_sim"]),
+            lexical_sim=float(candidate["lexical_sim"]),
+            info_a=infos[ea],
+            info_b=infos[eb],
+            include_entity_profiles=False,
+        )
+        trial_profiles = profiles | new_profiles
+        trial = render([*batch, candidate], [*headers, header], trial_profiles, trial_sources)
+        if batch and (len(batch) >= batch_size or len(trial) > max_chars):
+            yield batch, render(batch, headers, profiles, sources)
+            # Only carry the next pair across the flush; don't retain the graph.
+            infos = {eid: infos[eid] for eid in (ea, eb)}
+            trial_profiles = {eid: trial_profiles[eid] for eid in (ea, eb)}
+            source_ids = dict.fromkeys(
+                cm["chunk_id"] for eid in (ea, eb) for cm in (infos[eid].get("chunks_meta") or [])[:2]
+            )
+            trial_sources = {cid: trial_sources[cid] for cid in source_ids if cid in trial_sources}
+            batch, headers, profiles = [], [], {}
+            trial = render([candidate], [header], trial_profiles, trial_sources)
+        if len(trial) > max_chars:
+            raise ValueError(f"Complete disambiguation evidence for {ea}|{eb} exceeds {max_chars} characters")
+        batch.append(candidate)
+        headers.append(header)
+        profiles = trial_profiles
+        sources = trial_sources
+    if batch:
+        yield batch, render(batch, headers, profiles, sources)
 
 
 def inspect_focus_node(
@@ -1008,8 +1112,7 @@ def _scan_shacl_violations(conn: sqlite3.Connection | YawConnection) -> list[SHA
                     focus_node=f"{s_id}->{d_id}",
                     result_path="skos:broader",
                     message=(
-                        f"Broader edge ({s_id} -> {d_id}) connects version/ordinal siblings "
-                        f"({s_name!r} vs {d_name!r})."
+                        f"Broader edge ({s_id} -> {d_id}) connects version/ordinal siblings ({s_name!r} vs {d_name!r})."
                     ),
                 )
             )
@@ -1124,11 +1227,7 @@ def lint_graph_shacl(
                     (eid,),
                 )
             ]
-            winner = (
-                tok_norm
-                if (tok_norm and tok_norm in norms)
-                else (raw_norm if raw_norm in norms else norms[0])
-            )
+            winner = tok_norm if (tok_norm and tok_norm in norms) else (raw_norm if raw_norm in norms else norms[0])
             conn.execute(
                 """
                 UPDATE entity_labels
@@ -1461,9 +1560,7 @@ def lint_graph_shacl(
                         "AND kind IN ('skos:broader', 'skos:related')",
                         (eid, eid),
                     )
-            elif is_scalar and (
-                is_subj or is_ent_obj or has_skos_edge or (not has_lit_fact and not has_passage_edge)
-            ):
+            elif is_scalar and (is_subj or is_ent_obj or has_skos_edge or (not has_lit_fact and not has_passage_edge)):
                 # Convert obj_kind='entity' facts where scalar entity was an object to obj_kind='literal'
                 conn.execute(
                     """

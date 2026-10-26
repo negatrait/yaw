@@ -5,6 +5,7 @@ import json
 import re
 import sqlite3
 from collections.abc import Iterator, Sequence
+from functools import lru_cache
 from typing import Any
 
 import numpy as np
@@ -92,16 +93,26 @@ def _get_pure_literal_entity_ids(conn: sqlite3.Connection | YawConnection) -> se
     return pure_literal_ids
 
 
+@lru_cache(maxsize=4096)
+def _lexical_name_parts(name: str) -> tuple[str, str, str, tuple[str, ...]]:
+    return (
+        name.strip().lower(),
+        str(text_processing(name)),
+        re.sub(r"[^a-z0-9]", "", name.strip().lower()),
+        tuple(re.sub(r"[^a-zA-Z0-9\s]", "", name).strip().split()),
+    )
+
+
 def _is_acronym_match(name_a: str, name_b: str) -> bool:
     """Return True if one label is an initialism/acronym of the other multi-token label."""
-    if is_acronym_pair(name_a, name_b):
+    na, nb = name_a.strip(), name_b.strip()
+    short_name = na if len(na) < len(nb) else nb
+    if not any(ch.isspace() for ch in short_name) and is_acronym_pair(name_a, name_b):
         return True
-    clean_a = re.sub(r"[^a-zA-Z0-9\s]", "", name_a).strip()
-    clean_b = re.sub(r"[^a-zA-Z0-9\s]", "", name_b).strip()
-    if not clean_a or not clean_b:
+    tokens_a = _lexical_name_parts(name_a)[3]
+    tokens_b = _lexical_name_parts(name_b)[3]
+    if not tokens_a or not tokens_b:
         return False
-    tokens_a = clean_a.split()
-    tokens_b = clean_b.split()
     if len(tokens_a) == 1 and len(tokens_b) >= 2:
         short, words = tokens_a[0].lower(), tokens_b
     elif len(tokens_b) == 1 and len(tokens_a) >= 2:
@@ -125,14 +136,12 @@ def _lexical_similarity_cascade(
     matcher: difflib.SequenceMatcher | None = None,
 ) -> float:
     """Run the 3-stage difflib.SequenceMatcher cascade + acronym and alnum detector."""
-    norm_a = name_a.strip().lower()
-    norm_b = name_b.strip().lower()
+    norm_a, tok_a, alnum_a, _ = _lexical_name_parts(name_a)
+    norm_b, tok_b, alnum_b, _ = _lexical_name_parts(name_b)
     if not norm_a or not norm_b:
         return 0.0
     if norm_a == norm_b:
         return 1.0
-    tok_a = str(text_processing(name_a))
-    tok_b = str(text_processing(name_b))
     if tok_a and tok_a == tok_b:
         return 1.0
     if _is_acronym_match(name_a, name_b):
@@ -153,13 +162,18 @@ def _lexical_similarity_cascade(
     best_ratio = 0.0
     if matcher.real_quick_ratio() >= threshold and matcher.quick_ratio() >= threshold:
         best_ratio = matcher.ratio()
-    if best_ratio < threshold and (" " in norm_a or " " in norm_b):
-        alnum_a = re.sub(r"[^a-z0-9]", "", norm_a)
-        alnum_b = re.sub(r"[^a-z0-9]", "", norm_b)
-        if alnum_a and alnum_b and not (alnum_a.isdigit() and alnum_b.isdigit()):
-            alnum_ratio = difflib.SequenceMatcher(None, alnum_b, alnum_a, autojunk=False).ratio()
-            if alnum_ratio > best_ratio:
-                best_ratio = alnum_ratio
+    if (
+        best_ratio < threshold
+        and (" " in norm_a or " " in norm_b)
+        and alnum_a
+        and alnum_b
+        and not (alnum_a.isdigit() and alnum_b.isdigit())
+    ):
+        alnum_matcher = difflib.SequenceMatcher(None, alnum_b, alnum_a, autojunk=False)
+        # Both quick ratios are upper bounds: rejecting below threshold
+        # preserves exactly the original set and scores of accepted pairs.
+        if alnum_matcher.real_quick_ratio() >= threshold and alnum_matcher.quick_ratio() >= threshold:
+            best_ratio = max(best_ratio, alnum_matcher.ratio())
     return best_ratio if best_ratio >= threshold else 0.0
 
 
@@ -261,26 +275,29 @@ def find_entity_disambiguation_candidates(
     target_set = (set(entity_ids) - pure_literals) if entity_ids is not None else None
 
     lexical_pairs: dict[tuple[str, str], float] = {}
-    n_ents = len(all_entities)
+    # Enumerate only pairs incident to the changed entities. The previous
+    # triangular scan visited every graph pair even for a one-entity update.
+    # Keep canonical orientation: SequenceMatcher can be order-sensitive.
+    positions = {eid: i for i, (eid, _, _) in enumerate(all_entities)}
+    target_positions = (
+        sorted(positions[eid] for eid in target_set if eid in positions) if target_set is not None else None
+    )
+    indices = range(len(all_entities)) if target_positions is None else target_positions
     matcher = difflib.SequenceMatcher(autojunk=False)
-    for i in range(n_ents):
-        eid_a, name_a, norm_a = all_entities[i]
-        if not norm_a:
-            continue
-        a_in_target = target_set is None or eid_a in target_set
-        matcher_seq2_set = False
-        for j in range(i + 1, n_ents):
-            eid_b, name_b, norm_b = all_entities[j]
-            if not a_in_target and (target_set is not None and eid_b not in target_set):
+    for i in indices:
+        others = range(i + 1, len(all_entities)) if target_set is None else range(len(all_entities))
+        for j in others:
+            if j == i or (j < i and target_set is not None and all_entities[j][0] in target_set):
                 continue
-            if not norm_b:
+            a, b = sorted((i, j))
+            eid_a, name_a, norm_a = all_entities[a]
+            eid_b, name_b, norm_b = all_entities[b]
+            if not norm_a or not norm_b:
                 continue
-            key = (eid_a, eid_b) if eid_a < eid_b else (eid_b, eid_a)
+            key = (eid_a, eid_b)
             if key in adjudicated:
                 continue
-            if not matcher_seq2_set:
-                matcher.set_seq2(norm_a)
-                matcher_seq2_set = True
+            matcher.set_seq2(norm_a)
             best_ratio = _lexical_similarity_cascade(name_a, name_b, lexical_threshold, matcher=matcher)
             if best_ratio >= lexical_threshold:
                 lexical_pairs[key] = best_ratio

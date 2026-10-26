@@ -85,6 +85,7 @@ from yaw.daemon.graph.storage import (
     hydrate_budgeted_passages,
     hydrate_passages,
     inspect_focus_node,
+    iter_disambiguation_dossiers,
     lint_graph_shacl,
     load_graph_topology,
     make_ast_island_hydrator,
@@ -1054,11 +1055,7 @@ class YawGraphEngine:
             self._hydrate_indexed_cids_from_db(program)
             ext_fp = extraction_fingerprint(program)
             req_chunks = self._resolve_chunks_for_docs(item_docs)
-            pool_chunks = (
-                list(self._opt_val_chunks_pool)
-                if self._opt_val_chunks_pool
-                else list(self._opt_chunks_pool)
-            )
+            pool_chunks = list(self._opt_val_chunks_pool) if self._opt_val_chunks_pool else list(self._opt_chunks_pool)
             missing_pool = [(p, t) for p, t in pool_chunks if p.chunk_id not in self._opt_indexed_cids]
             if missing_pool:
                 for b_start in range(0, len(missing_pool), 8):
@@ -1200,9 +1197,7 @@ class YawGraphEngine:
                 span_by_cid: dict[str, tuple[int, int]] = {}
                 curr_line = 2
                 for rec in all_records:
-                    item_str = "\n".join(
-                        "  " + ln for ln in json.dumps(rec, ensure_ascii=False, indent=2).splitlines()
-                    )
+                    item_str = "\n".join("  " + ln for ln in json.dumps(rec, ensure_ascii=False, indent=2).splitlines())
                     rendered_items.append(item_str)
                     s_line = curr_line
                     e_line = s_line + item_str.count("\n")
@@ -1525,8 +1520,7 @@ class YawGraphEngine:
                     s_norm = str(text_processing(st.subj))
                     p_norm = str(text_processing(st.pred))
                     is_literal_obj = (
-                        getattr(st, "obj_kind", "entity") == "literal"
-                        or detect_scalar_literal(str(st.obj))[0]
+                        getattr(st, "obj_kind", "entity") == "literal" or detect_scalar_literal(str(st.obj))[0]
                     )
                     o_val = o_raw_str if is_literal_obj else str(text_processing(st.obj))
                     if not s_norm or not p_norm or not o_val:
@@ -2327,13 +2321,15 @@ class YawGraphEngine:
                     for eid, name, _ in entity_nodes
                     if len(re.sub(r"[^A-Za-z0-9]", "", name)) >= 1
                     and not (
-                        detect_scalar_literal(name)[0]
-                        and eid not in concept_eids
-                        and eid not in shared_label_eids
+                        detect_scalar_literal(name)[0] and eid not in concept_eids and eid not in shared_label_eids
                     )
                     and eid not in lit_only_eids
                 ]
                 if valid_entity_ids:
+                    if progress_callback is not None:
+                        progress_callback(
+                            f"indexing: disambiguation candidate search ({len(valid_entity_ids)} changed entities)"
+                        )
                     raw_candidates = find_entity_disambiguation_candidates(
                         conn,
                         entity_ids=valid_entity_ids,
@@ -2377,55 +2373,40 @@ class YawGraphEngine:
                     decisions: list[dict[str, str]] = []
                     if candidates:
                         syn_fp = synonym_fingerprint(active_program)
-                        pairs_fp = hashlib.sha256(
-                            json.dumps(
-                                {
-                                    "candidates": candidates,
-                                    "ast_context_hops": self.ast_context_hops,
-                                },
-                                sort_keys=True,
-                                ensure_ascii=False,
-                            ).encode("utf-8")
-                        ).hexdigest()
-                        cached_syn = self._synonym_fp_cache.get((syn_fp, pairs_fp))
-                        if cached_syn is not None:
-                            cached_decs, cached_syn_tr, cached_syn_tok = cached_syn
-                            decisions = list(cached_decs)
-                            self._captured_graph_traces.extend(cached_syn_tr)
-                            self._graph_rlm_stats["synonym_judge_tokens"] += cached_syn_tok
-                        else:
+                        batch_limit = max(1, scale_context_budget(8, active_program.context_window_tokens))
+                        max_dossier_chars = min(40000, active_program._context_char_limit(12000))
+                        completed_pairs = 0
+                        for cand_batch, dossier_prompt in iter_disambiguation_dossiers(
+                            conn,
+                            candidates,
+                            self.workspace_root,
+                            ast_context_hops=self.ast_context_hops,
+                            batch_size=batch_limit,
+                            max_chars=max_dossier_chars,
+                        ):
+                            if progress_callback is not None:
+                                progress_callback(
+                                    f"indexing: synonym judgment ({completed_pairs}/{len(candidates)} pairs)"
+                                )
+                            # Include the actual evidence, not just entity IDs and similarity scores.
+                            pairs_fp = hashlib.sha256(dossier_prompt.encode("utf-8")).hexdigest()
+                            cached_syn = self._synonym_fp_cache.get((syn_fp, pairs_fp))
+                            completed_pairs += len(cand_batch)
+                            if cached_syn is not None:
+                                cached_decs, cached_syn_tr, cached_syn_tok = cached_syn
+                                decisions.extend(cached_decs)
+                                self._captured_graph_traces.extend(cached_syn_tr)
+                                self._graph_rlm_stats["synonym_judge_tokens"] += cached_syn_tok
+                                continue
                             syn_audit: list[dict[str, Any]] = getattr(active_program, "synonym_audit_trail", [])
                             tel: list[dict[str, Any]] = getattr(active_program, "telemetry", [])
                             prev_syn_audit_len = len(syn_audit)
                             prev_tel_len = len(tel)
                             local_syn_trace: list[Any] = []
-                            batch_limit = max(1, scale_context_budget(8, active_program.context_window_tokens))
-                            max_dossier_chars = min(40000, active_program._context_char_limit(12000))
                             with dspy.context(trace=local_syn_trace, usage_tracker=None):
-                                for b_start in range(0, len(candidates), batch_limit):
-                                    cand_batch = candidates[b_start : b_start + batch_limit]
-                                    index_json = json.dumps(cand_batch, ensure_ascii=False)
-                                    dossier_sections: list[str] = [
-                                        f"# Candidate Pairs Index\n```json\n{index_json}\n```"
-                                    ]
-                                    curr_chars = len(dossier_sections[0])
-                                    for c_item in cand_batch:
-                                        pair_md = format_pair_disambiguation_dossier(
-                                            conn,
-                                            str(c_item["entity_a"]),
-                                            str(c_item["entity_b"]),
-                                            corpus_root=self.workspace_root,
-                                            ast_context_hops=self.ast_context_hops,
-                                            dense_sim=float(c_item.get("dense_sim", 0.0)),
-                                            lexical_sim=float(c_item.get("lexical_sim", 0.0)),
-                                        )
-                                        if curr_chars + len(pair_md) + 8 <= max_dossier_chars:
-                                            dossier_sections.append(pair_md)
-                                            curr_chars += len(pair_md) + 8
-                                    dossier_prompt = "\n\n---\n\n".join(dossier_sections)
-                                    batch_decs = active_program.judge_synonyms(dossier_prompt)
-                                    if batch_decs:
-                                        decisions.extend(batch_decs)
+                                batch_decs = active_program.judge_synonyms(dossier_prompt)
+                                if batch_decs:
+                                    decisions.extend(batch_decs)
                             syn_traces = extract_named_trace_entries(
                                 active_program,
                                 local_syn_trace,
@@ -2439,10 +2420,12 @@ class YawGraphEngine:
                                 syn_tok = sum(int(x.get("tokens_used", 0)) for x in tel[prev_tel_len:])
                             self._graph_rlm_stats["synonym_judge_tokens"] += syn_tok
                             self._synonym_fp_cache[(syn_fp, pairs_fp)] = (
-                                list(decisions),
+                                list(batch_decs or []),
                                 list(syn_traces),
                                 syn_tok,
                             )
+                        if progress_callback is not None:
+                            progress_callback(f"indexing: synonym judgment ({completed_pairs}/{len(candidates)} pairs)")
 
                     merged_into: dict[str, str] = {}
 
@@ -2597,9 +2580,7 @@ class YawGraphEngine:
                         norm_def_tgt = str(text_processing(def_tgt)) if def_tgt else ""
                         same_or_empty_def = not norm_def_src or not norm_def_tgt or norm_def_src == norm_def_tgt
                         active_pkey = (min(src, tgt), max(src, tgt))
-                        if is_acronym_pair(name_src, name_tgt) and not (
-                            same_name and active_pkey in fact_linked_pairs
-                        ):
+                        if is_acronym_pair(name_src, name_tgt) and not (same_name and active_pkey in fact_linked_pairs):
                             merge_src, merge_dst = (src, tgt) if len(name_src) < len(name_tgt) else (tgt, src)
                             merge_entities(conn, merge_src, merge_dst, label_kind="skos:altLabel")
                             merged_into[merge_src] = merge_dst
@@ -2630,6 +2611,8 @@ class YawGraphEngine:
 
                 # In-transaction Closed-World SHACL Linting & Bounded Self-Healing via shacl_healer_rlm
                 batch_node_ids = set(chunk_ids) | set(all_entity_ids) | set(all_fact_ids)
+                if progress_callback is not None:
+                    progress_callback("indexing: SHACL validation and repair")
                 pre_heal_violations = lint_graph_shacl(conn, auto_heal=False)
                 pre_heal_batch_violations = [
                     v
