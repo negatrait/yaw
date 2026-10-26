@@ -41,11 +41,7 @@ from yaw.daemon.graph.storage import (
     open_yaw_db,
     serialize_graph_turtle,
 )
-from yaw.daemon.ingestion import (
-    extract_gold_answers,
-    extract_sample_docs_and_gold,
-    load_dataset_splits,
-)
+from yaw.daemon.ingestion import load_dataset_splits, resolve_dataset_source_files
 from yaw.daemon.runtime import YawRuntime, is_file_locked
 
 
@@ -505,17 +501,6 @@ def inspect_status(config: YawConfig) -> dict[str, Any]:
     return payload
 
 
-def _extract_item_gold_answers(item: dict[str, Any]) -> list[str]:
-    return extract_gold_answers(item, strict=False)
-
-
-def _extract_item_docs_and_gold(
-    item: dict[str, Any],
-    dataset_name: str = "",
-) -> tuple[list[str], list[str]]:
-    return extract_sample_docs_and_gold(item, dataset_name)
-
-
 def _load_dataset_splits(
     dataset_args: Sequence[str] | str | None,
     *,
@@ -849,6 +834,11 @@ def handle_dspy_optimize(
         train_queries=train_queries,
         query_offset=query_offset,
     )
+    source_files = resolve_dataset_source_files(
+        dataset_args,
+        workspace_root=config.workspace_root,
+        prefer_corpus=True,
+    )
 
     # Resolution order for sandbox: always isolate prompt compilation
     dspy.settings.configure(provide_traceback=True)
@@ -884,6 +874,7 @@ def handle_dspy_optimize(
             max_bootstrapped_demos=max_bootstrapped_demos,
             max_labeled_demos=max_labeled_demos,
             corpus_docs=corpus_docs,
+            source_files=source_files,
             progress_callback=_cli_progress,
             run_options={
                 "dataset": dataset_args,

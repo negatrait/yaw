@@ -57,6 +57,8 @@ _PUBLIC_API: dict[str, str] = {
     "delete_chunks": ".graph_ops",
     # Closed-world SQL SHACL linter, repair execution & W3C Turtle serializer
     "inspect_focus_node": ".shacl",
+    "format_entity_skos_markdown": ".shacl",
+    "format_pair_disambiguation_dossier": ".shacl",
     "lint_graph_shacl": ".shacl",
     "apply_shacl_repairs": ".shacl",
     "serialize_graph_turtle": ".shacl",
@@ -66,10 +68,13 @@ _PUBLIC_API: dict[str, str] = {
     "coalesce_chunk_spans": ".hydration",
     "coalesce_spans": ".hydration",
     "dehydrate_passage_ast": ".hydration",
+    "hydrate_ast_parent_context": ".hydration",
     "hydrate_budgeted_passages": ".hydration",
     "hydrate_chunk_pointer": ".hydration",
     "hydrate_passages": ".hydration",
+    "make_ast_island_hydrator": ".hydration",
     "make_chunk_hydrator": ".hydration",
+    "resolve_one_hop_upward_ast_bounds": ".hydration",
 }
 
 __all__ = sorted(_PUBLIC_API.keys())

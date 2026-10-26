@@ -5,7 +5,7 @@ import hashlib
 import json
 import re
 from collections.abc import Callable, Collection, Sequence
-from fnmatch import fnmatchcase
+from fnmatch import fnmatchcase, translate
 from pathlib import Path
 from typing import Any
 
@@ -371,6 +371,11 @@ def should_keep_json_key_path(
     return any(fnmatchcase(dotted_path, pat) or fnmatchcase(key, pat) for pat in whitelist)
 
 
+_PASSAGE_META_KEYS: frozenset[str] = frozenset({"idx", "id", "doc_id", "source_type"})
+_PASSAGE_BODY_KEYS: frozenset[str] = frozenset({"text", "paragraph_text", "contents", "body", "content"})
+_PASSAGE_ALL_KEYS: frozenset[str] = frozenset({"title", *_PASSAGE_BODY_KEYS, *_PASSAGE_META_KEYS})
+
+
 def project_json_records(
     content: str | CodeSource,
     rel_posix_path: str = "record.json",
@@ -386,44 +391,52 @@ def project_json_records(
         clean_text = content.replace("\r\n", "\n")
         if not clean_text.strip():
             return []
-        non_empty = [ln.strip() for ln in clean_text.splitlines() if ln.strip()]
-        if (
-            len(non_empty) > 1
-            and not non_empty[0].startswith("[")
-            and all(ln.startswith("{") and ln.endswith(("}", "},")) for ln in non_empty[:2])
-        ):
-            wrapped = "[\n" + ",\n".join(ln.rstrip(",") for ln in non_empty) + "\n]"
-            src = CodeSource(wrapped, language="json")
-        else:
-            src = CodeSource(clean_text, language="json")
+        src = CodeSource(clean_text, language="json")
 
     obj_spans = sorted(
-        ((m.chunks[0].start.byte_offset, m.chunks[0].end.byte_offset) for m in _JSON_OBJ_PATTERN.match_source(src)),
+        (
+            (
+                m.chunks[0].start.byte_offset,
+                m.chunks[0].end.byte_offset,
+                m.chunks[0].start.line,
+                inclusive_end_line(m.chunks[0].start.line, m.chunks[0].end.line, m.chunks[0].end.column),
+            )
+            for m in _JSON_OBJ_PATTERN.match_source(src)
+        ),
         key=lambda x: (x[0], -x[1]),
     )
     if not obj_spans:
         return []
 
-    top_objs: list[tuple[int, int]] = []
-    for o_s, o_e in obj_spans:
+    top_objs: list[tuple[int, int, int, int]] = []
+    for o_s, o_e, o_s_line, o_e_line in obj_spans:
         if not top_objs or o_s >= top_objs[-1][1]:
-            top_objs.append((o_s, o_e))
+            top_objs.append((o_s, o_e, o_s_line, o_e_line))
 
     all_pairs = sorted(
         _JSON_PAIR_PATTERN.match_source(src),
         key=lambda m: (m.chunks[0].start.byte_offset, -m.chunks[0].end.byte_offset),
     )
-    all_tuples = sorted(
-        _JSON_TUPLE_PASSAGE_PATTERN.match_source(src),
-        key=lambda m: m.chunks[0].start.byte_offset,
+    all_tuples = (
+        sorted(
+            _JSON_TUPLE_PASSAGE_PATTERN.match_source(src),
+            key=lambda m: m.chunks[0].start.byte_offset,
+        )
+        if '"context"' in clean_text
+        else []
     )
 
+    bl_re = re.compile("|".join(translate(pat) for pat in blacklist)) if blacklist else None
+    wl_all = not whitelist or "*" in whitelist
+    wl_re = re.compile("|".join(translate(pat) for pat in whitelist)) if not wl_all else None
+    wl_ancestors: set[str] = set()
+    if not wl_all:
+        for pat in whitelist:
+            parts = pat.split(".")
+            for i in range(1, len(parts)):
+                wl_ancestors.add(".".join(parts[:i]))
+
     records: list[tuple[str, str, int, int]] = []
-    clean_bytes = clean_text.encode("utf-8")
-
-    def line_of_byte(b_off: int) -> int:
-        return clean_bytes[:b_off].decode("utf-8", errors="replace").count("\n") + 1
-
     pair_idx = 0
     num_pairs = len(all_pairs)
     obj_idx = 0
@@ -432,7 +445,7 @@ def project_json_records(
     num_tuples = len(all_tuples)
     is_hotpot = "hotpot" in rel_posix_path.lower()
 
-    for o_s, o_e in top_objs:
+    for o_s, o_e, o_s_line, o_e_line in top_objs:
         while pair_idx < num_pairs and all_pairs[pair_idx].chunks[0].start.byte_offset < o_s:
             pair_idx += 1
         obj_pairs = []
@@ -445,12 +458,12 @@ def project_json_records(
 
         while obj_idx < num_objs and obj_spans[obj_idx][0] < o_s:
             obj_idx += 1
-        nested_objs: list[tuple[int, int]] = []
+        nested_objs: list[tuple[int, int, int, int]] = []
         o_cursor = obj_idx
         while o_cursor < num_objs and obj_spans[o_cursor][0] < o_e:
-            sub_s, sub_e = obj_spans[o_cursor]
-            if sub_e <= o_e and (sub_s > o_s or sub_e < o_e):
-                nested_objs.append((sub_s, sub_e))
+            n_s, n_e, n_s_line, n_e_line = obj_spans[o_cursor]
+            if n_e <= o_e and (n_s > o_s or n_e < o_e):
+                nested_objs.append((n_s, n_e, n_s_line, n_e_line))
             o_cursor += 1
 
         while tuple_idx < num_tuples and all_tuples[tuple_idx].chunks[0].start.byte_offset < o_s:
@@ -465,12 +478,16 @@ def project_json_records(
 
         stack: list[tuple[str, int]] = []
         blacklisted_spans: list[tuple[int, int]] = []
-        kept_pairs: list[tuple[str, str, int, int, int, int, str]] = []
+        has_non_meta_blacklisted = False
+        kept_pairs: list[tuple[str, str, int, int, int, int, int, int, str]] = []
         all_pair_spans: list[tuple[int, int]] = []
 
         for m in obj_pairs:
-            p_s = m.chunks[0].start.byte_offset
-            p_e = m.chunks[0].end.byte_offset
+            c = m.chunks[0]
+            p_s = c.start.byte_offset
+            p_e = c.end.byte_offset
+            p_s_line = c.start.line
+            p_e_line = inclusive_end_line(c.start.line, c.end.line, c.end.column)
             all_pair_spans.append((p_s, p_e))
             while stack and stack[-1][1] <= p_s:
                 stack.pop()
@@ -484,24 +501,39 @@ def project_json_records(
             v_e = val_chunk.end.byte_offset
             v_raw = val_chunk.text.strip()
 
-            is_bl = any(fnmatchcase(dotted, pat) or fnmatchcase(key, pat) for pat in blacklist)
-            if not is_bl and blacklist and len(v_raw) >= 2 and v_raw.startswith('"') and v_raw.endswith('"'):
+            is_bl = bl_re is not None and (bl_re.match(dotted) is not None or bl_re.match(key) is not None)
+            if (
+                not is_bl
+                and bl_re is not None
+                and 2 <= len(v_raw) <= 512
+                and v_raw.startswith('"')
+                and v_raw.endswith('"')
+            ):
                 v_unesc = _unescape_json_str(v_raw[1:-1])
-                if any(fnmatchcase(v_unesc, pat) for pat in blacklist):
+                if bl_re.match(v_unesc) is not None:
                     is_bl = True
 
             if is_bl:
                 blacklisted_spans.append((p_s, p_e))
+                if dotted not in _PASSAGE_META_KEYS:
+                    has_non_meta_blacklisted = True
                 continue
 
             stack.append((key, p_e))
-            is_wl = not whitelist or any(
-                fnmatchcase(dotted, pat) or fnmatchcase(key, pat) or pat.startswith(f"{dotted}.") for pat in whitelist
+            is_wl = wl_all or (
+                wl_re is not None
+                and (
+                    wl_re.match(dotted) is not None
+                    or wl_re.match(key) is not None
+                    or dotted in wl_ancestors
+                )
             )
             if is_wl:
-                kept_pairs.append((key, dotted, p_s, p_e, v_s, v_e, v_raw))
+                kept_pairs.append((key, dotted, p_s, p_e, p_s_line, p_e_line, v_s, v_e, v_raw))
             else:
                 blacklisted_spans.append((p_s, p_e))
+                if dotted not in _PASSAGE_META_KEYS:
+                    has_non_meta_blacklisted = True
 
         if not kept_pairs:
             continue
@@ -509,14 +541,17 @@ def project_json_records(
         extracted: list[tuple[str, str, int, int]] = []
 
         # 1. Nested passage objects (e.g., paragraphs, contexts, gold_docs)
-        for sub_s, sub_e in nested_objs:
-            if any(b_s <= sub_s and sub_e <= b_e for b_s, b_e in blacklisted_spans):
+        for n_s, n_e, n_s_line, n_e_line in nested_objs:
+            if any(b_s <= n_s and n_e <= b_e for b_s, b_e in blacklisted_spans):
                 continue
             direct_str: dict[str, str] = {}
             parent_dotted = ""
-            for k, d, p_s, p_e, _vs, _ve, v_raw in kept_pairs:
-                if sub_s < p_s and p_e < sub_e:
-                    if any(sub_s < in_s and in_e < sub_e and in_s < p_s and p_e < in_e for in_s, in_e in nested_objs):
+            for k, d, p_s, p_e, _ps_l, _pe_l, _vs, _ve, v_raw in kept_pairs:
+                if n_s < p_s and p_e < n_e:
+                    if any(
+                        n_s < in_s and in_e < n_e and in_s < p_s and p_e < in_e
+                        for in_s, in_e, _, _ in nested_objs
+                    ):
                         continue
                     if len(v_raw) >= 2 and v_raw.startswith('"') and v_raw.endswith('"'):
                         direct_str[k] = _unescape_json_str(v_raw[1:-1])
@@ -527,13 +562,11 @@ def project_json_records(
             sub_body = direct_str.get("text") or direct_str.get("paragraph_text") or direct_str.get("contents")
             if sub_body is not None:
                 sub_title = direct_str.get("title", "")
-                s_line = line_of_byte(sub_s)
-                e_line = line_of_byte(sub_e)
-                extracted.append((sub_title, sub_body, s_line, e_line))
+                extracted.append((sub_title, sub_body, n_s_line, n_e_line))
 
         # 2. 2-Tuple passages [title, [sents...]] under surviving "context"
         if not extracted and obj_tuples:
-            ctx_spans = [(v_s, v_e) for k, _d, _ps, _pe, v_s, v_e, _vr in kept_pairs if k == "context"]
+            ctx_spans = [(v_s, v_e) for k, _d, _ps, _pe, _ps_l, _pe_l, v_s, v_e, _vr in kept_pairs if k == "context"]
             sep = "" if is_hotpot else " "
             seen_tuple_spans: set[tuple[int, int]] = set()
             for c_vs, c_ve in ctx_spans:
@@ -568,13 +601,13 @@ def project_json_records(
 
         # 3. String "context" (lveval ### Passage N) or nested "document" (narrativeqa)
         dotted_str_map: dict[str, str] = {}
-        for _k, d, _ps, _pe, _vs, _ve, v_raw in kept_pairs:
+        for _k, d, _ps, _pe, _ps_l, _pe_l, _vs, _ve, v_raw in kept_pairs:
             if len(v_raw) >= 2 and v_raw.startswith('"') and v_raw.endswith('"'):
                 dotted_str_map[d] = _unescape_json_str(v_raw[1:-1])
 
         if not extracted:
-            s_line = line_of_byte(o_s)
-            e_line = line_of_byte(o_e)
+            s_line = o_s_line
+            e_line = o_e_line
             if "context" in dotted_str_map and "### Passage" in dotted_str_map["context"]:
                 parts = [p.strip() for p in _LVEVAL_SPLIT_RE.split(dotted_str_map["context"]) if p.strip()]
                 for p in parts:
@@ -588,17 +621,23 @@ def project_json_records(
         # 4. Direct top-level passage or general/corporate JSON record fallback
         if not extracted:
             leaf_kept = [
-                (k, d, p_s, p_e, v_s, v_e, v_raw)
-                for k, d, p_s, p_e, v_s, v_e, v_raw in kept_pairs
+                (k, d, p_s, p_e, p_s_line, p_e_line, v_s, v_e, v_raw)
+                for k, d, p_s, p_e, p_s_line, p_e_line, v_s, v_e, v_raw in kept_pairs
                 if not any(v_s <= p2_s and p2_e <= v_e for p2_s, p2_e in all_pair_spans)
             ]
             if leaf_kept:
                 body_kept = [p for p in leaf_kept if p[1] != "title"] or leaf_kept
-                s_line = line_of_byte(min(p[2] for p in body_kept))
-                e_line = line_of_byte(max(p[3] for p in body_kept))
                 leaf_keys = {d for _k, d, *_ in leaf_kept}
-                passage_keys = {"title", "text", "paragraph_text", "contents", "body", "content"}
-                if leaf_keys <= passage_keys:
+                is_pure_passage = leaf_keys <= _PASSAGE_ALL_KEYS and (
+                    bool(leaf_keys & _PASSAGE_BODY_KEYS) or "title" in leaf_keys
+                )
+                if not blacklisted_spans or (is_pure_passage and not has_non_meta_blacklisted):
+                    s_line = o_s_line
+                    e_line = o_e_line
+                else:
+                    s_line = min(p[4] for p in body_kept)
+                    e_line = max(p[5] for p in body_kept)
+                if is_pure_passage:
                     rec_title = dotted_str_map.get("title", "")
                     rec_body = (
                         dotted_str_map.get("text")
@@ -618,7 +657,7 @@ def project_json_records(
                         or Path(rel_posix_path).stem
                     )
                     surviving_dict: dict[str, Any] = {}
-                    for _k, d, _ps, _pe, _vs, _ve, v_raw in leaf_kept:
+                    for _k, d, _ps, _pe, _ps_l, _pe_l, _vs, _ve, v_raw in leaf_kept:
                         if d == "title" and rec_title == dotted_str_map.get("title"):
                             continue
                         try:
@@ -655,14 +694,14 @@ def chunk_json_text(
         whitelist=whitelist,
         blacklist=blacklist,
     )
-    unique_records = list(dict.fromkeys(records))
-    if not unique_records:
+    if not records:
         return ()
 
     results: list[tuple[ChunkPointer, str]] = []
     seen_cids: set[str] = set()
+    seen_passages: set[tuple[str, str]] = set()
 
-    for item in unique_records:
+    for item in records:
         if len(item) == 4:
             title_i, body_i, rec_start, rec_end = item
         else:
@@ -671,6 +710,10 @@ def chunk_json_text(
 
         clean_title = title_i.replace("\r\n", "\n").replace("\n", " ").strip()
         clean_body = body_i.replace("\r\n", "\n").rstrip("\n")
+        if (clean_title, clean_body) in seen_passages:
+            continue
+        seen_passages.add((clean_title, clean_body))
+
         passage_text = (
             f"{clean_title}\n{clean_body}"
             if clean_title and not (clean_body.startswith(f"{clean_title}\n") or clean_body == clean_title)
@@ -693,12 +736,20 @@ def chunk_json_text(
                 results.append((ptr, passage_text))
             continue
 
-        rec_src = CodeSource(passage_text, language="markdown")
+        body_to_split = (
+            clean_body[len(clean_title) + 1 :]
+            if clean_title and clean_body.startswith(f"{clean_title}\n")
+            else clean_body
+        )
+        if not body_to_split.strip():
+            body_to_split = passage_text
+        eff_chunk_size = max(min_chunk_size, chunk_size - len(clean_title) - 1) if clean_title else chunk_size
+        rec_src = CodeSource(body_to_split, language="markdown")
         sub_chunks = _SPLITTER.split(
             rec_src,
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            min_chunk_size=min(min_chunk_size, max(1, len(passage_text.strip()))),
+            chunk_size=eff_chunk_size,
+            chunk_overlap=min(chunk_overlap, max(0, eff_chunk_size - 1)),
+            min_chunk_size=min(min_chunk_size, max(1, len(body_to_split.strip()))),
         )
         if not sub_chunks:
             cid = compute_chunk_id(rel_posix_path, rec_start, rec_end, passage_text)
@@ -720,21 +771,14 @@ def chunk_json_text(
             sc_text = sc.text
             if clean_title and not sc_text.startswith(f"{clean_title}\n") and sc_text.strip() != clean_title:
                 sc_text = f"{clean_title}\n{sc_text.lstrip()}"
-            sub_s = max(rec_start, rec_start + sc.start.line - 1)
-            sub_e = min(
-                rec_end,
-                rec_start + inclusive_end_line(sc.start.line, sc.end.line, sc.end.column) - 1,
-            )
-            if sub_e < sub_s:
-                sub_e = sub_s
-            cid = compute_chunk_id(rel_posix_path, sub_s, sub_e, sc_text)
+            cid = compute_chunk_id(rel_posix_path, rec_start, rec_end, sc_text)
             if cid not in seen_cids:
                 seen_cids.add(cid)
                 ptr = ChunkPointer(
                     chunk_id=cid,
                     rel_posix_path=rel_posix_path,
-                    start_line=sub_s,
-                    end_line=sub_e,
+                    start_line=rec_start,
+                    end_line=rec_end,
                     title=clean_title,
                     ast_island_start=rec_start,
                     ast_island_end=rec_end,

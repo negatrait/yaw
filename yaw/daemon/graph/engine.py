@@ -70,6 +70,7 @@ from yaw.daemon.graph.storage import (
     apply_shacl_repairs,
     delete_chunks,
     find_entity_disambiguation_candidates,
+    format_pair_disambiguation_dossier,
     get_chunk_pointers,
     get_entities_by_label_norm,
     get_entity_doc_frequencies,
@@ -80,11 +81,13 @@ from yaw.daemon.graph.storage import (
     get_graph_counts,
     get_meta,
     get_openie_checkpoints,
+    hydrate_ast_parent_context,
     hydrate_budgeted_passages,
     hydrate_passages,
     inspect_focus_node,
     lint_graph_shacl,
     load_graph_topology,
+    make_ast_island_hydrator,
     make_chunk_hydrator,
     merge_entities,
     open_managed_yaw_db,
@@ -144,6 +147,7 @@ class YawGraphEngine:
         homograph_cosine_gate: float | None = None,
         max_context_chars: int | None = None,
         max_ast_expansion_hops: int = 1,
+        ast_context_hops: int = 0,
         traversal_policy: RelationTraversalPolicy | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
@@ -167,6 +171,7 @@ class YawGraphEngine:
             else context_char_limit(24000, program.context_window_tokens, program.max_output_tokens)
         )
         self.max_ast_expansion_hops = max_ast_expansion_hops
+        self.ast_context_hops = max(0, int(ast_context_hops))
         self.linking_top_k = linking_top_k
         self.fact_candidate_pool_k = fact_candidate_pool_k
         self.fact_fts_pool_k = fact_fts_pool_k
@@ -517,6 +522,10 @@ class YawGraphEngine:
         hydrator = make_chunk_hydrator(self.conn, self.workspace_root)
         return hydrator(chunk_id)
 
+    def _hydrate_single_ast_island(self, chunk_id: str) -> str:
+        hydrator = make_ast_island_hydrator(self.conn, self.workspace_root)
+        return hydrator(chunk_id)
+
     @staticmethod
     def _repair_signature(rep: Mapping[str, Any]) -> tuple[str, str, str, str]:
         focus = str(rep.get("focus_node", "")).strip()
@@ -570,8 +579,21 @@ class YawGraphEngine:
             target.set_retrieval_hook(self._canonical_retrieval_hook)
         if hasattr(target, "set_graph_tools"):
             target.set_graph_tools(
-                node_inspector=lambda eid: inspect_focus_node(self.conn, eid),
+                node_inspector=lambda eid: inspect_focus_node(
+                    self.conn,
+                    eid,
+                    corpus_root=self.workspace_root,
+                    ast_context_hops=self.ast_context_hops,
+                ),
+                pair_inspector=lambda a, b: format_pair_disambiguation_dossier(
+                    self.conn,
+                    a,
+                    b,
+                    corpus_root=self.workspace_root,
+                    ast_context_hops=self.ast_context_hops,
+                ),
                 chunk_hydrator=self._hydrate_single_chunk,
+                ast_island_hydrator=self._hydrate_single_ast_island,
                 shacl_repair_applier=self._apply_shacl_repairs_from_tool,
                 shacl_linter=lambda: [v.to_dict() for v in lint_graph_shacl(self.conn, auto_heal=False)],
             )
@@ -961,35 +983,6 @@ class YawGraphEngine:
         self._csr_graph = None
         self._graph_rlm_stats = self._empty_graph_rlm_stats()
 
-    def _materialize_doc_chunk(
-        self,
-        doc: str,
-        *,
-        cid: str | None = None,
-    ) -> tuple[ChunkPointer, str] | None:
-        lines = doc.splitlines(keepends=True)
-        n_lines = len(lines)
-        if n_lines == 0:
-            return None
-        chunk_id = cid or compute_mdhash_id(doc, prefix="chunk-")
-        corpus_dir = self.workspace_root / "corpus"
-        corpus_dir.mkdir(parents=True, exist_ok=True)
-        normalized_doc = "".join(line if line.endswith("\n") else line + "\n" for line in lines)
-        rel_posix_path = f"corpus/{chunk_id}.md"
-        write_text_atomic(self.workspace_root / rel_posix_path, normalized_doc)
-        first_line = doc.split("\n", 1)[0].strip()
-        title = first_line if len(first_line) < 100 else ""
-        ptr = ChunkPointer(
-            chunk_id=chunk_id,
-            rel_posix_path=rel_posix_path,
-            start_line=1,
-            end_line=n_lines,
-            title=title,
-            ast_island_start=1,
-            ast_island_end=n_lines,
-        )
-        return (ptr, doc)
-
     def _resolve_chunks_for_docs(
         self,
         item_docs: Sequence[str] | None,
@@ -1012,7 +1005,7 @@ class YawGraphEngine:
                         resolved.append((ptr, c_text))
                 continue
             doc_matches: list[tuple[ChunkPointer, str]] = []
-            direct_cid = compute_mdhash_id(d, prefix="chunk-")
+            direct_cid = d if d in pool_by_cid else compute_mdhash_id(d, prefix="chunk-")
             if direct_cid in pool_by_cid:
                 doc_matches.append(pool_by_cid[direct_cid])
             else:
@@ -1022,22 +1015,29 @@ class YawGraphEngine:
                     c_strip = c_text.strip()
                     if not c_strip:
                         continue
-                    title_match = bool(doc_title and ptr.title and ptr.title.strip() == doc_title)
+                    c_title = ptr.title.strip() if ptr.title else ""
+                    c_body = (
+                        c_strip[len(c_title) + 1 :].strip()
+                        if c_title and c_strip.startswith(f"{c_title}\n")
+                        else c_strip
+                    )
+                    title_match = bool(doc_title and c_title and c_title == doc_title)
                     body_match = (
                         c_strip in (d, doc_body)
+                        or (bool(c_body) and c_body in (d, doc_body))
                         or (len(c_strip) >= 30 and c_strip in d)
-                        or (title_match and (c_strip in doc_body or doc_body in c_strip))
+                        or (len(c_body) >= 30 and (c_body in d or c_body in doc_body))
+                        or (
+                            title_match
+                            and (
+                                c_strip in doc_body
+                                or doc_body in c_strip
+                                or (bool(c_body) and (c_body in doc_body or doc_body in c_body))
+                            )
+                        )
                     )
                     if body_match:
                         doc_matches.append((ptr, c_text))
-                if not doc_matches:
-                    mat = self._materialize_doc_chunk(d, cid=direct_cid)
-                    if mat is not None:
-                        if direct_cid not in pool_by_cid:
-                            self._opt_chunks_pool.append(mat)
-                            pool_by_cid[direct_cid] = mat
-                            pool_len = len(self._opt_chunks_pool)
-                        doc_matches.append(mat)
             self._resolved_docs_cache[(pool_len, d)] = doc_matches
             for ptr, c_text in doc_matches:
                 if ptr.chunk_id not in seen_cids:
@@ -1057,11 +1057,7 @@ class YawGraphEngine:
             pool_chunks = (
                 list(self._opt_val_chunks_pool)
                 if self._opt_val_chunks_pool
-                else (
-                    list(self._opt_chunks_pool)
-                    if len(self._opt_chunks_pool) <= 64 and self._opt_chunks_pool
-                    else (req_chunks if req_chunks else list(self._opt_chunks_pool[:32]))
-                )
+                else list(self._opt_chunks_pool)
             )
             missing_pool = [(p, t) for p, t in pool_chunks if p.chunk_id not in self._opt_indexed_cids]
             if missing_pool:
@@ -1151,9 +1147,11 @@ class YawGraphEngine:
             unique_docs: list[str] = []
             seen_docs: set[str] = set()
             for d in docs:
-                if d not in seen_docs:
+                if d and d not in seen_docs:
                     seen_docs.add(d)
                     unique_docs.append(d)
+            if not unique_docs:
+                return 0
 
             chunk_ids = [compute_mdhash_id(d, prefix="chunk-") for d in unique_docs]
             existing_chunks = get_existing_ids(self.conn, "chunk", chunk_ids)
@@ -1178,10 +1176,57 @@ class YawGraphEngine:
                         chunks_to_index.append((existing_ptrs[cid], doc_by_cid[cid]))
 
             if new_docs:
+                passages_path = self.workspace_root / "passages.json"
+                existing_records: list[dict[str, Any]] = []
+                if passages_path.is_file():
+                    with contextlib.suppress(OSError, json.JSONDecodeError):
+                        loaded = json.loads(passages_path.read_text(encoding="utf-8"))
+                        if isinstance(loaded, list):
+                            existing_records = [r for r in loaded if isinstance(r, dict)]
+
+                all_records = list(existing_records)
+                seen_rec_ids = {str(r.get("id", "")) for r in all_records}
+                new_doc_items: list[tuple[str, str, str]] = []
                 for doc in new_docs:
-                    mat = self._materialize_doc_chunk(doc)
-                    if mat is not None:
-                        chunks_to_index.append(mat)
+                    cid = compute_mdhash_id(doc, prefix="chunk-")
+                    first_line = doc.split("\n", 1)[0].strip()
+                    title = first_line if len(first_line) < 100 else ""
+                    new_doc_items.append((cid, title, doc))
+                    if cid not in seen_rec_ids:
+                        all_records.append({"id": cid, "title": title, "text": doc})
+                        seen_rec_ids.add(cid)
+
+                rendered_items: list[str] = []
+                span_by_cid: dict[str, tuple[int, int]] = {}
+                curr_line = 2
+                for rec in all_records:
+                    item_str = "\n".join(
+                        "  " + ln for ln in json.dumps(rec, ensure_ascii=False, indent=2).splitlines()
+                    )
+                    rendered_items.append(item_str)
+                    s_line = curr_line
+                    e_line = s_line + item_str.count("\n")
+                    rec_id = str(rec.get("id", ""))
+                    if rec_id:
+                        span_by_cid[rec_id] = (s_line, e_line)
+                    curr_line = e_line + 1
+
+                full_json = "[\n" + ",\n".join(rendered_items) + "\n]\n"
+                self.workspace_root.mkdir(parents=True, exist_ok=True)
+                write_text_atomic(passages_path, full_json)
+
+                for cid, title, doc in new_doc_items:
+                    s_line, e_line = span_by_cid[cid]
+                    ptr = ChunkPointer(
+                        chunk_id=cid,
+                        rel_posix_path="passages.json",
+                        start_line=s_line,
+                        end_line=e_line,
+                        title=title,
+                        ast_island_start=s_line,
+                        ast_island_end=e_line,
+                    )
+                    chunks_to_index.append((ptr, doc))
 
             return self.index_chunks(chunks_to_index, progress_callback=progress_callback)
 
@@ -1297,11 +1342,23 @@ class YawGraphEngine:
                 else:
                     if progress_callback is not None:
                         progress_callback(f"indexing: OpenIE extraction ({idx}/{total_chunks})")
+                    openie_passage = text
+                    if self.ast_context_hops > 0 and ptr.start_line > 1:
+                        ast_parent_ctx = hydrate_ast_parent_context(
+                            ptr,
+                            self.workspace_root,
+                            hops=self.ast_context_hops,
+                        )
+                        if ast_parent_ctx:
+                            openie_passage = (
+                                f"[Document AST Context ({ptr.rel_posix_path})]\n{ast_parent_ctx}\n\n"
+                                f"[Target Chunk]\n{text}"
+                            )
                     prev_def_audit_len = len(getattr(active_program, "entity_def_audit_trail", ()))
                     prev_telem_len = len(getattr(active_program, "telemetry", ()))
                     chunk_raw_trace: list[Any] = []
                     with dspy.context(trace=chunk_raw_trace, usage_tracker=None):
-                        rec = active_program.extract_openie(ptr.chunk_id, text)
+                        rec = active_program.extract_openie(ptr.chunk_id, openie_passage)
                     chunk_traces = extract_named_trace_entries(active_program, chunk_raw_trace)
                     self._captured_chunk_traces[ptr.chunk_id] = chunk_traces
                     new_telem_entries = list(getattr(active_program, "telemetry", ())[prev_telem_len:])
@@ -1679,6 +1736,57 @@ class YawGraphEngine:
                     for eid in eids
                 ]
 
+            def _doc_scope_key(rel_path: str, s_line: int, e_line: int, ast_s: int, ast_e: int) -> str:
+                if not rel_path:
+                    return ""
+                if rel_path.lower().endswith((".json", ".jsonl", ".ndjson")):
+                    span_s = ast_s if ast_s > 0 else s_line
+                    span_e = ast_e if ast_e > 0 else e_line
+                    return f"{rel_path}:{span_s}:{span_e}"
+                return rel_path
+
+            chunk_rel_path_by_id: dict[str, str] = {
+                ptr.chunk_id: _doc_scope_key(
+                    ptr.rel_posix_path,
+                    ptr.start_line,
+                    ptr.end_line,
+                    ptr.ast_island_start,
+                    ptr.ast_island_end,
+                )
+                for ptr, _ in chunks
+                if ptr.rel_posix_path
+            }
+            sense_docs_by_eid: dict[str, set[str]] = {}
+            sense_chunks_by_eid: dict[str, set[str]] = {}
+            if all_existing_eids:
+                ph = ",".join("?" for _ in all_existing_eids)
+                for r_eid, r_cid, r_doc, r_s, r_e, r_ast_s, r_ast_e in self.conn.execute(
+                    f"""
+                    SELECT
+                        el.entity_id,
+                        el.chunk_id,
+                        COALESCE(c.rel_posix_path, ''),
+                        COALESCE(c.start_line, 0),
+                        COALESCE(c.end_line, 0),
+                        COALESCE(c.ast_island_start, 0),
+                        COALESCE(c.ast_island_end, 0)
+                    FROM entity_labels el
+                    LEFT JOIN chunks c ON c.chunk_id = el.chunk_id
+                    WHERE el.entity_id IN ({ph}) AND el.chunk_id != ''
+                    """,
+                    all_existing_eids,
+                ):
+                    s_eid = str(r_eid)
+                    s_cid = str(r_cid)
+                    s_doc = (
+                        _doc_scope_key(str(r_doc), int(r_s), int(r_e), int(r_ast_s), int(r_ast_e))
+                        if r_doc
+                        else chunk_rel_path_by_id.get(s_cid, "")
+                    )
+                    sense_chunks_by_eid.setdefault(s_eid, set()).add(s_cid)
+                    if s_doc:
+                        sense_docs_by_eid.setdefault(s_eid, set()).add(s_doc)
+
             # Pre-batch candidate disambiguation embeddings across the batch to avoid 1-by-1 HTTP calls
             defs_by_label: dict[str, set[str]] = {}
             for lbl, senses in senses_by_label.items():
@@ -1686,18 +1794,27 @@ class YawGraphEngine:
                     if s_def.strip():
                         defs_by_label.setdefault(lbl, set()).add(s_def.strip().lower())
             cand_pairs_by_label: dict[str, list[tuple[str, str]]] = {}
-            for _cid, st_list, ner_entities in record_structured:
+            multi_sense_in_chunk: set[tuple[str, str]] = set()
+            for cid_r, st_list, ner_entities in record_structured:
+                chunk_defs_per_norm: dict[str, set[str]] = {}
                 for st in st_list:
                     for m_lbl, m_def in ((st.subj, st.subj_def), (st.obj, st.obj_def)):
+                        m_norm = str(text_processing(m_lbl)) or m_lbl.strip().lower()
                         c_def = m_def.strip()
-                        if c_def:
-                            defs_by_label.setdefault(m_lbl, set()).add(c_def.lower())
-                            cand_pairs_by_label.setdefault(m_lbl, []).append((m_lbl, c_def))
-                for e_norm, e_def in ner_entities:
+                        if c_def and m_norm:
+                            defs_by_label.setdefault(m_norm, set()).add(c_def.lower())
+                            cand_pairs_by_label.setdefault(m_norm, []).append((m_norm, c_def))
+                            chunk_defs_per_norm.setdefault(m_norm, set()).add(c_def.lower())
+                for e_raw_lbl, e_def in ner_entities:
+                    e_norm = str(text_processing(e_raw_lbl)) or e_raw_lbl.strip().lower()
                     c_def = e_def.strip()
-                    if c_def:
+                    if c_def and e_norm:
                         defs_by_label.setdefault(e_norm, set()).add(c_def.lower())
                         cand_pairs_by_label.setdefault(e_norm, []).append((e_norm, c_def))
+                        chunk_defs_per_norm.setdefault(e_norm, set()).add(c_def.lower())
+                for m_norm, c_dset in chunk_defs_per_norm.items():
+                    if len(c_dset) >= 2:
+                        multi_sense_in_chunk.add((cid_r, m_norm))
             prebatch_texts: list[str] = []
             seen_prebatch: set[str] = set()
             for lbl, dset in defs_by_label.items():
@@ -1734,29 +1851,78 @@ class YawGraphEngine:
                     else "skos:altLabel"
                 )
 
+            def _record_sense_provenance(eid: str, cid: str) -> None:
+                sense_chunks_by_eid.setdefault(eid, set()).add(cid)
+                doc_p = chunk_rel_path_by_id.get(cid, "")
+                if doc_p:
+                    sense_docs_by_eid.setdefault(eid, set()).add(doc_p)
+
+            # -------------------------------------------------------------------
+            # RATIONALE: Why we normalize ONLY the lookup/hash key (`label_norm`)
+            # here while preserving raw surface casing in `entities.name` and
+            # `entity_labels.raw_label`:
+            #
+            # We have iterated between two failure modes on text normalization:
+            # 1. Too much normalization (over-normalizing surface strings early
+            #    in OpenIE or storage) destroys domain-critical casing, acronyms
+            #    ("AWS TGW", "KMS", "MSA"), punctuation in paths/versions
+            #    ("KMS/region", "$1.2B"), and typed XSD literal lexical forms
+            #    (`owl:DatatypeProperty`).
+            # 2. Too little normalization (passing raw un-normalized mention
+            #    strings directly into `compute_mdhash_id` and `senses_by_label`
+            #    when an entity or non-scalar literal is materialized) causes
+            #    case/punctuation variants of the exact same concept (e.g.,
+            #    subject `"aws tgw"` -> `md5("aws tgw")` vs literal object
+            #    `"AWS TGW"` -> `md5("AWS TGW")`) to mint two distinct
+            #    `entity_id`s. Because `upsert_entity_labels` subsequently
+            #    normalizes both into the same `label_norm` (`"aws tgw"`), the
+            #    two identical concepts collide on `skos:prefLabel` and get
+            #    falsely separated as homographs (`owl:differentFrom`).
+            #
+            # The balanced solution is strict separation of concerns:
+            # - `label_norm = str(text_processing(raw_mention)) or raw_mention.strip().lower()`
+            #   is used EXCLUSIVELY as the canonical lookup key (`senses_by_label`),
+            #   primary `entity_id` hash seed (`compute_mdhash_id`), and
+            #   `entity_labels.label_norm`.
+            # - `canon_surface` / `mention_raw` preserve the original
+            #   un-normalized surface form (preferring cased forms like
+            #   `"AWS TGW"` or `"Priya Nair"`) for `entities.name`,
+            #   `entity_labels.raw_label`, and `facts.obj_literal_lex`.
+            # -------------------------------------------------------------------
             def _resolve_mention_entity_id(
-                label_norm: str,
+                raw_mention: str,
                 defn: str,
                 chunk_id: str,
                 *,
                 exclude_eid: str | None = None,
             ) -> str:
+                raw_clean = str(raw_mention).strip()
+                label_norm = str(text_processing(raw_clean)) or raw_clean.lower()
                 clean_def = defn.strip()
-                canon_surface = surface_by_norm.get(label_norm, label_norm)
-                mention_raw = chunk_surface_by_norm.get((chunk_id, label_norm), canon_surface)
+                canon_surface = (
+                    surface_by_norm.get(label_norm)
+                    or surface_by_norm.get(raw_clean)
+                    or (raw_clean if raw_clean != raw_clean.lower() else label_norm)
+                )
+                mention_raw = (
+                    chunk_surface_by_norm.get((chunk_id, label_norm))
+                    or chunk_surface_by_norm.get((chunk_id, raw_clean))
+                    or canon_surface
+                )
                 existing_senses = senses_by_label.get(label_norm, [])
                 if not existing_senses:
                     eid = compute_mdhash_id(label_norm, prefix="entity-")
                     senses_by_label[label_norm] = [(eid, canon_surface, clean_def, existing_vecs_by_id.get(eid))]
                     entity_map[eid] = (eid, canon_surface, clean_def)
                     entity_labels_to_upsert.append((label_norm, eid, "skos:prefLabel", mention_raw, chunk_id))
+                    _record_sense_provenance(eid, chunk_id)
                     return eid
 
                 def _best_surface(curr_name: str) -> str:
                     if (
                         curr_name == curr_name.lower()
                         and canon_surface != canon_surface.lower()
-                        and str(text_processing(curr_name)) == label_norm
+                        and (str(text_processing(curr_name)) or curr_name.lower()) == label_norm
                     ):
                         return canon_surface
                     return curr_name
@@ -1780,6 +1946,7 @@ class YawGraphEngine:
                                 chunk_id,
                             )
                         )
+                        _record_sense_provenance(eid, chunk_id)
                         return eid
                     eid, name, prev_def, prev_vec = existing_senses[0]
                     best_name = _best_surface(name)
@@ -1791,6 +1958,7 @@ class YawGraphEngine:
                     entity_labels_to_upsert.append(
                         (label_norm, eid, _label_kind_for(best_name, label_norm), mention_raw, chunk_id)
                     )
+                    _record_sense_provenance(eid, chunk_id)
                     return eid
 
                 # Check if any existing sense has no definition yet or identical definition
@@ -1816,7 +1984,54 @@ class YawGraphEngine:
                                 chunk_id,
                             )
                         )
+                        _record_sense_provenance(eid, chunk_id)
                         return eid
+
+                # Same-Document Co-reference Continuity:
+                # When consecutive chunks of the same document (`rel_posix_path`) extract the same
+                # named entity with complementary role descriptions (e.g., header title "Helix Procurement"
+                # in chunk 1 vs dialogue role "A participant in the meeting." in chunk 2) and neither chunk
+                # extracted multiple contrasting senses for that label, reuse the document's existing sense.
+                curr_doc = chunk_rel_path_by_id.get(chunk_id, "")
+                if (
+                    curr_doc
+                    and exclude_eid is None
+                    and len(existing_senses) == 1
+                    and (chunk_id, label_norm) not in multi_sense_in_chunk
+                ):
+                    eid0, name0, prev_def0, prev_vec0 = existing_senses[0]
+                    if curr_doc in sense_docs_by_eid.get(eid0, set()) and chunk_id not in sense_chunks_by_eid.get(
+                        eid0, set()
+                    ):
+                        best_name = _best_surface(name0)
+                        if (
+                            prev_def0
+                            and clean_def
+                            and clean_def.lower() not in prev_def0.lower()
+                            and prev_def0.lower() not in clean_def.lower()
+                            and len(prev_def0) + len(clean_def) <= 200
+                        ):
+                            merged_def = f"{prev_def0.rstrip('.')} — {clean_def}"
+                        else:
+                            merged_def = clean_def if len(clean_def) > len(prev_def0) else prev_def0
+                        existing_senses[0] = (
+                            eid0,
+                            best_name,
+                            merged_def,
+                            prev_vec0 if (merged_def == prev_def0 and best_name == name0) else None,
+                        )
+                        entity_map[eid0] = (eid0, best_name, merged_def)
+                        entity_labels_to_upsert.append(
+                            (
+                                label_norm,
+                                eid0,
+                                _label_kind_for(best_name, label_norm),
+                                mention_raw,
+                                chunk_id,
+                            )
+                        )
+                        _record_sense_provenance(eid0, chunk_id)
+                        return eid0
 
                 # Both have distinct non-empty definitions:
                 # Reuse existing concept only when high-confidence same sense (cos >= 0.85).
@@ -1864,6 +2079,7 @@ class YawGraphEngine:
                                 chunk_id,
                             )
                         )
+                        _record_sense_provenance(eid, chunk_id)
                         return eid
 
                 sense_id = compute_mdhash_id(f"{label_norm}::{clean_def.lower()}", prefix="entity-")
@@ -1871,6 +2087,7 @@ class YawGraphEngine:
                 existing_senses.append((sense_id, canon_surface, clean_def, cand_vec))
                 entity_map[sense_id] = (sense_id, canon_surface, clean_def)
                 entity_labels_to_upsert.append((label_norm, sense_id, "skos:prefLabel", mention_raw, chunk_id))
+                _record_sense_provenance(sense_id, chunk_id)
                 self._graph_rlm_stats["homograph_splits"] += 1
                 return sense_id
 
@@ -1887,16 +2104,24 @@ class YawGraphEngine:
                 chunk_to_entities.setdefault(cid, set())
                 resolved_in_chunk: set[tuple[str, str]] = set()
                 for st in st_list:
+                    s_norm_key = str(text_processing(st.subj)) or st.subj.strip().lower()
                     s_id = _resolve_mention_entity_id(st.subj, st.subj_def, cid)
-                    resolved_in_chunk.add((st.subj, st.subj_def.strip().lower()))
+                    resolved_in_chunk.add((s_norm_key, st.subj_def.strip().lower()))
                     chunk_to_entities[cid].add(s_id)
 
                     if st.obj_kind == "literal":
                         o_id: str | None = None
-                        if not (st.obj_datatype.startswith("xsd:") and not st.obj_def.strip()):
-                            eff_obj_def = st.obj_def.strip() or st.spo_def.strip() or f"Literal value {st.obj}."
+                        o_norm_key = str(text_processing(st.obj)) or st.obj.strip().lower()
+                        is_self_literal = o_norm_key == s_norm_key
+                        if not is_self_literal and not (st.obj_datatype.startswith("xsd:") and not st.obj_def.strip()):
+                            has_existing_sense = bool(senses_by_label.get(o_norm_key))
+                            eff_obj_def = (
+                                st.obj_def.strip()
+                                if (st.obj_def.strip() or has_existing_sense)
+                                else (st.spo_def.strip() or f"Literal value {st.obj}.")
+                            )
                             o_id = _resolve_mention_entity_id(st.obj, eff_obj_def, cid)
-                            resolved_in_chunk.add((st.obj, st.obj_def.strip().lower()))
+                            resolved_in_chunk.add((o_norm_key, st.obj_def.strip().lower()))
                             chunk_to_entities[cid].add(o_id)
                         eff_obj_dt = st.obj_datatype or "rdfs:Literal"
                         fact_oid = o_id if (o_id is not None and o_id != s_id) else None
@@ -1931,8 +2156,9 @@ class YawGraphEngine:
                             fact_linked_pairs.add((min(s_id, fact_oid), max(s_id, fact_oid)))
                             edges_with_sources.append((s_id, fact_oid, "fact", dt_weight, cid))
                     else:
+                        o_norm_key = str(text_processing(st.obj)) or st.obj.strip().lower()
                         distinct_homograph_pole = (
-                            st.subj == st.obj
+                            o_norm_key == s_norm_key
                             and bool(st.subj_def.strip())
                             and bool(st.obj_def.strip())
                             and st.subj_def.strip().lower() != st.obj_def.strip().lower()
@@ -1943,12 +2169,12 @@ class YawGraphEngine:
                             cid,
                             exclude_eid=s_id if distinct_homograph_pole else None,
                         )
-                        resolved_in_chunk.add((st.obj, st.obj_def.strip().lower()))
+                        resolved_in_chunk.add((o_norm_key, st.obj_def.strip().lower()))
                         chunk_to_entities[cid].add(o_id)
 
-                        base_s_id = compute_mdhash_id(st.subj, prefix="entity-")
-                        base_o_id = compute_mdhash_id(st.obj, prefix="entity-")
-                        if st.subj == st.obj or s_id != base_s_id or o_id != base_o_id:
+                        base_s_id = compute_mdhash_id(s_norm_key, prefix="entity-")
+                        base_o_id = compute_mdhash_id(o_norm_key, prefix="entity-")
+                        if s_norm_key == o_norm_key or s_id != base_s_id or o_id != base_o_id:
                             fid = compute_mdhash_id(str((s_id, st.pred, o_id)), prefix="fact-")
                         else:
                             raw_triple_str = str((st.subj, st.pred, st.obj))
@@ -1975,14 +2201,15 @@ class YawGraphEngine:
                             fact_linked_pairs.add((min(s_id, o_id), max(s_id, o_id)))
                             edges_with_sources.append((s_id, o_id, "fact", 1.0, cid))
 
-                for e_norm, e_def in ner_entities:
+                for e_raw_lbl, e_def in ner_entities:
+                    e_norm = str(text_processing(e_raw_lbl)) or e_raw_lbl.strip().lower()
                     e_key = (e_norm, e_def.strip().lower())
                     if e_key in resolved_in_chunk:
                         continue
                     if not e_def.strip() and any(k[0] == e_norm for k in resolved_in_chunk):
                         continue
                     resolved_in_chunk.add(e_key)
-                    ner_eid = _resolve_mention_entity_id(e_norm, e_def.strip(), cid)
+                    ner_eid = _resolve_mention_entity_id(e_raw_lbl, e_def.strip(), cid)
                     chunk_to_entities[cid].add(ner_eid)
 
             for cid, eids in chunk_to_entities.items():
@@ -2076,18 +2303,34 @@ class YawGraphEngine:
                         """
                     )
                 }
+                shared_label_eids = {
+                    str(r[0])
+                    for r in conn.execute(
+                        """
+                        SELECT DISTINCT el1.entity_id
+                        FROM entity_labels el1
+                        JOIN entity_labels el2
+                          ON el1.label_norm = el2.label_norm
+                         AND el1.entity_id != el2.entity_id
+                        """
+                    )
+                }
                 lit_only_eids = {
                     str(r[0])
                     for r in conn.execute(
                         "SELECT DISTINCT obj_id FROM facts WHERE obj_kind = 'literal' AND obj_id IS NOT NULL"
                     )
-                    if str(r[0]) not in concept_eids
+                    if str(r[0]) not in concept_eids and str(r[0]) not in shared_label_eids
                 }
                 valid_entity_ids = [
                     eid
                     for eid, name, _ in entity_nodes
                     if len(re.sub(r"[^A-Za-z0-9]", "", name)) >= 1
-                    and not (detect_scalar_literal(name)[0] and eid not in concept_eids)
+                    and not (
+                        detect_scalar_literal(name)[0]
+                        and eid not in concept_eids
+                        and eid not in shared_label_eids
+                    )
                     and eid not in lit_only_eids
                 ]
                 if valid_entity_ids:
@@ -2135,7 +2378,14 @@ class YawGraphEngine:
                     if candidates:
                         syn_fp = synonym_fingerprint(active_program)
                         pairs_fp = hashlib.sha256(
-                            json.dumps(candidates, sort_keys=True, ensure_ascii=False).encode("utf-8")
+                            json.dumps(
+                                {
+                                    "candidates": candidates,
+                                    "ast_context_hops": self.ast_context_hops,
+                                },
+                                sort_keys=True,
+                                ensure_ascii=False,
+                            ).encode("utf-8")
                         ).hexdigest()
                         cached_syn = self._synonym_fp_cache.get((syn_fp, pairs_fp))
                         if cached_syn is not None:
@@ -2149,8 +2399,33 @@ class YawGraphEngine:
                             prev_syn_audit_len = len(syn_audit)
                             prev_tel_len = len(tel)
                             local_syn_trace: list[Any] = []
+                            batch_limit = max(1, scale_context_budget(8, active_program.context_window_tokens))
+                            max_dossier_chars = min(40000, active_program._context_char_limit(12000))
                             with dspy.context(trace=local_syn_trace, usage_tracker=None):
-                                decisions = active_program.judge_synonyms(candidates)
+                                for b_start in range(0, len(candidates), batch_limit):
+                                    cand_batch = candidates[b_start : b_start + batch_limit]
+                                    index_json = json.dumps(cand_batch, ensure_ascii=False)
+                                    dossier_sections: list[str] = [
+                                        f"# Candidate Pairs Index\n```json\n{index_json}\n```"
+                                    ]
+                                    curr_chars = len(dossier_sections[0])
+                                    for c_item in cand_batch:
+                                        pair_md = format_pair_disambiguation_dossier(
+                                            conn,
+                                            str(c_item["entity_a"]),
+                                            str(c_item["entity_b"]),
+                                            corpus_root=self.workspace_root,
+                                            ast_context_hops=self.ast_context_hops,
+                                            dense_sim=float(c_item.get("dense_sim", 0.0)),
+                                            lexical_sim=float(c_item.get("lexical_sim", 0.0)),
+                                        )
+                                        if curr_chars + len(pair_md) + 8 <= max_dossier_chars:
+                                            dossier_sections.append(pair_md)
+                                            curr_chars += len(pair_md) + 8
+                                    dossier_prompt = "\n\n---\n\n".join(dossier_sections)
+                                    batch_decs = active_program.judge_synonyms(dossier_prompt)
+                                    if batch_decs:
+                                        decisions.extend(batch_decs)
                             syn_traces = extract_named_trace_entries(
                                 active_program,
                                 local_syn_trace,
@@ -2159,9 +2434,9 @@ class YawGraphEngine:
                             self._captured_graph_traces.extend(syn_traces)
                             syn_tok = 0
                             if len(syn_audit) > prev_syn_audit_len:
-                                syn_tok = int(syn_audit[-1].get("tokens_used", 0))
+                                syn_tok = sum(int(x.get("tokens_used", 0)) for x in syn_audit[prev_syn_audit_len:])
                             elif len(tel) > prev_tel_len:
-                                syn_tok = int(tel[-1].get("tokens_used", 0))
+                                syn_tok = sum(int(x.get("tokens_used", 0)) for x in tel[prev_tel_len:])
                             self._graph_rlm_stats["synonym_judge_tokens"] += syn_tok
                             self._synonym_fp_cache[(syn_fp, pairs_fp)] = (
                                 list(decisions),
@@ -2315,9 +2590,12 @@ class YawGraphEngine:
                         tgt = _resolve_active_eid(eb)
                         if src == tgt:
                             continue
-                        name_src, _ = cand_meta.get(src, (str(c["name_a"]), ""))
-                        name_tgt, _ = cand_meta.get(tgt, (str(c["name_b"]), ""))
+                        name_src, def_src = cand_meta.get(src, (str(c["name_a"]), str(c.get("def_a", ""))))
+                        name_tgt, def_tgt = cand_meta.get(tgt, (str(c["name_b"]), str(c.get("def_b", ""))))
                         same_name = text_processing(name_src) == text_processing(name_tgt)
+                        norm_def_src = str(text_processing(def_src)) if def_src else ""
+                        norm_def_tgt = str(text_processing(def_tgt)) if def_tgt else ""
+                        same_or_empty_def = not norm_def_src or not norm_def_tgt or norm_def_src == norm_def_tgt
                         active_pkey = (min(src, tgt), max(src, tgt))
                         if is_acronym_pair(name_src, name_tgt) and not (
                             same_name and active_pkey in fact_linked_pairs
@@ -2327,11 +2605,13 @@ class YawGraphEngine:
                             merged_into[merge_src] = merge_dst
                             self._graph_rlm_stats["merged_entities"] += 1
                         elif same_name:
-                            if float(c.get("dense_sim", 0.0)) >= 0.45 and active_pkey not in fact_linked_pairs:
+                            if (
+                                float(c.get("dense_sim", 0.0)) >= 0.45 or same_or_empty_def
+                            ) and active_pkey not in fact_linked_pairs:
                                 merge_entities(conn, src, tgt, label_kind="skos:altLabel")
                                 merged_into[src] = tgt
                                 self._graph_rlm_stats["merged_entities"] += 1
-                            else:
+                            elif active_pkey in fact_linked_pairs:
                                 semantic_batch.append((src, tgt, "owl:differentFrom", 0.0))
                                 self._graph_rlm_stats["different_from_edges"] += 1
                         elif float(c.get("dense_sim", 0.0)) >= self.synonymy_threshold:
@@ -2365,7 +2645,10 @@ class YawGraphEngine:
                 batch_attempted_keys: set[tuple[str, str]] = {
                     (v.focus_node, v.shape) for v in pre_heal_batch_violations
                 }
-                all_violations = lint_graph_shacl(conn, auto_heal=True, heal_definitions=False)
+                # Do NOT run SQL auto_heal=True before shacl_healer_rlm: pass all detected
+                # violations directly to the RLM healer first so it can inspect context and
+                # propose semantic repairs without pre-emptive SQL graph clobbering.
+                all_violations = pre_heal_violations
                 violations = [
                     v
                     for v in all_violations
@@ -2381,7 +2664,12 @@ class YawGraphEngine:
                         batch_attempted_keys.add(v_key)
                     bounded_violations = violations
                     focus_contexts = [
-                        inspect_focus_node(conn, v.focus_node)
+                        inspect_focus_node(
+                            conn,
+                            v.focus_node,
+                            corpus_root=self.workspace_root,
+                            ast_context_hops=self.ast_context_hops,
+                        )
                         for v in violations[: scale_context_budget(16, active_program.context_window_tokens)]
                     ]
                     shacl_fp = shacl_fingerprint(active_program)
@@ -2914,6 +3202,7 @@ class YawGraphEngine:
     ) -> None:
         self._in_optimization = True
         self._query_retrieval_memo.clear()
+        self._resolved_docs_cache.clear()
         self._last_memo_question = None
         if opt_chunks is not None:
             existing_cids = {p.chunk_id for p, _ in self._opt_chunks_pool}
@@ -2947,10 +3236,8 @@ class YawGraphEngine:
                         val_pool.append((p, t))
         if val_pool:
             self._opt_val_chunks_pool = val_pool
-        elif len(self._opt_chunks_pool) <= 64 and self._opt_chunks_pool:
-            self._opt_val_chunks_pool = list(self._opt_chunks_pool)
         else:
-            self._opt_val_chunks_pool = list(self._opt_chunks_pool[:64])
+            self._opt_val_chunks_pool = list(self._opt_chunks_pool)
 
         val_cids_set = {p.chunk_id for p, _ in self._opt_val_chunks_pool}
         train_cids_set: set[str] = set()
@@ -2959,6 +3246,8 @@ class YawGraphEngine:
             if ex_docs:
                 for p, _ in self._resolve_chunks_for_docs(ex_docs):
                     train_cids_set.add(p.chunk_id)
+        if not train_cids_set and self._opt_chunks_pool:
+            train_cids_set = {p.chunk_id for p, _ in self._opt_chunks_pool}
         all_pool_cids = val_cids_set | train_cids_set | {p.chunk_id for p, _ in self._opt_chunks_pool}
         self._graph_rlm_stats["val_pool_size"] = len(val_cids_set)
         self._graph_rlm_stats["train_pool_size"] = len(train_cids_set)
@@ -3015,7 +3304,7 @@ class YawGraphEngine:
                     ptrs_scores,
                     self.workspace_root,
                     max_island_chars=active_prog._context_char_limit(4000),
-                    max_total_chars=self.max_context_chars,
+                    max_total_chars=0,
                 ):
                     if hp.text:
                         hydrated_by_cid[hp.pointer.chunk_id] = hp.text.strip()

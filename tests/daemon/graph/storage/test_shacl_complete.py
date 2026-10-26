@@ -956,3 +956,86 @@ def test_punctuated_surface_name_repairs_and_label_priority(tmp_path: Path) -> N
         assert [str(r[0]) for r in py_pref] == ["python 3.10"]
     finally:
         conn.close()
+
+
+def test_identical_definition_duplicate_concepts_merged_deterministically_and_pair_inspection_dossier(
+    tmp_path: Path,
+) -> None:
+    """Verify identical-definition duplicate concepts sharing skos:prefLabel are merged deterministically
+    (even if an erroneous owl:differentFrom edge was present), and inspect_focus_node('a|b') renders
+    the full SKOS/RDF/OWL Markdown dossier with optional 1-hop upward AST context."""
+    doc_file = tmp_path / "arch.md"
+    doc_file.write_text(
+        "# Global Cloud Architecture\n"
+        " transit-gateway-overview: AWS TGW connects VPCs.\n\n"
+        "## Routing Table Scaling\n"
+        "TGW route table scaling supports 10,000 routes.\n",
+        encoding="utf-8",
+    )
+    conn = open_yaw_db(tmp_path / "yaw_dup_merge_dossier.db")
+    try:
+        c1 = ChunkPointer(
+            chunk_id="c-arch-2",
+            rel_posix_path="arch.md",
+            start_line=4,
+            end_line=5,
+            title="Routing Table Scaling",
+            ast_island_start=4,
+            ast_island_end=5,
+        )
+        upsert_chunk_pointers(
+            conn,
+            [(c1, "## Routing Table Scaling\nTGW route table scaling supports 10,000 routes.")],
+        )
+        upsert_entities(
+            conn,
+            [
+                ("entity-tgw-1", "TGW route table scaling", "Scaling of route tables in a Transit Gateway."),
+                ("entity-tgw-2", "TGW route table scaling", "Scaling of route tables in a Transit Gateway."),
+            ],
+        )
+        upsert_entity_labels(
+            conn,
+            [
+                ("tgw route table scaling", "entity-tgw-1", "skos:prefLabel", "TGW route table scaling", "c-arch-2"),
+                ("tgw route table scaling", "entity-tgw-2", "skos:prefLabel", "TGW route table scaling", "c-arch-2"),
+            ],
+        )
+        # Even if an erroneous owl:differentFrom edge was inserted between identical-definition clones:
+        conn.execute(
+            "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES "
+            "('entity-tgw-1', 'entity-tgw-2', 'owl:differentFrom', 0.0), "
+            "('entity-tgw-2', 'entity-tgw-1', 'owl:differentFrom', 0.0)"
+        )
+
+        # Pair inspection before merge renders SKOS/RDF/OWL profile and 1-hop upward AST header when ast_context_hops=1
+        pair_info_0 = inspect_focus_node(
+            conn,
+            "entity-tgw-1|entity-tgw-2",
+            corpus_root=tmp_path,
+            ast_context_hops=0,
+        )
+        assert "markdown_dossier" in pair_info_0
+        assert "### SKOS / RDF / OWL Profile" in pair_info_0["markdown_dossier"]
+        assert "[AST Parent Header]" not in pair_info_0["markdown_dossier"]
+
+        pair_info_1 = inspect_focus_node(
+            conn,
+            "entity-tgw-1|entity-tgw-2",
+            corpus_root=tmp_path,
+            ast_context_hops=1,
+        )
+        assert "[AST Parent Header] # Global Cloud Architecture" in pair_info_1["markdown_dossier"]
+
+        # Pre-heal scan flags identical-definition duplicates
+        pre_v = lint_graph_shacl(conn, auto_heal=False)
+        assert any(v.shape == "ConceptShape/homographDifferentFrom" for v in pre_v)
+
+        # Pre-RLM heal (heal_homographs=False) deterministically merges identical-definition duplicates
+        rem_v = lint_graph_shacl(conn, auto_heal=True, heal_definitions=False, heal_homographs=False)
+        assert rem_v == []
+        surviving = conn.execute("SELECT entity_id, name FROM entities").fetchall()
+        assert len(surviving) == 1
+        assert conn.execute("SELECT 1 FROM edges WHERE kind = 'owl:differentFrom'").fetchone() is None
+    finally:
+        conn.close()

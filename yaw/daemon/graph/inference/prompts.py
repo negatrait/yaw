@@ -258,18 +258,21 @@ triples"], ...]}"""
 
 class JudgeSynonyms(dspy.Signature):
     """You are a critical component in a high-stakes SKOS/RDF/OWL based ontology graph system. Your task is to \
-disambiguate entities.
-    Judge candidate pairs of entities that look similar semantically and in writing/spelling (including \
+disambiguate entities using their SKOS/RDF/OWL profiles, reified `rdf:Statement` facts, and source chunks.
+    Judge candidate pairs of entities/literals that look similar semantically and in writing/spelling (including \
 typos, acronyms, lookalikes like "Cindy Real" vs "Cinderella", or homonyms/homographs with the same name \
 like "a ball" vs "a ball"):
     - 'skos:altLabel': True synonym, acronym, initialism, or coreferent alias referring to the exact same \
-entity/concept (merge into canonical entity, where 'canonical' is the preferred entity name).
+entity/concept (merge into canonical entity, where 'canonical' is the preferred entity name). When two mentions \
+share the same name and originate from the same document or AST island (e.g. a person's title in a header \
+and their participation in the dialogue body), they are coreferent ('skos:altLabel').
     - 'skos:hiddenLabel': Typo, misspelling, transcription error, or surface spelling variant \
 referring to the exact same entity/concept (merge into canonical entity).
     - 'owl:differentFrom': Confusable homonym, homograph (e.g., "a ball" [formal dance] vs "a ball" \
 [spherical toy]), or false-friend lookalike (e.g., "Cindy Real" vs "Cinderella") that is easy to mix up \
 due to similar/identical surface form or context, but actually refers to a genuinely different \
-entity/concept (keep separate, add repulsive owl:differentFrom edge).
+entity/concept as proven by incompatible reified facts or disjoint contexts (keep separate, add repulsive \
+owl:differentFrom edge).
     - 'skos:related': Distinct, different `skos:Concept` entities that are associatively related in the \
 domain without being coreferent synonyms or confusable homonyms/lookalikes, including version or severity \
 siblings (e.g., "http 2" vs "http 3", "sev 1" vs "sev 2") (keep separate, add symmetric skos:related edge).
@@ -281,7 +284,10 @@ add directed skos:broader edge).
 "skos:altLabel|skos:hiddenLabel|skos:related|skos:broader|owl:differentFrom", "canonical": "id_a_or_id_b"}, ...]}"""
 
     candidate_pairs: str = dspy.InputField(
-        desc="JSON list of candidate entity pairs with names, definitions, and similarity scores"
+        desc=(
+            "Structured Markdown dossiers (or JSON list) of candidate entity/literal pairs with SKOS/RDF/OWL "
+            "profiles, reified rdf:Statement facts, source chunks, and similarity scores"
+        )
     )
     decisions: list[dict[str, str]] = dspy.OutputField(
         desc="List of SKOS/OWL disambiguation decisions per candidate pair"
@@ -360,8 +366,10 @@ class ExtractQueryIntent(dspy.Signature):
 
 
 class HealSHACLViolations(dspy.Signature):
-    """As a Recursive RLM orchestrator for closed-world SHACL graph repair,
-    you orchestrate the healing of SHACL violations using inspect_node and hydrate_chunk sandbox tools."""
+    """As a Recursive Language Model (RLM) orchestrator for closed-world SHACL graph repair,
+    you orchestrate the healing of SHACL violations using inspect_focus_node, inspect_pair,
+    hydrate_chunk, hydrate_ast_island, search_graph, qwen_propose_shacl_repairs,
+    apply_shacl_repairs, and lint_shacl sandbox tools."""
 
     violations: str = dspy.InputField(desc="JSON list of SHACLViolation report items")
     repairs: list[dict[str, Any]] = dspy.OutputField(

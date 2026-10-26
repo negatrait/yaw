@@ -411,16 +411,29 @@ def test_cli_resume_real_gepa_checkpoint_and_custom_output(tmp_path: Path, provi
     # touching the checkpoint, preserving both for inspection or recovery.
     original_checkpoint = checkpoint.read_bytes()
     assert cfg.corpus_root is not None
-    corpus_md_files = sorted((cfg.corpus_root / "corpus").glob("*.md"))
-    assert corpus_md_files
-    original_corpus = {p.name: p.read_bytes() for p in corpus_md_files}
+    assert not list((cfg.corpus_root / "corpus").glob("*.md"))
+    opt_cfg = cfg.for_optimization(db_override=db_path)
+    assert opt_cfg.corpus_root is not None
+    assert not list((opt_cfg.corpus_root / "corpus").glob("*.md"))
+    with closing(sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True)) as conn:
+        original_chunks = conn.execute(
+            "SELECT chunk_id, rel_posix_path, start_line, end_line FROM chunks ORDER BY chunk_id"
+        ).fetchall()
+    assert original_chunks
+    assert all(row[1] == "resume_dataset.json" for row in original_chunks)
     records[0]["question"] = "A changed training question"
     dataset.write_text(json.dumps(records), encoding="utf-8")
     rc, _, errors = run_cli(["--resume"], bare=True)
     assert rc == 1
     assert "Cannot resume" in errors
     assert checkpoint.read_bytes() == original_checkpoint
-    assert {p.name: p.read_bytes() for p in sorted((cfg.corpus_root / "corpus").glob("*.md"))} == original_corpus
+    with closing(sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True)) as conn:
+        assert (
+            conn.execute(
+                "SELECT chunk_id, rel_posix_path, start_line, end_line FROM chunks ORDER BY chunk_id"
+            ).fetchall()
+            == original_chunks
+        )
 
 
 def test_resume_preserves_unverifiable_legacy_checkpoint(tmp_path: Path) -> None:
@@ -819,7 +832,6 @@ Tier 2 anti-overfitting guard."""
     bench_dataset_path.write_text(json.dumps(bench_samples), encoding="utf-8")
 
     captured_gepa: dict[str, Any] = {}
-    corpus_md_dir = cfg.corpus_root / "corpus"
 
     class CaptureGEPA:
         def __init__(self, metric: Any, **kwargs: Any) -> None:
@@ -829,9 +841,17 @@ Tier 2 anti-overfitting guard."""
         def compile(self, student: Any, trainset: list[Any], valset: Any = None) -> Any:
             captured_gepa["trainset_len"] = len(trainset)
             captured_gepa["valset_len"] = len(valset) if valset is not None else 0
-            # Verify CocoIndex synced markdown passages exist during GEPA evolution for 1-indexed line hydration
-            md_files = list(corpus_md_dir.glob("*.md"))
-            assert len(md_files) >= 6
+            # Verify CocoIndex synced JSON passages in-place with zero markdown synthesis during GEPA evolution
+            opt_cfg = cfg.for_optimization(db_override="latest")
+            assert opt_cfg.corpus_root is not None
+            assert opt_cfg.db_path is not None
+            assert not list((opt_cfg.corpus_root / "corpus").glob("*.md"))
+            pools = json.loads((tmp_path / "custom_compiled_pools.json").read_text(encoding="utf-8"))
+            assert len(pools["corpus_chunk_ids"]) >= 6
+            with closing(sqlite3.connect(opt_cfg.db_path.as_uri() + "?mode=ro", uri=True)) as conn:
+                db_chunks = conn.execute("SELECT rel_posix_path FROM chunks").fetchall()
+            assert len(db_chunks) >= 4
+            assert all(row[0] == "tier1_samples.json" for row in db_chunks)
             pred = student(question=trainset[0].question)
             assert pred.context.strip() != ""
             proposer = captured_gepa.get("instruction_proposer")
@@ -874,7 +894,15 @@ Tier 2 anti-overfitting guard."""
             embedder=emb,
         )
     assert rc == 0
-    assert list(corpus_md_dir.glob("*.md"))
+    assert not list((cfg.corpus_root / "corpus").glob("*.md"))
+    opt_cfg_after = cfg.for_optimization(db_override="latest")
+    assert opt_cfg_after.corpus_root is not None
+    assert opt_cfg_after.db_path is not None
+    assert not list((opt_cfg_after.corpus_root / "corpus").glob("*.md"))
+    with closing(sqlite3.connect(opt_cfg_after.db_path.as_uri() + "?mode=ro", uri=True)) as conn:
+        db_chunks_after = conn.execute("SELECT rel_posix_path FROM chunks").fetchall()
+    assert len(db_chunks_after) >= 6
+    assert all(row[0] == "tier1_samples.json" for row in db_chunks_after)
     opt_out = json.loads(buf.getvalue())
     assert opt_out["optimized"] is True
     assert opt_out["mode"] == "gepa"
@@ -1314,6 +1342,7 @@ def test_cli_benchmark_and_gate_evaluation(tmp_path: Path, provider) -> None:
     assert report_pass["gate"]["passed"] is True
     assert report_pass["datasets"]["2wikimultihopqa"]["integrity"]["passed"] is True
     assert not Path(cfg.db_path).exists()
+    assert not list(tmp_path.rglob("chunk-*.md"))
 
     # 2. Failing gate (impossible threshold > 1.0 returns exit code 1)
     failing_gate = tmp_path / "failing_gate.json"
@@ -1419,12 +1448,21 @@ def test_canonical_benchmark_gate_json_and_dataset_ingestion_invariants(tmp_path
     user_md_dir.mkdir(parents=True, exist_ok=True)
     user_md = user_md_dir / "architecture.md"
     user_md.write_text("# Architecture\nImportant user documentation.\n", encoding="utf-8")
+    corpus_json = corpus_root / "corpus.json"
+    corpus_json.write_text(
+        json.dumps([{"title": "Doc Title", "text": "Doc body text for testing."}], indent=2) + "\n",
+        encoding="utf-8",
+    )
 
     state_dir = tmp_path / "coco_state"
     docs = ["Doc Title\nDoc body text for testing."]
-    chunks1 = sync_source_files_for_docs(corpus_root, state_dir, allowed_docs=docs, min_chunk_size=1)
+    chunks1 = sync_source_files_for_docs(
+        corpus_root, state_dir, allowed_docs=docs, source_files=[corpus_json], min_chunk_size=1
+    )
     assert user_md.exists()
+    assert not list(user_md_dir.glob("chunk-*.md"))
     assert len(chunks1) == 1
+    assert chunks1[0][0].rel_posix_path == "corpus.json"
 
     # Repeated call with allowed_docs=None returns chunks idempotently
     chunks2 = sync_source_files_for_docs(corpus_root, state_dir, allowed_docs=None, min_chunk_size=1)

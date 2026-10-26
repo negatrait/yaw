@@ -184,6 +184,7 @@ class YawConfig:
     embed_batch_chars: int = 3500
     max_context_chars: int | None = None
     max_ast_expansion_hops: int = 1
+    ast_context_hops: int = 0
 
     # Runtime & HTTP transport settings
     queue_maxsize: int = 32
@@ -337,6 +338,7 @@ class YawConfig:
             for f in fields(self)
             if f.name
             not in (
+                "corpus_root",
                 "db_path",
                 "lock_path",
                 "status_path",
@@ -344,6 +346,7 @@ class YawConfig:
                 "compiled_program_path",
             )
         }
+        cfg_dict["corpus_root"] = self.workspace_root
         cfg_dict["db_path"] = opt_db
         cfg_dict["lock_path"] = opt_lock
         cfg_dict["status_path"] = opt_status
@@ -542,6 +545,7 @@ _FIELD_TO_SECTION: dict[str, str] = {
     "embed_batch_chars": "graph",
     "max_context_chars": "graph",
     "max_ast_expansion_hops": "graph",
+    "ast_context_hops": "graph",
     "queue_maxsize": "runtime",
     "http_host": "runtime",
     "http_port": "runtime",

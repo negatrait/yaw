@@ -199,12 +199,15 @@ def test_engine_index_and_caching(test_engine: YawGraphEngine, tmp_path: Path) -
     indexed_count = test_engine.index(docs)
     assert indexed_count == 2
 
-    # Verify per-chunk corpus files written on disk
-    corpus_files = sorted((tmp_path / "corpus").glob("chunk-*.md"))
-    assert len(corpus_files) == 2
-    content = "\n".join(p.read_text(encoding="utf-8") for p in corpus_files)
+    # Verify passages.json written on disk and no corpus/chunk-*.md files created
+    assert not (tmp_path / "corpus").exists()
+    passages_path = tmp_path / "passages.json"
+    assert passages_path.is_file()
+    content = passages_path.read_text(encoding="utf-8")
     assert "Alan Turing" in content
     assert "Radio City" in content
+    records = json.loads(content)
+    assert isinstance(records, list) and len(records) == 2
 
     # Verify SQLite tables populated
     chunks = test_engine.conn.execute("SELECT chunk_id, start_line, end_line FROM chunks").fetchall()
@@ -393,12 +396,13 @@ def test_engine_multi_batch_indexing_and_bounded_embedding_batches(tmp_path: Pat
         # Every embedder call must respect embed_batch_size=2
         assert all(sz <= 2 for sz in batch_sizes_seen)
 
-        # Verify line numbers in SQLite match exact per-document 1-indexed spans
+        # Verify line numbers in SQLite match exact per-record 1-indexed spans in passages.json
+        assert not (tmp_path / "corpus").exists()
         spans = [
             tuple(r)
-            for r in engine.conn.execute("SELECT start_line, end_line FROM chunks ORDER BY end_line").fetchall()
+            for r in engine.conn.execute("SELECT start_line, end_line FROM chunks ORDER BY start_line").fetchall()
         ]
-        assert spans == [(1, 1), (1, 1), (1, 2), (1, 2), (1, 3)]
+        assert spans == [(2, 6), (7, 11), (12, 16), (17, 21), (22, 26)]
 
         # Verify DPR retrieval hydrates chunks from both batches accurately
         dpr_hits = engine.retrieve_dpr("Doc 4 line 1", top_k=5)
@@ -1982,6 +1986,7 @@ minibatch q_stats lookup."""
         doc_q1 = "Alan Turing\nAlan Turing designed the Automatic Computing Engine in 1945."
         doc_q2_a = "Ada Lovelace\nAda Lovelace wrote the first computer algorithm."
         doc_q2_b = "Charles Babbage\nCharles Babbage designed the Analytical Engine."
+        engine.index([doc_q1, doc_q2_a, doc_q2_b])
 
         ex1 = dspy.Example(
             question="Who designed the Automatic Computing Engine?",
@@ -2177,6 +2182,7 @@ def test_evolve_prompts_real_unmocked_gepa_and_miprov2_with_context_limit_guard(
         filler_docs = [
             f"Distractor {i}\n" + ("Historical archive notes on mechanical calculators. " * 25) for i in range(6)
         ]
+        engine.index([doc_turing, doc_lovelace, *filler_docs])
 
         trainset = [
             dspy.Example(

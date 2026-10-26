@@ -53,6 +53,7 @@ from yaw.daemon.ingestion import (
     build_benchmark_slice,
     load_dataset_files,
     resolve_dataset_name,
+    resolve_dataset_source_files,
     sync_source_files_for_docs,
 )
 
@@ -254,6 +255,7 @@ class YawRuntime:
             embed_batch_size=self.config.embed_batch_size,
             max_context_chars=self.config.max_context_chars,
             max_ast_expansion_hops=self.config.max_ast_expansion_hops,
+            ast_context_hops=self.config.ast_context_hops,
         )
         self.engine.config = self.config
         self.ingestor = CorpusIngestor(
@@ -893,6 +895,7 @@ class YawRuntime:
         max_bootstrapped_demos: int | None = None,
         max_labeled_demos: int | None = None,
         corpus_docs: Sequence[str] | None = None,
+        source_files: Sequence[Path | str] | None = None,
         progress_callback: Callable[[str], None] | None = None,
         run_options: dict[str, Any] | None = None,
     ) -> Path:
@@ -912,8 +915,8 @@ class YawRuntime:
                     progress_callback(msg)
 
             opt_chunks = []
-            if corpus_docs:
-                _progress(f"indexing: preparing {len(corpus_docs)} corpus passages")
+            if corpus_docs or source_files:
+                _progress(f"indexing: preparing {len(corpus_docs or ())} corpus passages")
                 assert self.config.corpus_root is not None
                 assert self.config.state_dir is not None
                 eff_whitelist = (
@@ -926,10 +929,31 @@ class YawRuntime:
                     if self.config.json_keys_whitelist == ("*",)
                     else self.config.json_keys_blacklist
                 )
+                eff_source_files: Sequence[Path | str] | None = source_files
+                if eff_source_files is None and isinstance(run_options, dict) and run_options.get("dataset"):
+                    eff_source_files = resolve_dataset_source_files(
+                        run_options["dataset"],
+                        workspace_root=self.config.workspace_root,
+                        prefer_corpus=True,
+                    )
+                opt_root = Path(self.config.corpus_root).resolve()
+                if eff_source_files and not all(Path(sf).resolve().is_relative_to(opt_root) for sf in eff_source_files):
+                    try:
+                        opt_root = Path(
+                            os.path.commonpath(
+                                [str(opt_root), *(str(Path(sf).resolve().parent) for sf in eff_source_files)]
+                            )
+                        ).resolve()
+                    except ValueError:
+                        opt_root = Path(
+                            os.path.commonpath([str(Path(sf).resolve().parent) for sf in eff_source_files])
+                        ).resolve()
+                    self.engine.workspace_root = opt_root
                 opt_chunks = sync_source_files_for_docs(
-                    corpus_root=self.config.corpus_root,
+                    corpus_root=opt_root,
                     state_dir=Path(self.config.state_dir) / "optimize_coco",
                     allowed_docs=corpus_docs,
+                    source_files=eff_source_files,
                     json_keys_whitelist=eff_whitelist,
                     json_keys_blacklist=eff_blacklist,
                     chunk_size=self.config.chunk_size,
@@ -1194,7 +1218,9 @@ class YawRuntime:
                 stem = resolved_file.stem.lower()
                 canonical_ds = DATASET_ALIASES.get(stem, stem)
                 include_corpus = bool(
-                    full_corpus or eff_max_q is None or canonical_ds in ("sample", "narrativeqa", "lveval")
+                    full_corpus
+                    or eff_max_q is None
+                    or canonical_ds in ("sample", "narrativeqa", "lveval", "enterprise_rag_bench")
                 )
                 if include_corpus and canonical_ds in DATASET_REGISTRY:
                     _, corpus_filename = DATASET_REGISTRY[canonical_ds]
@@ -1207,7 +1233,9 @@ class YawRuntime:
             else:
                 canonical_ds = resolve_dataset_name(ds_arg)
                 include_corpus = bool(
-                    full_corpus or eff_max_q is None or canonical_ds in ("sample", "narrativeqa", "lveval")
+                    full_corpus
+                    or eff_max_q is None
+                    or canonical_ds in ("sample", "narrativeqa", "lveval", "enterprise_rag_bench")
                 )
                 if eff_max_q is not None and eff_idx_q is not None:
                     total_needed: int | None = max(
@@ -1260,10 +1288,35 @@ class YawRuntime:
             if progress_callback is not None:
                 progress_callback(f"benchmarking {canonical_ds}: indexing {len(docs)} docs")
 
+            bench_source_files = resolve_dataset_source_files(
+                [ds_arg],
+                workspace_root=self.config.workspace_root,
+                prefer_corpus=include_corpus,
+            )
+            ws_root = (
+                Path(self.config.workspace_root).resolve()
+                if self.config.workspace_root
+                else Path.cwd().resolve()
+            )
+            if bench_source_files and all(sf.is_relative_to(ws_root) for sf in bench_source_files):
+                effective_corpus_root = ws_root
+            elif bench_source_files:
+                try:
+                    effective_corpus_root = Path(
+                        os.path.commonpath([str(ws_root), *(str(sf.parent) for sf in bench_source_files)])
+                    ).resolve()
+                except ValueError:
+                    effective_corpus_root = Path(
+                        os.path.commonpath([str(sf.parent) for sf in bench_source_files])
+                    ).resolve()
+            else:
+                effective_corpus_root = ws_root
+
             chunks = sync_source_files_for_docs(
-                bench_cfg.corpus_root,
+                effective_corpus_root,
                 bench_cfg.state_dir,
                 allowed_docs=docs,
+                source_files=bench_source_files,
                 json_keys_whitelist=bench_cfg.json_keys_whitelist,
                 json_keys_blacklist=bench_cfg.json_keys_blacklist,
                 chunk_size=bench_cfg.chunk_size,
@@ -1284,7 +1337,7 @@ class YawRuntime:
 
             bench_engine = YawGraphEngine(
                 db_path=bench_cfg.db_path,
-                workspace_root=bench_cfg.corpus_root,
+                workspace_root=effective_corpus_root,
                 program=prog,
                 embedder=emb,
                 linking_top_k=bench_cfg.linking_top_k,
@@ -1295,6 +1348,7 @@ class YawRuntime:
                 embed_batch_size=bench_cfg.embed_batch_size,
                 max_context_chars=bench_cfg.max_context_chars,
                 max_ast_expansion_hops=bench_cfg.max_ast_expansion_hops,
+                ast_context_hops=bench_cfg.ast_context_hops,
             )
             try:
                 existing_cids = {str(r[0]) for r in bench_engine.conn.execute("SELECT chunk_id FROM chunks").fetchall()}

@@ -62,6 +62,7 @@ from yaw.daemon.ingestion import (
     build_benchmark_slice,
     get_gold_answers,
     get_gold_docs,
+    resolve_dataset_source_files,
     sync_source_files_for_docs,
 )
 from yaw.daemon.ingestion import (
@@ -263,7 +264,7 @@ def run_yaw_benchmark(
 
     yaw_engine = YawGraphEngine(
         db_path=db_path,
-        workspace_root=index_dir,
+        workspace_root=PROJECT_ROOT,
         program=program,
         embedder=embedder,
         retrieval_top_k=RETRIEVAL_TOP_K,
@@ -286,9 +287,15 @@ def run_yaw_benchmark(
     try:
         index_start = perf_counter()
         num_docs = len(docs)
+        source_files = resolve_dataset_source_files(
+            [dataset],
+            workspace_root=PROJECT_ROOT,
+            prefer_corpus=True,
+        )
         chunks_to_index = sync_source_files_for_docs(
-            corpus_root=index_dir,
+            corpus_root=PROJECT_ROOT,
             state_dir=index_dir / "coco_state",
+            source_files=source_files,
             allowed_docs=docs,
             json_keys_whitelist=BENCHMARK_JSON_WHITELIST,
             json_keys_blacklist=BENCHMARK_JSON_BLACKLIST,
@@ -630,7 +637,9 @@ def main(
         qa_model = chat_model
     include_qa = mode not in ("embeddings", "retrieval")
     profile = resolve_embedding_profile(embedding_model, embedding_task_mode)
-    include_corpus = bool(full_corpus or max_queries is None or dataset in ("sample", "narrativeqa", "lveval"))
+    include_corpus = bool(
+        full_corpus or max_queries is None or dataset in ("sample", "narrativeqa", "lveval", "enterprise_rag_bench")
+    )
 
     total_needed = None
     if max_queries is not None:

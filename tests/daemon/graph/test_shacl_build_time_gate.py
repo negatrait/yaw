@@ -85,6 +85,8 @@ class PipelineGateMockLM(dspy.LM):
         # RLM healer or direct SHACL repair detection
         if "HealSHACLViolations" in full_text or "ProposeSHACLRepairs" in full_text or "violations" in full_text:
             self.rlm_healer_called = True
+            if "repl_history" in full_text and "code" in full_text:
+                return ['{"reasoning": "Inspect violations and submit repairs.", "code": "SUBMIT(repairs=[])"}']
             return ['{"repairs": []}']
 
         # Query intent stage
@@ -449,8 +451,8 @@ def test_build_time_shacl_gate_success(tmp_path: Path) -> None:
 
 
 def test_pre_rlm_deterministic_auto_heal_skips_rlm_healer(tmp_path: Path) -> None:
-    """Verify that when deterministic auto-healing run before RLM healing resolves all structural
-    SHACL violations (such as SKOS S27 broaderTransitive/related conflicts), shacl_healer_tokens == 0."""
+    """Verify that SHACL violations invoke the RLM healer first (without pre-emptive SQL auto_heal
+    clobbering), and that post-RLM fallback auto-healing guarantees a zero-violation build gate."""
     engine, mock_lm = _make_engine(tmp_path, mode="pre_rlm_heal")
     try:
         text = (
@@ -469,13 +471,10 @@ def test_pre_rlm_deterministic_auto_heal_skips_rlm_healer(tmp_path: Path) -> Non
         indexed = engine.index_chunks([(chunk, text)])
         assert indexed == 1
 
-        # Structural S27 violation existed prior to deterministic auto-heal
+        # Structural S27 violation was routed to the RLM healer first (not clobbered pre-RLM)
         assert int(engine._graph_rlm_stats.get("shacl_violations_before", 0)) >= 1
-        # Deterministic auto-heal resolved it before RLM healing, so RLM healer was never invoked
-        assert int(engine._graph_rlm_stats.get("shacl_healer_tokens", 0)) == 0
-        assert float(engine._chunk_rlm_stats[chunk.chunk_id].get("shacl_healer_tokens", 0.0)) == 0.0
-        assert mock_lm.rlm_healer_called is False
-        assert len(engine.program.shacl_audit_trail) == 0
+        assert mock_lm.rlm_healer_called is True
+        assert len(engine.program.shacl_audit_trail) >= 1
         assert int(engine._graph_rlm_stats.get("shacl_violations_after", 0)) == 0
 
         with engine.managed_conn.readonly() as conn:

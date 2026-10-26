@@ -27,12 +27,15 @@ def test_yaw_config_for_optimization(tmp_path: Path) -> None:
     cfg = YawConfig(workspace_root=tmp_path)
     opt = cfg.for_optimization("20261016_120000")
 
+    assert opt.corpus_root is not None
     assert opt.db_path is not None
     assert opt.lock_path is not None
     assert opt.status_path is not None
     assert opt.state_dir is not None
     assert opt.compiled_program_path is not None
 
+    assert opt.corpus_root == cfg.workspace_root
+    assert "corpus_optimize_" not in str(opt.corpus_root)
     assert opt.db_path.name == "yaw_optimize_20261016_120000.db"
     assert opt.lock_path.name == "yaw_optimize_20261016_120000.db.lock"
     assert opt.status_path.name == "status_optimize_20261016_120000.json"

@@ -19,13 +19,21 @@ from .parsers import (
 
 STAGE_RLM_DELEGATION_RULES: dict[str, str] = {
     "shacl_repair": (
-        "CRITICAL RLM SANDBOX RULE:\n"
-        "Prioritize aggressive 2-step resolution: do NOT perform exploratory node inspections "
-        "unless strictly necessary.\n"
-        "Immediately delegate to `qwen_propose_shacl_repairs(violations=violations)` on Step 1, "
-        "verify if needed, and call `SUBMIT(repairs=repairs)` by Step 2 without wandering:\n"
+        "RLM SHACL HEALING WORKFLOW:\n"
+        "1. Parse `violations` (`import json; items = json.loads(violations)`) and inspect each unique "
+        "`focus_node` using `inspect_focus_node(focus_node)` (which handles `'entity-a|entity-b'`, "
+        "`'entity-a->entity-b'`, `'fact-...'`, and `'entity-...'` and returns `'markdown_dossier'` with "
+        "SKOS/RDF/OWL profiles, reified facts, and hydrated source chunks). Use `inspect_pair(a, b)`, "
+        "`hydrate_ast_island(chunk_id)`, `hydrate_chunk(chunk_id)`, or `search_graph(query)` if additional "
+        "document or neighborhood context is needed.\n"
+        "2. Delegate structured repair synthesis with the gathered dossier context:\n"
         "```python\n"
-        "repairs = qwen_propose_shacl_repairs(violations=violations)\n"
+        "import json\n"
+        "items = json.loads(violations)\n"
+        "seen = list(dict.fromkeys(v['focus_node'] for v in items if v.get('focus_node')))\n"
+        "dossiers = [inspect_focus_node(fn).get('markdown_dossier', '') for fn in seen[:8]]\n"
+        "focus_context = '\\n\\n---\\n\\n'.join(d for d in dossiers if d)\n"
+        "repairs = qwen_propose_shacl_repairs(violations=violations, focus_context=focus_context)\n"
         "SUBMIT(repairs=repairs)\n"
         "```"
     ),
@@ -50,9 +58,17 @@ def build_rlm_action_demos() -> dict[str, list[dspy.Example]]:
                 variables_info="Variable: `violations` (type: str): JSON list of SHACLViolation report items",
                 repl_history=empty_history,
                 iteration="1/10",
-                reasoning="Immediately delegate to Qwen worker and submit in step 1 without wandering.",
+                reasoning=(
+                    "Inspect the violating focus nodes to gather their SKOS/RDF/OWL profiles, reified facts, "
+                    "and source chunk dossiers, then delegate to Qwen worker with focus_context and submit."
+                ),
                 code="```python\n"
-                "repairs = qwen_propose_shacl_repairs(violations=violations)\n"
+                "import json\n"
+                "items = json.loads(violations)\n"
+                "seen = list(dict.fromkeys(v['focus_node'] for v in items if v.get('focus_node')))\n"
+                "dossiers = [inspect_focus_node(fn).get('markdown_dossier', '') for fn in seen[:8]]\n"
+                "focus_context = '\\n\\n---\\n\\n'.join(d for d in dossiers if d)\n"
+                "repairs = qwen_propose_shacl_repairs(violations=violations, focus_context=focus_context)\n"
                 "SUBMIT(repairs=repairs)\n"
                 "```",
             ).with_inputs("variables_info", "repl_history", "iteration")
@@ -101,8 +117,9 @@ def _normalize_rlm_field(name: str, val: Any, annotation: Any) -> Any:
 
 
 def sanitize_repl_code(code: str) -> str:
-    """Strip hallucinated imports of pre-bound sandbox tools (`qwen_*`, `inspect_focus_node`, `hydrate_chunk`, \
-`apply_shacl_repairs`, `lint_shacl`, `synthesize_instruction`, `SUBMIT`, `llm_query`)."""
+    """Strip hallucinated imports of pre-bound sandbox tools (`qwen_*`, `inspect_focus_node`, `inspect_pair`, \
+`hydrate_chunk`, `hydrate_ast_island`, `search_graph`, `apply_shacl_repairs`, `lint_shacl`, `synthesize_instruction`, \
+`SUBMIT`, `llm_query`)."""
     cleaned_lines: list[str] = []
     for line in code.splitlines():
         stripped = line.strip()
@@ -110,8 +127,11 @@ def sanitize_repl_code(code: str) -> str:
             "qwen_" in stripped
             or "inspect_node" in stripped
             or "inspect_focus_node" in stripped
+            or "inspect_pair" in stripped
             or "hydrate_chunk" in stripped
+            or "hydrate_ast_island" in stripped
             or "read_source_chunk" in stripped
+            or "search_graph" in stripped
             or "apply_shacl_repairs" in stripped
             or "lint_shacl" in stripped
             or "synthesize_instruction" in stripped

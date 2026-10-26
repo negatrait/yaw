@@ -237,6 +237,37 @@ with open(out_path, "w", encoding="utf-8") as out_f:
         return payload["questions"], payload["documents"]
 
 
+ENTERPRISE_ABSTENTION_ALIASES: tuple[str, ...] = (
+    "Insufficient references in corpus to answer properly, consider ingesting more supporting documents.",
+    "Insufficient information",
+    "Information not found",
+    "Not mentioned",
+    "Cannot be determined from the provided context",
+)
+
+
+def _is_presplit_enterprise_questions(rows: list[dict[str, Any]]) -> bool:
+    if len(rows) != 250:
+        return False
+    tr_counts: dict[str, int] = {}
+    va_counts: dict[str, int] = {}
+    for r in rows:
+        if not isinstance(r, dict):
+            return False
+        sp = str(r.get("split") or "")
+        cat = _normalize_category(str(r.get("question_type") or ""))
+        if sp == "train":
+            tr_counts[cat] = tr_counts.get(cat, 0) + 1
+        elif sp == "val":
+            va_counts[cat] = va_counts.get(cat, 0) + 1
+        else:
+            return False
+    for cat, (n_tr, n_va) in ENTERPRISE_CATEGORY_QUOTAS.items():
+        if tr_counts.get(cat, 0) != n_tr or va_counts.get(cat, 0) != n_va:
+            return False
+    return True
+
+
 def download_enterprise_rag_bench(
     dest_dir: Path,
     *,
@@ -246,15 +277,35 @@ def download_enterprise_rag_bench(
     questions_rows: list[dict[str, Any]] | None = None,
     documents_rows: list[dict[str, Any]] | None = None,
 ) -> tuple[Path, Path]:
-    "Build stratified 250-query EnterpriseRAG-Bench dataset (150 train + 100 val) and 2.0x same-tool distractor corpus."
+    "Build stratified 250-query EnterpriseRAG-Bench pure questions table and shared corpus."
     q_file, c_file, _ = DATASET_REGISTRY["enterprise_rag_bench"]
     q_target = dest_dir / q_file
     c_target = dest_dir / c_file
+    q_questions_target = dest_dir / "enterprise_rag_bench_questions.json"
+    q_legacy_target = dest_dir / "enterprise_rag_bench.json"
+
+    needs_migration = False
+    if q_target.exists() and q_target.stat().st_size > 0:
+        try:
+            cached_q = json.loads(q_target.read_text(encoding="utf-8"))
+            if (
+                isinstance(cached_q, list)
+                and cached_q
+                and isinstance(cached_q[0], dict)
+                and (
+                    any(isinstance(r, dict) and "paragraphs" in r for r in cached_q)
+                    or (len(cached_q) == 250 and not q_questions_target.exists())
+                )
+            ):
+                needs_migration = True
+        except (OSError, json.JSONDecodeError):
+            pass
 
     if (
         questions_rows is None
         and documents_rows is None
         and not force
+        and not needs_migration
         and q_target.exists()
         and c_target.exists()
         and q_target.stat().st_size > 0
@@ -264,6 +315,33 @@ def download_enterprise_rag_bench(
         c_mb = c_target.stat().st_size / (1024 * 1024)
         print(f"  [cached] {q_file} ({q_mb:.2f} MB), {c_file} ({c_mb:.2f} MB)")
         return q_target, c_target
+
+    if documents_rows is None and c_target.exists() and c_target.stat().st_size > 0:
+        try:
+            raw_c = json.loads(c_target.read_text(encoding="utf-8"))
+            if (
+                isinstance(raw_c, list)
+                and raw_c
+                and all(isinstance(d, dict) and (d.get("idx") or d.get("doc_id") or d.get("id")) for d in raw_c)
+            ):
+                documents_rows = raw_c
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    if questions_rows is None:
+        for cand_q in (q_questions_target, q_legacy_target, q_target):
+            if cand_q.exists() and cand_q.stat().st_size > 0:
+                try:
+                    raw_q = json.loads(cand_q.read_text(encoding="utf-8"))
+                    if (
+                        isinstance(raw_q, list)
+                        and len(raw_q) == 250
+                        and all(isinstance(r, dict) and r.get("question") and r.get("question_type") for r in raw_q)
+                    ):
+                        questions_rows = raw_q
+                        break
+                except (OSError, json.JSONDecodeError):
+                    continue
 
     if questions_rows is None or documents_rows is None:
         fetched_q, fetched_d = _fetch_hf_enterprise_rows(
@@ -275,182 +353,191 @@ def download_enterprise_rag_bench(
         if documents_rows is None:
             documents_rows = fetched_d
 
-    by_category: dict[str, list[dict[str, Any]]] = {}
-    for row in questions_rows:
-        cat = _normalize_category(str(row.get("question_type") or ""))
-        by_category.setdefault(cat, []).append(row)
+    if _is_presplit_enterprise_questions(questions_rows):
+        train_presplit = [
+            ("train", _normalize_category(str(r.get("question_type") or "")), r)
+            for r in questions_rows
+            if str(r.get("split")) == "train"
+        ]
+        val_presplit = [
+            ("val", _normalize_category(str(r.get("question_type") or "")), r)
+            for r in questions_rows
+            if str(r.get("split")) == "val"
+        ]
+        ordered_split = train_presplit + val_presplit
+    else:
+        by_category: dict[str, list[dict[str, Any]]] = {}
+        for row in questions_rows:
+            cat = _normalize_category(str(row.get("question_type") or ""))
+            by_category.setdefault(cat, []).append(row)
 
-    rng = random.Random(seed)
-    train_raw: list[tuple[str, dict[str, Any]]] = []
-    val_raw: list[tuple[str, dict[str, Any]]] = []
+        rng = random.Random(seed)
+        train_raw: list[tuple[str, dict[str, Any]]] = []
+        val_raw: list[tuple[str, dict[str, Any]]] = []
 
-    for cat, (n_train, n_val) in ENTERPRISE_CATEGORY_QUOTAS.items():
-        pool = sorted(
-            by_category.get(cat, []),
-            key=lambda r: str(r.get("question_id") or r.get("id") or r.get("question") or ""),
-        )
-        if len(pool) < n_train + n_val:
-            raise ValueError(f"Category '{cat}' has only {len(pool)} questions, need {n_train + n_val}")
-        rng.shuffle(pool)
-        for item in pool[:n_train]:
-            train_raw.append((cat, item))
-        for item in pool[n_train : n_train + n_val]:
-            val_raw.append((cat, item))
+        for cat, (n_train, n_val) in ENTERPRISE_CATEGORY_QUOTAS.items():
+            pool = sorted(
+                by_category.get(cat, []),
+                key=lambda r: str(r.get("question_id") or r.get("id") or r.get("question") or ""),
+            )
+            if len(pool) < n_train + n_val:
+                raise ValueError(f"Category '{cat}' has only {len(pool)} questions, need {n_train + n_val}")
+            rng.shuffle(pool)
+            for item in pool[:n_train]:
+                train_raw.append((cat, item))
+            for item in pool[n_train : n_train + n_val]:
+                val_raw.append((cat, item))
 
-    rng.shuffle(train_raw)
-    rng.shuffle(val_raw)
-    ordered_split = [("train", cat, item) for cat, item in train_raw] + [("val", cat, item) for cat, item in val_raw]
-
-    docs_by_id: dict[str, dict[str, Any]] = {}
-    non_gold_by_tool: dict[str, list[dict[str, Any]]] = {}
-    all_gold_ids: set[str] = {str(did) for _, _, q in ordered_split for did in (q.get("expected_doc_ids") or ())}
-
-    for d in documents_rows:
-        did = str(d.get("doc_id") or d.get("id") or "")
-        if not did:
-            continue
-        docs_by_id[did] = d
-        if did not in all_gold_ids:
-            st = str(d.get("source_type") or "unknown").strip() or "unknown"
-            non_gold_by_tool.setdefault(st, []).append(d)
-
-    for st in non_gold_by_tool:
-        non_gold_by_tool[st].sort(key=lambda x: str(x.get("doc_id") or x.get("id") or ""))
-        rng.shuffle(non_gold_by_tool[st])
-
-    tool_cursors: dict[str, int] = {st: 0 for st in non_gold_by_tool}
-    all_non_gold_docs = [d for d in documents_rows if str(d.get("doc_id") or d.get("id") or "") not in all_gold_ids]
-    all_non_gold_docs.sort(key=lambda x: str(x.get("doc_id") or x.get("id") or ""))
-    rng.shuffle(all_non_gold_docs)
-    fallback_cursor = 0
+        rng.shuffle(train_raw)
+        rng.shuffle(val_raw)
+        ordered_split = [("train", cat, item) for cat, item in train_raw] + [
+            ("val", cat, item) for cat, item in val_raw
+        ]
 
     def _format_doc_entry(doc_obj: dict[str, Any]) -> tuple[str, str, str, str]:
-        did = str(doc_obj.get("doc_id") or doc_obj.get("id") or "")
+        did = str(doc_obj.get("doc_id") or doc_obj.get("id") or doc_obj.get("idx") or "")
         st = str(doc_obj.get("source_type") or "unknown").strip() or "unknown"
         raw_title = str(doc_obj.get("title") or did).strip() or did
         prefix = f"[{st}] "
-        title = raw_title if raw_title.startswith("[") else f"{prefix}{raw_title}"
+        title = raw_title if raw_title.startswith(prefix) else f"{prefix}{raw_title}"
         text = str(doc_obj.get("content") if "content" in doc_obj else doc_obj.get("text") or "").strip()
         return did, st, title, text
 
-    formatted_queries: list[dict[str, Any]] = []
+    docs_by_id: dict[str, dict[str, Any]] = {}
     corpus_map: dict[str, dict[str, Any]] = {}
+    for d in documents_rows:
+        doc_id, st, title, text = _format_doc_entry(d)
+        if not doc_id:
+            continue
+        docs_by_id[doc_id] = d
+        corpus_map.setdefault(
+            doc_id,
+            {"idx": doc_id, "title": title, "text": text, "source_type": st},
+        )
+
+    formatted_queries: list[dict[str, Any]] = []
 
     for split_name, canonical_cat, q in ordered_split:
         qid = str(q.get("question_id") or q.get("id") or "")
         question_text = str(q.get("question") or "").strip()
         gold_ans = str(q.get("gold_answer") if "gold_answer" in q else q.get("answer") or "").strip()
-        raw_facts = q.get("answer_facts") or q.get("answer_aliases") or []
-        aliases = [str(f).strip() for f in raw_facts if str(f).strip()]
-        if canonical_cat == "Info Not Found":
-            for abstain in (
-                "Insufficient references in corpus to answer properly, consider ingesting more supporting documents.",
-                "Insufficient information",
-                "Information not found",
-                "Not mentioned",
-                "Cannot be determined from the provided context",
-            ):
-                if abstain not in aliases:
-                    aliases.append(abstain)
+        if "answer_facts" in q:
+            raw_facts = q.get("answer_facts") or []
+            answer_facts = [str(f).strip() for f in raw_facts if str(f).strip()]
+        else:
+            raw_legacy = q.get("answer_aliases") or []
+            answer_facts = [
+                str(f).strip()
+                for f in raw_legacy
+                if str(f).strip() and str(f).strip() not in ENTERPRISE_ABSTENTION_ALIASES
+            ]
+        aliases: list[str] = list(ENTERPRISE_ABSTENTION_ALIASES) if canonical_cat == "Info Not Found" else []
 
         source_types = _normalize_source_types(q)
-        expected_ids = [str(x) for x in (q.get("expected_doc_ids") or ()) if str(x)]
-
-        paragraphs: list[dict[str, Any]] = []
-        for did in expected_ids:
-            doc_obj = docs_by_id.get(did)
-            if doc_obj is None:
-                continue
-            doc_id, st, title, text = _format_doc_entry(doc_obj)
-            paragraphs.append(
-                {
-                    "idx": doc_id,
-                    "title": title,
-                    "text": text,
-                    "paragraph_text": text,
-                    "source_type": st,
-                    "is_supporting": True,
-                }
-            )
-            corpus_map.setdefault(
-                doc_id,
-                {"idx": doc_id, "title": title, "text": text, "source_type": st},
-            )
-
-        n_gold_effective = max(1, len(expected_ids))
-        n_distractors = max(1, int(round(n_gold_effective * distractor_factor)))
-        picked_distractors: list[dict[str, Any]] = []
-        picked_ids: set[str] = set(expected_ids)
-
-        for i in range(n_distractors):
-            target_st = source_types[i % len(source_types)]
-            pool = non_gold_by_tool.get(target_st, [])
-            chosen: dict[str, Any] | None = None
-            if pool:
-                start_cur = tool_cursors.get(target_st, 0)
-                for offset in range(len(pool)):
-                    cand = pool[(start_cur + offset) % len(pool)]
-                    cid = str(cand.get("doc_id") or cand.get("id") or "")
-                    if cid not in picked_ids:
-                        chosen = cand
-                        tool_cursors[target_st] = (start_cur + offset + 1) % len(pool)
-                        break
-            if chosen is None and all_non_gold_docs:
-                for offset in range(len(all_non_gold_docs)):
-                    cand = all_non_gold_docs[(fallback_cursor + offset) % len(all_non_gold_docs)]
-                    cid = str(cand.get("doc_id") or cand.get("id") or "")
-                    if cid not in picked_ids:
-                        chosen = cand
-                        fallback_cursor = (fallback_cursor + offset + 1) % len(all_non_gold_docs)
-                        break
-            if chosen is not None:
-                cid = str(chosen.get("doc_id") or chosen.get("id") or "")
-                picked_ids.add(cid)
-                picked_distractors.append(chosen)
-
-        for d_obj in picked_distractors:
-            doc_id, st, title, text = _format_doc_entry(d_obj)
-            paragraphs.append(
-                {
-                    "idx": doc_id,
-                    "title": title,
-                    "text": text,
-                    "paragraph_text": text,
-                    "source_type": st,
-                    "is_supporting": False,
-                }
-            )
-            corpus_map.setdefault(
-                doc_id,
-                {"idx": doc_id, "title": title, "text": text, "source_type": st},
-            )
+        if "expected_doc_ids" in q:
+            raw_expected = q.get("expected_doc_ids") or ()
+        else:
+            raw_expected = [
+                p.get("idx")
+                for p in (q.get("paragraphs") or ())
+                if isinstance(p, dict) and p.get("is_supporting") and p.get("idx")
+            ]
+        expected_ids = [str(x) for x in raw_expected if str(x) and (not docs_by_id or str(x) in docs_by_id)]
 
         formatted_queries.append(
             {
                 "id": qid,
                 "question": question_text,
                 "answer": gold_ans,
+                "answer_facts": answer_facts,
                 "answer_aliases": aliases,
                 "question_type": canonical_cat,
                 "source_types": source_types,
                 "split": split_name,
-                "paragraphs": paragraphs,
+                "expected_doc_ids": expected_ids,
             }
         )
 
     dest_dir.mkdir(parents=True, exist_ok=True)
-    q_target.write_text(
-        json.dumps(formatted_queries, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    serialized_queries = json.dumps(formatted_queries, ensure_ascii=False, indent=2) + "\n"
+    q_target.write_text(serialized_queries, encoding="utf-8")
+    for extra_q_path in (q_questions_target, q_legacy_target):
+        if extra_q_path != q_target:
+            extra_q_path.write_text(serialized_queries, encoding="utf-8")
     c_target.write_text(
         json.dumps(list(corpus_map.values()), ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
     print(
-        f"  -> Wrote {len(formatted_queries)} stratified queries to {q_file} and {len(corpus_map)} passages to {c_file}"
+        f"  -> Wrote {len(formatted_queries)} stratified queries to {q_questions_target.name} "
+        f"and {len(corpus_map)} passages to {c_file}"
     )
     return q_target, c_target
+
+
+def verify_enterprise_rag_bench(dest_dir: Path) -> dict[str, Any]:
+    """Validate pure-question EnterpriseRAG-Bench schema and shared corpus integrity."""
+    q_file, c_file, desc = DATASET_REGISTRY["enterprise_rag_bench"]
+    candidate_q_paths: list[Path] = []
+    for candidate in (dest_dir / "enterprise_rag_bench_questions.json", dest_dir / q_file):
+        if candidate.exists() and candidate not in candidate_q_paths:
+            candidate_q_paths.append(candidate)
+    q_path = candidate_q_paths[0] if candidate_q_paths else (dest_dir / "enterprise_rag_bench_questions.json")
+    c_path = dest_dir / c_file
+
+    status: dict[str, Any] = {"name": "enterprise_rag_bench", "description": desc, "ready": False}
+    if not candidate_q_paths or not c_path.exists():
+        status["error"] = "Files missing"
+        return status
+
+    try:
+        corpus = json.loads(c_path.read_text(encoding="utf-8"))
+        if not isinstance(corpus, list):
+            status["error"] = "Dataset JSON root must be a list"
+            return status
+
+        corpus_ids = {str(d.get("idx")) for d in corpus if isinstance(d, dict) and d.get("idx")}
+        for d in corpus:
+            if not isinstance(d, dict) or "question" in d or "answer" in d or "is_supporting" in d:
+                status["error"] = "Corpus file contains question/answer/label fields"
+                return status
+
+        queries: list[Any] = []
+        for check_q_path in candidate_q_paths:
+            loaded_q = json.loads(check_q_path.read_text(encoding="utf-8"))
+            if not isinstance(loaded_q, list):
+                status["error"] = "Dataset JSON root must be a list"
+                return status
+            for q in loaded_q:
+                if not isinstance(q, dict):
+                    status["error"] = "Question entry must be a dict"
+                    return status
+                if "paragraphs" in q:
+                    status["error"] = "Inlined paragraphs found in pure-question file"
+                    return status
+                if "expected_doc_ids" not in q or "answer_facts" not in q or "answer_aliases" not in q:
+                    status["error"] = (
+                        "Missing required pure-question fields (expected_doc_ids/answer_facts/answer_aliases)"
+                    )
+                    return status
+                if q.get("question_type") != "Info Not Found" and q.get("answer_aliases"):
+                    status["error"] = "Non-abstention question has non-empty answer_aliases"
+                    return status
+                for did in q.get("expected_doc_ids") or ():
+                    if str(did) not in corpus_ids:
+                        status["error"] = f"expected_doc_id '{did}' missing from shared corpus"
+                        return status
+            if check_q_path == q_path:
+                queries = loaded_q
+
+        status["ready"] = True
+        status["queries"] = len(queries)
+        status["corpus_passages"] = len(corpus)
+        status["query_size_mb"] = round(q_path.stat().st_size / (1024 * 1024), 2)
+        status["corpus_size_mb"] = round(c_path.stat().st_size / (1024 * 1024), 2)
+    except (OSError, json.JSONDecodeError, ValueError, TypeError) as exc:
+        status["error"] = str(exc)
+    return status
 
 
 def download_file(filename: str, dest_dir: Path, force: bool = False) -> Path:
@@ -465,13 +552,21 @@ def download_file(filename: str, dest_dir: Path, force: bool = False) -> Path:
     )
 
 
-def verify_dataset(name: str, dest_dir: Path) -> dict:
+def verify_dataset(name: str, dest_dir: Path) -> dict[str, Any]:
     """Check integrity of a downloaded dataset."""
     q_file, c_file, desc = DATASET_REGISTRY[name]
     q_path = dest_dir / q_file
+    if name == "enterprise_rag_bench" and not q_path.exists():
+        alt_q = dest_dir / (
+            "enterprise_rag_bench.json"
+            if q_file == "enterprise_rag_bench_questions.json"
+            else "enterprise_rag_bench_questions.json"
+        )
+        if alt_q.exists():
+            q_path = alt_q
     c_path = dest_dir / c_file
 
-    status = {"name": name, "description": desc, "ready": False}
+    status: dict[str, Any] = {"name": name, "description": desc, "ready": False}
     if not q_path.exists() or not c_path.exists():
         status["error"] = "Files missing"
         return status
@@ -479,12 +574,23 @@ def verify_dataset(name: str, dest_dir: Path) -> dict:
     try:
         queries = json.loads(q_path.read_text(encoding="utf-8"))
         corpus = json.loads(c_path.read_text(encoding="utf-8"))
+        if (
+            name == "enterprise_rag_bench"
+            and isinstance(queries, list)
+            and queries
+            and any(
+                isinstance(q, dict)
+                and any(k in q for k in ("paragraphs", "expected_doc_ids", "question_type", "answer_facts"))
+                for q in queries
+            )
+        ):
+            return verify_enterprise_rag_bench(dest_dir)
         status["ready"] = True
         status["queries"] = len(queries)
         status["corpus_passages"] = len(corpus)
         status["query_size_mb"] = round(q_path.stat().st_size / (1024 * 1024), 2)
         status["corpus_size_mb"] = round(c_path.stat().st_size / (1024 * 1024), 2)
-    except Exception as exc:
+    except (OSError, json.JSONDecodeError, ValueError, TypeError) as exc:
         status["error"] = str(exc)
     return status
 

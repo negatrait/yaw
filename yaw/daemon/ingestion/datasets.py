@@ -15,11 +15,10 @@ from yaw.core import (
     DEFAULT_INCLUDED_PATTERNS,
     ChunkPointer,
     YawRuntimeError,
-    compute_mdhash_id,
     write_text_atomic,
 )
 
-from .corpus import chunk_source_text, sync_corpus_once
+from .corpus import sync_corpus_once
 
 PINNED_COMMIT = "d5c8329422e0a0b834a15874545cb6a74b4f9b26"
 HF_BASE_URL = "https://huggingface.co/datasets/osunlp/HippoRAG_2/resolve/main"
@@ -71,6 +70,10 @@ BENCHMARK_JSON_BLACKLIST: tuple[str, ...] = (
     "o_*",
     "question_decomposition*",
     "answerable*",
+    "split",
+    "source_type",
+    "source_types",
+    "expected_doc_ids",
 )
 
 DATASETS: tuple[str, ...] = (
@@ -96,6 +99,9 @@ DATASET_ALIASES: dict[str, str] = {
     "narrative": "narrativeqa",
     "narrativeqa_dev_10_doc": "narrativeqa",
     "enterprise": "enterprise_rag_bench",
+    "enterprise_rag_bench.json": "enterprise_rag_bench",
+    "enterprise_rag_bench_questions": "enterprise_rag_bench",
+    "enterprise_rag_bench_questions.json": "enterprise_rag_bench",
 }
 ALIASES: dict[str, str] = DATASET_ALIASES
 
@@ -109,7 +115,7 @@ DATASET_REGISTRY: dict[str, tuple[str, str]] = {
     "lveval": ("lveval.json", "lveval_corpus.json"),
     "narrativeqa": ("narrativeqa_dev_10_doc.json", "narrativeqa_dev_10_doc_corpus.json"),
     "case_study_university": ("case_study_university.json", "case_study_university_corpus.json"),
-    "enterprise_rag_bench": ("enterprise_rag_bench.json", "enterprise_rag_bench_corpus.json"),
+    "enterprise_rag_bench": ("enterprise_rag_bench_questions.json", "enterprise_rag_bench_corpus.json"),
 }
 
 DATASET_DESCRIPTIONS: dict[str, str] = {
@@ -476,6 +482,9 @@ def resolve_dataset_name(name: str) -> str:
     cleaned = name.strip().lower()
     resolved = DATASET_ALIASES.get(cleaned, cleaned)
     if resolved not in DATASET_REGISTRY:
+        stem = Path(cleaned).stem.lower()
+        resolved = DATASET_ALIASES.get(stem, stem)
+    if resolved not in DATASET_REGISTRY:
         raise ValueError(
             f"Unknown dataset '{name}'. Valid datasets: {', '.join(DATASETS)} (aliases: {', '.join(DATASET_ALIASES)})"
         )
@@ -563,6 +572,14 @@ def load_dataset_files(
     root = (project_root or Path(__file__).resolve().parents[3]).resolve()
     cache_dir = dataset_dir or (root / "outputs" / "datasets")
     cache_dir.mkdir(parents=True, exist_ok=True)
+
+    if (
+        canonical_name == "enterprise_rag_bench"
+        and not (cache_dir / q_file).exists()
+        and (cache_dir / "enterprise_rag_bench.json").exists()
+    ):
+        q_file = "enterprise_rag_bench.json"
+
     required_files = [q_file]
     if include_corpus:
         required_files.append(c_file)
@@ -604,7 +621,6 @@ def extract_gold_answers(sample: Mapping[str, Any], *, strict: bool = False) -> 
             raw = []
         ans = [raw] if isinstance(raw, str) else [str(a) for a in (raw or ())]
         ans.extend(str(a) for a in sample.get("answer_aliases", ()))
-        ans.extend(str(a) for a in sample.get("answer_facts", ()))
         return list(dict.fromkeys(ans))
 
     if "answers" in sample and sample["answers"] is not None:
@@ -648,15 +664,103 @@ def get_gold_answers(samples: Sequence[Mapping[str, Any]]) -> list[list[str]]:
     return [extract_gold_answers(sample, strict=True) for sample in samples]
 
 
+def _load_corpus_by_id(
+    dataset_name: str | Path,
+    *,
+    workspace_root: Path | None = None,
+) -> dict[str, str]:
+    """Load corpus documents mapping doc_id -> f"{title}\n{text}" from cached *_corpus.json."""
+    raw_str = str(dataset_name).strip()
+    p = Path(raw_str)
+    stem = p.stem.lower()
+    cleaned = raw_str.lower()
+    canonical = _OPTIMIZE_DATASET_ALIASES.get(cleaned, cleaned)
+    canonical = ALIASES.get(canonical, canonical)
+    if canonical not in DATASET_REGISTRY:
+        canonical = _OPTIMIZE_DATASET_ALIASES.get(stem, stem)
+        canonical = ALIASES.get(canonical, canonical)
+
+    c_file = DATASET_REGISTRY.get(canonical, (None, f"{canonical}_corpus.json"))[1]
+
+    roots = [Path.cwd(), Path(__file__).resolve().parents[3]]
+    if workspace_root is not None:
+        roots.insert(0, Path(workspace_root))
+
+    if p.exists():
+        if p.is_file():
+            roots.insert(0, p.parent)
+        elif p.is_dir():
+            roots.insert(0, p)
+    elif p.parent.exists():
+        roots.insert(0, p.parent)
+
+    candidate_names = list(
+        dict.fromkeys(
+            [
+                c_file,
+                f"{canonical}_corpus.json",
+                f"{stem[:-10]}_corpus.json" if stem.endswith("_questions") else "",
+                f"{stem}_corpus.json",
+                f"{cleaned}_corpus.json",
+            ]
+        )
+    )
+    candidate_names = [n for n in candidate_names if n]
+
+    for root in roots:
+        for fname in candidate_names:
+            for sub in ("outputs/datasets", ""):
+                c_path = (root / sub / fname) if sub else (root / fname)
+                if c_path.exists() and c_path.is_file():
+                    try:
+                        raw = json.loads(c_path.read_text(encoding="utf-8"))
+                        if isinstance(raw, list):
+                            lookup: dict[str, str] = {}
+                            for item in raw:
+                                if isinstance(item, dict):
+                                    did = str(item.get("idx") or item.get("id") or item.get("doc_id") or "")
+                                    if did:
+                                        title = str(item.get("title", "")).strip()
+                                        text = str(
+                                            item.get("text") if "text" in item else item.get("content", "")
+                                        ).strip()
+                                        lookup[did] = f"{title}\n{text}" if title else text
+                            if lookup:
+                                return lookup
+                    except Exception:
+                        pass
+    return {}
+
+
 def get_gold_docs(
     samples: Sequence[Mapping[str, Any]],
-    dataset_name: str | None = None,
+    dataset_name: str | Path | None = None,
     corpus: Sequence[Mapping[str, Any]] | None = None,
+    *,
+    corpus_by_id: Mapping[str, str] | None = None,
+    workspace_root: Path | None = None,
 ) -> list[list[str]]:
     """Extract gold supporting passages using upstream main.py's exact formatting contract."""
     gold_docs: list[list[str]] = []
-    canonical_dataset = ALIASES.get(dataset_name or "", dataset_name or "")
+    ds_str = str(dataset_name).strip() if dataset_name is not None else ""
+    ds_stem = Path(ds_str).stem.lower() if ds_str else ""
+    canonical_dataset = (
+        ALIASES.get(ds_stem, ALIASES.get(ds_str.lower(), ds_str))
+        if ds_str
+        else ""
+    )
     separator = "" if canonical_dataset.startswith("hotpotqa") else " "
+    c_by_id: dict[str, str] = dict(corpus_by_id) if corpus_by_id else {}
+    if not c_by_id and corpus:
+        for c in corpus:
+            cid = str(c.get("idx") or c.get("id") or c.get("doc_id") or "")
+            if cid:
+                t = str(c.get("title", "")).strip()
+                tx = str(c.get("text") if "text" in c else c.get("content", "")).strip()
+                c_by_id[cid] = f"{t}\n{tx}" if t else tx
+    if not c_by_id and ds_str:
+        c_by_id = _load_corpus_by_id(ds_str, workspace_root=workspace_root)
+
     for sample in samples:
         if "gold_docs" in sample and sample["gold_docs"]:
             gold_doc = [
@@ -719,6 +823,9 @@ def get_gold_docs(
                 top_passages = []
 
             gold_doc = [f"\n{p}" for p in top_passages]
+        elif "expected_doc_ids" in sample:
+            lookup = c_by_id
+            gold_doc = [lookup[str(did)] for did in sample.get("expected_doc_ids", []) if str(did) in lookup]
         elif "document" in sample and isinstance(sample["document"], Mapping):
             doc = sample["document"]
             doc_id = doc.get("id")
@@ -765,8 +872,8 @@ def get_gold_docs(
                     gold_doc = []
         else:
             raise ValueError(
-                "Each sample needs supporting_facts, contexts, paragraphs, context, or document for "
-                "retrieval evaluation"
+                "Each sample needs supporting_facts, contexts, paragraphs, context, expected_doc_ids, or "
+                "document for retrieval evaluation"
             )
         gold_docs.append(list(dict.fromkeys(gold_doc)))
     return gold_docs
@@ -774,7 +881,10 @@ def get_gold_docs(
 
 def extract_sample_docs_and_gold(
     sample: Mapping[str, Any],
-    dataset_name: str = "",
+    dataset_name: str | Path = "",
+    *,
+    corpus_by_id: Mapping[str, str] | None = None,
+    workspace_root: Path | None = None,
 ) -> tuple[list[str], list[str]]:
     """Extract `(all_docs, gold_docs)` from a single dataset item."""
     if "gold_docs" in sample and "paragraphs" not in sample and "context" not in sample and "contexts" not in sample:
@@ -783,8 +893,19 @@ def extract_sample_docs_and_gold(
         ]
         return g_docs, g_docs
 
-    cleaned_ds = dataset_name.strip().lower()
-    canonical_dataset = ALIASES.get(cleaned_ds, cleaned_ds)
+    ds_str = str(dataset_name).strip() if dataset_name else ""
+    ds_stem = Path(ds_str).stem.lower() if ds_str else ""
+    cleaned_ds = ds_str.lower()
+    canonical_dataset = ALIASES.get(ds_stem, ALIASES.get(cleaned_ds, cleaned_ds))
+
+    has_inline = any(k in sample for k in ("paragraphs", "context", "contexts", "supporting_facts"))
+    if not has_inline and "expected_doc_ids" in sample:
+        lookup = dict(corpus_by_id) if corpus_by_id else {}
+        if not lookup and (ds_str or canonical_dataset or cleaned_ds):
+            lookup = _load_corpus_by_id(ds_str or canonical_dataset or cleaned_ds, workspace_root=workspace_root)
+        gold_docs = [lookup[str(did)] for did in sample.get("expected_doc_ids", []) if str(did) in lookup]
+        return [], list(dict.fromkeys(gold_docs))
+
     separator = "" if canonical_dataset.startswith("hotpotqa") else " "
     all_docs: list[str] = []
     gold_docs: list[str] = []
@@ -848,7 +969,7 @@ def build_benchmark_slice(
     gold_docs = get_gold_docs(selected, canonical_dataset, corpus=corpus)
     gold_answers = get_gold_answers(selected)
 
-    if full_corpus or max_queries is None or canonical_dataset == "sample":
+    if full_corpus or max_queries is None or canonical_dataset in ("sample", "enterprise_rag_bench"):
         docs = [f"{doc['title']}\n{doc['text']}" for doc in corpus]
     else:
         effective_index_queries = int(max_queries * 1.4) if index_queries is None else index_queries
@@ -948,14 +1069,35 @@ def build_benchmark_slice(
     return list(dict.fromkeys(docs)), queries, gold_docs, gold_answers
 
 
+def _ensure_multiline_json_file(file_path: Path) -> Path:
+    """Ensure a JSON dataset file is formatted with multi-line indentation (indent=2) for line hydration."""
+    resolved = file_path.resolve()
+    if not resolved.exists() or not resolved.is_file() or resolved.suffix.lower() != ".json":
+        return resolved
+
+    try:
+        with open(resolved, encoding="utf-8") as f:
+            first_few = [f.readline() for _ in range(5)]
+        if len(first_few) > 1 and any(line.strip() for line in first_few[1:]):
+            return resolved
+
+        content = json.loads(resolved.read_text(encoding="utf-8"))
+        formatted = json.dumps(content, ensure_ascii=False, indent=2) + "\n"
+        write_text_atomic(resolved, formatted)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        pass
+    return resolved
+
+
 def resolve_dataset_source_files(
-    dataset_args: Sequence[str] | str | None,
+    dataset_args: Sequence[Path | str] | Path | str | None,
     *,
     workspace_root: Path | None = None,
+    prefer_corpus: bool = False,
 ) -> list[Path]:
     """Resolve CLI `--dataset` arguments (names, aliases, or file paths) to concrete JSON file paths."""
-    if isinstance(dataset_args, str):
-        ds_list = [p.strip() for p in dataset_args.split(",") if p.strip()]
+    if isinstance(dataset_args, (str, Path)):
+        ds_list = [p.strip() for p in str(dataset_args).split(",") if p.strip()]
     elif dataset_args:
         ds_list = []
         for item in dataset_args:
@@ -966,35 +1108,81 @@ def resolve_dataset_source_files(
         ds_list = []
 
     resolved_paths: list[Path] = []
+    roots = [Path.cwd(), Path(__file__).resolve().parents[3]]
+    if workspace_root is not None:
+        roots.insert(0, Path(workspace_root))
+
     for ds_clean in ds_list:
         candidate_path = Path(ds_clean)
-        if not candidate_path.exists() and ds_clean in _OPTIMIZE_KNOWN_DATASETS:
-            resolved_ds = _OPTIMIZE_DATASET_ALIASES.get(ds_clean, ds_clean)
-            candidate_filenames = list(
-                dict.fromkeys(
-                    [
-                        f"{resolved_ds}.json",
-                        f"{ds_clean}.json",
-                        *([DATASET_REGISTRY[resolved_ds][0]] if resolved_ds in DATASET_REGISTRY else []),
-                    ]
+        stem = candidate_path.stem.lower()
+        ds_norm = _OPTIMIZE_DATASET_ALIASES.get(ds_clean.lower(), ds_clean.lower())
+        ds_norm = ALIASES.get(ds_norm, ds_norm)
+        norm_stem = _OPTIMIZE_DATASET_ALIASES.get(stem, stem)
+        norm_stem = ALIASES.get(norm_stem, norm_stem)
+        effective_norm = norm_stem if norm_stem in DATASET_REGISTRY else ds_norm
+
+        if (
+            candidate_path.exists()
+            and candidate_path.is_file()
+            and prefer_corpus
+            and not stem.endswith("_corpus")
+        ):
+            c_fname = DATASET_REGISTRY.get(effective_norm, (None, f"{effective_norm}_corpus.json"))[1]
+            if c_fname and (candidate_path.parent / c_fname).exists():
+                candidate_path = candidate_path.parent / c_fname
+            elif stem.endswith("_questions") and (candidate_path.parent / f"{stem[:-10]}_corpus.json").exists():
+                candidate_path = candidate_path.parent / f"{stem[:-10]}_corpus.json"
+            elif (candidate_path.parent / f"{stem}_corpus.json").exists():
+                candidate_path = candidate_path.parent / f"{stem}_corpus.json"
+
+        if not (candidate_path.exists() and candidate_path.is_file()):
+            non_corpus_candidates = [
+                *([DATASET_REGISTRY[effective_norm][0]] if effective_norm in DATASET_REGISTRY else []),
+                *([DATASET_REGISTRY[ds_norm][0]] if ds_norm in DATASET_REGISTRY else []),
+                f"{effective_norm}.json",
+                f"{stem}.json",
+                f"{ds_norm}.json",
+                ds_clean if ds_clean.lower().endswith(".json") else "",
+                f"{ds_clean}.json",
+            ]
+            if prefer_corpus:
+                candidate_filenames = list(
+                    dict.fromkeys(
+                        [
+                            *([DATASET_REGISTRY[effective_norm][1]] if effective_norm in DATASET_REGISTRY else []),
+                            f"{effective_norm}_corpus.json",
+                            f"{stem[:-10]}_corpus.json" if stem.endswith("_questions") else "",
+                            f"{stem}_corpus.json",
+                            f"{ds_norm}_corpus.json",
+                            f"{ds_clean}_corpus.json",
+                            *non_corpus_candidates,
+                        ]
+                    )
                 )
-            )
-            roots = [Path.cwd(), Path(__file__).resolve().parents[3]]
-            if workspace_root is not None:
-                roots.insert(0, Path(workspace_root))
+            else:
+                candidate_filenames = list(dict.fromkeys(non_corpus_candidates))
+            candidate_filenames = [f for f in candidate_filenames if f]
+
             found = False
             for root in roots:
                 for fname in candidate_filenames:
-                    cached = root / "outputs" / "datasets" / fname
-                    if cached.exists():
-                        candidate_path = cached
-                        found = True
+                    for sub in ("outputs/datasets", ""):
+                        cached = (root / sub / fname) if sub else (root / fname)
+                        if cached.exists() and cached.is_file():
+                            candidate_path = cached
+                            found = True
+                            break
+                    if found:
                         break
                 if found:
                     break
-        if not candidate_path.exists():
+
+        if not (candidate_path.exists() and candidate_path.is_file()):
             raise YawRuntimeError("INVALID_INPUT", f"Training dataset not found: {ds_clean}")
+
+        _ensure_multiline_json_file(candidate_path)
         resolved_paths.append(candidate_path.resolve())
+
     return resolved_paths
 
 
@@ -1063,24 +1251,77 @@ def load_dataset_splits(
 
     for candidate_path in paths:
         ds_lower = candidate_path.stem.lower()
+        canonical_name = _OPTIMIZE_DATASET_ALIASES.get(ds_lower, ds_lower)
+        canonical_name = ALIASES.get(canonical_name, canonical_name)
+
+        corpus_by_id: dict[str, str] = {}
+        corpus_formatted_docs: list[str] = []
+        c_filename = DATASET_REGISTRY.get(canonical_name, (None, f"{canonical_name}_corpus.json"))[1]
+        candidate_corpus_paths = [
+            candidate_path.parent / c_filename,
+            candidate_path.parent / f"{candidate_path.stem}_corpus.json",
+            candidate_path.parent / f"{canonical_name}_corpus.json",
+        ]
+        if workspace_root is not None:
+            candidate_corpus_paths.append(Path(workspace_root) / "outputs" / "datasets" / c_filename)
+        candidate_corpus_paths.append(Path.cwd() / "outputs" / "datasets" / c_filename)
+
+        for c_cand in candidate_corpus_paths:
+            if c_cand.exists() and c_cand.is_file():
+                try:
+                    c_records = json.loads(c_cand.read_text(encoding="utf-8"))
+                    if isinstance(c_records, list):
+                        for rec in c_records:
+                            if isinstance(rec, dict):
+                                did = str(rec.get("idx") or rec.get("id") or rec.get("doc_id") or "")
+                                title = str(rec.get("title", "")).strip()
+                                text = str(rec.get("text") if "text" in rec else rec.get("content", "")).strip()
+                                doc_str = f"{title}\n{text}" if title else text
+                                if did:
+                                    corpus_by_id[did] = doc_str
+                                corpus_formatted_docs.append(doc_str)
+                        break
+                except Exception:
+                    pass
+
         raw_items = json.loads(candidate_path.read_text(encoding="utf-8"))
         start = max(0, int(query_offset))
         sliced = list(raw_items)[start : start + max_queries]
         d_examples: list[Any] = []
         d_docs: list[str] = []
         for item in sliced:
-            item_docs, gold_docs = extract_sample_docs_and_gold(item, ds_lower)
+            item_docs, gold_docs = extract_sample_docs_and_gold(
+                item,
+                canonical_name,
+                corpus_by_id=corpus_by_id,
+            )
             d_docs.extend(item_docs)
+
+            ex_kwargs: dict[str, Any] = {
+                "question": str(item["question"]),
+                "gold_answers": extract_gold_answers(item, strict=False),
+                "gold_docs": gold_docs,
+                "item_docs": item_docs,
+            }
+            if "answer_facts" in item:
+                ex_kwargs["answer_facts"] = list(item["answer_facts"])
+            if "question_type" in item:
+                ex_kwargs["question_type"] = str(item["question_type"])
+            if "expected_doc_ids" in item:
+                ex_kwargs["expected_doc_ids"] = list(item["expected_doc_ids"])
+
             d_examples.append(
                 _make_example(
                     inputs=("question", "item_docs"),
-                    question=str(item["question"]),
-                    gold_answers=extract_gold_answers(item, strict=False),
-                    gold_docs=gold_docs,
-                    item_docs=item_docs,
+                    **ex_kwargs,
                 )
             )
-        all_corpus_docs.extend(d_docs)
+
+        if corpus_formatted_docs and (canonical_name == "enterprise_rag_bench" or not d_docs):
+            all_corpus_docs.extend(corpus_formatted_docs)
+        else:
+            all_corpus_docs.extend(d_docs)
+
         if 0 < train_queries < len(d_examples):
             train_per_ds.append(d_examples[:train_queries])
             val_per_ds.append(d_examples[train_queries:])
@@ -1106,44 +1347,11 @@ def load_dataset_splits(
     return trainset, valset, list(dict.fromkeys(all_corpus_docs))
 
 
-def _chunk_matches_doc(ptr: ChunkPointer, text: str, doc: str) -> bool:
-    doc_stripped = doc.strip()
-    txt_stripped = text.strip()
-    if not doc_stripped or not txt_stripped:
-        return False
-    if txt_stripped == doc_stripped:
-        return True
-    if ptr.title:
-        titled = f"{ptr.title.strip()}\n{txt_stripped}"
-        if titled == doc_stripped:
-            return True
-        if doc_stripped.startswith(f"{ptr.title.strip()}\n") and txt_stripped in doc_stripped:
-            return True
-    return len(txt_stripped) >= 20 and txt_stripped in doc_stripped
-
-
-def _has_non_synthesized_sources(root: Path) -> bool:
-    for p in root.rglob("*"):
-        if not p.is_file():
-            continue
-        try:
-            rel = p.relative_to(root).as_posix()
-        except ValueError:
-            continue
-        if rel.startswith(".") or "/." in rel or rel.startswith("coco_state/"):
-            continue
-        if rel.startswith("corpus/chunk-") and rel.endswith(".md"):
-            continue
-        if rel in {"yaw.db", "yaw.db-wal", "yaw.db-shm", "yaw.db.lock", "status.json", "yaw.log"}:
-            continue
-        return True
-    return False
-
-
 def sync_source_files_for_docs(
     corpus_root: Path | str,
     state_dir: Path | str,
     *,
+    source_files: Sequence[Path | str] | None = None,
     included_patterns: Sequence[str] = (),
     excluded_patterns: Sequence[str] = (),
     json_keys_whitelist: Sequence[str] = BENCHMARK_JSON_WHITELIST,
@@ -1152,137 +1360,103 @@ def sync_source_files_for_docs(
     chunk_size: int = 1200,
     chunk_overlap: int = 100,
     min_chunk_size: int = 50,
-    source_files: Sequence[Path | str] | None = None,
 ) -> list[tuple[ChunkPointer, str]]:
-    """Sync source files in `corpus_root` via CocoIndex and return `(ChunkPointer, text)` pairs."""
+    """Sync source files via CocoIndex in-place and return `(ChunkPointer, text)` pairs."""
     root = Path(corpus_root).resolve()
     state = Path(state_dir).resolve()
     root.mkdir(parents=True, exist_ok=True)
     state.mkdir(parents=True, exist_ok=True)
 
     effective_excluded = tuple(excluded_patterns) if excluded_patterns else DEFAULT_EXCLUDED_PATTERNS
-    explicit_patterns: list[str] = list(included_patterns)
+
     if source_files:
-        for sf in source_files:
-            sf_path = Path(sf).resolve()
-            if sf_path.exists() and sf_path.is_file():
-                try:
-                    rel = sf_path.relative_to(root).as_posix()
-                    if rel not in explicit_patterns:
-                        explicit_patterns.append(rel)
-                except ValueError:
-                    pass
+        resolved_files = [_ensure_multiline_json_file(Path(f)) for f in source_files]
+        try:
+            rel_patterns = tuple(f.relative_to(root).as_posix() for f in resolved_files)
+            effective_root = root
+        except ValueError:
+            try:
+                import os
 
-    matched_chunks: list[tuple[ChunkPointer, str]] = []
-    covered_docs: set[str] = set()
+                common = Path(os.path.commonpath([str(root), *[str(f) for f in resolved_files]])).resolve()
+                effective_root = common
+                rel_patterns = tuple(f.relative_to(effective_root).as_posix() for f in resolved_files)
+            except ValueError:
+                if len(resolved_files) == 1:
+                    effective_root = resolved_files[0].parent
+                    rel_patterns = (resolved_files[0].name,)
+                else:
+                    import os
 
-    if explicit_patterns or allowed_docs is None or _has_non_synthesized_sources(root):
-        patterns_to_use = tuple(explicit_patterns) if explicit_patterns else DEFAULT_INCLUDED_PATTERNS
-        scan_excluded = (
-            effective_excluded
-            if allowed_docs is None or explicit_patterns
-            else (*effective_excluded, "corpus/chunk-*.md")
-        )
-        if (state / "coco_lmdb").exists():
-            shutil.rmtree(state / "coco_lmdb", ignore_errors=True)
-        delta = sync_corpus_once(
-            root,
-            state,
-            included_patterns=patterns_to_use,
-            excluded_patterns=scan_excluded,
-            json_keys_whitelist=json_keys_whitelist,
-            json_keys_blacklist=json_keys_blacklist,
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            min_chunk_size=min_chunk_size,
-        )
-        raw_chunks = list(delta.added_chunks)
-        if allowed_docs is None:
-            return raw_chunks
+                    common = Path(os.path.commonpath([str(f) for f in resolved_files])).resolve()
+                    effective_root = common
+                    rel_patterns = tuple(f.relative_to(effective_root).as_posix() for f in resolved_files)
+        patterns_to_use = rel_patterns
+    else:
+        effective_root = root
+        patterns_to_use = tuple(included_patterns) if included_patterns else DEFAULT_INCLUDED_PATTERNS
 
-        dedup_allowed = [d for d in dict.fromkeys(allowed_docs) if d and d.strip()]
-        for ptr, txt in raw_chunks:
-            matched_any = False
-            for d in dedup_allowed:
-                if _chunk_matches_doc(ptr, txt, d):
-                    covered_docs.add(d)
-                    matched_any = True
-            if matched_any:
-                matched_chunks.append((ptr, txt))
-        if len(covered_docs) == len(dedup_allowed) and matched_chunks:
-            return matched_chunks
+    if (state / "coco_lmdb").exists():
+        shutil.rmtree(state / "coco_lmdb", ignore_errors=True)
 
-    dedup_docs = [d for d in dict.fromkeys(allowed_docs or ()) if d and d.strip() and d not in covered_docs]
-    if not dedup_docs:
-        return matched_chunks
-
-    corpus_dir = root / "corpus"
-    corpus_dir.mkdir(parents=True, exist_ok=True)
-    expected_files: dict[str, str] = {}
-    for d in dedup_docs:
-        cid = compute_mdhash_id(d, prefix="chunk-")
-        fname = f"{cid}.md"
-        expected_files[fname] = d
-        fpath = corpus_dir / fname
-        if not fpath.exists() or fpath.read_text(encoding="utf-8") != d:
-            write_text_atomic(fpath, d)
-
-    for existing in corpus_dir.glob("chunk-*.md"):
-        if existing.name not in expected_files:
-            existing.unlink(missing_ok=True)
-
-    effective_min_chunk = min(min_chunk_size, 1)
-    md_state = state / "md_pool"
-    md_state.mkdir(parents=True, exist_ok=True)
-    md_delta = sync_corpus_once(
-        root,
-        md_state,
-        included_patterns=("corpus/chunk-*.md",),
+    delta = sync_corpus_once(
+        effective_root,
+        state,
+        included_patterns=patterns_to_use,
         excluded_patterns=effective_excluded,
         json_keys_whitelist=json_keys_whitelist,
         json_keys_blacklist=json_keys_blacklist,
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
-        min_chunk_size=effective_min_chunk,
+        min_chunk_size=min_chunk_size,
     )
+    added = list(delta.added_chunks)
 
-    by_rel_path: dict[str, list[tuple[ChunkPointer, str]]] = {}
-    for ptr, txt in md_delta.added_chunks:
-        by_rel_path.setdefault(ptr.rel_posix_path, []).append((ptr, txt))
+    if allowed_docs is None:
+        return added
 
-    if any(f"corpus/{fname}" not in by_rel_path for fname in expected_files) and (md_state / "coco_lmdb").exists():
-        shutil.rmtree(md_state / "coco_lmdb", ignore_errors=True)
-        md_delta = sync_corpus_once(
-            root,
-            md_state,
-            included_patterns=("corpus/chunk-*.md",),
-            excluded_patterns=effective_excluded,
-            json_keys_whitelist=json_keys_whitelist,
-            json_keys_blacklist=json_keys_blacklist,
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            min_chunk_size=effective_min_chunk,
-        )
-        by_rel_path.clear()
-        for ptr, txt in md_delta.added_chunks:
-            by_rel_path.setdefault(ptr.rel_posix_path, []).append((ptr, txt))
+    allowed_set = {d.strip() for d in allowed_docs if d and d.strip()}
+    if not allowed_set:
+        return []
 
-    for fname, doc_text in expected_files.items():
-        rel_posix = f"corpus/{fname}"
-        if rel_posix in by_rel_path:
-            matched_chunks.extend(by_rel_path[rel_posix])
-        else:
-            reconstructed = chunk_source_text(
-                doc_text,
-                rel_posix,
-                corpus_root=root,
-                chunk_size=chunk_size,
-                chunk_overlap=chunk_overlap,
-                min_chunk_size=effective_min_chunk,
-                json_keys_whitelist=json_keys_whitelist,
-                json_keys_blacklist=json_keys_blacklist,
-            )
-            matched_chunks.extend(reconstructed)
+    allowed_by_title: dict[str, list[str]] = {}
+    for d in allowed_set:
+        title_key = d.split("\n", 1)[0].strip()
+        if title_key:
+            allowed_by_title.setdefault(title_key, []).append(d)
+
+    matched_chunks: list[tuple[ChunkPointer, str]] = []
+    for ptr, txt in added:
+        txt_strip = txt.strip()
+        if txt_strip in allowed_set:
+            matched_chunks.append((ptr, txt))
+            continue
+        if ptr.title:
+            titled = f"{ptr.title.strip()}\n{txt_strip}"
+            if titled in allowed_set:
+                matched_chunks.append((ptr, txt))
+                continue
+        body = txt_strip.split("\n", 1)[1].strip() if "\n" in txt_strip else txt_strip
+        if body and body in allowed_set:
+            matched_chunks.append((ptr, txt))
+            continue
+        if ptr.title and ptr.title.strip() in allowed_by_title:
+            cand_docs = allowed_by_title[ptr.title.strip()]
+            if any(
+                (len(txt_strip) >= 20 and txt_strip in d)
+                or (len(body) >= 20 and body in d)
+                or (len(d) >= 20 and d in txt_strip)
+                for d in cand_docs
+            ):
+                matched_chunks.append((ptr, txt))
+                continue
+        elif any(
+            (len(txt_strip) >= 20 and txt_strip in d)
+            or (len(body) >= 20 and body in d)
+            or (len(d) >= 20 and d in txt_strip)
+            for d in allowed_set
+        ):
+            matched_chunks.append((ptr, txt))
 
     return matched_chunks
 

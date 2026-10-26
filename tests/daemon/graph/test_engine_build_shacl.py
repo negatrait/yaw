@@ -794,3 +794,168 @@ def test_technical_punctuation_and_surface_forms_preserved(tmp_path: Path) -> No
     assert lint_graph_shacl(conn, auto_heal=False) == []
 
 
+def test_cased_literal_objects_and_same_doc_consecutive_chunks_never_produce_false_different_from(
+    tmp_path: Path,
+) -> None:
+    """Verify cased literal objects ('AWS TGW', 'Pricing addendum', 'KMS/region support matrix', 'Diego Morales')
+    and consecutive chunks of the same document ('Priya Nair', 'Ethan Cole', 'Diego Morales') never split into
+    duplicate entities or produce false owl:differentFrom edges."""
+    engine, conn = _make_engine(tmp_path, "test_no_false_diff.db", synonym_callback=lambda _: [])
+
+    doc_path = tmp_path / "meeting.md"
+    doc_path.write_text(
+        "# Architecture & Procurement Sync\n"
+        "Participants: Priya Nair (Helix Procurement), Ethan Cole (Cloud Network Lead), Diego Morales (Security).\n"
+        "Topics: AWS TGW, Pricing addendum, KMS/region support matrix.\n\n"
+        "## Discussion\n"
+        "Priya Nair reviewed the Pricing addendum. Ethan Cole presented AWS TGW route scaling.\n"
+        "Diego Morales verified the KMS/region support matrix.\n",
+        encoding="utf-8",
+    )
+
+    c1 = ChunkPointer(
+        chunk_id="chunk-meet-1",
+        rel_posix_path="meeting.md",
+        start_line=1,
+        end_line=3,
+        title="Architecture & Procurement Sync",
+        ast_island_start=1,
+        ast_island_end=7,
+    )
+    r1 = OpenIERecord(
+        chunk_id="chunk-meet-1",
+        entities=[
+            ("Priya Nair", "Helix Procurement"),
+            ("Ethan Cole", "Cloud Network Lead"),
+            ("Diego Morales", "Security"),
+            ("AWS TGW", "AWS Transit Gateway networking component"),
+            ("Pricing addendum", "Contract pricing document under review"),
+            ("KMS/region support matrix", "Matrix of KMS regional support"),
+        ],
+        triples=[
+            ("AWS TGW", "has topic", "AWS TGW"),
+            ("Pricing addendum", "status", "Pricing addendum"),
+            ("KMS/region support matrix", "documented in", "KMS/region support matrix"),
+        ],
+        structured_triples=[
+            StructuredTriple(
+                subj="AWS TGW",
+                pred="has topic",
+                obj="AWS TGW",
+                obj_kind="literal",
+                obj_datatype="rdfs:Literal",
+                subj_def="AWS Transit Gateway networking component",
+                obj_def="AWS Transit Gateway networking component",
+                spo_def="AWS TGW is a topic in the meeting.",
+            ),
+            StructuredTriple(
+                subj="Pricing addendum",
+                pred="status",
+                obj="Pricing addendum",
+                obj_kind="literal",
+                obj_datatype="rdfs:Literal",
+                subj_def="Contract pricing document under review",
+                obj_def="",
+                spo_def="Pricing addendum is under procurement review.",
+            ),
+            StructuredTriple(
+                subj="KMS/region support matrix",
+                pred="documented in",
+                obj="KMS/region support matrix",
+                obj_kind="literal",
+                obj_datatype="rdfs:Literal",
+                subj_def="Matrix of KMS regional support",
+                obj_def="Matrix of KMS regional support",
+                spo_def="KMS/region support matrix is documented.",
+            ),
+        ],
+    )
+
+    c2 = ChunkPointer(
+        chunk_id="chunk-meet-2",
+        rel_posix_path="meeting.md",
+        start_line=5,
+        end_line=7,
+        title="Discussion",
+        ast_island_start=5,
+        ast_island_end=7,
+    )
+    r2 = OpenIERecord(
+        chunk_id="chunk-meet-2",
+        entities=[
+            ("Priya Nair", "A participant in the meeting."),
+            ("Ethan Cole", "A participant in the meeting."),
+            ("Diego Morales", "A participant in the meeting."),
+            ("Meeting", "Architecture and procurement sync meeting"),
+        ],
+        triples=[
+            ("Meeting", "hasDate", "Diego Morales"),
+            ("Priya Nair", "reviewed", "Pricing addendum"),
+        ],
+        structured_triples=[
+            StructuredTriple(
+                subj="Meeting",
+                pred="hasDate",
+                obj="Diego Morales",
+                obj_kind="literal",
+                obj_datatype="rdfs:Literal",
+                subj_def="Architecture and procurement sync meeting",
+                obj_def="",
+                spo_def="The meeting date is associated with Diego Morales.",
+            ),
+            StructuredTriple(
+                subj="Priya Nair",
+                pred="reviewed",
+                obj="Pricing addendum",
+                obj_kind="entity",
+                subj_def="A participant in the meeting.",
+                obj_def="Contract pricing document under review",
+                spo_def="Priya Nair reviewed the Pricing addendum.",
+            ),
+        ],
+    )
+
+    _index_chunk_with_record(
+        engine,
+        c1,
+        "# Architecture & Procurement Sync\nParticipants: Priya Nair, Ethan Cole, Diego Morales.",
+        r1,
+    )
+    _index_chunk_with_record(
+        engine,
+        c2,
+        "## Discussion\nPriya Nair reviewed the Pricing addendum.",
+        r2,
+    )
+
+    # Every named entity must exist exactly once (no duplicate sense splits)
+    for target_label in (
+        "priya nair",
+        "ethan cole",
+        "diego morales",
+        "aws tgw",
+        "pricing addendum",
+        "kms/region support matrix",
+    ):
+        eids = [
+            str(r[0])
+            for r in conn.execute(
+                "SELECT DISTINCT entity_id FROM entity_labels WHERE label_norm = ?",
+                (target_label,),
+            ).fetchall()
+        ]
+        assert len(eids) == 1, f"Expected 1 entity for {target_label!r}, got {eids}"
+
+    # Verify Priya Nair combined her header role and dialogue role in her definition
+    priya_def = str(
+        conn.execute("SELECT definition FROM entities WHERE name = 'Priya Nair'").fetchone()[0]
+    )
+    assert "Helix Procurement" in priya_def
+    assert "participant in the meeting" in priya_def
+
+    # Zero owl:differentFrom edges in the entire graph
+    diff_edges = conn.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'owl:differentFrom'").fetchall()
+    assert diff_edges == []
+    assert lint_graph_shacl(conn, auto_heal=False) == []
+
+

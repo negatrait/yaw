@@ -187,7 +187,9 @@ Deno/Pyodide WASM) with
         self.rm: YawRM = YawRM(hook=None, program=self, default_k=10)
         self.retriever: YawRetriever = YawRetriever(k=10, rm=self.rm)
         self._node_inspector: Callable[[str], dict[str, Any]] | None = None
+        self._pair_inspector: Callable[[str, str], str] | None = None
         self._chunk_hydrator: Callable[[str], str] | None = None
+        self._ast_island_hydrator: Callable[[str], str] | None = None
         self._shacl_repair_applier: Callable[[Sequence[Mapping[str, Any]]], int] | None = None
         self._shacl_linter: Callable[[], list[dict[str, str]]] | None = None
         self._graph_search_tool: Callable[[str], str] | None = None
@@ -313,14 +315,18 @@ Deno/Pyodide WASM) with
         self,
         *,
         node_inspector: Callable[[str], dict[str, Any]] | None = None,
+        pair_inspector: Callable[[str, str], str] | None = None,
         chunk_hydrator: Callable[[str], str] | None = None,
+        ast_island_hydrator: Callable[[str], str] | None = None,
         shacl_repair_applier: Callable[[Sequence[Mapping[str, Any]]], int] | None = None,
         shacl_linter: Callable[[], list[dict[str, str]]] | None = None,
     ) -> None:
-        """Bind storage tools (`inspect_focus_node`, `hydrate_chunk`, `apply_shacl_repairs`, `lint_shacl`) for the \
-SHACL RLM sandbox."""
+        """Bind storage tools (`inspect_focus_node`, `inspect_pair`, `hydrate_chunk`, `hydrate_ast_island`, \
+`apply_shacl_repairs`, `lint_shacl`) for the SHACL RLM sandbox."""
         self._node_inspector = node_inspector
+        self._pair_inspector = pair_inspector
         self._chunk_hydrator = chunk_hydrator
+        self._ast_island_hydrator = ast_island_hydrator
         self._shacl_repair_applier = shacl_repair_applier
         self._shacl_linter = shacl_linter
 
@@ -336,7 +342,9 @@ SHACL RLM sandbox."""
         target.set_retrieval_hook(self._retrieval_hook)
         target.set_graph_tools(
             node_inspector=self._node_inspector,
+            pair_inspector=self._pair_inspector,
             chunk_hydrator=self._chunk_hydrator,
+            ast_island_hydrator=self._ast_island_hydrator,
             shacl_repair_applier=self._shacl_repair_applier,
             shacl_linter=self._shacl_linter,
         )
@@ -471,7 +479,9 @@ SHACL RLM sandbox."""
             if k in (
                 "_retrieval_hook",
                 "_node_inspector",
+                "_pair_inspector",
                 "_chunk_hydrator",
+                "_ast_island_hydrator",
                 "_shacl_repair_applier",
                 "_shacl_linter",
                 "_graph_search_tool",
@@ -512,19 +522,54 @@ SHACL RLM sandbox."""
             """Propose bounded closed-world SHACL repairs using Qwen GPU GBNF."""
             worker_lm = self._resolve_worker_lm()
             raw = violations if violations is not None else violations_json
+            resolved_context = str(focus_context or "")
+            if not resolved_context.strip() and self._node_inspector is not None and raw:
+                try:
+                    parsed_items = json.loads(raw) if isinstance(raw, str) else list(raw)
+                except json.JSONDecodeError, TypeError:
+                    parsed_items = []
+                seen_fns: list[str] = []
+                for item in parsed_items:
+                    fn = (
+                        str(item.get("focus_node", "")).strip()
+                        if isinstance(item, Mapping)
+                        else str(getattr(item, "focus_node", "")).strip()
+                    )
+                    if fn and fn not in seen_fns:
+                        seen_fns.append(fn)
+                dossiers: list[str] = []
+                for fn in seen_fns[:8]:
+                    info = self._node_inspector(fn)
+                    if isinstance(info, Mapping):
+                        md = str(info.get("markdown_dossier", "")).strip()
+                        if md:
+                            dossiers.append(md)
+                if dossiers:
+                    resolved_context = "\n\n---\n\n".join(dossiers)
             return self.propose_shacl_repairs(
                 raw,
-                focus_context=focus_context,
+                focus_context=resolved_context,
                 mode="direct",
                 lm=worker_lm,
                 use_gbnf=self.enable_gbnf,
             )
 
         def inspect_focus_node(entity_id: str) -> dict[str, Any]:
-            """Inspect focus node labels, definition, semantic edges, facts, and chunk pointers."""
+            """Inspect focus node (`entity-...`, `fact-...`, `entity-a|entity-b`, or `entity-a->entity-b`) labels, \
+definition, semantic edges, reified facts, chunk pointers, and markdown_dossier."""
             if self._node_inspector is None:
                 return {}
             return dict(self._node_inspector(str(entity_id)))
+
+        def inspect_pair(node_a: str, node_b: str) -> str:
+            """Return a structured Markdown + SKOS/RDF/OWL comparison dossier for two entities/literals."""
+            if self._pair_inspector is not None:
+                return str(self._pair_inspector(str(node_a), str(node_b)))
+            if self._node_inspector is not None:
+                info = self._node_inspector(f"{node_a}|{node_b}")
+                if isinstance(info, Mapping):
+                    return str(info.get("markdown_dossier", "")) or json.dumps(dict(info), ensure_ascii=False)
+            return ""
 
         def hydrate_chunk(chunk_id: str) -> str:
             """Hydrate source chunk lines from disk for a given chunk_id."""
@@ -532,9 +577,21 @@ SHACL RLM sandbox."""
                 return ""
             return str(self._chunk_hydrator(str(chunk_id)))
 
+        def hydrate_ast_island(chunk_id: str) -> str:
+            """Hydrate the full enclosing CocoIndex AST island for a given chunk_id."""
+            if self._ast_island_hydrator is not None:
+                return str(self._ast_island_hydrator(str(chunk_id)))
+            return hydrate_chunk(chunk_id)
+
         def read_source_chunk(chunk_id: str) -> str:
             """Hydrate source chunk lines from disk for a given chunk_id."""
             return hydrate_chunk(chunk_id)
+
+        def search_graph(query: str) -> str:
+            """Search the graph for entities and reified facts matching a query string."""
+            if self._graph_search_tool is None:
+                return ""
+            return str(self._graph_search_tool(str(query)))
 
         def apply_shacl_repairs(repairs: Any) -> int:
             """Apply bounded SHACL repair actions to the active in-transaction database connection."""
@@ -552,8 +609,11 @@ SHACL RLM sandbox."""
         return [
             qwen_propose_shacl_repairs,
             inspect_focus_node,
+            inspect_pair,
             hydrate_chunk,
+            hydrate_ast_island,
             read_source_chunk,
+            search_graph,
             apply_shacl_repairs,
             lint_shacl,
         ]

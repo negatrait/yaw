@@ -3,6 +3,7 @@
 import json
 import sqlite3
 from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 from yaw.core import (
@@ -16,23 +17,31 @@ from yaw.core import (
 from .db import YawConnection, batched, write_tx
 from .graph_ops import (
     LABEL_KIND_PRIORITY,
+    get_chunk_pointers,
     get_existing_ids,
     merge_entities,
     upsert_entity_labels,
     upsert_semantic_edges,
 )
+from .hydration import (
+    hydrate_ast_parent_context,
+    hydrate_chunk_pointer,
+    resolve_one_hop_upward_ast_bounds,
+)
 
 
-def inspect_focus_node(
+def _inspect_single_entity_or_fact(
     conn: sqlite3.Connection | YawConnection,
     focus_node: str,
+    corpus_root: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Read-only neighborhood inspection tool for RLM synonym judgment and SHACL healing."""
+    """Inspect a single entity or fact node with resolved neighbor names, reified facts, and AST chunk metadata."""
+    root_path = Path(corpus_root) if corpus_root is not None else None
     ent_row = conn.execute(
         "SELECT entity_id, name, definition FROM entities WHERE entity_id = ? OR name = ? LIMIT 1",
         (focus_node, focus_node),
     ).fetchone()
-    if ent_row is None:
+    if ent_row is None and not focus_node.startswith("fact-"):
         norm_focus = str(text_processing(focus_node)) or focus_node.strip().lower()
         if norm_focus:
             ent_row = conn.execute(
@@ -71,6 +80,35 @@ def inspect_focus_node(
         )
     ]
 
+    raw_fact_rows = conn.execute(
+        """
+        SELECT
+            fact_id,
+            subj_id,
+            pred,
+            obj_id,
+            raw_triple_json,
+            definition,
+            COALESCE(obj_kind, 'entity'),
+            obj_literal_lex,
+            COALESCE(obj_datatype, ''),
+            COALESCE(obj_lang, '')
+        FROM facts
+        WHERE fact_id = ? OR subj_id = ? OR obj_id = ?
+        """,
+        (focus_node, eid, eid),
+    ).fetchall()
+
+    fact_ids = [str(r[0]) for r in raw_fact_rows]
+    fact_chunks_map: dict[str, list[str]] = {}
+    if fact_ids:
+        placeholders = ",".join("?" for _ in fact_ids)
+        for fr in conn.execute(
+            f"SELECT fact_id, chunk_id FROM fact_sources WHERE fact_id IN ({placeholders}) ORDER BY chunk_id ASC",
+            fact_ids,
+        ):
+            fact_chunks_map.setdefault(str(fr[0]), []).append(str(fr[1]))
+
     facts = [
         {
             "fact_id": str(r[0]),
@@ -80,42 +118,52 @@ def inspect_focus_node(
             "raw_triple": json.loads(r[4]),
             "definition": str(r[5]),
             "obj_kind": str(r[6]),
+            "property_type": "owl:DatatypeProperty" if str(r[6]) == "literal" else "owl:ObjectProperty",
             "obj_literal_lex": str(r[7]) if r[7] is not None else "",
             "obj_datatype": str(r[8]),
             "obj_lang": str(r[9]),
+            "chunk_ids": fact_chunks_map.get(str(r[0]), []),
         }
-        for r in conn.execute(
-            """
-            SELECT
-                fact_id,
-                subj_id,
-                pred,
-                obj_id,
-                raw_triple_json,
-                definition,
-                COALESCE(obj_kind, 'entity'),
-                obj_literal_lex,
-                COALESCE(obj_datatype, ''),
-                COALESCE(obj_lang, '')
-            FROM facts
-            WHERE fact_id = ? OR subj_id = ? OR obj_id = ?
-            """,
-            (focus_node, eid, eid),
-        )
+        for r in raw_fact_rows
     ]
 
-    edges = [
-        {
-            "src_id": str(r[0]),
-            "dst_id": str(r[1]),
-            "kind": str(r[2]),
-            "weight": float(r[3]),
-        }
-        for r in conn.execute(
-            "SELECT src_id, dst_id, kind, weight FROM edges WHERE src_id IN (?, ?) OR dst_id IN (?, ?)",
-            (focus_node, eid, focus_node, eid),
+    raw_edges = conn.execute(
+        "SELECT src_id, dst_id, kind, weight FROM edges WHERE src_id IN (?, ?) OR dst_id IN (?, ?)",
+        (focus_node, eid, focus_node, eid),
+    ).fetchall()
+
+    neighbor_ids = {
+        str(other)
+        for r in raw_edges
+        for other in (r[0], r[1])
+        if str(other) not in (focus_node, eid) and str(other).startswith("entity-")
+    }
+    neighbor_meta: dict[str, tuple[str, str]] = {}
+    if neighbor_ids:
+        n_list = sorted(neighbor_ids)
+        placeholders = ",".join("?" for _ in n_list)
+        for nr in conn.execute(
+            f"SELECT entity_id, name, definition FROM entities WHERE entity_id IN ({placeholders})",
+            n_list,
+        ):
+            neighbor_meta[str(nr[0])] = (str(nr[1]), str(nr[2]))
+
+    edges = []
+    for r in raw_edges:
+        s_id, d_id, k_str, w_val = str(r[0]), str(r[1]), str(r[2]), float(r[3])
+        other_id = d_id if s_id in (focus_node, eid) else s_id
+        other_name, other_def = neighbor_meta.get(other_id, ("", ""))
+        edges.append(
+            {
+                "src_id": s_id,
+                "dst_id": d_id,
+                "kind": k_str,
+                "weight": w_val,
+                "neighbor_id": other_id,
+                "neighbor_name": other_name,
+                "neighbor_definition": other_def,
+            }
         )
-    ]
 
     chunk_ids_set: set[str] = {
         item["chunk_id"] for item in labels if item["chunk_id"] and not item["chunk_id"].startswith("__")
@@ -125,19 +173,37 @@ def inspect_focus_node(
         (focus_node, eid, focus_node, eid),
     ):
         chunk_ids_set.add(str(r[0]))
-    for r in conn.execute(
-        """
-        SELECT DISTINCT fs.chunk_id
-        FROM fact_sources fs
-        INNER JOIN facts f ON f.fact_id = fs.fact_id
-        WHERE f.fact_id = ? OR f.subj_id = ? OR f.obj_id = ?
-        """,
-        (focus_node, eid, eid),
-    ):
-        chunk_ids_set.add(str(r[0]))
+    for f_cids in fact_chunks_map.values():
+        chunk_ids_set.update(f_cids)
     for e in edges:
         if e["kind"] == "passage" and e["dst_id"] == eid:
             chunk_ids_set.add(str(e["src_id"]))
+
+    sorted_cids = sorted(c for c in chunk_ids_set if c and not c.startswith("__"))
+    chunk_pointers = get_chunk_pointers(conn, sorted_cids) if sorted_cids else {}
+    chunks_meta: list[dict[str, Any]] = []
+    for cid in sorted_cids:
+        ptr = chunk_pointers.get(cid)
+        if ptr is not None:
+            parent_s, parent_e, parent_title = (
+                resolve_one_hop_upward_ast_bounds(root_path / ptr.rel_posix_path, ptr)
+                if root_path is not None
+                else (ptr.ast_island_start, ptr.ast_island_end, ptr.title)
+            )
+            chunks_meta.append(
+                {
+                    "chunk_id": cid,
+                    "rel_posix_path": ptr.rel_posix_path,
+                    "title": ptr.title,
+                    "start_line": ptr.start_line,
+                    "end_line": ptr.end_line,
+                    "ast_island_start": ptr.ast_island_start,
+                    "ast_island_end": ptr.ast_island_end,
+                    "parent_ast_start": parent_s,
+                    "parent_ast_end": parent_e,
+                    "parent_ast_title": parent_title,
+                }
+            )
 
     return {
         "focus_node": focus_node,
@@ -145,8 +211,310 @@ def inspect_focus_node(
         "labels": labels,
         "facts": facts,
         "edges": edges,
-        "chunk_ids": sorted(chunk_ids_set),
+        "chunk_ids": sorted_cids,
+        "chunks_meta": chunks_meta,
     }
+
+
+def format_entity_skos_markdown(
+    conn: sqlite3.Connection | YawConnection,
+    entity_id: str,
+    corpus_root: Path | str | None = None,
+    *,
+    heading_prefix: str = "## Entity",
+    ast_context_hops: int = 0,
+    max_facts: int = 6,
+    max_chunks: int = 2,
+    max_chunk_chars: int = 900,
+    info: dict[str, Any] | None = None,
+) -> str:
+    """Format an entity or literal node's SKOS/RDF/OWL profile, reified facts, and source chunks."""
+    node_info = info if info is not None else _inspect_single_entity_or_fact(conn, entity_id, corpus_root)
+    ent = node_info.get("entity") or {"entity_id": entity_id, "name": entity_id, "definition": ""}
+    eid = str(ent.get("entity_id", entity_id))
+    ename = str(ent.get("name", eid))
+    edef = str(ent.get("definition", "")).strip()
+    labels: list[dict[str, str]] = list(node_info.get("labels") or [])
+    facts: list[dict[str, Any]] = list(node_info.get("facts") or [])
+    edges: list[dict[str, Any]] = list(node_info.get("edges") or [])
+    chunks_meta: list[dict[str, Any]] = list(node_info.get("chunks_meta") or [])
+
+    pref_labels = sorted(
+        {
+            f'"{it["raw_label"]}" (norm: "{it["label_norm"]}")'
+            for it in labels
+            if it["label_kind"] == "skos:prefLabel"
+        }
+    )
+    alt_labels = sorted({f'"{it["raw_label"]}"' for it in labels if it["label_kind"] == "skos:altLabel"})
+    hidden_labels = sorted({f'"{it["raw_label"]}"' for it in labels if it["label_kind"] == "skos:hiddenLabel"})
+
+    is_subj_or_ent_obj = any(
+        f["subj_id"] == eid or (f["obj_id"] == eid and f.get("obj_kind", "entity") == "entity") for f in facts
+    )
+    lit_facts_as_obj = [f for f in facts if f["obj_id"] == eid and f.get("obj_kind") == "literal"]
+    is_literal_node = bool(lit_facts_as_obj and not is_subj_or_ent_obj)
+    lit_datatypes = sorted(
+        {str(f.get("obj_datatype") or "rdfs:Literal") for f in lit_facts_as_obj if f.get("obj_datatype")}
+    )
+    lit_langs = sorted({str(f.get("obj_lang")) for f in lit_facts_as_obj if f.get("obj_lang")})
+
+    broader_targets: list[str] = []
+    narrower_sources: list[str] = []
+    related_neighbors: list[str] = []
+    diff_neighbors: list[str] = []
+    seen_sem: set[tuple[str, str]] = set()
+    for e in edges:
+        k = str(e.get("kind", ""))
+        n_id = str(e.get("neighbor_id", ""))
+        n_name = str(e.get("neighbor_name", "")) or n_id
+        n_def = str(e.get("neighbor_definition", "")).strip()
+        if not n_id or (k, n_id) in seen_sem:
+            continue
+        if k == "skos:broader":
+            if e["src_id"] == eid:
+                seen_sem.add(("broader", n_id))
+                broader_targets.append(f'"{n_name}" ({n_id})')
+            elif e["dst_id"] == eid:
+                seen_sem.add(("narrower", n_id))
+                narrower_sources.append(f'"{n_name}" ({n_id})')
+        elif k == "skos:related" and e["src_id"] == eid:
+            seen_sem.add(("related", n_id))
+            related_neighbors.append(f'"{n_name}" ({n_id})')
+        elif k == "owl:differentFrom" and e["src_id"] == eid:
+            seen_sem.add(("diff", n_id))
+            short_def = f" — {n_def[:80]}" if n_def else ""
+            diff_neighbors.append(f'"{n_name}{short_def}" ({n_id})')
+
+    lines: list[str] = [f"{heading_prefix}: `{ename}` (`{eid}`)"]
+    lines.append("### SKOS / RDF / OWL Profile")
+    lines.append("```turtle")
+    if is_literal_node:
+        dt_str = ", ".join(lit_datatypes) if lit_datatypes else "rdfs:Literal"
+        lang_str = f" @{','.join(lit_langs)}" if lit_langs else ""
+        lines.append(f"a rdfs:Literal ; # datatype: {dt_str}{lang_str}")
+    else:
+        lines.append("a skos:Concept ;")
+    if pref_labels:
+        lines.append(f"skos:prefLabel {', '.join(pref_labels[:4])} ;")
+    else:
+        lines.append(f'skos:prefLabel "{ename}" ;')
+    if alt_labels:
+        lines.append(f"skos:altLabel {', '.join(alt_labels[:8])} ;")
+    if hidden_labels:
+        lines.append(f"skos:hiddenLabel {', '.join(hidden_labels[:6])} ;")
+    if broader_targets:
+        lines.append(f"skos:broader {', '.join(broader_targets[:5])} ;")
+    if narrower_sources:
+        lines.append(f"skos:narrower {', '.join(narrower_sources[:5])} ;")
+    if related_neighbors:
+        lines.append(f"skos:related {', '.join(related_neighbors[:6])} ;")
+    if diff_neighbors:
+        lines.append(f"owl:differentFrom {', '.join(diff_neighbors[:5])} ;")
+    escaped_def = edef.replace('"', '\\"') if edef else "(empty)"
+    lines.append(f'skos:definition "{escaped_def}" .')
+    lines.append("```")
+
+    lines.append("### Reified Facts (`rdf:Statement`)")
+    if facts:
+        for f in facts[:max_facts]:
+            rt = f.get("raw_triple") or [f["subj_id"], f["pred"], f["obj_id"] or f["obj_literal_lex"]]
+            s_str = str(rt[0]) if len(rt) > 0 else f["subj_id"]
+            p_str = str(rt[1]) if len(rt) > 1 else f["pred"]
+            o_str = str(rt[2]) if len(rt) > 2 else (f["obj_literal_lex"] or f["obj_id"])
+            prop_type = f.get("property_type", "owl:ObjectProperty")
+            if f.get("obj_kind") == "literal":
+                dt = f.get("obj_datatype") or "rdfs:Literal"
+                lg = f"@{f['obj_lang']}" if f.get("obj_lang") else ""
+                o_fmt = f'"{o_str}"^^{dt}{lg}'
+            else:
+                o_fmt = f"`{o_str}`"
+            f_def = str(f.get("definition", "")).strip()
+            lines.append(f"- (`{s_str}`, `{p_str}` [{prop_type}], {o_fmt}) — *{f_def or 'No fact definition.'}*")
+    else:
+        lines.append("- *(No reified facts attached)*")
+
+    lines.append(
+        f"### Source Chunks ({ast_context_hops}-Hop AST Context)" if ast_context_hops > 0 else "### Source Chunks"
+    )
+    root_path = Path(corpus_root) if corpus_root is not None else None
+    if chunks_meta:
+        ptrs_map = get_chunk_pointers(conn, [cm["chunk_id"] for cm in chunks_meta[:max_chunks]])
+        for cm in chunks_meta[:max_chunks]:
+            cid = cm["chunk_id"]
+            lines.append(
+                f"- **Document `{cm['rel_posix_path']}` | AST Section `{cm['title'] or '(root)'}` "
+                f"(Chunk Lines {cm['start_line']}–{cm['end_line']}, "
+                f"AST Island {cm['ast_island_start']}–{cm['ast_island_end']})** [`{cid}`]:"
+            )
+            ptr = ptrs_map.get(cid)
+            hydrated_body = ""
+            parent_header = ""
+            if ptr is not None and root_path is not None:
+                if ast_context_hops > 0:
+                    parent_header = hydrate_ast_parent_context(
+                        ptr,
+                        root_path,
+                        hops=ast_context_hops,
+                        max_chars=max_chunk_chars // 2,
+                    )
+                hp = hydrate_chunk_pointer(ptr, root_path, max_chars=max_chunk_chars)
+                if not hp.stale_on_disk and hp.text:
+                    hydrated_body = hp.text.strip()
+            if parent_header:
+                indented_parent = "\n".join(f"  > [AST Parent Header] {ln}" for ln in parent_header.splitlines()[:6])
+                lines.append(indented_parent)
+            if hydrated_body:
+                indented_body = "\n".join(f"  > {ln}" for ln in hydrated_body.splitlines()[:14])
+                lines.append(indented_body)
+    elif node_info.get("chunk_ids"):
+        lines.append(f"- Chunk IDs: {', '.join(node_info['chunk_ids'][:max_chunks])}")
+    else:
+        lines.append("- *(No source chunks recorded)*")
+
+    return "\n".join(lines)
+
+
+def format_pair_disambiguation_dossier(
+    conn: sqlite3.Connection | YawConnection,
+    entity_a: str,
+    entity_b: str,
+    corpus_root: Path | str | None = None,
+    *,
+    ast_context_hops: int = 0,
+    dense_sim: float | None = None,
+    lexical_sim: float | None = None,
+    max_chunk_chars: int = 900,
+    info_a: dict[str, Any] | None = None,
+    info_b: dict[str, Any] | None = None,
+) -> str:
+    """Build a structured Markdown + SKOS/RDF/OWL comparison dossier for a candidate entity/literal pair."""
+    ia = info_a if info_a is not None else _inspect_single_entity_or_fact(conn, entity_a, corpus_root)
+    ib = info_b if info_b is not None else _inspect_single_entity_or_fact(conn, entity_b, corpus_root)
+
+    docs_a = {cm["rel_posix_path"] for cm in ia.get("chunks_meta") or [] if cm.get("rel_posix_path")}
+    docs_b = {cm["rel_posix_path"] for cm in ib.get("chunks_meta") or [] if cm.get("rel_posix_path")}
+    shared_docs = sorted(docs_a & docs_b)
+
+    islands_a = {
+        (cm["rel_posix_path"], cm["parent_ast_start"], cm["parent_ast_end"])
+        for cm in ia.get("chunks_meta") or []
+        if cm.get("rel_posix_path")
+    }
+    islands_b = {
+        (cm["rel_posix_path"], cm["parent_ast_start"], cm["parent_ast_end"])
+        for cm in ib.get("chunks_meta") or []
+        if cm.get("rel_posix_path")
+    }
+    shared_islands = sorted(islands_a & islands_b)
+
+    direct_facts = [
+        f
+        for f in ia.get("facts") or []
+        if (f["subj_id"] == entity_a and f["obj_id"] == entity_b)
+        or (f["subj_id"] == entity_b and f["obj_id"] == entity_a)
+    ]
+
+    header_lines = [f"# Candidate Pair `{entity_a}|{entity_b}`"]
+    sim_parts: list[str] = []
+    if dense_sim is not None:
+        sim_parts.append(f"dense=`{dense_sim:.3f}`")
+    if lexical_sim is not None:
+        sim_parts.append(f"lexical=`{lexical_sim:.3f}`")
+    if sim_parts:
+        header_lines.append(f"- **Similarity**: {', '.join(sim_parts)}")
+    if shared_islands:
+        isl_str = ", ".join(f"`{p}` (AST lines {s}–{e})" for p, s, e in shared_islands[:2])
+        header_lines.append(f"- **Shared AST Island / Document**: `YES` ({isl_str})")
+    elif shared_docs:
+        header_lines.append(f"- **Shared Document**: `YES` ({', '.join(f'`{d}`' for d in shared_docs[:2])})")
+    else:
+        header_lines.append("- **Shared Document / AST Island**: `NO` (disjoint source documents)")
+    if direct_facts:
+        df_str = "; ".join(f"`{f.get('raw_triple')}`" for f in direct_facts[:2])
+        header_lines.append(f"- **Direct Fact Link Between A and B**: `YES` ({df_str})")
+
+    sec_a = format_entity_skos_markdown(
+        conn,
+        entity_a,
+        corpus_root,
+        heading_prefix="## Entity A",
+        ast_context_hops=ast_context_hops,
+        max_chunk_chars=max_chunk_chars,
+        info=ia,
+    )
+    sec_b = format_entity_skos_markdown(
+        conn,
+        entity_b,
+        corpus_root,
+        heading_prefix="## Entity B",
+        ast_context_hops=ast_context_hops,
+        max_chunk_chars=max_chunk_chars,
+        info=ib,
+    )
+    return "\n".join(header_lines) + "\n\n" + sec_a + "\n\n" + sec_b
+
+
+def inspect_focus_node(
+    conn: sqlite3.Connection | YawConnection,
+    focus_node: str,
+    corpus_root: Path | str | None = None,
+    *,
+    ast_context_hops: int = 0,
+) -> dict[str, Any]:
+    """Read-only neighborhood inspection tool for RLM synonym judgment and SHACL healing.
+
+    Supports single entity IDs (`entity-...`), fact IDs (`fact-...`), and pair/edge focus nodes
+    (`entity-a|entity-b` or `entity-a->entity-b`).
+    """
+    clean_focus = str(focus_node or "").strip()
+    sep = "|" if "|" in clean_focus else ("->" if "->" in clean_focus else None)
+    if sep is not None:
+        parts = [p.strip() for p in clean_focus.split(sep, 1)]
+        if len(parts) == 2 and parts[0] and parts[1]:
+            node_a, node_b = parts[0], parts[1]
+            info_a = _inspect_single_entity_or_fact(conn, node_a, corpus_root)
+            info_b = _inspect_single_entity_or_fact(conn, node_b, corpus_root)
+            dossier = format_pair_disambiguation_dossier(
+                conn,
+                node_a,
+                node_b,
+                corpus_root,
+                ast_context_hops=ast_context_hops,
+                info_a=info_a,
+                info_b=info_b,
+            )
+            docs_a = {cm["rel_posix_path"] for cm in info_a.get("chunks_meta") or [] if cm.get("rel_posix_path")}
+            docs_b = {cm["rel_posix_path"] for cm in info_b.get("chunks_meta") or [] if cm.get("rel_posix_path")}
+            return {
+                "focus_node": clean_focus,
+                "focus_kind": "pair",
+                "entity": info_a.get("entity"),
+                "partner_entity": info_b.get("entity"),
+                "node_a": info_a,
+                "node_b": info_b,
+                "shared_documents": sorted(docs_a & docs_b),
+                "labels": [*info_a.get("labels", []), *info_b.get("labels", [])],
+                "facts": [*info_a.get("facts", []), *info_b.get("facts", [])],
+                "edges": [*info_a.get("edges", []), *info_b.get("edges", [])],
+                "chunk_ids": sorted(set(info_a.get("chunk_ids", [])) | set(info_b.get("chunk_ids", []))),
+                "markdown_dossier": dossier,
+            }
+
+    single = _inspect_single_entity_or_fact(conn, clean_focus, corpus_root)
+    if single.get("entity") is not None:
+        single["focus_kind"] = "entity"
+        single["markdown_dossier"] = format_entity_skos_markdown(
+            conn,
+            str(single["entity"]["entity_id"]),
+            corpus_root,
+            heading_prefix="## Focus Entity",
+            ast_context_hops=ast_context_hops,
+            info=single,
+        )
+    else:
+        single["focus_kind"] = "fact" if clean_focus.startswith("fact-") else "unknown"
+    return single
 
 
 def _scan_shacl_violations(conn: sqlite3.Connection | YawConnection) -> list[SHACLViolation]:
@@ -251,34 +619,62 @@ def _scan_shacl_violations(conn: sqlite3.Connection | YawConnection) -> list[SHA
                 )
             )
 
-    # 4. ConceptShape/homographDifferentFrom: Distinct entities sharing a skos:prefLabel norm must have
-    # owl:differentFrom
+    # 4. ConceptShape/homographDifferentFrom: Distinct entities sharing a skos:prefLabel norm must either have
+    # distinct definitions with owl:differentFrom, or be merged if their definitions are identical.
     for row in conn.execute(
         """
-        SELECT a.entity_id, b.entity_id, a.label_norm
+        SELECT a.entity_id, b.entity_id, a.label_norm,
+               LOWER(TRIM(COALESCE(ea.definition, ''))) AS def_a,
+               LOWER(TRIM(COALESCE(eb.definition, ''))) AS def_b,
+               EXISTS (
+                   SELECT 1 FROM edges e
+                   WHERE e.src_id = a.entity_id
+                     AND e.dst_id = b.entity_id
+                     AND e.kind = 'owl:differentFrom'
+               ) AS has_diff_edge
         FROM entity_labels a
         INNER JOIN entity_labels b
           ON a.label_norm = b.label_norm
          AND a.label_kind = 'skos:prefLabel'
          AND b.label_kind = 'skos:prefLabel'
          AND a.entity_id < b.entity_id
+        INNER JOIN entities ea ON ea.entity_id = a.entity_id
+        INNER JOIN entities eb ON eb.entity_id = b.entity_id
         WHERE NOT EXISTS (
             SELECT 1 FROM edges e
             WHERE e.src_id = a.entity_id
               AND e.dst_id = b.entity_id
               AND e.kind = 'owl:differentFrom'
         )
+        OR (
+            LOWER(TRIM(COALESCE(ea.definition, ''))) != ''
+            AND LOWER(TRIM(COALESCE(ea.definition, ''))) = LOWER(TRIM(COALESCE(eb.definition, '')))
+        )
         GROUP BY a.entity_id, b.entity_id, a.label_norm
         ORDER BY a.entity_id ASC, b.entity_id ASC
         """
     ):
-        ea, eb, lnorm = str(row[0]), str(row[1]), str(row[2])
+        ea, eb, lnorm, def_a, def_b, has_diff = (
+            str(row[0]),
+            str(row[1]),
+            str(row[2]),
+            str(row[3]),
+            str(row[4]),
+            bool(row[5]),
+        )
+        if def_a and def_a == def_b and has_diff:
+            msg = (
+                f"Duplicate concepts {ea} and {eb} share prefLabel {lnorm!r} and identical definition "
+                "but are separated by owl:differentFrom instead of being merged."
+            )
+        else:
+            msg = f"Homograph concepts {ea} and {eb} share prefLabel {lnorm!r} without owl:differentFrom."
         violations.append(
             SHACLViolation(
                 shape="ConceptShape/homographDifferentFrom",
                 focus_node=f"{ea}|{eb}",
                 result_path="owl:differentFrom",
-                message=f"Homograph concepts {ea} and {eb} share prefLabel {lnorm!r} without owl:differentFrom.",
+                message=msg,
             )
         )
 
@@ -649,6 +1045,7 @@ def lint_graph_shacl(
     *,
     auto_heal: bool = False,
     heal_definitions: bool = True,
+    heal_homographs: bool = True,
 ) -> list[SHACLViolation]:
     """Run closed-world SQL SHACL validation shapes over yaw.db and optionally apply deterministic SQL repairs."""
     violations = _scan_shacl_violations(conn)
@@ -799,7 +1196,9 @@ def lint_graph_shacl(
                 )
 
         # Heal 3: ConceptShape/homographDifferentFrom
-        homographs = conn.execute(
+        # 3a. Identical-definition duplicates sharing skos:prefLabel are NEVER homographs;
+        # deterministically collapse them via merge_entities even before RLM healing.
+        identical_def_clones = conn.execute(
             """
             SELECT a.entity_id, b.entity_id
             FROM entity_labels a
@@ -808,20 +1207,53 @@ def lint_graph_shacl(
              AND a.label_kind = 'skos:prefLabel'
              AND b.label_kind = 'skos:prefLabel'
              AND a.entity_id < b.entity_id
-            WHERE NOT EXISTS (
-                SELECT 1 FROM edges e
-                WHERE e.src_id = a.entity_id
-                  AND e.dst_id = b.entity_id
-                  AND e.kind = 'owl:differentFrom'
-            )
+            INNER JOIN entities ea ON ea.entity_id = a.entity_id
+            INNER JOIN entities eb ON eb.entity_id = b.entity_id
+            WHERE LOWER(TRIM(COALESCE(ea.definition, ''))) != ''
+              AND LOWER(TRIM(COALESCE(ea.definition, ''))) = LOWER(TRIM(COALESCE(eb.definition, '')))
             GROUP BY a.entity_id, b.entity_id
+            ORDER BY a.entity_id ASC, b.entity_id ASC
             """
         ).fetchall()
-        if homographs:
-            upsert_semantic_edges(
-                conn,
-                [(str(r[0]), str(r[1]), "owl:differentFrom", 0.0) for r in homographs],
-            )
+        merged_clone_map: dict[str, str] = {}
+        for r in identical_def_clones:
+            dst_eid = str(r[0])
+            src_eid = str(r[1])
+            while dst_eid in merged_clone_map:
+                dst_eid = merged_clone_map[dst_eid]
+            while src_eid in merged_clone_map:
+                src_eid = merged_clone_map[src_eid]
+            if dst_eid != src_eid:
+                merge_entities(conn, src_eid, dst_eid, label_kind="skos:altLabel")
+                merged_clone_map[src_eid] = dst_eid
+
+        # 3b. Only stamp fallback owl:differentFrom on distinct-definition homographs when
+        # heal_homographs=True (post-RLM safety pass). In the pre-RLM pass (heal_homographs=False),
+        # leave ambiguous homographs open so shacl_healer_rlm can inspect their AST dossiers.
+        if heal_homographs:
+            homographs = conn.execute(
+                """
+                SELECT a.entity_id, b.entity_id
+                FROM entity_labels a
+                INNER JOIN entity_labels b
+                  ON a.label_norm = b.label_norm
+                 AND a.label_kind = 'skos:prefLabel'
+                 AND b.label_kind = 'skos:prefLabel'
+                 AND a.entity_id < b.entity_id
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM edges e
+                    WHERE e.src_id = a.entity_id
+                      AND e.dst_id = b.entity_id
+                      AND e.kind = 'owl:differentFrom'
+                )
+                GROUP BY a.entity_id, b.entity_id
+                """
+            ).fetchall()
+            if homographs:
+                upsert_semantic_edges(
+                    conn,
+                    [(str(r[0]), str(r[1]), "owl:differentFrom", 0.0) for r in homographs],
+                )
 
         # Heal 4: ConceptShape/definition
         if heal_definitions:
