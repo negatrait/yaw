@@ -1,11 +1,13 @@
 """1-Indexed disk line hydration with CocoIndex AST island bounds and graceful context dehydration."""
 
 import json
+import re
 import sqlite3
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from cocoindex._internal import core as _coco_core
 from cocoindex.ops.code import CodeSource
 from cocoindex.ops.text import RecursiveSplitter, detect_code_language
 
@@ -70,6 +72,10 @@ class CoalescedSpan:
     hit_chunk_ids: tuple[str, ...]
 
 
+def _is_json_corpus_path(rel_posix_path: str) -> bool:
+    return rel_posix_path.lower().endswith((".json", ".jsonl", ".ndjson"))
+
+
 def coalesce_spans(spans: Sequence[MutableSpan]) -> list[CoalescedSpan]:
     """Merge overlapping or contiguous line spans within each file so no line is duplicated."""
     if not spans:
@@ -81,6 +87,7 @@ def coalesce_spans(spans: Sequence[MutableSpan]) -> list[CoalescedSpan]:
 
     coalesced: list[CoalescedSpan] = []
     for rel_path, file_spans in by_file.items():
+        is_json_file = _is_json_corpus_path(rel_path)
         sorted_spans = sorted(file_spans, key=lambda s: (s.start_line, -s.end_line))
         cur = sorted_spans[0]
         cur_s, cur_e = cur.start_line, cur.end_line
@@ -91,19 +98,21 @@ def coalesce_spans(spans: Sequence[MutableSpan]) -> list[CoalescedSpan]:
         cur_ast_e = cur.ast_island_end
 
         for nxt in sorted_spans[1:]:
-            same_title = not cur_title or not nxt.title or cur_title == nxt.title
-            same_ast_island = (
-                cur_ast_s > 0
-                and cur_ast_s == nxt.ast_island_start
-                and cur_ast_e == nxt.ast_island_end
-            )
-            in_same_island = (
-                (cur_ast_s == 0 or nxt.ast_island_start == 0 or cur_ast_s == nxt.ast_island_start)
-                and (cur_ast_e == 0 or nxt.start_line <= cur_ast_e)
-                and (nxt.ast_island_start == 0 or cur_e >= nxt.ast_island_start - 1)
-            )
-            is_contiguous = nxt.start_line <= cur_e + 1
-            if same_title and (same_ast_island or (in_same_island and is_contiguous)):
+            if is_json_file:
+                should_merge = cur_s == nxt.start_line and cur_e == nxt.end_line
+            else:
+                same_title = not cur_title or not nxt.title or cur_title == nxt.title
+                same_ast_island = (
+                    cur_ast_s > 0 and cur_ast_s == nxt.ast_island_start and cur_ast_e == nxt.ast_island_end
+                )
+                in_same_island = (
+                    (cur_ast_s == 0 or nxt.ast_island_start == 0 or cur_ast_s == nxt.ast_island_start)
+                    and (cur_ast_e == 0 or nxt.start_line <= cur_ast_e)
+                    and (nxt.ast_island_start == 0 or cur_e >= nxt.ast_island_start - 1)
+                )
+                is_contiguous = nxt.start_line <= cur_e + 1
+                should_merge = same_title and (same_ast_island or (in_same_island and is_contiguous))
+            if should_merge:
                 cur_e = max(cur_e, nxt.end_line)
                 if not cur_title and nxt.title:
                     cur_title = nxt.title
@@ -167,8 +176,7 @@ def normalize_json_passage_text(raw_text: str, default_title: str = "") -> str:
         except Exception:
             return (
                 f"{default_title}\n{stripped}"
-                if default_title
-                and not (stripped.startswith(f"{default_title}\n") or stripped == default_title)
+                if default_title and not (stripped.startswith(f"{default_title}\n") or stripped == default_title)
                 else stripped
             )
 
@@ -273,9 +281,7 @@ def dehydrate_passage_ast(
                 else:
                     break
             if last_valid_end_byte > 0:
-                best_body = (
-                    body_bytes[:last_valid_end_byte].decode("utf-8", errors="replace").rstrip()
-                )
+                best_body = body_bytes[:last_valid_end_byte].decode("utf-8", errors="replace").rstrip()
                 break
 
     if not best_body:
@@ -352,21 +358,17 @@ def hydrate_chunk_pointer(
 ) -> HydratedPassage:
     """Hydrate a 1-indexed [start_line, end_line] AST island from disk, gracefully dehydrating if oversized."""
     if pointer.start_line < 1 or pointer.end_line < pointer.start_line:
-        raise ValueError(
-            f"Invalid line span [{pointer.start_line}, {pointer.end_line}] for chunk {pointer.chunk_id}"
-        )
+        raise ValueError(f"Invalid line span [{pointer.start_line}, {pointer.end_line}] for chunk {pointer.chunk_id}")
     line_count = pointer.end_line - pointer.start_line + 1
     if line_count > _MAX_CHUNK_LINE_SPAN:
-        raise ValueError(
-            f"Line span {line_count} exceeds maximum {_MAX_CHUNK_LINE_SPAN} for chunk {pointer.chunk_id}"
-        )
+        raise ValueError(f"Line span {line_count} exceeds maximum {_MAX_CHUNK_LINE_SPAN} for chunk {pointer.chunk_id}")
 
     target_path = resolve_corpus_path(corpus_root, pointer.rel_posix_path)
     text = read_corpus_lines(target_path, pointer.start_line, pointer.end_line)
     if text is None:
         return HydratedPassage(pointer=pointer, text="", score=score, stale_on_disk=True)
 
-    if pointer.rel_posix_path.lower().endswith((".json", ".jsonl")):
+    if _is_json_corpus_path(pointer.rel_posix_path):
         text = normalize_json_passage_text(text, default_title=pointer.title)
     if max_chars > 0 and len(text) > max_chars:
         text = dehydrate_passage_ast(
@@ -420,12 +422,153 @@ def hydrate_passages(
     return tuple(hydrated)
 
 
+_ATX_HEADING_LEVEL_RE = re.compile(r"^ {0,3}(#{1,6})(?:\s+(.*?))?(?:\s+#+\s*)?$")
+
+
+def resolve_one_hop_upward_ast_bounds(
+    target_path: Path,
+    pointer: ChunkPointer,
+    *,
+    hops: int = 1,
+) -> tuple[int, int, str]:
+    """Expand `hops` levels upwards in the document AST (unless already at the root or `hops <= 0`).
+
+    Returns `(parent_start_line, parent_end_line, parent_heading_title)`.
+    - If `hops <= 0`, returns `(pointer.start_line, pointer.end_line, pointer.title)`.
+    - If `pointer` is already at the root (`start_line <= 1` and `ast_island_start <= 1`),
+      returns `(1, max(end_line, ast_island_end), pointer.title)`.
+    - If `pointer.start_line > pointer.ast_island_start`, 1 hop upwards in the AST is the
+      enclosing AST island `[ast_island_start, ast_island_end]`.
+    - If `pointer.start_line == pointer.ast_island_start > 1`, climbs one level up the
+      CocoIndex Tree-sitter AST frame / Markdown ATX heading hierarchy toward the document root.
+    """
+    if hops <= 0:
+        return pointer.start_line, pointer.end_line, pointer.title
+    if _is_json_corpus_path(pointer.rel_posix_path):
+        ast_s = max(1, pointer.ast_island_start if pointer.ast_island_start > 0 else pointer.start_line)
+        ast_e = max(pointer.end_line, pointer.ast_island_end if pointer.ast_island_end > 0 else pointer.end_line)
+        return min(ast_s, pointer.start_line), max(ast_e, pointer.end_line), pointer.title
+    curr_ptr = pointer
+    parent_s, parent_e, parent_title = pointer.start_line, pointer.end_line, pointer.title
+    for _ in range(hops):
+        ast_s = max(1, curr_ptr.ast_island_start if curr_ptr.ast_island_start > 0 else curr_ptr.start_line)
+        ast_e = max(curr_ptr.end_line, curr_ptr.ast_island_end if curr_ptr.ast_island_end > 0 else curr_ptr.end_line)
+        if curr_ptr.start_line <= 1 and ast_s <= 1:
+            return 1, ast_e, curr_ptr.title
+
+        cached = get_cached_code_source(target_path) if target_path.is_file() else None
+        if cached is None:
+            parent_s = ast_s if curr_ptr.start_line > ast_s else 1
+            return parent_s, ast_e, curr_ptr.title
+
+        _, lines = cached
+        total_lines = len(lines)
+        ast_e = min(total_lines, max(ast_e, curr_ptr.end_line))
+
+        if curr_ptr.start_line > ast_s:
+            h_line = lines[ast_s - 1].strip() if 1 <= ast_s <= total_lines else ""
+            m_h = _ATX_HEADING_LEVEL_RE.match(h_line)
+            p_title = (m_h.group(2) or "").strip() if m_h else (curr_ptr.title or h_line[:80])
+            parent_s, parent_e, parent_title = ast_s, ast_e, p_title
+        else:
+            curr_line_text = lines[ast_s - 1].rstrip("\r\n") if 1 <= ast_s <= total_lines else ""
+            m_curr = _ATX_HEADING_LEVEL_RE.match(curr_line_text)
+            resolved_step = False
+            if m_curr is not None:
+                curr_level = len(m_curr.group(1))
+                for idx in range(ast_s - 2, -1, -1):
+                    m_prev = _ATX_HEADING_LEVEL_RE.match(lines[idx].rstrip("\r\n"))
+                    if m_prev is not None and len(m_prev.group(1)) < curr_level:
+                        parent_s, parent_e, parent_title = idx + 1, ast_e, (m_prev.group(2) or "").strip()
+                        resolved_step = True
+                        break
+                if not resolved_step:
+                    parent_s, parent_e, parent_title = 1, ast_e, curr_ptr.title
+                    resolved_step = True
+
+            if not resolved_step:
+                lang = detect_code_language(filename=curr_ptr.rel_posix_path)
+                if lang is not None:
+                    try:
+                        full_text = "".join(lines)
+                        lang_src = CodeSource(full_text, language=lang)
+                        byte_start = sum(len(line.encode("utf-8")) for line in lines[: ast_s - 1])
+                        byte_end = byte_start + len(lines[ast_s - 1].encode("utf-8"))
+                        view = _coco_core.render_ranges(lang_src._src, [(byte_start, byte_end)])
+                        enclosing_frames = [
+                            seg.start_line
+                            for seg in view.segments
+                            if seg.kind == "frame" and seg.summary is None and seg.start_line < ast_s
+                        ]
+                        if enclosing_frames:
+                            parent_line = max(enclosing_frames)
+                            p_text = lines[parent_line - 1].strip().rstrip("{:").strip()
+                            parent_s, parent_e, parent_title = parent_line, ast_e, p_text or curr_ptr.title
+                            resolved_step = True
+                    except Exception:
+                        pass
+            if not resolved_step:
+                parent_s, parent_e, parent_title = 1, ast_e, curr_ptr.title
+
+        if parent_s <= 1:
+            break
+        curr_ptr = ChunkPointer(
+            chunk_id=curr_ptr.chunk_id,
+            rel_posix_path=curr_ptr.rel_posix_path,
+            start_line=parent_s,
+            end_line=parent_e,
+            title=parent_title,
+            ast_island_start=parent_s,
+            ast_island_end=parent_e,
+        )
+    return parent_s, parent_e, parent_title
+
+
+def hydrate_ast_parent_context(
+    pointer: ChunkPointer,
+    corpus_root: Path,
+    *,
+    hops: int = 0,
+    max_chars: int = 1600,
+) -> str:
+    """Hydrate `hops`-level upward parent AST header/preamble lines preceding `pointer.start_line`.
+
+    Defaults to `hops=0` (returns `""` unless `hops > 0` and `pointer.start_line > 1`).
+    """
+    if hops <= 0 or pointer.start_line <= 1 or _is_json_corpus_path(pointer.rel_posix_path):
+        return ""
+    target_path = resolve_corpus_path(corpus_root, pointer.rel_posix_path)
+    if not target_path.is_file():
+        return ""
+    parent_s, _parent_e, _parent_title = resolve_one_hop_upward_ast_bounds(target_path, pointer, hops=hops)
+    preamble_end = pointer.start_line - 1
+    if preamble_end < parent_s:
+        return ""
+
+    parts: list[str] = []
+    if parent_s > 1:
+        root_end = min(parent_s - 1, 8)
+        root_head = read_corpus_lines(target_path, 1, root_end)
+        if root_head and root_head.strip():
+            parts.append(root_head.strip())
+    parent_head = read_corpus_lines(target_path, parent_s, min(preamble_end, parent_s + 14))
+    if parent_head and parent_head.strip():
+        parts.append(parent_head.strip())
+
+    combined = "\n...\n".join(parts)
+    if not combined:
+        return ""
+    if len(combined) > max_chars:
+        combined = combined[:max_chars].rstrip() + " ..."
+    return combined
+
+
 def make_chunk_hydrator(
     conn: sqlite3.Connection,
     corpus_root: Path,
 ) -> Callable[[str], str]:
     """Create a callable `hydrate_chunk(chunk_id: str) -> str` tool for dspy.RLM passage inspection."""
-    from yaw.daemon.graph.storage.db import get_chunk_pointer
+    from .graph_ops import get_chunk_pointer
 
     def hydrate_chunk(chunk_id: str) -> str:
         pointer = get_chunk_pointer(conn, chunk_id)
@@ -437,6 +580,43 @@ def make_chunk_hydrator(
         return passage.text
 
     return hydrate_chunk
+
+
+def make_ast_island_hydrator(
+    conn: sqlite3.Connection,
+    corpus_root: Path,
+    *,
+    max_chars: int = _DEFAULT_MAX_ISLAND_CHARS,
+) -> Callable[[str], str]:
+    """Create a callable `hydrate_ast_island(chunk_id: str) -> str` expanding 1 hop upwards in the document AST."""
+    from .graph_ops import get_chunk_pointer
+
+    def hydrate_ast_island(chunk_id: str) -> str:
+        pointer = get_chunk_pointer(conn, chunk_id)
+        if pointer is None:
+            return f"Error: Chunk '{chunk_id}' not found in database."
+        target_path = resolve_corpus_path(corpus_root, pointer.rel_posix_path)
+        parent_s, parent_e, parent_title = resolve_one_hop_upward_ast_bounds(target_path, pointer)
+        expanded_ptr = ChunkPointer(
+            chunk_id=pointer.chunk_id,
+            rel_posix_path=pointer.rel_posix_path,
+            start_line=min(parent_s, pointer.start_line),
+            end_line=max(parent_e, pointer.end_line),
+            title=parent_title or pointer.title,
+            ast_island_start=min(parent_s, pointer.ast_island_start or pointer.start_line),
+            ast_island_end=max(parent_e, pointer.ast_island_end or pointer.end_line),
+        )
+        passage = hydrate_chunk_pointer(expanded_ptr, corpus_root, max_chars=max_chars)
+        if passage.stale_on_disk:
+            return f"Error: Chunk '{chunk_id}' file is missing or unreadable on disk."
+        header = (
+            f"# Document: {pointer.rel_posix_path} | AST Section: {expanded_ptr.title or '(root)'} "
+            f"(Lines {expanded_ptr.start_line}–{expanded_ptr.end_line}, "
+            f"Focus Chunk Lines {pointer.start_line}–{pointer.end_line})\n"
+        )
+        return f"{header}{passage.text}"
+
+    return hydrate_ast_island
 
 
 def _hydrate_spans(
@@ -462,15 +642,11 @@ def _hydrate_spans(
         target_path = resolve_corpus_path(corpus_root, span.rel_posix_path)
         text = read_corpus_lines(target_path, span.start_line, span.end_line)
         if text is None:
-            passages.append(
-                HydratedPassage(pointer=ptr, text="", score=span.max_score, stale_on_disk=True)
-            )
+            passages.append(HydratedPassage(pointer=ptr, text="", score=span.max_score, stale_on_disk=True))
             continue
-        if span.rel_posix_path.lower().endswith((".json", ".jsonl")):
+        if _is_json_corpus_path(span.rel_posix_path):
             text = normalize_json_passage_text(text, default_title=span.title)
-        passages.append(
-            HydratedPassage(pointer=ptr, text=text, score=span.max_score, stale_on_disk=False)
-        )
+        passages.append(HydratedPassage(pointer=ptr, text=text, score=span.max_score, stale_on_disk=False))
     return passages
 
 
@@ -484,10 +660,11 @@ def hydrate_budgeted_passages(
     """Hydrate retrieved chunks via greedy priority AST-expansion:
     1. Sort chunks by relevance descending (FIFO queue).
     2. Pick the most relevant remaining chunk.
-    3. Expand ONCE to immediate neighbors (max_expansion_hops=1, non-recursive) respecting AST boundaries if headroom permits.
+    3. Expand ONCE to immediate neighbors (max_expansion_hops=1, non-recursive) respecting AST boundaries \
+if headroom permits.
     4. Deduplicate / coalesce contiguous spans (MaxP score inheritance).
     5. Inviolate Hit Invariant: retrieved hit chunks are never dropped.
-    """
+"""
     if not pointers_with_scores:
         return []
 

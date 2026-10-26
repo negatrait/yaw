@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import os
 import shutil
 import sys
 from datetime import UTC, datetime
@@ -34,6 +35,7 @@ if callable(reconfigure_stdout):
 
 import benchmark  # noqa: E402
 from benchmark import ALIASES, MONKEYPATCHED_HIPPORAG_BASELINES, PAPER_BASELINES  # noqa: E402
+from yaw.daemon.graph.inference import evaluate_benchmark_gate  # noqa: E402
 
 DEFAULT_DATASETS: tuple[str, ...] = (
     "popqa",
@@ -44,8 +46,6 @@ DEFAULT_DATASETS: tuple[str, ...] = (
     "nq",
     "musique",
 )
-
-PER_DATASET_TOLERANCE = -0.02
 
 
 def build_monkeypatched_baseline_report(
@@ -76,9 +76,7 @@ def build_monkeypatched_baseline_report(
                     "Recall@5": float(b.get("Recall@5", 0.0)),
                 },
                 "qa": {
-                    "ExactMatch": float(b["ExactMatch"])
-                    if b.get("ExactMatch") is not None
-                    else None,
+                    "ExactMatch": float(b["ExactMatch"]) if b.get("ExactMatch") is not None else None,
                     "F1": float(b["F1"]) if b.get("F1") is not None else None,
                 },
             },
@@ -124,9 +122,7 @@ def extract_engine_summary(report: dict[str, Any]) -> dict[str, Any]:
             "ExactMatch": round(float(qa["ExactMatch"]), 4)
             if isinstance(qa, dict) and qa.get("ExactMatch") is not None
             else None,
-            "F1": round(float(qa["F1"]), 4)
-            if isinstance(qa, dict) and qa.get("F1") is not None
-            else None,
+            "F1": round(float(qa["F1"]), 4) if isinstance(qa, dict) and qa.get("F1") is not None else None,
         },
         "recognition_memory": {
             "queries_with_graph_seeds": int(rec_mem.get("queries_with_graph_seeds", 0)),
@@ -145,57 +141,49 @@ def compare_engine_reports(
     index_queries: int,
     mode: str = "eval",
 ) -> dict[str, Any]:
-    """Compare Target 1 (Monkeypatched HippoRAG 2) and Target 2 (Paper 70B) against YAW on the same dataset slice."""
-    canonical_ds = ALIASES.get(dataset, dataset)
+    """Compare Target 1 (Monkeypatched HippoRAG 2) and Target 2 (Paper 70B) against YAW via evaluate_benchmark_gate."""
+    cleaned_ds = str(dataset).strip().lower()
+    canonical_ds = ALIASES.get(
+        cleaned_ds,
+        cleaned_ds if cleaned_ds in PAPER_BASELINES or cleaned_ds in MONKEYPATCHED_HIPPORAG_BASELINES else dataset,
+    )
     hippo_sum = extract_engine_summary(hipporag_report)
     yaw_sum = extract_engine_summary(yaw_report)
+    num_docs = yaw_sum["num_docs"] or hippo_sum["num_docs"]
+    num_queries = yaw_sum["num_queries"] or hippo_sum["num_queries"]
 
-    delta_r1 = round(yaw_sum["retrieval"]["Recall@1"] - hippo_sum["retrieval"]["Recall@1"], 4)
-    delta_r2 = round(yaw_sum["retrieval"]["Recall@2"] - hippo_sum["retrieval"]["Recall@2"], 4)
-    delta_r5 = round(yaw_sum["retrieval"]["Recall@5"] - hippo_sum["retrieval"]["Recall@5"], 4)
+    has_em = yaw_sum["qa"]["ExactMatch"] is not None and hippo_sum["qa"]["ExactMatch"] is not None
+    has_f1 = yaw_sum["qa"]["F1"] is not None and hippo_sum["qa"]["F1"] is not None
+    paper_base = PAPER_BASELINES.get(canonical_ds, {})
 
-    hippo_em = hippo_sum["qa"]["ExactMatch"]
-    yaw_em = yaw_sum["qa"]["ExactMatch"]
-    delta_em = (
-        round(float(yaw_em) - float(hippo_em), 4)
-        if yaw_em is not None and hippo_em is not None
-        else None
-    )
-
-    hippo_f1 = hippo_sum["qa"]["F1"]
-    yaw_f1 = yaw_sum["qa"]["F1"]
-    delta_f1 = (
-        round(float(yaw_f1) - float(hippo_f1), 4)
-        if yaw_f1 is not None and hippo_f1 is not None
-        else None
-    )
-
-    paper_h2 = PAPER_BASELINES.get(canonical_ds, {}).get("hipporag2_llama3.3_70b_nvembed_v2", {})
-    paper_r2 = paper_h2.get("Recall@2")
-    paper_r5 = paper_h2.get("Recall@5")
-    paper_em = paper_h2.get("ExactMatch")
-    paper_f1 = paper_h2.get("F1")
-    delta_yaw_vs_paper = {
-        "Recall@2": round(yaw_sum["retrieval"]["Recall@2"] - float(paper_r2), 4)
-        if paper_r2 is not None
-        else None,
-        "Recall@5": round(yaw_sum["retrieval"]["Recall@5"] - float(paper_r5), 4)
-        if paper_r5 is not None
-        else None,
-        "ExactMatch": round(float(yaw_em) - float(paper_em), 4)
-        if yaw_em is not None and paper_em is not None
-        else None,
-        "F1": round(float(yaw_f1) - float(paper_f1), 4)
-        if yaw_f1 is not None and paper_f1 is not None
-        else None,
+    gate_spec = {
+        "queries_per_dataset": num_queries or queries_per_dataset,
+        "aliases": ALIASES,
+        "datasets": {
+            canonical_ds: {
+                "monkeypatched_hipporag": {
+                    **hippo_sum["retrieval"],
+                    "ExactMatch": hippo_sum["qa"]["ExactMatch"],
+                    "F1": hippo_sum["qa"]["F1"],
+                },
+                "paper_70b": paper_base,
+            }
+        },
     }
-
-    if mode == "eval" and delta_f1 is not None:
-        gate_passed = (delta_r5 >= PER_DATASET_TOLERANCE) and (delta_f1 >= PER_DATASET_TOLERANCE)
-        if delta_em is not None:
-            gate_passed = gate_passed and (delta_em >= PER_DATASET_TOLERANCE)
-    else:
-        gate_passed = delta_r5 >= PER_DATASET_TOLERANCE
+    gate_res = evaluate_benchmark_gate(
+        {
+            canonical_ds: {
+                **yaw_sum,
+                "num_docs": num_docs,
+                "num_queries": num_queries or queries_per_dataset,
+            }
+        },
+        gate_spec,
+        mode=mode,
+    )
+    ds_eval = gate_res["datasets"].get(canonical_ds) or next(iter(gate_res["datasets"].values()))
+    raw_delta_hippo = ds_eval["delta_yaw_vs_hipporag"]
+    raw_delta_paper = ds_eval["delta_yaw_vs_paper"]
 
     return {
         "dataset": canonical_ds,
@@ -203,29 +191,28 @@ def compare_engine_reports(
         "mode": mode,
         "queries_per_dataset": queries_per_dataset,
         "index_queries": index_queries,
-        "num_docs": yaw_sum["num_docs"] or hippo_sum["num_docs"],
-        "num_queries": yaw_sum["num_queries"] or hippo_sum["num_queries"],
+        "num_docs": num_docs,
+        "num_queries": num_queries,
         "hipporag": hippo_sum,
         "yaw": yaw_sum,
         "delta_yaw_vs_hipporag": {
-            "Recall@1": delta_r1,
-            "Recall@2": delta_r2,
-            "Recall@5": delta_r5,
-            "ExactMatch": delta_em,
-            "F1": delta_f1,
+            "Recall@1": raw_delta_hippo["Recall@1"],
+            "Recall@2": raw_delta_hippo["Recall@2"],
+            "Recall@5": raw_delta_hippo["Recall@5"],
+            "ExactMatch": raw_delta_hippo["ExactMatch"] if has_em else None,
+            "F1": raw_delta_hippo["F1"] if has_f1 else None,
         },
-        "delta_yaw_vs_paper": delta_yaw_vs_paper,
-        "paper_baselines": PAPER_BASELINES.get(canonical_ds, {}),
-        "gate_passed": bool(gate_passed),
-        "gate_status": "PASS" if gate_passed else "FAIL",
+        "delta_yaw_vs_paper": {
+            "Recall@2": raw_delta_paper["Recall@2"],
+            "Recall@5": raw_delta_paper["Recall@5"],
+            "ExactMatch": raw_delta_paper["ExactMatch"] if yaw_sum["qa"]["ExactMatch"] is not None else None,
+            "F1": raw_delta_paper["F1"] if yaw_sum["qa"]["F1"] is not None else None,
+        },
+        "paper_baselines": paper_base,
+        "confidence": ds_eval["confidence"],
+        "gate_passed": bool(ds_eval["gate_passed"]),
+        "gate_status": ds_eval["gate_status"],
     }
-
-
-def _mean_or_none(values: list[float | None]) -> float | None:
-    valid = [float(v) for v in values if v is not None]
-    if not valid:
-        return None
-    return round(sum(valid) / len(valid), 4)
 
 
 def aggregate_gate_summary(
@@ -233,11 +220,9 @@ def aggregate_gate_summary(
     *,
     mode: str = "eval",
 ) -> dict[str, Any]:
-    """Compute macro-averaged metrics and overall gate status across completed datasets."""
+    """Compute macro-averaged metrics, statistical confidence, and overall gate status via evaluate_benchmark_gate."""
     completed = [
-        entry
-        for entry in dataset_results.values()
-        if isinstance(entry, dict) and entry.get("status") == "completed"
+        entry for entry in dataset_results.values() if isinstance(entry, dict) and entry.get("status") == "completed"
     ]
     if not completed:
         return {
@@ -247,6 +232,7 @@ def aggregate_gate_summary(
             "yaw_mean": {},
             "dpr_mean": {},
             "delta_mean": {},
+            "confidence": {},
             "mean_recall5_parity": False,
             "mean_f1_parity": False,
             "all_datasets_within_tolerance": False,
@@ -254,34 +240,74 @@ def aggregate_gate_summary(
             "overall_gate_status": "INCOMPLETE",
         }
 
+    reports: dict[str, dict[str, Any]] = {}
+    spec_datasets: dict[str, dict[str, Any]] = {}
+    for idx, d in enumerate(completed):
+        ds_name = str(d.get("dataset") or f"ds_{idx}")
+        h = d.get("hipporag", {})
+        y = d.get("yaw", {})
+        h_ret = h.get("retrieval", {})
+        h_qa = h.get("qa", {})
+        y_ret = y.get("retrieval", {})
+        y_qa = y.get("qa", {})
+        spec_datasets[ds_name] = {
+            "monkeypatched_hipporag": {
+                "Recall@1": h_ret.get("Recall@1", 0.0),
+                "Recall@2": h_ret.get("Recall@2", 0.0),
+                "Recall@5": h_ret.get("Recall@5", 0.0),
+                "ExactMatch": h_qa.get("ExactMatch"),
+                "F1": h_qa.get("F1"),
+            },
+            "paper_70b": d.get("paper_baselines") or PAPER_BASELINES.get(ds_name, {}),
+        }
+        reports[ds_name] = {
+            "num_queries": d.get("num_queries") or d.get("queries_per_dataset") or 25,
+            "num_docs": d.get("num_docs", 0),
+            "retrieval": y_ret,
+            "qa": {"ExactMatch": y_qa.get("ExactMatch"), "F1": y_qa.get("F1")},
+            "standard_dpr": y.get("standard_dpr", {}),
+            "recognition_memory": y.get("recognition_memory", {}),
+        }
+
+    gate_res = evaluate_benchmark_gate(
+        reports,
+        {"aliases": ALIASES, "datasets": spec_datasets},
+        mode=mode,
+    )
+    mm = gate_res["macro_means"]
+    any_hippo_em = any(d.get("hipporag", {}).get("qa", {}).get("ExactMatch") is not None for d in completed)
+    any_hippo_f1 = any(d.get("hipporag", {}).get("qa", {}).get("F1") is not None for d in completed)
+    any_yaw_em = any(d.get("yaw", {}).get("qa", {}).get("ExactMatch") is not None for d in completed)
+    any_yaw_f1 = any(d.get("yaw", {}).get("qa", {}).get("F1") is not None for d in completed)
+    any_delta_em = any(d.get("delta_yaw_vs_hipporag", {}).get("ExactMatch") is not None for d in completed)
+    any_delta_f1 = any(d.get("delta_yaw_vs_hipporag", {}).get("F1") is not None for d in completed)
+
     hippo_mean = {
-        "Recall@1": _mean_or_none([d["hipporag"]["retrieval"]["Recall@1"] for d in completed]),
-        "Recall@2": _mean_or_none([d["hipporag"]["retrieval"]["Recall@2"] for d in completed]),
-        "Recall@5": _mean_or_none([d["hipporag"]["retrieval"]["Recall@5"] for d in completed]),
-        "ExactMatch": _mean_or_none([d["hipporag"]["qa"]["ExactMatch"] for d in completed]),
-        "F1": _mean_or_none([d["hipporag"]["qa"]["F1"] for d in completed]),
+        **mm["monkeypatched_hipporag"],
+        "ExactMatch": mm["monkeypatched_hipporag"]["ExactMatch"] if any_hippo_em else None,
+        "F1": mm["monkeypatched_hipporag"]["F1"] if any_hippo_f1 else None,
     }
     yaw_mean = {
-        "Recall@1": _mean_or_none([d["yaw"]["retrieval"]["Recall@1"] for d in completed]),
-        "Recall@2": _mean_or_none([d["yaw"]["retrieval"]["Recall@2"] for d in completed]),
-        "Recall@5": _mean_or_none([d["yaw"]["retrieval"]["Recall@5"] for d in completed]),
-        "ExactMatch": _mean_or_none([d["yaw"]["qa"]["ExactMatch"] for d in completed]),
-        "F1": _mean_or_none([d["yaw"]["qa"]["F1"] for d in completed]),
+        **mm["yaw_hipporag"],
+        "ExactMatch": mm["yaw_hipporag"]["ExactMatch"] if any_yaw_em else None,
+        "F1": mm["yaw_hipporag"]["F1"] if any_yaw_f1 else None,
     }
-    dpr_mean = {
-        "Recall@1": _mean_or_none([d["yaw"]["standard_dpr"]["Recall@1"] for d in completed]),
-        "Recall@2": _mean_or_none([d["yaw"]["standard_dpr"]["Recall@2"] for d in completed]),
-        "Recall@5": _mean_or_none([d["yaw"]["standard_dpr"]["Recall@5"] for d in completed]),
-    }
+    dpr_mean = dict(mm["yaw_dpr"])
     delta_mean = {
-        "Recall@1": _mean_or_none([d["delta_yaw_vs_hipporag"]["Recall@1"] for d in completed]),
-        "Recall@2": _mean_or_none([d["delta_yaw_vs_hipporag"]["Recall@2"] for d in completed]),
-        "Recall@5": _mean_or_none([d["delta_yaw_vs_hipporag"]["Recall@5"] for d in completed]),
-        "ExactMatch": _mean_or_none([d["delta_yaw_vs_hipporag"]["ExactMatch"] for d in completed]),
-        "F1": _mean_or_none([d["delta_yaw_vs_hipporag"]["F1"] for d in completed]),
+        **mm["delta_yaw_vs_hipporag"],
+        "ExactMatch": mm["delta_yaw_vs_hipporag"]["ExactMatch"] if any_delta_em else None,
+        "F1": mm["delta_yaw_vs_hipporag"]["F1"] if any_delta_f1 else None,
     }
 
-    datasets_passed = sum(1 for d in completed if d.get("gate_passed"))
+    eval_values = list(gate_res["datasets"].values())
+    datasets_passed = sum(
+        1
+        for idx, d in enumerate(completed)
+        if d.get(
+            "gate_passed",
+            eval_values[idx].get("gate_passed", False) if idx < len(eval_values) else False,
+        )
+    )
     all_within_tol = datasets_passed == len(completed)
     mean_r5_ok = delta_mean["Recall@5"] is not None and delta_mean["Recall@5"] >= 0.0
     if mode == "eval" and delta_mean["F1"] is not None:
@@ -291,7 +317,9 @@ def aggregate_gate_summary(
         mean_f1_ok = True
         mean_em_ok = True
 
-    overall_passed = bool(all_within_tol and mean_r5_ok and mean_f1_ok and mean_em_ok)
+    overall_passed = bool(
+        gate_res["overall_gate_passed"] and all_within_tol and mean_r5_ok and mean_f1_ok and mean_em_ok
+    )
     return {
         "datasets_completed": len(completed),
         "datasets_passed": datasets_passed,
@@ -299,6 +327,7 @@ def aggregate_gate_summary(
         "yaw_mean": yaw_mean,
         "dpr_mean": dpr_mean,
         "delta_mean": delta_mean,
+        "confidence": gate_res["confidence"],
         "mean_recall5_parity": bool(mean_r5_ok),
         "mean_f1_parity": bool(mean_f1_ok),
         "all_datasets_within_tolerance": bool(all_within_tol),
@@ -315,50 +344,144 @@ def _fmt_num(val: float | None, *, signed: bool = False) -> str:
     return f"{val:.4f}"
 
 
+def _esc_svg(val: Any) -> str:
+    return str(val).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def _build_gate_table_rows(gate_payload: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    """Build normalized row records shared by format_gate_markdown and format_gate_html."""
+    cfg = gate_payload.get("config", {}) or {}
+    datasets_map = gate_payload.get("datasets", {}) or {}
+    ordered_names = cfg.get("datasets", list(datasets_map.keys()))
+
+    quality_rows: list[dict[str, Any]] = []
+    telemetry_rows: list[dict[str, Any]] = []
+    paper_rows: list[dict[str, Any]] = []
+
+    for ds in ordered_names:
+        entry = datasets_map.get(ds)
+        completed = isinstance(entry, dict) and entry.get("status") == "completed"
+        if not completed:
+            quality_rows.append({"dataset": ds, "completed": False})
+        else:
+            assert isinstance(entry, dict)
+            h = entry["hipporag"]
+            y = entry["yaw"]
+            d = entry["delta_yaw_vs_hipporag"]
+            nq = entry["num_queries"]
+            h_rec = h["recognition_memory"]
+            y_rec = y["recognition_memory"]
+            h_tot = float(h.get("indexing_seconds", 0.0)) + float(h.get("evaluation_seconds", 0.0))
+            y_tot = float(y.get("indexing_seconds", 0.0)) + float(y.get("evaluation_seconds", 0.0))
+            speedup = (h_tot / y_tot) if y_tot > 0 else 1.0
+
+            quality_rows.append(
+                {
+                    "dataset": ds,
+                    "completed": True,
+                    "num_docs": entry["num_docs"],
+                    "num_queries": nq,
+                    "h_r1": _fmt_num(h["retrieval"]["Recall@1"]),
+                    "y_r1": _fmt_num(y["retrieval"]["Recall@1"]),
+                    "h_r2": _fmt_num(h["retrieval"]["Recall@2"]),
+                    "y_r2": _fmt_num(y["retrieval"]["Recall@2"]),
+                    "h_r5": _fmt_num(h["retrieval"]["Recall@5"]),
+                    "y_r5": _fmt_num(y["retrieval"]["Recall@5"]),
+                    "d_r5": _fmt_num(d["Recall@5"], signed=True),
+                    "h_em": _fmt_num(h["qa"]["ExactMatch"]),
+                    "y_em": _fmt_num(y["qa"]["ExactMatch"]),
+                    "h_f1": _fmt_num(h["qa"]["F1"]),
+                    "y_f1": _fmt_num(y["qa"]["F1"]),
+                    "d_f1": _fmt_num(d["F1"], signed=True),
+                    "gate_status": entry["gate_status"],
+                }
+            )
+            telemetry_rows.append(
+                {
+                    "dataset": ds,
+                    "dpr_r5": _fmt_num(y["standard_dpr"]["Recall@5"]),
+                    "h_seeds": f"{h_rec['queries_with_graph_seeds']}/{nq}",
+                    "y_seeds": f"{y_rec['queries_with_graph_seeds']}/{nq}",
+                    "h_fb": f"{h_rec['dpr_fallback_rate']:.1%}",
+                    "y_fb": f"{y_rec['dpr_fallback_rate']:.1%}",
+                    "h_idx": f"{h['indexing_seconds']:.1f}",
+                    "y_idx": f"{y['indexing_seconds']:.1f}",
+                    "h_eval": f"{h['evaluation_seconds']:.1f}",
+                    "y_eval": f"{y['evaluation_seconds']:.1f}",
+                    "h_tot": f"{h_tot:.1f}",
+                    "y_tot": f"{y_tot:.1f}",
+                    "speedup": f"{speedup:.1f}× FASTER",
+                }
+            )
+
+        pb = PAPER_BASELINES.get(ds, {})
+        h2 = pb.get("hipporag2_llama3.3_70b_nvembed_v2", {})
+        std = pb.get("standard_nvembed_v2_llama3.3_70b", {})
+        paper_rows.append(
+            {
+                "dataset": ds,
+                "r2": _fmt_num(h2.get("Recall@2")),
+                "r5": _fmt_num(h2.get("Recall@5")),
+                "em": _fmt_num(h2.get("ExactMatch")),
+                "f1": _fmt_num(h2.get("F1")),
+                "std_r5": _fmt_num(std.get("Recall@5")),
+                "std_f1": _fmt_num(std.get("F1")),
+                "status": "PASS" if completed else "QUEUED",
+            }
+        )
+
+    return {
+        "quality": quality_rows,
+        "telemetry": telemetry_rows,
+        "paper": paper_rows,
+    }
+
+
 def format_gate_markdown(gate_payload: dict[str, Any]) -> str:
     """Format the full Layer 2 gate report as a Markdown document."""
     cfg = gate_payload.get("config", {}) or {}
     summary = gate_payload.get("summary", {}) or {}
     datasets_map = gate_payload.get("datasets", {}) or {}
     ordered_names = cfg.get("datasets", list(datasets_map.keys()))
+    rows = _build_gate_table_rows(gate_payload)
 
     lines: list[str] = [
         "# Pre-Epic 2 HippoRAG 2 Paper Parity Gate Report",
         "",
         f"- **Generated At**: `{gate_payload.get('updated_at', '')}`",
         f"- **Mode**: `{cfg.get('mode', 'eval')}`",
-        f"- **Queries per Dataset**: `{cfg.get('queries_per_dataset', 25)}` (Index Pool Queries: `{cfg.get('index_queries', 35)}`)",
+        f"- **Queries per Dataset**: "
+        f"`{cfg.get('queries_per_dataset', 25)}` (Index Pool Queries: "
+        f"`{cfg.get('index_queries', 35)}`)",
         f"- **Compiled DSPy Program**: `{cfg.get('compiled_program', '.yaw/compiled_program.json')}`",
         f"- **Datasets Completed**: `{summary.get('datasets_completed', 0)}/{len(ordered_names)}`",
-        f"- **Datasets Passing Tolerance**: `{summary.get('datasets_passed', 0)}/{summary.get('datasets_completed', 0)}`",
+        f"- **Datasets Passing Tolerance**: "
+        f"`{summary.get('datasets_passed', 0)}/{summary.get('datasets_completed', 0)}`",
         f"- **Overall Gate Status**: **{summary.get('overall_gate_status', 'INCOMPLETE')}**",
         "",
         "## 1. Head-to-Head Retrieval & QA Comparison (YAW vs. Upstream HippoRAG 2)",
         "",
-        "| Dataset | Docs | Qs | Hippo R@1 | YAW R@1 | Hippo R@2 | YAW R@2 | Hippo R@5 | YAW R@5 | Δ R@5 | Hippo EM | YAW EM | Hippo F1 | YAW F1 | Δ F1 | Gate |",
-        "| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |",
+        "| Dataset | Docs | Qs | Hippo R@1 | YAW R@1 | Hippo R@2 | YAW R@2 | Hippo R@5 | YAW R@5 | "
+        "Δ R@5 | Hippo EM | YAW EM | Hippo F1 | YAW F1 | Δ F1 | Gate |",
+        "| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | "
+        "---: | ---: | ---: | :---: |",
     ]
 
-    for ds in ordered_names:
-        entry = datasets_map.get(ds)
-        if not isinstance(entry, dict) or entry.get("status") != "completed":
-            lines.append(
-                f"| `{ds}` | — | — | — | — | — | — | — | — | — | — | — | — | — | — | PENDING |"
-            )
+    for r in rows["quality"]:
+        ds = r["dataset"]
+        if not r["completed"]:
+            lines.append(f"| `{ds}` | — | — | — | — | — | — | — | — | — | — | — | — | — | — | PENDING |")
             continue
-        h = entry["hipporag"]
-        y = entry["yaw"]
-        d = entry["delta_yaw_vs_hipporag"]
         lines.append(
-            f"| `{ds}` | {entry['num_docs']} | {entry['num_queries']} "
-            f"| {_fmt_num(h['retrieval']['Recall@1'])} | {_fmt_num(y['retrieval']['Recall@1'])} "
-            f"| {_fmt_num(h['retrieval']['Recall@2'])} | {_fmt_num(y['retrieval']['Recall@2'])} "
-            f"| {_fmt_num(h['retrieval']['Recall@5'])} | {_fmt_num(y['retrieval']['Recall@5'])} "
-            f"| **{_fmt_num(d['Recall@5'], signed=True)}** "
-            f"| {_fmt_num(h['qa']['ExactMatch'])} | {_fmt_num(y['qa']['ExactMatch'])} "
-            f"| {_fmt_num(h['qa']['F1'])} | {_fmt_num(y['qa']['F1'])} "
-            f"| **{_fmt_num(d['F1'], signed=True)}** "
-            f"| **{entry['gate_status']}** |"
+            f"| `{ds}` | {r['num_docs']} | {r['num_queries']} "
+            f"| {r['h_r1']} | {r['y_r1']} "
+            f"| {r['h_r2']} | {r['y_r2']} "
+            f"| {r['h_r5']} | {r['y_r5']} "
+            f"| **{r['d_r5']}** "
+            f"| {r['h_em']} | {r['y_em']} "
+            f"| {r['h_f1']} | {r['y_f1']} "
+            f"| **{r['d_f1']}** "
+            f"| **{r['gate_status']}** |"
         )
 
     if summary.get("datasets_completed", 0) > 0:
@@ -386,26 +509,19 @@ def format_gate_markdown(gate_payload: dict[str, Any]) -> str:
             "",
             "## 2. Standard DPR Baseline, Recognition Memory & Runtime Telemetry",
             "",
-            "| Dataset | DPR R@5 | Hippo Seeds | YAW Seeds | Hippo Fallback | YAW Fallback | Hippo Idx (s) | YAW Idx (s) | Hippo Eval (s) | YAW Eval (s) |",
+            "| Dataset | DPR R@5 | Hippo Seeds | YAW Seeds | Hippo Fallback | YAW Fallback | Hippo Idx "
+            "(s) | YAW Idx (s) | Hippo Eval (s) | YAW Eval (s) |",
             "| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
 
-    for ds in ordered_names:
-        entry = datasets_map.get(ds)
-        if not isinstance(entry, dict) or entry.get("status") != "completed":
-            continue
-        h = entry["hipporag"]
-        y = entry["yaw"]
-        nq = entry["num_queries"]
-        h_rec = h["recognition_memory"]
-        y_rec = y["recognition_memory"]
+    for r in rows["telemetry"]:
         lines.append(
-            f"| `{ds}` | {_fmt_num(y['standard_dpr']['Recall@5'])} "
-            f"| {h_rec['queries_with_graph_seeds']}/{nq} | {y_rec['queries_with_graph_seeds']}/{nq} "
-            f"| {h_rec['dpr_fallback_rate']:.1%} | {y_rec['dpr_fallback_rate']:.1%} "
-            f"| {h['indexing_seconds']:.1f} | {y['indexing_seconds']:.1f} "
-            f"| {h['evaluation_seconds']:.1f} | {y['evaluation_seconds']:.1f} |"
+            f"| `{r['dataset']}` | {r['dpr_r5']} "
+            f"| {r['h_seeds']} | {r['y_seeds']} "
+            f"| {r['h_fb']} | {r['y_fb']} "
+            f"| {r['h_idx']} | {r['y_idx']} "
+            f"| {r['h_eval']} | {r['y_eval']} |"
         )
 
     lines.extend(
@@ -417,37 +533,22 @@ def format_gate_markdown(gate_payload: dict[str, Any]) -> str:
             "",
             "## 3. Published HippoRAG 2 Paper Reference Baselines (arXiv:2502.14802v1)",
             "",
-            "| Dataset | Paper HippoRAG 2 R@2 | Paper HippoRAG 2 R@5 | Paper HippoRAG 2 EM | Paper HippoRAG 2 F1 | Paper Standard RAG R@5 | Paper Standard RAG F1 |",
+            "| Dataset | Paper HippoRAG 2 R@2 | Paper HippoRAG 2 R@5 | Paper HippoRAG 2 EM | Paper "
+            "HippoRAG 2 F1 | Paper Standard RAG R@5 | Paper Standard RAG F1 |",
             "| :--- | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
 
-    for ds in ordered_names:
-        pb = PAPER_BASELINES.get(ds, {})
-        h2 = pb.get("hipporag2_llama3.3_70b_nvembed_v2", {})
-        std = pb.get("standard_nvembed_v2_llama3.3_70b", {})
+    for r in rows["paper"]:
         lines.append(
-            f"| `{ds}` | {_fmt_num(h2.get('Recall@2'))} | {_fmt_num(h2.get('Recall@5'))} "
-            f"| {_fmt_num(h2.get('ExactMatch'))} | {_fmt_num(h2.get('F1'))} "
-            f"| {_fmt_num(std.get('Recall@5'))} | {_fmt_num(std.get('F1'))} |"
+            f"| `{r['dataset']}` | {r['r2']} | {r['r5']} | {r['em']} | {r['f1']} | {r['std_r5']} | {r['std_f1']} |"
         )
 
     lines.append("")
     return "\n".join(lines)
 
 
-def _esc_svg(val: Any) -> str:
-    return (
-        str(val)
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-    )
-
-
-def generate_quality_svg(gate_payload: dict[str, Any]) -> str:
-    """Generate a responsive SVG bar chart comparing quality metrics with strict consistent colors."""
+def _completed_dataset_names(gate_payload: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
     cfg = gate_payload.get("config", {}) or {}
     datasets_map = gate_payload.get("datasets", {}) or {}
     ordered_names = cfg.get("datasets", list(datasets_map.keys()))
@@ -458,39 +559,80 @@ def generate_quality_svg(gate_payload: dict[str, Any]) -> str:
     ]
     if not completed:
         completed = [
-            ds
-            for ds, val in datasets_map.items()
-            if isinstance(val, dict) and val.get("status") == "completed"
+            ds for ds, val in datasets_map.items() if isinstance(val, dict) and val.get("status") == "completed"
         ]
+    return completed, datasets_map
 
-    item_h = 320
-    total_h = max(380, 130 + len(completed) * item_h)
 
-    svg = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 840 {total_h}" width="100%" height="100%" style="background:#0b1120; font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',Roboto,Helvetica,Arial,sans-serif;">',
+def _render_svg_card_frame(
+    title: str,
+    subtitle: str,
+    legend_items: list[tuple[int, str, str]],
+    total_h: int,
+    grad_suffix: str = "",
+) -> list[str]:
+    """Render shared SVG header, linearGradient defs, outer card frame, and global legend."""
+    defs = [
+        f'    <linearGradient id="bgGrad{grad_suffix}" x1="0" y1="0" x2="1" y2="1">'
+        '<stop offset="0%" stop-color="#0b1120"/><stop offset="100%" stop-color="#0f172a"/></linearGradient>',
+        f'    <linearGradient id="yawGrad{grad_suffix}" x1="0" y1="0" x2="1" y2="0">'
+        '<stop offset="0%" stop-color="#059669"/><stop offset="100%" stop-color="#10b981"/></linearGradient>',
+        f'    <linearGradient id="hippoGrad{grad_suffix}" x1="0" y1="0" x2="1" y2="0">'
+        '<stop offset="0%" stop-color="#7e22ce"/><stop offset="100%" stop-color="#a855f7"/></linearGradient>',
+    ]
+    if not grad_suffix:
+        defs.extend(
+            [
+                '    <linearGradient id="paperGrad" x1="0" y1="0" x2="1" y2="0">'
+                '<stop offset="0%" stop-color="#0284c7"/><stop offset="100%" stop-color="#38bdf8"/></linearGradient>',
+                '    <linearGradient id="dprGrad" x1="0" y1="0" x2="1" y2="0">'
+                '<stop offset="0%" stop-color="#d97706"/><stop offset="100%" stop-color="#fbbf24"/></linearGradient>',
+            ]
+        )
+
+    legend_svg: list[str] = []
+    for x_pos, grad_id, label in legend_items:
+        legend_svg.append(f'    <rect x="{x_pos}" y="0" width="12" height="12" rx="3" fill="url(#{grad_id})"/>')
+        legend_svg.append(
+            f'    <text x="{x_pos + 18}" y="10" fill="#f8fafc" font-size="11" font-weight="600">{label}</text>'
+        )
+
+    font_stack = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif"
+    return [
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 840 {total_h}" width="100%" height="100%" '
+        f'style="background:#0b1120; font-family:{font_stack};">',
         "  <defs>",
-        '    <linearGradient id="bgGrad" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#0b1120"/><stop offset="100%" stop-color="#0f172a"/></linearGradient>',
-        '    <linearGradient id="yawGrad" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#059669"/><stop offset="100%" stop-color="#10b981"/></linearGradient>',
-        '    <linearGradient id="hippoGrad" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#7e22ce"/><stop offset="100%" stop-color="#a855f7"/></linearGradient>',
-        '    <linearGradient id="paperGrad" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#0284c7"/><stop offset="100%" stop-color="#38bdf8"/></linearGradient>',
-        '    <linearGradient id="dprGrad" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#d97706"/><stop offset="100%" stop-color="#fbbf24"/></linearGradient>',
+        *defs,
         "  </defs>",
-        f'  <rect width="840" height="{total_h}" rx="16" fill="url(#bgGrad)" stroke="#1e293b" stroke-width="1.5"/>',
-        '  <text x="36" y="44" fill="#f8fafc" font-size="20" font-weight="700">Pre-Epic 2 Gate: Retrieval &amp; QA Quality</text>',
-        f'  <text x="36" y="68" fill="#94a3b8" font-size="12">Head-to-head comparison ({len(completed)} datasets completed) • Consistent engine color mapping</text>',
+        f'  <rect width="840" height="{total_h}" rx="16" '
+        f'fill="url(#bgGrad{grad_suffix})" stroke="#1e293b" stroke-width="1.5"/>',
+        f'  <text x="36" y="44" fill="#f8fafc" font-size="20" font-weight="700">{title}</text>',
+        f'  <text x="36" y="68" fill="#94a3b8" font-size="12">{subtitle}</text>',
         "  <!-- Consistent Global Legend -->",
         '  <g transform="translate(36, 92)">',
-        '    <rect x="0" y="0" width="12" height="12" rx="3" fill="url(#yawGrad)"/>',
-        '    <text x="18" y="10" fill="#f8fafc" font-size="11" font-weight="600">Native YAW (Qwen3-4B + yaw.db)</text>',
-        '    <rect x="235" y="0" width="12" height="12" rx="3" fill="url(#hippoGrad)"/>',
-        '    <text x="253" y="10" fill="#f8fafc" font-size="11" font-weight="600">Upstream HippoRAG 2 (Qwen3-4B)</text>',
-        '    <rect x="475" y="0" width="12" height="12" rx="3" fill="url(#paperGrad)"/>',
-        '    <text x="493" y="10" fill="#f8fafc" font-size="11" font-weight="600">Paper Reference (70B Llama-3.3)</text>',
-        '    <rect x="670" y="0" width="12" height="12" rx="3" fill="url(#dprGrad)"/>',
-        '    <text x="688" y="10" fill="#f8fafc" font-size="11" font-weight="600">Standard DPR</text>',
+        *legend_svg,
         "  </g>",
         '  <line x1="36" y1="116" x2="804" y2="116" stroke="#1e293b" stroke-width="1"/>',
     ]
+
+
+def generate_quality_svg(gate_payload: dict[str, Any]) -> str:
+    """Generate a responsive SVG bar chart comparing quality metrics with strict consistent colors."""
+    completed, datasets_map = _completed_dataset_names(gate_payload)
+    item_h = 320
+    total_h = max(380, 130 + len(completed) * item_h)
+
+    svg = _render_svg_card_frame(
+        "Pre-Epic 2 Gate: Retrieval &amp; QA Quality",
+        f"Head-to-head comparison ({len(completed)} datasets completed) • Consistent engine color mapping",
+        [
+            (0, "yawGrad", "Native YAW (Qwen3-4B + yaw.db)"),
+            (235, "hippoGrad", "Upstream HippoRAG 2 (Qwen3-4B)"),
+            (475, "paperGrad", "Paper Reference (70B Llama-3.3)"),
+            (670, "dprGrad", "Standard DPR"),
+        ],
+        total_h,
+    )
 
     curr_y = 132
     for ds in completed:
@@ -521,7 +663,11 @@ def generate_quality_svg(gate_payload: dict[str, Any]) -> str:
         delta_r5 = float(d.get("Recall@5") or (y_r5 - h_r5))
         delta_f1 = float(d.get("F1") or (y_f1 - h_f1))
 
-        status_text = "PASS" if delta_r5 >= -0.02 and delta_f1 >= -0.02 else "FAIL"
+        gate_passed = entry.get("gate_passed")
+        if gate_passed is None:
+            delta_em = d.get("ExactMatch")
+            gate_passed = delta_r5 >= 0.0 and delta_f1 >= 0.0 and (delta_em is None or float(delta_em) >= 0.0)
+        status_text = "PASS" if gate_passed else "FAIL"
         badge_color = "#10b981" if status_text == "PASS" else "#ef4444"
 
         svg.append(f'  <g transform="translate(36, {curr_y})">')
@@ -529,10 +675,15 @@ def generate_quality_svg(gate_payload: dict[str, Any]) -> str:
             '    <rect x="0" y="0" width="768" height="300" rx="10" fill="#0f172a" stroke="#1e293b" stroke-width="1"/>'
         )
         svg.append(
-            f'    <text x="16" y="24" fill="#f8fafc" font-size="14" font-weight="700">Dataset: {_esc_svg(ds)} ({entry.get("num_queries", 25)} queries, {entry.get("num_docs", 70)} docs)</text>'
+            f'    <text x="16" y="24" fill="#f8fafc" font-size="14" '
+            f'font-weight="700">Dataset: {_esc_svg(ds)} '
+            f"({entry.get('num_queries', 25)} queries, "
+            f"{entry.get('num_docs', 70)} docs)</text>"
         )
         svg.append(
-            f'    <text x="752" y="24" text-anchor="end" fill="{badge_color}" font-size="12" font-weight="700">{status_text} (ΔR@5={delta_r5:+.2%}, ΔF1={delta_f1:+.2%})</text>'
+            f'    <text x="752" y="24" text-anchor="end" fill="{badge_color}" '
+            f'font-size="12" font-weight="700">{status_text} '
+            f"(ΔR@5={delta_r5:+.2%}, ΔF1={delta_f1:+.2%})</text>"
         )
         svg.append('    <line x1="16" y1="36" x2="752" y2="36" stroke="#1e293b" stroke-width="1"/>')
 
@@ -546,42 +697,34 @@ def generate_quality_svg(gate_payload: dict[str, Any]) -> str:
         m_y = 48
         for m_name, y_val, h_val, p_val, d_val in metrics:
             svg.append(f'    <g transform="translate(16, {m_y})">')
-            svg.append(
-                f'      <text x="0" y="11" fill="#94a3b8" font-size="11" font-weight="600">{m_name}</text>'
-            )
+            svg.append(f'      <text x="0" y="11" fill="#94a3b8" font-size="11" font-weight="600">{m_name}</text>')
             b_x = 120
             bar_w_max = 480
 
             yw = max(3, int(y_val * bar_w_max))
+            svg.append(f'      <rect x="{b_x}" y="0" width="{yw}" height="11" rx="2" fill="url(#yawGrad)"/>')
             svg.append(
-                f'      <rect x="{b_x}" y="0" width="{yw}" height="11" rx="2" fill="url(#yawGrad)"/>'
-            )
-            svg.append(
-                f'      <text x="{b_x + yw + 6}" y="10" fill="#10b981" font-size="10" font-weight="700">YAW {y_val:.4f}</text>'
+                f'      <text x="{b_x + yw + 6}" y="10" fill="#10b981" '
+                f'font-size="10" font-weight="700">YAW {y_val:.4f}</text>'
             )
 
             hw = max(3, int(h_val * bar_w_max))
+            svg.append(f'      <rect x="{b_x}" y="14" width="{hw}" height="11" rx="2" fill="url(#hippoGrad)"/>')
             svg.append(
-                f'      <rect x="{b_x}" y="14" width="{hw}" height="11" rx="2" fill="url(#hippoGrad)"/>'
-            )
-            svg.append(
-                f'      <text x="{b_x + hw + 6}" y="24" fill="#c084fc" font-size="10" font-weight="600">Hippo {h_val:.4f}</text>'
+                f'      <text x="{b_x + hw + 6}" y="24" fill="#c084fc" '
+                f'font-size="10" font-weight="600">Hippo {h_val:.4f}</text>'
             )
 
             if p_val > 0.0:
                 pw = max(3, int(p_val * bar_w_max))
-                svg.append(
-                    f'      <rect x="{b_x}" y="28" width="{pw}" height="11" rx="2" fill="url(#paperGrad)"/>'
-                )
+                svg.append(f'      <rect x="{b_x}" y="28" width="{pw}" height="11" rx="2" fill="url(#paperGrad)"/>')
                 svg.append(
                     f'      <text x="{b_x + pw + 6}" y="38" fill="#7dd3fc" font-size="10">Paper {p_val:.4f}</text>'
                 )
 
             if d_val is not None and d_val > 0.0:
                 dw = max(3, int(d_val * bar_w_max))
-                svg.append(
-                    f'      <rect x="{b_x}" y="42" width="{dw}" height="11" rx="2" fill="url(#dprGrad)"/>'
-                )
+                svg.append(f'      <rect x="{b_x}" y="42" width="{dw}" height="11" rx="2" fill="url(#dprGrad)"/>')
                 svg.append(
                     f'      <text x="{b_x + dw + 6}" y="52" fill="#fbbf24" font-size="10">DPR {d_val:.4f}</text>'
                 )
@@ -598,43 +741,20 @@ def generate_quality_svg(gate_payload: dict[str, Any]) -> str:
 
 def generate_latency_svg(gate_payload: dict[str, Any]) -> str:
     """Generate a responsive SVG bar chart comparing wall-clock latency with strict consistent colors."""
-    cfg = gate_payload.get("config", {}) or {}
-    datasets_map = gate_payload.get("datasets", {}) or {}
-    ordered_names = cfg.get("datasets", list(datasets_map.keys()))
-    completed = [
-        ds
-        for ds in ordered_names
-        if isinstance(datasets_map.get(ds), dict) and datasets_map[ds].get("status") == "completed"
-    ]
-    if not completed:
-        completed = [
-            ds
-            for ds, val in datasets_map.items()
-            if isinstance(val, dict) and val.get("status") == "completed"
-        ]
-
+    completed, datasets_map = _completed_dataset_names(gate_payload)
     item_h = 240
     total_h = max(340, 130 + len(completed) * item_h)
 
-    svg = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 840 {total_h}" width="100%" height="100%" style="background:#0b1120; font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',Roboto,Helvetica,Arial,sans-serif;">',
-        "  <defs>",
-        '    <linearGradient id="bgGrad2" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#0b1120"/><stop offset="100%" stop-color="#0f172a"/></linearGradient>',
-        '    <linearGradient id="yawGrad2" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#059669"/><stop offset="100%" stop-color="#10b981"/></linearGradient>',
-        '    <linearGradient id="hippoGrad2" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#7e22ce"/><stop offset="100%" stop-color="#a855f7"/></linearGradient>',
-        "  </defs>",
-        f'  <rect width="840" height="{total_h}" rx="16" fill="url(#bgGrad2)" stroke="#1e293b" stroke-width="1.5"/>',
-        '  <text x="36" y="44" fill="#f8fafc" font-size="20" font-weight="700">Pre-Epic 2 Gate: Wall-Clock Latency &amp; Speedup</text>',
-        f'  <text x="36" y="68" fill="#94a3b8" font-size="12">Lower is better • Local GPU/NPU server • {len(completed)} datasets completed</text>',
-        "  <!-- Consistent Global Legend -->",
-        '  <g transform="translate(36, 92)">',
-        '    <rect x="0" y="0" width="12" height="12" rx="3" fill="url(#yawGrad2)"/>',
-        '    <text x="18" y="10" fill="#f8fafc" font-size="11" font-weight="600">Native YAW (yaw.db + CocoIndex AST + pure-JSON GBNF)</text>',
-        '    <rect x="420" y="0" width="12" height="12" rx="3" fill="url(#hippoGrad2)"/>',
-        '    <text x="438" y="10" fill="#f8fafc" font-size="11" font-weight="600">Upstream HippoRAG 2 (File Storage + Unconstrained Prompt)</text>',
-        "  </g>",
-        '  <line x1="36" y1="116" x2="804" y2="116" stroke="#1e293b" stroke-width="1"/>',
-    ]
+    svg = _render_svg_card_frame(
+        "Pre-Epic 2 Gate: Wall-Clock Latency &amp; Speedup",
+        f"Lower is better • Local GPU/NPU server • {len(completed)} datasets completed",
+        [
+            (0, "yawGrad2", "Native YAW (yaw.db + CocoIndex AST + pure-JSON GBNF)"),
+            (420, "hippoGrad2", "Upstream HippoRAG 2 (File Storage + Unconstrained Prompt)"),
+        ],
+        total_h,
+        grad_suffix="2",
+    )
 
     curr_y = 132
     for ds in completed:
@@ -658,10 +778,15 @@ def generate_latency_svg(gate_payload: dict[str, Any]) -> str:
             '    <rect x="0" y="0" width="768" height="220" rx="10" fill="#0f172a" stroke="#1e293b" stroke-width="1"/>'
         )
         svg.append(
-            f'    <text x="16" y="24" fill="#f8fafc" font-size="14" font-weight="700">Dataset: {_esc_svg(ds)} ({entry.get("num_queries", 25)} queries, {entry.get("num_docs", 70)} docs)</text>'
+            f'    <text x="16" y="24" fill="#f8fafc" font-size="14" '
+            f'font-weight="700">Dataset: {_esc_svg(ds)} '
+            f"({entry.get('num_queries', 25)} queries, "
+            f"{entry.get('num_docs', 70)} docs)</text>"
         )
         svg.append(
-            f'    <text x="752" y="24" text-anchor="end" fill="#10b981" font-size="12" font-weight="700">{tot_speedup:.1f}× OVERALL SPEEDUP</text>'
+            f'    <text x="752" y="24" text-anchor="end" fill="#10b981" '
+            f'font-size="12" font-weight="700">{tot_speedup:.1f}× OVERALL '
+            f"SPEEDUP</text>"
         )
         svg.append('    <line x1="16" y1="36" x2="752" y2="36" stroke="#1e293b" stroke-width="1"/>')
 
@@ -674,11 +799,10 @@ def generate_latency_svg(gate_payload: dict[str, Any]) -> str:
         l_y = 48
         for m_name, y_val, h_val, sp_text in lat_metrics:
             svg.append(f'    <g transform="translate(16, {l_y})">')
+            svg.append(f'      <text x="0" y="14" fill="#94a3b8" font-size="11" font-weight="600">{m_name}</text>')
             svg.append(
-                f'      <text x="0" y="14" fill="#94a3b8" font-size="11" font-weight="600">{m_name}</text>'
-            )
-            svg.append(
-                f'      <text x="736" y="14" text-anchor="end" fill="#10b981" font-size="11" font-weight="700">{sp_text}</text>'
+                f'      <text x="736" y="14" text-anchor="end" fill="#10b981" '
+                f'font-size="11" font-weight="700">{sp_text}</text>'
             )
 
             max_val = max(h_val, y_val, 1.0)
@@ -686,12 +810,21 @@ def generate_latency_svg(gate_payload: dict[str, Any]) -> str:
             b_x = 120
 
             yw = max(4, int((y_val / max_val) * bar_w_max))
+            svg.append(f'      <rect x="{b_x}" y="3" width="{yw}" height="14" rx="3" fill="url(#yawGrad2)"/>')
             svg.append(
-                f'      <rect x="{b_x}" y="3" width="{yw}" height="14" rx="3" fill="url(#yawGrad2)"/>'
+                f'      <text x="{b_x + yw + 6}" y="14" fill="#10b981" '
+                f'font-size="10" font-weight="700">YAW {y_val:.1f}s</text>'
             )
+            hw = max(4, int((h_val / max_val) * bar_w_max))
+            svg.append(f'      <rect x="{b_x}" y="23" width="{hw}" height="14" rx="3" fill="url(#hippoGrad2)"/>')
             svg.append(
-                f'      <text x="{b_x + yw + 6}" y="14" fill="#10b981" font-size="10" font-weight="700">YAW {y_val:.1f}s</text>'
+                f'      <text x="{b_x + hw + 6}" y="34" fill="#c084fc" '
+                f'font-size="10" font-weight="600">Hippo {h_val:.1f}s</text>'
             )
+            svg.append("    </g>")
+            l_y += 52
+        svg.append("  </g>")
+        curr_y += item_h
 
     svg.append("</svg>")
     return "\n".join(svg)
@@ -703,75 +836,55 @@ def format_gate_html(gate_payload: dict[str, Any], quality_svg: str, latency_svg
     summary = gate_payload.get("summary", {}) or {}
     datasets_map = gate_payload.get("datasets", {}) or {}
     ordered_names = cfg.get("datasets", list(datasets_map.keys()))
+    rows = _build_gate_table_rows(gate_payload)
 
     table1_rows: list[str] = []
-    for ds in ordered_names:
-        entry = datasets_map.get(ds)
-        if not isinstance(entry, dict) or entry.get("status") != "completed":
+    for r in rows["quality"]:
+        ds_esc = _esc_svg(r["dataset"])
+        if not r["completed"]:
             table1_rows.append(
-                f"<tr><td style='font-weight:600; color:#fff;'>{_esc_svg(ds)}</td><td colspan='7' style='color:#64748b; font-style:italic;'>Pending</td></tr>"
+                f"<tr><td style='font-weight:600; color:#fff;'>{ds_esc}</td>"
+                "<td colspan='7' style='color:#64748b; font-style:italic;'>Pending</td></tr>"
             )
             continue
-        h = entry["hipporag"]
-        y = entry["yaw"]
-        d = entry["delta_yaw_vs_hipporag"]
         table1_rows.append(
             f"<tr>"
-            f"<td style='font-weight:600; color:#fff;'>{_esc_svg(ds)}</td>"
-            f"<td class='highlight-hippo'>{_fmt_num(h['retrieval']['Recall@5'])}</td>"
-            f"<td class='highlight-yaw'>{_fmt_num(y['retrieval']['Recall@5'])}</td>"
-            f"<td class='highlight-yaw'>{_fmt_num(d['Recall@5'], signed=True)}</td>"
-            f"<td class='highlight-hippo'>{_fmt_num(h['qa']['F1'])}</td>"
-            f"<td class='highlight-yaw'>{_fmt_num(y['qa']['F1'])}</td>"
-            f"<td class='highlight-yaw'>{_fmt_num(d['F1'], signed=True)}</td>"
-            f"<td class='highlight-yaw'><strong>{entry['gate_status']}</strong></td>"
+            f"<td style='font-weight:600; color:#fff;'>{ds_esc}</td>"
+            f"<td class='highlight-hippo'>{r['h_r5']}</td>"
+            f"<td class='highlight-yaw'>{r['y_r5']}</td>"
+            f"<td class='highlight-yaw'>{r['d_r5']}</td>"
+            f"<td class='highlight-hippo'>{r['h_f1']}</td>"
+            f"<td class='highlight-yaw'>{r['y_f1']}</td>"
+            f"<td class='highlight-yaw'>{r['d_f1']}</td>"
+            f"<td class='highlight-yaw'><strong>{r['gate_status']}</strong></td>"
             f"</tr>"
         )
 
-    table2_rows: list[str] = []
-    for ds in ordered_names:
-        entry = datasets_map.get(ds)
-        if not isinstance(entry, dict) or entry.get("status") != "completed":
-            continue
-        h = entry["hipporag"]
-        y = entry["yaw"]
-        h_tot = float(h.get("indexing_seconds", 0.0)) + float(h.get("evaluation_seconds", 0.0))
-        y_tot = float(y.get("indexing_seconds", 0.0)) + float(y.get("evaluation_seconds", 0.0))
-        sp = (h_tot / y_tot) if y_tot > 0 else 1.0
-        table2_rows.append(
-            f"<tr>"
-            f"<td style='font-weight:600; color:#fff;'>{_esc_svg(ds)}</td>"
-            f"<td class='highlight-hippo'>{h['indexing_seconds']:.1f} s</td>"
-            f"<td class='highlight-yaw'>{y['indexing_seconds']:.1f} s</td>"
-            f"<td class='highlight-hippo'>{h['evaluation_seconds']:.1f} s</td>"
-            f"<td class='highlight-yaw'>{y['evaluation_seconds']:.1f} s</td>"
-            f"<td class='highlight-hippo'>{h_tot:.1f} s</td>"
-            f"<td class='highlight-yaw'>{y_tot:.1f} s</td>"
-            f"<td class='highlight-yaw'><strong>{sp:.1f}× FASTER</strong></td>"
-            f"</tr>"
-        )
+    table2_rows: list[str] = [
+        f"<tr>"
+        f"<td style='font-weight:600; color:#fff;'>{_esc_svg(r['dataset'])}</td>"
+        f"<td class='highlight-hippo'>{r['h_idx']} s</td>"
+        f"<td class='highlight-yaw'>{r['y_idx']} s</td>"
+        f"<td class='highlight-hippo'>{r['h_eval']} s</td>"
+        f"<td class='highlight-yaw'>{r['y_eval']} s</td>"
+        f"<td class='highlight-hippo'>{r['h_tot']} s</td>"
+        f"<td class='highlight-yaw'>{r['y_tot']} s</td>"
+        f"<td class='highlight-yaw'><strong>{r['speedup']}</strong></td>"
+        f"</tr>"
+        for r in rows["telemetry"]
+    ]
 
-    table3_rows: list[str] = []
-    for ds in ordered_names:
-        pb = PAPER_BASELINES.get(ds, {})
-        h2 = pb.get("hipporag2_llama3.3_70b_nvembed_v2", {})
-        status = (
-            "PASS"
-            if isinstance(datasets_map.get(ds), dict)
-            and datasets_map[ds].get("status") == "completed"
-            else "QUEUED"
-        )
-        color_class = "highlight-yaw" if status == "PASS" else ""
-        table3_rows.append(
-            f"<tr>"
-            f"<td style='font-weight:600; color:#fff;'>{_esc_svg(ds)}</td>"
-            f"<td class='highlight-paper'>{_fmt_num(h2.get('Recall@2'))}</td>"
-            f"<td class='highlight-paper'>{_fmt_num(h2.get('Recall@5'))}</td>"
-            f"<td class='highlight-paper'>{_fmt_num(h2.get('ExactMatch'))}</td>"
-            f"<td class='highlight-paper'>{_fmt_num(h2.get('F1'))}</td>"
-            f"<td class='{color_class}'>{status}</td>"
-            f"</tr>"
-        )
+    table3_rows: list[str] = [
+        f"<tr>"
+        f"<td style='font-weight:600; color:#fff;'>{_esc_svg(r['dataset'])}</td>"
+        f"<td class='highlight-paper'>{r['r2']}</td>"
+        f"<td class='highlight-paper'>{r['r5']}</td>"
+        f"<td class='highlight-paper'>{r['em']}</td>"
+        f"<td class='highlight-paper'>{r['f1']}</td>"
+        f"<td class='{'highlight-yaw' if r['status'] == 'PASS' else ''}'>{r['status']}</td>"
+        f"</tr>"
+        for r in rows["paper"]
+    ]
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -812,7 +925,15 @@ def format_gate_html(gate_payload: dict[str, Any], quality_svg: str, latency_svg
     }}
     .table-wrapper {{ overflow-x: auto; -webkit-overflow-scrolling: touch; }}
     table {{ width: 100%; border-collapse: collapse; font-size: 12px; text-align: left; }}
-    th {{ padding: 8px 10px; background-color: #1e293b; color: #94a3b8; font-weight: 600; text-transform: uppercase; font-size: 10px; border-bottom: 1px solid #334155; }}
+    th {{
+      padding: 8px 10px;
+      background-color: #1e293b;
+      color: #94a3b8;
+      font-weight: 600;
+      text-transform: uppercase;
+      font-size: 10px;
+      border-bottom: 1px solid #334155;
+    }}
     td {{ padding: 8px 10px; border-bottom: 1px solid #1e293b; white-space: nowrap; }}
     .highlight-yaw {{ color: #10b981; font-weight: 700; }}
     .highlight-hippo {{ color: #c084fc; font-weight: 600; }}
@@ -830,7 +951,8 @@ def format_gate_html(gate_payload: dict[str, Any], quality_svg: str, latency_svg
       <div style="font-size: 12px; color: #94a3b8;">
         <div>• Completed: <strong>{summary.get("datasets_completed", 0)}/{len(ordered_names)} datasets</strong></div>
         <div>• Mode: <strong>{cfg.get("mode", "eval")}</strong></div>
-        <div>• Slice: <strong>{cfg.get("queries_per_dataset", 25)} queries over {cfg.get("index_queries", 35)} candidate pool passages</strong></div>
+        <div>• Slice: <strong>{cfg.get("queries_per_dataset", 25)} queries over
+          {cfg.get("index_queries", 35)} candidate pool passages</strong></div>
       </div>
     </div>
 
@@ -970,23 +1092,21 @@ def _persist_gate_outputs(
     latency_svg_path.write_text(latency_svg_str, encoding="utf-8")
 
     # Generate self-contained HTML report with inlined SVGs (renders natively on mobile)
-    html_content = format_gate_html(
-        gate_payload, quality_svg=quality_svg_str, latency_svg=latency_svg_str
-    )
+    html_content = format_gate_html(gate_payload, quality_svg=quality_svg_str, latency_svg=latency_svg_str)
     output_html_path = output_md.parent / "paper_parity_gate.html"
     output_html_path.write_text(html_content, encoding="utf-8")
 
-    # Mirror to brain artifact directory if present
-    brain_dir = Path(
-        "C:/Users/Harri.Ahokas/.gemini/antigravity/brain/3061c87c-9ec6-4ff5-b756-80b05e1c4342"
-    )
-    if brain_dir.exists():
-        try:
-            (brain_dir / "paper_parity_quality.svg").write_text(quality_svg_str, encoding="utf-8")
-            (brain_dir / "paper_parity_latency.svg").write_text(latency_svg_str, encoding="utf-8")
-            (brain_dir / "parity_report_mobile.html").write_text(html_content, encoding="utf-8")
-        except Exception:
-            pass
+    # Mirror to optional artifact directory if configured
+    artifact_dir_raw = os.environ.get("YAW_ARTIFACT_DIR")
+    if artifact_dir_raw:
+        brain_dir = Path(artifact_dir_raw)
+        if brain_dir.exists():
+            try:
+                (brain_dir / "paper_parity_quality.svg").write_text(quality_svg_str, encoding="utf-8")
+                (brain_dir / "paper_parity_latency.svg").write_text(latency_svg_str, encoding="utf-8")
+                (brain_dir / "parity_report_mobile.html").write_text(html_content, encoding="utf-8")
+            except Exception:
+                pass
 
     output_md.write_text(
         format_gate_markdown(gate_payload),
@@ -1041,7 +1161,6 @@ def run_parity_gate(
             "compiled_program": compiled_program,
             "mode": mode,
             "qa_model": benchmark.DEFAULT_QA_CHAT,
-            "per_dataset_tolerance": PER_DATASET_TOLERANCE,
         },
         "datasets": {},
         "summary": {},
@@ -1072,16 +1191,7 @@ def run_parity_gate(
         if isinstance(prev_partial, dict) and isinstance(prev_partial.get("hipporag"), dict):
             hippo_report_like = prev_partial["hipporag"]
         else:
-            hippo_report_like = build_monkeypatched_baseline_report(
-                ds, queries_per_dataset=queries_per_dataset
-            )
-
-        # Ensure QA model worker is freshly reloaded before YAW execution if running on NPU
-        if (
-            "ryzen" in benchmark.DEFAULT_QA_CHAT.lower()
-            or "mistral" in benchmark.DEFAULT_QA_CHAT.lower()
-        ):
-            benchmark.recycle_lemonade_model(benchmark.DEFAULT_QA_CHAT)
+            hippo_report_like = build_monkeypatched_baseline_report(ds, queries_per_dataset=queries_per_dataset)
 
         print(
             f"\n{'=' * 72}\n[Gate] Dataset '{ds}': Running Native YAW Engine against Dual Baselines "

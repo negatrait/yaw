@@ -3,7 +3,7 @@
 Grammar:
   yaw daemon {start|stop|status|run} [--config <path>]
   yaw graph {build|rebuild|lint} [--config <path>] [--turtle]
-  yaw dspy {optimize|load-program} [--flags]
+  yaw dspy {optimize|load-program|benchmark} [--flags]
   yaw config {get|set} [--flags]
 """
 
@@ -11,7 +11,6 @@ import argparse
 import contextlib
 import json
 import os
-import shutil
 import signal
 import sqlite3
 import subprocess
@@ -23,7 +22,6 @@ from pathlib import Path
 from typing import Any
 
 import dspy
-import filelock
 
 from yaw.core import (
     DaemonStatus,
@@ -33,20 +31,23 @@ from yaw.core import (
     get_config_value,
     load_config,
     set_config_value,
+    write_text_atomic,
 )
-from yaw.daemon.graph.inference import DSPyEmbeddingAdapter, HippoRAGProgram
+from yaw.daemon.graph.inference import DSPyEmbeddingAdapter, HippoRAGProgram, promote_compiled_program
 from yaw.daemon.graph.storage import (
     get_graph_counts,
     lint_graph_shacl,
+    open_readonly_yaw_db,
     open_yaw_db,
     serialize_graph_turtle,
 )
-from yaw.daemon.runtime import YawRuntime
+from yaw.daemon.ingestion import load_dataset_splits, resolve_dataset_source_files
+from yaw.daemon.runtime import YawRuntime, is_file_locked
 
 
 def build_parser() -> argparse.ArgumentParser:
     """Build hierarchical argument parser for `yaw <domain> <action> --<flags>`."""
-    common = argparse.ArgumentParser(add_help=False)
+    common = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     common.add_argument(
         "--config",
         "-c",
@@ -59,6 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="yaw",
         description="YAW: Native HippoRAG 2 & CocoIndex v1 persistent daemon.",
+        allow_abbrev=False,
     )
     parser.add_argument(
         "--config",
@@ -74,28 +76,30 @@ def build_parser() -> argparse.ArgumentParser:
     # -------------------------------------------------------------------------
     # 1. yaw daemon {start|stop|status|run}
     # -------------------------------------------------------------------------
-    p_daemon = domain_subparsers.add_parser("daemon", help="Daemon lifecycle commands")
+    p_daemon = domain_subparsers.add_parser("daemon", help="Daemon lifecycle commands", allow_abbrev=False)
     daemon_subs = p_daemon.add_subparsers(dest="action", help="Daemon action")
 
-    daemon_subs.add_parser("start", parents=[common], help="Start persistent daemon in background")
+    daemon_subs.add_parser("start", parents=[common], help="Start persistent daemon in background", allow_abbrev=False)
 
-    daemon_subs.add_parser("stop", parents=[common], help="Gracefully stop a running daemon")
+    daemon_subs.add_parser("stop", parents=[common], help="Gracefully stop a running daemon", allow_abbrev=False)
     daemon_subs.add_parser(
         "status",
         parents=[common],
         help="Inspect daemon status, graph index statistics, and active optimizations as JSON",
+        allow_abbrev=False,
     )
     daemon_subs.add_parser(
         "run",
         parents=[common],
         help="Run persistent daemon in the foreground until stopped",
+        allow_abbrev=False,
     )
 
     # -------------------------------------------------------------------------
     # 2. yaw graph {build|rebuild|lint}
     # -------------------------------------------------------------------------
     p_graph = domain_subparsers.add_parser(
-        "graph", help="Standalone graph and corpus index commands"
+        "graph", help="Standalone graph and corpus index commands", allow_abbrev=False
     )
     graph_subs = p_graph.add_subparsers(dest="action", help="Graph action")
 
@@ -103,16 +107,19 @@ def build_parser() -> argparse.ArgumentParser:
         "build",
         parents=[common],
         help="Run standalone incremental CocoIndex corpus sync and update yaw.db",
+        allow_abbrev=False,
     )
     graph_subs.add_parser(
         "rebuild",
         parents=[common],
         help="Wipe yaw.db and CocoIndex state and perform a full rebuild from scratch",
+        allow_abbrev=False,
     )
     p_lint = graph_subs.add_parser(
         "lint",
         parents=[common],
         help="Run closed-world SHACL graph lint or emit W3C Turtle (RDF/SKOS/OWL/SHACL)",
+        allow_abbrev=False,
     )
     p_lint.add_argument(
         "--turtle",
@@ -121,24 +128,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # -------------------------------------------------------------------------
-    # 3. yaw dspy {optimize|load-program} + top-level aliases {optimize|load-program}
+    # 3. yaw dspy {optimize|load-program|benchmark}
     # -------------------------------------------------------------------------
-    p_opt_common = argparse.ArgumentParser(add_help=False)
-    p_opt_common.add_argument(
+    p_dspy = domain_subparsers.add_parser(
+        "dspy", help="DSPy prompt optimization, benchmark, and program management", allow_abbrev=False
+    )
+    dspy_subs = p_dspy.add_subparsers(dest="action", help="DSPy action")
+
+    p_opt = dspy_subs.add_parser(
+        "optimize",
+        parents=[common],
+        help="Compile and evolve DSPy prompts in an isolated sandbox and save candidate JSON",
+        allow_abbrev=False,
+    )
+    p_opt.add_argument(
         "--auto",
         dest="auto",
         choices=["light", "medium", "heavy"],
         default=None,
         help="GEPA/MIPROv2 evaluation budget mode (defaults to yaw.toml [optimization].auto, then 'light')",
     )
-    p_opt_common.add_argument(
+    p_opt.add_argument(
         "--mode",
         dest="mode",
         choices=["miprov2", "gepa", "hybrid"],
         default=None,
         help="Prompt optimization mode (defaults to yaw.toml [optimization].mode, then 'hybrid')",
     )
-    p_opt_common.add_argument(
+    p_opt.add_argument(
         "--dataset",
         dest="dataset",
         nargs="*",
@@ -148,121 +165,182 @@ def build_parser() -> argparse.ArgumentParser:
             "or path to JSON training file (defaults to yaw.toml [optimization].datasets)"
         ),
     )
-    p_opt_common.add_argument(
+    p_opt.add_argument(
         "--max-queries",
         type=int,
         default=None,
         help="Maximum queries to load (defaults to yaw.toml [optimization].max_queries, max 50 on Tier 2 corpora)",
     )
-    p_opt_common.add_argument(
+    p_opt.add_argument(
         "--train-queries",
         type=int,
         default=None,
         help="Number of queries for training [0:K] (defaults to yaw.toml [optimization].train_queries)",
     )
-    p_opt_common.add_argument(
+    p_opt.add_argument(
         "--query-offset",
         type=int,
         default=None,
         help="Starting query offset in dataset (defaults to yaw.toml [optimization].query_offset)",
     )
-    p_opt_common.add_argument(
+    p_opt.add_argument(
         "--output",
         dest="output",
         type=str,
         default=None,
         help="Override output path for candidate compiled_program JSON",
     )
-    p_opt_common.add_argument(
+    p_opt.add_argument(
         "--num-trials",
         type=int,
         default=None,
         help="Explicit number of optimization trials (sets auto to None for fast smoke tests)",
     )
-    p_opt_common.add_argument(
+    p_opt.add_argument(
         "--num-candidates",
         type=int,
         default=None,
         help="Explicit number of instruction/fewshot candidates per predictor",
     )
-    p_opt_common.add_argument(
+    p_opt.add_argument(
         "--sleep",
         dest="sleep_seconds",
         type=float,
         default=None,
-        help="Sleep pause in seconds between LLM/embedding calls to manage thermal duty cycles (defaults to yaw.toml [optimization].sleep_seconds, default 0.0)",
+        help="Sleep pause in seconds between LLM/embedding calls to manage thermal duty cycles "
+        "(defaults to yaw.toml [optimization].sleep_seconds, default 0.0)",
     )
-    p_opt_common.add_argument(
+    p_opt.add_argument(
         "--max-bootstrapped-demos",
         dest="max_bootstrapped_demos",
         type=int,
         default=None,
-        help="Maximum bootstrapped demonstrations for MIPROv2 (defaults to yaw.toml [optimization].max_bootstrapped_demos, 0 to disable)",
+        help="Maximum bootstrapped demonstrations for MIPROv2 (defaults to yaw.toml "
+        "[optimization].max_bootstrapped_demos, 0 to disable)",
     )
-    p_opt_common.add_argument(
+    p_opt.add_argument(
         "--max-labeled-demos",
         dest="max_labeled_demos",
         type=int,
         default=None,
-        help="Maximum labeled demonstrations for MIPROv2 (defaults to yaw.toml [optimization].max_labeled_demos, 0 to disable)",
+        help="Maximum labeled demonstrations for MIPROv2 (defaults to yaw.toml "
+        "[optimization].max_labeled_demos, 0 to disable)",
     )
-    p_opt_common.add_argument(
-        "--db",
+    p_opt.add_argument(
         "--db-path",
         dest="db_path",
         type=str,
         default=None,
         help="Resume an existing sandbox database; 'latest' selects the newest run by timestamp",
     )
-    p_opt_common.add_argument(
+    p_opt.add_argument(
         "--resume",
         action="store_true",
         help="Resume the newest optimization run (or the run selected by --db-path)",
     )
 
-    p_dspy = domain_subparsers.add_parser(
-        "dspy", help="DSPy prompt optimization and program management"
+    p_load = dspy_subs.add_parser(
+        "load-program",
+        parents=[common],
+        help="Promote a compiled DSPy program JSON into production and hot-reload in-memory",
+        allow_abbrev=False,
     )
-    dspy_subs = p_dspy.add_subparsers(dest="action", help="DSPy action")
-
-    dspy_subs.add_parser(
-        "optimize",
-        parents=[common, p_opt_common],
-        help="Compile and evolve DSPy prompts in an isolated sandbox and save candidate JSON",
-    )
-
-    domain_subparsers.add_parser(
-        "optimize",
-        parents=[common, p_opt_common],
-        help="Alias for `yaw dspy optimize`: compile and evolve DSPy prompts in an isolated sandbox",
-    )
-
-    p_load_common = argparse.ArgumentParser(add_help=False)
-    p_load_common.add_argument(
+    p_load.add_argument(
         "file",
         type=str,
         help="Path to compiled DSPy program JSON file to promote and load",
     )
 
-    dspy_subs.add_parser(
-        "load-program",
-        parents=[common, p_load_common],
-        help="Promote a compiled DSPy program JSON into production and hot-reload in-memory",
+    p_bench = dspy_subs.add_parser(
+        "benchmark",
+        parents=[common],
+        help="Run HippoRAG 2 + DPR benchmark evaluation and optional parity gate",
+        allow_abbrev=False,
     )
-
-    domain_subparsers.add_parser(
-        "load-program",
-        parents=[common, p_load_common],
-        help="Alias for `yaw dspy load-program`: promote a compiled DSPy program JSON into production",
+    p_bench.add_argument(
+        "--dataset",
+        dest="dataset",
+        nargs="*",
+        default=None,
+        help="One or more dataset names/aliases or JSON files to benchmark",
+    )
+    p_bench.add_argument(
+        "--gate",
+        dest="gate",
+        nargs="?",
+        const="benchmark_gate.json",
+        default=None,
+        help="Evaluate against benchmark_gate.json (or optional path to gate JSON file)",
+    )
+    p_bench.add_argument(
+        "--target",
+        dest="target",
+        type=str,
+        default=None,
+        help="Primary baseline target key in gate specification (default: monkeypatched_hipporag)",
+    )
+    p_bench.add_argument(
+        "--max-queries",
+        dest="max_queries",
+        type=int,
+        default=None,
+        help="Maximum queries to evaluate per dataset (default: 25 or gate spec)",
+    )
+    p_bench.add_argument(
+        "--index-queries",
+        dest="index_queries",
+        type=int,
+        default=None,
+        help="Queries pooled for distractor passage indexing (default: 35 or gate spec)",
+    )
+    p_bench.add_argument(
+        "--query-offset",
+        dest="query_offset",
+        type=int,
+        default=0,
+        help="Starting query offset in dataset (default: 0)",
+    )
+    p_bench.add_argument(
+        "--full-corpus",
+        dest="full_corpus",
+        action="store_true",
+        help="Index the full dataset corpus instead of an N-query slice",
+    )
+    p_bench.add_argument(
+        "--mode",
+        dest="mode",
+        choices=["eval", "retrieval"],
+        default="eval",
+        help="Benchmark mode: full QA+retrieval ('eval') or retrieval-only ('retrieval')",
+    )
+    p_bench.add_argument(
+        "--compiled-program",
+        dest="compiled_program",
+        type=str,
+        default=None,
+        help="Optional path to compiled DSPy program JSON to load before evaluation",
+    )
+    p_bench.add_argument(
+        "--output",
+        dest="output",
+        type=str,
+        default=None,
+        help="Optional path to write full benchmark report JSON",
+    )
+    p_bench.add_argument(
+        "--fresh",
+        dest="fresh",
+        action="store_true",
+        help="Wipe existing benchmark sandbox before indexing",
     )
 
     # -------------------------------------------------------------------------
     # 4. yaw config {get|set}
     # -------------------------------------------------------------------------
-    p_cfg = domain_subparsers.add_parser("config", help="Configuration management")
+    p_cfg = domain_subparsers.add_parser("config", help="Configuration management", allow_abbrev=False)
     cfg_subs = p_cfg.add_subparsers(dest="action", help="Config action")
 
-    p_get = cfg_subs.add_parser("get", parents=[common], help="Read configuration value(s)")
+    p_get = cfg_subs.add_parser("get", parents=[common], help="Read configuration value(s)", allow_abbrev=False)
     p_get.add_argument(
         "key",
         nargs="?",
@@ -270,7 +348,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Configuration key to read (e.g. 'optimization.auto' or 'qa_model'). Omit to dump all.",
     )
 
-    p_set = cfg_subs.add_parser("set", parents=[common], help="Update a configuration value")
+    p_set = cfg_subs.add_parser("set", parents=[common], help="Update a configuration value", allow_abbrev=False)
     p_set.add_argument(
         "key",
         type=str,
@@ -287,16 +365,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def is_daemon_locked(config: YawConfig) -> bool:
     """Return True if another process currently holds yaw.db.lock."""
-    assert config.lock_path is not None
-    config.lock_path.parent.mkdir(parents=True, exist_ok=True)
-    lock = filelock.FileLock(str(config.lock_path), timeout=0)
-    try:
-        lock.acquire(timeout=0)
-    except filelock.Timeout:
-        return True
-    else:
-        lock.release()
-        return False
+    return is_file_locked(config.lock_path)
+
+
+def _nonnegative_status_count(value: Any, fallback: int = 0) -> int:
+    return value if type(value) is int and value >= 0 else fallback
 
 
 def _inspect_active_optimization(config: YawConfig) -> dict[str, Any] | None:
@@ -308,15 +381,7 @@ def _inspect_active_optimization(config: YawConfig) -> dict[str, Any] | None:
         return None
 
     for lock_file in base_dir.glob("yaw_optimize_*.db.lock"):
-        fl = filelock.FileLock(str(lock_file), timeout=0)
-        is_held = False
-        try:
-            fl.acquire(timeout=0)
-            fl.release()
-        except filelock.Timeout:
-            is_held = True
-
-        if is_held:
+        if is_file_locked(lock_file):
             raw_name = lock_file.name
             # Format: yaw_optimize_<datestamp>.db.lock
             stem = raw_name.removesuffix(".lock").removesuffix(".db")
@@ -326,28 +391,36 @@ def _inspect_active_optimization(config: YawConfig) -> dict[str, Any] | None:
 
             openie = 0
             if opt_db.exists():
-                with contextlib.suppress(sqlite3.Error):
-                    db_uri = f"file:{opt_db.resolve().as_posix()}?mode=ro"
-                    conn = sqlite3.connect(db_uri, uri=True, timeout=1.0)
-                    try:
-                        _, _, _, _, openie = get_graph_counts(conn)
-                    finally:
-                        conn.close()
+                with (
+                    contextlib.suppress(sqlite3.Error),
+                    contextlib.closing(open_readonly_yaw_db(opt_db, timeout=1.0)) as conn,
+                ):
+                    _, _, _, _, openie = get_graph_counts(conn)
 
             snap: dict[str, Any] = {}
             if status_file.exists():
                 with contextlib.suppress(Exception):
-                    snap = json.loads(status_file.read_text(encoding="utf-8"))
+                    parsed = json.loads(status_file.read_text(encoding="utf-8"))
+                    if isinstance(parsed, dict):
+                        snap = parsed
+
+            stats = snap.get("stats", {})
+            if not isinstance(stats, dict):
+                stats = {}
+            status = snap.get("status", {})
+            if not isinstance(status, dict):
+                status = {}
+            active_op = status.get("active_op")
+            if not isinstance(active_op, str) or not active_op:
+                active_op = "optimizing"
 
             return {
                 "active": True,
                 "datestamp": ds,
                 "sandbox_db": str(opt_db),
-                "openie_checkpoints": max(
-                    openie, snap.get("stats", {}).get("openie_checkpoints", 0)
-                ),
-                "active_op": snap.get("status", {}).get("active_op", "optimizing"),
-                "status": snap.get("status", {}),
+                "openie_checkpoints": max(openie, _nonnegative_status_count(stats.get("openie_checkpoints"))),
+                "active_op": active_op,
+                "status": status,
             }
     return None
 
@@ -358,27 +431,33 @@ def inspect_status(config: YawConfig) -> dict[str, Any]:
     chunks = entities = facts = edges = openie = entity_labels = 0
     shacl_conforms = True
     if config.db_path and Path(config.db_path).exists():
-        with contextlib.suppress(sqlite3.Error):
-            db_uri = f"file:{Path(config.db_path).resolve().as_posix()}?mode=ro"
-            conn = sqlite3.connect(db_uri, uri=True, timeout=1.0)
-            try:
-                chunks, entities, facts, edges, openie = get_graph_counts(conn)
-                with contextlib.suppress(sqlite3.Error):
-                    row = conn.execute("SELECT COUNT(*) FROM entity_labels").fetchone()
-                    entity_labels = int(row[0]) if row else 0
-                    shacl_conforms = len(lint_graph_shacl(conn, auto_heal=False)) == 0
-            finally:
-                conn.close()
+        with (
+            contextlib.suppress(sqlite3.Error),
+            contextlib.closing(open_readonly_yaw_db(config.db_path, timeout=1.0)) as conn,
+        ):
+            chunks, entities, facts, edges, openie = get_graph_counts(conn)
+            with contextlib.suppress(sqlite3.Error):
+                row = conn.execute("SELECT COUNT(*) FROM entity_labels").fetchone()
+                entity_labels = int(row[0]) if row else 0
+                shacl_conforms = len(lint_graph_shacl(conn, auto_heal=False)) == 0
 
     opt_info = _inspect_active_optimization(config)
 
     if running and config.status_path and Path(config.status_path).exists():
         with contextlib.suppress(OSError, json.JSONDecodeError):
             data = json.loads(Path(config.status_path).read_text(encoding="utf-8"))
-            if isinstance(data, dict) and "status" in data and "stats" in data:
+            if (
+                isinstance(data, dict)
+                and isinstance(data.get("status"), dict)
+                and isinstance(data.get("stats"), dict)
+                and data["status"].get("lifecycle") in ("stopped", "starting", "ready", "degraded", "stopping")
+            ):
                 data["stats"]["openie_checkpoints"] = max(
-                    openie, data["stats"].get("openie_checkpoints", 0)
+                    openie, _nonnegative_status_count(data["stats"].get("openie_checkpoints"))
                 )
+                data["stats"]["chunks"] = _nonnegative_status_count(data["stats"].get("chunks"), chunks)
+                if not isinstance(data["status"].get("active_op"), (str, type(None))):
+                    data["status"]["active_op"] = None
                 data["stats"].setdefault("entity_labels", entity_labels)
                 data["stats"].setdefault("shacl_conforms", shacl_conforms)
                 if not data["status"].get("active_op") and openie > data["stats"].get("chunks", 0):
@@ -422,125 +501,6 @@ def inspect_status(config: YawConfig) -> dict[str, Any]:
     return payload
 
 
-_TIER2_CORPORA = frozenset({"2wikimultihopqa", "musique", "hotpotqa"})
-_KNOWN_DATASETS = frozenset(
-    {
-        "sample",
-        "2wikimultihopqa",
-        "musique",
-        "hotpotqa",
-        "enterprise_rag_bench",
-        "enterprise",
-    }
-)
-_DATASET_ALIASES = {"enterprise": "enterprise_rag_bench"}
-
-
-def _extract_item_gold_answers(item: dict[str, Any]) -> list[str]:
-    if "gold_answers" in item:
-        raw = item["gold_answers"]
-    elif "answer" in item or "gold_ans" in item:
-        raw = item.get("answer", item.get("gold_ans"))
-    elif "reference" in item:
-        raw = item["reference"]
-    else:
-        raw = []
-    ans = [raw] if isinstance(raw, str) else [str(a) for a in (raw or ())]
-    ans.extend(str(a) for a in item.get("answer_aliases", ()))
-    ans.extend(str(a) for a in item.get("answer_facts", ()))
-    return list(dict.fromkeys(ans))
-
-
-def _extract_item_docs_and_gold(
-    item: dict[str, Any],
-    dataset_name: str = "",
-) -> tuple[list[str], list[str]]:
-    if (
-        "gold_docs" in item
-        and "paragraphs" not in item
-        and "context" not in item
-        and "contexts" not in item
-    ):
-        g_docs = [str(d) for d in item.get("gold_docs", ())]
-        return g_docs, g_docs
-
-    separator = "" if dataset_name.startswith("hotpotqa") else " "
-    all_docs: list[str] = []
-    gold_docs: list[str] = []
-
-    if "supporting_facts" in item and "context" in item:
-        gold_titles = {sf[0] for sf in item["supporting_facts"]}
-        for title, sents in item["context"]:
-            passage = f"{title}\n{separator.join(sents)}"
-            all_docs.append(passage)
-            if title in gold_titles:
-                gold_docs.append(passage)
-    elif "contexts" in item:
-        for ctx in item["contexts"]:
-            passage = f"{ctx['title']}\n{ctx['text']}"
-            all_docs.append(passage)
-            if ctx.get("is_supporting", True):
-                gold_docs.append(passage)
-    elif "paragraphs" in item:
-        for p in item["paragraphs"]:
-            text = p["text"] if "text" in p else p.get("paragraph_text", "")
-            passage = f"{p['title']}\n{text}"
-            all_docs.append(passage)
-            if p.get("is_supporting", True):
-                gold_docs.append(passage)
-
-    return list(dict.fromkeys(all_docs)), list(dict.fromkeys(gold_docs))
-
-
-def _load_single_dataset_examples(
-    dataset_name: str,
-    *,
-    workspace_root: Path | None = None,
-    max_queries: int = 10,
-    query_offset: int = 0,
-) -> tuple[list[dspy.Example], list[str]]:
-    ds_clean = dataset_name.strip()
-    ds_lower = Path(ds_clean).stem.lower()
-    if (ds_clean in _TIER2_CORPORA or ds_lower in _TIER2_CORPORA) and max_queries > 50:
-        raise YawRuntimeError(
-            "INVALID_INPUT",
-            f"Anti-overfitting policy forbids prompt evolution on >50 queries of Tier 2 dataset '{ds_clean}' (got max_queries={max_queries}).",
-        )
-
-    candidate_path = Path(ds_clean)
-    if not candidate_path.exists() and ds_clean in _KNOWN_DATASETS:
-        resolved_ds = _DATASET_ALIASES.get(ds_clean, ds_clean)
-        roots = [Path.cwd()]
-        if workspace_root is not None:
-            roots.insert(0, workspace_root)
-        for root in roots:
-            cached = root / "outputs" / "datasets" / f"{resolved_ds}.json"
-            if cached.exists():
-                candidate_path = cached
-                break
-
-    if not candidate_path.exists():
-        raise YawRuntimeError("INVALID_INPUT", f"Training dataset not found: {ds_clean}")
-
-    raw_items = json.loads(candidate_path.read_text(encoding="utf-8"))
-    start = max(0, int(query_offset))
-    sliced = list(raw_items)[start : start + max_queries]
-    examples: list[dspy.Example] = []
-    corpus_docs: list[str] = []
-    for item in sliced:
-        item_docs, gold_docs = _extract_item_docs_and_gold(item, ds_lower)
-        corpus_docs.extend(item_docs)
-        examples.append(
-            dspy.Example(
-                question=str(item["question"]),
-                gold_answers=_extract_item_gold_answers(item),
-                gold_docs=gold_docs,
-                item_docs=item_docs,
-            ).with_inputs("question", "item_docs")
-        )
-    return examples, list(dict.fromkeys(corpus_docs))
-
-
 def _load_dataset_splits(
     dataset_args: Sequence[str] | str | None,
     *,
@@ -549,66 +509,17 @@ def _load_dataset_splits(
     train_queries: int = 7,
     query_offset: int = 0,
 ) -> tuple[list[dspy.Example], list[dspy.Example] | None, list[str]]:
-    if max_queries < 1:
-        raise YawRuntimeError("INVALID_INPUT", "max_queries must be >= 1.")
+    def _dspy_example_factory(*, _inputs: tuple[str, ...] = ("question", "item_docs"), **kwargs: Any) -> dspy.Example:
+        return dspy.Example(**kwargs).with_inputs(*_inputs)
 
-    if not dataset_args:
-        return (
-            [
-                dspy.Example(
-                    question="When was the University of Southampton founded?",
-                    gold_answers=["1862"],
-                    gold_docs=[],
-                ).with_inputs("question")
-            ],
-            None,
-            [],
-        )
-
-    if isinstance(dataset_args, str):
-        ds_list = [p.strip() for p in dataset_args.split(",") if p.strip()]
-    else:
-        ds_list = []
-        for item in dataset_args:
-            for sub in str(item).split(","):
-                if sub.strip():
-                    ds_list.append(sub.strip())
-
-    train_per_ds: list[list[dspy.Example]] = []
-    val_per_ds: list[list[dspy.Example]] = []
-    all_corpus_docs: list[str] = []
-
-    for ds_name in ds_list:
-        d_examples, d_docs = _load_single_dataset_examples(
-            ds_name,
-            workspace_root=workspace_root,
-            max_queries=max_queries,
-            query_offset=query_offset,
-        )
-        all_corpus_docs.extend(d_docs)
-        if 0 < train_queries < len(d_examples):
-            train_per_ds.append(d_examples[:train_queries])
-            val_per_ds.append(d_examples[train_queries:])
-        else:
-            train_per_ds.append(d_examples)
-            val_per_ds.append(list(d_examples))
-
-    trainset: list[dspy.Example] = []
-    max_t = max((len(t) for t in train_per_ds), default=0)
-    for i in range(max_t):
-        for t in train_per_ds:
-            if i < len(t):
-                trainset.append(t[i])
-
-    valset_list: list[dspy.Example] = []
-    max_v = max((len(v) for v in val_per_ds), default=0)
-    for i in range(max_v):
-        for v in val_per_ds:
-            if i < len(v):
-                valset_list.append(v[i])
-
-    valset = valset_list if valset_list else None
-    return trainset, valset, list(dict.fromkeys(all_corpus_docs))
+    return load_dataset_splits(
+        dataset_args,
+        workspace_root=workspace_root,
+        max_queries=max_queries,
+        train_queries=train_queries,
+        query_offset=query_offset,
+        example_factory=_dspy_example_factory,
+    )
 
 
 def handle_daemon_run(
@@ -625,7 +536,6 @@ def handle_daemon_run(
         embedder=embedder,
         auto_poll=True,
     )
-    runtime.start(sync_on_start=True)
 
     def _sig_handler(_signum: int, _frame: Any) -> None:
         runtime.request_stop()
@@ -642,6 +552,7 @@ def handle_daemon_run(
             signal.signal(sig, _sig_handler)
 
     try:
+        runtime.start(sync_on_start=True)
         runtime.wait(timeout=max_seconds)
     finally:
         runtime.stop()
@@ -670,23 +581,38 @@ def handle_daemon_start(config: YawConfig, config_path: Path | None) -> int:
         "stderr": subprocess.DEVNULL,
     }
     if os.name == "nt":
-        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(
+            subprocess, "CREATE_NO_WINDOW", 0
+        )
     else:
         popen_kwargs["start_new_session"] = True
 
     proc = subprocess.Popen(cmd, **popen_kwargs)
 
-    deadline = time.monotonic() + 10.0
+    def _detach(p: subprocess.Popen[Any]) -> None:
+        handle = getattr(p, "_handle", None)
+        if handle is not None and hasattr(handle, "Close"):
+            with contextlib.suppress(OSError):
+                handle.Close()
+        p.returncode = 0
+
+    deadline = time.monotonic() + 30.0
     while time.monotonic() < deadline:
         if is_daemon_locked(config):
+            started_pid = proc.pid
+            _detach(proc)
             payload = inspect_status(config)
-            payload["started_pid"] = proc.pid
+            payload["started_pid"] = started_pid
             sys.stdout.write(json.dumps(payload, indent=2) + "\n")
             return 0
         if proc.poll() is not None:
             break
         time.sleep(0.05)
 
+    if proc.poll() is None:
+        with contextlib.suppress(OSError):
+            proc.terminate()
+            proc.wait(timeout=5)
     raise YawRuntimeError("NOT_READY", "Background daemon failed to acquire lock before timeout.")
 
 
@@ -697,31 +623,46 @@ def handle_daemon_stop(config: YawConfig) -> int:
         return 0
 
     assert config.lock_path is not None
-    signaled_local = YawRuntime.signal_local_stop(config.lock_path)
+    lock_p = Path(config.lock_path)
+    signaled_local = YawRuntime.signal_local_stop(lock_p)
 
     pid: int | None = None
     if not signaled_local and config.status_path is not None:
         status_p = Path(config.status_path)
         if status_p.exists():
-            with contextlib.suppress(OSError, json.JSONDecodeError):
-                snap = json.loads(status_p.read_text(encoding="utf-8"))
-                raw_pid = snap.get("status", {}).get("pid")
-                if isinstance(raw_pid, int):
-                    pid = raw_pid
+            for _ in range(3):
+                try:
+                    snap = json.loads(status_p.read_text(encoding="utf-8"))
+                    raw_pid = snap.get("status", {}).get("pid")
+                    if isinstance(raw_pid, int):
+                        pid = raw_pid
+                        break
+                except OSError, json.JSONDecodeError:
+                    pass
+                time.sleep(0.01)
 
-    if pid is not None and pid != os.getpid():
-        polite_sig = getattr(signal, "CTRL_BREAK_EVENT", signal.SIGTERM)
+    if pid is not None and pid != os.getpid() and os.name != "nt":
         with contextlib.suppress(OSError):
-            os.kill(pid, polite_sig)
+            os.kill(pid, signal.SIGTERM)
 
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
         if not is_daemon_locked(config):
             sys.stdout.write(json.dumps({"stopped": True, "was_running": True}, indent=2) + "\n")
             return 0
+        YawRuntime.signal_local_stop(lock_p)
+        if os.name != "nt" and pid is None and config.status_path is not None:
+            status_p = Path(config.status_path)
+            if status_p.exists():
+                with contextlib.suppress(OSError, json.JSONDecodeError):
+                    snap = json.loads(status_p.read_text(encoding="utf-8"))
+                    raw_pid = snap.get("status", {}).get("pid")
+                    if isinstance(raw_pid, int) and raw_pid != os.getpid():
+                        pid = raw_pid
+                        os.kill(pid, signal.SIGTERM)
         time.sleep(0.05)
 
-    if pid is not None and pid != os.getpid():
+    if pid is not None and pid != os.getpid() and os.name != "nt":
         with contextlib.suppress(OSError):
             os.kill(pid, signal.SIGTERM)
         kill_deadline = time.monotonic() + 5.0
@@ -786,8 +727,7 @@ def handle_graph_lint(
     """Validate closed-world SHACL graph shapes or emit W3C Turtle over a read-only WAL snapshot."""
     db_file = Path(config.db_path).resolve() if config.db_path else None
     if db_file is not None and db_file.exists() and db_file.stat().st_size > 0:
-        db_uri = f"file:{db_file.as_posix()}?mode=ro"
-        conn = sqlite3.connect(db_uri, uri=True, timeout=5.0)
+        conn = open_readonly_yaw_db(db_file, timeout=5.0)
     else:
         conn = open_yaw_db(":memory:")
 
@@ -833,24 +773,19 @@ def handle_dspy_optimize(
         # Read metadata before loading datasets, so bare --resume can recover
         # the original slice and budget even when they were CLI overrides.
         assert opt_config.db_path is not None
-        with contextlib.closing(
-            sqlite3.connect(opt_config.db_path.as_uri() + "?mode=ro", uri=True)
-        ) as conn:
+        with contextlib.closing(open_readonly_yaw_db(opt_config.db_path, timeout=5.0)) as conn:
             row = conn.execute("SELECT value FROM meta WHERE key = 'optimization_run'").fetchone()
         if row is not None:
             saved_run = json.loads(row[0])
             saved_output = Path(saved_run["output_path"])
             if out_override and Path(out_override).resolve() != saved_output:
-                raise YawRuntimeError(
-                    "INVALID_INPUT", f"Resume must use the original output path: {saved_output}"
-                )
+                raise YawRuntimeError("INVALID_INPUT", f"Resume must use the original output path: {saved_output}")
             out_override = str(saved_output)
             for key, value in saved_run.get("cli_options", {}).items():
                 if getattr(args, key, None) is None:
                     setattr(args, key, value)
         print(
-            f"[yaw optimize] Resuming {opt_config.db_path}; "
-            f"output={out_override or opt_config.compiled_program_path}",
+            f"[yaw optimize] Resuming {opt_config.db_path}; output={out_override or opt_config.compiled_program_path}",
             file=sys.stderr,
             flush=True,
         )
@@ -875,14 +810,10 @@ def handle_dspy_optimize(
     max_queries = int(raw_max_q if raw_max_q is not None else (config.optimize_max_queries or 20))
 
     raw_offset = getattr(args, "query_offset", None)
-    query_offset = int(
-        raw_offset if raw_offset is not None else (config.optimize_query_offset or 0)
-    )
+    query_offset = int(raw_offset if raw_offset is not None else (config.optimize_query_offset or 0))
 
     raw_train_q = getattr(args, "train_queries", None)
-    train_queries = int(
-        raw_train_q if raw_train_q is not None else (config.optimize_train_queries or 7)
-    )
+    train_queries = int(raw_train_q if raw_train_q is not None else (config.optimize_train_queries or 7))
 
     raw_auto = getattr(args, "auto", None)
     auto = raw_auto or config.optimize_auto or "light"
@@ -903,25 +834,24 @@ def handle_dspy_optimize(
         train_queries=train_queries,
         query_offset=query_offset,
     )
+    source_files = resolve_dataset_source_files(
+        dataset_args,
+        workspace_root=config.workspace_root,
+        prefer_corpus=True,
+    )
 
     # Resolution order for sandbox: always isolate prompt compilation
     dspy.settings.configure(provide_traceback=True)
     raw_sleep = getattr(args, "sleep_seconds", None)
-    sleep_seconds = (
-        float(raw_sleep) if raw_sleep is not None else float(config.optimize_sleep_seconds or 0.0)
-    )
+    sleep_seconds = float(raw_sleep) if raw_sleep is not None else float(config.optimize_sleep_seconds or 0.0)
     object.__setattr__(opt_config, "optimize_sleep_seconds", sleep_seconds)
 
     raw_bootstrapped = getattr(args, "max_bootstrapped_demos", None)
     max_bootstrapped_demos = (
-        int(raw_bootstrapped)
-        if raw_bootstrapped is not None
-        else int(config.optimize_max_bootstrapped_demos or 0)
+        int(raw_bootstrapped) if raw_bootstrapped is not None else int(config.optimize_max_bootstrapped_demos or 0)
     )
     raw_labeled = getattr(args, "max_labeled_demos", None)
-    max_labeled_demos = (
-        int(raw_labeled) if raw_labeled is not None else int(config.optimize_max_labeled_demos or 0)
-    )
+    max_labeled_demos = int(raw_labeled) if raw_labeled is not None else int(config.optimize_max_labeled_demos or 0)
     object.__setattr__(opt_config, "optimize_max_bootstrapped_demos", max_bootstrapped_demos)
     object.__setattr__(opt_config, "optimize_max_labeled_demos", max_labeled_demos)
 
@@ -944,6 +874,7 @@ def handle_dspy_optimize(
             max_bootstrapped_demos=max_bootstrapped_demos,
             max_labeled_demos=max_labeled_demos,
             corpus_docs=corpus_docs,
+            source_files=source_files,
             progress_callback=_cli_progress,
             run_options={
                 "dataset": dataset_args,
@@ -969,27 +900,21 @@ def handle_dspy_optimize(
             with contextlib.suppress(Exception):
                 raw_eval = json.loads(val_eval_file.read_text(encoding="utf-8"))
                 if isinstance(raw_eval, list) and raw_eval:
-                    f1_scores = [
-                        float(it.get("f1", it.get("score", 0.0)))
-                        for it in raw_eval
-                        if isinstance(it, dict)
-                    ]
-                    em_scores = [
-                        float(it.get("em", 0.0)) for it in raw_eval if isinstance(it, dict)
-                    ]
-                    apm_scores = [
-                        float(it.get("answer_passage_match", 0.0))
-                        for it in raw_eval
-                        if isinstance(it, dict)
-                    ]
+                    dict_items = [it for it in raw_eval if isinstance(it, dict)]
+                    f1_scores = [float(it.get("f1", it.get("score", 0.0))) for it in dict_items]
+                    em_scores = [float(it.get("em", 0.0)) for it in dict_items]
+                    apm_scores = [float(it.get("answer_passage_match", 0.0)) for it in dict_items]
                     eval_summary = {
                         "num_evaluated": len(raw_eval),
                         "mean_f1": (sum(f1_scores) / len(f1_scores) if f1_scores else 0.0),
                         "mean_em": (sum(em_scores) / len(em_scores) if em_scores else 0.0),
-                        "answer_passage_match_rate": (
-                            sum(apm_scores) / len(apm_scores) if apm_scores else 0.0
-                        ),
+                        "answer_passage_match_rate": (sum(apm_scores) / len(apm_scores) if apm_scores else 0.0),
                     }
+                    for k_val in (1, 2, 5, 10, 20):
+                        rk_key = f"recall_at_{k_val}"
+                        rk_scores = [float(it[rk_key]) for it in dict_items if rk_key in it]
+                        if rk_scores:
+                            eval_summary[f"mean_recall_at_{k_val}"] = sum(rk_scores) / len(rk_scores)
         payload: dict[str, Any] = {
             "optimized": True,
             "mode": mode,
@@ -1002,13 +927,9 @@ def handle_dspy_optimize(
             "val_eval_path": str(val_eval_file) if val_eval_file.exists() else None,
             "eval_summary": eval_summary,
             "sandbox_db_path": str(opt_config.db_path),
-            "proposer_telemetry_path": (
-                str(proposer_telemetry) if proposer_telemetry.exists() else None
-            ),
+            "proposer_telemetry_path": (str(proposer_telemetry) if proposer_telemetry.exists() else None),
             "graph_rlm_audit_path": (str(graph_rlm_audit) if graph_rlm_audit.exists() else None),
-            "gepa_telemetry_dir": (
-                str(gepa_telemetry_dir) if gepa_telemetry_dir.exists() else None
-            ),
+            "gepa_telemetry_dir": (str(gepa_telemetry_dir) if gepa_telemetry_dir.exists() else None),
             "stats": runtime.stats().to_dict(),
         }
         sys.stdout.write(json.dumps(payload, indent=2) + "\n")
@@ -1031,20 +952,14 @@ def handle_dspy_load_program(
         if not isinstance(content, dict):
             raise ValueError("Root JSON must be a dictionary object")
     except Exception as exc:
-        raise YawRuntimeError(
-            "INVALID_INPUT", f"Invalid compiled program JSON in {src}: {exc}"
-        ) from exc
+        raise YawRuntimeError("INVALID_INPUT", f"Invalid compiled program JSON in {src}: {exc}") from exc
 
     target_path = (
         Path(config.compiled_program_path).resolve()
         if config.compiled_program_path
         else (config.workspace_root / ".yaw" / "compiled_program.json").resolve()
     )
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    if src != target_path:
-        tmp_target = target_path.with_suffix(f".tmp.{os.getpid()}")
-        shutil.copy2(src, tmp_target)
-        tmp_target.replace(target_path)
+    promote_compiled_program(src, target_path)
 
     if is_daemon_locked(config):
         assert config.lock_path is not None
@@ -1070,7 +985,7 @@ def handle_dspy_load_program(
             "source_path": str(src),
             "req_id": req_id,
         }
-        signal_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        write_text_atomic(signal_file, json.dumps(payload, indent=2))
 
         deadline = time.monotonic() + 3.0
         while time.monotonic() < deadline:
@@ -1091,7 +1006,8 @@ def handle_dspy_load_program(
                     "staged": True,
                     "program_path": str(target_path),
                     "source_path": str(src),
-                    "message": "Signal written; daemon did not acknowledge before timeout. Program staged for next startup.",
+                    "message": "Signal written; daemon did not acknowledge before timeout. Program staged for next "
+                    "startup.",
                 },
                 indent=2,
             )
@@ -1106,13 +1022,52 @@ def handle_dspy_load_program(
                 "staged": True,
                 "compiled_program_path": str(target_path),
                 "source_path": str(src),
-                "message": "Daemon is not running. Program promoted to compiled_program_path and will load on next daemon start.",
+                "message": "Daemon is not running. Program promoted to compiled_program_path and will load on next "
+                "daemon start.",
             },
             indent=2,
         )
         + "\n"
     )
     return 0
+
+
+def handle_dspy_benchmark(
+    config: YawConfig,
+    args: argparse.Namespace,
+    *,
+    program: HippoRAGProgram | None = None,
+    embedder: DSPyEmbeddingAdapter | None = None,
+) -> int:
+    """Execute per-dataset HippoRAG 2 + DPR benchmark evaluation and optional gate verification."""
+    raw_gate = getattr(args, "gate", None)
+    gate_path: Path | str | None = None
+    if isinstance(raw_gate, str):
+        cand_path = Path(raw_gate)
+        if cand_path.exists():
+            gate_path = cand_path
+        elif raw_gate == "benchmark_gate.json":
+            default_gate = Path(__file__).resolve().parents[2] / "benchmark_gate.json"
+            gate_path = default_gate if default_gate.exists() else raw_gate
+        else:
+            gate_path = raw_gate
+
+    runtime = YawRuntime(config, program=program, embedder=embedder, auto_poll=False)
+    res = runtime.benchmark(
+        datasets=getattr(args, "dataset", None),
+        gate_path=gate_path,
+        max_queries=getattr(args, "max_queries", None),
+        index_queries=getattr(args, "index_queries", None),
+        query_offset=int(getattr(args, "query_offset", 0) or 0),
+        full_corpus=bool(getattr(args, "full_corpus", False)),
+        mode=getattr(args, "mode", "eval") or "eval",
+        compiled_program=getattr(args, "compiled_program", None),
+        output_path=getattr(args, "output", None),
+        fresh=bool(getattr(args, "fresh", False)),
+        target=getattr(args, "target", None),
+    )
+    sys.stdout.write(json.dumps(res, indent=2) + "\n")
+    return 0 if res.get("overall_gate_passed", True) else 1
 
 
 def handle_config_get(
@@ -1165,12 +1120,6 @@ def main(
 
     domain = getattr(args, "domain", None)
     action = getattr(args, "action", None)
-    if domain == "optimize":
-        domain = "dspy"
-        action = "optimize"
-    elif domain == "load-program":
-        domain = "dspy"
-        action = "load-program"
 
     if not domain or not action:
         parser.print_help(sys.stderr)
@@ -1201,21 +1150,21 @@ def main(
             if action == "lint":
                 return handle_graph_lint(config, as_turtle=bool(getattr(args, "turtle", False)))
 
-        # 3. yaw dspy {optimize|load-program}
+        # 3. yaw dspy {optimize|load-program|benchmark}
         if domain == "dspy":
             if action == "optimize":
                 return handle_dspy_optimize(config, args, program=program, embedder=embedder)
             if action == "load-program":
                 return handle_dspy_load_program(config, args.file)
+            if action == "benchmark":
+                return handle_dspy_benchmark(config, args, program=program, embedder=embedder)
 
         # 4. yaw config {get|set}
         if domain == "config":
             if action == "get":
                 return handle_config_get(config, key=args.key, config_path=cfg_path)
             if action == "set":
-                return handle_config_set(
-                    config, key=args.key, value_raw=args.value, config_path=cfg_path
-                )
+                return handle_config_set(config, key=args.key, value_raw=args.value, config_path=cfg_path)
 
         parser.print_help(sys.stderr)
         return 2
@@ -1237,6 +1186,7 @@ __all__ = [
     "handle_daemon_run",
     "handle_daemon_start",
     "handle_daemon_stop",
+    "handle_dspy_benchmark",
     "handle_dspy_load_program",
     "handle_dspy_optimize",
     "handle_graph_build",

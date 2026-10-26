@@ -1,8 +1,8 @@
 """Separate-process client for the loopback candidate-cache integration test."""
 
 import argparse
+import inspect
 import json
-import sys
 from pathlib import Path
 
 import dspy
@@ -74,10 +74,7 @@ def main() -> None:
             doc += " This source was edited after the previous run."
         engine.index([doc])
         with engine.managed_conn.transaction() as conn:
-            conn.execute(
-                "UPDATE entities SET definition = '' "
-                "WHERE name IN ('alan turing', 'turing machine')"
-            )
+            conn.execute("UPDATE entities SET definition = '' WHERE name IN ('alan turing', 'turing machine')")
         assert not engine.lint_graph()["conforms"]
         engine.index(["Alan M. Turing worked on cryptanalysis at Bletchley Park."])
         assert engine.lint_graph()["conforms"]
@@ -92,10 +89,7 @@ def main() -> None:
                             "missing_entity_defs_tokens",
                         )
                     },
-                    "openie_tokens": [
-                        stats["openie_tokens"]
-                        for _, stats in sorted(engine._chunk_rlm_stats.items())
-                    ],
+                    "openie_tokens": [stats["openie_tokens"] for _, stats in sorted(engine._chunk_rlm_stats.items())],
                     "hits": {
                         cache.stage: cache.hits
                         for cache in (
@@ -105,16 +99,12 @@ def main() -> None:
                             engine._shacl_fp_cache,
                         )
                     },
-                    "cache_rows": engine.conn.execute(
-                        "SELECT COUNT(*) FROM candidate_stage_cache"
-                    ).fetchone()[0],
+                    "cache_rows": engine.conn.execute("SELECT COUNT(*) FROM candidate_stage_cache").fetchone()[0],
                     "trace_names": sorted({name for name, _, _ in engine._captured_graph_traces}),
                     "namespace": engine._candidate_cache_namespace(),
                     "code_fp": engine._candidate_cache_code_fp,
                     "embedding_kwargs": embedder.default_kwargs,
-                    "implementation_root": str(
-                        Path(sys.modules[YawGraphEngine.__module__].__file__).parent
-                    ),
+                    "implementation_root": str(Path(inspect.getfile(YawGraphEngine)).parent),
                 }
             )
         )

@@ -5,6 +5,8 @@ import json
 from dataclasses import dataclass
 from urllib.request import Request, urlopen
 
+from yaw.core.config import DEFAULT_CONTEXT_WINDOW_TOKENS
+
 
 @dataclass(frozen=True)
 class ChatProfile:
@@ -76,7 +78,7 @@ CHAT_MODELS = {
         qa_temperature=0.2,
         reflection_frequency_penalty=0.0,
         expected_device="gpu",
-        expected_context=32768,
+        expected_context=DEFAULT_CONTEXT_WINDOW_TOKENS,
     ),
     "gemma4-it-12b-FLM": ChatProfile(
         checkpoint="gemma4-it:12b",
@@ -99,9 +101,7 @@ CHAT_MODELS = {
 }
 DEFAULT_EXTRACTION_CHAT = "Gemma-4-E4B-it-GGUF"
 DEFAULT_QA_CHAT = "Gemma-4-E4B-it-GGUF"
-DEFAULT_CHAT = DEFAULT_QA_CHAT
 BASE_URL = "http://localhost:13305/api/v1"
-DEFAULT_BASE_URL = BASE_URL
 
 
 def get_json(base_url, route):
@@ -114,11 +114,7 @@ def canonical(name):
 
 
 def select_model(models, name):
-    matches = [
-        model
-        for model in models
-        if canonical(model.get("id", model.get("model_name", ""))) == canonical(name)
-    ]
+    matches = [model for model in models if canonical(model.get("id", model.get("model_name", ""))) == canonical(name)]
     if len(matches) != 1:
         raise ValueError(f"Expected exactly one registered model for {name}.")
     return matches[0]
@@ -159,10 +155,7 @@ def preflight(profile, chat_model=None, qa_model=None, base_url=BASE_URL):
 def embedding_evidence(profile, base_url=BASE_URL):
     health = get_json(base_url, "/health")
     loaded_models = health.get("all_models_loaded", [])
-    if not any(
-        canonical(m.get("id", m.get("model_name", ""))) == canonical(profile.model)
-        for m in loaded_models
-    ):
+    if not any(canonical(m.get("id", m.get("model_name", ""))) == canonical(profile.model) for m in loaded_models):
         # Warm / auto-load the configured embedding model into residency if Lemonade evicted it.
         probe_req = Request(
             base_url.rstrip("/") + "/embeddings",
@@ -186,16 +179,12 @@ def embedding_evidence(profile, base_url=BASE_URL):
         raise ValueError("Loaded embedding backend differs from the selected profile.")
     command = model.get("launch_command", [])
     if "--pooling" not in command or command[command.index("--pooling") + 1] != profile.pooling:
-        raise ValueError(
-            f"{profile.model} requires explicit --pooling {profile.pooling} in Lemonade."
-        )
+        raise ValueError(f"{profile.model} requires explicit --pooling {profile.pooling} in Lemonade.")
     # Resolve the actual local weights, not just the mutable registry alias.
     if "-m" not in command:
         raise ValueError("Cannot identify the loaded embedding weights.")
     weights_path = command[command.index("-m") + 1]
-    identity = hashlib.sha256(
-        (profile.index_identity + "\n" + weights_path).encode("utf-8")
-    ).hexdigest()
+    identity = hashlib.sha256((profile.index_identity + "\n" + weights_path).encode("utf-8")).hexdigest()
     return {
         "version": health.get("version"),
         "embedding_backend": model,
@@ -208,16 +197,10 @@ def chat_evidence(model_name, base_url=BASE_URL):
     checkpoint, recipe = profile.checkpoint, profile.recipe
     health = get_json(base_url, "/health")
     model = select_model(health.get("all_models_loaded", []), model_name)
-    if (
-        model.get("checkpoint") != checkpoint
-        or model.get("recipe") != recipe
-        or model.get("backend_health") != "ready"
-    ):
+    if model.get("checkpoint") != checkpoint or model.get("recipe") != recipe or model.get("backend_health") != "ready":
         raise ValueError(f"Loaded chat backend for {model_name} differs from its declared profile.")
     if profile.expected_device is not None and model.get("device") != profile.expected_device:
-        raise ValueError(
-            f"{model_name} expected device {profile.expected_device}, got {model.get('device')}."
-        )
+        raise ValueError(f"{model_name} expected device {profile.expected_device}, got {model.get('device')}.")
     if recipe == "llamacpp":
         command = model.get("launch_command", [])
         if "-dio" in command or "--direct-io" in command:
@@ -225,13 +208,5 @@ def chat_evidence(model_name, base_url=BASE_URL):
         if "--cache-ram" not in command or command[command.index("--cache-ram") + 1] != "0":
             raise ValueError(
                 f"{model_name} requires explicit --cache-ram 0 in Lemonade to prevent host RAM prompt-cache growth."
-            )
-    elif recipe == "ryzenai-llm":
-        if model.get("device") != "npu":
-            raise ValueError(f"{model_name} requires device 'npu' in Lemonade.")
-        ctx_size = model.get("recipe_options", {}).get("ctx_size")
-        if profile.expected_context and ctx_size and ctx_size < profile.expected_context:
-            raise ValueError(
-                f"{model_name} requires ctx_size >= {profile.expected_context}, got {ctx_size}."
             )
     return model

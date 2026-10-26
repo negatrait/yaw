@@ -11,9 +11,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import dspy
 import pytest
 
-from yaw.daemon.graph.candidate_cache import CandidatePayloadCodec, CandidateStageCache
 from yaw.daemon.graph.inference.chat import create_dspy_lm
-from yaw.daemon.graph.inference.program import RLMInstructionProposer
+from yaw.daemon.graph.inference.proposer import RLMInstructionProposer
 from yaw.daemon.graph.inference.reflection import (
     ReflectionBudgetError,
     ReflectionLM,
@@ -22,12 +21,18 @@ from yaw.daemon.graph.inference.reflection import (
     reflection_examples,
     resolve_evidence,
 )
-from yaw.daemon.graph.storage import CandidateCacheStore, open_managed_yaw_db
+from yaw.daemon.graph.storage import (
+    CandidateCacheStore,
+    CandidatePayloadCodec,
+    CandidateStageCache,
+    open_managed_yaw_db,
+)
 
 
 @pytest.fixture
-def provider():
+def provider(request: pytest.FixtureRequest):
     calls = []
+    context_tokens = getattr(request, "param", 65536)
     weights = "C:/models/reflection.gguf"
 
     class Handler(BaseHTTPRequestHandler):
@@ -40,15 +45,17 @@ def provider():
             self.wfile.write(raw)
 
         def do_GET(self):
+            assert isinstance(self.server, ThreadingHTTPServer)
             if self.path.endswith("/health"):
                 self.reply(
                     {
                         "all_models_loaded": [
                             {
-                                "id": "reflection-model",
+                                "id": model,
                                 "backend_url": f"http://127.0.0.1:{self.server.server_port}",
                                 "launch_command": ["server", "-m", weights],
                             }
+                            for model in ("reflection-model", "test-runtime-lm")
                         ]
                     }
                 )
@@ -57,7 +64,7 @@ def provider():
                     {
                         "model_path": weights,
                         "chat_template": "test-template",
-                        "default_generation_settings": {"n_ctx": 65536},
+                        "default_generation_settings": {"n_ctx": context_tokens},
                     }
                 )
             else:
@@ -92,9 +99,7 @@ def provider():
                     "[{'example_id':'invented','path':[]}]})",
                 }
             elif "shortened_instruction" in prompt:
-                result = {
-                    "shortened_instruction": "Use source evidence; preserve the output schema."
-                }
+                result = {"shortened_instruction": "Use source evidence; preserve the output schema."}
             elif "OVERSIZED_DRAFT" in prompt:
                 result = {"new_instruction": "x" * 20000}
             elif "LONG_DRAFT" in prompt:
@@ -118,7 +123,7 @@ def provider():
                 }
             )
 
-        def log_message(self, *_args):
+        def log_message(self, format: str, *args: object) -> None:
             pass
 
     with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
@@ -165,10 +170,7 @@ def test_exact_evidence_and_training_answers():
         ]
     }
     assert resolve_evidence(examples, selection)[0]["evidence"] == "needle"
-    assert (
-        "Turing"
-        in resolve_evidence(examples, deterministic_evidence(examples))[0]["evidence"]["Feedback"]
-    )
+    assert "Turing" in resolve_evidence(examples, deterministic_evidence(examples))[0]["evidence"]["Feedback"]
     selection["references"][0]["end"] = 10007
     with pytest.raises(ValueError, match="span"):
         resolve_evidence(examples, selection)
@@ -427,8 +429,7 @@ def test_completed_request_invalidates_when_learned_writer_changes(tmp_path, pro
         assert prop(candidate, data, ["qa.predict"]) == first
         assert len(calls) == completed_calls
         prop.qwen_proposer.signature = prop.qwen_proposer.signature.with_instructions(
-            prop.qwen_proposer.signature.instructions
-            + "\nPreserve exact source names in task outputs."
+            prop.qwen_proposer.signature.instructions + "\nPreserve exact source names in task outputs."
         )
         assert prop(candidate, data, ["qa.predict"]) == first
         assert len(calls) == completed_calls + 1  # Evidence is reused; the new writer runs once.
@@ -442,9 +443,26 @@ def test_completed_request_invalidates_when_learned_writer_changes(tmp_path, pro
 def test_budget_includes_default_lm_template_options(provider):
     url, calls = provider
     prop = proposer(url)
-    prop.worker_lm.kwargs["extra_body"] = {
-        "chat_template_kwargs": {"tool_description": "x" * 50000}
-    }
+    prop.worker_lm.kwargs["extra_body"] = {"chat_template_kwargs": {"tool_description": "x" * 50000}}
     with pytest.raises(ReflectionBudgetError, match="input limit"):
         prop(component_name="qa.predict", current_instruction="Use evidence.")
     assert calls == []
+
+
+@pytest.mark.parametrize("provider", [65536, 131072], indirect=True)
+def test_default_reflection_budgets_follow_verified_serving_capacity(provider):
+    url, calls = provider
+    counter = ServingTokenCounter(url, "reflection-model")
+    context = counter.context_tokens
+    lm = create_dspy_lm("reflection-model", base_url=url, cache=False, context_window_tokens=context)
+    guarded = ReflectionLM(lm, counter, context_tokens=context)
+    assert guarded.context_tokens == context
+    assert guarded.input_tokens == context // 4
+    assert guarded.output_tokens == guarded.kwargs["max_tokens"] == context // 16
+    prop = RLMInstructionProposer(orchestrator_lm=lm, worker_lm=lm, token_counter=counter)
+    prop.preflight()
+    assert prop.reflection_input_tokens == prop.worker_lm.input_tokens == context // 4
+    assert prop.max_instruction_chars == 1500 * context // 65536
+    with pytest.raises(ReflectionBudgetError, match="input limit"):
+        guarded.count([{"role": "user", "content": "x" * (3 * (context // 4) + 100)}])
+    assert not calls

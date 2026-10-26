@@ -1,6 +1,7 @@
 """Real SQLite cache budget, FIFO, replacement and rollback invariants."""
 
 import sqlite3
+from contextlib import closing
 
 import pytest
 
@@ -8,7 +9,7 @@ from yaw.daemon.graph.storage import CandidateCacheStore
 
 
 def test_candidate_cache_shared_budget_replacement_and_rollback() -> None:
-    with sqlite3.connect(":memory:") as conn:
+    with closing(sqlite3.connect(":memory:")) as conn:
         store = CandidateCacheStore(conn)
         store.put("openie", "a", b"a" * 12, max_bytes=24)
         store.put("shacl", "b", b"b" * 12, max_bytes=24)
@@ -33,7 +34,7 @@ def test_candidate_cache_shared_budget_replacement_and_rollback() -> None:
 
 
 def test_candidate_cache_zero_budget_never_retains_entries() -> None:
-    with sqlite3.connect(":memory:") as conn:
+    with closing(sqlite3.connect(":memory:")) as conn:
         store = CandidateCacheStore(conn)
         store.put("embedding", "key", b"", max_bytes=0)
         assert not store.contains("embedding", "key")

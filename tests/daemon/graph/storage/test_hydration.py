@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from yaw.core import ChunkPointer
-from yaw.daemon.graph.storage.db import open_yaw_db, upsert_chunk_pointers
+from yaw.daemon.graph.storage import open_yaw_db, upsert_chunk_pointers
 from yaw.daemon.graph.storage.hydration import (
     hydrate_chunk_pointer,
     hydrate_passages,
@@ -113,9 +113,7 @@ def test_make_chunk_hydrator_tool(tmp_path: Path) -> None:
     try:
         f = tmp_path / "corpus" / "story.txt"
         f.parent.mkdir(parents=True)
-        f.write_text(
-            "Once upon a time in a faraway land.\nThere lived a wise queen.\n", encoding="utf-8"
-        )
+        f.write_text("Once upon a time in a faraway land.\nThere lived a wise queen.\n", encoding="utf-8")
 
         p = ChunkPointer("c_story", "corpus/story.txt", 1, 2, "Story")
         upsert_chunk_pointers(conn, [(p, f.read_text(encoding="utf-8"))])
@@ -221,9 +219,7 @@ def test_hydrate_budgeted_passages_1hop_ast_expansion(tmp_path: Path) -> None:
     lines = [f"Line {i:02d}: Context statement for testing.\n" for i in range(1, 41)]
     f.write_text("".join(lines), encoding="utf-8")
 
-    p1 = ChunkPointer(
-        "c_hit", "article.txt", 15, 18, "Article", ast_island_start=10, ast_island_end=25
-    )
+    p1 = ChunkPointer("c_hit", "article.txt", 15, 18, "Article", ast_island_start=10, ast_island_end=25)
 
     # Large budget: expands to ±10 lines bounded by [ast_island_start, ast_island_end] = [10, 25]
     passages = hydrate_budgeted_passages(
@@ -263,3 +259,207 @@ def test_read_corpus_lines_cocoindex_codesource_caching(tmp_path: Path) -> None:
     # 4. Out of range returns None
     out_of_range = read_corpus_lines(f, 10, 20)
     assert out_of_range is None
+
+
+@pytest.mark.parametrize("rel_path", ["corpus/records.json", "corpus/records.jsonl", "corpus/records.ndjson"])
+def test_coalesce_spans_json_merges_only_identical_line_bounds(rel_path: str) -> None:
+    from yaw.daemon.graph.storage.hydration import MutableSpan, coalesce_spans
+
+    spans = [
+        # Two sub-chunks of the exact same JSON record at lines 2..7
+        MutableSpan("rec1_sub1", rel_path, 2, 7, "SameTitle", 0.65, 2, 7),
+        MutableSpan("rec1_sub2", rel_path, 2, 7, "SameTitle", 0.92, 2, 7),
+        # Adjacent JSON record at lines 8..13 with identical title and ast_island_start=0
+        MutableSpan("rec2_sub1", rel_path, 8, 13, "SameTitle", 0.80, 0, 0),
+        # Third adjacent JSON record at lines 14..19 with empty title and ast_island_start=0
+        MutableSpan("rec3_sub1", rel_path, 14, 19, "", 0.50, 0, 0),
+    ]
+
+    coalesced = coalesce_spans(spans)
+    assert len(coalesced) == 3
+
+    # First coalesced span is the merged rec1 (lines 2..7) with max_score=0.92 and both hit chunk IDs
+    assert coalesced[0].rel_posix_path == rel_path
+    assert coalesced[0].start_line == 2
+    assert coalesced[0].end_line == 7
+    assert coalesced[0].max_score == 0.92
+    assert coalesced[0].hit_chunk_ids == ("rec1_sub1", "rec1_sub2")
+
+    # Second coalesced span is rec2 (lines 8..13), never merged into lines 2..13
+    assert coalesced[1].rel_posix_path == rel_path
+    assert coalesced[1].start_line == 8
+    assert coalesced[1].end_line == 13
+    assert coalesced[1].max_score == 0.80
+    assert coalesced[1].hit_chunk_ids == ("rec2_sub1",)
+
+    # Third coalesced span is rec3 (lines 14..19), never merged into lines 8..19
+    assert coalesced[2].rel_posix_path == rel_path
+    assert coalesced[2].start_line == 14
+    assert coalesced[2].end_line == 19
+    assert coalesced[2].max_score == 0.50
+    assert coalesced[2].hit_chunk_ids == ("rec3_sub1",)
+
+
+def test_resolve_upward_ast_bounds_and_ast_island_hydrator_clamped_for_json(tmp_path: Path) -> None:
+    from yaw.daemon.graph.storage.hydration import (
+        hydrate_budgeted_passages,
+        make_ast_island_hydrator,
+        resolve_one_hop_upward_ast_bounds,
+    )
+
+    corpus_json = tmp_path / "outputs" / "datasets" / "enterprise_rag_bench_corpus.json"
+    corpus_json.parent.mkdir(parents=True, exist_ok=True)
+    # Line 1: [
+    # Lines 2..7: Record 1
+    # Lines 8..13: Record 2
+    # Line 14: ]
+    json_lines = [
+        "[\n",
+        "  {\n",
+        '    "idx": "doc_1",\n',
+        '    "title": "First Document",\n',
+        '    "text": "Forbidden sibling record content from doc_1.",\n',
+        '    "source_type": "github"\n',
+        "  },\n",
+        "  {\n",
+        '    "idx": "doc_2",\n',
+        '    "title": "Second Document",\n',
+        '    "text": "Target content inside doc_2 only.",\n',
+        '    "source_type": "slack"\n',
+        "  }\n",
+        "]\n",
+    ]
+    corpus_json.write_text("".join(json_lines), encoding="utf-8")
+
+    rel_path = "outputs/datasets/enterprise_rag_bench_corpus.json"
+    ptr_rec1_sub1 = ChunkPointer(
+        chunk_id="chunk_rec1_a",
+        rel_posix_path=rel_path,
+        start_line=2,
+        end_line=7,
+        title="[github] First Document",
+        ast_island_start=2,
+        ast_island_end=7,
+    )
+    ptr_rec1_sub2 = ChunkPointer(
+        chunk_id="chunk_rec1_b",
+        rel_posix_path=rel_path,
+        start_line=2,
+        end_line=7,
+        title="[github] First Document",
+        ast_island_start=2,
+        ast_island_end=7,
+    )
+    ptr_rec2 = ChunkPointer(
+        chunk_id="chunk_rec2",
+        rel_posix_path=rel_path,
+        start_line=8,
+        end_line=13,
+        title="[slack] Second Document",
+        ast_island_start=8,
+        ast_island_end=13,
+    )
+    ptr_rec2_excised = ChunkPointer(
+        chunk_id="chunk_rec2_excised",
+        rel_posix_path=rel_path,
+        start_line=10,
+        end_line=11,
+        title="[slack] Second Document",
+        ast_island_start=8,
+        ast_island_end=13,
+    )
+
+    # 1. resolve_one_hop_upward_ast_bounds stays clamped at (8, 13, title) for hops=1 and hops=2
+    assert resolve_one_hop_upward_ast_bounds(corpus_json, ptr_rec2, hops=0) == (
+        8,
+        13,
+        "[slack] Second Document",
+    )
+    assert resolve_one_hop_upward_ast_bounds(corpus_json, ptr_rec2, hops=1) == (
+        8,
+        13,
+        "[slack] Second Document",
+    )
+    assert resolve_one_hop_upward_ast_bounds(corpus_json, ptr_rec2, hops=2) == (
+        8,
+        13,
+        "[slack] Second Document",
+    )
+    # Excised inner sub-span expands to enclosing JSON record (8, 13) on hops>=1, never climbing to line 1
+    assert resolve_one_hop_upward_ast_bounds(corpus_json, ptr_rec2_excised, hops=0) == (
+        10,
+        11,
+        "[slack] Second Document",
+    )
+    assert resolve_one_hop_upward_ast_bounds(corpus_json, ptr_rec2_excised, hops=1) == (
+        8,
+        13,
+        "[slack] Second Document",
+    )
+
+    # 2. make_ast_island_hydrator hydrates clean normalized text of Record 2 only
+    db_file = tmp_path / "yaw.db"
+    conn = open_yaw_db(db_file)
+    try:
+        upsert_chunk_pointers(
+            conn,
+            [(ptr_rec2, "[slack] Second Document\nTarget content inside doc_2 only.")],
+        )
+        hydrate_island = make_ast_island_hydrator(conn, tmp_path)
+        hydrated_output = hydrate_island("chunk_rec2")
+
+        assert "Lines 8–13, Focus Chunk Lines 8–13" in hydrated_output
+        assert "Target content inside doc_2 only." in hydrated_output
+        assert "Forbidden sibling record content" not in hydrated_output
+        assert "doc_1" not in hydrated_output
+    finally:
+        conn.close()
+
+    # 3. hydrate_budgeted_passages coalesces sub-chunks of rec1 and keeps adjacent rec2 separate and normalized
+    passages = hydrate_budgeted_passages(
+        [(ptr_rec2, 0.95), (ptr_rec1_sub1, 0.70), (ptr_rec1_sub2, 0.85)],
+        corpus_root=tmp_path,
+        max_context_chars=24000,
+        max_expansion_hops=1,
+    )
+    assert len(passages) == 2
+    assert passages[0].score == 0.95
+    assert passages[0].text == "Second Document\nTarget content inside doc_2 only."
+    assert passages[1].score == 0.85
+    assert passages[1].text == "First Document\nForbidden sibling record content from doc_1."
+
+
+@pytest.mark.parametrize("rel_path", ["corpus/data.json", "corpus/data.jsonl", "corpus/data.ndjson"])
+def test_hydrate_ast_parent_context_returns_empty_for_json_and_jsonl(tmp_path: Path, rel_path: str) -> None:
+    from yaw.daemon.graph.storage.hydration import hydrate_ast_parent_context
+
+    target = tmp_path / rel_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "[\n",
+        "  {\n",
+        '    "idx": "doc_1",\n',
+        '    "title": "First Record",\n',
+        '    "text": "Leaked first record text"\n',
+        "  },\n",
+        "  {\n",
+        '    "idx": "doc_2",\n',
+        '    "title": "Second Record",\n',
+        '    "text": "Second record text"\n',
+        "  }\n",
+        "]\n",
+    ]
+    target.write_text("".join(lines), encoding="utf-8")
+
+    # Even when start_line=8 (or inside an excised span with ast_island_start=7, start_line=9) and hops=1 or 2
+    ptr = ChunkPointer(
+        chunk_id="c_rec2",
+        rel_posix_path=rel_path,
+        start_line=8,
+        end_line=11,
+        title="Second Record",
+        ast_island_start=7,
+        ast_island_end=11,
+    )
+    assert hydrate_ast_parent_context(ptr, tmp_path, hops=1) == ""
+    assert hydrate_ast_parent_context(ptr, tmp_path, hops=2) == ""

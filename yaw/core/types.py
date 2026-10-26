@@ -1,9 +1,10 @@
 """Frozen, zero-dependency data contracts and pure coordinate/ID helpers for YAW."""
 
 import hashlib
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, overload
 
 ErrorCode = Literal[
     "INVALID_INPUT",
@@ -58,6 +59,9 @@ class StructuredTriple:
     obj: str = ""
     obj_def: str = ""
     spo_def: str = ""
+    obj_kind: Literal["entity", "literal"] = "entity"
+    obj_datatype: str = ""
+    obj_lang: str = ""
 
     @property
     def subject(self) -> str:
@@ -73,6 +77,53 @@ class StructuredTriple:
 
     def as_tuple(self) -> tuple[str, str, str]:
         return (self.subj, self.pred, self.obj)
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "subj": self.subj,
+            "subj_def": self.subj_def,
+            "pred": self.pred,
+            "obj": self.obj,
+            "obj_def": self.obj_def,
+            "spo_def": self.spo_def,
+        }
+        if self.obj_kind != "entity" or self.obj_datatype or self.obj_lang:
+            d["obj_kind"] = self.obj_kind
+            d["obj_datatype"] = self.obj_datatype
+            d["obj_lang"] = self.obj_lang
+        return d
+
+
+@dataclass(slots=True, frozen=True)
+class RelationTraversalPolicy:
+    """Versioned relation-aware directed traversal policy for Personalized PageRank."""
+
+    passage: float = 1.0
+    fact_forward: float = 1.0
+    fact_reverse: float = 1.0
+    datatype_property: float = 0.5
+    skos_related: float = 1.0
+    skos_broader_up: float = 1.0
+    skos_broader_down: float = 0.5
+    owl_different_from: float = 0.0
+    parallel_aggregation: Literal["max", "sum", "capped_sum"] = "max"
+    parallel_cap: float = 2.0
+
+    @property
+    def fact_fwd(self) -> float:
+        return self.fact_forward
+
+    @property
+    def fact_rev(self) -> float:
+        return self.fact_reverse
+
+    @property
+    def skos_broader(self) -> float:
+        return self.skos_broader_up
+
+    @property
+    def skos_narrower(self) -> float:
+        return self.skos_broader_down
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -158,6 +209,43 @@ def compute_mdhash_id(content: str, prefix: str = "") -> str:
     return prefix + hashlib.md5(content.encode("utf-8")).hexdigest()
 
 
+@overload
+def text_processing(text: list[Any]) -> list[Any]: ...
+
+
+@overload
+def text_processing(text: Any) -> str: ...
+
+
+def text_processing(text: Any) -> str | list[Any]:
+    """Normalize entity/fact text to lowercase tokens while preserving significant technical punctuation."""
+    if isinstance(text, list):
+        return [text_processing(t) for t in text]
+    if not isinstance(text, str):
+        text = str(text)
+    folded = text.casefold()
+    n = len(folded)
+    out: list[str] = []
+    for i, ch in enumerate(folded):
+        if (
+            ch.isalnum()
+            or ch.isspace()
+            or (ch in "+#%" and i > 0 and (folded[i - 1].isalnum() or (out and out[-1] in "+#%")))
+            or (ch in "./:" and 0 < i < n - 1 and folded[i - 1].isalnum() and folded[i + 1].isalnum())
+            or (
+                ch == "-"
+                and 0 < i < n - 1
+                and folded[i - 1].isalnum()
+                and folded[i + 1].isalnum()
+                and (folded[i - 1].isdigit() or folded[i + 1].isdigit())
+            )
+        ):
+            out.append(ch)
+        else:
+            out.append(" ")
+    return " ".join("".join(out).split())
+
+
 def compute_chunk_id(rel_posix_path: str, start_line: int, end_line: int, text: str) -> str:
     """Compute deterministic canonical chunk ID from relative path, line span, and slice text."""
     payload = f"{rel_posix_path}:{start_line}:{end_line}:{text}"
@@ -176,9 +264,7 @@ def resolve_corpus_path(corpus_root: Path, rel_posix_path: str) -> Path:
     root_resolved = corpus_root.resolve()
     target_path = (root_resolved / rel_posix_path).resolve()
     if not target_path.is_relative_to(root_resolved):
-        raise ValueError(
-            f"Path traversal detected: {rel_posix_path!r} resolves outside corpus root {corpus_root}"
-        )
+        raise ValueError(f"Path traversal detected: {rel_posix_path!r} resolves outside corpus root {corpus_root}")
     return target_path
 
 
@@ -189,3 +275,138 @@ def to_rel_posix_path(corpus_root: Path, file_path: Path | str) -> str:
     if not target_path.is_relative_to(root_resolved):
         raise ValueError(f"File path {file_path!r} resolves outside corpus root {corpus_root}")
     return target_path.relative_to(root_resolved).as_posix()
+
+
+_SCALAR_FALLBACK_RE = re.compile(
+    r"^(?:"
+    r"\d{4}[-/\s](?:0?[1-9]|1[0-2])[-/\s](?:0?[1-9]|[12]\d|3[01])"
+    r"(?:[T\s]\d{2}[:\s]\d{2}(?:[:\s]\d{2}(?:[.\s]\d+)?)?\s*(?:Z|UTC|GMT|[+-]?\s*\d{2}[:\s]?\d{2})?)?"
+    r"|(?:true|false)"
+    r"|[+-]?\d+(?:[.,]\d+)*(?:\s*%)?"
+    r"|v(?:ersion)?\s*\d+(?:[.\s]\d+)+(?:[-_][a-zA-Z0-9]+)?"
+    r"|\d+(?:\.\d+){2,}(?:[-_][a-zA-Z0-9]+)?"
+    r")$",
+    re.IGNORECASE,
+)
+_ORDINAL_SUFFIX_RE = re.compile(
+    r"^(.*?[a-z])[-\s_.]*?(?:[-\s_.]+v(?:ersion)?[-\s_.]*)?(\d+(?:[-\s_.]+\d+)*(?:[-_.]?[a-z])?)$",
+    re.IGNORECASE,
+)
+_ACRONYM_STOPWORDS = frozenset({"of", "the", "and", "in", "on", "for", "to", "a", "an", "by", "with"})
+
+
+def detect_scalar_literal(text: str, definition: str = "") -> tuple[bool, str]:
+    """Minimal fallback helper for bare ISO dates, numbers/percentages, booleans, and version strings."""
+    _ = definition
+    if not isinstance(text, str):
+        return (False, "")
+    val = text.strip()
+    if val and _SCALAR_FALLBACK_RE.match(val):
+        return (True, "rdfs:Literal")
+    return (False, "")
+
+
+def _split_version_or_ordinal(name: str) -> tuple[str, str] | None:
+    """Split a concept name into normalized (base_concept, version_or_ordinal_suffix)."""
+    m = _ORDINAL_SUFFIX_RE.match(name)
+    if m is None:
+        return None
+    base = re.sub(r"[-\s_.]+", " ", m.group(1)).strip()
+    if base == "version":
+        base = "v"
+    suff = re.sub(r"[-\s_.]+", ".", m.group(2)).strip()
+    while re.match(r"^\d+(?:\.\d+)*\.0$", suff):
+        suff = suff[:-2]
+    if not base or not suff:
+        return None
+    return (base, suff)
+
+
+def is_version_or_ordinal_sibling(name_a: str, name_b: str) -> bool:
+    """Return True if two concept names differ only by trailing version, ordinal, tier, or severity."""
+    if not isinstance(name_a, str) or not isinstance(name_b, str):
+        return False
+    na = name_a.strip().lower()
+    nb = name_b.strip().lower()
+    if not na or not nb or na == nb:
+        return False
+    sa = _split_version_or_ordinal(na)
+    sb = _split_version_or_ordinal(nb)
+    if sa is None or sb is None:
+        return False
+    return sa[0] == sb[0] and sa[1] != sb[1]
+
+
+def _matches_initialism(short_clean: str, words: list[str]) -> bool:
+    """Check whether short_clean matches the initialism of words (or its plural)."""
+    if len(words) < 2 or not any(len(w) >= 2 for w in words):
+        return False
+    acr = "".join(w[0].lower() for w in words)
+    if short_clean == acr:
+        return True
+    if short_clean.endswith("s") and len(short_clean) > 2 and short_clean[:-1] == acr:
+        return True
+    content_words = [w for w in words if w.lower() not in _ACRONYM_STOPWORDS]
+    if len(content_words) >= 2 and len(content_words) != len(words):
+        acr_content = "".join(w[0].lower() for w in content_words)
+        if short_clean == acr_content or (
+            short_clean.endswith("s") and len(short_clean) > 2 and short_clean[:-1] == acr_content
+        ):
+            return True
+    return False
+
+
+def is_acronym_pair(name_a: str, name_b: str) -> bool:
+    """Return True if one entity name is an acronym or initialism of the other."""
+    if not isinstance(name_a, str) or not isinstance(name_b, str):
+        return False
+    na = name_a.strip()
+    nb = name_b.strip()
+    if not na or not nb or na.lower() == nb.lower():
+        return False
+    if is_version_or_ordinal_sibling(na, nb):
+        return False
+    short_cand, long_cand = (na, nb) if len(na) < len(nb) else (nb, na)
+    if any(ch.isspace() for ch in short_cand):
+        return False
+    short_clean = re.sub(r"[^a-zA-Z0-9]", "", short_cand).lower()
+    long_clean = re.sub(r"[^a-zA-Z0-9]", "", long_cand).lower()
+    if not (2 <= len(short_clean) <= 8) or short_clean == long_clean:
+        return False
+    if short_clean in _ACRONYM_STOPWORDS:
+        return False
+    if sum(ch.isalpha() for ch in short_clean) < 2:
+        return False
+    words = [w for w in re.findall(r"[a-zA-Z0-9]+", long_cand) if w]
+    if _matches_initialism(short_clean, words):
+        return True
+    short_base = short_clean[:-1] if short_clean.endswith("s") and len(short_clean) > 2 else short_clean
+    self_tokens = {short_clean, short_base, short_base + "s"}
+    trimmed_words = list(words)
+    if trimmed_words and trimmed_words[-1].lower() in self_tokens:
+        trimmed_words = trimmed_words[:-1]
+    elif trimmed_words and trimmed_words[0].lower() in self_tokens:
+        trimmed_words = trimmed_words[1:]
+    if len(trimmed_words) != len(words):
+        return _matches_initialism(short_clean, trimmed_words)
+    return False
+
+
+def check_lexical_subsumption_inversion(name_narrower: str, name_broader: str) -> bool:
+    """Return True if an asserted (narrower -> broader) hierarchy edge violates lexical subsumption.
+
+    In SKOS, an edge (narrower, broader, 'skos:broader') asserts narrower is a child of broader.
+    If the child's token set T(narrower) is a strict subset of the parent's token set T(broader),
+    the hierarchy is inverted (the parent is actually the specialized compound concept).
+    """
+    if not isinstance(name_narrower, str) or not isinstance(name_broader, str):
+        return False
+    if is_version_or_ordinal_sibling(name_narrower, name_broader) or is_acronym_pair(
+        name_narrower, name_broader
+    ):
+        return False
+    toks_n = {tok for tok in str(text_processing(name_narrower)).split() if tok}
+    toks_b = {tok for tok in str(text_processing(name_broader)).split() if tok}
+    if not toks_n or not toks_b:
+        return False
+    return toks_n < toks_b

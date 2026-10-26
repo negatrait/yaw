@@ -26,13 +26,13 @@ embedding_task_mode = "distinct-titled"
 extraction_model = "Gemma-4-E4B-it-GGUF"
 qa_model = "Gemma-4-E4B-it-GGUF"
 # Match the external server's configured serving window, not its advertised maximum.
-context_window_tokens = 65536
-max_output_tokens = 4096
+context_window_tokens = 131072
+# Omitted budgets follow context capacity: at 128K, output=8192 tokens,
+# reflection input=32768 tokens, and RLM output=20000 characters.
+# Set max_output_tokens, reflection_input_tokens or rlm_max_output_chars to pin a limit.
 # Independent execution budgets; a larger context does not require more tool calls.
 rlm_max_iters = 10
 rlm_max_llm_calls = 20
-rlm_max_output_chars = 10000
-reflection_input_tokens = 16384
 # Set only when Lemonade does not advertise the resident llama.cpp backend URL.
 reflection_tokenizer_url = ""
 enable_gbnf = true

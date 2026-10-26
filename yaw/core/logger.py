@@ -66,10 +66,9 @@ class FIFOLineRotatingHandler(logging.Handler):
 
 
 class SuppressThirdPartyInfoFilter(logging.Filter):
-    """Filter to suppress noisy INFO chatter from upstream hipporag, litellm, httpx, httpx2, and openai."""
+    """Filter to suppress noisy INFO chatter from upstream litellm, httpx, httpx2, and openai."""
 
     _SUPPRESSED_PREFIXES = (
-        "hipporag",
         "httpx",
         "httpx2",
         "httpcore",
@@ -80,15 +79,11 @@ class SuppressThirdPartyInfoFilter(logging.Filter):
     )
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if record.levelno < logging.WARNING and any(
-            record.name == prefix or record.name.startswith(f"{prefix}.")
-            for prefix in self._SUPPRESSED_PREFIXES
-        ):
-            return False
-        # Suppress repetitive benign warnings from upstream hipporag
         return not (
-            record.name.startswith("hipporag")
-            and "does not have a customized prompt template" in record.getMessage()
+            record.levelno < logging.WARNING
+            and any(
+                record.name == prefix or record.name.startswith(f"{prefix}.") for prefix in self._SUPPRESSED_PREFIXES
+            )
         )
 
 
@@ -117,15 +112,6 @@ def configure_logging(
             "LiteLLM",
             "LiteLLM Router",
             "LiteLLM Proxy",
-            "hipporag",
-            "hipporag.HippoRAG",
-            "hipporag.information_extraction",
-            "hipporag.evaluation",
-            "hipporag.llm",
-            "hipporag.embedding_model",
-            "hipporag.embedding_store",
-            "hipporag.prompts",
-            "hipporag.utils",
         ):
             logging.getLogger(name).setLevel(logging.WARNING)
 

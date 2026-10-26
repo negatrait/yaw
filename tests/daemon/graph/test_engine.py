@@ -1,6 +1,7 @@
 """Unmocked integration and invariant tests for YawGraphEngine with real SQLite and disk files."""
 
 import hashlib
+import json
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
@@ -12,22 +13,29 @@ import pytest
 from daemon.graph.inference.test_reflection import provider as provider
 from yaw.core import ChunkPointer
 from yaw.daemon.graph.engine import YawGraphEngine
-from yaw.daemon.graph.inference import HippoRAGProgram
+from yaw.daemon.graph.inference import (
+    ActiveTraceComponentSelector,
+    HippoRAGProgram,
+    extraction_fingerprint,
+)
+
+
+class ProtocolTokenCounter:
+    """Exact loopback tokenizer with an independent synthetic task LM identity."""
+
+    def __init__(self, url):
+        from yaw.daemon.graph.inference import ServingTokenCounter
+
+        self.serving = ServingTokenCounter(url, "reflection-model")
+        self.identity = self.serving.identity
+        self.context_tokens = self.serving.context_tokens
+
+    def __call__(self, messages, **kwargs):
+        return self.serving(messages, **kwargs)
 
 
 def protocol_token_counter(url):
-    from yaw.daemon.graph.inference import ServingTokenCounter
-
-    serving = ServingTokenCounter(url, "reflection-model")
-
-    def count(messages, **kwargs):
-        return serving(messages, **kwargs)
-
-    # Synthetic task LMs have no resident serving identity. The loopback
-    # tokenizer still exercises exact request budgeting for orchestration.
-    count.identity = serving.identity
-    count.context_tokens = serving.context_tokens
-    return count
+    return ProtocolTokenCounter(url)
 
 
 @pytest.fixture
@@ -51,6 +59,8 @@ class DeterministicMockLM(dspy.LM):
                 {"prompt_tokens": 32, "completion_tokens": 16, "total_tokens": 48},
             )
         req_str = str(prompt or messages or kwargs)
+        if "ExtractQueryIntent" in req_str or "query_intent" in req_str:
+            return [json.dumps({"query_intent": "Ada Lovelace" if "Lovelace" in req_str else "Alan Turing"})]
         if (
             "JudgeSynonyms" in req_str
             or "OrchestrateSynonymJudgment" in req_str
@@ -58,11 +68,7 @@ class DeterministicMockLM(dspy.LM):
             or "candidate_pairs" in req_str
         ):
             return ['{"decisions": []}']
-        if (
-            "ProposeSHACLRepairs" in req_str
-            or "HealSHACLViolations" in req_str
-            or "violations_json" in req_str
-        ):
+        if "ProposeSHACLRepairs" in req_str or "HealSHACLViolations" in req_str or "violations_json" in req_str:
             return ['{"repairs": []}']
         if (
             "DefineMissingEntities" in req_str
@@ -72,10 +78,12 @@ class DeterministicMockLM(dspy.LM):
         ):
             if "Lovelace" in req_str:
                 return [
-                    '{"entity_definitions": [["Ada Lovelace", "English mathematician"], ["Analytical Engine", "Mechanical general-purpose computer"]]}'
+                    '{"entity_definitions": [["Ada Lovelace", "English mathematician"], ["Analytical Engine", '
+                    '"Mechanical general-purpose computer"]]}'
                 ]
             return [
-                '{"entity_definitions": [["Alan Turing", "English mathematician and computer scientist"], ["computer science", "Study of computation and information"]]}'
+                '{"entity_definitions": [["Alan Turing", "English mathematician and computer scientist"], '
+                '["computer science", "Study of computation and information"]]}'
             ]
         # Filter triples stage
         if "FilterTriples" in req_str or "fact_before_filter" in req_str:
@@ -86,37 +94,31 @@ class DeterministicMockLM(dspy.LM):
         if "ExtractTriples" in req_str or '"triples"' in req_str or "`triples`" in req_str:
             if "Lovelace" in req_str:
                 return [
-                    '{"triples": [{"sub": "Ada Lovelace", "pred": "worked on", "obj": "Analytical Engine", "def": "Ada Lovelace worked on the Analytical Engine."}]}'
+                    '{"triples": [{"sub": "Ada Lovelace", "pred": "worked on", "obj": "Analytical Engine", '
+                    '"def": "Ada Lovelace worked on the Analytical Engine."}]}'
                 ]
             return [
-                '{"triples": [{"sub": "Alan Turing", "pred": "father of", "obj": "computer science", "def": "Alan Turing is the father of computer science."}]}'
+                '{"triples": [{"sub": "Alan Turing", "pred": "father of", "obj": "computer science", '
+                '"def": "Alan Turing is the father of computer science."}]}'
             ]
         # NER stage
         if "ExtractEntities" in req_str or "named_entities" in req_str:
             if "Lovelace" in req_str:
                 return [
-                    '{"named_entities": [["Ada Lovelace", "English mathematician"], ["Analytical Engine", "Mechanical general-purpose computer"]]}'
+                    '{"named_entities": [["Ada Lovelace", "English mathematician"], ["Analytical Engine", '
+                    '"Mechanical general-purpose computer"]]}'
                 ]
             return [
-                '{"named_entities": [["Alan Turing", "English mathematician and computer scientist"], ["computer science", "Study of computation and information"]]}'
+                '{"named_entities": [["Alan Turing", "English mathematician and computer scientist"], '
+                '["computer science", "Study of computation and information"]]}'
             ]
         # QA stage
-        if (
-            "AnswerQuestion" in req_str
-            or "Retrieved evidence passages" in req_str
-            or "context" in req_str
-        ):
+        if "AnswerQuestion" in req_str or "Retrieved evidence passages" in req_str or "context" in req_str:
             if "Turing" in req_str:
-                return [
-                    '{"reasoning": "Alan Turing founded computer science.", "answer": "Alan Turing"}'
-                ]
+                return ['{"reasoning": "Alan Turing founded computer science.", "answer": "Alan Turing"}']
             if "Lovelace" in req_str:
-                return [
-                    '{"reasoning": "Ada Lovelace worked on the Analytical Engine.", "answer": "Ada Lovelace"}'
-                ]
-            return [
-                '{"reasoning": "Alan Turing founded computer science.", "answer": "Alan Turing"}'
-            ]
+                return ['{"reasoning": "Ada Lovelace worked on the Analytical Engine.", "answer": "Ada Lovelace"}']
+            return ['{"reasoning": "Alan Turing founded computer science.", "answer": "Alan Turing"}']
         return ['{"reasoning": "Alan Turing founded computer science.", "answer": "Alan Turing"}']
 
 
@@ -197,23 +199,22 @@ def test_engine_index_and_caching(test_engine: YawGraphEngine, tmp_path: Path) -
     indexed_count = test_engine.index(docs)
     assert indexed_count == 2
 
-    # Verify passages.txt written on disk
-    passages_file = tmp_path / "corpus" / "passages.txt"
-    assert passages_file.exists()
-    content = passages_file.read_text(encoding="utf-8")
+    # Verify passages.json written on disk and no corpus/chunk-*.md files created
+    assert not (tmp_path / "corpus").exists()
+    passages_path = tmp_path / "passages.json"
+    assert passages_path.is_file()
+    content = passages_path.read_text(encoding="utf-8")
     assert "Alan Turing" in content
     assert "Radio City" in content
+    records = json.loads(content)
+    assert isinstance(records, list) and len(records) == 2
 
     # Verify SQLite tables populated
-    chunks = test_engine.conn.execute(
-        "SELECT chunk_id, start_line, end_line FROM chunks"
-    ).fetchall()
+    chunks = test_engine.conn.execute("SELECT chunk_id, start_line, end_line FROM chunks").fetchall()
     assert len(chunks) == 2
 
     # Check FTS5 populated
-    fts_hits = test_engine.conn.execute(
-        "SELECT chunk_id FROM chunk_fts WHERE chunk_fts MATCH 'Turing'"
-    ).fetchall()
+    fts_hits = test_engine.conn.execute("SELECT chunk_id FROM chunk_fts WHERE chunk_fts MATCH 'Turing'").fetchall()
     assert len(fts_hits) == 1
 
     # Check openie_chunks populated
@@ -257,9 +258,7 @@ def test_openie_resume_reuses_matching_prompts_and_invalidates_mutations(tmp_pat
         ids = [str(row[0]) for row in engine.conn.execute("SELECT chunk_id FROM chunks")]
         pointers = get_chunk_pointers(engine.conn, ids)
         chunks = [(pointers[cid], doc) for cid in ids]
-        provenance = engine.conn.execute(
-            "SELECT value FROM meta WHERE key GLOB 'indexed_fp:*'"
-        ).fetchall()
+        provenance = engine.conn.execute("SELECT value FROM meta WHERE key GLOB 'indexed_fp:*'").fetchall()
     finally:
         engine.close()
 
@@ -274,19 +273,13 @@ def test_openie_resume_reuses_matching_prompts_and_invalidates_mutations(tmp_pat
     try:
         engine.index_chunks(chunks)
         assert second.openie_calls == 0
-        assert (
-            engine.conn.execute("SELECT value FROM meta WHERE key GLOB 'indexed_fp:*'").fetchall()
-            == provenance
-        )
+        assert engine.conn.execute("SELECT value FROM meta WHERE key GLOB 'indexed_fp:*'").fetchall() == provenance
         second.ner.signature = second.ner.signature.with_instructions(
             second.ner.signature.instructions + " Include all explicitly named people."
         )
         engine.index_chunks(chunks, program=second)
         assert second.openie_calls == 1
-        assert (
-            engine.conn.execute("SELECT value FROM meta WHERE key GLOB 'indexed_fp:*'").fetchall()
-            != provenance
-        )
+        assert engine.conn.execute("SELECT value FROM meta WHERE key GLOB 'indexed_fp:*'").fetchall() != provenance
     finally:
         engine.close()
 
@@ -403,9 +396,13 @@ def test_engine_multi_batch_indexing_and_bounded_embedding_batches(tmp_path: Pat
         # Every embedder call must respect embed_batch_size=2
         assert all(sz <= 2 for sz in batch_sizes_seen)
 
-        # Verify line numbers in SQLite match exact lines in passages.txt (2 + 3 + 1 + 2 + 1 = 9 lines)
-        max_end = engine.conn.execute("SELECT MAX(end_line) FROM chunks").fetchone()[0]
-        assert max_end == 9
+        # Verify line numbers in SQLite match exact per-record 1-indexed spans in passages.json
+        assert not (tmp_path / "corpus").exists()
+        spans = [
+            tuple(r)
+            for r in engine.conn.execute("SELECT start_line, end_line FROM chunks ORDER BY start_line").fetchall()
+        ]
+        assert spans == [(2, 6), (7, 11), (12, 16), (17, 21), (22, 26)]
 
         # Verify DPR retrieval hydrates chunks from both batches accurately
         dpr_hits = engine.retrieve_dpr("Doc 4 line 1", top_k=5)
@@ -568,9 +565,7 @@ def test_engine_evolve_prompts_miprov2_and_gepa_metric_contracts(
     monkeypatch.setattr(dspy, "MIPROv2", FakeMIPROv2, raising=False)
     monkeypatch.setattr(dspy, "GEPA", FakeGEPA, raising=False)
 
-    test_engine.evolve_prompts(
-        trainset, mode="hybrid", reflection_token_counter=reflection_token_counter
-    )
+    test_engine.evolve_prompts(trainset, mode="hybrid", reflection_token_counter=reflection_token_counter)
     assert len(mipro_scores) == 1
     assert len(gepa_scores) == 1
 
@@ -730,9 +725,7 @@ def test_engine_homograph_gate_edc_and_shacl_conformance(tmp_path: Path) -> None
                 )
             req_str = str(prompt or messages or kwargs)
             if "JudgeSynonyms" in req_str or "candidate_pairs" in req_str:
-                pair_ids = list(
-                    dict.fromkeys(re.findall(r"entity-[0-9a-f]+\|entity-[0-9a-f]+", req_str))
-                )
+                pair_ids = list(dict.fromkeys(re.findall(r"entity-[0-9a-f]+\|entity-[0-9a-f]+", req_str)))
                 decisions = [
                     {
                         "pair_id": pid,
@@ -742,7 +735,9 @@ def test_engine_homograph_gate_edc_and_shacl_conformance(tmp_path: Path) -> None
                     for pid in pair_ids
                 ]
                 return [json.dumps({"decisions": decisions})]
-            if "ExtractTriples" in req_str or "triples" in req_str:
+            if "ExtractTriples" in req_str or (
+                "triples" in req_str and "missing_entities" not in req_str and "fact_before_filter" not in req_str
+            ):
                 if "Cupertino" in req_str:
                     return [
                         json.dumps(
@@ -777,7 +772,7 @@ def test_engine_homograph_gate_edc_and_shacl_conformance(tmp_path: Path) -> None
                             }
                         )
                     ]
-            if "ExtractEntities" in req_str or "named_entities" in req_str:
+            if "ExtractEntities" in req_str or ("named_entities" in req_str and "triples" not in req_str):
                 if "Cupertino" in req_str:
                     return [
                         json.dumps(
@@ -819,9 +814,7 @@ def test_engine_homograph_gate_edc_and_shacl_conformance(tmp_path: Path) -> None
         assert n1 == 1
 
         # Index second passage: "Apple" with different inline definition triggers provisional sense split
-        n2 = engine.index(
-            ["The apple is an edible pome fruit harvested in orchard trees during Autumn."]
-        )
+        n2 = engine.index(["The apple is an edible pome fruit harvested in orchard trees during Autumn."])
         assert n2 == 1
 
         # Verify two distinct Apple entities exist, linked by owl:differentFrom and sharing prefLabel "apple"
@@ -830,9 +823,7 @@ def test_engine_homograph_gate_edc_and_shacl_conformance(tmp_path: Path) -> None
         ).fetchall()
         assert len(apple_entities) == 2
 
-        diff_edges = engine.conn.execute(
-            "SELECT COUNT(*) FROM edges WHERE kind = 'owl:differentFrom';"
-        ).fetchone()[0]
+        diff_edges = engine.conn.execute("SELECT COUNT(*) FROM edges WHERE kind = 'owl:differentFrom';").fetchone()[0]
         assert diff_edges >= 2
 
         report = engine.lint_graph(as_turtle=True)
@@ -848,7 +839,8 @@ def test_engine_homograph_gate_edc_and_shacl_conformance(tmp_path: Path) -> None
 def test_engine_same_label_provisional_split_merged_by_judge_synonyms_and_stage1_standalone_ner(
     tmp_path: Path,
 ) -> None:
-    """Verify Hazard 2 (same-label cos < 0.85 merged back when JudgeSynonyms returns skos:altLabel) and Hazard 3 Option A (standalone Stage 1 NER entities preserved with definitions)."""
+    """Verify Hazard 2 (same-label cos < 0.85 merged back when JudgeSynonyms returns skos:altLabel) and Hazard 3 \
+Option A (standalone Stage 1 NER entities preserved with definitions)."""
     import json
     import re
 
@@ -866,9 +858,7 @@ def test_engine_same_label_provisional_split_merged_by_judge_synonyms_and_stage1
                 )
             req_str = str(prompt or messages or kwargs)
             if "JudgeSynonyms" in req_str or "candidate_pairs" in req_str:
-                pair_ids = list(
-                    dict.fromkeys(re.findall(r"entity-[0-9a-f]+\|entity-[0-9a-f]+", req_str))
-                )
+                pair_ids = list(dict.fromkeys(re.findall(r"entity-[0-9a-f]+\|entity-[0-9a-f]+", req_str)))
                 decisions = []
                 for pid in pair_ids:
                     ea, eb = pid.split("|", 1)
@@ -881,7 +871,9 @@ def test_engine_same_label_provisional_split_merged_by_judge_synonyms_and_stage1
                         }
                     )
                 return [json.dumps({"decisions": decisions})]
-            if "ExtractTriples" in req_str or "triples" in req_str:
+            if "ExtractTriples" in req_str or (
+                "triples" in req_str and "missing_entities" not in req_str and "fact_before_filter" not in req_str
+            ):
                 if "iPhone" in req_str:
                     return [
                         json.dumps(
@@ -902,7 +894,7 @@ def test_engine_same_label_provisional_split_merged_by_judge_synonyms_and_stage1
                             }
                         )
                     ]
-            if "ExtractEntities" in req_str or "named_entities" in req_str:
+            if "ExtractEntities" in req_str or ("named_entities" in req_str and "triples" not in req_str):
                 if "iPhone" in req_str:
                     return [
                         json.dumps(
@@ -954,15 +946,13 @@ def test_engine_same_label_provisional_split_merged_by_judge_synonyms_and_stage1
             "SELECT entity_id, name, definition FROM entities WHERE name = 'apple'"
         ).fetchall()
         assert len(apple_rows) == 1
-        diff_edges = engine.conn.execute(
-            "SELECT COUNT(*) FROM edges WHERE kind = 'owl:differentFrom'"
-        ).fetchone()[0]
+        diff_edges = engine.conn.execute("SELECT COUNT(*) FROM edges WHERE kind = 'owl:differentFrom'").fetchone()[0]
         assert diff_edges == 0
 
         # Hazard 3 Option A: Standalone Stage 1 NER entities ("2007" and "m3 max") that did NOT appear in any triple
         # are preserved in entities with their Stage 1 definitions and linked via passage edges!
         standalone_rows = {
-            str(r[0]): str(r[1])
+            str(r[0]).lower(): str(r[1])
             for r in engine.conn.execute(
                 "SELECT name, definition FROM entities WHERE name IN ('2007', 'm3 max')"
             ).fetchall()
@@ -996,7 +986,8 @@ def test_engine_same_label_provisional_split_merged_by_judge_synonyms_and_stage1
 def test_engine_step7_heal_shacl_violations_rlm_repl_tools_and_token_stats(
     tmp_path: Path,
 ) -> None:
-    """Verify Step 6 direct GBNF synonym_judge_tokens and Step 7 heal_shacl_violations via shacl_healer_rlm using all 5 bound REPL tools."""
+    """Verify Step 6 direct GBNF synonym_judge_tokens and Step 7 heal_shacl_violations via shacl_healer_rlm \
+using all 5 bound REPL tools."""
     import json
     import re
 
@@ -1064,10 +1055,7 @@ def test_engine_step7_heal_shacl_violations_rlm_repl_tools_and_token_stats(
                     {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30},
                 )
             req_str = str(prompt or messages or kwargs)
-            if (
-                "[[ ## violations ## ]]" in req_str
-                or "bounded closed-world SHACL repair" in req_str
-            ):
+            if "[[ ## violations ## ]]" in req_str or "bounded closed-world SHACL repair" in req_str:
                 focus_matches = list(dict.fromkeys(re.findall(r"entity-[0-9a-f]+", req_str)))
                 for fn in focus_matches:
                     repl_tool_events.append(f"qwen_propose_shacl_repairs:{fn}")
@@ -1078,7 +1066,8 @@ def test_engine_step7_heal_shacl_violations_rlm_repl_tools_and_token_stats(
                                 {
                                     "focus_node": fn,
                                     "action": "set_definition",
-                                    "value": "Healed concept definition from Alan Turing formulated the Turing machine in 1936.",
+                                    "value": "Healed concept definition from Alan Turing formulated t"
+                                    "he Turing machine in 1936.",
                                 }
                                 for fn in focus_matches
                             ]
@@ -1086,9 +1075,7 @@ def test_engine_step7_heal_shacl_violations_rlm_repl_tools_and_token_stats(
                     )
                 ]
             if "[[ ## candidate_pairs ## ]]" in req_str or "candidate_pairs" in req_str:
-                pair_ids = list(
-                    dict.fromkeys(re.findall(r"entity-[0-9a-f]+\|entity-[0-9a-f]+", req_str))
-                )
+                pair_ids = list(dict.fromkeys(re.findall(r"entity-[0-9a-f]+\|entity-[0-9a-f]+", req_str)))
                 decisions = [
                     {
                         "pair_id": pid,
@@ -1098,10 +1085,7 @@ def test_engine_step7_heal_shacl_violations_rlm_repl_tools_and_token_stats(
                     for pid in pair_ids
                 ]
                 return [json.dumps({"decisions": decisions})]
-            if (
-                "[[ ## named_entities ## ]]" in req_str
-                or "Resource Description Framework" in req_str
-            ):
+            if "[[ ## named_entities ## ]]" in req_str or "Resource Description Framework" in req_str:
                 if "Bletchley" in req_str:
                     return [
                         json.dumps(
@@ -1204,9 +1188,7 @@ def test_engine_step7_heal_shacl_violations_rlm_repl_tools_and_token_stats(
             assert orphan_lbls == 0
 
             # Inject 2 ConceptShape/definition SHACL violations on "alan turing" and "turing machine"
-            conn.execute(
-                "UPDATE entities SET definition = '' WHERE name IN ('alan turing', 'turing machine')"
-            )
+            conn.execute("UPDATE entities SET definition = '' WHERE name IN ('alan turing', 'turing machine')")
 
         pre_lint = engine.lint_graph()
         assert pre_lint["conforms"] is False
@@ -1215,7 +1197,8 @@ def test_engine_step7_heal_shacl_violations_rlm_repl_tools_and_token_stats(
 
         # 2. Index second document:
         #    - Step 6 runs direct GBNF synonym_judge on candidate pairs (30 tokens)
-        #    - Step 7 runs shacl_healer_rlm using all 5 bound REPL tools (applying repair[0] in REPL + repair[1] post-RLM)
+        # - Step 7 runs shacl_healer_rlm using all 5 bound REPL tools (applying repair[0] in REPL + repair[1] post-
+        # RLM)
         program.telemetry.clear()
         program.synonym_audit_trail.clear()
         program.shacl_audit_trail.clear()
@@ -1224,9 +1207,7 @@ def test_engine_step7_heal_shacl_violations_rlm_repl_tools_and_token_stats(
 
         # Verify all 5 REPL tools ran inside shacl_healer_rlm and healed both violations
         assert "shacl_healer_rlm_invoked" in repl_tool_events
-        assert (
-            sum(1 for ev in repl_tool_events if ev.startswith("qwen_propose_shacl_repairs:")) == 2
-        )
+        assert sum(1 for ev in repl_tool_events if ev.startswith("qwen_propose_shacl_repairs:")) == 2
 
         # Verify exact non-double-counted token accounting:
         # Step 6 (direct GBNF synonym_judge) = 30 tokens on doc 2 (total 30 + 30 = 60 across doc 1 + doc 2)
@@ -1271,7 +1252,8 @@ def test_engine_step7_heal_shacl_violations_rlm_repl_tools_and_token_stats(
 def test_engine_define_missing_entities_telemetry_and_no_heuristic_fallbacks(
     tmp_path: Path,
 ) -> None:
-    """Verify index_chunks repairs missing entity definitions via DefineMissingEntities, tracks stats, and never uses heuristic fallbacks."""
+    """Verify index_chunks repairs missing entity definitions via DefineMissingEntities, tracks stats, and never \
+uses heuristic fallbacks."""
     import json
 
     class MissingEntityRepairLM(DeterministicMockLM):
@@ -1287,11 +1269,7 @@ def test_engine_define_missing_entities_telemetry_and_no_heuristic_fallbacks(
                     {"prompt_tokens": 30, "completion_tokens": 15, "total_tokens": 45},
                 )
             req_str = str(prompt or messages or kwargs)
-            if (
-                "DefineMissingEntities" in req_str
-                or "missing_entities" in req_str
-                or "entity_definitions" in req_str
-            ):
+            if "DefineMissingEntities" in req_str or "missing_entities" in req_str or "entity_definitions" in req_str:
                 return [
                     json.dumps(
                         {
@@ -1304,7 +1282,9 @@ def test_engine_define_missing_entities_telemetry_and_no_heuristic_fallbacks(
                         }
                     )
                 ]
-            if "ExtractTriples" in req_str or "triples" in req_str:
+            if "ExtractTriples" in req_str or (
+                "triples" in req_str and "missing_entities" not in req_str and "fact_before_filter" not in req_str
+            ):
                 return [
                     json.dumps(
                         {
@@ -1319,7 +1299,7 @@ def test_engine_define_missing_entities_telemetry_and_no_heuristic_fallbacks(
                         }
                     )
                 ]
-            if "ExtractEntities" in req_str or "named_entities" in req_str:
+            if "ExtractEntities" in req_str or ("named_entities" in req_str and "triples" not in req_str):
                 return [
                     json.dumps(
                         {
@@ -1353,13 +1333,11 @@ def test_engine_define_missing_entities_telemetry_and_no_heuristic_fallbacks(
         assert program.entity_def_audit_trail[0]["tokens"] == 45
 
         rows = {
-            str(r[0]): str(r[1])
+            str(r[0]).lower(): str(r[1])
             for r in engine.conn.execute("SELECT name, definition FROM entities").fetchall()
         }
         assert rows["ada lovelace"] == "English mathematician and writer"
-        assert (
-            rows["charles babbage"] == "English polymath who originated the programmable computer"
-        )
+        assert rows["charles babbage"] == "English polymath who originated the programmable computer"
         for defn in rows.values():
             assert "(in statement:" not in defn
             assert "(in passage:" not in defn
@@ -1377,7 +1355,8 @@ def test_engine_evolve_prompts_reindexes_on_extraction_mutation_and_captures_all
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify mutating extraction/graph predictors in GEPA triggers candidate re-indexing, injects all stage traces into dspy.settings.trace, and emits per-predictor feedback."""
+    """Verify mutating extraction/graph predictors in GEPA triggers candidate re-indexing, injects all stage \
+traces into dspy.settings.trace, and emits per-predictor feedback."""
     import json
 
     ner_calls: list[str] = []
@@ -1395,7 +1374,7 @@ def test_engine_evolve_prompts_reindexes_on_extraction_mutation_and_captures_all
                     {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30},
                 )
             req_str = str(prompt or messages or kwargs)
-            if "ExtractEntities" in req_str or "named_entities" in req_str:
+            if "ExtractEntities" in req_str or ("named_entities" in req_str and "triples" not in req_str):
                 ner_calls.append(req_str)
                 if "MUTATED_NER_MARKER" in req_str:
                     return [
@@ -1420,7 +1399,9 @@ def test_engine_evolve_prompts_reindexes_on_extraction_mutation_and_captures_all
                         }
                     )
                 ]
-            if "ExtractTriples" in req_str or "triples" in req_str:
+            if "ExtractTriples" in req_str or (
+                "triples" in req_str and "missing_entities" not in req_str and "fact_before_filter" not in req_str
+            ):
                 if "Alan Turing" in req_str:
                     return [
                         json.dumps(
@@ -1450,11 +1431,7 @@ def test_engine_evolve_prompts_reindexes_on_extraction_mutation_and_captures_all
                         }
                     )
                 ]
-            if (
-                "DefineMissingEntities" in req_str
-                or "missing_entities" in req_str
-                or "entity_definitions" in req_str
-            ):
+            if "DefineMissingEntities" in req_str or "missing_entities" in req_str or "entity_definitions" in req_str:
                 return [
                     json.dumps(
                         {
@@ -1496,19 +1473,17 @@ def test_engine_evolve_prompts_reindexes_on_extraction_mutation_and_captures_all
             ).with_inputs("question", "item_docs")
         ]
 
-        # 1. Verify _extraction_fingerprint sensitivity
-        fp_base = engine._extraction_fingerprint(program)
+        # 1. Verify extraction_fingerprint sensitivity
+        fp_base = extraction_fingerprint(program)
         qa_mutated = program.deepcopy()
-        qa_mutated.qa.predict.signature = qa_mutated.qa.predict.signature.with_instructions(
-            "QA-only mutation"
-        )
-        assert engine._extraction_fingerprint(qa_mutated) == fp_base
+        qa_mutated.qa.predict.signature = qa_mutated.qa.predict.signature.with_instructions("QA-only mutation")
+        assert extraction_fingerprint(qa_mutated) == fp_base
 
         ner_mutated = program.deepcopy()
         ner_mutated.ner.signature = ner_mutated.ner.signature.with_instructions(
             "MUTATED_NER_MARKER: Extract all entities with definitions."
         )
-        assert engine._extraction_fingerprint(ner_mutated) != fp_base
+        assert extraction_fingerprint(ner_mutated) != fp_base
 
         # 2. Verify GEPA compile loop triggers re-indexing on NER mutation, reuses cache on QA-only mutation,
         #    captures extraction + QA traces in dspy.settings.trace, and provides stage-specific feedback.
@@ -1527,16 +1502,14 @@ def test_engine_evolve_prompts_reindexes_on_extraction_mutation_and_captures_all
                 with dspy.context(trace=trace_base, track_usage=True):
                     _ = student(**ex.inputs())
                 entities_before = {
-                    str(r[0]) for r in engine.conn.execute("SELECT name FROM entities").fetchall()
+                    str(r[0]).lower() for r in engine.conn.execute("SELECT name FROM entities").fetchall()
                 }
                 assert "unknown person" in entities_before
 
                 # Evaluate QA-only mutated candidate: must NOT re-run NER extraction
                 ner_count_after_base = len(ner_calls)
                 cand_qa = student.deepcopy()
-                cand_qa.qa.predict.signature = cand_qa.qa.predict.signature.with_instructions(
-                    "Answer concisely."
-                )
+                cand_qa.qa.predict.signature = cand_qa.qa.predict.signature.with_instructions("Answer concisely.")
                 with dspy.context(trace=[], track_usage=True):
                     _ = cand_qa(**ex.inputs())
                 assert len(ner_calls) == ner_count_after_base
@@ -1552,7 +1525,7 @@ def test_engine_evolve_prompts_reindexes_on_extraction_mutation_and_captures_all
                 assert len(ner_calls) > ner_count_after_base
 
                 entities_after = {
-                    str(r[0]) for r in engine.conn.execute("SELECT name FROM entities").fetchall()
+                    str(r[0]).lower() for r in engine.conn.execute("SELECT name FROM entities").fetchall()
                 }
                 assert "alan turing" in entities_after
                 assert "bletchley park" in entities_after
@@ -1576,9 +1549,7 @@ def test_engine_evolve_prompts_reindexes_on_extraction_mutation_and_captures_all
                 return cand_ner
 
         monkeypatch.setattr(dspy, "GEPA", InspectingGEPA, raising=False)
-        compiled = engine.evolve_prompts(
-            trainset, mode="gepa", reflection_token_counter=reflection_token_counter
-        )
+        compiled = engine.evolve_prompts(trainset, mode="gepa", reflection_token_counter=reflection_token_counter)
         assert "MUTATED_NER_MARKER" in compiled.ner.signature.instructions
         assert len(observed_traces) >= 3
         assert "[ner]" in feedback_by_stage["ner"]
@@ -1593,7 +1564,8 @@ def test_engine_evolve_prompts_reindexes_on_extraction_mutation_and_captures_all
 def test_sprint3_engine_as_rm_and_as_retriever_and_dspy_retrieve_compatibility(
     tmp_path: Path,
 ) -> None:
-    """Verify YawGraphEngine.as_rm, as_retriever, workspace DSPy cache isolation, and stock dspy.Retrieve(k=...) compatibility."""
+    """Verify YawGraphEngine.as_rm, as_retriever, workspace DSPy cache isolation, and stock dspy.Retrieve(k=...) \
+compatibility."""
     from yaw.daemon.graph.inference import YawPassage, YawRetriever, YawRM
 
     dspy.settings.configure(lm=DeterministicMockLM())
@@ -1612,9 +1584,7 @@ def test_sprint3_engine_as_rm_and_as_retriever_and_dspy_retrieve_compatibility(
         assert getattr(dspy, "cache", None) is not None
 
         doc_turing = "Alan Turing designed the Automatic Computing Engine (ACE) at the National Physical Laboratory."
-        doc_lovelace = (
-            "Ada Lovelace wrote the first algorithm for Charles Babbage's Analytical Engine."
-        )
+        doc_lovelace = "Ada Lovelace wrote the first algorithm for Charles Babbage's Analytical Engine."
         engine.index([doc_turing, doc_lovelace])
 
         rm = engine.as_rm(k=2, configure_dspy=True)
@@ -1648,7 +1618,8 @@ def test_sprint3_engine_as_rm_and_as_retriever_and_dspy_retrieve_compatibility(
 def test_sprint3_engine_search_graph_for_react_and_react_v2_fallback_integration(
     tmp_path: Path,
 ) -> None:
-    """Verify _search_graph_for_react queries real SQLite yaw.db facts and passages and powers dspy.ReActV2 multi-hop fallback."""
+    """Verify _search_graph_for_react queries real SQLite yaw.db facts and passages and powers dspy.ReActV2 \
+multi-hop fallback."""
     import json
 
     class ReActEngineMockLM(DeterministicMockLM):
@@ -1669,11 +1640,19 @@ def test_sprint3_engine_search_graph_for_react_and_react_v2_fallback_integration
                     return [
                         json.dumps(
                             {
-                                "thought": "Found the year in the graph facts.",
-                                "tool_name": "finish",
-                                "tool_args": {
-                                    "reasoning": "Alan Turing received the Presidential Medal of Freedom in 1969 according to the graph search.",
-                                    "answer": "1969",
+                                "next_thought": {"content": "Found the year in the graph facts."},
+                                "tool_calls": {
+                                    "tool_calls": [
+                                        {
+                                            "name": "submit",
+                                            "args": {
+                                                "reasoning": "Alan Turing received the Presidential Medal of Freedom "
+                                                "in 1969 according to the graph "
+                                                "search.",
+                                                "answer": "1969",
+                                            },
+                                        }
+                                    ]
                                 },
                             }
                         )
@@ -1681,9 +1660,10 @@ def test_sprint3_engine_search_graph_for_react_and_react_v2_fallback_integration
                 return [
                     json.dumps(
                         {
-                            "thought": "Search graph facts for Alan Turing.",
-                            "tool_name": "search_graph_facts",
-                            "tool_args": {"query": "Alan Turing"},
+                            "next_thought": {"content": "Search graph facts for Alan Turing."},
+                            "tool_calls": {
+                                "tool_calls": [{"name": "search_graph_facts", "args": {"query": "Alan Turing"}}]
+                            },
                         }
                     )
                 ]
@@ -1730,9 +1710,7 @@ def test_sprint3_engine_search_graph_for_react_and_react_v2_fallback_integration
         assert "Alan Turing" in graph_search_text
         assert "computer science" in graph_search_text
 
-        pred = engine.program(
-            question="When did Alan Turing receive the Presidential Medal of Freedom?"
-        )
+        pred = engine.program(question="When did Alan Turing receive the Presidential Medal of Freedom?")
         assert pred.answer == "1969"
     finally:
         engine.close()
@@ -1740,13 +1718,11 @@ def test_sprint3_engine_search_graph_for_react_and_react_v2_fallback_integration
 
 def test_sprint3_engine_evaluate_and_pareto_frontier_export(
     tmp_path: Path,
+    reflection_token_counter,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify YawGraphEngine.evaluate (dspy.Evaluate + answer_passage_match) and top-3 Pareto frontier export in optimize()."""
+    """Verify YawGraphEngine.evaluate (dspy.Evaluate + answer_passage_match) and compiled candidate persistence."""
     import json
-    from types import SimpleNamespace
-
-    from yaw.daemon.graph.inference import ParetoProgramEnsemble
 
     lm = DeterministicMockLM()
     dspy.settings.configure(lm=lm)
@@ -1803,26 +1779,6 @@ def test_sprint3_engine_evaluate_and_pareto_frontier_export(
                 cand_0.qa.predict.signature = cand_0.qa.predict.signature.with_instructions(
                     "Pareto candidate 0 instruction."
                 )
-                cand_1 = student.deepcopy()
-                cand_1.qa.predict.signature = cand_1.qa.predict.signature.with_instructions(
-                    "Pareto candidate 1 instruction."
-                )
-                cand_2 = student.deepcopy()
-                cand_2.qa.predict.signature = cand_2.qa.predict.signature.with_instructions(
-                    "Pareto candidate 2 instruction."
-                )
-                cand_dup = student.deepcopy()
-                cand_dup.qa.predict.signature = cand_dup.qa.predict.signature.with_instructions(
-                    "Pareto candidate 0 instruction."
-                )
-
-                cand_0.detailed_results = SimpleNamespace(
-                    candidates=[cand_0, cand_1, cand_2, cand_dup],
-                    val_aggregate_scores=[0.92, 0.89, 0.87, 0.92],
-                    per_val_instance_best_candidates={0: [0, 1], 1: [2]},
-                    per_objective_best_candidates=None,
-                    best_idx=0,
-                )
                 return cand_0
 
         monkeypatch.setattr(dspy, "GEPA", FrontierMockGEPA, raising=False)
@@ -1832,18 +1788,19 @@ def test_sprint3_engine_evaluate_and_pareto_frontier_export(
             valset=devset,
             mode="gepa",
             save_path=save_path,
+            reflection_token_counter=reflection_token_counter,
         )
         assert len(observed_feedbacks) == 1
         assert "AnswerPassageMatch=1" in observed_feedbacks[0]
-        assert len(compiled.pareto_frontier_states) == 3
-        assert isinstance(compiled.pareto_ensemble, ParetoProgramEnsemble)
-        assert len(compiled.pareto_ensemble.programs) == 3
+        assert compiled.qa.predict.signature.instructions == "Pareto candidate 0 instruction."
         assert save_path.exists()
         assert (tmp_path / "compiled_sprint3_eval.json").exists()
 
-        reloaded = HippoRAGProgram(enable_gbnf=False, compiled_path=save_path)
-        assert len(reloaded.pareto_frontier_states) == 3
-        assert isinstance(reloaded.pareto_ensemble, ParetoProgramEnsemble)
+        reloaded = HippoRAGProgram(enable_gbnf=False, compiled_path=save_path, orchestrator_lm=lm, rlm_sub_lm=lm)
+        assert reloaded.qa.predict.signature.instructions == "Pareto candidate 0 instruction."
+        ensemble = dspy.Ensemble(reduce_fn=dspy.majority).compile([compiled, reloaded])
+        ens_pred = ensemble(context=doc, question="Who designed the ACE?")
+        assert ens_pred.answer == "Alan Turing"
     finally:
         engine.close()
 
@@ -1851,7 +1808,8 @@ def test_sprint3_engine_evaluate_and_pareto_frontier_export(
 def test_canonical_retrieval_hook_and_rag_qa_forward_unification(
     tmp_path: Path,
 ) -> None:
-    """Verify _canonical_retrieval_hook unifies YawRM, YawRetriever, HippoRAGProgram.forward, and rag_qa with GEPA trace replay and ReActV2/Pareto support."""
+    """Verify _canonical_retrieval_hook unifies YawRM, YawRetriever, HippoRAGProgram.forward, and rag_qa with \
+GEPA trace replay and ReActV2/Pareto support."""
     import json
 
     class UnifiedHookMockLM(DeterministicMockLM):
@@ -1872,11 +1830,17 @@ def test_canonical_retrieval_hook_and_rag_qa_forward_unification(
                     return [
                         json.dumps(
                             {
-                                "thought": "Found the answer in graph facts.",
-                                "tool_name": "finish",
-                                "tool_args": {
-                                    "reasoning": "Recovered via ReActV2 graph exploration.",
-                                    "answer": "Alan Turing",
+                                "next_thought": {"content": "Found the answer in graph facts."},
+                                "tool_calls": {
+                                    "tool_calls": [
+                                        {
+                                            "name": "submit",
+                                            "args": {
+                                                "reasoning": "Recovered via ReActV2 graph exploration.",
+                                                "answer": "Alan Turing",
+                                            },
+                                        }
+                                    ]
                                 },
                             }
                         )
@@ -1884,9 +1848,10 @@ def test_canonical_retrieval_hook_and_rag_qa_forward_unification(
                 return [
                     json.dumps(
                         {
-                            "thought": "Search graph facts for Alan Turing.",
-                            "tool_name": "search_graph_facts",
-                            "tool_args": {"query": "Alan Turing"},
+                            "next_thought": {"content": "Search graph facts for Alan Turing."},
+                            "tool_calls": {
+                                "tool_calls": [{"name": "search_graph_facts", "args": {"query": "Alan Turing"}}]
+                            },
                         }
                     )
                 ]
@@ -1924,9 +1889,7 @@ def test_canonical_retrieval_hook_and_rag_qa_forward_unification(
     )
     try:
         # 1. Oblivion verification: legacy dual hooks demolished, only _canonical_retrieval_hook bound
-        assert [m for m in dir(engine) if m.endswith("_retrieval_hook")] == [
-            "_canonical_retrieval_hook"
-        ]
+        assert [m for m in dir(engine) if m.endswith("_retrieval_hook")] == ["_canonical_retrieval_hook"]
         assert engine.program._retrieval_hook == engine._canonical_retrieval_hook
 
         doc_turing = "Alan Turing\nAlan Turing was an English mathematician and computer scientist."
@@ -1950,9 +1913,7 @@ def test_canonical_retrieval_hook_and_rag_qa_forward_unification(
             rm_hits = rm(q, k=2, item_docs=[doc_turing, doc_lovelace])
         assert len(rm_hits) == 2
         assert [h.pid for h in rm_hits] == list(pids[:2])
-        assert (
-            len(ext_trace) >= 2
-        )  # Captured NER and triples traces replayed into dspy.settings.trace!
+        assert len(ext_trace) >= 2  # Captured NER and triples traces replayed into dspy.settings.trace!
 
         fwd_pred = engine.program(question=q)
         assert tuple(getattr(fwd_pred, "retrieved_chunk_ids", ()))[:2] == pids[:2]
@@ -1981,7 +1942,8 @@ def test_hybrid_e2e_per_query_isolation_stage_caching_and_reflective_stats(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify per-query sandbox isolation, 4-tier stage caching, component selector mutation resilience, and minibatch q_stats lookup."""
+    """Verify per-query sandbox isolation, 4-tier stage caching, component selector mutation resilience, and \
+minibatch q_stats lookup."""
     import json
     from types import SimpleNamespace
 
@@ -2000,7 +1962,7 @@ def test_hybrid_e2e_per_query_isolation_stage_caching_and_reflective_stats(
                     {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30},
                 )
             req_str = str(prompt or messages or kwargs)
-            if "ExtractEntities" in req_str or "named_entities" in req_str:
+            if "ExtractEntities" in req_str or ("named_entities" in req_str and "triples" not in req_str):
                 stage_call_counts["ner"] += 1
             elif "JudgeSynonyms" in req_str or "candidate_pairs" in req_str:
                 stage_call_counts["synonym_judge"] += 1
@@ -2024,6 +1986,7 @@ def test_hybrid_e2e_per_query_isolation_stage_caching_and_reflective_stats(
         doc_q1 = "Alan Turing\nAlan Turing designed the Automatic Computing Engine in 1945."
         doc_q2_a = "Ada Lovelace\nAda Lovelace wrote the first computer algorithm."
         doc_q2_b = "Charles Babbage\nCharles Babbage designed the Analytical Engine."
+        engine.index([doc_q1, doc_q2_a, doc_q2_b])
 
         ex1 = dspy.Example(
             question="Who designed the Automatic Computing Engine?",
@@ -2038,8 +2001,8 @@ def test_hybrid_e2e_per_query_isolation_stage_caching_and_reflective_stats(
             item_docs=[doc_q2_a, doc_q2_b],
         ).with_inputs("question", "item_docs")
 
-        # Verify _ActiveTraceComponentSelector continues matching after candidate instructions mutate
-        selector = YawGraphEngine._ActiveTraceComponentSelector(program)
+        # Verify ActiveTraceComponentSelector continues matching after candidate instructions mutate
+        selector = ActiveTraceComponentSelector(program)
         mut_ner_sig = program.ner.signature.with_instructions("Mutated NER instruction v2")
         fake_pred_obj = SimpleNamespace(signature=mut_ner_sig)
         fake_state = SimpleNamespace(
@@ -2078,15 +2041,20 @@ def test_hybrid_e2e_per_query_isolation_stage_caching_and_reflective_stats(
                 score1_live = self.metric(ex1, pred1_live)
                 score2_live = self.metric(ex2, pred2_live)
                 assert score1_live.score > 0.0
+                # This query misses its answer and early retrieval ranks, but hits later
+                # retrieval ranks; unweighted arithmetic mean preserves positive signal (> 0.0).
+                assert score2_live.score == pytest.approx(
+                    sum(score2_live.objective_scores.values()) / len(score2_live.objective_scores)
+                )
                 assert score2_live.score > 0.0
+                assert score2_live.objective_scores["f1"] == 0.0
+                assert score2_live.objective_scores["recall_at_20"] == 1.0
 
                 # 2. Mutate QA only: OpenIE and SynonymJudge must hit stage caches (0 extra LLM calls)
                 ner_before = stage_call_counts["ner"]
                 syn_before = stage_call_counts["synonym_judge"]
                 cand_qa = student.deepcopy()
-                cand_qa.qa.predict.signature = cand_qa.qa.predict.signature.with_instructions(
-                    "Mutated QA instruction"
-                )
+                cand_qa.qa.predict.signature = cand_qa.qa.predict.signature.with_instructions("Mutated QA instruction")
                 with dspy.context(trace=[], track_usage=True):
                     pred1_cached = cand_qa(**ex1.inputs())
                 assert stage_call_counts["ner"] == ner_before
@@ -2097,10 +2065,8 @@ def test_hybrid_e2e_per_query_isolation_stage_caching_and_reflective_stats(
 
                 # 3. Mutate SynonymJudge only: OpenIE hits cache (0 extra NER calls), SynonymJudge runs live!
                 cand_syn = student.deepcopy()
-                cand_syn.synonym_judge.signature = (
-                    cand_syn.synonym_judge.signature.with_instructions(
-                        "Mutated SynonymJudge instruction"
-                    )
+                cand_syn.synonym_judge.signature = cand_syn.synonym_judge.signature.with_instructions(
+                    "Mutated SynonymJudge instruction"
                 )
                 with dspy.context(trace=[], track_usage=True):
                     _ = cand_syn(**ex2.inputs())
@@ -2109,9 +2075,7 @@ def test_hybrid_e2e_per_query_isolation_stage_caching_and_reflective_stats(
                 return cand_syn
 
         monkeypatch.setattr(dspy, "GEPA", VerifyingGEPA, raising=False)
-        _ = engine.evolve_prompts(
-            [ex1, ex2], mode="gepa", reflection_token_counter=reflection_token_counter
-        )
+        _ = engine.evolve_prompts([ex1, ex2], mode="gepa", reflection_token_counter=reflection_token_counter)
     finally:
         engine.close()
 
@@ -2143,9 +2107,7 @@ def test_evolve_prompts_real_unmocked_gepa_and_miprov2_with_context_limit_guard(
             req_str = str(prompt or messages or kwargs)
             max_observed_prompt_chars = max(max_observed_prompt_chars, len(req_str))
             if len(req_str) > 32000:
-                raise RuntimeError(
-                    f"Request ({len(req_str)} chars) exceeds available context size (32000 chars)"
-                )
+                raise RuntimeError(f"Request ({len(req_str)} chars) exceeds available context size (32000 chars)")
             if "variables_info" in req_str and "repl_history" in req_str:
                 return [
                     "[[ ## reasoning ## ]]\n"
@@ -2157,15 +2119,19 @@ def test_evolve_prompts_real_unmocked_gepa_and_miprov2_with_context_limit_guard(
                     "```\n"
                     "[[ ## completed ## ]]"
                 ]
-            if "new_instruction" in req_str and (
-                "examples_with_feedback" in req_str or "length_limit" in req_str
-            ):
+            if "new_instruction" in req_str and ("examples_with_feedback" in req_str or "length_limit" in req_str):
                 return [
                     json.dumps(
                         {
                             "new_instruction": (
-                                "Extract accurate entities, triples, and answers strictly grounded in the passage context. "
-                                'Respond with JSON: {"named_entities": [["Entity", "Definition"]], "triples": [["s", "s_def", "p", "o", "o_def", "spo_def"]], "entity_definitions": [["E", "D"]], "decisions": [], "repairs": [], "fact": [["s", "p", "o"]], "query_intent": "...", "reasoning": "...", "answer": "..."}.'
+                                "Extract accurate entities, triples, and answers strictl"
+                                "y grounded in the passage context. "
+                                'Respond with JSON: {"named_entities": [["Entity", "Definition"]], "triples": [["s", '
+                                '"s_def", "p", "o", "o_def", "spo_def"]], "entity_defini'
+                                'tions": [["E", "D"]], "decisions": '
+                                '[], "repairs": [], "fact": [["s", "p", "o"]], "query_in'
+                                'tent": "...", "reasoning": "...", '
+                                '"answer": "..."}.'
                             )
                         }
                     )
@@ -2214,9 +2180,9 @@ def test_evolve_prompts_real_unmocked_gepa_and_miprov2_with_context_limit_guard(
         doc_lovelace = "Ada Lovelace\nAda Lovelace wrote the first computer algorithm."
         # Pad item_docs with large distractor strings so 10 raw examples would exceed 60,000 chars if un-distilled
         filler_docs = [
-            f"Distractor {i}\n" + ("Historical archive notes on mechanical calculators. " * 25)
-            for i in range(6)
+            f"Distractor {i}\n" + ("Historical archive notes on mechanical calculators. " * 25) for i in range(6)
         ]
+        engine.index([doc_turing, doc_lovelace, *filler_docs])
 
         trainset = [
             dspy.Example(
@@ -2269,11 +2235,12 @@ def test_evolve_prompts_real_unmocked_gepa_and_miprov2_with_context_limit_guard(
 def test_engine_homographs_paronyms_and_same_label_triple_permutations(
     tmp_path: Path,
 ) -> None:
-    """Verify paronyms ('Cindy Real' vs 'Cinderella'), typos ('Cindarella'), and homograph permutations ('a ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a ball')."""
+    """Verify paronyms ('Cindy Real' vs 'Cinderella'), typos ('Cindarella'), and homograph permutations ('a \
+ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a ball')."""
     import json
     import re
 
-    from yaw.daemon.graph.storage.db import load_graph_topology
+    from yaw.daemon.graph.storage import load_graph_topology
 
     class HomographAndParonymLM(DeterministicMockLM):
         def __call__(
@@ -2324,10 +2291,7 @@ def test_engine_homographs_paronyms_and_same_label_triple_permutations(
                         )
                 return [json.dumps({"decisions": decisions})]
 
-            if (
-                "[[ ## named_entities ## ]]" in req_str
-                or "Resource Description Framework" in req_str
-            ):
+            if "[[ ## named_entities ## ]]" in req_str or "Resource Description Framework" in req_str:
                 if "Cindy Real" in req_str:
                     return [
                         json.dumps(
@@ -2428,23 +2392,17 @@ def test_engine_homographs_paronyms_and_same_label_triple_permutations(
     try:
         n = engine.index(
             [
-                "Cinderella (sometimes misspelled Cindarella) attended a ball at the palace, while journalist Cindy Real wrote about a ball.",
+                "Cinderella (sometimes misspelled Cindarella) attended a ball at the palace, while "
+                "journalist Cindy Real wrote about a ball.",
                 "During the ceremony, a ball was handled in a ball, and a ball featured a ball.",
             ]
         )
         assert n == 2
 
         # 1. Verify 'Cindarella' merged into 'cinderella' as skos:hiddenLabel
-        cinderella_row = engine.conn.execute(
-            "SELECT entity_id FROM entities WHERE name = 'cinderella'"
-        ).fetchone()
+        cinderella_row = engine.conn.execute("SELECT entity_id FROM entities WHERE name = 'cinderella'").fetchone()
         assert cinderella_row is not None
-        assert (
-            engine.conn.execute(
-                "SELECT entity_id FROM entities WHERE name = 'cindarella'"
-            ).fetchone()
-            is None
-        )
+        assert engine.conn.execute("SELECT entity_id FROM entities WHERE name = 'cindarella'").fetchone() is None
         hidden_labels = [
             str(r[0])
             for r in engine.conn.execute(
@@ -2455,9 +2413,7 @@ def test_engine_homographs_paronyms_and_same_label_triple_permutations(
         assert "cindarella" in hidden_labels
 
         # 2. Verify 'Cindy Real' remained distinct from 'Cinderella' with an owl:differentFrom edge
-        cindy_real_row = engine.conn.execute(
-            "SELECT entity_id FROM entities WHERE name = 'cindy real'"
-        ).fetchone()
+        cindy_real_row = engine.conn.execute("SELECT entity_id FROM entities WHERE name = 'cindy real'").fetchone()
         assert cindy_real_row is not None
         diff_cindy = engine.conn.execute(
             """
@@ -2475,9 +2431,7 @@ def test_engine_homographs_paronyms_and_same_label_triple_permutations(
         assert int(diff_cindy) == 2
 
         # 3. Verify homograph 'a ball' entities exist as distinct sense nodes
-        ball_rows = engine.conn.execute(
-            "SELECT entity_id, definition FROM entities WHERE name = 'a ball'"
-        ).fetchall()
+        ball_rows = engine.conn.execute("SELECT entity_id, definition FROM entities WHERE name = 'a ball'").fetchall()
         assert len(ball_rows) >= 2
         ball_ids = {str(r[0]) for r in ball_rows}
 
@@ -2514,9 +2468,7 @@ def test_engine_homographs_paronyms_and_same_label_triple_permutations(
         ).fetchall()
         assert len(ball_facts) == 2
         for fid, sid, pred, oid in ball_facts:
-            assert str(sid) != str(oid), (
-                f"Homograph triple collapsed into self-loop on {fid} ({pred})"
-            )
+            assert str(sid) != str(oid), f"Homograph triple collapsed into self-loop on {fid} ({pred})"
             assert str(sid) in ball_ids and str(oid) in ball_ids
 
         # Verify the two permutations have reversed (subject_id, object_id) poles
@@ -2540,5 +2492,329 @@ def test_engine_homographs_paronyms_and_same_label_triple_permutations(
         # 7. Verify SHACL graph lint conforms with zero violations
         lint = engine.lint_graph()
         assert lint["conforms"] is True, f"Unexpected SHACL violations: {lint['violations']}"
+    finally:
+        engine.close()
+
+
+def test_step10_engine_pareto_ensemble_readonly_graph_and_memoization(
+    tmp_path: Path,
+) -> None:
+    """Verify Pareto dspy.Ensemble runs read-only against yaw.db and memoizes identical query retrievals."""
+
+    ner_calls: list[str] = []
+
+    class TrackingEnsembleLM(DeterministicMockLM):
+        def __call__(
+            self,
+            prompt: str | None = None,
+            messages: list[dict[str, Any]] | None = None,
+            **kwargs: Any,
+        ) -> list[str]:
+            req_str = str(prompt or messages or kwargs)
+            if "ExtractEntities" in req_str or ("named_entities" in req_str and "triples" not in req_str):
+                ner_calls.append(req_str)
+            return super().__call__(prompt=prompt, messages=messages, **kwargs)
+
+    lm = TrackingEnsembleLM()
+    dspy.settings.configure(lm=lm)
+    prog = HippoRAGProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
+    embedder: Any = DeterministicMockEmbedder(dim=64)
+    engine = YawGraphEngine(
+        db_path=tmp_path / "yaw_step10_ens.db",
+        workspace_root=tmp_path,
+        program=prog,
+        embedder=embedder,
+        retrieval_top_k=2,
+    )
+    try:
+        doc_a = "Alan Turing\nAlan Turing worked at Bletchley Park during World War II."
+        doc_b = "Grace Hopper\nGrace Hopper pioneered compiler design for COBOL."
+        engine.index([doc_a, doc_b])
+        ner_calls_after_index = len(ner_calls)
+        assert ner_calls_after_index >= 1
+
+        # Save primary program and 2 Pareto siblings where sibling 1 has a DIFFERENT extraction_fingerprint
+        # (mutated NER instruction) but IDENTICAL query_retrieval_fingerprint, and sibling 2 has a different
+        # query_retrieval_fingerprint (mutated query_intent instruction).
+        prog_path = tmp_path / "compiled_program.json"
+        tel_dir = tmp_path / "compiled_program_telemetry"
+        tel_dir.mkdir(parents=True, exist_ok=True)
+        prog.save(str(prog_path))
+
+        sib_0 = prog.deepcopy()
+        sib_1 = prog.deepcopy()
+        sib_1.ner.signature = sib_1.ner.signature.with_instructions("SIBLING_1_MUTATED_NER_INSTRUCTION")
+        sib_1.qa.predict.signature = sib_1.qa.predict.signature.with_instructions("SIBLING_1_QA")
+        sib_2 = prog.deepcopy()
+        sib_2.query_intent.signature = sib_2.query_intent.signature.with_instructions("SIBLING_2_QUERY_INTENT")
+        sib_2.qa.predict.signature = sib_2.qa.predict.signature.with_instructions("SIBLING_2_QA")
+
+        sib_0.save(str(tel_dir / "pareto_member_0.json"))
+        sib_1.save(str(tel_dir / "pareto_member_1.json"))
+        sib_2.save(str(tel_dir / "pareto_member_2.json"))
+
+        engine.program.load(str(prog_path))
+        engine.refresh_program_bindings()
+        assert len(getattr(engine.ensemble, "programs", ())) == 3
+
+        # Spy on engine.retrieve to count how many times full retrieval executes across the 3 ensemble members
+        retrieve_calls = 0
+        orig_retrieve = engine.retrieve
+
+        def _counting_retrieve(
+            query: str, top_k: int = 10, *, program: Any | None = None
+        ) -> list[tuple[Any, float, str]]:
+            nonlocal retrieve_calls
+            retrieve_calls += 1
+            return orig_retrieve(query, top_k=top_k, program=program)
+
+        object.__setattr__(engine, "retrieve", _counting_retrieve)
+
+        qa_out = engine.rag_qa(["Where did Alan Turing work?"])
+        assert len(qa_out) == 1
+        assert qa_out[0]["answer"]
+        assert len(qa_out[0]["retrieved_chunk_ids"]) >= 1
+        # Must NOT have wiped or re-indexed yaw.db despite sib_1 having a different extraction_fingerprint!
+        assert len(ner_calls) == ner_calls_after_index
+        # 3 ensemble members, but sib_0 & sib_1 share query_retrieval_fingerprint -> only 2 retrieve() calls!
+        assert retrieve_calls == 2
+
+        # Retrieve-only ensemble mode (answer == "") must fuse via RRF and reuse memoized query retrieval
+        ret_pred = engine.ensemble(question="Where did Alan Turing work?", retrieve_only=True, k=2)
+        assert getattr(ret_pred, "answer", None) == ""
+        assert len(getattr(ret_pred, "retrieved_chunk_ids", ())) >= 1
+        assert len(getattr(engine, "_last_query_seeds", ())) >= 1
+        assert len(ner_calls) == ner_calls_after_index
+    finally:
+        engine.close()
+
+
+def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
+    tmp_path: Path,
+) -> None:
+    """Verify Step 11 (H1-H4) end-to-end: literal-object triples, SHACL, PPR seeding, and skos:broader."""
+    import json
+    import re
+
+    from yaw.core import RelationTraversalPolicy
+
+    class Step11MockLM(DeterministicMockLM):
+        def __call__(
+            self,
+            prompt: str | None = None,
+            messages: list[dict[str, Any]] | None = None,
+            **kwargs: Any,
+        ) -> list[str]:
+            req_str = str(prompt or messages or kwargs)
+            if "[[ ## candidate_pairs ## ]]" in req_str or "candidate_pairs" in req_str:
+                decisions = []
+                for match in re.finditer(r"\{[^{}]*\"pair_id\"[^{}]*\}", req_str):
+                    try:
+                        p = json.loads(match.group(0))
+                    except Exception:
+                        continue
+                    pid = str(p.get("pair_id", ""))
+                    na = str(p.get("name_a", "")).lower()
+                    nb = str(p.get("name_b", "")).lower()
+                    if not na or not nb:
+                        continue
+                    if {na, nb} == {"cryptanalysis", "mathematics"}:
+                        decisions.append(
+                            {
+                                "pair_id": pid,
+                                "relation": "skos:broader",
+                                "canonical": "A" if na == "mathematics" else "B",
+                            }
+                        )
+                    else:
+                        decisions.append(
+                            {
+                                "pair_id": pid,
+                                "relation": "skos:related",
+                                "canonical": "A",
+                            }
+                        )
+                return [json.dumps({"decisions": decisions})]
+            if "FilterTriples" in req_str or "fact_before_filter" in req_str:
+                return [json.dumps({"fact": [["alan turing", "was born on", "1912-06-23"]]})]
+            if "ExtractTriples" in req_str or '"triples"' in req_str or "`triples`" in req_str:
+                if "1912-06-23" in req_str:
+                    return [
+                        json.dumps(
+                            {
+                                "triples": [
+                                    {
+                                        "sub": "Alan Turing",
+                                        "sub_def": "English mathematician and logician",
+                                        "pred": "was born on",
+                                        "obj": "1912-06-23",
+                                        "obj_def": "",
+                                        "obj_kind": "literal",
+                                        "obj_datatype": "xsd:date",
+                                        "def": "Alan Turing was born on 1912-06-23.",
+                                    },
+                                    {
+                                        "sub": "Alan Turing",
+                                        "sub_def": "English mathematician and logician",
+                                        "pred": "worked on",
+                                        "obj": "Cryptanalysis",
+                                        "obj_def": "Study of analyzing information systems to decipher ciphertexts",
+                                        "obj_kind": "entity",
+                                        "def": "Alan Turing worked on cryptanalysis during World War II.",
+                                    },
+                                    {
+                                        "sub": "Alan Turing",
+                                        "sub_def": "English mathematician and logician",
+                                        "pred": "pioneered",
+                                        "obj": "Cryptanalysis",
+                                        "obj_def": "Study of analyzing information systems to decipher ciphertexts",
+                                        "obj_kind": "entity",
+                                        "def": "Alan Turing pioneered modern cryptanalysis.",
+                                    },
+                                ]
+                            }
+                        )
+                    ]
+                return [
+                    json.dumps(
+                        {
+                            "triples": [
+                                {
+                                    "sub": "Cryptanalysis",
+                                    "sub_def": "Study of analyzing information systems to decipher ciphertexts",
+                                    "pred": "is a subfield of",
+                                    "obj": "Mathematics",
+                                    "obj_def": "Formal science of numbers, structure, and logic",
+                                    "obj_kind": "entity",
+                                    "def": "Cryptanalysis is a subfield of mathematics.",
+                                }
+                            ]
+                        }
+                    )
+                ]
+            if "ExtractEntities" in req_str or "named_entities" in req_str:
+                if "1912-06-23" in req_str:
+                    return [
+                        json.dumps(
+                            {
+                                "named_entities": [
+                                    ["Alan Turing", "English mathematician and logician"],
+                                    ["Cryptanalysis", "Study of analyzing information systems to decipher ciphertexts"],
+                                ]
+                            }
+                        )
+                    ]
+                return [
+                    json.dumps(
+                        {
+                            "named_entities": [
+                                ["Cryptanalysis", "Study of analyzing information systems to decipher ciphertexts"],
+                                ["Mathematics", "Formal science of numbers, structure, and logic"],
+                            ]
+                        }
+                    )
+                ]
+            return super().__call__(prompt=prompt, messages=messages, **kwargs)
+
+    lm = Step11MockLM()
+    dspy.settings.configure(lm=lm)
+    prog = HippoRAGProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
+    embedder: Any = DeterministicMockEmbedder(dim=64)
+    engine = YawGraphEngine(
+        db_path=tmp_path / "yaw_step11_e2e.db",
+        workspace_root=tmp_path,
+        program=prog,
+        embedder=embedder,
+        retrieval_top_k=2,
+        synonymy_threshold=-1.0,
+        traversal_policy=RelationTraversalPolicy(skos_broader_up=1.0, skos_broader_down=0.25),
+    )
+    try:
+        doc_turing = "Alan Turing\nAlan Turing was born on 1912-06-23 and worked on cryptanalysis."
+        doc_math = "Mathematics\nCryptanalysis is a subfield of mathematics."
+        engine.index([doc_turing, doc_math])
+
+        # 1. Literal "1912-06-23" is NOT materialized in entities, entity_labels, or entity_vec
+        ent_rows = {
+            str(r[0]).lower(): str(r[1]) for r in engine.conn.execute("SELECT name, entity_id FROM entities").fetchall()
+        }
+        ent_names = set(ent_rows.keys())
+        assert "1912-06-23" not in ent_names
+        assert "alan turing" in ent_names
+        assert "cryptanalysis" in ent_names
+        assert "mathematics" in ent_names
+        turing_id = ent_rows["alan turing"]
+        crypt_id = ent_rows["cryptanalysis"]
+
+        # 2. Literal fact is stored in facts with obj_kind='literal', obj_id IS NULL, and recorded in fact_sources
+        lit_row = engine.conn.execute(
+            "SELECT fact_id, obj_id, obj_kind, obj_literal_lex, obj_datatype FROM facts WHERE obj_kind = 'literal'"
+        ).fetchone()
+        assert lit_row is not None
+        assert lit_row[1] is None
+        assert str(lit_row[2]) == "literal"
+        assert str(lit_row[3]) == "1912-06-23"
+        assert str(lit_row[4]) == "xsd:date"
+        src_cnt = engine.conn.execute(
+            "SELECT COUNT(*) FROM fact_sources WHERE fact_id = ?", (str(lit_row[0]),)
+        ).fetchone()[0]
+        assert int(src_cnt) == 1
+
+        # 3. Directed skos:broader edge exists from cryptanalysis -> mathematics
+        broader_cnt = engine.conn.execute("SELECT COUNT(*) FROM edges WHERE kind = 'skos:broader'").fetchone()[0]
+        assert int(broader_cnt) == 1
+
+        # 3b. H4: load_graph_topology(include_kinds=True) preserves asserted fact direction (turing -> cryptanalysis)
+        #     without synthetic reverse rows and preserves both parallel predicates from the same chunk.
+        from yaw.daemon.graph.ppr import build_transition_matrix
+        from yaw.daemon.graph.storage import load_graph_topology
+
+        c_ids, e_ids, kind_edges = load_graph_topology(engine.conn, include_kinds=True)
+        turing_to_crypt_facts = [
+            w for s, d, k, w in kind_edges if s == turing_id and d == crypt_id and k == "fact"
+        ]
+        crypt_to_turing_facts = [
+            w for s, d, k, w in kind_edges if s == crypt_id and d == turing_id and k == "fact"
+        ]
+        assert len(turing_to_crypt_facts) == 2
+        assert len(crypt_to_turing_facts) == 0
+
+        csr_dir = build_transition_matrix(
+            c_ids,
+            e_ids,
+            kind_edges,
+            policy=RelationTraversalPolicy(fact_forward=1.0, fact_reverse=0.1, skos_related=0.0),
+        )
+        u_tur = csr_dir.node_to_idx[turing_id]
+        v_cry = csr_dir.node_to_idx[crypt_id]
+        # Asymmetric policy gives higher transition weight in asserted direction (turing -> crypt)
+        assert float(csr_dir.transition_t[v_cry, u_tur]) > float(csr_dir.transition_t[u_tur, v_cry])
+
+        csr_max = build_transition_matrix(
+            c_ids,
+            e_ids,
+            kind_edges,
+            policy=RelationTraversalPolicy(parallel_aggregation="max", skos_related=0.0),
+        )
+        csr_sum = build_transition_matrix(
+            c_ids,
+            e_ids,
+            kind_edges,
+            policy=RelationTraversalPolicy(parallel_aggregation="sum", skos_related=0.0),
+        )
+        # Parallel predicates ("worked on" + "pioneered") in the same chunk increase transition share under "sum"
+        assert float(csr_sum.transition_t[v_cry, u_tur]) > float(csr_max.transition_t[v_cry, u_tur])
+
+        # 4. Graph conforms to SHACL
+        lint = engine.lint_graph(as_turtle=True)
+        assert lint["conforms"] is True, lint["violations"]
+        assert 'rdf:object "1912-06-23"^^xsd:date' in lint["turtle"]
+        assert "skos:broader yaw:entity-" in lint["turtle"]
+
+        # 5. Retrieving for the literal fact seeds the subject + fact_sources chunk and retrieves doc_turing
+        hits, kept_facts = engine.retrieve_with_seeds("When was Alan Turing born on 1912-06-23?", top_k=2)
+        assert len(hits) >= 1
+        assert "1912-06-23" in hits[0][2]
+        assert any(o == "1912-06-23" for _, _, o in kept_facts)
     finally:
         engine.close()

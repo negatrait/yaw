@@ -235,7 +235,7 @@ Offline test suite: `uv run --locked python -m unittest discover -s tests -v` â€
 
 1. **Pure-JSON `dspy.JSONAdapter` + GBNF Grammars & Sizecoding Pareto Metric (`yaw/daemon/graph/inference/prompts.py`):**
    - Eliminated `[[ ## field ## ]]` output markers on `Qwen3-4B-Instruct-2507-GGUF` (`llamacpp`) by routing direct `dspy.Predict` / `dspy.ChainOfThought` calls through `dspy.JSONAdapter()` and pure-JSON GBNF grammars (`DSPY_NER_GBNF_GRAMMAR`, `DSPY_TRIPLES_GBNF_GRAMMAR`, `build_dspy_rerank_grammar`, `DSPY_QA_COT_GBNF_GRAMMAR`) with optional sizecoding caps (`gbnf_max_entities`, `gbnf_max_triples`, `gbnf_max_facts`, `gbnf_max_reasoning_chars`).
-   - Added `compute_sizecoding_pareto_score` (`pareto = recall@5 / (tokens * elapsed_seconds)`) with a hard Tier 1 baseline gate (`clamped_recall < min_baseline_recall` clamped below `0.05` with zero `pareto_raw`/`efficiency` objective scores) for `dspy.GEPA` multi-objective optimization.
+   - Added `compute_task_quality_score` (`pareto = recall@5 / (tokens * elapsed_seconds)`) with a hard Tier 1 baseline gate (`clamped_recall < min_baseline_recall` clamped below `0.05` with zero `pareto_raw`/`efficiency` objective scores) for `dspy.GEPA` multi-objective optimization.
    - Added `lm_supports_gbnf(lm)` and `create_dspy_rlm_pair()` (`yaw/daemon/graph/inference/chat.py`) so GBNF grammars are **only** attached to `llamacpp` GPU calls (`Qwen3-4B-Instruct-2507-GGUF`) and **never** sent to Ryzen AI NPU/OGA (`Mistral-7B-Instruct-v0.3-Hybrid`, `recipe == "ryzenai-llm"`).
 2. **Real-Silicon Failure Modes Caught on Live Lemonade Server (`http://localhost:13305/api/v1`) and Fixes (`_PositionalSafeRLM`):**
    - **Failure 1 â€” Positional tool arguments inside `dspy.LocalInterpreter`:** Upstream `dspy.RLM._make_interpreter_tool` wraps tools as `def invoke(**kwargs): return tool(**kwargs)`. On live silicon, `Mistral-7B-Instruct-v0.3-Hybrid` invoked `qwen_extract_entities(passage)` positionally, raising `TypeError: invoke() takes 0 positional arguments`. Fixed in `_PositionalSafeRLM._make_interpreter_tool` by binding `*args, **kwargs` via `inspect.signature(tool.func).bind(*args, **kwargs)`.
@@ -290,11 +290,11 @@ Offline test suite: `uv run --locked python -m unittest discover -s tests -v` â€
 
 3. **Native HippoRAG 2 Graph & Retrieval Engine (`yaw/daemon/graph/engine.py`, `yaw/daemon/graph/storage/db.py`):**
    - Ported graph construction, indexing, and retrieval onto single `yaw.db` (`sqlite-vec` + FTS5) + `inference` (`HippoRAGProgram`, `DSPyEmbeddingAdapter`).
-   - Raw passages appended to `workspace_root / corpus / passages.txt` with $O(1)$ B-tree indexed line-offset resolution (`idx_chunks_path_end`, `get_max_end_line`) and 1-indexed `(start_line, end_line)` spans. 1-indexed line hydration streams directly from disk with SHA-256 staleness checking and trailing newline normalization.
+   - Raw passages appended to `workspace_root / corpus / passages.txt` with $O(1)$ B-tree indexed line-offset resolution (`idx_chunks_path_end`) and 1-indexed `(start_line, end_line)` spans. 1-indexed line hydration streams directly from disk with SHA-256 staleness checking and trailing newline normalization.
    - Self-healing crash-resilient checkpointing (`openie_chunks`, `chunk_vec`), bounded embedding micro-batches (`_encode_in_batches`, `embed_batch_size=64`), single-evaluation `vec_distance_cosine` synonymy mining, pre-aggregated SQL `GROUP BY src_id, dst_id` topology loading, and atomic cascading deletion (`delete_chunks`).
    - Real min-max normalized fact-score entity seeding ($w(e) = \text{mean\_fact\_score}(e) / \max(1, \text{doc\_freq}(e))$), `retrieve_with_seeds` returning `(hydrated_hits, kept_facts)`, and `retrieve_dpr` providing the Standard DPR dense KNN baseline.
    - Implemented `YawJSONAdapter(dspy.JSONAdapter)` to transparently handle bare JSON lists/arrays emitted by local quantized models during OpenIE extraction without `AdapterParseError`.
-   - Separate `_mipro_metric` (scalar `float`) and `_gepa_metric` (`dspy.Prediction(score=..., feedback=...)` via `compute_sizecoding_pareto_score`) in `evolve_prompts`, plus `check_same_thread=False` and `threading.RLock()` thread safety across `YawGraphEngine`.
+   - Separate `_mipro_metric` (scalar `float`) and `_gepa_metric` (`dspy.Prediction(score=..., feedback=...)` via `compute_task_quality_score`) in `evolve_prompts`, plus `check_same_thread=False` and `threading.RLock()` thread safety across `YawGraphEngine`.
 
 4. **Benchmark Suite Disjoint Slicing, DPR Baseline & Telemetry (`benchmark.py`):**
    - Added CLI flags: `--engine {hipporag, yaw}`, `--execution-mode {direct, rlm}`, `--qa-mode {cot, rlm}`, `--enable-gbnf`, `--query-offset`, `--evolve {none, miprov2, gepa, hybrid}`, `--train-queries`, `--compiled-program`.
@@ -515,7 +515,7 @@ Offline test suite: `uv run --locked python -m unittest discover -s tests -v` â€
   - **CLI Entrypoint (`yaw/daemon/cli.py`, `yaw/__main__.py`):**
     - Implemented `python -m yaw {run|start|status|sync|stop|rebuild|optimize} --config yaw.toml`.
   - **Composite Fitness Objective & Full Optimizable Surface (`yaw/daemon/graph/inference/{grammars.py,embedding.py,program.py}`, `yaw/daemon/graph/engine.py`):**
-    - Upgraded `compute_sizecoding_pareto_score` and `YawGraphEngine.evolve_prompts` to compute the full multiplicative quality curve $\prod_{k \in \{1,2,5,10,20\}} \text{Recall@}k \times \text{EM} \times \text{F1} / (\text{tokens} \times \text{wall\_clock\_seconds})$.
+    - Upgraded `compute_task_quality_score` and `YawGraphEngine.evolve_prompts` to compute the full multiplicative quality curve $\prod_{k \in \{1,2,5,10,20\}} \text{Recall@}k \times \text{EM} \times \text{F1} / (\text{tokens} \times \text{wall\_clock\_seconds})$.
     - Exposed and persisted all 5 optimizable surfaces (`EmbeddingGemma` prefixes, OpenIE Extraction RLM, `FilterFacts`/`ExtractQueryIntent`, Multi-Hop QA RLM, and parametric GBNF bounds) via `HippoRAGProgram.dump_state()` / `load_state()` and `DSPyEmbeddingAdapter.update_prefixes()`.
 
 - **Verification Status:**
@@ -622,15 +622,15 @@ Offline test suite: `uv run --locked python -m unittest discover -s tests -v` â€
   - `git diff --check` $\to$ **Clean**.
   - `git grep -n "def forward" yaw/daemon/graph/inference/chat.py` $\to$ **0 matches**.
 
-17. **Sprint 2 â€” First-Class `YawRM` / `YawRetriever(dspy.Retrieve)`, Stage Invariants (`yaw_assert` / `yaw_suggest` / `dspy.Refine`), GEPA Pareto Frontier Ensemble (`dspy.Ensemble`) & `dspy.ReActV2` (2026-10-19):**
+17. **Sprint 2 â€” First-Class `YawRM` / `YawRetriever(dspy.Retrieve)`, Stage Invariants (`validate_stage_invariants`), GEPA Pareto Frontier Ensemble (`dspy.Ensemble`) & `dspy.ReActV2` (2026-10-19):**
 
 - **Architecture & Implementation:**
   - **First-Class `dspy.Retrieve` / `dspy.RM` Adapter (`yaw/daemon/graph/inference/program.py`, `yaw/daemon/graph/inference/__init__.py`):**
     - Implemented `YawPassage(dspy.Prediction)` exposing `.long_text` (required by `dspy.Retrieve.forward`), `.pid`, `.score`, and `.rank`.
     - Implemented `YawRM` (`__call__(query_or_queries, k=None, **kwargs) -> list[YawPassage]`) compatible with `dspy.configure(rm=...)` / `dspy.context(rm=...)` so stock `dspy.Retrieve(k=...)` modules query YAW's hybrid PPR graph engine natively.
     - Implemented `YawRetriever(dspy.Retrieve)` with backward-compatible `dump_state` / `load_state` (`state_copy.setdefault("retriever", {"k": ...})`) and wired `self.rm` and `self.retriever` onto `HippoRAGProgram` while preserving the 9-predictor `named_predictors()` invariant.
-  - **Exhaustive Stage & Closed-World SHACL/SKOS/Connected-Node Invariants (`yaw/daemon/graph/inference/program.py`):**
-    - Implemented `YawAssertionError`, `yaw_assert(condition, message, *, target_module=None)`, `yaw_suggest(condition, message, *, target_module=None)`, `validate_stage_invariants(...)`, and `wrap_stage_with_refine(module, stage_name, *, N=2, threshold=1.0, use_refine=True)` (`dspy.Refine` / `dspy.BestOfN`).
+  - **Exhaustive Stage & Closed-World SHACL/SKOS/Connected-Node Invariants (`yaw/daemon/graph/inference/invariants.py`):**
+    - Implemented `validate_stage_invariants(...)` and `is_abstaining_answer(...)`.
     - Enforces all 9 stage contracts (`ner`, `triples`, `entity_definer`, `synonym_judge`, `shacl_repair` / `shacl_healer_rlm`, `query_intent`, `triple_filter`, `qa`, `qwen_proposer` / `qwen_compressor`) and all 6 closed-world SHACL shapes (`ConceptShape/prefLabel`, `ConceptShape/definition`, `ConceptShape/S13-disjointLabels`, `ConceptShape/homographDifferentFrom`, `StatementShape/closedWorld`, `EdgeShape/closedWorld`), plus connected-node subgraph topology (`_count_connected_components`), closed-world candidate fact subset closure, and anti-leakage instruction validation.
     - Wired feedback-guided self-correction retry (`max_invariant_retries = 1`) into `HippoRAGProgram._invoke_stage`, recording `invariant_score`, `invariant_feedback`, and `invariant_retries` in `self.telemetry`.
   - **GEPA Pareto Frontier Ensembling (`yaw/daemon/graph/inference/program.py`):**
@@ -707,7 +707,7 @@ Offline test suite: `uv run --locked python -m unittest discover -s tests -v` â€
 ## 21. GEPA Metric Fix: Quality-Led Score, 10-Example Minibatch, Clean Objective Score Card (2026-10-22)
 
 - **Observed failure (run `yaw_optimize_20261021_174008`, 150 train / 100 val, Qwen3-4B):** after 10 candidates (401 evals) the seed stayed "best" (val score `0.0573`) while candidate #5 had higher full-valset R@5 (`0.90` vs `0.87`) and F1 (`0.359` vs `0.350`). Six of ten candidates were judged on 3-example minibatches only.
-- **Root causes (`compute_sizecoding_pareto_score`, `yaw/daemon/graph/inference/grammars.py`):**
+- **Root causes (`compute_task_quality_score`, `yaw/daemon/graph/inference/parsers.py`):**
   - `target_tokens=100` against ~20k tokens/query made the token cost term ~228; a 50% token cut moved the score ~20% while a +10pt F1 gain moved it ~3%. The score tracked cost, not quality.
   - `objective_scores` (GEPA per-objective frontier -> `ParetoProgramEnsemble` / `dspy.Ensemble`) included `gm_bad` (lower-is-better), so the frontier kept the most expensive candidate, plus redundant composites (`gm_good`, `pareto_raw`, `quality_numerator`).
   - `reflection_minibatch_size=3` (`yaw/daemon/graph/engine.py`) let a single answer accept/reject a proposal.
@@ -1298,11 +1298,10 @@ Offline test suite: `uv run --locked python -m unittest discover -s tests -v` â€
   early candidates faster than recent GEPA runs. No optimizer/prompt changes
   or live inference were performed for this inspection.
 - Both optimizers use YAW's `RLMInstructionProposer`: MIPRO's instruction
-  proposer is replaced with `propose_mipro_instructions`, which calls the same
-  per-component reflection method. The inputs differ: MIPRO builds candidate
-  banks from successful demos or dataset labels; GEPA supplies failure traces
-  and diagnostic feedback. This is not a comparison of wholly separate
-  generation models/templates.
+  proposer delegates to the same per-component reflection method. The inputs
+  differ: MIPRO builds candidate banks from successful demos or dataset labels;
+  GEPA supplies failure traces and diagnostic feedback. This is not a
+  comparison of wholly separate generation models/templates.
 - GEPA feedback preparation replaces expected answers and gold answers with
   `<TargetAnswer>` before reflection. A local no-inference probe confirmed
   `Predicted=North != Expected=['South']` becomes
@@ -1599,3 +1598,563 @@ zero selected tests when unchanged. Runner, test and conftest pass Ruff and ty;
 `uv run --locked preflight --help` succeeds. Existing formatting-only edits were
 checked for equivalent Python ASTs before inclusion. No full-repository green
 claim is made: other audited fixture/type/lint failures remain to be repaired.
+
+## 39. Complete Ruff, ty and pytest repair (2026-10-23)
+
+Started from clean commit `2e9eded`. The baseline was 52 ty diagnostics and
+218 Ruff findings at the existing 120-character limit. Typed native-DSPy
+fixtures, exact tokenizer callables and HTTP handlers now declare their actual
+contracts. Runtime optimizer tests use loopback tokenizer endpoints, one
+persistence test now uses native GEPA instead of replacing its class, and the
+retrieval-only fixture declares inference capacities. No static rules or test
+assertions were disabled. Prompt/template/grammar/SQL literal values were
+checked against the original source ASTs; only non-signature docstring trailing
+whitespace required normalized comparison.
+
+Automatic/conditional live-test skipping has been removed. Tests use the
+configured resident Gemma model and native DSPy callbacks instead of requiring
+Qwen or unbounded inspection histories. `--live` is retained only for command
+compatibility. Full verification disables testmon deselection; incremental
+preflight remains available for development.
+
+The first full preflight ran all 259 cases: **257 passed, 2 failed, 0 skipped**,
+731.95 s, with 81.37% line coverage. Both failures were in a new typed DummyLM
+fixture whose capability default incorrectly said GBNF unsupported. Restoring
+the original unspecified default fixed the unchanged assertions. Both actual
+resident-model tests passed in this full run. Initial artifacts:
+`outputs/preflight/20261023T162322Z-54704/`.
+
+The run also exposed unclosed native diskcache SQLite connections. An allocation
+trace located them in diskcache/core.py, rather than graph storage. YAW closes
+constructor handles on their creating thread and per-operation handles on the
+using thread, retaining persistent entries and native key/serialization logic.
+An unmanaged two-worker control reproduced two ResourceWarnings. New real-cache
+regressions cover both usage-accounting modes, thread teardown and persisted
+reconfiguration reuse; **3 passed** with ResourceWarnings escalated to errors
+(15.23 s). CLI resume and the two corrected grammar cases also passed under that
+strict warning setting (**3 passed**, 24.18 s). Three transaction-only SQLite
+test contexts now explicitly close their connections.
+
+Final `uv run --locked preflight --full` passed all four gates. Ruff and ty
+report **0 diagnostics**. Pytest executed **261 collected / 261 unique cases:
+261 passed, 0 failures, 0 errors, 0 skipped**, with testmon selection deactivated.
+Pytest took 721.85 s (728.5 s process time). Coverage.py measured **8,168 / 9,992
+lines = 81.75%**, with zero excluded lines. Both configured-resident-model tests
+and all native/SQLite/fresh-process recovery checks executed successfully.
+
+The final run emitted **0 ResourceWarnings**. Its 23 remaining notices are one
+Pydantic ReadOnly qualifier warning, four DSPy legacy message-API deprecations,
+and 18 DSPy temperature-zero/rollout notices. None were suppressed. These API
+migration/metadata notices do not represent skipped tests or failed assertions.
+
+Artifacts: `outputs/preflight/20261023T164646Z-31068/`, including the actual logs,
+JUnit XML, coverage JSON and `completion-audit.json`. The completion audit
+independently reconciles collected, executed and unique case counts, confirms
+required live/recovery cases, and rejects any failed/errored/skipped case. Tracked
+Python source timestamps were checked to ensure no source changed during this
+final run. `git diff --check` passes. This establishes developer-gate correctness,
+not new corpus quality or Tier 2 benchmark parity.
+
+## 40. Complete production coverage work in progress (2026-10-23)
+
+The user confirmed that 100% coverage includes all production Python: yaw/,
+benchmark.py and the four executable/support modules in scripts/. This goal is
+not achieved. Development measurements below are accumulated focused-test
+coverage, not a fresh full-suite acceptance result.
+
+New tests exercise actual subprocess output/timeout/interruption cleanup,
+durable reports, configuration writes, native DSPy objects, evidence provenance,
+real sparse matrices, SQLite payload corruption, loopback model identity and
+async embeddings, and CocoIndex AST/disk hydration. No production lines were
+excluded. Configuration rejects unknown field writes before touching the file.
+Parser fixes reject null coordinates/definitions, preserve case-variant
+homograph senses and normalize NumPy string triples before fuzzy matching.
+
+Coverage.py's native subprocess patch is enabled in the tracked .coveragerc;
+the .gitignore exception retains that configuration. Actual Python children now
+contribute coverage of the real source tree. Copied fixture implementations do
+not count as production execution. Preflight's reporting text was reconciled
+and its coverage command now includes benchmark and scripts. A disposable
+project test checks all three source locations in the actual coverage JSON.
+
+Verified focused runs: 82 parser/preflight edge cases passed in 134.71 seconds;
+9 real sparse/cache cases passed in 11.73 seconds; the combined inference,
+registry, evidence, graph and hydration edge suite passed 80 cases in 33.83
+seconds. A subsequent real async HTTP embedding/registry run passed 15 cases in
+35.75 seconds. All 15 preflight cases passed after the reporting-text update
+(162.36 seconds). The expanded-scope command, actual three-source coverage
+report and newest prefix-update case subsequently passed in a 33-case run
+(177.76 seconds). Repository-wide Ruff and ty currently report zero
+diagnostics. Earlier new-test failures were corrected fixtures: JSON-valid
+nonfinite score text and explicit optional-value/type narrowing.
+
+Before the expanded-scope command change, accumulated yaw-only coverage was
+8,743 / 9,994 executable lines (87.48%); core, parsers, model registry, graph
+candidate cache and PPR measured 100%. Hydration measured 95%, reflection 93%,
+and embeddings 89%. The separate first benchmark/script measurement passed
+28 tests in 25.80 seconds, covering 907 / 2,206 lines (41.12%). These separate
+percentages must not be presented as complete production coverage.
+
+An additional 15 benchmark metric cases passed in 2.28 seconds. They establish
+exact recall denominators, rank ordering, title/crop/whitespace matching,
+empty/malformed inputs, answer aliases and configurable EM/F1 aggregation.
+scripts/evaluation.py now measures 126 / 126 lines (100%) in the development
+data; the aggregate script scope is 983 / 2,206 lines (44.56%). One unsuppressed
+coverage notice reports that benchmark was not imported in this narrowly
+selected metric run; benchmark data was retained from the preceding run.
+
+The runtime and script databases were then combined with coverage.py's native
+combine operation: **9,735 / 12,200 lines = 79.7951%, 2,465 missing, 0 excluded**
+across all 36 production files. The lower percentage reflects the expanded
+denominator, not a regression. See all-production-coverage.json. This combined
+database is now the append baseline; future focused runs must keep all three
+source flags (`--cov=yaw --cov=benchmark --cov=scripts`). Production source
+identity was verified after combination. No source file changed during merging.
+
+Artifacts are under outputs/coverage-work/: coverage.json, scripts-coverage.json,
+separate coverage databases and the production source-hash manifest. Changed
+production files are purged before development append runs; a fresh complete
+suite with exact zero missing/excluded lines remains required for acceptance.
+Large remaining gaps include engine/program/storage/runtime/CLI, executable
+scripts, and genuine platform/error paths. No unattended optimization was
+started by this coverage work; the user's existing optimizer/watchdog processes
+were inspected and left running.
+
+## 41. SQLite, downloader and report coverage packet (2026-10-23)
+
+New real SQLite cases migrate an actual legacy database with old entity name
+uniqueness, chunk hashes, missing AST/definition columns, synonymy edges and
+malformed historical fact JSON. They verify row preservation, SKOS backfill,
+FTS reconstruction and migration idempotence. Transaction cases distinguish
+owned rollback from an active outer transaction. Additional cases verify
+global cross-source label priority, missing/zero vector sense resolution and
+independent dense/lexical candidate scores. Fourteen new storage cases pass;
+db.py now measures 855 / 965 lines (88.60%).
+
+Downloader tests stream more than 1 MiB through real loopback HTTP, exercise
+fallback and forced replacement, and verify failed requests preserve the prior
+target and remove the temporary file. Actual CLI processes check valid/invalid
+cached datasets and aliases without external network. Eight cases pass;
+download-datasets.py measures 229 / 261 lines (87.74%).
+
+Ten dashboard cases render actual Matplotlib SVGs and read audit JSON from disk.
+They verify candidate ordering, validation-score precedence, cumulative best
+scores, last-good snapshots after malformed writes, observed throughput,
+placeholders and configuration fallback. watchdog.py measures 514 / 825 lines
+(62.30%). No live dashboard output was overwritten by these tests.
+
+Parity rendering tests exposed two source defects: latency SVG groups were
+unclosed and baseline bars were missing, while the quality chart could report
+PASS despite an ExactMatch failure in the actual gate. The latency chart now
+closes groups, advances rows and renders both engines; the quality chart uses
+the recorded gate decision and includes ExactMatch when deriving legacy status.
+XML parsing tests verify real outputs, escaping, zero-duration comparisons and
+agreement with gate decisions. The source coverage for this edited module was
+purged before remeasurement. Native benchmark comparison regressions still pass.
+
+Final focused packet: **60 passed in 43.39 seconds**, with testmon deselection
+disabled. Repository-wide Ruff and ty report zero diagnostics; git diff --check
+passes. Production source hashes match all 36 measured files. The accumulated
+all-production report is **10,255 / 12,211 lines = 83.9817%, 1,956 missing and
+0 excluded**. The additional executable lines implement the verified SVG fixes.
+Earlier focused runs emitted coverage-only notices about benchmark not being
+imported or no new parent-process data; no warnings were suppressed. The final
+60-case run includes benchmark execution and reports no warnings.
+
+This packet makes progress toward the full 100% goal; it does not complete it.
+Remaining gaps and the final fresh complete-suite acceptance remain open.
+
+## 42. Native engine recovery and reflection boundaries (2026-10-23)
+
+The new engine cases use native dspy.LM, HippoRAGProgram and dspy.Embedder,
+actual loopback HTTP chat responses, real source files and yaw.db. They first
+index a source, delete the bounded candidate-stage cache in a transaction,
+close the engine and recreate its objects. Structured, legacy triples-only,
+structured-only and partially invalid statement checkpoints make no new NER
+or triple requests. A legacy checkpoint lacking definitions makes exactly one
+definition-repair request and still reuses its committed NER/triples. Persisted
+OpenIE JSON, prompt fingerprints and the single fact survive replay. Empty
+index/retrieval/context/deletion operations leave graph rows empty and make no
+inference calls. These are orchestration guarantees for the exercised cases,
+not a quality measurement or an unattended-run stability guarantee.
+
+Reflection tests execute the native async wrapper with the verified serving
+tokenizer, check output allowance, disabled history, deepcopy and serialized
+state, and reject incompatible checkpoint context. Real HTTP-served JSON tests
+reject missing tokenizer discovery, zero serving context, different weights,
+malformed JSON, nonresident models and missing backend routes. Completed
+proposal state rejects blank or nontext instructions. The installed DSPy
+OpenAI adapter uses max_completion_tokens on the wire; the test checks the
+actual 128-token allowance instead of assuming the legacy max_tokens name.
+
+Final focused packet: **29 passed in 42.40 seconds**, including the prior native
+engine cache/resume and prompt-mutation invalidation regressions. Ruff and ty
+pass repository-wide, git diff --check passes, and all 36 production hashes
+match. No production code changed in this packet. reflection.py measures
+**220 / 220 executable lines (100%)** in accumulated development data. Engine
+coverage rose to 2,053 / 2,351 lines; additional genuine definition-repair paths
+also execute in program.py.
+
+The complete production development report is **10,325 / 12,211 lines =
+84.5549%, 1,886 missing, 0 excluded**. Remaining notices are DSPy's existing
+legacy-message API deprecation and the focused-run notice that benchmark was
+not imported; neither is suppressed. The overall goal remains incomplete and
+requires the remaining cases plus a fresh complete-suite acceptance run.
+
+## 43. Benchmark input, persistence and end-to-end coverage (2026-10-23)
+
+New benchmark cases exercise answer cleanup, ordered aliases, null/missing
+answer rejection, document fallbacks, source-document matching, four dataset
+padding formats, local-cache reuse and actual HTTP dataset fallback/failure.
+Native dspy.Embedder callables verify repeatability under batching, individual
+calls and reversed inputs across the active embedding roles; an intentionally
+changing mathematical embedding function is rejected. Integrity checks retain
+provider errors and distinguish QA checks from retrieval-only validation.
+
+The numeric-alias case exposed a real runtime type-contract mismatch:
+get_gold_answers was declared to return strings but could return numeric
+aliases. Values are now normalized to strings before ordered deduplication;
+the new regression verifies that numeric 3 and string "3" collapse to one
+answer. The benchmark module's old measurements were purged before running
+its tests against the changed implementation. User prompt edits are preserved.
+
+Two complete run_yaw_benchmark cases use real CocoIndex ingestion, SQLite,
+native DSPy HTTP chat/embedding calls and sparse retrieval. Retrieval-only and
+QA reports contain the expected source and fixture scores; repeated invocation
+reuses the committed index and cached LM responses without new LM requests.
+These oracle-provider scores verify orchestration, not local-model quality.
+Any retry executable lookup is confined to the disposable test environment.
+
+Actual benchmark.main tests persist success and registry-rejection reports,
+verify the serialized report against the returned data, and keep training
+queries out of evaluation embedding probes. Real model-identity functions are
+bound to loopback HTTP endpoints. Each test restores the previous DSPy LM
+binding, preventing a stopped fixture server from leaking into later tests.
+
+Verification: **63 passed in 51.44 seconds** across benchmark, new edge cases,
+native engine recovery and parity rendering. After adding LM-binding isolation,
+the full benchmark edge file passed **29 cases in 43.74 seconds**. Four final
+gold-retention/distractor-padding variants passed in **26.33 seconds**. Ruff,
+ty and git diff --check pass. The remaining three notices in the full packet
+are existing Pydantic ReadOnly metadata and DSPy temperature/rollout warnings;
+none were suppressed. All 36 production source hashes match the final data.
+
+benchmark.py now measures **538 / 627 lines (85.81%)**. Complete production
+development coverage is **10,589 / 12,211 lines = 86.7169%, 1,622 missing and
+0 excluded**. The 100% goal and fresh complete-suite acceptance remain open.
+
+## 44. GEPA quality-only geometric reward (2026-10-24)
+
+Accepted reward change: the scalar objective is the unweighted geometric mean
+of labeled R@1, R@2, R@5, R@10, R@20, EM and token F1. Token, repair, latency
+and SHACL penalties are removed, together with efficiency/integrity Pareto
+objectives. Tokens and integrity remain diagnostics. There is no smoothing or
+extra weighting; a zero component yields zero. QA-only examples no longer
+substitute EM for unmeasured recall. Unlabeled examples fail explicitly.
+Missing token telemetry no longer prevents quality evaluation.
+
+QA now uses native DSPy normalized exact match and continuous best-reference
+token F1. The previous substring-as-exact-match rule and F1 promotion are
+removed. Installed `answer_exact_match(frac < 1)` was inspected: it thresholds
+F1 to a boolean, so continuous F1 comes from `dspy.evaluate.metrics.F1`.
+`SemanticF1` is an LM judge and remains an optional evaluation diagnostic.
+Reflection's deterministic fallback recognizes the new feedback score format.
+Run and SIMBA task-cache identities record `task-quality-geometric-mean-v1`;
+old scored optimization state must not resume into this objective. Existing
+processes keep their loaded implementation until restarted with fresh state.
+
+Verification used actual DSPy metric/GEPA classes, real SQLite checkpoints and
+loopback task providers. **126 passed in 122.54 seconds** in the focused metric,
+grammar, parser and prompt packet. The broader reflection/SIMBA/engine/benchmark
+packet initially had **104 passed and 1 failed in 160.34 seconds**: an old
+cache-isolation test expected positive smoothed reward for a missed answer.
+It now asserts zero composite, zero F1 and preserved R@20=1 diagnostics.
+The corrected case plus real GEPA resume, legacy checkpoint rejection and
+architecture checks passed **12 cases in 43.13 seconds**. SIMBA's partial-answer
+baseline assertion was also updated for zero EM, retaining a real correct-to-wrong
+regression check and zero repeated task calls for cached evaluations; the full
+SIMBA packet passed in the broader run. Real GEPA runtime/persistence cases for
+combined, QA-only and retrieval-only labels passed **3 cases in 28.74 seconds**,
+verifying the serialized scores against the formula. Ruff, ty and
+`git diff --check` pass. Existing DSPy message-API deprecation, temperature/rollout
+and Pydantic metadata warnings remain visible.
+
+These tests establish metric and orchestration behavior. They do not establish
+better held-out model quality. No unattended optimization run was launched.
+This packet does not update or complete the separate all-production coverage goal.
+
+## 45. DSPy Signature, History and predictor construction audit (2026-10-24)
+
+Read-only source audit and runtime probes against installed DSPy **3.4.1**.
+Signatures are wrapped in native Predict/ChainOfThought modules; demonstrations
+are native Example objects attached through predictor.demos. QA's generated
+reasoning/answer signature and RLM's generated REPLHistory inputs are expected
+DSPy behavior. DiagnosticHistory and LM.history are observational records, not
+conversation inputs. Current QA signatures and forward APIs do not accept a
+conversation history. A native History field rendered through YawGBNFAdapter
+correctly produced system/user/assistant/user messages, including the prior answer.
+Settings are read at call time; constructing predictors before configure/context
+does not by itself invalidate them.
+
+Confirmed defects in disposable probes, with no resident inference calls:
+
+- A real loopback HTTP request through ner.lm.copy(temperature=0.9,
+  max_tokens=123) sent temperature **0.1** and max_completion_tokens **77**,
+  the original target settings. _PredictorBoundLM.copy stores overrides on the
+  proxy, but its __call__ forwards neither those kwargs nor a copied target.
+- Native program.ner.acall raised **NotImplementedError: Subclasses must
+  implement this method** before sending an HTTP request. The proxy inherits
+  BaseLM.acall without implementing its async execution contract. The separate
+  program.as_async helper uses asyncify over synchronous execution.
+- YawJSONAdapter.parse accepted {"reasoning": "Only reasoning"} for the
+  ChainOfThought QA signature, returning no answer. Native JSONAdapter rejected
+  the same payload with AdapterParseError. The repair fallback returns the
+  first matching output field without validating all required outputs.
+
+Additional integration risks: the LM proxy prefers ambient settings.lm over
+its bound target, unlike native Predict's explicit-binding precedence. A context
+probe resolved a bound predictor to the ambient model. Dedicated proxy identities
+also make HippoRAGProgram.get_lm report multiple LMs even when all roles use one
+underlying LM. These behaviors need explicit design decisions when replacing the
+proxy. DSPy 3.4 emits legacy LM/message deprecations; its documented 3.5 cutoff
+requires migrating custom integration to the native engine/request contract.
+OpenIE output annotations remain list[Any], leaving structural guarantees to
+GBNF and host parsing rather than the signature type itself.
+
+A fresh default program contains 1 NER, 1 triples, 10 triple-filter and 2 QA
+demonstrations. GEPA-only optimization retains seed demos; the zero-demo clearing
+currently occurs inside the MIPRO branch. This is distinct from conversation
+history and should be made explicit in any intended zero-shot policy.
+
+Verification: **4 passed in 22.29 seconds** for the existing signature/demo,
+canonical predictor, adapter and asyncify/embedding checks. Additional construction,
+message rendering, parser and isolated HTTP probes produced the results above;
+git diff --check passed. Those passing tests do not cover the confirmed defects.
+No production source was changed and no optimization run was launched.
+
+## 46. Native DSPy predictor binding and parsing repair (2026-10-24)
+
+The custom per-predictor BaseLM proxy is removed. Task predictors now bind
+native LMs by role; an unbound predictor follows DSPy's context. Explicit
+per-call LM overrides are forwarded to Predict, including query-intent calls.
+Native LM copies preserve their generation settings through candidate copies.
+RLM explicit overrides operate on a copied module instead of mutating shared
+predictors. The native instruction writer and compressor remain unbound so
+their selected worker/SIMBA rollout context and verified token guard apply.
+Predictor enumeration is inherited directly from DSPy.
+
+The additional YAW JSON recovery adapter and legacy ReAct field-renaming helper
+are removed. YawGBNFAdapter supplies grammar only and inherits native formatting
+and parsing. DSPy's JSONAdapter already repairs JSON syntax and validates
+declared output fields; YAW no longer guesses field names, accepts partial QA
+objects or fabricates empty success results. This was legacy response-format
+compatibility, not a GBNF parser. No reproduced server-side GBNF defect justified
+that extra layer. Invalid signatures now expose invalid scripted fixtures too:
+some fixtures answered query-intent requests with QA fields or confused an
+extraction input field with the required output. Those fixtures now produce the
+actual native schemas, including ReAct tool calls.
+
+Fresh task and reflection programs have zero demonstrations by default. The
+existing user-edited examples are retained unchanged for explicit opt-in, with
+no claim of measured generalization. Native compiled demos remain intact on
+load, including deliberately empty lists. Explicit deployment LMs are retained
+before rebuilding Pareto members; missing legacy predictors get configured
+defaults without importing serialized custom clients. Native LM identities
+remain in candidate-cache keys while credentials are excluded. No implicit
+conversational memory was added; History remains an explicit signature input.
+
+Regression tests use native DSPy classes, real HTTP requests and JSON state files
+for sync/async execution, copied parameters, role/context/explicit-call
+precedence, candidate cloning, state restoration, zero-shot defaults and history
+formatting. Malformed output cases exercise DSPy's own validator. Initial
+targeted checks passed **16 cases in 22.51 seconds**; the complete prompt suite,
+including resident-model GBNF and RLM smoke checks, passed **33 cases in 111.05
+seconds**. A broader run passed **145 cases and failed 13 in 576.09 seconds**;
+the failures identified legacy engine fixture schemas and an obsolete proxy
+identity assertion in the cache-retention test, plus fixtures attempting to
+reconstruct their custom test clients instead of supplying deployment LMs.
+
+The corrected serial engine/native-binding/cache packet passed **43 cases and
+failed 1 in 314.22 seconds**; the last failure was the custom test-LM restoration
+case, corrected by explicitly supplying its deployment client. The final packet
+passed **36 cases in 66.47 seconds**: all new native binding/parser/history
+regressions, that corrected frontier export/load case, real GEPA runtime
+optimization/persistence for QA-only, retrieval-only and combined labels, native
+SIMBA learning/process restart and architecture checks. All failures encountered
+in the affected packets were corrected and reverified. This is targeted
+verification, not a fresh complete repository suite or a model-quality benchmark.
+
+The 600-query disk-cache retention test passed with **one physical provider
+request**, **18,000 logically accounted tokens**, no retained LM/global histories
+and less than **1,000,000 bytes** of retained allocation growth after warmup.
+Ruff, ty and git diff --check pass. Existing DSPy 3.4 message-API and
+temperature/rollout warnings remain visible. No user processes were stopped and
+no unattended optimization run was launched. The separate all-production
+coverage goal is unchanged.
+
+## 47. Gemma 128K capacity and automatic budgets (2026-10-24)
+
+The configured and Python/model-profile Gemma default is **131,072 tokens**.
+The user reports approximately **65 TPS without flash attention**; this packet
+records that deployment evidence and does not remeasure throughput or modify
+the external inference service. Embedding model limits remain independent.
+
+Unpinned completion, reflection-input and RLM-output budgets scale from the
+64K deployment baseline. At 128K they resolve to **8,192 output tokens**,
+**32,768 reflection input tokens** and **20,000 RLM output characters**. The
+repository TOML no longer pins those budgets at their old 64K values. Explicit
+overrides remain authoritative; changing the context in TOML recomputes omitted
+budgets on load. Standalone programs infer capacity from supplied LM metadata
+or use the same 128K default. Existing smaller model profiles retain their
+previous completion default unless an explicit deployment context is supplied.
+
+Extraction, QA and graph hydration use available-input-scaled character limits;
+the default graph context budget is **102,857 characters** at 128K/8K output.
+SHACL focus context and metric hydration no longer have separate fixed small
+caps. Synonym/SHACL prompt-size batch caps scale from 16 items at 64K to 32 at
+128K; structured lists are fitted as whole JSON input items, never split mid-item.
+Default native proposal and diagnosis length limits also scale. Explicit
+unbounded proposal length is passed through to its grammar without a hidden
+1,500-character fallback. These are input-budget changes, not a revival of the
+removed custom response recovery parser.
+
+The verified serving tokenizer still measures complete reflection requests and
+reserves output plus a fixed **512-token safety margin**. RLM iteration/call
+counts, retry limits, retrieval parameters and diagnostic retention stay
+independent. Prompt-state loading, including hot reload and Pareto restoration,
+cannot replace the deployment's serving context/output caps with stale values.
+Changed settings/code retain the existing optimization-resume compatibility
+checks; a running process retains its startup settings.
+
+Verification: **73 passed in 93.18 seconds** across initial budget, native
+binding, tokenizer/reflection and configuration tests. Extended real-HTTP and
+SQLite graph/tokenizer/architecture checks passed **93 cases in 182.44 seconds**.
+Native GEPA/SIMBA learning and persistence plus capacity checks passed **27 cases
+in 68.12 seconds**. The final hot-reload/legacy-Pareto/real-GEPA and architecture
+packet passed **28 cases in 41.09 seconds**. Tests show source text beyond the
+old 64K safeguards reaching 128K requests, automatic and pinned settings,
+context-sized structured batches, exact loopback tokenizer rejection before
+generation, and preserved configured capacity on prompt reload. Ruff, ty and
+git diff --check pass. Existing DSPy/Pydantic warnings remain visible. No
+unattended optimization or resident-model performance benchmark was launched.
+
+### Watchdog individual evaluation scores (2026-10-24)
+
+Fig. 3 now plots individual evaluation scores in evaluation order, with the
+current all-evaluation mean for each candidate overlaid. The latest evaluation
+number, candidate, score and mean appear above the panel. Existing candidate
+mean/min/max, validation/best-program and mean-latency panels remain available.
+Individual points use the optimizer's existing bounded 500-record audit tail;
+candidate aggregates still cover all recorded evaluations. Audits without
+individual scores show an explicit unavailable message. The optimizer already
+writes the audit after each completed evaluation, so a dashboard refresh can
+show progress within a candidate without optimizer changes. An existing
+watchdog process must restart to load the new renderer.
+
+Verification: all **15 focused watchdog tests passed in 10.57 seconds**, including
+real audit-file updates and SVG rendering as another evaluation completes on
+the same candidate. Ruff checks/formatting, focused ty checks and
+`git diff --check` passed. A three-candidate PNG preview was visually inspected.
+Initial sandbox checks could not access uv's cache/Python environment; the
+authorized rerun succeeded. No inference or optimization run was needed.
+
+### Native GEPA progress in watchdog Fig. 5 (2026-10-24)
+
+Replaced the dashboard-derived quality/latency frontier and its misleading
+archive-size trend. Fig. 5 now uses a versioned `gepa_progress` snapshot in the
+existing optimization audit. GEPA callbacks publish validation scores, scored
+example counts and validation-set sizes, exact native frontier membership,
+bounded addition/displacement history, iteration and execution phase. Audit
+publication happens on callbacks as well as individual metric evaluations, so
+reflection and validation completion are visible without waiting for another
+candidate evaluation. GEPA's native CompositeCallback wraps optional observers.
+
+Full-validation scores have a seed baseline and best-so-far line. Partial
+validation results are marked separately and excluded from that line. Scores
+have no smoothing floor. Native candidate indices start at zero and differ
+from the dashboard's first-seen fingerprint numbering. Frontier membership
+comes from `on_pareto_front_updated` and `get_pareto_front_mapping()`, including
+the configured hybrid frontier. A restored native checkpoint supplies all
+known candidate score/count summaries and current membership without requiring
+new inference. The first frontier observation is a baseline, not an addition;
+the latest 250 observations in the current process are retained. Programs,
+outputs and traces are never held by this observer. Completed validation
+coverage includes cached results; in-flight counters explicitly report metric
+calls observed during the phase, which cache reuse may bypass.
+
+Older audits explicitly report native telemetry unavailable. Restarting the
+watchdog loads the renderer; restarting/resuming the optimizer with this code
+enables native publication. No running optimizer was stopped or relaunched.
+
+Verification: the final focused packet passed **30 tests in 37.57 seconds**,
+covering a real deterministic GEPA optimization loop, native hybrid frontier
+displacement, real checkpoint save/load, YAW CLI resume with unchanged native
+evaluation counts and exact published frontier, real audit/SVG updates,
+partial-validation rendering, legacy placeholders, architectural containment
+and hybrid metric integration. Earlier test-adapter/interface failures were
+corrected before the final run. Ruff and focused ty checks passed; a PNG preview
+was visually inspected and `git diff --check` passed. The native GEPA test is an
+offline arithmetic task: it verifies monitoring/orchestration, not model quality.
+
+### SSOT/DRY canonicalization and legacy purge (2026-10-24)
+
+Completed full-codebase SSOT/DRY canonicalization and legacy symbol retirement across `yaw/`, `benchmark.py`, `scripts/`, `tests/`, and `docs/`:
+
+- **Retired legacy symbols, dead wrappers, and duplicate helpers**: Removed legacy GBNF synonym-judgment grammar helpers, dead assertion/refine wrappers, unused entity-node/fact-flattening helpers, batch-overflow repackers, mutable delta-compiler setter (replaced with read-only `CorpusIngestor.on_delta` property), candidate-list partitioning and the residual `16`-candidate cap in `YawGraphEngine` synonym discovery/adjudication (so all unadjudicated candidate pairs with `dense_sim >= synonymy_threshold` emit `skos:related` fallback edges), dead model-recycling helper, unused `--index-batch-size` / `--qa-batch-size` flags in `benchmark.py`, 11 private staticmethod bindings on `YawGraphEngine`, duplicate `corpus/{cid}.md` materialization (consolidated into `YawGraphEngine._materialize_doc_chunk`), dead `HippoRAGProgram` repair aliases, duplicate `DEFAULT_CHAT` / `DEFAULT_BASE_URL` constants in `models.py` and `embedding.py`, and hardcoded user paths (`YAW_ARTIFACT_DIR` env var or workspace default used instead).
+- **Task quality & benchmark integrity**: Consolidated `compute_task_quality_score` in `parsers.py`. Added `check_benchmark_integrity(records, *, k_values=...)` in `parsers.py` and wired it into `benchmark.py` and `YawRuntime.benchmark` (`report["integrity"] = {"passed": ..., "errors": ...}`).
+- **Entity definition canonicalization**: Unified `extract_entity_definitions(raw_input, *, normalize_keys=False)` in `parsers.py` as the single parser for list/dict/tuple inputs and delegated `HippoRAGProgram._merge_openie_definitions` to `extract_entity_definitions(..., normalize_keys=True)`.
+- **SHACL action SSOT**: Synchronized `ProposeSHACLRepairs` docstring with `VALID_SHACL_ACTIONS` and `HealSHACLViolations` (all 11 canonical actions).
+- **Runtime & CLI canonicalization**: Prevented duplicate `_apply_delta` execution in `YawRuntime._execute_sync_worker` when `ingestor.on_delta` is bound, preserved pre-startup `stop()` signals across `start()`, drained queued `_WorkItem` futures on worker exit, renamed `handle_dspy_benchmark`, inlined single-use subparser parents, and enforced canonical CLI grammar (`yaw {daemon|graph|dspy|config} <action>`, `--db-path`, `--gate`) with `allow_abbrev=False` across all subparsers.
+
+Verification: All 17 Oblivion Demolition Table `Test-Path` and repository-wide `git grep -w` checks returned **0 matches**. Offline real-substrate pytest suite (`uv run --locked pytest -o addopts="" -k "not live_silicon" tests/core/ tests/daemon/ tests/scripts/ tests/test_benchmark.py tests/test_benchmark_edges.py tests/test_download_datasets.py`) passed **610 cases with 0 failures** (`88%` total line coverage across `yaw/`). Repository-wide `ruff check`, `ty check`, and `git diff --check` passed with zero diagnostics. Live `:13305` model-server tests were intentionally not executed while an external optimization process held the local endpoint.
+
+## 48. Step 10 & Step 11: External Pareto `dspy.Ensemble`, Dual-Perspective Reporting, and SKOS/RDF/OWL/PPR Hardening (2026-10-25)
+
+### Step 10: Canonical External `dspy.Ensemble` & Dual-Perspective (`recall@N` + `QA (F1, EM)`) Reporting
+- **Prediction final-field invariant & `retrieve_only` mode (`yaw/daemon/graph/inference/program.py`)**: Enforced `answer` as the final keyword argument on `HippoRAGProgram.forward` predictions (`signature=None`) so `dspy.majority` resolves `field = "answer"` by default, and added `retrieve_only: bool = False` to execute `self.retriever(question, k=k)` while skipping `self.answer_question` (`answer=""`).
+- **Dual-perspective Pareto frontier selection & reduction (`yaw/daemon/graph/inference/optimizer.py`)**:
+  - `select_pareto_frontier_programs` filters strictly non-dominated candidates from `compiled.detailed_results`, deduplicates by query-time predictors (`query_intent`, `triple_filter`, `qa.predict`), and assigns Slot 0 (`best_candidate`), Slot 1 (`recall@N` Pareto leader), and Slot 2 (`QA (F1, EM)` Pareto leader), falling back to `<stem>_telemetry/pareto_member_*.json` when loaded from disk.
+  - `reduce_pareto_predictions` delegates directly to `dspy.majority(list(predictions))` when any prediction has a non-empty `answer`, and fuses retrieval rankings via `rrf_fuse_passage_lists` (`1 / (60 + r)` + min-max normalized PPR scores) when all predictions have `answer == ""` (`retrieve_only=True`).
+  - `compile_pareto_ensemble` unconditionally returns `dspy.Ensemble(reduce_fn=reduce_pareto_predictions).compile(programs)`.
+  - `promote_compiled_program` and `sync_pareto_telemetry_siblings` atomically synchronize `<stem>_telemetry/pareto_member_*.json` and `pareto_frontier_manifest.json` across `evolve_prompts` and `yaw dspy load-program`.
+  - `evaluate_program` evaluates `compile_pareto_ensemble(program)` and attaches `recall_at_k` (`1, 2, 5, 10, 20`) alongside `em`, `f1`, and `score`.
+- **Read-only graph index & retrieval memoization (`yaw/daemon/graph/engine.py`, `yaw/daemon/runtime.py`)**: `YawGraphEngine._canonical_retrieval_hook` memoizes post-optimization query retrievals by `(question, k, query_retrieval_fingerprint(active_program))` while replaying extraction traces when `_in_optimization` or `item_docs` is active. `YawRuntime._run_retrieve`, `YawRuntime._run_qa`, and `YawRuntime.benchmark` route unconditionally through `engine.ensemble`.
+
+### Step 11: SKOS / RDF / OWL / SHACL & Relation-Aware PPR Hardening (`H1`â€“`H4`)
+- **`H1` Baseline Diagnostics Measured (Pre-Purge)**:
+  | Database | Entities | Facts | Edges | Literal-Like Entity Rate | Singleton Entity Rate | Duplicate Directed Fact-Pair Rate | Semantic Edge Share | SHACL Violations (Pre-Heal) |
+  | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+  | `.yaw/yaw.db` | 8,659 | 11,086 | 56,116 | 3.48% | 62.78% | 11.96% | 14.74% | 19,745 (legacy pre-`fact_sources` rows) |
+  | `.yaw/yaw_optimize_20261024_053147.db` | 4,838 | 5,112 | 25,444 | 0.10% | 89.25% | 5.34% | 14.31% | 5 |
+  - All `.yaw/*optimize*` remnants were subsequently purged, leaving only `coco_state`, `corpus`, `dspy_cache`, and `yaw.db`.
+- **`H2` Literal-Aware Facts & `fact_sources` Provenance (`schema.py`, `graph_ops.py`, `shacl.py`, `parsers.py`, `engine.py`)**:
+  - Extended `facts` with mutual-exclusion `CHECK` constraint (`obj_kind = 'entity'` vs `obj_kind = 'literal'`) and added `fact_sources(fact_id, chunk_id)` provenance table with automatic migration/backfill from `edges`.
+  - Added deterministic literal object classifier (`xsd:dateTime`, `xsd:date`, `xsd:gYear`, `xsd:integer`, `xsd:decimal`, `xsd:boolean`, `xsd:anyURI`, `xsd:string`); literal objects skip `entities`, `entity_labels`, `entity_vec`, and synonym mining, and seed PPR via `subj_id` plus `fact_sources` chunks.
+  - Updated `delete_chunks` to prune orphaned facts via `fact_sources` and `merge_entities` to deduplicate colliding entity/literal facts while merging their `fact_sources`.
+  - Updated `lint_graph_shacl` (`FactTripleShape` + `FactProvenanceShape`) and `serialize_graph_turtle` to validate and emit typed/language-tagged RDF literals.
+- **`H3` Directed `skos:broader` Hierarchy & Cycle-Safe SHACL Validation (`shacl.py`, `graph_ops.py`, `engine.py`, `signatures.py`, `invariants.py`)**:
+  - Added directed `skos:broader` (`src_id = narrower`, `dst_id = broader`) to `edges`, `VALID_SYNONYM_RELATIONS` (5 relations), and `VALID_SHACL_ACTIONS` (14 actions including `assert_broader`, `remove_hierarchy_cycle`, `remove_conflicting_related`).
+  - Added cycle-safe recursive CTE cycle detection (`ConceptHierarchyCycleShape`, SKOS S19/S23) and disjointness validation against `skos:related` (`ConceptDisjointRelationShape`, SKOS S27) and `owl:differentFrom` (`ConceptDisjointDifferentFromBroaderShape`) in `lint_graph_shacl`.
+- **`H4` Relation-Aware Directed PPR (`yaw/core/types.py`, `yaw/daemon/graph/ppr.py`, `engine.py`)**:
+  - Added `RelationTraversalPolicy` (`passage`, `fact_forward`, `fact_reverse`, `skos_related`, `skos_broader_up`, `skos_broader_down`, `parallel_aggregation`, `parallel_cap`) and updated `build_transition_matrix` with asymmetric `skos:broader` transitions (`up = 1.0`, `down = 0.5` default) while preserving exact `0.0` matrix diff on symmetric graphs when `policy=None` or default `RelationTraversalPolicy()`.
+
+### Verification
+- Full offline pytest suite (`uv run --locked pytest -m "not live_llm" -q`): **652 passed, 0 failed** (648 passed in initial batch + all 4 edge/contract regressions resolved and verified in `task-687` and `task-700`).
+- Focused Step 10 & Step 11 suite (`test_step10_*` and `test_step11_*` across `test_prompts.py`, `test_db.py`, `test_ppr.py`, `test_engine.py`): **6 passed in 19.71s**.
+- Static analysis & formatting (`uv run --locked ruff check`, `uv run --locked ty check`, `git diff --check`): **All checks passed (0 diagnostics)**.
+
+## 49. Step 12: W3C SKOS/RDF/OWL/SHACL Build-Time Hardening, Typed-Predicate Disambiguation, Low-Weight (`0.5`) Literal Connectivity, and Structural `text_processing` (2026-10-25)
+
+- **Owner & Canonical Contract:** [`FOUNDATIONAL.md`](../FOUNDATIONAL.md) & [`docs/skos-rdf-owl-shacl-hardening.md`](skos-rdf-owl-shacl-hardening.md).
+- **Core Architecture & Achievements:**
+  - **Typed Predicate Disambiguation (`owl:ObjectProperty` vs `owl:DatatypeProperty`):** Rather than brittle regex guessing on stripped text, extraction stages (`ExtractTriples`, `prompts.py`, `grammars.py`, `parsers.py`) emit `["pred", "owl:ObjectProperty" | "owl:DatatypeProperty"]`. Untyped literals default to `rdfs:Literal` (in RDF 1.1, untyped literals are `xsd:string`), and `skos:definition` on literals is strictly preserved under `rdfs:Resource`.
+  - **Low-Weight (`0.5`) Literal Connectivity:** Instead of severing literal objects (`obj_id = NULL`), `rdfs:Literal` targets remain materialized in `entities`, connected to chunks via `passage` edges and to subjects via `0.5`-weighted `'fact'` edges (`RelationTraversalPolicy.datatype_property = 0.5`), while being excluded from `skos:broader`/`skos:related` taxonomies and `JudgeSynonyms`.
+  - **Taxonomy Hierarchy & Disambiguation Guards:** Enforced `is_acronym_pair` ($\to$ `skos:altLabel`), `is_version_or_ordinal_sibling` ($\to$ `skos:related`), and `check_lexical_subsumption_inversion` across `YawGraphEngine.index_chunks`, `upsert_semantic_edges`, and `JudgeSynonyms`.
+  - **Deterministic Pre-RLM Auto-Healing & Build-Time Gate:** In `engine.py`, `lint_graph_shacl(conn, auto_heal=True, heal_definitions=False)` runs before invoking `active_program.heal_shacl_violations`, repairing structural violations at zero token cost. `lint_graph_shacl` validates all 11 closed-world shapes, checks the 10,000 recursive CTE cap (`ConceptShape/broaderTransitiveCapExceeded`), prunes true orphan facts, and serializes clean declared CURIE syntax (`^^xsd:date`).
+  - **Structural `text_processing` & Surface Form Preservation:** `text_processing` preserves token-internal structural punctuation (`.`, `-`, `+`, `#`, `/`, `%`, `:`) attached to alphanumeric tokens (`"C++"`, `"C#"`, `"Python 3.10"`, `"19.5.1995"`, `"8080/tcp"`), while `entities.name` (`COLLATE NOCASE`) and `entity_labels.raw_label` store canonical surface forms, using `text_processing` strictly for `label_norm` and hash key matching. Bumped `"schema_version": "skos-shacl-v3"` in `optimizer.py`.
+- **Verification:**
+  - Full offline test suite (`uv run pytest --no-testmon tests/core/ tests/daemon/graph/`): **561 passed, 0 failed**.
+  - All 11 SHACL shapes, deterministic auto-healers, un-mocked pipeline build gates, and structural normalization verified with real SQLite and DSPy modules.
+  - `uv run ruff check` -> **All checks passed!**
+  - `uv run ty check` -> **All checks passed!**
+  - `git diff --check` -> **Clean (0 errors)**.

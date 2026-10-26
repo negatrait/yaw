@@ -31,10 +31,7 @@ def parse_module_imports(file_path: Path) -> list[tuple[int, str]]:
                 # level=1 means from . import X (current package)
                 # level=2 means from .. import X (parent package)
                 drop = node.level - 1
-                if drop > len(current_pkg_parts):
-                    base_parts = []
-                else:
-                    base_parts = current_pkg_parts[: len(current_pkg_parts) - drop]
+                base_parts = [] if drop > len(current_pkg_parts) else current_pkg_parts[: len(current_pkg_parts) - drop]
                 mod = ".".join(base_parts)
                 full_mod = (f"{mod}.{node.module}" if mod else node.module) if node.module else mod
                 imports.append((node.lineno, full_mod))
@@ -68,9 +65,7 @@ def is_allowed_internal_import(importer_pkg: str, imported_mod: str) -> bool:
         return False
 
     # Rule: Top-level __main__.py can import daemon.cli
-    if importer_pkg == "yaw" and (
-        imported_mod == "yaw.daemon.cli" or imported_mod.startswith("yaw.daemon.cli.")
-    ):
+    if importer_pkg == "yaw" and (imported_mod == "yaw.daemon.cli" or imported_mod.startswith("yaw.daemon.cli.")):
         return True
 
     # Rule: daemon.runtime is the daemon orchestrator and can import direct children (ingestion, graph)
@@ -88,10 +83,7 @@ def is_allowed_internal_import(importer_pkg: str, imported_mod: str) -> bool:
 
 def is_leaf_package(package_dir: Path) -> bool:
     """Return True if package_dir contains no subdirectories with an __init__.py file."""
-    for child in package_dir.iterdir():
-        if child.is_dir() and (child / "__init__.py").exists():
-            return False
-    return True
+    return all(not (child.is_dir() and (child / "__init__.py").exists()) for child in package_dir.iterdir())
 
 
 def build_internal_import_graph() -> dict[str, set[str]]:
@@ -192,15 +184,12 @@ class ArchitectureTests(unittest.TestCase):
         for init_file in intermediate_inits:
             content = init_file.read_text(encoding="utf-8").strip()
             # Must not contain any non-comment executable code
-            lines = [
-                line.strip()
-                for line in content.splitlines()
-                if line.strip() and not line.strip().startswith("#")
-            ]
+            lines = [line.strip() for line in content.splitlines() if line.strip() and not line.strip().startswith("#")]
             self.assertEqual(
                 lines,
                 [],
-                f"Non-empty intermediate __init__.py with executable statements found at: {init_file.relative_to(PROJECT_ROOT)}",
+                f"Non-empty intermediate __init__.py with executable statements "
+                f"found at: {init_file.relative_to(PROJECT_ROOT)}",
             )
 
     def test_leaf_package_facades_allow_contract_import_without_knowing_file(self):
@@ -226,11 +215,22 @@ class ArchitectureTests(unittest.TestCase):
         self.assertTrue(hasattr(inference, "create_dspy_lm"))
         self.assertTrue(hasattr(inference, "HippoRAGProgram"))
         self.assertTrue(hasattr(inference, "DSPyEmbeddingAdapter"))
-        self.assertTrue(hasattr(inference, "compute_sizecoding_pareto_score"))
+        self.assertTrue(hasattr(inference, "compute_task_quality_score"))
+        self.assertTrue(hasattr(inference, "check_benchmark_integrity"))
+        self.assertTrue(hasattr(inference, "GepaProgress"))
+        self.assertTrue(hasattr(inference, "GraphOptimizationHooks"))
+        self.assertTrue(hasattr(inference, "ActiveTraceComponentSelector"))
+        self.assertTrue(hasattr(inference, "configure_simba_task_learning"))
+        self.assertTrue(hasattr(inference, "evolve_program_prompts"))
+        self.assertTrue(hasattr(inference, "evaluate_program"))
         self.assertFalse(hasattr(inference, "RetrievalEmbedding"))
         self.assertFalse(hasattr(inference, "LocalChat"))
         self.assertFalse(hasattr(inference, "CacheOpenAI"))
         self.assertFalse(hasattr(inference, "chat_identity"))
+
+        # Verify yaw/daemon/graph top-level files are strictly __init__.py, engine.py, and ppr.py
+        graph_files = {f.name for f in (YAW_DIR / "daemon" / "graph").glob("*.py")}
+        self.assertEqual(graph_files, {"__init__.py", "engine.py", "ppr.py"})
 
         # Verify storage public facade
         import yaw.daemon.graph.storage as storage
@@ -262,7 +262,7 @@ class ArchitectureTests(unittest.TestCase):
 
         # Verify facade is strictly constricted: internal helpers cannot leak through
         with self.assertRaises(AttributeError):
-            _ = inference._strip_mistral_bracket_prefix
+            _ = inference._nullable_text
         with self.assertRaises(AttributeError):
             _ = inference._build_default_ner_demos
         with self.assertRaises(AttributeError):
@@ -283,9 +283,9 @@ class ArchitectureTests(unittest.TestCase):
             imports = parse_module_imports(py_file)
 
             for lineno, imported_mod in imports:
-                if (
-                    imported_mod.startswith("yaw.") or imported_mod == "yaw"
-                ) and not is_allowed_internal_import(importer_pkg, imported_mod):
+                if (imported_mod.startswith("yaw.") or imported_mod == "yaw") and not is_allowed_internal_import(
+                    importer_pkg, imported_mod
+                ):
                     violations.append(
                         f"{py_file.relative_to(PROJECT_ROOT)}:{lineno}: "
                         f"package '{importer_pkg}' forbidden to import '{imported_mod}'"
@@ -300,7 +300,10 @@ class ArchitectureTests(unittest.TestCase):
     def test_core_imports_stdlib_only(self):
         """Rule: yaw/core/* must strictly import standard library only (zero third-party, zero daemon)."""
         core_files = list((YAW_DIR / "core").glob("*.py"))
-        self.assertGreater(len(core_files), 0)
+        self.assertEqual(
+            {f.name for f in core_files},
+            {"__init__.py", "config.py", "logger.py", "types.py"},
+        )
 
         # Python supplies the authoritative set, including platform-specific modules.
         stdlib_whitelist = sys.stdlib_module_names
@@ -313,13 +316,9 @@ class ArchitectureTests(unittest.TestCase):
                 if top_pkg == "yaw":
                     # Only yaw.core is permitted inside yaw.core
                     if not (mod == "yaw.core" or mod.startswith("yaw.core.")):
-                        violations.append(
-                            f"{py_file.relative_to(PROJECT_ROOT)}:{lineno}: imports non-core '{mod}'"
-                        )
+                        violations.append(f"{py_file.relative_to(PROJECT_ROOT)}:{lineno}: imports non-core '{mod}'")
                 elif top_pkg not in stdlib_whitelist:
-                    violations.append(
-                        f"{py_file.relative_to(PROJECT_ROOT)}:{lineno}: imports non-stdlib '{mod}'"
-                    )
+                    violations.append(f"{py_file.relative_to(PROJECT_ROOT)}:{lineno}: imports non-stdlib '{mod}'")
 
         self.assertEqual(
             violations,
@@ -330,33 +329,19 @@ class ArchitectureTests(unittest.TestCase):
     def test_synthetic_boundary_violation_detection(self):
         """Verify the test architecture checker properly rejects synthetic cross-domain and parent imports."""
         # storage importing inference (horizontal sibling edge) -> must be rejected
-        self.assertFalse(
-            is_allowed_internal_import(
-                "yaw.daemon.graph.storage", "yaw.daemon.graph.inference.models"
-            )
-        )
+        self.assertFalse(is_allowed_internal_import("yaw.daemon.graph.storage", "yaw.daemon.graph.inference.models"))
         # inference importing storage (horizontal sibling edge) -> must be rejected
-        self.assertFalse(
-            is_allowed_internal_import("yaw.daemon.graph.inference", "yaw.daemon.graph.storage.db")
-        )
+        self.assertFalse(is_allowed_internal_import("yaw.daemon.graph.inference", "yaw.daemon.graph.storage.db"))
         # ingestion importing graph (horizontal sibling edge) -> must be rejected
-        self.assertFalse(
-            is_allowed_internal_import("yaw.daemon.ingestion", "yaw.daemon.graph.engine")
-        )
+        self.assertFalse(is_allowed_internal_import("yaw.daemon.ingestion", "yaw.daemon.graph.engine"))
         # inference importing daemon runtime (child importing parent) -> must be rejected
-        self.assertFalse(
-            is_allowed_internal_import("yaw.daemon.graph.inference", "yaw.daemon.runtime")
-        )
+        self.assertFalse(is_allowed_internal_import("yaw.daemon.graph.inference", "yaw.daemon.runtime"))
         # core importing daemon (core importing non-core) -> must be rejected
         self.assertFalse(is_allowed_internal_import("yaw.core", "yaw.daemon.graph.inference"))
         # inference importing core -> allowed
         self.assertTrue(is_allowed_internal_import("yaw.daemon.graph.inference", "yaw.core.types"))
         # inference importing internal sibling -> allowed
-        self.assertTrue(
-            is_allowed_internal_import(
-                "yaw.daemon.graph.inference", "yaw.daemon.graph.inference.models"
-            )
-        )
+        self.assertTrue(is_allowed_internal_import("yaw.daemon.graph.inference", "yaw.daemon.graph.inference.models"))
 
     def test_zero_hipporag_imports_in_yaw(self):
         """Rule 4: Zero hipporag imports across the entire repository (yaw/, benchmark.py, scripts/, tests/)."""
@@ -405,7 +390,8 @@ class ArchitectureTests(unittest.TestCase):
                                 if isinstance(key, ast.Constant) and isinstance(key.value, str):
                                     self.assertFalse(
                                         key.value.startswith("_"),
-                                        f"Public facade {init_file.relative_to(PROJECT_ROOT)} exports protected/private symbol '{key.value}'",
+                                        f"Public facade {init_file.relative_to(PROJECT_ROOT)} exports "
+                                        f"protected/private symbol '{key.value}'",
                                     )
 
         # 2. Check all yaw/**/*.py files for cross-module private imports
@@ -417,8 +403,7 @@ class ArchitectureTests(unittest.TestCase):
             for node in ast.walk(tree):
                 if isinstance(node, ast.ImportFrom):
                     is_internal = node.level > 0 or (
-                        bool(node.module)
-                        and (node.module.startswith("yaw.") or node.module == "yaw")
+                        bool(node.module) and (node.module.startswith("yaw.") or node.module == "yaw")
                     )
                     if is_internal:
                         for alias in node.names:

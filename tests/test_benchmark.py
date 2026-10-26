@@ -134,9 +134,7 @@ class DatasetSliceTests(unittest.TestCase):
 
     def test_negative_boundaries_on_malformed_samples_and_max_queries(self):
         with self.assertRaises(ValueError):
-            build_benchmark_slice(
-                "musique", self.musique_samples, self.musique_corpus, max_queries=0
-            )
+            build_benchmark_slice("musique", self.musique_samples, self.musique_corpus, max_queries=0)
         with self.assertRaises(ValueError):
             get_gold_docs([{"question": "No context fields"}], "musique")
         with self.assertRaises(ValueError):
@@ -147,12 +145,8 @@ class DatasetSliceTests(unittest.TestCase):
     def test_load_dataset_files_reads_local_disk_without_network(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            (tmp_path / "sample.json").write_text(
-                json.dumps(self.musique_samples), encoding="utf-8"
-            )
-            (tmp_path / "sample_corpus.json").write_text(
-                json.dumps(self.musique_corpus[:3]), encoding="utf-8"
-            )
+            (tmp_path / "sample.json").write_text(json.dumps(self.musique_samples), encoding="utf-8")
+            (tmp_path / "sample_corpus.json").write_text(json.dumps(self.musique_corpus[:3]), encoding="utf-8")
             samples, corpus = load_dataset_files("sample", dataset_dir=tmp_path)
             self.assertEqual(len(samples), 2)
             self.assertEqual(len(corpus), 3)
@@ -168,9 +162,7 @@ class DatasetSliceTests(unittest.TestCase):
             self.assertEqual(len(sliced_samples), 1)
             self.assertEqual(empty_corpus, [])
             with self.assertRaises(ValueError):
-                load_dataset_files(
-                    "sample", dataset_dir=tmp_path, max_queries=0, include_corpus=False
-                )
+                load_dataset_files("sample", dataset_dir=tmp_path, max_queries=0, include_corpus=False)
 
     def test_dataset_aliasing_and_registry_resolution(self):
         expected_aliases = {
@@ -198,7 +190,7 @@ class DatasetSliceTests(unittest.TestCase):
                 "case_study_university_corpus.json",
             ),
             "enterprise_rag_bench": (
-                "enterprise_rag_bench.json",
+                "enterprise_rag_bench_questions.json",
                 "enterprise_rag_bench_corpus.json",
             ),
         }
@@ -403,11 +395,7 @@ class DatasetSliceTests(unittest.TestCase):
         gold_docs = get_gold_docs(samples, "narrativeqa")
         self.assertEqual(
             gold_docs,
-            [
-                [
-                    "All About Steve\nMary Horowitz, a crossword puzzle writer for the Sacramento Herald."
-                ]
-            ],
+            [["All About Steve\nMary Horowitz, a crossword puzzle writer for the Sacramento Herald."]],
         )
 
         # Test with corpus matching chunks by doc_id and answer keywords
@@ -421,9 +409,7 @@ class DatasetSliceTests(unittest.TestCase):
             {"idx": "other_0", "title": "Other", "text": "Different document."},
         ]
         corpus_gold = get_gold_docs(samples, "narrativeqa", corpus=corpus)
-        self.assertEqual(
-            corpus_gold, [["Script\nMary works as a crossword writer for the Herald."]]
-        )
+        self.assertEqual(corpus_gold, [["Script\nMary works as a crossword writer for the Herald."]])
 
         # Test bounded slice generation for narrativeqa
         slice_docs, queries, s_gold, _ = build_benchmark_slice(
@@ -463,55 +449,33 @@ class DatasetSliceTests(unittest.TestCase):
             self.assertIn(name, PAPER_BASELINES)
 
         # NQ
-        self.assertEqual(
-            PAPER_BASELINES["nq"]["hipporag2_llama3.3_70b_nvembed_v2"]["Recall@5"], 0.780
-        )
-        self.assertEqual(
-            PAPER_BASELINES["nq"]["hipporag2_llama3.3_70b_nvembed_v2"]["ExactMatch"], 0.485
-        )
+        self.assertEqual(PAPER_BASELINES["nq"]["hipporag2_llama3.3_70b_nvembed_v2"]["Recall@5"], 0.780)
+        self.assertEqual(PAPER_BASELINES["nq"]["hipporag2_llama3.3_70b_nvembed_v2"]["ExactMatch"], 0.485)
         self.assertEqual(PAPER_BASELINES["nq"]["hipporag2_llama3.3_70b_nvembed_v2"]["F1"], 0.633)
-        self.assertEqual(
-            PAPER_BASELINES["nq"]["standard_nvembed_v2_llama3.3_70b"]["Recall@5"], 0.754
-        )
+        self.assertEqual(PAPER_BASELINES["nq"]["standard_nvembed_v2_llama3.3_70b"]["Recall@5"], 0.754)
         self.assertEqual(PAPER_BASELINES["nq"]["standard_nvembed_v2_llama3.3_70b"]["F1"], 0.619)
         self.assertEqual(PAPER_BASELINES["nq"]["hipporag_reproduced"]["Recall@5"], 0.444)
         self.assertEqual(PAPER_BASELINES["nq"]["hipporag_reproduced"]["F1"], 0.553)
 
         # PopQA
-        self.assertEqual(
-            PAPER_BASELINES["popqa"]["hipporag2_llama3.3_70b_nvembed_v2"]["Recall@5"], 0.517
-        )
-        self.assertEqual(
-            PAPER_BASELINES["popqa"]["hipporag2_llama3.3_70b_nvembed_v2"]["ExactMatch"], 0.490
-        )
+        self.assertEqual(PAPER_BASELINES["popqa"]["hipporag2_llama3.3_70b_nvembed_v2"]["Recall@5"], 0.517)
+        self.assertEqual(PAPER_BASELINES["popqa"]["hipporag2_llama3.3_70b_nvembed_v2"]["ExactMatch"], 0.490)
         self.assertEqual(PAPER_BASELINES["popqa"]["hipporag2_llama3.3_70b_nvembed_v2"]["F1"], 0.562)
-        self.assertEqual(
-            PAPER_BASELINES["popqa"]["standard_nvembed_v2_llama3.3_70b"]["Recall@5"], 0.510
-        )
+        self.assertEqual(PAPER_BASELINES["popqa"]["standard_nvembed_v2_llama3.3_70b"]["Recall@5"], 0.510)
         self.assertEqual(PAPER_BASELINES["popqa"]["standard_nvembed_v2_llama3.3_70b"]["F1"], 0.557)
         self.assertEqual(PAPER_BASELINES["popqa"]["hipporag_reproduced"]["Recall@5"], 0.538)
         self.assertEqual(PAPER_BASELINES["popqa"]["hipporag_reproduced"]["F1"], 0.559)
 
         # LV-Eval
-        self.assertEqual(
-            PAPER_BASELINES["lveval"]["hipporag2_llama3.3_70b_nvembed_v2"]["ExactMatch"], 0.080
-        )
-        self.assertEqual(
-            PAPER_BASELINES["lveval"]["hipporag2_llama3.3_70b_nvembed_v2"]["F1"], 0.129
-        )
+        self.assertEqual(PAPER_BASELINES["lveval"]["hipporag2_llama3.3_70b_nvembed_v2"]["ExactMatch"], 0.080)
+        self.assertEqual(PAPER_BASELINES["lveval"]["hipporag2_llama3.3_70b_nvembed_v2"]["F1"], 0.129)
         self.assertEqual(PAPER_BASELINES["lveval"]["standard_nvembed_v2_llama3.3_70b"]["F1"], 0.098)
         self.assertEqual(PAPER_BASELINES["lveval"]["hipporag_reproduced"]["F1"], 0.084)
 
         # NarrativeQA
-        self.assertEqual(
-            PAPER_BASELINES["narrativeqa"]["hipporag2_llama3.3_70b_nvembed_v2"]["ExactMatch"], 0.180
-        )
-        self.assertEqual(
-            PAPER_BASELINES["narrativeqa"]["hipporag2_llama3.3_70b_nvembed_v2"]["F1"], 0.259
-        )
-        self.assertEqual(
-            PAPER_BASELINES["narrativeqa"]["standard_nvembed_v2_llama3.3_70b"]["F1"], 0.257
-        )
+        self.assertEqual(PAPER_BASELINES["narrativeqa"]["hipporag2_llama3.3_70b_nvembed_v2"]["ExactMatch"], 0.180)
+        self.assertEqual(PAPER_BASELINES["narrativeqa"]["hipporag2_llama3.3_70b_nvembed_v2"]["F1"], 0.259)
+        self.assertEqual(PAPER_BASELINES["narrativeqa"]["standard_nvembed_v2_llama3.3_70b"]["F1"], 0.257)
         self.assertEqual(PAPER_BASELINES["narrativeqa"]["hipporag_reproduced"]["F1"], 0.163)
 
     def test_monkeypatched_hipporag_baselines_contain_all_required_datasets(self):
@@ -619,18 +583,21 @@ class DatasetSliceTests(unittest.TestCase):
                 self.assertEqual(train_counts[cat], exp_tr)
                 self.assertEqual(val_counts[cat], exp_va)
 
+            corpus_data = json.loads(c_path.read_text(encoding="utf-8"))
+            corpus_ids = {c["idx"] for c in corpus_data}
+
             for q in queries_data:
-                supp = [p for p in q["paragraphs"] if p["is_supporting"]]
-                dists = [p for p in q["paragraphs"] if not p["is_supporting"]]
-                supp_ids = {p["idx"] for p in supp}
-                dist_ids = {p["idx"] for p in dists}
-                self.assertTrue(supp_ids.isdisjoint(dist_ids))
+                self.assertNotIn("paragraphs", q)
+                self.assertIn("expected_doc_ids", q)
+                self.assertIn("answer_facts", q)
+                self.assertIn("question_type", q)
+                expected = q["expected_doc_ids"]
                 if q["question_type"] == "Info Not Found":
-                    self.assertEqual(len(supp), 0)
+                    self.assertEqual(len(expected), 0)
                     self.assertIn("Insufficient information", q["answer_aliases"])
                 else:
-                    self.assertEqual(len(supp), 1)
-                self.assertEqual(len(dists), 2)
+                    self.assertEqual(len(expected), 1)
+                    self.assertTrue(set(expected).issubset(corpus_ids))
 
             trainset, valset, corpus_docs = _load_dataset_splits(
                 ["enterprise"],
@@ -643,10 +610,13 @@ class DatasetSliceTests(unittest.TestCase):
             assert valset is not None
             self.assertEqual(len(valset), 100)
             self.assertGreater(len(corpus_docs), 300)
+            self.assertEqual(len(corpus_docs), len(corpus_data))
             for ex in trainset[:5] + valset[:5]:
                 self.assertTrue(hasattr(ex, "item_docs"))
-                self.assertGreaterEqual(len(ex.item_docs), 2)
+                self.assertEqual(len(ex.item_docs), 0)
                 self.assertIn("item_docs", ex.inputs())
+                self.assertTrue(hasattr(ex, "answer_facts"))
+                self.assertTrue(hasattr(ex, "question_type"))
 
     def test_text_stopwords(self):
         self.assertGreater(len(TEXT_STOPWORDS), 50)
@@ -870,7 +840,9 @@ class PaperParityGateTests(unittest.TestCase):
                 "within the town of Ramapo in Rockland County."
             )
             full_gold_passage = f"Montebello\n{long_body}"
-            distractor_passage = "Albany\nAlbany is the capital city of the U.S. state of New York and seat of Albany County."
+            distractor_passage = (
+                "Albany\nAlbany is the capital city of the U.S. state of New York and seat of Albany County."
+            )
 
             dataset_payload = [
                 {
@@ -893,7 +865,7 @@ class PaperParityGateTests(unittest.TestCase):
                     ],
                 }
             ]
-            (corpus_dir / "musique_slice.json").write_text(
+            (corpus_dir / "musique.json").write_text(
                 json.dumps(dataset_payload, indent=2),
                 encoding="utf-8",
             )
@@ -909,14 +881,11 @@ class PaperParityGateTests(unittest.TestCase):
             )
             # Long passage is split into multiple sub-chunks, plus 1 distractor chunk
             self.assertGreaterEqual(len(delta.added_chunks), 3)
-            montebello_subchunks = [
-                (ptr, txt) for ptr, txt in delta.added_chunks if ptr.title == "Montebello"
-            ]
+            montebello_subchunks = [(ptr, txt) for ptr, txt in delta.added_chunks if ptr.title == "Montebello"]
             self.assertGreaterEqual(len(montebello_subchunks), 2)
             # All Montebello sub-chunks share the exact same parent record AST island
             ast_islands = {
-                (ptr.rel_posix_path, ptr.ast_island_start, ptr.ast_island_end)
-                for ptr, _ in montebello_subchunks
+                (ptr.rel_posix_path, ptr.ast_island_start, ptr.ast_island_end) for ptr, _ in montebello_subchunks
             }
             self.assertEqual(len(ast_islands), 1)
 
@@ -936,9 +905,7 @@ class PaperParityGateTests(unittest.TestCase):
                     for t in texts:
                         v = np.array(
                             [
-                                1.0
-                                if "montebello" in t.lower() or "erik hort" in t.lower()
-                                else 0.1,
+                                1.0 if "montebello" in t.lower() or "erik hort" in t.lower() else 0.1,
                                 1.0 if "rockland" in t.lower() else 0.1,
                                 0.5,
                                 0.2,
@@ -953,7 +920,11 @@ class PaperParityGateTests(unittest.TestCase):
                     return self.encode(texts, instruction=instruction)
 
             class MinimalProgram:
-                execution_mode = "direct"
+                context_window_tokens = 32768
+                max_output_tokens = 4096
+
+                def _context_char_limit(self, base_chars: int = 8000) -> int:
+                    return base_chars
 
                 def set_retrieval_hook(self, hook):
                     self.hook = hook
@@ -1006,12 +977,8 @@ class PaperParityGateTests(unittest.TestCase):
                         fmt_str.startswith(("title: Montebello | text:", "title: Albany | text:")),
                     )
 
-                hits, _ = engine.retrieve_with_seeds(
-                    "Which county is Erik Hort's birthplace part of?", top_k=5
-                )
-                dpr_hits = engine.retrieve_dpr(
-                    "Which county is Erik Hort's birthplace part of?", top_k=5
-                )
+                hits, _ = engine.retrieve_with_seeds("Which county is Erik Hort's birthplace part of?", top_k=5)
+                dpr_hits = engine.retrieve_dpr("Which county is Erik Hort's birthplace part of?", top_k=5)
                 # MaxP deduplicates the multiple Montebello sub-chunks into 1 full passage hit
                 self.assertEqual(len(hits), 2)
                 self.assertEqual(len(dpr_hits), 2)
@@ -1024,6 +991,139 @@ class PaperParityGateTests(unittest.TestCase):
                     k_list=[1, 2, 5],
                 )
                 self.assertEqual(overall["Recall@1"], 1.0)
+            finally:
+                engine.close()
+
+    def test_benchmark_inplace_corpus_resolution_and_sync(self):
+        import inspect
+
+        import numpy as np
+
+        import benchmark
+        from yaw.core import OpenIERecord
+        from yaw.daemon.graph.engine import YawGraphEngine
+        from yaw.daemon.graph.inference.embedding import resolve_embedding_profile
+
+        self.assertTrue(hasattr(benchmark, "resolve_dataset_source_files"))
+        run_src = inspect.getsource(benchmark.run_yaw_benchmark)
+        self.assertIn("workspace_root=PROJECT_ROOT", run_src)
+        self.assertIn("prefer_corpus=True", run_src)
+        self.assertIn("corpus_root=PROJECT_ROOT", run_src)
+        self.assertIn("source_files=source_files", run_src)
+
+        main_src = inspect.getsource(benchmark.main)
+        self.assertIn('"enterprise_rag_bench"', main_src)
+
+        ent_source_files = benchmark.resolve_dataset_source_files(
+            ["enterprise_rag_bench"],
+            workspace_root=benchmark.PROJECT_ROOT,
+            prefer_corpus=True,
+        )
+        self.assertEqual(
+            ent_source_files,
+            [(benchmark.PROJECT_ROOT / "outputs" / "datasets" / "enterprise_rag_bench_corpus.json").resolve()],
+        )
+        ent_samples, ent_corpus = benchmark.load_dataset_files(
+            "enterprise_rag_bench",
+            max_queries=5,
+            include_corpus=True,
+        )
+        ent_docs, ent_queries, _, _ = benchmark.build_benchmark_slice(
+            "enterprise_rag_bench",
+            ent_samples,
+            ent_corpus,
+            max_queries=2,
+            full_corpus=False,
+        )
+        self.assertEqual(len(ent_queries), 2)
+        self.assertEqual(len(ent_docs), len(ent_corpus))
+        self.assertGreaterEqual(len(ent_docs), 1300)
+
+        samples, corpus = benchmark.load_dataset_files("sample", include_corpus=True)
+        docs, _, _, _ = benchmark.build_benchmark_slice("sample", samples, corpus, full_corpus=True)
+        source_files = benchmark.resolve_dataset_source_files(
+            ["sample"],
+            workspace_root=benchmark.PROJECT_ROOT,
+            prefer_corpus=True,
+        )
+        self.assertEqual(
+            source_files,
+            [(benchmark.PROJECT_ROOT / "outputs" / "datasets" / "sample_corpus.json").resolve()],
+        )
+
+        profile = resolve_embedding_profile(task_mode="distinct-titled")
+
+        class _DetEmbedder:
+            def __init__(self, prof):
+                self.profile = prof
+                self.dimensions = 4
+
+            def encode(self, texts, *, instruction=""):
+                vecs = [np.array([0.6, 0.4, 0.5, 0.3], dtype=np.float32) for _ in texts]
+                return np.vstack([v / np.linalg.norm(v) for v in vecs])
+
+            def batch_encode(self, texts, *, instruction="", batch_size=64):
+                return self.encode(texts, instruction=instruction)
+
+        class _DetProgram:
+            context_window_tokens = 32768
+            max_output_tokens = 4096
+
+            def _context_char_limit(self, base_chars: int = 8000) -> int:
+                return base_chars
+
+            def set_retrieval_hook(self, hook):
+                self.hook = hook
+
+            def extract_openie(self, chunk_id, text):
+                return OpenIERecord(
+                    chunk_id=chunk_id,
+                    entities=("erik hort", "montebello"),
+                    triples=(("erik hort", "born in", "montebello"),),
+                )
+
+            def extract_query_intent(self, query):
+                return query
+
+            def filter_triples(self, query, candidates):
+                return [0] if candidates else []
+
+            def judge_synonyms(self, candidates):
+                return []
+
+            def heal_shacl_violations(self, violations, focus_context="", *args, **kwargs):
+                return []
+
+        with tempfile.TemporaryDirectory() as tmp_str:
+            index_dir = Path(tmp_str) / "index"
+            chunks_to_index = benchmark.sync_source_files_for_docs(
+                corpus_root=benchmark.PROJECT_ROOT,
+                state_dir=index_dir / "coco_state",
+                source_files=source_files,
+                allowed_docs=docs,
+                json_keys_whitelist=benchmark.BENCHMARK_JSON_WHITELIST,
+                json_keys_blacklist=benchmark.BENCHMARK_JSON_BLACKLIST,
+            )
+            self.assertGreater(len(chunks_to_index), 0)
+            for ptr, _ in chunks_to_index:
+                self.assertEqual(ptr.rel_posix_path, "outputs/datasets/sample_corpus.json")
+                self.assertTrue((benchmark.PROJECT_ROOT / ptr.rel_posix_path).exists())
+                self.assertFalse((index_dir / ptr.rel_posix_path).exists())
+
+            engine = YawGraphEngine(
+                db_path=index_dir / "yaw.db",
+                workspace_root=benchmark.PROJECT_ROOT,
+                program=_DetProgram(),
+                embedder=_DetEmbedder(profile),
+                retrieval_top_k=5,
+            )
+            try:
+                engine.index_chunks(chunks_to_index)
+                dpr_hits = engine.retrieve_dpr("Where was Erik Hort born?", top_k=3)
+                self.assertGreater(len(dpr_hits), 0)
+                for ptr, _, text in dpr_hits:
+                    self.assertEqual(ptr.rel_posix_path, "outputs/datasets/sample_corpus.json")
+                    self.assertTrue(len(text.strip()) > 0)
             finally:
                 engine.close()
 

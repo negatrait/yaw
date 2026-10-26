@@ -4,6 +4,7 @@ import contextlib
 import hashlib
 import json
 import os
+import time
 import tomllib
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -12,6 +13,93 @@ from typing import Any, Literal
 from .types import YawRuntimeError
 
 DEFAULT_EMBEDDING_MODEL = "embeddinggemma-300m-qat-q8_0-GGUF-Q8_0"
+DEFAULT_CONTEXT_WINDOW_TOKENS = 131072
+DEFAULT_INCLUDED_PATTERNS: tuple[str, ...] = (
+    "*.md",
+    "*.mdx",
+    "*.txt",
+    "*.rst",
+    "*.adoc",
+    "*.org",
+    "*.py",
+    "*.pyi",
+    "*.rs",
+    "*.ts",
+    "*.tsx",
+    "*.js",
+    "*.jsx",
+    "*.mjs",
+    "*.cjs",
+    "*.go",
+    "*.java",
+    "*.kt",
+    "*.kts",
+    "*.c",
+    "*.h",
+    "*.cpp",
+    "*.hpp",
+    "*.cc",
+    "*.cs",
+    "*.rb",
+    "*.php",
+    "*.swift",
+    "*.scala",
+    "*.lua",
+    "*.r",
+    "*.R",
+    "*.sh",
+    "*.bash",
+    "*.zsh",
+    "*.sql",
+    "*.graphql",
+    "*.proto",
+    "*.yaml",
+    "*.yml",
+    "*.toml",
+    "*.json",
+    "*.jsonl",
+    "*.xml",
+    "*.html",
+    "*.css",
+    "*.scss",
+    "*.tex",
+    "*.bib",
+    "*.pas",
+    "*.dpr",
+    "*.f90",
+    "*.sol",
+    "*.dtd",
+)
+DEFAULT_EXCLUDED_PATTERNS: tuple[str, ...] = (".*", "*/.*", "__pycache__/*")
+
+
+def write_text_atomic(path: Path | str, content: str, *, retries: int = 6) -> None:
+    """Atomically write UTF-8 text via a sibling temporary file with Windows PermissionError backoff."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(f".{target.name}.{os.getpid()}_{time.time_ns()}.tmp")
+    max_attempts = max(1, int(retries))
+    try:
+        tmp.write_text(content, encoding="utf-8")
+        for attempt in range(max_attempts):
+            try:
+                os.replace(tmp, target)
+                return
+            except PermissionError:
+                if attempt == max_attempts - 1:
+                    target.write_text(content, encoding="utf-8")
+                    return
+                time.sleep(0.01 * (2**attempt))
+    finally:
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
+
+
+def scale_context_budget(base_budget: int, context_tokens: int) -> int:
+    """Scale a 64K deployment budget with the configured serving capacity."""
+    if base_budget < 1 or context_tokens < 1:
+        raise ValueError("Context capacity and base budget must be positive")
+    return max(1, base_budget * context_tokens // 65536)
 
 
 def context_char_limit(base_chars: int, context_tokens: int, output_tokens: int) -> int:
@@ -55,63 +143,8 @@ class YawConfig:
     compiled_program_path: Path | None = None
 
     # Ingestion settings
-    included_patterns: tuple[str, ...] = (
-        "*.md",
-        "*.mdx",
-        "*.txt",
-        "*.rst",
-        "*.adoc",
-        "*.org",
-        "*.py",
-        "*.pyi",
-        "*.rs",
-        "*.ts",
-        "*.tsx",
-        "*.js",
-        "*.jsx",
-        "*.mjs",
-        "*.cjs",
-        "*.go",
-        "*.java",
-        "*.kt",
-        "*.kts",
-        "*.c",
-        "*.h",
-        "*.cpp",
-        "*.hpp",
-        "*.cc",
-        "*.cs",
-        "*.rb",
-        "*.php",
-        "*.swift",
-        "*.scala",
-        "*.lua",
-        "*.r",
-        "*.R",
-        "*.sh",
-        "*.bash",
-        "*.zsh",
-        "*.sql",
-        "*.graphql",
-        "*.proto",
-        "*.yaml",
-        "*.yml",
-        "*.toml",
-        "*.json",
-        "*.jsonl",
-        "*.xml",
-        "*.html",
-        "*.css",
-        "*.scss",
-        "*.tex",
-        "*.bib",
-        "*.pas",
-        "*.dpr",
-        "*.f90",
-        "*.sol",
-        "*.dtd",
-    )
-    excluded_patterns: tuple[str, ...] = (".*", "*/.*", "__pycache__/*")
+    included_patterns: tuple[str, ...] = DEFAULT_INCLUDED_PATTERNS
+    excluded_patterns: tuple[str, ...] = DEFAULT_EXCLUDED_PATTERNS
     json_keys_whitelist: tuple[str, ...] = ("*",)
     json_keys_blacklist: tuple[str, ...] = ()
     chunk_size: int = 1500
@@ -127,12 +160,12 @@ class YawConfig:
     embedding_task_mode: str = "distinct-titled"
     extraction_model: str = "Gemma-4-E4B-it-GGUF"
     qa_model: str = "Gemma-4-E4B-it-GGUF"
-    context_window_tokens: int = 32768
-    max_output_tokens: int = 4096
+    context_window_tokens: int = DEFAULT_CONTEXT_WINDOW_TOKENS
+    max_output_tokens: int | None = None
     rlm_max_iters: int = 10
     rlm_max_llm_calls: int = 20
-    rlm_max_output_chars: int = 10000
-    reflection_input_tokens: int = 16384
+    rlm_max_output_chars: int | None = None
+    reflection_input_tokens: int | None = None
     reflection_tokenizer_url: str = ""
     enable_gbnf: bool = True
     gbnf_max_entities: int | None = None
@@ -151,6 +184,7 @@ class YawConfig:
     embed_batch_chars: int = 3500
     max_context_chars: int | None = None
     max_ast_expansion_hops: int = 1
+    ast_context_hops: int = 0
 
     # Runtime & HTTP transport settings
     queue_maxsize: int = 32
@@ -182,34 +216,38 @@ class YawConfig:
             raise YawRuntimeError("INVALID_INPUT", "queue_maxsize must be >= 1")
         if self.chunk_size < 1:
             raise YawRuntimeError("INVALID_INPUT", "chunk_size must be >= 1")
-        if not 0 < self.max_output_tokens < self.context_window_tokens:
-            raise YawRuntimeError(
-                "INVALID_INPUT", "Require 0 < max_output_tokens < context_window_tokens"
-            )
+        if self.context_window_tokens < 2:
+            raise YawRuntimeError("INVALID_INPUT", "context_window_tokens must be >= 2")
+        for name, base_budget in (
+            ("max_output_tokens", 4096),
+            ("rlm_max_output_chars", 10000),
+            ("reflection_input_tokens", 16384),
+        ):
+            if getattr(self, name) is None:
+                object.__setattr__(self, name, scale_context_budget(base_budget, self.context_window_tokens))
+        output_tokens = self.max_output_tokens
+        assert output_tokens is not None
+        if not 0 < output_tokens < self.context_window_tokens:
+            raise YawRuntimeError("INVALID_INPUT", "Require 0 < max_output_tokens < context_window_tokens")
         for name in (
             "rlm_max_iters",
             "rlm_max_llm_calls",
             "rlm_max_output_chars",
             "reflection_input_tokens",
         ):
-            if getattr(self, name) < 1:
+            value = getattr(self, name)
+            if value is None or value < 1:
                 raise YawRuntimeError("INVALID_INPUT", f"{name} must be positive")
         context_chars = self.max_context_chars
         if context_chars is None:
-            context_chars = context_char_limit(
-                24000, self.context_window_tokens, self.max_output_tokens
-            )
+            context_chars = context_char_limit(24000, self.context_window_tokens, output_tokens)
             object.__setattr__(self, "max_context_chars", context_chars)
         if context_chars < 1:
             raise YawRuntimeError("INVALID_INPUT", "max_context_chars must be positive")
         if self.optimize_mode not in ("miprov2", "gepa", "hybrid"):
-            raise YawRuntimeError(
-                "INVALID_INPUT", f"Unsupported optimize_mode: {self.optimize_mode!r}"
-            )
+            raise YawRuntimeError("INVALID_INPUT", f"Unsupported optimize_mode: {self.optimize_mode!r}")
         if self.optimize_auto not in ("light", "medium", "heavy"):
-            raise YawRuntimeError(
-                "INVALID_INPUT", f"Unsupported optimize_auto: {self.optimize_auto!r}"
-            )
+            raise YawRuntimeError("INVALID_INPUT", f"Unsupported optimize_auto: {self.optimize_auto!r}")
         object.__setattr__(
             self,
             "optimize_sleep_seconds",
@@ -274,9 +312,7 @@ class YawConfig:
                     reverse=True,
                 )
                 candidates = [
-                    p
-                    for p in candidates
-                    if p.is_file() and re.fullmatch(r"yaw_optimize_\d{8}_\d{6}\.db", p.name)
+                    p for p in candidates if p.is_file() and re.fullmatch(r"yaw_optimize_\d{8}_\d{6}\.db", p.name)
                 ]
                 if not candidates:
                     raise YawRuntimeError("INVALID_INPUT", "No optimization run exists to resume.")
@@ -284,9 +320,7 @@ class YawConfig:
             else:
                 opt_db = _resolve_path(self.workspace_root, raw_path, raw_path)
                 if not opt_db.is_file():
-                    raise YawRuntimeError(
-                        "INVALID_INPUT", f"Optimization database does not exist: {opt_db}"
-                    )
+                    raise YawRuntimeError("INVALID_INPUT", f"Optimization database does not exist: {opt_db}")
             base_dir = opt_db.parent
             ds_match = re.search(r"yaw_optimize_(\d{8}_\d{6})", opt_db.name)
             ds = ds_match.group(1) if ds_match else opt_db.stem
@@ -304,6 +338,7 @@ class YawConfig:
             for f in fields(self)
             if f.name
             not in (
+                "corpus_root",
                 "db_path",
                 "lock_path",
                 "status_path",
@@ -311,12 +346,116 @@ class YawConfig:
                 "compiled_program_path",
             )
         }
+        cfg_dict["corpus_root"] = self.workspace_root
         cfg_dict["db_path"] = opt_db
         cfg_dict["lock_path"] = opt_lock
         cfg_dict["status_path"] = opt_status
         cfg_dict["state_dir"] = opt_state
         cfg_dict["compiled_program_path"] = opt_program
         cfg_dict["poll_interval_seconds"] = 0.0
+        return YawConfig(**cfg_dict)
+
+    def for_benchmark(
+        self,
+        dataset: str,
+        slice_hash: str,
+        *,
+        index_root: Path | None = None,
+        fresh: bool = False,
+    ) -> YawConfig:
+        """Derive an isolated sandbox configuration for per-dataset benchmark runs."""
+        import re
+        import shutil
+
+        safe_ds = re.sub(r"[^a-zA-Z0-9_.-]+", "_", dataset.strip().lower()).strip("_") or "dataset"
+        safe_hash = re.sub(r"[^a-zA-Z0-9_.-]+", "_", slice_hash.strip().lower()).strip("_") or "default"
+        ws = Path(self.workspace_root).resolve() if self.workspace_root else Path.cwd().resolve()
+        root_dir = Path(index_root).resolve() if index_root is not None else (ws / "outputs" / "benchmarks" / "indexes")
+        sandbox_dir = root_dir / f"{safe_ds}_{safe_hash}"
+
+        if fresh and sandbox_dir.exists():
+            shutil.rmtree(sandbox_dir, ignore_errors=True)
+        sandbox_dir.mkdir(parents=True, exist_ok=True)
+
+        bench_db = sandbox_dir / "yaw.db"
+        bench_lock = sandbox_dir / "yaw.db.lock"
+        bench_status = sandbox_dir / "status.json"
+        bench_state = sandbox_dir / "coco_state"
+        bench_log = sandbox_dir / "yaw.log"
+
+        cfg_dict: dict[str, Any] = {
+            f.name: getattr(self, f.name)
+            for f in fields(self)
+            if f.name
+            not in (
+                "workspace_root",
+                "corpus_root",
+                "db_path",
+                "lock_path",
+                "status_path",
+                "state_dir",
+                "log_path",
+            )
+        }
+        cfg_dict["workspace_root"] = sandbox_dir
+        cfg_dict["corpus_root"] = sandbox_dir
+        cfg_dict["db_path"] = bench_db
+        cfg_dict["lock_path"] = bench_lock
+        cfg_dict["status_path"] = bench_status
+        cfg_dict["state_dir"] = bench_state
+        cfg_dict["log_path"] = bench_log
+        cfg_dict["poll_interval_seconds"] = 0.0
+        if self.json_keys_whitelist == ("*",):
+            cfg_dict["json_keys_whitelist"] = (
+                "title",
+                "text",
+                "paragraph_text",
+                "contents",
+                "context",
+                "context.*",
+                "contexts",
+                "contexts.*",
+                "paragraphs",
+                "paragraphs.*",
+                "document",
+                "document.title",
+                "document.text",
+                "document.summary",
+                "document.summary.*",
+            )
+            cfg_dict["json_keys_blacklist"] = tuple(
+                dict.fromkeys(
+                    (
+                        *self.json_keys_blacklist,
+                        "question*",
+                        "answer*",
+                        "answers*",
+                        "gold*",
+                        "reference*",
+                        "supporting_facts*",
+                        "is_supporting*",
+                        "evidences*",
+                        "obj*",
+                        "subj*",
+                        "prop*",
+                        "*_id",
+                        "id",
+                        "idx",
+                        "type",
+                        "level",
+                        "all_classes",
+                        "distractor",
+                        "length",
+                        "language",
+                        "dataset",
+                        "possible_answers*",
+                        "s_*",
+                        "o_*",
+                        "question_decomposition*",
+                        "answerable*",
+                    )
+                )
+            )
         return YawConfig(**cfg_dict)
 
     def config_fingerprint(self) -> str:
@@ -406,6 +545,7 @@ _FIELD_TO_SECTION: dict[str, str] = {
     "embed_batch_chars": "graph",
     "max_context_chars": "graph",
     "max_ast_expansion_hops": "graph",
+    "ast_context_hops": "graph",
     "queue_maxsize": "runtime",
     "http_host": "runtime",
     "http_port": "runtime",
@@ -435,9 +575,7 @@ def _parse_toml_scalar(val_str: str) -> Any:
         return int(cleaned)
     with contextlib.suppress(ValueError):
         return float(cleaned)
-    if (cleaned.startswith('"') and cleaned.endswith('"')) or (
-        cleaned.startswith("'") and cleaned.endswith("'")
-    ):
+    if (cleaned.startswith('"') and cleaned.endswith('"')) or (cleaned.startswith("'") and cleaned.endswith("'")):
         return cleaned[1:-1]
     return cleaned
 
@@ -497,9 +635,7 @@ def load_config(
                         kwargs[mapped_k] = tuple(v) if isinstance(v, list) else v
 
     ws_raw = kwargs.pop("workspace_root", None)
-    kwargs["workspace_root"] = (
-        _resolve_path(base_dir, ws_raw, ".") if ws_raw and not workspace_override else base_dir
-    )
+    kwargs["workspace_root"] = _resolve_path(base_dir, ws_raw, ".") if ws_raw and not workspace_override else base_dir
     return YawConfig(**kwargs)
 
 
@@ -537,9 +673,7 @@ def get_config_value(
         sub_mapped = _OPTIMIZATION_KEY_ALIASES.get(subkey, subkey)
         if hasattr(cfg, sub_mapped):
             val = getattr(cfg, sub_mapped)
-            return (
-                str(val) if isinstance(val, Path) else list(val) if isinstance(val, tuple) else val
-            )
+            return str(val) if isinstance(val, Path) else list(val) if isinstance(val, tuple) else val
 
     raise YawRuntimeError("INVALID_INPUT", f"Unknown configuration key: {key!r}")
 
@@ -567,13 +701,13 @@ def set_config_value(
         prop_name = prop_name.strip()
 
     field_name = (
-        _OPTIMIZATION_KEY_ALIASES.get(prop_name, prop_name)
-        if section_name in (None, "optimization")
-        else prop_name
+        _OPTIMIZATION_KEY_ALIASES.get(prop_name, prop_name) if section_name in (None, "optimization") else prop_name
     )
     resolved_section = section_name or _FIELD_TO_SECTION.get(field_name)
     if not resolved_section:
         raise YawRuntimeError("INVALID_INPUT", f"Cannot determine section for key: {key!r}")
+    if field_name not in {field.name for field in fields(YawConfig)}:
+        raise YawRuntimeError("INVALID_INPUT", f"Unknown configuration key: {key!r}")
 
     parsed_val = _parse_toml_scalar(raw_value)
     formatted_val = _format_toml_scalar(parsed_val)
@@ -628,8 +762,11 @@ def set_config_value(
 
 
 __all__ = [
+    "DEFAULT_EXCLUDED_PATTERNS",
+    "DEFAULT_INCLUDED_PATTERNS",
     "YawConfig",
     "get_config_value",
     "load_config",
     "set_config_value",
+    "write_text_atomic",
 ]

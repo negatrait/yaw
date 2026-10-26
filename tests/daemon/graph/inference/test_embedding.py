@@ -83,18 +83,12 @@ class EmbeddingTests(unittest.TestCase):
 
     def test_dspy_embedder_and_adapter_preserve_prefixes_and_l2_normalization(self):
         # Verify Lemonade (openai/...) and Ollama (ollama/...) dspy.Embedder initialization
-        lemonade_emb = create_dspy_embedder(
-            MODEL, base_url="http://localhost:13305/api/v1", provider="openai"
-        )
+        lemonade_emb = create_dspy_embedder(MODEL, base_url="http://localhost:13305/api/v1", provider="openai")
         self.assertEqual(lemonade_emb.model, f"openai/{MODEL}")
         self.assertEqual(lemonade_emb.default_kwargs.get("encoding_format"), "float")
-        self.assertEqual(
-            lemonade_emb.default_kwargs.get("api_base"), "http://localhost:13305/api/v1"
-        )
+        self.assertEqual(lemonade_emb.default_kwargs.get("api_base"), "http://localhost:13305/api/v1")
 
-        ollama_emb = create_dspy_embedder(
-            "nomic-embed-text", base_url="http://localhost:11434", provider="ollama"
-        )
+        ollama_emb = create_dspy_embedder("nomic-embed-text", base_url="http://localhost:11434", provider="ollama")
         self.assertEqual(ollama_emb.model, "ollama/nomic-embed-text")
         self.assertEqual(ollama_emb.default_kwargs.get("api_base"), "http://localhost:11434")
 
@@ -183,7 +177,8 @@ class EmbeddingTests(unittest.TestCase):
         def overflow_embed_fn(texts: list[str]) -> np.ndarray:
             if len(texts) > 1 or any(len(x) > 4000 for x in texts):
                 raise RuntimeError(
-                    "input (4056 tokens) is too large to process. increase the physical batch size (current batch size: 2048)"
+                    "input (4056 tokens) is too large to process. increase the physical batch size (current "
+                    "batch size: 2048)"
                 )
             vec = np.zeros((1, 768), dtype=np.float32)
             vec[0, 0] = 1.0

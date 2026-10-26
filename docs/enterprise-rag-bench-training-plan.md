@@ -45,7 +45,7 @@ flowchart TD
 
     subgraph NativeCLI ["3. Native CLI Sandbox Optimization (yaw dspy optimize)"]
         OUT_DS --> CLI_OPT["yaw dspy optimize --dataset enterprise_rag_bench<br/>--max-queries 250 --train-queries 150 --mode gepa --auto heavy"]
-        CLI_OPT --> SANDBOX["YawRuntime.optimize() Sandbox:<br/>Persist indent=2 .yaw_optimize_slice.json throughout evolve_prompts()"]
+        CLI_OPT --> SANDBOX["YawRuntime.optimize() Sandbox:<br/>Ingest isolated sandbox corpus throughout evolve_prompts()"]
         SANDBOX --> GEPA["dspy.GEPA + Gate-Free Pareto Metric: GM(Goods) / GM(Bads)"]
         GEPA --> PROPOSER["Stratum B Fixed Meta-Optimizer (RLMInstructionProposer, Sigs 10–12):<br/>Distill Traces in Python REPL & Propose GBNF Instructions"]
         PROPOSER --> TARGETS["Mutate ONLY Stratum A Runtime Predictors (HippoRAGProgram, Sigs 1–9)"]
@@ -176,7 +176,7 @@ def download_enterprise_rag_bench(
 
 ### 3.3 Optimization Sandbox Lifecycle Fix (`yaw/daemon/runtime.py`)
 
-In [`YawRuntime.optimize()`](../yaw/daemon/runtime.py#L783-L851), `.yaw_optimize_slice.json` is serialized with `indent=2` and unlinked in an outer `finally:` block only **after** `self.engine.evolve_prompts(...)` finishes, preventing premature unlinking.
+In [`YawRuntime.optimize()`](../yaw/daemon/runtime.py#L783-L851), the optimization sandbox corpus is ingested directly in an isolated sandbox workspace and cleaned up only **after** `self.engine.evolve_prompts(...)` finishes.
 
 ### 3.4 Two-Stratum Separation of the Canonical 12 DSPy Signatures
 
@@ -191,7 +191,7 @@ In [`YawRuntime.optimize()`](../yaw/daemon/runtime.py#L783-L851), `.yaw_optimize
 1. **Zero Upstream `hipporag` Invariant**: `git grep -i "from hipporag"` and `git grep -i "import hipporag"` return `0` matches across the entire repository.
 2. **Dual-Target Parity Invariant**: Native YAW must match or beat `MONKEYPATCHED_HIPPORAG_BASELINES` ($\Delta_{\text{local}} \ge -0.02$) while marching toward `PAPER_BASELINES`.
 3. **One-Way Meta-Reflection Invariant**: `RLMInstructionProposer` (Stratum B, Signatures 10–12) reflects exclusively on `HippoRAGProgram.named_predictors()` (Stratum A, Signatures 1–9).
-4. **Live Disk Slice Invariant During `optimize()`**: `.yaw_optimize_slice.json` is formatted with `indent=2` and remains on disk throughout `evolve_prompts(...)`.
+4. **Live Disk Sandbox Invariant During `optimize()`**: The sandbox corpus files remain on disk throughout `evolve_prompts(...)` so 1-indexed line hydration never encounters missing files.
 
 ### 4.2 Explicit Non-Goals (Anti-Invention Contract)
 - **Zero Custom Optimization Scripts**: Do **NOT** create `scripts/optimize_dspy_pipeline.py`. Use the existing [`yaw dspy optimize`](../yaw/daemon/cli.py#L126-L185) and [`yaw dspy load-program`](../yaw/daemon/cli.py#L186-L195) CLI commands.
@@ -206,7 +206,7 @@ In [`YawRuntime.optimize()`](../yaw/daemon/runtime.py#L783-L851), `.yaw_optimize
 1. **[MODIFY] [`pyproject.toml`](../pyproject.toml) & [`uv.lock`](../uv.lock)**: Remove `hipporag` git pin; run `uv lock --upgrade && uv sync --locked`.
 2. **[DELETE] [`yaw/daemon/graph/inference/legacy_chat.py`](../yaw/daemon/graph/inference/legacy_chat.py)** & **[DELETE] [`yaw/daemon/graph/inference/legacy_embedding.py`](../yaw/daemon/graph/inference/legacy_embedding.py)**: Permanently delete legacy HippoRAG adapter modules.
 3. **[MODIFY] [`yaw/daemon/graph/inference/__init__.py`](../yaw/daemon/graph/inference/__init__.py)**: Remove `LocalChat`, `CacheOpenAI`, `chat_identity`, and `RetrievalEmbedding` from `_PUBLIC_API`.
-4. **[MODIFY] [`yaw/daemon/runtime.py`](../yaw/daemon/runtime.py)**: Fix `YawRuntime.optimize()` to write `.yaw_optimize_slice.json` with `indent=2` and keep it alive on disk during `evolve_prompts(...)`.
+4. **[MODIFY] [`yaw/daemon/runtime.py`](../yaw/daemon/runtime.py)**: Fix `YawRuntime.optimize()` to keep sandbox corpus files alive on disk during `evolve_prompts(...)`.
 5. **[MODIFY] [`yaw/daemon/cli.py`](../yaw/daemon/cli.py)**: Add `"enterprise_rag_bench"` (and alias `"enterprise"`) to `_KNOWN_DATASETS`.
 6. **[MODIFY] [`scripts/download-datasets.py`](../scripts/download-datasets.py)**: Add `enterprise_rag_bench` to `DATASET_REGISTRY` to download and curate the 250-query stratified slice.
 7. **[MODIFY] [`benchmark.py`](../benchmark.py)** & **[MODIFY] [`scripts/verify_paper_parity_gate.py`](../scripts/verify_paper_parity_gate.py)**: Remove all `hipporag` imports and upstream runner functions, integrate `MONKEYPATCHED_HIPPORAG_BASELINES`, and evaluate native YAW against both targets.

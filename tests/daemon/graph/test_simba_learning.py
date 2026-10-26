@@ -17,7 +17,7 @@ from yaw.daemon.graph.inference import (
     RLMInstructionProposer,
     ServingTokenCounter,
     compute_qa_em_f1,
-    compute_sizecoding_pareto_score,
+    compute_task_quality_score,
     create_dspy_lm,
 )
 
@@ -33,6 +33,7 @@ def provider():
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
+            assert isinstance(self.server, ThreadingHTTPServer)
             value = {
                 "all_models_loaded": [
                     {
@@ -70,11 +71,7 @@ def provider():
             prompt = str(request["messages"])
             calls.append(request)
             if "task-model" in request["model"]:
-                answer = (
-                    "Alan Turing"
-                    if "FULL_NAME" in prompt
-                    else ("Unknown" if BAD in prompt else "Turing")
-                )
+                answer = "Alan Turing" if "FULL_NAME" in prompt else ("Unknown" if BAD in prompt else "Turing")
                 result = {"reasoning": "Use the provided evidence.", "answer": answer}
             elif "module_advice" in prompt and "discussion" in prompt:
                 result = {
@@ -113,7 +110,7 @@ def provider():
             self.end_headers()
             self.wfile.write(raw)
 
-        def log_message(self, *_args):
+        def log_message(self, format: str, *args: object) -> None:
             pass
 
     with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
@@ -128,7 +125,7 @@ def provider():
 
 def task_metric(gold, pred):
     em, f1 = compute_qa_em_f1(pred.answer, gold.gold_answers)
-    return float(compute_sizecoding_pareto_score(em, em=em, f1=f1, tokens=25).score)
+    return float(compute_task_quality_score(em, em=em, f1=f1, tokens=25).score)
 
 
 def make_learning(root, url, *, resume=False, answer="Alan Turing"):
@@ -181,6 +178,7 @@ def test_task_reward_disk_cache_and_isolated_training_queries(tmp_path, provider
         good = proposer._score_task_improvement(ex, dspy.Prediction(new_instruction=GOOD))
         bad = proposer._score_task_improvement(ex, dspy.Prediction(new_instruction=BAD))
         same = proposer._score_task_improvement(ex, dspy.Prediction(new_instruction=BASE))
+        # Partial answer (BASE: surname only, F1>0) scores higher than wrong answer (BAD: F1=0).
         assert good > same == 0.5 > bad
         assert len(calls) == 8  # paired task evaluations; subsequent repeats must reuse the cache
         assert all("task-model" in call["model"] for call in calls)
@@ -188,6 +186,10 @@ def test_task_reward_disk_cache_and_isolated_training_queries(tmp_path, provider
         proposer._score_task_improvement(ex, dspy.Prediction(new_instruction=GOOD))
         assert len(calls) == 8
         assert "task_candidate" not in ex.inputs()
+        correct_baseline = dspy.Example(
+            **{**ex.toDict(), "task_candidate": {"qa.predict": GOOD}, "current_instruction": GOOD}
+        ).with_inputs("component_name", "current_instruction", "examples_with_feedback")
+        assert proposer._score_task_improvement(correct_baseline, dspy.Prediction(new_instruction=BAD)) < 0.5
     finally:
         engine.close()
 
@@ -200,12 +202,8 @@ def test_native_simba_learning_survives_process_restart(tmp_path, provider):
         before = proposer.qwen_proposer.signature.instructions
         assert proposer.step_simba()
         assert proposer._simba_steps == 1
-        assert any(
-            call.get("temperature") == 1.0 and "worker-model" in call["model"] for call in calls
-        )
-        assert (
-            proposer.qwen_proposer.signature.instructions != before or proposer.qwen_proposer.demos
-        )
+        assert any(call.get("temperature") == 1.0 and "worker-model" in call["model"] for call in calls)
+        assert proposer.qwen_proposer.signature.instructions != before or proposer.qwen_proposer.demos
         # Persist demos on both predictors as well as the genuinely learned rule.
         proposer.qwen_compressor.demos = [
             dspy.Example(shortened_instruction=GOOD, instruction=GOOD, length_limit="1500")
@@ -242,11 +240,7 @@ finally:
         timeout=60,
     )
     restored = json.loads(
-        next(
-            line.removeprefix("RESTORED=")
-            for line in result.stdout.splitlines()
-            if line.startswith("RESTORED=")
-        )
+        next(line.removeprefix("RESTORED=") for line in result.stdout.splitlines() if line.startswith("RESTORED="))
     )
     assert restored == learned
     assert len(calls) == before_restart + 1  # only the next worker call; task scores are cached
@@ -267,16 +261,12 @@ def test_failed_sqlite_snapshot_preserves_previous_complete_state(tmp_path, prov
     engine, proposer = make_learning(tmp_path, url)
     try:
         proposer.save_simba_state(proposer.dump_simba_state())
-        before = engine.conn.execute(
-            "SELECT value FROM meta WHERE key LIKE 'simba_worker:%'"
-        ).fetchone()[0]
+        before = engine.conn.execute("SELECT value FROM meta WHERE key LIKE 'simba_worker:%'").fetchone()[0]
         engine.conn.execute("PRAGMA query_only=ON")
         proposer._simba_steps = 1
         with pytest.raises(sqlite3.OperationalError, match="readonly"):
             proposer.save_simba_state(proposer.dump_simba_state())
-        after = engine.conn.execute(
-            "SELECT value FROM meta WHERE key LIKE 'simba_worker:%'"
-        ).fetchone()[0]
+        after = engine.conn.execute("SELECT value FROM meta WHERE key LIKE 'simba_worker:%'").fetchone()[0]
         assert after == before
     finally:
         engine.close()
@@ -292,14 +282,10 @@ def test_active_request_survives_cache_eviction_with_atomic_worker_state(tmp_pat
     url, _calls = provider
     engine, proposer = make_learning(tmp_path, url)
     try:
-        proposer.checkpoint_put(
-            "request:one", {"phase": "collecting", "state": proposer.dump_simba_state()}
-        )
+        proposer.checkpoint_put("request:one", {"phase": "collecting", "state": proposer.dump_simba_state()})
         proposer.checkpoint_put("evidence:one", {"references": ["original-training-record"]})
         proposer._simba_steps = 1
-        proposer.checkpoint_put(
-            "request:one", {"phase": "learned", "state": proposer.dump_simba_state()}
-        )
+        proposer.checkpoint_put("request:one", {"phase": "learned", "state": proposer.dump_simba_state()})
         with engine.managed_conn.transaction() as conn:
             conn.execute("DELETE FROM candidate_stage_cache")
     finally:
@@ -308,9 +294,7 @@ def test_active_request_survives_cache_eviction_with_atomic_worker_state(tmp_pat
     try:
         assert restored.dump_simba_state()["steps"] == 1
         assert restored.checkpoint_get("request:one")["phase"] == "learned"
-        assert restored.checkpoint_get("evidence:one") == {
-            "references": ["original-training-record"]
-        }
+        assert restored.checkpoint_get("evidence:one") == {"references": ["original-training-record"]}
     finally:
         engine.close()
 

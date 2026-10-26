@@ -8,6 +8,8 @@ from typing import Any
 
 import dspy
 
+from yaw.core.config import scale_context_budget
+
 from .grammars import lm_supports_gbnf
 from .models import BASE_URL, CHAT_MODELS, DEFAULT_EXTRACTION_CHAT, DEFAULT_QA_CHAT
 
@@ -27,19 +29,28 @@ class _UsageAccountingCache:
     artificial advantage. LM history retains DSPy's zero physical usage.
     """
 
-    def __init__(self, backend: Any) -> None:
+    def __init__(self, backend: Any, account_cached_usage: bool = True) -> None:
         self.backend = backend
+        self.account_cached_usage = account_cached_usage
         self.cache_hits = 0
         self.cached_tokens = 0
+        # FanoutCache constructs connections on this thread. Do not transfer
+        # those handles to short-lived DSPy evaluation/daemon worker lifetimes.
+        self.close()
+
+    def close(self) -> None:
+        """Close this thread's disk handles; persisted entries remain available."""
+        disk_cache = getattr(self.backend, "disk_cache", None)
+        close = getattr(disk_cache, "close", None)
+        if callable(close):
+            close()
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.backend, name)
 
     @staticmethod
     def _is_lm_request(request: dict[str, Any]) -> bool:
-        return str(request.get("_fn_identifier", "")).startswith(
-            ("dspy.clients.lm.", "dspy.clients.lm15.")
-        )
+        return str(request.get("_fn_identifier", "")).startswith(("dspy.clients.lm.", "dspy.clients.lm15."))
 
     @staticmethod
     def _ignored(ignored: list[str] | None) -> list[str]:
@@ -55,9 +66,15 @@ class _UsageAccountingCache:
         request: dict[str, Any],
         ignored_args_for_cache_key: list[str] | None = None,
     ) -> Any:
+        try:
+            return self._get(request, ignored_args_for_cache_key)
+        finally:
+            self.close()
+
+    def _get(self, request: dict[str, Any], ignored_args_for_cache_key: list[str] | None) -> Any:
         ignored_args_for_cache_key = self._ignored(ignored_args_for_cache_key)
         record = self.backend.get(request, ignored_args_for_cache_key)
-        if record is None or not self._is_lm_request(request):
+        if record is None or not self.account_cached_usage or not self._is_lm_request(request):
             return record
         if isinstance(record, dict) and "_dspy_format" in record:
             usage = record.get("usage")
@@ -91,9 +108,21 @@ class _UsageAccountingCache:
         ignored_args_for_cache_key: list[str] | None = None,
         enable_memory_cache: bool = True,
     ) -> None:
+        try:
+            self._put(request, value, ignored_args_for_cache_key, enable_memory_cache)
+        finally:
+            self.close()
+
+    def _put(
+        self,
+        request: dict[str, Any],
+        value: Any,
+        ignored_args_for_cache_key: list[str] | None,
+        enable_memory_cache: bool,
+    ) -> None:
         ignored_args_for_cache_key = self._ignored(ignored_args_for_cache_key)
         self.backend.put(request, value, ignored_args_for_cache_key, enable_memory_cache)
-        if not self._is_lm_request(request):
+        if not self.account_cached_usage or not self._is_lm_request(request):
             return
         if not (isinstance(value, dict) and "_dspy_format" in value):
             usage = getattr(value, "usage", None)
@@ -135,24 +164,6 @@ class YawDSPyLM(dspy.LM):
     _yaw_supports_gbnf: bool = False
 
     def __call__(self, prompt: Any = None, *, messages: Any = None, **kwargs: Any) -> Any:
-        if (
-            getattr(self, "_yaw_recipe", None) == "ryzenai-llm"
-            and isinstance(messages, list)
-            and len(messages) >= 2
-            and isinstance(messages[0], dict)
-            and messages[0].get("role") == "system"
-            and isinstance(messages[1], dict)
-            and messages[1].get("role") == "user"
-        ):
-            messages = [
-                {
-                    "role": "user",
-                    "content": str(messages[0].get("content", "")).strip()
-                    + "\n\n"
-                    + str(messages[1].get("content", "")),
-                },
-                *messages[2:],
-            ]
         res = super().__call__(prompt=prompt, messages=messages, **kwargs)
         sleep_sec = get_yaw_sleep_seconds()
         if sleep_sec > 0:
@@ -203,8 +214,7 @@ def configure_yaw_dspy_cache(
     if callable(close_fn):
         close_fn()
     dspy.configure_cache(**kwargs)
-    if account_cached_usage:
-        dspy.cache = _UsageAccountingCache(dspy.cache)
+    dspy.cache = _UsageAccountingCache(dspy.cache, account_cached_usage=account_cached_usage)
 
 
 def create_dspy_lm(
@@ -254,16 +264,15 @@ def create_dspy_lm(
         else:
             temperature = 0.0
 
-    if max_tokens is None:
-        # Per-completion output cap; model context is a separate server setting.
-        max_tokens = 4096
     context_tokens = (
-        context_window_tokens
-        if context_window_tokens is not None
-        else profile.expected_context
-        if profile
-        else None
+        context_window_tokens if context_window_tokens is not None else profile.expected_context if profile else None
     )
+    if max_tokens is None:
+        max_tokens = (
+            scale_context_budget(4096, context_tokens)
+            if context_tokens is not None and (context_window_tokens is not None or context_tokens >= 65536)
+            else 4096
+        )
     if context_tokens is not None and not 0 < max_tokens < context_tokens:
         raise ValueError("Require 0 < max_tokens < context_window_tokens")
 
@@ -279,9 +288,7 @@ def create_dspy_lm(
 
     if provider == "ollama" or model_name.startswith(("ollama_chat/", "ollama/")):
         litellm_model = (
-            model_name
-            if model_name.startswith(("ollama_chat/", "ollama/"))
-            else f"ollama_chat/{clean_name}"
+            model_name if model_name.startswith(("ollama_chat/", "ollama/")) else f"ollama_chat/{clean_name}"
         )
         lm = YawDSPyLM(
             model=litellm_model,

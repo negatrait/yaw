@@ -103,9 +103,7 @@ def test_run_ppr_mass_conservation_and_multi_hop() -> None:
 
     # Seed entity-A only
     reset = {"entity-A": 1.0}
-    p = run_ppr(
-        graph, reset, damping=0.5, max_iter=100, tol=1e-6, activation="linear", dual_weight=None
-    )
+    p = run_ppr(graph, reset, damping=0.5, max_iter=100, tol=1e-6, activation="linear", dual_weight=None)
 
     # Probability mass conserved in linear mode
     assert np.isclose(np.sum(p), 1.0, atol=1e-5)
@@ -174,9 +172,7 @@ def test_apply_graph_activation_invariants() -> None:
         # Lipschitz condition: |f(x) - f(y)| <= |x - y|
         diffs_f = np.abs(f_grid[1:] - f_grid[:-1])
         diffs_x = np.abs(grid[1:] - grid[:-1])
-        assert np.all(diffs_f <= diffs_x + 1e-9), (
-            f"Activation {act} violates 1-Lipschitz contraction"
-        )
+        assert np.all(diffs_f <= diffs_x + 1e-9), f"Activation {act} violates 1-Lipschitz contraction"
 
     # 2. Hub suppression: scaled_tanh and hard_tanh compress large values
     large_x = np.array([0.5, 1.0, 2.0])
@@ -312,3 +308,73 @@ def test_run_ppr_dual_weight_combination() -> None:
     assert len(ranked) == 2
     assert ranked[0][0] == "c-1"
     assert ranked[1][0] == "c-2"
+
+
+def test_step11_relation_traversal_policy_broader_asymmetry_and_zero_diff_parity() -> None:
+    """Verify H4: RelationTraversalPolicy zero-diff parity, parallel aggregation, and skos:broader asymmetry."""
+    from yaw.core import RelationTraversalPolicy
+
+    chunks = ["c-child", "c-parent", "c-other"]
+    entities = ["ent-child", "ent-parent", "ent-other"]
+    sym_edges: list[tuple[str, str, str, float]] = [
+        ("c-child", "ent-child", "passage", 1.0),
+        ("ent-child", "c-child", "passage", 1.0),
+        ("c-parent", "ent-parent", "passage", 1.0),
+        ("ent-parent", "c-parent", "passage", 1.0),
+        ("ent-child", "ent-parent", "fact", 1.0),
+        ("ent-parent", "ent-child", "fact", 1.0),
+    ]
+
+    # 1. Zero-diff parity between policy=None and default RelationTraversalPolicy() on symmetric graphs
+    g_none = build_transition_matrix(chunks, entities, sym_edges, beta=0.5, policy=None)
+    g_def = build_transition_matrix(chunks, entities, sym_edges, beta=0.5, policy=RelationTraversalPolicy())
+    max_abs_diff = float(np.max(np.abs(g_none.transition_t.toarray() - g_def.transition_t.toarray())))
+    assert max_abs_diff == 0.0
+
+    # 2. Parallel-edge aggregation modes: max vs sum vs capped_sum
+    par_edges: list[tuple[str, str, str, float]] = [
+        ("c-child", "ent-child", "passage", 1.0),
+        ("ent-child", "ent-parent", "fact", 1.0),
+        ("ent-child", "ent-parent", "skos:related", 0.8),
+    ]
+    g_max = build_transition_matrix(
+        chunks, entities, par_edges, beta=0.0, policy=RelationTraversalPolicy(parallel_aggregation="max")
+    )
+    g_sum = build_transition_matrix(
+        chunks, entities, par_edges, beta=0.0, policy=RelationTraversalPolicy(parallel_aggregation="sum")
+    )
+    g_cap = build_transition_matrix(
+        chunks,
+        entities,
+        par_edges,
+        beta=0.0,
+        policy=RelationTraversalPolicy(parallel_aggregation="capped_sum", parallel_cap=1.2),
+    )
+    idx_ec = g_max.node_to_idx["ent-child"]
+    idx_ep = g_max.node_to_idx["ent-parent"]
+    # Under max: weight(ec->ep) = 1.0, weight(ec->c-child) = 1.0 -> P[ep | ec] = 1.0 / 2.0 = 0.5
+    assert np.isclose(g_max.transition_t.toarray()[idx_ep, idx_ec], 0.5)
+    # Under sum: weight(ec->ep) = 1.8, weight(ec->c-child) = 1.0 -> P[ep | ec] = 1.8 / 2.8
+    assert np.isclose(g_sum.transition_t.toarray()[idx_ep, idx_ec], 1.8 / 2.8)
+    # Under capped_sum(1.2): weight(ec->ep) = 1.2, weight(ec->c-child) = 1.0 -> P[ep | ec] = 1.2 / 2.2
+    assert np.isclose(g_cap.transition_t.toarray()[idx_ep, idx_ec], 1.2 / 2.2)
+
+    # 3. Asymmetric skos:broader upward (1.0) vs downward (0.25) and column-stochastic normalization at beta=0.0
+    broader_edges: list[tuple[str, str, str, float]] = [
+        ("c-child", "ent-child", "passage", 1.0),
+        ("c-parent", "ent-parent", "passage", 1.0),
+        ("ent-child", "ent-parent", "skos:broader", 1.0),
+    ]
+    pol_broader = RelationTraversalPolicy(skos_broader_up=1.0, skos_broader_down=0.25)
+    g_b0 = build_transition_matrix(chunks, entities, broader_edges, beta=0.0, policy=pol_broader)
+    pt_b0 = g_b0.transition_t.toarray()
+
+    # Every non-dangling column must sum to 1.0 (out-degree normalization)
+    for col_idx in range(len(g_b0.node_ids)):
+        if not g_b0.dangling_mask[col_idx]:
+            assert np.isclose(np.sum(pt_b0[:, col_idx]), 1.0), f"Column {col_idx} sum != 1.0"
+
+    # Transition child -> parent (upward = 1.0 / 2.0 = 0.5) > parent -> child (downward = 0.25 / 1.25 = 0.2)
+    assert np.isclose(pt_b0[idx_ep, idx_ec], 0.5)
+    assert np.isclose(pt_b0[idx_ec, idx_ep], 0.2)
+    assert pt_b0[idx_ep, idx_ec] > pt_b0[idx_ec, idx_ep]

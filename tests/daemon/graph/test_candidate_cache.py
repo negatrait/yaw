@@ -18,8 +18,7 @@ import numpy as np
 from dspy.primitives.repl_types import REPLHistory
 
 from yaw.core import OpenIERecord, StructuredTriple
-from yaw.daemon.graph.candidate_cache import CandidateStageCache
-from yaw.daemon.graph.storage import CandidateCacheStore, open_managed_yaw_db
+from yaw.daemon.graph.storage import CandidateCacheStore, CandidateStageCache, open_managed_yaw_db
 
 
 def test_stage_cache_roundtrips_typed_traces_without_storing_passage(tmp_path: Path) -> None:
@@ -34,11 +33,7 @@ def test_stage_cache_roundtrips_typed_traces_without_storing_passage(tmp_path: P
             "chunk",
             ("Ada",),
             (("Ada", "wrote", "Notes"),),
-            (
-                StructuredTriple(
-                    "Ada", "Author", "wrote", "Notes", "Publication", "Ada wrote Notes"
-                ),
-            ),
+            (StructuredTriple("Ada", "Author", "wrote", "Notes", "Publication", "Ada wrote Notes"),),
             (("Ada", "Author"),),
         )
         value = (
@@ -79,9 +74,7 @@ def test_stage_cache_roundtrips_typed_traces_without_storing_passage(tmp_path: P
                 dspy.Prediction(code="SUBMIT(repairs=[])"),
             )
         ]
-        row = conn.execute(
-            "SELECT payload FROM candidate_stage_cache WHERE stage = 'shacl'"
-        ).fetchone()
+        row = conn.execute("SELECT payload FROM candidate_stage_cache WHERE stage = 'shacl'").fetchone()
         assert text not in zlib.decompress(row[0]).decode()
         restored = replay[("trace",)]
         assert restored[0][1]["repl_history"].format() == history.format()
@@ -123,9 +116,7 @@ def test_candidate_stages_make_zero_requests_after_process_restart(tmp_path: Pat
                         {
                             "object": "embedding",
                             "index": i,
-                            "embedding": [
-                                (b + 1) / 256 for b in hashlib.sha256(t.encode()).digest() * 24
-                            ],
+                            "embedding": [(b + 1) / 256 for b in hashlib.sha256(t.encode()).digest() * 24],
                         }
                         for i, t in enumerate(texts)
                     ],

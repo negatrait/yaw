@@ -19,6 +19,7 @@ import dspy
 import numpy as np
 import pytest
 
+from daemon.graph.inference.test_reflection import provider as provider
 from yaw.core import (
     OpenIERecord,
     YawConfig,
@@ -28,7 +29,7 @@ from yaw.core import (
 from yaw.daemon.cli import build_parser, inspect_status, main
 from yaw.daemon.graph.inference import (
     HippoRAGProgram,
-    compute_sizecoding_pareto_score,
+    compute_task_quality_score,
     resolve_embedding_profile,
 )
 from yaw.daemon.graph.storage import get_meta, get_openie_checkpoints, open_yaw_db
@@ -49,42 +50,31 @@ class DeterministicTestLM(dspy.LM):
         **kwargs: Any,
     ) -> list[str]:
         if self.fail_online:
-            raise ConnectionError(
-                "Inference server at http://localhost:13305/api/v1 is unreachable"
-            )
+            raise ConnectionError("Inference server at http://localhost:13305/api/v1 is unreachable")
         req_str = str(prompt or messages or kwargs)
         if dspy.settings.usage_tracker is not None:
             dspy.settings.usage_tracker.add_usage(
                 self.model,
                 {"prompt_tokens": 32, "completion_tokens": 16, "total_tokens": 48},
             )
-        if (
-            "JudgeSynonyms" in req_str
-            or "candidate_pairs_json" in req_str
-            or "candidate_pairs" in req_str
-        ):
+        if "JudgeSynonyms" in req_str or "candidate_pairs_json" in req_str or "candidate_pairs" in req_str:
             return ['{"decisions": []}']
-        if (
-            "ProposeSHACLRepairs" in req_str
-            or "HealSHACLViolations" in req_str
-            or "violations_json" in req_str
-        ):
+        if "ProposeSHACLRepairs" in req_str or "HealSHACLViolations" in req_str or "violations_json" in req_str:
             return ['{"repairs": []}']
-        if (
-            "DefineMissingEntities" in req_str
-            or "missing_entities" in req_str
-            or "entity_definitions" in req_str
-        ):
+        if "DefineMissingEntities" in req_str or "missing_entities" in req_str or "entity_definitions" in req_str:
             if "Turing" in req_str:
                 return [
-                    '{"entity_definitions": [["Alan Turing", "English mathematician and cryptanalyst"], ["Bletchley Park", "British wartime codebreaking center"]]}'
+                    '{"entity_definitions": [["Alan Turing", "English mathematician and cryptanalyst"], '
+                    '["Bletchley Park", "British wartime codebreaking center"]]}'
                 ]
             if "Lovelace" in req_str:
                 return [
-                    '{"entity_definitions": [["Ada Lovelace", "English mathematician"], ["Analytical Engine", "Early mechanical general-purpose computer"]]}'
+                    '{"entity_definitions": [["Ada Lovelace", "English mathematician"], ["Analytical Engine", '
+                    '"Early mechanical general-purpose computer"]]}'
                 ]
             return [
-                '{"entity_definitions": [["University of Southampton", "Public research university in Southampton"], ["1862", "Founding year of the Hartley Institution"]]}'
+                '{"entity_definitions": [["University of Southampton", "Public research university in '
+                'Southampton"], ["1862", "Founding year of the Hartley Institution"]]}'
             ]
         if "FilterTriples" in req_str or "fact_before_filter" in req_str:
             if "Turing" in req_str:
@@ -95,26 +85,32 @@ class DeterministicTestLM(dspy.LM):
         if "ExtractTriples" in req_str or '"triples"' in req_str or "`triples`" in req_str:
             if "Turing" in req_str:
                 return [
-                    '{"triples": [{"sub": "Alan Turing", "pred": "worked at", "obj": "Bletchley Park", "def": "Alan Turing worked at Bletchley Park."}]}'
+                    '{"triples": [{"sub": "Alan Turing", "pred": "worked at", "obj": "Bletchley Park", "def": '
+                    '"Alan Turing worked at Bletchley Park."}]}'
                 ]
             if "Lovelace" in req_str:
                 return [
-                    '{"triples": [{"sub": "Ada Lovelace", "pred": "programmed", "obj": "Analytical Engine", "def": "Ada Lovelace programmed the Analytical Engine."}]}'
+                    '{"triples": [{"sub": "Ada Lovelace", "pred": "programmed", "obj": "Analytical Engine", '
+                    '"def": "Ada Lovelace programmed the Analytical Engine."}]}'
                 ]
             return [
-                '{"triples": [{"sub": "University of Southampton", "pred": "founded in", "obj": "1862", "def": "University of Southampton was founded in 1862."}]}'
+                '{"triples": [{"sub": "University of Southampton", "pred": "founded in", "obj": "1862", '
+                '"def": "University of Southampton was founded in 1862."}]}'
             ]
         if "ExtractEntities" in req_str or "named_entities" in req_str:
             if "Turing" in req_str:
                 return [
-                    '{"named_entities": [["Alan Turing", "English mathematician and cryptanalyst"], ["Bletchley Park", "British wartime codebreaking center"]]}'
+                    '{"named_entities": [["Alan Turing", "English mathematician and cryptanalyst"], '
+                    '["Bletchley Park", "British wartime codebreaking center"]]}'
                 ]
             if "Lovelace" in req_str:
                 return [
-                    '{"named_entities": [["Ada Lovelace", "English mathematician"], ["Analytical Engine", "Early mechanical general-purpose computer"]]}'
+                    '{"named_entities": [["Ada Lovelace", "English mathematician"], ["Analytical Engine", '
+                    '"Early mechanical general-purpose computer"]]}'
                 ]
             return [
-                '{"named_entities": [["University of Southampton", "Public research university in Southampton"], ["1862", "Founding year of the Hartley Institution"]]}'
+                '{"named_entities": [["University of Southampton", "Public research university in '
+                'Southampton"], ["1862", "Founding year of the Hartley Institution"]]}'
             ]
         if "ExtractQueryIntent" in req_str or "query_intent" in req_str:
             return ['{"query_intent": "Alan Turing worked at Bletchley Park"}']
@@ -170,7 +166,9 @@ class DeterministicTestEmbedder:
         return vecs
 
 
-def _make_test_config(tmp_path: Path, *, queue_maxsize: int = 32) -> tuple[YawConfig, Path]:
+def _make_test_config(
+    tmp_path: Path, *, queue_maxsize: int = 32, base_url: str = "http://localhost:13305/api/v1"
+) -> tuple[YawConfig, Path]:
     toml_path = tmp_path / "yaw.toml"
     toml_content = f"""
 [paths]
@@ -191,7 +189,7 @@ min_chunk_size = 20
 poll_interval_seconds = 0.2
 
 [inference]
-base_url = "http://localhost:13305/api/v1"
+base_url = "{base_url}"
 enable_gbnf = false
 
 [graph]
@@ -210,9 +208,7 @@ http_port = 13306
     return cfg, toml_path
 
 
-def _make_program_and_embedder() -> tuple[
-    HippoRAGProgram, Any, DeterministicTestLM, DeterministicTestEmbedder
-]:
+def _make_program_and_embedder() -> tuple[HippoRAGProgram, Any, DeterministicTestLM, DeterministicTestEmbedder]:
     lm = DeterministicTestLM()
     dspy.settings.configure(lm=lm)
     prog = HippoRAGProgram(
@@ -229,7 +225,7 @@ def test_load_config_and_fingerprint(tmp_path: Path) -> None:
     repo_cfg = load_config(Path(__file__).resolve().parents[2] / "yaw.toml")
     assert repo_cfg.queue_maxsize == 32
     assert repo_cfg.embedding_model == "embeddinggemma-300m-qat-q8_0-GGUF-Q8_0"
-    assert repo_cfg.context_window_tokens == 65536
+    assert repo_cfg.context_window_tokens == 131072
     assert repo_cfg.extraction_model == "Gemma-4-E4B-it-GGUF"
     assert repo_cfg.qa_model == "Gemma-4-E4B-it-GGUF"
     assert repo_cfg.config_fingerprint().startswith("yaw-cfg-v1:")
@@ -268,11 +264,13 @@ def test_runtime_applies_configured_hydration_capacity(tmp_path: Path) -> None:
 
 def test_optimize_resume_parser_aliases() -> None:
     parser = build_parser()
-    for command in (["dspy", "optimize"], ["optimize"]):
-        assert parser.parse_args([*command, "--resume"]).resume
-        for flag in ("--db", "--db-path"):
-            args = parser.parse_args([*command, flag, "latest"])
-            assert args.db_path == "latest"
+    assert parser.parse_args(["dspy", "optimize", "--resume"]).resume
+    args = parser.parse_args(["dspy", "optimize", "--db-path", "latest"])
+    assert args.db_path == "latest"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["optimize", "--resume"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["dspy", "optimize", "--db", "latest"])
 
 
 def test_cli_resume_without_a_run_fails_before_dataset_or_provider_access(tmp_path: Path) -> None:
@@ -285,17 +283,17 @@ def test_cli_resume_without_a_run_fails_before_dataset_or_provider_access(tmp_pa
     assert cfg.db_path is not None and not cfg.db_path.exists()
 
 
-def test_cli_resume_real_gepa_checkpoint_and_custom_output(tmp_path: Path) -> None:
+def test_cli_resume_real_gepa_checkpoint_and_custom_output(tmp_path: Path, provider) -> None:
     """Real GEPA/DSPy + SQLite + CocoIndex; deterministic LM tests orchestration only."""
     from gepa.core.state import GEPAState, ValsetEvaluation
 
-    cfg, toml_path = _make_test_config(tmp_path)
+    cfg, toml_path = _make_test_config(tmp_path, base_url=provider[0])
     dataset = tmp_path / "resume_dataset.json"
     records = [
         {
             "id": f"q{i}",
             "question": f"Where did Alan Turing work ({i})?",
-            "answer": ["Bletchley Park"],
+            "answer": ["Alan Turing at Bletchley Park"],
             "paragraphs": [
                 {
                     "title": "Alan Turing",
@@ -370,24 +368,72 @@ def test_cli_resume_real_gepa_checkpoint_and_custom_output(tmp_path: Path) -> No
         loaded = GEPAState.load(str(telemetry))
         assert loaded.program_candidates == state.program_candidates
         assert loaded.total_num_evals == state.total_num_evals
+        audit = json.loads((tmp_path / "my_compiled_graph_rlm_audit.json").read_text(encoding="utf-8"))
+        native = audit["gepa_progress"]
+        expected_front = sorted({idx for group in loaded.get_pareto_front_mapping().values() for idx in group})
+        assert native["frontier"] == expected_front
+        assert native["validation"][1]["score"] == 1.0
+        assert native["phase"] == "optimization complete"
         pools = json.loads((tmp_path / "my_compiled_pools.json").read_text())
         assert pools["corpus_chunk_ids"]
         with closing(sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True)) as conn:
             assert conn.execute("SELECT * FROM openie_chunks").fetchall() == initial_openie
 
+    # Metric/code upgrade with identical data, settings, mode, packages, and output path:
+    # preserves openie_chunks while invalidating stale pre-upgrade gepa_state.bin and simba scores.
+    with closing(sqlite3.connect(db_path)) as conn, conn:
+        saved_meta = json.loads(conn.execute("SELECT value FROM meta WHERE key = 'optimization_run'").fetchone()[0])
+        saved_meta["identity"]["metric"] = "task-quality-legacy-v1"
+        saved_meta["identity"]["code_sha256"] = "0" * 64
+        conn.execute(
+            "UPDATE meta SET value = ? WHERE key = 'optimization_run'",
+            (json.dumps(saved_meta),),
+        )
+        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('simba_worker:stale', '{}')")
+        conn.execute(
+            "INSERT OR REPLACE INTO candidate_stage_cache(stage, cache_key, payload, size_bytes) "
+            "VALUES ('simba_task_score', 'stale-key', X'00', 1)"
+        )
+    rc, output, errors = run_cli(["--resume"], bare=True)
+    assert rc == 0, errors
+    assert "RESUMED_WINNER" not in custom_output.read_text(encoding="utf-8")
+    with closing(sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True)) as conn:
+        assert conn.execute("SELECT * FROM openie_chunks").fetchall() == initial_openie
+        upgraded_meta = json.loads(conn.execute("SELECT value FROM meta WHERE key = 'optimization_run'").fetchone()[0])
+        assert upgraded_meta["identity"]["metric"] == "task-quality-arithmetic-mean-v2"
+        assert conn.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'simba_worker:%'").fetchone()[0] == 0
+        assert (
+            conn.execute("SELECT COUNT(*) FROM candidate_stage_cache WHERE stage = 'simba_task_score'").fetchone()[0]
+            == 0
+        )
+
     # Same length, different questions: reject before replacing the corpus or
     # touching the checkpoint, preserving both for inspection or recovery.
     original_checkpoint = checkpoint.read_bytes()
     assert cfg.corpus_root is not None
-    corpus_path = cfg.corpus_root / ".yaw_optimize_slice.json"
-    original_corpus = corpus_path.read_bytes()
+    assert not list((cfg.corpus_root / "corpus").glob("*.md"))
+    opt_cfg = cfg.for_optimization(db_override=db_path)
+    assert opt_cfg.corpus_root is not None
+    assert not list((opt_cfg.corpus_root / "corpus").glob("*.md"))
+    with closing(sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True)) as conn:
+        original_chunks = conn.execute(
+            "SELECT chunk_id, rel_posix_path, start_line, end_line FROM chunks ORDER BY chunk_id"
+        ).fetchall()
+    assert original_chunks
+    assert all(row[1] == "resume_dataset.json" for row in original_chunks)
     records[0]["question"] = "A changed training question"
     dataset.write_text(json.dumps(records), encoding="utf-8")
     rc, _, errors = run_cli(["--resume"], bare=True)
     assert rc == 1
     assert "Cannot resume" in errors
     assert checkpoint.read_bytes() == original_checkpoint
-    assert corpus_path.read_bytes() == original_corpus
+    with closing(sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True)) as conn:
+        assert (
+            conn.execute(
+                "SELECT chunk_id, rel_posix_path, start_line, end_line FROM chunks ORDER BY chunk_id"
+            ).fetchall()
+            == original_chunks
+        )
 
 
 def test_resume_preserves_unverifiable_legacy_checkpoint(tmp_path: Path) -> None:
@@ -486,7 +532,8 @@ def test_bounded_32_slot_queue_overflow_and_non_blocking_status(tmp_path: Path) 
 
 
 def test_stage1_crash_resume_does_not_reextract_completed_chunks(tmp_path: Path) -> None:
-    """D1-A3 & D1-A5: Crash mid-OpenIE persists completed chunks and pending_sync_delta; restart resumes without re-extracting."""
+    """D1-A3 & D1-A5: Crash mid-OpenIE persists completed chunks and pending_sync_delta; restart resumes without \
+re-extracting."""
     cfg, _ = _make_test_config(tmp_path)
     assert cfg.corpus_root is not None
     assert cfg.db_path is not None
@@ -561,7 +608,8 @@ def test_stage1_crash_resume_does_not_reextract_completed_chunks(tmp_path: Path)
 
 
 def test_inference_outage_degradation_and_recovery(tmp_path: Path) -> None:
-    """D1-A5: Inference outage sets provider_ready=False and lifecycle='degraded' without crashing; recovery restores ready."""
+    """D1-A5: Inference outage sets provider_ready=False and lifecycle='degraded' without crashing; recovery \
+restores ready."""
     cfg, _ = _make_test_config(tmp_path)
     assert cfg.corpus_root is not None
     (cfg.corpus_root / "turing.md").write_text(
@@ -603,10 +651,11 @@ def test_inference_outage_degradation_and_recovery(tmp_path: Path) -> None:
         rt.stop()
 
 
-def test_optimize_and_reload_compiled_program_with_composite_fitness(tmp_path: Path) -> None:
-    """D1-A4: Verify composite fitness formula (Recall@1..20 * EM * F1) / tokens and full-surface persistence."""
-    # 1. Verify exact composite fitness calculation in compute_sizecoding_pareto_score
-    pred_metric = compute_sizecoding_pareto_score(
+@pytest.mark.parametrize("labels", ["combined", "qa", "retrieval"])
+def test_optimize_and_reload_compiled_program_with_composite_fitness(tmp_path: Path, provider, labels: str) -> None:
+    """D1-A4: Verify unweighted arithmetic mean task quality and full-surface persistence."""
+    # 1. Verify exact composite fitness calculation in compute_task_quality_score
+    pred_metric = compute_task_quality_score(
         0.8,
         recall_at_1=0.5,
         recall_at_2=0.6,
@@ -616,17 +665,15 @@ def test_optimize_and_reload_compiled_program_with_composite_fitness(tmp_path: P
         f1=0.9,
         tokens=50,
     )
-    expected_quality = 0.5 * 0.6 * 0.8 * 1.0 * 1.0 * 1.0 * 0.9
-    expected_pareto_raw = expected_quality / 50
-    assert pytest.approx(pred_metric.quality_numerator) == expected_quality
-    assert pytest.approx(pred_metric.pareto_raw) == expected_pareto_raw
+    expected_quality = (0.5 + 0.6 + 0.8 + 1.0 + 1.0 + 1.0 + 0.9) / 7
+    assert pred_metric.score == pytest.approx(expected_quality)
     assert "em" in pred_metric.objective_scores
     assert "f1" in pred_metric.objective_scores
     assert "recall_at_1" in pred_metric.objective_scores
     assert "recall_at_20" in pred_metric.objective_scores
 
     # 2. Verify full-surface optimization and persistence via YawRuntime.optimize()
-    cfg, _ = _make_test_config(tmp_path)
+    cfg, _ = _make_test_config(tmp_path, base_url=provider[0])
     assert cfg.corpus_root is not None
     (cfg.corpus_root / "turing.md").write_text(
         "# Alan Turing\nAlan Turing worked at Bletchley Park.\n",
@@ -644,57 +691,27 @@ def test_optimize_and_reload_compiled_program_with_composite_fitness(tmp_path: P
     prog.gbnf_max_reasoning_chars = 160
     prog.ner.signature = prog.ner.signature.with_instructions("Optimized NER surface instruction.")
 
-    class StubGEPA:
-        def __init__(
-            self,
-            metric: Any,
-            reflection_lm: Any = None,
-            instruction_proposer: Any = None,
-            auto: str = "light",
-            track_stats: bool = False,
-            track_best_outputs: bool = False,
-            log_dir: str | None = None,
-            **kwargs: Any,
-        ) -> None:
-            self.metric = metric
-            self.reflection_lm = reflection_lm
-            self.instruction_proposer = instruction_proposer
-            self.auto = auto
-            self.track_stats = track_stats
-            self.track_best_outputs = track_best_outputs
-            self.log_dir = log_dir
-
-        def compile(self, student: Any, trainset: list[Any], valset: Any = None) -> Any:
-            assert self.reflection_lm is not None
-            assert self.instruction_proposer is not None
-            assert callable(self.instruction_proposer)
-            assert self.track_stats is True
-            assert self.track_best_outputs is True
-            pred = student(question=trainset[0].question)
-            score_pred = self.metric(trainset[0], pred, pred_name="qa")
-            assert score_pred.score > 0.0
-            return student
-
-    orig_gepa = getattr(dspy, "GEPA", None)
-    dspy.GEPA = StubGEPA
+    rt1 = YawRuntime(cfg, program=prog, embedder=emb)
+    rt1.start(sync_on_start=True)
     try:
-        rt1 = YawRuntime(cfg, program=prog, embedder=emb)
-        rt1.start(sync_on_start=True)
-        try:
-            trainset = [
-                dspy.Example(
-                    question="Where did Alan Turing work?",
-                    gold_answers=["Bletchley Park"],
-                    gold_docs=["Alan Turing worked at Bletchley Park."],
-                ).with_inputs("question")
-            ]
-            saved_path = rt1.optimize(trainset, mode="gepa")
-            assert saved_path.exists()
-        finally:
-            rt1.stop()
+        example_data: dict[str, Any] = {"question": "Where did Alan Turing work?"}
+        if labels in ("combined", "qa"):
+            example_data["gold_answers"] = ["Bletchley Park"]
+        if labels in ("combined", "retrieval"):
+            example_data["gold_docs"] = ["Alan Turing worked at Bletchley Park."]
+        trainset = [dspy.Example(**example_data).with_inputs("question")]
+        # Use GEPA itself with a one-evaluation budget, not an optimizer replacement.
+        saved_path = rt1.optimize(trainset, mode="gepa", num_trials=1)
+        assert saved_path.exists()
+        audit = json.loads(saved_path.with_name(f"{saved_path.stem}_graph_rlm_audit.json").read_text(encoding="utf-8"))
+        assert audit["eval_records"]
+        for row in audit["eval_records"]:
+            keys = ["r1", "r2", "r5", "r10", "r20"] if labels != "qa" else []
+            keys += ["em", "f1"] if labels != "retrieval" else []
+            expected_mean = sum(row[key] for key in keys) / len(keys)
+            assert row["score"] == pytest.approx(expected_mean, abs=0.0001)
     finally:
-        if orig_gepa is not None:
-            dspy.GEPA = orig_gepa
+        rt1.stop()
 
     # 3. Start a brand-new YawRuntime and verify compiled_program.json restores all 5 surfaces
     fresh_prog, fresh_emb, _, _ = _make_program_and_embedder()
@@ -709,9 +726,7 @@ def test_optimize_and_reload_compiled_program_with_composite_fitness(tmp_path: P
         assert loaded_p.gbnf_max_facts == 3
         assert loaded_p.gbnf_max_reasoning_chars == 160
         assert rt2.engine.embedder.profile.query_prefix == "task: custom optimized query | query: "
-        assert (
-            rt2.engine.embedder.profile.fact_query_prefix == "task: custom optimized fact | query: "
-        )
+        assert rt2.engine.embedder.profile.fact_query_prefix == "task: custom optimized fact | query: "
         assert rt2.engine.embedder.profile.document_prefix == "title: custom | text: "
     finally:
         rt2.stop()
@@ -757,9 +772,7 @@ def test_cli_subcommands_sync_status_rebuild_and_stop(tmp_path: Path) -> None:
 
     # 4. Foreground daemon run + CLI stop from another thread
     run_thread = threading.Thread(
-        target=lambda: main(
-            ["daemon", "run", "--config", str(toml_path)], program=prog, embedder=emb
-        ),
+        target=lambda: main(["daemon", "run", "--config", str(toml_path)], program=prog, embedder=emb),
         daemon=True,
     )
     run_thread.start()
@@ -785,15 +798,17 @@ def test_cli_subcommands_sync_status_rebuild_and_stop(tmp_path: Path) -> None:
 
 def test_cli_optimize_ergonomics_and_anti_overfitting_gate(
     tmp_path: Path,
+    provider,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify `yaw dspy optimize` CLI ergonomics: benchmark slice parsing, train/val split, telemetry paths, and Tier 2 anti-overfitting guard."""
-    cfg, toml_path = _make_test_config(tmp_path)
+    """Verify `yaw dspy optimize` CLI ergonomics: benchmark slice parsing, train/val split, telemetry paths, and \
+Tier 2 anti-overfitting guard."""
+    cfg, toml_path = _make_test_config(tmp_path, base_url=provider[0])
     assert cfg.corpus_root is not None
     prog, emb, _, _ = _make_program_and_embedder()
 
     # Write a 6-query benchmark-format dataset JSON (with paragraphs + is_supporting)
-    bench_dataset_path = tmp_path / "tier1_slice.json"
+    bench_dataset_path = tmp_path / "tier1_samples.json"
     bench_samples = [
         {
             "id": f"q-{i}",
@@ -817,7 +832,6 @@ def test_cli_optimize_ergonomics_and_anti_overfitting_gate(
     bench_dataset_path.write_text(json.dumps(bench_samples), encoding="utf-8")
 
     captured_gepa: dict[str, Any] = {}
-    opt_slice_file = cfg.corpus_root / ".yaw_optimize_slice.json"
 
     class CaptureGEPA:
         def __init__(self, metric: Any, **kwargs: Any) -> None:
@@ -827,10 +841,17 @@ def test_cli_optimize_ergonomics_and_anti_overfitting_gate(
         def compile(self, student: Any, trainset: list[Any], valset: Any = None) -> Any:
             captured_gepa["trainset_len"] = len(trainset)
             captured_gepa["valset_len"] = len(valset) if valset is not None else 0
-            # Verify .yaw_optimize_slice.json stays on disk with indent=2 during GEPA evolution
-            assert opt_slice_file.exists()
-            raw_slice_text = opt_slice_file.read_text(encoding="utf-8")
-            assert "\n  {\n" in raw_slice_text
+            # Verify CocoIndex synced JSON passages in-place with zero markdown synthesis during GEPA evolution
+            opt_cfg = cfg.for_optimization(db_override="latest")
+            assert opt_cfg.corpus_root is not None
+            assert opt_cfg.db_path is not None
+            assert not list((opt_cfg.corpus_root / "corpus").glob("*.md"))
+            pools = json.loads((tmp_path / "custom_compiled_pools.json").read_text(encoding="utf-8"))
+            assert len(pools["corpus_chunk_ids"]) >= 6
+            with closing(sqlite3.connect(opt_cfg.db_path.as_uri() + "?mode=ro", uri=True)) as conn:
+                db_chunks = conn.execute("SELECT rel_posix_path FROM chunks").fetchall()
+            assert len(db_chunks) >= 4
+            assert all(row[0] == "tier1_samples.json" for row in db_chunks)
             pred = student(question=trainset[0].question)
             assert pred.context.strip() != ""
             proposer = captured_gepa.get("instruction_proposer")
@@ -873,7 +894,15 @@ def test_cli_optimize_ergonomics_and_anti_overfitting_gate(
             embedder=emb,
         )
     assert rc == 0
-    assert opt_slice_file.exists()
+    assert not list((cfg.corpus_root / "corpus").glob("*.md"))
+    opt_cfg_after = cfg.for_optimization(db_override="latest")
+    assert opt_cfg_after.corpus_root is not None
+    assert opt_cfg_after.db_path is not None
+    assert not list((opt_cfg_after.corpus_root / "corpus").glob("*.md"))
+    with closing(sqlite3.connect(opt_cfg_after.db_path.as_uri() + "?mode=ro", uri=True)) as conn:
+        db_chunks_after = conn.execute("SELECT rel_posix_path FROM chunks").fetchall()
+    assert len(db_chunks_after) >= 6
+    assert all(row[0] == "tier1_samples.json" for row in db_chunks_after)
     opt_out = json.loads(buf.getvalue())
     assert opt_out["optimized"] is True
     assert opt_out["mode"] == "gepa"
@@ -911,10 +940,11 @@ def test_cli_optimize_ergonomics_and_anti_overfitting_gate(
 
 def test_cli_optimize_multi_dataset_interleaved_splits(
     tmp_path: Path,
+    provider,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Verify multi-dataset optimization: array of datasets, interleaved train/val splits, and budget allocation."""
-    _, toml_path = _make_test_config(tmp_path)
+    _, toml_path = _make_test_config(tmp_path, base_url=provider[0])
     prog, emb, _, _ = _make_program_and_embedder()
 
     # Create 3 synthetic datasets (each with 10 questions)
@@ -1015,10 +1045,7 @@ def test_cli_status_reports_active_indexing_progress(tmp_path: Path) -> None:
     conn = open_yaw_db(cfg.db_path)
     try:
         # Seed 3 dummy openie records
-        records = [
-            OpenIERecord(chunk_id=f"chunk-{i}", entities=("E",), triples=(("A", "r", "B"),))
-            for i in range(3)
-        ]
+        records = [OpenIERecord(chunk_id=f"chunk-{i}", entities=("E",), triples=(("A", "r", "B"),)) for i in range(3)]
         save_openie_checkpoints(conn, records)
     finally:
         conn.close()
@@ -1073,9 +1100,7 @@ def test_cli_config_get_and_set(tmp_path: Path) -> None:
     # 3. Setting invalid value fails with INVALID_INPUT and preserves yaw.toml integrity
     err_buf = io.StringIO()
     with redirect_stderr(err_buf):
-        rc_err = main(
-            ["config", "set", "optimization.auto", "super_heavy", "--config", str(toml_path)]
-        )
+        rc_err = main(["config", "set", "optimization.auto", "super_heavy", "--config", str(toml_path)])
     assert rc_err == 1
     err_payload = json.loads(err_buf.getvalue())
     assert err_payload["error"] == "INVALID_INPUT"
@@ -1138,12 +1163,13 @@ def test_cli_dspy_load_program_hot_reload_live_and_staged(tmp_path: Path) -> Non
 
 def test_cli_dspy_optimize_sandbox_isolation_and_status(
     tmp_path: Path,
+    provider,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Verify `yaw dspy optimize` runs in an isolated sandbox concurrently with production daemon."""
     from yaw.daemon.cli import is_daemon_locked
 
-    cfg, toml_path = _make_test_config(tmp_path)
+    cfg, toml_path = _make_test_config(tmp_path, base_url=provider[0])
     prog, emb, _, _ = _make_program_and_embedder()
 
     # Start persistent production daemon holding yaw.db.lock
@@ -1161,9 +1187,7 @@ def test_cli_dspy_optimize_sandbox_isolation_and_status(
                         "id": "q1",
                         "question": "Question 1?",
                         "answer": ["Answer 1"],
-                        "paragraphs": [
-                            {"title": "Doc 1", "text": "Content 1.", "is_supporting": True}
-                        ],
+                        "paragraphs": [{"title": "Doc 1", "text": "Content 1.", "is_supporting": True}],
                     }
                 ]
             ),
@@ -1250,3 +1274,245 @@ def test_cli_graph_lint_and_turtle_over_read_only_snapshot_while_daemon_locked(
         assert "sh:conforms true" in ttl_out
     finally:
         prod_rt.stop()
+
+
+def test_cli_benchmark_and_gate_evaluation(tmp_path: Path, provider) -> None:
+    """Verify `yaw benchmark [--gate]` isolates state via YawConfig.for_benchmark and evaluates benchmark_gate.json."""
+    cfg, toml_path = _make_test_config(tmp_path, base_url=provider[0])
+    prog, emb, _, _ = _make_program_and_embedder()
+
+    dataset_path = tmp_path / "2wikimultihopqa.json"
+    dataset_samples = [
+        {
+            "id": "q-1",
+            "question": "Where did Alan Turing work?",
+            "answer": ["Bletchley Park"],
+            "paragraphs": [
+                {
+                    "title": "Alan Turing",
+                    "text": "Alan Turing worked at Bletchley Park during World War II.",
+                    "is_supporting": True,
+                }
+            ],
+        }
+    ]
+    dataset_path.write_text(json.dumps(dataset_samples), encoding="utf-8")
+
+    # 1. Passing gate (thresholds <= 1.0)
+    passing_gate = tmp_path / "passing_gate.json"
+    passing_gate.write_text(
+        json.dumps(
+            {
+                "tolerance": 0.0,
+                "targets": {
+                    "monkeypatched_hipporag": {
+                        "datasets": {
+                            "2wikimultihopqa": {"Recall@5": 0.5, "F1": 0.5},
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    buf_pass = io.StringIO()
+    with redirect_stdout(buf_pass):
+        rc_pass = main(
+            [
+                "dspy",
+                "benchmark",
+                "--config",
+                str(toml_path),
+                "--dataset",
+                str(dataset_path),
+                "--max-queries",
+                "1",
+                "--gate",
+                str(passing_gate),
+                "--target",
+                "monkeypatched_hipporag",
+            ],
+            program=prog,
+            embedder=emb,
+        )
+    assert rc_pass == 0
+    report_pass = json.loads(buf_pass.getvalue())
+    assert report_pass["status"] == "passed"
+    assert report_pass["gate"]["passed"] is True
+    assert report_pass["datasets"]["2wikimultihopqa"]["integrity"]["passed"] is True
+    assert not Path(cfg.db_path).exists()
+    assert not list(tmp_path.rglob("chunk-*.md"))
+
+    # 2. Failing gate (impossible threshold > 1.0 returns exit code 1)
+    failing_gate = tmp_path / "failing_gate.json"
+    failing_gate.write_text(
+        json.dumps(
+            {
+                "tolerance": 0.0,
+                "targets": {
+                    "monkeypatched_hipporag": {
+                        "datasets": {
+                            "2wikimultihopqa": {"Recall@5": 1.5},
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    buf_fail = io.StringIO()
+    with redirect_stdout(buf_fail):
+        rc_fail = main(
+            [
+                "dspy",
+                "benchmark",
+                "--config",
+                str(toml_path),
+                "--dataset",
+                str(dataset_path),
+                "--max-queries",
+                "1",
+                "--gate",
+                str(failing_gate),
+                "--target",
+                "monkeypatched_hipporag",
+            ],
+            program=prog,
+            embedder=emb,
+        )
+    assert rc_fail == 1
+    report_fail = json.loads(buf_fail.getvalue())
+    assert report_fail["gate"]["passed"] is False
+    assert report_fail["gate"]["failures"]
+
+    # 3. Verify ExactMatch tolerance enforcement and positional runtime.benchmark call
+    em_failing_gate = tmp_path / "em_failing_gate.json"
+    em_failing_gate.write_text(
+        json.dumps(
+            {
+                "tolerance": 0.0,
+                "targets": {
+                    "monkeypatched_hipporag": {
+                        "datasets": {
+                            "2wikimultihopqa": {"Recall@5": 0.0, "F1": 0.0, "ExactMatch": 1.5},
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    rt = YawRuntime(cfg, program=prog, embedder=emb, auto_poll=False)
+    progress_msgs: list[str] = []
+    pos_report = rt.benchmark(
+        [str(dataset_path)],
+        gate_path=em_failing_gate,
+        max_queries=1,
+        target="monkeypatched_hipporag",
+        progress_callback=progress_msgs.append,
+    )
+    assert pos_report["overall_gate_passed"] is False
+    assert any("ExactMatch" in f for f in pos_report["gate"]["failures"])
+    assert len(progress_msgs) >= 2
+
+
+def test_canonical_benchmark_gate_json_and_dataset_ingestion_invariants(tmp_path: Path) -> None:
+    """Verify benchmark_gate.json matches consolidated baselines and sync_source_files_for_docs preserves user files."""
+    from yaw.daemon.ingestion import (
+        MONKEYPATCHED_HIPPORAG_BASELINES,
+        PAPER_BASELINES,
+        load_dataset_splits,
+        sync_source_files_for_docs,
+    )
+
+    gate_file = Path(__file__).resolve().parents[2] / "benchmark_gate.json"
+    gate_data = json.loads(gate_file.read_text(encoding="utf-8"))
+    assert set(gate_data["datasets"].keys()) == set(MONKEYPATCHED_HIPPORAG_BASELINES.keys())
+    for ds in MONKEYPATCHED_HIPPORAG_BASELINES:
+        assert gate_data["datasets"][ds]["monkeypatched_hipporag"] == MONKEYPATCHED_HIPPORAG_BASELINES[ds]
+        paper_ref = PAPER_BASELINES[ds]["hipporag2_llama3.3_70b_nvembed_v2"]
+        for metric_key in ("Recall@2", "Recall@5", "ExactMatch", "F1"):
+            if metric_key in paper_ref:
+                assert gate_data["datasets"][ds]["paper_70b"][metric_key] == paper_ref[metric_key]
+
+    # Anti-overfitting alias check on load_dataset_splits
+    with pytest.raises(YawRuntimeError) as exc_info:
+        load_dataset_splits(["2wiki"], workspace_root=tmp_path, max_queries=100)
+    assert exc_info.value.code == "INVALID_INPUT"
+
+    # sync_source_files_for_docs preserves user corpus/*.md files and is idempotent across repeated calls
+    corpus_root = tmp_path / "ws"
+    user_md_dir = corpus_root / "corpus"
+    user_md_dir.mkdir(parents=True, exist_ok=True)
+    user_md = user_md_dir / "architecture.md"
+    user_md.write_text("# Architecture\nImportant user documentation.\n", encoding="utf-8")
+    corpus_json = corpus_root / "corpus.json"
+    corpus_json.write_text(
+        json.dumps([{"title": "Doc Title", "text": "Doc body text for testing."}], indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    state_dir = tmp_path / "coco_state"
+    docs = ["Doc Title\nDoc body text for testing."]
+    chunks1 = sync_source_files_for_docs(
+        corpus_root, state_dir, allowed_docs=docs, source_files=[corpus_json], min_chunk_size=1
+    )
+    assert user_md.exists()
+    assert not list(user_md_dir.glob("chunk-*.md"))
+    assert len(chunks1) == 1
+    assert chunks1[0][0].rel_posix_path == "corpus.json"
+
+    # Repeated call with allowed_docs=None returns chunks idempotently
+    chunks2 = sync_source_files_for_docs(corpus_root, state_dir, allowed_docs=None, min_chunk_size=1)
+    assert len(chunks2) >= 2
+    chunks3 = sync_source_files_for_docs(corpus_root, state_dir, allowed_docs=None, min_chunk_size=1)
+    assert len(chunks3) == len(chunks2)
+
+
+def test_sync_now_executes_single_index_chunks_and_pre_start_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify sync_now invokes engine.index_chunks once per sync (no double _apply_delta) and pre-start stop works."""
+    cfg, _ = _make_test_config(tmp_path)
+    assert cfg.corpus_root is not None
+    (cfg.corpus_root / "turing.md").write_text(
+        "# Alan Turing\nAlan Turing worked at Bletchley Park.\n",
+        encoding="utf-8",
+    )
+    prog, emb, _, _ = _make_program_and_embedder()
+
+    # 1. Pre-start stop() sets stop event; subsequent first start() honors it immediately
+    rt_pre = YawRuntime(cfg, program=prog, embedder=emb, auto_poll=False)
+    rt_pre.stop()
+    rt_pre.start(sync_on_start=False)
+    assert rt_pre.status().lifecycle == "stopped"
+
+    # 2. Normal start and verify engine.index_chunks is called exactly once during sync_now()
+    rt = YawRuntime(cfg, program=prog, embedder=emb, auto_poll=False)
+    rt.start(sync_on_start=False)
+    try:
+        assert rt.ingestor is not None
+        assert rt.ingestor.on_delta is not None
+        assert rt.engine is not None
+
+        index_calls = 0
+        orig_index_chunks = rt.engine.index_chunks
+
+        def counted_index_chunks(
+            chunks: Sequence[tuple[Any, str]],
+            *,
+            progress_callback: Any | None = None,
+            program: Any | None = None,
+        ) -> int:
+            nonlocal index_calls
+            index_calls += 1
+            return orig_index_chunks(chunks, progress_callback=progress_callback, program=program)
+
+        monkeypatch.setattr(rt.engine, "index_chunks", counted_index_chunks)
+        summary = rt.sync_now()
+        assert len(summary.added_chunks) == 1
+        assert index_calls == 1
+    finally:
+        rt.stop()
