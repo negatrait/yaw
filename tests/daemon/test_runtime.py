@@ -36,6 +36,21 @@ from yaw.daemon.graph.storage import get_meta, get_openie_checkpoints, open_yaw_
 from yaw.daemon.runtime import YawRuntime
 
 
+def prepare_runtime_bundle(source: Path, *, dataset_name: str | None = None, validation_row: bool = False) -> Path:
+    from yaw.daemon.ingestion import prepare_dataset_bundle
+
+    rows: list[dict[str, Any]] = json.loads(source.read_text(encoding="utf-8"))
+    if validation_row and len(rows) == 1:
+        rows = [*rows, dict(rows[0], id="validation", question="A distinct validation question?")]
+        source.write_text(json.dumps(rows), encoding="utf-8")
+    documents = [
+        {"title": p["title"], "text": p.get("text", p.get("paragraph_text"))} for row in rows for p in row["paragraphs"]
+    ]
+    corpus = source.with_name(source.stem + "_documents.json")
+    corpus.write_text(json.dumps(documents), encoding="utf-8")
+    return prepare_dataset_bundle(dataset_name or source.stem, corpus, source, source.parent / "outputs/datasets").root
+
+
 class DeterministicTestLM(dspy.LM):
     """Deterministic in-process dspy.LM for offline daemon runtime tests."""
 
@@ -305,6 +320,7 @@ def test_cli_resume_real_gepa_checkpoint_and_custom_output(tmp_path: Path, provi
         for i in range(2)
     ]
     dataset.write_text(json.dumps(records), encoding="utf-8")
+    dataset_bundle = prepare_runtime_bundle(dataset)
     custom_output = tmp_path / "my_compiled.json"
     common = [
         "dspy",
@@ -312,7 +328,7 @@ def test_cli_resume_real_gepa_checkpoint_and_custom_output(tmp_path: Path, provi
         "--config",
         str(toml_path),
         "--dataset",
-        str(dataset),
+        str(dataset_bundle),
         "--mode",
         "gepa",
         "--max-queries",
@@ -420,9 +436,10 @@ def test_cli_resume_real_gepa_checkpoint_and_custom_output(tmp_path: Path, provi
             "SELECT chunk_id, rel_posix_path, start_line, end_line FROM chunks ORDER BY chunk_id"
         ).fetchall()
     assert original_chunks
-    assert all(row[1] == "resume_dataset.json" for row in original_chunks)
+    assert all("/documents/" in row[1] for row in original_chunks)
     records[0]["question"] = "A changed training question"
     dataset.write_text(json.dumps(records), encoding="utf-8")
+    dataset_bundle = prepare_runtime_bundle(dataset)
     rc, _, errors = run_cli(["--resume"], bare=True)
     assert rc == 1
     assert "Cannot resume" in errors
@@ -830,6 +847,7 @@ Tier 2 anti-overfitting guard."""
         for i in range(6)
     ]
     bench_dataset_path.write_text(json.dumps(bench_samples), encoding="utf-8")
+    bench_bundle = prepare_runtime_bundle(bench_dataset_path)
 
     captured_gepa: dict[str, Any] = {}
 
@@ -851,7 +869,7 @@ Tier 2 anti-overfitting guard."""
             with closing(sqlite3.connect(opt_cfg.db_path.as_uri() + "?mode=ro", uri=True)) as conn:
                 db_chunks = conn.execute("SELECT rel_posix_path FROM chunks").fetchall()
             assert len(db_chunks) >= 4
-            assert all(row[0] == "tier1_samples.json" for row in db_chunks)
+            assert all("/documents/" in row[0] for row in db_chunks)
             pred = student(question=trainset[0].question)
             assert pred.context.strip() != ""
             proposer = captured_gepa.get("instruction_proposer")
@@ -878,7 +896,7 @@ Tier 2 anti-overfitting guard."""
                 "--config",
                 str(toml_path),
                 "--dataset",
-                str(bench_dataset_path),
+                str(bench_bundle),
                 "--mode",
                 "gepa",
                 "--max-queries",
@@ -902,7 +920,7 @@ Tier 2 anti-overfitting guard."""
     with closing(sqlite3.connect(opt_cfg_after.db_path.as_uri() + "?mode=ro", uri=True)) as conn:
         db_chunks_after = conn.execute("SELECT rel_posix_path FROM chunks").fetchall()
     assert len(db_chunks_after) >= 6
-    assert all(row[0] == "tier1_samples.json" for row in db_chunks_after)
+    assert all("/documents/" in row[0] for row in db_chunks_after)
     opt_out = json.loads(buf.getvalue())
     assert opt_out["optimized"] is True
     assert opt_out["mode"] == "gepa"
@@ -967,7 +985,7 @@ def test_cli_optimize_multi_dataset_interleaved_splits(
             for i in range(10)
         ]
         ds_file.write_text(json.dumps(samples), encoding="utf-8")
-        ds_paths.append(ds_file)
+        ds_paths.append(prepare_runtime_bundle(ds_file))
 
     captured_gepa: dict[str, Any] = {}
 
@@ -1194,6 +1212,8 @@ def test_cli_dspy_optimize_sandbox_isolation_and_status(
             encoding="utf-8",
         )
 
+        bench_bundle = prepare_runtime_bundle(bench_ds, validation_row=True)
+
         class FastGEPA:
             def __init__(self, *args: Any, **kwargs: Any) -> None:
                 pass
@@ -1214,9 +1234,9 @@ def test_cli_dspy_optimize_sandbox_isolation_and_status(
                     "--config",
                     str(toml_path),
                     "--dataset",
-                    str(bench_ds),
+                    str(bench_bundle),
                     "--max-queries",
-                    "1",
+                    "2",
                     "--train-queries",
                     "1",
                     "--auto",
@@ -1297,6 +1317,7 @@ def test_cli_benchmark_and_gate_evaluation(tmp_path: Path, provider) -> None:
         }
     ]
     dataset_path.write_text(json.dumps(dataset_samples), encoding="utf-8")
+    dataset_bundle = prepare_runtime_bundle(dataset_path, dataset_name="2wikimultihopqa")
 
     # 1. Passing gate (thresholds <= 1.0)
     passing_gate = tmp_path / "passing_gate.json"
@@ -1325,7 +1346,7 @@ def test_cli_benchmark_and_gate_evaluation(tmp_path: Path, provider) -> None:
                 "--config",
                 str(toml_path),
                 "--dataset",
-                str(dataset_path),
+                str(dataset_bundle),
                 "--max-queries",
                 "1",
                 "--gate",
@@ -1371,7 +1392,7 @@ def test_cli_benchmark_and_gate_evaluation(tmp_path: Path, provider) -> None:
                 "--config",
                 str(toml_path),
                 "--dataset",
-                str(dataset_path),
+                str(dataset_bundle),
                 "--max-queries",
                 "1",
                 "--gate",
@@ -1407,7 +1428,7 @@ def test_cli_benchmark_and_gate_evaluation(tmp_path: Path, provider) -> None:
     rt = YawRuntime(cfg, program=prog, embedder=emb, auto_poll=False)
     progress_msgs: list[str] = []
     pos_report = rt.benchmark(
-        [str(dataset_path)],
+        [str(dataset_bundle)],
         gate_path=em_failing_gate,
         max_queries=1,
         target="monkeypatched_hipporag",
@@ -1419,56 +1440,17 @@ def test_cli_benchmark_and_gate_evaluation(tmp_path: Path, provider) -> None:
 
 
 def test_canonical_benchmark_gate_json_and_dataset_ingestion_invariants(tmp_path: Path) -> None:
-    """Verify benchmark_gate.json matches consolidated baselines and sync_source_files_for_docs preserves user files."""
-    from yaw.daemon.ingestion import (
-        MONKEYPATCHED_HIPPORAG_BASELINES,
-        PAPER_BASELINES,
-        load_dataset_splits,
-        sync_source_files_for_docs,
-    )
+    from yaw.daemon.ingestion import MONKEYPATCHED_HIPPORAG_BASELINES, PAPER_BASELINES, load_dataset_splits
 
-    gate_file = Path(__file__).resolve().parents[2] / "benchmark_gate.json"
-    gate_data = json.loads(gate_file.read_text(encoding="utf-8"))
-    assert set(gate_data["datasets"].keys()) == set(MONKEYPATCHED_HIPPORAG_BASELINES.keys())
-    for ds in MONKEYPATCHED_HIPPORAG_BASELINES:
-        assert gate_data["datasets"][ds]["monkeypatched_hipporag"] == MONKEYPATCHED_HIPPORAG_BASELINES[ds]
-        paper_ref = PAPER_BASELINES[ds]["hipporag2_llama3.3_70b_nvembed_v2"]
-        for metric_key in ("Recall@2", "Recall@5", "ExactMatch", "F1"):
-            if metric_key in paper_ref:
-                assert gate_data["datasets"][ds]["paper_70b"][metric_key] == paper_ref[metric_key]
-
-    # Anti-overfitting alias check on load_dataset_splits
-    with pytest.raises(YawRuntimeError) as exc_info:
+    gate = json.loads((Path(__file__).resolve().parents[2] / "benchmark_gate.json").read_text(encoding="utf-8"))
+    assert set(gate["datasets"]) == set(MONKEYPATCHED_HIPPORAG_BASELINES)
+    for dataset, baseline in MONKEYPATCHED_HIPPORAG_BASELINES.items():
+        assert gate["datasets"][dataset]["monkeypatched_hipporag"] == baseline
+        for metric, score in PAPER_BASELINES[dataset]["hipporag2_llama3.3_70b_nvembed_v2"].items():
+            if metric in ("Recall@2", "Recall@5", "ExactMatch", "F1"):
+                assert gate["datasets"][dataset]["paper_70b"][metric] == score
+    with pytest.raises(YawRuntimeError, match="held-out"):
         load_dataset_splits(["2wiki"], workspace_root=tmp_path, max_queries=100)
-    assert exc_info.value.code == "INVALID_INPUT"
-
-    # sync_source_files_for_docs preserves user corpus/*.md files and is idempotent across repeated calls
-    corpus_root = tmp_path / "ws"
-    user_md_dir = corpus_root / "corpus"
-    user_md_dir.mkdir(parents=True, exist_ok=True)
-    user_md = user_md_dir / "architecture.md"
-    user_md.write_text("# Architecture\nImportant user documentation.\n", encoding="utf-8")
-    corpus_json = corpus_root / "corpus.json"
-    corpus_json.write_text(
-        json.dumps([{"title": "Doc Title", "text": "Doc body text for testing."}], indent=2) + "\n",
-        encoding="utf-8",
-    )
-
-    state_dir = tmp_path / "coco_state"
-    docs = ["Doc Title\nDoc body text for testing."]
-    chunks1 = sync_source_files_for_docs(
-        corpus_root, state_dir, allowed_docs=docs, source_files=[corpus_json], min_chunk_size=1
-    )
-    assert user_md.exists()
-    assert not list(user_md_dir.glob("chunk-*.md"))
-    assert len(chunks1) == 1
-    assert chunks1[0][0].rel_posix_path == "corpus.json"
-
-    # Repeated call with allowed_docs=None returns chunks idempotently
-    chunks2 = sync_source_files_for_docs(corpus_root, state_dir, allowed_docs=None, min_chunk_size=1)
-    assert len(chunks2) >= 2
-    chunks3 = sync_source_files_for_docs(corpus_root, state_dir, allowed_docs=None, min_chunk_size=1)
-    assert len(chunks3) == len(chunks2)
 
 
 def test_sync_now_executes_single_index_chunks_and_pre_start_stop(

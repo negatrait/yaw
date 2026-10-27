@@ -316,9 +316,18 @@ print(json.dumps([p.title for p, text in delta.added_chunks]))
     module = snapshot / "yaw/daemon/ingestion/corpus.py"
     before = module.read_text(encoding="utf-8")
     after = before.replace(
-        "title = resolve_heading_for_line(headings, start_line, fallback_title)",
-        'title = "Changed by parser helper"',
+        "return heading_title if heading_title else fallback_title",
+        'return "Changed by parser helper"',
     )
+    assert before != after
+    module.write_text(after, encoding="utf-8")
+    assert scan() == ["Changed by parser helper"]
+    assert scan() == []
+    # Shared rendering/identity contracts are dependencies too: a helper in
+    # yaw.core must invalidate file memos even when corpus.py is unchanged.
+    module = snapshot / "yaw/core/types.py"
+    before = module.read_text(encoding="utf-8")
+    after = before.replace('prefix="chunk-"', 'prefix="updated-chunk-"')
     assert before != after
     module.write_text(after, encoding="utf-8")
     assert scan() == ["Changed by parser helper"]
@@ -392,238 +401,110 @@ def test_native_cocoindex_ast_headings_across_languages() -> None:
     assert "TokenVerifier" in py_chunks[0][0].title
 
 
-def test_corporate_json_secret_blacklisting_and_hydration(tmp_path: Path) -> None:
+def test_strict_json_projection_excludes_secrets_during_real_hydration(tmp_path):
     import json
 
-    corpus_dir = tmp_path / "corpus"
-    state_dir = tmp_path / "state"
-    corpus_dir.mkdir()
-    state_dir.mkdir()
+    from yaw.daemon.ingestion import chunk_json_text
 
-    corporate_payload = [
-        {
-            "title": "Internal Payment Gateway",
-            "user": "corp_admin_secret_user",
-            "password": "super_secret_password_987",
-            "credentials": {
-                "db_password": "nested_password_456",
-                "auth_header": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.secret",
+    source = tmp_path / "record.json"
+    source.write_text(
+        json.dumps(
+            {
+                "title": "Service",
+                "credentials": {"password": "SECRET"},
+                "endpoint": "https://example.test",
+                "retries": 3,
             },
-            "endpoint": "https://payments.internal.example/v2",
-            "retries": 3,
-        }
-    ]
-    json_file = corpus_dir / "services.json"
-    json_file.write_text(json.dumps(corporate_payload, indent=2), encoding="utf-8")
-
-    delta = sync_corpus_once(
-        corpus_dir,
-        state_dir,
-        json_keys_whitelist=("*",),
-        json_keys_blacklist=("Bearer*", "*password*", "user"),
+            indent=2,
+        ),
+        encoding="utf-8",
     )
-    assert len(delta.added_chunks) == 1
-    ptr, chunk_text = delta.added_chunks[0]
-    assert ptr.title == "Internal Payment Gateway"
-    assert "https://payments.internal.example/v2" in chunk_text
-    assert "corp_admin_secret_user" not in chunk_text
-    assert "super_secret_password_987" not in chunk_text
-    assert "nested_password_456" not in chunk_text
-    assert "Bearer eyJ" not in chunk_text
-
-    # Physical air-gap check on source file and 1-indexed line hydration
-    hydrated = hydrate_chunk_pointer(ptr, corpus_dir)
-    assert not hydrated.stale_on_disk
-    assert "Internal Payment Gateway" in hydrated.text
-    assert "https://payments.internal.example/v2" in hydrated.text
-    assert "corp_admin_secret_user" not in hydrated.text
-    assert "super_secret_password_987" not in hydrated.text
-    assert "Bearer eyJ" not in hydrated.text
-
-
-def test_benchmark_json_air_gapping_and_exact_passage_hydration(tmp_path: Path) -> None:
-    import json
-
-    from benchmark import BENCHMARK_JSON_BLACKLIST, BENCHMARK_JSON_WHITELIST
-
-    corpus_dir = tmp_path / "corpus"
-    state_dir = tmp_path / "state"
-    corpus_dir.mkdir()
-    state_dir.mkdir()
-
-    hotpot_sample = [
-        {
-            "_id": "hp_leak_test_1",
-            "question": "LEAKED_QUESTION_STRING_XYZ?",
-            "answer": "LEAKED_ANSWER_STRING_ABC",
-            "supporting_facts": [["Montebello", 0], ["Rockland County", 0]],
-            "context": [
-                [
-                    "Montebello",
-                    [
-                        "Montebello is an incorporated village in the town of Ramapo.",
-                        "It is in Rockland County, New York.",
-                    ],
-                ],
-                [
-                    "Rockland County",
-                    ["Rockland County is the southernmost county on the west side of the Hudson River."],
-                ],
-            ],
-        }
-    ]
-    hp_path = corpus_dir / "hotpotqa_sample.json"
-    hp_path.write_text(json.dumps(hotpot_sample, indent=2), encoding="utf-8")
-
-    delta = sync_corpus_once(
-        corpus_dir,
-        state_dir,
-        json_keys_whitelist=BENCHMARK_JSON_WHITELIST,
-        json_keys_blacklist=BENCHMARK_JSON_BLACKLIST,
-    )
-    assert len(delta.added_chunks) == 2
-
-    hydrated_texts = []
-    for ptr, c_text in sorted(delta.added_chunks, key=lambda item: item[0].start_line):
-        assert "LEAKED_QUESTION_STRING_XYZ" not in c_text
-        assert "LEAKED_ANSWER_STRING_ABC" not in c_text
-        hp = hydrate_chunk_pointer(ptr, corpus_dir)
-        assert not hp.stale_on_disk
-        assert "LEAKED_QUESTION_STRING_XYZ" not in hp.text
-        assert "LEAKED_ANSWER_STRING_ABC" not in hp.text
-        hydrated_texts.append(hp.text)
-
-    expected_p1 = (
-        "Montebello\nMontebello is an incorporated village in the town of Ramapo.It is in Rockland County, New York."
-    )
-    expected_p2 = "Rockland County\nRockland County is the southernmost county on the west side of the Hudson River."
-    assert hydrated_texts == [expected_p1, expected_p2]
-
-
-def test_json_direct_line_bounds_and_multi_subchunk_hydration(tmp_path: Path) -> None:
-    import inspect
-    import json
-
-    import yaw.daemon.ingestion.corpus as corpus_mod
-    from yaw.daemon.graph.storage.hydration import read_corpus_lines
-    from yaw.daemon.ingestion.corpus import chunk_json_text, project_json_records
-    from yaw.daemon.ingestion.datasets import BENCHMARK_JSON_BLACKLIST, BENCHMARK_JSON_WHITELIST
-
-    # Verify retired symbols are demolished from project_json_records and chunk_json_text
-    proj_src = inspect.getsource(corpus_mod.project_json_records)
-    chunk_src = inspect.getsource(corpus_mod.chunk_json_text)
-    assert "line_of_byte" not in proj_src
-    assert "clean_bytes" not in proj_src
-    assert "sub_s" not in chunk_src
-    assert "sub_e" not in chunk_src
-
-    long_para_1 = "Paragraph one explains the distributed consensus protocol in detail. " * 12
-    long_para_2 = "Paragraph two describes leader election and log replication invariants. " * 12
-    long_body = f"{long_para_1.strip()}\n\n{long_para_2.strip()}"
-
-    payload = [
-        {
-            "idx": "dsid_001",
-            "title": "[github] Consensus Protocol",
-            "text": long_body,
-            "source_type": "github",
-        },
-        {
-            "idx": "dsid_001_dup",
-            "title": "[github] Consensus Protocol",
-            "text": long_body,
-            "source_type": "github",
-        },
-    ]
-    raw_json = json.dumps(payload, indent=2) + "\n"
-    corpus_file = tmp_path / "enterprise_rag_bench_corpus.json"
-    corpus_file.write_text(raw_json, encoding="utf-8")
-
-    # 1. Both default (no blacklist) and BENCHMARK_JSON_BLACKLIST preserve native object lines (2..7)
-    #    and extract long_body cleanly even when idx and source_type are present
-    recs_no_bl = project_json_records(raw_json, "enterprise_rag_bench_corpus.json")
-    assert len(recs_no_bl) == 2
-    assert recs_no_bl[0] == ("[github] Consensus Protocol", long_body, 2, 7)
-    assert recs_no_bl[1] == ("[github] Consensus Protocol", long_body, 8, 13)
-
-    recs_bl = project_json_records(
-        raw_json,
-        "enterprise_rag_bench_corpus.json",
-        whitelist=BENCHMARK_JSON_WHITELIST,
-        blacklist=BENCHMARK_JSON_BLACKLIST,
-    )
-    assert len(recs_bl) == 2
-    assert recs_bl[0] == ("[github] Consensus Protocol", long_body, 2, 7)
-    assert recs_bl[1] == ("[github] Consensus Protocol", long_body, 8, 13)
-
-    # 2. Split with chunk_size smaller than long_body + deduplicate identical (clean_title, clean_body)
     chunks = chunk_json_text(
-        raw_json,
-        "enterprise_rag_bench_corpus.json",
-        chunk_size=900,
-        chunk_overlap=80,
-        whitelist=BENCHMARK_JSON_WHITELIST,
-        blacklist=BENCHMARK_JSON_BLACKLIST,
+        source.read_text(encoding="utf-8"), source.name, blacklist=("credentials",), min_chunk_size=1
     )
-    assert len(chunks) >= 2
-    for ptr, sc_text in chunks:
-        assert ptr.title == "[github] Consensus Protocol"
-        assert sc_text.startswith("[github] Consensus Protocol\n")
-        assert len(sc_text) <= 900
-        # Every sub-chunk retains the parent JSON record's exact 1-indexed object line bounds (2..7)
-        assert ptr.start_line == 2
-        assert ptr.end_line == 7
-        assert ptr.ast_island_start == 2
-        assert ptr.ast_island_end == 7
-        hp = hydrate_chunk_pointer(ptr, tmp_path)
-        assert not hp.stale_on_disk
-        assert hp.text.startswith("[github] Consensus Protocol\n")
-        assert "Paragraph one" in hp.text
-        assert "dsid_001" not in hp.text
+    assert chunks
+    hydrated = [hydrate_chunk_pointer(ptr, tmp_path).text for ptr, _ in chunks]
+    assert any("https://example.test" in text for text in hydrated)
+    assert all("SECRET" not in text and "password" not in text for text in hydrated)
 
-    # 3. JSONL physical line accuracy (no off-by-one shift from synthetic array wrapping)
-    jsonl_content = (
-        json.dumps({"idx": "j1", "title": "First JSONL", "text": "First JSONL body text."})
+
+def test_native_scopes_preserve_unindented_brace_style():
+    from yaw.daemon.ingestion import extract_ast_headings
+
+    code = "int add(int a, int b)\n{ return a + b; }\nint main() {\nreturn add(1, 2);\n}\n"
+    headings = extract_ast_headings(code, "c")
+    assert any("add(" in title for _, title in headings)
+    assert any("main(" in title for _, title in headings)
+
+
+def test_markdown_fences_require_matching_marker_and_closing_length():
+    source = "````md\n# Hidden\n~~~\n# Also hidden\n```\n# Still hidden\n````\n# Visible\n"
+    assert extract_markdown_headings(source) == [(8, "Visible")]
+
+
+def test_json_projection_rejects_unsafe_compact_spans_and_malformed_input(tmp_path):
+    import pytest
+
+    from yaw.daemon.ingestion import chunk_json_text
+
+    with pytest.raises(ValueError, match="unsafe JSON projection"):
+        chunk_json_text(
+            '{"title":"Service","password":"SECRET","text":"public"}', "unsafe.json", blacklist=("password",)
+        )
+    with pytest.raises(ValueError):
+        chunk_json_text('{"title": malformed}', "invalid.json")
+    assert chunk_json_text("[]", "empty.json") == ()
+
+
+def test_jsonl_and_escaped_multiline_body_keep_original_source_coordinates(tmp_path):
+    import json
+
+    from yaw.daemon.ingestion import chunk_json_text
+
+    source = tmp_path / "records.jsonl"
+    source.write_text(
+        json.dumps({"title": "First", "text": "line\n" * 500})
         + "\n\n"
-        + json.dumps({"idx": "j2", "title": "Second JSONL", "text": "Second JSONL body text."})
-        + "\n"
+        + json.dumps({"title": "Second", "text": "äö \U0001f600"})
+        + "\n",
+        encoding="utf-8",
     )
-    jsonl_file = tmp_path / "records.jsonl"
-    jsonl_file.write_text(jsonl_content, encoding="utf-8")
-    jsonl_chunks = chunk_json_text(
-        jsonl_content,
-        "records.jsonl",
-        whitelist=BENCHMARK_JSON_WHITELIST,
-        blacklist=BENCHMARK_JSON_BLACKLIST,
-    )
-    assert len(jsonl_chunks) == 2
-    assert (jsonl_chunks[0][0].start_line, jsonl_chunks[0][0].end_line) == (1, 1)
-    assert (jsonl_chunks[1][0].start_line, jsonl_chunks[1][0].end_line) == (3, 3)
-    hp_j1 = hydrate_chunk_pointer(jsonl_chunks[0][0], tmp_path)
-    hp_j2 = hydrate_chunk_pointer(jsonl_chunks[1][0], tmp_path)
-    assert not hp_j1.stale_on_disk and hp_j1.text == "First JSONL\nFirst JSONL body text."
-    assert not hp_j2.stale_on_disk and hp_j2.text == "Second JSONL\nSecond JSONL body text."
+    chunks = chunk_json_text(source.read_text(encoding="utf-8"), source.name, chunk_size=200, min_chunk_size=1)
+    assert len(chunks) > 2
+    for ptr, _ in chunks:
+        assert (ptr.start_line, ptr.end_line) == ((1, 1) if ptr.title == "First" else (3, 3))
+        assert ptr.ast_island_start == ptr.start_line and ptr.ast_island_end == ptr.end_line
+        assert not hydrate_chunk_pointer(ptr, tmp_path).stale_on_disk
 
-    # 4. Non-metadata blacklisted keys (question/answer) still trigger physical line excision
-    mixed_payload = [
-        {
-            "question": "LEAKED_TOP_QUESTION?",
-            "answer": "LEAKED_TOP_ANSWER",
-            "title": "Clean Passage",
-            "text": "Clean body without question or answer.",
-        }
-    ]
-    mixed_json = json.dumps(mixed_payload, indent=2) + "\n"
-    mixed_file = tmp_path / "mixed.json"
-    mixed_file.write_text(mixed_json, encoding="utf-8")
-    mixed_chunks = chunk_json_text(
-        mixed_json,
-        "mixed.json",
-        whitelist=BENCHMARK_JSON_WHITELIST,
-        blacklist=BENCHMARK_JSON_BLACKLIST,
-    )
-    assert len(mixed_chunks) == 1
-    m_ptr, _ = mixed_chunks[0]
-    raw_slice = read_corpus_lines(mixed_file, m_ptr.start_line, m_ptr.end_line) or ""
-    assert "LEAKED_TOP_QUESTION" not in raw_slice
-    assert "LEAKED_TOP_ANSWER" not in raw_slice
+
+def test_nested_projection_preserves_object_identity_or_rejects_unsafe_partial_object(tmp_path):
+    import json
+
+    import pytest
+
+    from yaw.daemon.ingestion import chunk_json_text
+
+    source = tmp_path / "nested.json"
+    source.write_text(json.dumps({"profile": {"name": "Ada"}, "password": "SECRET"}, indent=2), encoding="utf-8")
+    chunks = chunk_json_text(source.read_text(encoding="utf-8"), source.name, blacklist=("password",), min_chunk_size=1)
+    assert chunks
+    text = hydrate_chunk_pointer(chunks[0][0], tmp_path).text
+    assert "profile" in text and "Ada" in text and "SECRET" not in text
+    source.write_text(json.dumps({"profile": {"name": "Ada", "password": "SECRET"}}, indent=2), encoding="utf-8")
+    with pytest.raises(ValueError, match="enclosing object"):
+        chunk_json_text(source.read_text(encoding="utf-8"), source.name, blacklist=("password",))
+
+
+def test_compact_multi_record_array_cannot_masquerade_as_individual_source_spans():
+    import pytest
+
+    from yaw.daemon.ingestion import chunk_json_text
+
+    with pytest.raises(ValueError, match="unsafe JSON projection/source span"):
+        chunk_json_text('[{"title":"A","text":"Body"},{"title":"B","text":"Other"}]', "records.json")
+
+
+def test_whitelist_excludes_empty_objects_without_leaking_their_keys():
+    from yaw.daemon.ingestion import chunk_json_text
+
+    assert chunk_json_text('{"secret":{}}', "record.json", whitelist=("text",)) == ()

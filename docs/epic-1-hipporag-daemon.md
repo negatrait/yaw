@@ -23,7 +23,7 @@ RLM separation, embedding selection, and historical benchmark targets remain.
 yaw/
   core/                    types.py, config.py, logger.py          (imports: stdlib only)
   daemon/                  runtime.py, cli.py, mcp_server.py       (imports: daemon.*, core)
-    ingestion/             corpus.py, datasets.py                  (imports: core, cocoindex)
+    ingestion/             corpus.py, datasets.py, bundles.py      (imports: core, cocoindex)
     graph/                 engine.py, ppr.py                       (imports: graph.*, core, scipy)
       storage/             db.py, vectors.py, graph_ops.py, shacl.py, hydration.py, candidate_cache.py (imports: core, sqlite3, sqlite_vec)
       inference/           models.py, prompts.py, embedding.py, chat.py, grammars.py, parsers.py, invariants.py, adapter.py, rlm.py, retriever.py, proposer.py, diagnostics.py, reflection.py, optimizer.py, program.py (imports: core, dspy)
@@ -147,6 +147,13 @@ Execute strictly in order `E1-S1` $\to$ `E1-S6`. Never start Sprint $k+1$ until 
 ---
 
 ### Sprint 5 (`E1-S5`): `yaw/daemon/ingestion/corpus.py` — CocoIndex Incremental Line-Pointer Pipeline & Target Sink Compiler Hook
+- **2026-10-27 replacement packet:** execute the restart checklist in
+  [dataset ingestion refactor](dataset-ingestion-refactor.md). Dataset preparation
+  emits isolated document files; persistent CocoIndex snapshots replace fresh-state
+  reconstruction. The exit condition includes warm snapshots without reparsing,
+  unchanged source values, loader-owned Enterprise stratification and no legacy
+  discovery/projection consumers. The packet supersedes benchmark-shape parsing
+  and automatic benchmark JSON projection settings described elsewhere.
 - **Files:** `yaw/daemon/ingestion/corpus.py`, `tests/daemon/ingestion/test_corpus.py`.
 - **Allowed imports:** `yaw.core.*`, `cocoindex`, `hashlib`, `pathlib`. (Zero imports from `graph/`).
 - **Copy/Adapt From:**

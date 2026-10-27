@@ -2,20 +2,23 @@
 
 import bisect
 import hashlib
+import inspect
 import json
 import re
 from collections.abc import Callable, Collection, Sequence
-from fnmatch import fnmatchcase, translate
+from dataclasses import dataclass
+from fnmatch import fnmatchcase
+from importlib.metadata import version
 from pathlib import Path
 from typing import Any
 
 import cocoindex as coco
-from cocoindex._internal import core as _coco_core
 from cocoindex.connectorkits import statediff
 from cocoindex.connectorkits.fingerprint import fingerprint_object
 from cocoindex.connectors import localfs
-from cocoindex.ops.code import CodePattern, CodeSource
+from cocoindex.ops.code import CodeMatch, CodePattern, CodeSource, render_match
 from cocoindex.ops.text import RecursiveSplitter, detect_code_language
+from cocoindex.resources.chunk import Chunk, TextPosition
 from cocoindex.resources.file import FileLike, PatternFilePathMatcher
 
 from yaw.core import (
@@ -25,13 +28,14 @@ from yaw.core import (
     SyncDelta,
     compute_chunk_id,
     inclusive_end_line,
+    json_document_fields,
+    render_document_text,
 )
 
 _SPLITTER = RecursiveSplitter()
 _ATX_HEADING_RE = re.compile(r"^ {0,3}#{1,6}(?:\s+(.*?))?(?:\s+#+\s*)?$")
 _SETEXT_UNDERLINE_RE = re.compile(r"^ {0,3}(?:=+|-+)\s*$")
 _PLAIN_TITLE_LINE_RE = re.compile(r"^\s*(?:title\s*:\s*(.+)|#+\s*(.+))\s*$", re.IGNORECASE)
-_LVEVAL_SPLIT_RE = re.compile(r"\n*###\s*Passage\s*\d+\s*[:\n]\s*")
 
 _HTML_HEADING_PATTERNS: tuple[CodePattern, ...] = (
     CodePattern(r"<title>\TEXT</title>", language="html", min_len=1),
@@ -42,9 +46,7 @@ _TOML_SECTION_PATTERNS: tuple[CodePattern, ...] = (
     CodePattern(r"[[\SECTION]]", language="toml", min_len=1),
 )
 _YAML_PAIR_PATTERN = CodePattern(r"\KEY: \VAL", language="yaml", min_len=1)
-_JSON_OBJ_PATTERN = CodePattern(r"{\(PAIRS*\)}", language="json", min_len=1)
 _JSON_PAIR_PATTERN = CodePattern(r"\Q\KEY\Q: \VAL", language="json", min_len=1)
-_JSON_TUPLE_PASSAGE_PATTERN = CodePattern(r"[\Q\TITLE\Q, [\(SENTS*\)]]", language="json", min_len=1)
 
 _ChunkValue = tuple[ChunkPointer, str]
 _ChunkAction = tuple[str, _ChunkValue | None]
@@ -146,54 +148,22 @@ def _extract_markdown_ast_headings(source: str | CodeSource) -> list[tuple[int, 
     if not raw_text.strip():
         return []
 
-    if isinstance(source, CodeSource) and source.language == "markdown" and raw_text.endswith("\n"):
-        md_src = source
-    else:
-        padded = raw_text if raw_text.endswith("\n") else raw_text + "\n"
-        md_src = CodeSource(padded, language="markdown")
-
-    src_text = md_src.text
     headings_by_line: dict[int, str] = {}
-    pos = 0
-    in_fence_marker: str | None = None
+    in_fence_marker: tuple[str, int] | None = None
     prev_non_fenced_line: tuple[int, str] | None = None
 
     for line_idx, line in enumerate(raw_text.splitlines(keepends=True), start=1):
-        b_len = len(line.encode("utf-8"))
-        end_pos = pos + b_len
         stripped_line = line.rstrip("\r\n")
-        lstripped = stripped_line.lstrip()
-
-        fence_prefix: str | None = None
-        if lstripped.startswith("```"):
-            fence_prefix = "```"
-        elif lstripped.startswith("~~~"):
-            fence_prefix = "~~~"
-
+        fence = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", stripped_line)
         is_fence_delimiter = False
-        if fence_prefix is not None:
+        if fence is not None:
             is_fence_delimiter = True
             if in_fence_marker is None:
-                in_fence_marker = fence_prefix
-            elif lstripped.startswith(in_fence_marker):
+                in_fence_marker = (fence[1][0], len(fence[1]))
+            elif fence[1][0] == in_fence_marker[0] and len(fence[1]) >= in_fence_marker[1] and not fence[2].strip():
                 in_fence_marker = None
 
-        view = _coco_core.render_ranges(md_src._src, [(pos, end_pos)])
         in_ast_code_fence = in_fence_marker is not None or is_fence_delimiter
-        for seg in view.segments:
-            if seg.kind == "frame" and seg.summary is None:
-                seg_text = src_text[seg.start_char_offset : seg.end_char_offset]
-                seg_lines = seg_text.splitlines()
-                first_line = seg_lines[0].strip() if seg_lines else ""
-                if first_line.startswith(("```", "~~~")):
-                    in_ast_code_fence = True
-                elif seg.start_line not in headings_by_line:
-                    m_atx = _ATX_HEADING_RE.match(first_line)
-                    if m_atx is not None:
-                        headings_by_line[seg.start_line] = (m_atx.group(1) or "").strip()
-                    elif len(seg_lines) >= 2 and _SETEXT_UNDERLINE_RE.match(seg_lines[1]) is not None:
-                        headings_by_line[seg.start_line] = first_line
-
         if not in_ast_code_fence:
             m_line_atx = _ATX_HEADING_RE.match(stripped_line)
             if m_line_atx is not None:
@@ -215,8 +185,6 @@ def _extract_markdown_ast_headings(source: str | CodeSource) -> list[tuple[int, 
                 prev_non_fenced_line = None
         else:
             prev_non_fenced_line = None
-
-        pos = end_pos
 
     return sorted(headings_by_line.items(), key=lambda h: h[0])
 
@@ -251,10 +219,7 @@ def extract_ast_headings(
         return []
 
     if code_src is None or code_src.language != lang:
-        try:
-            code_src = CodeSource(clean_text, language=lang)
-        except ValueError:
-            return []
+        code_src = CodeSource(clean_text, language=lang)
 
     headings_by_line: dict[int, str] = {}
     if lang == "html":
@@ -297,25 +262,52 @@ def extract_ast_headings(
                 raw_v = v_cap[0].text.strip()
                 if len(raw_v) >= 2 and raw_v.startswith('"') and raw_v.endswith('"'):
                     line_no = m.chunks[0].start.line
-                    headings_by_line[line_no] = _unescape_json_str(raw_v[1:-1])
+                    headings_by_line[line_no] = json.loads(raw_v)
         return sorted(headings_by_line.items(), key=lambda h: h[0])
 
     # General Tree-sitter programming languages: extract enclosing AST scope frames
     src_text = code_src.text
     pos = 0
-    for line in clean_text.splitlines(keepends=True):
+    char_pos = 0
+    ranges = []
+    previous_indent = -1
+    previous_text = ""
+    for line_number, line in enumerate(clean_text.splitlines(keepends=True), start=1):
         b_len = len(line.encode("utf-8"))
         content_len = len(line.rstrip("\r\n").encode("utf-8"))
-        if content_len > 0:
-            view = _coco_core.render_ranges(code_src._src, [(pos, pos + content_len)])
-            for seg in view.segments:
-                if seg.kind == "frame" and seg.summary is None and seg.start_line not in headings_by_line:
-                    seg_text = src_text[seg.start_char_offset : seg.end_char_offset].strip()
-                    first_sig = seg_text.splitlines()[0].strip() if seg_text else ""
-                    first_sig = first_sig.rstrip("{:").strip()
-                    if first_sig:
-                        headings_by_line[seg.start_line] = first_sig
+        indent = len(line.expandtabs(4)) - len(line.expandtabs(4).lstrip())
+        if content_len > 0 and (
+            indent > previous_indent or previous_text.endswith(("{", ":")) or line.lstrip().startswith("{")
+        ):
+            anchor = line.rstrip("\r\n")
+            ranges.append(
+                CodeMatch(
+                    kind="scope_anchor",
+                    chunks=[
+                        Chunk(
+                            text=anchor,
+                            start=TextPosition(pos, char_pos, line_number, 1),
+                            end=TextPosition(pos + content_len, char_pos + len(anchor), line_number, len(anchor) + 1),
+                        )
+                    ],
+                    captures={},
+                )
+            )
+        if line.strip():
+            previous_indent = indent
+            previous_text = line.rstrip()
         pos += b_len
+        char_pos += len(line)
+    # Rendering returns frames around the ranges' common envelope. Combining
+    # unrelated scopes loses their headers; inspect indentation anchors instead
+    # of every body line, sharing the same native AST across all inspections.
+    for anchor_match in ranges:
+        view = render_match(code_src, anchor_match)
+        for seg in view.segments:
+            if seg.kind == "frame" and seg.summary is None and seg.start.line not in headings_by_line:
+                text = src_text[seg.start.char_offset : seg.end.char_offset].strip()
+                if text:
+                    headings_by_line[seg.start.line] = text.splitlines()[0].strip().rstrip("{:").strip()
 
     return sorted(headings_by_line.items(), key=lambda h: h[0])
 
@@ -349,12 +341,12 @@ def extract_chunk_title(content: str, start_line: int, rel_posix_path: str) -> s
     return resolve_heading_for_line(headings, start_line, fallback_title)
 
 
-def _unescape_json_str(raw: str) -> str:
-    try:
-        val = json.loads(f'"{raw}"')
-        return str(val)
-    except json.JSONDecodeError:
-        return raw
+@dataclass(frozen=True, slots=True)
+class ProjectedRecord:
+    title: str
+    body: str
+    start_line: int
+    end_line: int
 
 
 def should_keep_json_key_path(
@@ -363,17 +355,9 @@ def should_keep_json_key_path(
     whitelist: Sequence[str] = ("*",),
     blacklist: Sequence[str] = (),
 ) -> bool:
-    """Evaluate formal JSON key projection rule pi_{W, B} with blacklist dominance."""
-    if any(fnmatchcase(dotted_path, pat) or fnmatchcase(key, pat) for pat in blacklist):
+    if any(fnmatchcase(dotted_path, p) or fnmatchcase(key, p) for p in blacklist):
         return False
-    if not whitelist:
-        return True
-    return any(fnmatchcase(dotted_path, pat) or fnmatchcase(key, pat) for pat in whitelist)
-
-
-_PASSAGE_META_KEYS: frozenset[str] = frozenset({"idx", "id", "doc_id", "source_type"})
-_PASSAGE_BODY_KEYS: frozenset[str] = frozenset({"text", "paragraph_text", "contents", "body", "content"})
-_PASSAGE_ALL_KEYS: frozenset[str] = frozenset({"title", *_PASSAGE_BODY_KEYS, *_PASSAGE_META_KEYS})
+    return not whitelist or any(fnmatchcase(dotted_path, p) or fnmatchcase(key, p) for p in whitelist)
 
 
 def project_json_records(
@@ -382,612 +366,308 @@ def project_json_records(
     *,
     whitelist: Sequence[str] = ("*",),
     blacklist: Sequence[str] = (),
-) -> list[tuple[str, str, int, int]]:
-    "Project JSON/JSONL records via CocoIndex Tree-sitter AST key filtering into (title, body, s_line, e_line) tuples."
-    if isinstance(content, CodeSource):
-        clean_text = content.text
-        src = content
-    else:
-        clean_text = content.replace("\r\n", "\n")
-        if not clean_text.strip():
-            return []
-        src = CodeSource(clean_text, language="json")
-
-    obj_spans = sorted(
-        (
-            (
-                m.chunks[0].start.byte_offset,
-                m.chunks[0].end.byte_offset,
-                m.chunks[0].start.line,
-                inclusive_end_line(m.chunks[0].start.line, m.chunks[0].end.line, m.chunks[0].end.column),
-            )
-            for m in _JSON_OBJ_PATTERN.match_source(src)
-        ),
-        key=lambda x: (x[0], -x[1]),
-    )
-    if not obj_spans:
+) -> list[ProjectedRecord]:
+    """Strict document objects/JSONL with source-aligned, hydratable projection."""
+    src = content if isinstance(content, CodeSource) else CodeSource(content, language="json")
+    text = src.text
+    whitelist, blacklist = tuple(whitelist), tuple(blacklist)
+    if not text.strip():
         return []
-
-    top_objs: list[tuple[int, int, int, int]] = []
-    for o_s, o_e, o_s_line, o_e_line in obj_spans:
-        if not top_objs or o_s >= top_objs[-1][1]:
-            top_objs.append((o_s, o_e, o_s_line, o_e_line))
-
-    all_pairs = sorted(
-        _JSON_PAIR_PATTERN.match_source(src),
-        key=lambda m: (m.chunks[0].start.byte_offset, -m.chunks[0].end.byte_offset),
-    )
-    all_tuples = (
+    decoder = json.JSONDecoder()
+    objects = []
+    if Path(rel_posix_path).suffix.lower() in (".jsonl", ".ndjson"):
+        offset = 0
+        for line in text.splitlines(keepends=True):
+            if line.strip():
+                data = json.loads(line)
+                objects.append((data, offset, offset + len(line.rstrip("\r\n"))))
+            offset += len(line)
+    else:
+        data = json.loads(text)  # Malformed input must not become an empty corpus.
+        if isinstance(data, list):
+            cursor = text.index("[") + 1
+            for item in data:
+                while text[cursor].isspace() or text[cursor] == ",":
+                    cursor += 1
+                _, end = decoder.raw_decode(text, cursor)
+                objects.append((item, cursor, end))
+                cursor = end
+        else:
+            start = len(text) - len(text.lstrip())
+            objects.append((data, start, len(text.rstrip())))
+    line_starts = [0] + [m.end() for m in re.finditer("\n", text)]
+    pair_matches = (
         sorted(
-            _JSON_TUPLE_PASSAGE_PATTERN.match_source(src),
-            key=lambda m: m.chunks[0].start.byte_offset,
+            _JSON_PAIR_PATTERN.match_source(src),
+            key=lambda m: (m.chunks[0].start.byte_offset, -m.chunks[0].end.byte_offset),
         )
-        if '"context"' in clean_text
+        if blacklist or whitelist not in ((), ("*",))
         else []
     )
+    pair_starts = [match.chunks[0].start.char_offset for match in pair_matches]
+    records = []
 
-    bl_re = re.compile("|".join(translate(pat) for pat in blacklist)) if blacklist else None
-    wl_all = not whitelist or "*" in whitelist
-    wl_re = re.compile("|".join(translate(pat) for pat in whitelist)) if not wl_all else None
-    wl_ancestors: set[str] = set()
-    if not wl_all:
-        for pat in whitelist:
-            parts = pat.split(".")
-            for i in range(1, len(parts)):
-                wl_ancestors.add(".".join(parts[:i]))
+    def safe_lines(start_char: int, end_char: int, key_path: str) -> tuple[int, int]:
+        sl = bisect.bisect_right(line_starts, start_char)
+        el = bisect.bisect_right(line_starts, max(start_char, end_char - 1))
+        before = text[line_starts[sl - 1] : start_char].strip()
+        line_end = line_starts[el] if el < len(line_starts) else len(text)
+        after = text[end_char:line_end].strip()
+        if before or after not in ("", ","):
+            raise ValueError(f"{rel_posix_path}:{sl}: unsafe JSON projection/source span for {key_path!r}")
+        return sl, el
 
-    records: list[tuple[str, str, int, int]] = []
-    pair_idx = 0
-    num_pairs = len(all_pairs)
-    obj_idx = 0
-    num_objs = len(obj_spans)
-    tuple_idx = 0
-    num_tuples = len(all_tuples)
-    is_hotpot = "hotpot" in rel_posix_path.lower()
-
-    for o_s, o_e, o_s_line, o_e_line in top_objs:
-        while pair_idx < num_pairs and all_pairs[pair_idx].chunks[0].start.byte_offset < o_s:
-            pair_idx += 1
-        obj_pairs = []
-        p_cursor = pair_idx
-        while p_cursor < num_pairs and all_pairs[p_cursor].chunks[0].start.byte_offset < o_e:
-            if all_pairs[p_cursor].chunks[0].end.byte_offset <= o_e:
-                obj_pairs.append(all_pairs[p_cursor])
-            p_cursor += 1
-        pair_idx = p_cursor
-
-        while obj_idx < num_objs and obj_spans[obj_idx][0] < o_s:
-            obj_idx += 1
-        nested_objs: list[tuple[int, int, int, int]] = []
-        o_cursor = obj_idx
-        while o_cursor < num_objs and obj_spans[o_cursor][0] < o_e:
-            n_s, n_e, n_s_line, n_e_line = obj_spans[o_cursor]
-            if n_e <= o_e and (n_s > o_s or n_e < o_e):
-                nested_objs.append((n_s, n_e, n_s_line, n_e_line))
-            o_cursor += 1
-
-        while tuple_idx < num_tuples and all_tuples[tuple_idx].chunks[0].start.byte_offset < o_s:
-            tuple_idx += 1
-        obj_tuples = []
-        t_cursor = tuple_idx
-        while t_cursor < num_tuples and all_tuples[t_cursor].chunks[0].start.byte_offset < o_e:
-            if all_tuples[t_cursor].chunks[0].end.byte_offset <= o_e:
-                obj_tuples.append(all_tuples[t_cursor])
-            t_cursor += 1
-        tuple_idx = t_cursor
-
-        stack: list[tuple[str, int]] = []
-        blacklisted_spans: list[tuple[int, int]] = []
-        has_non_meta_blacklisted = False
-        kept_pairs: list[tuple[str, str, int, int, int, int, int, int, str]] = []
-        all_pair_spans: list[tuple[int, int]] = []
-
-        for m in obj_pairs:
-            c = m.chunks[0]
-            p_s = c.start.byte_offset
-            p_e = c.end.byte_offset
-            p_s_line = c.start.line
-            p_e_line = inclusive_end_line(c.start.line, c.end.line, c.end.column)
-            all_pair_spans.append((p_s, p_e))
-            while stack and stack[-1][1] <= p_s:
-                stack.pop()
-            if any(b_s <= p_s and p_e <= b_e for b_s, b_e in blacklisted_spans):
-                continue
-
-            key = _unescape_json_str(m.captures["KEY"][0].text)
-            dotted = ".".join([*(k for k, _ in stack), key])
-            val_chunk = m.captures["VAL"][0]
-            v_s = val_chunk.start.byte_offset
-            v_e = val_chunk.end.byte_offset
-            v_raw = val_chunk.text.strip()
-
-            is_bl = bl_re is not None and (bl_re.match(dotted) is not None or bl_re.match(key) is not None)
-            if (
-                not is_bl
-                and bl_re is not None
-                and 2 <= len(v_raw) <= 512
-                and v_raw.startswith('"')
-                and v_raw.endswith('"')
-            ):
-                v_unesc = _unescape_json_str(v_raw[1:-1])
-                if bl_re.match(v_unesc) is not None:
-                    is_bl = True
-
-            if is_bl:
-                blacklisted_spans.append((p_s, p_e))
-                if dotted not in _PASSAGE_META_KEYS:
-                    has_non_meta_blacklisted = True
-                continue
-
-            stack.append((key, p_e))
-            is_wl = wl_all or (
-                wl_re is not None
-                and (
-                    wl_re.match(dotted) is not None
-                    or wl_re.match(key) is not None
-                    or dotted in wl_ancestors
-                )
-            )
-            if is_wl:
-                kept_pairs.append((key, dotted, p_s, p_e, p_s_line, p_e_line, v_s, v_e, v_raw))
-            else:
-                blacklisted_spans.append((p_s, p_e))
-                if dotted not in _PASSAGE_META_KEYS:
-                    has_non_meta_blacklisted = True
-
-        if not kept_pairs:
+    for obj, start, end in objects:
+        if not isinstance(obj, dict):
+            raise ValueError(f"{rel_posix_path}: expected document object, got {type(obj).__name__}")
+        if not obj:
             continue
-
-        extracted: list[tuple[str, str, int, int]] = []
-
-        # 1. Nested passage objects (e.g., paragraphs, contexts, gold_docs)
-        for n_s, n_e, n_s_line, n_e_line in nested_objs:
-            if any(b_s <= n_s and n_e <= b_e for b_s, b_e in blacklisted_spans):
+        title = obj.get("title", "")
+        if not isinstance(title, str):
+            raise ValueError(f"{rel_posix_path}: title must be a string")
+        if not should_keep_json_key_path("title", "title", whitelist, blacklist) or any(
+            fnmatchcase(title, p) for p in blacklist
+        ):
+            title = ""
+        s_line, e_line = safe_lines(start, end, "document")
+        if not pair_matches:
+            if blacklist or whitelist not in ((), ("*",)):
                 continue
-            direct_str: dict[str, str] = {}
-            parent_dotted = ""
-            for k, d, p_s, p_e, _ps_l, _pe_l, _vs, _ve, v_raw in kept_pairs:
-                if n_s < p_s and p_e < n_e:
-                    if any(
-                        n_s < in_s and in_e < n_e and in_s < p_s and p_e < in_e
-                        for in_s, in_e, _, _ in nested_objs
-                    ):
-                        continue
-                    if len(v_raw) >= 2 and v_raw.startswith('"') and v_raw.endswith('"'):
-                        direct_str[k] = _unescape_json_str(v_raw[1:-1])
-                        if "." in d:
-                            parent_dotted = d.rsplit(".", 1)[0]
-            if parent_dotted == "document.summary":
+            _, body = json_document_fields(obj)
+            if body or title:
+                records.append(ProjectedRecord(title, body, s_line, e_line))
+            continue
+        kept = []
+        containers = []
+        nested_spans = set()
+        excluded = []
+        stack = []
+        first_pair = bisect.bisect_left(pair_starts, start)
+        last_pair = bisect.bisect_left(pair_starts, end)
+        for pair_index in range(first_pair, last_pair):
+            match = pair_matches[pair_index]
+            chunk = match.chunks[0]
+            if chunk.start.char_offset < start or chunk.end.char_offset > end:
                 continue
-            sub_body = direct_str.get("text") or direct_str.get("paragraph_text") or direct_str.get("contents")
-            if sub_body is not None:
-                sub_title = direct_str.get("title", "")
-                extracted.append((sub_title, sub_body, n_s_line, n_e_line))
-
-        # 2. 2-Tuple passages [title, [sents...]] under surviving "context"
-        if not extracted and obj_tuples:
-            ctx_spans = [(v_s, v_e) for k, _d, _ps, _pe, _ps_l, _pe_l, v_s, v_e, _vr in kept_pairs if k == "context"]
-            sep = "" if is_hotpot else " "
-            seen_tuple_spans: set[tuple[int, int]] = set()
-            for c_vs, c_ve in ctx_spans:
-                for tm in obj_tuples:
-                    ts = tm.chunks[0].start.byte_offset
-                    te = tm.chunks[0].end.byte_offset
-                    if (ts, te) in seen_tuple_spans:
-                        continue
-                    if c_vs <= ts and te <= c_ve and not any(b_s <= ts and te <= b_e for b_s, b_e in blacklisted_spans):
-                        seen_tuple_spans.add((ts, te))
-                        try:
-                            parsed_tuple = json.loads(tm.chunks[0].text)
-                        except json.JSONDecodeError:
-                            continue
-                        if (
-                            isinstance(parsed_tuple, list)
-                            and len(parsed_tuple) >= 2
-                            and isinstance(parsed_tuple[0], str)
-                            and isinstance(parsed_tuple[1], list)
-                        ):
-                            t_title = parsed_tuple[0]
-                            sents = [str(s) for s in parsed_tuple[1] if isinstance(s, str)]
-                            t_body = sep.join(sents)
-                            if t_title or t_body:
-                                s_line = tm.chunks[0].start.line
-                                e_line = inclusive_end_line(
-                                    tm.chunks[0].start.line,
-                                    tm.chunks[0].end.line,
-                                    tm.chunks[0].end.column,
-                                )
-                                extracted.append((t_title, t_body, s_line, e_line))
-
-        # 3. String "context" (lveval ### Passage N) or nested "document" (narrativeqa)
-        dotted_str_map: dict[str, str] = {}
-        for _k, d, _ps, _pe, _ps_l, _pe_l, _vs, _ve, v_raw in kept_pairs:
-            if len(v_raw) >= 2 and v_raw.startswith('"') and v_raw.endswith('"'):
-                dotted_str_map[d] = _unescape_json_str(v_raw[1:-1])
-
-        if not extracted:
-            s_line = o_s_line
-            e_line = o_e_line
-            if "context" in dotted_str_map and "### Passage" in dotted_str_map["context"]:
-                parts = [p.strip() for p in _LVEVAL_SPLIT_RE.split(dotted_str_map["context"]) if p.strip()]
-                for p in parts:
-                    extracted.append(("", p, s_line, e_line))
-            elif "document.summary.text" in dotted_str_map or "document.text" in dotted_str_map:
-                doc_title = dotted_str_map.get("document.summary.title") or dotted_str_map.get("document.title") or ""
-                doc_body = dotted_str_map.get("document.summary.text") or dotted_str_map.get("document.text") or ""
-                if doc_body:
-                    extracted.append((doc_title, doc_body, s_line, e_line))
-
-        # 4. Direct top-level passage or general/corporate JSON record fallback
-        if not extracted:
-            leaf_kept = [
-                (k, d, p_s, p_e, p_s_line, p_e_line, v_s, v_e, v_raw)
-                for k, d, p_s, p_e, p_s_line, p_e_line, v_s, v_e, v_raw in kept_pairs
-                if not any(v_s <= p2_s and p2_e <= v_e for p2_s, p2_e in all_pair_spans)
-            ]
-            if leaf_kept:
-                body_kept = [p for p in leaf_kept if p[1] != "title"] or leaf_kept
-                leaf_keys = {d for _k, d, *_ in leaf_kept}
-                is_pure_passage = leaf_keys <= _PASSAGE_ALL_KEYS and (
-                    bool(leaf_keys & _PASSAGE_BODY_KEYS) or "title" in leaf_keys
+            while stack and stack[-1][1] <= chunk.start.byte_offset:
+                stack.pop()
+            key = json.loads('"' + match.captures["KEY"][0].text + '"')
+            value = match.captures["VAL"][0]
+            dotted = ".".join([*(entry[0] for entry in stack), key])
+            parsed = json.loads(value.text)
+            inherited = any(entry[2] for entry in stack)
+            rejected = inherited or any(fnmatchcase(dotted, p) or fnmatchcase(key, p) for p in blacklist)
+            if isinstance(parsed, str) and any(fnmatchcase(parsed, p) for p in blacklist):
+                rejected = True
+            stack.append((key, chunk.end.byte_offset, rejected))
+            if rejected:
+                excluded.append(
+                    (chunk.start.line, inclusive_end_line(chunk.start.line, chunk.end.line, chunk.end.column))
                 )
-                if not blacklisted_spans or (is_pure_passage and not has_non_meta_blacklisted):
-                    s_line = o_s_line
-                    e_line = o_e_line
-                else:
-                    s_line = min(p[4] for p in body_kept)
-                    e_line = max(p[5] for p in body_kept)
-                if is_pure_passage:
-                    rec_title = dotted_str_map.get("title", "")
-                    rec_body = (
-                        dotted_str_map.get("text")
-                        or dotted_str_map.get("paragraph_text")
-                        or dotted_str_map.get("contents")
-                        or dotted_str_map.get("body")
-                        or dotted_str_map.get("content")
-                        or ""
-                    )
-                    if rec_body or rec_title:
-                        extracted.append((rec_title, rec_body, s_line, e_line))
-                else:
-                    rec_title = (
-                        dotted_str_map.get("title")
-                        or dotted_str_map.get("name")
-                        or dotted_str_map.get("service")
-                        or Path(rel_posix_path).stem
-                    )
-                    surviving_dict: dict[str, Any] = {}
-                    for _k, d, _ps, _pe, _ps_l, _pe_l, _vs, _ve, v_raw in leaf_kept:
-                        if d == "title" and rec_title == dotted_str_map.get("title"):
-                            continue
-                        try:
-                            surviving_dict[d] = json.loads(v_raw)
-                        except json.JSONDecodeError:
-                            surviving_dict[d] = v_raw
-                    if surviving_dict:
-                        rec_body = json.dumps(surviving_dict, ensure_ascii=False)
-                        extracted.append((rec_title, rec_body, s_line, e_line))
-                    elif rec_title:
-                        extracted.append((rec_title, rec_title, s_line, e_line))
-
-        records.extend(extracted)
-
+                continue
+            if (isinstance(parsed, dict) and parsed) or (
+                isinstance(parsed, list) and any(isinstance(v, (dict, list)) for v in parsed)
+            ):
+                if len(stack) == 1:
+                    containers.append((key, parsed, chunk))
+                continue
+            if should_keep_json_key_path(key, dotted, whitelist, blacklist):
+                kept.append((dotted, parsed, chunk))
+                if len(stack) > 1:
+                    nested_spans.add((chunk.start.byte_offset, chunk.end.byte_offset))
+            else:
+                excluded.append(
+                    (chunk.start.line, inclusive_end_line(chunk.start.line, chunk.end.line, chunk.end.column))
+                )
+        if not excluded:
+            _, body = json_document_fields(obj)
+            if title or body:
+                records.append(ProjectedRecord(title, body, s_line, e_line))
+            continue
+        safe_containers = [
+            (key, value, chunk)
+            for key, value, chunk in containers
+            if not any(a <= chunk.end.line and b >= chunk.start.line for a, b in excluded)
+            and any(chunk.start.char_offset < leaf.start.char_offset < chunk.end.char_offset for _, _, leaf in kept)
+        ]
+        kept = safe_containers + [
+            (key, value, chunk)
+            for key, value, chunk in kept
+            if not any(
+                parent.start.char_offset < chunk.start.char_offset < parent.end.char_offset
+                for _, _, parent in safe_containers
+            )
+        ]
+        for key, value, chunk in kept:
+            if key == "title":
+                continue
+            if (chunk.start.byte_offset, chunk.end.byte_offset) in nested_spans:
+                raise ValueError(
+                    f"{rel_posix_path}:{chunk.start.line}: unsafe JSON projection for {key!r}; "
+                    "its enclosing object cannot be hydrated without excluded content"
+                )
+            sl, el = safe_lines(chunk.start.char_offset, chunk.end.char_offset, key)
+            if any(a <= el and b >= sl for a, b in excluded):
+                raise ValueError(
+                    f"{rel_posix_path}:{sl}: unsafe JSON projection for {key!r}; excluded data shares source lines"
+                )
+            # A projected property has an explicit decoder contract in hydration;
+            # it is never repaired by guessing braces or returning raw JSON.
+            body = (
+                value
+                if key in ("text", "content") and isinstance(value, str)
+                else json.dumps({key: value}, ensure_ascii=False)
+            )
+            records.append(ProjectedRecord(title, body, sl, el))
     return records
 
 
-def chunk_json_text(
-    content: str,
-    rel_posix_path: str,
-    *,
-    corpus_root: Path | None = None,
-    chunk_size: int = 1200,
-    chunk_overlap: int = 100,
-    min_chunk_size: int = 50,
-    max_island_chars: int = 3600,
-    whitelist: Sequence[str] = ("*",),
-    blacklist: Sequence[str] = (),
-) -> tuple[tuple[ChunkPointer, str], ...]:
-    """Project JSON/JSONL records via AST filtering and map line coordinates directly to the source file."""
-    records = project_json_records(
-        content,
-        rel_posix_path,
-        whitelist=whitelist,
-        blacklist=blacklist,
-    )
-    if not records:
-        return ()
-
-    results: list[tuple[ChunkPointer, str]] = []
-    seen_cids: set[str] = set()
-    seen_passages: set[tuple[str, str]] = set()
-
-    for item in records:
-        if len(item) == 4:
-            title_i, body_i, rec_start, rec_end = item
-        else:
-            title_i, body_i = item[0], item[1]
-            rec_start, rec_end = 1, max(1, content.count("\n") + 1)
-
-        clean_title = title_i.replace("\r\n", "\n").replace("\n", " ").strip()
-        clean_body = body_i.replace("\r\n", "\n").rstrip("\n")
-        if (clean_title, clean_body) in seen_passages:
-            continue
-        seen_passages.add((clean_title, clean_body))
-
-        passage_text = (
-            f"{clean_title}\n{clean_body}"
-            if clean_title and not (clean_body.startswith(f"{clean_title}\n") or clean_body == clean_title)
-            else clean_body
-        )
-
-        if len(passage_text) <= chunk_size:
-            cid = compute_chunk_id(rel_posix_path, rec_start, rec_end, passage_text)
-            if cid not in seen_cids:
-                seen_cids.add(cid)
-                ptr = ChunkPointer(
-                    chunk_id=cid,
-                    rel_posix_path=rel_posix_path,
-                    start_line=rec_start,
-                    end_line=rec_end,
-                    title=clean_title,
-                    ast_island_start=rec_start,
-                    ast_island_end=rec_end,
-                )
-                results.append((ptr, passage_text))
-            continue
-
-        body_to_split = (
-            clean_body[len(clean_title) + 1 :]
-            if clean_title and clean_body.startswith(f"{clean_title}\n")
-            else clean_body
-        )
-        if not body_to_split.strip():
-            body_to_split = passage_text
-        eff_chunk_size = max(min_chunk_size, chunk_size - len(clean_title) - 1) if clean_title else chunk_size
-        rec_src = CodeSource(body_to_split, language="markdown")
-        sub_chunks = _SPLITTER.split(
-            rec_src,
-            chunk_size=eff_chunk_size,
-            chunk_overlap=min(chunk_overlap, max(0, eff_chunk_size - 1)),
-            min_chunk_size=min(min_chunk_size, max(1, len(body_to_split.strip()))),
-        )
-        if not sub_chunks:
-            cid = compute_chunk_id(rel_posix_path, rec_start, rec_end, passage_text)
-            if cid not in seen_cids:
-                seen_cids.add(cid)
-                ptr = ChunkPointer(
-                    chunk_id=cid,
-                    rel_posix_path=rel_posix_path,
-                    start_line=rec_start,
-                    end_line=rec_end,
-                    title=clean_title,
-                    ast_island_start=rec_start,
-                    ast_island_end=rec_end,
-                )
-                results.append((ptr, passage_text))
-            continue
-
-        for sc in sub_chunks:
-            sc_text = sc.text
-            if clean_title and not sc_text.startswith(f"{clean_title}\n") and sc_text.strip() != clean_title:
-                sc_text = f"{clean_title}\n{sc_text.lstrip()}"
-            cid = compute_chunk_id(rel_posix_path, rec_start, rec_end, sc_text)
-            if cid not in seen_cids:
-                seen_cids.add(cid)
-                ptr = ChunkPointer(
-                    chunk_id=cid,
-                    rel_posix_path=rel_posix_path,
-                    start_line=rec_start,
-                    end_line=rec_end,
-                    title=clean_title,
-                    ast_island_start=rec_start,
-                    ast_island_end=rec_end,
-                )
-                results.append((ptr, sc_text))
-
-    return tuple(results)
-
-
-def resolve_ast_island_bounds(
-    headings: Sequence[tuple[int, str]],
-    line: int,
-    total_lines: int,
-) -> tuple[int, int]:
-    """Resolve enclosing AST section line bounds [ast_start, ast_end] for a line."""
-    if not headings:
-        return 1, max(1, total_lines)
-    ast_start = 1
-    ast_end = total_lines
-    for i, (h_line, _) in enumerate(headings):
-        if h_line <= line:
-            ast_start = h_line
-            ast_end = max(ast_start, headings[i + 1][0] - 1) if i + 1 < len(headings) else total_lines
-        else:
-            break
-    return ast_start, ast_end
+def resolve_ast_island_bounds(headings: Sequence[tuple[int, str]], line: int, total_lines: int) -> tuple[int, int]:
+    index = bisect.bisect_right([h[0] for h in headings], line) - 1
+    if index < 0:
+        return 1, headings[0][0] - 1 if headings else max(1, total_lines)
+    return headings[index][0], headings[index + 1][0] - 1 if index + 1 < len(headings) else total_lines
 
 
 def chunk_source_text(
     content: str,
     rel_posix_path: str,
     *,
-    corpus_root: Path | None = None,
     chunk_size: int = 1200,
     chunk_overlap: int = 100,
     min_chunk_size: int = 50,
-    max_island_chars: int = 3600,
     json_keys_whitelist: Sequence[str] = ("*",),
     json_keys_blacklist: Sequence[str] = (),
 ) -> tuple[tuple[ChunkPointer, str], ...]:
-    """Single-parse CocoIndex Tree-sitter AST splitting and scope/heading resolution across all languages."""
-    clean_text = content.replace("\r\n", "\n")
-    if not clean_text.strip():
+    text = content.replace("\r\n", "\n")
+    if not text.strip():
         return ()
-
-    lang = detect_corpus_language(rel_posix_path)
-    if lang == "json":
-        return chunk_json_text(
-            clean_text,
-            rel_posix_path,
-            corpus_root=corpus_root,
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            min_chunk_size=min_chunk_size,
-            max_island_chars=max_island_chars,
-            whitelist=json_keys_whitelist,
-            blacklist=json_keys_blacklist,
-        )
-
-    fallback_title = Path(rel_posix_path).stem
-    code_src: CodeSource | None = None
-    if lang is not None:
-        try:
-            code_src = CodeSource(clean_text, language=lang)
-        except ValueError:
-            code_src = None
-
-    headings = extract_ast_headings(
-        code_src if code_src is not None else clean_text,
-        language=lang,
+    language = detect_corpus_language(rel_posix_path)
+    source = CodeSource(text, language=language)
+    records = (
+        project_json_records(source, rel_posix_path, whitelist=json_keys_whitelist, blacklist=json_keys_blacklist)
+        if language == "json"
+        else None
     )
-
-    effective_min = min(min_chunk_size, len(clean_text.strip()))
-    if code_src is not None:
-        chunks = _SPLITTER.split(
-            code_src,
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            min_chunk_size=effective_min,
-        )
-    else:
-        chunks = _SPLITTER.split(
-            clean_text,
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            min_chunk_size=effective_min,
-            language=lang,
-        )
-
-    total_file_lines = max(1, clean_text.count("\n") + 1)
-    if not chunks:
-        lines = clean_text.splitlines()
-        end_line = max(1, len(lines))
-        title = resolve_heading_for_line(headings, 1, fallback_title)
-        ast_s, ast_e = resolve_ast_island_bounds(headings, 1, total_file_lines)
-        cid = compute_chunk_id(rel_posix_path, 1, end_line, clean_text)
-        ptr = ChunkPointer(
-            chunk_id=cid,
-            rel_posix_path=rel_posix_path,
-            start_line=1,
-            end_line=end_line,
-            title=title,
-            ast_island_start=ast_s,
-            ast_island_end=ast_e,
-        )
-        return ((ptr, clean_text),)
-
-    results: list[tuple[ChunkPointer, str]] = []
-    seen_cids: set[str] = set()
-    for c in chunks:
-        start_line = c.start.line
-        end_line = inclusive_end_line(c.start.line, c.end.line, c.end.column)
-        title = resolve_heading_for_line(headings, start_line, fallback_title)
-        ast_s, ast_e = resolve_ast_island_bounds(headings, start_line, total_file_lines)
-        cid = compute_chunk_id(rel_posix_path, start_line, end_line, c.text)
-        if cid not in seen_cids:
-            seen_cids.add(cid)
-            ptr = ChunkPointer(
-                chunk_id=cid,
-                rel_posix_path=rel_posix_path,
-                start_line=start_line,
-                end_line=end_line,
-                title=title,
-                ast_island_start=ast_s,
-                ast_island_end=ast_e,
+    headings = [] if records is not None else extract_ast_headings(source, language)
+    result = []
+    units = records if records is not None else [ProjectedRecord("", text, 1, max(1, len(text.splitlines())))]
+    for record in units:
+        body = record.body
+        full = render_document_text(record.title, body)
+        if records is not None and len(full) <= chunk_size:
+            pieces = [(full, record.start_line, record.end_line)]
+        else:
+            unit_source = CodeSource(body, language="markdown") if records is not None else source
+            effective_size = max(min_chunk_size, chunk_size - len(record.title) - 1) if record.title else chunk_size
+            chunks = _SPLITTER.split(
+                unit_source,
+                chunk_size=effective_size,
+                chunk_overlap=min(chunk_overlap, max(0, effective_size - 1)),
+                min_chunk_size=min(min_chunk_size, max(1, len(body.strip()))),
             )
-            results.append((ptr, c.text))
+            if not chunks:
+                raise ValueError(f"{rel_posix_path}: splitter produced no chunks for nonempty content")
+            pieces = [
+                (render_document_text(record.title, c.text), record.start_line, record.end_line)
+                if records is not None
+                else (c.text, c.start.line, inclusive_end_line(c.start.line, c.end.line, c.end.column))
+                for c in chunks
+            ]
+        for body, sl, el in pieces:
+            title = (
+                record.title
+                if records is not None
+                else resolve_heading_for_line(headings, sl, Path(rel_posix_path).stem)
+            )
+            ast_s, ast_e = (
+                (record.start_line, record.end_line)
+                if records is not None
+                else resolve_ast_island_bounds(headings, sl, len(text.splitlines()))
+            )
+            ptr = ChunkPointer(
+                compute_chunk_id(rel_posix_path, sl, el, body), rel_posix_path, sl, el, title, ast_s, ast_e
+            )
+            result.append((ptr, body))
+    return tuple(dict((p.chunk_id, (p, t)) for p, t in result).values())
 
-    return tuple(results)
 
-
-def chunk_markdown_text(
+def chunk_json_text(
     content: str,
     rel_posix_path: str,
     *,
     chunk_size: int = 1200,
     chunk_overlap: int = 100,
     min_chunk_size: int = 50,
+    whitelist: Sequence[str] = ("*",),
+    blacklist: Sequence[str] = (),
 ) -> tuple[tuple[ChunkPointer, str], ...]:
-    """Pure syntax-aware text splitting returning 1-indexed ChunkPointers and passage texts."""
     return chunk_source_text(
         content,
         rel_posix_path,
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
         min_chunk_size=min_chunk_size,
+        json_keys_whitelist=whitelist,
+        json_keys_blacklist=blacklist,
+    )
+
+
+def chunk_markdown_text(
+    content: str, rel_posix_path: str, *, chunk_size: int = 1200, chunk_overlap: int = 100, min_chunk_size: int = 50
+) -> tuple[tuple[ChunkPointer, str], ...]:
+    return chunk_source_text(
+        content, rel_posix_path, chunk_size=chunk_size, chunk_overlap=chunk_overlap, min_chunk_size=min_chunk_size
     )
 
 
 @coco.fn(
     memo=True,
-    version=2,
-    # Plain helpers and projection constants are in this module. Track their
-    # source too; adopting a new dependency must invalidate older memo entries.
-    deps={"parser_source": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()},
+    version=3,
+    deps={
+        "parser_source": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "contract_source": hashlib.sha256(Path(inspect.getfile(json_document_fields)).read_bytes()).hexdigest(),
+        "cocoindex_version": version("cocoindex"),
+    },
 )
 async def process_corpus_file(
     file: FileLike,
-    corpus_root_str: str,
     chunk_size: int,
     chunk_overlap: int,
     min_chunk_size: int,
     json_keys_whitelist: tuple[str, ...],
     json_keys_blacklist: tuple[str, ...],
-) -> None:
-    """Memoized per-file processing component declaring chunks as target state."""
+) -> tuple[tuple[ChunkPointer, str], ...]:
     if file.file_path.path.is_absolute():
-        raise ValueError(f"Expected relative FilePath from localfs.walk_dir, got absolute path: {file.file_path.path}")
-    rel_posix_path = file.file_path.path.as_posix()
-    text = await file.read_text()
-
+        raise ValueError("CocoIndex source paths must be relative")
     chunks = chunk_source_text(
-        text,
-        rel_posix_path,
-        corpus_root=Path(corpus_root_str),
+        await file.read_text(),
+        file.file_path.path.as_posix(),
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
         min_chunk_size=min_chunk_size,
         json_keys_whitelist=json_keys_whitelist,
         json_keys_blacklist=json_keys_blacklist,
     )
-    for ptr, chunk_text in chunks:
-        _declare_chunk(ptr.chunk_id, (ptr, chunk_text))
+    for ptr, text in chunks:
+        _declare_chunk(ptr.chunk_id, (ptr, text))
+    return chunks
 
 
 @coco.fn
-async def corpus_app_main(
-    corpus_root_str: str,
-    included_patterns: tuple[str, ...],
-    excluded_patterns: tuple[str, ...],
+async def mount_corpus_file(
+    item: tuple[coco.StableKey, FileLike],
     chunk_size: int,
     chunk_overlap: int,
     min_chunk_size: int,
     json_keys_whitelist: tuple[str, ...],
     json_keys_blacklist: tuple[str, ...],
-) -> None:
-    """Top-level CocoIndex application function walking corpus_root and mounting files."""
-    files = localfs.walk_dir(
-        _CORPUS_ROOT_KEY,
-        recursive=True,
-        path_matcher=PatternFilePathMatcher(
-            included_patterns=list(included_patterns),
-            excluded_patterns=list(excluded_patterns),
-        ),
-    )
-    await coco.mount_each(
+) -> tuple[tuple[ChunkPointer, str], ...]:
+    key, file = item
+    return await coco.use_mount(
+        coco.component_subpath("file", key),
         process_corpus_file,
-        files.items(),
-        corpus_root_str,
+        file,
         chunk_size,
         chunk_overlap,
         min_chunk_size,
@@ -996,8 +676,40 @@ async def corpus_app_main(
     )
 
 
+@coco.fn
+async def corpus_app_main(
+    included_patterns: tuple[str, ...],
+    excluded_patterns: tuple[str, ...],
+    chunk_size: int,
+    chunk_overlap: int,
+    min_chunk_size: int,
+    json_keys_whitelist: tuple[str, ...],
+    json_keys_blacklist: tuple[str, ...],
+) -> tuple[tuple[ChunkPointer, str], ...]:
+    files = localfs.walk_dir(
+        _CORPUS_ROOT_KEY,
+        recursive=True,
+        path_matcher=PatternFilePathMatcher(
+            included_patterns=list(included_patterns), excluded_patterns=list(excluded_patterns)
+        ),
+    )
+    # Materialize enumeration before target reconciliation: an unreadable/partial
+    # directory scan must never be mistaken for removal of unvisited sources.
+    items = [item async for item in files.items()]
+    results = await coco.map(
+        mount_corpus_file,
+        items,
+        chunk_size,
+        chunk_overlap,
+        min_chunk_size,
+        json_keys_whitelist,
+        json_keys_blacklist,
+    )
+    return tuple(chunk for chunks in results for chunk in chunks)
+
+
 class CorpusIngestor:
-    """Incremental line-pointer corpus ingestor backed by CocoIndex v1."""
+    """Persistent native CocoIndex targets plus complete cached component results."""
 
     def __init__(
         self,
@@ -1014,52 +726,57 @@ class CorpusIngestor:
         on_delta: Callable[[SyncDelta], None] | None = None,
     ) -> None:
         self.corpus_root = Path(corpus_root).resolve()
+        if not self.corpus_root.is_dir():
+            raise ValueError(f"Corpus root does not exist: {self.corpus_root}")
         self.state_dir = Path(state_dir).resolve()
-        self.corpus_root.mkdir(parents=True, exist_ok=True)
         self.state_dir.mkdir(parents=True, exist_ok=True)
-
-        self.included_patterns = tuple(included_patterns)
-        self.excluded_patterns = tuple(excluded_patterns)
-        self.json_keys_whitelist = tuple(json_keys_whitelist)
-        self.json_keys_blacklist = tuple(json_keys_blacklist)
-        self.chunk_size = chunk_size
-        self.chunk_overlap = chunk_overlap
-        self.min_chunk_size = min_chunk_size
         self._on_delta = on_delta
-
-        self._actions_list: list[_ChunkAction] = []
-        self._compiler_errors: list[Exception] = []
-        self._cp = coco.ContextProvider()
-        self._cp.provide(_SINK_KEY, self._actions_list)
-        self._cp.provide(_CORPUS_ROOT_KEY, self.corpus_root)
-        self._cp.provide(_COMPILER_KEY, self._on_delta)
-        self._cp.provide(_COMPILER_ERROR_KEY, self._compiler_errors)
-
-        lmdb_path = self.state_dir / "coco_lmdb"
-        self._env = coco.Environment(
-            settings=coco.Settings.from_env(lmdb_path),
-            context_provider=self._cp,
-        )
+        self._actions_list = []
+        self._compiler_errors = []
+        self._snapshot = None
+        cp = coco.ContextProvider()
+        cp.provide(_SINK_KEY, self._actions_list)
+        cp.provide(_CORPUS_ROOT_KEY, self.corpus_root)
+        cp.provide(_COMPILER_KEY, on_delta)
+        cp.provide(_COMPILER_ERROR_KEY, self._compiler_errors)
+        self._env = coco.Environment(settings=coco.Settings.from_env(self.state_dir / "coco_lmdb"), context_provider=cp)
         self._app = coco.App(
-            coco.AppConfig(name="yaw_corpus", environment=self._env),
+            coco.AppConfig(name="yaw_corpus", environment=self._env, max_inflight_components=4),
             corpus_app_main,
-            corpus_root_str=self.corpus_root.as_posix(),
-            included_patterns=self.included_patterns,
-            excluded_patterns=self.excluded_patterns,
-            chunk_size=self.chunk_size,
-            chunk_overlap=self.chunk_overlap,
-            min_chunk_size=self.min_chunk_size,
-            json_keys_whitelist=self.json_keys_whitelist,
-            json_keys_blacklist=self.json_keys_blacklist,
+            included_patterns=tuple(included_patterns),
+            excluded_patterns=tuple(excluded_patterns),
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            min_chunk_size=min_chunk_size,
+            json_keys_whitelist=tuple(json_keys_whitelist),
+            json_keys_blacklist=tuple(json_keys_blacklist),
         )
 
     @property
     def on_delta(self) -> Callable[[SyncDelta], None] | None:
-        """Return the configured target sink delta compiler callback."""
         return self._on_delta
 
+    def poll(self) -> SyncDelta:
+        self._actions_list.clear()
+        self._compiler_errors.clear()
+        self._snapshot = None
+        result = self._app.update_blocking()
+        if self._compiler_errors:
+            raise self._compiler_errors[0]
+        if not isinstance(result, tuple):
+            raise TypeError("CocoIndex corpus app must return a complete chunk tuple")
+        self._snapshot = result
+        return SyncDelta(
+            tuple(v for _, v in self._actions_list if v is not None),
+            tuple(k for k, v in self._actions_list if v is None),
+        )
+
+    def snapshot(self) -> tuple[tuple[ChunkPointer, str], ...]:
+        if self._snapshot is None:
+            raise RuntimeError("A successful poll is required before requesting a snapshot")
+        return self._snapshot
+
     def close(self) -> None:
-        """Close the underlying CocoIndex environment and release LMDB resources."""
         self._env.close()
 
     def __enter__(self) -> CorpusIngestor:
@@ -1068,35 +785,7 @@ class CorpusIngestor:
     def __exit__(self, *args: Any) -> None:
         self.close()
 
-    def poll(self) -> SyncDelta:
-        """Run incremental CocoIndex update and return coalesced batch SyncDelta."""
-        self._actions_list.clear()
-        self._compiler_errors.clear()
-        self._app.update_blocking()
-        if self._compiler_errors:
-            raise self._compiler_errors[0]
 
-        added_chunks: list[tuple[ChunkPointer, str]] = []
-        deleted_chunk_ids: list[str] = []
-
-        for chunk_id, value in self._actions_list:
-            if value is not None:
-                ptr, chunk_text = value
-                added_chunks.append((ptr, chunk_text))
-            else:
-                deleted_chunk_ids.append(chunk_id)
-
-        return SyncDelta(
-            added_chunks=tuple(added_chunks),
-            deleted_chunk_ids=tuple(deleted_chunk_ids),
-        )
-
-
-def sync_corpus_once(
-    corpus_root: Path | str,
-    state_dir: Path | str,
-    **kwargs: Any,
-) -> SyncDelta:
-    """One-shot helper to initialize a CorpusIngestor and poll for changes once."""
+def sync_corpus_once(corpus_root: Path | str, state_dir: Path | str, **kwargs: Any) -> SyncDelta:
     with CorpusIngestor(corpus_root, state_dir, **kwargs) as ingestor:
         return ingestor.poll()

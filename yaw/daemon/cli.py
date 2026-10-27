@@ -41,7 +41,7 @@ from yaw.daemon.graph.storage import (
     open_yaw_db,
     serialize_graph_turtle,
 )
-from yaw.daemon.ingestion import load_dataset_splits, resolve_dataset_source_files
+from yaw.daemon.ingestion import load_dataset_splits, resolve_dataset_bundle
 from yaw.daemon.runtime import YawRuntime, is_file_locked
 
 
@@ -834,11 +834,7 @@ def handle_dspy_optimize(
         train_queries=train_queries,
         query_offset=query_offset,
     )
-    source_files = resolve_dataset_source_files(
-        dataset_args,
-        workspace_root=config.workspace_root,
-        prefer_corpus=True,
-    )
+    dataset_bundles = [resolve_dataset_bundle(arg, workspace_root=config.workspace_root) for arg in dataset_args]
 
     # Resolution order for sandbox: always isolate prompt compilation
     dspy.settings.configure(provide_traceback=True)
@@ -874,7 +870,7 @@ def handle_dspy_optimize(
             max_bootstrapped_demos=max_bootstrapped_demos,
             max_labeled_demos=max_labeled_demos,
             corpus_docs=corpus_docs,
-            source_files=source_files,
+            dataset_bundles=dataset_bundles,
             progress_callback=_cli_progress,
             run_options={
                 "dataset": dataset_args,
@@ -1170,6 +1166,9 @@ def main(
         return 2
     except YawRuntimeError as err:
         sys.stderr.write(json.dumps({"error": err.code, "message": err.message}) + "\n")
+        return 1
+    except (ValueError, FileNotFoundError) as err:
+        sys.stderr.write(json.dumps({"error": "INVALID_INPUT", "message": str(err)}) + "\n")
         return 1
 
 

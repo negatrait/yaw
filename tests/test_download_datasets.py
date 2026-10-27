@@ -34,21 +34,18 @@ class DownloadDatasetsTests(unittest.TestCase):
         for _alias, canonical in download_datasets.ALIASES.items():
             self.assertIn(canonical, download_datasets.DATASET_REGISTRY)
 
-    def test_verify_dataset_detects_missing_and_valid_files(self):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            dest = Path(tmp_dir)
-            # 1. Missing files
-            missing_status = download_datasets.verify_dataset("sample", dest)
-            self.assertFalse(missing_status["ready"])
-            self.assertEqual(missing_status["error"], "Files missing")
+    def test_bundle_verification_detects_missing_and_valid_files(self):
+        from yaw.daemon.ingestion import load_dataset_bundle, prepare_dataset_bundle
 
-            # 2. Present and valid JSON
-            (dest / "sample.json").write_text(json.dumps([{"q": 1}]), encoding="utf-8")
-            (dest / "sample_corpus.json").write_text(json.dumps([{"c": 1}, {"c": 2}]), encoding="utf-8")
-            valid_status = download_datasets.verify_dataset("sample", dest)
-            self.assertTrue(valid_status["ready"])
-            self.assertEqual(valid_status["queries"], 1)
-            self.assertEqual(valid_status["corpus_passages"], 2)
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            with self.assertRaises(FileNotFoundError):
+                load_dataset_bundle(root / "sample")
+            corpus, questions = root / "corpus.json", root / "questions.json"
+            corpus.write_text(json.dumps([{"title": "A", "text": "Body"}]), encoding="utf-8")
+            questions.write_text(json.dumps([{"question": "Q", "answer": "A"}]), encoding="utf-8")
+            bundle = prepare_dataset_bundle("sample", corpus, questions, root)
+            self.assertEqual(load_dataset_bundle(bundle.root), bundle)
 
     def test_download_file_reuses_existing_cache_without_network(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -57,7 +54,7 @@ class DownloadDatasetsTests(unittest.TestCase):
             target.write_text("{}", encoding="utf-8")
 
             # With force=False, returns target without network
-            result = download_datasets.download_file("test.json", dest, force=False)
+            result = download_datasets.download_dataset_file("test.json", dest, force=False)
             self.assertEqual(result, target)
 
 

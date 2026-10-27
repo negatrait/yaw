@@ -98,10 +98,8 @@ def test_yaw_config_for_benchmark(tmp_path: Path) -> None:
     assert bench.state_dir == bench.workspace_root / "coco_state"
     assert bench.log_path == bench.workspace_root / "yaw.log"
     assert bench.poll_interval_seconds == 0.0
-    assert "title" in bench.json_keys_whitelist
-    assert "paragraphs.*" in bench.json_keys_whitelist
-    assert "question*" in bench.json_keys_blacklist
-    assert "answer*" in bench.json_keys_blacklist
+    assert bench.json_keys_whitelist == cfg.json_keys_whitelist
+    assert bench.json_keys_blacklist == cfg.json_keys_blacklist
 
     # Verify fresh=True cleans existing sandbox dir
     marker = bench.workspace_root / "stale.txt"

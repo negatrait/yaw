@@ -5,9 +5,17 @@ from typing import Any
 
 # Single source of truth: only these symbols are exposed as the public package contract.
 _PUBLIC_API: dict[str, str] = {
+    "select_enterprise_questions": ".datasets",
+    "ENTERPRISE_CATEGORY_QUOTAS": ".datasets",
+    "DATASET_SOURCE_FIELDS": ".datasets",
+    "resolve_dataset_bundle": ".datasets",
+    "document_text": ".bundles",
+    "snapshot_dataset_bundle": ".bundles",
+    "prepare_dataset_bundle": ".bundles",
+    "load_dataset_bundle": ".bundles",
+    "DatasetDocument": ".bundles",
+    "DatasetBundle": ".bundles",
     "ALIASES": ".datasets",
-    "BENCHMARK_JSON_BLACKLIST": ".datasets",
-    "BENCHMARK_JSON_WHITELIST": ".datasets",
     "CorpusIngestor": ".corpus",
     "DATASETS": ".datasets",
     "DATASET_ALIASES": ".datasets",
@@ -31,18 +39,15 @@ _PUBLIC_API: dict[str, str] = {
     "extract_chunk_title": ".corpus",
     "extract_gold_answers": ".datasets",
     "extract_markdown_headings": ".corpus",
-    "extract_sample_docs_and_gold": ".datasets",
     "get_gold_answers": ".datasets",
     "get_gold_docs": ".datasets",
     "load_dataset_files": ".datasets",
     "load_dataset_splits": ".datasets",
     "project_json_records": ".corpus",
     "resolve_dataset_name": ".datasets",
-    "resolve_dataset_source_files": ".datasets",
     "resolve_heading_for_line": ".corpus",
     "should_keep_json_key_path": ".corpus",
     "sync_corpus_once": ".corpus",
-    "sync_source_files_for_docs": ".datasets",
 }
 
 __all__ = sorted(_PUBLIC_API.keys())

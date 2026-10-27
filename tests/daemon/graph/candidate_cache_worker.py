@@ -10,6 +10,7 @@ import numpy as np
 
 from yaw.daemon.graph.engine import YawGraphEngine
 from yaw.daemon.graph.inference import PASSAGE_INSTRUCTION, DSPyEmbeddingAdapter, HippoRAGProgram
+from yaw.daemon.ingestion import prepare_dataset_bundle, snapshot_dataset_bundle
 
 
 def main() -> None:
@@ -40,7 +41,7 @@ def main() -> None:
     embedder = DSPyEmbeddingAdapter(base_url=args.url, api_key="test", caching=False)
     engine = YawGraphEngine(
         db_path=args.root / "yaw.db",
-        workspace_root=args.root,
+        workspace_root=args.root / "datasets",
         program=program,
         embedder=embedder,
         synonymy_threshold=-1.0,
@@ -72,11 +73,23 @@ def main() -> None:
         doc = "Alan Turing formulated the Turing machine in 1936."
         if args.mutation == "source":
             doc += " This source was edited after the previous run."
-        engine.index([doc])
+        source, questions = args.root / "source.json", args.root / "questions.json"
+        source.write_text(
+            json.dumps(
+                [
+                    {"idx": "first", "title": "", "text": doc},
+                    {"idx": "second", "title": "", "text": "Alan M. Turing worked on cryptanalysis at Bletchley Park."},
+                ]
+            ),
+            encoding="utf-8",
+        )
+        questions.write_text("[]", encoding="utf-8")
+        bundle = prepare_dataset_bundle("cache_documents", source, questions, args.root / "datasets")
+        engine.index_chunks(snapshot_dataset_bundle(bundle, args.root / "coco_state", document_ids=["first"]))
         with engine.managed_conn.transaction() as conn:
             conn.execute("UPDATE entities SET definition = '' WHERE name IN ('alan turing', 'turing machine')")
         assert not engine.lint_graph()["conforms"]
-        engine.index(["Alan M. Turing worked on cryptanalysis at Bletchley Park."])
+        engine.index_chunks(snapshot_dataset_bundle(bundle, args.root / "coco_state", document_ids=["second"]))
         assert engine.lint_graph()["conforms"]
         print(
             json.dumps(

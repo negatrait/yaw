@@ -1,5 +1,206 @@
 # Evaluation record
 
+## Dataset bundles and persistent ingestion (2026-10-27)
+
+Implemented on `dev`, origin `https://github.com/negatrait/yaw.git`, using the
+CocoIndex and engineering-real-tests workspace skills. This supersedes the
+proposal-only ingestion audit below. Raw source files and existing experiments
+were preserved. No optimizer, watchdog or unattended model run was launched.
+
+### Delivered contracts and removals
+
+Preparation now exports the complete configured corpus into
+`outputs/datasets/<dataset>/documents/*.json`. Declared ID/title/body keys retain
+their original values. QA bytes/order are preserved in `evaluation/questions.json`.
+Opaque paths, original identities and hashes live in the manifest. Atomic file
+writes and a manifest published last operate under a bundle lock; readers validate
+the inventory and hashes under that same lock. Incomplete/stale bundles fail.
+Unknown document references and conflicting duplicate IDs fail explicitly.
+
+Enterprise quota selection remains seed 42, 150 training and 100 validation
+examples, owned by the evaluation loader. Valid preassigned memberships are
+preserved; duplicate question identities are rejected. Smaller optimization slices
+select separately within those partitions. Other benchmark subset/distractor and
+gold-answer policies remain in evaluation adapters. The reward was not changed.
+
+| Removed responsibility | Replacement and verification |
+| --- | --- |
+| Downloader title/category/tool normalization, answer-alias synthesis, relevance-driven document selection, embedded Enterprise Parquet sampling and migration branches | Configured JSON inputs, direct declared-field export; all ten registry entries tested with real files, exact QA bytes and unchanged-file modification times |
+| Monolithic filename guessing/reformatting, source-file fallback resolution, mixed document/label helpers and facade exports | Typed `DatasetBundle`, manifest lookup and original document-ID selection in CLI/runtime/benchmark |
+| CocoIndex state resets and candidate pools reconstructed from changed targets | Persistent per-file memo components return complete typed snapshots independently of callbacks |
+| Benchmark key allow/deny constants and injected projection defaults | Physical document/evaluation separation; production whitelist/blacklist settings remain |
+| Hotpot tuples, LV-Eval markers and NarrativeQA parsing inside ingestion/hydration | Generic strict JSON/JSONL projection; dataset interpretation stays in evaluation adapters |
+| Repeated whole-corpus/nested-span scans and duplicated chunk builders | Ordered native property spans with indexed record ranges, shared source ASTs and one chunk construction path |
+| JSON brace repair, raw substitutes after parsing failure and broad splitter/scope exception recovery | Explicit projected-property grammar, strict UTF-8, propagated errors and source/key diagnostics for unsafe spans |
+| Retired tests and documentation commands | Bundle fidelity, isolation, native restart reuse, settings/helper invalidation and strict-error tests; updated preparation/fresh-index commands |
+
+Repository searches found no retired API references in `yaw/`, `scripts/`,
+`benchmark.py` or tests. Historical audit and explicit removal-inventory mentions
+remain in documentation. Genuine aliases, production JSON/JSONL filtering,
+Markdown/code scopes and graph inference caches/checkpoints remain.
+
+Native CocoIndex concurrency is bounded to four file components. Directory
+enumeration completes before mounted processing, so partial scans cannot establish
+deletion. The memo dependency includes parser code, shared core contracts and
+the installed CocoIndex version. Scope rendering uses the public `render_match`
+API with source-grounded anchors; touched modules have no private API access.
+`poll()` remains incremental; `snapshot()` requires a successful scan and returns
+the complete cached current tuple. Compact multi-record arrays and partially
+excluded nested objects that cannot retain source identity in a safe physical
+line span fail. Decoded string lines never become file coordinates.
+
+### Configured Enterprise measurement
+
+Final serial measurement used a fresh generated copy under
+`.yaw/dataset-ingestion-audit/final/`, with the configured `1500/120/100`
+chunk-size/overlap/minimum settings. It exported all **1,308** configured documents
+and produced **9,062** chunks. Inputs outside the audit directory were untouched.
+
+| Operation | Seconds | Documents reparsed | Complete chunks |
+| --- | ---: | ---: | ---: |
+| Initial preparation | 45.848 | n/a | n/a |
+| Cold scan | 14.628 | 1,308 | 9,062 |
+| Warm scan | 2.078 | 0 | 9,062 |
+| Warm snapshot getter | 0.00783 | 0 | 9,062 |
+| Reopened environment scan | 2.147 | 0 | 9,062 |
+| One-document edit | 2.006 | 1 | 9,062 |
+
+Warm scans emitted zero additions/deletions. The edit emitted one added and one
+deleted chunk. Sampled peak process RSS was **144.96 MiB** (20 ms sampling).
+Low-overhead Python monitoring counted parser entries. The getter releases the
+previous retained tuple in this measurement, so its timing includes that release.
+Fresh-process reuse is established separately by regression tests. Earlier
+measurements varied with filesystem/cache activity; these timings establish
+scan behavior, not an overnight stability guarantee or LLM throughput improvement.
+
+### Verification and practical limits
+
+The complete affected selection, explicitly disabling testmon deselection once,
+passed **274 tests in 351.91 seconds**. It included ingestion, hydration, graph
+indexing/storage/cache, architecture/configuration, download transport/CLI,
+benchmark, runtime and CLI tests. One external Pydantic `ReadOnly` schema warning
+remains. A preceding testmon selection passed 116 (154 deselected). After final
+strict hydration and indexed-span changes, another testmon selection passed
+52 (22 deselected), including fresh-process insertion, chunk/projection settings
+invalidation and shared helper edits. The final Enterprise subset consumer
+selection passed 18 (104 deselected) in 82.79 seconds. After replacing private
+scope API access with the public renderer, the final scope/hydration/architecture
+selection passed 57 (26 deselected) in 6.70 seconds. These overlapping counts
+are not additive.
+
+Real SQLite tests verify callback retry and that a failed scan cannot delete
+unvisited sources. A separate-process loopback inference test forces graph
+reconstruction and verifies **zero additional provider calls** for completed
+unchanged indexing, plus invalidation after source/prompt/model/sampling changes.
+This is orchestration evidence; no resident-model quality evaluation or corpus
+parity benchmark was performed. Existing resume/GEPA orchestration tests passed.
+
+Intermediate failures came from retired layout assertions, consumer fixtures and
+document-pool padding before identity resolution; those were replaced/fixed. One
+mistyped test path collected no tests before the corrected command ran. Repository
+Ruff and ty checks passed. Final repository Ruff, ty, scoped formatting checks
+and `git diff --check` passed. No dependency or lockfile update was required.
+
+Prepare and start a **fresh** run (commands documented, not launched):
+
+```powershell
+uv run --locked python scripts/download-datasets.py --dataset enterprise_rag_bench --source-dir outputs/datasets
+uv run --locked python scripts/download-datasets.py --dataset enterprise_rag_bench --check
+uv run --locked yaw dspy optimize
+```
+
+The source directory above names the existing configured JSON inputs. For other
+locations use explicit `--corpus` and `--questions`; for all registered inputs use
+`--dataset all --source-dir <inputs>`. Do not resume a pre-refactor index. No
+migration, compatibility alias or legacy-layout fallback was added.
+
+## Indexing performance repair and ingestion proposal audit (2026-10-26–27)
+
+Checkout verified on `dev`, origin `https://github.com/negatrait/yaw.git`. The graph performance
+changes are now in `25f886f`. No optimization run or watchdog was launched during this work.
+
+### Measured graph preparation changes
+
+Read-only snapshot: `.yaw/yaw_optimize_20261026_144726.db`, 385 entities. Experimental removal
+of adjudicated semantic edges occurred only in an in-memory SQLite copy. Comparisons used the
+pre-change source and replacement in the same probe process; these are microbenchmarks, not
+full indexing throughput or task-quality results.
+
+| Probe | Before | After | Correctness check |
+| --- | ---: | ---: | --- |
+| 80 hydration calls, cold start | 0.5481 s | 0.2199 s | Exact rendered text equality |
+| 80 repeated hydration calls | 0.4211 s | 0.0560 s | Same pointers and 900-character budget |
+| Candidate search, last 100 entity IDs | 2.2893 s | 1.0735 s | Identical empty result on already adjudicated snapshot |
+| Candidate search, unadjudicated copy | 2.3617 s | 1.1413 s | Identical 25 pairs and similarity scores |
+| Dossiers for those 25 pairs | 75,327 characters, 2 requests | 64,644 characters, 2 requests | Old batching omitted 8 pair dossiers; replacement includes all 25 |
+
+Changes: incident-pair enumeration instead of visiting all graph pairs; bounded lexical and
+hydrated-text caches; reuse of a parsed source across splitter attempts; shared entity profiles
+and source excerpts in synonym requests; request cache keys include the actual dossier;
+candidate-search, synonym-judgment and SHACL progress messages are separate.
+
+The hydration caches are bounded, in-process accelerators; they are not durable checkpoints.
+Synonym stage-cache writes still participate in the graph transaction. They are not independently
+committed after each request. Existing per-chunk OpenIE checkpoints remain separate and survive
+graph rollback. Code changes invalidate the broad candidate-cache namespace; this does not erase
+the OpenIE checkpoint tables or already committed graph. Reusing those requires compatible
+model, prompt and run settings.
+
+Verification before the final small edits: the focused graph/storage/cache suite passed
+97 tests (4 testmon-deselected); the subsequent storage/SHACL/engine/architecture selection
+passed 45 (34 deselected). These selections overlap and must not be added as a unique test count.
+Ruff and ty passed at that checkpoint. The final additions were two progress notifications,
+source-file-edit coverage and a source-cache eviction test. Formatting passed afterward, but
+the final pytest/Ruff/ty rerun was not executed: automatic approval review reported exhausted
+workspace credits. Final test status for those last additions remains pending.
+
+The suggested JSON object-pattern substitution was also measured: `r"{\(PAIRS*\)}"` matched
+1,383 object spans in approximately 13 seconds; `"{ ... }"` matched only one in approximately
+0.7 seconds. The latter is not an equivalent optimization and was not adopted. Lexical thresholds,
+dense top-k, the full shared retrieval corpus and the strict graph validation gate were preserved.
+
+### Attached ingestion replacement: source audit
+
+The 2026-10-27 attachment is useful design input, not an executable replacement for current YAW.
+No ingestion source changes were made during this proposal review. Verified issues:
+
+- `sync_source_files_for_docs` removes `state/coco_lmdb` before each sync, then reconstructs the
+  complete optimization pool from `delta.added_chunks`. Record-level memoization alone cannot
+  improve restart reuse while this reset remains. Removing the reset alone is also incorrect:
+  unchanged chunks would disappear from the returned candidate pool. A complete snapshot read
+  path must accompany persistent incremental state.
+- The proposal retains the same variadic JSON object pattern and adds `json.loads` on matched
+  objects. It does not establish a solution to the measured matching cost.
+- `_split_and_build_chunks` derives physical JSON file lines from the decoded passage's line
+  numbers. Escaped newlines in a JSON string are not source-file newlines. Long-record chunks
+  must retain valid original record spans and AST bounds.
+- The early tuple-pattern branch processes every matching tuple before applying its ancestor
+  key path. A tuple beneath a blacklisted field can enter the corpus. Whole-object source spans
+  can also reintroduce excluded fields during hydration. Projection and hydration must be tested
+  together, including compact JSON and escaped Unicode/newlines.
+- The proposal imports nonexistent YAW `DEFAULT_CHUNK_SIZE` / `DEFAULT_CHUNK_OVERLAP` exports,
+  calls the three-argument `inclusive_end_line` with two arguments, changes exported function
+  signatures and tuple layouts, and leaves `ChunkPointer.ast_island_*` at defaults. Its match
+  access differs from the current working `m.chunks[0]` and capture-list API. Runtime compatibility
+  was not established; reading the installed dependency source was sandbox-denied.
+- Generic corporate records without a recognized body field become an empty result; programming
+  language scope extraction is removed. The Markdown fence toggle also conflates backtick and
+  tilde fences. These are lost behaviors, not proven performance improvements.
+- The current implementation does contain avoidable work: per-line `render_ranges` calls,
+  repeated nested-span scans and duplicated chunk assembly. It also masks JSON decoding errors,
+  suppresses `CodeSource` construction errors, and substitutes whole passages when splitting
+  unexpectedly produces no chunks. Those failure paths merit explicit, contextual errors.
+
+Recommended implementation order: preserve a complete optimization corpus snapshot while keeping
+CocoIndex state; define a typed projected-record contract with original source coordinates; replace
+nested JSON searches with one ordered span traversal; memoize record transformation with tracked
+helper dependencies; remove silent parser recovery and propagate component failures through poll;
+then consolidate chunk construction and scope extraction. Acceptance requires unchanged-corpus
+restart reuse, one-record edits, real deletion, malformed-input failure/retry, exact hydration and
+blacklist exclusion, plus cold/warm timings on the full EnterpriseRAG corpus. Current snapshot
+reconstruction, projection semantics and source-coordinate guarantees must not be weakened to
+obtain a faster timing.
+
 Date: 2026-10-13. This file owns measured results and open failures. The [daemon](epic-1-hipporag-daemon.md) and [FastMCP](epic-2-fastmcp-http.md) epic checklists remain uncompleted until implementation evidence is added.
 
 ## Installed baseline

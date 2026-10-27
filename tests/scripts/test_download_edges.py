@@ -12,6 +12,8 @@ from typing import TypedDict
 
 import pytest
 
+from yaw.daemon.ingestion import download_dataset_file, prepare_dataset_bundle, select_enterprise_questions
+
 
 class DownloadState(TypedDict):
     requests: list[str]
@@ -62,16 +64,18 @@ def test_download_fallback_streams_complete_bytes_and_force_replaces_atomically(
     tmp_path, monkeypatch, downloader, download_server
 ):
     state, url = download_server
-    monkeypatch.setattr(downloader, "HF_BASE_URL", url + "/primary")
-    monkeypatch.setattr(downloader, "GITHUB_BASE_URL", url + "/fallback")
-    target = downloader.download_file("sample.json", tmp_path)
+    target = download_dataset_file(
+        "sample.json", tmp_path, hf_base_url=url + "/primary", upstream_base_url=url + "/fallback"
+    )
     assert target.read_bytes() == state["payload"]
     assert state["requests"] == ["/primary/sample.json", "/fallback/sample.json"]
     assert not target.with_suffix(".json.tmp").exists()
-    downloader.download_file("sample.json", tmp_path)
+    download_dataset_file("sample.json", tmp_path, hf_base_url=url + "/primary", upstream_base_url=url + "/fallback")
     assert len(state["requests"]) == 2
     state["payload"] = b"replacement"
-    downloader.download_file("sample.json", tmp_path, force=True)
+    download_dataset_file(
+        "sample.json", tmp_path, force=True, hf_base_url=url + "/primary", upstream_base_url=url + "/fallback"
+    )
     assert target.read_bytes() == b"replacement"
 
 
@@ -79,56 +83,58 @@ def test_failed_download_preserves_previous_target_and_removes_temporary_file(
     tmp_path, monkeypatch, downloader, download_server
 ):
     state, url = download_server
-    monkeypatch.setattr(downloader, "HF_BASE_URL", url + "/primary")
-    monkeypatch.setattr(downloader, "GITHUB_BASE_URL", url + "/fallback")
     state["fail_all"] = True
     target = tmp_path / "sample.json"
     target.write_bytes(b"original")
     temporary = tmp_path / "sample.json.tmp"
     temporary.write_bytes(b"incomplete")
     with pytest.raises(RuntimeError, match="Could not download.*any source"):
-        downloader.download_file("sample.json", tmp_path, force=True)
+        download_dataset_file(
+            "sample.json", tmp_path, force=True, hf_base_url=url + "/primary", upstream_base_url=url + "/fallback"
+        )
     assert target.read_bytes() == b"original"
     assert not temporary.exists()
     assert len(state["requests"]) == 2
 
 
-@pytest.mark.parametrize("mode", ["check-valid", "check-invalid", "all-cached", "alias-cached", "invalid-cached"])
-def test_downloader_cli_reports_real_file_integrity_without_external_network(tmp_path, downloader, mode):
-    for query, corpus, _description in downloader.DATASET_REGISTRY.values():
-        (tmp_path / query).write_text('[{"question":"Source"}]', encoding="utf-8")
-        (tmp_path / corpus).write_text('[{"text":"Content"}]', encoding="utf-8")
-    if mode in ("check-invalid", "invalid-cached"):
-        (tmp_path / "sample.json").write_text("invalid json", encoding="utf-8")
-    arguments = ["--dest", str(tmp_path)]
-    if mode.startswith("check"):
-        arguments.append("--check")
-    else:
-        arguments += ["--dataset", "naturalquestions" if mode == "alias-cached" else "all"]
+@pytest.mark.parametrize("mode", ["check-valid", "check-invalid", "all-cached", "alias-cached", "invalid-source"])
+def test_downloader_cli_reports_real_bundle_integrity_without_external_network(tmp_path, downloader, mode):
+    sources, prepared = tmp_path / "sources", tmp_path / "prepared"
+    sources.mkdir()
+    for dataset, (query, corpus) in downloader.DATASET_REGISTRY.items():
+        qp, cp = sources / query, sources / corpus
+        qp.write_text('[{"question":"Source","answer":"Original"}]', encoding="utf-8")
+        cp.write_text('[{"title":"Original","text":"Content"}]', encoding="utf-8")
+        if mode.startswith("check"):
+            prepare_dataset_bundle(dataset, cp, qp, prepared)
+    if mode == "check-invalid":
+        (prepared / "sample/evaluation/questions.json").write_text("invalid", encoding="utf-8")
+    if mode == "invalid-source":
+        (sources / "sample.json").write_text("invalid", encoding="utf-8")
+    arguments = ["--dest", str(prepared), "--source-dir", str(sources)]
+    arguments += (
+        ["--check"]
+        if mode.startswith("check")
+        else ["--dataset", "naturalquestions" if mode == "alias-cached" else "all"]
+    )
     result = subprocess.run(
         [sys.executable, downloader.__file__, *arguments],
         capture_output=True,
         text=True,
         encoding="utf-8",
         env={**os.environ, "PYTHONIOENCODING": "utf-8"},
-        timeout=30,
+        timeout=60,
     )
-    assert result.returncode == (1 if mode == "check-invalid" else 0), result.stdout + result.stderr
+    assert (result.returncode != 0) == (mode in ("check-invalid", "invalid-source")), result.stdout + result.stderr
     if mode == "check-invalid":
-        assert "[MISSING] sample" in result.stdout
-    elif mode == "invalid-cached":
         assert "[FAIL] sample" in result.stdout
-    else:
+    elif mode != "invalid-source":
         assert "[OK]" in result.stdout
-    assert "Downloading sample.json from" not in result.stdout
 
 
-def test_enterprise_cache_is_used_and_undersized_category_is_rejected(tmp_path, downloader):
-    query, corpus, _ = downloader.DATASET_REGISTRY["enterprise_rag_bench"]
-    for filename in (query, corpus):
-        (tmp_path / filename).write_text(json.dumps([{"preserved": True}]), encoding="utf-8")
-    assert downloader.download_enterprise_rag_bench(tmp_path) == (tmp_path / query, tmp_path / corpus)
-    before = (tmp_path / query).read_bytes()
-    with pytest.raises(ValueError, match="Category.*only 0 questions"):
-        downloader.download_enterprise_rag_bench(tmp_path, questions_rows=[], documents_rows=[])
-    assert (tmp_path / query).read_bytes() == before
+def test_undersized_enterprise_selection_is_rejected_by_loader_without_touching_sources(tmp_path):
+    source = tmp_path / "questions.json"
+    source.write_text("[]", encoding="utf-8")
+    with pytest.raises(ValueError, match="Enterprise category"):
+        select_enterprise_questions(json.loads(source.read_text(encoding="utf-8")))
+    assert source.read_text(encoding="utf-8") == "[]"

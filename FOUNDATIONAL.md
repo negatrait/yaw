@@ -1,5 +1,17 @@
 # FOUNDATIONAL
 
+Accepted dataset/ingestion refactor (2026-10-27): prepared datasets contain one
+small JSON file per document under `documents/`, untouched evaluation rows under
+`evaluation/`, and an explicit manifest. Preparation copies configured source
+fields without normalization or QA-driven corpus sampling. Enterprise's existing
+deterministic 150/100 stratification belongs to the evaluation loader. Runtime
+consumers resolve bundles and document IDs; legacy monolithic corpus discovery,
+input rewriting and migration fallbacks are removed. Fresh prepared datasets and
+indexes are required; existing experiments remain untouched. CocoIndex state is
+persistent; complete snapshots include cached unchanged chunks, independently of
+target deltas. Generic production JSON projection remains strict and must also
+exclude rejected content during hydration. See docs/dataset-ingestion-refactor.md.
+
 Accepted development-tool update (2026-10-23): Python is pinned to 3.14.9.
 `uv run preflight` applies Ruff formatting/safe fixes and ty fixes, then runs
 pytest with testmon and coverage.py through pytest-cov. SlipCover is removed.
@@ -55,7 +67,7 @@ Baseline: 2026-10-19. YAW is a native HippoRAG 2 graph & storage engine (`yaw/da
    - Every added piece of graph/ranking logic must prove measurable `Recall@k` or `F1` lift on [`benchmark.py`](benchmark.py).
 4. **Single-Parse CocoIndex Rust Tree-Sitter AST + Target Sink Compilation + `ManagedConnection`:**
    - `cocoindex>=1.0.0` (`CorpusIngestor`) walks `corpus_root` across 30+ supported file formats (Markdown, JSON/JSONL, HTML/XML, YAML/TOML, SQL, Python, Rust, TypeScript, etc.). All syntax-aware chunking and enclosing scope/heading resolution are executed purely via CocoIndex's single-parse Rust Tree-sitter engine (`CodeSource`, `RecursiveSplitter`, `_coco_core.render_ranges`, and `CodePattern`) with zero `markdown-it` or competing third-party parsers.
-   - Declarative key projection operator $\pi_{\mathcal{W}, \mathcal{B}}$ (`json_keys_whitelist` & `json_keys_blacklist` with blacklist dominance) prunes blacklisted AST subtrees (corporate secrets like `Bearer*` and `*password*`; benchmark labels like `question*`, `answer*`, and `supporting_facts*`), guaranteeing zero test contamination ($I(\mathcal{I}; Q, A, D^*_{\text{labels}}) = 0$) and physical air-gapping directly on source files for 1-indexed line hydration without intermediate projection files.
+   - Prepared benchmarks contain only declared source document fields in individual JSON files. Evaluation rows, relevance labels and manifests remain outside the document scan root; registry field mappings and manifests connect consumers explicitly. Production `json_keys_whitelist` / `json_keys_blacklist` projection retains blacklist dominance. A projected result must be representable by safe original source spans during hydration; otherwise ingestion fails explicitly. It never rewrites source files, repairs JSON, or substitutes an unfiltered whole-file passage.
    - `YawGraphEngine.index()`, `YawRuntime.optimize()`, and `benchmark.py` (`run_yaw_benchmark`) all ingest through `CorpusIngestor` (`sync_corpus_once`) into `yaw.db` via `cocoindex.connectors.sqlite.ManagedConnection` (`open_managed_yaw_db`, FIFO RWLock + `sqlite-vec`). The engine executes Stage 1 `ExtractEntities` (`[name, definition]`) + Stage 2 `ExtractTriples` indexing (preserving all standalone Stage 1 NER entities with non-empty `skos:definition`), the Provisional Same-Label Sense-Split Gate ($\cos \ge 0.85 \implies$ reuse concept; $\cos < 0.85 \implies$ provisional `sense_id` without premature `owl:differentFrom`), Two-Channel Candidate Combiner (`find_entity_disambiguation_candidates` surfacing kNN + `difflib` + unadjudicated same-`label_norm` pairs $\to$ `judge_synonyms` $\to$ `merge_entities` / `upsert_semantic_edges`), and in-transaction SHACL linting + RLM self-healing (`lint_graph_shacl(conn, auto_heal=False)` $\to$ `heal_shacl_violations`) inside `with self.managed_conn.transaction() as conn:`.
    - Enforce single-owner write lock via `filelock.FileLock("yaw.db.lock")`. External CLI/inspection processes (`yaw daemon status`, `yaw graph lint`) read `yaw.db` strictly via read-only `file:...?mode=ro` SQLite WAL snapshots.
    - Treat inference (`http://localhost:13305/api/v1` or configured URL) as an external persistent server; never load/unload models from the daemon.

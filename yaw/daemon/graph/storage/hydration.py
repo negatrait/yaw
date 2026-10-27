@@ -9,14 +9,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
 
-from cocoindex._internal import core as _coco_core
-from cocoindex.ops.code import CodeSource
+from cocoindex.ops.code import CodeMatch, CodeSource, render_match
 from cocoindex.ops.text import RecursiveSplitter, detect_code_language
+from cocoindex.resources.chunk import Chunk, TextPosition
 
 from yaw.core import (
     ChunkPointer,
     HydratedPassage,
     compute_chunk_id,
+    json_document_fields,
+    render_document_text,
     resolve_corpus_path,
 )
 
@@ -163,58 +165,47 @@ coalesce_chunk_spans = coalesce_spans
 
 
 def normalize_json_passage_text(raw_text: str, default_title: str = "") -> str:
-    """Normalize raw JSON passage lines hydrated from disk into clean, readable text."""
-    stripped = raw_text.strip()
-    if not stripped:
+    """Decode a document object or an explicitly projected property sequence.
+
+    Source-aligned properties may retain their JSON separator commas. This is
+    a defined projection grammar, not malformed-document recovery.
+    """
+    raw = raw_text.strip()
+    if not raw:
         return ""
-    if stripped.endswith(",") and not stripped.startswith('"'):
-        stripped = stripped[:-1].rstrip()
-
-    try:
-        data = json.loads(stripped)
-    except Exception:
-        try:
-            data = json.loads("{" + stripped.rstrip(",") + "}")
-        except Exception:
-            return (
-                f"{default_title}\n{stripped}"
-                if default_title and not (stripped.startswith(f"{default_title}\n") or stripped == default_title)
-                else stripped
-            )
-
-    if isinstance(data, list):
-        if len(data) >= 2 and isinstance(data[0], str) and isinstance(data[1], list):
-            title = data[0].strip()
-            sents = [str(s) for s in data[1] if s is not None]
-            sep = "" if any(s.endswith((".", "!", "?", " ")) for s in sents[:-1]) else " "
-            body = sep.join(sents).strip()
-            return f"{title}\n{body}" if title else body
-        if len(data) == 1 and isinstance(data[0], str):
-            return data[0].strip()
-        return " ".join(str(x) for x in data)
-
-    if isinstance(data, dict):
-        title = str(data.get("title") or data.get("name") or default_title).strip()
-        body = data.get("text") or data.get("paragraph_text") or data.get("contents")
-        if body is not None:
-            body_str = str(body).strip()
-            return (
-                f"{title}\n{body_str}"
-                if title and not (body_str.startswith(f"{title}\n") or body_str == title)
-                else body_str
-            )
-        items = [f"{k}: {v}" for k, v in data.items() if v is not None]
-        body_str = "\n".join(items)
-        return (
-            f"{title}\n{body_str}"
-            if title and not (body_str.startswith(f"{title}\n") or body_str == title)
-            else body_str
-        )
-
-    if isinstance(data, str):
-        return data.strip()
-
-    return stripped
+    decoder = json.JSONDecoder()
+    data, end = decoder.raw_decode(raw)
+    remainder = raw[end:].lstrip()
+    if isinstance(data, str) and remainder.startswith(":"):
+        fields = {}
+        cursor = 0
+        while cursor < len(raw):
+            while cursor < len(raw) and raw[cursor].isspace():
+                cursor += 1
+            if cursor == len(raw):
+                break
+            key, cursor = decoder.raw_decode(raw, cursor)
+            if not isinstance(key, str):
+                raise ValueError("Projected JSON property key must be a string")
+            while cursor < len(raw) and raw[cursor].isspace():
+                cursor += 1
+            if cursor == len(raw) or raw[cursor] != ":":
+                raise ValueError("Projected JSON property requires a colon")
+            cursor += 1
+            while cursor < len(raw) and raw[cursor].isspace():
+                cursor += 1
+            fields[key], cursor = decoder.raw_decode(raw, cursor)
+            while cursor < len(raw) and raw[cursor].isspace():
+                cursor += 1
+            if cursor < len(raw):
+                if raw[cursor] != ",":
+                    raise ValueError("Invalid projected JSON property separator")
+                cursor += 1
+        data = fields
+    elif remainder not in ("", ","):
+        raise ValueError("Unexpected content after JSON source value")
+    title, body = json_document_fields(data, default_title)
+    return render_document_text(title, body)
 
 
 def _detect_hydration_language(rel_posix_path: str) -> str:
@@ -265,30 +256,30 @@ def dehydrate_passage_ast(
     # All splitter attempts share CocoIndex's lazy parsed AST.
     src = CodeSource(body_text, language=lang)
     for step_size in (min(body_budget, 600), max(40, body_budget // 3), 80):
-        try:
-            ast_chunks = _HYDRATION_SPLITTER.split(
-                src,
-                chunk_size=max(20, step_size),
-                chunk_overlap=0,
-                min_chunk_size=1,
-            )
-        except Exception:
-            ast_chunks = []
+        ast_chunks = _HYDRATION_SPLITTER.split(
+            src,
+            chunk_size=max(20, step_size),
+            chunk_overlap=0,
+            min_chunk_size=1,
+        )
+        if not ast_chunks and body_text.strip():
+            raise ValueError(f"{rel_posix_path}: splitter produced no chunks during hydration")
 
         if ast_chunks:
             last_valid_end_byte = 0
             for ch in ast_chunks:
-                cand = body_bytes[: ch.end.byte_offset].decode("utf-8", errors="replace")
+                cand = body_bytes[: ch.end.byte_offset].decode("utf-8")
                 if len(cand) <= body_budget:
                     last_valid_end_byte = ch.end.byte_offset
                 else:
                     break
             if last_valid_end_byte > 0:
-                best_body = body_bytes[:last_valid_end_byte].decode("utf-8", errors="replace").rstrip()
+                best_body = body_bytes[:last_valid_end_byte].decode("utf-8").rstrip()
                 break
 
     if not best_body:
-        # Fallback to last paragraph or sentence boundary within body_budget
+        # Valid AST chunks may all exceed the budget (for example a long word).
+        # Crop that valid text at a lexical boundary; parser failures propagate.
         window = body_text[:body_budget]
         for sep in ("\n\n", "\n", ". ", "; ", " "):
             idx = window.rfind(sep)
@@ -326,7 +317,7 @@ def get_cached_code_source(target_path: Path) -> tuple[CodeSource, list[str]] | 
             return cached[1], cached[2]
         _CODE_SOURCE_CACHE.pop(path_key, None)
     try:
-        text = target_path.read_text(encoding="utf-8", errors="replace")
+        text = target_path.read_text(encoding="utf-8")
     except OSError:
         return None
     src = CodeSource(text)
@@ -360,7 +351,7 @@ def read_corpus_lines(
         if start_line < 1 or start_line - 1 >= len(lines):
             return None
         raw_text = "".join(lines[start_line - 1 : end_line])
-    except OSError, UnicodeDecodeError:
+    except OSError:
         return None
 
     if not raw_text:
@@ -533,24 +524,38 @@ def resolve_one_hop_upward_ast_bounds(
             if not resolved_step:
                 lang = detect_code_language(filename=curr_ptr.rel_posix_path)
                 if lang is not None:
-                    try:
-                        full_text = "".join(lines)
-                        lang_src = CodeSource(full_text, language=lang)
-                        byte_start = sum(len(line.encode("utf-8")) for line in lines[: ast_s - 1])
-                        byte_end = byte_start + len(lines[ast_s - 1].encode("utf-8"))
-                        view = _coco_core.render_ranges(lang_src._src, [(byte_start, byte_end)])
-                        enclosing_frames = [
-                            seg.start_line
-                            for seg in view.segments
-                            if seg.kind == "frame" and seg.summary is None and seg.start_line < ast_s
-                        ]
-                        if enclosing_frames:
-                            parent_line = max(enclosing_frames)
-                            p_text = lines[parent_line - 1].strip().rstrip("{:").strip()
-                            parent_s, parent_e, parent_title = parent_line, ast_e, p_text or curr_ptr.title
-                            resolved_step = True
-                    except Exception:
-                        pass
+                    full_text = "".join(lines)
+                    lang_src = CodeSource(full_text, language=lang)
+                    byte_start = sum(len(line.encode("utf-8")) for line in lines[: ast_s - 1])
+                    char_start = sum(map(len, lines[: ast_s - 1]))
+                    anchor = lines[ast_s - 1].rstrip("\r\n")
+                    anchor_match = CodeMatch(
+                        kind="scope_anchor",
+                        chunks=[
+                            Chunk(
+                                text=anchor,
+                                start=TextPosition(byte_start, char_start, ast_s, 1),
+                                end=TextPosition(
+                                    byte_start + len(anchor.encode("utf-8")),
+                                    char_start + len(anchor),
+                                    ast_s,
+                                    len(anchor) + 1,
+                                ),
+                            )
+                        ],
+                        captures={},
+                    )
+                    view = render_match(lang_src, anchor_match)
+                    enclosing_frames = [
+                        seg.start.line
+                        for seg in view.segments
+                        if seg.kind == "frame" and seg.summary is None and seg.start.line < ast_s
+                    ]
+                    if enclosing_frames:
+                        parent_line = max(enclosing_frames)
+                        p_text = lines[parent_line - 1].strip().rstrip("{:").strip()
+                        parent_s, parent_e, parent_title = parent_line, ast_e, p_text or curr_ptr.title
+                        resolved_step = True
             if not resolved_step:
                 parent_s, parent_e, parent_title = 1, ast_e, curr_ptr.title
 

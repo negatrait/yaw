@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "FOUNDATIONAL.md",
+                "file": "AGENTS.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "FOUNDATIONAL"
+              "title": "AGENTS"
             }
           }
         ]
@@ -190,8 +190,8 @@
   },
   "active": "e8e0d511a8b3182d",
   "lastOpenFiles": [
-    "audit_report.md",
     "FOUNDATIONAL.md",
+    "audit_report.md",
     "AGENTS.md",
     "LEAN-CTX.md",
     "GEMINI.md"

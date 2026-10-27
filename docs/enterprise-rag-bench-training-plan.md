@@ -1,6 +1,6 @@
 # Technical Specification: Upstream `hipporag` Retirement, Dependency Upgrade & EnterpriseRAG-Bench Evolution
 
-**Document Status**: Implemented & Verified
+**Document Status**: Dataset contract updated 2026-10-27; see [replacement evidence](evaluation.md).
 **Target Milestone**: Immediate Upstream `hipporag` Demolition, Dependency Upgrade & EnterpriseRAG-Bench GEPA Evolution
 **Governing Documents**: [`FOUNDATIONAL.md`](../FOUNDATIONAL.md), [`docs/pre-epic2-memo.md`](pre-epic2-memo.md), [`docs/epic-1-hipporag-daemon.md`](epic-1-hipporag-daemon.md)
 
@@ -38,16 +38,17 @@ flowchart TD
         DEL_LEGACY["Delete legacy_chat.py & legacy_embedding.py"] --> NATIVE_BENCH["benchmark.py & verify_paper_parity_gate.py:<br/>Native YAW evaluated against TWO Targets"]
     end
 
-    subgraph DataCuration ["2. Doubled EnterpriseRAG-Bench Curation (scripts/download-datasets.py)"]
-        HF["onyx-dot-app/EnterpriseRAG-Bench<br/>(data/questions/test.parquet & data/documents/test.parquet)"] --> STRAT["Stratified Interleaved Sampler (N=250: 150 Train / 100 Val<br/>across 10 Categories + 2.0x Same-Tool Hard Distractors)"]
-        STRAT --> OUT_DS["outputs/datasets/enterprise_rag_bench.json &<br/>outputs/datasets/enterprise_rag_bench_corpus.json"]
+    subgraph DataCuration ["2. Faithful prepared bundle"]
+        INPUTS["Configured corpus JSON + original question JSON"] --> PREP["scripts/download-datasets.py: copy every document"]
+        PREP --> OUT_DS["documents/*.json + evaluation/questions.json + manifest.json"]
+        OUT_DS --> STRAT["Evaluation loader: seed 42, category quotas, 150 train / 100 validation"]
     end
 
     subgraph NativeCLI ["3. Native CLI Sandbox Optimization (yaw dspy optimize)"]
-        OUT_DS --> CLI_OPT["yaw dspy optimize --dataset enterprise_rag_bench<br/>--max-queries 250 --train-queries 150 --mode gepa --auto heavy"]
-        CLI_OPT --> SANDBOX["YawRuntime.optimize() Sandbox:<br/>Ingest isolated sandbox corpus throughout evolve_prompts()"]
-        SANDBOX --> GEPA["dspy.GEPA + Gate-Free Pareto Metric: GM(Goods) / GM(Bads)"]
-        GEPA --> PROPOSER["Stratum B Fixed Meta-Optimizer (RLMInstructionProposer, Sigs 10–12):<br/>Distill Traces in Python REPL & Propose GBNF Instructions"]
+        STRAT --> CLI_OPT["yaw dspy optimize --dataset enterprise_rag_bench<br/>--max-queries 250 --train-queries 150 --mode gepa --auto heavy"]
+        CLI_OPT --> SANDBOX["Persistent CocoIndex snapshot of documents only; isolated graph database"]
+        SANDBOX --> GEPA["dspy.GEPA + existing task-quality metric"]
+        GEPA --> PROPOSER["RLM evidence selection + native DSPy instruction proposer"]
         PROPOSER --> TARGETS["Mutate ONLY Stratum A Runtime Predictors (HippoRAGProgram, Sigs 1–9)"]
         TARGETS --> ARTIFACT[".yaw/compiled_program_enterprise.json"]
     end
@@ -145,9 +146,11 @@ Reports evaluate native YAW with side-by-side delta comparisons:
 - $\Delta_{\text{local}} = \text{YAW} - \text{MONKEYPATCHED\_HIPPORAG\_BASELINES}$ (Target 1: Must be $\ge -0.02$).
 - $\Delta_{\text{paper}} = \text{YAW} - \text{PAPER\_BASELINES}$ (Target 2: Tracking SOTA trajectory).
 
-### 3.2 EnterpriseRAG-Bench Schema & Stratification (`scripts/download-datasets.py`)
+### 3.2 EnterpriseRAG-Bench Schema & Stratification (evaluation loader)
 
-Curates 250 queries (`150` Train / `100` Validation) from `onyx-dot-app/EnterpriseRAG-Bench` across the 10 real categories:
+The downloader copies the complete configured corpus and original QA bytes.
+It does not fetch the upstream document table or sample documents using QA labels.
+The evaluation loader owns the following 250-query policy (`150` Train / `100` Validation):
 
 ```python
 ENTERPRISE_CATEGORY_QUOTAS: dict[str, tuple[int, int]] = {
@@ -162,21 +165,20 @@ ENTERPRISE_CATEGORY_QUOTAS: dict[str, tuple[int, int]] = {
     "Info Not Found": (9, 6),
     "High Level": (6, 4),
 }
-
-
-def download_enterprise_rag_bench(
-    dest_dir: Path,
-    *,
-    distractor_factor: float = 2.0,
-    seed: int = 42,
-    force: bool = False,
-) -> tuple[Path, Path]:
-    """Curate 250 stratified EnterpriseRAG-Bench queries (150 train + 100 val) and 2x hard distractors."""
 ```
+
+`select_enterprise_questions` in `yaw/daemon/ingestion/datasets.py` uses seed 42
+and preserves valid preassigned splits. Document identity and paths come from
+the manifest, with original ID/title/text values in document files. No synthesized
+answer aliases or title/category rewriting is performed. Evaluation files are
+outside the CocoIndex document root.
 
 ### 3.3 Optimization Sandbox Lifecycle Fix (`yaw/daemon/runtime.py`)
 
-In [`YawRuntime.optimize()`](../yaw/daemon/runtime.py#L783-L851), the optimization sandbox corpus is ingested directly in an isolated sandbox workspace and cleaned up only **after** `self.engine.evolve_prompts(...)` finishes.
+[`YawRuntime.optimize()`](../yaw/daemon/runtime.py) obtains a complete snapshot
+from persistent per-bundle CocoIndex state. Source files remain in the prepared
+bundle throughout optimization and hydration. Fresh graph indexes are required
+when adopting this breaking layout; no migration or legacy-layout discovery exists.
 
 ### 3.4 Two-Stratum Separation of the Canonical 12 DSPy Signatures
 
@@ -208,7 +210,7 @@ In [`YawRuntime.optimize()`](../yaw/daemon/runtime.py#L783-L851), the optimizati
 3. **[MODIFY] [`yaw/daemon/graph/inference/__init__.py`](../yaw/daemon/graph/inference/__init__.py)**: Remove `LocalChat`, `CacheOpenAI`, `chat_identity`, and `RetrievalEmbedding` from `_PUBLIC_API`.
 4. **[MODIFY] [`yaw/daemon/runtime.py`](../yaw/daemon/runtime.py)**: Fix `YawRuntime.optimize()` to keep sandbox corpus files alive on disk during `evolve_prompts(...)`.
 5. **[MODIFY] [`yaw/daemon/cli.py`](../yaw/daemon/cli.py)**: Add `"enterprise_rag_bench"` (and alias `"enterprise"`) to `_KNOWN_DATASETS`.
-6. **[MODIFY] [`scripts/download-datasets.py`](../scripts/download-datasets.py)**: Add `enterprise_rag_bench` to `DATASET_REGISTRY` to download and curate the 250-query stratified slice.
+6. **[MODIFY] [`scripts/download-datasets.py`](../scripts/download-datasets.py)**: Export faithful bundles from configured source inputs; the evaluation loader selects the 250-query stratified slice.
 7. **[MODIFY] [`benchmark.py`](../benchmark.py)** & **[MODIFY] [`scripts/verify_paper_parity_gate.py`](../scripts/verify_paper_parity_gate.py)**: Remove all `hipporag` imports and upstream runner functions, integrate `MONKEYPATCHED_HIPPORAG_BASELINES`, and evaluate native YAW against both targets.
 8. **[MODIFY] Documentation (`FOUNDATIONAL.md`, `AGENTS.md`, `README.md`, `docs/epic-1-hipporag-daemon.md`)**: Update to reflect upstream retirement and dual-target benchmark protocol.
 9. **[MODIFY] Test Suite (`tests/core/test_architecture.py`, `tests/daemon/graph/inference/*`, `tests/test_benchmark.py`)**: Enforce repo-wide zero-`hipporag` import invariant and test EnterpriseRAG-Bench stratification.
@@ -233,10 +235,10 @@ In [`YawRuntime.optimize()`](../yaw/daemon/runtime.py#L783-L851), the optimizati
    git grep -w "legacy_chat"
    git grep -w "legacy_embedding"
    ```
-2. **EnterpriseRAG-Bench Download & 250-Query Stratification Check**:
+2. **EnterpriseRAG-Bench Preparation & Bundle Integrity Check**:
    ```powershell
-   uv run --locked python scripts/download-datasets.py --dataset enterprise_rag_bench
-   uv run --locked python scripts/download-datasets.py --check
+   uv run --locked python scripts/download-datasets.py --dataset enterprise_rag_bench --source-dir outputs/datasets
+   uv run --locked python scripts/download-datasets.py --dataset enterprise_rag_bench --check
    ```
 3. **CLI Optimization & Hot-Reload Promotion**:
    ```powershell

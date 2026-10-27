@@ -73,14 +73,14 @@ DEFAULT_INCLUDED_PATTERNS: tuple[str, ...] = (
 DEFAULT_EXCLUDED_PATTERNS: tuple[str, ...] = (".*", "*/.*", "__pycache__/*")
 
 
-def write_text_atomic(path: Path | str, content: str, *, retries: int = 6) -> None:
+def write_text_atomic(path: Path | str, content: str, *, retries: int = 6, newline: str | None = None) -> None:
     """Atomically write UTF-8 text via a sibling temporary file with Windows PermissionError backoff."""
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_name(f".{target.name}.{os.getpid()}_{time.time_ns()}.tmp")
     max_attempts = max(1, int(retries))
     try:
-        tmp.write_text(content, encoding="utf-8")
+        tmp.write_text(content, encoding="utf-8", newline=newline)
         for attempt in range(max_attempts):
             try:
                 os.replace(tmp, target)
@@ -405,57 +405,6 @@ class YawConfig:
         cfg_dict["state_dir"] = bench_state
         cfg_dict["log_path"] = bench_log
         cfg_dict["poll_interval_seconds"] = 0.0
-        if self.json_keys_whitelist == ("*",):
-            cfg_dict["json_keys_whitelist"] = (
-                "title",
-                "text",
-                "paragraph_text",
-                "contents",
-                "context",
-                "context.*",
-                "contexts",
-                "contexts.*",
-                "paragraphs",
-                "paragraphs.*",
-                "document",
-                "document.title",
-                "document.text",
-                "document.summary",
-                "document.summary.*",
-            )
-            cfg_dict["json_keys_blacklist"] = tuple(
-                dict.fromkeys(
-                    (
-                        *self.json_keys_blacklist,
-                        "question*",
-                        "answer*",
-                        "answers*",
-                        "gold*",
-                        "reference*",
-                        "supporting_facts*",
-                        "is_supporting*",
-                        "evidences*",
-                        "obj*",
-                        "subj*",
-                        "prop*",
-                        "*_id",
-                        "id",
-                        "idx",
-                        "type",
-                        "level",
-                        "all_classes",
-                        "distractor",
-                        "length",
-                        "language",
-                        "dataset",
-                        "possible_answers*",
-                        "s_*",
-                        "o_*",
-                        "question_decomposition*",
-                        "answerable*",
-                    )
-                )
-            )
         return YawConfig(**cfg_dict)
 
     def config_fingerprint(self) -> str:

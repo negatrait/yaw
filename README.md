@@ -12,7 +12,7 @@ uv run preflight
 uv run preflight --full
 uv run typecheck
 uv run pytest -v
-uv run python scripts/download-datasets.py --dataset enterprise_rag_bench
+uv run --locked python scripts/download-datasets.py --dataset enterprise_rag_bench --source-dir outputs/datasets
 uv run yaw daemon status
 uv run yaw daemon run
 uv run yaw daemon start
@@ -34,6 +34,24 @@ uv run python benchmark.py --dataset hotpotqa --max-queries 25 --mode retrieval
 uv run python benchmark.py --dataset musique --max-queries 25 --mode retrieval
 uv run python scripts/verify_paper_parity_gate.py
 ```
+
+Dataset preparation now writes one JSON file per document under
+`outputs/datasets/<dataset>/documents/`, with evaluation rows and the manifest
+outside that scan root. `--source-dir` names the configured input JSON directory;
+the existing monolithic files are preserved as source inputs. To use explicit
+inputs, pass `--corpus <corpus.json> --questions <questions.json>` for one dataset.
+Use `--dataset all --source-dir <inputs>` to prepare all registered datasets and
+`--dataset enterprise_rag_bench --check` to validate that prepared bundle.
+Preparation copies the configured corpus in full and does not rewrite titles,
+answers or categories. Enterprise's deterministic 150/100 split is selected by
+the loader.
+
+This development refactor requires fresh prepared bundles and indexes. After
+preparation, `uv run --locked yaw dspy optimize` starts a new sandbox; use
+`--resume` only for a run created with this document layout. Normal scans retain
+CocoIndex state, and complete snapshots include unchanged memoized documents.
+Production JSON key projection remains configurable. Unsafe source spans and
+malformed inputs fail explicitly rather than being repaired or silently skipped.
 
 `preflight` formats with Ruff, applies safe Ruff and ty fixes, then runs pytest
 with testmon and coverage.py through pytest-cov. It continues after failures and
@@ -144,7 +162,7 @@ Upstream `hipporag` and `optuna` are permanently retired from `pyproject.toml`, 
 The unified local model stack (`http://localhost:13305/api/v1`) uses:
 - **Embeddings (`--embedding-model`):** `embeddinggemma-300m-GGUF` on GPU `llamacpp` (`--embedding-task-mode` defaults to `distinct-titled` under `retrieval-prompts-v3`).
 - **Unified Chat, GBNF Worker, QA Reader & RLM Orchestrator (`--extraction-model`, `--qa-model`):** `Gemma-4-E4B-it-GGUF` (`Q4_K_M`, 32,768 context) on GPU `llamacpp` (`--parallel 1 --cache-ram 0`) with pure-JSON GBNF grammar enforcement (`_yaw_supports_gbnf=True`) for direct/worker predictors and unconstrained Python REPL execution (`_yaw_supports_gbnf=False`) inside DSPy's managed Deno/Pyodide WASM sandbox (`dspy[deno]`, `dspy.PythonInterpreter`) for `shacl_healer_rlm` and `RLMInstructionProposer.inner_rlm`. Historical Qwen benchmark targets remain unchanged.
-- **OOD Enterprise Prompt Evolution (`uv run yaw dspy optimize`):** Configured by default in [`yaw.toml`](yaw.toml) to train on the stratified 250-query (`150` train + `100` val) **EnterpriseRAG-Bench** (`enterprise_rag_bench`, `onyx-dot-app/EnterpriseRAG-Bench`) dataset across all 10 reasoning categories (`Basic`, `Semantic`, `Intra-Document Reasoning`, `Project Related`, `Constrained`, `Conflicting Info`, `Completeness`, `Miscellaneous`, `Info Not Found`, `High Level`) with $2.0\times$ same-tool hard distractors via canonical `"hybrid"` optimization (`dspy.MIPROv2` warm-up + `dspy.GEPA` handoff with `candidate_selection_strategy="pareto"` and `use_merge=True` + always-on `dspy.SIMBA`, `auto = "heavy"`) and `compute_task_quality_score` (`yaw/daemon/graph/inference/parsers.py`, unweighted arithmetic mean $\text{score} = \frac{1}{|M|}\sum_{m \in M} m$ over available `Recall@1/2/5/10/20`, `EM`, and `F1`, preserving all 7 raw metrics in `objective_scores`).
+- **OOD Enterprise Prompt Evolution (`uv run yaw dspy optimize`):** Configured by default in [`yaw.toml`](yaw.toml) to train on the stratified 250-query (`150` train + `100` val) **EnterpriseRAG-Bench** (`enterprise_rag_bench`, `onyx-dot-app/EnterpriseRAG-Bench`) dataset across all 10 reasoning categories (`Basic`, `Semantic`, `Intra-Document Reasoning`, `Project Related`, `Constrained`, `Conflicting Info`, `Completeness`, `Miscellaneous`, `Info Not Found`, `High Level`). Preparation exports every document in the configured corpus, including its existing distractors. The loader owns stratification. Optimization uses canonical `"hybrid"` (`dspy.MIPROv2` warm-up + `dspy.GEPA` handoff with `candidate_selection_strategy="pareto"` and `use_merge=True` + always-on `dspy.SIMBA`, `auto = "heavy"`) and `compute_task_quality_score` (`yaw/daemon/graph/inference/parsers.py`, unweighted arithmetic mean $\text{score} = \frac{1}{|M|}\sum_{m \in M} m$ over available `Recall@1/2/5/10/20`, `EM`, and `F1`, preserving all 7 raw metrics in `objective_scores`).
 
 On this machine the models and settings are already installed. For a fresh Lemonade installation, register/download the embedding checkpoint and save both `llamacpp` models and settings explicitly before running benchmarks. 
 

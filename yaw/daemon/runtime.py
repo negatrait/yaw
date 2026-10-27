@@ -42,19 +42,14 @@ from yaw.daemon.graph.inference import (
     evaluate_benchmark_gate,
 )
 from yaw.daemon.ingestion import (
-    BENCHMARK_JSON_BLACKLIST,
-    BENCHMARK_JSON_WHITELIST,
-    DATASET_ALIASES,
-    DATASET_REGISTRY,
     DEFAULT_PARITY_DATASETS,
     MONKEYPATCHED_HIPPORAG_BASELINES,
     PAPER_BASELINES,
     CorpusIngestor,
+    DatasetBundle,
     build_benchmark_slice,
-    load_dataset_files,
-    resolve_dataset_name,
-    resolve_dataset_source_files,
-    sync_source_files_for_docs,
+    resolve_dataset_bundle,
+    snapshot_dataset_bundle,
 )
 
 logger = logging.getLogger(__name__)
@@ -895,7 +890,7 @@ class YawRuntime:
         max_bootstrapped_demos: int | None = None,
         max_labeled_demos: int | None = None,
         corpus_docs: Sequence[str] | None = None,
-        source_files: Sequence[Path | str] | None = None,
+        dataset_bundles: Sequence[DatasetBundle] | None = None,
         progress_callback: Callable[[str], None] | None = None,
         run_options: dict[str, Any] | None = None,
     ) -> Path:
@@ -915,51 +910,24 @@ class YawRuntime:
                     progress_callback(msg)
 
             opt_chunks = []
-            if corpus_docs or source_files:
-                _progress(f"indexing: preparing {len(corpus_docs or ())} corpus passages")
-                assert self.config.corpus_root is not None
+            if dataset_bundles:
+                _progress("indexing: loading complete persistent corpus snapshot")
                 assert self.config.state_dir is not None
-                eff_whitelist = (
-                    BENCHMARK_JSON_WHITELIST
-                    if self.config.json_keys_whitelist == ("*",)
-                    else self.config.json_keys_whitelist
-                )
-                eff_blacklist = (
-                    tuple(dict.fromkeys((*self.config.json_keys_blacklist, *BENCHMARK_JSON_BLACKLIST)))
-                    if self.config.json_keys_whitelist == ("*",)
-                    else self.config.json_keys_blacklist
-                )
-                eff_source_files: Sequence[Path | str] | None = source_files
-                if eff_source_files is None and isinstance(run_options, dict) and run_options.get("dataset"):
-                    eff_source_files = resolve_dataset_source_files(
-                        run_options["dataset"],
-                        workspace_root=self.config.workspace_root,
-                        prefer_corpus=True,
+                opt_chunks = []
+                roots = {bundle.root.parent for bundle in dataset_bundles}
+                if len(roots) != 1:
+                    raise ValueError("Dataset bundles must share one dataset directory")
+                self.engine.workspace_root = next(iter(roots))
+                for bundle in dataset_bundles:
+                    opt_chunks.extend(
+                        snapshot_dataset_bundle(
+                            bundle,
+                            Path(self.config.state_dir) / "optimize_coco" / bundle.dataset,
+                            chunk_size=self.config.chunk_size,
+                            chunk_overlap=self.config.chunk_overlap,
+                            min_chunk_size=self.config.min_chunk_size,
+                        )
                     )
-                opt_root = Path(self.config.corpus_root).resolve()
-                if eff_source_files and not all(Path(sf).resolve().is_relative_to(opt_root) for sf in eff_source_files):
-                    try:
-                        opt_root = Path(
-                            os.path.commonpath(
-                                [str(opt_root), *(str(Path(sf).resolve().parent) for sf in eff_source_files)]
-                            )
-                        ).resolve()
-                    except ValueError:
-                        opt_root = Path(
-                            os.path.commonpath([str(Path(sf).resolve().parent) for sf in eff_source_files])
-                        ).resolve()
-                    self.engine.workspace_root = opt_root
-                opt_chunks = sync_source_files_for_docs(
-                    corpus_root=opt_root,
-                    state_dir=Path(self.config.state_dir) / "optimize_coco",
-                    allowed_docs=corpus_docs,
-                    source_files=eff_source_files,
-                    json_keys_whitelist=eff_whitelist,
-                    json_keys_blacklist=eff_blacklist,
-                    chunk_size=self.config.chunk_size,
-                    chunk_overlap=self.config.chunk_overlap,
-                    min_chunk_size=self.config.min_chunk_size,
-                )
                 new_stats = self.engine.get_stats(self.config.config_fingerprint())
                 with self._state_lock:
                     self._stats = new_stats
@@ -1209,46 +1177,12 @@ class YawRuntime:
 
         dataset_reports: dict[str, dict[str, Any]] = {}
         for ds_arg in raw_datasets:
-            cand_path = Path(ds_arg)
-            if cand_path.exists() and cand_path.is_file():
-                resolved_file = cand_path.resolve()
-                raw_data = json.loads(resolved_file.read_text(encoding="utf-8"))
-                samples = raw_data if isinstance(raw_data, list) else raw_data.get("data", raw_data.get("samples", []))
-                corpus: list[dict[str, Any]] = []
-                stem = resolved_file.stem.lower()
-                canonical_ds = DATASET_ALIASES.get(stem, stem)
-                include_corpus = bool(
-                    full_corpus
-                    or eff_max_q is None
-                    or canonical_ds in ("sample", "narrativeqa", "lveval", "enterprise_rag_bench")
-                )
-                if include_corpus and canonical_ds in DATASET_REGISTRY:
-                    _, corpus_filename = DATASET_REGISTRY[canonical_ds]
-                    if corpus_filename:
-                        sibling_corpus = resolved_file.parent / corpus_filename
-                        if sibling_corpus.exists() and sibling_corpus.is_file():
-                            raw_corpus = json.loads(sibling_corpus.read_text(encoding="utf-8"))
-                            if isinstance(raw_corpus, list):
-                                corpus = raw_corpus
-            else:
-                canonical_ds = resolve_dataset_name(ds_arg)
-                include_corpus = bool(
-                    full_corpus
-                    or eff_max_q is None
-                    or canonical_ds in ("sample", "narrativeqa", "lveval", "enterprise_rag_bench")
-                )
-                if eff_max_q is not None and eff_idx_q is not None:
-                    total_needed: int | None = max(
-                        eff_max_q,
-                        eff_idx_q * 2 if canonical_ds == "popqa" else eff_idx_q,
-                    ) + max(0, query_offset)
-                else:
-                    total_needed = None
-                samples, corpus = load_dataset_files(
-                    canonical_ds,
-                    max_queries=total_needed,
-                    include_corpus=include_corpus,
-                )
+            bundle = resolve_dataset_bundle(ds_arg, workspace_root=self.config.workspace_root)
+            canonical_ds = bundle.dataset
+            samples, document_rows = bundle.read_inputs()
+            corpus = [
+                dict(row, idx=entry.document_id) for entry, row in zip(bundle.documents, document_rows, strict=True)
+            ]
 
             docs, queries, gold_docs, gold_answers = build_benchmark_slice(
                 canonical_ds,
@@ -1288,37 +1222,11 @@ class YawRuntime:
             if progress_callback is not None:
                 progress_callback(f"benchmarking {canonical_ds}: indexing {len(docs)} docs")
 
-            bench_source_files = resolve_dataset_source_files(
-                [ds_arg],
-                workspace_root=self.config.workspace_root,
-                prefer_corpus=include_corpus,
-            )
-            ws_root = (
-                Path(self.config.workspace_root).resolve()
-                if self.config.workspace_root
-                else Path.cwd().resolve()
-            )
-            if bench_source_files and all(sf.is_relative_to(ws_root) for sf in bench_source_files):
-                effective_corpus_root = ws_root
-            elif bench_source_files:
-                try:
-                    effective_corpus_root = Path(
-                        os.path.commonpath([str(ws_root), *(str(sf.parent) for sf in bench_source_files)])
-                    ).resolve()
-                except ValueError:
-                    effective_corpus_root = Path(
-                        os.path.commonpath([str(sf.parent) for sf in bench_source_files])
-                    ).resolve()
-            else:
-                effective_corpus_root = ws_root
-
-            chunks = sync_source_files_for_docs(
-                effective_corpus_root,
+            effective_corpus_root = bundle.root.parent
+            chunks = snapshot_dataset_bundle(
+                bundle,
                 bench_cfg.state_dir,
-                allowed_docs=docs,
-                source_files=bench_source_files,
-                json_keys_whitelist=bench_cfg.json_keys_whitelist,
-                json_keys_blacklist=bench_cfg.json_keys_blacklist,
+                document_ids=docs,
                 chunk_size=bench_cfg.chunk_size,
                 chunk_overlap=bench_cfg.chunk_overlap,
                 min_chunk_size=1,

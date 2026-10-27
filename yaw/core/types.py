@@ -1,6 +1,7 @@
 """Frozen, zero-dependency data contracts and pure coordinate/ID helpers for YAW."""
 
 import hashlib
+import json
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -24,6 +25,31 @@ class YawRuntimeError(RuntimeError):
         super().__init__(f"[{code}] {message}")
         self.code: ErrorCode = code
         self.message: str = message
+
+
+def json_document_fields(data: object, default_title: str = "") -> tuple[str, str]:
+    """One rendering contract for decoded document objects and projected values."""
+    if isinstance(data, str):
+        return default_title, data
+    if not isinstance(data, dict):
+        raise ValueError("JSON document must be an object or string")
+    title = data.get("title", default_title)
+    if "text" in data:
+        body = data["text"]
+    elif "content" in data:
+        body = data["content"]
+    else:
+        body = json.dumps(data, ensure_ascii=False)
+    if not isinstance(title, str) or not isinstance(body, str):
+        raise ValueError("JSON document title/body must be strings")
+    return title, body
+
+
+def render_document_text(title: str, body: str) -> str:
+    """Render source fields once, preserving an already present title line."""
+    if title and body != title and not body.startswith((title + "\n", title + "\r\n")):
+        return f"{title}\n{body}"
+    return body
 
 
 @dataclass(slots=True, frozen=True)
@@ -401,9 +427,7 @@ def check_lexical_subsumption_inversion(name_narrower: str, name_broader: str) -
     """
     if not isinstance(name_narrower, str) or not isinstance(name_broader, str):
         return False
-    if is_version_or_ordinal_sibling(name_narrower, name_broader) or is_acronym_pair(
-        name_narrower, name_broader
-    ):
+    if is_version_or_ordinal_sibling(name_narrower, name_broader) or is_acronym_pair(name_narrower, name_broader):
         return False
     toks_n = {tok for tok in str(text_processing(name_narrower)).split() if tok}
     toks_b = {tok for tok in str(text_processing(name_broader)).split() if tok}

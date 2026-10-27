@@ -52,18 +52,14 @@ from yaw.daemon.graph.inference.models import (
 )
 from yaw.daemon.ingestion import (
     ALIASES,
-    BENCHMARK_JSON_BLACKLIST,
-    BENCHMARK_JSON_WHITELIST,
     DATASETS,
-    HF_BASE_URL,
     MONKEYPATCHED_HIPPORAG_BASELINES,
     PAPER_BASELINES,
-    UPSTREAM_DATASET_BASE_URL,
     build_benchmark_slice,
     get_gold_answers,
     get_gold_docs,
-    resolve_dataset_source_files,
-    sync_source_files_for_docs,
+    resolve_dataset_bundle,
+    snapshot_dataset_bundle,
 )
 from yaw.daemon.ingestion import (
     DATASET_REGISTRY as DATASET_REGISTRY,
@@ -117,8 +113,6 @@ def load_dataset_files(
         dataset_dir,
         max_queries=max_queries,
         include_corpus=include_corpus,
-        hf_base_url=HF_BASE_URL,
-        upstream_base_url=UPSTREAM_DATASET_BASE_URL,
         project_root=PROJECT_ROOT,
     )
 
@@ -198,7 +192,7 @@ def print_benchmark_summary(
 def run_yaw_benchmark(
     *,
     dataset: str,
-    docs: list[str],
+    document_ids: list[str],
     queries: list[str],
     gold_docs: list[list[str]],
     gold_answers: list[list[str]],
@@ -286,20 +280,10 @@ def run_yaw_benchmark(
     )
     try:
         index_start = perf_counter()
-        num_docs = len(docs)
-        source_files = resolve_dataset_source_files(
-            [dataset],
-            workspace_root=PROJECT_ROOT,
-            prefer_corpus=True,
-        )
-        chunks_to_index = sync_source_files_for_docs(
-            corpus_root=PROJECT_ROOT,
-            state_dir=index_dir / "coco_state",
-            source_files=source_files,
-            allowed_docs=docs,
-            json_keys_whitelist=BENCHMARK_JSON_WHITELIST,
-            json_keys_blacklist=BENCHMARK_JSON_BLACKLIST,
-        )
+        num_docs = len(document_ids)
+        bundle = resolve_dataset_bundle(dataset, workspace_root=PROJECT_ROOT)
+        yaw_engine.workspace_root = bundle.root.parent
+        chunks_to_index = snapshot_dataset_bundle(bundle, index_dir / "coco_state", document_ids=document_ids)
         report["index_batches"] = (
             yaw_engine.index_chunks(
                 chunks_to_index,
@@ -308,7 +292,7 @@ def run_yaw_benchmark(
             if chunks_to_index
             else int(yaw_engine.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
         )
-        del docs
+        del document_ids
         gc.collect()
         report["indexing_seconds"] = round(perf_counter() - index_start, 2)
         num_facts = int(yaw_engine.conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0])
@@ -327,7 +311,7 @@ def run_yaw_benchmark(
                 flush=True,
             )
             train_golds = get_gold_answers(train_samples)
-            train_gold_docs = get_gold_docs(train_samples, dataset)
+            train_gold_docs = get_gold_docs(train_samples, dataset, corpus_by_id=bundle.corpus_by_id())
             trainset = [
                 dspy.Example(
                     question=s["question"],
@@ -637,9 +621,6 @@ def main(
         qa_model = chat_model
     include_qa = mode not in ("embeddings", "retrieval")
     profile = resolve_embedding_profile(embedding_model, embedding_task_mode)
-    include_corpus = bool(
-        full_corpus or max_queries is None or dataset in ("sample", "narrativeqa", "lveval", "enterprise_rag_bench")
-    )
 
     total_needed = None
     if max_queries is not None:
@@ -653,7 +634,7 @@ def main(
     samples, corpus = load_dataset_files(
         dataset,
         max_queries=total_needed,
-        include_corpus=include_corpus,
+        include_corpus=True,
     )
 
     train_samples: list[dict] = []
@@ -673,11 +654,12 @@ def main(
         index_queries=index_queries,
     )
     if train_samples:
-        for gd in get_gold_docs(train_samples, dataset):
-            docs.extend(gd)
+        training_references = {doc for refs in get_gold_docs(train_samples, dataset, corpus=corpus) for doc in refs}
+        docs.extend(str(row["idx"]) for row in corpus if f"{row['title']}\n{row['text']}" in training_references)
         docs = list(dict.fromkeys(docs))
-
-    del samples, corpus
+    corpus_text = {str(row["idx"]): f"{row['title']}\n{row['text']}" for row in corpus}
+    embedding_probe_docs = [corpus_text[document_id] for document_id in docs[:3]]
+    del samples, corpus, corpus_text
     gc.collect()
     num_docs = len(docs)
 
@@ -757,7 +739,7 @@ def main(
         if mode in ("embeddings", "all"):
             embed_client = create_dspy_embedder(profile, base_url=BASE_URL)
             embedder = DSPyEmbeddingAdapter(profile=profile, embedder=embed_client)
-            report["embedding_probes"] = verify_embeddings(embedder, queries, docs)
+            report["embedding_probes"] = verify_embeddings(embedder, queries, embedding_probe_docs)
             report["server"] = embedding_evidence(profile)
             report["index_identity"] = report["server"]["resolved_index_identity"]
             if mode == "embeddings":
@@ -770,7 +752,7 @@ def main(
         report["status"] = "passed"
         return run_yaw_benchmark(
             dataset=dataset,
-            docs=docs,
+            document_ids=docs,
             queries=queries,
             gold_docs=gold_docs,
             gold_answers=gold_answers,
