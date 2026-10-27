@@ -1,163 +1,121 @@
-# Epic 2 — Sprint 2 Specification (`E2-S2`): 5 MCP Tools, Progress Streaming, Loopback Security & Real-TCP Verification
+# Epic 2 — Sprint 2: MCP Tools and Transport Acceptance
 
-Parent Epic SSOT: [epic-2-fastmcp-http.md](epic-2-fastmcp-http.md) | Prerequisite: [Sprint 1 (`E2-S1`)](epic-2-sprint-1-spec.md) | Constitution: [FOUNDATIONAL.md](../FOUNDATIONAL.md)
+Parent: [Epic 2](epic-2-fastmcp-http.md) | Prerequisite: [Sprint 1](epic-2-sprint-1-spec.md) | Constitution: [FOUNDATIONAL](../FOUNDATIONAL.md)
 
----
+Status: planned, reconciled 2026-10-27 against `dev`. Sprint 1 and Epic 1 `D1-A6`
+acceptance are prerequisites, not claims of completed work. This sprint completes
+the parent's five tool contracts and verifies `E2-A2`/`E2-A3` over real TCP.
 
-## 1. Context & Root-Cause Problem Statement
+## 1. Thin transport implementation
 
-With the `FastMCP` server mounted onto `YawRuntime`'s lifespan in [Sprint 1 (`E2-S1`)](epic-2-sprint-1-spec.md), Sprint 2 (`E2-S2`) completes the 5 fixed MCP tools (`retrieve`, `rag_qa`, `index_stats`, `daemon_status`, `sync_sources`), bridges worker-thread progress callbacks (`queued`, `started`, `ready`) into non-blocking `Context.report_progress` notifications over Streamable HTTP, enforces loopback `Host`/`Origin` request protection, and verifies all multi-client concurrency, cancellation, and error contracts over real loopback TCP sockets (`tests/daemon/test_mcp_http.py`).
+Register exactly `retrieve`, `rag_qa`, `index_stats`, `daemon_status` and
+`sync_sources`, with the parent's schemas and all four annotations. Delegate to
+public runtime APIs; never import graph/ingestion or own a second database writer.
 
----
+Await retrieval/QA futures with `asyncio.wrap_future`. Status/statistics read
+cached snapshots directly. `sync_sources` returns its accepted/already-pending
+receipt immediately; it does not keep the tool request open until indexing ends.
 
-## 2. Architecture, Dataflow & Domain Containment
+Use strict transport types so schema validation cannot coerce `true`, `"5"` or
+`5.0` to integer `top_k` before runtime validation. Preserve the same rules for
+direct callers. Map invalid tool arguments, synchronous runtime failures and
+future failures to the parent's seven codes with `isError=true` and `[CODE]`
+prefixes. Malformed JSON-RPC remains a protocol error, not a runtime tool failure.
+Redact credentials in tool errors, status, readiness and exposed exception details.
 
-```mermaid
-flowchart LR
-    subgraph ClientLoop["FastMCP Client (TCP 127.0.0.1)"]
-        C1["Client 1 (retrieve / rag_qa / sync_sources)"]
-        C2["Client 2 (daemon_status / index_stats / /healthz)"]
-    end
+## 2. Progress, cancellation and sync receipts
 
-    subgraph ServerLoop["ASGI Event Loop (yaw/daemon/mcp_server.py)"]
-        Guard["LoopbackHostOriginGuardMiddleware"]
-        PQueue["asyncio.Queue (Progress Pump)"]
-        WrapFut["asyncio.wrap_future(concurrent.futures.Future)"]
-        FastRead["runtime.status() / runtime.stats() (<1ms)"]
-    end
+Bridge synchronous callbacks into the active loop with
+`loop.call_soon_threadsafe` and a bounded per-request progress channel. Await
+`Context.report_progress` through public APIs of the locked FastMCP version.
+Preserve runtime stage order; drain successful completion progress before returning.
 
-    subgraph RuntimeWorker["YawRuntime Single Worker Thread (yaw/daemon/runtime.py)"]
-        WQueue["queue.Queue(maxsize=32)"]
-        Worker["_worker_loop (yaw.db + CocoIndex + DSPy)"]
-    end
+- Successful retrieval/QA with a progress token emits exactly `queued` (1/3),
+  `started` (2/3), `ready` (3/3), even for immediate operations.
+- Errors/cancellation emit only the valid prefix reached, never fabricated
+  `ready`. Failed admission emits no `queued`. Calls without progress tokens
+  still work and must not retain unused progress state.
+- Accepted sync receipts may emit `queued` after admission. `already_pending`
+  refers to the existing scan, not a second admission. Read later scan state
+  through `daemon_status`; never notify an already returned tool context.
+- Explicit request cancellation cancels pending work and reclaims its slot
+  immediately. Already running work finishes safely without delivering to that caller.
+- Test explicit MCP cancellation and dropped connections separately. Closing HTTP
+  is not necessarily session-request cancellation. Document the locked transport's
+  observed behavior; where cancellation propagates, apply the same queue rules.
+  A disconnected session may retain work according to protocol behavior, but must
+  not orphan request-local progress tasks.
+- Detach callbacks and stop/await progress tasks on every completion/failure/
+  cancellation path. Never call a closed loop or let a slow progress consumer
+  block the database worker.
 
-    C1 --> Guard --> WrapFut
-    C2 --> Guard --> FastRead
-    WrapFut --> WQueue --> Worker
-    Worker -->|"loop.call_soon_threadsafe('queued'|'started'|'ready')"| PQueue
-    PQueue -->|"await ctx.report_progress(i, 3, stage)"| C1
-```
+## 3. Loopback Host and Origin guard
 
-### Domain Containment Check
-- `yaw/daemon/mcp_server.py` imports **only** `yaw.daemon.runtime`, `yaw.core.*`, `fastmcp`, `mcp.types`, `starlette`, `uvicorn`, and `stdlib`.
-- `tests/daemon/test_mcp_http.py` tests the full stack over real loopback TCP sockets (`127.0.0.1:<ephemeral_port>`) using `fastmcp.Client` and `urllib.request`, real SQLite (`yaw.db`), real CocoIndex ingestion, and a localhost loopback HTTP inference server.
+Implement with Sprint 1's mount; exercise the full matrix here. Apply to `/mcp`,
+`/healthz` and `/readyz` before route dispatch.
 
----
+- Validate configuration as loopback; it cannot extend trust to arbitrary hosts.
+  Recognized request hostnames: `localhost`, `127.0.0.1`, `::1`. Parse
+  authorities correctly, including bracketed IPv6 and optional valid ports;
+  do not split naively on `:`.
+- Reject missing, malformed, duplicate or untrusted Host headers with HTTP 403.
+- Missing Origin is valid for non-browser clients. When present, require one
+  well-formed HTTP(S) origin with a recognized loopback hostname and valid optional
+  port. Reject `null`, userinfo, unexpected path/query/fragment, duplicate/multiple
+  origins and external domains. Never use hostname suffix matching.
+- Return a small sanitized 403 response. No wildcard CORS, stdio/SSE compatibility
+  or remote deployment support.
 
-## 3. Formal Contracts & Typed Interfaces
+## 4. Acceptance tests
 
-### Step 04: 5 Fixed MCP Tools, Async Progress Pump & Loopback Security Guard (`yaw/daemon/mcp_server.py`) {#step-04}
+Use workspace engineering-real-tests and CocoIndex skills. Run a real ASGI/FastMCP
+server on an ephemeral loopback port, real `fastmcp.Client` sessions, temporary
+SQLite/files, CocoIndex and a loopback HTTP inference provider. Do not mock
+storage or runtime methods. Synthetic provider outputs establish orchestration
+only; model quality remains the user's benchmark work.
 
-```python
-_PROGRESS_STAGES: dict[str, tuple[int, int]] = {
-    "queued": (1, 3),
-    "started": (2, 3),
-    "ready": (3, 3),
-}
+| Test packet | Required evidence |
+| --- | --- |
+| Lifespan/containment (E2-A1 regression) | Health/readiness during blocked initial sync, empty-ready, failure and stopping; bind/startup cleanup; lock reacquisition; adapter import boundary |
+| Five tools (E2-A2) | Exact names, schemas and four annotations; calls without progress; ordered immediate/slow success; valid prefixes on error/cancellation |
+| Citations (E2-A2) | Actual text/physical coordinates for Markdown/code and prepared JSON; shared-record subchunks, namespaced paths and MaxP coalescing; unchanged fresh-process restart; edit/delete/truncate detection without excluded-data leaks; text hashes and QA evidence match captured predictor context |
+| Errors (E2-A2) | All seven codes from real validation/provider/storage/lifecycle conditions; empty/oversized UTF-8 and non-string query, top_k bounds/bool/string/float; lifecycle before empty-index errors; redaction |
+| Responsive reads (E2-A3) | Two clients; daemon_status, index_stats, /healthz and /readyz finish within two seconds while inference remains blocked on an explicit event |
+| Capacity/cancellation (E2-A3) | One blocked active operation plus 32 actual pending items; overflow BUSY; pending cancellation reduces depth and permits replacement before releasing the worker; cancelled work never executes; running cancellation finishes safely |
+| Atomic sync (E2-A3) | Simultaneously released clients get one accepted and remaining already_pending receipts with one scan ID; one actual scan; failed admission leaves no reservation; failed scans retry; partial scans never delete sources |
+| Live update (E2-A3) | CocoIndex source edit plus sync; new consistent citation/provenance after commit; unchanged warm scans reuse persistent results |
+| Security/disconnects (E2-A3) | Raw duplicate headers, IPv6, missing Origin, hostile hosts and non-loopback bind rejection; separate cancellation/disconnect/reconnect evidence; no leaked progress tasks |
 
+Use barriers/events to control concurrency, not short sleeps and tighter-than-
+contract latency thresholds. Release events in `finally` blocks and bound waits.
+Assert status arrives **before** releasing inference as well as measuring the
+two-second bound. Small-capacity unit cases supplement but do not replace the
+real 32-slot acceptance case.
 
-async def _await_runtime_future_with_progress(
-    submit_fn: Callable[[Callable[[str], None]], Future[T]],
-    ctx: Context | None,
-) -> T:
-    """Submit work to YawRuntime, stream ('queued', 'started', 'ready') to ctx.report_progress,
-    and await the worker Future without blocking the asyncio loop.
+Send raw tool-call arguments when client schema validation would hide server
+behavior. Verify tool-result errors independently of JSON-RPC parse errors.
+Exercise failures with real invalid bytes, provider errors and resource/lifecycle
+conditions, rather than patching runtime methods.
 
-    On asyncio.CancelledError (client disconnect), calls fut.cancel() so queued items are
-    immediately removed from YawRuntime._queue while in-flight items finish on the worker thread.
-    Translates YawRuntimeError(code, message) into FastMCP ToolError(f'[{code}] {message}').
-    """
-```
+## 5. Delivery and verification
 
-#### Exact Tool Contracts on `FastMCP("yaw-mcp")`:
+Changes belong in `yaw/daemon/mcp_server.py`, affected runtime/core contracts,
+`tests/daemon/test_mcp_http.py` and runtime/architecture tests. Replace obsolete
+paths rather than retaining adapters. README must describe only delivered commands
+and verified endpoints; keep target commands separate.
 
-1. **`retrieve(query: str, top_k: int = 5, ctx: Context | None = None) -> dict[str, Any]`**
-   - Annotations: `ToolAnnotations(title="Retrieve Passages", readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)`
-   - Validation: `validate_query_input(query)` and `not isinstance(top_k, bool) and isinstance(top_k, int) and 1 <= top_k <= 20`.
-   - Returns:
-     ```python
-     {
-         "query": cleaned_query,
-         "top_k": top_k,
-         "results": [serialize_hydrated_passage(idx + 1, hp) for idx, hp in enumerate(passages)],
-     }
-     ```
-2. **`rag_qa(question: str, ctx: Context | None = None) -> dict[str, Any]`**
-   - Annotations: `ToolAnnotations(title="Multi-Hop RAG QA", readOnlyHint=True, destructiveHint=False, idempotentHint=False, openWorldHint=False)`
-   - Validation: `validate_query_input(question)`; raises `ToolError("[NOT_READY] ...")` if `lifecycle == "starting"`, `ToolError("[SHUTTING_DOWN] ...")` if `lifecycle in ("stopping", "stopped")`, and `ToolError("[EMPTY_INDEX] ...")` if `stats().chunks == 0`.
-   - Returns:
-     ```python
-     {
-         "question": str,
-         "answer": str,
-         "reasoning": str,
-         "evidence": list[dict[str, Any]],  # up to 5 items from serialize_hydrated_passage
-         "last_sync_at": float | None,
-     }
-     ```
-3. **`index_stats() -> dict[str, Any]`**
-   - Annotations: `ToolAnnotations(title="Graph Index Statistics", readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)`
-   - Returns: `runtime.stats().to_dict()` immediately from memory without touching the worker queue.
-4. **`daemon_status() -> dict[str, Any]`**
-   - Annotations: `ToolAnnotations(title="Daemon Lifecycle & Queue Status", readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)`
-   - Returns: `runtime.status().to_dict()` immediately from memory without touching the worker queue.
-5. **`sync_sources(ctx: Context | None = None) -> dict[str, Any]`**
-   - Annotations: `ToolAnnotations(title="Incremental Corpus Sync", readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False)`
-   - Action: Emits `"queued"` progress notification if `ctx is not None`, invokes `runtime.request_sync()`, and returns `{"scan_id": str, "status": "accepted" | "already_pending"}`.
-
-#### Loopback Host & Origin Protection Contract (`LoopbackHostOriginGuardMiddleware`):
-- Allowed `Host` values (hostname portion after stripping optional `:port`): `{"127.0.0.1", "localhost", "::1", "[::1]", configured_host.lower()}`. Missing or non-matching `Host` header returns HTTP `403 Forbidden` (`{"error": "INVALID_INPUT", "message": "Forbidden Host header."}`).
-- Allowed `Origin` values: `Origin` header may be omitted (standard non-browser MCP clients); if present, its parsed scheme must be `http` or `https` and its hostname must be in `{"127.0.0.1", "localhost", "::1", configured_host.lower()}`. Any other `Origin` (including `"null"` or external domains) returns HTTP `403 Forbidden` (`{"error": "INVALID_INPUT", "message": "Forbidden Origin header."}`).
-
----
-
-## 4. Invariants & Explicit Non-Goals
-
-- **7 Canonical Error Codes Invariant:** Every `YawRuntimeError` raised synchronously during input validation or asynchronously on the worker queue is surfaced to the MCP client as an MCP tool error (`result.is_error == True`) whose text begins with `[{code}]` where `code` $\in$ `{"INVALID_INPUT", "NOT_READY", "EMPTY_INDEX", "BUSY", "MODEL_ERROR", "CONSISTENCY_ERROR", "SHUTTING_DOWN"}`.
-- **Progress Ordering Invariant:** For any `retrieve` or `rag_qa` tool call with a client progress handler, progress notifications arrive in monotonic order: `(1, 3, "queued")` $\to$ `(2, 3, "started")` $\to$ `(3, 3, "ready")`.
-- **Non-Blocking Read Invariant:** While the single worker thread is blocked inside slow LLM/embedding execution (`retrieve`, `rag_qa`, or `sync_sources`), concurrent calls to `daemon_status`, `index_stats`, `GET /healthz`, and `GET /readyz` complete in `<2.0s` without waiting on the worker thread.
-- **Explicit Non-Goals:**
-  - Zero `stdio` or `sse` transport shims.
-  - Zero wildcard CORS headers.
-
----
-
-## 5. File-by-File Blueprint (`E2-S2`) {#step-05}
-
-| Order | Tag | File | Planned Changes |
-| :--- | :--- | :--- | :--- |
-| **1** | `[MODIFY]` | `yaw/daemon/mcp_server.py` | Register all 5 tools with `ToolAnnotations`, wire `_await_runtime_future_with_progress`, attach `LoopbackHostOriginGuardMiddleware`, and map `YawRuntimeError` to `ToolError`. |
-| **2** | `[NEW]` | `tests/daemon/test_mcp_http.py` | Author comprehensive unmocked loopback TCP test suite covering `E2-A1`, `E2-A2`, and `E2-A3`. |
-| **3** | `[MODIFY]` | [`README.md`](../README.md), [`docs/evaluation.md`](evaluation.md), [`docs/epic-2-fastmcp-http.md`](epic-2-fastmcp-http.md) | Document FastMCP HTTP endpoint and 5 tools in `README.md`, record measured test/acceptance metrics in `docs/evaluation.md`, and check off `E2-A1..E2-A3` in `docs/epic-2-fastmcp-http.md`. |
-
----
-
-## 6. Real-Substrate Verification Strategy (`tests/daemon/test_mcp_http.py`)
-
-All tests in `tests/daemon/test_mcp_http.py` run without mocks against a live `Uvicorn` + `FastMCP` server bound to `127.0.0.1:<ephemeral_port>`, a real `tmp_path` SQLite `yaw.db`, real CocoIndex file ingestion, and a localhost loopback HTTP inference server:
-
-1. **`test_e2_a1_lifespan_healthz_readyz_and_containment`:**
-   - Verifies `/healthz` returns `200` and `/readyz` returns `503` while initial startup sync is running (`lifecycle == "starting"`), transitions `/readyz` to `200` once `lifecycle == "ready"`, and returns `503` when `lifecycle == "degraded"` or stopping.
-2. **`test_e2_a2_five_tools_progress_and_hydrated_passages`:**
-   - Connects `fastmcp.Client("http://127.0.0.1:<port>/mcp")`, verifies exact 5 tool names and `readOnlyHint`/`destructiveHint` annotations.
-   - Executes `retrieve` and `rag_qa` with a `progress_handler`, asserting `[("queued", 1, 3), ("started", 2, 3), ("ready", 3, 3)]`.
-   - Verifies 1-indexed `start_line`/`end_line`, `content_hash`, and `stale_on_disk=False` on intact files, then modifies/deletes the file on disk before re-sync and asserts `stale_on_disk=True`.
-3. **`test_e2_a2_error_codes_contract`:**
-   - Verifies `isError=true` and exact `[CODE]` prefixes for `INVALID_INPUT` (empty query, `>1024` UTF-8 bytes, `top_k=0`, `top_k=21`, `top_k=True`), `EMPTY_INDEX` (`rag_qa` on empty corpus), `NOT_READY`, `BUSY`, `MODEL_ERROR`, `CONSISTENCY_ERROR`, and `SHUTTING_DOWN`.
-4. **`test_e2_a3_two_concurrent_clients_nonblocking_status_busy_and_cancellation`:**
-   - Connects two concurrent `fastmcp.Client` instances over TCP while the worker thread is paused inside a slow loopback inference request (`0.6s`).
-   - Asserts `daemon_status`, `index_stats`, and `GET /healthz` respond in `<0.2s` (`<< 2.0s` gate).
-   - Fills all 32 queue slots (`queue_maxsize=4` in isolated test or `32` full slots), proves the overflow request fails fast with `[BUSY]`, cancels one queued request before worker execution, and proves the freed slot immediately accepts a new request and decrements `queue_depth`.
-5. **`test_e2_a3_live_cocoindex_sync_sources_and_host_origin_guard`:**
-   - Edits a workspace file, calls `sync_sources` (verifying `"accepted"` and coalesced `"already_pending"`), and verifies updated citations on `retrieve`.
-   - Sends raw HTTP requests with `Host: evil.example.com` and `Origin: https://evil.example.com` to `/mcp`, asserting HTTP `403 Forbidden`.
-
-### Deterministic Quality Gates
+After implementation, run affected tests with testmon and repository checks:
 
 ```powershell
+uv run --locked pytest tests/core/test_architecture.py tests/daemon/test_runtime.py tests/daemon/test_mcp_http.py -vv
 uv run --locked preflight
-uv run --locked pytest tests/core/test_architecture.py tests/daemon/test_mcp_http.py -vv
-uv run --locked ruff check .
-uv run --locked ty check
 git diff --check
 ```
+
+Report selection/deselection and coverage scope. If testmon deselects required
+acceptance cases, run them explicitly with selection disabled and record why;
+deselection is not evidence that a new acceptance condition passed. Do not hide
+unavailable resident-provider prerequisites. Record results, failures, versions,
+Windows lifecycle evidence and observed disconnect semantics in
+[evaluation](evaluation.md); mark E2-A2/E2-A3 only when their tests pass.
+Do not launch GEPA or benchmarks or infer quality gains from loopback tests.

@@ -241,8 +241,8 @@ def test_load_config_and_fingerprint(tmp_path: Path) -> None:
     assert repo_cfg.queue_maxsize == 32
     assert repo_cfg.embedding_model == "embeddinggemma-300m-qat-q8_0-GGUF-Q8_0"
     assert repo_cfg.context_window_tokens == 131072
-    assert repo_cfg.extraction_model == "Gemma-4-E4B-it-GGUF"
-    assert repo_cfg.qa_model == "Gemma-4-E4B-it-GGUF"
+    assert repo_cfg.extraction_model == "gemma-4-E4B-it-qat-q4_0-gguf-Q4_0"
+    assert repo_cfg.qa_model == "gemma-4-E4B-it-qat-q4_0-gguf-Q4_0"
     assert repo_cfg.config_fingerprint().startswith("yaw-cfg-v1:")
 
     cfg1, toml_path = _make_test_config(tmp_path)

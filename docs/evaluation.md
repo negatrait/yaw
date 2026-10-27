@@ -1,5 +1,35 @@
 # Evaluation record
 
+## Epic 2 specification reconciliation (2026-10-27)
+
+Documentation-only update on `dev`, origin `https://github.com/negatrait/yaw.git`.
+Reconciled the Epic 2 parent and both sprint specs against the current runtime
+and prepared-bundle ingestion contracts. Added a planned provenance-schema note
+to FOUNDATIONAL; preserved other in-progress changes. No runtime implementation,
+dependency installation, GEPA run or benchmark was performed for this update.
+
+The specs now keep `D1-A6` open pending user-run Tier 2 holdout evidence. They
+require indexed source fingerprints distinct from chunk IDs and returned-text
+hashes, typed citation propagation, immediate pending-queue cancellation,
+ordered progress, atomic sync coalescing and public lifecycle integration.
+They distinguish sync receipts from awaited calls and explicit MCP cancellation
+from transport disconnection. Deferred Epic 3 CLI/Optuna ideas do not override
+FOUNDATIONAL or become Epic 2 prerequisites. Optuna's current manifest/lock
+presence remains a separately identified policy discrepancy.
+
+The preceding audit's real prepared-file/CocoIndex/hydration probe found that
+recomputing chunk IDs from hydrated results mismatched both unchanged chunks
+(2/2); Python's queue also lacked the prescribed `_queue` attribute. These
+observations motivated replacing those prescriptions; the probe was not rerun
+during this documentation update. No FastMCP HTTP acceptance or model-quality
+gain is claimed.
+
+Verification for this update: all 19 local file links across the three specs
+resolve; `git diff --check` passes. Runtime tests, Ruff/ty and preflight were not
+run because this packet changes documentation only. Future acceptance tests
+remain unchecked and specify real SQLite/files, loopback TCP, event-controlled
+concurrency, actual 32-slot saturation, source isolation and restart behavior.
+
 ## Dataset bundles and persistent ingestion (2026-10-27)
 
 Implemented on `dev`, origin `https://github.com/negatrait/yaw.git`, using the
@@ -1321,8 +1351,8 @@ Offline test suite: `uv run --locked python -m unittest discover -s tests -v` â€
 
 - **User-authorized change after the SIMBA check:** switch Qwen chat/extraction/
   QA/reflection roles to Gemma 4. Read-only registry/health inspection identified
-  the already-downloaded and loaded **Gemma-4-E4B-it-GGUF**,
-  `unsloth/gemma-4-E4B-it-GGUF:Q4_K_M`, on the existing external GPU llama.cpp
+  the already-downloaded and loaded **gemma-4-E4B-it-qat-q4_0-gguf-Q4_0**,
+  `unsloth/gemma-4-E4B-it-qat-q4_0-gguf-Q4_0:Q4_K_M`, on the existing external GPU llama.cpp
   service with **32,768 context**, `--parallel 1 --cache-ram 0`. No model download,
   server restart, model-management API call, or embedding-selection change.
 - Added the exact registry profile, updated native LM and `YawConfig` defaults
@@ -1336,7 +1366,7 @@ Offline test suite: `uv run --locked python -m unittest discover -s tests -v` â€
   and Analytical Engine with a grounded triple. Direct constrained QA answered
   **Ada Lovelace**. A bounded RLM reflection run invoked its GBNF worker and
   returned an instruction preserving `named_entities`. Reflection telemetry
-  reports **3,101 tokens** under `openai/Gemma-4-E4B-it-GGUF`, including the
+  reports **3,101 tokens** under `openai/gemma-4-E4B-it-qat-q4_0-gguf-Q4_0`, including the
   worker call. Evidence: `outputs/gemma4-migration-smoke.json`.
 - Profile/chat/core-config tests -> **19 passed, 3 subtests passed in 11.80 s**.
   Runtime config/resume-parser selection -> **2 passed, 25 deselected in 14.28 s**.
@@ -1611,7 +1641,7 @@ Task signatures retain their output schemas. The native compressor uses its real
 
 ### Bounded live pilot
 
-A serial EnterpriseRAG pilot used Gemma-4-E4B-it-GGUF, its actual serving tokenizer
+A serial EnterpriseRAG pilot used gemma-4-E4B-it-qat-q4_0-gguf-Q4_0, its actual serving tokenizer
 and a verified 65,536-token context on native Windows / Python 3.14.7, with DSPy
 3.4.1. Two training queries (dataset indices 0â€“1) supplied reflection and SIMBA
 calibration; twelve disjoint held-out queries (indices 2â€“13) were reserved for

@@ -235,7 +235,7 @@ def create_dspy_lm(
     """Create a native dspy.LM configured for Lemonade (openai/...) or Ollama (ollama_chat/...).
 
     Applies recipe-aware and role-aware defaults for our local hardware stack:
-    - Gemma-4-E4B-it-GGUF (llamacpp GPU): default chat/reflection model;
+    - gemma-4-E4B-it-qat-q4_0-gguf-Q4_0 (llamacpp GPU): default chat/reflection model;
       direct/worker roles support GBNF, while RLM orchestrators generate plain code.
     - Qwen3-4B-Instruct-2507-GGUF (llamacpp on Vulkan GPU, 16384 ctx): supports GBNF for direct/worker
       roles (`extraction`, `qa`, `reflection_worker`) with temp=0.2, freq_penalty=0.5, and runs

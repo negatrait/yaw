@@ -4,8 +4,8 @@ Owner: [FOUNDATIONAL](../FOUNDATIONAL.md) | Results: [evaluation](evaluation.md)
 
 ## Hard Gates
 
-Runtime model update, 2026-10-22: the user selected `Gemma-4-E4B-it-GGUF`
-(`unsloth/gemma-4-E4B-it-GGUF:Q4_K_M`) for extraction, QA and reflection on the
+Runtime model update, 2026-10-22: the user selected `gemma-4-E4B-it-qat-q4_0-gguf-Q4_0`
+(`unsloth/gemma-4-E4B-it-qat-q4_0-gguf-Q4_0:Q4_K_M`) for extraction, QA and reflection on the
 existing external llama.cpp GPU service (32,768 context). This supersedes Qwen
 as the runtime default in the packet descriptions below. GBNF worker / plain
 RLM separation, embedding selection, and historical benchmark targets remain.

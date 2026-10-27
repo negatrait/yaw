@@ -158,8 +158,8 @@ class YawConfig:
     provider: str = "openai"
     embedding_model: str = DEFAULT_EMBEDDING_MODEL
     embedding_task_mode: str = "distinct-titled"
-    extraction_model: str = "Gemma-4-E4B-it-GGUF"
-    qa_model: str = "Gemma-4-E4B-it-GGUF"
+    extraction_model: str = "gemma-4-E4B-it-qat-q4_0-gguf-Q4_0"
+    qa_model: str = "gemma-4-E4B-it-qat-q4_0-gguf-Q4_0"
     context_window_tokens: int = DEFAULT_CONTEXT_WINDOW_TOKENS
     max_output_tokens: int | None = None
     rlm_max_iters: int = 10

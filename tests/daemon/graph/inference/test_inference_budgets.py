@@ -188,7 +188,7 @@ def test_automatic_budgets_follow_context_and_explicit_overrides_remain_fixed(tm
 def test_gemma_profile_config_and_standalone_program_share_128k_defaults(tmp_path):
     config = YawConfig(workspace_root=tmp_path)
     program = HippoRAGProgram()
-    lm = create_dspy_lm("Gemma-4-E4B-it-GGUF")
+    lm = create_dspy_lm("gemma-4-E4B-it-qat-q4_0-gguf-Q4_0")
     proposer = RLMInstructionProposer(worker_lm=lm, orchestrator_lm=lm)
     assert CHAT_MODELS[config.qa_model].expected_context == config.context_window_tokens == 131072
     assert program.context_window_tokens == lm._yaw_context_window_tokens == 131072

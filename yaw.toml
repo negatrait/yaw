@@ -23,8 +23,8 @@ api_key = "lemonade"
 provider = "openai"
 embedding_model = "embeddinggemma-300m-qat-q8_0-GGUF-Q8_0"
 embedding_task_mode = "distinct-titled"
-extraction_model = "Gemma-4-E4B-it-GGUF"
-qa_model = "Gemma-4-E4B-it-GGUF"
+extraction_model = "gemma-4-E4B-it-qat-q4_0-gguf-Q4_0"
+qa_model = "gemma-4-E4B-it-qat-q4_0-gguf-Q4_0"
 # Match the external server's configured serving window, not its advertised maximum.
 context_window_tokens = 131072
 # Omitted budgets follow context capacity: at 128K, output=8192 tokens,
