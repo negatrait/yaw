@@ -279,6 +279,16 @@ def validate_stage_invariants(
             return 0.0, "[synonym_judge] Empty decisions (EdgeShape/closedWorld)."
         seen_pairs: dict[str, tuple[str, str]] = {}
         issues = []
+        packet = inputs.get("candidate_pairs", "")
+        try:
+            packet = json.loads(packet) if isinstance(packet, str) else packet
+        except json.JSONDecodeError:
+            packet = None
+        expected = (
+            {pair["pair_id"] for pair in packet["pairs"]}
+            if isinstance(packet, dict) and packet.get("format") == "synonym-evidence-v1"
+            else None
+        )
         for d in items:
             if not isinstance(d, Mapping):
                 issues.append("EdgeShape/closedWorld non-dict decision")
@@ -286,6 +296,8 @@ def validate_stage_invariants(
             pair_id = str(d.get("pair_id", "") or "").strip()
             rel = str(d.get("relation", "") or "").strip()
             canon = str(d.get("canonical", "") or "").strip()
+            if expected is not None and (pair_id not in expected or pair_id in seen_pairs):
+                issues.append(f"Unknown or duplicate synonym pair {pair_id!r}")
             if "|" not in pair_id:
                 issues.append(f"EdgeShape/closedWorld invalid pair_id={pair_id!r}")
                 continue
@@ -294,11 +306,13 @@ def validate_stage_invariants(
                 issues.append(f"EdgeShape/closedWorld self-loop or empty pair_id={pair_id!r}")
             if rel not in VALID_SYNONYM_RELATIONS:
                 issues.append(f"ConceptShape/S13-disjointLabels invalid relation={rel!r}")
-            if canon not in ("A", "B", id_a, id_b):
+            if canon not in ((id_a, id_b) if expected is not None else ("A", "B", id_a, id_b)):
                 issues.append(f"EdgeShape/closedWorld invalid canonical={canon!r} for {pair_id!r}")
             if pair_id in seen_pairs and seen_pairs[pair_id] != (rel, canon):
                 issues.append(f"ConceptShape/homographDifferentFrom conflicting decisions for {pair_id!r}")
             seen_pairs[pair_id] = (rel, canon)
+        if expected is not None and set(seen_pairs) != expected:
+            issues.append(f"Missing synonym pairs: {sorted(expected - set(seen_pairs))}")
         if not issues:
             return 1.0, "PASS [synonym_judge]"
         return max(0.0, round(1.0 - 0.35 * len(issues), 4)), f"[synonym_judge] {'; '.join(issues)}"

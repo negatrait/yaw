@@ -2,7 +2,7 @@
 
 import json
 import sqlite3
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +30,7 @@ from .hydration import (
 )
 
 
-def _inspect_single_entity_or_fact(
+def inspect_entity_or_fact(
     conn: sqlite3.Connection | YawConnection,
     focus_node: str,
     corpus_root: Path | str | None = None,
@@ -230,7 +230,7 @@ def format_entity_skos_markdown(
     shared_source_excerpts: dict[str, str] | None = None,
 ) -> str:
     """Format an entity or literal node's SKOS/RDF/OWL profile, reified facts, and source chunks."""
-    node_info = info if info is not None else _inspect_single_entity_or_fact(conn, entity_id, corpus_root)
+    node_info = info if info is not None else inspect_entity_or_fact(conn, entity_id, corpus_root)
     ent = node_info.get("entity") or {"entity_id": entity_id, "name": entity_id, "definition": ""}
     eid = str(ent.get("entity_id", entity_id))
     ename = str(ent.get("name", eid))
@@ -400,8 +400,8 @@ def format_pair_disambiguation_dossier(
     include_entity_profiles: bool = True,
 ) -> str:
     """Build a structured Markdown + SKOS/RDF/OWL comparison dossier for a candidate entity/literal pair."""
-    ia = info_a if info_a is not None else _inspect_single_entity_or_fact(conn, entity_a, corpus_root)
-    ib = info_b if info_b is not None else _inspect_single_entity_or_fact(conn, entity_b, corpus_root)
+    ia = info_a if info_a is not None else inspect_entity_or_fact(conn, entity_a, corpus_root)
+    ib = info_b if info_b is not None else inspect_entity_or_fact(conn, entity_b, corpus_root)
 
     docs_a = {cm["rel_posix_path"] for cm in ia.get("chunks_meta") or [] if cm.get("rel_posix_path")}
     docs_b = {cm["rel_posix_path"] for cm in ib.get("chunks_meta") or [] if cm.get("rel_posix_path")}
@@ -469,96 +469,6 @@ def format_pair_disambiguation_dossier(
     return "\n".join(header_lines) + "\n\n" + sec_a + "\n\n" + sec_b
 
 
-def iter_disambiguation_dossiers(
-    conn: sqlite3.Connection | YawConnection,
-    candidates: Sequence[dict[str, Any]],
-    corpus_root: Path,
-    *,
-    ast_context_hops: int = 0,
-    batch_size: int = 16,
-    max_chars: int = 40000,
-) -> Iterator[tuple[list[dict[str, Any]], str]]:
-    """Pack complete pair evidence with each entity profile rendered once per request.
-
-    The caller must keep the graph snapshot stable while consuming this iterator.
-    Each yielded batch owns only its bounded set of entity inspections. Every
-    pair receives both profiles; a full batch flushes instead of dropping evidence.
-    """
-    batch: list[dict[str, Any]] = []
-    headers: list[str] = []
-    profiles: dict[str, str] = {}
-    infos: dict[str, dict[str, Any]] = {}
-    sources: dict[str, str] = {}
-
-    def render(
-        items: Sequence[dict[str, Any]],
-        pair_headers: Sequence[str],
-        entity_profiles: Mapping[str, str],
-        source_excerpts: Mapping[str, str],
-    ) -> str:
-        index = [{k: v for k, v in c.items() if k not in ("def_a", "def_b")} for c in items]
-        return (
-            "# Candidate Pairs Index\n```json\n"
-            + json.dumps(index, ensure_ascii=False)
-            + "\n```\n\n"
-            + "\n\n".join(pair_headers)
-            + "\n\n# Shared Entity Profiles\n\n"
-            + "\n\n".join(entity_profiles.values())
-            + "\n\n# Shared Source Excerpts\n\n"
-            + "\n\n".join(source_excerpts.values())
-        )
-
-    for candidate in candidates:
-        ea, eb = str(candidate["entity_a"]), str(candidate["entity_b"])
-        new_profiles = {}
-        trial_sources = dict(sources)
-        for eid in (ea, eb):
-            if eid not in infos:
-                infos[eid] = _inspect_single_entity_or_fact(conn, eid, corpus_root)
-            if eid not in profiles:
-                new_profiles[eid] = format_entity_skos_markdown(
-                    conn,
-                    eid,
-                    corpus_root,
-                    ast_context_hops=ast_context_hops,
-                    info=infos[eid],
-                    shared_source_excerpts=trial_sources,
-                )
-        header = format_pair_disambiguation_dossier(
-            conn,
-            ea,
-            eb,
-            corpus_root,
-            ast_context_hops=ast_context_hops,
-            dense_sim=float(candidate["dense_sim"]),
-            lexical_sim=float(candidate["lexical_sim"]),
-            info_a=infos[ea],
-            info_b=infos[eb],
-            include_entity_profiles=False,
-        )
-        trial_profiles = profiles | new_profiles
-        trial = render([*batch, candidate], [*headers, header], trial_profiles, trial_sources)
-        if batch and (len(batch) >= batch_size or len(trial) > max_chars):
-            yield batch, render(batch, headers, profiles, sources)
-            # Only carry the next pair across the flush; don't retain the graph.
-            infos = {eid: infos[eid] for eid in (ea, eb)}
-            trial_profiles = {eid: trial_profiles[eid] for eid in (ea, eb)}
-            source_ids = dict.fromkeys(
-                cm["chunk_id"] for eid in (ea, eb) for cm in (infos[eid].get("chunks_meta") or [])[:2]
-            )
-            trial_sources = {cid: trial_sources[cid] for cid in source_ids if cid in trial_sources}
-            batch, headers, profiles = [], [], {}
-            trial = render([candidate], [header], trial_profiles, trial_sources)
-        if len(trial) > max_chars:
-            raise ValueError(f"Complete disambiguation evidence for {ea}|{eb} exceeds {max_chars} characters")
-        batch.append(candidate)
-        headers.append(header)
-        profiles = trial_profiles
-        sources = trial_sources
-    if batch:
-        yield batch, render(batch, headers, profiles, sources)
-
-
 def inspect_focus_node(
     conn: sqlite3.Connection | YawConnection,
     focus_node: str,
@@ -577,8 +487,8 @@ def inspect_focus_node(
         parts = [p.strip() for p in clean_focus.split(sep, 1)]
         if len(parts) == 2 and parts[0] and parts[1]:
             node_a, node_b = parts[0], parts[1]
-            info_a = _inspect_single_entity_or_fact(conn, node_a, corpus_root)
-            info_b = _inspect_single_entity_or_fact(conn, node_b, corpus_root)
+            info_a = inspect_entity_or_fact(conn, node_a, corpus_root)
+            info_b = inspect_entity_or_fact(conn, node_b, corpus_root)
             dossier = format_pair_disambiguation_dossier(
                 conn,
                 node_a,
@@ -605,7 +515,7 @@ def inspect_focus_node(
                 "markdown_dossier": dossier,
             }
 
-    single = _inspect_single_entity_or_fact(conn, clean_focus, corpus_root)
+    single = inspect_entity_or_fact(conn, clean_focus, corpus_root)
     if single.get("entity") is not None:
         single["focus_kind"] = "entity"
         single["markdown_dossier"] = format_entity_skos_markdown(

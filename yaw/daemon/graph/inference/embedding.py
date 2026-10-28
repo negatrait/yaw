@@ -1,10 +1,14 @@
 """Native DSPy and OpenAI/Ollama embedding adapter with explicit model-specific retrieval contracts."""
 
+import asyncio
 import hashlib
 import json
 import re
+import time
 from collections.abc import Awaitable, Callable, Sequence
+from concurrent.futures import CancelledError
 from dataclasses import asdict, dataclass, replace
+from threading import Event
 from typing import Any, cast
 
 import dspy
@@ -309,6 +313,23 @@ def batch_texts_by_budget(
     return micro_batches
 
 
+@dataclass(frozen=True)
+class EmbeddingRequest:
+    texts: tuple[str, ...]
+    profile: EmbeddingProfile
+    task_mode: str
+    batch_size: int
+    max_batch_chars: int
+    instruction: str = ""
+    stage: str = "chunk_embed"
+
+
+@dataclass(frozen=True)
+class EmbeddingResult:
+    vectors: np.ndarray
+    telemetry: dict[str, Any]
+
+
 class DSPyEmbeddingAdapter(dspy.Embedder):
     """Profile-aware retrieval embedding adapter subclassing native `dspy.Embedder`."""
 
@@ -365,6 +386,96 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
     def reset_telemetry(self) -> None:
         """Clear accumulated embedding telemetry entries."""
         self.telemetry.clear()
+
+    def prepare_request(self, texts: Sequence[str], *, batch_size: int, stage: str) -> EmbeddingRequest:
+        """Capture an immutable embedding contract on the engine owner thread."""
+        return EmbeddingRequest(
+            tuple(texts), self.profile, self.task_mode, batch_size, self.max_batch_chars, stage=stage
+        )
+
+    def execute_request(self, request: EmbeddingRequest, stop: Event | None = None) -> EmbeddingResult:
+        """Execute without publishing history, invoking hooks or accessing storage."""
+        if (self.profile, self.task_mode, self.max_batch_chars) != (
+            request.profile,
+            request.task_mode,
+            request.max_batch_chars,
+        ):
+            raise RuntimeError("Embedding settings changed during an indexing batch")
+        started = time.perf_counter()
+        texts, query, mapping, pieces, weights, batches = self._prepare_pieces_and_batches(
+            list(request.texts), instruction=request.instruction, batch_size=request.batch_size
+        )
+        flat: list[np.ndarray | None] = [None] * len(pieces)
+        for batch in batches:
+            if stop is not None and stop.is_set():
+                raise CancelledError("Indexing stopped before the next embedding request")
+            vectors = self._encode_prepared([pieces[i] for i in batch], {"batch_size": len(batch)})
+            if vectors.shape != (len(batch), request.profile.dimensions) or not np.isfinite(vectors).all():
+                raise ValueError("Embedding provider returned an invalid vector count, dimensions or values")
+            for i, vector in zip(batch, vectors, strict=True):
+                flat[i] = vector
+        result = self._build_embedding_result(
+            texts,
+            mapping,
+            pieces,
+            weights,
+            batches,
+            flat,
+            is_query=query,
+            instruction=request.instruction,
+            norm=True,
+            stage=request.stage,
+        )
+        result.telemetry["duration_seconds"] = time.perf_counter() - started
+        result.telemetry["started_at"] = started
+        result.telemetry["completed_at"] = time.perf_counter()
+        result.telemetry["batch_sizes"] = [len(batch) for batch in batches]
+        return result
+
+    def publish_result(self, result: EmbeddingResult) -> np.ndarray:
+        """Publish validated inference telemetry on the engine owner thread."""
+        self.telemetry.append(result.telemetry)
+        trim_diagnostics(self)
+        if self._telemetry_hook is not None:
+            self._telemetry_hook(result.telemetry)
+        return result.vectors
+
+    async def aexecute_request(self, request: EmbeddingRequest) -> EmbeddingResult:
+        """Execute on the native async provider without publishing shared state."""
+        if (self.profile, self.task_mode, self.max_batch_chars) != (
+            request.profile,
+            request.task_mode,
+            request.max_batch_chars,
+        ):
+            raise RuntimeError("Embedding settings changed during an indexing batch")
+        started = time.perf_counter()
+        texts, query, mapping, pieces, weights, batches = self._prepare_pieces_and_batches(
+            list(request.texts), instruction=request.instruction, batch_size=request.batch_size
+        )
+        flat: list[np.ndarray | None] = [None] * len(pieces)
+        for batch in batches:
+            vectors = await self._aencode_prepared([pieces[i] for i in batch], {"batch_size": len(batch)})
+            if vectors.shape != (len(batch), request.profile.dimensions) or not np.isfinite(vectors).all():
+                raise ValueError("Embedding provider returned an invalid vector count, dimensions or values")
+            for i, vector in zip(batch, vectors, strict=True):
+                flat[i] = vector
+        result = self._build_embedding_result(
+            texts,
+            mapping,
+            pieces,
+            weights,
+            batches,
+            flat,
+            is_query=query,
+            instruction=request.instruction,
+            norm=True,
+            stage=request.stage,
+        )
+        result.telemetry["duration_seconds"] = time.perf_counter() - started
+        result.telemetry["started_at"] = started
+        result.telemetry["completed_at"] = time.perf_counter()
+        result.telemetry["batch_sizes"] = [len(batch) for batch in batches]
+        return result
 
     @classmethod
     def from_config(cls, config: YawConfig) -> DSPyEmbeddingAdapter:
@@ -446,9 +557,7 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
 
             sleep_sec = get_yaw_sleep_seconds()
             if sleep_sec > 0:
-                import time
-
-                time.sleep(sleep_sec)
+                await asyncio.sleep(sleep_sec)
             return vectors
         except Exception as exc:
             if not is_batch_overflow_error(exc):
@@ -528,7 +637,7 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
         )
         return texts, is_query, text_piece_map, flat_pieces, piece_weights, micro_batches
 
-    def _finalize_vectors_and_telemetry(
+    def _build_embedding_result(
         self,
         texts: list[str],
         text_piece_map: list[list[int]],
@@ -541,7 +650,7 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
         instruction: str | None,
         norm: bool,
         stage: str | None,
-    ) -> np.ndarray:
+    ) -> EmbeddingResult:
         doc_vectors: list[np.ndarray] = []
         for indices in text_piece_map:
             sub_vecs = np.asarray(
@@ -600,12 +709,7 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
                 f"prefix={active_prefix!r}, sample={flat_pieces[0][:120]!r}"
             ),
         }
-        self.telemetry.append(entry)
-        trim_diagnostics(self)
-        if self._telemetry_hook is not None:
-            self._telemetry_hook(entry)
-
-        return vectors
+        return EmbeddingResult(vectors, entry)
 
     def batch_encode(
         self,
@@ -633,17 +737,19 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
             for local_idx, global_idx in enumerate(mb):
                 flat_vectors[global_idx] = vecs[local_idx]
 
-        return self._finalize_vectors_and_telemetry(
-            resolved_texts,
-            text_piece_map,
-            flat_pieces,
-            piece_weights,
-            micro_batches,
-            flat_vectors,
-            is_query=is_query,
-            instruction=instruction,
-            norm=norm,
-            stage=stage,
+        return self.publish_result(
+            self._build_embedding_result(
+                resolved_texts,
+                text_piece_map,
+                flat_pieces,
+                piece_weights,
+                micro_batches,
+                flat_vectors,
+                is_query=is_query,
+                instruction=instruction,
+                norm=norm,
+                stage=stage,
+            )
         )
 
     async def abatch_encode(
@@ -683,17 +789,19 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
                 for mb in micro_batches:
                     tg.start_soon(_run_micro_batch, mb)
 
-        return self._finalize_vectors_and_telemetry(
-            resolved_texts,
-            text_piece_map,
-            flat_pieces,
-            piece_weights,
-            micro_batches,
-            flat_vectors,
-            is_query=is_query,
-            instruction=instruction,
-            norm=norm,
-            stage=stage,
+        return self.publish_result(
+            self._build_embedding_result(
+                resolved_texts,
+                text_piece_map,
+                flat_pieces,
+                piece_weights,
+                micro_batches,
+                flat_vectors,
+                is_query=is_query,
+                instruction=instruction,
+                norm=norm,
+                stage=stage,
+            )
         )
 
     def __call__(

@@ -5,6 +5,8 @@ from typing import Any
 
 # Single source of truth: only these symbols are exposed as the public package contract.
 _PUBLIC_API: dict[str, str] = {
+    "PreparedGraphRows": ".publication",
+    "apply_prepared_graph_rows": ".publication",
     "CandidateCacheStore": ".candidate_cache",
     "CandidatePayloadCodec": ".candidate_cache",
     "CandidateStageCache": ".candidate_cache",
@@ -59,7 +61,8 @@ _PUBLIC_API: dict[str, str] = {
     "inspect_focus_node": ".shacl",
     "format_entity_skos_markdown": ".shacl",
     "format_pair_disambiguation_dossier": ".shacl",
-    "iter_disambiguation_dossiers": ".shacl",
+    "inspect_entity_or_fact": ".shacl",
+    "iter_synonym_evidence": ".synonyms",
     "lint_graph_shacl": ".shacl",
     "apply_shacl_repairs": ".shacl",
     "serialize_graph_turtle": ".shacl",

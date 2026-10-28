@@ -186,8 +186,34 @@ def build_dspy_missing_entity_defs_grammar(
     )
 
 
-def build_dspy_synonym_judge_grammar(max_decisions: int | None = None) -> str:
+def build_dspy_synonym_judge_grammar(
+    max_decisions: int | None = None,
+    *,
+    pair_ids: Sequence[str] | None = None,
+) -> str:
     """Build pure-JSON GBNF grammar for JudgeSynonyms (`{"decisions": [...]}`)."""
+    if pair_ids is not None:
+        if not pair_ids or len(set(pair_ids)) != len(pair_ids):
+            raise ValueError("Synonym grammar requires nonempty, unique pair IDs")
+        sequence = ' ", " '.join(f"decision-{i}" for i in range(len(pair_ids)))
+        opening = gbnf_escape_literal('{"decisions": [')
+        closing = gbnf_escape_literal("]}")
+        rules = [f"root ::= {opening} {sequence} {closing}"]
+        for i, pair_id in enumerate(pair_ids):
+            ids = pair_id.split("|")
+            if len(ids) != 2 or not all(ids) or ids[0] == ids[1]:
+                raise ValueError(f"Invalid synonym pair ID {pair_id!r}")
+            prefix = '{"pair_id": ' + json.dumps(pair_id) + ', "relation": '
+            middle = ', "canonical": '
+            choices = " | ".join(gbnf_escape_literal(json.dumps(eid)) for eid in ids)
+            rules.append(
+                f"decision-{i} ::= {gbnf_escape_literal(prefix)} relation-kind "
+                f"{gbnf_escape_literal(middle)} ({choices}) {gbnf_escape_literal('}')}"
+            )
+        rules.extend(
+            line for line in DSPY_SYNONYM_JUDGE_GBNF_GRAMMAR.splitlines() if line.startswith("relation-kind ::=")
+        )
+        return "\n".join(rules) + "\n"
     if max_decisions is None or max_decisions <= 0:
         return DSPY_SYNONYM_JUDGE_GBNF_GRAMMAR
     seq = "decision"

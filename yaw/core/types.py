@@ -76,6 +76,46 @@ class HydratedPassage:
 
 
 @dataclass(slots=True, frozen=True)
+class SynonymEvidenceBatch:
+    """A bounded model request with reversible IDs and content-addressed evidence."""
+
+    candidates: tuple[dict[str, Any], ...]
+    payload: str
+    identifiers: dict[str, str]
+    construction_seconds: float = 0.0
+
+    @property
+    def cache_identity(self) -> str:
+        value = ["synonym-evidence-v1", self.payload, self.identifiers, self.candidates]
+        return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+    def resolve_decisions(self, decisions: list[dict[str, str]]) -> list[dict[str, str]]:
+        """Validate exact pair coverage and resolve request-local IDs before graph writes."""
+        pairs = {p["pair_id"] for p in json.loads(self.payload)["pairs"]}
+        seen: set[str] = set()
+        result = []
+        for decision in decisions:
+            pair = decision.get("pair_id", "")
+            if pair not in pairs or pair in seen:
+                raise ValueError(f"Unknown or duplicate synonym pair {pair!r}")
+            a, b = pair.split("|")
+            canonical = decision.get("canonical", "")
+            if canonical not in (a, b):
+                raise ValueError(f"Invalid canonical ID {canonical!r} for synonym pair {pair!r}")
+            result.append(
+                {
+                    "pair_id": f"{self.identifiers[a]}|{self.identifiers[b]}",
+                    "relation": decision["relation"],
+                    "canonical": self.identifiers[canonical],
+                }
+            )
+            seen.add(pair)
+        if seen != pairs:
+            raise ValueError(f"Missing synonym decisions for {sorted(pairs - seen)}")
+        return result
+
+
+@dataclass(slots=True, frozen=True)
 class StructuredTriple:
     """An OpenIE relation triple enriched with inline subject, object, and statement definitions."""
 

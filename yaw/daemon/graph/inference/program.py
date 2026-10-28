@@ -2,6 +2,7 @@
 
 import json
 import logging
+import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal
@@ -9,7 +10,7 @@ from typing import Any, Literal
 import dspy
 
 from yaw.core.config import DEFAULT_CONTEXT_WINDOW_TOKENS, YawConfig, context_char_limit, scale_context_budget
-from yaw.core.types import OpenIERecord, StructuredTriple
+from yaw.core.types import OpenIERecord, StructuredTriple, SynonymEvidenceBatch
 
 from .adapter import YawGBNFAdapter, sum_usage_tokens
 from .chat import create_dspy_lm
@@ -50,8 +51,10 @@ from .prompts import (
     JudgeSynonyms,
     ProposeSHACLRepairs,
 )
+from .reflection import ServingTokenCounter
 from .retriever import YawRetriever, YawRM
 from .rlm import STAGE_RLM_DELEGATION_RULES, PositionalSafeRLM, build_rlm_action_demos
+from .synonyms import SynonymRequestBudget
 
 
 def _bounded_prompt_json(items: Sequence[Any], max_items: int, max_chars: int) -> str:
@@ -142,6 +145,7 @@ Deno/Pyodide WASM) with
         enable_react_fallback: bool = False,
         context_window_tokens: int | None = None,
         max_output_tokens: int | None = None,
+        synonym_token_counter: Any = None,
     ) -> None:
         super().__init__()
         if context_window_tokens is None:
@@ -159,6 +163,9 @@ Deno/Pyodide WASM) with
         context_char_limit(1, context_window_tokens, max_output_tokens)
         self.context_window_tokens = context_window_tokens
         self.max_output_tokens = max_output_tokens
+        self.synonym_token_counter = synonym_token_counter
+        self._synonym_tokenizer_settings: tuple[str, str] | None = None
+        self._synonym_budget: SynonymRequestBudget | None = None
         self.enable_gbnf: bool = enable_gbnf
         self.gbnf_max_entities: int | None = gbnf_max_entities
         self.gbnf_max_triples: int | None = gbnf_max_triples
@@ -397,6 +404,7 @@ Deno/Pyodide WASM) with
         program.shacl_healer_rlm.max_iters = config.rlm_max_iters
         program.shacl_healer_rlm.max_llm_calls = config.rlm_max_llm_calls
         program.shacl_healer_rlm.max_output_chars = config.rlm_max_output_chars
+        program._synonym_tokenizer_settings = (config.base_url, config.reflection_tokenizer_url)
         return program
 
     def _context_char_limit(self, base_chars: int) -> int:
@@ -618,12 +626,12 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
             lint_shacl,
         ]
 
-    def _dspy_ctx(self, lm: dspy.BaseLM | None, *, use_json_adapter: bool = True):
+    def _dspy_ctx(self, lm: dspy.BaseLM | None, *, use_json_adapter: bool = True, adapter: dspy.Adapter | None = None):
         ctx_kwargs: dict[str, Any] = {}
         if lm is not None:
             ctx_kwargs["lm"] = lm
         if use_json_adapter:
-            ctx_kwargs["adapter"] = self.json_adapter
+            ctx_kwargs["adapter"] = adapter or self.json_adapter
         return dspy.context(**ctx_kwargs)
 
     def _should_use_gbnf(self, use_gbnf: bool | None, lm: dspy.BaseLM | None) -> bool:
@@ -672,6 +680,7 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
         lm: Any,
         use_gbnf: bool | None,
         grammar_fn: Callable[[], str],
+        request_adapter: dspy.Adapter | None = None,
         **inputs: Any,
     ) -> Any:
         from dspy.utils.usage_tracker import track_usage
@@ -714,7 +723,7 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
                     call_kwargs["lm"] = lm
                 if self._should_use_gbnf(use_gbnf, effective_lm):
                     call_kwargs["config"] = {"extra_body": {"grammar": grammar_fn()}}
-                with self._dspy_ctx(effective_lm, use_json_adapter=True):
+                with self._dspy_ctx(effective_lm, use_json_adapter=True, adapter=request_adapter):
                     pred = direct_mod(**direct_inputs, **call_kwargs)
                     inv_score, inv_feedback = validate_stage_invariants(
                         stage_name,
@@ -1081,62 +1090,94 @@ chunk."""
             entity_definitions=merged_defs,
         )
 
+    def synonym_request_budget(self, lm: Any = None) -> SynonymRequestBudget:
+        """Resolve a verified tokenizer for the active synonym LM, retaining one budget object."""
+        effective = lm or self.synonym_judge.lm or dspy.settings.lm
+        if effective is None:
+            raise ValueError("Synonym judgment requires an LM")
+        counter = self.synonym_token_counter
+        if counter is None:
+            settings = self._synonym_tokenizer_settings
+            base_url = settings[0] if settings else effective.kwargs.get("api_base")
+            if not base_url:
+                raise ValueError("Synonym judgment requires an explicit serving token counter")
+            counter = ServingTokenCounter(base_url, effective.model, settings[1] if settings else "")
+            self.synonym_token_counter = counter
+        if isinstance(counter, ServingTokenCounter):
+            counter = counter.for_model(effective.model)
+            self.synonym_token_counter = counter
+        if (
+            self._synonym_budget is None
+            or self._synonym_budget.counter is not counter
+            or self._synonym_budget.adapter is not self.json_adapter
+            or self._synonym_budget.output_tokens != self.max_output_tokens
+            or self._synonym_budget.context_tokens
+            != min(self.context_window_tokens, getattr(counter, "context_tokens", self.context_window_tokens))
+        ):
+            self._synonym_budget = SynonymRequestBudget(
+                self.json_adapter,
+                counter,
+                self.context_window_tokens,
+                self.max_output_tokens,
+            )
+        return self._synonym_budget
+
+    def synonym_batch_fits(self, batch: SynonymEvidenceBatch) -> bool:
+        """Check a whole pair packet including signature, demos, output budget and chat template."""
+        lm = self.synonym_judge.lm or dspy.settings.lm
+        return self.synonym_request_budget(lm).fits(batch, self.synonym_judge, lm)
+
     def judge_synonyms(
         self,
-        candidate_pairs: Sequence[Mapping[str, Any]] | str,
+        batch: SynonymEvidenceBatch,
         *,
         lm: Any = None,
         use_gbnf: bool | None = None,
     ) -> list[dict[str, str]]:
-        """Classify candidate entity pairs into SKOS/OWL relations (`skos:altLabel`, `skos:hiddenLabel`, \
-`skos:related`, `owl:differentFrom`)."""
-        if not candidate_pairs:
-            return []
-        if isinstance(candidate_pairs, str):
-            pairs_json = candidate_pairs.strip()
-            if not pairs_json or pairs_json == "[]":
-                return []
-            if len(pairs_json) > self._context_char_limit(12000):
-                try:
-                    parsed_pairs = json.loads(pairs_json)
-                    if isinstance(parsed_pairs, list):
-                        pairs_json = _bounded_prompt_json(
-                            parsed_pairs,
-                            scale_context_budget(16, self.context_window_tokens),
-                            self._context_char_limit(12000),
-                        )
-                except json.JSONDecodeError, TypeError:
-                    pairs_json = pairs_json[: self._context_char_limit(12000)]
-        else:
-            pairs_list = [dict(p) for p in candidate_pairs if isinstance(p, Mapping)]
-            if not pairs_list:
-                return []
-            pairs_json = _bounded_prompt_json(
-                pairs_list, scale_context_budget(16, self.context_window_tokens), self._context_char_limit(12000)
-            )
-        if pairs_json == "[]":
-            return []
-
+        """Judge every packet pair and resolve local references before graph application."""
+        budget = self.synonym_request_budget(lm)
         prev_telem_len = len(self.telemetry)
+        started = time.perf_counter()
         pred = self._invoke_stage(
             self.synonym_judge,
             stage_name="synonym_judge",
             is_rlm=False,
             lm=lm,
             use_gbnf=use_gbnf,
-            grammar_fn=build_dspy_synonym_judge_grammar,
-            candidate_pairs=pairs_json,
+            grammar_fn=lambda: build_dspy_synonym_judge_grammar(
+                pair_ids=[pair["pair_id"] for pair in json.loads(batch.payload)["pairs"]],
+            ),
+            request_adapter=budget,
+            candidate_pairs=batch.payload,
         )
-        raw_decisions = getattr(pred, "decisions", [])
-        decisions = parse_synonym_decisions(raw_decisions)
+        elapsed = time.perf_counter() - started
+        score, feedback = validate_stage_invariants(
+            "synonym_judge",
+            {"candidate_pairs": batch.payload},
+            pred,
+        )
+        if score < 1.0:
+            raise ValueError(feedback)
+        decisions = batch.resolve_decisions(parse_synonym_decisions(pred.decisions))
         stage_tokens = int(self.telemetry[-1].get("tokens_used", 0)) if len(self.telemetry) > prev_telem_len else 0
+        summary = {
+            "packet_id": batch.cache_identity,
+            "pair_count": len(batch.candidates),
+            "packet_chars": len(batch.payload),
+            "input_tokens": budget.last_count,
+            "construction_seconds": batch.construction_seconds,
+            "inference_seconds": elapsed,
+            "cache_hit": False,
+        }
+        if len(self.telemetry) > prev_telem_len:
+            self.telemetry[-1].update(summary)
         self.synonym_audit_trail.append(
             {
                 "mode": "direct",
                 "predictor": "synonym_judge",
                 "signature": JudgeSynonyms.__name__,
                 "tokens_used": stage_tokens,
-                "candidate_pairs": pairs_json,
+                **summary,
                 "decisions": decisions,
             }
         )

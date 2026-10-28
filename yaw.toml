@@ -12,7 +12,7 @@ compiled_program_path = ".yaw/compiled_program.json"
 [ingestion]
 included_patterns = ["*.md", "*.txt"]
 excluded_patterns = [".*", "*/.*", "__pycache__/*"]
-chunk_size = 1500
+chunk_size = 1200
 chunk_overlap = 120
 min_chunk_size = 100
 poll_interval_seconds = 10.0
@@ -50,6 +50,7 @@ embed_batch_size = 64
 embed_batch_chars = 3500
 
 [runtime]
+indexing_overlap = false
 queue_maxsize = 32
 http_host = "127.0.0.1"
 http_port = 13306

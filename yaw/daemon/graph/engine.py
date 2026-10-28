@@ -33,6 +33,7 @@ from yaw.daemon.graph.inference import (
     FACT_INSTRUCTION,
     PASSAGE_INSTRUCTION,
     DSPyEmbeddingAdapter,
+    EmbeddingLane,
     GraphOptimizationHooks,
     HippoRAGProgram,
     RLMInstructionProposer,
@@ -67,6 +68,8 @@ from yaw.daemon.graph.storage import (
     CandidatePayloadCodec,
     CandidateStageCache,
     ManagedConnection,
+    PreparedGraphRows,
+    apply_prepared_graph_rows,
     apply_shacl_repairs,
     delete_chunks,
     find_entity_disambiguation_candidates,
@@ -85,7 +88,7 @@ from yaw.daemon.graph.storage import (
     hydrate_budgeted_passages,
     hydrate_passages,
     inspect_focus_node,
-    iter_disambiguation_dossiers,
+    iter_synonym_evidence,
     lint_graph_shacl,
     load_graph_topology,
     make_ast_island_hydrator,
@@ -100,15 +103,6 @@ from yaw.daemon.graph.storage import (
     search_facts_fts,
     serialize_graph_turtle,
     set_meta,
-    upsert_chunk_pointers,
-    upsert_chunk_vectors,
-    upsert_edges_with_sources,
-    upsert_entities,
-    upsert_entity_labels,
-    upsert_entity_vectors,
-    upsert_fact_sources,
-    upsert_fact_vectors,
-    upsert_facts,
     upsert_semantic_edges,
 )
 
@@ -1241,7 +1235,8 @@ class YawGraphEngine:
             set_yaw_sleep_seconds(opt_sleep)
 
         active_program = program if program is not None else self.program
-        with self._lock:
+        with self._lock, contextlib.ExitStack() as batch_resources:
+            batch_started = time.perf_counter()
             trim_diagnostics(active_program)
             self._bind_program_hooks(active_program)
             self._apply_program_embedding_prefixes(active_program)
@@ -1279,12 +1274,31 @@ class YawGraphEngine:
             existing_chunk_vecs = get_existing_ids(self.conn, "chunk_vec", chunk_ids)
             missing_chunks = [(p, t) for p, t in chunks if p.chunk_id not in existing_chunk_vecs]
             chunk_vec_pairs: list[tuple[str, np.ndarray]] = []
+            embedding_lane = None
+            overlap = bool(getattr(self.config, "indexing_overlap", False))
             if missing_chunks:
                 if progress_callback is not None:
-                    progress_callback(f"indexing: embedding {len(missing_chunks)} chunk vectors")
+                    progress_callback(
+                        f"indexing: embedding {len(missing_chunks)} chunk vectors"
+                        + (" concurrently with OpenIE" if overlap else "")
+                    )
                 texts_to_embed = [fmt_chunk(p, t) for p, t in missing_chunks]
-                vecs = self._encode_in_batches(texts_to_embed, instruction="", stage="chunk_embed")
-                chunk_vec_pairs = [(p.chunk_id, v) for (p, _), v in zip(missing_chunks, vecs, strict=False)]
+                if overlap:
+                    if not isinstance(self.embedder, DSPyEmbeddingAdapter):
+                        raise TypeError("Indexing overlap requires DSPyEmbeddingAdapter")
+                    embed_fp = embed_fingerprint(self.embedder.profile, "")
+                    embedding_lane = batch_resources.enter_context(
+                        EmbeddingLane(
+                            self.embedder,
+                            texts_to_embed,
+                            batch_size=self.embed_batch_size,
+                            lookup=lambda text: self._text_vec_cache.get((embed_fp, "", text)),
+                            store=lambda text, vector: self._text_vec_cache.__setitem__((embed_fp, "", text), vector),
+                        )
+                    )
+                else:
+                    vecs = self._encode_in_batches(texts_to_embed, instruction="", stage="chunk_embed")
+                    chunk_vec_pairs = [(p.chunk_id, v) for (p, _), v in zip(missing_chunks, vecs, strict=True)]
 
             # 2. Crash-resilient OpenIE extraction (persisted per-chunk immediately)
             cached_openie = get_openie_checkpoints(self.conn, chunk_ids)
@@ -1292,7 +1306,10 @@ class YawGraphEngine:
             attempted_missing_by_cid: dict[str, set[str]] = {}
             chunk_openie_tok_by_cid: dict[str, int] = {}
             total_chunks = len(chunks)
+            openie_started = time.perf_counter()
             for idx, (ptr, text) in enumerate(chunks, 1):
+                if embedding_lane is not None:
+                    embedding_lane.drain()
                 # The previous chunk's slices are already consumed. Do not trim
                 # inside extract_openie: its caller still needs the new records.
                 trim_diagnostics(active_program)
@@ -1391,6 +1408,25 @@ class YawGraphEngine:
                         save_openie_checkpoints(self.conn, [rec])
                         set_meta(self.conn, f"openie_fp:{ptr.chunk_id}", openie_fp)
                     all_records.append(rec)
+
+            openie_finished = time.perf_counter()
+            openie_seconds = openie_finished - openie_started
+            if embedding_lane is not None:
+                vecs = embedding_lane.finish()
+                chunk_vec_pairs = [(p.chunk_id, v) for (p, _), v in zip(missing_chunks, vecs, strict=True)]
+                active_program.telemetry.append(
+                    {
+                        "stage": "indexing_overlap",
+                        "tokens_used": 0,
+                        "openie_seconds": openie_seconds,
+                        "embedding_seconds": embedding_lane.provider_seconds,
+                        "join_seconds": embedding_lane.join_seconds,
+                        "cache_hits": embedding_lane.cache_hits,
+                        "overlap_seconds": embedding_lane.overlap_seconds(openie_started, openie_finished),
+                    }
+                )
+
+            preparation_started = time.perf_counter()
 
             # 3. Resolve Stage 1 NER Entities, Stage 2 StructuredTriples, Provisional Sense-Split Gate, and
             # Contextual Embeddings
@@ -2251,40 +2287,24 @@ class YawGraphEngine:
             # 4. Atomic Closed-World Transaction: Upsert Graph + EDC Disambiguation + SHACL Self-Healing
             if progress_callback is not None:
                 progress_callback("indexing: committing SKOS/RDF/OWL graph & SHACL validation")
+            transaction_started = time.perf_counter()
+            synonym_seconds = 0.0
+            prepared_rows = PreparedGraphRows(
+                chunks=tuple(chunks),
+                entities=tuple(entity_nodes),
+                entity_labels=tuple(entity_labels_to_upsert),
+                facts=tuple(
+                    (fid, sid, pred, oid, raw, definition, kind, lexical, datatype, language)
+                    for fid, sid, pred, oid, raw, definition, _sd, _od, kind, lexical, datatype, language in fact_nodes
+                ),
+                fact_sources=tuple(fact_sources_batch),
+                edges=tuple(edges_with_sources),
+                chunk_vectors=tuple(chunk_vec_pairs),
+                entity_vectors=tuple(entity_vec_pairs),
+                fact_vectors=tuple(fact_vec_pairs),
+            )
             with self.managed_conn.transaction() as conn:
-                if chunk_vec_pairs:
-                    upsert_chunk_vectors(conn, chunk_vec_pairs)
-                # Commit ChunkPointer metadata and FTS5 index first so RLM tools can hydrate chunks
-                upsert_chunk_pointers(conn, chunks)
-                upsert_entities(conn, entity_nodes)
-                upsert_entity_labels(conn, entity_labels_to_upsert)
-                upsert_facts(
-                    conn,
-                    [
-                        (fid, s_id, pred, o_id, raw_json, spo_d, okind, olex, odt, olang)
-                        for (
-                            fid,
-                            s_id,
-                            pred,
-                            o_id,
-                            raw_json,
-                            spo_d,
-                            _subj_d,
-                            _obj_d,
-                            okind,
-                            olex,
-                            odt,
-                            olang,
-                        ) in fact_nodes
-                    ],
-                )
-                if fact_sources_batch:
-                    upsert_fact_sources(conn, fact_sources_batch)
-                if entity_vec_pairs:
-                    upsert_entity_vectors(conn, entity_vec_pairs)
-                if fact_vec_pairs:
-                    upsert_fact_vectors(conn, fact_vec_pairs)
-                upsert_edges_with_sources(conn, edges_with_sources)
+                apply_prepared_graph_rows(conn, prepared_rows)
 
                 concept_eids = {
                     str(r[0])
@@ -2376,27 +2396,41 @@ class YawGraphEngine:
                         batch_limit = max(1, scale_context_budget(8, active_program.context_window_tokens))
                         max_dossier_chars = min(40000, active_program._context_char_limit(12000))
                         completed_pairs = 0
-                        for cand_batch, dossier_prompt in iter_disambiguation_dossiers(
+                        for evidence in iter_synonym_evidence(
                             conn,
                             candidates,
                             self.workspace_root,
                             ast_context_hops=self.ast_context_hops,
                             batch_size=batch_limit,
                             max_chars=max_dossier_chars,
+                            fits=active_program.synonym_batch_fits,
                         ):
                             if progress_callback is not None:
                                 progress_callback(
                                     f"indexing: synonym judgment ({completed_pairs}/{len(candidates)} pairs)"
                                 )
                             # Include the actual evidence, not just entity IDs and similarity scores.
-                            pairs_fp = hashlib.sha256(dossier_prompt.encode("utf-8")).hexdigest()
+                            pairs_fp = evidence.cache_identity
                             cached_syn = self._synonym_fp_cache.get((syn_fp, pairs_fp))
-                            completed_pairs += len(cand_batch)
+                            completed_pairs += len(evidence.candidates)
                             if cached_syn is not None:
                                 cached_decs, cached_syn_tr, cached_syn_tok = cached_syn
                                 decisions.extend(cached_decs)
                                 self._captured_graph_traces.extend(cached_syn_tr)
                                 self._graph_rlm_stats["synonym_judge_tokens"] += cached_syn_tok
+                                active_program.telemetry.append(
+                                    {
+                                        "stage": "synonym_judge",
+                                        "mode": "cache",
+                                        "cache_hit": True,
+                                        "packet_id": pairs_fp,
+                                        "pair_count": len(evidence.candidates),
+                                        "packet_chars": len(evidence.payload),
+                                        "tokens_used": 0,
+                                        "construction_seconds": evidence.construction_seconds,
+                                        "inference_seconds": 0.0,
+                                    }
+                                )
                                 continue
                             syn_audit: list[dict[str, Any]] = getattr(active_program, "synonym_audit_trail", [])
                             tel: list[dict[str, Any]] = getattr(active_program, "telemetry", [])
@@ -2404,7 +2438,9 @@ class YawGraphEngine:
                             prev_tel_len = len(tel)
                             local_syn_trace: list[Any] = []
                             with dspy.context(trace=local_syn_trace, usage_tracker=None):
-                                batch_decs = active_program.judge_synonyms(dossier_prompt)
+                                synonym_started = time.perf_counter()
+                                batch_decs = active_program.judge_synonyms(evidence)
+                                synonym_seconds += time.perf_counter() - synonym_started
                                 if batch_decs:
                                     decisions.extend(batch_decs)
                             syn_traces = extract_named_trace_entries(
@@ -2798,6 +2834,20 @@ class YawGraphEngine:
             for cid in chunk_ids:
                 self._chunk_indexed_ext_fp[cid] = ext_fp
             self._persist_dspy_trails_to_db(active_program)
+            trim_diagnostics(active_program)
+            active_program.telemetry.append(
+                {
+                    "stage": "indexing_batch",
+                    "tokens_used": 0,
+                    "chunks": len(chunks),
+                    "overlap_enabled": overlap,
+                    "total_seconds": time.perf_counter() - batch_started,
+                    "openie_seconds": openie_seconds,
+                    "preparation_seconds": transaction_started - preparation_started,
+                    "transaction_seconds": time.perf_counter() - transaction_started,
+                    "synonym_seconds": synonym_seconds,
+                }
+            )
             trim_diagnostics(active_program)
             return len(chunks)
 

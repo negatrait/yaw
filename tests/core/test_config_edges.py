@@ -54,6 +54,7 @@ def test_constructor_normalizes_comma_separated_filters_and_dataset_names(tmp_pa
     ("key", "literal", "expected"),
     [
         ("inference.enable_gbnf", "false", False),
+        ("runtime.indexing_overlap", "true", True),
         ("inference.enable_gbnf", "TRUE", True),
         ("optimization.sleep_seconds", "1.25", 1.25),
         ("inference.qa_model", "'model with spaces'", "model with spaces"),

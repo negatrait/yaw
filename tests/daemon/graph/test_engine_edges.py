@@ -325,9 +325,7 @@ def test_slice5_passages_json_shared_corpus_pools_and_unbounded_eval_hydration(t
                 set_meta(conn, f"indexed_fp:{ptr.chunk_id}", ext_fp)
                 set_meta(conn, f"openie_fp:{ptr.chunk_id}", oie_fp)
 
-        shared_train = [
-            dspy.Example(question=f"Question {i}?", item_docs=[]).with_inputs("question") for i in range(3)
-        ]
+        shared_train = [dspy.Example(question=f"Question {i}?", item_docs=[]).with_inputs("question") for i in range(3)]
         shared_val = [
             dspy.Example(question=f"Val Question {i}?", item_docs=[]).with_inputs("question") for i in range(2)
         ]

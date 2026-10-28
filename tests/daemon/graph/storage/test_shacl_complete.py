@@ -132,9 +132,7 @@ def test_shacl_new_shapes_detection(tmp_path: Path) -> None:
         # - dangling endpoint (ent-sys -> ent-dangling)
         # - skos:related + owl:differentFrom collision on non-homographs (ent-sys | ent-s13)
         # - asymmetric skos:related (ent-sys -> ent-eng without reverse)
-        conn.execute(
-            "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-sys', 'ent-dangling', 'fact', 1.0)"
-        )
+        conn.execute("INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-sys', 'ent-dangling', 'fact', 1.0)")
         conn.execute(
             "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-s13', 'ent-sys', 'skos:related', 0.6)"
         )
@@ -578,9 +576,7 @@ def test_shacl_auto_healing_complete(tmp_path: Path) -> None:
         # 1. ConceptShape/prefLabel healed: ent-no-pref promoted, ent-multi-pref demoted extra prefLabel
         no_pref_kinds = [
             str(r[0])
-            for r in conn.execute(
-                "SELECT label_kind FROM entity_labels WHERE entity_id = 'ent-no-pref'"
-            ).fetchall()
+            for r in conn.execute("SELECT label_kind FROM entity_labels WHERE entity_id = 'ent-no-pref'").fetchall()
         ]
         assert no_pref_kinds == ["skos:prefLabel"]
         multi_pref_rows = {
@@ -593,9 +589,7 @@ def test_shacl_auto_healing_complete(tmp_path: Path) -> None:
         assert multi_pref_rows["secondary label"] == "skos:altLabel"
 
         # 2. ConceptShape/definition healed: ent-empty-def has a synthesized non-empty definition
-        empty_def_row = conn.execute(
-            "SELECT definition FROM entities WHERE entity_id = 'ent-empty-def'"
-        ).fetchone()
+        empty_def_row = conn.execute("SELECT definition FROM entities WHERE entity_id = 'ent-empty-def'").fetchone()
         assert empty_def_row is not None and str(empty_def_row[0]).strip() != ""
 
         # 3. ConceptShape/S13-disjointLabels healed: ent-s13 has only skos:prefLabel for 'caching layer'
@@ -626,8 +620,7 @@ def test_shacl_auto_healing_complete(tmp_path: Path) -> None:
         # 6. EdgeShape/closedWorld healed: dangling edge deleted, related+differentFrom conflict resolved,
         # asymmetric skos:related symmetrized
         assert (
-            conn.execute("SELECT 1 FROM edges WHERE src_id = 'ent-sys' AND dst_id = 'ent-missing'").fetchone()
-            is None
+            conn.execute("SELECT 1 FROM edges WHERE src_id = 'ent-sys' AND dst_id = 'ent-missing'").fetchone() is None
         )
         assert (
             conn.execute(
@@ -691,8 +684,7 @@ def test_shacl_auto_healing_complete(tmp_path: Path) -> None:
 
         # 9. Inverted broader edge was inverted: security engineering -> engineering
         eng_broader = conn.execute(
-            "SELECT src_id, dst_id FROM edges WHERE kind = 'skos:broader' "
-            "AND src_id IN ('ent-eng', 'ent-sec-eng')"
+            "SELECT src_id, dst_id FROM edges WHERE kind = 'skos:broader' AND src_id IN ('ent-eng', 'ent-sec-eng')"
         ).fetchall()
         assert len(eng_broader) == 1
         assert (str(eng_broader[0][0]), str(eng_broader[0][1])) == ("ent-sec-eng", "ent-eng")
@@ -805,7 +797,7 @@ def test_serialize_graph_turtle_literal_datatypes_and_lang_tags(tmp_path: Path) 
         assert lint_graph_shacl(conn, auto_heal=False) == []
         ttl = serialize_graph_turtle(conn)
         assert 'rdf:object "2026-10-25"^^xsd:date' in ttl
-        assert '^^<xsd:date>' not in ttl
+        assert "^^<xsd:date>" not in ttl
         assert 'rdf:object "42.5"^^<http://example.org/datatypes#millisecond>' in ttl
         assert 'rdf:object "fast graph retrieval"@en' in ttl
         assert 'rdf:object "8080" ;' in ttl

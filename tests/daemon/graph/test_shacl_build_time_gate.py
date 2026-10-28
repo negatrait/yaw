@@ -7,6 +7,7 @@ from typing import Any
 
 import dspy
 
+from daemon.graph.synonym_protocol import candidate_rows, complete_decisions
 from yaw.core import ChunkPointer
 from yaw.daemon.graph.engine import YawGraphEngine
 from yaw.daemon.graph.inference import HippoRAGProgram
@@ -60,22 +61,7 @@ class PipelineGateMockLM(dspy.LM):
         return "\n".join(parts)
 
     def _parse_candidate_pairs_from_text(self, text: str) -> list[dict[str, Any]]:
-        decoder = json.JSONDecoder()
-        found: list[dict[str, Any]] = []
-        for idx, ch in enumerate(text):
-            if ch != "[":
-                continue
-            try:
-                parsed, _ = decoder.raw_decode(text[idx:])
-            except json.JSONDecodeError:
-                continue
-            if (
-                isinstance(parsed, list)
-                and parsed
-                and all(isinstance(item, dict) and "pair_id" in item for item in parsed)
-            ):
-                found = parsed
-        return found
+        return candidate_rows(text)
 
     def __call__(
         self, prompt: str | None = None, messages: list[dict[str, Any]] | None = None, **kwargs: Any
@@ -184,7 +170,7 @@ class PipelineGateMockLM(dspy.LM):
                                 "canonical": "A",
                             }
                         )
-            return [json.dumps({"decisions": decisions})]
+            return [json.dumps({"decisions": complete_decisions(cands, decisions)})]
 
         # Stage 2: ExtractTriples (has both `named_entities` input and `triples` output)
         if "triples" in full_text and "named_entities" in full_text:
@@ -274,13 +260,17 @@ class PipelineGateMockLM(dspy.LM):
         ]
 
 
-def _make_engine(tmp_path: Path, *, mode: str = "gate") -> tuple[YawGraphEngine, PipelineGateMockLM]:
+def _make_engine(
+    synonym_token_counter, tmp_path: Path, *, mode: str = "gate"
+) -> tuple[YawGraphEngine, PipelineGateMockLM]:
     db_path = tmp_path / f"yaw_{mode}.db"
     open_yaw_db(db_path).close()
     mock_lm = PipelineGateMockLM(mode=mode)
     dspy.settings.configure(lm=mock_lm)
     embedder = DummyEmbedder(dim=16)
-    prog = HippoRAGProgram(enable_gbnf=False, orchestrator_lm=mock_lm, rlm_sub_lm=mock_lm)
+    prog = HippoRAGProgram(
+        synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=mock_lm, rlm_sub_lm=mock_lm
+    )
     engine = YawGraphEngine(
         db_path=db_path,
         workspace_root=tmp_path,
@@ -290,10 +280,10 @@ def _make_engine(tmp_path: Path, *, mode: str = "gate") -> tuple[YawGraphEngine,
     return engine, mock_lm
 
 
-def test_build_time_shacl_gate_success(tmp_path: Path) -> None:
+def test_build_time_shacl_gate_success(synonym_token_counter, tmp_path: Path) -> None:
     """Verify that index_chunks executes Stage 1 -> Stage 2 -> Stage 3 -> SHACL build gate end-to-end without
     checkpoint pre-seeding, materializing 0.5-weighted owl:DatatypeProperty literal nodes and healing SKOS edges."""
-    engine, mock_lm = _make_engine(tmp_path, mode="gate")
+    engine, mock_lm = _make_engine(synonym_token_counter, tmp_path, mode="gate")
     try:
         text = (
             "Yet Another Wiki (YAW) was launched on 2026-10-25. It listens on port 8080.\n"
@@ -450,15 +440,12 @@ def test_build_time_shacl_gate_success(tmp_path: Path) -> None:
         engine.close()
 
 
-def test_pre_rlm_deterministic_auto_heal_skips_rlm_healer(tmp_path: Path) -> None:
+def test_pre_rlm_deterministic_auto_heal_skips_rlm_healer(synonym_token_counter, tmp_path: Path) -> None:
     """Verify that SHACL violations invoke the RLM healer first (without pre-emptive SQL auto_heal
     clobbering), and that post-RLM fallback auto-healing guarantees a zero-violation build gate."""
-    engine, mock_lm = _make_engine(tmp_path, mode="pre_rlm_heal")
+    engine, mock_lm = _make_engine(synonym_token_counter, tmp_path, mode="pre_rlm_heal")
     try:
-        text = (
-            "Cryptanalysis applies discrete mathematics.\n"
-            "Discrete mathematics includes number theory.\n"
-        )
+        text = "Cryptanalysis applies discrete mathematics.\nDiscrete mathematics includes number theory.\n"
         (tmp_path / "math.md").write_text(text, encoding="utf-8")
         chunk = ChunkPointer(
             chunk_id="chunk-pre-rlm-1",
@@ -481,4 +468,3 @@ def test_pre_rlm_deterministic_auto_heal_skips_rlm_healer(tmp_path: Path) -> Non
             assert lint_graph_shacl(conn, auto_heal=False) == []
     finally:
         engine.close()
-

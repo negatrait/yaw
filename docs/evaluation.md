@@ -1,5 +1,127 @@
 # Evaluation record
 
+## Native indexing replacement: partial orchestration evidence (2026-10-28)
+
+The new daemon-level app composes native file components, concurrent OpenIE and
+embedding functions, and native SQLite source/inference targets. The existing
+runtime has not yet switched to this app; graph planning/publication and legacy
+scheduler removal remain incomplete.
+
+Real-file/SQLite/loopback-HTTP checks executed individually:
+
+- Source replacement/deletion and environment restart: passed.
+- Malformed replacement preserves prior source rows; corrected replacement retries: passed.
+- Native embedding batching and persistent environment reopen without new HTTP calls: passed.
+- OpenIE/embedding concurrent admission, named trace restoration and unchanged-update reuse: passed.
+- Composed file app produces one source row and one inference row using three HTTP
+  requests, makes no further requests on unchanged update, and removes both rows
+  on confirmed file deletion through native target reconciliation: passed.
+
+The last check ran with `-k native_file_pipeline`: 1 passed, 18 deselected.
+These checks establish orchestration only, not real-model quality or throughput.
+No fresh-process crash, full runtime lifecycle or live-mode acceptance is claimed.
+Focused production ty and Ruff checks passed. The latest repository diff check
+reports pre-existing/user-edited trailing whitespace at AGENTS.md:31, left intact.
+
+## Bounded indexing overlap (2026-10-28)
+
+Implemented on `dev` at `https://github.com/negatrait/yaw.git`, preserving the
+existing compact-synonym work and user configuration changes. The new scheduling
+switch defaults to false. It is excluded from both index fingerprints and the
+runtime optimization resume identity. One embedding worker performs only provider
+work; the engine owner resolves caches, persists validated results and publishes
+telemetry between OpenIE accounting slices. Graph writes, sense resolution,
+synonyms and SHACL remain ordered. No new dependencies, index reset or commit.
+
+The first live overlap attempt exposed an OpenAI SDK cold-import race:
+`deadlock detected by _ModuleLock('openai.resources.chat')`. Resolve SDK resource
+imports on the owner before starting the embedding worker. A fresh-process
+loopback regression now verifies concurrent first chat/embedding calls. This fix
+has not received a second live-model comparison: the original 20-minute budget
+elapsed during diagnosis and verification. The continuation checked that same
+deadline and sent no model requests. Overlap remains opt-in; no speedup is claimed.
+
+### Authorized pilot evidence
+
+Sixteen Enterprise chunks were frozen with physical source files under ignored
+`.yaw/overlap_pilot/`. Both resident models were ready; no optimizer was active.
+The models were Gemma 4 E4B (131,072 context) and the configured Q8 EmbeddingGemma,
+both on CUDA. Separate disposable arm databases and DSPy cache directories were
+used. The gateway proxy recorded physical provider requests and enforced the
+shared deadline. No GEPA or full benchmark was launched.
+
+| Observation | Serial, first eight chunks | Original overlap attempt |
+|---|---:|---:|
+| Completed batch | yes | no: SDK import race |
+| Elapsed indexing | 297.88 s | 42.70 s before failure |
+| OpenIE phase | 258.65 s | incomplete |
+| Graph preparation after OpenIE | 5.09 s | not reached |
+| Transaction, including synonym judgment | 31.87 s | not reached |
+| Synonym generation | 31.51 s, 18 decisions | not reached |
+| Physical embedding/chat requests | 11 / 18 | 0 / 2 |
+| Peak process working set | 291.8 MiB | 283.5 MiB |
+| Maximum sampled device memory | 7,091 MiB | 7,091 MiB |
+| Committed chunks/entities/facts | 8 / 61 / 73 | 0 / 0 / 0 |
+
+Serial chat requests consumed 30,853 provider-reported tokens. Its initial eight
+chunk embeddings comprised two physical requests totaling 0.344 s at the proxy;
+formatting, initialization and owner-side costs are outside that HTTP duration.
+OpenIE dominated this sample. The failed arm is not a performance comparison or
+a quality regression measurement. Remaining paired batches were not completed.
+CPU regression tests also ran during the pilot, so even the serial timing is a
+diagnostic observation rather than an isolated hardware benchmark.
+
+### Verification
+
+- Final affected graph, synonym, embedding, storage, configuration and architecture
+  selection: **122 passed** in 238.64 s, `--testmon-noselect` (no testmon deselection).
+- Added real-SQLite optimization resume identity check: **1 passed**, 32 explicitly
+  deselected by `-k`, not by testmon. TOML scalar/array round trips, including the
+  new switch: **8 passed** with `--testmon-noselect` in 1.38 s.
+- Cold-process concurrent calls, serial/overlap graph and provenance equivalence,
+  one request per lane, stage token attribution, invalid vectors, malformed chat,
+  real HTTP timeout, failure draining, bounded retained results/threads, and
+  fresh-process reuse of persisted embeddings are exercised with native DSPy,
+  loopback HTTP and real SQLite. These establish orchestration, not model quality.
+- Earlier compact/engine selection: **45 passed**. Mandatory pair-specific GBNF
+  reached the native loopback provider and all 18 live serial-pilot synonym
+  decisions passed coverage validation. Three obsolete fixtures were corrected;
+  missing canonical IDs now assert rejection and no graph writes.
+- Repository Ruff lint, formatting and ty checks pass; `git diff --check` passes.
+  The formatter also corrected existing formatting in watchdog and two graph tests.
+- One upstream Pydantic `ReadOnly` warning remains; it is not suppressed. The full
+  repository test suite and full-corpus quality/performance gates were not run.
+
+Artifacts: `.yaw/overlap_pilot/run.py`, `chunks.json`, `health.json`, `report.json`,
+`continuation.json`, per-arm logs and `batch-0.json` reports. Production sources,
+indexes and experiments were not overwritten.
+
+## Compact synonym coverage failure (2026-10-27)
+
+The user-reported optimization failure omitted one requested decision (`e0|e4`).
+Inspection found that compact packets required exact coverage in host validation,
+while generation still used a generic grammar permitting an empty/short list.
+The repair generates a mandatory ordered decision rule for every supplied pair,
+with fixed pair IDs, the existing five relation choices and pair-local canonical
+IDs. Native DSPy dispatch passes this grammar in the request; full coverage is
+still validated before graph writes. Changed grammar request keys prevent reuse
+of the old incomplete raw response. Completed graph/OpenIE caches are preserved.
+
+The runtime progress message now says it is preparing the optimizer and that
+validation indexing precedes trials, instead of claiming evolution has started.
+The 150/100 query split can use a shared corpus; validation passage counts describe
+that corpus, not the number of validation questions.
+
+Added a loopback regression for packet-specific grammar dispatch and unique IDs.
+Execution was unverified at the time of this entry: automatic approval review rejected the preceding
+pytest rerun because workspace credits were exhausted, explicitly stating that
+the review could not complete (not that the command was unsafe). No alternate
+execution route was used to bypass that block. The earlier compact-focused run
+passed 24 tests; that result predates this coverage repair. Broader engine fixture
+adaptations, final lint/type checks and the paired live pilot were outstanding.
+The 2026-10-28 record above supersedes the regression-verification limitation;
+a completed paired performance pilot remains unavailable.
+
 ## Epic 2 specification reconciliation (2026-10-27)
 
 Documentation-only update on `dev`, origin `https://github.com/negatrait/yaw.git`.
@@ -82,7 +204,7 @@ line span fail. Decoded string lines never become file coordinates.
 ### Configured Enterprise measurement
 
 Final serial measurement used a fresh generated copy under
-`.yaw/dataset-ingestion-audit/final/`, with the configured `1500/120/100`
+`.yaw/dataset-ingestion-audit/final/`, with the configured `1200/120/100`
 chunk-size/overlap/minimum settings. It exported all **1,308** configured documents
 and produced **9,062** chunks. Inputs outside the audit directory were untouched.
 

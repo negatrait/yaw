@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,7 @@ import numpy as np
 import pytest
 
 from daemon.graph.inference.test_reflection import provider as provider
+from daemon.graph.synonym_protocol import candidate_rows, complete_decisions
 from yaw.core import ChunkPointer
 from yaw.daemon.graph.engine import YawGraphEngine
 from yaw.daemon.graph.inference import (
@@ -67,7 +69,17 @@ class DeterministicMockLM(dspy.LM):
             or "candidate_pairs_json" in req_str
             or "candidate_pairs" in req_str
         ):
-            return ['{"decisions": []}']
+            pair_ids = list(dict.fromkeys(re.findall(r"e[0-9]+\|e[0-9]+", req_str)))
+            return [
+                json.dumps(
+                    {
+                        "decisions": [
+                            {"pair_id": pid, "relation": "skos:related", "canonical": pid.split("|")[0]}
+                            for pid in pair_ids
+                        ]
+                    }
+                )
+            ]
         if "ProposeSHACLRepairs" in req_str or "HealSHACLViolations" in req_str or "violations_json" in req_str:
             return ['{"repairs": []}']
         if (
@@ -170,12 +182,12 @@ class DeterministicMockEmbedder:
 
 
 @pytest.fixture
-def test_engine(tmp_path: Path) -> Iterator[YawGraphEngine]:
+def test_engine(synonym_token_counter, tmp_path: Path) -> Iterator[YawGraphEngine]:
     db_path = tmp_path / "yaw.db"
     mock_lm = DeterministicMockLM()
     dspy.settings.configure(lm=mock_lm)
 
-    program = HippoRAGProgram(enable_gbnf=False)
+    program = HippoRAGProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
     engine = YawGraphEngine(
@@ -353,7 +365,7 @@ def test_engine_delete_chunks_cascades_and_invalidates_csr(test_engine: YawGraph
     assert c1_id not in graph2.chunk_ids
 
 
-def test_engine_multi_batch_indexing_and_bounded_embedding_batches(tmp_path: Path) -> None:
+def test_engine_multi_batch_indexing_and_bounded_embedding_batches(synonym_token_counter, tmp_path: Path) -> None:
     batch_sizes_seen: list[int] = []
 
     class TrackingEmbedder(DeterministicMockEmbedder):
@@ -369,7 +381,7 @@ def test_engine_multi_batch_indexing_and_bounded_embedding_batches(tmp_path: Pat
 
     mock_lm = DeterministicMockLM()
     dspy.settings.configure(lm=mock_lm)
-    program = HippoRAGProgram(enable_gbnf=False)
+    program = HippoRAGProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = TrackingEmbedder(dim=64)
 
     engine = YawGraphEngine(
@@ -414,7 +426,7 @@ def test_engine_multi_batch_indexing_and_bounded_embedding_batches(tmp_path: Pat
         engine.close()
 
 
-def test_engine_fact_score_weighting_and_thread_safe_retrieval(tmp_path: Path) -> None:
+def test_engine_fact_score_weighting_and_thread_safe_retrieval(synonym_token_counter, tmp_path: Path) -> None:
     from concurrent.futures import ThreadPoolExecutor
 
     class ControlledFactEmbedder:
@@ -448,7 +460,7 @@ def test_engine_fact_score_weighting_and_thread_safe_retrieval(tmp_path: Path) -
             return super().__call__(prompt=prompt, messages=messages, **kwargs)
 
     dspy.settings.configure(lm=KeepAllFactsLM())
-    program = HippoRAGProgram(enable_gbnf=False)
+    program = HippoRAGProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = ControlledFactEmbedder()
 
     engine = YawGraphEngine(
@@ -570,7 +582,7 @@ def test_engine_evolve_prompts_miprov2_and_gepa_metric_contracts(
     assert len(gepa_scores) == 1
 
 
-def test_engine_hybrid_fact_candidate_retrieval(tmp_path: Path) -> None:
+def test_engine_hybrid_fact_candidate_retrieval(synonym_token_counter, tmp_path: Path) -> None:
     class HybridFactEmbedder:
         """Deterministic embedder: query is close to Turing in dense space."""
 
@@ -603,7 +615,7 @@ def test_engine_hybrid_fact_candidate_retrieval(tmp_path: Path) -> None:
             return super().__call__(prompt=prompt, messages=messages, **kwargs)
 
     dspy.settings.configure(lm=InspectFilterLM())
-    program = HippoRAGProgram(enable_gbnf=False)
+    program = HippoRAGProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = HybridFactEmbedder()
 
     engine = YawGraphEngine(
@@ -642,7 +654,7 @@ def test_engine_hybrid_fact_candidate_retrieval(tmp_path: Path) -> None:
         engine.close()
 
 
-def test_engine_query_intent_escalation_once_without_infinite_recursion(tmp_path: Path) -> None:
+def test_engine_query_intent_escalation_once_without_infinite_recursion(synonym_token_counter, tmp_path: Path) -> None:
     intent_calls: list[str] = []
     filter_calls: list[str] = []
 
@@ -668,7 +680,7 @@ def test_engine_query_intent_escalation_once_without_infinite_recursion(tmp_path
             return super().__call__(prompt=prompt, messages=messages, **kwargs)
 
     dspy.settings.configure(lm=IntentEscalationLM())
-    program = HippoRAGProgram(enable_gbnf=False)
+    program = HippoRAGProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
     engine = YawGraphEngine(
@@ -706,7 +718,7 @@ def test_engine_query_intent_escalation_once_without_infinite_recursion(tmp_path
         engine.close()
 
 
-def test_engine_homograph_gate_edc_and_shacl_conformance(tmp_path: Path) -> None:
+def test_engine_homograph_gate_edc_and_shacl_conformance(synonym_token_counter, tmp_path: Path) -> None:
     """Verify Same-Label Homograph Gate splits conflicting senses via JudgeSynonyms and passes SHACL linting."""
     import json
     import re
@@ -725,7 +737,7 @@ def test_engine_homograph_gate_edc_and_shacl_conformance(tmp_path: Path) -> None
                 )
             req_str = str(prompt or messages or kwargs)
             if "JudgeSynonyms" in req_str or "candidate_pairs" in req_str:
-                pair_ids = list(dict.fromkeys(re.findall(r"entity-[0-9a-f]+\|entity-[0-9a-f]+", req_str)))
+                pair_ids = list(dict.fromkeys(re.findall(r"e[0-9]+\|e[0-9]+", req_str)))
                 decisions = [
                     {
                         "pair_id": pid,
@@ -798,7 +810,7 @@ def test_engine_homograph_gate_edc_and_shacl_conformance(tmp_path: Path) -> None
             return super().__call__(prompt=prompt, messages=messages, **kwargs)
 
     dspy.settings.configure(lm=HomographGateLM())
-    program = HippoRAGProgram(enable_gbnf=False)
+    program = HippoRAGProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
     engine = YawGraphEngine(
@@ -837,6 +849,7 @@ def test_engine_homograph_gate_edc_and_shacl_conformance(tmp_path: Path) -> None
 
 
 def test_engine_same_label_provisional_split_merged_by_judge_synonyms_and_stage1_standalone_ner(
+    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
     """Verify Hazard 2 (same-label cos < 0.85 merged back when JudgeSynonyms returns skos:altLabel) and Hazard 3 \
@@ -858,7 +871,7 @@ Option A (standalone Stage 1 NER entities preserved with definitions)."""
                 )
             req_str = str(prompt or messages or kwargs)
             if "JudgeSynonyms" in req_str or "candidate_pairs" in req_str:
-                pair_ids = list(dict.fromkeys(re.findall(r"entity-[0-9a-f]+\|entity-[0-9a-f]+", req_str)))
+                pair_ids = list(dict.fromkeys(re.findall(r"e[0-9]+\|e[0-9]+", req_str)))
                 decisions = []
                 for pid in pair_ids:
                     ea, eb = pid.split("|", 1)
@@ -925,7 +938,7 @@ Option A (standalone Stage 1 NER entities preserved with definitions)."""
             return super().__call__(prompt=prompt, messages=messages, **kwargs)
 
     dspy.settings.configure(lm=SynonymMergeAndStandaloneNerLM())
-    program = HippoRAGProgram(enable_gbnf=False)
+    program = HippoRAGProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
     engine = YawGraphEngine(
@@ -984,6 +997,7 @@ Option A (standalone Stage 1 NER entities preserved with definitions)."""
 
 
 def test_engine_step7_heal_shacl_violations_rlm_repl_tools_and_token_stats(
+    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
     """Verify Step 6 direct GBNF synonym_judge_tokens and Step 7 heal_shacl_violations via shacl_healer_rlm \
@@ -1075,7 +1089,7 @@ using all 5 bound REPL tools."""
                     )
                 ]
             if "[[ ## candidate_pairs ## ]]" in req_str or "candidate_pairs" in req_str:
-                pair_ids = list(dict.fromkeys(re.findall(r"entity-[0-9a-f]+\|entity-[0-9a-f]+", req_str)))
+                pair_ids = list(dict.fromkeys(re.findall(r"e[0-9]+\|e[0-9]+", req_str)))
                 decisions = [
                     {
                         "pair_id": pid,
@@ -1144,6 +1158,7 @@ using all 5 bound REPL tools."""
     orch_lm = RLMOrchestratorLM()
     worker_lm = QwenWorkerLM()
     program = HippoRAGProgram(
+        synonym_token_counter=synonym_token_counter,
         enable_gbnf=True,
         orchestrator_lm=orch_lm,
         rlm_sub_lm=worker_lm,
@@ -1250,6 +1265,7 @@ using all 5 bound REPL tools."""
 
 
 def test_engine_define_missing_entities_telemetry_and_no_heuristic_fallbacks(
+    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
     """Verify index_chunks repairs missing entity definitions via DefineMissingEntities, tracks stats, and never \
@@ -1312,7 +1328,7 @@ uses heuristic fallbacks."""
             return super().__call__(prompt=prompt, messages=messages, **kwargs)
 
     dspy.settings.configure(lm=MissingEntityRepairLM())
-    program = HippoRAGProgram(enable_gbnf=False)
+    program = HippoRAGProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
     engine = YawGraphEngine(
@@ -1351,6 +1367,7 @@ uses heuristic fallbacks."""
 
 
 def test_engine_evolve_prompts_reindexes_on_extraction_mutation_and_captures_all_stage_traces(
+    synonym_token_counter,
     reflection_token_counter,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1443,12 +1460,24 @@ traces into dspy.settings.trace, and emits per-predictor feedback."""
                     )
                 ]
             if "JudgeSynonyms" in req_str or "candidate_pairs" in req_str:
-                return [json.dumps({"decisions": []})]
+                pair_ids = list(dict.fromkeys(re.findall(r"e[0-9]+\|e[0-9]+", req_str)))
+                return [
+                    json.dumps(
+                        {
+                            "decisions": [
+                                {"pair_id": p, "relation": "skos:related", "canonical": p.split("|")[0]}
+                                for p in pair_ids
+                            ]
+                        }
+                    )
+                ]
             return super().__call__(prompt=prompt, messages=messages, **kwargs)
 
     lm = CandidateSensitiveExtractionLM()
     dspy.settings.configure(lm=lm)
-    program = HippoRAGProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
+    program = HippoRAGProgram(
+        synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm
+    )
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
     engine = YawGraphEngine(
@@ -1562,6 +1591,7 @@ traces into dspy.settings.trace, and emits per-predictor feedback."""
 
 
 def test_sprint3_engine_as_rm_and_as_retriever_and_dspy_retrieve_compatibility(
+    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
     """Verify YawGraphEngine.as_rm, as_retriever, workspace DSPy cache isolation, and stock dspy.Retrieve(k=...) \
@@ -1569,7 +1599,7 @@ compatibility."""
     from yaw.daemon.graph.inference import YawPassage, YawRetriever, YawRM
 
     dspy.settings.configure(lm=DeterministicMockLM())
-    program = HippoRAGProgram(enable_gbnf=False)
+    program = HippoRAGProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
     engine = YawGraphEngine(
@@ -1616,6 +1646,7 @@ compatibility."""
 
 
 def test_sprint3_engine_search_graph_for_react_and_react_v2_fallback_integration(
+    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
     """Verify _search_graph_for_react queries real SQLite yaw.db facts and passages and powers dspy.ReActV2 \
@@ -1685,6 +1716,7 @@ multi-hop fallback."""
     lm = ReActEngineMockLM()
     dspy.settings.configure(lm=lm)
     program = HippoRAGProgram(
+        synonym_token_counter=synonym_token_counter,
         enable_gbnf=False,
         orchestrator_lm=lm,
         rlm_sub_lm=lm,
@@ -1717,6 +1749,7 @@ multi-hop fallback."""
 
 
 def test_sprint3_engine_evaluate_and_pareto_frontier_export(
+    synonym_token_counter,
     tmp_path: Path,
     reflection_token_counter,
     monkeypatch: pytest.MonkeyPatch,
@@ -1726,7 +1759,9 @@ def test_sprint3_engine_evaluate_and_pareto_frontier_export(
 
     lm = DeterministicMockLM()
     dspy.settings.configure(lm=lm)
-    program = HippoRAGProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
+    program = HippoRAGProgram(
+        synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm
+    )
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
     engine = YawGraphEngine(
@@ -1796,7 +1831,13 @@ def test_sprint3_engine_evaluate_and_pareto_frontier_export(
         assert save_path.exists()
         assert (tmp_path / "compiled_sprint3_eval.json").exists()
 
-        reloaded = HippoRAGProgram(enable_gbnf=False, compiled_path=save_path, orchestrator_lm=lm, rlm_sub_lm=lm)
+        reloaded = HippoRAGProgram(
+            synonym_token_counter=synonym_token_counter,
+            enable_gbnf=False,
+            compiled_path=save_path,
+            orchestrator_lm=lm,
+            rlm_sub_lm=lm,
+        )
         assert reloaded.qa.predict.signature.instructions == "Pareto candidate 0 instruction."
         ensemble = dspy.Ensemble(reduce_fn=dspy.majority).compile([compiled, reloaded])
         ens_pred = ensemble(context=doc, question="Who designed the ACE?")
@@ -1806,6 +1847,7 @@ def test_sprint3_engine_evaluate_and_pareto_frontier_export(
 
 
 def test_canonical_retrieval_hook_and_rag_qa_forward_unification(
+    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
     """Verify _canonical_retrieval_hook unifies YawRM, YawRetriever, HippoRAGProgram.forward, and rag_qa with \
@@ -1873,6 +1915,7 @@ GEPA trace replay and ReActV2/Pareto support."""
     lm = UnifiedHookMockLM()
     dspy.settings.configure(lm=lm)
     program = HippoRAGProgram(
+        synonym_token_counter=synonym_token_counter,
         enable_gbnf=False,
         orchestrator_lm=lm,
         rlm_sub_lm=lm,
@@ -1938,6 +1981,7 @@ GEPA trace replay and ReActV2/Pareto support."""
 
 
 def test_hybrid_e2e_per_query_isolation_stage_caching_and_reflective_stats(
+    synonym_token_counter,
     reflection_token_counter,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1966,12 +2010,24 @@ minibatch q_stats lookup."""
                 stage_call_counts["ner"] += 1
             elif "JudgeSynonyms" in req_str or "candidate_pairs" in req_str:
                 stage_call_counts["synonym_judge"] += 1
-                return [json.dumps({"decisions": []})]
+                pair_ids = list(dict.fromkeys(re.findall(r"e[0-9]+\|e[0-9]+", req_str)))
+                return [
+                    json.dumps(
+                        {
+                            "decisions": [
+                                {"pair_id": p, "relation": "skos:related", "canonical": p.split("|")[0]}
+                                for p in pair_ids
+                            ]
+                        }
+                    )
+                ]
             return super().__call__(prompt=prompt, messages=messages, **kwargs)
 
     lm = StageCountingMockLM()
     dspy.settings.configure(lm=lm)
-    program = HippoRAGProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
+    program = HippoRAGProgram(
+        synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm
+    )
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
     engine = YawGraphEngine(
@@ -2081,6 +2137,7 @@ minibatch q_stats lookup."""
 
 
 def test_evolve_prompts_real_unmocked_gepa_and_miprov2_with_context_limit_guard(
+    synonym_token_counter,
     tmp_path: Path,
     provider,
 ) -> None:
@@ -2162,6 +2219,7 @@ def test_evolve_prompts_real_unmocked_gepa_and_miprov2_with_context_limit_guard(
     lm = ContextGuardedRealOptLM()
     dspy.settings.configure(lm=lm)
     program = HippoRAGProgram(
+        synonym_token_counter=synonym_token_counter,
         enable_gbnf=False,
         orchestrator_lm=lm,
         rlm_sub_lm=lm,
@@ -2218,7 +2276,9 @@ def test_evolve_prompts_real_unmocked_gepa_and_miprov2_with_context_limit_guard(
         assert getattr(compiled, "detailed_results", None) is not None
         # Zero-shot optimization must remove seeded task demos, including SHACL's.
         # Verify the saved artifact preserves that contract as well.
-        restored = HippoRAGProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
+        restored = HippoRAGProgram(
+            synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm
+        )
         restored.load(str(save_path))
         for task_program in (compiled, restored):
             for name, predictor in task_program.named_predictors():
@@ -2233,12 +2293,12 @@ def test_evolve_prompts_real_unmocked_gepa_and_miprov2_with_context_limit_guard(
 
 
 def test_engine_homographs_paronyms_and_same_label_triple_permutations(
+    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
     """Verify paronyms ('Cindy Real' vs 'Cinderella'), typos ('Cindarella'), and homograph permutations ('a \
 ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a ball')."""
     import json
-    import re
 
     from yaw.daemon.graph.storage import load_graph_topology
 
@@ -2252,12 +2312,9 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
             req_str = str(prompt or messages or kwargs)
             if "[[ ## candidate_pairs ## ]]" in req_str or "candidate_pairs" in req_str:
                 decisions = []
-                # Extract JSON array of candidate pairs from prompt
-                for match in re.finditer(r"\{[^{}]*\"pair_id\"[^{}]*\}", req_str):
-                    try:
-                        p = json.loads(match.group(0))
-                    except Exception:
-                        continue
+                packet_text = "\n".join(str(m.get("content", "")) for m in messages or [])
+                candidates = candidate_rows(packet_text)
+                for p in candidates:
                     pid = str(p.get("pair_id", ""))
                     na = str(p.get("name_a", "")).lower()
                     nb = str(p.get("name_b", "")).lower()
@@ -2289,7 +2346,7 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
                                 "canonical": "A",
                             }
                         )
-                return [json.dumps({"decisions": decisions})]
+                return [json.dumps({"decisions": complete_decisions(candidates, decisions)})]
 
             if "[[ ## named_entities ## ]]" in req_str or "Resource Description Framework" in req_str:
                 if "Cindy Real" in req_str:
@@ -2379,7 +2436,7 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
             ]
 
     dspy.settings.configure(lm=HomographAndParonymLM())
-    program = HippoRAGProgram(enable_gbnf=False)
+    program = HippoRAGProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
     engine = YawGraphEngine(
@@ -2497,6 +2554,7 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
 
 
 def test_step10_engine_pareto_ensemble_readonly_graph_and_memoization(
+    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
     """Verify Pareto dspy.Ensemble runs read-only against yaw.db and memoizes identical query retrievals."""
@@ -2517,7 +2575,9 @@ def test_step10_engine_pareto_ensemble_readonly_graph_and_memoization(
 
     lm = TrackingEnsembleLM()
     dspy.settings.configure(lm=lm)
-    prog = HippoRAGProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
+    prog = HippoRAGProgram(
+        synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm
+    )
     embedder: Any = DeterministicMockEmbedder(dim=64)
     engine = YawGraphEngine(
         db_path=tmp_path / "yaw_step10_ens.db",
@@ -2590,11 +2650,11 @@ def test_step10_engine_pareto_ensemble_readonly_graph_and_memoization(
 
 
 def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
+    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
     """Verify Step 11 (H1-H4) end-to-end: literal-object triples, SHACL, PPR seeding, and skos:broader."""
     import json
-    import re
 
     from yaw.core import RelationTraversalPolicy
 
@@ -2608,11 +2668,9 @@ def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
             req_str = str(prompt or messages or kwargs)
             if "[[ ## candidate_pairs ## ]]" in req_str or "candidate_pairs" in req_str:
                 decisions = []
-                for match in re.finditer(r"\{[^{}]*\"pair_id\"[^{}]*\}", req_str):
-                    try:
-                        p = json.loads(match.group(0))
-                    except Exception:
-                        continue
+                packet_text = "\n".join(str(m.get("content", "")) for m in messages or [])
+                candidates = candidate_rows(packet_text)
+                for p in candidates:
                     pid = str(p.get("pair_id", ""))
                     na = str(p.get("name_a", "")).lower()
                     nb = str(p.get("name_b", "")).lower()
@@ -2634,7 +2692,7 @@ def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
                                 "canonical": "A",
                             }
                         )
-                return [json.dumps({"decisions": decisions})]
+                return [json.dumps({"decisions": complete_decisions(candidates, decisions)})]
             if "FilterTriples" in req_str or "fact_before_filter" in req_str:
                 return [json.dumps({"fact": [["alan turing", "was born on", "1912-06-23"]]})]
             if "ExtractTriples" in req_str or '"triples"' in req_str or "`triples`" in req_str:
@@ -2718,7 +2776,9 @@ def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
 
     lm = Step11MockLM()
     dspy.settings.configure(lm=lm)
-    prog = HippoRAGProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
+    prog = HippoRAGProgram(
+        synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm
+    )
     embedder: Any = DeterministicMockEmbedder(dim=64)
     engine = YawGraphEngine(
         db_path=tmp_path / "yaw_step11_e2e.db",
@@ -2770,12 +2830,8 @@ def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
         from yaw.daemon.graph.storage import load_graph_topology
 
         c_ids, e_ids, kind_edges = load_graph_topology(engine.conn, include_kinds=True)
-        turing_to_crypt_facts = [
-            w for s, d, k, w in kind_edges if s == turing_id and d == crypt_id and k == "fact"
-        ]
-        crypt_to_turing_facts = [
-            w for s, d, k, w in kind_edges if s == crypt_id and d == turing_id and k == "fact"
-        ]
+        turing_to_crypt_facts = [w for s, d, k, w in kind_edges if s == turing_id and d == crypt_id and k == "fact"]
+        crypt_to_turing_facts = [w for s, d, k, w in kind_edges if s == crypt_id and d == turing_id and k == "fact"]
         assert len(turing_to_crypt_facts) == 2
         assert len(crypt_to_turing_facts) == 0
 

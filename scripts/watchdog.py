@@ -1924,9 +1924,7 @@ def generate_report_markdown(
                 label_lines.append(f"  - `{k_label}`: {', '.join(f'`{raw}`' for raw in uniq_labels)}")
         assertions_md += (
             "### Audit Trail: Largest Concept by SKOS Labels\n\n"
-            f"**`{top_name}`** ({top_cnt} total unique labels):\n"
-            + "\n".join(label_lines)
-            + "\n\n"
+            f"**`{top_name}`** ({top_cnt} total unique labels):\n" + "\n".join(label_lines) + "\n\n"
         )
 
     # Small image files referenced by path (no inline base64: that made the report multi-MB and

@@ -6,7 +6,9 @@ from typing import Any
 
 import dspy
 import numpy as np
+import pytest
 
+from daemon.graph.synonym_protocol import candidate_rows, complete_decisions
 from yaw.core import ChunkPointer, OpenIERecord, RelationTraversalPolicy, StructuredTriple
 from yaw.daemon.graph.engine import YawGraphEngine
 from yaw.daemon.graph.inference import HippoRAGProgram, parse_synonym_decisions
@@ -54,22 +56,7 @@ class DeterministicMockLM(dspy.LM):
 
     @staticmethod
     def _parse_candidate_pairs_from_text(text: str) -> list[dict[str, Any]]:
-        decoder = json.JSONDecoder()
-        found: list[dict[str, Any]] = []
-        for idx, ch in enumerate(text):
-            if ch != "[":
-                continue
-            try:
-                parsed, _ = decoder.raw_decode(text[idx:])
-            except json.JSONDecodeError:
-                continue
-            if (
-                isinstance(parsed, list)
-                and parsed
-                and all(isinstance(item, dict) and "pair_id" in item for item in parsed)
-            ):
-                found = parsed
-        return found
+        return candidate_rows(text)
 
     def __call__(
         self, prompt: str | None = None, messages: list[dict[str, Any]] | None = None, **kwargs: Any
@@ -78,7 +65,7 @@ class DeterministicMockLM(dspy.LM):
         if "candidate_pairs" in full_text or '"pair_id"' in full_text:
             cands = self._parse_candidate_pairs_from_text(full_text)
             self.observed_candidates.extend(cands)
-            decisions = self._synonym_fn(cands) if self._synonym_fn is not None else []
+            decisions = complete_decisions(cands, self._synonym_fn(cands) if self._synonym_fn is not None else [])
             return [json.dumps({"decisions": decisions})]
         if "triples" in full_text and "named_entities" in full_text and self._triples_json is not None:
             return [self._triples_json]
@@ -103,6 +90,7 @@ class DeterministicMockEmbedder:
 
 
 def _make_engine(
+    synonym_token_counter,
     tmp_path: Path,
     db_name: str,
     synonym_callback: Any = None,
@@ -110,7 +98,9 @@ def _make_engine(
     db_path = tmp_path / db_name
     mock_lm = DeterministicMockLM(synonym_fn=synonym_callback)
     dspy.settings.configure(lm=mock_lm)
-    program = HippoRAGProgram(enable_gbnf=False, orchestrator_lm=mock_lm, rlm_sub_lm=mock_lm)
+    program = HippoRAGProgram(
+        synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=mock_lm, rlm_sub_lm=mock_lm
+    )
     embedder: Any = DeterministicMockEmbedder(dim=64)
     engine = YawGraphEngine(
         db_path=db_path,
@@ -158,6 +148,7 @@ def _index_chunk_with_record(
 
 
 def test_datatype_property_literal_objects_stored_with_weighted_edges_and_excluded_from_skos(
+    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
     """Verify owl:DatatypeProperty literal objects are materialized in entities with contextual definitions,
@@ -176,7 +167,7 @@ def test_datatype_property_literal_objects_stored_with_weighted_edges_and_exclud
         }
     )
     dspy.settings.configure(lm=DeterministicMockLM([lm_triple_json]))
-    prog = HippoRAGProgram(enable_gbnf=False)
+    prog = HippoRAGProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     extracted_sts = prog.extract_structured_triples(
         "YAW Service listens on port 8080.",
         [
@@ -201,7 +192,7 @@ def test_datatype_property_literal_objects_stored_with_weighted_edges_and_exclud
             for c in candidates
         ]
 
-    engine, conn = _make_engine(tmp_path, "test_lit_edges.db", synonym_callback=_judge)
+    engine, conn = _make_engine(synonym_token_counter, tmp_path, "test_lit_edges.db", synonym_callback=_judge)
 
     chunk = ChunkPointer(
         chunk_id="chunk-1",
@@ -247,8 +238,7 @@ def test_datatype_property_literal_objects_stored_with_weighted_edges_and_exclud
 
     # Verify both 8080 and non-scalar $1.2B are stored as literal nodes with no duplicate '1 2b' concept node
     all_entities = {
-        r[1]: (r[0], r[2])
-        for r in conn.execute("SELECT entity_id, name, definition FROM entities").fetchall()
+        r[1]: (r[0], r[2]) for r in conn.execute("SELECT entity_id, name, definition FROM entities").fetchall()
     }
     assert "8080" in all_entities
     assert "$1.2B" in all_entities
@@ -275,9 +265,7 @@ def test_datatype_property_literal_objects_stored_with_weighted_edges_and_exclud
     assert fact_edges == {(subj_id, lit_id): 0.5, (subj_id, rev_id): 0.5}
 
     # Verify passage edges connect chunk-1 to subj_id, lit_id, and rev_id
-    passage_edges = conn.execute(
-        "SELECT src_id, dst_id FROM edges WHERE kind = 'passage'"
-    ).fetchall()
+    passage_edges = conn.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'passage'").fetchall()
     passage_pairs = {(r[0], r[1]) for r in passage_edges}
     assert ("chunk-1", subj_id) in passage_pairs
     assert ("chunk-1", lit_id) in passage_pairs
@@ -305,11 +293,12 @@ def test_datatype_property_literal_objects_stored_with_weighted_edges_and_exclud
 
 
 def test_dual_role_literal_promoted_to_concept_and_weight_preserved_across_merge_and_delete(
+    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
     """Verify a surface form used first as a literal and later as an ObjectProperty endpoint is promoted
     to a skos:Concept, and merge_entities/delete_chunks preserve 0.5 weights on pure literal fact edges."""
-    engine, conn = _make_engine(tmp_path, "test_dual_role.db")
+    engine, conn = _make_engine(synonym_token_counter, tmp_path, "test_dual_role.db")
 
     c1 = ChunkPointer("c1", "doc1.md", 1, 5, "Rollout")
     r1 = OpenIERecord(
@@ -442,10 +431,10 @@ def test_dual_role_literal_promoted_to_concept_and_weight_preserved_across_merge
     assert lint_graph_shacl(conn, auto_heal=False) == []
 
 
-def test_forward_fact_edges_strictly_directed(tmp_path: Path) -> None:
+def test_forward_fact_edges_strictly_directed(synonym_token_counter, tmp_path: Path) -> None:
     """Verify that entity-to-entity facts store ONLY forward (subj -> obj) edges with weight 1.0,
     and topology + transition matrix distinguish ObjectProperty (1.0) vs DatatypeProperty (0.5)."""
-    engine, conn = _make_engine(tmp_path, "test_directed_edges.db")
+    engine, conn = _make_engine(synonym_token_counter, tmp_path, "test_directed_edges.db")
 
     chunk = ChunkPointer(
         chunk_id="chunk-2",
@@ -519,11 +508,12 @@ def test_forward_fact_edges_strictly_directed(tmp_path: Path) -> None:
     assert raw_s_to_o > raw_s_to_lit > 0.0
 
 
-def test_lexical_subsumption_guard_inverts_erroneous_direction_and_missing_canonical_demotes(
+def test_lexical_subsumption_guard_inverts_erroneous_direction_and_rejects_missing_canonical(
+    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
     """Verify that inverted subsumption assertions are corrected from child to parent,
-    missing canonical on skos:broader is demoted to symmetric skos:related, and direct
+    missing canonical on skos:broader is rejected, and direct
     upsert_semantic_edges calls also enforce lexical subsumption inversion."""
     # First check parse_synonym_decisions does not default missing canonical to 'A' on skos:broader
     parsed = parse_synonym_decisions('{"decisions": [{"pair_id": 0, "relation": "skos:broader"}]}')
@@ -540,7 +530,7 @@ def test_lexical_subsumption_guard_inverts_erroneous_direction_and_missing_canon
             for c in candidates
         ]
 
-    engine, conn = _make_engine(tmp_path, "test_subsumption.db", synonym_callback=_judge)
+    engine, conn = _make_engine(synonym_token_counter, tmp_path, "test_subsumption.db", synonym_callback=_judge)
 
     chunk = ChunkPointer(
         chunk_id="chunk-3",
@@ -565,22 +555,18 @@ def test_lexical_subsumption_guard_inverts_erroneous_direction_and_missing_canon
     inf_id = ent_rows["inference"]
     rhi_id = ent_rows["redwood hosted inference"]
 
-    broader_edges = conn.execute(
-        "SELECT src_id, dst_id FROM edges WHERE kind = 'skos:broader'"
-    ).fetchall()
+    broader_edges = conn.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'skos:broader'").fetchall()
     assert len(broader_edges) == 1
     assert tuple(broader_edges[0]) == (rhi_id, inf_id)
 
     # Verify direct upsert_semantic_edges also inverts erroneous (head -> modifier_head) skos:broader
     conn.execute("DELETE FROM edges WHERE kind = 'skos:broader'")
     upsert_semantic_edges(conn, [(inf_id, rhi_id, "skos:broader", 0.85)])
-    direct_broader = conn.execute(
-        "SELECT src_id, dst_id FROM edges WHERE kind = 'skos:broader'"
-    ).fetchall()
+    direct_broader = conn.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'skos:broader'").fetchall()
     assert len(direct_broader) == 1
     assert tuple(direct_broader[0]) == (rhi_id, inf_id)
 
-    # Also verify missing canonical on skos:broader demotes to symmetric skos:related
+    # Missing canonical is invalid model output, not a symmetric relation.
     def _judge_empty_canonical(candidates: list[dict[str, Any]]) -> list[dict[str, str]]:
         return [
             {
@@ -591,7 +577,9 @@ def test_lexical_subsumption_guard_inverts_erroneous_direction_and_missing_canon
             for c in candidates
         ]
 
-    engine2, conn2 = _make_engine(tmp_path, "test_missing_canon.db", synonym_callback=_judge_empty_canonical)
+    engine2, conn2 = _make_engine(
+        synonym_token_counter, tmp_path, "test_missing_canon.db", synonym_callback=_judge_empty_canonical
+    )
     record2 = OpenIERecord(
         chunk_id="chunk-3b",
         entities=[
@@ -601,25 +589,21 @@ def test_lexical_subsumption_guard_inverts_erroneous_direction_and_missing_canon
         triples=[],
         structured_triples=[],
     )
-    _index_chunk_with_record(
-        engine2,
-        ChunkPointer("chunk-3b", "doc3b.md", 1, 5, "Subsystems"),
-        "Alpha engine and beta router.",
-        record2,
-    )
-    assert (
-        len(conn2.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'skos:broader'").fetchall())
-        == 0
-    )
-    assert (
-        len(conn2.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'skos:related'").fetchall())
-        == 2
-    )
+    with pytest.raises(ValueError, match="invalid canonical"):
+        _index_chunk_with_record(
+            engine2,
+            ChunkPointer("chunk-3b", "doc3b.md", 1, 5, "Subsystems"),
+            "Alpha engine and beta router.",
+            record2,
+        )
+    assert len(conn2.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'skos:broader'").fetchall()) == 0
+    assert len(conn2.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'skos:related'").fetchall()) == 0
 
 
-def test_version_sibling_guard_demotes_to_related(tmp_path: Path) -> None:
+def test_version_sibling_guard_demotes_to_related(synonym_token_counter, tmp_path: Path) -> None:
     """Verify that coordinate version siblings are demoted from skos:broader to skos:related
     both in JudgeSynonyms and in direct upsert_semantic_edges calls."""
+
     def _judge(candidates: list[dict[str, Any]]) -> list[dict[str, str]]:
         return [
             {
@@ -630,7 +614,7 @@ def test_version_sibling_guard_demotes_to_related(tmp_path: Path) -> None:
             for c in candidates
         ]
 
-    engine, conn = _make_engine(tmp_path, "test_siblings.db", synonym_callback=_judge)
+    engine, conn = _make_engine(synonym_token_counter, tmp_path, "test_siblings.db", synonym_callback=_judge)
 
     chunk = ChunkPointer(
         chunk_id="chunk-4",
@@ -668,9 +652,10 @@ def test_version_sibling_guard_demotes_to_related(tmp_path: Path) -> None:
     assert len(conn.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'skos:related'").fetchall()) == 2
 
 
-def test_acronym_guard_routes_to_alt_label_merge(tmp_path: Path) -> None:
+def test_acronym_guard_routes_to_alt_label_merge(synonym_token_counter, tmp_path: Path) -> None:
     """Verify that acronym pairs are merged as skos:altLabel instead of emitting skos:broader,
     both in the JudgeSynonyms loop and in the fallback loop."""
+
     def _judge(candidates: list[dict[str, Any]]) -> list[dict[str, str]]:
         return [
             {
@@ -681,7 +666,7 @@ def test_acronym_guard_routes_to_alt_label_merge(tmp_path: Path) -> None:
             for c in candidates
         ]
 
-    engine, conn = _make_engine(tmp_path, "test_acronym.db", synonym_callback=_judge)
+    engine, conn = _make_engine(synonym_token_counter, tmp_path, "test_acronym.db", synonym_callback=_judge)
 
     chunk = ChunkPointer(
         chunk_id="chunk-5",
@@ -718,7 +703,7 @@ def test_acronym_guard_routes_to_alt_label_merge(tmp_path: Path) -> None:
 
     # Verify fallback loop also merges acronyms when JudgeSynonyms returns empty decisions
     engine_fb, conn_fb = _make_engine(
-        tmp_path, "test_acronym_fallback.db", synonym_callback=lambda _: []
+        synonym_token_counter, tmp_path, "test_acronym_fallback.db", synonym_callback=lambda _: []
     )
     _index_chunk_with_record(engine_fb, chunk, "SRE SLOs and service level objectives.", record)
     entities_fb = conn_fb.execute("SELECT entity_id, name FROM entities").fetchall()
@@ -726,10 +711,10 @@ def test_acronym_guard_routes_to_alt_label_merge(tmp_path: Path) -> None:
     assert entities_fb[0][1].lower() == "service level objectives"
 
 
-def test_technical_punctuation_and_surface_forms_preserved(tmp_path: Path) -> None:
+def test_technical_punctuation_and_surface_forms_preserved(synonym_token_counter, tmp_path: Path) -> None:
     """Verify C++, C#, and Python 3.10 remain distinct entities with preserved surface forms in entities.name
     and entity_labels.raw_label, normalized label_norms in entity_labels, and COLLATE NOCASE on entities.name."""
-    engine, conn = _make_engine(tmp_path, "test_tech_punct.db", synonym_callback=lambda _: [])
+    engine, conn = _make_engine(synonym_token_counter, tmp_path, "test_tech_punct.db", synonym_callback=lambda _: [])
     chunk = ChunkPointer(
         chunk_id="chunk-tech-1",
         rel_posix_path="languages.md",
@@ -795,12 +780,13 @@ def test_technical_punctuation_and_surface_forms_preserved(tmp_path: Path) -> No
 
 
 def test_cased_literal_objects_and_same_doc_consecutive_chunks_never_produce_false_different_from(
+    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
     """Verify cased literal objects ('AWS TGW', 'Pricing addendum', 'KMS/region support matrix', 'Diego Morales')
     and consecutive chunks of the same document ('Priya Nair', 'Ethan Cole', 'Diego Morales') never split into
     duplicate entities or produce false owl:differentFrom edges."""
-    engine, conn = _make_engine(tmp_path, "test_no_false_diff.db", synonym_callback=lambda _: [])
+    engine, conn = _make_engine(synonym_token_counter, tmp_path, "test_no_false_diff.db", synonym_callback=lambda _: [])
 
     doc_path = tmp_path / "meeting.md"
     doc_path.write_text(
@@ -947,9 +933,7 @@ def test_cased_literal_objects_and_same_doc_consecutive_chunks_never_produce_fal
         assert len(eids) == 1, f"Expected 1 entity for {target_label!r}, got {eids}"
 
     # Verify Priya Nair combined her header role and dialogue role in her definition
-    priya_def = str(
-        conn.execute("SELECT definition FROM entities WHERE name = 'Priya Nair'").fetchone()[0]
-    )
+    priya_def = str(conn.execute("SELECT definition FROM entities WHERE name = 'Priya Nair'").fetchone()[0])
     assert "Helix Procurement" in priya_def
     assert "participant in the meeting" in priya_def
 
@@ -957,5 +941,3 @@ def test_cased_literal_objects_and_same_doc_consecutive_chunks_never_produce_fal
     diff_edges = conn.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'owl:differentFrom'").fetchall()
     assert diff_edges == []
     assert lint_graph_shacl(conn, auto_heal=False) == []
-
-

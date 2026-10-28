@@ -4,21 +4,17 @@
     "type": "split",
     "children": [
       {
-        "id": "db11024016b78be3",
+        "id": "d06d7de956ad4cd1",
         "type": "tabs",
         "children": [
           {
-            "id": "e8e0d511a8b3182d",
+            "id": "4281216c0e61954a",
             "type": "leaf",
             "state": {
-              "type": "markdown",
-              "state": {
-                "file": "AGENTS.md",
-                "mode": "source",
-                "source": false
-              },
+              "type": "empty",
+              "state": {},
               "icon": "lucide-file",
-              "title": "AGENTS"
+              "title": "New tab"
             }
           }
         ]
@@ -188,11 +184,27 @@
       "bases:Create new base": false
     }
   },
-  "active": "e8e0d511a8b3182d",
+  "active": "4281216c0e61954a",
   "lastOpenFiles": [
+    "outputs/dashboard/knowledge_graph_2d_projection.png",
+    "outputs/dashboard/pareto_frontier_progress.svg",
+    "outputs/dashboard/knowledge_graph_extraction_dashboard.svg",
+    "outputs/dashboard/candidate_score_progress.svg",
+    "outputs/dashboard/candidate_quality_metrics.svg",
+    "outputs/dashboard/benchmark_mobile_report.md",
+    "outputs/commit-review/evaluation-ingestion.md",
+    "outputs/commit-review/evaluation-preflight.md",
+    "outputs/commit-review/README-preflight.md",
+    "outputs/preflight/20261023T112454Z-34312/report.md",
+    "scratch/test_universe.svg",
+    "scratch/test_550.svg",
+    "outputs/test_fonttype_none.svg",
+    "outputs/test_fig2.svg",
+    "outputs/benchmarks/paper_parity_quality.svg",
+    "outputs/benchmarks/paper_parity_gate.md",
+    "AGENTS.md",
     "FOUNDATIONAL.md",
     "audit_report.md",
-    "AGENTS.md",
     "LEAN-CTX.md",
     "GEMINI.md"
   ]

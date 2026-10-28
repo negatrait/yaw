@@ -947,7 +947,7 @@ class YawRuntime:
                     max_tokens=self.config.max_output_tokens,
                 )
 
-            _progress(f"optimizing: starting {mode} (auto={resolved_auto}) evolution")
+            _progress(f"optimizing: preparing {mode} (auto={resolved_auto}); validation indexing precedes trials")
             eff_sleep = (
                 sleep_seconds if sleep_seconds is not None else getattr(self.config, "optimize_sleep_seconds", 0.0)
             )
@@ -994,7 +994,7 @@ class YawRuntime:
             for k, v in asdict(self.config).items()
             if not k.endswith(("_path", "_dir", "_root"))
             and not k.startswith(("optimize_", "http_"))
-            and k not in {"api_key", "poll_interval_seconds", "queue_maxsize"}
+            and k not in {"api_key", "poll_interval_seconds", "queue_maxsize", "indexing_overlap"}
         }
         settings.update(
             max_bootstrapped_demos=self.config.optimize_max_bootstrapped_demos,

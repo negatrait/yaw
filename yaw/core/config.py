@@ -147,7 +147,7 @@ class YawConfig:
     excluded_patterns: tuple[str, ...] = DEFAULT_EXCLUDED_PATTERNS
     json_keys_whitelist: tuple[str, ...] = ("*",)
     json_keys_blacklist: tuple[str, ...] = ()
-    chunk_size: int = 1500
+    chunk_size: int = 1200
     chunk_overlap: int = 120
     min_chunk_size: int = 100
     poll_interval_seconds: float = 10.0
@@ -188,6 +188,7 @@ class YawConfig:
 
     # Runtime & HTTP transport settings
     queue_maxsize: int = 32
+    indexing_overlap: bool = False
     http_host: str = "127.0.0.1"
     http_port: int = 13306
     http_path: str = "/mcp"
@@ -496,6 +497,7 @@ _FIELD_TO_SECTION: dict[str, str] = {
     "max_ast_expansion_hops": "graph",
     "ast_context_hops": "graph",
     "queue_maxsize": "runtime",
+    "indexing_overlap": "runtime",
     "http_host": "runtime",
     "http_port": "runtime",
     "http_path": "runtime",

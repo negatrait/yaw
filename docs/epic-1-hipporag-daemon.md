@@ -4,6 +4,19 @@ Owner: [FOUNDATIONAL](../FOUNDATIONAL.md) | Results: [evaluation](evaluation.md)
 
 ## Hard Gates
 
+Accepted replacement packet (2026-10-28): [native CocoIndex indexing and live ingestion](native-cocoindex-indexing.md).
+Both inference and live-ingestion gates are required within unfinished D1-A6.
+
+Superseded indexing packet (2026-10-28): [bounded inference overlap](indexing-overlap.md)
+preserves single-owner persistence and recovery. Its exit condition is verified
+serial equivalence, bounded concurrent provider execution, restart reuse and a
+reported paired pilot; it does not replace either benchmark parity gate.
+
+Accepted indexing packet (2026-10-27): [compact synonym judgment](compact-synonym-judgment.md)
+replaces verbose model dossiers while preserving candidate/evidence coverage,
+native DSPy prompts, graph commit cadence, caches and SHACL acceptance. Its bounded
+pilot establishes stage performance, not Tier 2 parity.
+
 Runtime model update, 2026-10-22: the user selected `gemma-4-E4B-it-qat-q4_0-gguf-Q4_0`
 (`unsloth/gemma-4-E4B-it-qat-q4_0-gguf-Q4_0:Q4_K_M`) for extraction, QA and reflection on the
 existing external llama.cpp GPU service (32,768 context). This supersedes Qwen
