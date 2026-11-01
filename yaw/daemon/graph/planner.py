@@ -1016,45 +1016,13 @@ def apply_synonym_adjudication(
         ea, eb = str(c["entity_a"]), str(c["entity_b"])
         cand_by_pair[(min(ea, eb), max(ea, eb))] = c
 
-    cluster_members: dict[str, set[str]] = {}
-    separated_neighbors: dict[str, set[str]] = {}
-
-    def _add_separation(ea: str, eb: str) -> None:
-        if ea and eb and ea != eb:
-            separated_neighbors.setdefault(ea, set()).add(eb)
-            separated_neighbors.setdefault(eb, set()).add(ea)
-
-    for ea, eb in fact_linked_pairs:
-        _add_separation(ea, eb)
-
-    for dec in decisions:
-        pid = str(dec.get("pair_id", "")).strip()
-        if "|" in pid:
-            ea, eb = pid.split("|", 1)
-            raw_src, raw_tgt = ea.strip(), eb.strip()
-        else:
-            raw_src = str(dec.get("source_id", "")).strip()
-            raw_tgt = str(dec.get("target_id", "")).strip()
-        rel = str(dec.get("relation") or dec.get("decision") or "").strip()
-        if not raw_src or not raw_tgt:
-            continue
-        pkey = (min(raw_src, raw_tgt), max(raw_src, raw_tgt))
-        if pkey not in cand_by_pair:
-            continue
-        if rel in (
-            "owl:differentFrom",
-            "different",
-            "different_from",
-            "skos:broader",
-            "skos:related",
-            "related",
-        ):
-            _add_separation(raw_src, raw_tgt)
-
-    def _clusters_separated(root_a: str, root_b: str) -> bool:
-        members_a = cluster_members.get(root_a, {root_a})
-        members_b = cluster_members.get(root_b, {root_b})
-        return any(bool(separated_neighbors.get(ma, set()) & members_b) for ma in members_a)
+    def _is_active_fact_pole(u: str, v: str) -> bool:
+        target_pair = (min(u, v), max(u, v))
+        for fa, fb in fact_linked_pairs:
+            ra, rb = _resolve_active_eid(fa), _resolve_active_eid(fb)
+            if (min(ra, rb), max(ra, rb)) == target_pair:
+                return True
+        return False
 
     with stage_conn:
         for dec in decisions:
@@ -1082,7 +1050,7 @@ def apply_synonym_adjudication(
             name_tgt, _ = cand_meta.get(tgt, cand_meta.get(raw_tgt, (tgt, "")))
 
             if rel in ("skos:altLabel", "skos:hiddenLabel", "exact_match"):
-                if _clusters_separated(src, tgt):
+                if _is_active_fact_pole(src, tgt):
                     raw_semantic_batch.append((src, tgt, "skos:related", max(0.5, sim)))
                     continue
                 if canon and (
@@ -1104,8 +1072,6 @@ def apply_synonym_adjudication(
                 merge_entities(stage_conn, merge_src, merge_dst, label_kind=lkind)
                 staged_merges.append((merge_src, merge_dst, lkind))
                 merged_into[merge_src] = merge_dst
-                dst_members = cluster_members.setdefault(merge_dst, {merge_dst})
-                dst_members.update(cluster_members.pop(merge_src, {merge_src}))
                 rlm_stats["merged_entities"] += 1
             elif rel in ("owl:differentFrom", "different", "different_from"):
                 raw_semantic_batch.append((src, tgt, "owl:differentFrom", 0.0))

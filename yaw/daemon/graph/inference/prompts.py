@@ -264,29 +264,24 @@ disambiguate entities using their SKOS/RDF/OWL profiles, reified `rdf:Statement`
     Judge candidate pairs of entities/literals that look similar semantically and in writing/spelling (including \
 typos, acronyms, lookalikes like "Cindy Real" vs "Cinderella", or homonyms/homographs with the same name \
 like "a ball" vs "a ball"):
-    - 'skos:altLabel': Strict co-referents referring to the exact same entity/concept of the exact same \
-ontological category (System == System, Process/Job == Process/Job, Schema Field/Identifier == Schema \
-Field/Identifier, Data Record == Data Record, Document/Artifact == Document/Artifact; merge into canonical \
-entity, where 'canonical' is the preferred entity ID/name), including true synonyms, acronyms/initialisms, \
-singular/plural surface forms ("consumer" / "Consumers", "manager" / "Managers"), and cross-chunk mentions of the \
-same concept/role ("Security", "Tier 1", "KV-cache" / "KV cache"). Never use when `direct_facts >= 1` (`dfact >= 1`) \
-links two distinct entities as Subject and Object, or across distinct ontological categories: never merge a Software \
-System ("NetSuite", "Stripe", "Zipper"), an Ingestion Job/Process ("NetSuite import", "NetSuite staging import", \
-"zippering"), a Schema Mapping/Column/Primary-Key Identifier ("NetSuite mapping", "invoice_item_id", \
-"reconciliation_reason"), Domain Records/Rows ("invoice_items", "NetSuite import rows"), or a Design Document \
-("ZIPPER-Design"), or when one phrase adds a distinct component/artifact head noun ("Audit logs" vs "Audit log \
-store" / "audit-log-exporter", "break-glass access" vs "break-glass role" / "break-glass credentials").
+    - 'skos:altLabel': Strict co-referents denoting the exact same intensional entity/concept (merge into \
+canonical entity, where 'canonical' is the preferred entity ID/name), including true synonyms, \
+acronyms/initialisms, singular/plural surface forms ("consumer" / "Consumers", "manager" / "Managers"), and \
+cross-chunk mentions of the same concept. Two mentions are 'skos:altLabel' ONLY if they are 100% interchangeable \
+referents in the domain; never merge coordinate siblings ("plan A" vs "plan B", "v1" vs "v2"), never merge a \
+system/platform with a specific job, process, simulator, mapping, patch, or log, never merge a schema \
+field/identifier with the data records it identifies, and never merge two entities linked by a direct fact.
     - 'skos:hiddenLabel': Typo, misspelling, transcription error, or surface spelling variant \
 referring to the exact same entity/concept (merge into canonical entity).
     - 'owl:differentFrom': Genuine polysemous homonyms/homographs across unrelated domains (e.g., "a ball" \
 [formal dance] vs "a ball" [spherical toy]), false-friend lookalikes (e.g., "Cindy Real" vs "Cinderella"), or \
 mutually exclusive schema enum values proven disjoint by incompatible reified facts (keep separate, add repulsive \
 owl:differentFrom edge; never use for the same concept discussed across different documents).
-    - 'skos:related': Non-equivalent domain association between distinct `skos:Concept` entities, including \
-coordinate version/tier/plan/severity siblings ("http 2" vs "http 3", "sev 1" vs "sev 2", "plan A" vs "plan B"), \
-distinct schema/field identifiers ("invoice_id" vs "invoice_item_id" / "Stripe invoice items"), system vs \
-subsystem/log/config/patch/import/store, or pairs linked by `direct_facts >= 1` (`dfact >= 1`) (keep separate, add \
-symmetric skos:related edge).
+    - 'skos:related': Non-equivalent domain association between distinct `skos:Concept` entities that are related \
+but not interchangeable—including coordinate version/tier/plan/severity siblings ("plan A" vs "plan B", \
+"sev 1" vs "sev 2"), a system/service and its jobs/processes/mappings/patches/logs/simulators, a schema \
+field/identifier and its domain records, or pairs linked by a direct fact (keep separate, add symmetric \
+skos:related edge).
     - 'skos:broader': Strict generic `is-a` or partitive hierarchy where the narrower child concept points to \
 `canonical` as its broader parent concept (e.g., "cryptanalysis" -> "mathematics", where 'canonical' is \
 "mathematics"; child has compound specialization tokens, parent has general category tokens; never use for \

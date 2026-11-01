@@ -1042,30 +1042,30 @@ def test_apply_synonym_adjudication_remaps_semantic_edges_after_later_merge() ->
 
 
 def test_apply_synonym_adjudication_prevents_transitive_collapse_across_separated_clusters() -> None:
-    """Verify two clusters separated by an explicit non-merge decision or fact_linked_pairs cannot be
-    transitively collapsed by a 2-hop chain of skos:altLabel merges."""
+    """Verify fact_linked_pairs blocks transitive self-loop collapse while non-fact semantic edges do not
+    override Gemma 4 skos:altLabel merges and have any resulting self-loops dropped in Phase 2."""
     stage_conn = open_yaw_db(":memory:")
     try:
         upsert_entities(
             stage_conn,
             [
-                ("ent-a", "Zipper", "Stream-joining service"),
-                ("ent-b", "ZIPPER-Design", "Architecture design doc for Zipper"),
-                ("ent-c", "zippering", "Operational stream-joining process"),
-                ("ent-p1", "Stripe", "Payment processor"),
-                ("ent-alias", "Stripe Billing", "Billing platform"),
-                ("ent-p2", "invoice_item_id", "Primary key of a Stripe invoice item"),
+                ("ent-a", "Service Alpha", "Primary service mention A"),
+                ("ent-b", "Alpha Service", "Primary service mention B"),
+                ("ent-c", "Alpha", "Primary service mention C"),
+                ("ent-p1", "Billing Service", "Core billing system"),
+                ("ent-alias", "Billing Platform", "Core billing system alias"),
+                ("ent-p2", "invoice_record", "Invoice record emitted by Billing Service"),
             ],
         )
         upsert_entity_labels(
             stage_conn,
             [
-                ("zipper", "ent-a", "skos:prefLabel", "Zipper", "c1"),
-                ("zipper design", "ent-b", "skos:prefLabel", "ZIPPER-Design", "c1"),
-                ("zippering", "ent-c", "skos:prefLabel", "zippering", "c2"),
-                ("stripe", "ent-p1", "skos:prefLabel", "Stripe", "c3"),
-                ("stripe billing", "ent-alias", "skos:prefLabel", "Stripe Billing", "c3"),
-                ("invoice_item_id", "ent-p2", "skos:prefLabel", "invoice_item_id", "c3"),
+                ("service alpha", "ent-a", "skos:prefLabel", "Service Alpha", "c1"),
+                ("alpha service", "ent-b", "skos:prefLabel", "Alpha Service", "c1"),
+                ("alpha", "ent-c", "skos:prefLabel", "Alpha", "c2"),
+                ("billing service", "ent-p1", "skos:prefLabel", "Billing Service", "c3"),
+                ("billing platform", "ent-alias", "skos:prefLabel", "Billing Platform", "c3"),
+                ("invoice_record", "ent-p2", "skos:prefLabel", "invoice_record", "c3"),
             ],
         )
         candidates = [
@@ -1076,12 +1076,12 @@ def test_apply_synonym_adjudication_prevents_transitive_collapse_across_separate
             {"entity_a": "ent-alias", "entity_b": "ent-p2", "similarity": 0.82},
         ]
         cand_meta = {
-            "ent-a": ("Zipper", "Stream-joining service"),
-            "ent-b": ("ZIPPER-Design", "Architecture design doc for Zipper"),
-            "ent-c": ("zippering", "Operational stream-joining process"),
-            "ent-p1": ("Stripe", "Payment processor"),
-            "ent-alias": ("Stripe Billing", "Billing platform"),
-            "ent-p2": ("invoice_item_id", "Primary key of a Stripe invoice item"),
+            "ent-a": ("Service Alpha", "Primary service mention A"),
+            "ent-b": ("Alpha Service", "Primary service mention B"),
+            "ent-c": ("Alpha", "Primary service mention C"),
+            "ent-p1": ("Billing Service", "Core billing system"),
+            "ent-alias": ("Billing Platform", "Core billing system alias"),
+            "ent-p2": ("invoice_record", "Invoice record emitted by Billing Service"),
         }
         decisions = [
             {"pair_id": "ent-a|ent-c", "relation": "skos:related", "canonical": "ent-a"},
@@ -1091,7 +1091,7 @@ def test_apply_synonym_adjudication_prevents_transitive_collapse_across_separate
             {"pair_id": "ent-alias|ent-p2", "relation": "skos:altLabel", "canonical": "ent-p2"},
         ]
         rlm_stats = {"merged_entities": 0, "related_edges": 0, "different_from_edges": 0, "broader_edges": 0}
-        staged_merges, _ = apply_synonym_adjudication(
+        staged_merges, resolved_batch = apply_synonym_adjudication(
             stage_conn,
             candidates,
             cand_meta,
@@ -1102,10 +1102,12 @@ def test_apply_synonym_adjudication_prevents_transitive_collapse_across_separate
         )
         assert staged_merges == [
             ("ent-b", "ent-a", "skos:altLabel"),
+            ("ent-a", "ent-c", "skos:altLabel"),
             ("ent-p1", "ent-alias", "skos:altLabel"),
         ]
+        assert resolved_batch == [("ent-alias", "ent-p2", "skos:related", 0.82)]
         surviving = {str(r[0]) for r in stage_conn.execute("SELECT entity_id FROM entities").fetchall()}
-        assert surviving == {"ent-a", "ent-c", "ent-alias", "ent-p2"}
+        assert surviving == {"ent-c", "ent-alias", "ent-p2"}
         assert lint_graph_shacl(stage_conn) == []
     finally:
         stage_conn.close()
