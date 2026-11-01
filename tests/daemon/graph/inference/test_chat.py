@@ -25,7 +25,7 @@ class ChatTests(unittest.TestCase):
         self.assertEqual(qwen_lm.model, "openai/Qwen3-4B-Instruct-2507-GGUF")
         self.assertAlmostEqual(qwen_lm.kwargs["temperature"], 0.2)
         self.assertEqual(qwen_lm.kwargs["max_tokens"], 4096)
-        self.assertAlmostEqual(qwen_lm.kwargs["frequency_penalty"], 0.5)
+        self.assertNotIn("frequency_penalty", qwen_lm.kwargs)
         self.assertTrue(lm_supports_gbnf(qwen_lm))
 
         # Qwen3-4B QA on Lemonade (llamacpp GPU -> GBNF supported for direct QA)
@@ -33,6 +33,7 @@ class ChatTests(unittest.TestCase):
         self.assertEqual(qwen_qa_lm.model, "openai/Qwen3-4B-Instruct-2507-GGUF")
         self.assertAlmostEqual(qwen_qa_lm.kwargs["temperature"], 0.2)
         self.assertEqual(qwen_qa_lm.kwargs["max_tokens"], 4096)
+        self.assertNotIn("frequency_penalty", qwen_qa_lm.kwargs)
         self.assertTrue(lm_supports_gbnf(qwen_qa_lm))
 
         # Configured default: Gemma RLM without GBNF and Gemma worker with GBNF.
@@ -43,12 +44,13 @@ class ChatTests(unittest.TestCase):
         self.assertTrue(lm_supports_gbnf(sub_lm))
         self.assertNotIn("frequency_penalty", sub_lm.kwargs)
 
-        # Gemma4 FLM recipe sets think=False and disables GBNF
+        # Gemma4 FLM recipe sets think=False, disables GBNF, and keeps temperature > 0.1
         flm_lm = create_dspy_lm("gemma4-it-12b-FLM", role="qa")
         self.assertEqual(flm_lm.kwargs.get("extra_body"), {"think": False})
+        self.assertGreater(flm_lm.kwargs["temperature"], 0.1)
         self.assertFalse(lm_supports_gbnf(flm_lm))
 
-        # Ollama provider configures ollama_chat/...
+        # Ollama provider configures ollama_chat/... with default temperature > 0.1
         ollama_lm = create_dspy_lm(
             "qwen3:4b",
             base_url="http://localhost:11434",
@@ -57,6 +59,7 @@ class ChatTests(unittest.TestCase):
         )
         self.assertEqual(ollama_lm.model, "ollama_chat/qwen3:4b")
         self.assertEqual(ollama_lm.kwargs.get("api_base"), "http://localhost:11434")
+        self.assertGreater(ollama_lm.kwargs["temperature"], 0.1)
 
     def test_legacy_chat_shims_are_retired(self):
         """Verify legacy HippoRAG chat adapters are completely removed from chat and inference facade."""

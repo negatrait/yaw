@@ -20,8 +20,6 @@ class ChatProfile:
     qa_temperature: float = 0.2
     reflection_temperature: float = 0.8
     reflection_worker_temperature: float = 0.7
-    frequency_penalty: float = 0.0
-    reflection_frequency_penalty: float = 0.3
     expected_device: str | None = None
     expected_context: int | None = None
 
@@ -45,7 +43,6 @@ CHAT_MODELS = {
         default_temperature=0.2,
         extraction_temperature=0.2,
         qa_temperature=0.2,
-        frequency_penalty=0.5,
         expected_device="gpu",
         expected_context=16384,
     ),
@@ -56,7 +53,6 @@ CHAT_MODELS = {
         default_temperature=0.2,
         extraction_temperature=0.2,
         qa_temperature=0.2,
-        frequency_penalty=0.5,
         expected_device="gpu",
         expected_context=16384,
     ),
@@ -67,7 +63,6 @@ CHAT_MODELS = {
         default_temperature=0.2,
         extraction_temperature=0.2,
         qa_temperature=0.2,
-        frequency_penalty=0.5,
         expected_device="gpu",
         expected_context=16384,
     ),
@@ -78,7 +73,6 @@ CHAT_MODELS = {
         default_temperature=0.2,
         extraction_temperature=0.2,
         qa_temperature=0.2,
-        reflection_frequency_penalty=0.0,
         expected_device="gpu",
         expected_context=DEFAULT_CONTEXT_WINDOW_TOKENS,
     ),
@@ -86,19 +80,17 @@ CHAT_MODELS = {
         checkpoint="gemma4-it:12b",
         recipe="flm",
         role="both",
-        default_temperature=0.0,
-        extraction_temperature=0.0,
-        qa_temperature=0.0,
-        frequency_penalty=0.0,
+        default_temperature=0.2,
+        extraction_temperature=0.2,
+        qa_temperature=0.2,
     ),
     "qwen3.5-9b-FLM": ChatProfile(
         checkpoint="qwen3.5:9b",
         recipe="flm",
         role="both",
-        default_temperature=0.0,
-        extraction_temperature=0.0,
-        qa_temperature=0.0,
-        frequency_penalty=0.0,
+        default_temperature=0.2,
+        extraction_temperature=0.2,
+        qa_temperature=0.2,
     ),
 }
 DEFAULT_EXTRACTION_CHAT = "gemma-4-E4B-it-qat-q4_0-gguf-Q4_0"

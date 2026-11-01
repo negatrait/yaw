@@ -769,7 +769,7 @@ tools."""
 
         self.assertEqual(qwen_ref.kwargs["temperature"], 0.7)
         self.assertEqual(qwen_ref.kwargs["max_tokens"], 4096)
-        self.assertEqual(qwen_ref.kwargs["frequency_penalty"], 0.3)
+        self.assertNotIn("frequency_penalty", qwen_ref.kwargs)
         self.assertTrue(getattr(qwen_ref, "_yaw_supports_gbnf", False))
 
         orch_ref, worker_ref = create_dspy_rlm_pair(reflection=True)
@@ -871,7 +871,7 @@ tools."""
 
     def test_extract_query_intent_gbnf_and_sampling_contract(self):
         """TDD Contract: extract_query_intent enforces DSPY_QUERY_INTENT_GBNF_GRAMMAR on llamacpp with temp=0.4 and \
-freq_penalty=0.2."""
+no frequency penalty."""
 
         from yaw.daemon.graph.inference import (
             DSPY_QUERY_INTENT_GBNF_GRAMMAR,
@@ -895,7 +895,7 @@ freq_penalty=0.2."""
         self.assertEqual(len(qwen_lm.history), 1)
         call_kwargs = qwen_lm.history[0]["kwargs"]
         self.assertAlmostEqual(call_kwargs.get("temperature"), 0.4)
-        self.assertAlmostEqual(call_kwargs.get("frequency_penalty"), 0.2)
+        self.assertNotIn("frequency_penalty", call_kwargs)
         self.assertEqual(
             (call_kwargs.get("extra_body") or {}).get("grammar"),
             DSPY_QUERY_INTENT_GBNF_GRAMMAR,

@@ -237,7 +237,7 @@ def create_dspy_lm(
     - gemma-4-E4B-it-qat-q4_0-gguf-Q4_0 (llamacpp GPU): default chat/reflection model;
       direct/worker roles support GBNF, while RLM orchestrators generate plain code.
     - Qwen3-4B-Instruct-2507-GGUF (llamacpp on Vulkan GPU, 16384 ctx): supports GBNF for direct/worker
-      roles (`extraction`, `qa`, `reflection_worker`) with temp=0.2, freq_penalty=0.5, and runs
+      roles (`extraction`, `qa`, `reflection_worker`) with temp=0.2, and runs
       unconstrained Python REPL code generation (`_yaw_supports_gbnf=False`) for RLM orchestrator roles
       (`rlm`, `reflection`).
     - gemma4-it-12b-FLM (flm): extra_body={"think": False}.
@@ -261,7 +261,7 @@ def create_dspy_lm(
         elif role in ("qa", "rlm") and profile is not None and profile.qa_temperature > 0:
             temperature = profile.qa_temperature
         else:
-            temperature = 0.0
+            temperature = profile.default_temperature if profile is not None else 0.2
 
     context_tokens = (
         context_window_tokens if context_window_tokens is not None else profile.expected_context if profile else None
@@ -276,12 +276,6 @@ def create_dspy_lm(
         raise ValueError("Require 0 < max_tokens < context_window_tokens")
 
     lm_kwargs: dict[str, Any] = dict(kwargs)
-    if role == "extraction" and profile is not None and profile.frequency_penalty > 0:
-        lm_kwargs.setdefault("frequency_penalty", profile.frequency_penalty)
-    elif role == "reflection_worker":
-        freq = profile.reflection_frequency_penalty if profile is not None else 0.3
-        if freq > 0:
-            lm_kwargs.setdefault("frequency_penalty", freq)
     if recipe == "flm":
         lm_kwargs.setdefault("extra_body", {"think": False})
 

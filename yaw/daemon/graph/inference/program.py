@@ -1277,13 +1277,12 @@ chunk."""
         lm: Any = None,
         use_gbnf: bool | None = None,
     ) -> str:
-        """Rewrite question into a declarative query_intent string (GBNF on Qwen GPU, temp=0.4, freq_penalty=0.2)."""
+        """Rewrite question into a declarative query_intent string (GBNF on Qwen GPU, temp=0.4)."""
         from dspy.utils.usage_tracker import track_usage
 
         effective_lm = lm or self.query_intent.lm or dspy.settings.lm
         call_cfg: dict[str, Any] = {
             "temperature": 0.4,
-            "frequency_penalty": 0.2,
         }
         if self._should_use_gbnf(use_gbnf, effective_lm):
             call_cfg["extra_body"] = {"grammar": build_dspy_query_intent_grammar()}
