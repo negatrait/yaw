@@ -262,15 +262,15 @@ def build_parser() -> argparse.ArgumentParser:
         dest="dataset",
         nargs="*",
         default=None,
-        help="One or more dataset names/aliases or JSON files to benchmark",
+        help="One or more dataset names or JSON files to benchmark",
     )
     p_bench.add_argument(
         "--gate",
         dest="gate",
         nargs="?",
-        const="benchmark_gate.json",
+        const="data/benchmarks/baselines.json",
         default=None,
-        help="Evaluate against benchmark_gate.json (or optional path to gate JSON file)",
+        help="Evaluate against data/benchmarks/baselines.json (or optional path to gate JSON file)",
     )
     p_bench.add_argument(
         "--target",
@@ -399,7 +399,7 @@ def _inspect_active_optimization(config: YawConfig) -> dict[str, Any] | None:
 
             snap: dict[str, Any] = {}
             if status_file.exists():
-                with contextlib.suppress(Exception):
+                with contextlib.suppress(OSError, json.JSONDecodeError, ValueError, TypeError):
                     parsed = json.loads(status_file.read_text(encoding="utf-8"))
                     if isinstance(parsed, dict):
                         snap = parsed
@@ -439,7 +439,7 @@ def inspect_status(config: YawConfig) -> dict[str, Any]:
             with contextlib.suppress(sqlite3.Error):
                 row = conn.execute("SELECT COUNT(*) FROM entity_labels").fetchone()
                 entity_labels = int(row[0]) if row else 0
-                shacl_conforms = len(lint_graph_shacl(conn, auto_heal=False)) == 0
+                shacl_conforms = len(lint_graph_shacl(conn)) == 0
 
     opt_info = _inspect_active_optimization(config)
 
@@ -450,7 +450,7 @@ def inspect_status(config: YawConfig) -> dict[str, Any]:
                 isinstance(data, dict)
                 and isinstance(data.get("status"), dict)
                 and isinstance(data.get("stats"), dict)
-                and data["status"].get("lifecycle") in ("stopped", "starting", "ready", "degraded", "stopping")
+                and data["status"].get("lifecycle") in ("stopped", "starting", "ready", "stopping")
             ):
                 data["stats"]["openie_checkpoints"] = max(
                     openie, _nonnegative_status_count(data["stats"].get("openie_checkpoints"))
@@ -732,12 +732,7 @@ def handle_graph_lint(
         conn = open_yaw_db(":memory:")
 
     try:
-        try:
-            violations = lint_graph_shacl(conn, auto_heal=False)
-        except sqlite3.OperationalError:
-            conn.close()
-            conn = open_yaw_db(":memory:")
-            violations = lint_graph_shacl(conn, auto_heal=False)
+        violations = lint_graph_shacl(conn)
 
         if as_turtle:
             ttl = serialize_graph_turtle(conn, violations=violations)
@@ -893,7 +888,7 @@ def handle_dspy_optimize(
         val_eval_file = saved_path.parent / f"{saved_path.stem}_eval.json"
         eval_summary: dict[str, Any] | None = None
         if val_eval_file.exists():
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(OSError, json.JSONDecodeError, ValueError, TypeError):
                 raw_eval = json.loads(val_eval_file.read_text(encoding="utf-8"))
                 if isinstance(raw_eval, list) and raw_eval:
                     dict_items = [it for it in raw_eval if isinstance(it, dict)]
@@ -991,7 +986,7 @@ def handle_dspy_load_program(
                     if res.get("req_id") == req_id:
                         sys.stdout.write(json.dumps(res, indent=2) + "\n")
                         return 0 if res.get("reloaded", True) else 1
-                except Exception:
+                except OSError, json.JSONDecodeError, ValueError, TypeError:
                     pass
             time.sleep(0.05)
 
@@ -1042,8 +1037,8 @@ def handle_dspy_benchmark(
         cand_path = Path(raw_gate)
         if cand_path.exists():
             gate_path = cand_path
-        elif raw_gate == "benchmark_gate.json":
-            default_gate = Path(__file__).resolve().parents[2] / "benchmark_gate.json"
+        elif raw_gate in ("data/benchmarks/baselines.json", "baselines.json"):
+            default_gate = Path(__file__).resolve().parents[2] / "data" / "benchmarks" / "baselines.json"
             gate_path = default_gate if default_gate.exists() else raw_gate
         else:
             gate_path = raw_gate

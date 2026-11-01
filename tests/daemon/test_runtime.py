@@ -20,6 +20,7 @@ import numpy as np
 import pytest
 
 from daemon.graph.inference.test_reflection import provider as provider
+from daemon.graph.synonym_protocol import candidate_rows, complete_decisions
 from yaw.core import (
     OpenIERecord,
     YawConfig,
@@ -29,10 +30,11 @@ from yaw.core import (
 from yaw.daemon.cli import build_parser, inspect_status, main
 from yaw.daemon.graph.inference import (
     HippoRAGProgram,
+    ServingTokenCounter,
     compute_task_quality_score,
     resolve_embedding_profile,
 )
-from yaw.daemon.graph.storage import get_meta, get_openie_checkpoints, open_yaw_db
+from yaw.daemon.graph.storage import get_openie_checkpoints, open_yaw_db
 from yaw.daemon.runtime import YawRuntime
 
 
@@ -73,7 +75,8 @@ class DeterministicTestLM(dspy.LM):
                 {"prompt_tokens": 32, "completion_tokens": 16, "total_tokens": 48},
             )
         if "JudgeSynonyms" in req_str or "candidate_pairs_json" in req_str or "candidate_pairs" in req_str:
-            return ['{"decisions": []}']
+            packet_text = prompt or "\n".join(str(m.get("content", "")) for m in messages or [])
+            return [json.dumps({"decisions": complete_decisions(candidate_rows(packet_text), [])})]
         if "ProposeSHACLRepairs" in req_str or "HealSHACLViolations" in req_str or "violations_json" in req_str:
             return ['{"repairs": []}']
         if "DefineMissingEntities" in req_str or "missing_entities" in req_str or "entity_definitions" in req_str:
@@ -223,13 +226,16 @@ http_port = 13306
     return cfg, toml_path
 
 
-def _make_program_and_embedder() -> tuple[HippoRAGProgram, Any, DeterministicTestLM, DeterministicTestEmbedder]:
+def _make_program_and_embedder(
+    tokenizer_url: str,
+) -> tuple[HippoRAGProgram, Any, DeterministicTestLM, DeterministicTestEmbedder]:
     lm = DeterministicTestLM()
     dspy.settings.configure(lm=lm)
     prog = HippoRAGProgram(
         enable_gbnf=False,
         orchestrator_lm=lm,
         rlm_sub_lm=lm,
+        synonym_token_counter=ServingTokenCounter(tokenizer_url, lm.model),
     )
     emb = DeterministicTestEmbedder(dim=16)
     return prog, emb, lm, emb
@@ -256,7 +262,7 @@ def test_load_config_and_fingerprint(tmp_path: Path) -> None:
     assert exc_info.value.code == "INVALID_INPUT"
 
 
-def test_runtime_applies_configured_hydration_capacity(tmp_path: Path) -> None:
+def test_runtime_applies_configured_hydration_capacity(tmp_path: Path, provider) -> None:
     config, _ = _make_test_config(tmp_path)
     config = replace(
         config,
@@ -265,7 +271,7 @@ def test_runtime_applies_configured_hydration_capacity(tmp_path: Path) -> None:
         max_context_chars=None,
         max_ast_expansion_hops=2,
     )
-    program, embedder, _, _ = _make_program_and_embedder()
+    program, embedder, _, _ = _make_program_and_embedder(provider[0])
     runtime = YawRuntime(config, program=program, embedder=embedder)
     try:
         runtime.start(sync_on_start=False)
@@ -340,7 +346,7 @@ def test_cli_resume_real_gepa_checkpoint_and_custom_output(tmp_path: Path, provi
     ]
 
     def run_cli(extra: list[str], *, bare: bool = False) -> tuple[int, str, str]:
-        prog, emb, _, _ = _make_program_and_embedder()
+        prog, emb, _, _ = _make_program_and_embedder(provider[0])
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
             invocation = ["dspy", "optimize", "--config", str(toml_path)] if bare else common
@@ -453,9 +459,9 @@ def test_cli_resume_real_gepa_checkpoint_and_custom_output(tmp_path: Path, provi
         )
 
 
-def test_resume_preserves_unverifiable_legacy_checkpoint(tmp_path: Path) -> None:
+def test_resume_preserves_unverifiable_legacy_checkpoint(tmp_path: Path, provider) -> None:
     cfg, _ = _make_test_config(tmp_path)
-    prog, emb, _, _ = _make_program_and_embedder()
+    prog, emb, _, _ = _make_program_and_embedder(provider[0])
     target = tmp_path / "legacy.json"
     checkpoint = tmp_path / "legacy_telemetry" / "gepa_state.bin"
     checkpoint.parent.mkdir()
@@ -471,11 +477,11 @@ def test_resume_preserves_unverifiable_legacy_checkpoint(tmp_path: Path) -> None
         runtime.stop()
 
 
-def test_second_runtime_fails_fast_on_lock(tmp_path: Path) -> None:
+def test_second_runtime_fails_fast_on_lock(tmp_path: Path, provider) -> None:
     """D1-A5: A second YawRuntime targeting the same yaw.db.lock fails fast with BUSY."""
     cfg, _ = _make_test_config(tmp_path)
-    prog1, emb1, _, _ = _make_program_and_embedder()
-    prog2, emb2, _, _ = _make_program_and_embedder()
+    prog1, emb1, _, _ = _make_program_and_embedder(provider[0])
+    prog2, emb2, _, _ = _make_program_and_embedder(provider[0])
 
     rt1 = YawRuntime(cfg, program=prog1, embedder=emb1)
     rt2 = YawRuntime(cfg, program=prog2, embedder=emb2)
@@ -497,10 +503,10 @@ def test_second_runtime_fails_fast_on_lock(tmp_path: Path) -> None:
         rt2.stop()
 
 
-def test_bounded_32_slot_queue_overflow_and_non_blocking_status(tmp_path: Path) -> None:
+def test_bounded_32_slot_queue_overflow_and_non_blocking_status(tmp_path: Path, provider) -> None:
     """D1-A5 & E2-A3: 32-slot bounded queue overflows with BUSY on the 33rd queued item while status() stays <50ms."""
     cfg, _ = _make_test_config(tmp_path, queue_maxsize=32)
-    prog, emb, _, _ = _make_program_and_embedder()
+    prog, emb, _, _ = _make_program_and_embedder(provider[0])
     rt = YawRuntime(cfg, program=prog, embedder=emb)
     rt.start(sync_on_start=False)
 
@@ -548,7 +554,7 @@ def test_bounded_32_slot_queue_overflow_and_non_blocking_status(tmp_path: Path) 
         rt.stop()
 
 
-def test_stage1_crash_resume_does_not_reextract_completed_chunks(tmp_path: Path) -> None:
+def test_stage1_crash_resume_does_not_reextract_completed_chunks(tmp_path: Path, provider) -> None:
     """D1-A3 & D1-A5: Crash mid-OpenIE persists completed chunks and pending_sync_delta; restart resumes without \
 re-extracting."""
     cfg, _ = _make_test_config(tmp_path)
@@ -564,7 +570,7 @@ re-extracting."""
         encoding="utf-8",
     )
 
-    prog1, emb1, _, _ = _make_program_and_embedder()
+    prog1, emb1, _, _ = _make_program_and_embedder(provider[0])
     extracted_counts: dict[str, int] = {}
     orig_extract1 = prog1.extract_openie
     should_crash_on_second = [True]
@@ -587,19 +593,19 @@ re-extracting."""
     finally:
         rt1.stop()
 
-    # Verify chunk 1 was checkpointed to openie_chunks and pending_sync_delta was saved in yaw.db meta
+    # Verify chunk 1 was persisted in CocoIndex chunk_inference while graph publication was aborted
     first_chunk_id = next(iter(extracted_counts.keys()))
     conn = open_yaw_db(cfg.db_path)
     try:
-        saved_openie = get_openie_checkpoints(conn, list(extracted_counts.keys()))
-        assert first_chunk_id in saved_openie
-        assert get_meta(conn, "pending_sync_delta") is not None
+        saved_inferences = {r[0] for r in conn.execute("SELECT chunk_id FROM chunk_inference").fetchall()}
+        assert first_chunk_id in saved_inferences
+        assert conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 0
     finally:
         conn.close()
 
     # Restart a new YawRuntime with the crash cleared: chunk 1 must NOT be re-extracted!
     should_crash_on_second[0] = False
-    prog2, emb2, _, _ = _make_program_and_embedder()
+    prog2, emb2, _, _ = _make_program_and_embedder(provider[0])
     orig_extract2 = prog2.extract_openie
 
     def _InstrumentedExtract2(chunk_id: str, passage: str, **kw: Any) -> OpenIERecord:
@@ -615,7 +621,8 @@ re-extracting."""
         assert extracted_counts[first_chunk_id] == 1
         assert rt2.stats().chunks == 2
         assert rt2.engine is not None
-        assert rt2.engine.get_meta("pending_sync_delta") is None
+        saved_openie = get_openie_checkpoints(rt2.engine.conn, list(extracted_counts.keys()))
+        assert first_chunk_id in saved_openie
 
         hits = rt2.retrieve("Where did Alan Turing work?", top_k=2)
         assert len(hits) == 2
@@ -624,9 +631,8 @@ re-extracting."""
         rt2.stop()
 
 
-def test_inference_outage_degradation_and_recovery(tmp_path: Path) -> None:
-    """D1-A5: Inference outage sets provider_ready=False and lifecycle='degraded' without crashing; recovery \
-restores ready."""
+def test_inference_outage_degradation_and_recovery(tmp_path: Path, provider) -> None:
+    """D1-A5: Inference outage sets provider_ready=False without crashing; recovery restores provider_ready=True."""
     cfg, _ = _make_test_config(tmp_path)
     assert cfg.corpus_root is not None
     (cfg.corpus_root / "turing.md").write_text(
@@ -634,7 +640,7 @@ restores ready."""
         encoding="utf-8",
     )
 
-    prog, emb, lm, raw_emb = _make_program_and_embedder()
+    prog, emb, lm, raw_emb = _make_program_and_embedder(provider[0])
     rt = YawRuntime(cfg, program=prog, embedder=emb)
     rt.start(sync_on_start=True)
     try:
@@ -648,7 +654,7 @@ restores ready."""
         assert exc_info.value.code == "MODEL_ERROR"
 
         degraded_status = rt.status()
-        assert degraded_status.lifecycle == "degraded"
+        assert degraded_status.lifecycle == "ready"
         assert degraded_status.provider_ready is False
         assert degraded_status.last_error is not None
         assert "unreachable" in degraded_status.last_error
@@ -697,7 +703,7 @@ def test_optimize_and_reload_compiled_program_with_composite_fitness(tmp_path: P
         encoding="utf-8",
     )
 
-    prog, emb, _, _ = _make_program_and_embedder()
+    prog, emb, _, _ = _make_program_and_embedder(provider[0])
     # Mutate full optimizable surface: instructions, EmbeddingGemma prefixes, and GBNF bounds
     prog.embedding_query_prefix = "task: custom optimized query | query: "
     prog.embedding_fact_prefix = "task: custom optimized fact | query: "
@@ -731,7 +737,7 @@ def test_optimize_and_reload_compiled_program_with_composite_fitness(tmp_path: P
         rt1.stop()
 
     # 3. Start a brand-new YawRuntime and verify compiled_program.json restores all 5 surfaces
-    fresh_prog, fresh_emb, _, _ = _make_program_and_embedder()
+    fresh_prog, fresh_emb, _, _ = _make_program_and_embedder(provider[0])
     rt2 = YawRuntime(cfg, program=fresh_prog, embedder=fresh_emb)
     rt2.start(sync_on_start=False)
     try:
@@ -749,7 +755,7 @@ def test_optimize_and_reload_compiled_program_with_composite_fitness(tmp_path: P
         rt2.stop()
 
 
-def test_cli_subcommands_sync_status_rebuild_and_stop(tmp_path: Path) -> None:
+def test_cli_subcommands_sync_status_rebuild_and_stop(tmp_path: Path, provider) -> None:
     """Verify CLI subcommands sync, status, rebuild, and stop with --config yaw.toml."""
     cfg, toml_path = _make_test_config(tmp_path)
     assert cfg.corpus_root is not None
@@ -758,7 +764,7 @@ def test_cli_subcommands_sync_status_rebuild_and_stop(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    prog, emb, _, _ = _make_program_and_embedder()
+    prog, emb, _, _ = _make_program_and_embedder(provider[0])
 
     # 1. CLI graph build (standalone incremental sync)
     buf = io.StringIO()
@@ -822,7 +828,7 @@ def test_cli_optimize_ergonomics_and_anti_overfitting_gate(
 Tier 2 anti-overfitting guard."""
     cfg, toml_path = _make_test_config(tmp_path, base_url=provider[0])
     assert cfg.corpus_root is not None
-    prog, emb, _, _ = _make_program_and_embedder()
+    prog, emb, _, _ = _make_program_and_embedder(provider[0])
 
     # Write a 6-query benchmark-format dataset JSON (with paragraphs + is_supporting)
     bench_dataset_path = tmp_path / "tier1_samples.json"
@@ -963,7 +969,7 @@ def test_cli_optimize_multi_dataset_interleaved_splits(
 ) -> None:
     """Verify multi-dataset optimization: array of datasets, interleaved train/val splits, and budget allocation."""
     _, toml_path = _make_test_config(tmp_path, base_url=provider[0])
-    prog, emb, _, _ = _make_program_and_embedder()
+    prog, emb, _, _ = _make_program_and_embedder(provider[0])
 
     # Create 3 synthetic datasets (each with 10 questions)
     ds_paths: list[Path] = []
@@ -1052,7 +1058,7 @@ def test_cli_optimize_multi_dataset_interleaved_splits(
     assert "gamma" in valset[2].question
 
 
-def test_cli_status_reports_active_indexing_progress(tmp_path: Path) -> None:
+def test_cli_status_reports_active_indexing_progress(tmp_path: Path, provider) -> None:
     """Verify yaw status inspects openie checkpoints and surfaces active indexing progress."""
     from yaw.core import OpenIERecord
     from yaw.daemon.cli import inspect_status
@@ -1074,7 +1080,7 @@ def test_cli_status_reports_active_indexing_progress(tmp_path: Path) -> None:
     assert offline_status["status"]["lifecycle"] == "stopped"
 
     # With daemon locked, inspect_status recognizes indexing in progress
-    prog, emb, _, _ = _make_program_and_embedder()
+    prog, emb, _, _ = _make_program_and_embedder(provider[0])
     rt = YawRuntime(cfg, program=prog, embedder=emb)
     rt.start(sync_on_start=False)
     try:
@@ -1131,10 +1137,10 @@ def test_cli_config_get_and_set(tmp_path: Path) -> None:
     assert json.loads(buf.getvalue())["optimization.auto"] == "medium"
 
 
-def test_cli_dspy_load_program_hot_reload_live_and_staged(tmp_path: Path) -> None:
+def test_cli_dspy_load_program_hot_reload_live_and_staged(tmp_path: Path, provider) -> None:
     """Verify `yaw dspy load-program <file>` stages offline and hot-reloads live daemon in-memory."""
     cfg, toml_path = _make_test_config(tmp_path)
-    prog, emb, _, _ = _make_program_and_embedder()
+    prog, emb, _, _ = _make_program_and_embedder(provider[0])
 
     # Create dummy candidate program JSON using prog.save()
     cand1 = tmp_path / "cand1.json"
@@ -1188,7 +1194,7 @@ def test_cli_dspy_optimize_sandbox_isolation_and_status(
     from yaw.daemon.cli import is_daemon_locked
 
     cfg, toml_path = _make_test_config(tmp_path, base_url=provider[0])
-    prog, emb, _, _ = _make_program_and_embedder()
+    prog, emb, _, _ = _make_program_and_embedder(provider[0])
 
     # Start persistent production daemon holding yaw.db.lock
     prod_rt = YawRuntime(cfg, program=prog, embedder=emb)
@@ -1263,12 +1269,13 @@ def test_cli_dspy_optimize_sandbox_isolation_and_status(
 
 def test_cli_graph_lint_and_turtle_over_read_only_snapshot_while_daemon_locked(
     tmp_path: Path,
+    provider,
 ) -> None:
     """Verify `yaw graph lint [--turtle]` runs over a read-only WAL snapshot while daemon holds yaw.db.lock."""
     from yaw.daemon.cli import is_daemon_locked
 
     cfg, toml_path = _make_test_config(tmp_path)
-    prog, emb, _, _ = _make_program_and_embedder()
+    prog, emb, _, _ = _make_program_and_embedder(provider[0])
 
     prod_rt = YawRuntime(cfg, program=prog, embedder=emb)
     prod_rt.start(sync_on_start=True)
@@ -1299,7 +1306,7 @@ def test_cli_graph_lint_and_turtle_over_read_only_snapshot_while_daemon_locked(
 def test_cli_benchmark_and_gate_evaluation(tmp_path: Path, provider) -> None:
     """Verify `yaw benchmark [--gate]` isolates state via YawConfig.for_benchmark and evaluates benchmark_gate.json."""
     cfg, toml_path = _make_test_config(tmp_path, base_url=provider[0])
-    prog, emb, _, _ = _make_program_and_embedder()
+    prog, emb, _, _ = _make_program_and_embedder(provider[0])
 
     dataset_path = tmp_path / "2wikimultihopqa.json"
     dataset_samples = [
@@ -1440,30 +1447,33 @@ def test_cli_benchmark_and_gate_evaluation(tmp_path: Path, provider) -> None:
 
 
 def test_canonical_benchmark_gate_json_and_dataset_ingestion_invariants(tmp_path: Path) -> None:
-    from yaw.daemon.ingestion import MONKEYPATCHED_HIPPORAG_BASELINES, PAPER_BASELINES, load_dataset_splits
+    from yaw.daemon.ingestion import DATASETS, load_dataset_splits, resolve_dataset_name
 
-    gate = json.loads((Path(__file__).resolve().parents[2] / "benchmark_gate.json").read_text(encoding="utf-8"))
-    assert set(gate["datasets"]) == set(MONKEYPATCHED_HIPPORAG_BASELINES)
-    for dataset, baseline in MONKEYPATCHED_HIPPORAG_BASELINES.items():
-        assert gate["datasets"][dataset]["monkeypatched_hipporag"] == baseline
-        for metric, score in PAPER_BASELINES[dataset]["hipporag2_llama3.3_70b_nvembed_v2"].items():
-            if metric in ("Recall@2", "Recall@5", "ExactMatch", "F1"):
-                assert gate["datasets"][dataset]["paper_70b"][metric] == score
+    spec_path = Path(__file__).resolve().parents[2] / "data" / "benchmarks" / "baselines.json"
+    gate = json.loads(spec_path.read_text(encoding="utf-8"))
+    assert set(gate["datasets"]) == set(DATASETS)
+    for dataset, entry in gate["baselines"].items():
+        assert dataset in gate["datasets"]
+        assert "monkeypatched_hipporag" in entry
+        assert "hipporag2_llama3.3_70b_nvembed_v2" in entry
+        for metric in ("ExactMatch", "F1"):
+            assert metric in entry["monkeypatched_hipporag"]
+            assert metric in entry["hipporag2_llama3.3_70b_nvembed_v2"]
+    with pytest.raises(ValueError, match="Unknown dataset"):
+        resolve_dataset_name("2wiki")
     with pytest.raises(YawRuntimeError, match="held-out"):
-        load_dataset_splits(["2wiki"], workspace_root=tmp_path, max_queries=100)
+        load_dataset_splits(["2wikimultihopqa"], workspace_root=tmp_path, max_queries=100)
 
 
-def test_sync_now_executes_single_index_chunks_and_pre_start_stop(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Verify sync_now invokes engine.index_chunks once per sync (no double _apply_delta) and pre-start stop works."""
+def test_sync_now_executes_single_index_chunks_and_pre_start_stop(tmp_path: Path, provider) -> None:
+    """Verify sync_now executes CocoIndex update once per sync and pre-start stop works."""
     cfg, _ = _make_test_config(tmp_path)
     assert cfg.corpus_root is not None
     (cfg.corpus_root / "turing.md").write_text(
         "# Alan Turing\nAlan Turing worked at Bletchley Park.\n",
         encoding="utf-8",
     )
-    prog, emb, _, _ = _make_program_and_embedder()
+    prog, emb, _, _ = _make_program_and_embedder(provider[0])
 
     # 1. Pre-start stop() sets stop event; subsequent first start() honors it immediately
     rt_pre = YawRuntime(cfg, program=prog, embedder=emb, auto_poll=False)
@@ -1471,30 +1481,19 @@ def test_sync_now_executes_single_index_chunks_and_pre_start_stop(
     rt_pre.start(sync_on_start=False)
     assert rt_pre.status().lifecycle == "stopped"
 
-    # 2. Normal start and verify engine.index_chunks is called exactly once during sync_now()
+    # 2. Normal start and verify sync_now() publishes once and second sync_now() is a no-op
     rt = YawRuntime(cfg, program=prog, embedder=emb, auto_poll=False)
     rt.start(sync_on_start=False)
     try:
-        assert rt.ingestor is not None
-        assert rt.ingestor.on_delta is not None
+        assert rt._coco_app is not None
         assert rt.engine is not None
 
-        index_calls = 0
-        orig_index_chunks = rt.engine.index_chunks
-
-        def counted_index_chunks(
-            chunks: Sequence[tuple[Any, str]],
-            *,
-            progress_callback: Any | None = None,
-            program: Any | None = None,
-        ) -> int:
-            nonlocal index_calls
-            index_calls += 1
-            return orig_index_chunks(chunks, progress_callback=progress_callback, program=program)
-
-        monkeypatch.setattr(rt.engine, "index_chunks", counted_index_chunks)
         summary = rt.sync_now()
         assert len(summary.added_chunks) == 1
-        assert index_calls == 1
+        assert rt.stats().chunks == 1
+
+        summary2 = rt.sync_now()
+        assert len(summary2.added_chunks) == 0
+        assert rt.stats().chunks == 1
     finally:
         rt.stop()

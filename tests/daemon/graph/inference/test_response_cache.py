@@ -141,7 +141,6 @@ def test_long_qa_run_bounds_diagnostics_preserves_cost_and_avoids_history(
     )
     lm = create_dspy_lm("retention-test", base_url=url, api_key="test", max_tokens=200)
     program = HippoRAGProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
-    program.max_invariant_retries = 0
     before_global = len(GLOBAL_HISTORY)
     total_tokens = 0
     # This is the same supported DSPy context used throughout engine evolution.

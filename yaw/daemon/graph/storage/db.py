@@ -469,7 +469,7 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
                     try:
                         items = json.loads(row[2])
                         fts_items.append((fid, f"{items[0]} {pred} {items[2]}"))
-                    except Exception:
+                    except json.JSONDecodeError, TypeError, IndexError:
                         fts_items.append((fid, pred))
                 if fts_items:
                     conn.executemany("INSERT INTO fact_fts (fact_id, text) VALUES (?, ?)", fts_items)

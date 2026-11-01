@@ -2,8 +2,6 @@
 
 import hashlib
 import json
-import math
-import re
 from collections.abc import Mapping, Sequence
 from typing import Any, TypedDict
 from urllib.error import URLError
@@ -297,34 +295,6 @@ def reflection_examples(examples: Sequence[Mapping[str, Any]]) -> list[dict[str,
         )
         result.append({"evidence_id": reflection_digest(value), **value})
     return result
-
-
-def deterministic_evidence(examples: Sequence[Mapping[str, Any]], limit: int = 5) -> dict[str, Any]:
-    def score(example: Mapping[str, Any]) -> float:
-        value = example.get("Score", example.get("score"))
-        feedback = example.get("Feedback", "")
-        if value is None and isinstance(feedback, Mapping):
-            value = feedback.get("score")
-        if value is None:
-            match = re.search(
-                r"(?:Task quality (?:arithmetic|geometric) mean|GM_good/GM_bad|score)\s*=\s*([0-9.eE+-]+)",
-                str(feedback),
-            )
-            value = match.group(1) if match else 0
-        try:
-            result = float(value)
-            return result if math.isfinite(result) else 0.0
-        except ValueError, TypeError:
-            return 0.0
-
-    ordered = sorted(examples, key=lambda example: (score(example), example["evidence_id"]))
-    failures = min(3, limit, len(ordered))
-    chosen = ordered[:failures]
-    chosen += [ex for ex in reversed(ordered[failures:])][: limit - failures]
-    return {
-        "diagnosis": "Contrast lower-scoring failures with higher-scoring examples.",
-        "references": [{"example_id": ex["evidence_id"], "path": []} for ex in chosen],
-    }
 
 
 def resolve_evidence(

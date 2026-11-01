@@ -17,7 +17,6 @@ from yaw.daemon.graph.inference.reflection import (
     ReflectionBudgetError,
     ReflectionLM,
     ServingTokenCounter,
-    deterministic_evidence,
     reflection_examples,
     resolve_evidence,
 )
@@ -170,7 +169,6 @@ def test_exact_evidence_and_training_answers():
         ]
     }
     assert resolve_evidence(examples, selection)[0]["evidence"] == "needle"
-    assert "Turing" in resolve_evidence(examples, deterministic_evidence(examples))[0]["evidence"]["Feedback"]
     selection["references"][0]["end"] = 10007
     with pytest.raises(ValueError, match="span"):
         resolve_evidence(examples, selection)
@@ -280,23 +278,21 @@ def test_rlm_selects_original_evidence_in_real_sandbox(provider):
         )
     assert outer_trace == []
     assert "source evidence" in result
-    assert prop.telemetry[-1]["fallback"] is None
+    assert "fallback" not in prop.telemetry[-1]
     assert 2 <= len(calls) <= 3
     assert "Turing" in str(calls[-1])
 
 
 @pytest.mark.parametrize("instruction", ["RLM_FAILURE", "INVALID_REF"])
-def test_failed_selector_uses_original_evidence_with_native_writer(provider, instruction):
-    url, calls = provider
+def test_failed_selector_raises_without_fallback(provider, instruction):
+    url, _calls = provider
     prop = proposer(url, enable_simba=False, rlm_max_iters=2)
-    result = prop.propose_for_component(
-        "qa.predict",
-        instruction,
-        [{"Inputs": {"question": "Who?"}, "Feedback": "Expected=['Turing']"}],
-    )
-    assert "source evidence" in result
-    assert prop.telemetry[-1]["fallback"] is not None
-    assert "Turing" in str(calls[-1])
+    with pytest.raises((KeyError, ValueError, RuntimeError, Exception)):
+        prop.propose_for_component(
+            "qa.predict",
+            instruction,
+            [{"Inputs": {"question": "Who?"}, "Feedback": "Expected=['Turing']"}],
+        )
 
 
 def test_missing_tokenizer_and_legacy_state_rejected():

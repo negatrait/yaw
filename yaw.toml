@@ -50,7 +50,6 @@ embed_batch_size = 64
 embed_batch_chars = 3500
 
 [runtime]
-indexing_overlap = false
 queue_maxsize = 32
 http_host = "127.0.0.1"
 http_port = 13306

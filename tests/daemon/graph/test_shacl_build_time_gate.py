@@ -72,7 +72,20 @@ class PipelineGateMockLM(dspy.LM):
         if "HealSHACLViolations" in full_text or "ProposeSHACLRepairs" in full_text or "violations" in full_text:
             self.rlm_healer_called = True
             if "repl_history" in full_text and "code" in full_text:
-                return ['{"reasoning": "Inspect violations and submit repairs.", "code": "SUBMIT(repairs=[])"}']
+                return [
+                    json.dumps(
+                        {
+                            "reasoning": "Inspect violations and remove conflicting related edge.",
+                            "code": (
+                                "import json\n"
+                                "items = json.loads(violations)\n"
+                                "repairs = [{'focus_node': v['focus_node'], 'action': 'remove_conflicting_related', "
+                                "'target_node': '', 'value': ''} for v in items]\n"
+                                "SUBMIT(repairs=repairs)"
+                            ),
+                        }
+                    )
+                ]
             return ['{"repairs": []}']
 
         # Query intent stage
@@ -319,7 +332,7 @@ def test_build_time_shacl_gate_success(synonym_token_counter, tmp_path: Path) ->
 
         with engine.managed_conn.readonly() as conn:
             # 1. Zero SHACL violations exist immediately after index_chunks and Turtle conforms
-            violations = lint_graph_shacl(conn, auto_heal=False)
+            violations = lint_graph_shacl(conn)
             assert violations == [], f"Build gate leaked SHACL violations: {violations}"
             ttl = serialize_graph_turtle(conn)
             assert "sh:conforms true" in ttl
@@ -465,6 +478,6 @@ def test_pre_rlm_deterministic_auto_heal_skips_rlm_healer(synonym_token_counter,
         assert int(engine._graph_rlm_stats.get("shacl_violations_after", 0)) == 0
 
         with engine.managed_conn.readonly() as conn:
-            assert lint_graph_shacl(conn, auto_heal=False) == []
+            assert lint_graph_shacl(conn) == []
     finally:
         engine.close()

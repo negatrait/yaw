@@ -1,7 +1,6 @@
 """Native DSPy HippoRAGProgram orchestrator."""
 
 import json
-import logging
 import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -26,7 +25,7 @@ from .grammars import (
     build_dspy_triples_grammar,
     lm_supports_gbnf,
 )
-from .invariants import is_abstaining_answer, should_retry_stage_invariants, validate_stage_invariants
+from .invariants import validate_stage_invariants
 from .parsers import (
     coerce_generated_facts,
     extract_entity_definitions,
@@ -114,7 +113,7 @@ Multi-Hop QA.
        - `shacl_healer_rlm` (`HealSHACLViolations`) running inside `dspy.PythonInterpreter` (managed \
 Deno/Pyodide WASM) with
          bound graph inspection, hydration, repair, and SQL SHACL linting tools (`inspect_focus_node`,
-         `hydrate_chunk`, `qwen_propose_shacl_repairs`, `apply_shacl_repairs`, `lint_shacl`).
+         `hydrate_chunk`, `qwen_propose_shacl_repairs`, `lint_shacl`). Repairs are returned as proposals.
     3. **First-Class Embedding Trail (`record_embedding_telemetry` / `embedding_audit_trail`):**
        - Tracks every `DSPyEmbeddingAdapter` (`dspy.Embedder`) invocation and the 3 optimizable
          task prefixes (`embedding_query_prefix`, `embedding_fact_prefix`, `embedding_document_prefix`)
@@ -142,7 +141,6 @@ Deno/Pyodide WASM) with
         rlm_tools: list[Callable[..., Any]] | None = None,
         rlm_interpreter_factory: Callable[[], Any] = dspy.PythonInterpreter,
         compiled_path: str | Path | None = None,
-        enable_react_fallback: bool = False,
         context_window_tokens: int | None = None,
         max_output_tokens: int | None = None,
         synonym_token_counter: Any = None,
@@ -197,12 +195,9 @@ Deno/Pyodide WASM) with
         self._pair_inspector: Callable[[str, str], str] | None = None
         self._chunk_hydrator: Callable[[str], str] | None = None
         self._ast_island_hydrator: Callable[[str], str] | None = None
-        self._shacl_repair_applier: Callable[[Sequence[Mapping[str, Any]]], int] | None = None
         self._shacl_linter: Callable[[], list[dict[str, str]]] | None = None
         self._graph_search_tool: Callable[[str], str] | None = None
         self._last_ner_definitions: dict[str, str] = {}
-        self.max_invariant_retries: int = 1
-        self.enable_react_fallback: bool = bool(enable_react_fallback)
         self.telemetry: list[dict[str, Any]] = DiagnosticHistory()
         self.history = DiagnosticHistory()
         self.embedding_audit_trail: list[dict[str, Any]] = DiagnosticHistory()
@@ -325,16 +320,14 @@ Deno/Pyodide WASM) with
         pair_inspector: Callable[[str, str], str] | None = None,
         chunk_hydrator: Callable[[str], str] | None = None,
         ast_island_hydrator: Callable[[str], str] | None = None,
-        shacl_repair_applier: Callable[[Sequence[Mapping[str, Any]]], int] | None = None,
         shacl_linter: Callable[[], list[dict[str, str]]] | None = None,
     ) -> None:
         """Bind storage tools (`inspect_focus_node`, `inspect_pair`, `hydrate_chunk`, `hydrate_ast_island`, \
-`apply_shacl_repairs`, `lint_shacl`) for the SHACL RLM sandbox."""
+`lint_shacl`) for the read-only SHACL RLM sandbox."""
         self._node_inspector = node_inspector
         self._pair_inspector = pair_inspector
         self._chunk_hydrator = chunk_hydrator
         self._ast_island_hydrator = ast_island_hydrator
-        self._shacl_repair_applier = shacl_repair_applier
         self._shacl_linter = shacl_linter
 
     def set_graph_search_tool(
@@ -352,7 +345,6 @@ Deno/Pyodide WASM) with
             pair_inspector=self._pair_inspector,
             chunk_hydrator=self._chunk_hydrator,
             ast_island_hydrator=self._ast_island_hydrator,
-            shacl_repair_applier=self._shacl_repair_applier,
             shacl_linter=self._shacl_linter,
         )
         target.set_graph_search_tool(self._graph_search_tool)
@@ -490,7 +482,6 @@ Deno/Pyodide WASM) with
                 "_pair_inspector",
                 "_chunk_hydrator",
                 "_ast_island_hydrator",
-                "_shacl_repair_applier",
                 "_shacl_linter",
                 "_graph_search_tool",
                 "orchestrator_lm",
@@ -510,6 +501,9 @@ Deno/Pyodide WASM) with
         new_prog.retriever = YawRetriever(
             k=getattr(self.retriever, "k", 10),
             rm=new_prog.rm,
+        )
+        new_prog.shacl_healer_rlm._user_tools = new_prog.shacl_healer_rlm._normalize_tools(
+            new_prog._build_shacl_repl_tools()
         )
         return new_prog
 
@@ -532,10 +526,7 @@ Deno/Pyodide WASM) with
             raw = violations if violations is not None else violations_json
             resolved_context = str(focus_context or "")
             if not resolved_context.strip() and self._node_inspector is not None and raw:
-                try:
-                    parsed_items = json.loads(raw) if isinstance(raw, str) else list(raw)
-                except json.JSONDecodeError, TypeError:
-                    parsed_items = []
+                parsed_items = json.loads(raw) if isinstance(raw, str) else list(raw)
                 seen_fns: list[str] = []
                 for item in parsed_items:
                     fn = (
@@ -601,13 +592,6 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
                 return ""
             return str(self._graph_search_tool(str(query)))
 
-        def apply_shacl_repairs(repairs: Any) -> int:
-            """Apply bounded SHACL repair actions to the active in-transaction database connection."""
-            if self._shacl_repair_applier is None:
-                return 0
-            parsed = parse_shacl_repairs(repairs)
-            return int(self._shacl_repair_applier(parsed))
-
         def lint_shacl() -> list[dict[str, str]]:
             """Re-run closed-world SQL SHACL validation on the active in-transaction database connection."""
             if self._shacl_linter is None:
@@ -622,7 +606,6 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
             hydrate_ast_island,
             read_source_chunk,
             search_graph,
-            apply_shacl_repairs,
             lint_shacl,
         ]
 
@@ -685,7 +668,6 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
     ) -> Any:
         from dspy.utils.usage_tracker import track_usage
 
-        retry_count = 0
         inv_score = 1.0
         inv_feedback = ""
         with track_usage() as usage_tracker:
@@ -702,7 +684,7 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
                     stage_name or active_name,
                     inputs,
                     pred,
-                    shacl_linter=self._shacl_linter,
+                    shacl_linter=None,
                 )
             else:
                 predictor = direct_mod.predict if isinstance(direct_mod, dspy.ChainOfThought) else direct_mod
@@ -731,30 +713,6 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
                         pred,
                         shacl_linter=None,
                     )
-                    max_retries = self.max_invariant_retries
-                    while (
-                        inv_score < 1.0
-                        and retry_count < max_retries
-                        and should_retry_stage_invariants(stage_name, pred, effective_lm)
-                    ):
-                        retry_count += 1
-                        retry_cfg = dict(call_kwargs.get("config") or {})
-                        retry_cfg["rollout_id"] = retry_count
-                        retry_kwargs = {**call_kwargs, "config": retry_cfg}
-                        try:
-                            cand_pred = direct_mod(**direct_inputs, **retry_kwargs)
-                        except Exception:
-                            break
-                        cand_score, cand_fb = validate_stage_invariants(
-                            stage_name,
-                            direct_inputs,
-                            cand_pred,
-                            shacl_linter=None,
-                        )
-                        if cand_score >= inv_score:
-                            pred = cand_pred
-                            inv_score = cand_score
-                            inv_feedback = cand_fb
                 active_mod = direct_mod
                 active_name = "qa" if stage_name == "qa" else (stage_name or "direct")
         tokens = usage_tracker.get_total_tokens()
@@ -773,7 +731,6 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
                 outputs_summary=str(pred)[:240],
                 invariant_score=inv_score,
                 invariant_feedback=inv_feedback,
-                invariant_retries=retry_count,
             )
         return pred
 
@@ -1380,56 +1337,6 @@ chunk."""
         self.rm.hook = hook
         self.retriever.hook = hook
 
-    def _run_react_qa_fallback(
-        self,
-        question: str,
-        initial_context: str,
-    ) -> dspy.Prediction | None:
-        """Run bounded `dspy.ReActV2` multi-hop graph exploration when single-shot PPR/QA abstains or retrieval \
-confidence < 0.15."""
-        react_cls = getattr(dspy, "ReActV2", None)
-        if react_cls is None:
-            return None
-
-        def search_graph_facts(query: str) -> str:
-            """Search the knowledge graph or retrieval engine for facts matching query."""
-            if self._graph_search_tool is not None:
-                return str(self._graph_search_tool(str(query)))
-            if self._retrieval_hook is not None:
-                ctx, _, _ = self.rm._invoke_hook(str(query))
-                return str(ctx)
-            return ""
-
-        def inspect_entity_neighborhood(entity_id: str) -> str:
-            """Inspect the 1-hop entity neighborhood and definitions for entity_id."""
-            if self._node_inspector is not None:
-                return json.dumps(self._node_inspector(str(entity_id)), ensure_ascii=False)
-            return "{}"
-
-        def read_passage_chunk(chunk_id: str) -> str:
-            """Hydrate the original passage chunk text for chunk_id."""
-            if self._chunk_hydrator is not None:
-                return str(self._chunk_hydrator(str(chunk_id)))
-            return ""
-
-        sig = self.qa.predict.signature
-        eff_lm = self.orchestrator_lm or self.rlm_sub_lm
-        try:
-            agent = react_cls(
-                sig,
-                tools=[
-                    search_graph_facts,
-                    inspect_entity_neighborhood,
-                    read_passage_chunk,
-                ],
-                max_iters=10,
-            )
-            with self._dspy_ctx(eff_lm, use_json_adapter=True):
-                return agent(context=initial_context, question=question)
-        except Exception as exc:
-            logging.getLogger(__name__).debug("ReActV2 fallback skipped (%s: %s)", type(exc).__name__, exc)
-            return None
-
     @diagnostic_boundary
     def forward(
         self,
@@ -1471,15 +1378,6 @@ confidence < 0.15."""
                         reas_str = ""
                     else:
                         pred = self.answer_question(context=hydrated_ctx, question=question, use_gbnf=use_gbnf)
-                        top_score = max(scores) if len(scores) > 0 else 1.0
-                        if self.enable_react_fallback and (
-                            is_abstaining_answer(str(getattr(pred, "answer", "") or "")) or top_score < 0.15
-                        ):
-                            react_pred = self._run_react_qa_fallback(question, hydrated_ctx)
-                            if react_pred is not None and not is_abstaining_answer(
-                                str(getattr(react_pred, "answer", "") or "")
-                            ):
-                                pred = react_pred
                         ans_str = str(getattr(pred, "answer", "") or "")
                         reas_str = str(getattr(pred, "reasoning", "") or "")
                 tokens = usage_tracker.get_total_tokens()

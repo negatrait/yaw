@@ -51,10 +51,10 @@ from yaw.daemon.graph.inference.models import (
     preflight,
 )
 from yaw.daemon.ingestion import (
-    ALIASES,
+    DATASET_REGISTRY as DATASET_REGISTRY,
+)
+from yaw.daemon.ingestion import (
     DATASETS,
-    MONKEYPATCHED_HIPPORAG_BASELINES,
-    PAPER_BASELINES,
     build_benchmark_slice,
     get_gold_answers,
     get_gold_docs,
@@ -62,19 +62,16 @@ from yaw.daemon.ingestion import (
     snapshot_dataset_bundle,
 )
 from yaw.daemon.ingestion import (
-    DATASET_REGISTRY as DATASET_REGISTRY,
-)
-from yaw.daemon.ingestion import (
     PINNED_COMMIT as PINNED_COMMIT,
-)
-from yaw.daemon.ingestion import (
-    TEXT_STOPWORDS as TEXT_STOPWORDS,
 )
 from yaw.daemon.ingestion import (
     load_dataset_files as _ingestion_load_dataset_files,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+BASELINES: dict[str, dict[str, Any]] = json.loads(
+    (PROJECT_ROOT / "data" / "benchmarks" / "baselines.json").read_text(encoding="utf-8")
+)["baselines"]
 
 QA_TOP_K = 5
 RETRIEVAL_TOP_K = 10
@@ -194,7 +191,7 @@ def run_yaw_benchmark(
     dataset: str,
     document_ids: list[str],
     queries: list[str],
-    gold_docs: list[list[str]],
+    gold_docs: list[list[str]] | None,
     gold_answers: list[list[str]],
     train_samples: list[dict],
     profile: Any,
@@ -316,14 +313,16 @@ def run_yaw_benchmark(
                 dspy.Example(
                     question=s["question"],
                     gold_answers=train_golds[idx],
-                    gold_docs=train_gold_docs[idx],
+                    gold_docs=train_gold_docs[idx] if train_gold_docs is not None else [],
                 ).with_inputs("question")
                 for idx, s in enumerate(train_samples)
             ]
             valset: list[Any] | None = None
             train_q_set = {s["question"] for s in train_samples}
             disjoint_val = [
-                (q, gold_answers[idx], gold_docs[idx]) for idx, q in enumerate(queries) if q not in train_q_set
+                (q, gold_answers[idx], gold_docs[idx] if gold_docs is not None else [])
+                for idx, q in enumerate(queries)
+                if q not in train_q_set
             ]
             if disjoint_val:
                 valset = [
@@ -380,34 +379,9 @@ def run_yaw_benchmark(
             if include_qa:
                 t_qa0 = perf_counter()
                 context = yaw_engine.format_qa_context(hits[:QA_TOP_K])
-                pred = None
-                for qa_attempt in range(3):
-                    try:
-                        pred = yaw_engine.program.answer_question(context=context, question=query)
-                        break
-                    except Exception as exc:
-                        if qa_attempt < 2:
-                            print(
-                                f"[Native YAW] [{dataset}] QA query {q_idx} encountered {type(exc).__name__}: {exc}. "
-                                f"Retrying (attempt {qa_attempt + 1}/3)...",
-                                flush=True,
-                            )
-                            try:
-                                if hasattr(yaw_engine.program, "orchestrator_lm") and hasattr(
-                                    yaw_engine.program.orchestrator_lm, "close"
-                                ):
-                                    yaw_engine.program.orchestrator_lm.close()
-                            except Exception:
-                                pass
-                        else:
-                            print(
-                                f"[Native YAW] [{dataset}] QA query {q_idx} failed after 3 attempts: {exc}. "
-                                "Falling back to empty prediction.",
-                                flush=True,
-                            )
-                            pred = None
+                pred = yaw_engine.program.answer_question(context=context, question=query)
                 qa_elapsed = perf_counter() - t_qa0
-                qa_raw = str(getattr(pred, "answer", "")).strip() if pred is not None else ""
+                qa_raw = str(getattr(pred, "answer", "")).strip()
                 qa_answer = clean_qa_answer(qa_raw)
                 qa_answers.append(qa_answer)
             timing_records.append((retrieval_elapsed, qa_elapsed))
@@ -418,28 +392,32 @@ def run_yaw_benchmark(
                     flush=True,
                 )
 
-        gold_docs_norm = [[d.strip() for d in gd] for gd in gold_docs]
-        ret_docs_norm = [[p.strip() for p in rp] for rp in all_retrieved_passages]
-        dpr_docs_norm = [[p.strip() for p in dp] for dp in all_dpr_passages]
+        if gold_docs is not None:
+            gold_docs_norm = [[d.strip() for d in gd] for gd in gold_docs]
+            ret_docs_norm = [[p.strip() for p in rp] for rp in all_retrieved_passages]
+            dpr_docs_norm = [[p.strip() for p in dp] for dp in all_dpr_passages]
 
-        _, ret_per_query = ScriptRetrievalRecall().calculate_metric_scores(
-            gold_docs=gold_docs_norm,
-            retrieved_docs=ret_docs_norm,
-            k_list=[1, 2, 5, 10],
-        )
-        _, dpr_per_query = ScriptRetrievalRecall().calculate_metric_scores(
-            gold_docs=gold_docs_norm,
-            retrieved_docs=dpr_docs_norm,
-            k_list=[1, 2, 5, 10],
-        )
-        recalls_1 = [round(float(r["Recall@1"]), 4) for r in ret_per_query]
-        recalls_2 = [round(float(r["Recall@2"]), 4) for r in ret_per_query]
-        recalls_5 = [round(float(r["Recall@5"]), 4) for r in ret_per_query]
-        recalls_10 = [round(float(r["Recall@10"]), 4) for r in ret_per_query]
-        dpr_recalls_1 = [round(float(r["Recall@1"]), 4) for r in dpr_per_query]
-        dpr_recalls_2 = [round(float(r["Recall@2"]), 4) for r in dpr_per_query]
-        dpr_recalls_5 = [round(float(r["Recall@5"]), 4) for r in dpr_per_query]
-        dpr_recalls_10 = [round(float(r["Recall@10"]), 4) for r in dpr_per_query]
+            _, ret_per_query = ScriptRetrievalRecall().calculate_metric_scores(
+                gold_docs=gold_docs_norm,
+                retrieved_docs=ret_docs_norm,
+                k_list=[1, 2, 5, 10],
+            )
+            _, dpr_per_query = ScriptRetrievalRecall().calculate_metric_scores(
+                gold_docs=gold_docs_norm,
+                retrieved_docs=dpr_docs_norm,
+                k_list=[1, 2, 5, 10],
+            )
+            recalls_1 = [round(float(r["Recall@1"]), 4) for r in ret_per_query]
+            recalls_2 = [round(float(r["Recall@2"]), 4) for r in ret_per_query]
+            recalls_5 = [round(float(r["Recall@5"]), 4) for r in ret_per_query]
+            recalls_10 = [round(float(r["Recall@10"]), 4) for r in ret_per_query]
+            dpr_recalls_1 = [round(float(r["Recall@1"]), 4) for r in dpr_per_query]
+            dpr_recalls_2 = [round(float(r["Recall@2"]), 4) for r in dpr_per_query]
+            dpr_recalls_5 = [round(float(r["Recall@5"]), 4) for r in dpr_per_query]
+            dpr_recalls_10 = [round(float(r["Recall@10"]), 4) for r in dpr_per_query]
+        else:
+            recalls_1 = recalls_2 = recalls_5 = recalls_10 = []
+            dpr_recalls_1 = dpr_recalls_2 = dpr_recalls_5 = dpr_recalls_10 = []
 
         qa_metrics = None
         em_list: list[float] = []
@@ -463,22 +441,30 @@ def run_yaw_benchmark(
                     "answer": qa_answers[q_idx] if include_qa else "",
                     "dpr_answer": "",
                     "gold_answers": gold_answers[q_idx],
-                    "gold_docs": gold_docs[q_idx],
+                    "gold_docs": gold_docs[q_idx] if gold_docs is not None else None,
                     "qa_evidence": all_retrieved_passages[q_idx],
                     "dpr_evidence": all_dpr_passages[q_idx],
                     "graph_seeds": kept_facts_per_query[q_idx],
-                    "recall": {
-                        "@1": recalls_1[q_idx],
-                        "@2": recalls_2[q_idx],
-                        "@5": recalls_5[q_idx],
-                        "@10": recalls_10[q_idx],
-                    },
-                    "dpr_recall": {
-                        "@1": dpr_recalls_1[q_idx],
-                        "@2": dpr_recalls_2[q_idx],
-                        "@5": dpr_recalls_5[q_idx],
-                        "@10": dpr_recalls_10[q_idx],
-                    },
+                    "recall": (
+                        {
+                            "@1": recalls_1[q_idx],
+                            "@2": recalls_2[q_idx],
+                            "@5": recalls_5[q_idx],
+                            "@10": recalls_10[q_idx],
+                        }
+                        if gold_docs is not None
+                        else None
+                    ),
+                    "dpr_recall": (
+                        {
+                            "@1": dpr_recalls_1[q_idx],
+                            "@2": dpr_recalls_2[q_idx],
+                            "@5": dpr_recalls_5[q_idx],
+                            "@10": dpr_recalls_10[q_idx],
+                        }
+                        if gold_docs is not None
+                        else None
+                    ),
                     "retrieved_chunk_ids": retrieved_ids_list[q_idx],
                     "exact_match": em_list[q_idx] if include_qa else None,
                     "f1": f1_list[q_idx] if include_qa else None,
@@ -493,18 +479,29 @@ def run_yaw_benchmark(
         avg_facts_kept = (
             round(float(np.mean([len(s) for s in kept_facts_per_query])), 4) if kept_facts_per_query else 0.0
         )
-        hipporag_ret = {
-            "Recall@1": round(float(np.mean(recalls_1)), 4) if recalls_1 else 0.0,
-            "Recall@2": round(float(np.mean(recalls_2)), 4) if recalls_2 else 0.0,
-            "Recall@5": round(float(np.mean(recalls_5)), 4) if recalls_5 else 0.0,
-            "Recall@10": round(float(np.mean(recalls_10)), 4) if recalls_10 else 0.0,
-        }
-        dpr_ret = {
-            "Recall@1": round(float(np.mean(dpr_recalls_1)), 4) if dpr_recalls_1 else 0.0,
-            "Recall@2": round(float(np.mean(dpr_recalls_2)), 4) if dpr_recalls_2 else 0.0,
-            "Recall@5": round(float(np.mean(dpr_recalls_5)), 4) if dpr_recalls_5 else 0.0,
-            "Recall@10": round(float(np.mean(dpr_recalls_10)), 4) if dpr_recalls_10 else 0.0,
-        }
+        if gold_docs is not None:
+            hipporag_ret: dict[str, Any] = {
+                "Recall@1": round(float(np.mean(recalls_1)), 4) if recalls_1 else 0.0,
+                "Recall@2": round(float(np.mean(recalls_2)), 4) if recalls_2 else 0.0,
+                "Recall@5": round(float(np.mean(recalls_5)), 4) if recalls_5 else 0.0,
+                "Recall@10": round(float(np.mean(recalls_10)), 4) if recalls_10 else 0.0,
+            }
+            dpr_ret: dict[str, Any] = {
+                "Recall@1": round(float(np.mean(dpr_recalls_1)), 4) if dpr_recalls_1 else 0.0,
+                "Recall@2": round(float(np.mean(dpr_recalls_2)), 4) if dpr_recalls_2 else 0.0,
+                "Recall@5": round(float(np.mean(dpr_recalls_5)), 4) if dpr_recalls_5 else 0.0,
+                "Recall@10": round(float(np.mean(dpr_recalls_10)), 4) if dpr_recalls_10 else 0.0,
+            }
+            delta_vs_dpr: dict[str, Any] = {
+                "Recall@1": round(hipporag_ret["Recall@1"] - dpr_ret["Recall@1"], 4),
+                "Recall@2": round(hipporag_ret["Recall@2"] - dpr_ret["Recall@2"], 4),
+                "Recall@5": round(hipporag_ret["Recall@5"] - dpr_ret["Recall@5"], 4),
+                "Recall@10": round(hipporag_ret["Recall@10"] - dpr_ret["Recall@10"], 4),
+            }
+        else:
+            hipporag_ret = {}
+            dpr_ret = {}
+            delta_vs_dpr = {}
         metrics: dict[str, Any] = {
             "hipporag": {
                 "retrieval": hipporag_ret,
@@ -514,12 +511,7 @@ def run_yaw_benchmark(
                 "retrieval": dpr_ret,
                 "qa": None,
             },
-            "delta_vs_dpr": {
-                "Recall@1": round(hipporag_ret["Recall@1"] - dpr_ret["Recall@1"], 4),
-                "Recall@2": round(hipporag_ret["Recall@2"] - dpr_ret["Recall@2"], 4),
-                "Recall@5": round(hipporag_ret["Recall@5"] - dpr_ret["Recall@5"], 4),
-                "Recall@10": round(hipporag_ret["Recall@10"] - dpr_ret["Recall@10"], 4),
-            },
+            "delta_vs_dpr": delta_vs_dpr,
             "recognition_memory": {
                 "queries_with_graph_seeds": seeds_active,
                 "dpr_fallback_count": fallback_count,
@@ -527,13 +519,26 @@ def run_yaw_benchmark(
                 "average_facts_kept": avg_facts_kept,
             },
         }
-        if dataset in MONKEYPATCHED_HIPPORAG_BASELINES:
-            mp = MONKEYPATCHED_HIPPORAG_BASELINES[dataset]
+        ds_baselines = BASELINES.get(dataset, {})
+        mp = ds_baselines.get("monkeypatched_hipporag")
+        if isinstance(mp, dict):
             metrics["monkeypatched_hipporag_baseline"] = mp
             metrics["delta_vs_monkeypatched_hipporag"] = {
-                "Recall@1": round(hipporag_ret["Recall@1"] - float(mp["Recall@1"]), 4),
-                "Recall@2": round(hipporag_ret["Recall@2"] - float(mp["Recall@2"]), 4),
-                "Recall@5": round(hipporag_ret["Recall@5"] - float(mp["Recall@5"]), 4),
+                "Recall@1": (
+                    round(hipporag_ret["Recall@1"] - float(mp["Recall@1"]), 4)
+                    if "Recall@1" in hipporag_ret and mp.get("Recall@1") is not None
+                    else None
+                ),
+                "Recall@2": (
+                    round(hipporag_ret["Recall@2"] - float(mp["Recall@2"]), 4)
+                    if "Recall@2" in hipporag_ret and mp.get("Recall@2") is not None
+                    else None
+                ),
+                "Recall@5": (
+                    round(hipporag_ret["Recall@5"] - float(mp["Recall@5"]), 4)
+                    if "Recall@5" in hipporag_ret and mp.get("Recall@5") is not None
+                    else None
+                ),
                 "ExactMatch": (
                     round(float(qa_metrics["ExactMatch"]) - float(mp["ExactMatch"]), 4)
                     if qa_metrics is not None and mp.get("ExactMatch") is not None
@@ -545,8 +550,9 @@ def run_yaw_benchmark(
                     else None
                 ),
             }
-        if dataset in PAPER_BASELINES:
-            metrics["paper_baselines"] = PAPER_BASELINES[dataset]
+        paper_baselines = {k: v for k, v in ds_baselines.items() if k != "monkeypatched_hipporag"}
+        if paper_baselines:
+            metrics["paper_baselines"] = paper_baselines
         report["hyperparameters"] = {
             "linking_top_k": linking_top_k,
             "fact_candidate_pool_k": fact_candidate_pool_k,
@@ -615,7 +621,6 @@ def main(
     graph_beta: float = 0.5,
     graph_dual_weight: float | None = 0.5,
 ):
-    dataset = ALIASES.get(dataset, dataset)
     if chat_model is not None:
         extraction_model = chat_model
         qa_model = chat_model
@@ -654,7 +659,9 @@ def main(
         index_queries=index_queries,
     )
     if train_samples:
-        training_references = {doc for refs in get_gold_docs(train_samples, dataset, corpus=corpus) for doc in refs}
+        training_references = {
+            doc for refs in (get_gold_docs(train_samples, dataset, corpus=corpus) or ()) for doc in refs
+        }
         docs.extend(str(row["idx"]) for row in corpus if f"{row['title']}\n{row['text']}" in training_references)
         docs = list(dict.fromkeys(docs))
     corpus_text = {str(row["idx"]): f"{row['title']}\n{row['text']}" for row in corpus}
@@ -798,7 +805,7 @@ def main(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset", choices=[*DATASETS, *ALIASES], default="sample")
+    parser.add_argument("--dataset", choices=DATASETS, default="sample")
     parser.add_argument(
         "--max-queries",
         type=int,

@@ -4,9 +4,16 @@ Practical design patterns, lessons learned, and future architecture investigatio
 
 ---
 
-## 1. Zero-Shot Optimization on Local Silicon (Active Epic 1 Rule)
+## 1. Zero-Shot Optimization, Reward Contract & Runtime Binding (Active Epic 1 Rules)
 
-- **The Issue**: Bootstrapping few-shot demonstrations on local 4B models (`Qwen3-4B-Instruct`) causes prompt bloat ($3,500+$ tokens), generation timeouts and repetition loops. Historical token penalties were removed on 2026-10-24: GEPA now rewards the unweighted arithmetic mean of labeled retrieval recall (`Recall@1, 2, 5, 10, 20`) and QA `EM`/`F1` (`task-quality-arithmetic-mean-v2`). See [the reward contract](gepa-reflection-repair.md#scope).
+- **The Issue**: Bootstrapping few-shot demonstrations on local 4B models (`Qwen3-4B-Instruct`, `Gemma-4-E4B`) causes prompt bloat ($3,500+$ tokens), generation timeouts and repetition loops. Historical token penalties were removed on 2026-10-24: GEPA now rewards the unweighted arithmetic mean of labeled retrieval recall (`Recall@1, 2, 5, 10, 20`) and QA `EM`/`F1` (`task-quality-arithmetic-mean-v2`):
+  $$\text{score} = \frac{1}{|M|}\sum_{m \in M} m \quad \text{for } M \subseteq \{\text{Recall@1}, \text{Recall@2}, \text{Recall@5}, \text{Recall@10}, \text{Recall@20}, \text{EM}, \text{F1}\}$$
+  while preserving all 7 raw metrics in `objective_scores` for the GEPA Pareto frontier.
+- **SIMBA Counterfactual Delta Reward & Checkpoint State**: Native DSPy SIMBA instruction evaluation scores candidates on the first two training queries using the bounded delta reward:
+  $$\text{reward} = 0.5 + 0.5 \cdot \frac{\Delta}{1 + |\Delta|}$$
+  and persists worker state (version 2) and counterfactual task-score cache entries atomically in `yaw.db` metadata.
+- **Reflection Serving Tokenizer Budget**: Reflection requests (`training traces -> sandbox evidence selection -> native DSPy InstructionProposer -> downstream task scoring`) measure the complete rendered prompt against `inference.reflection_input_tokens` using the resident llama.cpp chat template and `/tokenize` endpoint (`ServingTokenCounter`).
+- **Native `YawGBNFAdapter` & Deployment-Owned LM Binding**: Task predictors bind their actual `dspy.LM` directly (no `BaseLM` proxy). `YawGBNFAdapter` subclasses `dspy.JSONAdapter` without custom fallback parsing shims and fails hard on missing/invalid fields. Loading a compiled program JSON preserves deployment-owned endpoints, credentials, and context capacities rather than letting serialized prompt metadata overwrite them.
 - **The Rule**: Always set `max_bootstrapped_demos = 0` and `max_labeled_demos = 0` in `yaw.toml`. Optimize pure instructions zero-shot.
 - **Fresh program policy (2026-10-24)**: Task and reflection constructors default to `include_demos=False`, so a fresh GEPA-only run also starts without fixed examples. Existing example sets require explicit opt-in; loaded compiled demonstrations are preserved. Their generalization has not been established by a paired benchmark.
 

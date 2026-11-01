@@ -2,14 +2,12 @@
 
 import copy
 import json
-import logging
 import math
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Literal
 
 import dspy
-from dspy.utils.exceptions import AdapterParseError, LMError
 
 from yaw.core.config import DEFAULT_CONTEXT_WINDOW_TOKENS, scale_context_budget
 
@@ -25,7 +23,6 @@ from .reflection import (
     ReflectionBudgetError,
     ReflectionLM,
     checkpoint_object,
-    deterministic_evidence,
     reflection_digest,
     reflection_examples,
     resolve_evidence,
@@ -417,77 +414,58 @@ class RLMInstructionProposer:
         prev_inst = str(getattr(self.qwen_proposer.signature, "instructions", "") or "")
         prev_demos = len(getattr(self.qwen_proposer, "demos", ()) or ())
 
-        try:
-            self._simba_reward_errors = 0
-            simba = dspy.SIMBA(
-                metric=self._score_task_improvement,
-                bsize=bsize,
-                num_candidates=self.simba_num_candidates,
-                max_steps=self.simba_max_steps,
-                max_demos=self.simba_max_demos,
-                demo_input_field_maxlen=sys.maxsize,
-                prompt_model=eff_worker,
-                num_threads=1,
+        self._simba_reward_errors = 0
+        simba = dspy.SIMBA(
+            metric=self._score_task_improvement,
+            bsize=bsize,
+            num_candidates=self.simba_num_candidates,
+            max_steps=self.simba_max_steps,
+            max_demos=self.simba_max_demos,
+            demo_input_field_maxlen=sys.maxsize,
+            prompt_model=eff_worker,
+            num_threads=1,
+        )
+        with dspy.context(lm=eff_worker, adapter=self.json_adapter, trace=[]):
+            compiled_worker = simba.compile(
+                self.worker_module,
+                trainset=trainset,
+                seed=self._simba_steps,
             )
-            with dspy.context(lm=eff_worker, adapter=self.json_adapter, trace=[]):
-                compiled_worker = simba.compile(
-                    self.worker_module,
-                    trainset=trainset,
-                    seed=self._simba_steps,
-                )
-            if self._simba_reward_errors:
-                raise RuntimeError("SIMBA task evaluations failed; retaining previous worker")
-            if not isinstance(compiled_worker, InstructionSynthesizerWorker):
-                raise TypeError("SIMBA returned an incompatible instruction worker")
-            # Learned instructions/demos are also part of the next rendered prompt.
-            # Reject an oversized worker before adopting or checkpointing its state.
-            compiled_worker._rollout_lm = None
-            for example in trainset:
-                compiled_worker.fit_evidence(
-                    example.current_instruction,
-                    example.examples_with_feedback,
-                    example.component_name,
-                )
-            new_inst = str(compiled_worker.qwen_proposer.signature.instructions).strip()
-            self.qwen_proposer.signature = compiled_worker.qwen_proposer.signature
-            self.qwen_proposer.demos = list(getattr(compiled_worker.qwen_proposer, "demos", ()) or ())
-            self.qwen_compressor.signature = compiled_worker.qwen_compressor.signature
-            self.qwen_compressor.demos = list(getattr(compiled_worker.qwen_compressor, "demos", ()) or ())
-            self._bind_predictor_lms()
+        if self._simba_reward_errors:
+            raise RuntimeError("SIMBA task evaluations failed; retaining previous worker")
+        if not isinstance(compiled_worker, InstructionSynthesizerWorker):
+            raise TypeError("SIMBA returned an incompatible instruction worker")
+        # Learned instructions/demos are also part of the next rendered prompt.
+        # Reject an oversized worker before adopting or checkpointing its state.
+        compiled_worker._rollout_lm = None
+        for example in trainset:
+            compiled_worker.fit_evidence(
+                example.current_instruction,
+                example.examples_with_feedback,
+                example.component_name,
+            )
+        new_inst = str(compiled_worker.qwen_proposer.signature.instructions).strip()
+        self.qwen_proposer.signature = compiled_worker.qwen_proposer.signature
+        self.qwen_proposer.demos = list(getattr(compiled_worker.qwen_proposer, "demos", ()) or ())
+        self.qwen_compressor.signature = compiled_worker.qwen_compressor.signature
+        self.qwen_compressor.demos = list(getattr(compiled_worker.qwen_compressor, "demos", ()) or ())
+        self._bind_predictor_lms()
 
-            entry = {
-                "optimizer": "dspy.SIMBA",
-                "target": "worker_module.qwen_proposer",
-                "trainset_size": len(trainset),
-                "bsize": bsize,
-                "num_candidates": self.simba_num_candidates,
-                "max_steps": self.simba_max_steps,
-                "demos_before": prev_demos,
-                "demos_after": len(self.qwen_proposer.demos),
-                "instruction_changed": new_inst != prev_inst.strip(),
-                "proposer_instruction": new_inst,
-            }
-            self.simba_telemetry.append(entry)
-            self._simba_steps += 1
-            trim_diagnostics(self)
-        except (
-            AdapterParseError,
-            LMError,
-            OSError,
-            RuntimeError,
-            ValueError,
-            TypeError,
-            StopIteration,
-            KeyError,
-            IndexError,
-            AssertionError,
-        ) as exc:
-            logging.getLogger(__name__).warning(
-                "SIMBA inner-worker step skipped (%s: %s)",
-                type(exc).__name__,
-                exc,
-            )
-            return False
+        entry = {
+            "optimizer": "dspy.SIMBA",
+            "target": "worker_module.qwen_proposer",
+            "trainset_size": len(trainset),
+            "bsize": bsize,
+            "num_candidates": self.simba_num_candidates,
+            "max_steps": self.simba_max_steps,
+            "demos_before": prev_demos,
+            "demos_after": len(self.qwen_proposer.demos),
+            "instruction_changed": new_inst != prev_inst.strip(),
+            "proposer_instruction": new_inst,
+        }
+        self.simba_telemetry.append(entry)
+        self._simba_steps += 1
+        trim_diagnostics(self)
         # Persistence failures must reach the caller, rather than look like a
         # successful durable step. SQLite keeps the previous complete snapshot.
         if self.save_simba_state is not None:
@@ -562,7 +540,7 @@ class RLMInstructionProposer:
         component_name: str,
         current_instruction: str,
         component_examples: Sequence[Mapping[str, Any]],
-    ) -> tuple[str, list[dict[str, Any]], Any]:
+    ) -> tuple[str, list[dict[str, Any]]]:
         """Checkpoint validated references, retaining exact training evidence."""
         self.preflight()
         originals = reflection_examples(component_examples)
@@ -595,37 +573,20 @@ class RLMInstructionProposer:
         put = self.checkpoint_put or (lambda key, value: None)
         saved = get("evidence:" + evidence_key)
         if saved is None:
-            fallback = None
-            try:
-                with dspy.context(lm=self.orchestrator_lm or self.worker_lm, trace=[]):
-                    result = self.inner_rlm(current_instruction=current_instruction, examples_with_feedback=originals)
-                selection = checkpoint_object(result.selection, "evidence selection")
-                resolve_evidence(originals, selection, self.max_feedback_examples)
-            except (
-                ValueError,
-                KeyError,
-                TypeError,
-                RuntimeError,
-                IndexError,
-                AdapterParseError,
-                LMError,
-                OSError,
-            ) as exc:
-                fallback = type(exc).__name__
-                selection = deterministic_evidence(originals, self.max_feedback_examples)
-            saved = {"selection": selection, "fallback": fallback}
+            with dspy.context(lm=self.orchestrator_lm or self.worker_lm, trace=[]):
+                result = self.inner_rlm(current_instruction=current_instruction, examples_with_feedback=originals)
+            selection = checkpoint_object(result.selection, "evidence selection")
+            resolve_evidence(originals, selection, self.max_feedback_examples)
+            saved = {"selection": selection}
             put("evidence:" + evidence_key, saved)
         saved = checkpoint_object(saved, "evidence checkpoint")
         selection = checkpoint_object(saved.get("selection"), "evidence selection")
-        fallback = saved.get("fallback")
-        if fallback is not None and not isinstance(fallback, str):
-            raise ValueError("Malformed evidence checkpoint fallback")
         packet = resolve_evidence(originals, selection, self.max_feedback_examples)
         diagnosis = selection.get("diagnosis", "")
         if not isinstance(diagnosis, str):
             raise ValueError("Malformed evidence diagnosis")
         packet.insert(0, {"diagnosis": diagnosis[: scale_context_budget(2000, self.context_window_tokens)]})
-        return evidence_key, packet, fallback
+        return evidence_key, packet
 
     @diagnostic_boundary
     def propose_for_component(
@@ -634,7 +595,7 @@ class RLMInstructionProposer:
         current_instruction: str,
         component_examples: Sequence[Mapping[str, Any]],
     ) -> str:
-        evidence_key, packet, fallback = self.select_evidence(component_name, current_instruction, component_examples)
+        evidence_key, packet = self.select_evidence(component_name, current_instruction, component_examples)
         get = self.checkpoint_get or (lambda key: None)
         put = self.checkpoint_put or (lambda key, value: None)
         key = "proposal:" + reflection_digest(
@@ -673,7 +634,6 @@ class RLMInstructionProposer:
             {
                 "component_name": component_name,
                 "mode": "evidence_native",
-                "fallback": fallback,
                 "evidence_key": evidence_key,
                 "usage": usage,
                 "tokens_used": sum_usage_tokens(usage),
@@ -774,7 +734,7 @@ class RLMInstructionProposer:
             for name in components_to_update:
                 if name not in candidate or not reflective_dataset.get(name):
                     continue
-                _, packet, _ = self.select_evidence(name, candidate[name], reflective_dataset[name])
+                _, packet = self.select_evidence(name, candidate[name], reflective_dataset[name])
                 prepared = self.worker_module.fit_evidence(candidate[name], packet, name)
                 self._simba_examples.append(
                     dspy.Example(

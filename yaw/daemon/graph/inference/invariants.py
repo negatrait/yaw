@@ -1,6 +1,5 @@
 """Closed-world SHACL/SKOS stage invariant validation."""
 
-import copy
 import json
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -450,54 +449,8 @@ def validate_stage_invariants(
     return 1.0, f"PASS [{stage}]"
 
 
-def should_retry_stage_invariants(
-    stage_name: str,
-    pred: Any,
-    effective_lm: Any,
-) -> bool:
-    """Determine if `_invoke_stage` can perform a self-correction retry without exhausting scripted `DummyLM` queues."""
-    if stage_name == "triples":
-        # Stage 2 missing definitions are repaired by Stage 3 (DefineMissingEntities)
-        return False
-    if stage_name == "ner":
-        raw_entities = getattr(pred, "named_entities", None)
-        if (
-            isinstance(raw_entities, (list, tuple))
-            and raw_entities
-            and not any(isinstance(x, (list, tuple, Mapping)) for x in raw_entities)
-        ):
-            return False
-
-    target_lm = effective_lm
-    if target_lm is None:
-        return False
-    answers_it = getattr(target_lm, "answers", None)
-    if answers_it is not None and not isinstance(answers_it, Mapping):
-        try:
-            peek_it = copy.copy(answers_it)
-            next_ans = next(peek_it, None)
-        except TypeError:
-            return False
-        if not isinstance(next_ans, Mapping):
-            return False
-        expected_key_map = {
-            "ner": "named_entities",
-            "entity_definer": "entity_definitions",
-            "synonym_judge": "decisions",
-            "shacl_repair": "repairs",
-            "triple_filter": "fact",
-            "query_intent": "query_intent",
-            "qa": "answer",
-        }
-        exp_key = expected_key_map.get(stage_name)
-        if exp_key and exp_key not in next_ans:
-            return False
-    return True
-
-
 __all__ = [
     "STAGE_SCHEMA_CONTRACTS",
     "is_abstaining_answer",
-    "should_retry_stage_invariants",
     "validate_stage_invariants",
 ]

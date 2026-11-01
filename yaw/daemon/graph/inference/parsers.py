@@ -230,39 +230,6 @@ def filter_invalid_triples(triples: Sequence[Any]) -> list[list[str]]:
     return valid_triples
 
 
-def repair_truncated_json(response: str, *, is_triples: bool = False) -> str:
-    """String-aware bracket depth scanner to repair JSON responses truncated by max tokens."""
-    try:
-        json.loads(response)
-        return response
-    except ValueError, TypeError:
-        pass
-
-    depth, in_str, esc, last_end = 0, False, False, -1
-    for i, ch in enumerate(response):
-        if in_str:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_str = False
-                if not is_triples and depth == 2:
-                    last_end = i + 1
-        elif ch == '"':
-            in_str = True
-        elif ch in "{[":
-            depth += 1
-        elif ch in "}]":
-            if depth == 3 and ch in "]}":
-                last_end = i + 1
-            depth -= 1
-
-    if last_end == -1:
-        return '{"triples": []}' if is_triples else '{"named_entities": []}'
-    return response[:last_end] + "]}"
-
-
 def _extract_json_list_field(response: str, field_name: str) -> list[Any]:
     """Scan a response string for the first JSON object containing `field_name` as a list."""
     decoder = json.JSONDecoder()
@@ -316,18 +283,9 @@ DefineMissingEntities output, or {name: definition} mappings."""
                 raw_list = _extract_json_list_field(raw_input, "entity_definitions")
             except ValueError:
                 bare = _parse_bare_json_list(raw_input)
-                if bare is not None:
-                    raw_list = bare
-                else:
-                    repaired = repair_truncated_json(raw_input, is_triples=False)
-                    try:
-                        raw_list = _extract_json_list_field(repaired, "named_entities")
-                    except ValueError:
-                        try:
-                            raw_list = _extract_json_list_field(repaired, "entity_definitions")
-                        except ValueError:
-                            bare_repaired = _parse_bare_json_list(repaired)
-                            raw_list = bare_repaired if bare_repaired is not None else ()
+                if bare is None:
+                    raise
+                raw_list = bare
     elif isinstance(raw_input, Mapping):
         if "named_entities" in raw_input or "entity_definitions" in raw_input:
             if "named_entities" in raw_input and isinstance(raw_input["named_entities"], list):
@@ -437,15 +395,10 @@ def extract_structured_triples(
         try:
             raw_list = _extract_json_list_field(raw_input, "triples")
         except ValueError:
-            repaired = repair_truncated_json(raw_input, is_triples=True)
-            try:
-                raw_list = _extract_json_list_field(repaired, "triples")
-            except ValueError:
-                try:
-                    loaded = json.loads(raw_input)
-                    raw_list = loaded if isinstance(loaded, list) else []
-                except Exception:
-                    raw_list = []
+            loaded = json.loads(raw_input)
+            if not isinstance(loaded, list):
+                raise
+            raw_list = loaded
     elif isinstance(raw_input, dict) and "triples" in raw_input and isinstance(raw_input["triples"], list):
         raw_list = raw_input["triples"]
     elif isinstance(raw_input, Sequence):
@@ -502,15 +455,7 @@ def extract_structured_triples(
 
 def extract_triples(response: str) -> tuple[tuple[str, str, str], ...]:
     """Extract, validate, and deduplicate relation triples from LLM response."""
-    try:
-        raw_list = _extract_json_list_field(response, "triples")
-    except ValueError:
-        repaired = repair_truncated_json(response, is_triples=True)
-        try:
-            raw_list = _extract_json_list_field(repaired, "triples")
-        except ValueError:
-            return ()
-
+    raw_list = _extract_json_list_field(response, "triples")
     filtered = filter_invalid_triples(raw_list)
     return tuple((t[0], t[1], t[2]) for t in filtered)
 
@@ -774,11 +719,10 @@ def parse_synonym_decisions(
         try:
             items = _extract_json_list_field(raw_output, "decisions")
         except ValueError:
-            try:
-                loaded = json.loads(raw_output)
-                items = loaded if isinstance(loaded, list) else ()
-            except Exception:
-                items = ()
+            loaded = json.loads(raw_output)
+            if not isinstance(loaded, list):
+                raise
+            items = loaded
     elif isinstance(raw_output, Sequence):
         items = raw_output
 
@@ -818,11 +762,10 @@ def parse_shacl_repairs(raw_output: Any) -> list[dict[str, str]]:
         try:
             items = _extract_json_list_field(raw_output, "repairs")
         except ValueError:
-            try:
-                loaded = json.loads(raw_output)
-                items = loaded if isinstance(loaded, list) else ()
-            except Exception:
-                items = ()
+            loaded = json.loads(raw_output)
+            if not isinstance(loaded, list):
+                raise
+            items = loaded
     elif isinstance(raw_output, Sequence):
         items = raw_output
 
@@ -876,35 +819,11 @@ def evaluate_benchmark_gate(
     mode: Literal["eval", "retrieval"] = "eval",
     target: str | None = None,
 ) -> dict[str, Any]:
-    """Evaluate per-dataset benchmark reports against a benchmark_gate.json specification."""
-    aliases: dict[str, str] = {
-        "nq_rear": "nq",
-        "naturalquestions": "nq",
-        "2wiki": "2wikimultihopqa",
-        "hotpot": "hotpotqa",
-        "narrative": "narrativeqa",
-        "narrativeqa_dev_10_doc": "narrativeqa",
-        "enterprise": "enterprise_rag_bench",
-        "popqa": "popqa",
-        "lveval": "lveval",
-        "narrativeqa": "narrativeqa",
-        "2wikimultihopqa": "2wikimultihopqa",
-        "hotpotqa": "hotpotqa",
-        "nq": "nq",
-        "musique": "musique",
-        "sample": "sample",
-        "case_study_university": "case_study_university",
-        "enterprise_rag_bench": "enterprise_rag_bench",
-    }
-    raw_aliases = gate_spec.get("aliases")
-    if isinstance(raw_aliases, Mapping):
-        for ak, av in raw_aliases.items():
-            aliases[str(ak).strip().lower()] = str(av).strip()
-
+    """Evaluate per-dataset benchmark reports against a baselines.json specification."""
     effective_mode = str(mode or gate_spec.get("mode", "eval")).strip().lower()
     tolerance = float(gate_spec.get("per_dataset_tolerance", gate_spec.get("tolerance", 0.0)))
     primary_target = str(target or gate_spec.get("primary_target", "monkeypatched_hipporag"))
-    spec_datasets = gate_spec.get("datasets", {})
+    spec_datasets = gate_spec.get("baselines", gate_spec.get("datasets", {}))
     if not isinstance(spec_datasets, Mapping):
         spec_datasets = {}
     targets_map = gate_spec.get("targets", {})
@@ -929,9 +848,7 @@ def evaluate_benchmark_gate(
             continue
         raw_stripped = str(raw_name).strip()
         cleaned = raw_stripped.lower()
-        if cleaned in aliases:
-            canonical = aliases[cleaned]
-        elif cleaned in spec_datasets or cleaned in target_datasets or raw_stripped == cleaned:
+        if cleaned in spec_datasets or cleaned in target_datasets or raw_stripped == cleaned:
             canonical = cleaned
         else:
             canonical = raw_stripped
@@ -969,10 +886,25 @@ def evaluate_benchmark_gate(
         yaw_f1_explicit_none = isinstance(qa_block, Mapping) and "F1" in qa_block and yaw_f1_raw is None
         yaw_em_opt = round(float(yaw_em_raw), 4) if yaw_em_raw is not None else None
         yaw_f1_opt = round(float(yaw_f1_raw), 4) if yaw_f1_raw is not None else None
-        yaw_metrics = {
-            "Recall@1": round(float(ret_block.get("Recall@1", 0.0) or 0.0), 4),
-            "Recall@2": round(float(ret_block.get("Recall@2", 0.0) or 0.0), 4),
-            "Recall@5": round(float(ret_block.get("Recall@5", 0.0) or 0.0), 4),
+        yaw_r1 = (
+            round(float(rv), 4)
+            if isinstance(ret_block, Mapping) and (rv := ret_block.get("Recall@1")) is not None
+            else None
+        )
+        yaw_r2 = (
+            round(float(rv), 4)
+            if isinstance(ret_block, Mapping) and (rv := ret_block.get("Recall@2")) is not None
+            else None
+        )
+        yaw_r5 = (
+            round(float(rv), 4)
+            if isinstance(ret_block, Mapping) and (rv := ret_block.get("Recall@5")) is not None
+            else None
+        )
+        yaw_metrics: dict[str, float | None] = {
+            "Recall@1": yaw_r1,
+            "Recall@2": yaw_r2,
+            "Recall@5": yaw_r5,
             "ExactMatch": yaw_em_opt if yaw_em_opt is not None else 0.0,
             "F1": yaw_f1_opt if yaw_f1_opt is not None else 0.0,
         }
@@ -988,7 +920,6 @@ def evaluate_benchmark_gate(
             or spec_datasets.get(raw_stripped)
             or spec_datasets_lower.get(canonical.lower())
             or spec_datasets_lower.get(cleaned)
-            or (spec_datasets.get("nq_rear") if canonical == "nq" else None)
             or target_datasets.get(canonical)
             or target_datasets.get(cleaned)
             or target_datasets.get(raw_stripped)
@@ -1002,7 +933,7 @@ def evaluate_benchmark_gate(
         base_block = ds_spec.get(primary_target, ds_spec.get("monkeypatched_hipporag", ds_spec))
         if not isinstance(base_block, Mapping):
             base_block = {}
-        paper_block = ds_spec.get("paper_70b", {})
+        paper_block = ds_spec.get("hipporag2_llama3.3_70b_nvembed_v2", ds_spec.get("paper_70b", {}))
         if not isinstance(paper_block, Mapping):
             paper_block = {}
         elif isinstance(paper_block.get("hipporag2_llama3.3_70b_nvembed_v2"), Mapping):
@@ -1024,16 +955,20 @@ def evaluate_benchmark_gate(
             for k in ("Recall@2", "Recall@5", "ExactMatch", "F1")
         }
 
-        delta_vs_hippo = {
-            k: round(yaw_metrics[k] - hippo_metrics[k], 4)
+        delta_vs_hippo: dict[str, float | None] = {
+            k: (round(yv - hippo_metrics[k], 4) if (yv := yaw_metrics[k]) is not None else None)
             for k in ("Recall@1", "Recall@2", "Recall@5", "ExactMatch", "F1")
         }
         delta_vs_paper = {
             "Recall@2": (
-                round(yaw_metrics["Recall@2"] - pv, 4) if (pv := paper_metrics["Recall@2"]) is not None else None
+                round(yv - pv, 4)
+                if (yv := yaw_metrics["Recall@2"]) is not None and (pv := paper_metrics["Recall@2"]) is not None
+                else None
             ),
             "Recall@5": (
-                round(yaw_metrics["Recall@5"] - pv, 4) if (pv := paper_metrics["Recall@5"]) is not None else None
+                round(yv - pv, 4)
+                if (yv := yaw_metrics["Recall@5"]) is not None and (pv := paper_metrics["Recall@5"]) is not None
+                else None
             ),
             "ExactMatch": (
                 round(yaw_em_opt - pv, 4)
@@ -1046,7 +981,10 @@ def evaluate_benchmark_gate(
                 else None
             ),
         }
-        delta_vs_dpr = {k: round(yaw_metrics[k] - dpr_metrics[k], 4) for k in ("Recall@1", "Recall@2", "Recall@5")}
+        delta_vs_dpr = {
+            k: (round(yv - dpr_metrics[k], 4) if (yv := yaw_metrics[k]) is not None else None)
+            for k in ("Recall@1", "Recall@2", "Recall@5")
+        }
 
         eval_em_enforced = base_em_opt is not None and not yaw_em_explicit_none
         eval_f1_enforced = base_f1_opt is not None and not yaw_f1_explicit_none
@@ -1065,17 +1003,13 @@ def evaluate_benchmark_gate(
             int_errors = integrity.get("errors", [])
             failures.append(f"Integrity gate failed: {int_errors}")
 
-        if delta_vs_hippo["Recall@5"] < tolerance - 1e-9:
-            failures.append(
-                f"Recall@5 delta vs historical HippoRAG ({delta_vs_hippo['Recall@5']:+.4f}) < {tolerance:+.2f}"
-            )
+        if (d_r5 := delta_vs_hippo["Recall@5"]) is not None and d_r5 < tolerance - 1e-9:
+            failures.append(f"Recall@5 delta vs historical HippoRAG ({d_r5:+.4f}) < {tolerance:+.2f}")
         if effective_mode == "eval":
-            if eval_f1_enforced and delta_vs_hippo["F1"] < tolerance - 1e-9:
-                failures.append(f"QA F1 delta vs historical HippoRAG ({delta_vs_hippo['F1']:+.4f}) < {tolerance:+.2f}")
-            if eval_em_enforced and delta_vs_hippo["ExactMatch"] < tolerance - 1e-9:
-                failures.append(
-                    f"ExactMatch delta vs historical HippoRAG ({delta_vs_hippo['ExactMatch']:+.4f}) < {tolerance:+.2f}"
-                )
+            if eval_f1_enforced and (d_f1 := delta_vs_hippo["F1"]) is not None and d_f1 < tolerance - 1e-9:
+                failures.append(f"QA F1 delta vs historical HippoRAG ({d_f1:+.4f}) < {tolerance:+.2f}")
+            if eval_em_enforced and (d_em := delta_vs_hippo["ExactMatch"]) is not None and d_em < tolerance - 1e-9:
+                failures.append(f"ExactMatch delta vs historical HippoRAG ({d_em:+.4f}) < {tolerance:+.2f}")
 
         raw_q = rep.get("num_queries") or rep.get("queries_count")
         if raw_q is None:
@@ -1104,7 +1038,7 @@ def evaluate_benchmark_gate(
         )
 
         ds_confidence = {
-            k: _compute_metric_confidence(yaw_metrics[k], hippo_metrics[k], n_queries)
+            k: _compute_metric_confidence(float(yaw_metrics[k] or 0.0), hippo_metrics[k], n_queries)
             for k in ("Recall@5", "ExactMatch", "F1")
         }
 
@@ -1397,6 +1331,5 @@ __all__ = [
     "normalize_answer",
     "parse_shacl_repairs",
     "parse_synonym_decisions",
-    "repair_truncated_json",
     "text_processing",
 ]

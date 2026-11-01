@@ -1,5 +1,6 @@
 """Single-owner persistent daemon runtime with FileLock, 32-slot bounded queue, and crash-resilient CocoIndex sync."""
 
+import asyncio
 import contextlib
 import hashlib
 import importlib.metadata
@@ -18,14 +19,13 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, ClassVar, Literal, TypeVar
 
+import cocoindex as coco
 import filelock
 
 from yaw.core import (
-    ChunkPointer,
     DaemonStatus,
     HydratedPassage,
     IndexStats,
-    SyncDelta,
     YawConfig,
     YawRuntimeError,
     configure_logging,
@@ -40,22 +40,38 @@ from yaw.daemon.graph.inference import (
     compute_retrieval_recalls,
     create_dspy_rlm_pair,
     evaluate_benchmark_gate,
+    openie_fingerprint,
+    shacl_fingerprint,
+    synonym_fingerprint,
+)
+from yaw.daemon.graph.inference.components import (
+    EMBEDDING_ENDPOINT,
+    OPENIE_ENDPOINT,
+    EmbeddingEndpoint,
+    OpenIEEndpoint,
+)
+from yaw.daemon.graph.planner import GraphPlanSettings
+from yaw.daemon.graph.storage.publication import GRAPH_DB
+from yaw.daemon.indexing import (
+    RELOAD_SIGNAL_HANDLER,
+    RELOAD_SIGNAL_ROOT,
+    InferenceIdentity,
+    SyncOutcome,
+    get_graph_delta_coordinator,
+    indexing_app_main,
 )
 from yaw.daemon.ingestion import (
     DEFAULT_PARITY_DATASETS,
-    MONKEYPATCHED_HIPPORAG_BASELINES,
-    PAPER_BASELINES,
-    CorpusIngestor,
     DatasetBundle,
     build_benchmark_slice,
     resolve_dataset_bundle,
     snapshot_dataset_bundle,
 )
+from yaw.daemon.ingestion.source_targets import SOURCE_DB, SOURCE_ROOT, SourceSettings
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
-_PENDING_DELTA_META_KEY = "pending_sync_delta"
 _CONFIG_FP_META_KEY = "config_fingerprint"
 
 if os.name == "nt":
@@ -106,23 +122,6 @@ class _WorkItem:
     progress_callback: Callable[[str], None] | None = None
 
 
-def _serialize_sync_delta(delta: SyncDelta) -> str:
-    return json.dumps(
-        {
-            "added_chunks": [[asdict(ptr), text] for ptr, text in delta.added_chunks],
-            "deleted_chunk_ids": list(delta.deleted_chunk_ids),
-        },
-        ensure_ascii=False,
-    )
-
-
-def _deserialize_sync_delta(raw: str) -> SyncDelta:
-    data = json.loads(raw)
-    added = tuple((ChunkPointer(**ptr_dict), str(text)) for ptr_dict, text in data.get("added_chunks", ()))
-    deleted = tuple(str(cid) for cid in data.get("deleted_chunk_ids", ()))
-    return SyncDelta(added_chunks=added, deleted_chunk_ids=deleted)
-
-
 def validate_query_input(text: str) -> str:
     """Validate and trim a query/question input (non-empty, <= 1024 UTF-8 bytes)."""
     if not isinstance(text, str):
@@ -163,14 +162,16 @@ class YawRuntime:
         self._stop_event = threading.Event()
         self._has_started = False
         self._worker_thread: threading.Thread | None = None
-        self._poller_thread: threading.Thread | None = None
         self._win32_stop_handle: int | None = None
         self._win32_waiter_thread: threading.Thread | None = None
 
-        self._pending_sync_future: Future[SyncDelta] | None = None
+        self._pending_sync_future: Future[SyncOutcome] | None = None
         self._pending_scan_id: str | None = None
 
-        self.ingestor: CorpusIngestor | None = None
+        self._coco_env: coco.Environment | None = None
+        self._coco_app: coco.App[..., Any] | None = None
+        self._openie_endpoint: OpenIEEndpoint | None = None
+        self._embedding_endpoint: EmbeddingEndpoint | None = None
         self.engine: YawGraphEngine | None = None
 
         self._stats = IndexStats(config_fingerprint=self.config.config_fingerprint())
@@ -218,6 +219,111 @@ class YawRuntime:
         """Block until the runtime is signaled to stop or timeout expires."""
         return self._stop_event.wait(timeout=timeout)
 
+    def _on_reload_signal(self, raw: str) -> None:
+        assert self.config.workspace_root is not None
+        yaw_dir = (self.config.workspace_root / ".yaw").resolve()
+        signal_file = yaw_dir / "reload.signal"
+        result_file = yaw_dir / "reload.result"
+        if not raw.strip():
+            return
+        req_id: Any = None
+        try:
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise ValueError("Reload signal payload must be a JSON object")
+            req_id = data.get("req_id")
+            prog_path = data.get("program_path")
+            if not prog_path:
+                return
+            res = self.reload_program(prog_path)
+            res["req_id"] = req_id
+            write_text_atomic(result_file, json.dumps(res, indent=2))
+        except Exception as exc:
+            err_payload = {
+                "reloaded": False,
+                "req_id": req_id,
+                "error": str(exc),
+                "pid": os.getpid(),
+            }
+            write_text_atomic(result_file, json.dumps(err_payload, indent=2))
+        finally:
+            with contextlib.suppress(OSError):
+                signal_file.unlink(missing_ok=True)
+
+    def _build_coco_app(self) -> None:
+        assert self.engine is not None
+        assert self.config.corpus_root is not None
+        assert self.config.state_dir is not None
+        assert self.config.workspace_root is not None
+        if self._coco_env is not None:
+            with contextlib.suppress(OSError, RuntimeError):
+                self._coco_env.close()
+            self._coco_env = None
+            self._coco_app = None
+
+        program = self.engine.program
+        embedder = self.engine.embedder
+        prog_id = openie_fingerprint(program)
+        emb_id = str(embedder.profile.index_identity)
+        syn_id = synonym_fingerprint(program)
+        shacl_id = shacl_fingerprint(program)
+        lm = getattr(program, "orchestrator_lm", None) or getattr(program, "rlm_sub_lm", None)
+
+        yaw_dir = (self.config.workspace_root / ".yaw").resolve()
+        yaw_dir.mkdir(parents=True, exist_ok=True)
+
+        self._embedding_endpoint = EmbeddingEndpoint(embedder, asyncio.Semaphore(4))
+        self._openie_endpoint = OpenIEEndpoint(program, lm, prog_id, asyncio.Semaphore(1))
+
+        context = coco.ContextProvider()
+        context.provide(SOURCE_DB, self.engine.managed_conn)
+        context.provide(GRAPH_DB, self.engine.managed_conn)
+        context.provide(SOURCE_ROOT, Path(self.config.corpus_root).resolve())
+        context.provide(EMBEDDING_ENDPOINT, self._embedding_endpoint)
+        context.provide(OPENIE_ENDPOINT, self._openie_endpoint)
+        context.provide(RELOAD_SIGNAL_ROOT, yaw_dir)
+        context.provide(RELOAD_SIGNAL_HANDLER, self._on_reload_signal)
+
+        state_dir = Path(self.config.state_dir).resolve() / "indexing_coco"
+        self._coco_env = coco.Environment(
+            settings=coco.Settings.from_env(state_dir),
+            context_provider=context,
+        )
+        src_settings = SourceSettings(
+            included_patterns=tuple(self.config.included_patterns),
+            excluded_patterns=tuple(self.config.excluded_patterns),
+            json_keys_whitelist=tuple(self.config.json_keys_whitelist),
+            json_keys_blacklist=tuple(self.config.json_keys_blacklist),
+            chunk_size=self.config.chunk_size,
+            chunk_overlap=self.config.chunk_overlap,
+            min_chunk_size=self.config.min_chunk_size,
+        )
+        graph_settings = GraphPlanSettings(
+            corpus_root=Path(self.config.corpus_root).resolve(),
+            program_identity=prog_id,
+            embedding_identity=emb_id,
+            synonym_identity=syn_id,
+            shacl_identity=shacl_id,
+            same_sense_cosine_gate=self.engine.same_sense_cosine_gate,
+            synonymy_threshold=self.config.synonymy_threshold,
+            synonymy_top_k=self.config.synonymy_top_k,
+            datatype_property_weight=0.5,
+            ast_context_hops=self.config.ast_context_hops,
+            context_window_tokens=self.config.context_window_tokens,
+            max_output_tokens=self.config.max_output_tokens,
+            chunk_size=self.config.chunk_size,
+            chunk_overlap=self.config.chunk_overlap,
+            min_chunk_size=self.config.min_chunk_size,
+        )
+        self._coco_app = coco.App(
+            coco.AppConfig(name="yaw_indexing", environment=self._coco_env, max_inflight_components=4),
+            indexing_app_main,
+            src_settings,
+            InferenceIdentity(program=prog_id, embedding=emb_id),
+            graph_settings,
+            self.auto_poll,
+        )
+
     def _open_components(self) -> None:
         assert self.config.corpus_root is not None
         assert self.config.state_dir is not None
@@ -253,18 +359,7 @@ class YawRuntime:
             ast_context_hops=self.config.ast_context_hops,
         )
         self.engine.config = self.config
-        self.ingestor = CorpusIngestor(
-            corpus_root=self.config.corpus_root,
-            state_dir=self.config.state_dir,
-            included_patterns=self.config.included_patterns,
-            excluded_patterns=self.config.excluded_patterns,
-            json_keys_whitelist=self.config.json_keys_whitelist,
-            json_keys_blacklist=self.config.json_keys_blacklist,
-            chunk_size=self.config.chunk_size,
-            chunk_overlap=self.config.chunk_overlap,
-            min_chunk_size=self.config.min_chunk_size,
-            on_delta=self._apply_delta,
-        )
+        self._build_coco_app()
         fp = self.config.config_fingerprint()
         self.engine.set_meta(_CONFIG_FP_META_KEY, fp)
         stats = self.engine.get_stats(fp)
@@ -272,10 +367,13 @@ class YawRuntime:
             self._stats = stats
 
     def _close_components(self) -> None:
-        if self.ingestor is not None:
+        if self._coco_env is not None:
             with contextlib.suppress(OSError, RuntimeError):
-                self.ingestor.close()
-            self.ingestor = None
+                self._coco_env.close()
+            self._coco_env = None
+            self._coco_app = None
+        self._openie_endpoint = None
+        self._embedding_endpoint = None
         if self.engine is not None:
             with contextlib.suppress(OSError, sqlite3.Error, RuntimeError):
                 self.engine.close()
@@ -349,7 +447,7 @@ class YawRuntime:
     def start(self, *, sync_on_start: bool = True) -> None:
         """Acquire exclusive yaw.db.lock, open CocoIndex + YawGraphEngine, and start worker thread."""
         with self._state_lock:
-            if self._status.lifecycle in ("starting", "ready", "degraded"):
+            if self._status.lifecycle in ("starting", "ready"):
                 return
 
         try:
@@ -387,8 +485,7 @@ class YawRuntime:
             )
             self._worker_thread.start()
 
-            has_pending = self.engine is not None and self.engine.get_meta(_PENDING_DELTA_META_KEY) is not None
-            if (sync_on_start or has_pending) and not self._stop_event.is_set():
+            if sync_on_start and not self._stop_event.is_set():
                 try:
                     self.sync_now()
                 except YawRuntimeError as err:
@@ -400,14 +497,6 @@ class YawRuntime:
             if self._stop_event.is_set():
                 self.stop()
                 return
-
-            if self.auto_poll and self.config.poll_interval_seconds > 0 and not self._stop_event.is_set():
-                self._poller_thread = threading.Thread(
-                    target=self._poll_loop,
-                    name="yaw-runtime-poller",
-                    daemon=True,
-                )
-                self._poller_thread.start()
         except Exception:
             self._close_win32_stop_event()
             if self.config.lock_path is not None:
@@ -419,7 +508,7 @@ class YawRuntime:
             raise
 
     def stop(self) -> None:
-        """Gracefully stop poller and worker threads, close databases, and release yaw.db.lock."""
+        """Gracefully stop live CocoIndex stream and worker thread, close databases, and release yaw.db.lock."""
         self._stop_event.set()
         if self.config.lock_path is not None:
             with self._active_lock:
@@ -444,10 +533,6 @@ class YawRuntime:
 
         self._stop_event.set()
         self._close_win32_stop_event()
-
-        if self._poller_thread is not None and self._poller_thread.is_alive():
-            self._poller_thread.join(timeout=2.0)
-        self._poller_thread = None
 
         # Cancel queued items that have not started yet
         while True:
@@ -542,47 +627,6 @@ class YawRuntime:
         self._update_state()
         return fut
 
-    def _poll_loop(self) -> None:
-        poll_interval = max(0.05, float(self.config.poll_interval_seconds))
-        last_sync_check = time.monotonic()
-        assert self.config.workspace_root is not None
-        yaw_dir = (self.config.workspace_root / ".yaw").resolve()
-        signal_file = yaw_dir / "reload.signal"
-        result_file = yaw_dir / "reload.result"
-
-        while not self._stop_event.is_set():
-            if signal_file.exists():
-                with contextlib.suppress(Exception):
-                    raw = signal_file.read_text(encoding="utf-8")
-                    data = json.loads(raw) if raw.strip() else {}
-                    prog_path = data.get("program_path")
-                    req_id = data.get("req_id")
-                    if prog_path:
-                        try:
-                            res = self.reload_program(prog_path)
-                            res["req_id"] = req_id
-                            result_file.write_text(json.dumps(res, indent=2), encoding="utf-8")
-                        except Exception as exc:
-                            err_payload = {
-                                "reloaded": False,
-                                "req_id": req_id,
-                                "error": str(exc),
-                                "pid": os.getpid(),
-                            }
-                            result_file.write_text(json.dumps(err_payload, indent=2), encoding="utf-8")
-                        finally:
-                            with contextlib.suppress(OSError):
-                                signal_file.unlink(missing_ok=True)
-
-            now = time.monotonic()
-            if now - last_sync_check >= poll_interval:
-                last_sync_check = now
-                with contextlib.suppress(YawRuntimeError):
-                    self.request_sync()
-
-            if self._stop_event.wait(0.2):
-                break
-
     def _worker_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
@@ -609,7 +653,7 @@ class YawRuntime:
             except YawRuntimeError as err:
                 if err.code == "MODEL_ERROR":
                     self._update_state(
-                        lifecycle="degraded",
+                        lifecycle="ready",
                         provider_ready=False,
                         sync_state="error" if item.op_name == "sync" else "idle",
                         active_op=None,
@@ -625,7 +669,7 @@ class YawRuntime:
                 )
                 wrapped = YawRuntimeError(err_code, msg)
                 self._update_state(
-                    lifecycle="degraded" if err_code == "MODEL_ERROR" else self._status.lifecycle,
+                    lifecycle="ready" if err_code == "MODEL_ERROR" else self._status.lifecycle,
                     provider_ready=err_code != "MODEL_ERROR",
                     sync_state="error" if item.op_name == "sync" else "idle",
                     active_op=None,
@@ -659,57 +703,47 @@ class YawRuntime:
                 )
             self._queue.task_done()
 
-    def _apply_delta(
-        self,
-        delta: SyncDelta,
-        *,
-        progress_callback: Callable[[str], None] | None = None,
-    ) -> None:
-        assert self.engine is not None
-        if not delta.deleted_chunk_ids and not delta.added_chunks:
-            return
-        cb = progress_callback
-        if cb is None:
+    def _execute_sync_worker(self) -> SyncOutcome:
+        if self._coco_app is None or self.engine is None:
+            raise YawRuntimeError("NOT_READY", "Engine or CocoIndex app is not initialized.")
 
-            def _default_sync_progress(msg: str) -> None:
-                self._update_state(active_op=msg, sync_state="syncing")
+        self._update_state(active_op="syncing corpus via CocoIndex", sync_state="syncing")
+        coordinator = get_graph_delta_coordinator(self.engine.managed_conn)
+        coordinator.pop_error()
 
-            cb = _default_sync_progress
-        self.engine.set_meta(_PENDING_DELTA_META_KEY, _serialize_sync_delta(delta))
-        if delta.deleted_chunk_ids:
-            self.engine.delete_chunks(delta.deleted_chunk_ids)
-        if delta.added_chunks:
-            self.engine.index_chunks(delta.added_chunks, progress_callback=cb)
-        self.engine.set_meta(_PENDING_DELTA_META_KEY, None)
+        with self.engine._lock:
+            before_cids = {str(r[0]) for r in self.engine.conn.execute("SELECT chunk_id FROM chunks").fetchall()}
 
-    def _execute_sync_worker(self) -> SyncDelta:
-        if self.ingestor is None or self.engine is None:
-            raise YawRuntimeError("NOT_READY", "Engine or ingestor is not initialized.")
+        async def _run_coco_update(app: coco.App[..., Any]) -> coco.UpdateStats | None:
+            handle = app.update()
+            await handle.result()
+            return handle.stats()
 
-        def _sync_progress(msg: str) -> None:
-            self._update_state(active_op=msg, sync_state="syncing")
+        update_stats = asyncio.run(_run_coco_update(self._coco_app))
 
-        # 1. Replay any uncommitted pending delta before polling CocoIndex
-        raw_pending = self.engine.get_meta(_PENDING_DELTA_META_KEY)
-        if raw_pending:
-            pending_delta = _deserialize_sync_delta(raw_pending)
-            self._apply_delta(pending_delta, progress_callback=_sync_progress)
-        else:
-            pending_delta = None
+        err = coordinator.pop_error()
+        if err is not None:
+            raise err
+        if update_stats is not None and update_stats.total.num_errors > 0:
+            raise YawRuntimeError(
+                "CONSISTENCY_ERROR",
+                f"CocoIndex update failed with {update_stats.total.num_errors} component error(s).",
+            )
 
-        # 2. Poll CocoIndex for subsequent corpus changes (compiled inside target sink before LMDB commit)
-        _sync_progress("polling CocoIndex for corpus changes")
-        polled_delta = self.ingestor.poll()
-        if getattr(self.ingestor, "on_delta", getattr(self.ingestor, "_on_delta", None)) is None:
-            self._apply_delta(polled_delta, progress_callback=_sync_progress)
+        with self.engine._lock:
+            after_cids = {str(r[0]) for r in self.engine.conn.execute("SELECT chunk_id FROM chunks").fetchall()}
+            self.engine._csr_graph = None
+            self.engine._query_retrieval_memo.clear()
+            self.engine._last_memo_question = None
+            self.engine._hydrate_indexed_cids_from_db()
 
         new_stats = self.engine.get_stats(self.config.config_fingerprint())
         with self._state_lock:
             self._stats = new_stats
 
-        if polled_delta.added_chunks or polled_delta.deleted_chunk_ids or pending_delta is None:
-            return polled_delta
-        return pending_delta
+        added = tuple(sorted(after_cids - before_cids))
+        deleted = tuple(sorted(before_cids - after_cids))
+        return SyncOutcome(added_chunks=added, deleted_chunk_ids=deleted)
 
     def request_sync(
         self,
@@ -738,8 +772,8 @@ class YawRuntime:
         self,
         *,
         progress_callback: Callable[[str], None] | None = None,
-    ) -> SyncDelta:
-        """Run or await a CocoIndex incremental sync and return the applied SyncDelta."""
+    ) -> SyncOutcome:
+        """Run or await a CocoIndex incremental sync and return the applied SyncOutcome."""
         with self._state_lock:
             existing_fut = (
                 self._pending_sync_future
@@ -994,7 +1028,7 @@ class YawRuntime:
             for k, v in asdict(self.config).items()
             if not k.endswith(("_path", "_dir", "_root"))
             and not k.startswith(("optimize_", "http_"))
-            and k not in {"api_key", "poll_interval_seconds", "queue_maxsize", "indexing_overlap"}
+            and k not in {"api_key", "poll_interval_seconds", "queue_maxsize"}
         }
         settings.update(
             max_bootstrapped_demos=self.config.optimize_max_bootstrapped_demos,
@@ -1002,6 +1036,7 @@ class YawRuntime:
         )
         daemon_dir = Path(__file__).parent
         source_paths = sorted((daemon_dir / "graph").rglob("*.py"))
+        source_paths.append(daemon_dir / "indexing.py")
         source_paths.append(daemon_dir / "ingestion" / "corpus.py")
         identity = {
             "version": 1,
@@ -1096,8 +1131,27 @@ class YawRuntime:
         def _run_reload() -> dict[str, Any]:
             if self.engine is None:
                 raise YawRuntimeError("NOT_READY", "Graph engine is not initialized.")
+            old_prog_id = openie_fingerprint(self.engine.program)
+            old_emb_id = str(self.engine.embedder.profile.index_identity)
+            old_syn_id = synonym_fingerprint(self.engine.program)
+            old_shacl_id = shacl_fingerprint(self.engine.program)
             self.engine.program.load(str(p))
             self.engine.refresh_program_bindings()
+            new_prog_id = openie_fingerprint(self.engine.program)
+            new_emb_id = str(self.engine.embedder.profile.index_identity)
+            new_syn_id = synonym_fingerprint(self.engine.program)
+            new_shacl_id = shacl_fingerprint(self.engine.program)
+            if self._openie_endpoint is not None:
+                self._openie_endpoint.program_identity = new_prog_id
+            if self._embedding_endpoint is not None:
+                self._embedding_endpoint.adapter = self.engine.embedder
+            if (old_prog_id, old_emb_id, old_syn_id, old_shacl_id) != (
+                new_prog_id,
+                new_emb_id,
+                new_syn_id,
+                new_shacl_id,
+            ):
+                self._build_coco_app()
             self._update_state()
             return {
                 "reloaded": True,
@@ -1151,7 +1205,9 @@ class YawRuntime:
                 for item in datasets:
                     raw_datasets.extend(p.strip() for p in str(item).split(",") if p.strip())
         if not raw_datasets:
-            if gate_spec and isinstance(gate_spec.get("datasets"), dict) and gate_spec["datasets"]:
+            if gate_spec and isinstance(gate_spec.get("baselines"), dict) and gate_spec["baselines"]:
+                raw_datasets = list(DEFAULT_PARITY_DATASETS)
+            elif gate_spec and isinstance(gate_spec.get("datasets"), dict) and gate_spec["datasets"]:
                 raw_datasets = list(gate_spec["datasets"].keys())
             else:
                 raw_datasets = list(DEFAULT_PARITY_DATASETS)
@@ -1279,7 +1335,6 @@ class YawRuntime:
                 bench_records: list[dict[str, Any]] = []
 
                 for q_idx, q in enumerate(queries):
-                    g_docs = gold_docs[q_idx] if q_idx < len(gold_docs) else []
                     g_ans = gold_answers[q_idx] if q_idx < len(gold_answers) else []
                     ens_pred = bench_engine.ensemble(
                         question=q,
@@ -1299,14 +1354,16 @@ class YawRuntime:
                     ret_texts = [t for _, _, t in hits]
                     dpr_texts = [t for _, _, t in dpr_hits]
 
-                    h_rec = compute_retrieval_recalls(g_docs, ret_texts, k_list=(1, 2, 5))
-                    d_rec = compute_retrieval_recalls(g_docs, dpr_texts, k_list=(1, 2, 5))
-                    hippo_r1 += h_rec.get(1, 0.0)
-                    hippo_r2 += h_rec.get(2, 0.0)
-                    hippo_r5 += h_rec.get(5, 0.0)
-                    dpr_r1 += d_rec.get(1, 0.0)
-                    dpr_r2 += d_rec.get(2, 0.0)
-                    dpr_r5 += d_rec.get(5, 0.0)
+                    if gold_docs is not None:
+                        g_docs = gold_docs[q_idx] if q_idx < len(gold_docs) else []
+                        h_rec = compute_retrieval_recalls(g_docs, ret_texts, k_list=(1, 2, 5))
+                        d_rec = compute_retrieval_recalls(g_docs, dpr_texts, k_list=(1, 2, 5))
+                        hippo_r1 += h_rec.get(1, 0.0)
+                        hippo_r2 += h_rec.get(2, 0.0)
+                        hippo_r5 += h_rec.get(5, 0.0)
+                        dpr_r1 += d_rec.get(1, 0.0)
+                        dpr_r2 += d_rec.get(2, 0.0)
+                        dpr_r5 += d_rec.get(5, 0.0)
 
                     pred_ans = ""
                     dpr_ans: str | None = None
@@ -1372,11 +1429,15 @@ class YawRuntime:
                     "integrity": {"passed": len(integrity_errors) == 0, "errors": integrity_errors},
                     "evaluation_metrics": {
                         "hipporag": {
-                            "retrieval": {
-                                "Recall@1": round(hippo_r1 / n_q, 4),
-                                "Recall@2": round(hippo_r2 / n_q, 4),
-                                "Recall@5": round(hippo_r5 / n_q, 4),
-                            },
+                            "retrieval": (
+                                {
+                                    "Recall@1": round(hippo_r1 / n_q, 4),
+                                    "Recall@2": round(hippo_r2 / n_q, 4),
+                                    "Recall@5": round(hippo_r5 / n_q, 4),
+                                }
+                                if gold_docs is not None
+                                else {}
+                            ),
                             "qa": (
                                 {
                                     "ExactMatch": round(hippo_em / n_q, 4),
@@ -1387,11 +1448,15 @@ class YawRuntime:
                             ),
                         },
                         "standard_dpr": {
-                            "retrieval": {
-                                "Recall@1": round(dpr_r1 / n_q, 4),
-                                "Recall@2": round(dpr_r2 / n_q, 4),
-                                "Recall@5": round(dpr_r5 / n_q, 4),
-                            },
+                            "retrieval": (
+                                {
+                                    "Recall@1": round(dpr_r1 / n_q, 4),
+                                    "Recall@2": round(dpr_r2 / n_q, 4),
+                                    "Recall@5": round(dpr_r5 / n_q, 4),
+                                }
+                                if gold_docs is not None
+                                else {}
+                            ),
                             "qa": (
                                 {
                                     "ExactMatch": round(dpr_em / n_q, 4),
@@ -1411,20 +1476,19 @@ class YawRuntime:
             finally:
                 bench_engine.close()
 
-        effective_gate_spec = gate_spec or {
-            "mode": effective_mode,
-            "per_dataset_tolerance": 0.0,
-            "require_mean_recall5_parity": True,
-            "require_mean_f1_parity": effective_mode == "eval",
-            "require_mean_em_parity": effective_mode == "eval",
-            "datasets": {
-                ds_key: {
-                    "monkeypatched_hipporag": MONKEYPATCHED_HIPPORAG_BASELINES.get(ds_key, {}),
-                    "paper_70b": PAPER_BASELINES.get(ds_key, {}),
-                }
-                for ds_key in dataset_reports
-            },
-        }
+        if gate_spec is not None:
+            effective_gate_spec = gate_spec
+        else:
+            default_baselines_path = Path(__file__).resolve().parents[2] / "data" / "benchmarks" / "baselines.json"
+            default_baselines = json.loads(default_baselines_path.read_text(encoding="utf-8")).get("baselines", {})
+            effective_gate_spec = {
+                "mode": effective_mode,
+                "per_dataset_tolerance": 0.0,
+                "require_mean_recall5_parity": True,
+                "require_mean_f1_parity": effective_mode == "eval",
+                "require_mean_em_parity": effective_mode == "eval",
+                "baselines": {ds_key: default_baselines.get(ds_key, {}) for ds_key in dataset_reports},
+            }
         gate_eval = evaluate_benchmark_gate(
             dataset_reports,
             effective_gate_spec,

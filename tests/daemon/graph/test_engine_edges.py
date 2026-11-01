@@ -21,8 +21,45 @@ def indexing_provider():
     calls = []
 
     class Handler(BaseHTTPRequestHandler):
+        def send_json(self, payload):
+            raw = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_GET(self):
+            if self.path.endswith("health"):
+                assert isinstance(self.server, ThreadingHTTPServer)
+                self.send_json(
+                    {
+                        "all_models_loaded": [
+                            {
+                                "id": "indexing-contract",
+                                "backend_url": f"http://127.0.0.1:{self.server.server_port}",
+                                "launch_command": ["-m", "indexing-contract.gguf"],
+                            }
+                        ]
+                    }
+                )
+            else:
+                self.send_json(
+                    {
+                        "model_path": "indexing-contract.gguf",
+                        "chat_template": "bytes",
+                        "default_generation_settings": {"n_ctx": 131072},
+                    }
+                )
+
         def do_POST(self):
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            if self.path.endswith("apply-template"):
+                self.send_json({"prompt": json.dumps(request["messages"])})
+                return
+            if self.path.endswith("tokenize"):
+                self.send_json({"tokens": list(request["content"].encode())})
+                return
             if self.path.endswith("/embeddings"):
                 texts = request["input"] if isinstance(request["input"], list) else [request["input"]]
                 raw = json.dumps(
@@ -215,21 +252,16 @@ def test_empty_engine_operations_do_not_call_inference_or_create_graph_rows(tmp_
         engine.close()
 
 
-def test_unadjudicated_synonym_candidates_below_16_emit_skos_related_fallback(tmp_path, indexing_provider):
+def test_unadjudicated_synonym_candidates_abort_graph_publication(tmp_path, indexing_provider):
     url, calls = indexing_provider
     engine = make_engine(tmp_path, url)
     engine.synonymy_threshold = 0.1
     try:
-        assert engine.index(["Ada wrote Notes."]) == 1
+        with pytest.raises(ValueError, match="Missing synonym pairs|Empty decisions"):
+            engine.index(["Ada wrote Notes."])
         assert "synonyms" in calls
-        relations = [
-            tuple(row)
-            for row in engine.conn.execute(
-                "SELECT src_id, dst_id, kind FROM edges WHERE kind = 'skos:related' ORDER BY src_id"
-            )
-        ]
-        assert len(relations) == 2
-        assert all(rel == "skos:related" for _, _, rel in relations)
+        for table in ("chunks", "entities", "facts", "edges", "edge_sources", "chunk_fts"):
+            assert engine.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
         resolved = engine._resolve_chunks_for_docs(["Ada wrote Notes."])
         assert len(resolved) == 1
         pointer, _ = resolved[0]

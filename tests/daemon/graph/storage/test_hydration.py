@@ -463,3 +463,33 @@ def test_hydrate_ast_parent_context_returns_empty_for_json_and_jsonl(tmp_path: P
     )
     assert hydrate_ast_parent_context(ptr, tmp_path, hops=1) == ""
     assert hydrate_ast_parent_context(ptr, tmp_path, hops=2) == ""
+
+
+def test_resolve_chunk_text_matches_split_and_projected_json_chunks(tmp_path: Path) -> None:
+    import json
+
+    from yaw.daemon.graph.storage import resolve_chunk_text
+    from yaw.daemon.ingestion import chunk_source_text
+
+    source = tmp_path / "split_records.jsonl"
+    source.write_text(
+        json.dumps({"title": "SplitDoc", "text": ("Paragraph alpha.\n\n" * 20) + ("Paragraph beta.\n\n" * 20)}) + "\n",
+        encoding="utf-8",
+    )
+    chunks = chunk_source_text(
+        source.read_text(encoding="utf-8"),
+        source.name,
+        chunk_size=180,
+        chunk_overlap=20,
+        min_chunk_size=20,
+    )
+    assert len(chunks) > 1
+    for ptr, expected_text in chunks:
+        resolved = resolve_chunk_text(
+            ptr,
+            tmp_path,
+            chunk_size=180,
+            chunk_overlap=20,
+            min_chunk_size=20,
+        )
+        assert resolved == expected_text

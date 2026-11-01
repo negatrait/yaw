@@ -62,6 +62,10 @@ class DeterministicMockLM(dspy.LM):
         self, prompt: str | None = None, messages: list[dict[str, Any]] | None = None, **kwargs: Any
     ) -> list[str]:
         full_text = self._extract_prompt_text(prompt, messages)
+        if "repl_history" in full_text and "variables_info" in full_text:
+            return [
+                json.dumps({"reasoning": "No semantic repair proposed by this fixture.", "code": "SUBMIT(repairs=[])"})
+            ]
         if "candidate_pairs" in full_text or '"pair_id"' in full_text:
             cands = self._parse_candidate_pairs_from_text(full_text)
             self.observed_candidates.extend(cands)
@@ -389,7 +393,7 @@ def test_dual_role_literal_promoted_to_concept_and_weight_preserved_across_merge
     # Delete chunk c2: remaining literal fact in c1 between alpha and 8080 must have weight 0.5 (not 1.0!)
     merge_entities(conn, beta_id, alpha_id, label_kind="skos:altLabel")
     delete_chunks(conn, ["c2"])
-    assert lint_graph_shacl(conn, auto_heal=False) == []
+    assert lint_graph_shacl(conn) == []
     w_row = conn.execute(
         "SELECT weight FROM edges WHERE src_id = ? AND dst_id = ? AND kind = 'fact'",
         (alpha_id, lit_id),
@@ -428,7 +432,7 @@ def test_dual_role_literal_promoted_to_concept_and_weight_preserved_across_merge
         (canary_concept_id, argo_id),
     ).fetchall()
     assert len(skos_rows) == 1
-    assert lint_graph_shacl(conn, auto_heal=False) == []
+    assert lint_graph_shacl(conn) == []
 
 
 def test_forward_fact_edges_strictly_directed(synonym_token_counter, tmp_path: Path) -> None:
@@ -776,7 +780,7 @@ def test_technical_punctuation_and_surface_forms_preserved(synonym_token_counter
     assert labels_by_norm["c++"] == ("C++", "skos:prefLabel")
     assert labels_by_norm["c#"] == ("C#", "skos:prefLabel")
     assert labels_by_norm["python 3.10"] == ("Python 3.10", "skos:prefLabel")
-    assert lint_graph_shacl(conn, auto_heal=False) == []
+    assert lint_graph_shacl(conn) == []
 
 
 def test_cased_literal_objects_and_same_doc_consecutive_chunks_never_produce_false_different_from(
@@ -940,4 +944,4 @@ def test_cased_literal_objects_and_same_doc_consecutive_chunks_never_produce_fal
     # Zero owl:differentFrom edges in the entire graph
     diff_edges = conn.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'owl:differentFrom'").fetchall()
     assert diff_edges == []
-    assert lint_graph_shacl(conn, auto_heal=False) == []
+    assert lint_graph_shacl(conn) == []

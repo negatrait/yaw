@@ -4,7 +4,6 @@ import contextlib
 import hashlib
 import importlib.metadata
 import json
-import re
 import sqlite3
 import threading
 import time
@@ -22,10 +21,6 @@ from yaw.core import (
     RelationTraversalPolicy,
     StructuredTriple,
     YawRuntimeError,
-    check_lexical_subsumption_inversion,
-    detect_scalar_literal,
-    is_acronym_pair,
-    is_version_or_ordinal_sibling,
     write_text_atomic,
 )
 from yaw.core.config import context_char_limit, scale_context_budget
@@ -33,7 +28,6 @@ from yaw.daemon.graph.inference import (
     FACT_INSTRUCTION,
     PASSAGE_INSTRUCTION,
     DSPyEmbeddingAdapter,
-    EmbeddingLane,
     GraphOptimizationHooks,
     HippoRAGProgram,
     RLMInstructionProposer,
@@ -56,6 +50,19 @@ from yaw.daemon.graph.inference import (
     text_processing,
     trim_diagnostics,
 )
+from yaw.daemon.graph.normalization import normalize_openie_record
+from yaw.daemon.graph.planner import (
+    apply_stage1_definitions,
+    apply_synonym_adjudication,
+    clone_graph_to_memory,
+    collect_missing_entity_norms,
+    collect_shacl_violation_dossiers,
+    materialize_entities_and_facts,
+    prepare_sense_resolution_state,
+    prepare_synonym_candidates,
+    record_surface_form,
+    synthesize_copular_is_a_triples,
+)
 from yaw.daemon.graph.ppr import (
     CSRGraph,
     build_transition_matrix,
@@ -72,13 +79,9 @@ from yaw.daemon.graph.storage import (
     apply_prepared_graph_rows,
     apply_shacl_repairs,
     delete_chunks,
-    find_entity_disambiguation_candidates,
     format_pair_disambiguation_dossier,
     get_chunk_pointers,
-    get_entities_by_label_norm,
     get_entity_doc_frequencies,
-    get_entity_metadata_batch,
-    get_entity_vectors,
     get_existing_ids,
     get_facts_by_ids,
     get_graph_counts,
@@ -139,7 +142,6 @@ class YawGraphEngine:
         beta: float = 0.5,
         dual_weight: float | None = 0.5,
         same_sense_cosine_gate: float = _SAME_SENSE_COSINE_GATE,
-        homograph_cosine_gate: float | None = None,
         max_context_chars: int | None = None,
         max_ast_expansion_hops: int = 1,
         ast_context_hops: int = 0,
@@ -186,15 +188,10 @@ class YawGraphEngine:
         self.activation_renormalize = activation_renormalize
         self.beta = beta
         self.dual_weight = dual_weight
-        self.same_sense_cosine_gate = float(
-            homograph_cosine_gate if homograph_cosine_gate is not None else same_sense_cosine_gate
-        )
-        self.homograph_cosine_gate = self.same_sense_cosine_gate
+        self.same_sense_cosine_gate = float(same_sense_cosine_gate)
         self.traversal_policy: RelationTraversalPolicy | None = traversal_policy
 
         self._csr_graph: CSRGraph | None = None
-        self._active_repl_repair_keys: set[tuple[str, str, str, str]] | None = None
-        self._active_repl_repairs_list: list[dict[str, str]] | None = None
         self._graph_rlm_stats: dict[str, Any] = self._empty_graph_rlm_stats()
         self._attempted_shacl_keys: set[tuple[str, str]] = set()
         self._chunk_rlm_stats: dict[str, dict[str, float]] = {}
@@ -302,8 +299,9 @@ class YawGraphEngine:
     def _candidate_cache_sources(self) -> dict[str, str]:
         return {hashlib.sha256(text.encode("utf-8")).hexdigest(): text for _, text in self._opt_chunks_pool}
 
-    def _graph_cache_context(self) -> str:
+    def _graph_cache_context(self, conn: sqlite3.Connection | None = None) -> str:
         """Hash the graph visible to SHACL's inspection/repair tools, in bounded rows."""
+        active_conn = conn if conn is not None else self.conn
         digest = hashlib.sha256()
         for table, order in (
             ("entities", "entity_id"),
@@ -315,7 +313,7 @@ class YawGraphEngine:
             ("chunks", "chunk_id"),
         ):
             digest.update(table.encode())
-            for row in self.conn.execute(f"SELECT * FROM {table} ORDER BY {order}"):
+            for row in active_conn.execute(f"SELECT * FROM {table} ORDER BY {order}"):
                 digest.update(json.dumps(tuple(row), ensure_ascii=False).encode("utf-8"))
         digest.update(json.dumps(sorted(self._candidate_cache_sources())).encode())
         return digest.hexdigest()
@@ -326,22 +324,33 @@ class YawGraphEngine:
     ) -> None:
         """Populate _opt_indexed_cids, _chunk_indexed_ext_fp, and persisted DSPy trails from SQLite."""
         active_prog = program if program is not None else self.program
-        try:
-            rows = self.conn.execute(
-                "SELECT c.chunk_id, m.value, p.value FROM chunks c "
-                "INNER JOIN openie_chunks o ON c.chunk_id = o.chunk_id "
-                "INNER JOIN meta m ON m.key = 'indexed_fp:' || c.chunk_id "
-                "INNER JOIN meta p ON p.key = 'openie_fp:' || c.chunk_id"
-            ).fetchall()
-        except sqlite3.Error:
-            return
-        if not rows:
-            return
-        provenance = {}
+        provenance: dict[str, list[str]] = {}
+        rows = self.conn.execute(
+            "SELECT c.chunk_id, m.value, p.value FROM chunks c "
+            "INNER JOIN openie_chunks o ON c.chunk_id = o.chunk_id "
+            "INNER JOIN meta m ON m.key = 'indexed_fp:' || c.chunk_id "
+            "INNER JOIN meta p ON p.key = 'openie_fp:' || c.chunk_id"
+        ).fetchall()
         for cid, raw, saved_openie_fp in rows:
             recorded = json.loads(raw)
             if recorded[1] == saved_openie_fp:
                 provenance[str(cid)] = recorded
+        if (
+            self.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunk_inference' LIMIT 1"
+            ).fetchone()
+            is not None
+        ):
+            curr_ext_fp = extraction_fingerprint(active_prog)
+            curr_openie_fp = openie_fingerprint(active_prog)
+            inf_rows = self.conn.execute(
+                "SELECT c.chunk_id, i.program_identity FROM chunks c "
+                "INNER JOIN chunk_inference i ON c.chunk_id = i.chunk_id"
+            ).fetchall()
+            for cid, prog_id in inf_rows:
+                cid_str = str(cid)
+                if cid_str not in provenance:
+                    provenance[cid_str] = [curr_ext_fp, str(prog_id or curr_openie_fp)]
         seeded_cids = list(provenance)
         if not seeded_cids:
             return
@@ -356,49 +365,46 @@ class YawGraphEngine:
             if self._active_openie_fingerprint is None:
                 self._active_openie_fingerprint = provenance[next(iter(ready_cids))][1]
 
-            try:
-                raw_trails = get_meta(self.conn, "dspy_trails_state")
-                if raw_trails:
-                    state_obj = json.loads(raw_trails)
-                    if isinstance(state_obj, dict):
-                        g_stats = state_obj.get("graph_rlm_stats")
-                        if isinstance(g_stats, dict):
-                            for k, v in g_stats.items():
-                                if k in self._graph_rlm_stats and not self._graph_rlm_stats.get(k):
-                                    self._graph_rlm_stats[k] = v
-                        c_stats = state_obj.get("chunk_rlm_stats")
-                        if isinstance(c_stats, dict):
-                            for cid_k, c_val in c_stats.items():
-                                if isinstance(c_val, dict) and cid_k not in self._chunk_rlm_stats:
-                                    self._chunk_rlm_stats[str(cid_k)] = {str(sk): float(sv) for sk, sv in c_val.items()}
-                        for trail_attr in (
-                            "telemetry",
-                            "embedding_audit_trail",
-                            "synonym_audit_trail",
-                            "shacl_audit_trail",
-                            "entity_def_audit_trail",
+            raw_trails = get_meta(self.conn, "dspy_trails_state")
+            if raw_trails:
+                state_obj = json.loads(raw_trails)
+                if isinstance(state_obj, dict):
+                    g_stats = state_obj.get("graph_rlm_stats")
+                    if isinstance(g_stats, dict):
+                        for k, v in g_stats.items():
+                            if k in self._graph_rlm_stats and not self._graph_rlm_stats.get(k):
+                                self._graph_rlm_stats[k] = v
+                    c_stats = state_obj.get("chunk_rlm_stats")
+                    if isinstance(c_stats, dict):
+                        for cid_k, c_val in c_stats.items():
+                            if isinstance(c_val, dict) and cid_k not in self._chunk_rlm_stats:
+                                self._chunk_rlm_stats[str(cid_k)] = {str(sk): float(sv) for sk, sv in c_val.items()}
+                    for trail_attr in (
+                        "telemetry",
+                        "embedding_audit_trail",
+                        "synonym_audit_trail",
+                        "shacl_audit_trail",
+                        "entity_def_audit_trail",
+                    ):
+                        saved_list = state_obj.get(trail_attr)
+                        curr_list = getattr(active_prog, trail_attr, None)
+                        if (
+                            isinstance(saved_list, list)
+                            and saved_list
+                            and isinstance(curr_list, list)
+                            and not curr_list
                         ):
-                            saved_list = state_obj.get(trail_attr)
-                            curr_list = getattr(active_prog, trail_attr, None)
-                            if (
-                                isinstance(saved_list, list)
-                                and saved_list
-                                and isinstance(curr_list, list)
-                                and not curr_list
-                            ):
-                                curr_list.extend(saved_list)
-                else:
-                    rel_cnt_row = self.conn.execute("SELECT count(*) FROM edges WHERE kind = 'skos:related'").fetchone()
-                    diff_cnt_row = self.conn.execute(
-                        "SELECT count(*) FROM edges WHERE kind = 'owl:differentFrom'"
-                    ).fetchone()
-                    if rel_cnt_row and not self._graph_rlm_stats.get("related_edges"):
-                        self._graph_rlm_stats["related_edges"] = int(rel_cnt_row[0]) // 2
-                    if diff_cnt_row and not self._graph_rlm_stats.get("different_from_edges"):
-                        self._graph_rlm_stats["different_from_edges"] = int(diff_cnt_row[0]) // 2
-                    self._persist_dspy_trails_to_db(active_prog)
-            except Exception:
-                pass
+                            curr_list.extend(saved_list)
+            else:
+                rel_cnt_row = self.conn.execute("SELECT count(*) FROM edges WHERE kind = 'skos:related'").fetchone()
+                diff_cnt_row = self.conn.execute(
+                    "SELECT count(*) FROM edges WHERE kind = 'owl:differentFrom'"
+                ).fetchone()
+                if rel_cnt_row and not self._graph_rlm_stats.get("related_edges"):
+                    self._graph_rlm_stats["related_edges"] = int(rel_cnt_row[0]) // 2
+                if diff_cnt_row and not self._graph_rlm_stats.get("different_from_edges"):
+                    self._graph_rlm_stats["different_from_edges"] = int(diff_cnt_row[0]) // 2
+                self._persist_dspy_trails_to_db(active_prog)
 
     def _persist_dspy_trails_to_db(
         self,
@@ -406,15 +412,12 @@ class YawGraphEngine:
     ) -> None:
         """Persist graph RLM stats, per-chunk RLM stats, and DSPy audit trails into SQLite meta."""
         active_prog = program if program is not None else self.program
-        try:
-            payload = {
-                "graph_rlm_stats": dict(self._graph_rlm_stats),
-                "chunk_rlm_stats": dict(self._chunk_rlm_stats),
-                **active_prog.dump_audit_trails(bounded=True),
-            }
-            set_meta(self.conn, "dspy_trails_state", json.dumps(payload, ensure_ascii=False))
-        except Exception:
-            pass
+        payload = {
+            "graph_rlm_stats": dict(self._graph_rlm_stats),
+            "chunk_rlm_stats": dict(self._chunk_rlm_stats),
+            **(active_prog.dump_audit_trails(bounded=True) if hasattr(active_prog, "dump_audit_trails") else {}),
+        }
+        set_meta(self.conn, "dspy_trails_state", json.dumps(payload, ensure_ascii=False))
 
     def _hydrate_chunk_traces_and_stats_from_db(
         self,
@@ -428,10 +431,7 @@ class YawGraphEngine:
         ]
         if not missing_cids:
             return
-        try:
-            cached_openie = get_openie_checkpoints(self.conn, missing_cids)
-        except sqlite3.Error:
-            return
+        cached_openie = get_openie_checkpoints(self.conn, missing_cids)
         if not cached_openie:
             return
         text_by_cid = {p.chunk_id: t for p, t in target_list}
@@ -521,41 +521,6 @@ class YawGraphEngine:
         hydrator = make_ast_island_hydrator(self.conn, self.workspace_root)
         return hydrator(chunk_id)
 
-    @staticmethod
-    def _repair_signature(rep: Mapping[str, Any]) -> tuple[str, str, str, str]:
-        focus = str(rep.get("focus_node", "")).strip()
-        action = str(rep.get("action", "")).strip()
-        val = str(rep.get("value", "")).strip()
-        target = str(rep.get("target_node", "")).strip() or val
-        return (focus, action, target, val)
-
-    def _apply_shacl_repairs_from_tool(
-        self,
-        repairs: Sequence[Any],
-    ) -> int:
-        pending: list[dict[str, str]] = []
-        seen_in_call: set[tuple[str, str, str, str]] = set()
-        for rep in repairs:
-            if not isinstance(rep, Mapping):
-                continue
-            sig = self._repair_signature(rep)
-            if sig in seen_in_call:
-                continue
-            seen_in_call.add(sig)
-            if self._active_repl_repair_keys is not None:
-                if sig in self._active_repl_repair_keys:
-                    continue
-                self._active_repl_repair_keys.add(sig)
-            rep_dict = {str(k): str(v) for k, v in rep.items()}
-            if self._active_repl_repairs_list is not None:
-                self._active_repl_repairs_list.append(rep_dict)
-            pending.append(rep_dict)
-        if not pending:
-            return 0
-        applied = self._apply_shacl_repairs(self.conn, pending)
-        self._graph_rlm_stats["shacl_repairs_applied"] += applied
-        return applied
-
     def _on_embedding_telemetry(self, entry: Mapping[str, Any]) -> None:
         self._graph_rlm_stats["embedding_calls"] += 1
         self._graph_rlm_stats["embedding_tokens"] += int(entry.get("tokens_used", 0))
@@ -589,8 +554,7 @@ class YawGraphEngine:
                 ),
                 chunk_hydrator=self._hydrate_single_chunk,
                 ast_island_hydrator=self._hydrate_single_ast_island,
-                shacl_repair_applier=self._apply_shacl_repairs_from_tool,
-                shacl_linter=lambda: [v.to_dict() for v in lint_graph_shacl(self.conn, auto_heal=False)],
+                shacl_linter=lambda: [v.to_dict() for v in lint_graph_shacl(self.conn)],
             )
         if hasattr(target, "set_graph_search_tool"):
             target.set_graph_search_tool(self._search_graph_for_react)
@@ -624,7 +588,7 @@ class YawGraphEngine:
         q_str = str(question or "")
         memo_key = (q_str, qa_top_k, query_retrieval_fingerprint(active_program))
 
-        if self._in_optimization or bool(item_docs):
+        if self._in_optimization:
             target_cids = self._ensure_candidate_chunks_indexed(active_program, item_docs=item_docs)
             active_trace = getattr(dspy.settings, "trace", None)
             if isinstance(active_trace, list):
@@ -641,14 +605,28 @@ class YawGraphEngine:
         else:
             if not self._opt_indexed_cids:
                 self._hydrate_indexed_cids_from_db(self.program)
-            if not self._opt_indexed_cids and bool(self._opt_chunks_pool):
-                self._ensure_candidate_chunks_indexed(self.program, item_docs=item_docs)
-            if q_str != self._last_memo_question:
-                self._query_retrieval_memo.clear()
-                self._last_memo_question = q_str
-            cached_ret = self._query_retrieval_memo.get(memo_key)
-            if cached_ret is not None:
-                return cached_ret
+            active_trace = getattr(dspy.settings, "trace", None)
+            if isinstance(active_trace, list) and bool(item_docs):
+                req_chunks = self._resolve_chunks_for_docs(item_docs)
+                target_list = req_chunks if req_chunks else list(self._opt_chunks_pool)
+                self._hydrate_chunk_traces_and_stats_from_db(target_list)
+                named_map = dict(active_program.named_predictors())
+                for ptr, _ in target_list:
+                    for pred_name, inp_dict, out_obj in self._captured_chunk_traces.get(ptr.chunk_id, ()):
+                        pred_inst = named_map.get(pred_name)
+                        if pred_inst is not None:
+                            active_trace.append((pred_inst, dict(inp_dict), out_obj))
+                for pred_name, inp_dict, out_obj in self._captured_graph_traces:
+                    pred_inst = named_map.get(pred_name)
+                    if pred_inst is not None:
+                        active_trace.append((pred_inst, dict(inp_dict), out_obj))
+            if not bool(item_docs):
+                if q_str != self._last_memo_question:
+                    self._query_retrieval_memo.clear()
+                    self._last_memo_question = q_str
+                cached_ret = self._query_retrieval_memo.get(memo_key)
+                if cached_ret is not None:
+                    return cached_ret
 
         fetch_top_k = max(20, qa_top_k)
         if self._active_progress_callback is not None:
@@ -797,7 +775,7 @@ class YawGraphEngine:
             chunks, entities, facts, edges, openie = get_graph_counts(self.conn)
             label_row = self.conn.execute("SELECT COUNT(*) FROM entity_labels").fetchone()
             entity_labels = int(label_row[0]) if label_row else 0
-            violations = lint_graph_shacl(self.conn, auto_heal=False)
+            violations = lint_graph_shacl(self.conn)
             return IndexStats(
                 chunks=chunks,
                 entities=entities,
@@ -812,16 +790,11 @@ class YawGraphEngine:
     def lint_graph(
         self,
         *,
-        auto_heal: bool = False,
         as_turtle: bool = False,
     ) -> dict[str, Any]:
         """Run closed-world SHACL linting (and optional Turtle serialization) over yaw.db."""
         with self._lock:
-            if auto_heal:
-                with self.managed_conn.transaction() as conn:
-                    violations = lint_graph_shacl(conn, auto_heal=True)
-            else:
-                violations = lint_graph_shacl(self.conn, auto_heal=False)
+            violations = lint_graph_shacl(self.conn)
             report: dict[str, Any] = {
                 "conforms": len(violations) == 0,
                 "violation_count": len(violations),
@@ -1170,10 +1143,9 @@ class YawGraphEngine:
                 passages_path = self.workspace_root / "passages.json"
                 existing_records: list[dict[str, Any]] = []
                 if passages_path.is_file():
-                    with contextlib.suppress(OSError, json.JSONDecodeError):
-                        loaded = json.loads(passages_path.read_text(encoding="utf-8"))
-                        if isinstance(loaded, list):
-                            existing_records = [r for r in loaded if isinstance(r, dict)]
+                    loaded = json.loads(passages_path.read_text(encoding="utf-8"))
+                    if isinstance(loaded, list):
+                        existing_records = [r for r in loaded if isinstance(r, dict)]
 
                 all_records = list(existing_records)
                 seen_rec_ids = {str(r.get("id", "")) for r in all_records}
@@ -1235,7 +1207,7 @@ class YawGraphEngine:
             set_yaw_sleep_seconds(opt_sleep)
 
         active_program = program if program is not None else self.program
-        with self._lock, contextlib.ExitStack() as batch_resources:
+        with self._lock:
             batch_started = time.perf_counter()
             trim_diagnostics(active_program)
             self._bind_program_hooks(active_program)
@@ -1274,31 +1246,12 @@ class YawGraphEngine:
             existing_chunk_vecs = get_existing_ids(self.conn, "chunk_vec", chunk_ids)
             missing_chunks = [(p, t) for p, t in chunks if p.chunk_id not in existing_chunk_vecs]
             chunk_vec_pairs: list[tuple[str, np.ndarray]] = []
-            embedding_lane = None
-            overlap = bool(getattr(self.config, "indexing_overlap", False))
             if missing_chunks:
                 if progress_callback is not None:
-                    progress_callback(
-                        f"indexing: embedding {len(missing_chunks)} chunk vectors"
-                        + (" concurrently with OpenIE" if overlap else "")
-                    )
+                    progress_callback(f"indexing: embedding {len(missing_chunks)} chunk vectors")
                 texts_to_embed = [fmt_chunk(p, t) for p, t in missing_chunks]
-                if overlap:
-                    if not isinstance(self.embedder, DSPyEmbeddingAdapter):
-                        raise TypeError("Indexing overlap requires DSPyEmbeddingAdapter")
-                    embed_fp = embed_fingerprint(self.embedder.profile, "")
-                    embedding_lane = batch_resources.enter_context(
-                        EmbeddingLane(
-                            self.embedder,
-                            texts_to_embed,
-                            batch_size=self.embed_batch_size,
-                            lookup=lambda text: self._text_vec_cache.get((embed_fp, "", text)),
-                            store=lambda text, vector: self._text_vec_cache.__setitem__((embed_fp, "", text), vector),
-                        )
-                    )
-                else:
-                    vecs = self._encode_in_batches(texts_to_embed, instruction="", stage="chunk_embed")
-                    chunk_vec_pairs = [(p.chunk_id, v) for (p, _), v in zip(missing_chunks, vecs, strict=True)]
+                vecs = self._encode_in_batches(texts_to_embed, instruction="", stage="chunk_embed")
+                chunk_vec_pairs = [(p.chunk_id, v) for (p, _), v in zip(missing_chunks, vecs, strict=True)]
 
             # 2. Crash-resilient OpenIE extraction (persisted per-chunk immediately)
             cached_openie = get_openie_checkpoints(self.conn, chunk_ids)
@@ -1308,8 +1261,6 @@ class YawGraphEngine:
             total_chunks = len(chunks)
             openie_started = time.perf_counter()
             for idx, (ptr, text) in enumerate(chunks, 1):
-                if embedding_lane is not None:
-                    embedding_lane.drain()
                 # The previous chunk's slices are already consumed. Do not trim
                 # inside extract_openie: its caller still needs the new records.
                 trim_diagnostics(active_program)
@@ -1411,21 +1362,6 @@ class YawGraphEngine:
 
             openie_finished = time.perf_counter()
             openie_seconds = openie_finished - openie_started
-            if embedding_lane is not None:
-                vecs = embedding_lane.finish()
-                chunk_vec_pairs = [(p.chunk_id, v) for (p, _), v in zip(missing_chunks, vecs, strict=True)]
-                active_program.telemetry.append(
-                    {
-                        "stage": "indexing_overlap",
-                        "tokens_used": 0,
-                        "openie_seconds": openie_seconds,
-                        "embedding_seconds": embedding_lane.provider_seconds,
-                        "join_seconds": embedding_lane.join_seconds,
-                        "cache_hits": embedding_lane.cache_hits,
-                        "overlap_seconds": embedding_lane.overlap_seconds(openie_started, openie_finished),
-                    }
-                )
-
             preparation_started = time.perf_counter()
 
             # 3. Resolve Stage 1 NER Entities, Stage 2 StructuredTriples, Provisional Sense-Split Gate, and
@@ -1436,211 +1372,23 @@ class YawGraphEngine:
             surface_by_norm: dict[str, str] = {}
             chunk_surface_by_norm: dict[tuple[str, str], str] = {}
 
-            def _record_surface(norm_key: str, raw_val: str, cid_key: str = "") -> None:
-                clean_raw = raw_val.strip()
-                if not norm_key or not clean_raw:
-                    return
-                prev = surface_by_norm.get(norm_key)
-                if prev is None or (prev == prev.lower() and clean_raw != clean_raw.lower()):
-                    surface_by_norm[norm_key] = clean_raw
-                if cid_key:
-                    prev_c = chunk_surface_by_norm.get((cid_key, norm_key))
-                    if prev_c is None or (prev_c == prev_c.lower() and clean_raw != clean_raw.lower()):
-                        chunk_surface_by_norm[(cid_key, norm_key)] = clean_raw
-
             for rec in all_records:
                 cid = rec.chunk_id
-                raw_st_items = list(getattr(rec, "structured_triples", ()) or ())
-                entity_role_raws: set[str] = set()
-                literal_only_raws: set[str] = set()
-                for st_item in raw_st_items:
-                    s_r = str(getattr(st_item, "subj", "")).strip()
-                    o_r = str(getattr(st_item, "obj", "")).strip()
-                    if s_r:
-                        entity_role_raws.add(s_r)
-                        entity_role_raws.add(str(text_processing(s_r)))
-                    if getattr(st_item, "obj_kind", "entity") == "literal":
-                        if o_r:
-                            literal_only_raws.add(o_r)
-                    elif o_r:
-                        entity_role_raws.add(o_r)
-                        entity_role_raws.add(str(text_processing(o_r)))
-                literal_only_raws -= entity_role_raws
+                normalized = normalize_openie_record(rec)
+                normalized_sts = normalized.triples
+                ner_entities = normalized.entities
+                stage1_defs = normalized.definitions
+                all_norm_labels.update(normalized.labels)
+                for norm_key, surface in normalized.surfaces.items():
+                    record_surface_form(surface_by_norm, chunk_surface_by_norm, norm_key, surface, cid)
 
-                stage1_defs: dict[str, str] = {}
-                stage1_senses: dict[str, list[str]] = {}
-                for raw_pair in getattr(rec, "entity_definitions", ()) or ():
-                    if isinstance(raw_pair, (list, tuple)) and len(raw_pair) >= 2:
-                        raw_e0 = str(raw_pair[0]).strip()
-                        is_lit_norm = raw_e0 in literal_only_raws or detect_scalar_literal(raw_e0)[0]
-                        enorm = raw_e0 if is_lit_norm else str(text_processing(raw_e0))
-                        _record_surface(enorm, raw_e0, cid)
-                        edef = str(raw_pair[1]).strip()
-                        if enorm and edef:
-                            if enorm not in stage1_defs:
-                                stage1_defs[enorm] = edef
-                            senses_lst = stage1_senses.setdefault(enorm, [])
-                            if all(d.lower() != edef.lower() for d in senses_lst):
-                                senses_lst.append(edef)
-
-                ner_entities: list[tuple[str, str]] = []
-                seen_ner_norms: set[str] = set()
-                seen_ner_sense_keys: set[tuple[str, str]] = set()
-                for raw_ent in getattr(rec, "entities", ()) or ():
-                    if isinstance(raw_ent, (list, tuple)) and len(raw_ent) >= 1:
-                        e_str = str(raw_ent[0]).strip()
-                        e_inline_def = str(raw_ent[1]).strip() if len(raw_ent) >= 2 and raw_ent[1] is not None else ""
-                    else:
-                        e_str = str(raw_ent).strip()
-                        e_inline_def = ""
-                    is_lit_norm = e_str in literal_only_raws or detect_scalar_literal(e_str)[0]
-                    e_norm = e_str if is_lit_norm else str(text_processing(e_str))
-                    if not e_norm:
-                        continue
-                    _record_surface(e_norm, e_str, cid)
-                    e_def = e_inline_def or stage1_defs.get(e_norm, "")
-                    s_key = (e_norm, e_def.lower())
-                    if s_key in seen_ner_sense_keys or (not e_def and e_norm in seen_ner_norms):
-                        continue
-                    seen_ner_norms.add(e_norm)
-                    seen_ner_sense_keys.add(s_key)
-                    if e_inline_def:
-                        if e_norm not in stage1_defs:
-                            stage1_defs[e_norm] = e_inline_def
-                        senses_lst = stage1_senses.setdefault(e_norm, [])
-                        if all(d.lower() != e_inline_def.lower() for d in senses_lst):
-                            senses_lst.append(e_inline_def)
-                    all_norm_labels.add(e_norm)
-                    ner_entities.append((e_norm, e_def))
-
-                for enorm, senses_lst in stage1_senses.items():
-                    for edef in senses_lst:
-                        s_key = (enorm, edef.lower())
-                        if s_key not in seen_ner_sense_keys:
-                            seen_ner_norms.add(enorm)
-                            seen_ner_sense_keys.add(s_key)
-                            all_norm_labels.add(enorm)
-                            ner_entities.append((enorm, edef))
-
-                st_list: list[StructuredTriple] = list(raw_st_items)
-                if not st_list and getattr(rec, "triples", ()):
-                    for t in rec.triples:
-                        if len(t) >= 3:
-                            s_raw, p_raw, o_raw = (
-                                str(t[0]).strip(),
-                                str(t[1]).strip(),
-                                str(t[2]).strip(),
-                            )
-                            spo_synth = f"{s_raw} {p_raw} {o_raw}."
-                            s_raw_norm = str(text_processing(s_raw))
-                            o_raw_norm = str(text_processing(o_raw))
-                            s_def_val = stage1_defs.get(s_raw_norm, "")
-                            o_def_val = stage1_defs.get(o_raw_norm, "")
-                            if s_raw_norm and s_raw_norm == o_raw_norm and len(stage1_senses.get(s_raw_norm, ())) >= 2:
-                                s_def_val = stage1_senses[s_raw_norm][0]
-                                o_def_val = stage1_senses[s_raw_norm][1]
-                            st_list.append(
-                                StructuredTriple(
-                                    subj=s_raw,
-                                    subj_def=s_def_val,
-                                    pred=p_raw,
-                                    obj=o_raw,
-                                    obj_def=o_def_val,
-                                    spo_def=spo_synth,
-                                )
-                            )
-                normalized_sts: list[StructuredTriple] = []
-                for st in st_list:
-                    s_raw_str = str(st.subj).strip()
-                    o_raw_str = str(st.obj).strip()
-                    s_norm = str(text_processing(st.subj))
-                    p_norm = str(text_processing(st.pred))
-                    is_literal_obj = (
-                        getattr(st, "obj_kind", "entity") == "literal" or detect_scalar_literal(str(st.obj))[0]
-                    )
-                    o_val = o_raw_str if is_literal_obj else str(text_processing(st.obj))
-                    if not s_norm or not p_norm or not o_val:
-                        continue
-                    if detect_scalar_literal(s_norm)[0]:
-                        if not is_literal_obj:
-                            s_norm, o_val = o_val, s_norm
-                            s_raw_str, o_raw_str = o_raw_str, s_raw_str
-                            is_literal_obj = True
-                        else:
-                            continue
-                    _record_surface(s_norm, s_raw_str, cid)
-                    _record_surface(o_val, o_raw_str, cid)
-                    all_norm_labels.add(s_norm)
-                    all_norm_labels.add(o_val)
-                    o_tok_norm = str(text_processing(o_val))
-                    if o_tok_norm:
-                        all_norm_labels.add(o_tok_norm)
-                        _record_surface(o_tok_norm, o_raw_str, cid)
-                    spo_d = st.spo_def.strip() or f"{s_norm} {p_norm} {o_val}."
-                    raw_subj_d = st.subj_def.strip()
-                    subj_d = raw_subj_d or stage1_defs.get(s_norm, "")
-                    if subj_d:
-                        if s_norm not in stage1_defs:
-                            stage1_defs[s_norm] = subj_d
-                        senses_lst = stage1_senses.setdefault(s_norm, [])
-                        if all(d.lower() != subj_d.lower() for d in senses_lst):
-                            senses_lst.append(subj_d)
-
-                    raw_obj_d = st.obj_def.strip()
-                    obj_d = raw_obj_d or stage1_defs.get(o_val, "") or stage1_defs.get(o_tok_norm, "")
-                    if (
-                        not is_literal_obj
-                        and s_norm == o_val
-                        and subj_d
-                        and obj_d
-                        and subj_d.lower() == obj_d.lower()
-                        and len(stage1_senses.get(o_val, ())) >= 2
-                    ):
-                        obj_d = next(
-                            (d for d in stage1_senses[o_val] if d.lower() != subj_d.lower()),
-                            obj_d,
-                        )
-                    if obj_d:
-                        if o_val not in stage1_defs:
-                            stage1_defs[o_val] = obj_d
-                        senses_lst = stage1_senses.setdefault(o_val, [])
-                        if all(d.lower() != obj_d.lower() for d in senses_lst):
-                            senses_lst.append(obj_d)
-
-                    normalized_sts.append(
-                        StructuredTriple(
-                            subj=s_norm,
-                            pred=p_norm,
-                            obj=o_val,
-                            spo_def=spo_d,
-                            subj_def=subj_d,
-                            obj_def=obj_d,
-                            obj_kind="literal" if is_literal_obj else "entity",
-                            obj_datatype=str(getattr(st, "obj_datatype", "") or ""),
-                            obj_lang=str(getattr(st, "obj_lang", "") or ""),
-                        )
-                    )
-
-                already_attempted = attempted_missing_by_cid.get(cid, set())
-                missing_norms: list[str] = []
-                seen_missing: set[str] = set(already_attempted)
-                for st in normalized_sts:
-                    if not st.subj_def and not stage1_defs.get(st.subj) and st.subj not in seen_missing:
-                        seen_missing.add(st.subj)
-                        missing_norms.append(st.subj)
-                    if (
-                        st.obj_kind != "literal"
-                        and not st.obj_def
-                        and not stage1_defs.get(st.obj)
-                        and st.obj not in seen_missing
-                    ):
-                        seen_missing.add(st.obj)
-                        missing_norms.append(st.obj)
-                for e_norm, e_def in ner_entities:
-                    if not e_def and not stage1_defs.get(e_norm) and e_norm not in seen_missing:
-                        seen_missing.add(e_norm)
-                        missing_norms.append(e_norm)
-
+                missing_norms = collect_missing_entity_norms(
+                    normalized_sts,
+                    ner_entities,
+                    stage1_defs,
+                    attempted_missing_by_cid.get(cid, set()),
+                )
+                repaired_pairs: Sequence[tuple[str, str]] = ()
                 if missing_norms and hasattr(active_program, "define_missing_entities"):
                     prev_def_audit_len = len(getattr(active_program, "entity_def_audit_trail", ()))
                     def_raw_trace: list[Any] = []
@@ -1666,589 +1414,57 @@ class YawGraphEngine:
                         if isinstance(entry, dict):
                             self._graph_rlm_stats["missing_entity_defs_count"] += int(entry.get("missing_count", 0))
                             self._graph_rlm_stats["missing_entity_defs_tokens"] += int(entry.get("tokens", 0))
-                    for r_name, r_def in repaired_pairs:
-                        r_norm = str(text_processing(str(r_name)))
-                        _record_surface(r_norm, str(r_name), cid)
-                        r_clean = str(r_def).strip()
-                        if r_norm and r_clean:
-                            stage1_defs[r_norm] = r_clean
 
-                if stage1_defs:
-                    normalized_sts = [
-                        StructuredTriple(
-                            subj=st.subj,
-                            pred=st.pred,
-                            obj=st.obj,
-                            spo_def=st.spo_def,
-                            subj_def=st.subj_def or stage1_defs.get(st.subj, ""),
-                            obj_def=(
-                                st.obj_def
-                                or stage1_defs.get(st.obj, "")
-                                or stage1_defs.get(str(text_processing(st.obj)), "")
-                            ),
-                            obj_kind=st.obj_kind,
-                            obj_datatype=st.obj_datatype,
-                            obj_lang=st.obj_lang,
-                        )
-                        for st in normalized_sts
-                    ]
-                    ner_entities = [(e_norm, e_def or stage1_defs.get(e_norm, "")) for e_norm, e_def in ner_entities]
-
+                normalized_sts, ner_entities = apply_stage1_definitions(
+                    cid,
+                    normalized_sts,
+                    ner_entities,
+                    stage1_defs,
+                    repaired_pairs,
+                    surface_by_norm,
+                    chunk_surface_by_norm,
+                )
                 record_structured.append((cid, normalized_sts, ner_entities))
 
-            existing_by_label = get_entities_by_label_norm(self.conn, list(all_norm_labels))
-            all_existing_eids = list({eid for eids in existing_by_label.values() for eid in eids})
-            entity_info_by_id: dict[str, tuple[str, str]] = {}
-            existing_vecs_by_id: dict[str, np.ndarray] = {}
-            if all_existing_eids:
-                entity_info_by_id = get_entity_metadata_batch(self.conn, all_existing_eids)
-                raw_vecs = get_entity_vectors(self.conn, all_existing_eids)
-                for eid_v, vec_v in raw_vecs.items():
-                    v_norm = float(np.linalg.norm(vec_v))
-                    existing_vecs_by_id[eid_v] = vec_v / v_norm if v_norm > 0 else vec_v
+            synthesize_copular_is_a_triples(
+                chunks,
+                record_structured,
+                all_norm_labels,
+                surface_by_norm,
+                chunk_surface_by_norm,
+            )
+            sense_state = prepare_sense_resolution_state(
+                chunks,
+                record_structured,
+                all_norm_labels,
+                surface_by_norm,
+                fmt_entity=fmt_entity,
+                conn=self.conn,
+            )
+            prebatch_vec_by_text: dict[str, np.ndarray] = {}
+            if sense_state.prebatch_texts:
+                p_vecs = self._encode_in_batches(sense_state.prebatch_texts, instruction="", stage="entity_embed")
+                for ct, pv in zip(sense_state.prebatch_texts, p_vecs, strict=False):
+                    pv_arr = np.asarray(pv, dtype=np.float32)
+                    n_val = float(np.linalg.norm(pv_arr))
+                    prebatch_vec_by_text[ct] = pv_arr / n_val if n_val > 0 else pv_arr
 
-            # Bridge copular Stage 1 entity definitions to known graph concepts so definitions
-            # absorbed by Stage 1 NER still form explicit graph edges and retrievable facts.
-            if len(chunks) > 1:
-                known_concepts = {
-                    lbl
-                    for lbl in all_norm_labels
-                    if 3 <= len(lbl) <= 30 and not lbl.isdigit() and len(lbl.split()) <= 3
-                }
-                for ptr, _ in chunks:
-                    if ptr.title:
-                        t_norm = str(text_processing(ptr.title))
-                        _record_surface(t_norm, ptr.title, ptr.chunk_id)
-                        if 3 <= len(t_norm) <= 30 and not t_norm.isdigit():
-                            known_concepts.add(t_norm)
-                for _cid, normalized_sts, ner_entities in record_structured:
-                    existing_pairs = {(st.subj, st.obj) for st in normalized_sts} | {
-                        (st.obj, st.subj) for st in normalized_sts
-                    }
-                    for e_norm, e_def in ner_entities[:2]:
-                        if not e_def or len(e_norm) < 3:
-                            continue
-                        first_clause = re.split(r"\.(?:\s|$)", e_def, maxsplit=1)[0].lower()
-                        clause_words = set(str(text_processing(first_clause)).split()) | set(
-                            re.findall(r"[a-z0-9]+", first_clause)
-                        )
-                        for c_norm in known_concepts:
-                            if c_norm == e_norm or c_norm in e_norm or e_norm in c_norm:
-                                continue
-                            c_tokens = c_norm.split()
-                            if not all(tok in clause_words for tok in c_tokens):
-                                continue
-                            if (e_norm, c_norm) in existing_pairs:
-                                continue
-                            if re.search(rf"(?:^|(?<=\s)|(?<=\W)){re.escape(c_norm)}(?=$|\s|\W)", first_clause):
-                                existing_pairs.add((e_norm, c_norm))
-                                normalized_sts.append(
-                                    StructuredTriple(
-                                        subj=e_norm,
-                                        pred="is a",
-                                        obj=c_norm,
-                                        spo_def=e_def,
-                                        subj_def=e_def,
-                                        obj_def="",
-                                    )
-                                )
-
-            # Track senses per label_norm: list of (entity_id, name, definition, unit_vec_or_None)
-            senses_by_label: dict[str, list[tuple[str, str, str, np.ndarray | None]]] = {}
-            for lbl, eids in existing_by_label.items():
-                senses_by_label[lbl] = [
-                    (
-                        eid,
-                        entity_info_by_id.get(eid, (surface_by_norm.get(lbl, lbl), ""))[0],
-                        entity_info_by_id.get(eid, (surface_by_norm.get(lbl, lbl), ""))[1],
-                        existing_vecs_by_id.get(eid),
-                    )
-                    for eid in eids
-                ]
-
-            def _doc_scope_key(rel_path: str, s_line: int, e_line: int, ast_s: int, ast_e: int) -> str:
-                if not rel_path:
-                    return ""
-                if rel_path.lower().endswith((".json", ".jsonl", ".ndjson")):
-                    span_s = ast_s if ast_s > 0 else s_line
-                    span_e = ast_e if ast_e > 0 else e_line
-                    return f"{rel_path}:{span_s}:{span_e}"
-                return rel_path
-
-            chunk_rel_path_by_id: dict[str, str] = {
-                ptr.chunk_id: _doc_scope_key(
-                    ptr.rel_posix_path,
-                    ptr.start_line,
-                    ptr.end_line,
-                    ptr.ast_island_start,
-                    ptr.ast_island_end,
-                )
-                for ptr, _ in chunks
-                if ptr.rel_posix_path
-            }
-            sense_docs_by_eid: dict[str, set[str]] = {}
-            sense_chunks_by_eid: dict[str, set[str]] = {}
-            if all_existing_eids:
-                ph = ",".join("?" for _ in all_existing_eids)
-                for r_eid, r_cid, r_doc, r_s, r_e, r_ast_s, r_ast_e in self.conn.execute(
-                    f"""
-                    SELECT
-                        el.entity_id,
-                        el.chunk_id,
-                        COALESCE(c.rel_posix_path, ''),
-                        COALESCE(c.start_line, 0),
-                        COALESCE(c.end_line, 0),
-                        COALESCE(c.ast_island_start, 0),
-                        COALESCE(c.ast_island_end, 0)
-                    FROM entity_labels el
-                    LEFT JOIN chunks c ON c.chunk_id = el.chunk_id
-                    WHERE el.entity_id IN ({ph}) AND el.chunk_id != ''
-                    """,
-                    all_existing_eids,
-                ):
-                    s_eid = str(r_eid)
-                    s_cid = str(r_cid)
-                    s_doc = (
-                        _doc_scope_key(str(r_doc), int(r_s), int(r_e), int(r_ast_s), int(r_ast_e))
-                        if r_doc
-                        else chunk_rel_path_by_id.get(s_cid, "")
-                    )
-                    sense_chunks_by_eid.setdefault(s_eid, set()).add(s_cid)
-                    if s_doc:
-                        sense_docs_by_eid.setdefault(s_eid, set()).add(s_doc)
-
-            # Pre-batch candidate disambiguation embeddings across the batch to avoid 1-by-1 HTTP calls
-            defs_by_label: dict[str, set[str]] = {}
-            for lbl, senses in senses_by_label.items():
-                for _, _, s_def, _ in senses:
-                    if s_def.strip():
-                        defs_by_label.setdefault(lbl, set()).add(s_def.strip().lower())
-            cand_pairs_by_label: dict[str, list[tuple[str, str]]] = {}
-            multi_sense_in_chunk: set[tuple[str, str]] = set()
-            for cid_r, st_list, ner_entities in record_structured:
-                chunk_defs_per_norm: dict[str, set[str]] = {}
-                for st in st_list:
-                    for m_lbl, m_def in ((st.subj, st.subj_def), (st.obj, st.obj_def)):
-                        m_norm = str(text_processing(m_lbl)) or m_lbl.strip().lower()
-                        c_def = m_def.strip()
-                        if c_def and m_norm:
-                            defs_by_label.setdefault(m_norm, set()).add(c_def.lower())
-                            cand_pairs_by_label.setdefault(m_norm, []).append((m_norm, c_def))
-                            chunk_defs_per_norm.setdefault(m_norm, set()).add(c_def.lower())
-                for e_raw_lbl, e_def in ner_entities:
-                    e_norm = str(text_processing(e_raw_lbl)) or e_raw_lbl.strip().lower()
-                    c_def = e_def.strip()
-                    if c_def and e_norm:
-                        defs_by_label.setdefault(e_norm, set()).add(c_def.lower())
-                        cand_pairs_by_label.setdefault(e_norm, []).append((e_norm, c_def))
-                        chunk_defs_per_norm.setdefault(e_norm, set()).add(c_def.lower())
-                for m_norm, c_dset in chunk_defs_per_norm.items():
-                    if len(c_dset) >= 2:
-                        multi_sense_in_chunk.add((cid_r, m_norm))
-            prebatch_texts: list[str] = []
-            seen_prebatch: set[str] = set()
-            for lbl, dset in defs_by_label.items():
-                if len(dset) >= 2:
-                    for m_lbl, c_def in cand_pairs_by_label.get(lbl, ()):
-                        sense_cand_id = compute_mdhash_id(f"{m_lbl}::{c_def.lower()}", prefix="entity-")
-                        if sense_cand_id in existing_vecs_by_id:
-                            continue
-                        ct = fmt_entity(surface_by_norm.get(m_lbl, m_lbl), c_def)
-                        if ct not in seen_prebatch:
-                            seen_prebatch.add(ct)
-                            prebatch_texts.append(ct)
-                    for _, name_s, prev_def_s, prev_vec_s in senses_by_label.get(lbl, ()):
-                        if prev_vec_s is None and prev_def_s:
-                            pt = fmt_entity(name_s, prev_def_s)
-                            if pt not in seen_prebatch:
-                                seen_prebatch.add(pt)
-                                prebatch_texts.append(pt)
-            if prebatch_texts:
-                self._encode_in_batches(prebatch_texts, instruction="", stage="entity_embed")
-
-            entity_map: dict[str, tuple[str, str, str]] = {}
-            entity_labels_to_upsert: list[tuple[str, str, str, str, str]] = []
-            precomputed_entity_vecs: dict[str, np.ndarray] = {}
-
-            def _label_kind_for(entity_name: str, lbl_norm: str) -> str:
-                return (
-                    "skos:prefLabel"
-                    if (
-                        lbl_norm == entity_name
-                        or lbl_norm.lower() == entity_name.lower()
-                        or lbl_norm == str(text_processing(entity_name))
-                    )
-                    else "skos:altLabel"
-                )
-
-            def _record_sense_provenance(eid: str, cid: str) -> None:
-                sense_chunks_by_eid.setdefault(eid, set()).add(cid)
-                doc_p = chunk_rel_path_by_id.get(cid, "")
-                if doc_p:
-                    sense_docs_by_eid.setdefault(eid, set()).add(doc_p)
-
-            # -------------------------------------------------------------------
-            # RATIONALE: Why we normalize ONLY the lookup/hash key (`label_norm`)
-            # here while preserving raw surface casing in `entities.name` and
-            # `entity_labels.raw_label`:
-            #
-            # We have iterated between two failure modes on text normalization:
-            # 1. Too much normalization (over-normalizing surface strings early
-            #    in OpenIE or storage) destroys domain-critical casing, acronyms
-            #    ("AWS TGW", "KMS", "MSA"), punctuation in paths/versions
-            #    ("KMS/region", "$1.2B"), and typed XSD literal lexical forms
-            #    (`owl:DatatypeProperty`).
-            # 2. Too little normalization (passing raw un-normalized mention
-            #    strings directly into `compute_mdhash_id` and `senses_by_label`
-            #    when an entity or non-scalar literal is materialized) causes
-            #    case/punctuation variants of the exact same concept (e.g.,
-            #    subject `"aws tgw"` -> `md5("aws tgw")` vs literal object
-            #    `"AWS TGW"` -> `md5("AWS TGW")`) to mint two distinct
-            #    `entity_id`s. Because `upsert_entity_labels` subsequently
-            #    normalizes both into the same `label_norm` (`"aws tgw"`), the
-            #    two identical concepts collide on `skos:prefLabel` and get
-            #    falsely separated as homographs (`owl:differentFrom`).
-            #
-            # The balanced solution is strict separation of concerns:
-            # - `label_norm = str(text_processing(raw_mention)) or raw_mention.strip().lower()`
-            #   is used EXCLUSIVELY as the canonical lookup key (`senses_by_label`),
-            #   primary `entity_id` hash seed (`compute_mdhash_id`), and
-            #   `entity_labels.label_norm`.
-            # - `canon_surface` / `mention_raw` preserve the original
-            #   un-normalized surface form (preferring cased forms like
-            #   `"AWS TGW"` or `"Priya Nair"`) for `entities.name`,
-            #   `entity_labels.raw_label`, and `facts.obj_literal_lex`.
-            # -------------------------------------------------------------------
-            def _resolve_mention_entity_id(
-                raw_mention: str,
-                defn: str,
-                chunk_id: str,
-                *,
-                exclude_eid: str | None = None,
-            ) -> str:
-                raw_clean = str(raw_mention).strip()
-                label_norm = str(text_processing(raw_clean)) or raw_clean.lower()
-                clean_def = defn.strip()
-                canon_surface = (
-                    surface_by_norm.get(label_norm)
-                    or surface_by_norm.get(raw_clean)
-                    or (raw_clean if raw_clean != raw_clean.lower() else label_norm)
-                )
-                mention_raw = (
-                    chunk_surface_by_norm.get((chunk_id, label_norm))
-                    or chunk_surface_by_norm.get((chunk_id, raw_clean))
-                    or canon_surface
-                )
-                existing_senses = senses_by_label.get(label_norm, [])
-                if not existing_senses:
-                    eid = compute_mdhash_id(label_norm, prefix="entity-")
-                    senses_by_label[label_norm] = [(eid, canon_surface, clean_def, existing_vecs_by_id.get(eid))]
-                    entity_map[eid] = (eid, canon_surface, clean_def)
-                    entity_labels_to_upsert.append((label_norm, eid, "skos:prefLabel", mention_raw, chunk_id))
-                    _record_sense_provenance(eid, chunk_id)
-                    return eid
-
-                def _best_surface(curr_name: str) -> str:
-                    if (
-                        curr_name == curr_name.lower()
-                        and canon_surface != canon_surface.lower()
-                        and (str(text_processing(curr_name)) or curr_name.lower()) == label_norm
-                    ):
-                        return canon_surface
-                    return curr_name
-
-                if not clean_def:
-                    for idx_s, (eid, name, prev_def, prev_vec) in enumerate(existing_senses):
-                        if exclude_eid is not None and eid == exclude_eid:
-                            continue
-                        best_name = _best_surface(name)
-                        if best_name != name:
-                            existing_senses[idx_s] = (eid, best_name, prev_def, prev_vec)
-                            entity_map[eid] = (eid, best_name, prev_def)
-                        elif eid not in entity_map:
-                            entity_map[eid] = (eid, best_name, prev_def)
-                        entity_labels_to_upsert.append(
-                            (
-                                label_norm,
-                                eid,
-                                _label_kind_for(best_name, label_norm),
-                                mention_raw,
-                                chunk_id,
-                            )
-                        )
-                        _record_sense_provenance(eid, chunk_id)
-                        return eid
-                    eid, name, prev_def, prev_vec = existing_senses[0]
-                    best_name = _best_surface(name)
-                    if best_name != name:
-                        existing_senses[0] = (eid, best_name, prev_def, prev_vec)
-                        entity_map[eid] = (eid, best_name, prev_def)
-                    elif eid not in entity_map:
-                        entity_map[eid] = (eid, best_name, prev_def)
-                    entity_labels_to_upsert.append(
-                        (label_norm, eid, _label_kind_for(best_name, label_norm), mention_raw, chunk_id)
-                    )
-                    _record_sense_provenance(eid, chunk_id)
-                    return eid
-
-                # Check if any existing sense has no definition yet or identical definition
-                for idx_s, (eid, name, prev_def, prev_vec) in enumerate(existing_senses):
-                    if exclude_eid is not None and eid == exclude_eid:
-                        continue
-                    if not prev_def or prev_def.lower() == clean_def.lower():
-                        best_name = _best_surface(name)
-                        merged_def = clean_def if len(clean_def) > len(prev_def) else (prev_def or clean_def)
-                        existing_senses[idx_s] = (
-                            eid,
-                            best_name,
-                            merged_def,
-                            prev_vec if (merged_def == prev_def and best_name == name) else None,
-                        )
-                        entity_map[eid] = (eid, best_name, merged_def)
-                        entity_labels_to_upsert.append(
-                            (
-                                label_norm,
-                                eid,
-                                _label_kind_for(best_name, label_norm),
-                                mention_raw,
-                                chunk_id,
-                            )
-                        )
-                        _record_sense_provenance(eid, chunk_id)
-                        return eid
-
-                # Same-Document Co-reference Continuity:
-                # When consecutive chunks of the same document (`rel_posix_path`) extract the same
-                # named entity with complementary role descriptions (e.g., header title "Helix Procurement"
-                # in chunk 1 vs dialogue role "A participant in the meeting." in chunk 2) and neither chunk
-                # extracted multiple contrasting senses for that label, reuse the document's existing sense.
-                curr_doc = chunk_rel_path_by_id.get(chunk_id, "")
-                if (
-                    curr_doc
-                    and exclude_eid is None
-                    and len(existing_senses) == 1
-                    and (chunk_id, label_norm) not in multi_sense_in_chunk
-                ):
-                    eid0, name0, prev_def0, prev_vec0 = existing_senses[0]
-                    if curr_doc in sense_docs_by_eid.get(eid0, set()) and chunk_id not in sense_chunks_by_eid.get(
-                        eid0, set()
-                    ):
-                        best_name = _best_surface(name0)
-                        if (
-                            prev_def0
-                            and clean_def
-                            and clean_def.lower() not in prev_def0.lower()
-                            and prev_def0.lower() not in clean_def.lower()
-                            and len(prev_def0) + len(clean_def) <= 200
-                        ):
-                            merged_def = f"{prev_def0.rstrip('.')} — {clean_def}"
-                        else:
-                            merged_def = clean_def if len(clean_def) > len(prev_def0) else prev_def0
-                        existing_senses[0] = (
-                            eid0,
-                            best_name,
-                            merged_def,
-                            prev_vec0 if (merged_def == prev_def0 and best_name == name0) else None,
-                        )
-                        entity_map[eid0] = (eid0, best_name, merged_def)
-                        entity_labels_to_upsert.append(
-                            (
-                                label_norm,
-                                eid0,
-                                _label_kind_for(best_name, label_norm),
-                                mention_raw,
-                                chunk_id,
-                            )
-                        )
-                        _record_sense_provenance(eid0, chunk_id)
-                        return eid0
-
-                # Both have distinct non-empty definitions:
-                # Reuse existing concept only when high-confidence same sense (cos >= 0.85).
-                # When cos < 0.85 (whether in [0.65, 0.85) or < 0.65), mint a provisional sense_id
-                # WITHOUT writing any owl:differentFrom edge in Step 4 so Step 6 judge_synonyms
-                # adjudicates every ambiguous or divergent same-label pair.
-                sense_id = compute_mdhash_id(f"{label_norm}::{clean_def.lower()}", prefix="entity-")
-                cached_sense_vec = existing_vecs_by_id.get(sense_id)
-                if cached_sense_vec is None:
-                    cached_sense_vec = precomputed_entity_vecs.get(sense_id)
-                if cached_sense_vec is not None:
-                    cand_vec = cached_sense_vec
-                else:
-                    cand_text = fmt_entity(canon_surface, clean_def)
-                    cand_vec = self._encode_in_batches([cand_text], instruction="", stage="entity_embed")[0]
-                    c_norm = float(np.linalg.norm(cand_vec))
-                    if c_norm > 0:
-                        cand_vec = cand_vec / c_norm
-
-                for idx_s, (eid, name, prev_def, prev_vec) in enumerate(existing_senses):
-                    if exclude_eid is not None and eid == exclude_eid:
-                        continue
-                    if prev_vec is None:
-                        p_text = fmt_entity(name, prev_def)
-                        prev_vec = self._encode_in_batches([p_text], instruction="", stage="entity_embed")[0]
-                        p_norm = float(np.linalg.norm(prev_vec))
-                        if p_norm > 0:
-                            prev_vec = prev_vec / p_norm
-                        existing_senses[idx_s] = (eid, name, prev_def, prev_vec)
-                        precomputed_entity_vecs[eid] = prev_vec
-                    cos_sim = float(np.dot(cand_vec, prev_vec))
-                    if cos_sim >= self.same_sense_cosine_gate:
-                        best_name = _best_surface(name)
-                        merged_def = clean_def if len(clean_def) > len(prev_def) else prev_def
-                        if merged_def != prev_def or best_name != name:
-                            existing_senses[idx_s] = (eid, best_name, merged_def, cand_vec)
-                            precomputed_entity_vecs[eid] = cand_vec
-                        entity_map[eid] = (eid, best_name, merged_def)
-                        entity_labels_to_upsert.append(
-                            (
-                                label_norm,
-                                eid,
-                                _label_kind_for(best_name, label_norm),
-                                mention_raw,
-                                chunk_id,
-                            )
-                        )
-                        _record_sense_provenance(eid, chunk_id)
-                        return eid
-
-                sense_id = compute_mdhash_id(f"{label_norm}::{clean_def.lower()}", prefix="entity-")
-                precomputed_entity_vecs[sense_id] = cand_vec
-                existing_senses.append((sense_id, canon_surface, clean_def, cand_vec))
-                entity_map[sense_id] = (sense_id, canon_surface, clean_def)
-                entity_labels_to_upsert.append((label_norm, sense_id, "skos:prefLabel", mention_raw, chunk_id))
-                _record_sense_provenance(sense_id, chunk_id)
-                self._graph_rlm_stats["homograph_splits"] += 1
-                return sense_id
-
-            chunk_to_entities: dict[str, set[str]] = {}
-            fact_nodes_map: dict[
-                str,
-                tuple[str, str, str, str | None, str, str, str, str, str, str | None, str, str],
-            ] = {}
-            fact_sources_batch: list[tuple[str, str]] = []
-            edges_with_sources: list[tuple[str, str, str, float, str]] = []
-            fact_linked_pairs: set[tuple[str, str]] = set()
-
-            for cid, st_list, ner_entities in record_structured:
-                chunk_to_entities.setdefault(cid, set())
-                resolved_in_chunk: set[tuple[str, str]] = set()
-                for st in st_list:
-                    s_norm_key = str(text_processing(st.subj)) or st.subj.strip().lower()
-                    s_id = _resolve_mention_entity_id(st.subj, st.subj_def, cid)
-                    resolved_in_chunk.add((s_norm_key, st.subj_def.strip().lower()))
-                    chunk_to_entities[cid].add(s_id)
-
-                    if st.obj_kind == "literal":
-                        o_id: str | None = None
-                        o_norm_key = str(text_processing(st.obj)) or st.obj.strip().lower()
-                        is_self_literal = o_norm_key == s_norm_key
-                        if not is_self_literal and not (st.obj_datatype.startswith("xsd:") and not st.obj_def.strip()):
-                            has_existing_sense = bool(senses_by_label.get(o_norm_key))
-                            eff_obj_def = (
-                                st.obj_def.strip()
-                                if (st.obj_def.strip() or has_existing_sense)
-                                else (st.spo_def.strip() or f"Literal value {st.obj}.")
-                            )
-                            o_id = _resolve_mention_entity_id(st.obj, eff_obj_def, cid)
-                            resolved_in_chunk.add((o_norm_key, st.obj_def.strip().lower()))
-                            chunk_to_entities[cid].add(o_id)
-                        eff_obj_dt = st.obj_datatype or "rdfs:Literal"
-                        fact_oid = o_id if (o_id is not None and o_id != s_id) else None
-                        fid = compute_mdhash_id(
-                            str((s_id, st.pred, f"literal:{st.obj}:{eff_obj_dt}:{st.obj_lang}")),
-                            prefix="fact-",
-                        )
-                        raw_json = json.dumps([st.subj, st.pred, st.obj])
-                        prev_fact = fact_nodes_map.get(fid)
-                        if prev_fact is None or (not prev_fact[5] and st.spo_def):
-                            fact_nodes_map[fid] = (
-                                fid,
-                                s_id,
-                                st.pred,
-                                fact_oid,
-                                raw_json,
-                                st.spo_def,
-                                st.subj_def,
-                                st.obj_def,
-                                "literal",
-                                st.obj,
-                                eff_obj_dt,
-                                st.obj_lang,
-                            )
-                        fact_sources_batch.append((fid, cid))
-                        if fact_oid is not None:
-                            dt_weight = (
-                                float(self.traversal_policy.datatype_property)
-                                if self.traversal_policy is not None
-                                else 0.5
-                            )
-                            fact_linked_pairs.add((min(s_id, fact_oid), max(s_id, fact_oid)))
-                            edges_with_sources.append((s_id, fact_oid, "fact", dt_weight, cid))
-                    else:
-                        o_norm_key = str(text_processing(st.obj)) or st.obj.strip().lower()
-                        distinct_homograph_pole = (
-                            o_norm_key == s_norm_key
-                            and bool(st.subj_def.strip())
-                            and bool(st.obj_def.strip())
-                            and st.subj_def.strip().lower() != st.obj_def.strip().lower()
-                        )
-                        o_id = _resolve_mention_entity_id(
-                            st.obj,
-                            st.obj_def,
-                            cid,
-                            exclude_eid=s_id if distinct_homograph_pole else None,
-                        )
-                        resolved_in_chunk.add((o_norm_key, st.obj_def.strip().lower()))
-                        chunk_to_entities[cid].add(o_id)
-
-                        base_s_id = compute_mdhash_id(s_norm_key, prefix="entity-")
-                        base_o_id = compute_mdhash_id(o_norm_key, prefix="entity-")
-                        if s_norm_key == o_norm_key or s_id != base_s_id or o_id != base_o_id:
-                            fid = compute_mdhash_id(str((s_id, st.pred, o_id)), prefix="fact-")
-                        else:
-                            raw_triple_str = str((st.subj, st.pred, st.obj))
-                            fid = compute_mdhash_id(raw_triple_str, prefix="fact-")
-                        raw_json = json.dumps([st.subj, st.pred, st.obj])
-                        prev_fact = fact_nodes_map.get(fid)
-                        if prev_fact is None or (not prev_fact[5] and st.spo_def):
-                            fact_nodes_map[fid] = (
-                                fid,
-                                s_id,
-                                st.pred,
-                                o_id,
-                                raw_json,
-                                st.spo_def,
-                                st.subj_def,
-                                st.obj_def,
-                                "entity",
-                                None,
-                                "",
-                                "",
-                            )
-                        fact_sources_batch.append((fid, cid))
-                        if s_id != o_id:
-                            fact_linked_pairs.add((min(s_id, o_id), max(s_id, o_id)))
-                            edges_with_sources.append((s_id, o_id, "fact", 1.0, cid))
-
-                for e_raw_lbl, e_def in ner_entities:
-                    e_norm = str(text_processing(e_raw_lbl)) or e_raw_lbl.strip().lower()
-                    e_key = (e_norm, e_def.strip().lower())
-                    if e_key in resolved_in_chunk:
-                        continue
-                    if not e_def.strip() and any(k[0] == e_norm for k in resolved_in_chunk):
-                        continue
-                    resolved_in_chunk.add(e_key)
-                    ner_eid = _resolve_mention_entity_id(e_raw_lbl, e_def.strip(), cid)
-                    chunk_to_entities[cid].add(ner_eid)
-
-            for cid, eids in chunk_to_entities.items():
-                for eid in eids:
-                    edges_with_sources.append((cid, eid, "passage", 1.0, cid))
-                    edges_with_sources.append((eid, cid, "passage", 1.0, cid))
-
-            entity_nodes = list(entity_map.values())
-            fact_nodes = list(fact_nodes_map.values())
+            dt_weight = float(self.traversal_policy.datatype_property) if self.traversal_policy is not None else 0.5
+            materialized = materialize_entities_and_facts(
+                record_structured,
+                surface_by_norm,
+                chunk_surface_by_norm,
+                sense_state,
+                prebatch_vec_by_text,
+                fmt_entity=fmt_entity,
+                same_sense_cosine_gate=self.same_sense_cosine_gate,
+                datatype_property_weight=dt_weight,
+                embed_one=lambda text: self._encode_in_batches([text], instruction="", stage="entity_embed")[0],
+            )
+            self._graph_rlm_stats["homograph_splits"] += materialized.homograph_splits
+            entity_nodes = materialized.entity_nodes
+            fact_nodes = materialized.fact_nodes
+            precomputed_entity_vecs = materialized.precomputed_entity_vecs
 
             # Compute missing entity vectors using contextual `# {name}\n{definition}`
             all_entity_ids = [eid for eid, _, _ in entity_nodes]
@@ -2284,420 +1500,160 @@ class YawGraphEngine:
                 f_vecs = self._encode_in_batches(fact_texts, instruction="", stage="fact_embed")
                 fact_vec_pairs = [(f_row[0], v) for f_row, v in zip(missing_facts, f_vecs, strict=False)]
 
-            # 4. Atomic Closed-World Transaction: Upsert Graph + EDC Disambiguation + SHACL Self-Healing
+            # 4. Out-of-transaction Staging (EDC Disambiguation + SHACL Self-Healing) + Atomic Publication
             if progress_callback is not None:
                 progress_callback("indexing: committing SKOS/RDF/OWL graph & SHACL validation")
-            transaction_started = time.perf_counter()
             synonym_seconds = 0.0
             prepared_rows = PreparedGraphRows(
                 chunks=tuple(chunks),
                 entities=tuple(entity_nodes),
-                entity_labels=tuple(entity_labels_to_upsert),
+                entity_labels=tuple(materialized.entity_labels_to_upsert),
                 facts=tuple(
                     (fid, sid, pred, oid, raw, definition, kind, lexical, datatype, language)
-                    for fid, sid, pred, oid, raw, definition, _sd, _od, kind, lexical, datatype, language in fact_nodes
+                    for (
+                        fid,
+                        sid,
+                        pred,
+                        oid,
+                        raw,
+                        definition,
+                        _sd,
+                        _od,
+                        kind,
+                        lexical,
+                        datatype,
+                        language,
+                    ) in fact_nodes
                 ),
-                fact_sources=tuple(fact_sources_batch),
-                edges=tuple(edges_with_sources),
+                fact_sources=tuple(materialized.fact_sources_batch),
+                edges=tuple(materialized.edges_with_sources),
                 chunk_vectors=tuple(chunk_vec_pairs),
                 entity_vectors=tuple(entity_vec_pairs),
                 fact_vectors=tuple(fact_vec_pairs),
             )
-            with self.managed_conn.transaction() as conn:
-                apply_prepared_graph_rows(conn, prepared_rows)
+            staged_merges: list[tuple[str, str, str]] = []
+            resolved_semantic_batch: list[tuple[str, str, str, float]] = []
+            staged_repairs: list[Mapping[str, Any]] = []
+            stage_conn = clone_graph_to_memory(self.conn)
+            try:
+                with stage_conn:
+                    stage_conn.execute("BEGIN")
+                    apply_prepared_graph_rows(stage_conn, prepared_rows)
 
-                concept_eids = {
-                    str(r[0])
-                    for r in conn.execute(
-                        """
-                        SELECT subj_id FROM facts
-                        UNION
-                        SELECT obj_id FROM facts
-                        WHERE COALESCE(obj_kind, 'entity') = 'entity' AND obj_id IS NOT NULL
-                        """
-                    )
-                }
-                shared_label_eids = {
-                    str(r[0])
-                    for r in conn.execute(
-                        """
-                        SELECT DISTINCT el1.entity_id
-                        FROM entity_labels el1
-                        JOIN entity_labels el2
-                          ON el1.label_norm = el2.label_norm
-                         AND el1.entity_id != el2.entity_id
-                        """
-                    )
-                }
-                lit_only_eids = {
-                    str(r[0])
-                    for r in conn.execute(
-                        "SELECT DISTINCT obj_id FROM facts WHERE obj_kind = 'literal' AND obj_id IS NOT NULL"
-                    )
-                    if str(r[0]) not in concept_eids and str(r[0]) not in shared_label_eids
-                }
-                valid_entity_ids = [
-                    eid
-                    for eid, name, _ in entity_nodes
-                    if len(re.sub(r"[^A-Za-z0-9]", "", name)) >= 1
-                    and not (
-                        detect_scalar_literal(name)[0] and eid not in concept_eids and eid not in shared_label_eids
-                    )
-                    and eid not in lit_only_eids
-                ]
-                if valid_entity_ids:
-                    if progress_callback is not None:
-                        progress_callback(
-                            f"indexing: disambiguation candidate search ({len(valid_entity_ids)} changed entities)"
-                        )
-                    raw_candidates = find_entity_disambiguation_candidates(
-                        conn,
-                        entity_ids=valid_entity_ids,
-                        dense_threshold=self.synonymy_threshold,
-                        dense_top_k=self.synonymy_top_k,
-                    )
-                    self._graph_rlm_stats["candidate_pairs"] += len(raw_candidates)
-
-                    cand_eids = list({eid for ea, eb, _, _ in raw_candidates for eid in (ea, eb)})
-                    cand_meta = get_entity_metadata_batch(conn, cand_eids)
-
-                    candidates: list[dict[str, Any]] = []
-                    for ea, eb, d_sim, l_sim in raw_candidates:
-                        name_a, def_a = cand_meta.get(ea, (ea, ""))
-                        name_b, def_b = cand_meta.get(eb, (eb, ""))
-                        sim = max(float(d_sim), float(l_sim))
-                        candidates.append(
-                            {
-                                "pair_id": f"{ea}|{eb}",
-                                "entity_a": ea,
-                                "name_a": name_a,
-                                "def_a": def_a,
-                                "entity_b": eb,
-                                "name_b": name_b,
-                                "def_b": def_b,
-                                "dense_sim": float(d_sim),
-                                "lexical_sim": float(l_sim),
-                                "similarity": sim,
-                            }
-                        )
-
-                    candidates.sort(
-                        key=lambda c: (
-                            text_processing(str(c["name_a"])) == text_processing(str(c["name_b"])),
-                            float(c["lexical_sim"]) >= 0.72,
-                            0.5 * float(c["lexical_sim"]) + 0.5 * float(c["dense_sim"]),
-                            float(c["similarity"]),
-                        ),
-                        reverse=True,
-                    )
+                candidates, cand_meta, raw_cand_count = prepare_synonym_candidates(
+                    stage_conn,
+                    entity_nodes,
+                    synonymy_threshold=self.synonymy_threshold,
+                    synonymy_top_k=self.synonymy_top_k,
+                    progress_callback=progress_callback,
+                )
+                self._graph_rlm_stats["candidate_pairs"] += raw_cand_count
+                if candidates:
                     decisions: list[dict[str, str]] = []
-                    if candidates:
-                        syn_fp = synonym_fingerprint(active_program)
-                        batch_limit = max(1, scale_context_budget(8, active_program.context_window_tokens))
-                        max_dossier_chars = min(40000, active_program._context_char_limit(12000))
-                        completed_pairs = 0
-                        for evidence in iter_synonym_evidence(
-                            conn,
-                            candidates,
-                            self.workspace_root,
-                            ast_context_hops=self.ast_context_hops,
-                            batch_size=batch_limit,
-                            max_chars=max_dossier_chars,
-                            fits=active_program.synonym_batch_fits,
-                        ):
-                            if progress_callback is not None:
-                                progress_callback(
-                                    f"indexing: synonym judgment ({completed_pairs}/{len(candidates)} pairs)"
-                                )
-                            # Include the actual evidence, not just entity IDs and similarity scores.
-                            pairs_fp = evidence.cache_identity
-                            cached_syn = self._synonym_fp_cache.get((syn_fp, pairs_fp))
-                            completed_pairs += len(evidence.candidates)
-                            if cached_syn is not None:
-                                cached_decs, cached_syn_tr, cached_syn_tok = cached_syn
-                                decisions.extend(cached_decs)
-                                self._captured_graph_traces.extend(cached_syn_tr)
-                                self._graph_rlm_stats["synonym_judge_tokens"] += cached_syn_tok
-                                active_program.telemetry.append(
-                                    {
-                                        "stage": "synonym_judge",
-                                        "mode": "cache",
-                                        "cache_hit": True,
-                                        "packet_id": pairs_fp,
-                                        "pair_count": len(evidence.candidates),
-                                        "packet_chars": len(evidence.payload),
-                                        "tokens_used": 0,
-                                        "construction_seconds": evidence.construction_seconds,
-                                        "inference_seconds": 0.0,
-                                    }
-                                )
-                                continue
-                            syn_audit: list[dict[str, Any]] = getattr(active_program, "synonym_audit_trail", [])
-                            tel: list[dict[str, Any]] = getattr(active_program, "telemetry", [])
-                            prev_syn_audit_len = len(syn_audit)
-                            prev_tel_len = len(tel)
-                            local_syn_trace: list[Any] = []
-                            with dspy.context(trace=local_syn_trace, usage_tracker=None):
-                                synonym_started = time.perf_counter()
-                                batch_decs = active_program.judge_synonyms(evidence)
-                                synonym_seconds += time.perf_counter() - synonym_started
-                                if batch_decs:
-                                    decisions.extend(batch_decs)
-                            syn_traces = extract_named_trace_entries(
-                                active_program,
-                                local_syn_trace,
-                                allowed_names={"synonym_judge"},
-                            )
-                            self._captured_graph_traces.extend(syn_traces)
-                            syn_tok = 0
-                            if len(syn_audit) > prev_syn_audit_len:
-                                syn_tok = sum(int(x.get("tokens_used", 0)) for x in syn_audit[prev_syn_audit_len:])
-                            elif len(tel) > prev_tel_len:
-                                syn_tok = sum(int(x.get("tokens_used", 0)) for x in tel[prev_tel_len:])
-                            self._graph_rlm_stats["synonym_judge_tokens"] += syn_tok
-                            self._synonym_fp_cache[(syn_fp, pairs_fp)] = (
-                                list(batch_decs or []),
-                                list(syn_traces),
-                                syn_tok,
-                            )
+                    syn_fp = synonym_fingerprint(active_program)
+                    batch_limit = max(1, scale_context_budget(8, active_program.context_window_tokens))
+                    max_dossier_chars = min(40000, active_program._context_char_limit(12000))
+                    completed_pairs = 0
+                    for evidence in iter_synonym_evidence(
+                        stage_conn,
+                        candidates,
+                        self.workspace_root,
+                        ast_context_hops=self.ast_context_hops,
+                        batch_size=batch_limit,
+                        max_chars=max_dossier_chars,
+                        fits=active_program.synonym_batch_fits,
+                    ):
                         if progress_callback is not None:
                             progress_callback(f"indexing: synonym judgment ({completed_pairs}/{len(candidates)} pairs)")
-
-                    merged_into: dict[str, str] = {}
-
-                    def _resolve_active_eid(eid: str) -> str:
-                        curr = eid
-                        visited: set[str] = set()
-                        while curr in merged_into and curr not in visited:
-                            visited.add(curr)
-                            curr = merged_into[curr]
-                        return curr
-
-                    semantic_batch: list[tuple[str, str, str, float]] = []
-                    cand_by_pair: dict[tuple[str, str], dict[str, Any]] = {}
-                    for c in candidates:
-                        ea, eb = str(c["entity_a"]), str(c["entity_b"])
-                        cand_by_pair[(min(ea, eb), max(ea, eb))] = c
-
-                    adjudicated_pairs: set[tuple[str, str]] = set()
-                    for dec in decisions:
-                        pid = str(dec.get("pair_id", "")).strip()
-                        if "|" in pid:
-                            ea, eb = pid.split("|", 1)
-                            raw_src, raw_tgt = ea.strip(), eb.strip()
-                        else:
-                            raw_src = str(dec.get("source_id", "")).strip()
-                            raw_tgt = str(dec.get("target_id", "")).strip()
-                        rel = str(dec.get("relation") or dec.get("decision") or "").strip()
-                        canon = str(dec.get("canonical", "")).strip()
-                        if not raw_src or not raw_tgt:
-                            continue
-                        pkey = (min(raw_src, raw_tgt), max(raw_src, raw_tgt))
-                        if pkey not in cand_by_pair:
-                            continue
-                        adjudicated_pairs.add(pkey)
-                        src = _resolve_active_eid(raw_src)
-                        tgt = _resolve_active_eid(raw_tgt)
-                        if src == tgt:
-                            continue
-                        cand_info = cand_by_pair.get(pkey, {})
-                        sim = float(cand_info.get("similarity", 0.5) or 0.5)
-                        d_sim = float(cand_info.get("dense_sim", 0.0) or 0.0)
-                        name_src, _ = cand_meta.get(src, cand_meta.get(raw_src, (src, "")))
-                        name_tgt, _ = cand_meta.get(tgt, cand_meta.get(raw_tgt, (tgt, "")))
-                        same_name = text_processing(name_src) == text_processing(name_tgt)
-                        active_pkey = (min(src, tgt), max(src, tgt))
-                        is_fact_pole_pair = active_pkey in fact_linked_pairs
-                        if (
-                            rel not in ("owl:differentFrom", "different", "different_from")
-                            and is_acronym_pair(name_src, name_tgt)
-                            and not (same_name and is_fact_pole_pair)
-                        ):
-                            if len(name_src) < len(name_tgt):
-                                merge_src, merge_dst = src, tgt
-                            else:
-                                merge_src, merge_dst = tgt, src
-                            merge_entities(conn, merge_src, merge_dst, label_kind="skos:altLabel")
-                            merged_into[merge_src] = merge_dst
-                            self._graph_rlm_stats["merged_entities"] += 1
-                            continue
-                        if rel in ("skos:altLabel", "skos:hiddenLabel", "exact_match") and not (
-                            same_name and is_fact_pole_pair
-                        ):
-                            if canon and (
-                                canon.upper() == "A"
-                                or canon in (src, raw_src)
-                                or (
-                                    text_processing(canon) == text_processing(name_src)
-                                    and text_processing(canon) != text_processing(name_tgt)
-                                )
-                            ):
-                                merge_src, merge_dst = tgt, src
-                            else:
-                                merge_src, merge_dst = src, tgt
-                            lkind = (
-                                "skos:hiddenLabel"
-                                if rel == "skos:hiddenLabel" or str(dec.get("label_type", "")) == "hiddenLabel"
-                                else "skos:altLabel"
+                        # Include the actual evidence, not just entity IDs and similarity scores.
+                        pairs_fp = evidence.cache_identity
+                        cached_syn = self._synonym_fp_cache.get((syn_fp, pairs_fp))
+                        completed_pairs += len(evidence.candidates)
+                        if cached_syn is not None:
+                            cached_decs, cached_syn_tr, cached_syn_tok = cached_syn
+                            decisions.extend(cached_decs)
+                            self._captured_graph_traces.extend(cached_syn_tr)
+                            self._graph_rlm_stats["synonym_judge_tokens"] += cached_syn_tok
+                            active_program.telemetry.append(
+                                {
+                                    "stage": "synonym_judge",
+                                    "mode": "cache",
+                                    "cache_hit": True,
+                                    "packet_id": pairs_fp,
+                                    "pair_count": len(evidence.candidates),
+                                    "packet_chars": len(evidence.payload),
+                                    "tokens_used": 0,
+                                    "construction_seconds": evidence.construction_seconds,
+                                    "inference_seconds": 0.0,
+                                }
                             )
-                            merge_entities(conn, merge_src, merge_dst, label_kind=lkind)
-                            merged_into[merge_src] = merge_dst
-                            self._graph_rlm_stats["merged_entities"] += 1
-                        elif rel in ("owl:differentFrom", "different", "different_from"):
-                            semantic_batch.append((src, tgt, "owl:differentFrom", 0.0))
-                            self._graph_rlm_stats["different_from_edges"] += 1
-                        elif rel == "skos:broader":
-                            # 1. Version/Ordinal Sibling Guard: If version/ordinal siblings, demote to skos:related
-                            if is_version_or_ordinal_sibling(name_src, name_tgt):
-                                semantic_batch.append((src, tgt, "skos:related", max(0.5, sim)))
-                                self._graph_rlm_stats["related_edges"] += 1
-                                continue
-
-                            # 2. Missing/Invalid Canonical Guard: If canonical is missing/empty, demote to skos:related
-                            if canon and (
-                                canon.upper() == "A"
-                                or canon in (src, raw_src)
-                                or (
-                                    text_processing(canon) == text_processing(name_src)
-                                    and text_processing(canon) != text_processing(name_tgt)
-                                )
-                            ):
-                                child_id, parent_id = tgt, src
-                                child_name, parent_name = name_tgt, name_src
-                            elif canon and (
-                                canon.upper() == "B"
-                                or canon in (tgt, raw_tgt)
-                                or (
-                                    text_processing(canon) == text_processing(name_tgt)
-                                    and text_processing(canon) != text_processing(name_src)
-                                )
-                            ):
-                                child_id, parent_id = src, tgt
-                                child_name, parent_name = name_src, name_tgt
-                            else:
-                                semantic_batch.append((src, tgt, "skos:related", max(0.5, sim)))
-                                self._graph_rlm_stats["related_edges"] += 1
-                                continue
-
-                            # 3. Lexical Subsumption Inversion Guard:
-                            if check_lexical_subsumption_inversion(child_name, parent_name):
-                                child_id, parent_id = parent_id, child_id
-
-                            semantic_batch.append((child_id, parent_id, "skos:broader", max(0.5, sim)))
-                            self._graph_rlm_stats["broader_edges"] = (
-                                int(self._graph_rlm_stats.get("broader_edges", 0)) + 1
-                            )
-                        elif rel in ("skos:related", "related"):
-                            if same_name:
-                                semantic_batch.append((src, tgt, "owl:differentFrom", 0.0))
-                                self._graph_rlm_stats["different_from_edges"] += 1
-                                semantic_batch.append((src, tgt, "skos:related", max(0.5, sim)))
-                                self._graph_rlm_stats["related_edges"] += 1
-                            else:
-                                semantic_batch.append((src, tgt, "skos:related", max(0.5, sim)))
-                                self._graph_rlm_stats["related_edges"] += 1
-                        elif same_name and is_fact_pole_pair:
-                            semantic_batch.append((src, tgt, "owl:differentFrom", 0.0))
-                            self._graph_rlm_stats["different_from_edges"] += 1
-
-                    for c in candidates:
-                        ea, eb = str(c["entity_a"]), str(c["entity_b"])
-                        pkey = (min(ea, eb), max(ea, eb))
-                        if pkey in adjudicated_pairs:
                             continue
-                        src = _resolve_active_eid(ea)
-                        tgt = _resolve_active_eid(eb)
-                        if src == tgt:
-                            continue
-                        name_src, def_src = cand_meta.get(src, (str(c["name_a"]), str(c.get("def_a", ""))))
-                        name_tgt, def_tgt = cand_meta.get(tgt, (str(c["name_b"]), str(c.get("def_b", ""))))
-                        same_name = text_processing(name_src) == text_processing(name_tgt)
-                        norm_def_src = str(text_processing(def_src)) if def_src else ""
-                        norm_def_tgt = str(text_processing(def_tgt)) if def_tgt else ""
-                        same_or_empty_def = not norm_def_src or not norm_def_tgt or norm_def_src == norm_def_tgt
-                        active_pkey = (min(src, tgt), max(src, tgt))
-                        if is_acronym_pair(name_src, name_tgt) and not (same_name and active_pkey in fact_linked_pairs):
-                            merge_src, merge_dst = (src, tgt) if len(name_src) < len(name_tgt) else (tgt, src)
-                            merge_entities(conn, merge_src, merge_dst, label_kind="skos:altLabel")
-                            merged_into[merge_src] = merge_dst
-                            self._graph_rlm_stats["merged_entities"] += 1
-                        elif same_name:
-                            if (
-                                float(c.get("dense_sim", 0.0)) >= 0.45 or same_or_empty_def
-                            ) and active_pkey not in fact_linked_pairs:
-                                merge_entities(conn, src, tgt, label_kind="skos:altLabel")
-                                merged_into[src] = tgt
-                                self._graph_rlm_stats["merged_entities"] += 1
-                            elif active_pkey in fact_linked_pairs:
-                                semantic_batch.append((src, tgt, "owl:differentFrom", 0.0))
-                                self._graph_rlm_stats["different_from_edges"] += 1
-                        elif float(c.get("dense_sim", 0.0)) >= self.synonymy_threshold:
-                            sim = float(c.get("similarity", 0.5) or 0.5)
-                            semantic_batch.append((src, tgt, "skos:related", max(0.5, sim)))
-                            self._graph_rlm_stats["related_edges"] += 1
+                        syn_audit: list[dict[str, Any]] = getattr(active_program, "synonym_audit_trail", [])
+                        tel: list[dict[str, Any]] = getattr(active_program, "telemetry", [])
+                        prev_syn_audit_len = len(syn_audit)
+                        prev_tel_len = len(tel)
+                        local_syn_trace: list[Any] = []
+                        with dspy.context(trace=local_syn_trace, usage_tracker=None):
+                            synonym_started = time.perf_counter()
+                            batch_decs = active_program.judge_synonyms(evidence)
+                            synonym_seconds += time.perf_counter() - synonym_started
+                            if batch_decs:
+                                decisions.extend(batch_decs)
+                        syn_traces = extract_named_trace_entries(
+                            active_program,
+                            local_syn_trace,
+                            allowed_names={"synonym_judge"},
+                        )
+                        self._captured_graph_traces.extend(syn_traces)
+                        syn_tok = 0
+                        if len(syn_audit) > prev_syn_audit_len:
+                            syn_tok = sum(int(x.get("tokens_used", 0)) for x in syn_audit[prev_syn_audit_len:])
+                        elif len(tel) > prev_tel_len:
+                            syn_tok = sum(int(x.get("tokens_used", 0)) for x in tel[prev_tel_len:])
+                        self._graph_rlm_stats["synonym_judge_tokens"] += syn_tok
+                        self._synonym_fp_cache[(syn_fp, pairs_fp)] = (
+                            list(batch_decs or []),
+                            list(syn_traces),
+                            syn_tok,
+                        )
+                    if progress_callback is not None:
+                        progress_callback(f"indexing: synonym judgment ({completed_pairs}/{len(candidates)} pairs)")
 
-                    if semantic_batch:
-                        resolved_semantic_batch = [
-                            (_resolve_active_eid(s), _resolve_active_eid(d), k, w)
-                            for s, d, k, w in semantic_batch
-                            if _resolve_active_eid(s) != _resolve_active_eid(d)
-                        ]
-                        if resolved_semantic_batch:
-                            upsert_semantic_edges(conn, resolved_semantic_batch)
+                    staged_merges, resolved_semantic_batch = apply_synonym_adjudication(
+                        stage_conn,
+                        candidates,
+                        cand_meta,
+                        decisions,
+                        materialized.fact_linked_pairs,
+                        synonymy_threshold=self.synonymy_threshold,
+                        rlm_stats=self._graph_rlm_stats,
+                    )
 
-                # In-transaction Closed-World SHACL Linting & Bounded Self-Healing via shacl_healer_rlm
+                # Out-of-transaction Closed-World SHACL Linting & Bounded Self-Healing via shacl_healer_rlm
                 batch_node_ids = set(chunk_ids) | set(all_entity_ids) | set(all_fact_ids)
                 if progress_callback is not None:
                     progress_callback("indexing: SHACL validation and repair")
-                pre_heal_violations = lint_graph_shacl(conn, auto_heal=False)
-                pre_heal_batch_violations = [
-                    v
-                    for v in pre_heal_violations
-                    if (v.focus_node, v.shape) not in self._attempted_shacl_keys
-                    or v.focus_node in batch_node_ids
-                    or ("|" in v.focus_node and any(p.strip() in batch_node_ids for p in v.focus_node.split("|")))
-                    or ("->" in v.focus_node and any(p.strip() in batch_node_ids for p in v.focus_node.split("->")))
-                ]
-                batch_shacl_before = len(pre_heal_batch_violations)
+                _all_violations, violations, _focus_dossiers, focus_contexts = collect_shacl_violation_dossiers(
+                    stage_conn,
+                    self.workspace_root,
+                    ast_context_hops=self.ast_context_hops,
+                    context_window_tokens=active_program.context_window_tokens,
+                    attempted_keys=self._attempted_shacl_keys,
+                    batch_node_ids=batch_node_ids,
+                )
+                batch_shacl_before = len(violations)
                 self._graph_rlm_stats["shacl_violations_before"] += batch_shacl_before
                 self._graph_rlm_stats["shacl_violations_initial"] = self._graph_rlm_stats["shacl_violations_before"]
-                batch_attempted_keys: set[tuple[str, str]] = {
-                    (v.focus_node, v.shape) for v in pre_heal_batch_violations
-                }
-                # Do NOT run SQL auto_heal=True before shacl_healer_rlm: pass all detected
-                # violations directly to the RLM healer first so it can inspect context and
-                # propose semantic repairs without pre-emptive SQL graph clobbering.
-                all_violations = pre_heal_violations
-                violations = [
-                    v
-                    for v in all_violations
-                    if (v.focus_node, v.shape) not in self._attempted_shacl_keys
-                    or v.focus_node in batch_node_ids
-                    or ("|" in v.focus_node and any(p.strip() in batch_node_ids for p in v.focus_node.split("|")))
-                    or ("->" in v.focus_node and any(p.strip() in batch_node_ids for p in v.focus_node.split("->")))
-                ]
+                batch_attempted_keys: set[tuple[str, str]] = {(v.focus_node, v.shape) for v in violations}
                 if violations:
-                    for v in violations:
-                        v_key = (v.focus_node, v.shape)
-                        self._attempted_shacl_keys.add(v_key)
-                        batch_attempted_keys.add(v_key)
-                    bounded_violations = violations
-                    focus_contexts = [
-                        inspect_focus_node(
-                            conn,
-                            v.focus_node,
-                            corpus_root=self.workspace_root,
-                            ast_context_hops=self.ast_context_hops,
-                        )
-                        for v in violations[: scale_context_budget(16, active_program.context_window_tokens)]
-                    ]
+                    self._attempted_shacl_keys.update(batch_attempted_keys)
                     shacl_fp = shacl_fingerprint(active_program)
                     viol_fp = hashlib.sha256(
                         json.dumps(
                             {
-                                "violations": [v.to_dict() for v in bounded_violations],
+                                "violations": [v.to_dict() for v in violations],
                                 "focus_contexts": focus_contexts,
-                                "graph_context": self._graph_cache_context(),
+                                "graph_context": self._graph_cache_context(stage_conn),
                             },
                             sort_keys=True,
                             ensure_ascii=False,
@@ -2710,42 +1666,39 @@ class YawGraphEngine:
                         self._captured_graph_traces.extend(cached_shacl_tr)
                         self._graph_rlm_stats["shacl_healer_tokens"] += cached_shacl_tok
                         if cached_reps:
-                            applied = self._apply_shacl_repairs(conn, cached_reps)
+                            staged_repairs = list(cached_reps)
+                            applied = self._apply_shacl_repairs(stage_conn, staged_repairs)
                             self._graph_rlm_stats["shacl_repairs_applied"] += applied
-                        all_violations = lint_graph_shacl(conn, auto_heal=True)
                     else:
+                        if hasattr(active_program, "set_graph_tools"):
+                            active_program.set_graph_tools(
+                                node_inspector=lambda eid: inspect_focus_node(
+                                    stage_conn,
+                                    eid,
+                                    corpus_root=self.workspace_root,
+                                    ast_context_hops=self.ast_context_hops,
+                                ),
+                                pair_inspector=lambda a, b: format_pair_disambiguation_dossier(
+                                    stage_conn,
+                                    a,
+                                    b,
+                                    corpus_root=self.workspace_root,
+                                    ast_context_hops=self.ast_context_hops,
+                                ),
+                                chunk_hydrator=make_chunk_hydrator(stage_conn, self.workspace_root),
+                                ast_island_hydrator=make_ast_island_hydrator(stage_conn, self.workspace_root),
+                                shacl_linter=lambda: [v.to_dict() for v in lint_graph_shacl(stage_conn)],
+                            )
                         shacl_audit: list[dict[str, Any]] = getattr(active_program, "shacl_audit_trail", [])
                         shacl_tel: list[dict[str, Any]] = getattr(active_program, "telemetry", [])
                         prev_shacl_audit_len = len(shacl_audit)
                         prev_tel_len = len(shacl_tel)
-                        self._active_repl_repair_keys = set()
-                        self._active_repl_repairs_list = []
                         local_shacl_trace: list[Any] = []
-                        shacl_succeeded = True
-                        try:
-                            with dspy.context(trace=local_shacl_trace, usage_tracker=None):
-                                repairs = active_program.heal_shacl_violations(
-                                    bounded_violations,
-                                    focus_context=json.dumps(focus_contexts, ensure_ascii=False),
-                                )
-                        except Exception as exc:
-                            import logging
-
-                            logging.warning(
-                                "heal_shacl_violations encountered error: %s. Continuing indexing.",
-                                exc,
+                        with dspy.context(trace=local_shacl_trace, usage_tracker=None):
+                            repairs = active_program.heal_shacl_violations(
+                                violations,
+                                focus_context=json.dumps(focus_contexts, ensure_ascii=False),
                             )
-                            repairs = []
-                            shacl_succeeded = False
-                        finally:
-                            repl_applied_keys = (
-                                set(self._active_repl_repair_keys) if self._active_repl_repair_keys else set()
-                            )
-                            repl_repairs_list = (
-                                list(self._active_repl_repairs_list) if self._active_repl_repairs_list else []
-                            )
-                            self._active_repl_repair_keys = None
-                            self._active_repl_repairs_list = None
                         shacl_traces = extract_named_trace_entries(
                             active_program,
                             local_shacl_trace,
@@ -2759,26 +1712,19 @@ class YawGraphEngine:
                             shacl_tok = int(shacl_tel[-1].get("tokens_used", 0))
                         self._graph_rlm_stats["shacl_healer_tokens"] += shacl_tok
                         unapplied_repairs = [
-                            {str(k): str(v) for k, v in r.items()}
-                            for r in repairs
-                            if isinstance(r, Mapping) and self._repair_signature(r) not in repl_applied_keys
+                            {str(k): str(v) for k, v in r.items()} for r in repairs if isinstance(r, Mapping)
                         ]
                         if unapplied_repairs:
-                            applied = self._apply_shacl_repairs(conn, unapplied_repairs)
+                            staged_repairs = list(unapplied_repairs)
+                            applied = self._apply_shacl_repairs(stage_conn, staged_repairs)
                             self._graph_rlm_stats["shacl_repairs_applied"] += applied
-                        all_repairs_for_cache = [*repl_repairs_list, *unapplied_repairs]
-                        if shacl_succeeded:
-                            self._shacl_fp_cache[(shacl_fp, viol_fp)] = (
-                                all_repairs_for_cache,
-                                list(shacl_traces),
-                                shacl_tok,
-                            )
-                        all_violations = lint_graph_shacl(conn, auto_heal=True)
-                elif all_violations:
-                    all_violations = lint_graph_shacl(conn, auto_heal=True)
+                        self._shacl_fp_cache[(shacl_fp, viol_fp)] = (
+                            unapplied_repairs,
+                            list(shacl_traces),
+                            shacl_tok,
+                        )
 
-                # In-transaction Build-Time Gate: Enforce zero remaining SHACL violations
-                remaining_violations = lint_graph_shacl(conn, auto_heal=False)
+                remaining_violations = lint_graph_shacl(stage_conn)
                 if remaining_violations:
                     raise YawRuntimeError(
                         "CONSISTENCY_ERROR",
@@ -2787,6 +1733,25 @@ class YawGraphEngine:
                 batch_shacl_remaining = sum(
                     1 for v in remaining_violations if (v.focus_node, v.shape) in batch_attempted_keys
                 )
+            finally:
+                self._bind_program_hooks(active_program)
+                stage_conn.close()
+
+            transaction_started = time.perf_counter()
+            with self.managed_conn.transaction() as conn:
+                apply_prepared_graph_rows(conn, prepared_rows)
+                for merge_src, merge_dst, merge_lkind in staged_merges:
+                    merge_entities(conn, merge_src, merge_dst, label_kind=merge_lkind)
+                if resolved_semantic_batch:
+                    upsert_semantic_edges(conn, resolved_semantic_batch)
+                if staged_repairs:
+                    self._apply_shacl_repairs(conn, staged_repairs)
+                remaining_violations = lint_graph_shacl(conn)
+                if remaining_violations:
+                    raise YawRuntimeError(
+                        "CONSISTENCY_ERROR",
+                        f"Graph build left {len(remaining_violations)} SHACL violations: {remaining_violations[:3]}",
+                    )
                 self._graph_rlm_stats["shacl_violations_after"] = len(remaining_violations)
                 self._graph_rlm_stats["shacl_violations_remaining"] = len(remaining_violations)
                 self._graph_rlm_stats["shacl_conforms"] = len(remaining_violations) == 0
@@ -2835,19 +1800,19 @@ class YawGraphEngine:
                 self._chunk_indexed_ext_fp[cid] = ext_fp
             self._persist_dspy_trails_to_db(active_program)
             trim_diagnostics(active_program)
-            active_program.telemetry.append(
-                {
-                    "stage": "indexing_batch",
-                    "tokens_used": 0,
-                    "chunks": len(chunks),
-                    "overlap_enabled": overlap,
-                    "total_seconds": time.perf_counter() - batch_started,
-                    "openie_seconds": openie_seconds,
-                    "preparation_seconds": transaction_started - preparation_started,
-                    "transaction_seconds": time.perf_counter() - transaction_started,
-                    "synonym_seconds": synonym_seconds,
-                }
-            )
+            if hasattr(active_program, "telemetry"):
+                active_program.telemetry.append(
+                    {
+                        "stage": "indexing_batch",
+                        "tokens_used": 0,
+                        "chunks": len(chunks),
+                        "total_seconds": time.perf_counter() - batch_started,
+                        "openie_seconds": openie_seconds,
+                        "preparation_seconds": transaction_started - preparation_started,
+                        "transaction_seconds": time.perf_counter() - transaction_started,
+                        "synonym_seconds": synonym_seconds,
+                    }
+                )
             trim_diagnostics(active_program)
             return len(chunks)
 
@@ -3396,11 +2361,6 @@ class YawGraphEngine:
     def _build_optimization_hooks(self) -> GraphOptimizationHooks:
         codec = CandidatePayloadCodec(self._candidate_cache_sources)
         return GraphOptimizationHooks(
-            ensure_candidate_indexed=lambda prog, cids=None: self._ensure_candidate_chunks_indexed(
-                prog, item_docs=cids
-            ),
-            reset_sandbox_graph=lambda clear_openie: self._reset_sandbox_graph(clear_openie=clear_openie),
-            index_chunks=lambda chunks, prog: self.index_chunks(chunks, program=prog),
             persist_trails=self._persist_dspy_trails_to_db,
             get_meta=self.get_meta,
             set_meta=self.set_meta,

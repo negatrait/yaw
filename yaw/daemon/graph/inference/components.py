@@ -1,30 +1,30 @@
 """CocoIndex-owned inference operations; no graph or database side effects."""
 
 import asyncio
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 from uuid import uuid4
 
 import cocoindex as coco
 import dspy
+import numpy as np
 
-from yaw.core import OpenIERecord
+from yaw.core import OpenIERecord, SHACLViolation, SynonymEvidenceBatch
 
-from .embedding import DSPyEmbeddingAdapter, EmbeddingRequest
-from .program import HippoRAGProgram
+from .embedding import DSPyEmbeddingAdapter, EmbeddingRequest, EmbeddingResult
 
 
 @dataclass(frozen=True, slots=True)
 class EmbeddedText:
-    vector: tuple[float, ...]
+    vector_f32: bytes
     request_id: str
     telemetry: dict[str, Any]
 
 
 @dataclass
 class EmbeddingEndpoint:
-    adapter: DSPyEmbeddingAdapter
-    admission: asyncio.Semaphore
+    adapter: DSPyEmbeddingAdapter | Any
+    admission: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(4))
 
     @coco.fn.as_async(batching=True, max_batch_size=64)
     async def embed(self, requests: list[EmbeddingRequest]) -> list[EmbeddedText]:
@@ -42,10 +42,18 @@ class EmbeddingEndpoint:
                 batch_size=min(contract.batch_size, 64),
             )
             async with self.admission:
-                result = await self.adapter.aexecute_request(request)
+                if hasattr(self.adapter, "aexecute_request"):
+                    result = await self.adapter.aexecute_request(request)
+                else:
+                    encode_fn = self.adapter.encode
+                    vecs = await asyncio.to_thread(encode_fn, list(request.texts), request.instruction or "")
+                    result = EmbeddingResult(
+                        np.asarray(vecs, dtype=np.float32),
+                        {"stage": request.stage or "embed", "tokens_used": 0},
+                    )
             request_id = uuid4().hex
             for index, vector in zip(indices, result.vectors, strict=True):
-                results[index] = EmbeddedText(tuple(float(value) for value in vector), request_id, result.telemetry)
+                results[index] = EmbeddedText(vector.astype("<f4", copy=False).tobytes(), request_id, result.telemetry)
         return [results[index] for index in range(len(requests))]
 
 
@@ -77,14 +85,68 @@ class ExtractedText:
     record: OpenIERecord
     traces: tuple[PredictorTrace, ...]
     telemetry: tuple[dict[str, Any], ...]
+    entity_def_audit_trail: tuple[dict[str, Any], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class MissingEntityInput:
+    chunk_id: str
+    passage: str
+    missing_entities: tuple[str, ...]
+    triples: tuple[dict[str, str], ...]
+    program_identity: str
+
+
+@dataclass(frozen=True, slots=True)
+class DefinedEntities:
+    definitions: tuple[tuple[str, str], ...]
+    traces: tuple[PredictorTrace, ...]
+    telemetry: tuple[dict[str, Any], ...]
+    audit_trail: tuple[dict[str, Any], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class SynonymJudgeInput:
+    batch: SynonymEvidenceBatch
+    program_identity: str
+    synonym_identity: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class JudgedSynonyms:
+    decisions: tuple[dict[str, str], ...]
+    traces: tuple[PredictorTrace, ...]
+    telemetry: tuple[dict[str, Any], ...]
+    audit_trail: tuple[dict[str, Any], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class SHACLHealInput:
+    violations: tuple[SHACLViolation, ...]
+    focus_dossiers: dict[str, dict[str, Any]]
+    focus_context: str
+    program_identity: str
+    shacl_identity: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class HealedSHACL:
+    repairs: tuple[dict[str, str], ...]
+    traces: tuple[PredictorTrace, ...]
+    telemetry: tuple[dict[str, Any], ...]
+    audit_trail: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass
 class OpenIEEndpoint:
-    program: HippoRAGProgram
-    lm: dspy.LM
-    program_identity: str
-    admission: asyncio.Semaphore
+    program: Any
+    lm: Any = None
+    program_identity: str = ""
+    admission: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(1))
+
+    def _resolve_lm(self) -> Any:
+        active_lm = self.lm or getattr(dspy.settings, "lm", None)
+        return active_lm.copy() if active_lm is not None and hasattr(active_lm, "copy") else active_lm
 
     @coco.fn.as_async
     def extract(self, /, request: OpenIEInput) -> ExtractedText:
@@ -97,18 +159,112 @@ class OpenIEEndpoint:
             raise ValueError("OpenIE program identity does not match the bound program")
         program = self.program.deepcopy()
         program.telemetry.clear()
-        lm = self.lm.copy()
+        program.entity_def_audit_trail.clear()
+        self.program.telemetry.clear()
+        self.program.entity_def_audit_trail.clear()
+        lm = self._resolve_lm()
         traces: list[Any] = []
         with dspy.context(lm=lm, trace=traces):
             record = program.extract_openie(request.chunk_id, request.passage, lm=lm)
-        names = {id(predictor): name for name, predictor in program.named_predictors()}
+        names = {id(predictor): name for src in (self.program, program) for name, predictor in src.named_predictors()}
+        telemetry_src = program.telemetry or self.program.telemetry
+        audit_src = program.entity_def_audit_trail or self.program.entity_def_audit_trail
         return ExtractedText(
             record,
             tuple(
                 PredictorTrace(names[id(predictor)], dict(inputs), dict(outputs))
                 for predictor, inputs, outputs in traces
+                if id(predictor) in names
+            ),
+            tuple(dict(entry) for entry in telemetry_src),
+            tuple(dict(entry) for entry in audit_src),
+        )
+
+    @coco.fn.as_async
+    def define_entities(self, /, request: MissingEntityInput) -> DefinedEntities:
+        if request.program_identity != self.program_identity:
+            raise ValueError("OpenIE program identity does not match the bound program")
+        program = self.program.deepcopy()
+        program.telemetry.clear()
+        program.entity_def_audit_trail.clear()
+        lm = self._resolve_lm()
+        traces: list[Any] = []
+        with dspy.context(lm=lm, trace=traces):
+            defs = program.define_missing_entities(
+                request.passage,
+                request.missing_entities,
+                request.triples,
+                lm=lm,
+            )
+        names = {id(predictor): name for src in (self.program, program) for name, predictor in src.named_predictors()}
+        return DefinedEntities(
+            tuple((str(k), str(v)) for k, v in defs),
+            tuple(
+                PredictorTrace(names[id(predictor)], dict(inputs), dict(outputs))
+                for predictor, inputs, outputs in traces
+                if id(predictor) in names
             ),
             tuple(dict(entry) for entry in program.telemetry),
+            tuple(dict(entry) for entry in program.entity_def_audit_trail),
+        )
+
+    @coco.fn.as_async
+    def judge_synonyms(self, /, request: SynonymJudgeInput) -> JudgedSynonyms:
+        if request.program_identity != self.program_identity:
+            raise ValueError("OpenIE program identity does not match the bound program")
+        program = self.program.deepcopy()
+        program.telemetry.clear()
+        program.synonym_audit_trail.clear()
+        lm = self._resolve_lm()
+        traces: list[Any] = []
+        with dspy.context(lm=lm, trace=traces):
+            decisions = program.judge_synonyms(request.batch, lm=lm)
+        names = {id(predictor): name for src in (self.program, program) for name, predictor in src.named_predictors()}
+        return JudgedSynonyms(
+            tuple({str(k): str(v) for k, v in d.items()} for d in decisions),
+            tuple(
+                PredictorTrace(names[id(predictor)], dict(inputs), dict(outputs))
+                for predictor, inputs, outputs in traces
+                if id(predictor) in names
+            ),
+            tuple(dict(entry) for entry in program.telemetry),
+            tuple(dict(entry) for entry in program.synonym_audit_trail),
+        )
+
+    @coco.fn.as_async
+    def heal_shacl(self, /, request: SHACLHealInput) -> HealedSHACL:
+        if request.program_identity != self.program_identity:
+            raise ValueError("OpenIE program identity does not match the bound program")
+        program = self.program.deepcopy()
+        program.telemetry.clear()
+        program.shacl_audit_trail.clear()
+        program.set_graph_tools(
+            node_inspector=lambda fn: dict(request.focus_dossiers.get(fn, {})),
+            pair_inspector=lambda a, b: str(
+                request.focus_dossiers.get(
+                    f"{a}|{b}",
+                    request.focus_dossiers.get(f"{b}|{a}", {}),
+                ).get("markdown_dossier", "")
+            ),
+            shacl_linter=lambda: [v.to_dict() for v in request.violations],
+        )
+        lm = self._resolve_lm()
+        traces: list[Any] = []
+        with dspy.context(lm=lm, trace=traces):
+            repairs = program.heal_shacl_violations(
+                request.violations,
+                focus_context=request.focus_context,
+            )
+        names = {id(predictor): name for src in (self.program, program) for name, predictor in src.named_predictors()}
+        return HealedSHACL(
+            tuple({str(k): str(v) for k, v in r.items()} for r in repairs),
+            tuple(
+                PredictorTrace(names[id(predictor)], dict(inputs), dict(outputs))
+                for predictor, inputs, outputs in traces
+                if id(predictor) in names
+            ),
+            tuple(dict(entry) for entry in program.telemetry),
+            tuple(dict(entry) for entry in program.shacl_audit_trail),
         )
 
 
@@ -120,3 +276,24 @@ async def extract_text(request: OpenIEInput) -> ExtractedText:
     endpoint = coco.use_context(OPENIE_ENDPOINT)
     async with endpoint.admission:
         return await endpoint.extract(request)
+
+
+@coco.fn(memo=True)
+async def define_missing_entities(request: MissingEntityInput) -> DefinedEntities:
+    endpoint = coco.use_context(OPENIE_ENDPOINT)
+    async with endpoint.admission:
+        return await endpoint.define_entities(request)
+
+
+@coco.fn(memo=True)
+async def judge_synonyms(request: SynonymJudgeInput) -> JudgedSynonyms:
+    endpoint = coco.use_context(OPENIE_ENDPOINT)
+    async with endpoint.admission:
+        return await endpoint.judge_synonyms(request)
+
+
+@coco.fn(memo=True)
+async def heal_shacl_violations(request: SHACLHealInput) -> HealedSHACL:
+    endpoint = coco.use_context(OPENIE_ENDPOINT)
+    async with endpoint.admission:
+        return await endpoint.heal_shacl(request)

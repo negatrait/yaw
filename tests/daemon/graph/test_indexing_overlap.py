@@ -6,26 +6,20 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import AsyncGenerator
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 import cocoindex as coco
-import dspy
-import litellm
 import numpy as np
 import pytest
 from cocoindex.connectors import sqlite
 
-from yaw.core import ChunkPointer
-from yaw.core.config import YawConfig
-from yaw.daemon.graph.engine import YawGraphEngine
 from yaw.daemon.graph.inference import (
     DSPyEmbeddingAdapter,
-    EmbeddingLane,
     EmbeddingProfile,
     HippoRAGProgram,
-    ServingTokenCounter,
     create_dspy_lm,
 )
 from yaw.daemon.graph.inference.components import (
@@ -40,13 +34,21 @@ from yaw.daemon.graph.inference.components import (
     extract_text,
 )
 from yaw.daemon.graph.inference.embedding import EmbeddingRequest
-from yaw.daemon.graph.storage import CandidateCacheStore, CandidateStageCache, open_managed_yaw_db
-from yaw.daemon.indexing import InferenceIdentity, indexing_app_main
+from yaw.daemon.graph.planner import GraphPlanSettings
+from yaw.daemon.graph.storage import open_managed_yaw_db
+from yaw.daemon.graph.storage.publication import GRAPH_DB, GraphAction, GraphTargetHandler, PreparedGraphRows
+from yaw.daemon.indexing import (
+    RELOAD_SIGNAL_HANDLER,
+    RELOAD_SIGNAL_ROOT,
+    InferenceIdentity,
+    get_graph_delta_coordinator,
+    indexing_app_main,
+)
 from yaw.daemon.ingestion.source_targets import SOURCE_DB, SOURCE_ROOT, SourceSettings
-from yaw.daemon.runtime import YawRuntime
 
 
-def test_native_file_pipeline_owns_inference_rows(tmp_path, provider):
+@pytest.mark.parametrize("title_aware", [False, True])
+def test_native_file_pipeline_owns_inference_rows(tmp_path, provider, title_aware):
     url, state = provider
     root = tmp_path / "documents"
     root.mkdir()
@@ -55,11 +57,13 @@ def test_native_file_pipeline_owns_inference_rows(tmp_path, provider):
     db = sqlite.connect(tmp_path / "yaw.db", load_vec=False)
     lm = create_dspy_lm("overlap", base_url=url + "/v1", cache=False, num_retries=0, max_tokens=512)
     program = HippoRAGProgram(rlm_sub_lm=lm, max_output_tokens=512)
-    program.max_invariant_retries = 0
     context = coco.ContextProvider()
     context.provide(SOURCE_DB, db)
     context.provide(SOURCE_ROOT, root)
-    context.provide(EMBEDDING_ENDPOINT, EmbeddingEndpoint(adapter(url), asyncio.Semaphore(1)))
+    embedder = DSPyEmbeddingAdapter(
+        replace(adapter(url).profile, parse_document_title=title_aware), base_url=url + "/v1", batch_size=64
+    )
+    context.provide(EMBEDDING_ENDPOINT, EmbeddingEndpoint(embedder, asyncio.Semaphore(1)))
     endpoint = OpenIEEndpoint(program, lm, "fixture-v1", asyncio.Semaphore(1))
     context.provide(OPENIE_ENDPOINT, endpoint)
     env = coco.Environment(settings=coco.Settings.from_env(tmp_path / "state"), context_provider=context)
@@ -67,7 +71,7 @@ def test_native_file_pipeline_owns_inference_rows(tmp_path, provider):
         coco.AppConfig(name="file_pipeline", environment=env, max_inflight_components=4),
         indexing_app_main,
         SourceSettings(("**/*.md",), (), min_chunk_size=1),
-        InferenceIdentity("fixture-v1", adapter(url).profile.index_identity),
+        InferenceIdentity("fixture-v1", embedder.profile.index_identity),
     )
     try:
         app.update_blocking()
@@ -75,10 +79,15 @@ def test_native_file_pipeline_owns_inference_rows(tmp_path, provider):
             rows = conn.execute("SELECT chunk_id, extraction_json, traces_json FROM chunk_inference").fetchall()
             assert len(rows) == 1
             assert conn.execute("SELECT chunk_id FROM source_chunks").fetchall() == [(rows[0][0],)]
+            assert "vector_f32" not in {row[1] for row in conn.execute("PRAGMA table_info(chunk_inference)")}
         assert json.loads(rows[0][1])["entities"]
         assert len(json.loads(rows[0][2])) == 2
         calls = len(state["intervals"])
         assert calls == 3
+        if title_aware:
+            assert "source" in state["embedding_inputs"][0]
+        else:
+            assert state["embedding_inputs"] == ["text: Ada studies Algebra."]
         app.update_blocking()
         assert len(state["intervals"]) == calls
         endpoint.program_identity = "fixture-v2"
@@ -88,7 +97,7 @@ def test_native_file_pipeline_owns_inference_rows(tmp_path, provider):
             coco.AppConfig(name="file_pipeline", environment=env, max_inflight_components=4),
             indexing_app_main,
             SourceSettings(("**/*.md",), (), min_chunk_size=1),
-            InferenceIdentity("fixture-v2", adapter(url).profile.index_identity),
+            InferenceIdentity("fixture-v2", embedder.profile.index_identity),
         )
         app.update_blocking()
         assert len(state["intervals"]) == calls + 2
@@ -112,6 +121,60 @@ async def embedding_fixture(requests: tuple[EmbeddingRequest, ...]) -> tuple[Emb
     return tuple(await coco.map(embed_text, requests))
 
 
+def test_native_inference_survives_process_exit_before_graph_publication(tmp_path, provider):
+    url, state = provider
+    documents = tmp_path / "documents"
+    documents.mkdir()
+    (documents / "source.md").write_text("Ada studies Algebra.", encoding="utf-8")
+    script = r"""
+import asyncio
+import os
+import sys
+from pathlib import Path
+import cocoindex as coco
+from cocoindex.connectors import sqlite
+from yaw.daemon.graph.inference import DSPyEmbeddingAdapter, EmbeddingProfile, HippoRAGProgram, create_dspy_lm
+from yaw.daemon.graph.inference.components import EMBEDDING_ENDPOINT, OPENIE_ENDPOINT, EmbeddingEndpoint, OpenIEEndpoint
+from yaw.daemon.indexing import InferenceIdentity, indexing_app_main
+from yaw.daemon.ingestion.source_targets import SOURCE_DB, SOURCE_ROOT, SourceSettings
+
+root = Path(sys.argv[1])
+url = sys.argv[2]
+db = sqlite.connect(root / 'yaw.db', load_vec=False)
+profile = EmbeddingProfile('overlap', 'fixture', 4, 2048, 'mean', 'query: ', 'text: ')
+embedder = DSPyEmbeddingAdapter(profile, base_url=url + '/v1', batch_size=64)
+lm = create_dspy_lm('overlap', base_url=url + '/v1', cache=False, max_tokens=512)
+program = HippoRAGProgram(rlm_sub_lm=lm, max_output_tokens=512)
+context = coco.ContextProvider()
+context.provide(SOURCE_DB, db)
+context.provide(SOURCE_ROOT, root / 'documents')
+context.provide(EMBEDDING_ENDPOINT, EmbeddingEndpoint(embedder, asyncio.Semaphore(1)))
+context.provide(OPENIE_ENDPOINT, OpenIEEndpoint(program, lm, 'fixture-v1', asyncio.Semaphore(1)))
+env = coco.Environment(settings=coco.Settings.from_env(root / 'state'), context_provider=context)
+app = coco.App(coco.AppConfig(name='restart', environment=env, max_inflight_components=4),
+               indexing_app_main, SourceSettings(('**/*.md',), (), min_chunk_size=1),
+               InferenceIdentity('fixture-v1', profile.index_identity))
+app.update_blocking()
+with db.readonly() as conn:
+    assert conn.execute('SELECT COUNT(*) FROM chunk_inference').fetchone()[0] == 1
+    assert 'vector_f32' not in {row[1] for row in conn.execute('PRAGMA table_info(chunk_inference)')}
+if sys.argv[3] == 'interrupt':
+    os._exit(23)
+env.close()
+db.close()
+"""
+    for mode, expected_code in (("interrupt", 23), ("resume", 0)):
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(tmp_path), url, mode],
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+        assert result.returncode == expected_code, result.stderr
+        assert len(state["intervals"]) == 3
+        assert sum(kind == "embedding" for kind, _, _ in state["intervals"]) == 1
+
+
 @coco.fn
 async def inference_fixture(embedding: EmbeddingRequest, extraction: OpenIEInput) -> tuple[EmbeddedText, ExtractedText]:
     vector, record = await asyncio.gather(embed_text(embedding), extract_text(extraction))
@@ -123,7 +186,6 @@ def test_native_openie_overlaps_embedding_and_restores_traces(tmp_path, provider
     state["rendezvous"] = True
     lm = create_dspy_lm("overlap", base_url=url + "/v1", cache=False, num_retries=0, max_tokens=512)
     program = HippoRAGProgram(rlm_sub_lm=lm, max_output_tokens=512)
-    program.max_invariant_retries = 0
     embedder = adapter(url)
     context = coco.ContextProvider()
     context.provide(EMBEDDING_ENDPOINT, EmbeddingEndpoint(embedder, asyncio.Semaphore(1)))
@@ -233,6 +295,8 @@ def provider():
             started = time.perf_counter()
             kind = "embedding" if self.path.endswith("embeddings") else "chat"
             if kind == "embedding":
+                with lock:
+                    state.setdefault("embedding_inputs", []).extend(data["input"])
                 state["embedding_started"].set()
             elif state.get("rendezvous"):
                 assert state["embedding_started"].wait(10), "Embedding request did not overlap the chat request"
@@ -263,10 +327,34 @@ def provider():
                             for p in packet["pairs"]
                         ]
                     }
+                elif "missing_entities" in text:
+                    output = (
+                        {"entity_definitions": []}
+                        if state["mode"] == "shacl_unrepaired"
+                        else {"entity_definitions": [["London", "Capital of England"]]}
+                    )
+                elif "violations" in text:
+                    all_msg_text = json.dumps(data["messages"])
+                    output = (
+                        {"reasoning": "Leave violation unrepaired.", "code": "SUBMIT(repairs=[])"}
+                        if '"code"' in all_msg_text or "`code`" in all_msg_text
+                        else {"repairs": []}
+                    )
                 elif "[[ ## named_entities ## ]]" in text:
-                    output = {
-                        "triples": [{"sub": "Ada", "pred": "studies", "obj": "Algebra", "def": "Ada studies algebra."}]
-                    }
+                    if state["mode"] == "shacl_unrepaired" and "London" in text:
+                        output = {
+                            "triples": [
+                                {"sub": "Ada", "pred": "visited", "obj": "London", "def": "Ada visited London."}
+                            ]
+                        }
+                    else:
+                        output = {
+                            "triples": [
+                                {"sub": "Ada", "pred": "studies", "obj": "Algebra", "def": "Ada studies algebra."}
+                            ]
+                        }
+                elif state["mode"] == "shacl_unrepaired" and "London" in text:
+                    output = {"named_entities": [["Ada", "A mathematician"]]}
                 else:
                     output = {"named_entities": [["Ada", "A mathematician"], ["Algebra", "A mathematical discipline"]]}
                 if state["mode"] == "chat":
@@ -300,7 +388,9 @@ def provider():
             yield url, state
         finally:
             server.shutdown()
-            worker.join()
+            server.server_close()
+            worker.join(timeout=5)
+            assert not worker.is_alive()
 
 
 def adapter(url):
@@ -333,212 +423,195 @@ def test_async_embedding_request_rejects_invalid_provider_vectors(provider, mode
     assert not embedder.telemetry
 
 
-def engine(root, url, overlap):
-    root.mkdir(exist_ok=True)
+def test_declarative_live_graph_publication_without_polling(tmp_path, provider):
+    url, state = provider
+    state["delay"] = 0.01
+    root = tmp_path / "documents"
+    root.mkdir()
+    source = root / "source.md"
+    source.write_text("Ada studies Algebra.", encoding="utf-8")
+
+    db = open_managed_yaw_db(tmp_path / "yaw.db")
     lm = create_dspy_lm("overlap", base_url=url + "/v1", cache=False, num_retries=0, max_tokens=512)
-    program = HippoRAGProgram(
-        rlm_sub_lm=lm, synonym_token_counter=ServingTokenCounter(url, "overlap"), max_output_tokens=512
+    program = HippoRAGProgram(rlm_sub_lm=lm, max_output_tokens=512)
+    embedder = adapter(url)
+
+    signal_dir = tmp_path / ".yaw"
+    signal_dir.mkdir()
+    reload_payloads: list[str] = []
+    reload_event = threading.Event()
+
+    def on_reload_signal(raw: str) -> None:
+        reload_payloads.append(raw.strip())
+        reload_event.set()
+
+    context = coco.ContextProvider()
+    context.provide(SOURCE_DB, db)
+    context.provide(GRAPH_DB, db)
+    context.provide(SOURCE_ROOT, root)
+    context.provide(RELOAD_SIGNAL_ROOT, signal_dir)
+    context.provide(RELOAD_SIGNAL_HANDLER, on_reload_signal)
+    context.provide(EMBEDDING_ENDPOINT, EmbeddingEndpoint(embedder, asyncio.Semaphore(2)))
+    context.provide(OPENIE_ENDPOINT, OpenIEEndpoint(program, lm, "fixture-v1", asyncio.Semaphore(2)))
+
+    graph_settings = GraphPlanSettings(
+        corpus_root=root,
+        program_identity="fixture-v1",
+        embedding_identity=embedder.profile.index_identity,
+        synonymy_top_k=0,
     )
-    program.max_invariant_retries = 0
-    result = YawGraphEngine(db_path=root / "yaw.db", workspace_root=root, program=program, embedder=adapter(url))
-    result.config = YawConfig(workspace_root=root, indexing_overlap=overlap)
-    return result
+    env = coco.Environment(settings=coco.Settings.from_env(tmp_path / "state"), context_provider=context)
+    app = coco.App(
+        coco.AppConfig(name="live_graph_pipeline", environment=env, max_inflight_components=4),
+        indexing_app_main,
+        SourceSettings(("**/*.md",), (), min_chunk_size=1),
+        InferenceIdentity("fixture-v1", embedder.profile.index_identity),
+        graph_settings,
+        True,
+    )
 
+    async def run_live_cycle() -> None:
+        handle = app.update(live=True)
+        events = handle.watch()
+        assert isinstance(events, AsyncGenerator)
+        ready = False
 
-def chunks(root):
-    text = "Ada studies Algebra."
-    (root / "document.md").write_text(text, encoding="utf-8")
-    return [(ChunkPointer("chunk", "document.md", 1, 1, "Mathematics"), text)]
+        async def wait_for_published_count(expected_count: int) -> None:
+            nonlocal ready
+            async with asyncio.timeout(20):
+                while True:
+                    if not ready:
+                        event = await anext(events)
+                        assert event.stats.total.num_errors == 0
+                        ready = ready or event.status == coco.UpdateStatus.READY
+                        if not ready:
+                            continue
+                    with db.readonly() as conn:
+                        count = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+                        vec_count = conn.execute("SELECT COUNT(*) FROM chunk_vec").fetchone()[0]
+                    if count == expected_count and vec_count == expected_count:
+                        return
+                    await asyncio.sleep(0.02)
 
-
-def test_overlap_matches_serial_graph_and_preserves_accounting(tmp_path, provider):
-    url, state = provider
-    graphs = []
-    for overlap in (False, True):
-        graph = engine(tmp_path / str(overlap), url, overlap)
-        state["intervals"].clear()
         try:
-            assert graph.index_chunks(chunks(graph.workspace_root)) == 1
-            tables = ("chunks", "entities", "facts", "edges", "edge_sources", "entity_labels")
-            graphs.append({table: sorted(map(tuple, graph.conn.execute(f"SELECT * FROM {table}"))) for table in tables})
-            spans = state["intervals"]
-            simultaneous = any(
-                max(a, c) < min(b, d)
-                for kind, a, b in spans
-                for other, c, d in spans
-                if kind == "embedding" and other == "chat"
-            )
-            assert simultaneous is overlap
-            embeds = [(a, b) for k, a, b in spans if k == "embedding"]
-            assert all(b <= c for (_, b), (c, _) in zip(embeds, embeds[1:], strict=False))
-            stages = [t for t in graph.program.telemetry if t.get("stage") in ("ner", "triples")]
-            assert stages and all(t["tokens_used"] == 15 for t in stages)
-            assert graph.get_stats().shacl_conforms
+            await wait_for_published_count(1)
+            coordinator = get_graph_delta_coordinator(db)
+            assert coordinator.last_plan_summary is not None
+            assert len(coordinator.last_plan_summary.chunk_ids) == 1
+            assert {t.predictor for t in coordinator.last_plan_summary.traces} == {"ner", "triples"}
+
+            (signal_dir / "reload.signal").write_text('{"program_path": "compiled.json"}', encoding="utf-8")
+            assert await asyncio.to_thread(reload_event.wait, 10.0)
+            assert reload_payloads == ['{"program_path": "compiled.json"}']
+
+            second = root / "second.md"
+            second.write_text("Ada studies Algebra in London.", encoding="utf-8")
+            await wait_for_published_count(2)
+
+            second.unlink()
+            await wait_for_published_count(1)
+
+            source.unlink()
+            await wait_for_published_count(0)
+
+            await asyncio.wait_for(app.update().result(), timeout=10)
+            await asyncio.wait_for(handle.result(), timeout=10)
         finally:
-            graph.close()
-    assert graphs[0] == graphs[1]
-    assert not any(t.name.startswith("yaw-chunk-embedding") for t in threading.enumerate())
+            await events.aclose()
 
-
-@pytest.mark.parametrize("mode", ["count", "dimensions", "nan", "chat"])
-def test_failure_keeps_graph_atomic_and_closes_worker(tmp_path, provider, mode):
-    url, state = provider
-    graph = engine(tmp_path, url, True)
-    state["mode"] = mode
     try:
-        with pytest.raises((ValueError, dspy.AdapterParseError)):
-            graph.index_chunks(chunks(tmp_path))
-        assert graph.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 0
-        assert graph.conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0] == 0
+        asyncio.run(run_live_cycle())
     finally:
-        graph.close()
-    assert not any(t.name.startswith("yaw-chunk-embedding") for t in threading.enumerate())
+        env.close()
+        db.close()
 
 
-def test_lane_owner_publication_and_bounded_retention(tmp_path, provider):
+def test_publish_graph_shacl_violation_preserves_prior_graph_and_inference_rows(tmp_path, provider):
     url, state = provider
-    state["delay"] = 0
+    state["delay"] = 0.01
+    root = tmp_path / "documents"
+    root.mkdir()
+    source = root / "source.md"
+    source.write_text("Ada studies Algebra.", encoding="utf-8")
+
+    db = open_managed_yaw_db(tmp_path / "yaw.db")
+    lm = create_dspy_lm("overlap", base_url=url + "/v1", cache=False, num_retries=0, max_tokens=512)
+    program = HippoRAGProgram(rlm_sub_lm=lm, max_output_tokens=512)
     embedder = adapter(url)
-    owner = threading.get_ident()
-    publication_threads = []
-    embedder.bind_telemetry_hook(lambda _: publication_threads.append(threading.get_ident()))
-    managed = open_managed_yaw_db(tmp_path / "cache.db")
-    with managed.transaction() as conn:
-        cache = CandidateStageCache(CandidateCacheStore(conn), managed, "embedding", lambda: "stable")
-    try:
-        for _ in range(12):
-            with EmbeddingLane(
-                embedder,
-                ["a", "b", "a"],
-                batch_size=1,
-                lookup=lambda text: cache.get((text,)),
-                store=lambda text, vector: cache.__setitem__((text,), vector),
-            ) as lane:
-                vectors = lane.finish()
-                np.testing.assert_equal(vectors[0], vectors[2])
-            assert not lane.vectors and not lane.missing and lane.future is None
-        assert publication_threads == [owner, owner]
-        assert len(state["intervals"]) == 2
-    finally:
-        managed.close()
 
+    context = coco.ContextProvider()
+    context.provide(SOURCE_DB, db)
+    context.provide(GRAPH_DB, db)
+    context.provide(SOURCE_ROOT, root)
+    context.provide(EMBEDDING_ENDPOINT, EmbeddingEndpoint(embedder, asyncio.Semaphore(2)))
+    context.provide(OPENIE_ENDPOINT, OpenIEEndpoint(program, lm, "fixture-v1", asyncio.Semaphore(2)))
 
-def test_schedule_flag_does_not_change_index_identity(tmp_path):
-    config = YawConfig(workspace_root=tmp_path)
-    assert config.config_fingerprint() == replace(config, indexing_overlap=True).config_fingerprint()
-
-
-def test_schedule_flag_preserves_optimization_resume_identity(tmp_path, provider):
-    graph = engine(tmp_path, provider[0], False)
-    runtime = YawRuntime(graph.config)
-    runtime.engine = graph
-    try:
-        target = tmp_path / "program.json"
-        runtime.validate_optimization_run(target, [], [], [], "gepa")
-        before = graph.get_meta("optimization_run")
-        runtime.config = replace(runtime.config, indexing_overlap=True)
-        runtime.validate_optimization_run(target, [], [], [], "gepa")
-        assert graph.get_meta("optimization_run") == before
-        assert "indexing_overlap" not in json.loads(before)["identity"]["settings"]
-    finally:
-        graph.close()
-
-
-def test_failed_owner_drains_valid_request_without_scheduling_more(tmp_path, provider):
-    url, state = provider
-    managed = open_managed_yaw_db(tmp_path / "cache.db")
-    with managed.transaction() as conn:
-        cache = CandidateStageCache(CandidateCacheStore(conn), managed, "embedding", lambda: "stable")
-    try:
-        with (
-            pytest.raises(RuntimeError, match="OpenIE failed"),
-            EmbeddingLane(
-                adapter(url),
-                ["a", "b", "c"],
-                batch_size=1,
-                lookup=lambda text: cache.get((text,)),
-                store=lambda text, vector: cache.__setitem__((text,), vector),
-            ),
-        ):
-            assert state["embedding_started"].wait(timeout=5)
-            raise RuntimeError("OpenIE failed")
-        assert cache.get(("a",)) is not None
-        assert cache.get(("b",)) is None
-        assert len(state["intervals"]) == 1
-    finally:
-        managed.close()
-    assert not any(t.name.startswith("yaw-chunk-embedding") for t in threading.enumerate())
-
-
-def test_provider_timeout_closes_lane(provider):
-    url, _ = provider
-    embedder = adapter(url)
-    embedder.default_kwargs.update(timeout=0.03, num_retries=0)
-    published = []
-    with (
-        pytest.raises(litellm.Timeout),
-        EmbeddingLane(
-            embedder,
-            ["timeout"],
-            batch_size=1,
-            lookup=lambda _: None,
-            store=lambda text, vector: published.append((text, vector)),
-        ) as lane,
-    ):
-        lane.finish()
-    assert published == []
-    assert not any(t.name.startswith("yaw-chunk-embedding") for t in threading.enumerate())
-
-
-def test_fresh_process_first_chat_and_embedding_calls_overlap(tmp_path, provider):
-    url, state = provider
-    script = """
-import sys
-from yaw.daemon.graph.inference import (
- DSPyEmbeddingAdapter, EmbeddingProfile, EmbeddingLane, create_dspy_lm,
-)
-profile=EmbeddingProfile('overlap','fixture',4,2048,'mean','query: ','text: ')
-adapter=DSPyEmbeddingAdapter(profile,base_url=sys.argv[1]+'/v1')
-lm=create_dspy_lm('overlap',base_url=sys.argv[1]+'/v1',cache=False,num_retries=0,max_tokens=32)
-with EmbeddingLane(adapter,['first call'],batch_size=1,lookup=lambda _:None,store=lambda t,v:None) as lane:
- lm(messages=[{'role':'user','content':'Name the entities'}])
- assert len(lane.finish())==1
-"""
-    result = subprocess.run([sys.executable, "-c", script, url], capture_output=True, text=True, timeout=60)
-    assert result.returncode == 0, result.stderr
-    spans = state["intervals"]
-    assert any(
-        max(a, c) < min(b, d)
-        for kind, a, b in spans
-        for other, c, d in spans
-        if kind == "embedding" and other == "chat"
+    graph_settings = GraphPlanSettings(
+        corpus_root=root,
+        program_identity="fixture-v1",
+        embedding_identity=embedder.profile.index_identity,
+        synonymy_top_k=0,
     )
+    env = coco.Environment(settings=coco.Settings.from_env(tmp_path / "state"), context_provider=context)
+    app = coco.App(
+        coco.AppConfig(name="shacl_rollback_pipeline", environment=env, max_inflight_components=4),
+        indexing_app_main,
+        SourceSettings(("**/*.md",), (), min_chunk_size=1),
+        InferenceIdentity("fixture-v1", embedder.profile.index_identity),
+        graph_settings,
+    )
+    try:
+        app.update_blocking()
+        with db.readonly() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM source_chunks").fetchone()[0] == 1
+            assert conn.execute("SELECT COUNT(*) FROM chunk_inference").fetchone()[0] == 1
+            assert conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 1
+            assert conn.execute("SELECT COUNT(*) FROM chunk_vec").fetchone()[0] == 1
+            initial_entities = conn.execute("SELECT entity_id, name, definition FROM entities").fetchall()
 
-
-def test_fresh_process_reuses_persisted_embeddings_after_interruption(tmp_path, provider):
-    url, state = provider
-    script = """
-import sys
-from pathlib import Path
-from yaw.daemon.graph.inference import DSPyEmbeddingAdapter, EmbeddingProfile, EmbeddingLane
-from yaw.daemon.graph.storage import CandidateCacheStore, CandidateStageCache, open_managed_yaw_db
-profile = EmbeddingProfile('overlap','fixture',4,2048,'mean','query: ','text: ')
-adapter = DSPyEmbeddingAdapter(profile,base_url=sys.argv[2]+'/v1')
-db = open_managed_yaw_db(Path(sys.argv[1])/'cache.db')
-with db.transaction() as conn:
- cache = CandidateStageCache(CandidateCacheStore(conn),db,'embedding',lambda:'stable')
-try:
- with EmbeddingLane(adapter,['a','b'],batch_size=1,lookup=lambda t:cache.get((t,)),
-                    store=lambda t,v:cache.__setitem__((t,),v)) as lane:
-  assert len(lane.finish()) == 2
-  if sys.argv[3]=='crash': raise RuntimeError('before graph commit')
-except RuntimeError:
- if sys.argv[3]!='crash': raise
-finally: db.close()
-"""
-    for mode in ("crash", "resume"):
-        result = subprocess.run(
-            [sys.executable, "-c", script, str(tmp_path), url, mode], capture_output=True, text=True, timeout=60
+        # Verify GraphTargetHandler.apply_actions rolls back transaction on SHACL violation
+        invalid_rows = PreparedGraphRows(
+            chunks=(),
+            entities=(("entity-invalid", "broken", ""),),
+            entity_labels=(("broken", "entity-invalid", "skos:prefLabel", "Broken", ""),),
+            facts=(),
+            fact_sources=(),
+            edges=(),
+            chunk_vectors=(),
+            entity_vectors=(),
+            fact_vectors=(),
         )
-        assert result.returncode == 0, result.stderr
-        assert len(state["intervals"]) == 2
+        with pytest.raises(ValueError, match="SHACL violations"):
+            GraphTargetHandler().apply_actions(context, [GraphAction(invalid_rows, (), ())])
+        with db.readonly() as conn:
+            assert conn.execute("SELECT entity_id, name, definition FROM entities").fetchall() == initial_entities
+
+        # Verify publish_graph failure on SHACL violation keeps source_chunks & chunk_inference intact
+        # while preserving prior published graph rows
+        state["mode"] = "shacl_unrepaired"
+        second = root / "second.md"
+        second.write_text("Ada visited London.", encoding="utf-8")
+        app.update_blocking()
+        err = get_graph_delta_coordinator(db).pop_error()
+        assert err is not None and "SHACL violations" in str(err)
+
+        with db.readonly() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM source_chunks").fetchone()[0] == 2
+            assert conn.execute("SELECT COUNT(*) FROM chunk_inference").fetchone()[0] == 2
+            assert conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 1
+            assert conn.execute("SELECT COUNT(*) FROM chunk_vec").fetchone()[0] == 1
+            assert conn.execute("SELECT entity_id, name, definition FROM entities").fetchall() == initial_entities
+
+        # Restoring valid repair mode publishes the 2nd chunk using existing chunk_inference rows
+        state["mode"] = "valid"
+        get_graph_delta_coordinator(db).recovery_nonce = "recover-1"
+        app.update_blocking()
+        assert get_graph_delta_coordinator(db).pop_error() is None
+        with db.readonly() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM source_chunks").fetchone()[0] == 2
+            assert conn.execute("SELECT COUNT(*) FROM chunk_inference").fetchone()[0] == 2
+            assert conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 2
+            assert conn.execute("SELECT COUNT(*) FROM chunk_vec").fetchone()[0] == 2
+    finally:
+        env.close()
+        db.close()

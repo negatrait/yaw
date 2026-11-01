@@ -34,7 +34,7 @@ if callable(reconfigure_stdout):
     reconfigure_stdout(encoding="utf-8", errors="replace")
 
 import benchmark  # noqa: E402
-from benchmark import ALIASES, MONKEYPATCHED_HIPPORAG_BASELINES, PAPER_BASELINES  # noqa: E402
+from benchmark import BASELINES  # noqa: E402
 from yaw.daemon.graph.inference import evaluate_benchmark_gate  # noqa: E402
 
 DEFAULT_DATASETS: tuple[str, ...] = (
@@ -54,8 +54,7 @@ def build_monkeypatched_baseline_report(
     queries_per_dataset: int = 25,
 ) -> dict[str, Any]:
     """Build a normalized report dictionary from consolidated historical monkeypatched HippoRAG 2 baselines."""
-    canonical_ds = ALIASES.get(dataset, dataset)
-    b = MONKEYPATCHED_HIPPORAG_BASELINES.get(canonical_ds, {})
+    b = BASELINES.get(dataset, {}).get("monkeypatched_hipporag", {})
     return {
         "engine": "hipporag",
         "status": "passed",
@@ -71,9 +70,9 @@ def build_monkeypatched_baseline_report(
         "evaluation_metrics": {
             "hipporag": {
                 "retrieval": {
-                    "Recall@1": float(b.get("Recall@1", 0.0)),
-                    "Recall@2": float(b.get("Recall@2", 0.0)),
-                    "Recall@5": float(b.get("Recall@5", 0.0)),
+                    "Recall@1": float(b["Recall@1"]) if b.get("Recall@1") is not None else None,
+                    "Recall@2": float(b["Recall@2"]) if b.get("Recall@2") is not None else None,
+                    "Recall@5": float(b["Recall@5"]) if b.get("Recall@5") is not None else None,
                 },
                 "qa": {
                     "ExactMatch": float(b["ExactMatch"]) if b.get("ExactMatch") is not None else None,
@@ -91,8 +90,10 @@ def extract_engine_summary(report: dict[str, Any]) -> dict[str, Any]:
     eval_metrics = report.get("evaluation_metrics", {}) or {}
     hippo_block = eval_metrics.get("hipporag", {}) or {}
     dpr_block = eval_metrics.get("standard_dpr", {}) or {}
-    ret = hippo_block.get("retrieval") or report.get("retrieval", {}) or {}
-    dpr_ret = dpr_block.get("retrieval") or report.get("standard_dpr", {}) or {}
+    ret = hippo_block.get("retrieval") if "retrieval" in hippo_block else report.get("retrieval", {})
+    ret = ret or {}
+    dpr_ret = dpr_block.get("retrieval") if "retrieval" in dpr_block else report.get("standard_dpr", {})
+    dpr_ret = dpr_ret or {}
     qa = hippo_block.get("qa") if "qa" in hippo_block else report.get("qa")
     rec_mem = eval_metrics.get("recognition_memory") or report.get("recognition_memory", {}) or {}
 
@@ -109,14 +110,14 @@ def extract_engine_summary(report: dict[str, Any]) -> dict[str, Any]:
         "index_dir": str(report.get("index_dir", "")),
         "graph": dict(report.get("graph", {}) or {}),
         "retrieval": {
-            "Recall@1": round(float(ret.get("Recall@1", 0.0)), 4),
-            "Recall@2": round(float(ret.get("Recall@2", 0.0)), 4),
-            "Recall@5": round(float(ret.get("Recall@5", 0.0)), 4),
+            "Recall@1": round(float(ret["Recall@1"]), 4) if ret.get("Recall@1") is not None else None,
+            "Recall@2": round(float(ret["Recall@2"]), 4) if ret.get("Recall@2") is not None else None,
+            "Recall@5": round(float(ret["Recall@5"]), 4) if ret.get("Recall@5") is not None else None,
         },
         "standard_dpr": {
-            "Recall@1": round(float(dpr_ret.get("Recall@1", 0.0)), 4),
-            "Recall@2": round(float(dpr_ret.get("Recall@2", 0.0)), 4),
-            "Recall@5": round(float(dpr_ret.get("Recall@5", 0.0)), 4),
+            "Recall@1": round(float(dpr_ret["Recall@1"]), 4) if dpr_ret.get("Recall@1") is not None else None,
+            "Recall@2": round(float(dpr_ret["Recall@2"]), 4) if dpr_ret.get("Recall@2") is not None else None,
+            "Recall@5": round(float(dpr_ret["Recall@5"]), 4) if dpr_ret.get("Recall@5") is not None else None,
         },
         "qa": {
             "ExactMatch": round(float(qa["ExactMatch"]), 4)
@@ -143,10 +144,7 @@ def compare_engine_reports(
 ) -> dict[str, Any]:
     """Compare Target 1 (Monkeypatched HippoRAG 2) and Target 2 (Paper 70B) against YAW via evaluate_benchmark_gate."""
     cleaned_ds = str(dataset).strip().lower()
-    canonical_ds = ALIASES.get(
-        cleaned_ds,
-        cleaned_ds if cleaned_ds in PAPER_BASELINES or cleaned_ds in MONKEYPATCHED_HIPPORAG_BASELINES else dataset,
-    )
+    canonical_ds = cleaned_ds if cleaned_ds in BASELINES else dataset
     hippo_sum = extract_engine_summary(hipporag_report)
     yaw_sum = extract_engine_summary(yaw_report)
     num_docs = yaw_sum["num_docs"] or hippo_sum["num_docs"]
@@ -154,11 +152,10 @@ def compare_engine_reports(
 
     has_em = yaw_sum["qa"]["ExactMatch"] is not None and hippo_sum["qa"]["ExactMatch"] is not None
     has_f1 = yaw_sum["qa"]["F1"] is not None and hippo_sum["qa"]["F1"] is not None
-    paper_base = PAPER_BASELINES.get(canonical_ds, {})
+    paper_base = {k: v for k, v in BASELINES.get(canonical_ds, {}).items() if k != "monkeypatched_hipporag"}
 
     gate_spec = {
         "queries_per_dataset": num_queries or queries_per_dataset,
-        "aliases": ALIASES,
         "datasets": {
             canonical_ds: {
                 "monkeypatched_hipporag": {
@@ -196,9 +193,9 @@ def compare_engine_reports(
         "hipporag": hippo_sum,
         "yaw": yaw_sum,
         "delta_yaw_vs_hipporag": {
-            "Recall@1": raw_delta_hippo["Recall@1"],
-            "Recall@2": raw_delta_hippo["Recall@2"],
-            "Recall@5": raw_delta_hippo["Recall@5"],
+            "Recall@1": raw_delta_hippo["Recall@1"] if hippo_sum["retrieval"]["Recall@1"] is not None else None,
+            "Recall@2": raw_delta_hippo["Recall@2"] if hippo_sum["retrieval"]["Recall@2"] is not None else None,
+            "Recall@5": raw_delta_hippo["Recall@5"] if hippo_sum["retrieval"]["Recall@5"] is not None else None,
             "ExactMatch": raw_delta_hippo["ExactMatch"] if has_em else None,
             "F1": raw_delta_hippo["F1"] if has_f1 else None,
         },
@@ -252,13 +249,14 @@ def aggregate_gate_summary(
         y_qa = y.get("qa", {})
         spec_datasets[ds_name] = {
             "monkeypatched_hipporag": {
-                "Recall@1": h_ret.get("Recall@1", 0.0),
-                "Recall@2": h_ret.get("Recall@2", 0.0),
-                "Recall@5": h_ret.get("Recall@5", 0.0),
+                "Recall@1": h_ret.get("Recall@1"),
+                "Recall@2": h_ret.get("Recall@2"),
+                "Recall@5": h_ret.get("Recall@5"),
                 "ExactMatch": h_qa.get("ExactMatch"),
                 "F1": h_qa.get("F1"),
             },
-            "paper_70b": d.get("paper_baselines") or PAPER_BASELINES.get(ds_name, {}),
+            "paper_70b": d.get("paper_baselines")
+            or {k: v for k, v in BASELINES.get(ds_name, {}).items() if k != "monkeypatched_hipporag"},
         }
         reports[ds_name] = {
             "num_queries": d.get("num_queries") or d.get("queries_per_dataset") or 25,
@@ -271,7 +269,7 @@ def aggregate_gate_summary(
 
     gate_res = evaluate_benchmark_gate(
         reports,
-        {"aliases": ALIASES, "datasets": spec_datasets},
+        {"datasets": spec_datasets},
         mode=mode,
     )
     mm = gate_res["macro_means"]
@@ -414,7 +412,7 @@ def _build_gate_table_rows(gate_payload: dict[str, Any]) -> dict[str, list[dict[
                 }
             )
 
-        pb = PAPER_BASELINES.get(ds, {})
+        pb = BASELINES.get(ds, {})
         h2 = pb.get("hipporag2_llama3.3_70b_nvembed_v2", {})
         std = pb.get("standard_nvembed_v2_llama3.3_70b", {})
         paper_rows.append(
@@ -639,7 +637,7 @@ def generate_quality_svg(gate_payload: dict[str, Any]) -> str:
         entry = datasets_map.get(ds, {})
         h = entry.get("hipporag", {})
         y = entry.get("yaw", {})
-        pb = PAPER_BASELINES.get(ds, {})
+        pb = BASELINES.get(ds, {})
         pb_h2 = pb.get("hipporag2_llama3.3_70b_nvembed_v2", {})
         d = entry.get("delta_yaw_vs_hipporag", {})
 
@@ -1138,7 +1136,7 @@ def run_parity_gate(
     fresh: bool = False,
 ) -> dict[str, Any]:
     """Execute the 7-dataset head-to-head parity gate and persist JSON + Markdown reports."""
-    canonical_datasets = [ALIASES.get(ds, ds) for ds in datasets]
+    canonical_datasets = list(datasets)
     existing_datasets: dict[str, dict[str, Any]] = {}
 
     if fresh:

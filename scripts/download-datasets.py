@@ -5,7 +5,6 @@ import argparse
 from pathlib import Path
 
 from yaw.daemon.ingestion import (
-    ALIASES,
     DATASET_REGISTRY,
     DATASET_SOURCE_FIELDS,
     download_dataset_file,
@@ -16,7 +15,7 @@ from yaw.daemon.ingestion import (
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
-    parser.add_argument("--dataset", choices=["all", *DATASET_REGISTRY, *ALIASES], default="all")
+    parser.add_argument("--dataset", choices=["all", *DATASET_REGISTRY], default="all")
     parser.add_argument("--dest", type=Path, default=Path("outputs/datasets"))
     parser.add_argument("--source-dir", type=Path, default=Path("outputs/datasets/sources"))
     parser.add_argument("--corpus", type=Path, help="Configured corpus JSON for a single dataset")
@@ -26,7 +25,7 @@ def main() -> None:
     args = parser.parse_args()
     if args.dataset == "all" and (args.corpus or args.questions):
         parser.error("--corpus/--questions require a single --dataset")
-    selected = list(DATASET_REGISTRY) if args.dataset == "all" else [ALIASES.get(args.dataset, args.dataset)]
+    selected = list(DATASET_REGISTRY) if args.dataset == "all" else [args.dataset]
     failed = False
     for name in selected:
         if args.check:

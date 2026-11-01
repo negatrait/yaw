@@ -120,16 +120,16 @@ def test_same_label_different_senses_do_not_collapse_into_one_concept():
         ('noise {bad} {"other": []} {"entity_definitions": [["Ada", "Mathematician"]]}', (("Ada", "Mathematician"),)),
         ('```json\n[["Ada", "Mathematician"]]\n```', (("Ada", "Mathematician"),)),
         ('```\n["Ada"]\n```', (("Ada", ""),)),
-        ('{"entity_definitions": [["Ada", "Mathematician"], ["unfinished', (("Ada", "Mathematician"),)),
         ({"entity_definitions": [["Ada", "Mathematician"]]}, (("Ada", "Mathematician"),)),
         ({"named_entities": "wrong type"}, ()),
-        ("[42]", ()),
-        ("not JSON", ()),
         (None, ()),
     ],
 )
 def test_entity_response_envelopes_and_truncation(payload, expected):
     assert extract_entity_definitions(payload) == expected
+    for bad in ('{"entity_definitions": [["Ada", "Mathematician"], ["unfinished', "[42]", "not JSON"):
+        with pytest.raises((ValueError, json.JSONDecodeError)):
+            extract_entity_definitions(bad)
 
 
 def test_entity_definitions_fill_missing_data_and_preserve_homographs():
@@ -151,9 +151,12 @@ def test_entity_definitions_fill_missing_data_and_preserve_homographs():
     )
 
 
-@pytest.mark.parametrize("payload", ["", "not JSON", '{"triples": "wrong type"}', 42, None])
+@pytest.mark.parametrize("payload", [42, None])
 def test_broken_structured_response_envelopes_produce_no_triples(payload):
     assert extract_structured_triples(payload) == ()
+    for bad in ("", "not JSON", '{"triples": "wrong type"}'):
+        with pytest.raises((ValueError, json.JSONDecodeError)):
+            extract_structured_triples(bad)
 
 
 @pytest.mark.parametrize(
@@ -166,7 +169,8 @@ def test_bare_and_wrapped_structured_triples_are_equivalent(payload):
 
 @pytest.mark.parametrize("payload", ["not JSON", '{"triples": "wrong type"}'])
 def test_plain_triple_parser_rejects_invalid_response_shapes(payload):
-    assert extract_triples(payload) == ()
+    with pytest.raises((ValueError, json.JSONDecodeError)):
+        extract_triples(payload)
 
 
 @pytest.mark.parametrize(
@@ -228,11 +232,13 @@ def test_empty_answer_metrics_and_triple_filtering():
 @pytest.mark.parametrize("name", ['A"B', "A\\B"])
 def test_truncation_repair_preserves_escaped_characters_in_completed_names(name):
     truncated = json.dumps({"named_entities": [name]})[:-2] + ', "unfinished'
-    assert extract_entity_definitions(truncated) == ((name, ""),)
+    with pytest.raises((ValueError, json.JSONDecodeError)):
+        extract_entity_definitions(truncated)
 
 
 def test_wrong_nested_response_envelopes_and_missing_filter_output_are_not_facts():
-    assert extract_structured_triples('{"other":[["A"]], "unfinished') == ()
+    with pytest.raises((ValueError, json.JSONDecodeError)):
+        extract_structured_triples('{"other":[["A"]], "unfinished')
     assert extract_structured_triples({"triples": [["A", "p", "B"]]})[0].as_tuple() == ("A", "p", "B")
     assert match_facts_to_candidate_indices([("A", "p", "B")], coerce_generated_facts("No structured response")) == []
 
@@ -276,5 +282,7 @@ def test_synonym_and_shacl_decisions_reject_unknown_actions(envelope):
     assert parse_shacl_repairs(wrap("repairs", repairs)) == [
         {"focus_node": "A", "action": "set_definition", "value": "A concept"},
     ]
-    assert parse_synonym_decisions("not JSON") == []
-    assert parse_shacl_repairs("not JSON") == []
+    with pytest.raises(json.JSONDecodeError):
+        parse_synonym_decisions("not JSON")
+    with pytest.raises(json.JSONDecodeError):
+        parse_shacl_repairs("not JSON")

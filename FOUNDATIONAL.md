@@ -91,3 +91,22 @@ yaw/
     └── graph/
         ├── storage/
         └── inference/
+
+```
+
+## 6. Failure Policy
+
+Until YAW is feature complete, every failure is a hard failure.
+
+- DSPy's native retry policy is the only retry mechanism for transient model-service errors.
+- When those retries are exhausted, or a model service is unavailable, the operation aborts with the original error. Nothing is skipped, defaulted or degraded.
+- Fallbacks, degraded modes and recovery paths are out of scope until the core pipeline is complete. Each is then introduced as an explicit, scoped decision, with tests that exercise the failure it handles.
+
+At this stage a fallback hides defects and corrupts benchmark evidence. A visible failure is more useful than a run that completes.
+
+## 7. Further Context
+
+- [HippoRAG (`2405.14831v3`)](docs/arxiv-2405.14831v3-hipporag.md)
+- [HippoRAG 2 (`2502.14802v1`)](docs/arxiv-2502.14802v1-hipporag2.md)
+- [Epic 1: Native `yaw.db` Engine & CocoIndex Daemon](docs/epic-1-hipporag-daemon.md)
+- [Epic 2: FastMCP Streamable HTTP Adapter](docs/epic-2-fastmcp-http.md)

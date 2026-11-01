@@ -323,11 +323,10 @@ bound fact.
     The query requires careful analysis and possibly multi-hop reasoning to connect different pieces of \
 information. You must select up to 4 relevant facts from the provided candidate list that have a strong \
 connection to the query, aiding in reasoning and providing an accurate answer. The output should be in \
-JSON format, e.g., {"fact": [["s1", "p1", "o1"], ["s2", "p2", "o2"]]}, and if no facts are relevant, \
-return an empty list, {"fact": []}. The accuracy of your response is paramount, as it will directly \
-impact the decisions made by these high-level stakeholders. You must only use facts from the candidate \
-list and not generate new facts. The future of critical decision-making relies on your ability to \
-accurately filter and present relevant information."""
+JSON format, e.g., {"fact": [["s1", "p1", "o1"], ["s2", "p2", "o2"]]}. The accuracy of your response is \
+paramount, as it will directly impact the decisions made by these high-level stakeholders. You must only \
+use facts from the candidate list and not generate new facts. The future of critical decision-making \
+relies on your ability to accurately filter and present relevant information."""
 
     question: str = dspy.InputField(desc="Query for retrieval")
     fact_before_filter: str = dspy.InputField(desc="Candidate triples to be filtered")
@@ -369,7 +368,8 @@ class HealSHACLViolations(dspy.Signature):
     """As a Recursive Language Model (RLM) orchestrator for closed-world SHACL graph repair,
     you orchestrate the healing of SHACL violations using inspect_focus_node, inspect_pair,
     hydrate_chunk, hydrate_ast_island, search_graph, qwen_propose_shacl_repairs,
-    apply_shacl_repairs, and lint_shacl sandbox tools."""
+    and lint_shacl sandbox tools. These tools inspect the graph without changing it.
+    Return the complete proposed repair list; the host validates and applies it after inference."""
 
     violations: str = dspy.InputField(desc="JSON list of SHACLViolation report items")
     repairs: list[dict[str, Any]] = dspy.OutputField(
@@ -385,8 +385,10 @@ class HealSHACLViolations(dspy.Signature):
 class ReflectiveInnerDistillerSignature(dspy.Signature):
     """Inspect training traces in the sandbox and select original evidence by reference.
     Find generalizable failures and successful contrasts. Never write an instruction.
-    Return a diagnosis and up to five references: example_id, path (list of keys/indices),
-    optional start/end character offsets for a string excerpt. Do not reconstruct facts.
+    Return `selection` as `{"diagnosis": "...", "references": [{"example_id": "<evidence_id>", "path": []}]}`
+    where `path` is a list of dictionary keys inside that example (use `[]` for the full example or `["Feedback"]`,
+    never an example list index like `[0]`), with optional `start`/`end` character offsets when `path` resolves
+    to a string. Do not reconstruct facts.
     """
 
     current_instruction: str = dspy.InputField()

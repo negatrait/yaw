@@ -63,7 +63,7 @@ the tests executed in that invocation. Every collected test runs, including live
 must already be resident.
 Ruff fixes and pytest `--testmon` are project defaults. ty's `--fix` has no
 persistent configuration setting; `uv run typecheck` supplies it automatically.
-See the [preflight audit](docs/preflight-audit.md) for remaining cleanup work.
+See the [coverage plan](docs/coverage-plan.md) for remaining verification work.
 
 Optimization starts a fresh timestamped sandbox unless `--resume` or `--db-path`
 selects an existing run. `--resume` and `--db-path latest` select
@@ -111,7 +111,7 @@ GEPA reflection uses sandbox evidence selection followed by DSPy's native instru
 writer. `inference.reflection_input_tokens` defaults to **16,384**; the complete
 rendered request is checked with the resident model's serving tokenizer. Evidence,
 proposals and SIMBA state checkpoint in `yaw.db`, including a pinned active request.
-See [reflection repair and restart behavior](docs/gepa-reflection-repair.md).
+See [DSPy practical improvements](docs/dspy-improvements.md).
 
 During optimization, full DSPy LM/module inspection histories are disabled;
 GEPA traces and logical token accounting remain active. YAW keeps recent

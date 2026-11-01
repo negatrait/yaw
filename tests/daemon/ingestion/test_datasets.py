@@ -1,23 +1,23 @@
 """Prepared files, native persistent snapshots and untouched evaluation records."""
 
 import json
-import sqlite3
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
+from yaw.core import YawRuntimeError
 from yaw.daemon.graph.storage import hydrate_chunk_pointer
 from yaw.daemon.ingestion import (
     DATASET_REGISTRY,
     DATASET_SOURCE_FIELDS,
     ENTERPRISE_CATEGORY_QUOTAS,
-    CorpusIngestor,
     load_dataset_bundle,
     load_dataset_files,
     load_dataset_splits,
     prepare_dataset_bundle,
+    resolve_dataset_name,
     select_enterprise_questions,
     snapshot_dataset_bundle,
 )
@@ -123,29 +123,34 @@ def test_snapshot_reuses_native_memos_across_processes_and_updates_one_document(
     bundle = prepare_dataset_bundle("sample", corpus, qa, tmp_path / "prepared")
     worker = """
 import json, sys, threading
-from yaw.daemon.ingestion import CorpusIngestor
+from yaw.daemon.ingestion import load_dataset_bundle, snapshot_dataset_bundle
 calls = []
 def profile(frame, event, arg):
     if event == "call" and frame.f_code.co_name == "chunk_source_text":
         calls.append(frame.f_locals["rel_posix_path"])
 sys.setprofile(profile)
 threading.setprofile(profile)
-with CorpusIngestor(sys.argv[1], sys.argv[2], **json.loads(sys.argv[3])) as i:
-    delta = i.poll()
-    snapshot = i.snapshot()
+snapshot = snapshot_dataset_bundle(load_dataset_bundle(sys.argv[1]), sys.argv[2], **json.loads(sys.argv[3]))
 sys.setprofile(None)
-print(json.dumps([len(delta.added_chunks), len(delta.deleted_chunk_ids), len(snapshot), calls]))
+print(json.dumps([[p.chunk_id for p, _ in snapshot], calls]))
 """
+    prev_ids: set[str] = set()
 
     def scan(**settings):
+        nonlocal prev_ids
         result = subprocess.run(
-            [sys.executable, "-c", worker, str(bundle.documents_root), str(tmp_path / "state"), json.dumps(settings)],
+            [sys.executable, "-c", worker, str(bundle.root), str(tmp_path / "state"), json.dumps(settings)],
             capture_output=True,
             text=True,
             check=True,
             timeout=60,
         )
-        return json.loads(result.stdout.strip().splitlines()[-1])
+        chunk_ids, calls = json.loads(result.stdout.strip().splitlines()[-1])
+        cur_ids = set(chunk_ids)
+        added = len(cur_ids - prev_ids)
+        deleted = len(prev_ids - cur_ids)
+        prev_ids = cur_ids
+        return [added, deleted, len(chunk_ids), calls]
 
     first = scan()
     assert first[:3] == [2, 0, 2] and len(first[3]) == 2
@@ -216,16 +221,21 @@ def test_enterprise_stratification_is_owned_by_loader_and_does_not_rewrite_rows(
     corpus, qa = inputs(tmp_path, questions=rows)
     prepare_dataset_bundle("enterprise_rag_bench", corpus, qa, tmp_path / "outputs/datasets")
     train, val, documents = load_dataset_splits(
-        ["enterprise"], workspace_root=tmp_path, max_queries=250, train_queries=150
+        ["enterprise_rag_bench"], workspace_root=tmp_path, max_queries=250, train_queries=150
     )
     assert len(train) == 150 and len(val) == 100 and len(documents) == 2
     assert train[0]["gold_answers"] == [selected[0]["gold_answer"]]
     assert not train[0]["item_docs"]
     small_train, small_val, _ = load_dataset_splits(
-        ["enterprise"], workspace_root=tmp_path, max_queries=12, train_queries=7
+        ["enterprise_rag_bench"], workspace_root=tmp_path, max_queries=12, train_queries=7
     )
     assert [row["gold_answers"] for row in small_train] == [[r["gold_answer"]] for r in selected[:7]]
     assert [row["gold_answers"] for row in small_val] == [[r["gold_answer"]] for r in selected[150:155]]
+    for alias in ("2wiki", "naturalquestions", "nq_rear", "enterprise"):
+        with pytest.raises(ValueError, match="Unknown dataset"):
+            resolve_dataset_name(alias)
+    with pytest.raises(YawRuntimeError, match="held-out"):
+        load_dataset_splits(["nq"], workspace_root=tmp_path)
     presplit = [dict(row, split="train" if i < 150 else "val") for i, row in enumerate(selected)]
     assert select_enterprise_questions(presplit) == presplit
     presplit[150]["question_id"] = presplit[0]["question_id"]
@@ -233,52 +243,15 @@ def test_enterprise_stratification_is_owned_by_loader_and_does_not_rewrite_rows(
         select_enterprise_questions(presplit)
 
 
-def test_snapshot_requires_successful_scan_and_malformed_file_fails_then_retries(tmp_path):
-    docs = tmp_path / "docs"
-    docs.mkdir()
-    source = docs / "doc.json"
-    source.write_text('{"title": "A", "text": "Valid"}', encoding="utf-8")
-    with CorpusIngestor(docs, tmp_path / "state") as ingestor:
-        with pytest.raises(RuntimeError, match="successful poll"):
-            ingestor.snapshot()
-        assert ingestor.poll().added_chunks
-        source.write_text("{malformed", encoding="utf-8")
-        with pytest.raises(ValueError):
-            ingestor.poll()
-        with pytest.raises(RuntimeError):
-            ingestor.snapshot()
-        source.write_text('{"title": "A", "text": "Fixed"}', encoding="utf-8")
-        assert len(ingestor.poll().added_chunks) == 1
-        assert len(ingestor.snapshot()) == 1
-
-
-def test_failed_scan_does_not_delete_unvisited_sources_from_real_sqlite(tmp_path):
-    docs = tmp_path / "documents"
-    docs.mkdir()
-    a, b = docs / "a.json", docs / "b.json"
-    a.write_text('{"title":"A","text":"First"}', encoding="utf-8")
-    b.write_text('{"title":"B","text":"Second"}', encoding="utf-8")
-    with sqlite3.connect(tmp_path / "target.db") as conn:
-        conn.execute("CREATE TABLE chunks(id TEXT PRIMARY KEY, source TEXT)")
-
-        # SQLite callbacks run on CocoIndex's worker thread, so open the real
-        # connection in that thread rather than sharing a thread-bound handle.
-        def apply(delta):
-            with sqlite3.connect(tmp_path / "target.db") as target:
-                target.executemany(
-                    "INSERT OR REPLACE INTO chunks VALUES (?,?)",
-                    [(p.chunk_id, p.rel_posix_path) for p, _ in delta.added_chunks],
-                )
-                target.executemany("DELETE FROM chunks WHERE id=?", [(cid,) for cid in delta.deleted_chunk_ids])
-
-        with CorpusIngestor(docs, tmp_path / "state", on_delta=apply) as ingestor:
-            ingestor.poll()
-            before = conn.execute("SELECT * FROM chunks ORDER BY id").fetchall()
-            a.write_text("{bad", encoding="utf-8")
-            b.unlink()
-            with pytest.raises(ValueError):
-                ingestor.poll()
-            assert conn.execute("SELECT * FROM chunks ORDER BY id").fetchall() == before
-            a.write_text('{"title":"A","text":"Fixed"}', encoding="utf-8")
-            ingestor.poll()
-            assert conn.execute("SELECT source FROM chunks").fetchall() == [("a.json",)]
+def test_snapshot_dataset_bundle_fails_on_malformed_document_then_recovers(tmp_path):
+    corpus, qa = inputs(tmp_path)
+    bundle = prepare_dataset_bundle("sample", corpus, qa, tmp_path / "bundles")
+    first_doc = bundle.root / bundle.documents[0].path
+    original_bytes = first_doc.read_bytes()
+    state_dir = tmp_path / "state"
+    assert len(snapshot_dataset_bundle(bundle, state_dir=state_dir, min_chunk_size=1)) == 2
+    first_doc.write_text("{malformed", encoding="utf-8")
+    with pytest.raises(ValueError, match="Incomplete dataset export"):
+        snapshot_dataset_bundle(bundle, state_dir=state_dir, min_chunk_size=1)
+    first_doc.write_bytes(original_bytes)
+    assert len(snapshot_dataset_bundle(bundle, state_dir=state_dir, min_chunk_size=1)) == 2

@@ -14,9 +14,8 @@ from yaw.core import (
     text_processing,
 )
 
-from .db import YawConnection, batched, write_tx
+from .db import YawConnection, write_tx
 from .graph_ops import (
-    LABEL_KIND_PRIORITY,
     get_chunk_pointers,
     get_existing_ids,
     merge_entities,
@@ -1055,739 +1054,8 @@ def _scan_shacl_violations(conn: sqlite3.Connection | YawConnection) -> list[SHA
 
 def lint_graph_shacl(
     conn: sqlite3.Connection | YawConnection,
-    *,
-    auto_heal: bool = False,
-    heal_definitions: bool = True,
-    heal_homographs: bool = True,
 ) -> list[SHACLViolation]:
-    """Run closed-world SQL SHACL validation shapes over yaw.db and optionally apply deterministic SQL repairs."""
-    violations = _scan_shacl_violations(conn)
-    if not violations or not auto_heal:
-        return violations
-
-    with write_tx(conn):
-        # Heal 1: ConceptShape/prefLabel
-        missing_pref = conn.execute(
-            """
-            SELECT e.entity_id, e.name
-            FROM entities e
-            WHERE NOT EXISTS (
-                SELECT 1 FROM entity_labels el
-                WHERE el.entity_id = e.entity_id AND el.label_kind = 'skos:prefLabel'
-            )
-            """
-        ).fetchall()
-        for r in missing_pref:
-            eid, ename = str(r[0]), str(r[1])
-            tok_norm = str(text_processing(ename)) or ename.strip().lower()
-            raw_norm = ename.strip().lower()
-            alt_row = conn.execute(
-                """
-                SELECT label_norm, raw_label
-                FROM entity_labels
-                WHERE entity_id = ?
-                ORDER BY CASE WHEN label_norm = ? THEN 0
-                              WHEN label_norm = ? THEN 1
-                              ELSE 2 END ASC,
-                         CASE label_kind WHEN 'skos:altLabel' THEN 1 ELSE 2 END ASC,
-                         label_norm ASC
-                LIMIT 1
-                """,
-                (eid, tok_norm, raw_norm),
-            ).fetchone()
-            if alt_row is not None:
-                lnorm, rlabel = str(alt_row[0]), str(alt_row[1])
-                conn.execute(
-                    "UPDATE entity_labels SET label_kind = 'skos:prefLabel' WHERE entity_id = ? AND label_norm = ?",
-                    (eid, lnorm),
-                )
-                if rlabel and (not ename or lnorm not in (tok_norm, raw_norm)):
-                    conn.execute("UPDATE entities SET name = ? WHERE entity_id = ?", (rlabel, eid))
-            else:
-                norm = str(text_processing(ename)) or ename.strip().lower() or eid.lower()
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO entity_labels (label_norm, entity_id, label_kind, raw_label, chunk_id)
-                    VALUES (?, ?, 'skos:prefLabel', ?, '__healed__')
-                    """,
-                    (norm, eid, ename or eid),
-                )
-
-        multi_pref = conn.execute(
-            """
-            SELECT e.entity_id, e.name
-            FROM entities e
-            INNER JOIN entity_labels el ON el.entity_id = e.entity_id AND el.label_kind = 'skos:prefLabel'
-            GROUP BY e.entity_id
-            HAVING COUNT(DISTINCT el.label_norm) > 1
-            """
-        ).fetchall()
-        for r in multi_pref:
-            eid, ename = str(r[0]), str(r[1])
-            tok_norm = str(text_processing(ename))
-            raw_norm = ename.strip().lower()
-            norms = [
-                str(nr[0])
-                for nr in conn.execute(
-                    """
-                    SELECT DISTINCT label_norm FROM entity_labels
-                    WHERE entity_id = ? AND label_kind = 'skos:prefLabel'
-                    ORDER BY label_norm ASC
-                    """,
-                    (eid,),
-                )
-            ]
-            winner = tok_norm if (tok_norm and tok_norm in norms) else (raw_norm if raw_norm in norms else norms[0])
-            conn.execute(
-                """
-                UPDATE entity_labels
-                SET label_kind = 'skos:altLabel'
-                WHERE entity_id = ? AND label_kind = 'skos:prefLabel' AND label_norm != ?
-                """,
-                (eid, winner),
-            )
-
-        # Heal 2: ConceptShape/S13-disjointLabels
-        s13_rows = conn.execute(
-            """
-            SELECT entity_id, label_norm
-            FROM entity_labels
-            GROUP BY entity_id, label_norm
-            HAVING COUNT(DISTINCT label_kind) > 1
-            """
-        ).fetchall()
-        for r in s13_rows:
-            eid, lnorm = str(r[0]), str(r[1])
-            kinds = [
-                str(kr[0])
-                for kr in conn.execute(
-                    "SELECT DISTINCT label_kind FROM entity_labels WHERE entity_id = ? AND label_norm = ?",
-                    (eid, lnorm),
-                )
-            ]
-            best = max(kinds, key=lambda k: LABEL_KIND_PRIORITY.get(k, 0))
-            conn.execute(
-                "UPDATE entity_labels SET label_kind = ? WHERE entity_id = ? AND label_norm = ?",
-                (best, eid, lnorm),
-            )
-
-        s13_canon_rows = conn.execute(
-            """
-            SELECT DISTINCT el.entity_id, el.label_norm, e.name,
-                   EXISTS (
-                       SELECT 1 FROM entity_labels el2
-                       WHERE el2.entity_id = el.entity_id
-                         AND el2.label_kind = 'skos:prefLabel'
-                         AND el2.label_norm != el.label_norm
-                   ) AS has_other_pref
-            FROM entity_labels el
-            INNER JOIN entities e ON e.entity_id = el.entity_id
-            WHERE el.label_kind IN ('skos:altLabel', 'skos:hiddenLabel')
-            ORDER BY el.entity_id ASC, el.label_norm ASC
-            """
-        ).fetchall()
-        for r in s13_canon_rows:
-            eid, lnorm, ename, has_other_pref = str(r[0]), str(r[1]), str(r[2]), bool(r[3])
-            raw_norm = ename.strip().lower()
-            canon_norm = str(text_processing(ename)) or raw_norm
-            if lnorm == canon_norm or (lnorm == raw_norm and not has_other_pref):
-                conn.execute(
-                    """
-                    UPDATE entity_labels
-                    SET label_kind = 'skos:altLabel'
-                    WHERE entity_id = ? AND label_kind = 'skos:prefLabel' AND label_norm != ?
-                    """,
-                    (eid, lnorm),
-                )
-                conn.execute(
-                    "UPDATE entity_labels SET label_kind = 'skos:prefLabel' WHERE entity_id = ? AND label_norm = ?",
-                    (eid, lnorm),
-                )
-
-        # Heal 3: ConceptShape/homographDifferentFrom
-        # 3a. Identical-definition duplicates sharing skos:prefLabel are NEVER homographs;
-        # deterministically collapse them via merge_entities even before RLM healing.
-        identical_def_clones = conn.execute(
-            """
-            SELECT a.entity_id, b.entity_id
-            FROM entity_labels a
-            INNER JOIN entity_labels b
-              ON a.label_norm = b.label_norm
-             AND a.label_kind = 'skos:prefLabel'
-             AND b.label_kind = 'skos:prefLabel'
-             AND a.entity_id < b.entity_id
-            INNER JOIN entities ea ON ea.entity_id = a.entity_id
-            INNER JOIN entities eb ON eb.entity_id = b.entity_id
-            WHERE LOWER(TRIM(COALESCE(ea.definition, ''))) != ''
-              AND LOWER(TRIM(COALESCE(ea.definition, ''))) = LOWER(TRIM(COALESCE(eb.definition, '')))
-            GROUP BY a.entity_id, b.entity_id
-            ORDER BY a.entity_id ASC, b.entity_id ASC
-            """
-        ).fetchall()
-        merged_clone_map: dict[str, str] = {}
-        for r in identical_def_clones:
-            dst_eid = str(r[0])
-            src_eid = str(r[1])
-            while dst_eid in merged_clone_map:
-                dst_eid = merged_clone_map[dst_eid]
-            while src_eid in merged_clone_map:
-                src_eid = merged_clone_map[src_eid]
-            if dst_eid != src_eid:
-                merge_entities(conn, src_eid, dst_eid, label_kind="skos:altLabel")
-                merged_clone_map[src_eid] = dst_eid
-
-        # 3b. Only stamp fallback owl:differentFrom on distinct-definition homographs when
-        # heal_homographs=True (post-RLM safety pass). In the pre-RLM pass (heal_homographs=False),
-        # leave ambiguous homographs open so shacl_healer_rlm can inspect their AST dossiers.
-        if heal_homographs:
-            homographs = conn.execute(
-                """
-                SELECT a.entity_id, b.entity_id
-                FROM entity_labels a
-                INNER JOIN entity_labels b
-                  ON a.label_norm = b.label_norm
-                 AND a.label_kind = 'skos:prefLabel'
-                 AND b.label_kind = 'skos:prefLabel'
-                 AND a.entity_id < b.entity_id
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM edges e
-                    WHERE e.src_id = a.entity_id
-                      AND e.dst_id = b.entity_id
-                      AND e.kind = 'owl:differentFrom'
-                )
-                GROUP BY a.entity_id, b.entity_id
-                """
-            ).fetchall()
-            if homographs:
-                upsert_semantic_edges(
-                    conn,
-                    [(str(r[0]), str(r[1]), "owl:differentFrom", 0.0) for r in homographs],
-                )
-
-        # Heal 4: ConceptShape/definition
-        if heal_definitions:
-            empty_ent_defs = conn.execute("SELECT entity_id, name FROM entities WHERE TRIM(definition) = ''").fetchall()
-            for r in empty_ent_defs:
-                eid, ename = str(r[0]), str(r[1])
-                fact_row = conn.execute(
-                    "SELECT raw_triple_json, definition FROM facts WHERE subj_id = ? OR obj_id = ? LIMIT 1",
-                    (eid, eid),
-                ).fetchone()
-                if fact_row is not None and str(fact_row[1]).strip():
-                    synth_def = f"{ename}: {str(fact_row[1]).strip()}"
-                elif fact_row is not None:
-                    try:
-                        t = json.loads(fact_row[0])
-                        synth_def = f"{ename} participates in relation: {t[0]} {t[1]} {t[2]}."
-                    except Exception:
-                        synth_def = f"Concept representing {ename}."
-                else:
-                    synth_def = f"Concept representing {ename}."
-                conn.execute(
-                    "UPDATE entities SET definition = ? WHERE entity_id = ?",
-                    (synth_def, eid),
-                )
-
-        # Heal 5: StatementShape/closedWorld
-        dangling_fids = [
-            str(r[0])
-            for r in conn.execute(
-                """
-                SELECT f.fact_id
-                FROM facts f
-                LEFT JOIN entities es ON es.entity_id = f.subj_id
-                LEFT JOIN entities eo ON eo.entity_id = f.obj_id
-                WHERE es.entity_id IS NULL
-                   OR (COALESCE(f.obj_kind, 'entity') = 'entity' AND eo.entity_id IS NULL)
-                   OR (
-                       COALESCE(f.obj_kind, 'entity') = 'literal'
-                       AND (
-                           (f.obj_id IS NOT NULL AND eo.entity_id IS NULL)
-                           OR TRIM(COALESCE(f.obj_literal_lex, '')) = ''
-                       )
-                   )
-                """
-            )
-        ]
-        if dangling_fids:
-            for batch in batched(dangling_fids):
-                placeholders = ",".join("?" for _ in batch)
-                conn.execute(f"DELETE FROM fact_sources WHERE fact_id IN ({placeholders})", tuple(batch))
-                conn.execute(f"DELETE FROM fact_vec WHERE fact_id IN ({placeholders})", tuple(batch))
-                conn.execute(f"DELETE FROM fact_fts WHERE fact_id IN ({placeholders})", tuple(batch))
-                conn.execute(f"DELETE FROM facts WHERE fact_id IN ({placeholders})", tuple(batch))
-
-        if heal_definitions:
-            empty_fact_defs = conn.execute(
-                "SELECT fact_id, pred, raw_triple_json FROM facts WHERE TRIM(definition) = ''"
-            ).fetchall()
-            for r in empty_fact_defs:
-                fid, pred, raw_json = str(r[0]), str(r[1]), str(r[2])
-                try:
-                    t = json.loads(raw_json)
-                    synth_fdef = f"{t[0]} {t[1]} {t[2]}."
-                except Exception:
-                    synth_fdef = f"Statement with predicate {pred}."
-                conn.execute(
-                    "UPDATE facts SET definition = ? WHERE fact_id = ?",
-                    (synth_fdef, fid),
-                )
-
-        # Heal 11: ProvenanceShape/factSources (run before Heal 8 so scalar object IDs ground chunk provenance)
-        conn.execute(
-            """
-            DELETE FROM fact_sources
-            WHERE NOT EXISTS (
-                SELECT 1 FROM chunks c WHERE c.chunk_id = fact_sources.chunk_id
-            )
-            """
-        )
-        missing_fact_sources = conn.execute(
-            """
-            SELECT f.fact_id, f.subj_id, f.obj_id
-            FROM facts f
-            WHERE NOT EXISTS (
-                SELECT 1 FROM fact_sources fs
-                INNER JOIN chunks c ON c.chunk_id = fs.chunk_id
-                WHERE fs.fact_id = f.fact_id
-            )
-            ORDER BY f.fact_id ASC
-            """
-        ).fetchall()
-        orphan_fids: list[str] = []
-        for r in missing_fact_sources:
-            fid, sid, oid = str(r[0]), str(r[1]), str(r[2]) if r[2] is not None else ""
-            cid_row = conn.execute(
-                """
-                SELECT el.chunk_id
-                FROM entity_labels el
-                INNER JOIN chunks c ON c.chunk_id = el.chunk_id
-                WHERE el.entity_id IN (?, ?)
-                ORDER BY (el.entity_id = ?) DESC, el.chunk_id ASC
-                LIMIT 1
-                """,
-                (sid, oid, sid),
-            ).fetchone()
-            cid = str(cid_row[0]) if cid_row is not None and str(cid_row[0]) else ""
-            if not cid:
-                es_row = conn.execute(
-                    """
-                    SELECT es.chunk_id
-                    FROM edge_sources es
-                    INNER JOIN chunks c ON c.chunk_id = es.chunk_id
-                    WHERE (es.src_id = ? AND es.dst_id = ?)
-                       OR es.src_id IN (?, ?)
-                       OR es.dst_id IN (?, ?)
-                    ORDER BY (es.src_id = ? AND es.dst_id = ?) DESC, es.chunk_id ASC
-                    LIMIT 1
-                    """,
-                    (sid, oid, sid, oid, sid, oid, sid, oid),
-                ).fetchone()
-                cid = str(es_row[0]) if es_row is not None and str(es_row[0]) else ""
-            if not cid:
-                pe_row = conn.execute(
-                    """
-                    SELECT CASE
-                        WHEN EXISTS (SELECT 1 FROM chunks c WHERE c.chunk_id = e.src_id) THEN e.src_id
-                        ELSE e.dst_id
-                    END AS valid_cid
-                    FROM edges e
-                    WHERE e.kind = 'passage'
-                      AND (
-                          (e.dst_id IN (?, ?) AND EXISTS (SELECT 1 FROM chunks c WHERE c.chunk_id = e.src_id))
-                          OR (e.src_id IN (?, ?) AND EXISTS (SELECT 1 FROM chunks c WHERE c.chunk_id = e.dst_id))
-                      )
-                    ORDER BY valid_cid ASC
-                    LIMIT 1
-                    """,
-                    (sid, oid, sid, oid),
-                ).fetchone()
-                cid = str(pe_row[0]) if pe_row is not None and str(pe_row[0]) else ""
-            if cid:
-                conn.execute(
-                    "INSERT OR IGNORE INTO fact_sources (fact_id, chunk_id) VALUES (?, ?)",
-                    (fid, cid),
-                )
-            else:
-                orphan_fids.append(fid)
-        if orphan_fids:
-            for batch in batched(orphan_fids):
-                placeholders = ",".join("?" for _ in batch)
-                conn.execute(f"DELETE FROM fact_sources WHERE fact_id IN ({placeholders})", tuple(batch))
-                conn.execute(f"DELETE FROM fact_vec WHERE fact_id IN ({placeholders})", tuple(batch))
-                conn.execute(f"DELETE FROM fact_fts WHERE fact_id IN ({placeholders})", tuple(batch))
-                conn.execute(f"DELETE FROM facts WHERE fact_id IN ({placeholders})", tuple(batch))
-
-        # Heal 8: ConceptShape/noScalarLiterals
-        scalar_rows = conn.execute(
-            """
-            SELECT
-                e.entity_id,
-                e.name,
-                EXISTS (SELECT 1 FROM facts f WHERE f.subj_id = e.entity_id) AS is_subj,
-                EXISTS (
-                    SELECT 1 FROM facts f
-                    WHERE f.obj_id = e.entity_id AND COALESCE(f.obj_kind, 'entity') = 'entity'
-                ) AS is_ent_obj,
-                EXISTS (
-                    SELECT 1 FROM edges ed
-                    WHERE (ed.src_id = e.entity_id OR ed.dst_id = e.entity_id)
-                      AND ed.kind IN ('skos:broader', 'skos:related')
-                ) AS has_skos_edge,
-                EXISTS (
-                    SELECT 1 FROM facts f
-                    WHERE f.obj_id = e.entity_id AND f.obj_kind = 'literal'
-                ) AS has_lit_fact,
-                EXISTS (
-                    SELECT 1 FROM edges ed
-                    WHERE (ed.src_id = e.entity_id OR ed.dst_id = e.entity_id)
-                      AND ed.kind = 'passage'
-                ) AS has_passage_edge
-            FROM entities e
-            ORDER BY e.entity_id ASC
-            """
-        ).fetchall()
-        for r in scalar_rows:
-            eid, ename = str(r[0]), str(r[1])
-            is_subj, is_ent_obj, has_skos_edge, has_lit_fact, has_passage_edge = (
-                bool(r[2]),
-                bool(r[3]),
-                bool(r[4]),
-                bool(r[5]),
-                bool(r[6]),
-            )
-            is_pure_literal = has_lit_fact and not is_subj and not is_ent_obj
-            is_scalar, _ = detect_scalar_literal(ename)
-            if is_pure_literal:
-                if has_skos_edge:
-                    conn.execute(
-                        "DELETE FROM edges WHERE (src_id = ? OR dst_id = ?) "
-                        "AND kind IN ('skos:broader', 'skos:related')",
-                        (eid, eid),
-                    )
-                    conn.execute(
-                        "DELETE FROM edge_sources WHERE (src_id = ? OR dst_id = ?) "
-                        "AND kind IN ('skos:broader', 'skos:related')",
-                        (eid, eid),
-                    )
-            elif is_scalar and (is_subj or is_ent_obj or has_skos_edge or (not has_lit_fact and not has_passage_edge)):
-                # Convert obj_kind='entity' facts where scalar entity was an object to obj_kind='literal'
-                conn.execute(
-                    """
-                    UPDATE facts
-                    SET obj_kind = 'literal',
-                        obj_id = CASE WHEN ? AND subj_id != ? THEN ? ELSE NULL END,
-                        obj_literal_lex = ?,
-                        obj_datatype = 'rdfs:Literal',
-                        obj_lang = ''
-                    WHERE obj_id = ? AND COALESCE(obj_kind, 'entity') = 'entity'
-                    """,
-                    (1 if has_passage_edge else 0, eid, eid, ename, eid),
-                )
-                # Literals cannot be subjects: delete subject facts
-                subj_fids = [str(fr[0]) for fr in conn.execute("SELECT fact_id FROM facts WHERE subj_id = ?", (eid,))]
-                if subj_fids:
-                    for b in batched(subj_fids):
-                        ph = ",".join("?" for _ in b)
-                        conn.execute(f"DELETE FROM fact_sources WHERE fact_id IN ({ph})", tuple(b))
-                        conn.execute(f"DELETE FROM fact_vec WHERE fact_id IN ({ph})", tuple(b))
-                        conn.execute(f"DELETE FROM fact_fts WHERE fact_id IN ({ph})", tuple(b))
-                        conn.execute(f"DELETE FROM facts WHERE fact_id IN ({ph})", tuple(b))
-                if has_skos_edge:
-                    conn.execute(
-                        "DELETE FROM edges WHERE (src_id = ? OR dst_id = ?) "
-                        "AND kind IN ('skos:broader', 'skos:related')",
-                        (eid, eid),
-                    )
-                    conn.execute(
-                        "DELETE FROM edge_sources WHERE (src_id = ? OR dst_id = ?) "
-                        "AND kind IN ('skos:broader', 'skos:related')",
-                        (eid, eid),
-                    )
-                conn.execute(
-                    """
-                    DELETE FROM edges
-                    WHERE kind = 'fact'
-                      AND (src_id = ? OR dst_id = ?)
-                      AND NOT EXISTS (
-                          SELECT 1 FROM facts f
-                          WHERE f.subj_id = edges.src_id AND f.obj_id = edges.dst_id
-                      )
-                    """,
-                    (eid, eid),
-                )
-                conn.execute(
-                    """
-                    DELETE FROM edge_sources
-                    WHERE kind = 'fact'
-                      AND (src_id = ? OR dst_id = ?)
-                      AND NOT EXISTS (
-                          SELECT 1 FROM facts f
-                          WHERE f.subj_id = edge_sources.src_id AND f.obj_id = edge_sources.dst_id
-                      )
-                    """,
-                    (eid, eid),
-                )
-                conn.execute(
-                    """
-                    UPDATE edges
-                    SET weight = 0.5 * COALESCE(
-                        (
-                            SELECT CASE WHEN COUNT(*) > 0 THEN COUNT(*) ELSE 1 END
-                            FROM edge_sources es
-                            WHERE es.src_id = edges.src_id
-                              AND es.dst_id = edges.dst_id
-                              AND es.kind = 'fact'
-                        ),
-                        1
-                    )
-                    WHERE kind = 'fact'
-                      AND dst_id = ?
-                      AND NOT EXISTS (
-                          SELECT 1 FROM facts f
-                          WHERE f.subj_id = edges.src_id
-                            AND f.obj_id = edges.dst_id
-                            AND COALESCE(f.obj_kind, 'entity') = 'entity'
-                      )
-                    """,
-                    (eid,),
-                )
-                rem_lit_fact = (
-                    conn.execute(
-                        "SELECT 1 FROM facts WHERE obj_id = ? AND obj_kind = 'literal' LIMIT 1",
-                        (eid,),
-                    ).fetchone()
-                    is not None
-                )
-                if not rem_lit_fact and not has_passage_edge:
-                    # Delete any edges touching the scalar entity
-                    conn.execute("DELETE FROM edges WHERE src_id = ? OR dst_id = ?", (eid, eid))
-                    conn.execute("DELETE FROM edge_sources WHERE src_id = ? OR dst_id = ?", (eid, eid))
-                    # Delete entity from entity tables
-                    conn.execute("DELETE FROM entity_labels WHERE entity_id = ?", (eid,))
-                    conn.execute("DELETE FROM entity_vec WHERE entity_id = ?", (eid,))
-                    conn.execute("DELETE FROM entities WHERE entity_id = ?", (eid,))
-
-        # Multi-pass edge healing convergence loop (Heal 6, Heal 9, Heal 10, Heal 7)
-        for _pass in range(3):
-            # Heal 6: EdgeShape/closedWorld
-            conn.execute(
-                """
-                DELETE FROM edges
-                WHERE (
-                    kind = 'passage'
-                    AND NOT (
-                        (
-                            EXISTS (SELECT 1 FROM chunks c WHERE c.chunk_id = edges.src_id)
-                            AND EXISTS (SELECT 1 FROM entities ent WHERE ent.entity_id = edges.dst_id)
-                        )
-                        OR (
-                            EXISTS (SELECT 1 FROM entities ent WHERE ent.entity_id = edges.src_id)
-                            AND EXISTS (SELECT 1 FROM chunks c WHERE c.chunk_id = edges.dst_id)
-                        )
-                    )
-                )
-                OR (
-                    kind IN ('fact', 'skos:related', 'skos:broader', 'owl:differentFrom')
-                    AND (
-                        NOT EXISTS (SELECT 1 FROM entities ent1 WHERE ent1.entity_id = edges.src_id)
-                        OR NOT EXISTS (SELECT 1 FROM entities ent2 WHERE ent2.entity_id = edges.dst_id)
-                    )
-                )
-                """
-            )
-            conn.execute(
-                """
-                DELETE FROM edges
-                WHERE kind = 'skos:related'
-                  AND EXISTS (
-                      SELECT 1 FROM edges b
-                      WHERE b.src_id = edges.src_id
-                        AND b.dst_id = edges.dst_id
-                        AND b.kind = 'owl:differentFrom'
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM entities ea
-                      INNER JOIN entities eb ON ea.entity_id = edges.src_id AND eb.entity_id = edges.dst_id
-                      WHERE LOWER(TRIM(ea.name)) != '' AND LOWER(TRIM(ea.name)) = LOWER(TRIM(eb.name))
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM entity_labels la
-                      INNER JOIN entity_labels lb
-                        ON la.label_norm = lb.label_norm
-                       AND la.label_kind = 'skos:prefLabel'
-                       AND lb.label_kind = 'skos:prefLabel'
-                      WHERE la.entity_id = edges.src_id AND lb.entity_id = edges.dst_id
-                  )
-                """
-            )
-            asym_rows = conn.execute(
-                """
-                SELECT a.src_id, a.dst_id, a.kind, a.weight
-                FROM edges a
-                WHERE a.kind IN ('skos:related', 'owl:differentFrom')
-                  AND NOT EXISTS (
-                      SELECT 1 FROM edges b
-                      WHERE b.src_id = a.dst_id AND b.dst_id = a.src_id AND b.kind = a.kind
-                  )
-                """
-            ).fetchall()
-            for r in asym_rows:
-                conn.execute(
-                    "INSERT OR IGNORE INTO edges (src_id, dst_id, kind, weight) VALUES (?, ?, ?, ?)",
-                    (str(r[1]), str(r[0]), str(r[2]), float(r[3])),
-                )
-
-            # Heal 9: ConceptShape/lexicalSubsumption
-            subsumption_rows = conn.execute(
-                """
-                SELECT e.src_id, e.dst_id, es.name, ed.name, e.weight
-                FROM edges e
-                INNER JOIN entities es ON es.entity_id = e.src_id
-                INNER JOIN entities ed ON ed.entity_id = e.dst_id
-                WHERE e.kind = 'skos:broader'
-                """
-            ).fetchall()
-            for r in subsumption_rows:
-                s_id, d_id, s_name, d_name, weight = str(r[0]), str(r[1]), str(r[2]), str(r[3]), float(r[4])
-                if check_lexical_subsumption_inversion(s_name, d_name):
-                    conn.execute(
-                        "DELETE FROM edges WHERE kind = 'skos:broader' AND src_id = ? AND dst_id = ?",
-                        (s_id, d_id),
-                    )
-                    conn.execute(
-                        "INSERT OR IGNORE INTO edges (src_id, dst_id, kind, weight) VALUES (?, ?, 'skos:broader', ?)",
-                        (d_id, s_id, weight),
-                    )
-                    conn.execute(
-                        """
-                        UPDATE OR IGNORE edge_sources
-                        SET src_id = ?, dst_id = ?
-                        WHERE src_id = ? AND dst_id = ? AND kind = 'skos:broader'
-                        """,
-                        (d_id, s_id, s_id, d_id),
-                    )
-
-            # Heal 10: ConceptShape/siblingNotBroader
-            sibling_rows = conn.execute(
-                """
-                SELECT e.src_id, e.dst_id, es.name, ed.name
-                FROM edges e
-                INNER JOIN entities es ON es.entity_id = e.src_id
-                INNER JOIN entities ed ON ed.entity_id = e.dst_id
-                WHERE e.kind = 'skos:broader'
-                """
-            ).fetchall()
-            for r in sibling_rows:
-                s_id, d_id, s_name, d_name = str(r[0]), str(r[1]), str(r[2]), str(r[3])
-                if is_version_or_ordinal_sibling(s_name, d_name):
-                    conn.execute(
-                        """
-                        DELETE FROM edges
-                        WHERE kind = 'skos:broader'
-                          AND ((src_id = ? AND dst_id = ?) OR (src_id = ? AND dst_id = ?))
-                        """,
-                        (s_id, d_id, d_id, s_id),
-                    )
-                    upsert_semantic_edges(conn, [(s_id, d_id, "skos:related", 0.5)])
-                    conn.execute(
-                        """
-                        UPDATE OR IGNORE edge_sources
-                        SET kind = 'skos:related'
-                        WHERE ((src_id = ? AND dst_id = ?) OR (src_id = ? AND dst_id = ?))
-                          AND kind = 'skos:broader'
-                        """,
-                        (s_id, d_id, d_id, s_id),
-                    )
-
-            # Heal 7: ConceptShape/broaderCycle & ConceptShape/S27-disjointBroaderRelated
-            conn.execute("DELETE FROM edges WHERE kind = 'skos:broader' AND src_id = dst_id")
-            for _ in range(16):
-                cycle_nodes = [
-                    str(r[0])
-                    for r in conn.execute(
-                        """
-                        WITH RECURSIVE broader_tc(narrower_id, broader_id) AS (
-                            SELECT src_id, dst_id FROM edges WHERE kind = 'skos:broader'
-                            UNION
-                            SELECT tc.narrower_id, e.dst_id
-                            FROM broader_tc tc
-                            JOIN edges e ON e.src_id = tc.broader_id AND e.kind = 'skos:broader'
-                            LIMIT 10000
-                        )
-                        SELECT DISTINCT narrower_id
-                        FROM broader_tc
-                        WHERE narrower_id = broader_id
-                        ORDER BY narrower_id ASC
-                        """
-                    ).fetchall()
-                ]
-                if not cycle_nodes:
-                    break
-                placeholders = ",".join("?" for _ in cycle_nodes)
-                back_edge = conn.execute(
-                    f"""
-                    SELECT src_id, dst_id
-                    FROM edges
-                    WHERE kind = 'skos:broader'
-                      AND src_id IN ({placeholders})
-                      AND dst_id IN ({placeholders})
-                    ORDER BY (src_id > dst_id) DESC, src_id DESC, dst_id ASC
-                    LIMIT 1
-                    """,
-                    tuple(cycle_nodes) + tuple(cycle_nodes),
-                ).fetchone()
-                if back_edge is None:
-                    break
-                conn.execute(
-                    "DELETE FROM edges WHERE kind = 'skos:broader' AND src_id = ? AND dst_id = ?",
-                    (str(back_edge[0]), str(back_edge[1])),
-                )
-
-            s27_pairs = conn.execute(
-                """
-                WITH RECURSIVE broader_tc(narrower_id, broader_id) AS (
-                    SELECT src_id, dst_id FROM edges WHERE kind = 'skos:broader'
-                    UNION
-                    SELECT tc.narrower_id, e.dst_id
-                    FROM broader_tc tc
-                    JOIN edges e ON e.src_id = tc.broader_id AND e.kind = 'skos:broader'
-                    LIMIT 10000
-                )
-                SELECT DISTINCT tc.narrower_id, tc.broader_id
-                FROM broader_tc tc
-                INNER JOIN edges rel
-                  ON rel.kind = 'skos:related'
-                 AND (
-                     (rel.src_id = tc.narrower_id AND rel.dst_id = tc.broader_id)
-                     OR (rel.src_id = tc.broader_id AND rel.dst_id = tc.narrower_id)
-                 )
-                WHERE tc.narrower_id != tc.broader_id
-                """
-            ).fetchall()
-            for r in s27_pairs:
-                nid, bid = str(r[0]), str(r[1])
-                conn.execute(
-                    """
-                    DELETE FROM edges
-                    WHERE kind = 'skos:related'
-                      AND ((src_id = ? AND dst_id = ?) OR (src_id = ? AND dst_id = ?))
-                    """,
-                    (nid, bid, bid, nid),
-                )
-                conn.execute(
-                    """
-                    DELETE FROM edge_sources
-                    WHERE kind = 'skos:related'
-                      AND ((src_id = ? AND dst_id = ?) OR (src_id = ? AND dst_id = ?))
-                    """,
-                    (nid, bid, bid, nid),
-                )
-
-            rem_v = _scan_shacl_violations(conn)
-            if not rem_v or (not heal_definitions and all(v.result_path == "skos:definition" for v in rem_v)):
-                break
-
+    """Run read-only closed-world SQL SHACL validation shapes over yaw.db."""
     return _scan_shacl_violations(conn)
 
 
@@ -1810,30 +1078,35 @@ def apply_shacl_repairs(
             if not focus or not action:
                 continue
             if action in ("set_definition", "rewrite_definition") and val:
-                if focus.startswith("entity-"):
-                    cur = conn.execute(
-                        "UPDATE entities SET definition = ? WHERE entity_id = ?",
-                        (val, focus),
-                    )
-                    if cur.rowcount > 0:
-                        applied += 1
-                elif focus.startswith("fact-"):
+                if focus.startswith("fact-"):
                     cur = conn.execute(
                         "UPDATE facts SET definition = ? WHERE fact_id = ?",
                         (val, focus),
                     )
                     if cur.rowcount > 0:
                         applied += 1
-            elif action == "set_pref_label" and val and focus.startswith("entity-"):
+                else:
+                    cur = conn.execute(
+                        "UPDATE entities SET definition = ? WHERE entity_id = ?",
+                        (val, focus),
+                    )
+                    if cur.rowcount > 0:
+                        applied += 1
+            elif action == "set_pref_label" and val and not focus.startswith("fact-"):
                 cur = conn.execute(
                     "UPDATE entities SET name = ? WHERE entity_id = ?",
                     (val, focus),
                 )
                 if cur.rowcount > 0:
                     norm_val = str(text_processing(val)) or val.strip().lower()
-                    upsert_entity_labels(conn, [(norm_val, focus, "skos:prefLabel", val, "__healed__")])
+                    cid_row = conn.execute(
+                        "SELECT chunk_id FROM entity_labels WHERE entity_id = ? AND chunk_id != '' LIMIT 1",
+                        (focus,),
+                    ).fetchone()
+                    cid = str(cid_row[0]) if cid_row is not None and str(cid_row[0]) else "__healed__"
+                    upsert_entity_labels(conn, [(norm_val, focus, "skos:prefLabel", val, cid)])
                     applied += 1
-            elif action in ("demote_to_alt_label", "demote_label") and focus.startswith("entity-"):
+            elif action in ("demote_to_alt_label", "demote_label") and not focus.startswith("fact-"):
                 ent_row = conn.execute("SELECT name FROM entities WHERE entity_id = ?", (focus,)).fetchone()
                 ename = str(ent_row[0]).strip() if ent_row and ent_row[0] else ""
                 tok_norm = str(text_processing(ename)) if ename else ""
@@ -1883,9 +1156,39 @@ def apply_shacl_repairs(
                             (target_kind, focus, lnorm),
                         )
                         applied += 1
-            elif action in ("merge_altLabel", "merge_hiddenLabel") and (target or "|" in focus):
+                    if not s13_rows and not rows:
+                        alt_row = conn.execute(
+                            """
+                            SELECT label_norm, raw_label
+                            FROM entity_labels
+                            WHERE entity_id = ?
+                            ORDER BY CASE WHEN label_norm = ? THEN 0
+                                          WHEN label_norm = ? THEN 1
+                                          ELSE 2 END ASC,
+                                     label_norm ASC
+                            LIMIT 1
+                            """,
+                            (focus, tok_norm, raw_norm),
+                        ).fetchone()
+                        if alt_row is not None:
+                            lnorm, rlabel = str(alt_row[0]), str(alt_row[1])
+                            conn.execute(
+                                "UPDATE entity_labels SET label_kind = 'skos:prefLabel' "
+                                "WHERE entity_id = ? AND label_norm = ?",
+                                (focus, lnorm),
+                            )
+                            if rlabel and (not ename or lnorm not in (tok_norm, raw_norm)):
+                                conn.execute("UPDATE entities SET name = ? WHERE entity_id = ?", (rlabel, focus))
+                            applied += 1
+            elif action in ("merge_altLabel", "merge_hiddenLabel") and (target or "|" in focus or "->" in focus):
                 if "|" in focus:
                     ea, eb = (x.strip() for x in focus.split("|", 1))
+                    if target == ea:
+                        src_node, dst_node = eb, ea
+                    else:
+                        src_node, dst_node = ea, eb
+                elif "->" in focus:
+                    ea, eb = (x.strip() for x in focus.split("->", 1))
                     if target == ea:
                         src_node, dst_node = eb, ea
                     else:
@@ -1905,6 +1208,8 @@ def apply_shacl_repairs(
             elif action in ("add_different_from", "assert_differentFrom"):
                 if "|" in focus:
                     ea, eb = (x.strip() for x in focus.split("|", 1))
+                elif "->" in focus:
+                    ea, eb = (x.strip() for x in focus.split("->", 1))
                 else:
                     ea, eb = focus, target
                 if ea and eb and ea != eb:
@@ -1915,6 +1220,8 @@ def apply_shacl_repairs(
             elif action == "assert_related":
                 if "|" in focus:
                     ea, eb = (x.strip() for x in focus.split("|", 1))
+                elif "->" in focus:
+                    ea, eb = (x.strip() for x in focus.split("->", 1))
                 else:
                     ea, eb = focus, target
                 if ea and eb and ea != eb:
@@ -1925,6 +1232,8 @@ def apply_shacl_repairs(
             elif action == "assert_broader":
                 if "|" in focus:
                     ea, eb = (x.strip() for x in focus.split("|", 1))
+                elif "->" in focus:
+                    ea, eb = (x.strip() for x in focus.split("->", 1))
                 else:
                     ea, eb = focus, target
                 if ea and eb and ea != eb:
@@ -1959,6 +1268,8 @@ def apply_shacl_repairs(
             elif action == "remove_conflicting_related":
                 if "|" in focus:
                     ea, eb = (x.strip() for x in focus.split("|", 1))
+                elif "->" in focus:
+                    ea, eb = (x.strip() for x in focus.split("->", 1))
                 else:
                     ea, eb = focus, target
                 if ea and eb:
@@ -1980,6 +1291,13 @@ def apply_shacl_repairs(
                     )
                     if cur.rowcount > 0:
                         applied += 1
+            elif action in ("ground_fact_source", "set_fact_source") and val:
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO fact_sources (fact_id, chunk_id) VALUES (?, ?)",
+                    (focus, val),
+                )
+                if cur.rowcount > 0:
+                    applied += 1
             elif action == "invert_broader":
                 if "->" in focus:
                     s, d = (x.strip() for x in focus.split("->", 1))

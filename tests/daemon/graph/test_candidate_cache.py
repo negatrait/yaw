@@ -17,6 +17,7 @@ import dspy
 import numpy as np
 from dspy.primitives.repl_types import REPLHistory
 
+from daemon.graph.synonym_protocol import candidate_rows, complete_decisions
 from yaw.core import OpenIERecord, StructuredTriple
 from yaw.daemon.graph.storage import CandidateCacheStore, CandidateStageCache, open_managed_yaw_db
 
@@ -104,8 +105,48 @@ def test_candidate_stages_make_zero_requests_after_process_restart(tmp_path: Pat
     )
 
     class Handler(BaseHTTPRequestHandler):
+        def _send_json(self, payload: Any) -> None:
+            raw = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_GET(self) -> None:
+            assert isinstance(self.server, ThreadingHTTPServer)
+            if self.path.endswith("/health"):
+                self._send_json(
+                    {
+                        "all_models_loaded": [
+                            {
+                                "id": model_id,
+                                "backend_url": f"http://127.0.0.1:{self.server.server_port}",
+                                "launch_command": ["server", "-m", "C:/models/cache-test.gguf"],
+                            }
+                            for model_id in ("cache-test", "cache-test-v2")
+                        ]
+                    }
+                )
+            elif self.path == "/props":
+                self._send_json(
+                    {
+                        "model_path": "C:/models/cache-test.gguf",
+                        "chat_template": "test-template",
+                        "default_generation_settings": {"n_ctx": 131072},
+                    }
+                )
+            else:
+                self.send_error(404)
+
         def do_POST(self) -> None:
             data = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            if self.path == "/apply-template":
+                self._send_json({"prompt": json.dumps(data, ensure_ascii=False)})
+                return
+            if self.path == "/tokenize":
+                self._send_json({"tokens": list(range(len(data["content"].encode("utf-8")) // 3))})
+                return
             if self.path.endswith("/embeddings"):
                 requests.append("embedding")
                 texts = data["input"] if isinstance(data["input"], list) else [data["input"]]
@@ -153,7 +194,7 @@ def test_candidate_stages_make_zero_requests_after_process_restart(tmp_path: Pat
                     )
                 elif "[[ ## candidate_pairs ## ]]" in user:
                     requests.append("synonym")
-                    content = json.dumps({"decisions": []})
+                    content = json.dumps({"decisions": complete_decisions(candidate_rows(user), [])})
                 elif "[[ ## named_entities ## ]]" in user:
                     requests.append("triples")
                     if "Bletchley Park" in user:
@@ -199,12 +240,7 @@ def test_candidate_stages_make_zero_requests_after_process_restart(tmp_path: Pat
                     ],
                     "usage": {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30},
                 }
-            raw = json.dumps(payload).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(raw)))
-            self.end_headers()
-            self.wfile.write(raw)
+            self._send_json(payload)
 
         def log_message(self, format: str, *args: Any) -> None:
             pass

@@ -228,7 +228,6 @@ def create_dspy_lm(
     max_tokens: int | None = None,
     context_window_tokens: int | None = None,
     cache: bool = True,
-    num_retries: int = 1,
     timeout: float = 240.0,
     **kwargs: Any,
 ) -> YawDSPyLM:
@@ -296,7 +295,6 @@ def create_dspy_lm(
             temperature=temperature,
             max_tokens=max_tokens,
             cache=cache,
-            num_retries=num_retries,
             api_base=base_url,
             timeout=timeout,
             **lm_kwargs,
@@ -309,7 +307,6 @@ def create_dspy_lm(
             temperature=temperature,
             max_tokens=max_tokens,
             cache=cache,
-            num_retries=num_retries,
             api_base=base_url,
             api_key=api_key,
             timeout=timeout,
@@ -331,7 +328,6 @@ def create_dspy_rlm_pair(
     provider: str = "openai",
     reflection: bool = False,
     cache: bool = True,
-    num_retries: int = 0,
     context_window_tokens: int | None = None,
     max_tokens: int | None = None,
 ) -> tuple[YawDSPyLM, YawDSPyLM]:
@@ -351,7 +347,6 @@ def create_dspy_rlm_pair(
         provider=provider,
         role="reflection" if reflection else "rlm",
         cache=cache,
-        num_retries=num_retries,
         context_window_tokens=context_window_tokens,
         max_tokens=max_tokens,
     )
@@ -362,7 +357,6 @@ def create_dspy_rlm_pair(
         provider=provider,
         role="reflection_worker" if reflection else "extraction",
         cache=cache,
-        num_retries=num_retries,
         context_window_tokens=context_window_tokens,
         max_tokens=max_tokens,
     )

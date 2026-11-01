@@ -2,7 +2,6 @@
 
 import json
 import random
-import re
 import time
 import urllib.error
 import urllib.request
@@ -14,422 +13,59 @@ from yaw.core import YawRuntimeError
 
 from .bundles import DatasetBundle, document_identity, document_text, load_dataset_bundle
 
-PINNED_COMMIT = "d5c8329422e0a0b834a15874545cb6a74b4f9b26"
-HF_BASE_URL = "https://huggingface.co/datasets/osunlp/HippoRAG_2/resolve/main"
-UPSTREAM_DATASET_BASE_URL = (
-    f"https://raw.githubusercontent.com/OSU-NLP-Group/HippoRAG/{PINNED_COMMIT}/reproduce/dataset"
-)
+_CATALOG_PATH = Path(__file__).resolve().parents[3] / "data" / "benchmarks" / "baselines.json"
+_CATALOG: dict[str, Any] = json.loads(_CATALOG_PATH.read_text(encoding="utf-8"))
 
-DATASETS: tuple[str, ...] = (
-    "sample",
-    "2wikimultihopqa",
-    "hotpotqa",
-    "musique",
-    "nq",
-    "popqa",
-    "lveval",
-    "narrativeqa",
-    "case_study_university",
-    "enterprise_rag_bench",
-)
-DEFAULT_PARITY_DATASETS: tuple[str, ...] = ("2wikimultihopqa", "hotpotqa", "musique")
-TIER2_CORPORA: frozenset[str] = frozenset({"nq", "nq_rear", "popqa", "lveval", "narrativeqa"})
+PINNED_COMMIT: str = str(_CATALOG["pinned_commit"])
+HF_BASE_URL: str = str(_CATALOG["hf_base_url"])
+UPSTREAM_DATASET_BASE_URL: str = str(_CATALOG["upstream_dataset_base_url"])
 
-DATASET_ALIASES: dict[str, str] = {
-    "2wiki": "2wikimultihopqa",
-    "hotpot": "hotpotqa",
-    "naturalquestions": "nq",
-    "nq_rear": "nq",
-    "narrative": "narrativeqa",
-    "narrativeqa_dev_10_doc": "narrativeqa",
-    "enterprise": "enterprise_rag_bench",
-}
-ALIASES: dict[str, str] = DATASET_ALIASES
-
+_DATASET_SPECS: dict[str, dict[str, Any]] = dict(_CATALOG["datasets"])
+DATASETS: tuple[str, ...] = tuple(_DATASET_SPECS.keys())
+DEFAULT_PARITY_DATASETS: tuple[str, ...] = tuple(k for k, v in _DATASET_SPECS.items() if v.get("default_parity"))
+TIER2_CORPORA: frozenset[str] = frozenset(k for k, v in _DATASET_SPECS.items() if v.get("tier2"))
+QA_ONLY_DATASETS: frozenset[str] = frozenset(k for k, v in _DATASET_SPECS.items() if v.get("qa_only"))
 DATASET_REGISTRY: dict[str, tuple[str, str]] = {
-    "sample": ("sample.json", "sample_corpus.json"),
-    "2wikimultihopqa": ("2wikimultihopqa.json", "2wikimultihopqa_corpus.json"),
-    "hotpotqa": ("hotpotqa.json", "hotpotqa_corpus.json"),
-    "musique": ("musique.json", "musique_corpus.json"),
-    "nq": ("nq_rear.json", "nq_rear_corpus.json"),
-    "popqa": ("popqa.json", "popqa_corpus.json"),
-    "lveval": ("lveval.json", "lveval_corpus.json"),
-    "narrativeqa": ("narrativeqa_dev_10_doc.json", "narrativeqa_dev_10_doc_corpus.json"),
-    "case_study_university": ("case_study_university.json", "case_study_university_corpus.json"),
-    "enterprise_rag_bench": ("enterprise_rag_bench_questions.json", "enterprise_rag_bench_corpus.json"),
+    k: (str(v["questions_file"]), str(v["corpus_file"])) for k, v in _DATASET_SPECS.items()
 }
-
-DATASET_SOURCE_FIELDS: dict[str, dict[str, Any]] = {
-    name: {
-        "id_key": None if name in ("2wikimultihopqa", "musique", "popqa") else "idx",
-        "title_key": "title",
-        "body_key": "text",
-    }
-    for name in DATASET_REGISTRY
-}
-
-DATASET_DESCRIPTIONS: dict[str, str] = {
-    "sample": "Tier 0 validation fixture (1 query, 3 passages)",
-    "2wikimultihopqa": "Multi-hop QA from Wikipedia (1,000 queries, 6,119 passages)",
-    "hotpotqa": "Multi-hop QA with diverse reasoning (1,000 queries, 9,811 passages)",
-    "musique": "Complex multi-hop QA with 2-4 hops (1,000 queries, 11,656 passages)",
-    "nq": "NaturalQuestions single-hop QA (1,000 queries, 9,633 passages)",
-    "popqa": "PopQA entity-centric long-tail QA (1,000 queries, 8,676 passages)",
-    "lveval": "LV-Eval hotpotwikiqa-mixup 256k long-context QA (124 queries, 22,849 passages)",
-    "narrativeqa": "NarrativeQA discourse understanding on novels (293 queries, 4,111 passages)",
-    "case_study_university": "University Case Study graph reasoning demo",
-    "enterprise_rag_bench": (
-        "EnterpriseRAG-Bench stratified 10-category multi-tool dataset (250 queries: 150 train + 100 val)"
+DATASET_SOURCE_FIELDS: dict[str, dict[str, Any]] = {k: dict(v["source_fields"]) for k, v in _DATASET_SPECS.items()}
+ENTERPRISE_CATEGORY_QUOTAS: dict[str, tuple[int, int]] = next(
+    (
+        {str(k): (int(q[0]), int(q[1])) for k, q in v["category_quotas"].items()}
+        for v in _DATASET_SPECS.values()
+        if "category_quotas" in v
     ),
-}
-
-TEXT_STOPWORDS: frozenset[str] = frozenset(
-    {
-        "about",
-        "after",
-        "again",
-        "against",
-        "all",
-        "also",
-        "am",
-        "an",
-        "and",
-        "any",
-        "are",
-        "as",
-        "at",
-        "back",
-        "be",
-        "because",
-        "been",
-        "before",
-        "being",
-        "below",
-        "between",
-        "both",
-        "but",
-        "by",
-        "can",
-        " come",
-        "could",
-        "day",
-        "did",
-        "do",
-        "does",
-        "doing",
-        "down",
-        "during",
-        "each",
-        "even",
-        "few",
-        "first",
-        "for",
-        "from",
-        "further",
-        "get",
-        "give",
-        "go",
-        "good",
-        "had",
-        "has",
-        "have",
-        "having",
-        "he",
-        "her",
-        "here",
-        "hers",
-        "herself",
-        "him",
-        "himself",
-        "his",
-        "how",
-        "if",
-        "in",
-        "into",
-        "is",
-        "it",
-        "its",
-        "itself",
-        "just",
-        "know",
-        "like",
-        "look",
-        "make",
-        "many",
-        "may",
-        "me",
-        "might",
-        "more",
-        "most",
-        "much",
-        "must",
-        "my",
-        "myself",
-        "new",
-        "no",
-        "nor",
-        "not",
-        "now",
-        "of",
-        "off",
-        "on",
-        "once",
-        "one",
-        "only",
-        "or",
-        "other",
-        "our",
-        "ours",
-        "ourselves",
-        "out",
-        "over",
-        "own",
-        "part",
-        "people",
-        "place",
-        "same",
-        "see",
-        "she",
-        "should",
-        "so",
-        "some",
-        "state",
-        "such",
-        "take",
-        "than",
-        "that",
-        "the",
-        "their",
-        "them",
-        "then",
-        "there",
-        "these",
-        "they",
-        "think",
-        "this",
-        "time",
-        "to",
-        "two",
-        "up",
-        "use",
-        "was",
-        "way",
-        "we",
-        "well",
-        "were",
-        "what",
-        "when",
-        "which",
-        "who",
-        "will",
-        "with",
-        "work",
-        "would",
-        "year",
-        "you",
-        "your",
-    }
+    {},
 )
 
-MONKEYPATCHED_HIPPORAG_BASELINES: dict[str, dict[str, Any]] = {
-    "2wikimultihopqa": {
-        "Recall@1": 0.4545,
-        "Recall@2": 0.6591,
-        "Recall@5": 0.9091,
-        "ExactMatch": 0.6364,
-        "F1": 0.7227,
-        "indexing_seconds": 616.76,
-        "evaluation_seconds": 173.44,
-        "elapsed_seconds": 790.73,
-    },
-    "musique": {
-        "Recall@1": 0.3636,
-        "Recall@2": 0.5682,
-        "Recall@5": 0.6818,
-        "ExactMatch": 0.4091,
-        "F1": 0.5485,
-        "indexing_seconds": 1152.93,
-        "evaluation_seconds": 284.18,
-        "elapsed_seconds": 1437.36,
-    },
-    "hotpotqa": {
-        "Recall@1": 0.4750,
-        "Recall@2": 0.7750,
-        "Recall@5": 0.9000,
-        "ExactMatch": 0.4500,
-        "F1": 0.6426,
-        "indexing_seconds": 599.21,
-        "evaluation_seconds": 135.75,
-        "elapsed_seconds": 736.13,
-    },
-    "nq": {
-        "Recall@1": 0.5833,
-        "Recall@2": 0.8083,
-        "Recall@5": 0.9250,
-        "ExactMatch": 0.4500,
-        "F1": 0.6327,
-        "indexing_seconds": 807.52,
-        "evaluation_seconds": 110.22,
-        "elapsed_seconds": 917.85,
-    },
-    "popqa": {
-        "Recall@1": 0.8667,
-        "Recall@2": 0.9467,
-        "Recall@5": 1.0000,
-        "ExactMatch": 0.6800,
-        "F1": 0.7419,
-        "indexing_seconds": 236.44,
-        "evaluation_seconds": 274.38,
-        "elapsed_seconds": 511.12,
-    },
-    "lveval": {
-        "Recall@1": 0.6000,
-        "Recall@2": 0.8500,
-        "Recall@5": 0.9500,
-        "ExactMatch": 0.5000,
-        "F1": 0.5750,
-        "indexing_seconds": 182.23,
-        "evaluation_seconds": 87.34,
-        "elapsed_seconds": 269.67,
-    },
-    "narrativeqa": {
-        "Recall@1": 0.5000,
-        "Recall@2": 0.6500,
-        "Recall@5": 0.8000,
-        "ExactMatch": 0.1000,
-        "F1": 0.4557,
-        "indexing_seconds": 333.89,
-        "evaluation_seconds": 146.52,
-        "elapsed_seconds": 480.52,
-    },
-}
 
-PAPER_BASELINES: dict[str, dict[str, dict[str, float]]] = {
-    "musique": {
-        "hipporag2_llama3.3_70b_nvembed_v2": {
-            "Recall@2": 0.561,
-            "Recall@5": 0.747,
-            "ExactMatch": 0.372,
-            "F1": 0.486,
-        },
-        "standard_nvembed_v2_llama3.3_70b": {
-            "Recall@2": 0.527,
-            "Recall@5": 0.697,
-            "ExactMatch": 0.347,
-            "F1": 0.457,
-        },
-        "hipporag2_gpt4o_mini_nvembed_v2": {
-            "Recall@2": 0.535,
-            "Recall@5": 0.742,
-            "ExactMatch": 0.350,
-            "F1": 0.493,
-        },
-        "contriever_llama3.3_70b": {
-            "Recall@2": 0.348,
-            "Recall@5": 0.466,
-            "ExactMatch": 0.240,
-            "F1": 0.313,
-        },
-    },
-    "2wikimultihopqa": {
-        "hipporag2_llama3.3_70b_nvembed_v2": {
-            "Recall@2": 0.762,
-            "Recall@5": 0.904,
-            "ExactMatch": 0.650,
-            "F1": 0.710,
-        },
-        "standard_nvembed_v2_llama3.3_70b": {
-            "Recall@2": 0.671,
-            "Recall@5": 0.765,
-            "ExactMatch": 0.575,
-            "F1": 0.615,
-        },
-        "hipporag2_gpt4o_mini_nvembed_v2": {
-            "Recall@2": 0.746,
-            "Recall@5": 0.902,
-            "ExactMatch": 0.605,
-            "F1": 0.697,
-        },
-        "contriever_llama3.3_70b": {
-            "Recall@2": 0.466,
-            "Recall@5": 0.575,
-            "ExactMatch": 0.381,
-            "F1": 0.419,
-        },
-    },
-    "hotpotqa": {
-        "hipporag2_llama3.3_70b_nvembed_v2": {
-            "Recall@2": 0.835,
-            "Recall@5": 0.963,
-            "ExactMatch": 0.627,
-            "F1": 0.755,
-        },
-        "standard_nvembed_v2_llama3.3_70b": {
-            "Recall@2": 0.841,
-            "Recall@5": 0.945,
-            "ExactMatch": 0.628,
-            "F1": 0.753,
-        },
-        "hipporag2_gpt4o_mini_nvembed_v2": {
-            "Recall@2": 0.805,
-            "Recall@5": 0.957,
-            "ExactMatch": 0.563,
-            "F1": 0.711,
-        },
-        "contriever_llama3.3_70b": {
-            "Recall@2": 0.584,
-            "Recall@5": 0.753,
-            "ExactMatch": 0.513,
-            "F1": 0.623,
-        },
-    },
-    "nq": {
-        "hipporag2_llama3.3_70b_nvembed_v2": {
-            "Recall@2": 0.456,
-            "Recall@5": 0.780,
-            "ExactMatch": 0.485,
-            "F1": 0.633,
-        },
-        "standard_nvembed_v2_llama3.3_70b": {"Recall@2": 0.453, "Recall@5": 0.754, "F1": 0.619},
-        "hipporag_reproduced": {"Recall@2": 0.213, "Recall@5": 0.444, "F1": 0.553},
-    },
-    "popqa": {
-        "hipporag2_llama3.3_70b_nvembed_v2": {
-            "Recall@2": 0.439,
-            "Recall@5": 0.517,
-            "ExactMatch": 0.490,
-            "F1": 0.562,
-        },
-        "standard_nvembed_v2_llama3.3_70b": {"Recall@2": 0.453, "Recall@5": 0.510, "F1": 0.557},
-        "hipporag_reproduced": {"Recall@2": 0.400, "Recall@5": 0.538, "F1": 0.559},
-    },
-    "lveval": {
-        "hipporag2_llama3.3_70b_nvembed_v2": {"ExactMatch": 0.080, "F1": 0.129},
-        "standard_nvembed_v2_llama3.3_70b": {"F1": 0.098},
-        "hipporag_reproduced": {"F1": 0.084},
-    },
-    "narrativeqa": {
-        "hipporag2_llama3.3_70b_nvembed_v2": {"ExactMatch": 0.180, "F1": 0.259},
-        "standard_nvembed_v2_llama3.3_70b": {"F1": 0.257},
-        "hipporag_reproduced": {"F1": 0.163},
-    },
-}
-
-_OPTIMIZE_TIER2_CORPORA = frozenset({"2wikimultihopqa", "musique", "hotpotqa", *TIER2_CORPORA})
+def _dataset_spec(name: str | Path | None) -> dict[str, Any]:
+    if name is None:
+        return {}
+    raw = str(name).strip()
+    if not raw:
+        return {}
+    lowered = raw.lower()
+    if lowered in _DATASET_SPECS:
+        return _DATASET_SPECS[lowered]
+    stem = Path(raw).stem.strip().lower()
+    if stem in _DATASET_SPECS:
+        return _DATASET_SPECS[stem]
+    file_name = Path(raw).name.strip().lower()
+    for k, spec in _DATASET_SPECS.items():
+        if file_name in (str(spec.get("questions_file", "")).lower(), str(spec.get("corpus_file", "")).lower()):
+            return spec
+        if stem.startswith(k):
+            return spec
+    return {}
 
 
 def resolve_dataset_name(name: str) -> str:
-    """Resolve CLI/benchmark dataset aliases to canonical dataset keys."""
+    """Validate a canonical dataset key against DATASET_REGISTRY."""
     cleaned = name.strip().lower()
-    resolved = DATASET_ALIASES.get(cleaned, cleaned)
-    if resolved not in DATASET_REGISTRY:
-        stem = Path(cleaned).stem.lower()
-        resolved = DATASET_ALIASES.get(stem, stem)
-    if resolved not in DATASET_REGISTRY:
-        raise ValueError(
-            f"Unknown dataset '{name}'. Valid datasets: {', '.join(DATASETS)} (aliases: {', '.join(DATASET_ALIASES)})"
-        )
-    return resolved
+    if cleaned not in DATASET_REGISTRY:
+        raise ValueError(f"Unknown dataset '{name}'. Valid datasets: {', '.join(DATASETS)}")
+    return cleaned
 
 
 def download_dataset_file(
@@ -452,7 +88,7 @@ def download_dataset_file(
         return target
 
     urls = [f"{hf_base_url or HF_BASE_URL}/{filename}"]
-    if any(k in filename for k in ("sample", "2wiki", "hotpot", "musique")):
+    if bool(_dataset_spec(filename).get("allow_upstream_github_fallback", True)):
         urls.append(f"{upstream_base_url or UPSTREAM_DATASET_BASE_URL}/{filename}")
 
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -528,23 +164,8 @@ def load_dataset_files(
     return samples, corpus
 
 
-def extract_gold_answers(sample: Mapping[str, Any], *, strict: bool = False) -> list[str]:
+def extract_gold_answers(sample: Mapping[str, Any]) -> list[str]:
     """Extract gold answers and aliases from a single dataset sample."""
-    if not strict:
-        if "gold_answers" in sample:
-            raw = sample["gold_answers"]
-        elif "answer" in sample or "gold_ans" in sample or "gold_answer" in sample:
-            raw = sample.get("answer", sample.get("gold_ans", sample.get("gold_answer")))
-        elif "reference" in sample:
-            raw = sample["reference"]
-        elif "answers" in sample and sample["answers"] is not None:
-            raw = sample["answers"]
-        else:
-            raw = []
-        ans = [raw] if isinstance(raw, str) else [str(a) for a in (raw or ())]
-        ans.extend(str(a) for a in sample.get("answer_aliases", ()))
-        return list(dict.fromkeys(ans))
-
     if "answers" in sample and sample["answers"] is not None:
         gold_answer: Any = sample["answers"]
     elif "answer" in sample or "gold_ans" in sample or "gold_answer" in sample:
@@ -583,7 +204,49 @@ def extract_gold_answers(sample: Mapping[str, Any], *, strict: bool = False) -> 
 
 def get_gold_answers(samples: Sequence[Mapping[str, Any]]) -> list[list[str]]:
     """Extract gold answer sets and aliases using upstream main.py's exact contract."""
-    return [extract_gold_answers(sample, strict=True) for sample in samples]
+    return [extract_gold_answers(sample) for sample in samples]
+
+
+def _extract_sample_passages(
+    sample: Mapping[str, Any],
+    *,
+    separator: str = " ",
+    supporting_only: bool = False,
+    corpus_by_id: Mapping[str, str] | None = None,
+) -> list[str]:
+    if "gold_docs" in sample and sample["gold_docs"]:
+        return [
+            f"{item['title']}\n{item['text']}" if isinstance(item, Mapping) else str(item)
+            for item in sample["gold_docs"]
+        ]
+    if supporting_only and "supporting_facts" in sample:
+        gold_titles = {item[0] for item in sample["supporting_facts"]}
+        return [f"{item[0]}\n{separator.join(item[1])}" for item in sample["context"] if item[0] in gold_titles]
+    if "contexts" in sample:
+        items = (
+            [item for item in sample["contexts"] if item.get("is_supporting", False)]
+            if supporting_only
+            else sample["contexts"]
+        )
+        return [f"{item['title']}\n{item['text']}" for item in items]
+    if "paragraphs" in sample:
+        items = (
+            [item for item in sample["paragraphs"] if item.get("is_supporting", True)]
+            if supporting_only
+            else sample["paragraphs"]
+        )
+        return [f"{item['title']}\n{item['text'] if 'text' in item else item['paragraph_text']}" for item in items]
+    if "context" in sample and isinstance(sample["context"], list):
+        return [f"{item[0]}\n{separator.join(item[1])}" for item in sample["context"]]
+    if "expected_doc_ids" in sample:
+        lookup = corpus_by_id or {}
+        return [lookup[str(did)] for did in sample.get("expected_doc_ids", []) if supporting_only or str(did) in lookup]
+    if supporting_only:
+        raise ValueError(
+            "Each sample needs supporting_facts, contexts, paragraphs, context, or expected_doc_ids "
+            "for retrieval evaluation"
+        )
+    return []
 
 
 def get_gold_docs(
@@ -592,13 +255,12 @@ def get_gold_docs(
     corpus: Sequence[Mapping[str, Any]] | None = None,
     *,
     corpus_by_id: Mapping[str, str] | None = None,
-) -> list[list[str]]:
+) -> list[list[str]] | None:
     """Extract gold supporting passages using upstream main.py's exact formatting contract."""
-    gold_docs: list[list[str]] = []
-    ds_str = str(dataset_name).strip() if dataset_name is not None else ""
-    ds_stem = Path(ds_str).stem.lower() if ds_str else ""
-    canonical_dataset = ALIASES.get(ds_stem, ALIASES.get(ds_str.lower(), ds_str)) if ds_str else ""
-    separator = "" if canonical_dataset.startswith("hotpotqa") else " "
+    spec = _dataset_spec(dataset_name)
+    if spec.get("qa_only"):
+        return None
+    separator = str(spec.get("sentence_separator", " "))
     c_by_id: dict[str, str] = dict(corpus_by_id) if corpus_by_id else {}
     if not c_by_id and corpus:
         for c in corpus:
@@ -607,123 +269,19 @@ def get_gold_docs(
                 t = str(c.get("title", "")).strip()
                 tx = str(c.get("text") if "text" in c else c.get("content", "")).strip()
                 c_by_id[cid] = f"{t}\n{tx}" if t else tx
-
-    for sample in samples:
-        if "gold_docs" in sample and sample["gold_docs"]:
-            gold_doc = [
-                f"{item['title']}\n{item['text']}" if isinstance(item, Mapping) else str(item)
-                for item in sample["gold_docs"]
-            ]
-        elif "supporting_facts" in sample:
-            gold_titles = {item[0] for item in sample["supporting_facts"]}
-            supporting_contexts = [item for item in sample["context"] if item[0] in gold_titles]
-            gold_doc = [f"{item[0]}\n{separator.join(item[1])}" for item in supporting_contexts]
-        elif "contexts" in sample:
-            gold_doc = [
-                f"{item['title']}\n{item['text']}" for item in sample["contexts"] if item.get("is_supporting", False)
-            ]
-        elif "paragraphs" in sample:
-            paragraphs = [item for item in sample["paragraphs"] if item.get("is_supporting", True)]
-            gold_doc = [
-                f"{item['title']}\n{item['text'] if 'text' in item else item['paragraph_text']}" for item in paragraphs
-            ]
-        elif "context" in sample and isinstance(sample["context"], list):
-            gold_doc = [f"{item[0]}\n{separator.join(item[1])}" for item in sample["context"]]
-        elif isinstance(sample.get("context"), str):
-            passages = [p.strip() for p in re.split(r"\n*### Passage \d+\n*", sample["context"]) if p.strip()]
-            ans_set: set[str] = set()
-            if sample.get("gold_ans"):
-                ans_set.add(str(sample["gold_ans"]).strip())
-            for a in sample.get("answers", []):
-                if a:
-                    ans_set.add(str(a).strip())
-            if "answer" in sample and sample["answer"]:
-                if isinstance(sample["answer"], list):
-                    ans_set.update(str(x).strip() for x in sample["answer"] if x)
-                else:
-                    ans_set.add(str(sample["answer"]).strip())
-
-            question = str(sample.get("question", ""))
-            q_keywords = {w for w in re.findall(r"\w+", question.lower()) if len(w) >= 3 and w not in TEXT_STOPWORDS}
-            a_keywords = {
-                w for a in ans_set for w in re.findall(r"\w+", a.lower()) if len(w) >= 3 and w not in TEXT_STOPWORDS
-            }
-            ans_lower = [a.lower() for a in ans_set if a]
-
-            scored_passages: list[tuple[tuple[int, int, int, int], str]] = []
-            for idx, p in enumerate(passages):
-                p_lower = p.lower()
-                p_words = set(re.findall(r"\w+", p_lower))
-                exact_ans_matches = sum(1 for a in ans_lower if a in p_lower)
-                ans_kw_matches = len(a_keywords & p_words)
-                q_kw_matches = len(q_keywords & p_words)
-
-                if exact_ans_matches > 0 or ans_kw_matches > 0:
-                    scored_passages.append(((exact_ans_matches, ans_kw_matches, q_kw_matches, -idx), p))
-
-            if scored_passages:
-                scored_passages.sort(key=lambda x: x[0], reverse=True)
-                top_passages = [p for _, p in scored_passages[:2]]
-            elif passages:
-                top_passages = [passages[0]]
-            else:
-                top_passages = []
-
-            gold_doc = [f"\n{p}" for p in top_passages]
-        elif "expected_doc_ids" in sample:
-            lookup = c_by_id
-            gold_doc = [lookup[str(did)] for did in sample.get("expected_doc_ids", [])]
-        elif "document" in sample and isinstance(sample["document"], Mapping):
-            doc = sample["document"]
-            doc_id = doc.get("id")
-            gold_doc = []
-            if corpus and doc_id:
-                doc_chunks = [c for c in corpus if str(c.get("idx", "")).startswith(f"{doc_id}_")]
-                answers = get_gold_answers([sample])[0]
-                ans_lower = [a.lower().strip() for a in answers if a.strip()]
-                a_keywords = {
-                    w for a in answers for w in re.findall(r"\w+", a.lower()) if len(w) >= 3 and w not in TEXT_STOPWORDS
-                }
-                question = str(sample.get("question", ""))
-                q_keywords = {
-                    w for w in re.findall(r"\w+", question.lower()) if len(w) >= 3 and w not in TEXT_STOPWORDS
-                }
-
-                scored_chunks: list[tuple[tuple[int, int, int, int], str]] = []
-                for idx, c in enumerate(doc_chunks):
-                    c_text = str(c.get("text", ""))
-                    c_lower = c_text.lower()
-                    c_words = set(re.findall(r"\w+", c_lower))
-                    exact_ans_matches = sum(1 for a in ans_lower if a in c_lower)
-                    ans_kw_matches = len(a_keywords & c_words)
-                    q_kw_matches = len(q_keywords & c_words)
-
-                    if exact_ans_matches > 0 or ans_kw_matches > 0:
-                        formatted = f"{c['title']}\n{c_text}"
-                        scored_chunks.append(((exact_ans_matches, ans_kw_matches, q_kw_matches, -idx), formatted))
-
-                if scored_chunks:
-                    scored_chunks.sort(key=lambda x: x[0], reverse=True)
-                    gold_doc = [chunk for _, chunk in scored_chunks[:2]]
-                elif doc_chunks:
-                    gold_doc = [f"{doc_chunks[0]['title']}\n{doc_chunks[0]['text']}"]
-            if not gold_doc:
-                summary = doc.get("summary")
-                if isinstance(summary, Mapping) and summary.get("text"):
-                    gold_doc = [f"{summary.get('title', '')}\n{summary['text']}".strip()]
-                elif isinstance(summary, str) and summary.strip():
-                    gold_doc = [summary.strip()]
-                elif doc.get("text"):
-                    gold_doc = [str(doc["text"]).strip()]
-                else:
-                    gold_doc = []
-        else:
-            raise ValueError(
-                "Each sample needs supporting_facts, contexts, paragraphs, context, expected_doc_ids, or "
-                "document for retrieval evaluation"
+    return [
+        list(
+            dict.fromkeys(
+                _extract_sample_passages(
+                    sample,
+                    separator=separator,
+                    supporting_only=True,
+                    corpus_by_id=c_by_id,
+                )
             )
-        gold_docs.append(list(dict.fromkeys(gold_doc)))
-    return gold_docs
+        )
+        for sample in samples
+    ]
 
 
 def build_benchmark_slice(
@@ -734,7 +292,7 @@ def build_benchmark_slice(
     query_offset: int = 0,
     full_corpus: bool = False,
     index_queries: int | None = None,
-) -> tuple[list[str], list[str], list[list[str]], list[list[str]]]:
+) -> tuple[list[str], list[str], list[list[str]] | None, list[list[str]]]:
     """Build manifest document IDs and evaluation labels, retaining benchmark subset policies."""
     if max_queries is not None and max_queries < 1:
         raise ValueError("max_queries must be a positive integer when specified.")
@@ -745,114 +303,40 @@ def build_benchmark_slice(
     end = None if max_queries is None else start + max_queries
     selected = list(samples[start:end])
     queries = [str(sample["question"]) for sample in selected]
-    canonical_dataset = ALIASES.get(dataset_name or "", dataset_name or "")
-    gold_docs = get_gold_docs(selected, canonical_dataset, corpus=corpus)
+    spec = _dataset_spec(dataset_name)
+    gold_docs = get_gold_docs(selected, dataset_name, corpus=corpus)
     gold_answers = get_gold_answers(selected)
     minimum_document_count = 0
 
-    if full_corpus or max_queries is None or canonical_dataset in ("sample", "enterprise_rag_bench"):
+    if full_corpus or max_queries is None or bool(spec.get("full_corpus_slice")):
         docs = [f"{doc['title']}\n{doc['text']}" for doc in corpus]
     else:
         effective_index_queries = int(max_queries * 1.4) if index_queries is None else index_queries
         pooled_end = start + effective_index_queries
-        pooled_samples = list(samples[start:pooled_end])
-
-        docs = []
-        separator = "" if canonical_dataset.startswith("hotpotqa") else " "
-
-        if canonical_dataset in ("lveval", "narrativeqa"):
-            for gold_list in gold_docs:
-                docs.extend(gold_list)
-            gold_unique = list(dict.fromkeys(docs))
-            docs = list(gold_unique)
-
-            target_pool_size = max(
-                len(gold_unique) + (effective_index_queries - max_queries) * 2,
-                effective_index_queries * 2,
-            )
-            minimum_document_count = target_pool_size
-
-            candidate_pool: list[str] = []
-            if canonical_dataset == "lveval":
-                for sample in pooled_samples:
-                    if isinstance(sample.get("context"), str):
-                        passages = [
-                            p.strip() for p in re.split(r"\n*### Passage \d+\n*", sample["context"]) if p.strip()
-                        ]
-                        for p in passages:
-                            candidate_pool.append(f"\n{p}")
-                if corpus and len(candidate_pool) < target_pool_size:
-                    for c in corpus:
-                        candidate_pool.append(f"{c['title']}\n{c['text']}")
-            else:
-                for sample in pooled_samples:
-                    doc = sample.get("document", {})
-                    doc_id = doc.get("id") if isinstance(doc, Mapping) else None
-                    if doc_id and corpus:
-                        for c in corpus:
-                            if str(c.get("idx", "")).startswith(f"{doc_id}_"):
-                                candidate_pool.append(f"{c['title']}\n{c['text']}")
-                    summary = doc.get("summary") if isinstance(doc, Mapping) else None
-                    if isinstance(summary, Mapping) and summary.get("text"):
-                        candidate_pool.append(f"{summary.get('title', '')}\n{summary['text']}".strip())
-                if corpus and len(candidate_pool) < target_pool_size:
-                    for c in corpus:
-                        candidate_pool.append(f"{c['title']}\n{c['text']}")
-
-            for cand in candidate_pool:
-                if len(docs) >= target_pool_size:
-                    break
-                if cand not in docs:
-                    docs.append(cand)
-        else:
-            for sample in pooled_samples:
-                if "context" in sample:
-                    if isinstance(sample["context"], list):
-                        for title, sents in sample["context"]:
-                            docs.append(f"{title}\n{separator.join(sents)}")
-                    elif isinstance(sample["context"], str):
-                        passages = [
-                            p.strip() for p in re.split(r"\n*### Passage \d+\n*", sample["context"]) if p.strip()
-                        ]
-                        for p in passages:
-                            docs.append(f"\n{p}")
-                elif "contexts" in sample:
-                    for item in sample["contexts"]:
-                        docs.append(f"{item['title']}\n{item['text']}")
-                elif "paragraphs" in sample:
-                    for item in sample["paragraphs"]:
-                        text = item["text"] if "text" in item else item["paragraph_text"]
-                        docs.append(f"{item['title']}\n{text}")
-            if canonical_dataset == "popqa":
-                min_popqa_docs = effective_index_queries * 2
-                minimum_document_count = min_popqa_docs
-                docs = list(dict.fromkeys(docs))
-                if len(docs) < min_popqa_docs:
-                    for sample in samples[pooled_end:]:
-                        if "paragraphs" in sample:
-                            for item in sample["paragraphs"]:
-                                text = item["text"] if "text" in item else item["paragraph_text"]
-                                cand = f"{item['title']}\n{text}"
-                                if cand not in docs:
-                                    docs.append(cand)
-                                    if len(docs) >= min_popqa_docs:
-                                        break
-                        if len(docs) >= min_popqa_docs:
-                            break
-                if len(docs) < min_popqa_docs and corpus:
-                    for c in corpus:
-                        cand = f"{c['title']}\n{c['text']}"
+        separator = str(spec.get("sentence_separator", " "))
+        docs = [
+            passage
+            for sample in samples[start:pooled_end]
+            for passage in _extract_sample_passages(sample, separator=separator)
+        ]
+        if (min_per_query := int(spec.get("min_docs_per_query", 0))) > 0:
+            minimum_document_count = effective_index_queries * min_per_query
+            docs = list(dict.fromkeys(docs))
+            if len(docs) < minimum_document_count:
+                for sample in samples[pooled_end:]:
+                    for cand in _extract_sample_passages(sample, separator=separator):
                         if cand not in docs:
                             docs.append(cand)
-                            if len(docs) >= min_popqa_docs:
+                            if len(docs) >= minimum_document_count:
                                 break
+                    if len(docs) >= minimum_document_count:
+                        break
 
-    for gold_list in gold_docs:
-        docs.extend(gold_list)
+    if gold_docs is not None:
+        for gold_list in gold_docs:
+            docs.extend(gold_list)
     selected_text = set(docs)
     document_ids = [document_identity(c) for c in corpus if f"{c['title']}\n{c['text']}" in selected_text]
-    # Multiple evaluation views (summary/title/body) can identify one source.
-    # Pad after resolving identities so the pool contains real distinct documents.
     seen_ids = set(document_ids)
     for record in corpus:
         if len(document_ids) >= minimum_document_count:
@@ -864,34 +348,30 @@ def build_benchmark_slice(
     return document_ids, queries, gold_docs, gold_answers
 
 
-ENTERPRISE_CATEGORY_QUOTAS: dict[str, tuple[int, int]] = {
-    "Basic": (35, 24),
-    "Semantic": (27, 18),
-    "Intra-Document Reasoning": (16, 11),
-    "Project Related": (16, 11),
-    "Constrained": (12, 8),
-    "Conflicting Info": (10, 6),
-    "Completeness": (10, 6),
-    "Miscellaneous": (9, 6),
-    "Info Not Found": (9, 6),
-    "High Level": (6, 4),
-}
-
-
-def select_enterprise_questions(rows: Sequence[dict[str, Any]], *, seed: int = 42) -> list[dict[str, Any]]:
+def select_enterprise_questions(
+    rows: Sequence[dict[str, Any]],
+    *,
+    seed: int = 42,
+    quotas: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     """Select the existing 150/100 cohort without modifying any source row."""
+    effective_quotas: dict[str, tuple[int, int]] = {
+        str(k): (int(v[0]), int(v[1])) if isinstance(v, Sequence) else (int(v) * 3 // 5, int(v) - int(v) * 3 // 5)
+        for k, v in (quotas or ENTERPRISE_CATEGORY_QUOTAS).items()
+    }
+    total_cohort = sum(nt + nv for nt, nv in effective_quotas.values())
     identities = [str(row.get("question_id", row.get("id", row["question"]))) for row in rows]
     if len(set(identities)) != len(identities):
         raise ValueError("Duplicate Enterprise question identities cannot form disjoint splits")
-    if len(rows) == 250 and all(row.get("split") in ("train", "val") for row in rows):
-        for category, (train_count, val_count) in ENTERPRISE_CATEGORY_QUOTAS.items():
+    if len(rows) == total_cohort and all(row.get("split") in ("train", "val") for row in rows):
+        for category, (train_count, val_count) in effective_quotas.items():
             for split, count in (("train", train_count), ("val", val_count)):
                 if sum(row["question_type"] == category and row["split"] == split for row in rows) != count:
                     raise ValueError(f"Invalid Enterprise {category}/{split} split count")
         return [r for r in rows if r["split"] == "train"] + [r for r in rows if r["split"] == "val"]
     rng = random.Random(seed)
     train, val = [], []
-    for category, (nt, nv) in ENTERPRISE_CATEGORY_QUOTAS.items():
+    for category, (nt, nv) in effective_quotas.items():
         pool = sorted(
             (r for r in rows if r["question_type"] == category),
             key=lambda r: str(r.get("question_id", r.get("id", r["question"]))),
@@ -922,24 +402,33 @@ def load_dataset_splits(
     args = str(dataset_args).split(",") if isinstance(dataset_args, str) else dataset_args
     trains, vals, docs = [], [], []
     for arg in args:
-        canonical = ALIASES.get(str(arg).lower(), str(arg).lower())
-        if canonical in _OPTIMIZE_TIER2_CORPORA:
-            raise YawRuntimeError("INVALID_INPUT", f"{canonical} is a held-out benchmark, not optimization data")
+        spec = _dataset_spec(arg)
+        if spec.get("held_out") or ((spec.get("tier2") or spec.get("default_parity")) and max_queries > 50):
+            raise YawRuntimeError(
+                "INVALID_INPUT",
+                f"Held-out evaluation dataset '{arg}' is a held-out benchmark "
+                "and cannot be used for training/optimization.",
+            )
         bundle = resolve_dataset_bundle(arg, workspace_root=workspace_root)
-        if bundle.dataset in _OPTIMIZE_TIER2_CORPORA:
-            raise YawRuntimeError("INVALID_INPUT", f"{bundle.dataset} is a held-out benchmark, not optimization data")
+        spec = _dataset_spec(bundle.dataset) or spec
+        if spec.get("held_out") or ((spec.get("tier2") or spec.get("default_parity")) and max_queries > 50):
+            raise YawRuntimeError(
+                "INVALID_INPUT",
+                f"Held-out evaluation dataset '{bundle.dataset}' is a held-out benchmark "
+                "and cannot be used for training/optimization.",
+            )
         rows, document_rows = bundle.read_inputs()
-        if bundle.dataset == "enterprise_rag_bench":
-            cohort = select_enterprise_questions(rows)
-            # Smaller optimization slices still respect the fixed cohort's
-            # training/validation ownership instead of promoting training rows
-            # into validation merely because max_queries is smaller than 250.
+        if quotas := spec.get("category_quotas"):
+            cohort = select_enterprise_questions(rows, quotas=quotas)
+            train_part = int(spec.get("train_partition_size", 150))
             rows = (
-                cohort[:150][query_offset : query_offset + train_queries]
-                + cohort[150:][query_offset : query_offset + max_queries - train_queries]
+                cohort[:train_part][query_offset : query_offset + train_queries]
+                + cohort[train_part:][query_offset : query_offset + max_queries - train_queries]
             )
             if len(rows) != max_queries:
-                raise ValueError("Requested Enterprise slice exceeds its fixed 150/100 partitions")
+                raise ValueError(
+                    f"Requested Enterprise slice exceeds its fixed {train_part}/{len(cohort) - train_part} partitions"
+                )
         else:
             rows = rows[query_offset : query_offset + max_queries]
         if len(rows) <= train_queries:
@@ -949,8 +438,9 @@ def load_dataset_splits(
         ]
         by_id = {row["idx"]: document_text(row, bundle.title_key, bundle.body_key) for row in corpus_rows}
         gold = get_gold_docs(rows, bundle.dataset, corpus=corpus_rows, corpus_by_id=by_id)
+        gold_lists: Sequence[list[str]] = gold if gold is not None else [[] for _ in rows]
         examples = []
-        for row, references in zip(rows, gold, strict=True):
+        for row, references in zip(rows, gold_lists, strict=True):
             values = dict(
                 question=row["question"], gold_answers=extract_gold_answers(row), gold_docs=references, item_docs=[]
             )

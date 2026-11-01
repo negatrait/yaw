@@ -180,11 +180,11 @@ def test_task_reward_disk_cache_and_isolated_training_queries(tmp_path, provider
         same = proposer._score_task_improvement(ex, dspy.Prediction(new_instruction=BASE))
         # Partial answer (BASE: surname only, F1>0) scores higher than wrong answer (BAD: F1=0).
         assert good > same == 0.5 > bad
-        assert len(calls) == 8  # paired task evaluations; subsequent repeats must reuse the cache
+        assert len(calls) == 6  # paired task evaluations; subsequent repeats must reuse the cache
         assert all("task-model" in call["model"] for call in calls)
         assert all("Who designed ACE? 2" not in str(call) for call in calls)
         proposer._score_task_improvement(ex, dspy.Prediction(new_instruction=GOOD))
-        assert len(calls) == 8
+        assert len(calls) == 6
         assert "task_candidate" not in ex.inputs()
         correct_baseline = dspy.Example(
             **{**ex.toDict(), "task_candidate": {"qa.predict": GOOD}, "current_instruction": GOOD}
@@ -318,9 +318,9 @@ def test_native_simba_failed_task_evaluation_keeps_durable_worker(tmp_path, prov
             raise RuntimeError("task provider unavailable")
 
         proposer.task_scorer = failed_score
-        assert not proposer.step_simba()
+        with pytest.raises(RuntimeError, match="SIMBA task evaluations failed"):
+            proposer.step_simba()
         assert proposer.dump_simba_state() == before
-        assert "SIMBA inner-worker step skipped" in caplog.text
     finally:
         engine.close()
     engine, restored = make_learning(tmp_path, url, resume=True)

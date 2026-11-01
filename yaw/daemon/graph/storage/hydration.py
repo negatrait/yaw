@@ -164,15 +164,10 @@ def coalesce_spans(spans: Sequence[MutableSpan]) -> list[CoalescedSpan]:
 coalesce_chunk_spans = coalesce_spans
 
 
-def normalize_json_passage_text(raw_text: str, default_title: str = "") -> str:
-    """Decode a document object or an explicitly projected property sequence.
-
-    Source-aligned properties may retain their JSON separator commas. This is
-    a defined projection grammar, not malformed-document recovery.
-    """
+def _decode_json_passage_fields(raw_text: str, default_title: str = "") -> tuple[str, str]:
     raw = raw_text.strip()
     if not raw:
-        return ""
+        return "", ""
     decoder = json.JSONDecoder()
     data, end = decoder.raw_decode(raw)
     remainder = raw[end:].lstrip()
@@ -204,7 +199,18 @@ def normalize_json_passage_text(raw_text: str, default_title: str = "") -> str:
         data = fields
     elif remainder not in ("", ","):
         raise ValueError("Unexpected content after JSON source value")
-    title, body = json_document_fields(data, default_title)
+    return json_document_fields(data, default_title)
+
+
+def normalize_json_passage_text(raw_text: str, default_title: str = "") -> str:
+    """Decode a document object or an explicitly projected property sequence.
+
+    Source-aligned properties may retain their JSON separator commas. This is
+    a defined projection grammar, not malformed-document recovery.
+    """
+    title, body = _decode_json_passage_fields(raw_text, default_title)
+    if not title and not body:
+        return ""
     return render_document_text(title, body)
 
 
@@ -418,6 +424,49 @@ def hydrate_chunk_pointer(
         score=score,
         stale_on_disk=False,
     )
+
+
+def resolve_chunk_text(
+    pointer: ChunkPointer,
+    corpus_root: Path,
+    *,
+    chunk_size: int = 1200,
+    chunk_overlap: int = 100,
+    min_chunk_size: int = 50,
+) -> str:
+    """Resolve the exact chunk text for a ChunkPointer (including split JSON/JSONL sub-chunks)."""
+    hydrated = hydrate_chunk_pointer(pointer, corpus_root)
+    if hydrated.stale_on_disk or not hydrated.text.strip():
+        raise ValueError(f"Failed to hydrate source chunk {pointer.chunk_id} from {pointer.rel_posix_path}")
+    if _is_json_corpus_path(pointer.rel_posix_path):
+        full_unbounded = hydrate_chunk_pointer(pointer, corpus_root, max_chars=0)
+        if (
+            not full_unbounded.stale_on_disk
+            and compute_chunk_id(pointer.rel_posix_path, pointer.start_line, pointer.end_line, full_unbounded.text)
+            != pointer.chunk_id
+        ):
+            target_path = resolve_corpus_path(corpus_root, pointer.rel_posix_path)
+            raw_slice = read_corpus_lines(target_path, pointer.start_line, pointer.end_line)
+            if raw_slice is not None:
+                title, body = _decode_json_passage_fields(raw_slice, default_title=pointer.title)
+                if body.strip():
+                    c_size = max(1, int(chunk_size))
+                    c_overlap = max(0, min(int(chunk_overlap), c_size - 1))
+                    m_size = max(1, min(int(min_chunk_size), c_size))
+                    effective_size = max(m_size, c_size - len(title) - 1) if title else c_size
+                    for ch in _HYDRATION_SPLITTER.split(
+                        CodeSource(body, language="markdown"),
+                        chunk_size=effective_size,
+                        chunk_overlap=min(c_overlap, max(0, effective_size - 1)),
+                        min_chunk_size=min(m_size, max(1, len(body.strip()))),
+                    ):
+                        cand_text = render_document_text(title, ch.text)
+                        if (
+                            compute_chunk_id(pointer.rel_posix_path, pointer.start_line, pointer.end_line, cand_text)
+                            == pointer.chunk_id
+                        ):
+                            return cand_text
+    return hydrated.text
 
 
 def hydrate_passages(

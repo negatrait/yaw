@@ -1,13 +1,16 @@
 """Native SQLite source contributions, owned by CocoIndex file components."""
 
 import hashlib
-from dataclasses import dataclass
-from pathlib import Path
+import inspect
+from dataclasses import dataclass, replace
+from importlib.metadata import version
+from pathlib import Path, PurePath, PurePosixPath
 
 import cocoindex as coco
-from cocoindex.connectors import localfs, sqlite
-from cocoindex.resources.file import FileLike, PatternFilePathMatcher
+from cocoindex.connectors import sqlite
+from cocoindex.resources.file import FileLike, FilePathMatcher, PatternFilePathMatcher
 
+from yaw.core import json_document_fields
 from yaw.daemon.ingestion.corpus import chunk_source_text
 
 SOURCE_DB = coco.ContextKey[sqlite.ManagedConnection]("yaw/source_db")
@@ -15,8 +18,8 @@ SOURCE_ROOT = coco.ContextKey[Path]("yaw/source_root", detect_change=True)
 
 
 @dataclass(frozen=True, slots=True)
-class SourceChunk:
-    """Source evidence, distinct from the subsequently published graph."""
+class SourceMetadata:
+    """Persistent source pointer; corpus text is not duplicated in this target."""
 
     chunk_id: str
     rel_posix_path: str
@@ -26,7 +29,6 @@ class SourceChunk:
     title: str
     ast_island_start: int
     ast_island_end: int
-    text: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,13 +40,51 @@ class SourceSettings:
     min_chunk_size: int = 50
     json_keys_whitelist: tuple[str, ...] = ("*",)
     json_keys_blacklist: tuple[str, ...] = ()
+    included_files: tuple[str, ...] | None = None
 
 
-@coco.fn(memo=True)
-async def declare_source_file(
-    file: FileLike, table: sqlite.TableTarget[SourceChunk], settings: SourceSettings
-) -> tuple[SourceChunk, ...]:
-    """Failed parsing declares nothing; CocoIndex retains the previous targets."""
+class _SelectedFilesPathMatcher(FilePathMatcher):
+    def __init__(self, pattern_matcher: PatternFilePathMatcher, included_files: tuple[str, ...]) -> None:
+        self._pattern_matcher = pattern_matcher
+        self._included_files = frozenset(included_files)
+        self._included_dirs = frozenset(
+            parent.as_posix() for rel in self._included_files for parent in PurePosixPath(rel).parents
+        )
+
+    def is_dir_included(self, path: PurePath) -> bool:
+        return path.as_posix() in self._included_dirs and self._pattern_matcher.is_dir_included(path)
+
+    def is_file_included(self, path: PurePath) -> bool:
+        return path.as_posix() in self._included_files and self._pattern_matcher.is_file_included(path)
+
+
+def build_source_path_matcher(settings: SourceSettings) -> FilePathMatcher:
+    pattern_matcher = PatternFilePathMatcher(
+        included_patterns=list(settings.included_patterns),
+        excluded_patterns=list(settings.excluded_patterns),
+    )
+    if settings.included_files is None:
+        return pattern_matcher
+    return _SelectedFilesPathMatcher(pattern_matcher, settings.included_files)
+
+
+def normalize_chunking_settings(settings: SourceSettings) -> SourceSettings:
+    """Strip path-selection filters so file chunking memos depend only on chunking parameters."""
+    if not settings.included_patterns and not settings.excluded_patterns and settings.included_files is None:
+        return settings
+    return replace(settings, included_patterns=(), excluded_patterns=(), included_files=None)
+
+
+@coco.fn(
+    memo=True,
+    version=1,
+    deps={
+        "parser_source": hashlib.sha256(Path(inspect.getfile(chunk_source_text)).read_bytes()).hexdigest(),
+        "contract_source": hashlib.sha256(Path(inspect.getfile(json_document_fields)).read_bytes()).hexdigest(),
+        "cocoindex_version": version("cocoindex"),
+    },
+)
+async def _chunk_file_memo(file: FileLike, settings: SourceSettings) -> tuple[SourceMetadata, ...]:
     path = file.file_path.path
     if path.is_absolute():
         raise ValueError("Source contribution paths must be relative")
@@ -59,8 +99,8 @@ async def declare_source_file(
         json_keys_whitelist=settings.json_keys_whitelist,
         json_keys_blacklist=settings.json_keys_blacklist,
     )
-    contributions = tuple(
-        SourceChunk(
+    return tuple(
+        SourceMetadata(
             pointer.chunk_id,
             pointer.rel_posix_path,
             digest,
@@ -69,30 +109,17 @@ async def declare_source_file(
             pointer.title,
             pointer.ast_island_start,
             pointer.ast_island_end,
-            text,
         )
-        for pointer, text in chunks
+        for pointer, _ in chunks
     )
-    for contribution in contributions:
-        table.declare_row(row=contribution)
-    return contributions
 
 
 @coco.fn
-async def source_app_main(settings: SourceSettings) -> None:
-    """The same native file tree supports catch-up and live application runs."""
-    table = await sqlite.mount_table_target(
-        SOURCE_DB,
-        table_name="source_chunks",
-        table_schema=await sqlite.TableSchema[SourceChunk].from_class(SourceChunk, primary_key=["chunk_id"]),
-    )
-    files = localfs.walk_dir(
-        SOURCE_ROOT,
-        recursive=True,
-        live=True,
-        path_matcher=PatternFilePathMatcher(
-            included_patterns=list(settings.included_patterns),
-            excluded_patterns=list(settings.excluded_patterns),
-        ),
-    )
-    await coco.mount_each(declare_source_file, files.items(), table, settings)
+async def declare_source_file(
+    file: FileLike, table: sqlite.TableTarget[SourceMetadata], settings: SourceSettings
+) -> tuple[SourceMetadata, ...]:
+    """Failed parsing declares nothing; CocoIndex retains the previous targets."""
+    contributions = await _chunk_file_memo(file, normalize_chunking_settings(settings))
+    for contribution in contributions:
+        table.declare_row(row=contribution)
+    return contributions

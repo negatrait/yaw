@@ -154,6 +154,7 @@ def make_batch(tmp_path: Path, count: int = 5) -> SynonymEvidenceBatch:
 
 
 def make_program(url: str, *, context: int = 131072) -> HippoRAGProgram:
+    # Tests assert exact provider call counts; DSPy retries would add calls, so transport errors must fail directly.
     lm = create_dspy_lm(
         "packet-model", base_url=url + "/v1", max_tokens=512, context_window_tokens=context, num_retries=0, cache=False
     )
@@ -161,7 +162,6 @@ def make_program(url: str, *, context: int = 131072) -> HippoRAGProgram:
     program = HippoRAGProgram(
         rlm_sub_lm=lm, synonym_token_counter=counter, context_window_tokens=context, max_output_tokens=512
     )
-    program.max_invariant_retries = 0
     return program
 
 
@@ -288,9 +288,9 @@ root=Path(sys.argv[1]);url=sys.argv[2];crash=sys.argv[3]=='crash'
 data=json.loads((root/'batch.json').read_text(encoding='utf-8'))
 batch=SynonymEvidenceBatch(tuple(data['candidates']),data['payload'],data['identifiers'])
 configure_yaw_dspy_cache(root/'responses',enable_memory_cache=False)
+# len(calls) == 1 must count cache misses only; DSPy retries would add calls.
 lm=create_dspy_lm('packet-model',base_url=url+'/v1',max_tokens=512,context_window_tokens=131072,num_retries=0)
 program=HippoRAGProgram(rlm_sub_lm=lm,synonym_token_counter=ServingTokenCounter(url+'/v1','packet-model'),max_output_tokens=512)
-program.max_invariant_retries=0
 managed=open_managed_yaw_db(root/'recovery.db')
 with managed.transaction() as conn:
  cache=CandidateStageCache(CandidateCacheStore(conn),managed,'synonym',lambda:'packet-test')

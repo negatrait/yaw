@@ -1,6 +1,7 @@
 """CLI status and reload protocols using real locks, SQLite and signal files."""
 
 import json
+import sqlite3
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -179,8 +180,8 @@ def test_graph_lint_of_missing_or_uninitialized_database_uses_empty_schema(tmp_p
     assert json.loads(capsys.readouterr().out)["conforms"] is True
     with closing(open_yaw_db(config.db_path)) as conn:
         conn.execute("DROP TABLE entities")
-    assert handle_graph_lint(config, as_turtle=True) == 0
-    assert "@prefix" in capsys.readouterr().out
+    with pytest.raises(sqlite3.OperationalError):
+        handle_graph_lint(config, as_turtle=True)
 
 
 def test_cli_requires_a_complete_subcommand(capsys):

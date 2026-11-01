@@ -97,7 +97,10 @@ def test_failed_download_preserves_previous_target_and_removes_temporary_file(
     assert len(state["requests"]) == 2
 
 
-@pytest.mark.parametrize("mode", ["check-valid", "check-invalid", "all-cached", "alias-cached", "invalid-source"])
+@pytest.mark.parametrize(
+    "mode",
+    ["check-valid", "check-invalid", "all-cached", "single-cached", "alias-cached", "invalid-source"],
+)
 def test_downloader_cli_reports_real_bundle_integrity_without_external_network(tmp_path, downloader, mode):
     sources, prepared = tmp_path / "sources", tmp_path / "prepared"
     sources.mkdir()
@@ -112,11 +115,14 @@ def test_downloader_cli_reports_real_bundle_integrity_without_external_network(t
     if mode == "invalid-source":
         (sources / "sample.json").write_text("invalid", encoding="utf-8")
     arguments = ["--dest", str(prepared), "--source-dir", str(sources)]
-    arguments += (
-        ["--check"]
-        if mode.startswith("check")
-        else ["--dataset", "naturalquestions" if mode == "alias-cached" else "all"]
-    )
+    if mode.startswith("check"):
+        arguments += ["--check"]
+    elif mode == "single-cached":
+        arguments += ["--dataset", "nq"]
+    elif mode == "alias-cached":
+        arguments += ["--dataset", "naturalquestions"]
+    else:
+        arguments += ["--dataset", "all"]
     result = subprocess.run(
         [sys.executable, downloader.__file__, *arguments],
         capture_output=True,
@@ -125,10 +131,12 @@ def test_downloader_cli_reports_real_bundle_integrity_without_external_network(t
         env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         timeout=60,
     )
-    assert (result.returncode != 0) == (mode in ("check-invalid", "invalid-source")), result.stdout + result.stderr
+    assert (result.returncode != 0) == (mode in ("check-invalid", "invalid-source", "alias-cached")), (
+        result.stdout + result.stderr
+    )
     if mode == "check-invalid":
         assert "[FAIL] sample" in result.stdout
-    elif mode != "invalid-source":
+    elif mode not in ("invalid-source", "alias-cached"):
         assert "[OK]" in result.stdout
 
 

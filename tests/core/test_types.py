@@ -10,7 +10,6 @@ from yaw.core.types import (
     HydratedPassage,
     OpenIERecord,
     RetrievalResult,
-    SyncDelta,
     check_lexical_subsumption_inversion,
     compute_chunk_id,
     compute_mdhash_id,
@@ -98,25 +97,6 @@ class TypesTests(unittest.TestCase):
         with self.assertRaises((FrozenInstanceError, AttributeError)):
             result.answer = "mutated"  # type: ignore
         self.assertFalse(hasattr(result, "__dict__"))
-
-    def test_sync_delta_invariants(self):
-        delta_empty = SyncDelta()
-        self.assertEqual(delta_empty.added_chunks, ())
-        self.assertEqual(delta_empty.deleted_chunk_ids, ())
-
-        pointer = ChunkPointer("c1", "p.md", 1, 10, "Title")
-        delta = SyncDelta(
-            added_chunks=((pointer, "Full chunk body text"),),
-            deleted_chunk_ids=("c0",),
-        )
-        self.assertEqual(len(delta.added_chunks), 1)
-        self.assertEqual(delta.added_chunks[0][0], pointer)
-        self.assertEqual(delta.added_chunks[0][1], "Full chunk body text")
-        self.assertEqual(delta.deleted_chunk_ids, ("c0",))
-
-        with self.assertRaises((FrozenInstanceError, AttributeError)):
-            delta.deleted_chunk_ids = ()  # type: ignore
-        self.assertFalse(hasattr(delta, "__dict__"))
 
     def test_compute_mdhash_id_and_chunk_id(self):
         content = "test text"

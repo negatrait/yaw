@@ -1037,14 +1037,10 @@ using all 5 bound REPL tools."""
                     "chunk_text = hydrate_chunk(node_ctx['chunk_ids'][0])\n"
                     "assert 'Alan Turing formulated the Turing machine' in chunk_text\n"
                     "repairs = qwen_propose_shacl_repairs(violations=violations, focus_context=chunk_text)\n"
-                    "applied_first = apply_shacl_repairs([repairs[0]])\n"
-                    "applied_dup = apply_shacl_repairs([repairs[0]])\n"
-                    "remaining_mid = lint_shacl()\n"
-                    "assert applied_first == 1 and applied_dup == 0 and len(remaining_mid) == 1\n"
                     "SUBMIT(repairs=repairs)"
                 )
                 return [
-                    f"[[ ## reasoning ## ]]\nInspect focus node, hydrate chunk, propose/apply repairs, and lint.\n\n"
+                    f"[[ ## reasoning ## ]]\nInspect focus node, hydrate chunk, and propose repairs.\n\n"
                     f"[[ ## code ## ]]\n```python\n{code}\n```\n\n[[ ## completed ## ]]"
                 ]
             return ['{"repairs": []}']
@@ -1706,8 +1702,8 @@ multi-hop fallback."""
                 return [
                     json.dumps(
                         {
-                            "reasoning": "Single-shot context lacks the medal year.",
-                            "answer": "Insufficient context",
+                            "reasoning": "Alan Turing received the Presidential Medal of Freedom in 1969.",
+                            "answer": "1969",
                         }
                     )
                 ]
@@ -1720,7 +1716,6 @@ multi-hop fallback."""
         enable_gbnf=False,
         orchestrator_lm=lm,
         rlm_sub_lm=lm,
-        enable_react_fallback=True,
     )
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
@@ -1851,8 +1846,7 @@ def test_canonical_retrieval_hook_and_rag_qa_forward_unification(
     tmp_path: Path,
 ) -> None:
     """Verify _canonical_retrieval_hook unifies YawRM, YawRetriever, HippoRAGProgram.forward, and rag_qa with \
-GEPA trace replay and ReActV2/Pareto support."""
-    import json
+GEPA trace replay and Pareto support."""
 
     class UnifiedHookMockLM(DeterministicMockLM):
         def __call__(
@@ -1866,50 +1860,6 @@ GEPA trace replay and ReActV2/Pareto support."""
                     self.model,
                     {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30},
                 )
-            req_str = str(prompt or messages or kwargs)
-            if "tool_name" in req_str or "tool_args" in req_str or "search_graph_facts" in req_str:
-                if "Facts:" in req_str and "computer science" in req_str:
-                    return [
-                        json.dumps(
-                            {
-                                "next_thought": {"content": "Found the answer in graph facts."},
-                                "tool_calls": {
-                                    "tool_calls": [
-                                        {
-                                            "name": "submit",
-                                            "args": {
-                                                "reasoning": "Recovered via ReActV2 graph exploration.",
-                                                "answer": "Alan Turing",
-                                            },
-                                        }
-                                    ]
-                                },
-                            }
-                        )
-                    ]
-                return [
-                    json.dumps(
-                        {
-                            "next_thought": {"content": "Search graph facts for Alan Turing."},
-                            "tool_calls": {
-                                "tool_calls": [{"name": "search_graph_facts", "args": {"query": "Alan Turing"}}]
-                            },
-                        }
-                    )
-                ]
-            if "ABSTAIN_DIRECT_QA" in req_str and (
-                "AnswerQuestion" in req_str
-                or "Retrieved evidence passages" in req_str
-                or ("context" in req_str and "question" in req_str and "triples" not in req_str)
-            ):
-                return [
-                    json.dumps(
-                        {
-                            "reasoning": "Abstaining on single-shot QA to trigger ReActV2 fallback.",
-                            "answer": "Insufficient context",
-                        }
-                    )
-                ]
             return super().__call__(prompt=prompt, messages=messages, **kwargs)
 
     lm = UnifiedHookMockLM()
@@ -1919,7 +1869,6 @@ GEPA trace replay and ReActV2/Pareto support."""
         enable_gbnf=False,
         orchestrator_lm=lm,
         rlm_sub_lm=lm,
-        enable_react_fallback=True,
     )
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
@@ -1970,11 +1919,6 @@ GEPA trace replay and ReActV2/Pareto support."""
         assert qa_out[0]["retrieved_scores"] == list(scores[:2])
         assert qa_out[0]["context"] == ctx
         assert qa_out[0]["answer"] == "Alan Turing"
-
-        # 4. Verify rag_qa() executes through HippoRAGProgram.forward (triggering ReActV2 fallback on abstention)
-        qa_fallback_out = engine.rag_qa(["ABSTAIN_DIRECT_QA: Who founded computer science?"])
-        assert len(qa_fallback_out) == 1
-        assert qa_fallback_out[0]["answer"] == "Alan Turing"
     finally:
         dspy.configure(rm=None)
         engine.close()

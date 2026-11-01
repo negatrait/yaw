@@ -181,9 +181,6 @@ class GepaProgress:
 class GraphOptimizationHooks:
     """Explicit callback contract passed by `YawGraphEngine` into `optimizer.py` (zero horizontal imports)."""
 
-    ensure_candidate_indexed: Callable[[HippoRAGProgram, Sequence[str] | None], list[str]]
-    reset_sandbox_graph: Callable[[bool], None]
-    index_chunks: Callable[[Sequence[tuple[ChunkPointer, str]], HippoRAGProgram], int]
     persist_trails: Callable[[HippoRAGProgram], None]
     get_meta: Callable[[str], str | None]
     set_meta: Callable[[str, str | None], None]
@@ -531,16 +528,13 @@ def select_pareto_frontier_programs(
             for member_file in sorted(telem_dir.glob("pareto_member_*.json")):
                 if len(selected) >= max_programs:
                     break
-                try:
-                    sibling = copy.deepcopy(compiled)
-                    sibling.load(str(member_file))
-                    compiled.copy_runtime_hooks_to(sibling)
-                    fp = _query_qa_fingerprint(sibling)
-                    if fp not in seen_fps:
-                        seen_fps.add(fp)
-                        selected.append(sibling)
-                except Exception:
-                    continue
+                sibling = copy.deepcopy(compiled)
+                sibling.load(str(member_file))
+                compiled.copy_runtime_hooks_to(sibling)
+                fp = _query_qa_fingerprint(sibling)
+                if fp not in seen_fps:
+                    seen_fps.add(fp)
+                    selected.append(sibling)
 
     return selected
 

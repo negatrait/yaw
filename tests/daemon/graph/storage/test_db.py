@@ -7,6 +7,7 @@ import pytest
 
 from yaw.core import ChunkPointer, OpenIERecord
 from yaw.daemon.graph.storage import (
+    apply_shacl_repairs,
     delete_chunks,
     deserialize_f32_vector,
     find_entity_disambiguation_candidates,
@@ -37,10 +38,10 @@ from yaw.daemon.graph.storage import (
     upsert_entities,
     upsert_entity_labels,
     upsert_entity_vectors,
+    upsert_fact_sources,
     upsert_fact_vectors,
     upsert_facts,
     upsert_semantic_edges,
-    upsert_synonymy_edges,
 )
 
 
@@ -271,7 +272,7 @@ def test_graph_upserts_and_atomic_cascading_deletion(tmp_path: Path) -> None:
 
         # Synonymy edge between e1 and an alias e1_alias
         upsert_entities(conn, [("e1_alias", "A. Turing")])
-        upsert_synonymy_edges(conn, [("e1", "e1_alias", 0.95)])
+        upsert_semantic_edges(conn, [("e1", "e1_alias", "skos:related", 0.95)])
 
         # Assert initial state
         assert conn.execute("SELECT COUNT(*) FROM chunks;").fetchone()[0] == 2
@@ -698,6 +699,7 @@ def test_merge_entities_and_semantic_edge_dominance(tmp_path: Path) -> None:
 def test_closed_world_shacl_lint_auto_heal_and_turtle_export(tmp_path: Path) -> None:
     conn = open_yaw_db(tmp_path / "test_shacl.db")
     try:
+        upsert_chunk_pointers(conn, [(ChunkPointer("c1", "doc.md", 1, 2, "Doc"), "Entity A relates to Entity B.")])
         # Insert an entity with empty definition, an entity with valid definition, and an asymmetric semantic edge
         conn.execute("INSERT INTO entities(entity_id, name, definition) VALUES ('ent-a', 'Entity A', '');")
         conn.execute(
@@ -707,19 +709,40 @@ def test_closed_world_shacl_lint_auto_heal_and_turtle_export(tmp_path: Path) -> 
             "INSERT INTO facts(fact_id, subj_id, pred, obj_id, raw_triple_json, definition) "
             "VALUES ('fact-ab', 'ent-a', 'relates to', 'ent-b', '[\"Entity A\", \"relates to\", \"Entity B\"]', '');"
         )
+        upsert_fact_sources(conn, [("fact-ab", "c1")])
         conn.execute("INSERT INTO edges(src_id, dst_id, kind, weight) VALUES ('ent-a', 'ent-b', 'fact', 1.0);")
         conn.execute("INSERT INTO edges(src_id, dst_id, kind, weight) VALUES ('ent-a', 'ent-b', 'skos:related', 0.9);")
         conn.commit()
 
-        violations_before = lint_graph_shacl(conn, auto_heal=False)
+        violations_before = lint_graph_shacl(conn)
         shapes_before = {v.shape for v in violations_before}
         assert "ConceptShape/prefLabel" in shapes_before
         assert "ConceptShape/definition" in shapes_before
         assert "StatementShape/closedWorld" in shapes_before
         assert "EdgeShape/closedWorld" in shapes_before
 
-        # Auto-heal repairs deterministic violations (prefLabels, empty definitions, asymmetric semantic edge)
-        violations_after = lint_graph_shacl(conn, auto_heal=True)
+        # Apply explicit SHACL repairs
+        apply_shacl_repairs(
+            conn,
+            [
+                {"focus_node": "ent-a", "action": "set_pref_label", "target_node": "", "value": "Entity A"},
+                {"focus_node": "ent-b", "action": "set_pref_label", "target_node": "", "value": "Entity B"},
+                {
+                    "focus_node": "ent-a",
+                    "action": "set_definition",
+                    "target_node": "",
+                    "value": "Entity A participates in relation: Entity A relates to Entity B.",
+                },
+                {
+                    "focus_node": "fact-ab",
+                    "action": "set_definition",
+                    "target_node": "",
+                    "value": "Entity A relates to Entity B.",
+                },
+                {"focus_node": "ent-a->ent-b", "action": "assert_related", "target_node": "", "value": ""},
+            ],
+        )
+        violations_after = lint_graph_shacl(conn)
         assert violations_after == []
 
         # Inspect focus node neighbourhood
@@ -776,7 +799,7 @@ owl:differentFrom."""
                 ("ent-fruit", "c3", "passage", 1.0, "c3"),
             ],
         )
-        assert lint_graph_shacl(conn, auto_heal=False) == []
+        assert lint_graph_shacl(conn) == []
 
         # Deleting c1 removes "apple inc" prefLabel from ent-tech and promotes "apple" (from c2) to skos:prefLabel.
         # Step 7 in delete_chunks must link ent-tech and ent-fruit with symmetric owl:differentFrom (weight = 0.0).
@@ -794,7 +817,7 @@ owl:differentFrom."""
         ).fetchall()
         assert len(diff_rows) == 2
         assert all(float(r[2]) == 0.0 for r in diff_rows)
-        assert lint_graph_shacl(conn, auto_heal=False) == []
+        assert lint_graph_shacl(conn) == []
     finally:
         conn.close()
 
@@ -846,7 +869,7 @@ def test_multi_chunk_entity_labels_enforces_skos_s13_and_s14_disjointness(tmp_pa
             ).fetchall()
         ]
         assert pref_norms == ["united states"]
-        assert lint_graph_shacl(conn, auto_heal=False) == []
+        assert lint_graph_shacl(conn) == []
     finally:
         conn.close()
 
@@ -857,7 +880,7 @@ def test_step11_literal_facts_check_constraints_fact_sources_and_merge_collision
     """Verify H2: facts CHECK constraint, fact_sources provenance, orphan pruning, and merge collision dedup."""
     import sqlite3
 
-    from yaw.daemon.graph.storage import get_facts_with_meta_by_ids, upsert_fact_sources
+    from yaw.daemon.graph.storage import get_facts_with_meta_by_ids
 
     conn = open_yaw_db(tmp_path / "test_step11_h2.db")
     try:
@@ -949,7 +972,7 @@ def test_step11_literal_facts_check_constraints_fact_sources_and_merge_collision
         assert meta["fact-lit-1"]["obj_datatype"] == "xsd:date"
 
         # SHACL closed-world validation conforms for literal-object facts (obj_id IS NULL)
-        assert lint_graph_shacl(conn, auto_heal=False) == []
+        assert lint_graph_shacl(conn) == []
         ttl = serialize_graph_turtle(conn)
         assert 'rdf:object "1912-06-23"^^xsd:date' in ttl
 
@@ -1010,7 +1033,7 @@ def test_step11_skos_broader_cycle_safe_cte_and_s27_disjointness(tmp_path: Path)
             ("ent-dog", "ent-mammal"),
             ("ent-mammal", "ent-animal"),
         ]
-        assert lint_graph_shacl(conn, auto_heal=False) == []
+        assert lint_graph_shacl(conn) == []
 
         # 2. Inject a transitive S27 conflict (skos:related between dog and animal) and a 3-hop cycle (animal -> dog)
         conn.execute(
@@ -1024,13 +1047,30 @@ def test_step11_skos_broader_cycle_safe_cte_and_s27_disjointness(tmp_path: Path)
         )
         conn.commit()
 
-        violations = lint_graph_shacl(conn, auto_heal=False)
+        violations = lint_graph_shacl(conn)
         shapes = {v.shape for v in violations}
         assert "ConceptShape/broaderCycle" in shapes
         assert "ConceptShape/S27-disjointBroaderRelated" in shapes
 
-        # 3. Auto-heal breaks the hierarchy cycle and removes the conflicting skos:related edges
-        remaining = lint_graph_shacl(conn, auto_heal=True)
+        # 3. Explicit SHACL repairs break the hierarchy cycle and remove the conflicting skos:related edges
+        apply_shacl_repairs(
+            conn,
+            [
+                {
+                    "focus_node": "ent-animal->ent-dog",
+                    "action": "remove_hierarchy_cycle",
+                    "target_node": "",
+                    "value": "",
+                },
+                {
+                    "focus_node": "ent-dog|ent-animal",
+                    "action": "remove_conflicting_related",
+                    "target_node": "",
+                    "value": "",
+                },
+            ],
+        )
+        remaining = lint_graph_shacl(conn)
         assert remaining == []
         assert conn.execute("SELECT COUNT(*) FROM edges WHERE kind = 'skos:related'").fetchone()[0] == 0
     finally:

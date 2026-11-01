@@ -46,7 +46,6 @@ _PUBLIC_API: dict[str, str] = {
     "EmbeddingProfile": ".embedding",
     "EmbeddingRequest": ".embedding",
     "EmbeddingResult": ".embedding",
-    "EmbeddingLane": ".embedding_lane",
     "PROFILES": ".embedding",
     "MODEL": ".embedding",
     "GEMMA_TASK_MODES": ".embedding",

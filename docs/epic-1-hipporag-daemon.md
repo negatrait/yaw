@@ -5,17 +5,15 @@ Owner: [FOUNDATIONAL](../FOUNDATIONAL.md) | Results: [evaluation](evaluation.md)
 ## Hard Gates
 
 Accepted replacement packet (2026-10-28): [native CocoIndex indexing and live ingestion](native-cocoindex-indexing.md).
-Both inference and live-ingestion gates are required within unfinished D1-A6.
+Both inference and live-ingestion gates are required within unfinished D1-A6,
+superseding the earlier `EmbeddingLane` / `indexing_overlap` overlap packet.
 
-Superseded indexing packet (2026-10-28): [bounded inference overlap](indexing-overlap.md)
-preserves single-owner persistence and recovery. Its exit condition is verified
-serial equivalence, bounded concurrent provider execution, restart reuse and a
-reported paired pilot; it does not replace either benchmark parity gate.
-
-Accepted indexing packet (2026-10-27): [compact synonym judgment](compact-synonym-judgment.md)
-replaces verbose model dossiers while preserving candidate/evidence coverage,
-native DSPy prompts, graph commit cadence, caches and SHACL acceptance. Its bounded
-pilot establishes stage performance, not Tier 2 parity.
+Accepted compact synonym judgment invariant (2026-10-27): replaces verbose model
+dossiers with compact shared evidence batches while preserving candidate/evidence
+coverage, native DSPy prompts, graph commit cadence, caches and SHACL acceptance.
+Its llama.cpp GBNF grammar binds every candidate pair ID to one mandatory decision
+in input order and constrains canonical entity IDs strictly to that pair's two
+entities. Its bounded pilot establishes stage performance, not Tier 2 parity.
 
 Runtime model update, 2026-10-22: the user selected `gemma-4-E4B-it-qat-q4_0-gguf-Q4_0`
 (`unsloth/gemma-4-E4B-it-qat-q4_0-gguf-Q4_0:Q4_K_M`) for extraction, QA and reflection on the
@@ -128,8 +126,9 @@ Execute strictly in order `E1-S1` $\to$ `E1-S6`. Never start Sprint $k+1$ until 
     CREATE VIRTUAL TABLE fact_fts USING fts5(fact_id UNINDEXED, text, content='', contentless_delete=1);
     -- + sqlite-vec float32 tables: chunk_vec(chunk_id, embedding), entity_vec(entity_id, embedding), fact_vec(fact_id, embedding)
     ```
-  - **SKOS Label Resolution, Merging, Closed-World SHACL Linting & Turtle Export (`db.py`):**
+  - **SKOS Label Resolution, Merging, Closed-World SHACL Linting & Turtle Export (`db.py`, `shacl.py`):**
     - `find_entity_disambiguation_candidates` (2-channel dense KNN + lexical prefix/acronym/trigram blocking + unadjudicated same-`label_norm` distinct-`entity_id` pairs), `upsert_entity_labels` (enforcing SKOS `S13` & `S14` across all `chunk_id` rows), `resolve_entity_labels` (homograph query-vector cosine disambiguation), `merge_entities`, `upsert_semantic_edges` (`skos:related` / `owl:differentFrom` with `owl:differentFrom` dominance and exclusion from `load_graph_topology`), `delete_chunks` (including homograph `owl:differentFrom` preservation upon `skos:prefLabel` promotion), `lint_graph_shacl` (all 6 shapes), and `serialize_graph_turtle`.
+    - **In-Process SQLite SHACL & Taxonomy Guards (`shacl.py`):** Recursive `skos:broader` cycle-detection CTEs must omit `depth` from the recursive `UNION` projection so cyclic graphs terminate finitely; enforce deterministic lexical subsumption direction (`ConceptShape/lexicalSubsumption`: compound concepts narrower than root sub-tokens) and coordinate sibling separation (`ConceptShape/siblingNotBroader`: numbered siblings use `skos:related`, not `skos:broader`).
   - **1-Indexed Line Hydration (`hydration.py`):** Adapt `hydrate_disk_slice` from `git show d1bc65e:src/yaw/retrieval/retriever.py:30-75` (`itertools.islice(f, start_line - 1, end_line)` + `resolved.is_relative_to(corpus_root)` path guard), with missing file/span `stale_on_disk` detection, plus a callable `hydrate_chunk(chunk_id)` tool helper for `dspy.RLM` on-demand passage inspection.
 - **Drop (Anti-Spaghetti):** Drop all 7 upstream files (`EmbeddingStore` Parquet rewrite loops, `openie_results_*.json`, `chunk_metadata.json`, `graph.pickle`) AND drop `d1bc65e:src/yaw/storage/{rdf.py, schema.py}` (`unified_edges` SQL views, `compiled_violations`, `aliases`, `canon_verdicts`).
 - **Exit Gate (`D1-A3`):** Unmocked `test_db.py` & `test_hydration.py` pass top-$k$ `sqlite-vec` KNN, contentless `FTS5` BM25 (`1 / rank` L1-normalized), SKOS `S13`/`S14`, `owl:differentFrom` dominance, 6-shape SHACL linting, Turtle serialization, atomic `chunk_id` deletion cascading through `edge_sources` $\to$ `edges`/`entities`/`entity_labels`/`facts` (with homograph promotion `owl:differentFrom` preservation), and `stale_on_disk` detection.
@@ -160,13 +159,13 @@ Execute strictly in order `E1-S1` $\to$ `E1-S6`. Never start Sprint $k+1$ until 
 ---
 
 ### Sprint 5 (`E1-S5`): `yaw/daemon/ingestion/corpus.py` — CocoIndex Incremental Line-Pointer Pipeline & Target Sink Compiler Hook
-- **2026-10-27 replacement packet:** execute the restart checklist in
-  [dataset ingestion refactor](dataset-ingestion-refactor.md). Dataset preparation
-  emits isolated document files; persistent CocoIndex snapshots replace fresh-state
-  reconstruction. The exit condition includes warm snapshots without reparsing,
-  unchanged source values, loader-owned Enterprise stratification and no legacy
-  discovery/projection consumers. The packet supersedes benchmark-shape parsing
-  and automatic benchmark JSON projection settings described elsewhere.
+- **2026-10-27 replacement packet:** see [native CocoIndex indexing and live ingestion](native-cocoindex-indexing.md).
+  Dataset preparation emits isolated document files (`outputs/datasets/<dataset>/{documents/*.json,evaluation/questions.json,manifest.json}`);
+  persistent CocoIndex snapshots replace fresh-state reconstruction. The exit
+  condition includes warm snapshots without reparsing, unchanged source values,
+  loader-owned Enterprise stratification (seed 42, 150 train / 100 val) and no
+  legacy discovery/projection consumers. The packet supersedes benchmark-shape
+  parsing and automatic benchmark JSON projection settings described elsewhere.
 - **Files:** `yaw/daemon/ingestion/corpus.py`, `tests/daemon/ingestion/test_corpus.py`.
 - **Allowed imports:** `yaw.core.*`, `cocoindex`, `hashlib`, `pathlib`. (Zero imports from `graph/`).
 - **Copy/Adapt From:**
@@ -231,4 +230,4 @@ Execute strictly in order `E1-S1` $\to$ `E1-S6`. Never start Sprint $k+1$ until 
 - [x] **D1-A3 (`E1-S3`):** `storage/{db,hydration}.py` implements single-schema `yaw.db` (`sqlite-vec`, contentless `FTS5`, provenance edges) and 1-indexed `itertools.islice` line hydration.
 - [x] **D1-A4 (`E1-S4`):** `graph/{ppr,engine}.py` + `storage/*` + `--query-offset`/`--evolve` hooks achieve **Tier 1 benchmark parity** vs. upstream `hipporag` on the 3-model local setup (YAW Recall@2: 0.8250 vs upstream: 0.8000; Recall@5: 1.0000 vs upstream: 1.0000; EM: 0.20 vs 0.20).
 - [x] **D1-A5 (`E1-S5`):** `ingestion/corpus.py` (`cocoindex>=1.0.25`) emits pure coalesced line-pointer `SyncDelta`s across add/edit/rename/delete.
-- [ ] **D1-A6 (`E1-S6`):** `daemon/{runtime,cli}.py` (`yaw <domain> <action>` CLI & isolated sandbox `dspy optimize` / `load-program`) passes lifecycle/lock/recovery tests AND native engine + universal `MIPROv2`/`GEPA`/`RLM` program (trained only on Tier 1 / OOD corpora) beats baseline on **Tier 2** disjoint holdout benchmarks.
+- [ ] **D1-A6 (`E1-S6`):** `daemon/{runtime,cli}.py` (`yaw <domain> <action>` CLI & isolated sandbox `dspy optimize` / `load-program`) passes lifecycle/lock/recovery tests AND native engine + universal `MIPROv2`/`GEPA`/`RLM` program (trained only on Tier 1 / OOD corpora) beats baseline on **Tier 2** disjoint holdout benchmarks. Holdout benchmarks are in [HippoRAG 2 (`2502.14802v1`)](arxiv-2502.14802v1-hipporag2.md).

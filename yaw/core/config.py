@@ -188,7 +188,6 @@ class YawConfig:
 
     # Runtime & HTTP transport settings
     queue_maxsize: int = 32
-    indexing_overlap: bool = False
     http_host: str = "127.0.0.1"
     http_port: int = 13306
     http_path: str = "/mcp"
@@ -497,7 +496,6 @@ _FIELD_TO_SECTION: dict[str, str] = {
     "max_ast_expansion_hops": "graph",
     "ast_context_hops": "graph",
     "queue_maxsize": "runtime",
-    "indexing_overlap": "runtime",
     "http_host": "runtime",
     "http_port": "runtime",
     "http_path": "runtime",

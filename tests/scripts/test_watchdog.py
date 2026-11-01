@@ -118,14 +118,15 @@ def test_open_ro_sqlite_backoff_and_dark_figure_candidate_svgs(tmp_path):
         with closing(open_yaw_db(missing_db)):
             pass
 
-    writer = threading.Thread(target=_create_delayed)
+    writer = threading.Thread(target=_create_delayed, daemon=True)
     writer.start()
     ro_conn = open_readonly_yaw_db(missing_db, timeout=1.0, backoff=(0.04, 0.08, 0.12))
     try:
         assert get_graph_counts(ro_conn) == (0, 0, 0, 0, 0)
     finally:
         ro_conn.close()
-        writer.join(timeout=2.0)
+        writer.join(timeout=5.0)
+        assert not writer.is_alive()
 
     cands = [
         {

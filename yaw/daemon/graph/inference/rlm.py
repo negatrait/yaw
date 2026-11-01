@@ -38,8 +38,10 @@ STAGE_RLM_DELEGATION_RULES: dict[str, str] = {
         "```"
     ),
     "instruction_proposer_inner": (
-        "Inspect examples_with_feedback in Python. Select evidence by evidence_id and field path; "
-        "use start/end character offsets for string excerpts. Include failures and successes. "
+        "Inspect examples_with_feedback directly in Python without calling llm_query or llm_query_batched, and "
+        "call SUBMIT immediately once evidence is selected. Select evidence by evidence_id and field path inside "
+        "that example dict (use `[]` for the full example or `['Feedback']`, never an example list index like `[0]`); "
+        "use start/end character offsets only when `path` resolves to a string. Include failures and successful "
         "contrasts. Never write instructions or reconstruct facts. "
         "SUBMIT(selection={'diagnosis': 'brief generalizable diagnosis', "
         "'references': [{'example_id': examples_with_feedback[0]['evidence_id'], 'path': []}]})"
@@ -231,52 +233,6 @@ payloads."""
                     annotation = getattr(field, "annotation", str)
                     raw_output[name] = _normalize_rlm_field(name, raw_output[name], annotation)
         return super()._process_final_output(result, output_field_names)
-
-    def _extract_fallback(
-        self,
-        variables: list[Any],
-        history: Any,
-        output_field_names: list[str],
-    ) -> dspy.Prediction:
-        try:
-            pred = super()._extract_fallback(variables, history, output_field_names)
-        except Exception:
-            payload: dict[str, Any] = {}
-            for name in output_field_names:
-                for var in variables if isinstance(variables, list) else []:
-                    if hasattr(var, "name") and var.name == name:
-                        payload[name] = var.value
-                        break
-                    elif isinstance(var, dict) and name in var:
-                        payload[name] = var[name]
-                        break
-                if name not in payload:
-                    field = self.signature.output_fields.get(name)
-                    annotation = getattr(field, "annotation", None)
-                    if annotation is list or getattr(annotation, "__origin__", None) is list:
-                        payload[name] = []
-                    elif annotation is dict or getattr(annotation, "__origin__", None) is dict:
-                        payload[name] = {}
-                    elif annotation in (int, float):
-                        payload[name] = 0
-                    else:
-                        payload[name] = ""
-            traj: list[Any] = []
-            for item in history or []:
-                dump_fn = getattr(item, "model_dump", None)
-                traj.append(dump_fn() if callable(dump_fn) else str(item))
-            pred = dspy.Prediction(
-                trajectory=traj,
-                final_reasoning="Extract fallback recovered from REPL state",
-                **payload,
-            )
-        for name in output_field_names:
-            field = self.signature.output_fields[name]
-            annotation = getattr(field, "annotation", str)
-            val = getattr(pred, name, None)
-            if annotation is str and isinstance(val, str):
-                setattr(pred, name, val.strip())
-        return pred
 
 
 __all__ = [

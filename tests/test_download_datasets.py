@@ -30,9 +30,13 @@ class DownloadDatasetsTests(unittest.TestCase):
         }
         self.assertEqual(set(download_datasets.DATASET_REGISTRY.keys()), expected_benchmarks)
 
-    def test_aliases_map_to_canonical_keys(self):
-        for _alias, canonical in download_datasets.ALIASES.items():
-            self.assertIn(canonical, download_datasets.DATASET_REGISTRY)
+    def test_aliases_are_rejected_and_not_exported(self):
+        from yaw.daemon.ingestion import resolve_dataset_name
+
+        self.assertFalse(hasattr(download_datasets, "ALIASES"))
+        for alias in ("2wiki", "naturalquestions", "nq_rear"):
+            with self.assertRaises(ValueError):
+                resolve_dataset_name(alias)
 
     def test_bundle_verification_detects_missing_and_valid_files(self):
         from yaw.daemon.ingestion import load_dataset_bundle, prepare_dataset_bundle

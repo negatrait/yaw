@@ -229,14 +229,6 @@ class RetrievalResult:
 
 
 @dataclass(slots=True, frozen=True)
-class SyncDelta:
-    """Coalesced file additions and deletions emitted by the ingestion pipeline."""
-
-    added_chunks: tuple[tuple[ChunkPointer, str], ...] = ()
-    deleted_chunk_ids: tuple[str, ...] = ()
-
-
-@dataclass(slots=True, frozen=True)
 class IndexStats:
     """Cached non-blocking graph index statistics and configuration fingerprint."""
 

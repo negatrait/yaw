@@ -17,7 +17,6 @@ _PUBLIC_API: dict[str, str] = {
     "RetrievalResult": ".types",
     "SHACLViolation": ".types",
     "StructuredTriple": ".types",
-    "SyncDelta": ".types",
     "SynonymEvidenceBatch": ".types",
     "YawConfig": ".config",
     "YawRuntimeError": ".types",

@@ -1,8 +1,10 @@
 """Explicit model selection and read-only Lemonade identity checks."""
 
+import contextlib
 import hashlib
 import json
 from dataclasses import dataclass
+from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 from yaw.core.config import DEFAULT_CONTEXT_WINDOW_TOKENS
@@ -162,10 +164,7 @@ def embedding_evidence(profile, base_url=BASE_URL):
             data=json.dumps({"model": profile.model, "input": "probe"}).encode("utf-8"),
             headers={"Content-Type": "application/json"},
         )
-        try:
-            with urlopen(probe_req, timeout=30):
-                pass
-        except Exception:
+        with contextlib.suppress(URLError, OSError, TimeoutError), urlopen(probe_req, timeout=30):
             pass
         health = get_json(base_url, "/health")
         loaded_models = health.get("all_models_loaded", [])

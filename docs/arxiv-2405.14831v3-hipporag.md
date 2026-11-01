@@ -446,3 +446,6 @@ The prompts we used for indexing and query NER are shown in Figure 7 and Figure 
 **Figure 8: Prompt for query NER during retrieval.**
 
 **Figure 9: Prompt for OpenIE during indexing.**
+
+---
+- [[docs/arxiv-2502.14802v1-hipporag2]]

@@ -16,7 +16,6 @@ from yaw.daemon.graph.inference.reflection import (
     ReflectionBudgetError,
     ReflectionLM,
     ServingTokenCounter,
-    deterministic_evidence,
     reflection_digest,
     reflection_examples,
     resolve_evidence,
@@ -69,23 +68,6 @@ def test_checkpoint_writer_identity_and_active_request_are_validated():
         validate_active_checkpoint(active, "different-run")
     with pytest.raises(ValueError, match="request identity"):
         validate_active_checkpoint({**active, "request": "missing"}, "context")
-
-
-def test_deterministic_selector_handles_nested_malformed_and_nonfinite_scores():
-    examples = reflection_examples(
-        [
-            {"Feedback": {"score": 1.0}},
-            {"Score": "invalid"},
-            {"Score": "nan"},
-            {"Score": {}},
-            {"Feedback": "score=0.8"},
-        ]
-    )
-    selection = deterministic_evidence(examples)
-    resolved = resolve_evidence(examples, selection)
-    assert len(resolved) == 5
-    assert resolved[-2]["evidence"]["Feedback"]["score"] == 1.0
-    assert resolved[-1]["evidence"]["Feedback"] == "score=0.8"
 
 
 def test_reflection_examples_serialize_native_schema_values_and_keep_stable_ids():

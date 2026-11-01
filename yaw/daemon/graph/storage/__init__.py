@@ -32,6 +32,9 @@ _PUBLIC_API: dict[str, str] = {
     "search_chunks_fts": ".vectors",
     "search_facts_fts": ".vectors",
     # Chunk metadata, OpenIE checkpoints, SKOS/RDF/OWL graph CRUD & candidate mining
+    "deserialize_openie_record": ".graph_ops",
+    "filter_valid_concept_entity_ids": ".graph_ops",
+    "get_pure_literal_entity_ids": ".graph_ops",
     "find_entity_synonym_candidates": ".graph_ops",
     "find_entity_disambiguation_candidates": ".graph_ops",
     "upsert_chunk_pointers": ".graph_ops",
@@ -48,7 +51,6 @@ _PUBLIC_API: dict[str, str] = {
     "upsert_fact_sources": ".graph_ops",
     "upsert_edges_with_sources": ".graph_ops",
     "upsert_semantic_edges": ".graph_ops",
-    "upsert_synonymy_edges": ".graph_ops",
     "get_existing_ids": ".graph_ops",
     "get_facts_by_ids": ".graph_ops",
     "get_facts_with_meta_by_ids": ".graph_ops",
@@ -78,6 +80,7 @@ _PUBLIC_API: dict[str, str] = {
     "hydrate_passages": ".hydration",
     "make_ast_island_hydrator": ".hydration",
     "make_chunk_hydrator": ".hydration",
+    "resolve_chunk_text": ".hydration",
     "resolve_one_hop_upward_ast_bounds": ".hydration",
 }
 

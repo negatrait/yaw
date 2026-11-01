@@ -4,7 +4,7 @@ import difflib
 import json
 import re
 import sqlite3
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from functools import lru_cache
 from typing import Any
 
@@ -63,7 +63,11 @@ _INIT_DEL_TEMP_TABLES: tuple[str, ...] = (
 )
 
 
-def _get_pure_literal_entity_ids(conn: sqlite3.Connection | YawConnection) -> set[str]:
+def get_pure_literal_entity_ids(
+    conn: sqlite3.Connection | YawConnection,
+    *,
+    exclude_shared_labels: bool = False,
+) -> set[str]:
     """Return entity IDs that represent pure rdfs:Literal resources and must not participate in SKOS taxonomy."""
     concept_participant_ids: set[str] = {
         str(r[0])
@@ -76,6 +80,19 @@ def _get_pure_literal_entity_ids(conn: sqlite3.Connection | YawConnection) -> se
             """
         )
     }
+    if exclude_shared_labels:
+        concept_participant_ids.update(
+            str(r[0])
+            for r in conn.execute(
+                """
+                SELECT DISTINCT el1.entity_id
+                FROM entity_labels el1
+                JOIN entity_labels el2
+                  ON el1.label_norm = el2.label_norm
+                 AND el1.entity_id != el2.entity_id
+                """
+            )
+        )
     pure_literal_ids: set[str] = {
         str(r[0])
         for r in conn.execute(
@@ -91,6 +108,19 @@ def _get_pure_literal_entity_ids(conn: sqlite3.Connection | YawConnection) -> se
         if eid not in concept_participant_ids and detect_scalar_literal(name)[0]:
             pure_literal_ids.add(eid)
     return pure_literal_ids
+
+
+def filter_valid_concept_entity_ids(
+    conn: sqlite3.Connection | YawConnection,
+    entity_nodes: Sequence[tuple[str, str, str]],
+) -> list[str]:
+    """Filter entity nodes to valid SKOS concept candidates (excluding pure rdfs:Literal resources)."""
+    pure_literal_ids = get_pure_literal_entity_ids(conn, exclude_shared_labels=True)
+    return [
+        eid
+        for eid, name, _ in entity_nodes
+        if len(re.sub(r"[^A-Za-z0-9]", "", name)) >= 1 and eid not in pure_literal_ids
+    ]
 
 
 @lru_cache(maxsize=4096)
@@ -188,7 +218,7 @@ def find_entity_synonym_candidates(
         return []
     max_dist = max(0.0, 1.0 - threshold + 1e-6)
     pair_scores: dict[tuple[str, str], float] = {}
-    pure_literals = _get_pure_literal_entity_ids(conn)
+    pure_literals = get_pure_literal_entity_ids(conn)
 
     adjudicated: set[tuple[str, str]] = {
         (str(r[0]), str(r[1])) if str(r[0]) < str(r[1]) else (str(r[1]), str(r[0]))
@@ -251,7 +281,7 @@ def find_entity_disambiguation_candidates(
     lexical_threshold: float = 0.72,
 ) -> list[tuple[str, str, float, float]]:
     """Two-channel candidate generation combining sqlite-vec dense kNN and 3-stage SequenceMatcher cascade."""
-    pure_literals = _get_pure_literal_entity_ids(conn)
+    pure_literals = get_pure_literal_entity_ids(conn)
     adjudicated: set[tuple[str, str]] = {
         (str(r[0]), str(r[1])) if str(r[0]) < str(r[1]) else (str(r[1]), str(r[0]))
         for r in conn.execute(
@@ -443,6 +473,63 @@ def get_chunk_pointers(
     return results
 
 
+def deserialize_openie_record(
+    raw_json: str | Mapping[str, Any],
+    *,
+    chunk_id: str | None = None,
+) -> OpenIERecord:
+    """Deserialize an OpenIERecord JSON payload or mapping from chunk_inference or openie_chunks."""
+    data = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
+    cid = str(chunk_id if chunk_id is not None else data.get("chunk_id", ""))
+    raw_entities = data.get("entities") or ()
+    raw_defs = data.get("entity_definitions") or ()
+    entities_list: list[str] = []
+    inferred_defs: list[tuple[str, str]] = []
+    has_inferred_def = False
+    for item in raw_entities:
+        if isinstance(item, (list, tuple)) and len(item) >= 1:
+            ename = str(item[0]).strip()
+            edef = str(item[1]).strip() if len(item) >= 2 and item[1] is not None else ""
+            if ename:
+                entities_list.append(ename)
+                inferred_defs.append((ename, edef))
+                if edef:
+                    has_inferred_def = True
+        elif item is not None:
+            ename = str(item).strip()
+            if ename:
+                entities_list.append(ename)
+                inferred_defs.append((ename, ""))
+    explicit_defs = tuple(
+        (str(pair[0]), str(pair[1])) for pair in raw_defs if isinstance(pair, (list, tuple)) and len(pair) >= 2
+    )
+    return OpenIERecord(
+        chunk_id=cid,
+        entities=tuple(entities_list),
+        triples=tuple(
+            (str(t[0]), str(t[1]), str(t[2]))
+            for t in (data.get("triples") or ())
+            if isinstance(t, (list, tuple)) and len(t) >= 3
+        ),
+        structured_triples=tuple(
+            StructuredTriple(
+                subj=str(st.get("subj", "")),
+                subj_def=str(st.get("subj_def", "")),
+                pred=str(st.get("pred", "")),
+                obj=str(st.get("obj", "")),
+                obj_def=str(st.get("obj_def", "")),
+                spo_def=str(st.get("spo_def", "")),
+                obj_kind="literal" if str(st.get("obj_kind", "entity")) == "literal" else "entity",
+                obj_datatype=str(st.get("obj_datatype", "")),
+                obj_lang=str(st.get("obj_lang", "")),
+            )
+            for st in (data.get("structured_triples") or ())
+            if isinstance(st, Mapping) and "subj" in st and "pred" in st and "obj" in st
+        ),
+        entity_definitions=explicit_defs if explicit_defs else (tuple(inferred_defs) if has_inferred_def else ()),
+    )
+
+
 def get_openie_checkpoints(
     conn: sqlite3.Connection | YawConnection,
     chunk_ids: Sequence[str],
@@ -462,48 +549,30 @@ def get_openie_checkpoints(
         )
         for row in cursor:
             cid = str(row[0])
-            raw_entities = json.loads(row[1]) if row[1] else []
-            entities_list: list[str] = []
-            entity_defs_list: list[tuple[str, str]] = []
-            has_any_def = False
-            for item in raw_entities:
-                if isinstance(item, (list, tuple)) and len(item) >= 1:
-                    ename = str(item[0]).strip()
-                    edef = str(item[1]).strip() if len(item) >= 2 and item[1] is not None else ""
-                    if ename:
-                        entities_list.append(ename)
-                        entity_defs_list.append((ename, edef))
-                        if edef:
-                            has_any_def = True
-                elif isinstance(item, str):
-                    ename = item.strip()
-                    if ename:
-                        entities_list.append(ename)
-                        entity_defs_list.append((ename, ""))
-            triples = tuple((t[0], t[1], t[2]) for t in json.loads(row[2]))
-            raw_st = json.loads(row[3]) if row[3] else []
-            structured_triples = tuple(
-                StructuredTriple(
-                    subj=str(item["subj"]),
-                    subj_def=str(item.get("subj_def", "")),
-                    pred=str(item["pred"]),
-                    obj=str(item["obj"]),
-                    obj_def=str(item.get("obj_def", "")),
-                    spo_def=str(item.get("spo_def", "")),
-                    obj_kind="literal" if str(item.get("obj_kind", "entity")) == "literal" else "entity",
-                    obj_datatype=str(item.get("obj_datatype", "")),
-                    obj_lang=str(item.get("obj_lang", "")),
-                )
-                for item in raw_st
-                if isinstance(item, dict) and "subj" in item and "pred" in item and "obj" in item
-            )
-            results[cid] = OpenIERecord(
+            results[cid] = deserialize_openie_record(
+                {
+                    "chunk_id": cid,
+                    "entities": json.loads(row[1]) if row[1] else (),
+                    "triples": json.loads(row[2]) if row[2] else (),
+                    "structured_triples": json.loads(row[3]) if row[3] else (),
+                },
                 chunk_id=cid,
-                entities=tuple(entities_list),
-                triples=triples,
-                structured_triples=structured_triples,
-                entity_definitions=tuple(entity_defs_list) if has_any_def else (),
             )
+    missing_ids = [cid for cid in chunk_ids if cid not in results]
+    if (
+        missing_ids
+        and conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunk_inference' LIMIT 1").fetchone()
+        is not None
+    ):
+        for batch in batched(missing_ids):
+            placeholders = ",".join("?" for _ in batch)
+            cursor = conn.execute(
+                f"SELECT chunk_id, extraction_json FROM chunk_inference WHERE chunk_id IN ({placeholders})",
+                tuple(batch),
+            )
+            for row in cursor:
+                cid = str(row[0])
+                results[cid] = deserialize_openie_record(row[1] or "{}", chunk_id=cid)
     return results
 
 
@@ -1108,7 +1177,7 @@ def upsert_facts(
             try:
                 parsed_raw = json.loads(raw_json)
                 obj_lit = str(parsed_raw[2]) if isinstance(parsed_raw, list) and len(parsed_raw) >= 3 else ""
-            except Exception:
+            except json.JSONDecodeError, TypeError, IndexError:
                 obj_lit = ""
             obj_dt = ""
             obj_lang = ""
@@ -1125,7 +1194,7 @@ def upsert_facts(
                 try:
                     parsed_raw = json.loads(raw_json)
                     obj_lit = str(parsed_raw[2]) if isinstance(parsed_raw, list) and len(parsed_raw) >= 3 else ""
-                except Exception:
+                except json.JSONDecodeError, TypeError, IndexError:
                     obj_lit = ""
         else:
             oid_val = str(raw_oid) if raw_oid is not None else ""
@@ -1164,6 +1233,22 @@ def upsert_facts(
                 "INSERT OR IGNORE INTO fact_sources (fact_id, chunk_id) VALUES (?, ?)",
                 ((str(fid), str(cid)) for fid, cid in fact_sources if fid and cid),
             )
+        literal_oids = {
+            oid for _, _, _, okind, oid, _, _, _, _, _ in normalized_facts if okind == "literal" and oid
+        } & get_pure_literal_entity_ids(conn)
+        if literal_oids:
+            placeholders = ",".join("?" for _ in literal_oids)
+            params = (*literal_oids, *literal_oids)
+            conn.execute(
+                f"DELETE FROM edges WHERE kind IN ('skos:related', 'skos:broader') "
+                f"AND (src_id IN ({placeholders}) OR dst_id IN ({placeholders}))",
+                params,
+            )
+            conn.execute(
+                f"DELETE FROM edge_sources WHERE kind IN ('skos:related', 'skos:broader') "
+                f"AND (src_id IN ({placeholders}) OR dst_id IN ({placeholders}))",
+                params,
+            )
         conn.executemany(
             "DELETE FROM fact_fts WHERE fact_id = ?",
             ((fid,) for fid, _, _, _, _, _, _, _, _, _ in normalized_facts),
@@ -1173,7 +1258,7 @@ def upsert_facts(
             try:
                 items = json.loads(raw_json)
                 fts_items.append((fid, f"{items[0]} {pred} {items[2]}"))
-            except Exception:
+            except json.JSONDecodeError, TypeError, IndexError:
                 fts_items.append((fid, f"{pred} {obj_lit or ''}".strip()))
         if fts_items:
             conn.executemany(
@@ -1379,14 +1464,23 @@ def get_entity_metadata_batch(
 
 def get_graph_counts(conn: sqlite3.Connection | YawConnection) -> tuple[int, int, int, int, int]:
     """Return (chunks_count, entities_count, facts_count, edges_count, openie_count) in a single query."""
+    has_chunk_inference = (
+        conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunk_inference' LIMIT 1").fetchone()
+        is not None
+    )
+    openie_expr = (
+        "MAX((SELECT COUNT(*) FROM openie_chunks), (SELECT COUNT(*) FROM chunk_inference))"
+        if has_chunk_inference
+        else "(SELECT COUNT(*) FROM openie_chunks)"
+    )
     row = conn.execute(
-        """
+        f"""
         SELECT
             (SELECT COUNT(*) FROM chunks),
             (SELECT COUNT(*) FROM entities),
             (SELECT COUNT(*) FROM facts),
             (SELECT COUNT(*) FROM edges),
-            (SELECT COUNT(*) FROM openie_chunks)
+            {openie_expr}
         """
     ).fetchone()
     if row is None:
@@ -1514,7 +1608,7 @@ def upsert_semantic_edges(
     if not edges:
         return
     with write_tx(conn):
-        pure_literals = _get_pure_literal_entity_ids(conn)
+        pure_literals = get_pure_literal_entity_ids(conn)
         for ent1, ent2, kind, weight in edges:
             if ent1 == ent2:
                 continue
@@ -1623,19 +1717,6 @@ def upsert_semantic_edges(
                                 """,
                                 (s, d),
                             )
-
-
-def upsert_synonymy_edges(
-    conn: sqlite3.Connection | YawConnection,
-    edges: Sequence[tuple[str, str, float]],
-) -> None:
-    """Bulk upsert bidirectional skos:related semantic edges between entity pairs."""
-    if not edges:
-        return
-    upsert_semantic_edges(
-        conn,
-        [(ent1, ent2, "skos:related", sim) for ent1, ent2, sim in edges],
-    )
 
 
 def delete_chunks(conn: sqlite3.Connection | YawConnection, chunk_ids: Sequence[str]) -> None:

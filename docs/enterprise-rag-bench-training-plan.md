@@ -206,7 +206,7 @@ when adopting this breaking layout; no migration or legacy-layout discovery exis
 
 ### 5.1 Topological File Blueprint
 1. **[MODIFY] [`pyproject.toml`](../pyproject.toml) & [`uv.lock`](../uv.lock)**: Remove `hipporag` git pin; run `uv lock --upgrade && uv sync --locked`.
-2. **[DELETE] [`yaw/daemon/graph/inference/legacy_chat.py`](../yaw/daemon/graph/inference/legacy_chat.py)** & **[DELETE] [`yaw/daemon/graph/inference/legacy_embedding.py`](../yaw/daemon/graph/inference/legacy_embedding.py)**: Permanently delete legacy HippoRAG adapter modules.
+2. **[DELETE] `yaw/daemon/graph/inference/legacy_chat.py`** & **[DELETE] `yaw/daemon/graph/inference/legacy_embedding.py`**: Permanently delete legacy HippoRAG adapter modules.
 3. **[MODIFY] [`yaw/daemon/graph/inference/__init__.py`](../yaw/daemon/graph/inference/__init__.py)**: Remove `LocalChat`, `CacheOpenAI`, `chat_identity`, and `RetrievalEmbedding` from `_PUBLIC_API`.
 4. **[MODIFY] [`yaw/daemon/runtime.py`](../yaw/daemon/runtime.py)**: Fix `YawRuntime.optimize()` to keep sandbox corpus files alive on disk during `evolve_prompts(...)`.
 5. **[MODIFY] [`yaw/daemon/cli.py`](../yaw/daemon/cli.py)**: Add `"enterprise_rag_bench"` (and alias `"enterprise"`) to `_KNOWN_DATASETS`.

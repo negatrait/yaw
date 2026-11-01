@@ -94,11 +94,8 @@ def test_integrity_gate_preserves_provider_errors_and_respects_retrieval_only_mo
     [
         ({"gold_docs": ["one", {"title": "Title", "text": "Body"}, "one"]}, ["one", "Title\nBody"]),
         ({"context": [["Title", ["One", "Two"]]]}, ["Title\nOne Two"]),
-        ({"context": "", "answer": "missing"}, []),
-        ({"context": "unrelated passage", "answer": "missing"}, ["\nunrelated passage"]),
-        ({"document": {"summary": "  Summary  "}}, ["Summary"]),
-        ({"document": {"text": "  Full text  "}}, ["Full text"]),
-        ({"document": {}}, []),
+        ({"contexts": [{"title": "Title", "text": "Body", "is_supporting": True}]}, ["Title\nBody"]),
+        ({"paragraphs": [{"title": "Title", "paragraph_text": "Body", "is_supporting": True}]}, ["Title\nBody"]),
     ],
 )
 def test_gold_document_fallbacks_preserve_exact_format_and_empty_inputs(sample, expected):
@@ -111,7 +108,8 @@ def test_narrative_document_without_answer_match_uses_first_matching_corpus_chun
         {"idx": "other_1", "title": "Other", "text": "Not part of this document"},
         {"idx": "doc_1", "title": "First", "text": "Original context"},
     ]
-    assert benchmark.get_gold_docs([sample], "narrativeqa", corpus) == [["First\nOriginal context"]]
+    assert benchmark.get_gold_docs([sample], "lveval") is None
+    assert benchmark.get_gold_docs([sample], "narrativeqa", corpus) is None
 
 
 @pytest.mark.parametrize("dataset", ["custom", "popqa", "lveval", "narrativeqa"])
@@ -136,13 +134,14 @@ def test_benchmark_slice_pads_from_real_corpus_without_dropping_gold(dataset):
     )
     assert queries == ["Who wrote Notes?"] and answers == [["Ada"]]
     selected = {f"{row['title']}\n{row['text']}" for row in [source, *distractors] if row["idx"] in docs}
-    # LV-Eval's labels omit corpus titles; verify body identity in the adapter.
-    assert all(
-        any(reference.strip() == text or reference.strip() == text.split("\n", 1)[-1] for text in selected)
-        for reference in gold[0]
-    )
+    if dataset in ("lveval", "narrativeqa"):
+        assert gold is None
+        assert len(docs) == 6
+    else:
+        assert gold == [["Notes\nAda wrote Notes."]]
+        assert all(reference in selected for reference in gold[0])
+        assert len(docs) == (2 if dataset == "custom" else 4)
     assert len(docs) == len(set(docs))
-    assert len(docs) == (2 if dataset == "custom" else 4)
 
 
 def test_dataset_loading_requires_prepared_bundle_and_preserves_source_files(tmp_path):

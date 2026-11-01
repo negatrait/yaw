@@ -271,7 +271,7 @@ def test_shacl_new_shapes_detection(tmp_path: Path) -> None:
         upsert_fact_sources(conn, [("fact-dangling", "c1"), ("fact-empty-def", "c1")])
         # Note: we deliberately DO NOT call upsert_fact_sources for fact-orphan-1
 
-        violations = lint_graph_shacl(conn, auto_heal=False)
+        violations = lint_graph_shacl(conn)
         shapes = {v.shape for v in violations}
         assert ALL_11_SHACL_SHAPES.issubset(shapes), f"Missing shapes: {ALL_11_SHACL_SHAPES - shapes}"
 
@@ -564,13 +564,57 @@ def test_shacl_auto_healing_complete(tmp_path: Path) -> None:
             "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-sys', 'ent-lit-port', 'skos:related', 0.6)"
         )
 
-        # Before auto-heal, all 11 SHACL shapes flag violations
-        pre_violations = lint_graph_shacl(conn, auto_heal=False)
+        # Before repair, all 11 SHACL shapes flag violations
+        pre_violations = lint_graph_shacl(conn)
         pre_shapes = {v.shape for v in pre_violations}
         assert ALL_11_SHACL_SHAPES.issubset(pre_shapes), f"Missing pre-heal shapes: {ALL_11_SHACL_SHAPES - pre_shapes}"
 
-        # Run deterministic auto-heal
-        remaining = lint_graph_shacl(conn, auto_heal=True)
+        # Apply explicit SHACL repairs across all 11 shapes
+        repairs = [
+            {"focus_node": "ent-no-pref", "action": "demote_to_alt_label", "target_node": "", "value": ""},
+            {"focus_node": "ent-multi-pref", "action": "demote_to_alt_label", "target_node": "", "value": ""},
+            {
+                "focus_node": "ent-empty-def",
+                "action": "set_definition",
+                "target_node": "",
+                "value": "Undocumented service component.",
+            },
+            {"focus_node": "ent-s13", "action": "demote_to_alt_label", "target_node": "", "value": ""},
+            {"focus_node": "ent-hom-a|ent-hom-b", "action": "add_different_from", "target_node": "", "value": ""},
+            {"focus_node": "fact-dangling-1", "action": "delete_dangling", "target_node": "", "value": ""},
+            {
+                "focus_node": "fact-empty-def-1",
+                "action": "set_definition",
+                "target_node": "",
+                "value": "system caches in caching layer.",
+            },
+            {"focus_node": "ent-sys->ent-missing", "action": "delete_dangling", "target_node": "", "value": ""},
+            {"focus_node": "ent-s13|ent-sys", "action": "remove_conflicting_related", "target_node": "", "value": ""},
+            {"focus_node": "ent-sys->ent-multi-pref", "action": "assert_related", "target_node": "", "value": ""},
+            {
+                "focus_node": "ent-2cyc-b->ent-2cyc-a",
+                "action": "remove_hierarchy_cycle",
+                "target_node": "",
+                "value": "",
+            },
+            {"focus_node": "ent-cyc-c->ent-cyc-a", "action": "remove_hierarchy_cycle", "target_node": "", "value": ""},
+            {
+                "focus_node": "ent-cyc-a|ent-cyc-c",
+                "action": "remove_conflicting_related",
+                "target_node": "",
+                "value": "",
+            },
+            {"focus_node": "ent-lit-port", "action": "remove_scalar_entity", "target_node": "", "value": ""},
+            {"focus_node": "ent-date", "action": "remove_scalar_entity", "target_node": "", "value": ""},
+            {"focus_node": "ent-eng->ent-sec-eng", "action": "invert_broader", "target_node": "", "value": ""},
+            {"focus_node": "ent-v1->ent-v2", "action": "demote_sibling_to_related", "target_node": "", "value": ""},
+            {"focus_node": "fact-no-src", "action": "ground_fact_source", "target_node": "", "value": "c1"},
+            {"focus_node": "fact-no-src-es", "action": "ground_fact_source", "target_node": "", "value": "c2"},
+            {"focus_node": "fact-truly-orphan", "action": "delete_orphan", "target_node": "", "value": ""},
+        ]
+        applied = apply_shacl_repairs(conn, repairs)
+        assert applied == len(repairs)
+        remaining = lint_graph_shacl(conn)
         assert remaining == [], f"Unexpected remaining violations: {remaining}"
 
         # 1. ConceptShape/prefLabel healed: ent-no-pref promoted, ent-multi-pref demoted extra prefLabel
@@ -794,7 +838,7 @@ def test_serialize_graph_turtle_literal_datatypes_and_lang_tags(tmp_path: Path) 
             ],
         )
 
-        assert lint_graph_shacl(conn, auto_heal=False) == []
+        assert lint_graph_shacl(conn) == []
         ttl = serialize_graph_turtle(conn)
         assert 'rdf:object "2026-10-25"^^xsd:date' in ttl
         assert "^^<xsd:date>" not in ttl
@@ -808,7 +852,7 @@ def test_serialize_graph_turtle_literal_datatypes_and_lang_tags(tmp_path: Path) 
 
 
 def test_heal_8_scalar_entity_with_passage_edge_retains_obj_id_and_updates_fact_edge_weight(tmp_path: Path) -> None:
-    """Verify Heal 8 converts obj_kind='entity' to 'literal' while retaining obj_id and updating
+    """Verify remove_scalar_entity converts obj_kind='entity' to 'literal' while retaining obj_id and updating
     the fact edge weight from 1.0 to 0.5 when the scalar node is grounded by a passage edge."""
     conn = open_yaw_db(tmp_path / "test_heal8_passage_scalar.db")
     try:
@@ -854,10 +898,14 @@ def test_heal_8_scalar_entity_with_passage_edge_retains_obj_id_and_updates_fact_
             "INSERT INTO edge_sources (src_id, dst_id, kind, chunk_id) VALUES ('ent-sys', 'ent-date', 'fact', 'c1')"
         )
 
-        pre_v = lint_graph_shacl(conn, auto_heal=False)
+        pre_v = lint_graph_shacl(conn)
         assert any(v.shape == "ConceptShape/noScalarLiterals" and v.focus_node == "ent-date" for v in pre_v)
 
-        rem_v = lint_graph_shacl(conn, auto_heal=True)
+        apply_shacl_repairs(
+            conn,
+            [{"focus_node": "ent-date", "action": "remove_scalar_entity", "target_node": "", "value": ""}],
+        )
+        rem_v = lint_graph_shacl(conn)
         assert rem_v == []
 
         f_meta = get_facts_with_meta_by_ids(conn, ["fact-date-1"])["fact-date-1"]
@@ -876,7 +924,7 @@ def test_heal_8_scalar_entity_with_passage_edge_retains_obj_id_and_updates_fact_
 
 def test_punctuated_surface_name_repairs_and_label_priority(tmp_path: Path) -> None:
     """Verify punctuated surface names ('Apple Inc.', 'Python 3.10') preserve canonical
-    text_processing norms across upsert_entity_labels, apply_shacl_repairs, Heal 1, and inspect_focus_node."""
+    text_processing norms across upsert_entity_labels, apply_shacl_repairs, and inspect_focus_node."""
     conn = open_yaw_db(tmp_path / "yaw_punct_repairs.db")
     try:
         upsert_chunk_pointers(
@@ -899,7 +947,7 @@ def test_punctuated_surface_name_repairs_and_label_priority(tmp_path: Path) -> N
                 ("apple inc", "entity-apple", "skos:prefLabel", "Apple Inc", "c1"),
             ],
         )
-        assert lint_graph_shacl(conn, auto_heal=False) == []
+        assert lint_graph_shacl(conn) == []
         apple_kinds = {
             str(r[0]): str(r[1])
             for r in conn.execute(
@@ -925,9 +973,9 @@ def test_punctuated_surface_name_repairs_and_label_priority(tmp_path: Path) -> N
             [{"focus_node": "entity-apple", "action": "demote_to_alt_label", "target_node": "", "value": ""}],
         )
         assert applied == 1
-        assert lint_graph_shacl(conn, auto_heal=False) == []
+        assert lint_graph_shacl(conn) == []
 
-        # 4. Heal 1 promotes 'python 3.10' over alphabetically earlier 'a_alias' and preserves 'Python 3.10'
+        # 4. demote_to_alt_label promotes 'python 3.10' over 'a_alias' and preserves 'Python 3.10'
         upsert_entities(
             conn,
             [
@@ -939,7 +987,11 @@ def test_punctuated_surface_name_repairs_and_label_priority(tmp_path: Path) -> N
             "('a_alias', 'entity-py', 'skos:altLabel', 'a_alias', 'c1'), "
             "('python 3.10', 'entity-py', 'skos:altLabel', 'Python 3.10', 'c1')"
         )
-        assert lint_graph_shacl(conn, auto_heal=True) == []
+        apply_shacl_repairs(
+            conn,
+            [{"focus_node": "entity-py", "action": "demote_to_alt_label", "target_node": "", "value": ""}],
+        )
+        assert lint_graph_shacl(conn) == []
         py_name = conn.execute("SELECT name FROM entities WHERE entity_id = 'entity-py'").fetchone()
         assert py_name is not None and str(py_name[0]) == "Python 3.10"
         py_pref = conn.execute(
@@ -953,7 +1005,7 @@ def test_punctuated_surface_name_repairs_and_label_priority(tmp_path: Path) -> N
 def test_identical_definition_duplicate_concepts_merged_deterministically_and_pair_inspection_dossier(
     tmp_path: Path,
 ) -> None:
-    """Verify identical-definition duplicate concepts sharing skos:prefLabel are merged deterministically
+    """Verify identical-definition duplicate concepts sharing skos:prefLabel are merged via apply_shacl_repairs
     (even if an erroneous owl:differentFrom edge was present), and inspect_focus_node('a|b') renders
     the full SKOS/RDF/OWL Markdown dossier with optional 1-hop upward AST context."""
     doc_file = tmp_path / "arch.md"
@@ -1020,11 +1072,22 @@ def test_identical_definition_duplicate_concepts_merged_deterministically_and_pa
         assert "[AST Parent Header] # Global Cloud Architecture" in pair_info_1["markdown_dossier"]
 
         # Pre-heal scan flags identical-definition duplicates
-        pre_v = lint_graph_shacl(conn, auto_heal=False)
+        pre_v = lint_graph_shacl(conn)
         assert any(v.shape == "ConceptShape/homographDifferentFrom" for v in pre_v)
 
-        # Pre-RLM heal (heal_homographs=False) deterministically merges identical-definition duplicates
-        rem_v = lint_graph_shacl(conn, auto_heal=True, heal_definitions=False, heal_homographs=False)
+        # Explicit repair merges identical-definition duplicates
+        apply_shacl_repairs(
+            conn,
+            [
+                {
+                    "focus_node": "entity-tgw-1|entity-tgw-2",
+                    "action": "merge_altLabel",
+                    "target_node": "entity-tgw-1",
+                    "value": "",
+                }
+            ],
+        )
+        rem_v = lint_graph_shacl(conn)
         assert rem_v == []
         surviving = conn.execute("SELECT entity_id, name FROM entities").fetchall()
         assert len(surviving) == 1

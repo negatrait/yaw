@@ -53,6 +53,7 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.pytest.ini_options]
 addopts = ["--testmon"]
+faulthandler_timeout = 120
 testpaths = ["tests"]
 pythonpath = ["."]
 markers = ["live: explicitly enabled tests against a resident inference service"]

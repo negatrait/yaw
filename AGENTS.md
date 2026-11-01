@@ -18,7 +18,17 @@ Avoid these failure modes at all costs - deviation from the prime directives onl
 - Write the smallest clear, idiomatic implementation that satisfies the contract.
 - Avoid unnecessary abstractions, fallbacks, branching, configurability, compatibility layers, and dead code.
 - Prefer a single source of truth and explicit failures.
-- Every extra layer of code just makes it harder for you to read and understand.
+- Every extra layer of code just degrades performance, makes the code harder for you to read and understand.
+- Never duplicate logic, never hand roll a solution for something that can be handled with a robust well regarded dependency - your custom solutions will be brittle.
+
+### Masked Failures
+
+YAW is not feature complete. Failing hard is required, because fallbacks at this stage only hide defects.
+
+- Retry transient model errors only through DSPy's native retry (`dspy.LM(num_retries=...)`). Do not write custom retry loops, and do not lower DSPy's retry count to get around it.
+- When retries are exhausted or a model service is unavailable, abort and raise the original exception.
+- Do not catch errors to keep going. That means no broad `except`, log-and-continue, default values, skipped stages or degraded modes.
+- Add recovery scenarios only when they are assigned as scoped work with tests, never as part of unrelated changes.
 
 ### Unintended Side Effects
 
@@ -33,7 +43,7 @@ Avoid these failure modes at all costs - deviation from the prime directives onl
 
 ## Required Context
 
-Read `FOUNDATIONAL.md` first.
+Read [the foundational laws](FOUNDATIONAL.md) first.
 
 YAW is a native HippoRAG 2-style graph and storage engine using:
 

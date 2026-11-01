@@ -265,15 +265,15 @@ def test_standalone_engine_derives_hydration_budget_from_program(tmp_path, provi
 
 def test_structured_prompt_batches_scale_without_splitting_json_items(provider):
     url, requests = provider
-    pairs = [{"pair_id": f"PAIR_{index}", "left": "Aster", "right": "Project"} for index in range(25)]
+    violations = [{"focus_node": f"NODE_{index}", "source_shape": "ConceptShape"} for index in range(25)]
     for context in (65536, 131072):
         lm = create_dspy_lm("budget-test", base_url=url, cache=False, context_window_tokens=context)
         program = HippoRAGProgram(orchestrator_lm=lm, rlm_sub_lm=lm)
-        program.judge_synonyms(pairs)
-        assert ("PAIR_24" in str(requests[-1]["messages"])) == (context == 131072)
-    large_pairs = [{"pair_id": str(index), "definition": "x" * 20000} for index in range(10)]
-    program.judge_synonyms(large_pairs)
+        program.propose_shacl_repairs(violations, mode="direct")
+        assert ("NODE_24" in str(requests[-1]["messages"])) == (context == 131072)
+    large_violations = [{"focus_node": str(index), "message": "x" * 20000} for index in range(10)]
+    program.propose_shacl_repairs(large_violations, mode="direct")
     content = requests[-1]["messages"][-1]["content"]
-    serialized = content.split("[[ ## candidate_pairs ## ]]\n", 1)[1].split("\n\nRespond", 1)[0]
+    serialized = content.split("[[ ## violations ## ]]\n", 1)[1].split("\n\n[[ ##", 1)[0]
     assert len(serialized) <= program._context_char_limit(12000)
     assert len(json.loads(serialized)) == 2
