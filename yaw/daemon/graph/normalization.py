@@ -144,15 +144,7 @@ def normalize_openie_record(rec: OpenIERecord) -> NormalizedRecord:
                 is_literal_obj = True
             else:
                 continue
-        _record_surface(s_norm, s_raw_str)
-        _record_surface(o_val, o_raw_str)
-        all_norm_labels.add(s_norm)
-        all_norm_labels.add(o_val)
         o_tok_norm = str(text_processing(o_val))
-        if o_tok_norm:
-            all_norm_labels.add(o_tok_norm)
-            _record_surface(o_tok_norm, o_raw_str)
-        spo_d = st.spo_def.strip() or f"{s_norm} {p_norm} {o_val}."
         raw_subj_d = st.subj_def.strip()
         subj_d = raw_subj_d or stage1_defs.get(s_norm, "")
         if subj_d:
@@ -176,6 +168,17 @@ def normalize_openie_record(rec: OpenIERecord) -> NormalizedRecord:
                 (d for d in stage1_senses[o_val] if d.lower() != subj_d.lower()),
                 obj_d,
             )
+        if s_norm == o_tok_norm and (is_literal_obj or not (subj_d and obj_d and subj_d.lower() != obj_d.lower())):
+            continue
+
+        _record_surface(s_norm, s_raw_str)
+        _record_surface(o_val, o_raw_str)
+        all_norm_labels.add(s_norm)
+        all_norm_labels.add(o_val)
+        if o_tok_norm:
+            all_norm_labels.add(o_tok_norm)
+            _record_surface(o_tok_norm, o_raw_str)
+        spo_d = st.spo_def.strip() or f"{s_norm} {p_norm} {o_val}."
         if obj_d:
             if o_val not in stage1_defs:
                 stage1_defs[o_val] = obj_d

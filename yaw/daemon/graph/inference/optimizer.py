@@ -1323,7 +1323,7 @@ def evolve_program_prompts(
         if gold_answers is not None and len(gold_answers) > 0:
             apm_hit = compute_answer_passage_match(gold_answers, context_str)
 
-        gold_item_docs = getattr(gold, "item_docs", None)
+        gold_item_docs = getattr(gold, "item_docs", None) or getattr(gold, "gold_docs", None)
         q_stats = hooks.query_rlm_stats(gold_item_docs)
         usage_tokens += int(q_stats.get("openie_tokens", q_stats.get("cached_openie_tokens", 0)))
         score_pred = compute_task_quality_score(

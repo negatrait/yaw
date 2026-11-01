@@ -19,9 +19,10 @@ char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
 
 DSPY_TRIPLES_GBNF_GRAMMAR = r"""root ::= "{\"triples\": " triple-list "}"
 triple-list ::= "[]" | "[" triple (", " triple)* "]"
-triple ::= "{\"sub\": " entity-slot ", \"pred\": " pred-slot ", \"obj\": " entity-slot ", \"def\": " string "}"
+triple ::= "{\"sub\": " entity-slot ", \"pred\": " pred-slot ", \"obj\": " obj-slot ", \"def\": " string "}"
 pred-slot ::= string | "[" string ", " ("\"owl:ObjectProperty\"" | "\"owl:DatatypeProperty\"") "]"
 entity-slot ::= new-entity-pair | string
+obj-slot ::= entity-slot | string
 new-entity-pair ::= "[" string ", " string "]"
 string ::= "\"" char+ "\""
 char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
@@ -138,18 +139,23 @@ novel entities as [name, def] pairs."""
 
     triple_line = (
         'triple ::= "{\\"sub\\": " entity-slot ", \\"pred\\": " pred-slot '
-        '", \\"obj\\": " entity-slot ", \\"def\\": " string "}"\n'
+        '", \\"obj\\": " obj-slot ", \\"def\\": " string "}"\n'
         'pred-slot ::= string | "[" string ", " ("\\"owl:ObjectProperty\\"" | "\\"owl:DatatypeProperty\\"") "]"\n'
     )
     if deduped_known:
         known_rule = " | ".join(gbnf_escape_literal(json.dumps(e, ensure_ascii=False)) for e in deduped_known)
         slot_lines = (
             "entity-slot ::= known-entity | new-entity-pair\n"
+            "obj-slot ::= entity-slot | string\n"
             f"known-entity ::= {known_rule}\n"
             'new-entity-pair ::= "[" string ", " string "]"\n'
         )
     else:
-        slot_lines = 'entity-slot ::= new-entity-pair | string\nnew-entity-pair ::= "[" string ", " string "]"\n'
+        slot_lines = (
+            "entity-slot ::= new-entity-pair | string\n"
+            "obj-slot ::= entity-slot | string\n"
+            'new-entity-pair ::= "[" string ", " string "]"\n'
+        )
 
     return (
         root_line

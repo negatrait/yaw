@@ -432,3 +432,57 @@ def test_extract_entity_definitions_filters_scalar_literals() -> None:
     assert "2026-10-25" not in entities
     assert "8080" not in entities
     assert "v1.0.0" not in entities
+
+
+def test_normalize_openie_record_filters_degenerate_self_loops_and_preserves_homographs() -> None:
+    """Verify normalize_openie_record drops degenerate reflexive triples while keeping distinct homograph senses."""
+    from yaw.core import OpenIERecord, StructuredTriple
+    from yaw.daemon.graph.normalization import normalize_openie_record
+
+    rec = OpenIERecord(
+        chunk_id="chunk-reflexive",
+        entities=("Hyperslate", "a ball"),
+        entity_definitions=(
+            ("Hyperslate", "Enterprise customer evaluating KV-cache tiering."),
+            ("a ball", "Formal royal dance party."),
+        ),
+        triples=(),
+        structured_triples=(
+            StructuredTriple(
+                subj="Hyperslate",
+                subj_def="Enterprise customer evaluating KV-cache tiering.",
+                pred="is trialing",
+                obj="Hyperslate",
+                obj_def="Enterprise customer evaluating KV-cache tiering.",
+                spo_def="Hyperslate is trialing Hyperslate.",
+                obj_kind="entity",
+            ),
+            StructuredTriple(
+                subj="Hyperslate",
+                subj_def="Enterprise customer evaluating KV-cache tiering.",
+                pred="has lead source",
+                obj="Hyperslate",
+                obj_def="",
+                spo_def="Hyperslate has lead source Hyperslate.",
+                obj_kind="literal",
+            ),
+            StructuredTriple(
+                subj="a ball",
+                subj_def="Spherical golden toy object.",
+                pred="was handled in",
+                obj="a ball",
+                obj_def="Formal royal dance party.",
+                spo_def="A spherical golden toy ball was handled in a formal royal dance ball.",
+                obj_kind="entity",
+            ),
+        ),
+    )
+    norm = normalize_openie_record(rec)
+    assert len(norm.triples) == 1
+    assert norm.triples[0].subj == "a ball"
+    assert norm.triples[0].obj == "a ball"
+    assert norm.triples[0].subj_def == "Spherical golden toy object."
+    assert norm.triples[0].obj_def == "Formal royal dance party."
+
+    dyn_g = build_dspy_triples_grammar(max_triples=2, known_entities=["Hyperslate"])
+    assert "obj-slot ::= entity-slot | string" in dyn_g

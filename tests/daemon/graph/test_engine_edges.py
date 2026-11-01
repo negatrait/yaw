@@ -389,5 +389,44 @@ def test_slice5_passages_json_shared_corpus_pools_and_unbounded_eval_hydration(t
         hydrated = engine._hydrate_top_chunks_for_eval(top_20, engine.program)
         assert len(hydrated) == 20
         assert all(f"Shared corpus passage number {i}" in hydrated[f"chunk-shared-{i:03d}"] for i in range(20))
+
+        # 5. When examples have item_docs=[] and non-empty gold_docs (Enterprise RAG contract),
+        #    _prepare_optimization_pools narrows val_pool and train_pool to gold_docs and maps questions.
+        gold_train = [
+            dspy.Example(
+                question=f"Gold Train Q{i}?",
+                item_docs=[],
+                gold_docs=[shared_records[i]["text"]],
+            ).with_inputs("question", "item_docs")
+            for i in range(3)
+        ]
+        gold_val = [
+            dspy.Example(
+                question=f"Gold Val Q{i}?",
+                item_docs=[],
+                gold_docs=[shared_records[10 + i]["text"]],
+            ).with_inputs("question", "item_docs")
+            for i in range(2)
+        ]
+        save_gold_target = tmp_path / "opt_gold_out.json"
+        engine._prepare_optimization_pools(
+            gold_train,
+            gold_val,
+            None,
+            mode="gepa",
+            save_path=save_gold_target,
+            progress_callback=None,
+        )
+        assert len(engine._opt_val_chunks_pool) == 2
+        assert engine._graph_rlm_stats["val_pool_size"] == 2
+        assert engine._graph_rlm_stats["train_pool_size"] == 3
+        assert engine._graph_rlm_stats["corpus_pool_size"] == 75
+        assert engine._opt_docs_by_question["Gold Train Q0?"] == [shared_records[0]["text"]]
+        assert engine._opt_docs_by_question["Gold Val Q1?"] == [shared_records[11]["text"]]
+        ensured_q0 = engine._ensure_candidate_chunks_indexed(
+            engine.program,
+            item_docs=engine._opt_docs_by_question["Gold Train Q0?"],
+        )
+        assert ensured_q0 == ["chunk-shared-000"]
     finally:
         engine.close()

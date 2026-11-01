@@ -192,7 +192,8 @@ class FactList(BaseModel):
 
 class ExtractEntities(dspy.Signature):
     """You are a critical component in a high-stakes SKOS/RDF/OWL based ontology graph system.
-    Your task is to extract and named entities as `skos:Concept`, and their concise contextual \
+    Your task is to extract named entities and domain concepts as concise `skos:Concept` noun phrases \
+(never full sentences, imperative instructions, or checklist clauses), along with their concise contextual \
 definitions as `skos:definition` from the given paragraph.
     Respond with a JSON object in the format: {"named_entities": [["entity1", "concise contextual \
 definition of entity1"], ["entity2", "concise contextual definition of entity2"], ...]}"""
@@ -214,7 +215,8 @@ given passages and named entity lists.
     Pay attention to the following requirements:
     - Each triple should contain at least one, but preferably two, of the named entities in the list for \
 each passage.
-    - Clearly resolve pronouns to their specific names to maintain clarity.
+    - Clearly resolve pronouns to their specific names to maintain clarity, and never emit reflexive \
+self-loop triples where "sub" and "obj" are the same entity.
     - For "pred", emit a 2-element pair ["predicate phrase", "owl:ObjectProperty" | "owl:DatatypeProperty"]: \
 use "owl:ObjectProperty" when "obj" is a concept/entity (`skos:Concept` / `owl:NamedIndividual`), and \
 use "owl:DatatypeProperty" when "obj" is a data value or literal (`rdfs:Literal`, such as dates, \
@@ -264,18 +266,21 @@ typos, acronyms, lookalikes like "Cindy Real" vs "Cinderella", or homonyms/homog
 like "a ball" vs "a ball"):
     - 'skos:altLabel': True synonym, acronym, initialism, or coreferent alias referring to the exact same \
 entity/concept (merge into canonical entity, where 'canonical' is the preferred entity name). When two mentions \
-share the same name and originate from the same document or AST island (e.g. a person's title in a header \
-and their participation in the dialogue body), they are coreferent ('skos:altLabel').
+share the same name or hyphenation/spacing variant (e.g., "KV-cache" vs "KV cache") across the same document or \
+different documents and refer to the same underlying concept, system, or organization described from different \
+operational angles, they are coreferent ('skos:altLabel').
     - 'skos:hiddenLabel': Typo, misspelling, transcription error, or surface spelling variant \
 referring to the exact same entity/concept (merge into canonical entity).
     - 'owl:differentFrom': Confusable homonym, homograph (e.g., "a ball" [formal dance] vs "a ball" \
-[spherical toy]), or false-friend lookalike (e.g., "Cindy Real" vs "Cinderella") that is easy to mix up \
-due to similar/identical surface form or context, but actually refers to a genuinely different \
-entity/concept as proven by incompatible reified facts or disjoint contexts (keep separate, add repulsive \
-owl:differentFrom edge).
+[spherical toy]), false-friend lookalike (e.g., "Cindy Real" vs "Cinderella"), or mutually exclusive schema \
+enum value that is easy to mix up due to similar/identical surface form or context, but actually refers to a \
+genuinely different entity/concept as proven by incompatible reified facts or disjoint domains (keep separate, \
+add repulsive owl:differentFrom edge; never use 'owl:differentFrom' for the same technical concept discussed \
+across different documents).
     - 'skos:related': Distinct, different `skos:Concept` entities that are associatively related in the \
 domain without being coreferent synonyms or confusable homonyms/lookalikes, including version or severity \
-siblings (e.g., "http 2" vs "http 3", "sev 1" vs "sev 2") (keep separate, add symmetric skos:related edge).
+siblings (e.g., "http 2" vs "http 3", "sev 1" vs "sev 2") or a document/working-note title and the component \
+it discusses (keep separate, add symmetric skos:related edge).
     - 'skos:broader': Hierarchical broader-concept relation where the narrower child concept points to \
 `canonical` as its broader parent concept (e.g. "cryptanalysis" -> "mathematics", where 'canonical' is \
 "mathematics"; child has compound specialization tokens, parent has general category tokens) (keep separate, \
@@ -443,10 +448,8 @@ _NER_DEMO_ENTITY_DEFINITIONS: list[list[str]] = [
         "India",
         "Country where Radio City operates as its first private FM radio station.",
     ],
-    ["3 July 2001", "Date when Radio City was started."],
     ["Hindi", "Language in which Radio City plays songs."],
     ["English", "Language in which Radio City plays songs."],
-    ["May 2008", "Month and year when Radio City launched PlanetRadiocity.com."],
     [
         "PlanetRadiocity.com",
         "Music portal launched by Radio City in May 2008 offering music news, videos, and songs.",
@@ -472,7 +475,7 @@ _TRIPLE_DEMO_TRIPLES: list[dict[str, Any]] = [
     {
         "sub": "Radio City",
         "pred": ["started on", "owl:DatatypeProperty"],
-        "obj": "3 July 2001",
+        "obj": ["3 July 2001", "Date when Radio City was started."],
         "def": "Radio City started broadcasting on 3 July 2001.",
     },
     {
@@ -505,7 +508,7 @@ _TRIPLE_DEMO_TRIPLES: list[dict[str, Any]] = [
     {
         "sub": "PlanetRadiocity.com",
         "pred": ["launched in", "owl:DatatypeProperty"],
-        "obj": "May 2008",
+        "obj": ["May 2008", "Month and year when Radio City launched PlanetRadiocity.com."],
         "def": "PlanetRadiocity.com was launched in May 2008.",
     },
     {

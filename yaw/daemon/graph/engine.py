@@ -205,6 +205,7 @@ class YawGraphEngine:
         self._chunk_indexed_ext_fp: dict[str, str] = {}
         self._opt_chunks_pool: list[tuple[ChunkPointer, str]] = []
         self._opt_val_chunks_pool: list[tuple[ChunkPointer, str]] = []
+        self._opt_docs_by_question: dict[str, list[str]] = {}
         self._opt_indexed_cids: set[str] = set()
         self._resolved_docs_cache: dict[tuple[int, str], list[tuple[ChunkPointer, str]]] = {}
         self._captured_chunk_traces: dict[str, list[tuple[str, dict[str, Any], Any]]] = {}
@@ -589,7 +590,8 @@ class YawGraphEngine:
         memo_key = (q_str, qa_top_k, query_retrieval_fingerprint(active_program))
 
         if self._in_optimization:
-            target_cids = self._ensure_candidate_chunks_indexed(active_program, item_docs=item_docs)
+            eff_item_docs = item_docs or self._opt_docs_by_question.get(q_str.strip())
+            target_cids = self._ensure_candidate_chunks_indexed(active_program, item_docs=eff_item_docs)
             active_trace = getattr(dspy.settings, "trace", None)
             if isinstance(active_trace, list):
                 named_map = dict(active_program.named_predictors())
@@ -1021,16 +1023,17 @@ class YawGraphEngine:
         with self._lock:
             self._hydrate_indexed_cids_from_db(program)
             ext_fp = extraction_fingerprint(program)
-            req_chunks = self._resolve_chunks_for_docs(item_docs)
+            req_chunks = self._resolve_chunks_for_docs(item_docs) if item_docs else []
             pool_chunks = list(self._opt_val_chunks_pool) if self._opt_val_chunks_pool else list(self._opt_chunks_pool)
-            missing_pool = [(p, t) for p, t in pool_chunks if p.chunk_id not in self._opt_indexed_cids]
-            if missing_pool:
-                for b_start in range(0, len(missing_pool), 8):
-                    self.index_chunks(
-                        missing_pool[b_start : b_start + 8],
-                        program=program,
-                        progress_callback=self._active_progress_callback,
-                    )
+            if not req_chunks or len(pool_chunks) <= 64:
+                missing_pool = [(p, t) for p, t in pool_chunks if p.chunk_id not in self._opt_indexed_cids]
+                if missing_pool:
+                    for b_start in range(0, len(missing_pool), 8):
+                        self.index_chunks(
+                            missing_pool[b_start : b_start + 8],
+                            program=program,
+                            progress_callback=self._active_progress_callback,
+                        )
 
             target_list = req_chunks if req_chunks else pool_chunks
             stale_targets = [
@@ -2222,12 +2225,17 @@ class YawGraphEngine:
         ]
         if unverified_cids:
             self.delete_chunks(unverified_cids)
+        self._opt_docs_by_question.clear()
+        use_gold_docs = len(self._opt_chunks_pool) > 64
         val_slice = list(valset or trainset)
         val_pool: list[tuple[ChunkPointer, str]] = []
         seen_val_cids: set[str] = set()
         for ex in val_slice:
-            ex_docs = getattr(ex, "item_docs", None)
+            ex_docs = getattr(ex, "item_docs", None) or (getattr(ex, "gold_docs", None) if use_gold_docs else None)
+            q_str = str(getattr(ex, "question", "") or "").strip()
             if ex_docs:
+                if q_str:
+                    self._opt_docs_by_question[q_str] = [str(d) for d in ex_docs]
                 for p, t in self._resolve_chunks_for_docs(ex_docs):
                     if p.chunk_id not in seen_val_cids:
                         seen_val_cids.add(p.chunk_id)
@@ -2240,8 +2248,11 @@ class YawGraphEngine:
         val_cids_set = {p.chunk_id for p, _ in self._opt_val_chunks_pool}
         train_cids_set: set[str] = set()
         for ex in trainset or ():
-            ex_docs = getattr(ex, "item_docs", None)
+            ex_docs = getattr(ex, "item_docs", None) or (getattr(ex, "gold_docs", None) if use_gold_docs else None)
+            q_str = str(getattr(ex, "question", "") or "").strip()
             if ex_docs:
+                if q_str and q_str not in self._opt_docs_by_question:
+                    self._opt_docs_by_question[q_str] = [str(d) for d in ex_docs]
                 for p, _ in self._resolve_chunks_for_docs(ex_docs):
                     train_cids_set.add(p.chunk_id)
         if not train_cids_set and self._opt_chunks_pool:
@@ -2271,7 +2282,11 @@ class YawGraphEngine:
                     ),
                 )
 
-        missing_val_pool = [(p, t) for p, t in self._opt_val_chunks_pool if p.chunk_id not in self._opt_indexed_cids]
+        missing_val_pool = (
+            [(p, t) for p, t in self._opt_val_chunks_pool if p.chunk_id not in self._opt_indexed_cids]
+            if len(self._opt_val_chunks_pool) <= 64 or not self._opt_docs_by_question
+            else []
+        )
         if missing_val_pool:
             total_val_missing = len(missing_val_pool)
             for b_start in range(0, total_val_missing, 8):
