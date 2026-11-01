@@ -990,6 +990,38 @@ def prepare_synonym_candidates(
     return candidates, cand_meta, len(raw_candidates)
 
 
+_SNAKE_IDENT_RE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$", re.IGNORECASE)
+_ID_TOKEN_RE = re.compile(r"(?:^|[_\s-])(?:id|ids)(?:$|[_\s-])", re.IGNORECASE)
+
+
+def _is_incompatible_identifier_merge(name_a: str, name_b: str) -> bool:
+    """Return True when merging would collapse distinct snake_case fields or an *_id field with non-ID concepts."""
+    a = name_a.strip().lower()
+    b = name_b.strip().lower()
+    if not a or not b or a == b:
+        return False
+    a_snake = bool(_SNAKE_IDENT_RE.match(a))
+    b_snake = bool(_SNAKE_IDENT_RE.match(b))
+    if a_snake and b_snake:
+        return True
+    a_is_id_field = a.endswith("_id") or a.endswith(" id")
+    b_is_id_field = b.endswith("_id") or b.endswith(" id")
+    if a_is_id_field != b_is_id_field:
+        other = b if a_is_id_field else a
+        if not _ID_TOKEN_RE.search(other) and "identifier" not in other:
+            return True
+    if a_snake or b_snake:
+        snake_val = a if a_snake else b
+        other_str = b if a_snake else a
+        if any("_" in tok and tok.strip(".,:;()[]") != snake_val for tok in other_str.split()):
+            return True
+        snake_toks = [t for t in snake_val.split("_") if t]
+        other_toks = [t for t in re.split(r"[\s_-]+", other_str) if t]
+        if any(t not in other_toks for t in snake_toks):
+            return True
+    return False
+
+
 def apply_synonym_adjudication(
     stage_conn: sqlite3.Connection,
     candidates: Sequence[dict[str, Any]],
@@ -1059,6 +1091,12 @@ def apply_synonym_adjudication(
                 rlm_stats["merged_entities"] += 1
                 continue
             if rel in ("skos:altLabel", "skos:hiddenLabel", "exact_match") and not (same_name and is_fact_pole_pair):
+                if is_version_or_ordinal_sibling(name_src, name_tgt) or _is_incompatible_identifier_merge(
+                    name_src, name_tgt
+                ):
+                    semantic_batch.append((src, tgt, "skos:related", max(0.5, sim)))
+                    rlm_stats["related_edges"] += 1
+                    continue
                 if canon and (
                     canon.upper() == "A"
                     or canon in (src, raw_src)

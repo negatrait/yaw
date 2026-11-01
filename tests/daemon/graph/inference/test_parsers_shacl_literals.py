@@ -306,6 +306,8 @@ def test_detect_scalar_literal_rejects_normal_concepts(concept_str: str) -> None
         ("p0", "p1"),
         ("python 3 10", "python 3 11"),
         ("http 1 1", "http 2"),
+        ("plan A", "plan B"),
+        ("tier A", "tier B"),
     ],
 )
 def test_is_version_or_ordinal_sibling_positive(name_a: str, name_b: str) -> None:
@@ -327,6 +329,8 @@ def test_is_version_or_ordinal_sibling_positive(name_a: str, name_b: str) -> Non
         ("sev1", "sev 1"),
         ("tls 1.2", "tls 1 2"),
         ("osi layer 2", "tcp layer 3"),
+        ("plan A", "plan A"),
+        ("cat", "car"),
         ("", "http 2"),
         ("http 2", ""),
     ],

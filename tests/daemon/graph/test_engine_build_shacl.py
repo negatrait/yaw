@@ -655,6 +655,82 @@ def test_version_sibling_guard_demotes_to_related(synonym_token_counter, tmp_pat
     assert len(conn.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'skos:broader'").fetchall()) == 0
     assert len(conn.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'skos:related'").fetchall()) == 2
 
+    # Verify JudgeSynonyms proposing skos:altLabel on letter-enumerator siblings ("plan A" vs "plan B")
+    # or incompatible schema identifiers ("invoice_id" vs "invoice_item_id" / "Stripe invoice items")
+    # demotes them to skos:related instead of merging.
+    def _judge_alt_label(candidates: list[dict[str, Any]]) -> list[dict[str, str]]:
+        return [
+            {
+                "pair_id": c["pair_id"],
+                "relation": "skos:altLabel",
+                "canonical": "A",
+            }
+            for c in candidates
+        ]
+
+    engine_sib, conn_sib = _make_engine(
+        synonym_token_counter,
+        tmp_path,
+        "test_siblings_alt_label.db",
+        synonym_callback=_judge_alt_label,
+    )
+    rec_sib = OpenIERecord(
+        chunk_id="chunk-4b",
+        entities=[
+            ("plan A", "Original subscription tier"),
+            ("plan B", "Upgraded subscription tier"),
+        ],
+        triples=[],
+        structured_triples=[],
+    )
+    _index_chunk_with_record(
+        engine_sib,
+        ChunkPointer("chunk-4b", "doc4b.md", 1, 5, "Plans"),
+        "Plan A and plan B.",
+        rec_sib,
+    )
+    sib_names = {str(r[0]) for r in conn_sib.execute("SELECT name FROM entities").fetchall()}
+    assert sib_names == {"plan A", "plan B"}
+    assert (
+        conn_sib.execute(
+            "SELECT raw_label FROM entity_labels WHERE label_kind IN ('skos:altLabel', 'skos:hiddenLabel')"
+        ).fetchall()
+        == []
+    )
+    assert len(conn_sib.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'skos:related'").fetchall()) == 2
+
+    engine_id, conn_id = _make_engine(
+        synonym_token_counter,
+        tmp_path,
+        "test_id_alt_label.db",
+        synonym_callback=_judge_alt_label,
+    )
+    rec_id = OpenIERecord(
+        chunk_id="chunk-4c",
+        entities=[
+            ("invoice_id", "Primary identifier of a Stripe invoice"),
+            ("invoice_item_id", "Line-level identifier of a Stripe invoice item"),
+            ("Stripe invoice items", "Line items exported from Stripe invoices"),
+        ],
+        triples=[],
+        structured_triples=[],
+    )
+    _index_chunk_with_record(
+        engine_id,
+        ChunkPointer("chunk-4c", "doc4c.md", 1, 5, "Billing"),
+        "invoice_id, invoice_item_id, and Stripe invoice items.",
+        rec_id,
+    )
+    id_names = {str(r[0]) for r in conn_id.execute("SELECT name FROM entities").fetchall()}
+    assert id_names == {"invoice_id", "invoice_item_id", "Stripe invoice items"}
+    assert (
+        conn_id.execute(
+            "SELECT raw_label FROM entity_labels WHERE label_kind IN ('skos:altLabel', 'skos:hiddenLabel')"
+        ).fetchall()
+        == []
+    )
+    assert len(conn_id.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'skos:related'").fetchall()) >= 2
+
 
 def test_acronym_guard_routes_to_alt_label_merge(synonym_token_counter, tmp_path: Path) -> None:
     """Verify that acronym pairs are merged as skos:altLabel instead of emitting skos:broader,

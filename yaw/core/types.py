@@ -350,6 +350,10 @@ _ORDINAL_SUFFIX_RE = re.compile(
     r"^(.*?[a-z])[-\s_.]*?(?:[-\s_.]+v(?:ersion)?[-\s_.]*)?(\d+(?:[-\s_.]+\d+)*(?:[-_.]?[a-z])?)$",
     re.IGNORECASE,
 )
+_ALPHA_ENUM_SUFFIX_RE = re.compile(
+    r"^([a-z][a-z0-9\s_-]*?[a-z])[-\s_]+([a-z])$",
+    re.IGNORECASE,
+)
 _ACRONYM_STOPWORDS = frozenset({"of", "the", "and", "in", "on", "for", "to", "a", "an", "by", "with"})
 
 
@@ -368,7 +372,12 @@ def _split_version_or_ordinal(name: str) -> tuple[str, str] | None:
     """Split a concept name into normalized (base_concept, version_or_ordinal_suffix)."""
     m = _ORDINAL_SUFFIX_RE.match(name)
     if m is None:
-        return None
+        m_alpha = _ALPHA_ENUM_SUFFIX_RE.match(name)
+        if m_alpha is None:
+            return None
+        base_alpha = re.sub(r"[-\s_.]+", " ", m_alpha.group(1)).strip()
+        suff_alpha = m_alpha.group(2).strip().lower()
+        return (base_alpha, f"alpha:{suff_alpha}") if base_alpha and suff_alpha else None
     base = re.sub(r"[-\s_.]+", " ", m.group(1)).strip()
     if base == "version":
         base = "v"

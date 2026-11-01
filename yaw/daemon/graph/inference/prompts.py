@@ -278,9 +278,11 @@ genuinely different entity/concept as proven by incompatible reified facts or di
 add repulsive owl:differentFrom edge; never use 'owl:differentFrom' for the same technical concept discussed \
 across different documents).
     - 'skos:related': Distinct, different `skos:Concept` entities that are associatively related in the \
-domain without being coreferent synonyms or confusable homonyms/lookalikes, including version or severity \
-siblings (e.g., "http 2" vs "http 3", "sev 1" vs "sev 2") or a document/working-note title and the component \
-it discusses (keep separate, add symmetric skos:related edge).
+domain without being coreferent synonyms or confusable homonyms/lookalikes, including version, tier, plan, or \
+severity siblings (e.g., "http 2" vs "http 3", "sev 1" vs "sev 2", "plan A" vs "plan B"), distinct schema/field \
+identifiers (e.g., "invoice_id" vs "invoice_item_id"), an identifier field and the records it identifies \
+(e.g., "invoice_id" vs "Stripe invoice items"), or a document/working-note title and the component it discusses \
+(keep separate, add symmetric skos:related edge).
     - 'skos:broader': Hierarchical broader-concept relation where the narrower child concept points to \
 `canonical` as its broader parent concept (e.g. "cryptanalysis" -> "mathematics", where 'canonical' is \
 "mathematics"; child has compound specialization tokens, parent has general category tokens) (keep separate, \

@@ -129,7 +129,13 @@ class PoolTelemetry:
 
         val_done, val_pool = _split("val_chunk_ids")
         train_done, train_pool = _split("train_chunk_ids")
-        corpus_done, corpus_pool = _split("corpus_chunk_ids")
+        val_ids = pools.get("val_chunk_ids")
+        train_ids = pools.get("train_chunk_ids")
+        if isinstance(val_ids, list) and isinstance(train_ids, list) and (val_ids or train_ids):
+            train_val_union = set(val_ids) | set(train_ids)
+            corpus_done, corpus_pool = len(indexed.intersection(train_val_union)), len(train_val_union)
+        else:
+            corpus_done, corpus_pool = _split("corpus_chunk_ids")
 
         samples = sandbox.get("timeseries_samples", [])
         el_sec = max(
@@ -1432,7 +1438,7 @@ def _candidate_xaxis(ax: plt.Axes, cands: list[dict[str, Any]], legacy: bool) ->
     """Integer candidate axis with fixed padding so 1..N candidates never autoscale oddly."""
     hi = max(int(c["cand"]) for c in cands)
     ax.set_xlim(0.4, hi + 0.6)
-    ax.xaxis.set_major_locator(ticker.MaxNLocator(integer=True, nbins=14, min_n_ticks=1))
+    ax.xaxis.set_major_locator(ticker.MultipleLocator(1) if hi < 14 else ticker.MaxNLocator(integer=True, nbins=14))
     ax.set_xlabel(
         "Evaluation # (legacy audit without candidate tags) →"
         if legacy
@@ -1503,6 +1509,11 @@ def generate_candidate_score_svg(
             color="#cbd5e1",
         )
         ax_eval.set_xlim(min(eval_x) - 0.5, max(eval_x) + 0.5)
+        ax_eval.xaxis.set_major_locator(
+            ticker.MultipleLocator(1)
+            if (max(eval_x) - min(eval_x)) < 14
+            else ticker.MaxNLocator(integer=True, nbins=14)
+        )
         ax_eval.legend(loc="upper left", fontsize=8)
         ax_eval.set_xlabel(f"Evaluation # → (recent {len(evaluations)} recorded; older points may be evicted)")
     else:
@@ -1515,8 +1526,8 @@ def generate_candidate_score_svg(
             color="#cbd5e1",
         )
         ax_eval.set_xlabel("Evaluation # →")
+        ax_eval.xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
     ax_eval.set_ylim(-3, 105)
-    ax_eval.xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
     ax_eval.yaxis.set_major_formatter(ticker.PercentFormatter(decimals=0))
     ax_eval.set_ylabel("Score (%)")
 

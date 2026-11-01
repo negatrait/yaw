@@ -1025,6 +1025,13 @@ class YawGraphEngine:
             ext_fp = extraction_fingerprint(program)
             req_chunks = self._resolve_chunks_for_docs(item_docs) if item_docs else []
             pool_chunks = list(self._opt_val_chunks_pool) if self._opt_val_chunks_pool else list(self._opt_chunks_pool)
+            if not req_chunks and len(pool_chunks) > 64 and self._opt_docs_by_question:
+                indexed_pool = [
+                    (p, t)
+                    for p, t in pool_chunks
+                    if p.chunk_id in self._opt_indexed_cids and self._chunk_indexed_ext_fp.get(p.chunk_id) == ext_fp
+                ]
+                req_chunks = indexed_pool[:8] if indexed_pool else pool_chunks[:8]
             if not req_chunks or len(pool_chunks) <= 64:
                 missing_pool = [(p, t) for p, t in pool_chunks if p.chunk_id not in self._opt_indexed_cids]
                 if missing_pool:
