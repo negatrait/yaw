@@ -386,8 +386,9 @@ def test_gbnf_and_prompts_typed_predicate_and_shacl_actions() -> None:
     assert "owl:ObjectProperty" in ExtractTriples.instructions
     assert "owl:DatatypeProperty" in ExtractTriples.instructions
     assert "singular/plural" in JudgeSynonyms.instructions
-    assert "direct_facts >= 1" in JudgeSynonyms.instructions
-    assert "NetSuite" in JudgeSynonyms.instructions
+    assert "Leibniz" in JudgeSynonyms.instructions
+    assert "owl:sameAs" in JudgeSynonyms.instructions
+    assert "skos:broaderTransitive" in JudgeSynonyms.instructions
     assert "pred-slot ::=" in DSPY_TRIPLES_GBNF_GRAMMAR
     assert "owl:ObjectProperty" in DSPY_TRIPLES_GBNF_GRAMMAR
     assert "owl:DatatypeProperty" in DSPY_TRIPLES_GBNF_GRAMMAR

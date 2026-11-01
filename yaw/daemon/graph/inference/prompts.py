@@ -191,12 +191,15 @@ class FactList(BaseModel):
 
 
 class ExtractEntities(dspy.Signature):
-    """You are a critical component in a high-stakes SKOS/RDF/OWL based ontology graph system.
-    Your task is to extract named entities and domain concepts as concise `skos:Concept` noun phrases \
-(never full sentences, imperative instructions, or checklist clauses), along with their concise contextual \
-definitions as `skos:definition` from the given paragraph.
-    Respond with a JSON object in the format: {"named_entities": [["entity1", "concise contextual \
-definition of entity1"], ["entity2", "concise contextual definition of entity2"], ...]}"""
+    """Extract all named entities (people, organizations, locations, systems, products, artifacts) and domain \
+concepts from `passage` into `named_entities` as concise `[skos:prefLabel, skos:definition]` pairs.
+    - `skos:Concept` & `owl:NamedIndividual` Scope (SKOS S14): Represent every named entity and domain concept as \
+a concise canonical noun phrase (`skos:prefLabel`, never a full sentence, imperative instruction, or checklist \
+clause). Exclude bare scalar `rdfs:Literal` values (numbers, percentages, dates, timestamps, durations, booleans, \
+or version strings, which belong in `owl:DatatypeProperty` object slots).
+    - Contextual `skos:definition` (`ConceptShape/definition`, `sh:minCount 1`): Pair each extracted entity with a \
+concise, non-tautological `skos:definition` stating its ontological class (`rdf:type` / genus) and distinguishing \
+role in `passage` (never repeat `skos:prefLabel` verbatim as its own definition)."""
 
     passage: str = dspy.InputField(desc="Source passage text")
     named_entities: list[Any] = dspy.OutputField(
@@ -205,45 +208,40 @@ definition of entity1"], ["entity2", "concise contextual definition of entity2"]
 
 
 class ExtractTriples(dspy.Signature):
-    """Your are a critical component in a high-stakes SKOS/RDF/OWL based ontology graph system.
-    Your task is to construct an RDF (Resource Description Framework) `rdf:Statement` graph from the \
-given passages and named entity lists.
-    Respond with a JSON object in the format:
-    {"triples": [{"sub": "known_entity" or ["new_entity", "contextual definition"], "pred": ["predicate phrase", \
-"owl:ObjectProperty" | "owl:DatatypeProperty"], "obj": "known_resource" or ["new_resource", "contextual definition"], \
-"def": "concise contextual definition of the statement fact"}, ...]}
-    Pay attention to the following requirements:
-    - Each triple should contain at least one, but preferably two, of the named entities in the list for \
-each passage.
-    - Clearly resolve pronouns to their specific names to maintain clarity, and never emit reflexive \
-self-loop triples where "sub" and "obj" are the same entity.
-    - For "pred", emit a 2-element pair ["predicate phrase", "owl:ObjectProperty" | "owl:DatatypeProperty"]: \
-use "owl:ObjectProperty" when "obj" is a concept/entity (`skos:Concept` / `owl:NamedIndividual`), and \
-use "owl:DatatypeProperty" when "obj" is a data value or literal (`rdfs:Literal`, such as dates, \
-timestamps, numbers, ports, versions, or percentages).
-    - Because `skos:definition` has domain `rdfs:Resource` (which includes both `skos:Concept` and `rdfs:Literal`), \
-both "sub" and "obj" can provide `[name, contextual_definition]` when not already defined in `named_entities` \
-(or emit the exact string name if already in `named_entities`), and always provide a concise statement \
-definition in "def"."""
+    """Construct a closed-world W3C `rdf:Statement` graph in `triples` from `passage` and `named_entities`.
+    Each element in `triples` is a reified `rdf:Statement` object with keys `"sub"` (`rdf:subject`), `"pred"` \
+(`rdf:predicate` pair), `"obj"` (`rdf:object`), and `"def"` (statement-level `skos:definition`):
+    - Closed-World Anchoring & Connectedness (`StatementShape/closedWorld`): Resolve pronouns to canonical \
+`skos:prefLabel` strings from `named_entities`, emit `"sub"` or `"obj"` as an exact string when already defined \
+in `named_entities` or as `[name, contextual_definition]` when introducing a passage-grounded resource, and \
+bridge extracted `skos:Concept` nodes into a connected subgraph.
+    - `rdfs:domain` & Irreflexivity (`owl:IrreflexiveProperty`): `"sub"` must be a `skos:Concept` / \
+`owl:NamedIndividual` (never a bare `rdfs:Literal`), and `"sub"` and `"obj"` must never denote the same concept \
+(no reflexive self-loops).
+    - Property Range Typing (`"pred": ["predicate phrase", "owl:ObjectProperty" | "owl:DatatypeProperty"]`): \
+Use `"owl:ObjectProperty"` (`rdfs:range skos:Concept`) when `"obj"` is a domain concept or named individual, \
+and use `"owl:DatatypeProperty"` (`rdfs:range rdfs:Literal`) when `"obj"` is a data value or literal \
+(dates, timestamps, durations, quantities, percentages, ports, versions, or booleans) paired with its \
+`[value, contextual_definition]`."""
 
     passage: str = dspy.InputField(desc="Source passage text")
     named_entities: list[Any] = dspy.InputField(
         desc="Extracted [entity_name, contextual_definition] pairs (or entity names) from Stage 1"
     )
     triples: list[Any] = dspy.OutputField(
-        desc='List of relation triple objects {"sub", "pred", "obj", "def"} where "pred" is '
+        desc='List of reified rdf:Statement objects {"sub", "pred", "obj", "def"} where "pred" is '
         '["predicate phrase", "owl:ObjectProperty" | "owl:DatatypeProperty"], known resources are '
-        "strings, and new resources are [name, definition] pairs"
+        "strings, and new resources are [name, contextual_definition] pairs"
     )
 
 
 class DefineMissingEntities(dspy.Signature):
-    """You are a critical component in a high-stakes SKOS/RDF/OWL based ontology graph system.
-    Your task is to provide concise contextual definitions grounded in the passage and extracted triples \
-for any triple entities that were emitted without definitions.
-    Respond with a JSON object in the format:
-    {"entity_definitions": [["entity_name", "concise contextual definition grounded in the passage and \
-triples"], ...]}"""
+    """Synthesize a closed-world W3C `skos:definition` in `entity_definitions` for every `skos:Concept` in \
+`missing_entities` to satisfy SHACL `ConceptShape/definition` (`sh:minCount 1`).
+    - Derive each concept's intensional genus-differentia `skos:definition` from its `rdf:subject` and \
+`rdf:object` participation in the reified `rdf:Statement` `triples` and `passage`.
+    - Emit `[entity_name, contextual_definition]` for every requested concept using the exact string from \
+`missing_entities`; never emit an empty definition or repeat `entity_name` tautologically."""
 
     passage: str = dspy.InputField(desc="Source passage text")
     missing_entities: list[str] = dspy.InputField(
@@ -254,40 +252,42 @@ triples"], ...]}"""
         default=[],
     )
     entity_definitions: list[list[str]] = dspy.OutputField(
-        desc="List of [entity_name, contextual_definition] pairs for the missing entities"
+        desc="List of [entity_name, contextual_definition] pairs for every concept in missing_entities"
     )
 
 
 class JudgeSynonyms(dspy.Signature):
-    """You are a critical component in a high-stakes SKOS/RDF/OWL based ontology graph system. Your task is to \
-disambiguate entities using their SKOS/RDF/OWL profiles, reified `rdf:Statement` facts, and source chunks.
-    Judge candidate pairs of entities/literals that look similar semantically and in writing/spelling (including \
-typos, acronyms, lookalikes like "Cindy Real" vs "Cinderella", or homonyms/homographs with the same name \
-like "a ball" vs "a ball"):
-    - 'skos:altLabel': Strict co-referents denoting the exact same intensional entity/concept (merge into \
-canonical entity, where 'canonical' is the preferred entity ID/name), including true synonyms, \
-acronyms/initialisms, singular/plural surface forms ("consumer" / "Consumers", "manager" / "Managers"), and \
-cross-chunk mentions of the same concept. Two mentions are 'skos:altLabel' ONLY if they are 100% interchangeable \
-referents in the domain; never merge coordinate siblings ("plan A" vs "plan B", "v1" vs "v2"), never merge a \
-system/platform with a specific job, process, simulator, mapping, patch, or log, never merge a schema \
-field/identifier with the data records it identifies, and never merge two entities linked by a direct fact.
-    - 'skos:hiddenLabel': Typo, misspelling, transcription error, or surface spelling variant \
-referring to the exact same entity/concept (merge into canonical entity).
-    - 'owl:differentFrom': Genuine polysemous homonyms/homographs across unrelated domains (e.g., "a ball" \
-[formal dance] vs "a ball" [spherical toy]), false-friend lookalikes (e.g., "Cindy Real" vs "Cinderella"), or \
-mutually exclusive schema enum values proven disjoint by incompatible reified facts (keep separate, add repulsive \
-owl:differentFrom edge; never use for the same concept discussed across different documents).
-    - 'skos:related': Non-equivalent domain association between distinct `skos:Concept` entities that are related \
-but not interchangeable—including coordinate version/tier/plan/severity siblings ("plan A" vs "plan B", \
-"sev 1" vs "sev 2"), a system/service and its jobs/processes/mappings/patches/logs/simulators, a schema \
-field/identifier and its domain records, or pairs linked by a direct fact (keep separate, add symmetric \
-skos:related edge).
-    - 'skos:broader': Strict generic `is-a` or partitive hierarchy where the narrower child concept points to \
-`canonical` as its broader parent concept (e.g., "cryptanalysis" -> "mathematics", where 'canonical' is \
-"mathematics"; child has compound specialization tokens, parent has general category tokens; never use for \
-singular vs plural variants) (keep separate, add directed skos:broader edge).
-    Respond with JSON: {"decisions": [{"pair_id": "id_a|id_b", "relation": \
-"skos:altLabel|skos:hiddenLabel|skos:related|skos:broader|owl:differentFrom", "canonical": "id_a_or_id_b"}, ...]}"""
+    """Adjudicate the W3C SKOS / OWL 2 RL semantic relation in `decisions` for every candidate pair in \
+`candidate_pairs` using both concepts' `skos:prefLabel`, `skos:definition`, reified `rdf:Statement` assertions, \
+and source passages.
+    - Leibniz Substitutability Gate (`owl:sameAs` / SKOS S14): A `skos:Concept` has a single intensional identity. \
+Classify as `'skos:altLabel'` or `'skos:hiddenLabel'` ONLY when A and B are strictly coreferent (`owl:sameAs`) \
+such that substituting A for B across every `rdf:Statement` subject and object position preserves truth and \
+ontological sort (`rdf:type`) *salva veritate*.
+    - Ontological Sort, Mereological & Functional Role Disjointness (SKOS S13): If A and B have different \
+ontological classes (`rdf:type`), different mereological levels (whole system/platform vs component/module/artifact), \
+different causal or functional roles (an agent/platform/service vs an activity/job/process/execution; a \
+worker/job vs the event/snapshot/log/output it produces; a schema property/identifier key vs the data \
+records/collection it identifies; an operation/process vs its mapping/specification/rows), or participate as \
+subject and object of an `rdf:Statement` (`A --P--> B`), they fail Leibniz substitutability and MUST NOT be \
+merged as `'skos:altLabel'` or `'skos:hiddenLabel'`.
+    - For each `pair_id`, emit `{"pair_id": ..., "relation": ..., "canonical": ...}` selecting one relation and \
+the exact endpoint ID (`a.id` or `b.id`) as `canonical`:
+      1. `'skos:altLabel'`: Strictly coreferent `skos:Concept` (`owl:sameAs`) where one label is an acronym, \
+abbreviation, singular/plural inflection, or synonymous lexical variant of the exact same referent across \
+passages (`canonical` = more standard/complete `skos:prefLabel`).
+      2. `'skos:hiddenLabel'`: Strictly coreferent `skos:Concept` where the non-canonical label is an \
+orthographic typo, transcription error, or corrupted surface form (`canonical` = clean `skos:prefLabel`).
+      3. `'owl:differentFrom'`: Symmetric non-identity between homonymous or lexically confusable `skos:Concept` \
+nodes denoting disjoint referents (`owl:AllDisjointClasses` or mutually exclusive states with incompatible \
+`rdf:Statement` assertions).
+      4. `'skos:broader'`: Strict asymmetric transitive subsumption (`skos:broaderTransitive` / `rdfs:subClassOf` \
+generic *is-a* or partitive *part-of* hierarchy) where one concept is a restricted/qualified taxonomic subtype \
+or sub-component of the broader parent concept (`canonical` = the broader parent `skos:Concept`).
+      5. `'skos:related'`: Non-hierarchical symmetric associative relation (SKOS S27: disjoint from \
+`skos:broaderTransitive`) linking distinct `skos:Concept` nodes that interact in the domain, occupy different \
+functional roles (platform/process/mapping/row/field/artifact), participate in an `rdf:Statement`, or are \
+coordinate sibling concepts sharing a parent category."""
 
     candidate_pairs: str = dspy.InputField(
         desc=(
@@ -296,19 +296,33 @@ singular vs plural variants) (keep separate, add directed skos:broader edge).
         )
     )
     decisions: list[dict[str, str]] = dspy.OutputField(
-        desc="List of SKOS/OWL disambiguation decisions per candidate pair"
+        desc=(
+            'List of {"pair_id": "id_a|id_b", "relation": '
+            '"skos:altLabel|skos:hiddenLabel|skos:related|skos:broader|owl:differentFrom", '
+            '"canonical": "id_a_or_id_b"} decision objects'
+        )
     )
 
 
 class ProposeSHACLRepairs(dspy.Signature):
-    """You are a critical component in a high-stakes SKOS/RDF/OWL based ontology graph system. Your task is to \
-heal SHACL violations.
-    Propose closed-world SKOS/RDF/OWL repairs for SHACL validation report violations.
-    Supported actions: 'set_definition', 'rewrite_definition', 'set_pref_label', 'demote_to_alt_label', \
-'merge_altLabel', 'merge_hiddenLabel', 'add_different_from', 'assert_differentFrom', 'assert_related', \
-'assert_broader', 'invert_broader', 'demote_sibling_to_related', 'remove_hierarchy_cycle', \
-'remove_conflicting_related', 'delete_dangling', 'delete_invalid_fact'.
-    Respond with JSON: {"repairs": [{"focus_node": "...", "action": "...", "value": "..."}, ...]}"""
+    """Synthesize closed-world W3C SKOS/RDF/OWL repair actions in `repairs` (`{"focus_node", "action", "value"}`) \
+for the `sh:Violation` items in `violations` using `focus_context`:
+    - `ConceptShape/definition` (missing or tautological `skos:definition`): `'set_definition'` or \
+`'rewrite_definition'` (`value` = non-tautological genus-differentia definition).
+    - `ConceptShape/prefLabel` & `ConceptShape/S13-disjointLabels` (SKOS S13/S14 label integrity): \
+`'set_pref_label'` (`value` = canonical `skos:prefLabel`) or `'demote_to_alt_label'` (`value` = target \
+canonical entity ID).
+    - `ConceptShape/homographDifferentFrom` & Equivalence / Disjointness: `'merge_altLabel'` or \
+`'merge_hiddenLabel'` (`value` = canonical entity ID when coreferent `owl:sameAs`), or `'add_different_from'` / \
+`'assert_differentFrom'` (`value` = distinct homonym entity ID).
+    - `ConceptShape/broaderCycle`, `ConceptShape/lexicalSubsumption`, `ConceptShape/siblingNotBroader`, & \
+`ConceptShape/S27-disjointBroaderRelated` (SKOS S19-S27 hierarchy & association axioms): `'assert_broader'` \
+(`value` = broader parent entity ID), `'invert_broader'` (`value` = narrower/broader partner ID), \
+`'assert_related'` or `'demote_sibling_to_related'` (`value` = associative peer ID), \
+`'remove_hierarchy_cycle'` (`value` = cycle partner ID), or `'remove_conflicting_related'` (`value` = \
+conflicting relative ID).
+    - `EdgeShape/closedWorld` & `StatementShape/closedWorld` (referential & literal integrity): \
+`'delete_dangling'` or `'delete_invalid_fact'` (`value` = `""` or offending target ID)."""
 
     violations: str = dspy.InputField(desc="JSON list of SHACLViolation report items")
     focus_context: str = dspy.InputField(
@@ -316,42 +330,37 @@ heal SHACL violations.
         default="",
     )
     repairs: list[dict[str, Any]] = dspy.OutputField(
-        desc="List of structured repair actions to restore SHACL conformance"
+        desc='List of {"focus_node": "...", "action": "...", "value": "..."} SHACL repair objects'
     )
 
 
 class FilterTriples(dspy.Signature):
-    """You are a critical component of a high-stakes question-answering system used by top researchers and \
-decision-makers worldwide. Your task is to filter facts based on their relevance to a given query, \
-ensuring that the most crucial information is presented to these stakeholders.
-    The facts are presented to you in the form of `rdf:Statement` triples, they assert a text corpus \
-bound fact.
-    The query requires careful analysis and possibly multi-hop reasoning to connect different pieces of \
-information. You must select up to 4 relevant facts from the provided candidate list that have a strong \
-connection to the query, aiding in reasoning and providing an accurate answer. The output should be in \
-JSON format, e.g., {"fact": [["s1", "p1", "o1"], ["s2", "p2", "o2"]]}. The accuracy of your response is \
-paramount, as it will directly impact the decisions made by these high-level stakeholders. You must only \
-use facts from the candidate list and not generate new facts. The future of critical decision-making \
-relies on your ability to accurately filter and present relevant information."""
+    """Select the minimal closed-world subgraph of candidate `rdf:Statement` triples (`[rdf:subject, \
+rdf:predicate, rdf:object]`) from `fact_before_filter` into `fact` required to entail the answer to `question`.
+    - Prioritize triples that directly match the query's target `skos:Concept` anchors and sought relations, \
+as well as intermediate bridge triples (`?s ?p1 ?bridge . ?bridge ?p2 ?o`) that connect multi-hop reasoning \
+paths across passages.
+    - Select at most 4 verbatim `[subject, predicate, object]` triples from `fact_before_filter`, ordered by \
+evidentiary relevance; never fabricate or modify triple elements."""
 
     question: str = dspy.InputField(desc="Query for retrieval")
     fact_before_filter: str = dspy.InputField(desc="Candidate triples to be filtered")
     fact: list[list[str]] = dspy.OutputField(
-        desc="Selected relevant [subject, predicate, object] triples from the candidate list"
+        desc="Up to 4 verbatim [subject, predicate, object] triples selected from fact_before_filter"
     )
 
 
 class AnswerQuestion(dspy.Signature):
-    """As an advanced reading comprehension assistant, your task is to analyze text passages and corresponding \
-questions meticulously.
-    Break down the reasoning process methodically, illustrating how you arrive at conclusions, and \
-present a concise, definitive final answer devoid of additional elaborations.
+    """Deduce a definitive closed-world answer to `question` grounded in the retrieved `skos:Concept` passages \
+and reified `rdf:Statement` evidence in `context`.
+    Trace multi-hop entity and relation chains methodically in your reasoning, then emit a concise final \
+`answer` devoid of extraneous elaboration:
     - For 'Who', 'What', 'When', or 'Where' questions, state only the exact bare entity, name, or number \
-without conversational phrases or articles.
-    - For 'How' or 'Why' questions, state both the key condition/means and the resulting outcome from the \
-passages.
-    - If the provided context lacks sufficient information to answer the question, state: "Insufficient \
-references in corpus", "Insufficient information", or similar."""
+without conversational framing or leading articles.
+    - For 'How' or 'Why' questions, state both the governing condition/mechanism and the resulting outcome \
+established in `context`.
+    - If `context` lacks sufficient evidence to entail the answer, state: "Insufficient references in corpus" \
+or "Insufficient information"."""
 
     context: str = dspy.InputField(desc="Retrieved evidence passages")
     question: str = dspy.InputField(desc="Question to answer")
@@ -359,7 +368,8 @@ references in corpus", "Insufficient information", or similar."""
 
 
 class ExtractQueryIntent(dspy.Signature):
-    """Rewrite a question as a concise declarative statement or target relation phrase for fact retrieval."""
+    """Project `question` into a concise declarative `rdf:Statement` triple pattern (`query_intent`) preserving \
+all named `skos:Concept` anchors and the target relation sought for fact retrieval."""
 
     question: str = dspy.InputField(desc="User question")
     query_intent: str = dspy.OutputField(desc="Concise declarative statement of the sought fact")
@@ -371,11 +381,12 @@ class ExtractQueryIntent(dspy.Signature):
 
 
 class HealSHACLViolations(dspy.Signature):
-    """As a Recursive Language Model (RLM) orchestrator for closed-world SHACL graph repair,
-    you orchestrate the healing of SHACL violations using inspect_focus_node, inspect_pair,
-    hydrate_chunk, hydrate_ast_island, search_graph, qwen_propose_shacl_repairs,
-    and lint_shacl sandbox tools. These tools inspect the graph without changing it.
-    Return the complete proposed repair list; the host validates and applies it after inference."""
+    """As a Recursive Language Model (RLM) orchestrator for closed-world W3C SHACL graph healing, inspect \
+violating `sh:focusNode` items (`ConceptShape/*`, `StatementShape/closedWorld`, `EdgeShape/closedWorld`) \
+using `inspect_focus_node`, `inspect_pair`, `hydrate_chunk`, `hydrate_ast_island`, `search_graph`, \
+`qwen_propose_shacl_repairs`, and `lint_shacl` read-only sandbox tools.
+    Gather the SKOS/RDF/OWL neighborhood and source chunk dossiers for the focus nodes, delegate structured \
+repair synthesis to `qwen_propose_shacl_repairs`, and return the complete repair list in `repairs`."""
 
     violations: str = dspy.InputField(desc="JSON list of SHACLViolation report items")
     repairs: list[dict[str, Any]] = dspy.OutputField(
@@ -417,13 +428,16 @@ ProposeInstructionSignature = NativeProposeInstruction.with_instructions(
     "**YOUR MISSION:**\n"
     "Your task is to write an improved, generalizable instruction for the assistant.\n"
     "\n"
-    "**CRITICAL ANTI-LEAKAGE & GENERALIZATION RULES:**\n"
-    "- Allways focus strictly on universal task strategies, structural extraction/reasoning\n"
-    "rules, and schema invariants.\n"
+    "**CRITICAL ANTI-LEAKAGE & W3C SEMANTIC GENERALIZATION RULES:**\n"
+    "- Always focus strictly on universal task strategies, formal W3C SKOS / RDF 1.1 /\n"
+    "OWL 2 RL / SHACL structural axioms (such as Leibniz substitutability over reified\n"
+    "`rdf:Statement` assertions, SKOS S13/S14 label disjointness, `skos:broader` taxonomic\n"
+    "subsumption vs `skos:related` associative links, and `skos:Concept` vs `rdfs:Literal`\n"
+    "range typing), and stage schema invariants.\n"
     "- Never include specific entity names, proper nouns, locations, dates, numbers, or\n"
     "question-specific facts from the examples in the new instruction.\n"
-    "- Allways preserve the exact required JSON output schema and structural contract for\n"
-    "the component.\n"
+    "- Always preserve the exact required output field names and structural contract for\n"
+    "the component without duplicating adapter-level JSON wrapper boilerplate.\n"
     "- Your instruction must generalize cleanly across completely unseen domains,\n"
     "documents, and questions.\n"
     "\n"

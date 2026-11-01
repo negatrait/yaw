@@ -44,39 +44,37 @@ STAGE_SCHEMA_CONTRACTS: dict[str, tuple[str, tuple[str, ...], str]] = {
     "ner": (
         "named_entities",
         ("named_entities", "named entities"),
-        'Respond with JSON: {"named_entities": [["entity", "concise contextual definition"], ...]}.',
+        "Populate `named_entities` with `[skos:prefLabel, skos:definition]` pairs.",
     ),
     "triples": (
         "triples",
         ("triples",),
-        'Respond with JSON: {"triples": [{"sub": "...", "pred": "...", "obj": "...", "def": "..."}, ...]}.',
+        'Populate `triples` with reified `rdf:Statement` objects `{"sub", "pred", "obj", "def"}`.',
     ),
     "entity_definer": (
         "entity_definitions",
         ("entity_definitions", "entity definitions"),
-        'Respond with JSON: {"entity_definitions": [["entity_name", "concise contextual definition"], ...]}.',
+        "Populate `entity_definitions` with `[entity_name, contextual_definition]` pairs.",
     ),
     "synonym_judge": (
         "decisions",
         ("decisions",),
-        'Respond with JSON: {"decisions": [{"pair_id": "id_a|id_b", "relation": '
-        '"skos:altLabel|skos:hiddenLabel|skos:related|skos:broader|owl:differentFrom", "canonical": '
-        '"id_a_or_id_b"}, ...]}.',
+        'Populate `decisions` with `{"pair_id", "relation", "canonical"}` SKOS/OWL relation objects.',
     ),
     "shacl_repair": (
         "repairs",
         ("repairs",),
-        'Respond with JSON: {"repairs": [{"focus_node": "...", "action": "...", "value": "..."}, ...]}.',
+        'Populate `repairs` with `{"focus_node", "action", "value"}` SHACL repair objects.',
     ),
     "triple_filter": (
-        '"fact"',
-        ('"fact"', "'fact'"),
-        'Output in JSON: {"fact": [["s1", "p1", "o1"], ...]}.',
+        "fact",
+        ("fact", "facts"),
+        "Populate `fact` with up to 4 verbatim `[subject, predicate, object]` triples.",
     ),
     "fact_filter": (
-        '"fact"',
-        ('"fact"', "'fact'"),
-        'Output in JSON: {"fact": [["s1", "p1", "o1"], ...]}.',
+        "fact",
+        ("fact", "facts"),
+        "Populate `fact` with up to 4 verbatim `[subject, predicate, object]` triples.",
     ),
 }
 
