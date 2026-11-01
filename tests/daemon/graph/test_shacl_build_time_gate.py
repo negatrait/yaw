@@ -135,11 +135,11 @@ class PipelineGateMockLM(dspy.LM):
                             }
                         )
                     elif pair_names == {"yaw", "yet another wiki"}:
-                        # Adversarial skos:broader on an acronym pair (must be routed to skos:altLabel merge)
+                        # Canonical Gemma 4 skos:altLabel decision on an acronym pair
                         decisions.append(
                             {
                                 "pair_id": pid,
-                                "relation": "skos:broader",
+                                "relation": "skos:altLabel",
                                 "canonical": "Yet Another Wiki",
                             }
                         )

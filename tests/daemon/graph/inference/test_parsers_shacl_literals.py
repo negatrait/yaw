@@ -25,7 +25,7 @@ from yaw.daemon.graph.inference.parsers import (
     filter_invalid_triples,
     parse_shacl_repairs,
 )
-from yaw.daemon.graph.inference.prompts import ExtractTriples, ProposeSHACLRepairs
+from yaw.daemon.graph.inference.prompts import ExtractTriples, JudgeSynonyms, ProposeSHACLRepairs
 
 
 def test_typed_predicate_datatype_and_object_properties_preserve_definitions() -> None:
@@ -306,8 +306,6 @@ def test_detect_scalar_literal_rejects_normal_concepts(concept_str: str) -> None
         ("p0", "p1"),
         ("python 3 10", "python 3 11"),
         ("http 1 1", "http 2"),
-        ("plan A", "plan B"),
-        ("tier A", "tier B"),
     ],
 )
 def test_is_version_or_ordinal_sibling_positive(name_a: str, name_b: str) -> None:
@@ -330,6 +328,8 @@ def test_is_version_or_ordinal_sibling_positive(name_a: str, name_b: str) -> Non
         ("tls 1.2", "tls 1 2"),
         ("osi layer 2", "tcp layer 3"),
         ("plan A", "plan A"),
+        ("plan A", "plan B"),
+        ("tier A", "tier B"),
         ("cat", "car"),
         ("", "http 2"),
         ("http 2", ""),
@@ -382,9 +382,12 @@ def test_relation_traversal_policy_datatype_property_and_aliases() -> None:
 
 
 def test_gbnf_and_prompts_typed_predicate_and_shacl_actions() -> None:
-    """Verify ExtractTriples, ProposeSHACLRepairs, GBNF grammars, and VALID_SHACL_ACTIONS contracts."""
+    """Verify ExtractTriples, JudgeSynonyms, ProposeSHACLRepairs, GBNF grammars, and VALID_SHACL_ACTIONS contracts."""
     assert "owl:ObjectProperty" in ExtractTriples.instructions
     assert "owl:DatatypeProperty" in ExtractTriples.instructions
+    assert "singular/plural" in JudgeSynonyms.instructions
+    assert "direct_facts >= 1" in JudgeSynonyms.instructions
+    assert "NetSuite" in JudgeSynonyms.instructions
     assert "pred-slot ::=" in DSPY_TRIPLES_GBNF_GRAMMAR
     assert "owl:ObjectProperty" in DSPY_TRIPLES_GBNF_GRAMMAR
     assert "owl:DatatypeProperty" in DSPY_TRIPLES_GBNF_GRAMMAR

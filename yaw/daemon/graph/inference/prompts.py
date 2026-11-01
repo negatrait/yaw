@@ -264,29 +264,28 @@ disambiguate entities using their SKOS/RDF/OWL profiles, reified `rdf:Statement`
     Judge candidate pairs of entities/literals that look similar semantically and in writing/spelling (including \
 typos, acronyms, lookalikes like "Cindy Real" vs "Cinderella", or homonyms/homographs with the same name \
 like "a ball" vs "a ball"):
-    - 'skos:altLabel': True synonym, acronym, initialism, or coreferent alias referring to the exact same \
-entity/concept (merge into canonical entity, where 'canonical' is the preferred entity name). When two mentions \
-share the same name or hyphenation/spacing variant (e.g., "KV-cache" vs "KV cache") across the same document or \
-different documents and refer to the same underlying concept, system, or organization described from different \
-operational angles, they are coreferent ('skos:altLabel').
+    - 'skos:altLabel': Strict co-referents referring to the exact same entity/concept (merge into canonical \
+entity, where 'canonical' is the preferred entity ID/name), including true synonyms, acronyms/initialisms, \
+singular/plural surface forms ("consumer" / "Consumers", "manager" / "Managers"), and cross-chunk mentions of the \
+same concept/role ("Security", "Tier 1", "KV-cache" / "KV cache"). Never use when `direct_facts >= 1` (`dfact >= 1`) \
+links two distinct entities as Subject and Object, or when one phrase adds a distinct component/artifact head noun \
+("NetSuite" vs "NetSuite import" / "NetSuite mapping", "Audit logs" vs "Audit log store" / "audit-log-exporter", \
+"break-glass access" vs "break-glass role" / "break-glass credentials").
     - 'skos:hiddenLabel': Typo, misspelling, transcription error, or surface spelling variant \
 referring to the exact same entity/concept (merge into canonical entity).
-    - 'owl:differentFrom': Confusable homonym, homograph (e.g., "a ball" [formal dance] vs "a ball" \
-[spherical toy]), false-friend lookalike (e.g., "Cindy Real" vs "Cinderella"), or mutually exclusive schema \
-enum value that is easy to mix up due to similar/identical surface form or context, but actually refers to a \
-genuinely different entity/concept as proven by incompatible reified facts or disjoint domains (keep separate, \
-add repulsive owl:differentFrom edge; never use 'owl:differentFrom' for the same technical concept discussed \
-across different documents).
-    - 'skos:related': Distinct, different `skos:Concept` entities that are associatively related in the \
-domain without being coreferent synonyms or confusable homonyms/lookalikes, including version, tier, plan, or \
-severity siblings (e.g., "http 2" vs "http 3", "sev 1" vs "sev 2", "plan A" vs "plan B"), distinct schema/field \
-identifiers (e.g., "invoice_id" vs "invoice_item_id"), an identifier field and the records it identifies \
-(e.g., "invoice_id" vs "Stripe invoice items"), or a document/working-note title and the component it discusses \
-(keep separate, add symmetric skos:related edge).
-    - 'skos:broader': Hierarchical broader-concept relation where the narrower child concept points to \
-`canonical` as its broader parent concept (e.g. "cryptanalysis" -> "mathematics", where 'canonical' is \
-"mathematics"; child has compound specialization tokens, parent has general category tokens) (keep separate, \
-add directed skos:broader edge).
+    - 'owl:differentFrom': Genuine polysemous homonyms/homographs across unrelated domains (e.g., "a ball" \
+[formal dance] vs "a ball" [spherical toy]), false-friend lookalikes (e.g., "Cindy Real" vs "Cinderella"), or \
+mutually exclusive schema enum values proven disjoint by incompatible reified facts (keep separate, add repulsive \
+owl:differentFrom edge; never use for the same concept discussed across different documents).
+    - 'skos:related': Non-equivalent domain association between distinct `skos:Concept` entities, including \
+coordinate version/tier/plan/severity siblings ("http 2" vs "http 3", "sev 1" vs "sev 2", "plan A" vs "plan B"), \
+distinct schema/field identifiers ("invoice_id" vs "invoice_item_id" / "Stripe invoice items"), system vs \
+subsystem/log/config/patch/import/store, or pairs linked by `direct_facts >= 1` (`dfact >= 1`) (keep separate, add \
+symmetric skos:related edge).
+    - 'skos:broader': Strict generic `is-a` or partitive hierarchy where the narrower child concept points to \
+`canonical` as its broader parent concept (e.g., "cryptanalysis" -> "mathematics", where 'canonical' is \
+"mathematics"; child has compound specialization tokens, parent has general category tokens; never use for \
+singular vs plural variants) (keep separate, add directed skos:broader edge).
     Respond with JSON: {"decisions": [{"pair_id": "id_a|id_b", "relation": \
 "skos:altLabel|skos:hiddenLabel|skos:related|skos:broader|owl:differentFrom", "canonical": "id_a_or_id_b"}, ...]}"""
 

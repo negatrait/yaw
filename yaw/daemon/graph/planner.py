@@ -18,10 +18,7 @@ from yaw.core import (
     SHACLViolation,
     StructuredTriple,
     YawRuntimeError,
-    check_lexical_subsumption_inversion,
     compute_mdhash_id,
-    is_acronym_pair,
-    is_version_or_ordinal_sibling,
     text_processing,
 )
 from yaw.core.config import context_char_limit, scale_context_budget
@@ -990,38 +987,6 @@ def prepare_synonym_candidates(
     return candidates, cand_meta, len(raw_candidates)
 
 
-_SNAKE_IDENT_RE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$", re.IGNORECASE)
-_ID_TOKEN_RE = re.compile(r"(?:^|[_\s-])(?:id|ids)(?:$|[_\s-])", re.IGNORECASE)
-
-
-def _is_incompatible_identifier_merge(name_a: str, name_b: str) -> bool:
-    """Return True when merging would collapse distinct snake_case fields or an *_id field with non-ID concepts."""
-    a = name_a.strip().lower()
-    b = name_b.strip().lower()
-    if not a or not b or a == b:
-        return False
-    a_snake = bool(_SNAKE_IDENT_RE.match(a))
-    b_snake = bool(_SNAKE_IDENT_RE.match(b))
-    if a_snake and b_snake:
-        return True
-    a_is_id_field = a.endswith("_id") or a.endswith(" id")
-    b_is_id_field = b.endswith("_id") or b.endswith(" id")
-    if a_is_id_field != b_is_id_field:
-        other = b if a_is_id_field else a
-        if not _ID_TOKEN_RE.search(other) and "identifier" not in other:
-            return True
-    if a_snake or b_snake:
-        snake_val = a if a_snake else b
-        other_str = b if a_snake else a
-        if any("_" in tok and tok.strip(".,:;()[]") != snake_val for tok in other_str.split()):
-            return True
-        snake_toks = [t for t in snake_val.split("_") if t]
-        other_toks = [t for t in re.split(r"[\s_-]+", other_str) if t]
-        if any(t not in other_toks for t in snake_toks):
-            return True
-    return False
-
-
 def apply_synonym_adjudication(
     stage_conn: sqlite3.Connection,
     candidates: Sequence[dict[str, Any]],
@@ -1032,7 +997,8 @@ def apply_synonym_adjudication(
     synonymy_threshold: float,
     rlm_stats: dict[str, Any],
 ) -> tuple[list[tuple[str, str, str]], list[tuple[str, str, str, float]]]:
-    """Apply Stage 3 synonym decisions and unadjudicated candidate fallbacks on stage_conn."""
+    """Apply Stage 3 Gemma 4 synonym decisions on stage_conn without heuristic overrides or fallbacks."""
+    _ = synonymy_threshold
     merged_into: dict[str, str] = {}
 
     def _resolve_active_eid(eid: str) -> str:
@@ -1050,7 +1016,6 @@ def apply_synonym_adjudication(
         ea, eb = str(c["entity_a"]), str(c["entity_b"])
         cand_by_pair[(min(ea, eb), max(ea, eb))] = c
 
-    adjudicated_pairs: set[tuple[str, str]] = set()
     with stage_conn:
         for dec in decisions:
             pid = str(dec.get("pair_id", "")).strip()
@@ -1067,33 +1032,19 @@ def apply_synonym_adjudication(
             pkey = (min(raw_src, raw_tgt), max(raw_src, raw_tgt))
             if pkey not in cand_by_pair:
                 continue
-            adjudicated_pairs.add(pkey)
             src = _resolve_active_eid(raw_src)
             tgt = _resolve_active_eid(raw_tgt)
             if src == tgt:
                 continue
-            cand_info = cand_by_pair.get(pkey, {})
+            cand_info = cand_by_pair[pkey]
             sim = float(cand_info.get("similarity", 0.5) or 0.5)
             name_src, _ = cand_meta.get(src, cand_meta.get(raw_src, (src, "")))
             name_tgt, _ = cand_meta.get(tgt, cand_meta.get(raw_tgt, (tgt, "")))
-            same_name = text_processing(name_src) == text_processing(name_tgt)
             active_pkey = (min(src, tgt), max(src, tgt))
-            is_fact_pole_pair = active_pkey in fact_linked_pairs
-            if (
-                rel not in ("owl:differentFrom", "different", "different_from")
-                and is_acronym_pair(name_src, name_tgt)
-                and not (same_name and is_fact_pole_pair)
-            ):
-                merge_src, merge_dst = (src, tgt) if len(name_src) < len(name_tgt) else (tgt, src)
-                merge_entities(stage_conn, merge_src, merge_dst, label_kind="skos:altLabel")
-                staged_merges.append((merge_src, merge_dst, "skos:altLabel"))
-                merged_into[merge_src] = merge_dst
-                rlm_stats["merged_entities"] += 1
-                continue
-            if rel in ("skos:altLabel", "skos:hiddenLabel", "exact_match") and not (same_name and is_fact_pole_pair):
-                if is_version_or_ordinal_sibling(name_src, name_tgt) or _is_incompatible_identifier_merge(
-                    name_src, name_tgt
-                ):
+            is_fact_pole_pair = active_pkey in fact_linked_pairs or pkey in fact_linked_pairs
+
+            if rel in ("skos:altLabel", "skos:hiddenLabel", "exact_match"):
+                if is_fact_pole_pair:
                     semantic_batch.append((src, tgt, "skos:related", max(0.5, sim)))
                     rlm_stats["related_edges"] += 1
                     continue
@@ -1121,10 +1072,6 @@ def apply_synonym_adjudication(
                 semantic_batch.append((src, tgt, "owl:differentFrom", 0.0))
                 rlm_stats["different_from_edges"] += 1
             elif rel == "skos:broader":
-                if is_version_or_ordinal_sibling(name_src, name_tgt):
-                    semantic_batch.append((src, tgt, "skos:related", max(0.5, sim)))
-                    rlm_stats["related_edges"] += 1
-                    continue
                 if canon and (
                     canon.upper() == "A"
                     or canon in (src, raw_src)
@@ -1134,7 +1081,6 @@ def apply_synonym_adjudication(
                     )
                 ):
                     child_id, parent_id = tgt, src
-                    child_name, parent_name = name_tgt, name_src
                 elif canon and (
                     canon.upper() == "B"
                     or canon in (tgt, raw_tgt)
@@ -1144,77 +1090,19 @@ def apply_synonym_adjudication(
                     )
                 ):
                     child_id, parent_id = src, tgt
-                    child_name, parent_name = name_src, name_tgt
                 else:
                     semantic_batch.append((src, tgt, "skos:related", max(0.5, sim)))
                     rlm_stats["related_edges"] += 1
                     continue
-                if check_lexical_subsumption_inversion(child_name, parent_name):
-                    child_id, parent_id = parent_id, child_id
                 semantic_batch.append((child_id, parent_id, "skos:broader", max(0.5, sim)))
                 rlm_stats["broader_edges"] = int(rlm_stats.get("broader_edges", 0)) + 1
             elif rel in ("skos:related", "related"):
-                if same_name:
-                    semantic_batch.append((src, tgt, "owl:differentFrom", 0.0))
-                    rlm_stats["different_from_edges"] += 1
-                    semantic_batch.append((src, tgt, "skos:related", max(0.5, sim)))
-                    rlm_stats["related_edges"] += 1
-                else:
-                    semantic_batch.append((src, tgt, "skos:related", max(0.5, sim)))
-                    rlm_stats["related_edges"] += 1
-            elif same_name and is_fact_pole_pair:
-                semantic_batch.append((src, tgt, "owl:differentFrom", 0.0))
-                rlm_stats["different_from_edges"] += 1
-
-        for c in candidates:
-            ea, eb = str(c["entity_a"]), str(c["entity_b"])
-            pkey = (min(ea, eb), max(ea, eb))
-            if pkey in adjudicated_pairs:
-                continue
-            src = _resolve_active_eid(ea)
-            tgt = _resolve_active_eid(eb)
-            if src == tgt:
-                continue
-            name_src, def_src = cand_meta.get(src, (str(c["name_a"]), str(c.get("def_a", ""))))
-            name_tgt, def_tgt = cand_meta.get(tgt, (str(c["name_b"]), str(c.get("def_b", ""))))
-            same_name = text_processing(name_src) == text_processing(name_tgt)
-            norm_def_src = str(text_processing(def_src)) if def_src else ""
-            norm_def_tgt = str(text_processing(def_tgt)) if def_tgt else ""
-            same_or_empty_def = not norm_def_src or not norm_def_tgt or norm_def_src == norm_def_tgt
-            active_pkey = (min(src, tgt), max(src, tgt))
-            if is_acronym_pair(name_src, name_tgt) and not (same_name and active_pkey in fact_linked_pairs):
-                merge_src, merge_dst = (src, tgt) if len(name_src) < len(name_tgt) else (tgt, src)
-                merge_entities(stage_conn, merge_src, merge_dst, label_kind="skos:altLabel")
-                staged_merges.append((merge_src, merge_dst, "skos:altLabel"))
-                merged_into[merge_src] = merge_dst
-                rlm_stats["merged_entities"] += 1
-            elif same_name:
-                if (
-                    float(c.get("dense_sim", 0.0)) >= 0.45 or same_or_empty_def
-                ) and active_pkey not in fact_linked_pairs:
-                    merge_entities(stage_conn, src, tgt, label_kind="skos:altLabel")
-                    staged_merges.append((src, tgt, "skos:altLabel"))
-                    merged_into[src] = tgt
-                    rlm_stats["merged_entities"] += 1
-                elif active_pkey in fact_linked_pairs:
-                    semantic_batch.append((src, tgt, "owl:differentFrom", 0.0))
-                    rlm_stats["different_from_edges"] += 1
-            elif float(c.get("dense_sim", 0.0)) >= synonymy_threshold:
-                sim = float(c.get("similarity", 0.5) or 0.5)
                 semantic_batch.append((src, tgt, "skos:related", max(0.5, sim)))
                 rlm_stats["related_edges"] += 1
 
-        resolved_semantic_batch: list[tuple[str, str, str, float]] = []
-        if semantic_batch:
-            resolved_semantic_batch = [
-                (_resolve_active_eid(s), _resolve_active_eid(d), k, w)
-                for s, d, k, w in semantic_batch
-                if _resolve_active_eid(s) != _resolve_active_eid(d)
-            ]
-            if resolved_semantic_batch:
-                upsert_semantic_edges(stage_conn, resolved_semantic_batch)
-
-    return staged_merges, resolved_semantic_batch
+    if semantic_batch:
+        upsert_semantic_edges(stage_conn, semantic_batch)
+    return staged_merges, semantic_batch
 
 
 def collect_shacl_violation_dossiers(

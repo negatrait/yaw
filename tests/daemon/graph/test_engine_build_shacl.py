@@ -12,12 +12,15 @@ from daemon.graph.synonym_protocol import candidate_rows, complete_decisions
 from yaw.core import ChunkPointer, OpenIERecord, RelationTraversalPolicy, StructuredTriple
 from yaw.daemon.graph.engine import YawGraphEngine
 from yaw.daemon.graph.inference import HippoRAGProgram, parse_synonym_decisions
+from yaw.daemon.graph.planner import apply_synonym_adjudication
 from yaw.daemon.graph.ppr import build_transition_matrix
 from yaw.daemon.graph.storage import (
     delete_chunks,
     lint_graph_shacl,
     load_graph_topology,
     merge_entities,
+    open_yaw_db,
+    upsert_entities,
     upsert_semantic_edges,
 )
 
@@ -655,140 +658,103 @@ def test_version_sibling_guard_demotes_to_related(synonym_token_counter, tmp_pat
     assert len(conn.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'skos:broader'").fetchall()) == 0
     assert len(conn.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'skos:related'").fetchall()) == 2
 
-    # Verify JudgeSynonyms proposing skos:altLabel on letter-enumerator siblings ("plan A" vs "plan B")
-    # or incompatible schema identifiers ("invoice_id" vs "invoice_item_id" / "Stripe invoice items")
-    # demotes them to skos:related instead of merging.
-    def _judge_alt_label(candidates: list[dict[str, Any]]) -> list[dict[str, str]]:
+
+def test_canonical_gemma4_synonym_adjudication_and_fact_pole_self_loop_guard(
+    synonym_token_counter,
+    tmp_path: Path,
+) -> None:
+    """Verify apply_synonym_adjudication executes only Gemma 4 decisions without acronym/homograph overrides,
+    and prevents merging fact-linked poles even when entity names differ."""
+    # 1. Verify ("audit trails", "ATS") with Gemma 4 skos:related is NOT overridden into skos:altLabel merge
+    stage_conn = open_yaw_db(":memory:")
+    upsert_entities(
+        stage_conn,
+        [
+            ("ent-ats", "ATS", "Applicant Tracking System"),
+            ("ent-audit", "audit trails", "Immutable security audit logs"),
+            ("ent-sec-a", "Security", "Security team in doc A"),
+            ("ent-sec-b", "Security", "Security role in doc B"),
+        ],
+    )
+    candidates = [
+        {"entity_a": "ent-ats", "entity_b": "ent-audit", "similarity": 0.88},
+        {"entity_a": "ent-sec-a", "entity_b": "ent-sec-b", "similarity": 0.92},
+    ]
+    cand_meta = {
+        "ent-ats": ("ATS", "Applicant Tracking System"),
+        "ent-audit": ("audit trails", "Immutable security audit logs"),
+        "ent-sec-a": ("Security", "Security team in doc A"),
+        "ent-sec-b": ("Security", "Security role in doc B"),
+    }
+    decisions = [
+        {"pair_id": "ent-ats|ent-audit", "relation": "skos:related", "canonical": "ent-audit"},
+        {"pair_id": "ent-sec-a|ent-sec-b", "relation": "skos:related", "canonical": "ent-sec-a"},
+    ]
+    rlm_stats = {"merged_entities": 0, "related_edges": 0, "different_from_edges": 0, "broader_edges": 0}
+    staged_merges, semantic_batch = apply_synonym_adjudication(
+        stage_conn,
+        candidates,
+        cand_meta,
+        decisions,
+        set(),
+        synonymy_threshold=0.8,
+        rlm_stats=rlm_stats,
+    )
+    assert staged_merges == []
+    assert rlm_stats["merged_entities"] == 0
+    assert rlm_stats["different_from_edges"] == 0
+    assert rlm_stats["related_edges"] == 2
+    assert semantic_batch == [
+        ("ent-ats", "ent-audit", "skos:related", 0.88),
+        ("ent-sec-a", "ent-sec-b", "skos:related", 0.92),
+    ]
+    stage_conn.close()
+
+    # 2. Verify fact_linked_pairs prevents self-loop merge even when name_src != name_tgt
+    def _judge_alt(cands: list[dict[str, Any]]) -> list[dict[str, str]]:
         return [
             {
                 "pair_id": c["pair_id"],
                 "relation": "skos:altLabel",
-                "canonical": "A",
+                "canonical": "NetSuite",
             }
-            for c in candidates
+            for c in cands
         ]
 
-    engine_sib, conn_sib = _make_engine(
-        synonym_token_counter,
-        tmp_path,
-        "test_siblings_alt_label.db",
-        synonym_callback=_judge_alt_label,
-    )
-    rec_sib = OpenIERecord(
-        chunk_id="chunk-4b",
-        entities=[
-            ("plan A", "Original subscription tier"),
-            ("plan B", "Upgraded subscription tier"),
-        ],
-        triples=[],
-        structured_triples=[],
-    )
-    _index_chunk_with_record(
-        engine_sib,
-        ChunkPointer("chunk-4b", "doc4b.md", 1, 5, "Plans"),
-        "Plan A and plan B.",
-        rec_sib,
-    )
-    sib_names = {str(r[0]) for r in conn_sib.execute("SELECT name FROM entities").fetchall()}
-    assert sib_names == {"plan A", "plan B"}
-    assert (
-        conn_sib.execute(
-            "SELECT raw_label FROM entity_labels WHERE label_kind IN ('skos:altLabel', 'skos:hiddenLabel')"
-        ).fetchall()
-        == []
-    )
-    assert len(conn_sib.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'skos:related'").fetchall()) == 2
-
-    engine_id, conn_id = _make_engine(
-        synonym_token_counter,
-        tmp_path,
-        "test_id_alt_label.db",
-        synonym_callback=_judge_alt_label,
-    )
-    rec_id = OpenIERecord(
-        chunk_id="chunk-4c",
-        entities=[
-            ("invoice_id", "Primary identifier of a Stripe invoice"),
-            ("invoice_item_id", "Line-level identifier of a Stripe invoice item"),
-            ("Stripe invoice items", "Line items exported from Stripe invoices"),
-        ],
-        triples=[],
-        structured_triples=[],
-    )
-    _index_chunk_with_record(
-        engine_id,
-        ChunkPointer("chunk-4c", "doc4c.md", 1, 5, "Billing"),
-        "invoice_id, invoice_item_id, and Stripe invoice items.",
-        rec_id,
-    )
-    id_names = {str(r[0]) for r in conn_id.execute("SELECT name FROM entities").fetchall()}
-    assert id_names == {"invoice_id", "invoice_item_id", "Stripe invoice items"}
-    assert (
-        conn_id.execute(
-            "SELECT raw_label FROM entity_labels WHERE label_kind IN ('skos:altLabel', 'skos:hiddenLabel')"
-        ).fetchall()
-        == []
-    )
-    assert len(conn_id.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'skos:related'").fetchall()) >= 2
-
-
-def test_acronym_guard_routes_to_alt_label_merge(synonym_token_counter, tmp_path: Path) -> None:
-    """Verify that acronym pairs are merged as skos:altLabel instead of emitting skos:broader,
-    both in the JudgeSynonyms loop and in the fallback loop."""
-
-    def _judge(candidates: list[dict[str, Any]]) -> list[dict[str, str]]:
-        return [
-            {
-                "pair_id": c["pair_id"],
-                "relation": "skos:broader",
-                "canonical": "service level objectives",
-            }
-            for c in candidates
-        ]
-
-    engine, conn = _make_engine(synonym_token_counter, tmp_path, "test_acronym.db", synonym_callback=_judge)
-
+    engine, conn = _make_engine(synonym_token_counter, tmp_path, "test_fact_pole.db", synonym_callback=_judge_alt)
     chunk = ChunkPointer(
         chunk_id="chunk-5",
         rel_posix_path="doc5.md",
         start_line=1,
         end_line=5,
-        title="SRE Concepts",
+        title="ERP Sync",
     )
     record = OpenIERecord(
         chunk_id="chunk-5",
         entities=[
-            ("SLOs", "Reliability goals"),
-            ("service level objectives", "Formal reliability commitments"),
+            ("NetSuite", "Enterprise ERP system"),
+            ("NetSuite import", "Nightly financial import pipeline into NetSuite"),
         ],
-        triples=[],
-        structured_triples=[],
+        triples=[("NetSuite import", "loads into", "NetSuite")],
+        structured_triples=[
+            StructuredTriple(
+                subj="NetSuite import",
+                pred="loads into",
+                obj="NetSuite",
+                obj_kind="entity",
+                subj_def="Nightly financial import pipeline into NetSuite",
+                obj_def="Enterprise ERP system",
+                spo_def="NetSuite import loads into NetSuite.",
+            )
+        ],
     )
+    _index_chunk_with_record(engine, chunk, "NetSuite import loads into NetSuite.", record)
 
-    _index_chunk_with_record(engine, chunk, "SRE SLOs and service level objectives.", record)
-
-    # Zero skos:broader edges
-    broader_edges = conn.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'skos:broader'").fetchall()
-    assert len(broader_edges) == 0
-
-    # The entities must be merged into 1 entity with skos:altLabel
-    entities = conn.execute("SELECT entity_id, name FROM entities").fetchall()
-    assert len(entities) == 1
-    assert entities[0][1].lower() == "service level objectives"
-
-    labels = conn.execute("SELECT label_norm, label_kind FROM entity_labels").fetchall()
-    kinds = {lkind for _, lkind in labels}
-    assert "skos:prefLabel" in kinds
-    assert "skos:altLabel" in kinds
-
-    # Verify fallback loop also merges acronyms when JudgeSynonyms returns empty decisions
-    engine_fb, conn_fb = _make_engine(
-        synonym_token_counter, tmp_path, "test_acronym_fallback.db", synonym_callback=lambda _: []
-    )
-    _index_chunk_with_record(engine_fb, chunk, "SRE SLOs and service level objectives.", record)
-    entities_fb = conn_fb.execute("SELECT entity_id, name FROM entities").fetchall()
-    assert len(entities_fb) == 1
-    assert entities_fb[0][1].lower() == "service level objectives"
+    # Both fact poles must remain distinct entities and the connecting fact must survive
+    entities = {str(r[1]) for r in conn.execute("SELECT entity_id, name FROM entities").fetchall()}
+    assert entities == {"NetSuite", "NetSuite import"}
+    assert conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 1
+    assert len(conn.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'skos:related'").fetchall()) == 2
 
 
 def test_technical_punctuation_and_surface_forms_preserved(synonym_token_counter, tmp_path: Path) -> None:
