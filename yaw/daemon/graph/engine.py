@@ -1,6 +1,5 @@
 """Native DSPy HippoRAG 2 Graph and Retrieval Engine backed by yaw.db and disk line hydration."""
 
-import contextlib
 import hashlib
 import importlib.metadata
 import json
@@ -2270,24 +2269,23 @@ class YawGraphEngine:
         self._graph_rlm_stats["corpus_pool_size"] = max(1, len(all_pool_cids))
         if save_path is not None:
             # Publish the real split/pool composition immediately so monitors never guess it.
-            with contextlib.suppress(OSError):
-                p_save = Path(save_path)
-                p_save.parent.mkdir(parents=True, exist_ok=True)
-                write_text_atomic(
-                    p_save.parent / f"{p_save.stem}_pools.json",
-                    json.dumps(
-                        {
-                            "mode": mode,
-                            "train_queries": len(trainset),
-                            "val_queries": len(valset or ()),
-                            "gepa_val_queries": len(val_slice),
-                            "val_chunk_ids": sorted(val_cids_set),
-                            "train_chunk_ids": sorted(train_cids_set),
-                            "corpus_chunk_ids": sorted(all_pool_cids),
-                            "written_at": time.time(),
-                        }
-                    ),
-                )
+            p_save = Path(save_path)
+            p_save.parent.mkdir(parents=True, exist_ok=True)
+            write_text_atomic(
+                p_save.parent / f"{p_save.stem}_pools.json",
+                json.dumps(
+                    {
+                        "mode": mode,
+                        "train_queries": len(trainset),
+                        "val_queries": len(valset or ()),
+                        "gepa_val_queries": len(val_slice),
+                        "val_chunk_ids": sorted(val_cids_set),
+                        "train_chunk_ids": sorted(train_cids_set),
+                        "corpus_chunk_ids": sorted(all_pool_cids),
+                        "written_at": time.time(),
+                    }
+                ),
+            )
 
         missing_val_pool = (
             [(p, t) for p, t in self._opt_val_chunks_pool if p.chunk_id not in self._opt_indexed_cids]

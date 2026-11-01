@@ -21,6 +21,7 @@ from yaw.daemon.graph.storage import (
     merge_entities,
     open_yaw_db,
     upsert_entities,
+    upsert_entity_labels,
     upsert_semantic_edges,
 )
 
@@ -987,3 +988,124 @@ def test_cased_literal_objects_and_same_doc_consecutive_chunks_never_produce_fal
     diff_edges = conn.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'owl:differentFrom'").fetchall()
     assert diff_edges == []
     assert lint_graph_shacl(conn) == []
+
+
+def test_apply_synonym_adjudication_remaps_semantic_edges_after_later_merge() -> None:
+    """Verify semantic edges buffered before a later merge in the same batch are remapped to surviving entities
+    with zero EdgeShape/closedWorld dangling-endpoint SHACL violations."""
+    stage_conn = open_yaw_db(":memory:")
+    try:
+        upsert_entities(
+            stage_conn,
+            [
+                ("ent-a", "NetSuite", "Enterprise ERP platform"),
+                ("ent-b", "NetSuite import", "Nightly ERP import pipeline"),
+                ("ent-c", "NetSuite staging import", "Staging import pipeline into NetSuite"),
+            ],
+        )
+        upsert_entity_labels(
+            stage_conn,
+            [
+                ("netsuite", "ent-a", "skos:prefLabel", "NetSuite", "c1"),
+                ("netsuite import", "ent-b", "skos:prefLabel", "NetSuite import", "c1"),
+                ("netsuite staging import", "ent-c", "skos:prefLabel", "NetSuite staging import", "c2"),
+            ],
+        )
+        candidates = [
+            {"entity_a": "ent-a", "entity_b": "ent-b", "similarity": 0.85},
+            {"entity_a": "ent-b", "entity_b": "ent-c", "similarity": 0.91},
+        ]
+        cand_meta = {
+            "ent-a": ("NetSuite", "Enterprise ERP platform"),
+            "ent-b": ("NetSuite import", "Nightly ERP import pipeline"),
+            "ent-c": ("NetSuite staging import", "Staging import pipeline into NetSuite"),
+        }
+        decisions = [
+            {"pair_id": "ent-a|ent-b", "relation": "skos:related", "canonical": "ent-a"},
+            {"pair_id": "ent-b|ent-c", "relation": "skos:altLabel", "canonical": "ent-c"},
+        ]
+        rlm_stats = {"merged_entities": 0, "related_edges": 0, "different_from_edges": 0, "broader_edges": 0}
+        staged_merges, resolved_batch = apply_synonym_adjudication(
+            stage_conn,
+            candidates,
+            cand_meta,
+            decisions,
+            set(),
+            synonymy_threshold=0.8,
+            rlm_stats=rlm_stats,
+        )
+        assert staged_merges == [("ent-b", "ent-c", "skos:altLabel")]
+        assert resolved_batch == [("ent-a", "ent-c", "skos:related", 0.85)]
+        assert lint_graph_shacl(stage_conn) == []
+    finally:
+        stage_conn.close()
+
+
+def test_apply_synonym_adjudication_prevents_transitive_collapse_across_separated_clusters() -> None:
+    """Verify two clusters separated by an explicit non-merge decision or fact_linked_pairs cannot be
+    transitively collapsed by a 2-hop chain of skos:altLabel merges."""
+    stage_conn = open_yaw_db(":memory:")
+    try:
+        upsert_entities(
+            stage_conn,
+            [
+                ("ent-a", "Zipper", "Stream-joining service"),
+                ("ent-b", "ZIPPER-Design", "Architecture design doc for Zipper"),
+                ("ent-c", "zippering", "Operational stream-joining process"),
+                ("ent-p1", "Stripe", "Payment processor"),
+                ("ent-alias", "Stripe Billing", "Billing platform"),
+                ("ent-p2", "invoice_item_id", "Primary key of a Stripe invoice item"),
+            ],
+        )
+        upsert_entity_labels(
+            stage_conn,
+            [
+                ("zipper", "ent-a", "skos:prefLabel", "Zipper", "c1"),
+                ("zipper design", "ent-b", "skos:prefLabel", "ZIPPER-Design", "c1"),
+                ("zippering", "ent-c", "skos:prefLabel", "zippering", "c2"),
+                ("stripe", "ent-p1", "skos:prefLabel", "Stripe", "c3"),
+                ("stripe billing", "ent-alias", "skos:prefLabel", "Stripe Billing", "c3"),
+                ("invoice_item_id", "ent-p2", "skos:prefLabel", "invoice_item_id", "c3"),
+            ],
+        )
+        candidates = [
+            {"entity_a": "ent-a", "entity_b": "ent-c", "similarity": 0.84},
+            {"entity_a": "ent-a", "entity_b": "ent-b", "similarity": 0.89},
+            {"entity_a": "ent-b", "entity_b": "ent-c", "similarity": 0.87},
+            {"entity_a": "ent-p1", "entity_b": "ent-alias", "similarity": 0.93},
+            {"entity_a": "ent-alias", "entity_b": "ent-p2", "similarity": 0.82},
+        ]
+        cand_meta = {
+            "ent-a": ("Zipper", "Stream-joining service"),
+            "ent-b": ("ZIPPER-Design", "Architecture design doc for Zipper"),
+            "ent-c": ("zippering", "Operational stream-joining process"),
+            "ent-p1": ("Stripe", "Payment processor"),
+            "ent-alias": ("Stripe Billing", "Billing platform"),
+            "ent-p2": ("invoice_item_id", "Primary key of a Stripe invoice item"),
+        }
+        decisions = [
+            {"pair_id": "ent-a|ent-c", "relation": "skos:related", "canonical": "ent-a"},
+            {"pair_id": "ent-a|ent-b", "relation": "skos:altLabel", "canonical": "ent-a"},
+            {"pair_id": "ent-b|ent-c", "relation": "skos:altLabel", "canonical": "ent-c"},
+            {"pair_id": "ent-p1|ent-alias", "relation": "skos:altLabel", "canonical": "ent-alias"},
+            {"pair_id": "ent-alias|ent-p2", "relation": "skos:altLabel", "canonical": "ent-p2"},
+        ]
+        rlm_stats = {"merged_entities": 0, "related_edges": 0, "different_from_edges": 0, "broader_edges": 0}
+        staged_merges, _ = apply_synonym_adjudication(
+            stage_conn,
+            candidates,
+            cand_meta,
+            decisions,
+            {("ent-p1", "ent-p2")},
+            synonymy_threshold=0.8,
+            rlm_stats=rlm_stats,
+        )
+        assert staged_merges == [
+            ("ent-b", "ent-a", "skos:altLabel"),
+            ("ent-p1", "ent-alias", "skos:altLabel"),
+        ]
+        surviving = {str(r[0]) for r in stage_conn.execute("SELECT entity_id FROM entities").fetchall()}
+        assert surviving == {"ent-a", "ent-c", "ent-alias", "ent-p2"}
+        assert lint_graph_shacl(stage_conn) == []
+    finally:
+        stage_conn.close()

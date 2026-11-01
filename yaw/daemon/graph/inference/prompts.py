@@ -264,13 +264,18 @@ disambiguate entities using their SKOS/RDF/OWL profiles, reified `rdf:Statement`
     Judge candidate pairs of entities/literals that look similar semantically and in writing/spelling (including \
 typos, acronyms, lookalikes like "Cindy Real" vs "Cinderella", or homonyms/homographs with the same name \
 like "a ball" vs "a ball"):
-    - 'skos:altLabel': Strict co-referents referring to the exact same entity/concept (merge into canonical \
+    - 'skos:altLabel': Strict co-referents referring to the exact same entity/concept of the exact same \
+ontological category (System == System, Process/Job == Process/Job, Schema Field/Identifier == Schema \
+Field/Identifier, Data Record == Data Record, Document/Artifact == Document/Artifact; merge into canonical \
 entity, where 'canonical' is the preferred entity ID/name), including true synonyms, acronyms/initialisms, \
 singular/plural surface forms ("consumer" / "Consumers", "manager" / "Managers"), and cross-chunk mentions of the \
 same concept/role ("Security", "Tier 1", "KV-cache" / "KV cache"). Never use when `direct_facts >= 1` (`dfact >= 1`) \
-links two distinct entities as Subject and Object, or when one phrase adds a distinct component/artifact head noun \
-("NetSuite" vs "NetSuite import" / "NetSuite mapping", "Audit logs" vs "Audit log store" / "audit-log-exporter", \
-"break-glass access" vs "break-glass role" / "break-glass credentials").
+links two distinct entities as Subject and Object, or across distinct ontological categories: never merge a Software \
+System ("NetSuite", "Stripe", "Zipper"), an Ingestion Job/Process ("NetSuite import", "NetSuite staging import", \
+"zippering"), a Schema Mapping/Column/Primary-Key Identifier ("NetSuite mapping", "invoice_item_id", \
+"reconciliation_reason"), Domain Records/Rows ("invoice_items", "NetSuite import rows"), or a Design Document \
+("ZIPPER-Design"), or when one phrase adds a distinct component/artifact head noun ("Audit logs" vs "Audit log \
+store" / "audit-log-exporter", "break-glass access" vs "break-glass role" / "break-glass credentials").
     - 'skos:hiddenLabel': Typo, misspelling, transcription error, or surface spelling variant \
 referring to the exact same entity/concept (merge into canonical entity).
     - 'owl:differentFrom': Genuine polysemous homonyms/homographs across unrelated domains (e.g., "a ball" \

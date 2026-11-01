@@ -156,3 +156,68 @@ def test_open_ro_sqlite_backoff_and_dark_figure_candidate_svgs(tmp_path):
     generate_candidate_quality_svg(qual_svg, cands, False, ("RUNNING", "#10b981"), {})
     assert "<svg" in score_svg.read_text(encoding="utf-8")
     assert "<svg" in qual_svg.read_text(encoding="utf-8")
+
+
+def test_kg_dashboard_throughput_entities_per_chunk_and_apng_projection(tmp_path):
+    from PIL import Image
+
+    from scripts.watchdog import generate_kg_dashboard_svg
+
+    kg_svg = tmp_path / "kg_dashboard.svg"
+    sandbox_fig1 = {
+        "counts": {"openie_chunks": 10},
+        "kg_metrics": {"total_entities": 60, "total_triples": 45},
+        "timeseries_samples": [
+            {
+                "time_sec": 360.0,
+                "time_hours": 0.1,
+                "passages": 5,
+                "entities": 30,
+                "triples": 20,
+                "rolling_latency": 28.5,
+                "entities_per_chunk": 6.0,
+            },
+            {
+                "time_sec": 720.0,
+                "time_hours": 0.2,
+                "passages": 10,
+                "entities": 60,
+                "triples": 45,
+                "rolling_latency": 24.0,
+                "entities_per_chunk": 6.0,
+            },
+        ],
+    }
+    generate_kg_dashboard_svg(kg_svg, sandbox_fig1, {})
+    svg_text = kg_svg.read_text(encoding="utf-8")
+    assert "Throughput (s/chunk)" in svg_text
+    assert "Extraction (entities/chunk)" in svg_text
+    assert "Entities / chunk" in svg_text
+
+    apng_dest = tmp_path / "knowledge_graph_2d_projection.png"
+    frame_dir = tmp_path / "frames"
+    sandbox_step1 = {
+        "frame_dir": str(frame_dir),
+        "counts": {"openie_chunks": 1},
+        "kg_graph": {
+            "edges": [("a", "b", "skos:related")],
+            "entities": {"a": ("Alpha", "Def A", 1), "b": ("Beta", "Def B", 1)},
+        },
+    }
+    sandbox_step2 = {
+        "frame_dir": str(frame_dir),
+        "counts": {"openie_chunks": 2},
+        "kg_graph": {
+            "edges": [("a", "b", "skos:related"), ("b", "c", "fact")],
+            "entities": {
+                "a": ("Alpha", "Def A", 1),
+                "b": ("Beta", "Def B", 1),
+                "c": ("Gamma", "Def C", 1),
+            },
+        },
+    }
+    generate_graph_projection_svg(apng_dest, sandbox_step1, ("STEP 1", "#38bdf8"), layout_iterations=30)
+    generate_graph_projection_svg(apng_dest, sandbox_step2, ("STEP 2", "#38bdf8"), layout_iterations=30)
+    with Image.open(apng_dest) as img:
+        assert getattr(img, "is_animated", False) is True
+        assert getattr(img, "n_frames", 1) == 2

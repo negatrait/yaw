@@ -321,14 +321,20 @@ def get_empirical_telemetry_timeseries(
 
     # Interval rate/latency between consecutive real samples only; no seeded defaults.
     samples: list[dict[str, Any]] = []
-    prev: tuple[float, int] | None = None
+    prev: tuple[float, int, int] | None = None
     for i, cp in enumerate(deduped):
-        t_s, p_c = float(cp["time_sec"]), int(cp["passages"])
+        t_s, p_c, e_c = float(cp["time_sec"]), int(cp["passages"]), int(cp.get("entities", 0))
         vel = lat = None
         if prev is not None and t_s - prev[0] > 10:
             dt, dp = t_s - prev[0], max(0, p_c - prev[1])
             vel = round(dp / dt * 60.0, 2)
             lat = round(dt / dp, 1) if dp else None
+        if prev is not None and p_c - prev[1] > 0:
+            epc: float | None = round(max(0, e_c - prev[2]) / (p_c - prev[1]), 1)
+        elif p_c > 0:
+            epc = round(e_c / p_c, 1)
+        else:
+            epc = None
         samples.append(
             {
                 "index": i + 1,
@@ -339,9 +345,10 @@ def get_empirical_telemetry_timeseries(
                 "triples": cp["triples"],
                 "rolling_velocity": vel,
                 "rolling_latency": lat,
+                "entities_per_chunk": epc,
             }
         )
-        prev = (t_s, p_c)
+        prev = (t_s, p_c, e_c)
     return samples
 
 
@@ -859,32 +866,32 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
         fontsize=8,
     )
 
-    rv = [(float(s["time_hours"]), s["rolling_velocity"]) for s in samples]
-    rv = [(t, v) for t, v in rv if v is not None]
-    rl = [(float(s["time_hours"]), s["rolling_latency"]) for s in samples]
+    rl = [(float(s["time_hours"]), s.get("rolling_latency")) for s in samples]
     rl = [(t, v) for t, v in rl if v is not None]
-    if rv:
+    epc = [(float(s["time_hours"]), s.get("entities_per_chunk")) for s in samples]
+    epc = [(t, v) for t, v in epc if v is not None]
+    if rl:
         ax2.plot(
-            *zip(*rv, strict=True),
+            *zip(*rl, strict=True),
             color="#10b981",
             lw=1.0,
             marker="o",
             ms=2.5,
-            label="Interval rate (chunks/min)",
+            label="Throughput (s/chunk)",
         )
-        ax2.set_ylim(0.0, max(1.0, max(v for _, v in rv) * 1.25))
-    if rl:
+        ax2.set_ylim(0.0, max(1.0, max(v for _, v in rl) * 1.25))
+    if epc:
         ax2_r.plot(
-            *zip(*rl, strict=True),
+            *zip(*epc, strict=True),
             color="#fbbf24",
             lw=1.0,
             ls="--",
             marker="o",
             ms=2.5,
-            label="Interval latency (s/chunk)",
+            label="Extraction (entities/chunk)",
         )
-        ax2_r.set_ylim(0.0, max(1.0, max(v for _, v in rl) * 1.25))
-    if not rv and not rl:
+        ax2_r.set_ylim(0.0, max(1.0, max(v for _, v in epc) * 1.25))
+    if not rl and not epc:
         ax2.text(
             0.5,
             0.5,
@@ -895,8 +902,8 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
             color="#94a3b8",
         )
     ax2_r.grid(False)
-    ax2.set_ylabel("Rate (/min)", color="#10b981", fontweight="bold")
-    ax2_r.set_ylabel("Latency (s)", color="#fbbf24", fontweight="bold")
+    ax2.set_ylabel("Throughput (s/chunk)", color="#10b981", fontweight="bold")
+    ax2_r.set_ylabel("Entities / chunk", color="#fbbf24", fontweight="bold")
     ax2.set_xlabel("Wall-clock time since sandbox creation (hours) →", fontweight="bold")
     handles = ax2.get_legend_handles_labels()[0] + ax2_r.get_legend_handles_labels()[0]
     if handles:
@@ -1376,7 +1383,61 @@ def generate_graph_projection_svg(
 
     ax.set_xticks([])
     ax.set_yticks([])
-    _save(fig, dest)
+    if dest.suffix == ".png":
+        from PIL import Image
+
+        if sandbox.get("frame_dir"):
+            frame_dir = Path(sandbox["frame_dir"])
+        elif sandbox.get("datestamp"):
+            frame_dir = WORKSPACE_ROOT / ".yaw" / f"kg_frames_{sandbox['datestamp']}"
+        else:
+            frame_dir = dest.parent / f".kg_frames_{dest.stem}"
+        frame_dir.mkdir(parents=True, exist_ok=True)
+        state_key = (
+            n_cnt,
+            len(fact_segs),
+            len(rel_segs),
+            len(broader_segs),
+            len(diff_segs),
+            int(sandbox.get("counts", {}).get("openie_chunks", 0)),
+        )
+        frame_name = (
+            f"frame_{state_key[5]:05d}_{state_key[0]:05d}_{state_key[1]:05d}_"
+            f"{state_key[2]:05d}_{state_key[3]:05d}_{state_key[4]:05d}.png"
+        )
+        frame_path = frame_dir / frame_name
+        try:
+            if not frame_path.exists():
+                _atomic_write(frame_path, lambda t: fig.savefig(t, format="png", dpi=110))
+        finally:
+            plt.close(fig)
+        frame_files = sorted(frame_dir.glob("frame_*.png"))
+        if len(frame_files) > 24:
+            for old_f in frame_files[:-24]:
+                with contextlib.suppress(OSError):
+                    old_f.unlink(missing_ok=True)
+            frame_files = frame_files[-24:]
+        frames: list[Image.Image] = []
+        for fp in frame_files:
+            with Image.open(fp) as im:
+                frames.append(im.convert("RGBA"))
+        if len(frames) >= 2:
+            durations = [450] * (len(frames) - 1) + [1800]
+            _atomic_write(
+                dest,
+                lambda t: frames[0].save(
+                    t,
+                    format="PNG",
+                    save_all=True,
+                    append_images=frames[1:],
+                    duration=durations,
+                    loop=0,
+                ),
+            )
+        elif frames:
+            _atomic_write(dest, lambda t: frames[0].save(t, format="PNG"))
+    else:
+        _save(fig, dest)
     return {
         "nodes_rendered": n_cnt,
         "diff_nodes": len(diff_nodes),
