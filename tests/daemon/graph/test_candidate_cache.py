@@ -170,7 +170,7 @@ def test_candidate_stages_make_zero_requests_after_process_restart(tmp_path: Pat
                 if "variables_info" in prompt and "repl_history" in prompt:
                     requests.append("rlm")
                     code = (
-                        "repairs = qwen_propose_shacl_repairs(violations=violations, "
+                        "repairs = llm_propose_shacl_repairs(violations=violations, "
                         "focus_context='')\nSUBMIT(repairs=repairs)"
                     )
                     content = (

@@ -2,7 +2,6 @@
 
 import difflib
 import json
-import re
 import sqlite3
 from collections.abc import Iterator, Mapping, Sequence
 from functools import lru_cache
@@ -11,24 +10,17 @@ from typing import Any
 import numpy as np
 
 from yaw.core import (
+    LABEL_KIND_PRIORITY,
+    SEMANTIC_EDGE_KINDS,
     ChunkPointer,
     OpenIERecord,
     StructuredTriple,
-    check_lexical_subsumption_inversion,
     detect_scalar_literal,
-    is_acronym_pair,
-    is_version_or_ordinal_sibling,
     text_processing,
 )
 
 from .db import YawConnection, batched, write_tx
-from .vectors import FTS_STOPWORDS, get_entity_vectors
-
-LABEL_KIND_PRIORITY: dict[str, int] = {
-    "skos:prefLabel": 3,
-    "skos:altLabel": 2,
-    "skos:hiddenLabel": 1,
-}
+from .vectors import get_entity_vectors
 
 _EXISTING_ID_TABLES: dict[str, tuple[str, str]] = {
     "chunk": ("chunks", "chunk_id"),
@@ -116,46 +108,15 @@ def filter_valid_concept_entity_ids(
 ) -> list[str]:
     """Filter entity nodes to valid SKOS concept candidates (excluding pure rdfs:Literal resources)."""
     pure_literal_ids = get_pure_literal_entity_ids(conn, exclude_shared_labels=True)
-    return [
-        eid
-        for eid, name, _ in entity_nodes
-        if len(re.sub(r"[^A-Za-z0-9]", "", name)) >= 1 and eid not in pure_literal_ids
-    ]
+    return [eid for eid, name, _ in entity_nodes if bool(text_processing(name)) and eid not in pure_literal_ids]
 
 
 @lru_cache(maxsize=4096)
-def _lexical_name_parts(name: str) -> tuple[str, str, str, tuple[str, ...]]:
+def _lexical_name_parts(name: str) -> tuple[str, str]:
     return (
         name.strip().lower(),
         str(text_processing(name)),
-        re.sub(r"[^a-z0-9]", "", name.strip().lower()),
-        tuple(re.sub(r"[^a-zA-Z0-9\s]", "", name).strip().split()),
     )
-
-
-def _is_acronym_match(name_a: str, name_b: str) -> bool:
-    """Return True if one label is an initialism/acronym of the other multi-token label."""
-    na, nb = name_a.strip(), name_b.strip()
-    short_name = na if len(na) < len(nb) else nb
-    if not any(ch.isspace() for ch in short_name) and is_acronym_pair(name_a, name_b):
-        return True
-    tokens_a = _lexical_name_parts(name_a)[3]
-    tokens_b = _lexical_name_parts(name_b)[3]
-    if not tokens_a or not tokens_b:
-        return False
-    if len(tokens_a) == 1 and len(tokens_b) >= 2:
-        short, words = tokens_a[0].lower(), tokens_b
-    elif len(tokens_b) == 1 and len(tokens_a) >= 2:
-        short, words = tokens_b[0].lower(), tokens_a
-    else:
-        return False
-    if len(short) < 2:
-        return False
-    initials = "".join(w[0].lower() for w in words if w)
-    if short == initials:
-        return True
-    non_stop_initials = "".join(w[0].lower() for w in words if w and w.lower() not in FTS_STOPWORDS)
-    return len(non_stop_initials) >= 2 and short == non_stop_initials
 
 
 def _lexical_similarity_cascade(
@@ -165,46 +126,25 @@ def _lexical_similarity_cascade(
     *,
     matcher: difflib.SequenceMatcher | None = None,
 ) -> float:
-    """Run the 3-stage difflib.SequenceMatcher cascade + acronym and alnum detector."""
-    norm_a, tok_a, alnum_a, _ = _lexical_name_parts(name_a)
-    norm_b, tok_b, alnum_b, _ = _lexical_name_parts(name_b)
+    """Run the 3-stage difflib.SequenceMatcher cascade (real_quick_ratio -> quick_ratio -> ratio)."""
+    norm_a, tok_a = _lexical_name_parts(name_a)
+    norm_b, tok_b = _lexical_name_parts(name_b)
     if not norm_a or not norm_b:
         return 0.0
-    if norm_a == norm_b:
+    if norm_a == norm_b or (tok_a and tok_a == tok_b):
         return 1.0
-    if tok_a and tok_a == tok_b:
-        return 1.0
-    if _is_acronym_match(name_a, name_b):
-        return max(threshold, 0.85)
-    if is_version_or_ordinal_sibling(name_a, name_b):
-        return max(threshold, 0.80)
     if norm_a.isdigit() and norm_b.isdigit():
-        return 0.0
-
-    len_a, len_b = len(norm_a), len(norm_b)
-    if min(len_a, len_b) / max(len_a, len_b) < 0.4:
         return 0.0
 
     if matcher is None:
         matcher = difflib.SequenceMatcher(autojunk=False)
         matcher.set_seq2(norm_a)
     matcher.set_seq1(norm_b)
-    best_ratio = 0.0
     if matcher.real_quick_ratio() >= threshold and matcher.quick_ratio() >= threshold:
-        best_ratio = matcher.ratio()
-    if (
-        best_ratio < threshold
-        and (" " in norm_a or " " in norm_b)
-        and alnum_a
-        and alnum_b
-        and not (alnum_a.isdigit() and alnum_b.isdigit())
-    ):
-        alnum_matcher = difflib.SequenceMatcher(None, alnum_b, alnum_a, autojunk=False)
-        # Both quick ratios are upper bounds: rejecting below threshold
-        # preserves exactly the original set and scores of accepted pairs.
-        if alnum_matcher.real_quick_ratio() >= threshold and alnum_matcher.quick_ratio() >= threshold:
-            best_ratio = max(best_ratio, alnum_matcher.ratio())
-    return best_ratio if best_ratio >= threshold else 0.0
+        ratio = matcher.ratio()
+        if ratio >= threshold:
+            return ratio
+    return 0.0
 
 
 def find_entity_synonym_candidates(
@@ -278,7 +218,7 @@ def find_entity_disambiguation_candidates(
     *,
     dense_threshold: float = 0.75,
     dense_top_k: int = 5,
-    lexical_threshold: float = 0.72,
+    lexical_threshold: float = 0.70,
 ) -> list[tuple[str, str, float, float]]:
     """Two-channel candidate generation combining sqlite-vec dense kNN and 3-stage SequenceMatcher cascade."""
     pure_literals = get_pure_literal_entity_ids(conn)
@@ -374,16 +314,7 @@ def find_entity_disambiguation_candidates(
                 d_sim = 0.0
         l_sim = lexical_pairs.get((a, b))
         if l_sim is None:
-            raw_a = entity_names.get(a, "")
-            raw_b = entity_names.get(b, "")
-            na = raw_a.strip().lower()
-            nb = raw_b.strip().lower()
-            if _is_acronym_match(raw_a, raw_b):
-                l_sim = max(lexical_threshold, 0.85)
-            elif na and nb:
-                l_sim = difflib.SequenceMatcher(None, nb, na, autojunk=False).ratio()
-            else:
-                l_sim = 0.0
+            l_sim = _lexical_similarity_cascade(entity_names.get(a, ""), entity_names.get(b, ""), 0.0)
         results.append((a, b, float(d_sim), float(l_sim)))
 
     return results
@@ -1565,41 +1496,6 @@ def load_graph_topology(
     return chunk_ids, entity_ids, edges
 
 
-def _are_same_label_homographs(conn: sqlite3.Connection | YawConnection, ent1: str, ent2: str) -> bool:
-    "Return True if ent1 and ent2 share a skos:prefLabel norm or normalized entity name (e.g. 'a ball' vs 'a ball')."
-    row = conn.execute(
-        """
-        SELECT 1
-        FROM entities a
-        INNER JOIN entities b ON a.entity_id = ? AND b.entity_id = ?
-        WHERE LOWER(TRIM(a.name)) != '' AND LOWER(TRIM(a.name)) = LOWER(TRIM(b.name))
-        UNION ALL
-        SELECT 1
-        FROM entity_labels la
-        INNER JOIN entity_labels lb
-          ON la.label_norm = lb.label_norm
-         AND la.label_kind = 'skos:prefLabel'
-         AND lb.label_kind = 'skos:prefLabel'
-        WHERE la.entity_id = ? AND lb.entity_id = ?
-        LIMIT 1
-        """,
-        (ent1, ent2, ent1, ent2),
-    ).fetchone()
-    if row is not None:
-        return True
-    names = conn.execute(
-        "SELECT name FROM entities WHERE entity_id IN (?, ?)",
-        (ent1, ent2),
-    ).fetchall()
-    if len(names) == 2:
-        na, nb = str(names[0][0]).strip(), str(names[1][0]).strip()
-        if na and nb:
-            ta, tb = str(text_processing(na)), str(text_processing(nb))
-            if ta and ta == tb:
-                return True
-    return False
-
-
 def upsert_semantic_edges(
     conn: sqlite3.Connection | YawConnection,
     edges: Sequence[tuple[str, str, str, float]],
@@ -1612,31 +1508,19 @@ def upsert_semantic_edges(
         for ent1, ent2, kind, weight in edges:
             if ent1 == ent2:
                 continue
-            if kind not in ("skos:related", "skos:broader", "owl:differentFrom"):
+            if kind not in SEMANTIC_EDGE_KINDS:
                 raise ValueError(f"Unsupported semantic edge kind: {kind!r}")
             if kind in ("skos:related", "skos:broader") and (ent1 in pure_literals or ent2 in pure_literals):
                 continue
-            if kind == "skos:broader":
-                row_s = conn.execute("SELECT name FROM entities WHERE entity_id = ?", (ent1,)).fetchone()
-                row_d = conn.execute("SELECT name FROM entities WHERE entity_id = ?", (ent2,)).fetchone()
-                name_s = str(row_s[0]) if row_s is not None else ""
-                name_d = str(row_d[0]) if row_d is not None else ""
-                if name_s and name_d:
-                    if is_version_or_ordinal_sibling(name_s, name_d):
-                        kind = "skos:related"
-                    elif check_lexical_subsumption_inversion(name_s, name_d):
-                        ent1, ent2 = ent2, ent1
-            is_homograph = _are_same_label_homographs(conn, ent1, ent2)
             if kind == "owl:differentFrom":
-                if not is_homograph:
-                    conn.execute(
-                        """
-                        DELETE FROM edges
-                        WHERE kind IN ('skos:related', 'skos:broader')
-                          AND ((src_id = ? AND dst_id = ?) OR (src_id = ? AND dst_id = ?))
-                        """,
-                        (ent1, ent2, ent2, ent1),
-                    )
+                conn.execute(
+                    """
+                    DELETE FROM edges
+                    WHERE kind IN ('skos:related', 'skos:broader')
+                      AND ((src_id = ? AND dst_id = ?) OR (src_id = ? AND dst_id = ?))
+                    """,
+                    (ent1, ent2, ent2, ent1),
+                )
                 for s, d in ((ent1, ent2), (ent2, ent1)):
                     conn.execute(
                         """
@@ -1647,19 +1531,15 @@ def upsert_semantic_edges(
                         (s, d),
                     )
             elif kind == "skos:broader":
-                has_diff = (
-                    None
-                    if is_homograph
-                    else conn.execute(
-                        """
-                        SELECT 1 FROM edges
-                        WHERE kind = 'owl:differentFrom'
-                          AND ((src_id = ? AND dst_id = ?) OR (src_id = ? AND dst_id = ?))
-                        LIMIT 1
-                        """,
-                        (ent1, ent2, ent2, ent1),
-                    ).fetchone()
-                )
+                has_diff = conn.execute(
+                    """
+                    SELECT 1 FROM edges
+                    WHERE kind = 'owl:differentFrom'
+                      AND ((src_id = ? AND dst_id = ?) OR (src_id = ? AND dst_id = ?))
+                    LIMIT 1
+                    """,
+                    (ent1, ent2, ent2, ent1),
+                ).fetchone()
                 if has_diff is None:
                     # Enforce SKOS S27 disjointness with skos:related and prevent direct 2-cycles
                     conn.execute(
@@ -1683,19 +1563,15 @@ def upsert_semantic_edges(
                         (ent1, ent2, broader_weight),
                     )
             else:
-                has_conflict = (
-                    None
-                    if is_homograph
-                    else conn.execute(
-                        """
-                        SELECT 1 FROM edges
-                        WHERE kind IN ('owl:differentFrom', 'skos:broader')
-                          AND ((src_id = ? AND dst_id = ?) OR (src_id = ? AND dst_id = ?))
-                        LIMIT 1
-                        """,
-                        (ent1, ent2, ent2, ent1),
-                    ).fetchone()
-                )
+                has_conflict = conn.execute(
+                    """
+                    SELECT 1 FROM edges
+                    WHERE kind IN ('owl:differentFrom', 'skos:broader')
+                      AND ((src_id = ? AND dst_id = ?) OR (src_id = ? AND dst_id = ?))
+                    LIMIT 1
+                    """,
+                    (ent1, ent2, ent2, ent1),
+                ).fetchone()
                 if has_conflict is None:
                     rel_weight = max(float(weight), 1e-6)
                     for s, d in ((ent1, ent2), (ent2, ent1)):
@@ -1707,16 +1583,6 @@ def upsert_semantic_edges(
                             """,
                             (s, d, rel_weight),
                         )
-                    if is_homograph:
-                        for s, d in ((ent1, ent2), (ent2, ent1)):
-                            conn.execute(
-                                """
-                                INSERT INTO edges (src_id, dst_id, kind, weight)
-                                VALUES (?, ?, 'owl:differentFrom', 0.0)
-                                ON CONFLICT(src_id, dst_id, kind) DO UPDATE SET weight = 0.0
-                                """,
-                                (s, d),
-                            )
 
 
 def delete_chunks(conn: sqlite3.Connection | YawConnection, chunk_ids: Sequence[str]) -> None:

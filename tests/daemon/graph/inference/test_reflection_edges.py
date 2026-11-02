@@ -34,7 +34,7 @@ def simba_state():
         "version": 2,
         "steps": 0,
         "examples": [{"component_name": "ner", "current_instruction": "Extract", "examples_with_feedback": []}],
-        "predictors": {"qwen_proposer": predictor, "qwen_compressor": copy.deepcopy(predictor)},
+        "predictors": {"llm_proposer": predictor, "llm_compressor": copy.deepcopy(predictor)},
     }
 
 
@@ -46,11 +46,11 @@ def test_simba_checkpoint_rejects_malformed_nested_contracts(defect):
     elif defect == "example-input":
         state["examples"][0]["component_name"] = None
     elif defect == "signature":
-        state["predictors"]["qwen_proposer"]["signature"]["instructions"] = None
+        state["predictors"]["llm_proposer"]["signature"]["instructions"] = None
     elif defect == "field":
-        state["predictors"]["qwen_proposer"]["signature"]["fields"][0]["description"] = 2
+        state["predictors"]["llm_proposer"]["signature"]["fields"][0]["description"] = 2
     else:
-        state["predictors"]["qwen_proposer"]["demos"] = ["not-object"]
+        state["predictors"]["llm_proposer"]["demos"] = ["not-object"]
     with pytest.raises(ValueError, match="Malformed"):
         validate_simba_state(state)
 

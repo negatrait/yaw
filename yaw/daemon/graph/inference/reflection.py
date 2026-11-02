@@ -64,7 +64,7 @@ def validate_simba_state(value: object) -> SimbaState:
         checked_examples.append(example)
     predictors = checkpoint_object(state.get("predictors"), "SIMBA predictors")
     checked_predictors = {}
-    for name in ("qwen_proposer", "qwen_compressor"):
+    for name in ("llm_proposer", "llm_compressor"):
         predictor = checkpoint_object(predictors.get(name), f"SIMBA predictor {name}")
         signature = checkpoint_object(predictor.get("signature"), "SIMBA signature")
         if (

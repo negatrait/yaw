@@ -27,8 +27,6 @@ ALL_11_SHACL_SHAPES = {
     "ConceptShape/broaderCycle",
     "ConceptShape/S27-disjointBroaderRelated",
     "ConceptShape/noScalarLiterals",
-    "ConceptShape/lexicalSubsumption",
-    "ConceptShape/siblingNotBroader",
     "ProvenanceShape/factSources",
 }
 
@@ -298,8 +296,6 @@ def test_shacl_new_shapes_detection(tmp_path: Path) -> None:
         }.issubset(focus_by_shape["ConceptShape/broaderCycle"])
         assert "ent-s27-leaf|ent-s27-root" in focus_by_shape["ConceptShape/S27-disjointBroaderRelated"]
         assert {"ent-date", "ent-lit-port"}.issubset(focus_by_shape["ConceptShape/noScalarLiterals"])
-        assert "ent-eng->ent-sec-eng" in focus_by_shape["ConceptShape/lexicalSubsumption"]
-        assert "ent-v1->ent-v2" in focus_by_shape["ConceptShape/siblingNotBroader"]
         assert "fact-orphan-1" in focus_by_shape["ProvenanceShape/factSources"]
 
     finally:

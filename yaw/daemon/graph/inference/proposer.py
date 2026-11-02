@@ -38,8 +38,8 @@ class InstructionSynthesizerWorker(dspy.Module):
     def __init__(
         self,
         *,
-        qwen_proposer: Any,
-        qwen_compressor: Any,
+        llm_proposer: Any,
+        llm_compressor: Any,
         worker_lm: Any = None,
         orchestrator_lm: Any = None,
         enable_gbnf: bool = True,
@@ -49,8 +49,8 @@ class InstructionSynthesizerWorker(dspy.Module):
         json_adapter: dspy.Adapter | None = None,
     ) -> None:
         super().__init__()
-        self.qwen_proposer = qwen_proposer
-        self.qwen_compressor = qwen_compressor
+        self.llm_proposer = llm_proposer
+        self.llm_compressor = llm_compressor
         self.worker_lm = worker_lm
         self.orchestrator_lm = orchestrator_lm
         self.enable_gbnf = bool(enable_gbnf)
@@ -62,7 +62,7 @@ class InstructionSynthesizerWorker(dspy.Module):
         self.sub_telemetry: list[dict[str, Any]] = []
 
     def get_lm(self) -> Any:
-        return self._rollout_lm or self.worker_lm or self.orchestrator_lm or getattr(self.qwen_proposer, "lm", None)
+        return self._rollout_lm or self.worker_lm or self.orchestrator_lm or getattr(self.llm_proposer, "lm", None)
 
     def set_lm(self, lm: Any) -> None:
         self._rollout_lm = lm
@@ -91,8 +91,8 @@ class InstructionSynthesizerWorker(dspy.Module):
             max_chars=self.max_instruction_chars,
             adapter=self.json_adapter,
         )
-        native.propose = self.qwen_proposer
-        native.compress = self.qwen_compressor if self.max_instruction_chars else None
+        native.propose = self.llm_proposer
+        native.compress = self.llm_compressor if self.max_instruction_chars else None
         examples = self.fit_evidence(current_instruction, examples_with_feedback, component_name)
         stage = component_name.removesuffix(".predict")
         contract = STAGE_SCHEMA_CONTRACTS.get(stage, ("", (), "Preserve the existing output schema."))[2]
@@ -127,7 +127,7 @@ class InstructionSynthesizerWorker(dspy.Module):
             inputs["length_limit"] = f"The new instruction must be at most {self.max_instruction_chars} characters."
         while isinstance(lm, ReflectionLM):
             try:
-                lm.count(self.json_adapter.format(self.qwen_proposer.signature, self.qwen_proposer.demos, inputs))
+                lm.count(self.json_adapter.format(self.llm_proposer.signature, self.llm_proposer.demos, inputs))
                 break
             except ReflectionBudgetError:
                 if not examples:
@@ -143,7 +143,7 @@ class RLMInstructionProposer:
     Conforms to `gepa.core.adapter.ProposalFn` and stock DSPy `InstructionProposer`:
     `(candidate, reflective_dataset, components_to_update) -> dict[str, str]`, while its
     inner worker (`self.worker_module`: `InstructionSynthesizerWorker(dspy.Module)` wrapping
-    `qwen_proposer` + `qwen_compressor`) is continuously refined by an always-on `dspy.SIMBA`
+    `llm_proposer` + `llm_compressor`) is continuously refined by an always-on `dspy.SIMBA`
     meta-optimizer during prompt evolution.
     """
 
@@ -231,12 +231,12 @@ class RLMInstructionProposer:
             base_instructions=ProposeInstructionSignature.__doc__,
             max_chars=self.max_instruction_chars,
         )
-        self.qwen_proposer = native.propose
+        self.llm_proposer = native.propose
         # Keep both native predictors visible to SIMBA and state serialization.
-        self.qwen_compressor = native.compress or dspy.Predict(CompressInstructionSignature)
+        self.llm_compressor = native.compress or dspy.Predict(CompressInstructionSignature)
         self.worker_module = InstructionSynthesizerWorker(
-            qwen_proposer=self.qwen_proposer,
-            qwen_compressor=self.qwen_compressor,
+            llm_proposer=self.llm_proposer,
+            llm_compressor=self.llm_compressor,
             worker_lm=self.worker_lm,
             orchestrator_lm=self.orchestrator_lm,
             enable_gbnf=self.enable_gbnf,
@@ -271,10 +271,10 @@ class RLMInstructionProposer:
         # The native proposer runs under the worker's selected rollout context.
         # Leaving its predictors unbound makes DSPy's normal context precedence
         # apply, including the verified ReflectionLM token-budget guard.
-        self.qwen_proposer.set_lm(None)
-        self.qwen_compressor.set_lm(None)
-        self.worker_module.qwen_proposer = self.qwen_proposer
-        self.worker_module.qwen_compressor = self.qwen_compressor
+        self.llm_proposer.set_lm(None)
+        self.llm_compressor.set_lm(None)
+        self.worker_module.llm_proposer = self.llm_proposer
+        self.worker_module.llm_compressor = self.llm_compressor
         self.worker_module.worker_lm = self.worker_lm
         self.worker_module.orchestrator_lm = self.orchestrator_lm
 
@@ -325,17 +325,17 @@ class RLMInstructionProposer:
         self._bind_predictor_lms()
 
     def all_reflection_predictors(self) -> list[tuple[str, Any]]:
-        """Return all 3 active reflection predictors (`inner_rlm`, `qwen_proposer`, `qwen_compressor`)."""
+        """Return all 3 active reflection predictors (`inner_rlm`, `llm_proposer`, `llm_compressor`)."""
         return [
             ("inner_rlm", self.inner_rlm),
-            ("qwen_proposer", self.qwen_proposer),
-            ("qwen_compressor", self.qwen_compressor),
+            ("llm_proposer", self.llm_proposer),
+            ("llm_compressor", self.llm_compressor),
         ]
 
     def dump_simba_state(self) -> dict[str, Any]:
         """JSON-safe DSPy predictor state; exclude clients, traces and optimizer archives."""
         predictors = {}
-        for name in ("qwen_proposer", "qwen_compressor"):
+        for name in ("llm_proposer", "llm_compressor"):
             state = getattr(self, name).dump_state()
             state.update(lm=None, traces=[], train=[])
             predictors[name] = state
@@ -350,7 +350,7 @@ class RLMInstructionProposer:
         """Restore learned parameters into fresh predictors, then bind current clients."""
         state = validate_simba_state(state)
         restored = {}
-        for name in ("qwen_proposer", "qwen_compressor"):
+        for name in ("llm_proposer", "llm_compressor"):
             predictor = dspy.Predict(getattr(self, name).signature)
             saved = dict(state["predictors"][name])
             saved.update(lm=None, traces=[], train=[])
@@ -411,8 +411,8 @@ class RLMInstructionProposer:
 
         bsize = min(self.simba_bsize, len(self._simba_examples))
         trainset = list(self._simba_examples[-max(bsize, 8) :])
-        prev_inst = str(getattr(self.qwen_proposer.signature, "instructions", "") or "")
-        prev_demos = len(getattr(self.qwen_proposer, "demos", ()) or ())
+        prev_inst = str(getattr(self.llm_proposer.signature, "instructions", "") or "")
+        prev_demos = len(getattr(self.llm_proposer, "demos", ()) or ())
 
         self._simba_reward_errors = 0
         simba = dspy.SIMBA(
@@ -444,22 +444,22 @@ class RLMInstructionProposer:
                 example.examples_with_feedback,
                 example.component_name,
             )
-        new_inst = str(compiled_worker.qwen_proposer.signature.instructions).strip()
-        self.qwen_proposer.signature = compiled_worker.qwen_proposer.signature
-        self.qwen_proposer.demos = list(getattr(compiled_worker.qwen_proposer, "demos", ()) or ())
-        self.qwen_compressor.signature = compiled_worker.qwen_compressor.signature
-        self.qwen_compressor.demos = list(getattr(compiled_worker.qwen_compressor, "demos", ()) or ())
+        new_inst = str(compiled_worker.llm_proposer.signature.instructions).strip()
+        self.llm_proposer.signature = compiled_worker.llm_proposer.signature
+        self.llm_proposer.demos = list(getattr(compiled_worker.llm_proposer, "demos", ()) or ())
+        self.llm_compressor.signature = compiled_worker.llm_compressor.signature
+        self.llm_compressor.demos = list(getattr(compiled_worker.llm_compressor, "demos", ()) or ())
         self._bind_predictor_lms()
 
         entry = {
             "optimizer": "dspy.SIMBA",
-            "target": "worker_module.qwen_proposer",
+            "target": "worker_module.llm_proposer",
             "trainset_size": len(trainset),
             "bsize": bsize,
             "num_candidates": self.simba_num_candidates,
             "max_steps": self.simba_max_steps,
             "demos_before": prev_demos,
-            "demos_after": len(self.qwen_proposer.demos),
+            "demos_after": len(self.llm_proposer.demos),
             "instruction_changed": new_inst != prev_inst.strip(),
             "proposer_instruction": new_inst,
         }

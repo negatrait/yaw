@@ -111,8 +111,8 @@ def test_invalid_second_predictor_does_not_partially_restore_first():
     prop = RLMInstructionProposer()
     before = prop.dump_simba_state()
     broken = copy.deepcopy(before)
-    broken["predictors"]["qwen_proposer"]["signature"]["instructions"] = "A different writer."
-    broken["predictors"]["qwen_compressor"]["signature"]["fields"] = []
+    broken["predictors"]["llm_proposer"]["signature"]["instructions"] = "A different writer."
+    broken["predictors"]["llm_compressor"]["signature"]["fields"] = []
     with pytest.raises(ValueError, match="schema"):
         prop.load_simba_state(broken)
     assert prop.dump_simba_state() == before

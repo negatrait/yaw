@@ -4,17 +4,19 @@ import json
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
-from yaw.core.types import StructuredTriple
-
-from .parsers import (
+from yaw.core import (
     VALID_SHACL_ACTIONS,
     VALID_SYNONYM_RELATIONS,
     VALUE_BEARING_SHACL_ACTIONS,
+    StructuredTriple,
+    text_processing,
+)
+
+from .parsers import (
     coerce_generated_facts,
     extract_entity_definitions,
     extract_structured_triples,
     parse_shacl_repairs,
-    text_processing,
 )
 
 _ABSTAIN_PATTERNS: tuple[str, ...] = (
@@ -182,11 +184,16 @@ def validate_stage_invariants(
 
         stage1_raw = inputs.get("named_entities") or ()
         stage1_norms: set[str] = set()
+        stage1_defs: dict[str, str] = {}
         if isinstance(stage1_raw, Sequence) and not isinstance(stage1_raw, str):
             for ent in stage1_raw:
                 ename = str(ent[0]).strip() if isinstance(ent, (list, tuple)) and len(ent) >= 1 else str(ent).strip()
+                edef = str(ent[1]).strip() if isinstance(ent, (list, tuple)) and len(ent) >= 2 else ""
                 if ename:
-                    stage1_norms.add(str(text_processing(ename)) or ename.lower())
+                    norm_e = str(text_processing(ename)) or ename.lower()
+                    stage1_norms.add(norm_e)
+                    if edef:
+                        stage1_defs[norm_e] = edef.lower()
 
         closed_world_norms = set(stage1_norms)
         for st in structured:
@@ -209,11 +216,20 @@ def validate_stage_invariants(
                 continue
             s_norm = str(text_processing(st.subj)) or st.subj.lower()
             o_norm = str(text_processing(st.obj)) or st.obj.lower()
-            if st.obj_kind != "literal" and s_norm == o_norm:
-                s_def_clean = st.subj_def.strip().lower()
-                o_def_clean = st.obj_def.strip().lower()
-                if not s_def_clean or not o_def_clean or s_def_clean == o_def_clean:
-                    self_loops.append(st.subj)
+            spo_clean = st.spo_def.strip().lower()
+            s_def_clean = st.subj_def.strip().lower() or stage1_defs.get(s_norm, "")
+            o_def_clean = st.obj_def.strip().lower() or stage1_defs.get(o_norm, "")
+            if (s_def_clean and spo_clean == s_def_clean) or (
+                st.obj_kind != "literal" and o_def_clean and spo_clean == o_def_clean
+            ):
+                incomplete += 1
+                continue
+            if (
+                st.obj_kind != "literal"
+                and s_norm == o_norm
+                and (not s_def_clean or not o_def_clean or s_def_clean == o_def_clean)
+            ):
+                self_loops.append(st.subj)
             if stage1_norms:
                 if s_norm not in closed_world_norms:
                     unregistered.append(st.subj)
@@ -420,7 +436,7 @@ def validate_stage_invariants(
             return 1.0, "PASS [qa]"
         return max(0.2, round(1.0 - 0.45 * len(issues), 4)), f"[qa] {'; '.join(issues)}"
 
-    if stage in ("qwen_proposer", "qwen_compressor"):
+    if stage in ("llm_proposer", "llm_compressor"):
         new_inst = str(getattr(prediction, "new_instruction", "") or "").strip()
         max_chars = int(inputs.get("max_instruction_chars", 1500) or 1500)
         comp_name = str(inputs.get("component_name", "") or "").strip()

@@ -76,7 +76,7 @@ def provider():
             elif "module_advice" in prompt and "discussion" in prompt:
                 result = {
                     "discussion": "Full names improve measured task answers.",
-                    "module_advice": {"qwen_proposer": "LEARNED_RULE: Use FULL_NAME."},
+                    "module_advice": {"llm_proposer": "LEARNED_RULE: Use FULL_NAME."},
                 }
             else:
                 result = {
@@ -199,13 +199,13 @@ def test_native_simba_learning_survives_process_restart(tmp_path, provider):
     engine, proposer = make_learning(tmp_path, url)
     try:
         proposer._simba_examples = [example(), example()]
-        before = proposer.qwen_proposer.signature.instructions
+        before = proposer.llm_proposer.signature.instructions
         assert proposer.step_simba()
         assert proposer._simba_steps == 1
         assert any(call.get("temperature") == 1.0 and "worker-model" in call["model"] for call in calls)
-        assert proposer.qwen_proposer.signature.instructions != before or proposer.qwen_proposer.demos
+        assert proposer.llm_proposer.signature.instructions != before or proposer.llm_proposer.demos
         # Persist demos on both predictors as well as the genuinely learned rule.
-        proposer.qwen_compressor.demos = [
+        proposer.llm_compressor.demos = [
             dspy.Example(shortened_instruction=GOOD, instruction=GOOD, length_limit="1500")
         ]
         proposer.save_simba_state(proposer.dump_simba_state())
@@ -224,7 +224,7 @@ try:
     score = proposer._score_task_improvement(helpers['example'](),
         helpers['dspy'].Prediction(new_instruction=helpers['GOOD']))
     assert score > 0.5
-    assert proposer.worker_module.qwen_proposer is proposer.qwen_proposer
+    assert proposer.worker_module.llm_proposer is proposer.llm_proposer
     proposal = proposer(component_name='qa.predict', current_instruction=helpers['BASE'],
         examples_with_feedback=[{'Feedback': 'Incomplete answer'}])
     assert proposal.new_instruction == helpers['GOOD']

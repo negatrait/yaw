@@ -14,14 +14,12 @@ import numpy as np
 from yaw.daemon.graph.inference import (
     compute_qa_em_f1,
     doc_matches_gold,
-    normalize_answer,
 )
 
 __all__ = [
     "QAExactMatch",
     "QAF1Score",
     "RetrievalRecall",
-    "normalize_answer",
 ]
 
 

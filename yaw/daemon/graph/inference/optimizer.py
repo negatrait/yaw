@@ -840,7 +840,7 @@ def configure_simba_task_learning(
         "template": candidate_fingerprint(template),
         "trainset": [{"data": ex.toDict(), "inputs": sorted(ex.inputs())} for ex in trainset],
         "corpus": sorted(hooks.candidate_cache_sources()),
-        "worker": serialize_predictor_surface(proposer.qwen_proposer),
+        "worker": serialize_predictor_surface(proposer.llm_proposer),
         "orchestrator": serialize_predictor_surface(proposer.inner_rlm.generate_action),
         "settings": [
             proposer.simba_bsize,

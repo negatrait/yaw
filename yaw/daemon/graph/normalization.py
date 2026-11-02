@@ -2,8 +2,13 @@
 
 from dataclasses import dataclass
 
-from yaw.core import OpenIERecord, StructuredTriple, detect_scalar_literal
-from yaw.daemon.graph.inference import text_processing
+from yaw.core import (
+    OpenIERecord,
+    StructuredTriple,
+    clean_schema_definition,
+    detect_scalar_literal,
+    text_processing,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,7 +58,7 @@ def normalize_openie_record(rec: OpenIERecord) -> NormalizedRecord:
             is_lit_norm = raw_e0 in literal_only_raws or detect_scalar_literal(raw_e0)[0]
             enorm = raw_e0 if is_lit_norm else str(text_processing(raw_e0))
             _record_surface(enorm, raw_e0)
-            edef = str(raw_pair[1]).strip()
+            edef = clean_schema_definition(raw_pair[1])
             if enorm and edef:
                 if enorm not in stage1_defs:
                     stage1_defs[enorm] = edef
@@ -67,7 +72,7 @@ def normalize_openie_record(rec: OpenIERecord) -> NormalizedRecord:
     for raw_ent in getattr(rec, "entities", ()) or ():
         if isinstance(raw_ent, (list, tuple)) and len(raw_ent) >= 1:
             e_str = str(raw_ent[0]).strip()
-            e_inline_def = str(raw_ent[1]).strip() if len(raw_ent) >= 2 and raw_ent[1] is not None else ""
+            e_inline_def = clean_schema_definition(raw_ent[1]) if len(raw_ent) >= 2 else ""
         else:
             e_str = str(raw_ent).strip()
             e_inline_def = ""
@@ -114,9 +119,6 @@ def normalize_openie_record(rec: OpenIERecord) -> NormalizedRecord:
                 o_raw_norm = str(text_processing(o_raw))
                 s_def_val = stage1_defs.get(s_raw_norm, "")
                 o_def_val = stage1_defs.get(o_raw_norm, "")
-                if s_raw_norm and s_raw_norm == o_raw_norm and len(stage1_senses.get(s_raw_norm, ())) >= 2:
-                    s_def_val = stage1_senses[s_raw_norm][0]
-                    o_def_val = stage1_senses[s_raw_norm][1]
                 st_list.append(
                     StructuredTriple(
                         subj=s_raw,
@@ -133,19 +135,13 @@ def normalize_openie_record(rec: OpenIERecord) -> NormalizedRecord:
         o_raw_str = str(st.obj).strip()
         s_norm = str(text_processing(st.subj))
         p_norm = str(text_processing(st.pred))
-        is_literal_obj = getattr(st, "obj_kind", "entity") == "literal" or detect_scalar_literal(str(st.obj))[0]
+        _, detected_dt = detect_scalar_literal(str(st.obj))
+        is_literal_obj = getattr(st, "obj_kind", "entity") == "literal"
         o_val = o_raw_str if is_literal_obj else str(text_processing(st.obj))
         if not s_norm or not p_norm or not o_val:
             continue
-        if detect_scalar_literal(s_norm)[0]:
-            if not is_literal_obj:
-                s_norm, o_val = o_val, s_norm
-                s_raw_str, o_raw_str = o_raw_str, s_raw_str
-                is_literal_obj = True
-            else:
-                continue
         o_tok_norm = str(text_processing(o_val))
-        raw_subj_d = st.subj_def.strip()
+        raw_subj_d = clean_schema_definition(st.subj_def)
         subj_d = raw_subj_d or stage1_defs.get(s_norm, "")
         if subj_d:
             if s_norm not in stage1_defs:
@@ -154,21 +150,9 @@ def normalize_openie_record(rec: OpenIERecord) -> NormalizedRecord:
             if all(d.lower() != subj_d.lower() for d in senses_lst):
                 senses_lst.append(subj_d)
 
-        raw_obj_d = st.obj_def.strip()
+        raw_obj_d = clean_schema_definition(st.obj_def)
         obj_d = raw_obj_d or stage1_defs.get(o_val, "") or stage1_defs.get(o_tok_norm, "")
-        if (
-            not is_literal_obj
-            and s_norm == o_val
-            and subj_d
-            and obj_d
-            and subj_d.lower() == obj_d.lower()
-            and len(stage1_senses.get(o_val, ())) >= 2
-        ):
-            obj_d = next(
-                (d for d in stage1_senses[o_val] if d.lower() != subj_d.lower()),
-                obj_d,
-            )
-        if s_norm == o_tok_norm and (is_literal_obj or not (subj_d and obj_d and subj_d.lower() != obj_d.lower())):
+        if s_norm == o_tok_norm and not is_literal_obj and (not subj_d or not obj_d or subj_d.lower() == obj_d.lower()):
             continue
 
         _record_surface(s_norm, s_raw_str)
@@ -186,6 +170,8 @@ def normalize_openie_record(rec: OpenIERecord) -> NormalizedRecord:
             if all(d.lower() != obj_d.lower() for d in senses_lst):
                 senses_lst.append(obj_d)
 
+        raw_dt = str(getattr(st, "obj_datatype", "") or "").strip()
+        resolved_dt = (raw_dt if raw_dt and raw_dt != "rdfs:Literal" else detected_dt) if is_literal_obj else raw_dt
         normalized_sts.append(
             StructuredTriple(
                 subj=s_norm,
@@ -195,7 +181,7 @@ def normalize_openie_record(rec: OpenIERecord) -> NormalizedRecord:
                 subj_def=subj_d,
                 obj_def=obj_d,
                 obj_kind="literal" if is_literal_obj else "entity",
-                obj_datatype=str(getattr(st, "obj_datatype", "") or ""),
+                obj_datatype=resolved_dt,
                 obj_lang=str(getattr(st, "obj_lang", "") or ""),
             )
         )

@@ -60,7 +60,6 @@ from yaw.daemon.graph.planner import (
     prepare_sense_resolution_state,
     prepare_synonym_candidates,
     record_surface_form,
-    synthesize_copular_is_a_triples,
 )
 from yaw.daemon.graph.ppr import (
     CSRGraph,
@@ -108,7 +107,8 @@ from yaw.daemon.graph.storage import (
     upsert_semantic_edges,
 )
 
-_SAME_SENSE_COSINE_GATE = 0.85
+_AUTO_MERGE_COSINE_GATE = 0.95
+_AUTO_MERGE_DIFFLIB_GATE = 0.96
 
 
 class YawGraphEngine:
@@ -140,7 +140,8 @@ class YawGraphEngine:
         activation_renormalize: bool = False,
         beta: float = 0.5,
         dual_weight: float | None = 0.5,
-        same_sense_cosine_gate: float = _SAME_SENSE_COSINE_GATE,
+        auto_merge_cosine_gate: float = _AUTO_MERGE_COSINE_GATE,
+        auto_merge_difflib_gate: float = _AUTO_MERGE_DIFFLIB_GATE,
         max_context_chars: int | None = None,
         max_ast_expansion_hops: int = 1,
         ast_context_hops: int = 0,
@@ -187,7 +188,8 @@ class YawGraphEngine:
         self.activation_renormalize = activation_renormalize
         self.beta = beta
         self.dual_weight = dual_weight
-        self.same_sense_cosine_gate = float(same_sense_cosine_gate)
+        self.auto_merge_cosine_gate = float(auto_merge_cosine_gate)
+        self.auto_merge_difflib_gate = float(auto_merge_difflib_gate)
         self.traversal_policy: RelationTraversalPolicy | None = traversal_policy
 
         self._csr_graph: CSRGraph | None = None
@@ -1435,28 +1437,13 @@ class YawGraphEngine:
                 )
                 record_structured.append((cid, normalized_sts, ner_entities))
 
-            synthesize_copular_is_a_triples(
-                chunks,
-                record_structured,
-                all_norm_labels,
-                surface_by_norm,
-                chunk_surface_by_norm,
-            )
             sense_state = prepare_sense_resolution_state(
                 chunks,
                 record_structured,
                 all_norm_labels,
                 surface_by_norm,
-                fmt_entity=fmt_entity,
                 conn=self.conn,
             )
-            prebatch_vec_by_text: dict[str, np.ndarray] = {}
-            if sense_state.prebatch_texts:
-                p_vecs = self._encode_in_batches(sense_state.prebatch_texts, instruction="", stage="entity_embed")
-                for ct, pv in zip(sense_state.prebatch_texts, p_vecs, strict=False):
-                    pv_arr = np.asarray(pv, dtype=np.float32)
-                    n_val = float(np.linalg.norm(pv_arr))
-                    prebatch_vec_by_text[ct] = pv_arr / n_val if n_val > 0 else pv_arr
 
             dt_weight = float(self.traversal_policy.datatype_property) if self.traversal_policy is not None else 0.5
             materialized = materialize_entities_and_facts(
@@ -1464,28 +1451,19 @@ class YawGraphEngine:
                 surface_by_norm,
                 chunk_surface_by_norm,
                 sense_state,
-                prebatch_vec_by_text,
-                fmt_entity=fmt_entity,
-                same_sense_cosine_gate=self.same_sense_cosine_gate,
                 datatype_property_weight=dt_weight,
-                embed_one=lambda text: self._encode_in_batches([text], instruction="", stage="entity_embed")[0],
             )
             self._graph_rlm_stats["homograph_splits"] += materialized.homograph_splits
             entity_nodes = materialized.entity_nodes
             fact_nodes = materialized.fact_nodes
-            precomputed_entity_vecs = materialized.precomputed_entity_vecs
 
             # Compute missing entity vectors using contextual `# {name}\n{definition}`
             all_entity_ids = [eid for eid, _, _ in entity_nodes]
             existing_entity_vecs = get_existing_ids(self.conn, "entity_vec", all_entity_ids)
             missing_entities = [
-                (eid, name, defn)
-                for eid, name, defn in entity_nodes
-                if eid not in existing_entity_vecs and eid not in precomputed_entity_vecs
+                (eid, name, defn) for eid, name, defn in entity_nodes if eid not in existing_entity_vecs
             ]
-            entity_vec_pairs: list[tuple[str, np.ndarray]] = [
-                (eid, vec) for eid, vec in precomputed_entity_vecs.items() if eid not in existing_entity_vecs
-            ]
+            entity_vec_pairs: list[tuple[str, np.ndarray]] = []
             if missing_entities:
                 if progress_callback is not None:
                     progress_callback(f"indexing: embedding {len(missing_entities)} entity vectors")
@@ -1549,13 +1527,18 @@ class YawGraphEngine:
                     stage_conn.execute("BEGIN")
                     apply_prepared_graph_rows(stage_conn, prepared_rows)
 
-                candidates, cand_meta, raw_cand_count = prepare_synonym_candidates(
+                candidates, cand_meta, raw_cand_count, auto_merges = prepare_synonym_candidates(
                     stage_conn,
                     entity_nodes,
                     synonymy_threshold=self.synonymy_threshold,
                     synonymy_top_k=self.synonymy_top_k,
+                    auto_merge_cosine_gate=self.auto_merge_cosine_gate,
+                    auto_merge_difflib_gate=self.auto_merge_difflib_gate,
+                    fact_linked_pairs=materialized.fact_linked_pairs,
+                    rlm_stats=self._graph_rlm_stats,
                     progress_callback=progress_callback,
                 )
+                staged_merges.extend(auto_merges)
                 self._graph_rlm_stats["candidate_pairs"] += raw_cand_count
                 if candidates:
                     decisions: list[dict[str, str]] = []
@@ -1628,7 +1611,7 @@ class YawGraphEngine:
                     if progress_callback is not None:
                         progress_callback(f"indexing: synonym judgment ({completed_pairs}/{len(candidates)} pairs)")
 
-                    staged_merges, resolved_semantic_batch = apply_synonym_adjudication(
+                    adjudicated_merges, resolved_semantic_batch = apply_synonym_adjudication(
                         stage_conn,
                         candidates,
                         cand_meta,
@@ -1637,6 +1620,7 @@ class YawGraphEngine:
                         synonymy_threshold=self.synonymy_threshold,
                         rlm_stats=self._graph_rlm_stats,
                     )
+                    staged_merges.extend(adjudicated_merges)
 
                 # Out-of-transaction Closed-World SHACL Linting & Bounded Self-Healing via shacl_healer_rlm
                 batch_node_ids = set(chunk_ids) | set(all_entity_ids) | set(all_fact_ids)
@@ -2409,7 +2393,8 @@ class YawGraphEngine:
                     "activation_renormalize",
                     "beta",
                     "dual_weight",
-                    "same_sense_cosine_gate",
+                    "auto_merge_cosine_gate",
+                    "auto_merge_difflib_gate",
                 )
             },
             bind_program_hooks=self._bind_program_hooks,

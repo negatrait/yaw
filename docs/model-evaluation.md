@@ -2,6 +2,10 @@
 
 Decision: 2026-10-14. This document owns the selected model matrix and the comparison protocol. FOUNDATIONAL owns runtime scope; Epic 1 owns implementation acceptance. **Report differences; the user will decide what constitutes substantial degradation.** No automatic F1 cutoff selects a winner.
 
+> On Llama, models are loaded with args:
+> - embeddinggemma: `-ngl all --pooling mean --parallel 1 --cache-ram 0 --batch-size 2048 --ubatch-size 2048`
+> - gemma4: `-ngl all --pooling mean --parallel 1 --cache-ram 0 --batch-size 2048 --ubatch-size 2048`
+
 ## Selected development models
 
 | Role | Lemonade ID | Checkpoint | Model contract |

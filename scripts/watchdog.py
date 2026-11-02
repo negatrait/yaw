@@ -216,10 +216,10 @@ def get_lemonade_server_metrics() -> dict[str, Any]:
 
         return {
             "server_up": True,
-            "qwen_tps": round(pick("tokens_per_second"), 1),
-            "qwen_ttft_sec": round(pick("time_to_first_token"), 3),
-            "qwen_latest_prompt_tokens": int(pick("model_input_tokens{")),
-            "qwen_latest_output_tokens": int(pick("model_output_tokens{")),
+            "llm_tps": round(pick("tokens_per_second"), 1),
+            "llm_ttft_sec": round(pick("time_to_first_token"), 3),
+            "llm_latest_prompt_tokens": int(pick("model_input_tokens{")),
+            "llm_latest_output_tokens": int(pick("model_output_tokens{")),
             "cpu_usage_pct": round(m.get("lemonade_cpu_usage_percent", 0.0), 1),
             "memory_used_gb": round(m.get("lemonade_memory_used_gb", 0.0), 1),
             "requests_total": int(m.get("lemonade_requests_total", 0)),
@@ -794,7 +794,7 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
         fontweight="bold",
     )
     rate = f"{pt.velocity:.2f}/m" if pt.velocity is not None else "n/a"
-    tps = f"{lem['qwen_tps']:.0f} tok/s" if lem.get("server_up") else "LLM metrics n/a"
+    tps = f"{lem['llm_tps']:.0f} tok/s" if lem.get("server_up") else "LLM metrics n/a"
     fig.text(
         0.04,
         0.91,
@@ -1910,7 +1910,7 @@ def generate_report_markdown(
             "Throughput",
             f"**`{_v(pt.velocity, '{:.2f}')}` chunks/min** (last 20 min, "
             f"`{_v(pt.sec_per_chunk, '{:.1f}')}` s/chunk) • LLM "
-            f"**`{_v(lem.get('qwen_tps') if lem.get('server_up') else None, '{:.1f}')}` tok/s**",
+            f"**`{_v(lem.get('llm_tps') if lem.get('server_up') else None, '{:.1f}')}` tok/s**",
         ),
         (
             "GPU / Memory",

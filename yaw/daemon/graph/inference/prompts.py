@@ -192,11 +192,13 @@ class FactList(BaseModel):
 
 class ExtractEntities(dspy.Signature):
     """Extract all named entities (people, organizations, locations, systems, products, artifacts) and domain \
-concepts from `passage` into `named_entities` as concise `[skos:prefLabel, skos:definition]` pairs.
-    - `skos:Concept` & `owl:NamedIndividual` Scope (SKOS S14): Represent every named entity and domain concept as \
-a concise canonical noun phrase (`skos:prefLabel`, never a full sentence, imperative instruction, or checklist \
-clause). Exclude bare scalar `rdfs:Literal` values (numbers, percentages, dates, timestamps, durations, booleans, \
-or version strings, which belong in `owl:DatatypeProperty` object slots).
+concepts grounded in the body prose of `passage` into `named_entities` as concise `[skos:prefLabel, \
+skos:definition]` pairs.
+    - `skos:Concept` & `owl:NamedIndividual` Scope (SKOS S14): Represent every prose-grounded named entity and \
+domain concept as a concise canonical noun phrase (`skos:prefLabel`, never a full sentence, imperative \
+instruction, checklist clause, or document container/header metadata tag). Exclude bare scalar `rdfs:Literal` \
+values (numbers, percentages, dates, timestamps, durations, booleans, or version strings, which belong in \
+`owl:DatatypeProperty` object slots).
     - Contextual `skos:definition` (`ConceptShape/definition`, `sh:minCount 1`): Pair each extracted entity with a \
 concise, non-tautological `skos:definition` stating its ontological class (`rdf:type` / genus) and distinguishing \
 role in `passage` (never repeat `skos:prefLabel` verbatim as its own definition)."""
@@ -209,12 +211,17 @@ role in `passage` (never repeat `skos:prefLabel` verbatim as its own definition)
 
 class ExtractTriples(dspy.Signature):
     """Construct a closed-world W3C `rdf:Statement` graph in `triples` from `passage` and `named_entities`.
-    Each element in `triples` is a reified `rdf:Statement` object with keys `"sub"` (`rdf:subject`), `"pred"` \
-(`rdf:predicate` pair), `"obj"` (`rdf:object`), and `"def"` (statement-level `skos:definition`):
-    - Closed-World Anchoring & Connectedness (`StatementShape/closedWorld`): Resolve pronouns to canonical \
-`skos:prefLabel` strings from `named_entities`, emit `"sub"` or `"obj"` as an exact string when already defined \
-in `named_entities` or as `[name, contextual_definition]` when introducing a passage-grounded resource, and \
-bridge extracted `skos:Concept` nodes into a connected subgraph.
+    Each element in `triples` is a prose-grounded reified `rdf:Statement` object with keys `"sub"` \
+(`rdf:subject`), `"pred"` (`rdf:predicate` pair), `"obj"` (`rdf:object`), and `"def"` (statement-level \
+`skos:definition`):
+    - Closed-World Anchoring & Connectedness (`StatementShape/closedWorld`): Extract only factual assertions \
+grounded in `passage` prose (never fabricate triples from document container/header metadata tags). Resolve \
+pronouns to canonical `skos:prefLabel` strings from `named_entities`, emit `"sub"` or `"obj"` as an exact string \
+when already defined in `named_entities` or as `[name, contextual_definition]` when introducing a \
+passage-grounded resource, and bridge extracted `skos:Concept` nodes into a connected subgraph.
+    - Statement Definition Integrity (`"def"`, `StatementShape/closedWorld`): `"def"` must concisely define the \
+relational assertion linking `"sub"`, `"pred"`, and `"obj"` in `passage`, and MUST NEVER copy `"sub"`'s or \
+`"obj"`'s entity `skos:definition` verbatim.
     - `rdfs:domain` & Irreflexivity (`owl:IrreflexiveProperty`): `"sub"` must be a `skos:Concept` / \
 `owl:NamedIndividual` (never a bare `rdfs:Literal`), and `"sub"` and `"obj"` must never denote the same concept \
 (no reflexive self-loops).
@@ -263,7 +270,8 @@ and source passages.
     - Leibniz Substitutability Gate (`owl:sameAs` / SKOS S14): A `skos:Concept` has a single intensional identity. \
 Classify as `'skos:altLabel'` or `'skos:hiddenLabel'` ONLY when A and B are strictly coreferent (`owl:sameAs`) \
 such that substituting A for B across every `rdf:Statement` subject and object position preserves truth and \
-ontological sort (`rdf:type`) *salva veritate*.
+ontological sort (`rdf:type`) *salva veritate*. Never merge coordinate siblings, antonyms/opposites, distinct \
+telemetry metrics/headers, or numbered tiers/versions via `'skos:altLabel'` or `'skos:hiddenLabel'`.
     - Ontological Sort, Mereological & Functional Role Disjointness (SKOS S13): If A and B have different \
 ontological classes (`rdf:type`), different mereological levels (whole system/platform vs component/module/artifact), \
 different causal or functional roles (an agent/platform/service vs an activity/job/process/execution; a \
@@ -278,16 +286,16 @@ abbreviation, singular/plural inflection, or synonymous lexical variant of the e
 passages (`canonical` = more standard/complete `skos:prefLabel`).
       2. `'skos:hiddenLabel'`: Strictly coreferent `skos:Concept` where the non-canonical label is an \
 orthographic typo, transcription error, or corrupted surface form (`canonical` = clean `skos:prefLabel`).
-      3. `'owl:differentFrom'`: Symmetric non-identity between homonymous or lexically confusable `skos:Concept` \
-nodes denoting disjoint referents (`owl:AllDisjointClasses` or mutually exclusive states with incompatible \
-`rdf:Statement` assertions).
+      3. `'owl:differentFrom'`: Symmetric non-identity (`owl:AllDisjointClasses`) between any disjoint, \
+non-identical, or unrelated `skos:Concept` nodes (including polysemous homonyms, antonyms, and cross-domain \
+concepts that share no taxonomic `skos:broader` hierarchy and no direct domain `skos:related` interaction).
       4. `'skos:broader'`: Strict asymmetric transitive subsumption (`skos:broaderTransitive` / `rdfs:subClassOf` \
 generic *is-a* or partitive *part-of* hierarchy) where one concept is a restricted/qualified taxonomic subtype \
 or sub-component of the broader parent concept (`canonical` = the broader parent `skos:Concept`).
       5. `'skos:related'`: Non-hierarchical symmetric associative relation (SKOS S27: disjoint from \
-`skos:broaderTransitive`) linking distinct `skos:Concept` nodes that interact in the domain, occupy different \
-functional roles (platform/process/mapping/row/field/artifact), participate in an `rdf:Statement`, or are \
-coordinate sibling concepts sharing a parent category."""
+`skos:broaderTransitive`) linking distinct `skos:Concept` nodes that directly interact in the same domain, \
+occupy coupled functional roles (platform/process/mapping/row/field/artifact), participate in an `rdf:Statement`, \
+or are coordinate sibling concepts sharing a parent category."""
 
     candidate_pairs: str = dspy.InputField(
         desc=(
@@ -315,13 +323,16 @@ canonical entity ID).
     - `ConceptShape/homographDifferentFrom` & Equivalence / Disjointness: `'merge_altLabel'` or \
 `'merge_hiddenLabel'` (`value` = canonical entity ID when coreferent `owl:sameAs`), or `'add_different_from'` / \
 `'assert_differentFrom'` (`value` = distinct homonym entity ID).
-    - `ConceptShape/broaderCycle`, `ConceptShape/lexicalSubsumption`, `ConceptShape/siblingNotBroader`, & \
+    - `ConceptShape/broaderCycle` & \
 `ConceptShape/S27-disjointBroaderRelated` (SKOS S19-S27 hierarchy & association axioms): `'assert_broader'` \
 (`value` = broader parent entity ID), `'invert_broader'` (`value` = narrower/broader partner ID), \
 `'assert_related'` or `'demote_sibling_to_related'` (`value` = associative peer ID), \
 `'remove_hierarchy_cycle'` (`value` = cycle partner ID), or `'remove_conflicting_related'` (`value` = \
 conflicting relative ID).
-    - `EdgeShape/closedWorld` & `StatementShape/closedWorld` (referential & literal integrity): \
+    - `EdgeShape/closedWorld` & `StatementShape/closedWorld` (referential, statement definition & literal \
+integrity): for missing or endpoint-duplicated statement definitions (`result_path="skos:definition"` on a \
+`fact-*` focus node), emit `'set_definition'` or `'rewrite_definition'` (`value` = relational statement \
+definition distinct from its subject/object entity definitions); for dangling endpoints or invalid facts, emit \
 `'delete_dangling'` or `'delete_invalid_fact'` (`value` = `""` or offending target ID)."""
 
     violations: str = dspy.InputField(desc="JSON list of SHACLViolation report items")
@@ -353,18 +364,19 @@ evidentiary relevance; never fabricate or modify triple elements."""
 class AnswerQuestion(dspy.Signature):
     """Deduce a definitive closed-world answer to `question` grounded in the retrieved `skos:Concept` passages \
 and reified `rdf:Statement` evidence in `context`.
-    Trace multi-hop entity and relation chains methodically in your reasoning, then emit a concise final \
-`answer` devoid of extraneous elaboration:
-    - For 'Who', 'What', 'When', or 'Where' questions, state only the exact bare entity, name, or number \
-without conversational framing or leading articles.
-    - For 'How' or 'Why' questions, state both the governing condition/mechanism and the resulting outcome \
-established in `context`.
+    Trace multi-hop entity and relation chains methodically in your reasoning, then emit a final `answer` whose \
+completeness matches the scope of `question`:
+    - For single-target factoid questions ('Who', 'When', 'Where', or a single identifier/number), state the \
+concise canonical entity, name, or value without conversational filler.
+    - For multi-clause, mechanism, comparison, or 'What'/'How'/'Why' questions asking for causes, actions, \
+mitigations, or multiple attributes, state a complete grounded statement covering every requested facet and \
+governing condition established in `context`.
     - If `context` lacks sufficient evidence to entail the answer, state: "Insufficient references in corpus" \
 or "Insufficient information"."""
 
     context: str = dspy.InputField(desc="Retrieved evidence passages")
     question: str = dspy.InputField(desc="Question to answer")
-    answer: str = dspy.OutputField(desc="Concise, definitive final answer (bare entity or value)")
+    answer: str = dspy.OutputField(desc="Definitive grounded final answer matching the scope of question")
 
 
 class ExtractQueryIntent(dspy.Signature):
@@ -384,9 +396,9 @@ class HealSHACLViolations(dspy.Signature):
     """As a Recursive Language Model (RLM) orchestrator for closed-world W3C SHACL graph healing, inspect \
 violating `sh:focusNode` items (`ConceptShape/*`, `StatementShape/closedWorld`, `EdgeShape/closedWorld`) \
 using `inspect_focus_node`, `inspect_pair`, `hydrate_chunk`, `hydrate_ast_island`, `search_graph`, \
-`qwen_propose_shacl_repairs`, and `lint_shacl` read-only sandbox tools.
+`llm_propose_shacl_repairs`, and `lint_shacl` read-only sandbox tools.
     Gather the SKOS/RDF/OWL neighborhood and source chunk dossiers for the focus nodes, delegate structured \
-repair synthesis to `qwen_propose_shacl_repairs`, and return the complete repair list in `repairs`."""
+repair synthesis to `llm_propose_shacl_repairs`, and return the complete repair list in `repairs`."""
 
     violations: str = dspy.InputField(desc="JSON list of SHACLViolation report items")
     repairs: list[dict[str, Any]] = dspy.OutputField(

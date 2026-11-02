@@ -180,6 +180,8 @@ class YawConfig:
 
     synonymy_threshold: float = 0.8
     synonymy_top_k: int = 100
+    auto_merge_cosine_gate: float = 0.95
+    auto_merge_difflib_gate: float = 0.96
     embed_batch_size: int = 64
     embed_batch_chars: int = 3500
     max_context_chars: int | None = None
@@ -244,6 +246,10 @@ class YawConfig:
             object.__setattr__(self, "max_context_chars", context_chars)
         if context_chars < 1:
             raise YawRuntimeError("INVALID_INPUT", "max_context_chars must be positive")
+        if not 0.0 < self.auto_merge_cosine_gate <= 1.0:
+            raise YawRuntimeError("INVALID_INPUT", "auto_merge_cosine_gate must be in (0.0, 1.0]")
+        if not 0.0 < self.auto_merge_difflib_gate <= 1.0:
+            raise YawRuntimeError("INVALID_INPUT", "auto_merge_difflib_gate must be in (0.0, 1.0]")
         if self.optimize_mode not in ("miprov2", "gepa", "hybrid"):
             raise YawRuntimeError("INVALID_INPUT", f"Unsupported optimize_mode: {self.optimize_mode!r}")
         if self.optimize_auto not in ("light", "medium", "heavy"):
@@ -431,6 +437,8 @@ class YawConfig:
             "reflection_tokenizer_url": self.reflection_tokenizer_url,
             "max_context_chars": self.max_context_chars,
             "synonymy_threshold": self.synonymy_threshold,
+            "auto_merge_cosine_gate": self.auto_merge_cosine_gate,
+            "auto_merge_difflib_gate": self.auto_merge_difflib_gate,
             "damping": self.damping,
         }
         raw = json.dumps(payload, sort_keys=True).encode("utf-8")
@@ -490,6 +498,8 @@ _FIELD_TO_SECTION: dict[str, str] = {
     "damping": "graph",
     "synonymy_threshold": "graph",
     "synonymy_top_k": "graph",
+    "auto_merge_cosine_gate": "graph",
+    "auto_merge_difflib_gate": "graph",
     "embed_batch_size": "graph",
     "embed_batch_chars": "graph",
     "max_context_chars": "graph",

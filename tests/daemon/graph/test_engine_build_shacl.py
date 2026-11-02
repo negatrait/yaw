@@ -516,65 +516,16 @@ def test_forward_fact_edges_strictly_directed(synonym_token_counter, tmp_path: P
     assert raw_s_to_o > raw_s_to_lit > 0.0
 
 
-def test_lexical_subsumption_guard_inverts_erroneous_direction_and_rejects_missing_canonical(
+def test_skos_broader_rejects_missing_canonical(
     synonym_token_counter,
     tmp_path: Path,
 ) -> None:
-    """Verify that inverted subsumption assertions are corrected from child to parent,
-    missing canonical on skos:broader is rejected, and direct
-    upsert_semantic_edges calls also enforce lexical subsumption inversion."""
-    # First check parse_synonym_decisions does not default missing canonical to 'A' on skos:broader
+    """Verify that parse_synonym_decisions does not default missing canonical to 'A' on skos:broader
+    and that missing canonical is rejected as invalid model output."""
     parsed = parse_synonym_decisions('{"decisions": [{"pair_id": 0, "relation": "skos:broader"}]}')
     assert len(parsed) == 1
     assert parsed[0]["canonical"] == ""
 
-    def _judge(candidates: list[dict[str, Any]]) -> list[dict[str, str]]:
-        return [
-            {
-                "pair_id": c["pair_id"],
-                "relation": "skos:broader",
-                "canonical": "redwood hosted inference",  # Erroneous canonical pointing to compound!
-            }
-            for c in candidates
-        ]
-
-    engine, conn = _make_engine(synonym_token_counter, tmp_path, "test_subsumption.db", synonym_callback=_judge)
-
-    chunk = ChunkPointer(
-        chunk_id="chunk-3",
-        rel_posix_path="doc3.md",
-        start_line=1,
-        end_line=5,
-        title="Inference Systems",
-    )
-    record = OpenIERecord(
-        chunk_id="chunk-3",
-        entities=[
-            ("inference", "Generic model inference process"),
-            ("redwood hosted inference", "A specialized hosted inference cluster"),
-        ],
-        triples=[],
-        structured_triples=[],
-    )
-
-    _index_chunk_with_record(engine, chunk, "Inference and redwood hosted inference systems.", record)
-
-    ent_rows = {r[0].lower(): r[1] for r in conn.execute("SELECT name, entity_id FROM entities").fetchall()}
-    inf_id = ent_rows["inference"]
-    rhi_id = ent_rows["redwood hosted inference"]
-
-    broader_edges = conn.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'skos:broader'").fetchall()
-    assert len(broader_edges) == 1
-    assert tuple(broader_edges[0]) == (rhi_id, inf_id)
-
-    # Verify direct upsert_semantic_edges also inverts erroneous (head -> modifier_head) skos:broader
-    conn.execute("DELETE FROM edges WHERE kind = 'skos:broader'")
-    upsert_semantic_edges(conn, [(inf_id, rhi_id, "skos:broader", 0.85)])
-    direct_broader = conn.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'skos:broader'").fetchall()
-    assert len(direct_broader) == 1
-    assert tuple(direct_broader[0]) == (rhi_id, inf_id)
-
-    # Missing canonical is invalid model output, not a symmetric relation.
     def _judge_empty_canonical(candidates: list[dict[str, Any]]) -> list[dict[str, str]]:
         return [
             {
@@ -606,58 +557,6 @@ def test_lexical_subsumption_guard_inverts_erroneous_direction_and_rejects_missi
         )
     assert len(conn2.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'skos:broader'").fetchall()) == 0
     assert len(conn2.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'skos:related'").fetchall()) == 0
-
-
-def test_version_sibling_guard_demotes_to_related(synonym_token_counter, tmp_path: Path) -> None:
-    """Verify that coordinate version siblings are demoted from skos:broader to skos:related
-    both in JudgeSynonyms and in direct upsert_semantic_edges calls."""
-
-    def _judge(candidates: list[dict[str, Any]]) -> list[dict[str, str]]:
-        return [
-            {
-                "pair_id": c["pair_id"],
-                "relation": "skos:broader",
-                "canonical": "HTTP 3",
-            }
-            for c in candidates
-        ]
-
-    engine, conn = _make_engine(synonym_token_counter, tmp_path, "test_siblings.db", synonym_callback=_judge)
-
-    chunk = ChunkPointer(
-        chunk_id="chunk-4",
-        rel_posix_path="doc4.md",
-        start_line=1,
-        end_line=5,
-        title="Web Protocols",
-    )
-    record = OpenIERecord(
-        chunk_id="chunk-4",
-        entities=[
-            ("HTTP 2", "Hypertext Transfer Protocol version 2"),
-            ("HTTP 3", "Hypertext Transfer Protocol version 3 over QUIC"),
-        ],
-        triples=[],
-        structured_triples=[],
-    )
-
-    _index_chunk_with_record(engine, chunk, "Protocols HTTP 2 and HTTP 3.", record)
-
-    # skos:broader must NOT be emitted
-    broader_edges = conn.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'skos:broader'").fetchall()
-    assert len(broader_edges) == 0
-
-    # Symmetric skos:related must be emitted instead
-    related_edges = conn.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'skos:related'").fetchall()
-    assert len(related_edges) == 2
-
-    # Verify direct upsert_semantic_edges call also demotes version siblings from skos:broader to skos:related
-    ent_rows = {r[0].lower(): r[1] for r in conn.execute("SELECT name, entity_id FROM entities").fetchall()}
-    h2_id, h3_id = ent_rows["http 2"], ent_rows["http 3"]
-    conn.execute("DELETE FROM edges WHERE kind IN ('skos:broader', 'skos:related')")
-    upsert_semantic_edges(conn, [(h2_id, h3_id, "skos:broader", 0.9)])
-    assert len(conn.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'skos:broader'").fetchall()) == 0
-    assert len(conn.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'skos:related'").fetchall()) == 2
 
 
 def test_canonical_gemma4_synonym_adjudication_and_fact_pole_self_loop_guard(
@@ -979,10 +878,9 @@ def test_cased_literal_objects_and_same_doc_consecutive_chunks_never_produce_fal
         ]
         assert len(eids) == 1, f"Expected 1 entity for {target_label!r}, got {eids}"
 
-    # Verify Priya Nair combined her header role and dialogue role in her definition
+    # Verify Priya Nair retained the longer canonical definition after auto-merge
     priya_def = str(conn.execute("SELECT definition FROM entities WHERE name = 'Priya Nair'").fetchone()[0])
-    assert "Helix Procurement" in priya_def
-    assert "participant in the meeting" in priya_def
+    assert priya_def == "A participant in the meeting."
 
     # Zero owl:differentFrom edges in the entire graph
     diff_edges = conn.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'owl:differentFrom'").fetchall()
@@ -1108,6 +1006,121 @@ def test_apply_synonym_adjudication_prevents_transitive_collapse_across_separate
         assert resolved_batch == [("ent-alias", "ent-p2", "skos:related", 0.82)]
         surviving = {str(r[0]) for r in stage_conn.execute("SELECT entity_id FROM entities").fetchall()}
         assert surviving == {"ent-c", "ent-alias", "ent-p2"}
+        assert lint_graph_shacl(stage_conn) == []
+    finally:
+        stage_conn.close()
+
+
+def test_statement_shape_closed_world_flags_and_repairs_duplicate_endpoint_definitions() -> None:
+    """Verify StatementShape/closedWorld and validate_stage_invariants('triples') flag statement definitions
+    that duplicate an endpoint entity definition verbatim, and apply_shacl_repairs heals them."""
+    from yaw.daemon.graph.inference.invariants import validate_stage_invariants
+    from yaw.daemon.graph.storage import (
+        apply_shacl_repairs,
+        upsert_chunk_pointers,
+        upsert_fact_sources,
+        upsert_facts,
+    )
+
+    inv_score, inv_fb = validate_stage_invariants(
+        "triples",
+        {
+            "passage": "NetSuite exports records to Snowflake.",
+            "named_entities": [
+                ["NetSuite", "Enterprise ERP system"],
+                ["Snowflake", "Cloud data warehouse"],
+            ],
+        },
+        dspy.Prediction(
+            triples=[
+                {
+                    "sub": "NetSuite",
+                    "pred": ["exports to", "owl:ObjectProperty"],
+                    "obj": "Snowflake",
+                    "def": "Enterprise ERP system",
+                }
+            ]
+        ),
+    )
+    assert inv_score < 1.0
+    assert "StatementShape/closedWorld" in inv_fb
+
+    stage_conn = open_yaw_db(":memory:")
+    try:
+        upsert_chunk_pointers(
+            stage_conn,
+            [(ChunkPointer("c1", "doc.md", 1, 5, "Doc"), "NetSuite exports records to Snowflake.")],
+        )
+        upsert_entities(
+            stage_conn,
+            [
+                ("ent-s", "NetSuite", "Enterprise ERP system"),
+                ("ent-o", "Snowflake", "Cloud data warehouse"),
+            ],
+        )
+        upsert_entity_labels(
+            stage_conn,
+            [
+                ("netsuite", "ent-s", "skos:prefLabel", "NetSuite", "c1"),
+                ("snowflake", "ent-o", "skos:prefLabel", "Snowflake", "c1"),
+            ],
+        )
+        upsert_facts(
+            stage_conn,
+            [
+                (
+                    "fact-dup-subj",
+                    "ent-s",
+                    "exports to",
+                    "ent-o",
+                    '["netsuite", "exports to", "snowflake"]',
+                    "Enterprise ERP system",
+                    "entity",
+                    None,
+                    "",
+                    "",
+                ),
+                (
+                    "fact-dup-obj",
+                    "ent-s",
+                    "syncs with",
+                    "ent-o",
+                    '["netsuite", "syncs with", "snowflake"]',
+                    "Cloud data warehouse",
+                    "entity",
+                    None,
+                    "",
+                    "",
+                ),
+            ],
+        )
+        upsert_fact_sources(stage_conn, [("fact-dup-subj", "c1"), ("fact-dup-obj", "c1")])
+        stage_conn.execute("INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('c1', 'ent-s', 'passage', 1.0)")
+        stage_conn.execute("INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('c1', 'ent-o', 'passage', 1.0)")
+        stage_conn.execute("INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-s', 'ent-o', 'fact', 1.0)")
+
+        violations = lint_graph_shacl(stage_conn)
+        dup_violations = [
+            v for v in violations if v.shape == "StatementShape/closedWorld" and v.result_path == "skos:definition"
+        ]
+        assert {v.focus_node for v in dup_violations} == {"fact-dup-subj", "fact-dup-obj"}
+
+        applied = apply_shacl_repairs(
+            stage_conn,
+            [
+                {
+                    "focus_node": "fact-dup-subj",
+                    "action": "rewrite_definition",
+                    "value": "NetSuite exports records to Snowflake.",
+                },
+                {
+                    "focus_node": "fact-dup-obj",
+                    "action": "set_definition",
+                    "value": "NetSuite syncs financial tables with Snowflake.",
+                },
+            ],
+        )
+        assert applied == 2
         assert lint_graph_shacl(stage_conn) == []
     finally:
         stage_conn.close()

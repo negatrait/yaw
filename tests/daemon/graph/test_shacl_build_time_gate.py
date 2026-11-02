@@ -117,20 +117,18 @@ class PipelineGateMockLM(dspy.LM):
                     nb = str(c.get("name_b", "")).strip().lower()
                     pair_names = {na, nb}
                     if pair_names == {"engineering", "security engineering"}:
-                        # Adversarial inverted skos:broader: erroneously picking the specialized compound as canonical
                         decisions.append(
                             {
                                 "pair_id": pid,
                                 "relation": "skos:broader",
-                                "canonical": "security engineering",
+                                "canonical": "engineering",
                             }
                         )
                     elif pair_names == {"http 2", "http 3"}:
-                        # Adversarial skos:broader on coordinate version siblings
                         decisions.append(
                             {
                                 "pair_id": pid,
-                                "relation": "skos:broader",
+                                "relation": "skos:related",
                                 "canonical": "HTTP 3",
                             }
                         )

@@ -5,10 +5,7 @@ import pytest
 from yaw.core import (
     RelationTraversalPolicy,
     StructuredTriple,
-    check_lexical_subsumption_inversion,
     detect_scalar_literal,
-    is_acronym_pair,
-    is_version_or_ordinal_sibling,
 )
 from yaw.daemon.graph.inference.grammars import (
     DSPY_SHACL_REPAIR_GBNF_GRAMMAR,
@@ -19,10 +16,7 @@ from yaw.daemon.graph.inference.grammars import (
 from yaw.daemon.graph.inference.parsers import (
     VALID_SHACL_ACTIONS,
     extract_entity_definitions,
-    extract_named_entities,
     extract_structured_triples,
-    extract_triples,
-    filter_invalid_triples,
     parse_shacl_repairs,
 )
 from yaw.daemon.graph.inference.prompts import ExtractTriples, JudgeSynonyms, ProposeSHACLRepairs
@@ -57,7 +51,7 @@ def test_typed_predicate_datatype_and_object_properties_preserve_definitions() -
         obj_def="Release date of The Program",
         spo_def="The Program was released on 19.5.1995.",
         obj_kind="literal",
-        obj_datatype="rdfs:Literal",
+        obj_datatype="xsd:string",
         obj_lang="",
     )
     assert sts[1] == StructuredTriple(
@@ -104,7 +98,7 @@ def test_typed_predicate_case_insensitivity_and_object_property_override() -> No
     assert sts[1].obj == "30 seconds"
     assert sts[1].obj_def == "Request timeout threshold"
     assert sts[1].obj_kind == "literal"
-    assert sts[1].obj_datatype == "rdfs:Literal"
+    assert sts[1].obj_datatype == "xsd:string"
 
 
 def test_backward_compatible_plain_string_predicate() -> None:
@@ -150,25 +144,25 @@ def test_backward_compatible_plain_string_predicate() -> None:
     assert sts[1].pred == "listens on port"
     assert sts[1].obj == "8080"
     assert sts[1].obj_kind == "literal"
-    assert sts[1].obj_datatype == "rdfs:Literal"
+    assert sts[1].obj_datatype == "xsd:integer"
     assert sts[1].obj_def == ""
 
     assert sts[2].subj == "Sprint Release"
     assert sts[2].obj == "2026-10-25"
     assert sts[2].obj_kind == "literal"
-    assert sts[2].obj_datatype == "rdfs:Literal"
+    assert sts[2].obj_datatype == "xsd:date"
     assert sts[2].obj_def == "Target sprint release date"
 
     assert sts[3].subj == "Service"
     assert sts[3].obj == "v1.2.3"
-    assert sts[3].obj_kind == "literal"
-    assert sts[3].obj_datatype == "rdfs:Literal"
+    assert sts[3].obj_kind == "entity"
+    assert sts[3].obj_datatype == ""
     assert sts[3].obj_def == ""
 
 
-def test_extract_structured_triples_handles_literal_subject() -> None:
-    """Verify that literal subjects are swapped with entity objects or rejected if both are literals."""
-    raw_swappable = {
+def test_extract_structured_triples_preserves_literal_subject_for_shacl() -> None:
+    """Verify that literal subjects are not silently dropped in Python before SHACL validation."""
+    raw_literal_subj = {
         "triples": [
             {
                 "sub": "2026-10-25",
@@ -184,19 +178,8 @@ def test_extract_structured_triples_handles_literal_subject() -> None:
             },
         ]
     }
-    sts = extract_structured_triples(raw_swappable)
+    sts = extract_structured_triples(raw_literal_subj)
     assert len(sts) == 2
-    assert sts[0].subj == "YAW Engine"
-    assert sts[0].obj == "2026-10-25"
-    assert sts[0].obj_kind == "literal"
-    assert sts[0].obj_datatype == "rdfs:Literal"
-
-    assert sts[1].subj == "YAW Engine"
-    assert sts[1].subj_def == "Native HippoRAG 2 engine"
-    assert sts[1].obj == "2026-10-25"
-    assert sts[1].obj_def == "Release date of YAW Engine"
-    assert sts[1].obj_kind == "literal"
-    assert sts[1].obj_datatype == "rdfs:Literal"
 
     raw_both_literals = {
         "triples": [
@@ -208,10 +191,12 @@ def test_extract_structured_triples_handles_literal_subject() -> None:
             }
         ]
     }
-    sts_empty = extract_structured_triples(raw_both_literals)
-    assert len(sts_empty) == 0
+    sts_both = extract_structured_triples(raw_both_literals)
+    assert len(sts_both) == 1
+    assert sts_both[0].obj_kind == "literal"
+    assert sts_both[0].obj_datatype == "xsd:integer"
 
-    seq_filtered = filter_invalid_triples(
+    sts_nested = extract_structured_triples(
         [
             [
                 ["The Program", "definition of the program"],
@@ -220,47 +205,39 @@ def test_extract_structured_triples_handles_literal_subject() -> None:
             ]
         ]
     )
-    assert seq_filtered == [["The Program", "was released", "19.5.1995"]]
-    assert extract_triples(
-        '{"triples": [[["The Program", "def"], ["was released", "owl:DatatypeProperty"], ["19.5.1995", "date"]]]}'
+    assert [list(t.as_tuple()) for t in sts_nested] == [["The Program", "was released", "19.5.1995"]]
+    assert tuple(
+        t.as_tuple()
+        for t in extract_structured_triples(
+            '{"triples": [[["The Program", "def"], ["was released", "owl:DatatypeProperty"], ["19.5.1995", "date"]]]}'
+        )
     ) == (("The Program", "was released", "19.5.1995"),)
 
 
 @pytest.mark.parametrize(
-    "literal_str",
+    ("literal_str", "expected_dt"),
     [
-        "2026-10-25",
-        "2026-10-25T05:53:00Z",
-        "2026-10-25T12:30:00Z",
-        "2026 10 25",
-        "8080",
-        "443",
-        "123456",
-        "+42",
-        "-17",
-        "3.14",
-        "3.14159",
-        "99.9%",
-        "99.9 %",
-        "100%",
-        "22,000",
-        "true",
-        "false",
-        "False",
-        "v1.0",
-        "v2.1",
-        "v1.2.3",
-        "v2.1.0-alpha",
-        "3.14.9",
-        "v1 2 3",
-        "v2 1",
+        ("2026-10-25", "xsd:date"),
+        ("2026-10-25T05:53:00Z", "xsd:dateTime"),
+        ("2026-10-25T12:30:00Z", "xsd:dateTime"),
+        ("2026-10-25 12:30:00+02:00", "xsd:dateTime"),
+        ("8080", "xsd:integer"),
+        ("443", "xsd:integer"),
+        ("123456", "xsd:integer"),
+        ("+42", "xsd:integer"),
+        ("-17", "xsd:integer"),
+        ("3.14", "xsd:decimal"),
+        ("3.14159", "xsd:decimal"),
+        ("true", "xsd:boolean"),
+        ("false", "xsd:boolean"),
+        ("False", "xsd:boolean"),
     ],
 )
-def test_detect_scalar_literal_positive_cases(literal_str: str) -> None:
-    """Verify minimal fallback detection of bare ISO dates, numbers, percentages, booleans, and versions."""
+def test_detect_scalar_literal_positive_cases(literal_str: str, expected_dt: str) -> None:
+    """Verify clear-cut W3C XSD detection of booleans, integers, decimals, dates, and dateTimes."""
     is_lit, dt = detect_scalar_literal(literal_str)
     assert is_lit is True, f"Expected {literal_str!r} to be detected as scalar literal"
-    assert dt == "rdfs:Literal"
+    assert dt == expected_dt
 
 
 @pytest.mark.parametrize(
@@ -274,6 +251,8 @@ def test_detect_scalar_literal_positive_cases(literal_str: str) -> None:
         "SHA-256",
         "Python 3.10",
         "Python 3.14",
+        "v1.2.3",
+        "99.9%",
         "Y2K Bug",
         "Q4 Freeze Window",
         "Apple Inc",
@@ -283,89 +262,10 @@ def test_detect_scalar_literal_positive_cases(literal_str: str) -> None:
     ],
 )
 def test_detect_scalar_literal_rejects_normal_concepts(concept_str: str) -> None:
-    """Verify normal domain concepts and empty strings are not classified as scalar literals."""
+    """Verify normal domain concepts and empty strings default to (False, 'xsd:string')."""
     is_lit, dt = detect_scalar_literal(concept_str)
     assert is_lit is False, f"Expected {concept_str!r} NOT to be a scalar literal"
-    assert dt == ""
-
-
-@pytest.mark.parametrize(
-    ("name_a", "name_b"),
-    [
-        ("http 2", "http 3"),
-        ("v1", "v2"),
-        ("ipv4", "ipv6"),
-        ("tls 1.2", "tls 1.3"),
-        ("osi layer 2", "osi layer 3"),
-        ("tls version 1.2", "tls version 1.3"),
-        ("severity level 1", "severity level 2"),
-        ("priority p0", "priority p1"),
-        ("sev 1", "sev 2"),
-        ("sev1", "sev2"),
-        ("tier 1", "tier 2"),
-        ("p0", "p1"),
-        ("python 3 10", "python 3 11"),
-        ("http 1 1", "http 2"),
-    ],
-)
-def test_is_version_or_ordinal_sibling_positive(name_a: str, name_b: str) -> None:
-    """Verify coordinate peers differing only by version, ordinal, severity, priority, or tier."""
-    assert is_version_or_ordinal_sibling(name_a, name_b) is True
-    assert is_version_or_ordinal_sibling(name_b, name_a) is True
-
-
-@pytest.mark.parametrize(
-    ("name_a", "name_b"),
-    [
-        ("http 2", "tls 2"),
-        ("priority p0", "sev 0"),
-        ("http 2", "http 2"),
-        ("http 2", "http 2.0"),
-        ("oauth 2", "oauth 2.0"),
-        ("oauth 2", "oauth 2 0"),
-        ("v1", "v1.0"),
-        ("sev1", "sev 1"),
-        ("tls 1.2", "tls 1 2"),
-        ("osi layer 2", "tcp layer 3"),
-        ("plan A", "plan A"),
-        ("plan A", "plan B"),
-        ("tier A", "tier B"),
-        ("cat", "car"),
-        ("", "http 2"),
-        ("http 2", ""),
-    ],
-)
-def test_is_version_or_ordinal_sibling_negative(name_a: str, name_b: str) -> None:
-    """Verify non-siblings and identical/spacing/precision-variant names return False."""
-    assert is_version_or_ordinal_sibling(name_a, name_b) is False
-
-
-def test_is_acronym_pair() -> None:
-    """Verify is_acronym_pair handles initialisms, plurals, and parenthesized forms while rejecting siblings."""
-    assert is_acronym_pair("SLOs", "service level objectives") is True
-    assert is_acronym_pair("service level objectives", "SLOs") is True
-    assert is_acronym_pair("API", "application programming interface") is True
-    assert is_acronym_pair("LLM", "Large Language Model") is True
-    assert is_acronym_pair("LLM", "LLM (Large Language Model)") is True
-    assert is_acronym_pair("LLM", "Large Language Model (LLM)") is True
-    assert is_acronym_pair("DoS", "Denial of Service (DoS)") is True
-
-    assert is_acronym_pair("sev1", "sev 1") is False
-    assert is_acronym_pair("http 2", "http 3") is False
-    assert is_acronym_pair("p0", "p 0") is False
-    assert is_acronym_pair("s1", "s 1") is False
-    assert is_acronym_pair("API", "API") is False
-    assert is_acronym_pair("in a", "internal network architecture") is False
-    assert is_acronym_pair("of", "optical fiber") is False
-    assert is_acronym_pair("in", "internal network") is False
-
-
-def test_check_lexical_subsumption_inversion() -> None:
-    """Verify lexical subsumption inversion detects inverted compound hierarchies and excludes siblings."""
-    assert check_lexical_subsumption_inversion("engineering", "security engineering") is True
-    assert check_lexical_subsumption_inversion("security engineering", "engineering") is False
-    assert check_lexical_subsumption_inversion("tls 1", "tls 1.2") is False
-    assert check_lexical_subsumption_inversion("LLM", "Large Language Model (LLM)") is False
+    assert dt == "xsd:string"
 
 
 def test_relation_traversal_policy_datatype_property_and_aliases() -> None:
@@ -398,7 +298,7 @@ def test_gbnf_and_prompts_typed_predicate_and_shacl_actions() -> None:
     assert "owl:ObjectProperty" in dyn_g
     assert "owl:DatatypeProperty" in dyn_g
 
-    for action in ("invert_broader", "demote_sibling_to_related"):
+    for action in ("invert_broader", "assert_related"):
         assert action in VALID_SHACL_ACTIONS
         assert action in ProposeSHACLRepairs.instructions
         assert action in DSPY_SHACL_REPAIR_GBNF_GRAMMAR
@@ -415,8 +315,8 @@ def test_gbnf_and_prompts_typed_predicate_and_shacl_actions() -> None:
     assert repairs[1]["action"] == "demote_sibling_to_related"
 
 
-def test_extract_entity_definitions_filters_scalar_literals() -> None:
-    """Verify that extract_entity_definitions excludes scalar literals when exclude_scalars=True."""
+def test_extract_entity_definitions_preserves_pairs_for_normalization() -> None:
+    """Verify that extract_entity_definitions preserves all extracted (name, def) pairs for normalize_openie_record."""
     raw = {
         "named_entities": [
             ["YAW Engine", "Native HippoRAG 2 graph storage system."],
@@ -426,20 +326,9 @@ def test_extract_entity_definitions_filters_scalar_literals() -> None:
             ["FastMCP", "Model Context Protocol streaming transport."],
         ]
     }
-    defs = extract_entity_definitions(raw, exclude_scalars=True)
+    defs = extract_entity_definitions(raw)
     names = [d[0] for d in defs]
-    assert "YAW Engine" in names
-    assert "FastMCP" in names
-    assert "2026-10-25" not in names
-    assert "8080" not in names
-    assert "v1.0.0" not in names
-
-    entities = extract_named_entities(raw, exclude_scalars=True)
-    assert "YAW Engine" in entities
-    assert "FastMCP" in entities
-    assert "2026-10-25" not in entities
-    assert "8080" not in entities
-    assert "v1.0.0" not in entities
+    assert names == ["YAW Engine", "2026-10-25", "8080", "v1.0.0", "FastMCP"]
 
 
 def test_normalize_openie_record_filters_degenerate_self_loops_and_preserves_homographs() -> None:
@@ -486,11 +375,14 @@ def test_normalize_openie_record_filters_degenerate_self_loops_and_preserves_hom
         ),
     )
     norm = normalize_openie_record(rec)
-    assert len(norm.triples) == 1
-    assert norm.triples[0].subj == "a ball"
-    assert norm.triples[0].obj == "a ball"
-    assert norm.triples[0].subj_def == "Spherical golden toy object."
-    assert norm.triples[0].obj_def == "Formal royal dance party."
+    assert len(norm.triples) == 2
+    assert norm.triples[0].obj_kind == "literal"
+    assert norm.triples[0].obj_datatype == "xsd:string"
+    assert norm.triples[1].subj == "a ball"
+    assert norm.triples[1].obj == "a ball"
+    assert norm.triples[1].subj_def == "Spherical golden toy object."
+    assert norm.triples[1].obj_def == "Formal royal dance party."
+    assert ("a ball", "Formal royal dance party.") in norm.entities
 
     dyn_g = build_dspy_triples_grammar(max_triples=2, known_entities=["Hyperslate"])
     assert "obj-slot ::= entity-slot | string" in dyn_g

@@ -21,20 +21,20 @@ class ChatTests(unittest.TestCase):
 
     def test_create_dspy_lm_configures_lemonade_and_ollama_models(self):
         # Qwen3-4B extraction on Lemonade (16384 ctx window, llamacpp GPU -> GBNF supported)
-        qwen_lm = create_dspy_lm("Qwen3-4B-Instruct-2507-GGUF", role="extraction")
-        self.assertEqual(qwen_lm.model, "openai/Qwen3-4B-Instruct-2507-GGUF")
-        self.assertAlmostEqual(qwen_lm.kwargs["temperature"], 0.2)
-        self.assertEqual(qwen_lm.kwargs["max_tokens"], 4096)
-        self.assertNotIn("frequency_penalty", qwen_lm.kwargs)
-        self.assertTrue(lm_supports_gbnf(qwen_lm))
+        llm_lm = create_dspy_lm("Qwen3-4B-Instruct-2507-GGUF", role="extraction")
+        self.assertEqual(llm_lm.model, "openai/Qwen3-4B-Instruct-2507-GGUF")
+        self.assertAlmostEqual(llm_lm.kwargs["temperature"], 0.2)
+        self.assertEqual(llm_lm.kwargs["max_tokens"], 4096)
+        self.assertNotIn("frequency_penalty", llm_lm.kwargs)
+        self.assertTrue(lm_supports_gbnf(llm_lm))
 
         # Qwen3-4B QA on Lemonade (llamacpp GPU -> GBNF supported for direct QA)
-        qwen_qa_lm = create_dspy_lm("Qwen3-4B-Instruct-2507-GGUF", role="qa")
-        self.assertEqual(qwen_qa_lm.model, "openai/Qwen3-4B-Instruct-2507-GGUF")
-        self.assertAlmostEqual(qwen_qa_lm.kwargs["temperature"], 0.2)
-        self.assertEqual(qwen_qa_lm.kwargs["max_tokens"], 4096)
-        self.assertNotIn("frequency_penalty", qwen_qa_lm.kwargs)
-        self.assertTrue(lm_supports_gbnf(qwen_qa_lm))
+        llm_qa_lm = create_dspy_lm("Qwen3-4B-Instruct-2507-GGUF", role="qa")
+        self.assertEqual(llm_qa_lm.model, "openai/Qwen3-4B-Instruct-2507-GGUF")
+        self.assertAlmostEqual(llm_qa_lm.kwargs["temperature"], 0.2)
+        self.assertEqual(llm_qa_lm.kwargs["max_tokens"], 4096)
+        self.assertNotIn("frequency_penalty", llm_qa_lm.kwargs)
+        self.assertTrue(lm_supports_gbnf(llm_qa_lm))
 
         # Configured default: Gemma RLM without GBNF and Gemma worker with GBNF.
         orch_lm, sub_lm = create_dspy_rlm_pair()

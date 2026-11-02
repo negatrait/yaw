@@ -231,7 +231,7 @@ def test_indexing_dashboard_renders_measured_throughput_and_empty_state(tmp_path
             "kg_metrics": {"total_entities": 20, "total_triples": 15},
             "indexed_chunk_ids": {"a"},
             "pools": {"val_chunk_ids": ["a", "b"], "corpus_chunk_ids": ["a", "b", "c"]},
-            "lemonade_metrics": {"server_up": True, "qwen_tps": 20.0},
+            "lemonade_metrics": {"server_up": True, "llm_tps": 20.0},
             "timeseries_samples": [
                 {
                     "time_sec": 0,

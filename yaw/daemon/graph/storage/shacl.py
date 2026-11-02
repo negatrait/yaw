@@ -8,9 +8,7 @@ from typing import Any
 
 from yaw.core import (
     SHACLViolation,
-    check_lexical_subsumption_inversion,
     detect_scalar_literal,
-    is_version_or_ordinal_sibling,
     text_processing,
 )
 
@@ -18,6 +16,7 @@ from .db import YawConnection, write_tx
 from .graph_ops import (
     get_chunk_pointers,
     get_existing_ids,
+    get_pure_literal_entity_ids,
     merge_entities,
     upsert_entity_labels,
     upsert_semantic_edges,
@@ -632,8 +631,9 @@ def _scan_shacl_violations(conn: sqlite3.Connection | YawConnection) -> list[SHA
                 )
             )
 
-    # 4. ConceptShape/homographDifferentFrom: Distinct entities sharing a skos:prefLabel norm must either have
-    # distinct definitions with owl:differentFrom, or be merged if their definitions are identical.
+    # 4. ConceptShape/homographDifferentFrom: Distinct concepts sharing a skos:prefLabel norm must either have
+    # distinct definitions with an adjudicated semantic relation, or be merged if their definitions are identical.
+    pure_literal_ids = get_pure_literal_entity_ids(conn)
     for row in conn.execute(
         """
         SELECT a.entity_id, b.entity_id, a.label_norm,
@@ -655,9 +655,11 @@ def _scan_shacl_violations(conn: sqlite3.Connection | YawConnection) -> list[SHA
         INNER JOIN entities eb ON eb.entity_id = b.entity_id
         WHERE NOT EXISTS (
             SELECT 1 FROM edges e
-            WHERE e.src_id = a.entity_id
-              AND e.dst_id = b.entity_id
-              AND e.kind = 'owl:differentFrom'
+            WHERE (
+                (e.src_id = a.entity_id AND e.dst_id = b.entity_id)
+                OR (e.src_id = b.entity_id AND e.dst_id = a.entity_id)
+            )
+              AND e.kind IN ('owl:differentFrom', 'skos:related', 'skos:broader')
         )
         OR (
             LOWER(TRIM(COALESCE(ea.definition, ''))) != ''
@@ -675,6 +677,8 @@ def _scan_shacl_violations(conn: sqlite3.Connection | YawConnection) -> list[SHA
             str(row[4]),
             bool(row[5]),
         )
+        if ea in pure_literal_ids or eb in pure_literal_ids:
+            continue
         if def_a and def_a == def_b and has_diff:
             msg = (
                 f"Duplicate concepts {ea} and {eb} share prefLabel {lnorm!r} and identical definition "
@@ -692,7 +696,7 @@ def _scan_shacl_violations(conn: sqlite3.Connection | YawConnection) -> list[SHA
         )
 
     # 5. StatementShape/closedWorld: Facts must have valid subj_id in entities, valid entity/literal object,
-    # and non-empty definition
+    # and non-empty definition that does not duplicate an endpoint entity definition
     for row in conn.execute(
         """
         SELECT
@@ -706,7 +710,17 @@ def _scan_shacl_violations(conn: sqlite3.Connection | YawConnection) -> list[SHA
                 THEN ((f.obj_id IS NULL OR eo.entity_id IS NOT NULL) AND TRIM(COALESCE(f.obj_literal_lex, '')) != '')
                 ELSE (eo.entity_id IS NOT NULL)
             END AS has_valid_obj,
-            COALESCE(f.obj_kind, 'entity') AS obj_kind
+            COALESCE(f.obj_kind, 'entity') AS obj_kind,
+            (
+                TRIM(f.definition) != ''
+                AND (
+                    LOWER(TRIM(f.definition)) = LOWER(TRIM(COALESCE(es.definition, '')))
+                    OR (
+                        COALESCE(f.obj_kind, 'entity') = 'entity'
+                        AND LOWER(TRIM(f.definition)) = LOWER(TRIM(COALESCE(eo.definition, '')))
+                    )
+                )
+            ) AS is_dup_def
         FROM facts f
         LEFT JOIN entities es ON es.entity_id = f.subj_id
         LEFT JOIN entities eo ON eo.entity_id = f.obj_id
@@ -717,10 +731,15 @@ def _scan_shacl_violations(conn: sqlite3.Connection | YawConnection) -> list[SHA
                AND ((f.obj_id IS NOT NULL AND eo.entity_id IS NULL) OR TRIM(COALESCE(f.obj_literal_lex, '')) = '')
            )
            OR TRIM(f.definition) = ''
+           OR LOWER(TRIM(f.definition)) = LOWER(TRIM(COALESCE(es.definition, '')))
+           OR (
+               COALESCE(f.obj_kind, 'entity') = 'entity'
+               AND LOWER(TRIM(f.definition)) = LOWER(TRIM(COALESCE(eo.definition, '')))
+           )
         ORDER BY f.fact_id ASC
         """
     ):
-        fid, sid, oid, fdef, has_s, has_o, okind = (
+        fid, sid, oid, fdef, has_s, has_o, okind, is_dup_def = (
             str(row[0]),
             str(row[1]),
             str(row[2]) if row[2] is not None else "",
@@ -728,6 +747,7 @@ def _scan_shacl_violations(conn: sqlite3.Connection | YawConnection) -> list[SHA
             bool(row[4]),
             bool(row[5]),
             str(row[6]),
+            bool(row[7]),
         )
         if not has_s or not has_o:
             msg = (
@@ -750,6 +770,15 @@ def _scan_shacl_violations(conn: sqlite3.Connection | YawConnection) -> list[SHA
                     focus_node=fid,
                     result_path="skos:definition",
                     message=f"Fact {fid} has an empty statement definition.",
+                )
+            )
+        elif is_dup_def:
+            violations.append(
+                SHACLViolation(
+                    shape="StatementShape/closedWorld",
+                    focus_node=fid,
+                    result_path="skos:definition",
+                    message=f"Fact {fid} statement definition duplicates an endpoint entity definition.",
                 )
             )
 
@@ -801,19 +830,6 @@ def _scan_shacl_violations(conn: sqlite3.Connection | YawConnection) -> list[SHA
          AND a.kind = 'skos:related'
          AND b.kind = 'owl:differentFrom'
         WHERE a.src_id < a.dst_id
-          AND NOT EXISTS (
-              SELECT 1 FROM entities ea
-              INNER JOIN entities eb ON ea.entity_id = a.src_id AND eb.entity_id = a.dst_id
-              WHERE LOWER(TRIM(ea.name)) != '' AND LOWER(TRIM(ea.name)) = LOWER(TRIM(eb.name))
-          )
-          AND NOT EXISTS (
-              SELECT 1 FROM entity_labels la
-              INNER JOIN entity_labels lb
-                ON la.label_norm = lb.label_norm
-               AND la.label_kind = 'skos:prefLabel'
-               AND lb.label_kind = 'skos:prefLabel'
-              WHERE la.entity_id = a.src_id AND lb.entity_id = a.dst_id
-          )
         ORDER BY a.src_id ASC, a.dst_id ASC
         """
     ):
@@ -993,40 +1009,7 @@ def _scan_shacl_violations(conn: sqlite3.Connection | YawConnection) -> list[SHA
                 )
             )
 
-    # 9. ConceptShape/lexicalSubsumption & 10. ConceptShape/siblingNotBroader on skos:broader edges
-    for row in conn.execute(
-        """
-        SELECT e.src_id, e.dst_id, es.name, ed.name
-        FROM edges e
-        INNER JOIN entities es ON es.entity_id = e.src_id
-        INNER JOIN entities ed ON ed.entity_id = e.dst_id
-        WHERE e.kind = 'skos:broader'
-        ORDER BY e.src_id ASC, e.dst_id ASC
-        """
-    ):
-        s_id, d_id, s_name, d_name = str(row[0]), str(row[1]), str(row[2]), str(row[3])
-        if check_lexical_subsumption_inversion(s_name, d_name):
-            violations.append(
-                SHACLViolation(
-                    shape="ConceptShape/lexicalSubsumption",
-                    focus_node=f"{s_id}->{d_id}",
-                    result_path="skos:broader",
-                    message=f"Broader edge ({s_id} -> {d_id}) violates lexical subsumption ({s_name!r} vs {d_name!r}).",
-                )
-            )
-        if is_version_or_ordinal_sibling(s_name, d_name):
-            violations.append(
-                SHACLViolation(
-                    shape="ConceptShape/siblingNotBroader",
-                    focus_node=f"{s_id}->{d_id}",
-                    result_path="skos:broader",
-                    message=(
-                        f"Broader edge ({s_id} -> {d_id}) connects version/ordinal siblings ({s_name!r} vs {d_name!r})."
-                    ),
-                )
-            )
-
-    # 11. ProvenanceShape/factSources: Every fact must have at least one valid chunk entry in fact_sources
+    # 9. ProvenanceShape/factSources: Every fact must have at least one valid chunk entry in fact_sources
     for row in conn.execute(
         """
         SELECT f.fact_id
@@ -1387,11 +1370,18 @@ def apply_shacl_repairs(
                             SET obj_kind = 'literal',
                                 obj_id = CASE WHEN ? AND subj_id != ? THEN ? ELSE NULL END,
                                 obj_literal_lex = ?,
-                                obj_datatype = 'rdfs:Literal',
+                                obj_datatype = ?,
                                 obj_lang = ''
                             WHERE obj_id = ? AND COALESCE(obj_kind, 'entity') = 'entity'
                             """,
-                            (1 if has_passage_edge else 0, focus, focus, ename, focus),
+                            (
+                                1 if has_passage_edge else 0,
+                                focus,
+                                focus,
+                                ename,
+                                detect_scalar_literal(ename)[1],
+                                focus,
+                            ),
                         )
                         affected_fids = [
                             str(r[0])

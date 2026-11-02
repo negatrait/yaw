@@ -330,7 +330,7 @@ def create_dspy_rlm_pair(
     - `orchestrator_lm` (`role="rlm"` or `"reflection"`): runs `dspy.RLM` Python REPL code
       generation without GBNF (`_yaw_supports_gbnf=False`).
     - `sub_lm` (`role="extraction"` or `"reflection_worker"`): runs inner `llm_query`,
-      `synthesize_instruction`, and GBNF-constrained `qwen_*` worker calls (`_yaw_supports_gbnf=True`).
+      `synthesize_instruction`, and GBNF-constrained `llm_*` worker calls (`_yaw_supports_gbnf=True`).
     - When `reflection=True`, configures `orchestrator_lm` with `role="reflection"` (`temp=0.8`, `max_tokens=4096`)
       and `sub_lm` with `role="reflection_worker"`; sampling follows each model profile.
     """

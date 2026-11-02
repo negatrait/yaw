@@ -15,9 +15,8 @@ from yaw.core import load_config
 from yaw.daemon.graph.inference.parsers import (
     coerce_generated_facts,
     compute_mdhash_id,
-    extract_named_entities,
-    extract_triples,
-    filter_invalid_triples,
+    extract_entity_definitions,
+    extract_structured_triples,
     match_facts_to_candidate_indices,
     text_processing,
 )
@@ -76,48 +75,49 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             ["apple inc", "google llc", "deepmind uk"],
         )
 
-    def test_filter_invalid_triples_parity(self):
-        """Verify filter_invalid_triples deduplicates 3-element triples and coerces items to strings."""
+    def test_extract_structured_triples_deduplication_parity(self):
+        """Verify extract_structured_triples deduplicates 3-element triples and rejects non-string predicates."""
         input_triples: list[Any] = [
             ["Radio City", "located in", "India"],
             ["invalid", "only two"],
-            ["invalid", "too", "many", "items"],
+            ["invalid", "too", "many", "items", "extra", "extra2", "extra3"],
             ["Radio City", "located in", "India"],  # duplicate
             ["Radio City", "plays songs in", "Hindi"],
-            [123, 456, 789],  # non-string coercion
+            [123, 456, 789],  # non-string predicate rejected
+            ["Radio City", "established in", 1995],
         ]
-        actual = filter_invalid_triples(input_triples)
+        actual = [list(t.as_tuple()) for t in extract_structured_triples(input_triples)]
         self.assertEqual(
             actual,
             [
                 ["Radio City", "located in", "India"],
                 ["Radio City", "plays songs in", "Hindi"],
-                ["123", "456", "789"],
+                ["Radio City", "established in", "1995"],
             ],
         )
 
-    def test_extract_named_entities_parity(self):
-        """Verify extract_named_entities extracts entities cleanly."""
+    def test_extract_entity_definitions_parity(self):
+        """Verify extract_entity_definitions extracts entities cleanly."""
         resp1 = json.dumps({"named_entities": ["Alan Turing", "London", "1912"]})
         self.assertEqual(
-            extract_named_entities(resp1),
+            tuple(name for name, _ in extract_entity_definitions(resp1)),
             ("Alan Turing", "London", "1912"),
         )
 
         resp2 = json.dumps(["Alan Turing", "London", "1912"])
         self.assertEqual(
-            extract_named_entities(resp2),
+            tuple(name for name, _ in extract_entity_definitions(resp2)),
             ("Alan Turing", "London", "1912"),
         )
 
         resp3 = "```json\n" + json.dumps(["Alan Turing", "London"]) + "\n```"
         self.assertEqual(
-            extract_named_entities(resp3),
+            tuple(name for name, _ in extract_entity_definitions(resp3)),
             ("Alan Turing", "London"),
         )
 
-    def test_extract_triples_parity(self):
-        """Verify extract_triples parses and filters triples."""
+    def test_extract_structured_triples_json_parity(self):
+        """Verify extract_structured_triples parses and filters triples."""
         resp = json.dumps(
             {
                 "triples": [
@@ -128,7 +128,7 @@ class PromptsAndParsersParityTests(unittest.TestCase):
                 ]
             }
         )
-        triples = extract_triples(resp)
+        triples = tuple(t.as_tuple() for t in extract_structured_triples(resp))
         self.assertEqual(
             triples,
             (
@@ -165,11 +165,11 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             '{"triples": [\n  ["A", "is", "B"],\n  ["C", "located in", "D"],\n  ["E", "broken triple without close'
         )
         with self.assertRaises(ValueError):
-            extract_triples(truncated_triples)
+            extract_structured_triples(truncated_triples)
 
         truncated_ner = '{"named_entities": ["Alan Turing", "London", "United King'
         with self.assertRaises(ValueError):
-            extract_named_entities(truncated_ner)
+            extract_entity_definitions(truncated_ner)
 
     def test_dspy_signatures_and_default_demos(self):
         """Verify all 4 dspy.Signatures and seeded dspy.Example demos."""
@@ -330,7 +330,7 @@ tools."""
             [
                 {
                     "reasoning": "Propose SHACL repairs via GBNF tool using keyword argument violations=violations.",
-                    "code": ("reps = qwen_propose_shacl_repairs(violations=violations)\nSUBMIT(repairs=reps)"),
+                    "code": ("reps = llm_propose_shacl_repairs(violations=violations)\nSUBMIT(repairs=reps)"),
                 }
             ],
             adapter=dspy.ChatAdapter(),
@@ -761,16 +761,16 @@ tools."""
             )
 
         # 3. Reflection LM temperature & GBNF capability flags on Qwen3-4B-Instruct-2507-GGUF
-        qwen_orch_ref = create_dspy_lm("Qwen3-4B-Instruct-2507-GGUF", role="reflection")
-        qwen_ref = create_dspy_lm("Qwen3-4B-Instruct-2507-GGUF", role="reflection_worker")
-        self.assertEqual(qwen_orch_ref.kwargs["temperature"], 0.8)
-        self.assertEqual(qwen_orch_ref.kwargs["max_tokens"], 4096)
-        self.assertFalse(getattr(qwen_orch_ref, "_yaw_supports_gbnf", True))
+        llm_orch_ref = create_dspy_lm("Qwen3-4B-Instruct-2507-GGUF", role="reflection")
+        llm_ref = create_dspy_lm("Qwen3-4B-Instruct-2507-GGUF", role="reflection_worker")
+        self.assertEqual(llm_orch_ref.kwargs["temperature"], 0.8)
+        self.assertEqual(llm_orch_ref.kwargs["max_tokens"], 4096)
+        self.assertFalse(getattr(llm_orch_ref, "_yaw_supports_gbnf", True))
 
-        self.assertEqual(qwen_ref.kwargs["temperature"], 0.7)
-        self.assertEqual(qwen_ref.kwargs["max_tokens"], 4096)
-        self.assertNotIn("frequency_penalty", qwen_ref.kwargs)
-        self.assertTrue(getattr(qwen_ref, "_yaw_supports_gbnf", False))
+        self.assertEqual(llm_ref.kwargs["temperature"], 0.7)
+        self.assertEqual(llm_ref.kwargs["max_tokens"], 4096)
+        self.assertNotIn("frequency_penalty", llm_ref.kwargs)
+        self.assertTrue(getattr(llm_ref, "_yaw_supports_gbnf", False))
 
         orch_ref, worker_ref = create_dspy_rlm_pair(reflection=True)
         self.assertEqual(orch_ref.kwargs["temperature"], 0.8)
@@ -882,18 +882,18 @@ no frequency penalty."""
         self.assertEqual(build_dspy_query_intent_grammar(), DSPY_QUERY_INTENT_GBNF_GRAMMAR)
         self.assertIn("query_intent", DSPY_QUERY_INTENT_GBNF_GRAMMAR)
 
-        qwen_lm = CapabilityDummyLM([{"query_intent": "Erik Hort birthplace village town county"}])
-        qwen_lm._yaw_recipe = "llamacpp"
-        qwen_lm._yaw_supports_gbnf = True
+        llm_lm = CapabilityDummyLM([{"query_intent": "Erik Hort birthplace village town county"}])
+        llm_lm._yaw_recipe = "llamacpp"
+        llm_lm._yaw_supports_gbnf = True
 
         prog = HippoRAGProgram(
             enable_gbnf=True,
-            rlm_sub_lm=qwen_lm,
+            rlm_sub_lm=llm_lm,
         )
         intent = prog.extract_query_intent("What county is Erik Hort's birthplace a part of?")
         self.assertEqual(intent, "Erik Hort birthplace village town county")
-        self.assertEqual(len(qwen_lm.history), 1)
-        call_kwargs = qwen_lm.history[0]["kwargs"]
+        self.assertEqual(len(llm_lm.history), 1)
+        call_kwargs = llm_lm.history[0]["kwargs"]
         self.assertAlmostEqual(call_kwargs.get("temperature"), 0.4)
         self.assertNotIn("frequency_penalty", call_kwargs)
         self.assertEqual(
@@ -984,8 +984,8 @@ no frequency penalty."""
                 "query_intent",
                 "qa",
                 "inner_rlm",
-                "qwen_proposer",
-                "qwen_compressor",
+                "llm_proposer",
+                "llm_compressor",
             ],
         )
 
@@ -999,8 +999,8 @@ no frequency penalty."""
         self.assertIs(prog.qa.predict.lm, primary_lm)
         self.assertIs(prog.shacl_healer_rlm.get_lm(), primary_lm)
         self.assertIs(proposer.inner_rlm.get_lm(), primary_lm)
-        self.assertIsNone(proposer.qwen_proposer.lm)
-        self.assertIsNone(proposer.qwen_compressor.lm)
+        self.assertIsNone(proposer.llm_proposer.lm)
+        self.assertIsNone(proposer.llm_compressor.lm)
 
         # Test first-class embedding telemetry trail on HippoRAGProgram
         prog.record_embedding_telemetry(
@@ -1358,7 +1358,7 @@ repair, and Pareto penalty."""
         self.assertTrue(proposer.enable_simba)
         self.assertFalse(proposer.step_simba())
         self.assertEqual(proposer.dump_simba_state()["version"], 2)
-        self.assertIn("shortened_instruction", proposer.qwen_compressor.signature.output_fields)
+        self.assertIn("shortened_instruction", proposer.llm_compressor.signature.output_fields)
 
     def test_sprint1_configure_yaw_dspy_cache_and_zero_deprecation_warning(self) -> None:
         import tempfile
@@ -1887,9 +1887,9 @@ repair, and Pareto penalty."""
         )
         self.assertLess(qa_abstain, 1.0)
 
-        # 9. Stage 9: qwen_proposer / qwen_compressor
+        # 9. Stage 9: llm_proposer / llm_compressor
         prop_ok, _ = validate_stage_invariants(
-            "qwen_proposer",
+            "llm_proposer",
             {
                 "component_name": "ner",
                 "current_instruction": "Return JSON with key `named_entities`.",
@@ -1900,7 +1900,7 @@ repair, and Pareto penalty."""
         )
         self.assertEqual(prop_ok, 1.0)
         prop_leak, prop_leak_fb = validate_stage_invariants(
-            "qwen_proposer",
+            "llm_proposer",
             {
                 "component_name": "ner",
                 "current_instruction": "Return JSON with key `named_entities`.",

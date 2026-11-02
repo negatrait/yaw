@@ -67,8 +67,6 @@ _PUBLIC_API: dict[str, str] = {
     "text_processing": ".parsers",
     "extract_entity_definitions": ".parsers",
     "extract_structured_triples": ".parsers",
-    "filter_invalid_triples": ".parsers",
-    "normalize_answer": ".parsers",
     "parse_synonym_decisions": ".parsers",
     "parse_shacl_repairs": ".parsers",
     # Native DSPy Program & 12 Canonical Signatures

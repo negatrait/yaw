@@ -92,7 +92,7 @@ def _merge_openie_definitions(
                     seen_entity_norms.add(ent_norm)
             raw_pairs.append((ent_name, ent_def))
 
-    return tuple(merged_entities), extract_entity_definitions(raw_pairs, normalize_keys=True)
+    return tuple(merged_entities), extract_entity_definitions(raw_pairs)
 
 
 class HippoRAGProgram(dspy.Module):
@@ -113,7 +113,7 @@ Multi-Hop QA.
        - `shacl_healer_rlm` (`HealSHACLViolations`) running inside `dspy.PythonInterpreter` (managed \
 Deno/Pyodide WASM) with
          bound graph inspection, hydration, repair, and SQL SHACL linting tools (`inspect_focus_node`,
-         `hydrate_chunk`, `qwen_propose_shacl_repairs`, `lint_shacl`). Repairs are returned as proposals.
+         `hydrate_chunk`, `llm_propose_shacl_repairs`, `lint_shacl`). Repairs are returned as proposals.
     3. **First-Class Embedding Trail (`record_embedding_telemetry` / `embedding_audit_trail`):**
        - Tracks every `DSPyEmbeddingAdapter` (`dspy.Embedder`) invocation and the 3 optimizable
          task prefixes (`embedding_query_prefix`, `embedding_fact_prefix`, `embedding_document_prefix`)
@@ -197,7 +197,6 @@ Deno/Pyodide WASM) with
         self._ast_island_hydrator: Callable[[str], str] | None = None
         self._shacl_linter: Callable[[], list[dict[str, str]]] | None = None
         self._graph_search_tool: Callable[[str], str] | None = None
-        self._last_ner_definitions: dict[str, str] = {}
         self.telemetry: list[dict[str, Any]] = DiagnosticHistory()
         self.history = DiagnosticHistory()
         self.embedding_audit_trail: list[dict[str, Any]] = DiagnosticHistory()
@@ -516,7 +515,7 @@ Deno/Pyodide WASM) with
     def _build_shacl_repl_tools(self) -> list[Callable[..., Any]]:
         """Build the closed-world SHACL healing tools exposed inside `shacl_healer_rlm`."""
 
-        def qwen_propose_shacl_repairs(
+        def llm_propose_shacl_repairs(
             violations: Any = None,
             focus_context: str = "",
             violations_json: Any = None,
@@ -599,7 +598,7 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
             return list(self._shacl_linter())
 
         return [
-            qwen_propose_shacl_repairs,
+            llm_propose_shacl_repairs,
             inspect_focus_node,
             inspect_pair,
             hydrate_chunk,
@@ -752,11 +751,8 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
         )
         raw_entities = getattr(pred, "named_entities", [])
         parsed_defs = extract_entity_definitions(raw_entities)
-        enriched_defs: list[tuple[str, str]] = [
-            (ename, edef or self._last_ner_definitions.get(ename, "")) for ename, edef in parsed_defs
-        ]
-        entities = tuple(ename for ename, _ in enriched_defs)
-        return entities, tuple(enriched_defs)
+        entities = tuple(ename for ename, _ in parsed_defs)
+        return entities, tuple(parsed_defs)
 
     def extract_entity_definitions(
         self,
@@ -836,14 +832,10 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
             if defn:
                 resolved.append((m_name, defn))
                 seen_names.add(m_name)
-                if not _record_audit:
-                    self._last_ner_definitions[m_name] = defn
         for ename, edef in parsed:
             if ename and edef and ename not in seen_names:
                 resolved.append((ename, edef))
                 seen_names.add(ename)
-                if not _record_audit:
-                    self._last_ner_definitions[ename] = edef
 
         stage_tokens = int(self.telemetry[-1].get("tokens_used", 0)) if len(self.telemetry) > prev_telem_len else 0
         if _record_audit:
@@ -876,11 +868,6 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
         merged_defs: dict[str, str] = {}
         all_def_pairs: list[tuple[str, str]] = []
         defined_entity_names: list[str] = []
-        for k, v in self._last_ner_definitions.items():
-            if k and v:
-                merged_defs[k] = v
-                merged_defs[str(text_processing(k))] = v
-                all_def_pairs.append((k, v))
         if isinstance(entity_definitions, Mapping):
             for k, v in entity_definitions.items():
                 ck = str(k).strip()
@@ -1154,7 +1141,7 @@ chunk."""
         By default (`mode=None`), executes the single-level RLM Python REPL healer
         (`shacl_healer_rlm` / `HealSHACLViolations`), which inspects focus nodes,
         hydrates source chunks, and delegates structured repair synthesis to its
-        inner `qwen_propose_shacl_repairs` tool (`mode="direct"` -> `shacl_repair` /
+        inner `llm_propose_shacl_repairs` tool (`mode="direct"` -> `shacl_repair` /
         `ProposeSHACLRepairs` with pure-JSON GBNF).
         """
         if not violations:

@@ -211,7 +211,7 @@ YAW replaces upstream HippoRAG 2's flat, unvalidated 7-file Parquet/Pickle/JSON 
   5. `FactStatementShape/endpoints`: Subject and object must reference existing valid concepts.
   6. `ProvenanceShape/edgeSources`: Structural edges must link to at least one valid source chunk.
 - **Autonomous DSPy RLM Self-Healing (`heal_shacl_violations`):**
-  When SHACL shape violations occur during indexing transactions, YAW triggers a self-healing loop powered by `shacl_healer_rlm` with interactive REPL inspection tools (`hydrate_chunk`, `inspect_focus_node`, `qwen_propose_shacl_repairs`, `apply_shacl_repairs`) to heal the graph prior to transaction commit.
+  When SHACL shape violations occur during indexing transactions, YAW triggers a self-healing loop powered by `shacl_healer_rlm` with interactive REPL inspection tools (`hydrate_chunk`, `inspect_focus_node`, `llm_propose_shacl_repairs`, `apply_shacl_repairs`) to heal the graph prior to transaction commit.
 - **Zero-Dependency W3C Turtle 1.1 Export (`serialize_graph_turtle`):**
   `yaw graph lint --turtle` streams the entire closed-world graph directly to standard Turtle syntax with standard prefix namespaces (`rdf:`, `rdfs:`, `skos:`, `owl:`, `sh:`, `yaw:`).
 

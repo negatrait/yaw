@@ -2,20 +2,12 @@
 
 import functools
 import inspect
-import json
 from collections.abc import Callable
 from typing import Any
 
 import dspy
 
-from .parsers import (
-    coerce_generated_facts,
-    extract_entity_definitions,
-    extract_named_entities,
-    extract_triples,
-    parse_shacl_repairs,
-    parse_synonym_decisions,
-)
+from .parsers import parse_shacl_repairs
 
 STAGE_RLM_DELEGATION_RULES: dict[str, str] = {
     "shacl_repair": (
@@ -26,8 +18,7 @@ STAGE_RLM_DELEGATION_RULES: dict[str, str] = {
         "W3C SKOS/RDF/OWL profiles, reified `rdf:Statement` facts, and hydrated source chunks) to diagnose "
         "each violation's `source_shape` (`ConceptShape/definition`, `ConceptShape/prefLabel`, "
         "`ConceptShape/S13-disjointLabels`, `ConceptShape/homographDifferentFrom`, `ConceptShape/broaderCycle`, "
-        "`ConceptShape/S27-disjointBroaderRelated`, `ConceptShape/lexicalSubsumption`, "
-        "`ConceptShape/siblingNotBroader`, `EdgeShape/closedWorld`, `StatementShape/closedWorld`). Use "
+        "`ConceptShape/S27-disjointBroaderRelated`, `EdgeShape/closedWorld`, `StatementShape/closedWorld`). Use "
         "`inspect_pair(a, b)`, `hydrate_ast_island(chunk_id)`, `hydrate_chunk(chunk_id)`, or "
         "`search_graph(query)` if additional document or neighborhood context is needed.\n"
         "2. Delegate structured repair synthesis with the gathered dossier context:\n"
@@ -37,7 +28,7 @@ STAGE_RLM_DELEGATION_RULES: dict[str, str] = {
         "seen = list(dict.fromkeys(v['focus_node'] for v in items if v.get('focus_node')))\n"
         "dossiers = [inspect_focus_node(fn).get('markdown_dossier', '') for fn in seen[:8]]\n"
         "focus_context = '\\n\\n---\\n\\n'.join(d for d in dossiers if d)\n"
-        "repairs = qwen_propose_shacl_repairs(violations=violations, focus_context=focus_context)\n"
+        "repairs = llm_propose_shacl_repairs(violations=violations, focus_context=focus_context)\n"
         "SUBMIT(repairs=repairs)\n"
         "```"
     ),
@@ -74,7 +65,7 @@ def build_rlm_action_demos() -> dict[str, list[dspy.Example]]:
                 "seen = list(dict.fromkeys(v['focus_node'] for v in items if v.get('focus_node')))\n"
                 "dossiers = [inspect_focus_node(fn).get('markdown_dossier', '') for fn in seen[:8]]\n"
                 "focus_context = '\\n\\n---\\n\\n'.join(d for d in dossiers if d)\n"
-                "repairs = qwen_propose_shacl_repairs(violations=violations, focus_context=focus_context)\n"
+                "repairs = llm_propose_shacl_repairs(violations=violations, focus_context=focus_context)\n"
                 "SUBMIT(repairs=repairs)\n"
                 "```",
             ).with_inputs("variables_info", "repl_history", "iteration")
@@ -89,48 +80,22 @@ def _normalize_rlm_field(name: str, val: Any, annotation: Any) -> Any:
             val = val[name]
         elif len(val) == 1:
             val = next(iter(val.values()))
-    if name == "named_entities" and isinstance(val, str):
-        defs = extract_entity_definitions(val)
-        if defs:
-            return [[k, v] if v else k for k, v in defs]
-        return list(extract_named_entities(val))
-    if name == "entity_definitions":
-        if isinstance(val, (str, dict, list, tuple)):
-            defs = extract_entity_definitions(val)
-            return [[k, v] for k, v in defs if k]
-        return val
-    if name == "triples":
-        if isinstance(val, str):
-            try:
-                loaded = json.loads(val)
-            except json.JSONDecodeError, TypeError, ValueError:
-                loaded = None
-            if isinstance(loaded, list):
-                return loaded
-            return [list(t) for t in extract_triples(val)]
-        if isinstance(val, (list, tuple)):
-            return list(val)
-        return val
-    if name == "decisions":
-        return parse_synonym_decisions(val)
     if name == "repairs":
         return parse_shacl_repairs(val)
-    if name == "fact":
-        return coerce_generated_facts(val)
     if annotation is str and isinstance(val, str):
         return val.strip()
     return val
 
 
 def sanitize_repl_code(code: str) -> str:
-    """Strip hallucinated imports of pre-bound sandbox tools (`qwen_*`, `inspect_focus_node`, `inspect_pair`, \
+    """Strip hallucinated imports of pre-bound sandbox tools (`llm_*`, `inspect_focus_node`, `inspect_pair`, \
 `hydrate_chunk`, `hydrate_ast_island`, `search_graph`, `apply_shacl_repairs`, `lint_shacl`, `synthesize_instruction`, \
 `SUBMIT`, `llm_query`)."""
     cleaned_lines: list[str] = []
     for line in code.splitlines():
         stripped = line.strip()
         if (stripped.startswith("from ") or stripped.startswith("import ")) and (
-            "qwen_" in stripped
+            "llm_" in stripped
             or "inspect_node" in stripped
             or "inspect_focus_node" in stripped
             or "inspect_pair" in stripped

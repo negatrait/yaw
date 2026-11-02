@@ -195,10 +195,10 @@ def test_label_resolution_uses_available_vectors_and_deterministic_missing_vecto
     ("name_a", "name_b", "threshold", "lexical"),
     [
         ("", "Beta", 0.8, 0.0),
-        ("WHO", "World Health Organization", 0.8, 0.85),
-        ("United States of America", "USA", 0.8, 0.85),
+        ("WHO", "World Health Organization", 0.8, 1 / 7),
+        ("United States of America", "USA", 0.8, 2 / 9),
         ("alpha beta", "alphabeta", 0.8, 18 / 19),
-        ("alpha beta", "alphabeta", 0.98, 1.0),
+        ("alpha beta", "alphabeta", 0.98, 18 / 19),
     ],
 )
 def test_disambiguation_keeps_dense_and_lexical_channels_independent(tmp_path, name_a, name_b, threshold, lexical):

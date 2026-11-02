@@ -304,7 +304,8 @@ class YawRuntime:
             embedding_identity=emb_id,
             synonym_identity=syn_id,
             shacl_identity=shacl_id,
-            same_sense_cosine_gate=self.engine.same_sense_cosine_gate,
+            auto_merge_cosine_gate=self.engine.auto_merge_cosine_gate,
+            auto_merge_difflib_gate=self.engine.auto_merge_difflib_gate,
             synonymy_threshold=self.config.synonymy_threshold,
             synonymy_top_k=self.config.synonymy_top_k,
             datatype_property_weight=0.5,
@@ -357,6 +358,8 @@ class YawRuntime:
             max_context_chars=self.config.max_context_chars,
             max_ast_expansion_hops=self.config.max_ast_expansion_hops,
             ast_context_hops=self.config.ast_context_hops,
+            auto_merge_cosine_gate=self.config.auto_merge_cosine_gate,
+            auto_merge_difflib_gate=self.config.auto_merge_difflib_gate,
         )
         self.engine.config = self.config
         self._build_coco_app()

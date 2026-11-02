@@ -175,7 +175,7 @@ def test_fresh_programs_are_zero_shot_and_examples_require_explicit_opt_in():
     program = HippoRAGProgram()
     proposer = RLMInstructionProposer()
     assert all(not predictor.demos for _, predictor in program.named_predictors())
-    assert not proposer.qwen_proposer.demos and not proposer.qwen_compressor.demos
+    assert not proposer.llm_proposer.demos and not proposer.llm_compressor.demos
     assert all(not predictor.demos for _, predictor in proposer.inner_rlm.named_predictors())
     examples = HippoRAGProgram(include_demos=True)
     assert len(examples.ner.demos) == 1

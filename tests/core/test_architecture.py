@@ -376,7 +376,7 @@ class ArchitectureTests(unittest.TestCase):
         core_files = list((YAW_DIR / "core").glob("*.py"))
         self.assertEqual(
             {f.name for f in core_files},
-            {"__init__.py", "config.py", "logger.py", "types.py"},
+            {"__init__.py", "config.py", "constants.py", "logger.py", "types.py"},
         )
 
         # Python supplies the authoritative set, including platform-specific modules.

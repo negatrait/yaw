@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-import re
 import sqlite3
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -19,6 +18,7 @@ from yaw.core import (
     StructuredTriple,
     YawRuntimeError,
     compute_mdhash_id,
+    detect_scalar_literal,
     text_processing,
 )
 from yaw.core.config import context_char_limit, scale_context_budget
@@ -46,7 +46,6 @@ from yaw.daemon.graph.storage import (
     find_entity_disambiguation_candidates,
     get_entities_by_label_norm,
     get_entity_metadata_batch,
-    get_entity_vectors,
     inspect_focus_node,
     iter_synonym_evidence,
     lint_graph_shacl,
@@ -65,7 +64,8 @@ class GraphPlanSettings:
     embedding_identity: str
     synonym_identity: str = ""
     shacl_identity: str = ""
-    same_sense_cosine_gate: float = 0.85
+    auto_merge_cosine_gate: float = 0.95
+    auto_merge_difflib_gate: float = 0.96
     synonymy_threshold: float = 0.8
     synonymy_top_k: int = 5
     datatype_property_weight: float = 0.5
@@ -90,13 +90,7 @@ class GraphPlanResult:
 
 @dataclass(slots=True)
 class SenseResolutionState:
-    chunk_rel_path_by_id: dict[str, str]
-    senses_by_label: dict[str, list[tuple[str, str, str, np.ndarray | None]]]
-    existing_vecs_by_id: dict[str, np.ndarray]
-    sense_docs_by_eid: dict[str, set[str]]
-    sense_chunks_by_eid: dict[str, set[str]]
-    multi_sense_in_chunk: set[tuple[str, str]]
-    prebatch_texts: list[str]
+    senses_by_label: dict[str, list[tuple[str, str, str]]]
 
 
 @dataclass(slots=True)
@@ -107,7 +101,6 @@ class MaterializedGraphBatch:
     fact_sources_batch: list[tuple[str, str]]
     edges_with_sources: list[tuple[str, str, str, float, str]]
     fact_linked_pairs: set[tuple[str, str]]
-    precomputed_entity_vecs: dict[str, np.ndarray]
     homograph_splits: int
 
 
@@ -284,89 +277,17 @@ def apply_stage1_definitions(
     return normalized_sts, ner_entities
 
 
-def synthesize_copular_is_a_triples(
-    chunks: Sequence[tuple[ChunkPointer, str]],
-    record_structured: Sequence[tuple[str, list[StructuredTriple], list[tuple[str, str]]]],
-    all_norm_labels: set[str],
-    surface_by_norm: dict[str, str],
-    chunk_surface_by_norm: dict[tuple[str, str], str],
-) -> None:
-    """Bridge copular Stage 1 entity definitions to known graph concepts across multi-chunk corpora."""
-    if len(chunks) <= 1:
-        return
-    known_concepts = {
-        lbl for lbl in all_norm_labels if 3 <= len(lbl) <= 30 and not lbl.isdigit() and len(lbl.split()) <= 3
-    }
-    for ptr, _ in chunks:
-        if ptr.title:
-            t_norm = str(text_processing(ptr.title))
-            record_surface_form(surface_by_norm, chunk_surface_by_norm, t_norm, ptr.title, ptr.chunk_id)
-            if 3 <= len(t_norm) <= 30 and not t_norm.isdigit():
-                known_concepts.add(t_norm)
-    for _cid, normalized_sts, ner_entities in record_structured:
-        existing_pairs = {(st.subj, st.obj) for st in normalized_sts} | {(st.obj, st.subj) for st in normalized_sts}
-        for e_norm, e_def in ner_entities[:2]:
-            if not e_def or len(e_norm) < 3:
-                continue
-            first_clause = re.split(r"\.(?:\s|$)", e_def, maxsplit=1)[0].lower()
-            clause_words = set(str(text_processing(first_clause)).split()) | set(re.findall(r"[a-z0-9]+", first_clause))
-            for c_norm in known_concepts:
-                if c_norm == e_norm or c_norm in e_norm or e_norm in c_norm:
-                    continue
-                c_tokens = c_norm.split()
-                if not all(tok in clause_words for tok in c_tokens):
-                    continue
-                if (e_norm, c_norm) in existing_pairs:
-                    continue
-                if re.search(rf"(?:^|(?<=\s)|(?<=\W)){re.escape(c_norm)}(?=$|\s|\W)", first_clause):
-                    existing_pairs.add((e_norm, c_norm))
-                    normalized_sts.append(
-                        StructuredTriple(
-                            subj=e_norm,
-                            pred="is a",
-                            obj=c_norm,
-                            spo_def=e_def,
-                            subj_def=e_def,
-                            obj_def="",
-                        )
-                    )
-
-
-def _doc_scope_key(rel_path: str, s_line: int, e_line: int, ast_s: int, ast_e: int) -> str:
-    if not rel_path:
-        return ""
-    if rel_path.lower().endswith((".json", ".jsonl", ".ndjson")):
-        span_s = ast_s if ast_s > 0 else s_line
-        span_e = ast_e if ast_e > 0 else e_line
-        return f"{rel_path}:{span_s}:{span_e}"
-    return rel_path
-
-
 def prepare_sense_resolution_state(
     chunks: Sequence[tuple[ChunkPointer, str]],
     record_structured: Sequence[tuple[str, list[StructuredTriple], list[tuple[str, str]]]],
     all_norm_labels: Iterable[str],
     surface_by_norm: Mapping[str, str],
     *,
-    fmt_entity: Callable[[str, str], str],
     conn: sqlite3.Connection | None = None,
 ) -> SenseResolutionState:
-    """Prepare existing sense state and pre-batch homograph disambiguation texts."""
-    chunk_rel_path_by_id: dict[str, str] = {
-        ptr.chunk_id: _doc_scope_key(
-            ptr.rel_posix_path,
-            ptr.start_line,
-            ptr.end_line,
-            ptr.ast_island_start,
-            ptr.ast_island_end,
-        )
-        for ptr, _ in chunks
-        if ptr.rel_posix_path
-    }
-    senses_by_label: dict[str, list[tuple[str, str, str, np.ndarray | None]]] = {}
-    existing_vecs_by_id: dict[str, np.ndarray] = {}
-    sense_docs_by_eid: dict[str, set[str]] = {}
-    sense_chunks_by_eid: dict[str, set[str]] = {}
+    """Prepare existing sense state for deterministic mention materialization."""
+    del chunks, record_structured
+    senses_by_label: dict[str, list[tuple[str, str, str]]] = {}
 
     if conn is not None:
         existing_by_label = get_entities_by_label_norm(conn, list(all_norm_labels))
@@ -374,221 +295,17 @@ def prepare_sense_resolution_state(
         entity_info_by_id: dict[str, tuple[str, str]] = {}
         if all_existing_eids:
             entity_info_by_id = get_entity_metadata_batch(conn, all_existing_eids)
-            raw_vecs = get_entity_vectors(conn, all_existing_eids)
-            for eid_v, vec_v in raw_vecs.items():
-                v_norm = float(np.linalg.norm(vec_v))
-                existing_vecs_by_id[eid_v] = vec_v / v_norm if v_norm > 0 else vec_v
-            ph = ",".join("?" for _ in all_existing_eids)
-            for r_eid, r_cid, r_doc, r_s, r_e, r_ast_s, r_ast_e in conn.execute(
-                f"""
-                SELECT
-                    el.entity_id,
-                    el.chunk_id,
-                    COALESCE(c.rel_posix_path, ''),
-                    COALESCE(c.start_line, 0),
-                    COALESCE(c.end_line, 0),
-                    COALESCE(c.ast_island_start, 0),
-                    COALESCE(c.ast_island_end, 0)
-                FROM entity_labels el
-                LEFT JOIN chunks c ON c.chunk_id = el.chunk_id
-                WHERE el.entity_id IN ({ph}) AND el.chunk_id != ''
-                """,
-                all_existing_eids,
-            ):
-                s_eid = str(r_eid)
-                s_cid = str(r_cid)
-                s_doc = (
-                    _doc_scope_key(str(r_doc), int(r_s), int(r_e), int(r_ast_s), int(r_ast_e))
-                    if r_doc
-                    else chunk_rel_path_by_id.get(s_cid, "")
-                )
-                sense_chunks_by_eid.setdefault(s_eid, set()).add(s_cid)
-                if s_doc:
-                    sense_docs_by_eid.setdefault(s_eid, set()).add(s_doc)
         for lbl, eids in existing_by_label.items():
             senses_by_label[lbl] = [
                 (
                     eid,
                     entity_info_by_id.get(eid, (surface_by_norm.get(lbl, lbl), ""))[0],
                     entity_info_by_id.get(eid, (surface_by_norm.get(lbl, lbl), ""))[1],
-                    existing_vecs_by_id.get(eid),
                 )
                 for eid in eids
             ]
 
-    defs_by_label: dict[str, set[str]] = {}
-    for lbl, senses in senses_by_label.items():
-        for _, _, s_def, _ in senses:
-            if s_def.strip():
-                defs_by_label.setdefault(lbl, set()).add(s_def.strip().lower())
-
-    cand_pairs_by_label: dict[str, list[tuple[str, str]]] = {}
-    mentions_by_label: dict[str, list[tuple[str, str]]] = {}
-    surfaces_by_label: dict[str, list[str]] = {}
-    multi_sense_in_chunk: set[tuple[str, str]] = set()
-
-    def _record_canon_surface(raw_mention: str, label_norm: str) -> None:
-        raw_clean = str(raw_mention).strip()
-        canon = (
-            surface_by_norm.get(label_norm)
-            or surface_by_norm.get(raw_clean)
-            or (raw_clean if raw_clean != raw_clean.lower() else label_norm)
-        )
-        s_list = surfaces_by_label.setdefault(label_norm, [])
-        if canon and canon not in s_list:
-            s_list.append(canon)
-
-    for cid_r, st_list, ner_entities in record_structured:
-        chunk_defs_per_norm: dict[str, set[str]] = {}
-        for st in st_list:
-            s_norm = str(text_processing(st.subj)) or st.subj.strip().lower()
-            s_def = st.subj_def.strip()
-            if s_norm:
-                _record_canon_surface(st.subj, s_norm)
-                mentions_by_label.setdefault(s_norm, []).append((cid_r, s_def))
-                if s_def:
-                    defs_by_label.setdefault(s_norm, set()).add(s_def.lower())
-                    cand_pairs_by_label.setdefault(s_norm, []).append((s_norm, s_def))
-                    chunk_defs_per_norm.setdefault(s_norm, set()).add(s_def.lower())
-            o_norm = str(text_processing(st.obj)) or st.obj.strip().lower()
-            if st.obj_kind == "literal":
-                if o_norm and o_norm != s_norm and not (st.obj_datatype.startswith("xsd:") and not st.obj_def.strip()):
-                    _record_canon_surface(st.obj, o_norm)
-                    o_cand_def = st.obj_def.strip() or st.spo_def.strip() or f"Literal value {st.obj}."
-                    if o_cand_def:
-                        defs_by_label.setdefault(o_norm, set()).add(o_cand_def.lower())
-                        cand_pairs_by_label.setdefault(o_norm, []).append((o_norm, o_cand_def))
-                        chunk_defs_per_norm.setdefault(o_norm, set()).add(o_cand_def.lower())
-                    mentions_by_label.setdefault(o_norm, []).append((cid_r, o_cand_def))
-            elif o_norm:
-                _record_canon_surface(st.obj, o_norm)
-                o_def = st.obj_def.strip()
-                mentions_by_label.setdefault(o_norm, []).append((cid_r, o_def))
-                if o_def:
-                    defs_by_label.setdefault(o_norm, set()).add(o_def.lower())
-                    cand_pairs_by_label.setdefault(o_norm, []).append((o_norm, o_def))
-                    chunk_defs_per_norm.setdefault(o_norm, set()).add(o_def.lower())
-        for e_raw_lbl, e_def in ner_entities:
-            e_norm = str(text_processing(e_raw_lbl)) or e_raw_lbl.strip().lower()
-            c_def = e_def.strip()
-            if e_norm:
-                _record_canon_surface(e_raw_lbl, e_norm)
-                mentions_by_label.setdefault(e_norm, []).append((cid_r, c_def))
-                if c_def:
-                    defs_by_label.setdefault(e_norm, set()).add(c_def.lower())
-                    cand_pairs_by_label.setdefault(e_norm, []).append((e_norm, c_def))
-                    chunk_defs_per_norm.setdefault(e_norm, set()).add(c_def.lower())
-        for m_norm, c_dset in chunk_defs_per_norm.items():
-            if len(c_dset) >= 2:
-                multi_sense_in_chunk.add((cid_r, m_norm))
-
-    prebatch_texts: list[str] = []
-    seen_prebatch: set[str] = set()
-    for lbl, dset in defs_by_label.items():
-        if len(dset) >= 2:
-            existing_senses_lbl = senses_by_label.get(lbl, [])
-            if len(existing_senses_lbl) <= 1:
-                if existing_senses_lbl:
-                    eid0, _, def0, _ = existing_senses_lbl[0]
-                    possible_defs: list[str] = [def0] if def0 else []
-                    seen_docs: set[str] = set(sense_docs_by_eid.get(eid0, set()))
-                    seen_chunks: set[str] = set(sense_chunks_by_eid.get(eid0, set()))
-                    seeded = True
-                else:
-                    possible_defs = []
-                    seen_docs = set()
-                    seen_chunks = set()
-                    seeded = False
-
-                for cid_m, c_def in mentions_by_label.get(lbl, ()):
-                    doc_m = chunk_rel_path_by_id.get(cid_m, "")
-                    if not seeded:
-                        if c_def:
-                            possible_defs = [c_def]
-                        seen_chunks.add(cid_m)
-                        if doc_m:
-                            seen_docs.add(doc_m)
-                        seeded = True
-                        continue
-                    if not c_def:
-                        seen_chunks.add(cid_m)
-                        if doc_m:
-                            seen_docs.add(doc_m)
-                        continue
-                    if not possible_defs:
-                        possible_defs = [c_def]
-                        seen_chunks.add(cid_m)
-                        if doc_m:
-                            seen_docs.add(doc_m)
-                        continue
-                    if (
-                        doc_m
-                        and (cid_m, lbl) not in multi_sense_in_chunk
-                        and doc_m in seen_docs
-                        and cid_m not in seen_chunks
-                    ):
-                        next_defs: list[str] = []
-                        for p_def in possible_defs:
-                            if p_def.lower() == c_def.lower():
-                                m_def = c_def if len(c_def) > len(p_def) else p_def
-                            elif (
-                                p_def
-                                and c_def.lower() not in p_def.lower()
-                                and p_def.lower() not in c_def.lower()
-                                and len(p_def) + len(c_def) <= 200
-                            ):
-                                m_def = f"{p_def.rstrip('.')} — {c_def}"
-                            else:
-                                m_def = c_def if len(c_def) > len(p_def) else p_def
-                            cand_pairs_by_label.setdefault(lbl, []).append((lbl, m_def))
-                            if m_def not in next_defs:
-                                next_defs.append(m_def)
-                        for m_def in next_defs:
-                            if m_def not in possible_defs:
-                                possible_defs.append(m_def)
-                    elif c_def not in possible_defs:
-                        possible_defs.append(c_def)
-                    seen_chunks.add(cid_m)
-                    if doc_m:
-                        seen_docs.add(doc_m)
-
-            surface_names = list(surfaces_by_label.get(lbl) or [surface_by_norm.get(lbl, lbl)])
-            default_surf = surface_by_norm.get(lbl, lbl)
-            if default_surf and default_surf not in surface_names:
-                surface_names.append(default_surf)
-            for _, name_s, _, _ in existing_senses_lbl:
-                if name_s and name_s not in surface_names:
-                    surface_names.append(name_s)
-
-            base_eid = compute_mdhash_id(lbl, prefix="entity-")
-            for m_lbl, c_def in cand_pairs_by_label.get(lbl, ()):
-                sense_cand_id = compute_mdhash_id(f"{m_lbl}::{c_def.lower()}", prefix="entity-")
-                if sense_cand_id in existing_vecs_by_id and base_eid in existing_vecs_by_id:
-                    continue
-                for s_name in surface_names:
-                    ct = fmt_entity(s_name, c_def)
-                    if ct not in seen_prebatch:
-                        seen_prebatch.add(ct)
-                        prebatch_texts.append(ct)
-            for _, name_s, prev_def_s, prev_vec_s in existing_senses_lbl:
-                if prev_def_s and (prev_vec_s is None or len(surface_names) > 1):
-                    for s_name in surface_names:
-                        if prev_vec_s is not None and s_name == name_s:
-                            continue
-                        pt = fmt_entity(s_name, prev_def_s)
-                        if pt not in seen_prebatch:
-                            seen_prebatch.add(pt)
-                            prebatch_texts.append(pt)
-
-    return SenseResolutionState(
-        chunk_rel_path_by_id=chunk_rel_path_by_id,
-        senses_by_label=senses_by_label,
-        existing_vecs_by_id=existing_vecs_by_id,
-        sense_docs_by_eid=sense_docs_by_eid,
-        sense_chunks_by_eid=sense_chunks_by_eid,
-        multi_sense_in_chunk=multi_sense_in_chunk,
-        prebatch_texts=prebatch_texts,
-    )
+    return SenseResolutionState(senses_by_label=senses_by_label)
 
 
 def materialize_entities_and_facts(
@@ -596,24 +313,14 @@ def materialize_entities_and_facts(
     surface_by_norm: Mapping[str, str],
     chunk_surface_by_norm: Mapping[tuple[str, str], str],
     sense_state: SenseResolutionState,
-    prebatch_vec_by_text: Mapping[str, np.ndarray],
     *,
-    fmt_entity: Callable[[str, str], str],
-    same_sense_cosine_gate: float = 0.85,
     datatype_property_weight: float = 0.5,
-    embed_one: Callable[[str], np.ndarray] | None = None,
 ) -> MaterializedGraphBatch:
-    """Resolve entity mentions with homograph sense-splitting and materialize reified facts and edges."""
+    """Resolve entity mentions with provisional sense-splitting and materialize reified facts and edges."""
     senses_by_label = sense_state.senses_by_label
-    existing_vecs_by_id = sense_state.existing_vecs_by_id
-    chunk_rel_path_by_id = sense_state.chunk_rel_path_by_id
-    sense_docs_by_eid = sense_state.sense_docs_by_eid
-    sense_chunks_by_eid = sense_state.sense_chunks_by_eid
-    multi_sense_in_chunk = sense_state.multi_sense_in_chunk
 
     entity_map: dict[str, tuple[str, str, str]] = {}
     entity_labels_to_upsert: list[tuple[str, str, str, str, str]] = []
-    precomputed_entity_vecs: dict[str, np.ndarray] = {}
     homograph_splits = 0
 
     def _label_kind_for(entity_name: str, lbl_norm: str) -> str:
@@ -627,28 +334,13 @@ def materialize_entities_and_facts(
             else "skos:altLabel"
         )
 
-    def _record_sense_provenance(eid: str, cid: str) -> None:
-        sense_chunks_by_eid.setdefault(eid, set()).add(cid)
-        doc_p = chunk_rel_path_by_id.get(cid, "")
-        if doc_p:
-            sense_docs_by_eid.setdefault(eid, set()).add(doc_p)
-
-    def _unit_vec_for_text(text: str) -> np.ndarray:
-        vec_opt = prebatch_vec_by_text.get(text)
-        if vec_opt is not None:
-            return vec_opt
-        if embed_one is None:
-            raise KeyError(f"Entity vector not found in prebatch for {text!r}")
-        raw_v = np.asarray(embed_one(text), dtype=np.float32)
-        norm_v = float(np.linalg.norm(raw_v))
-        return raw_v / norm_v if norm_v > 0 else raw_v
-
     def _resolve_mention_entity_id(
         raw_mention: str,
         defn: str,
         chunk_id: str,
         *,
         exclude_eid: str | None = None,
+        allow_sense_split: bool = True,
     ) -> str:
         nonlocal homograph_splits
         raw_clean = str(raw_mention).strip()
@@ -667,10 +359,9 @@ def materialize_entities_and_facts(
         existing_senses = senses_by_label.get(label_norm, [])
         if not existing_senses:
             eid = compute_mdhash_id(label_norm, prefix="entity-")
-            senses_by_label[label_norm] = [(eid, canon_surface, clean_def, existing_vecs_by_id.get(eid))]
+            senses_by_label[label_norm] = [(eid, canon_surface, clean_def)]
             entity_map[eid] = (eid, canon_surface, clean_def)
             entity_labels_to_upsert.append((label_norm, eid, "skos:prefLabel", mention_raw, chunk_id))
-            _record_sense_provenance(eid, chunk_id)
             return eid
 
         def _best_surface(curr_name: str) -> str:
@@ -682,122 +373,51 @@ def materialize_entities_and_facts(
                 return canon_surface
             return curr_name
 
-        if not clean_def:
-            for idx_s, (eid, name, prev_def, prev_vec) in enumerate(existing_senses):
+        if not clean_def or not allow_sense_split:
+            for idx_s, (eid, name, prev_def) in enumerate(existing_senses):
                 if exclude_eid is not None and eid == exclude_eid:
                     continue
                 best_name = _best_surface(name)
-                if best_name != name:
-                    existing_senses[idx_s] = (eid, best_name, prev_def, prev_vec)
-                    entity_map[eid] = (eid, best_name, prev_def)
+                merged_def = prev_def or clean_def
+                if best_name != name or merged_def != prev_def:
+                    existing_senses[idx_s] = (eid, best_name, merged_def)
+                    entity_map[eid] = (eid, best_name, merged_def)
                 elif eid not in entity_map:
-                    entity_map[eid] = (eid, best_name, prev_def)
+                    entity_map[eid] = (eid, best_name, merged_def)
                 entity_labels_to_upsert.append(
                     (label_norm, eid, _label_kind_for(best_name, label_norm), mention_raw, chunk_id)
                 )
-                _record_sense_provenance(eid, chunk_id)
                 return eid
-            eid, name, prev_def, prev_vec = existing_senses[0]
+            eid, name, prev_def = existing_senses[0]
             best_name = _best_surface(name)
-            if best_name != name:
-                existing_senses[0] = (eid, best_name, prev_def, prev_vec)
-                entity_map[eid] = (eid, best_name, prev_def)
+            merged_def = prev_def or clean_def
+            if best_name != name or merged_def != prev_def:
+                existing_senses[0] = (eid, best_name, merged_def)
+                entity_map[eid] = (eid, best_name, merged_def)
             elif eid not in entity_map:
-                entity_map[eid] = (eid, best_name, prev_def)
+                entity_map[eid] = (eid, best_name, merged_def)
             entity_labels_to_upsert.append(
                 (label_norm, eid, _label_kind_for(best_name, label_norm), mention_raw, chunk_id)
             )
-            _record_sense_provenance(eid, chunk_id)
             return eid
 
-        for idx_s, (eid, name, prev_def, prev_vec) in enumerate(existing_senses):
+        for idx_s, (eid, name, prev_def) in enumerate(existing_senses):
             if exclude_eid is not None and eid == exclude_eid:
                 continue
             if not prev_def or prev_def.lower() == clean_def.lower():
                 best_name = _best_surface(name)
                 merged_def = clean_def if len(clean_def) > len(prev_def) else (prev_def or clean_def)
-                existing_senses[idx_s] = (
-                    eid,
-                    best_name,
-                    merged_def,
-                    prev_vec if (merged_def == prev_def and best_name == name) else None,
-                )
+                existing_senses[idx_s] = (eid, best_name, merged_def)
                 entity_map[eid] = (eid, best_name, merged_def)
                 entity_labels_to_upsert.append(
                     (label_norm, eid, _label_kind_for(best_name, label_norm), mention_raw, chunk_id)
                 )
-                _record_sense_provenance(eid, chunk_id)
                 return eid
-
-        curr_doc = chunk_rel_path_by_id.get(chunk_id, "")
-        if (
-            curr_doc
-            and exclude_eid is None
-            and len(existing_senses) == 1
-            and (chunk_id, label_norm) not in multi_sense_in_chunk
-        ):
-            eid0, name0, prev_def0, prev_vec0 = existing_senses[0]
-            if curr_doc in sense_docs_by_eid.get(eid0, set()) and chunk_id not in sense_chunks_by_eid.get(eid0, set()):
-                best_name = _best_surface(name0)
-                if (
-                    prev_def0
-                    and clean_def
-                    and clean_def.lower() not in prev_def0.lower()
-                    and prev_def0.lower() not in clean_def.lower()
-                    and len(prev_def0) + len(clean_def) <= 200
-                ):
-                    merged_def = f"{prev_def0.rstrip('.')} — {clean_def}"
-                else:
-                    merged_def = clean_def if len(clean_def) > len(prev_def0) else prev_def0
-                existing_senses[0] = (
-                    eid0,
-                    best_name,
-                    merged_def,
-                    prev_vec0 if (merged_def == prev_def0 and best_name == name0) else None,
-                )
-                entity_map[eid0] = (eid0, best_name, merged_def)
-                entity_labels_to_upsert.append(
-                    (label_norm, eid0, _label_kind_for(best_name, label_norm), mention_raw, chunk_id)
-                )
-                _record_sense_provenance(eid0, chunk_id)
-                return eid0
 
         sense_id = compute_mdhash_id(f"{label_norm}::{clean_def.lower()}", prefix="entity-")
-        cached_sense_vec = existing_vecs_by_id.get(sense_id)
-        if cached_sense_vec is None:
-            cached_sense_vec = precomputed_entity_vecs.get(sense_id)
-        cand_vec = (
-            cached_sense_vec
-            if cached_sense_vec is not None
-            else _unit_vec_for_text(fmt_entity(canon_surface, clean_def))
-        )
-
-        for idx_s, (eid, name, prev_def, prev_vec) in enumerate(existing_senses):
-            if exclude_eid is not None and eid == exclude_eid:
-                continue
-            if prev_vec is None:
-                prev_vec = _unit_vec_for_text(fmt_entity(name, prev_def))
-                existing_senses[idx_s] = (eid, name, prev_def, prev_vec)
-                precomputed_entity_vecs[eid] = prev_vec
-            cos_sim = float(np.dot(cand_vec, prev_vec))
-            if cos_sim >= same_sense_cosine_gate:
-                best_name = _best_surface(name)
-                merged_def = clean_def if len(clean_def) > len(prev_def) else prev_def
-                if merged_def != prev_def or best_name != name:
-                    existing_senses[idx_s] = (eid, best_name, merged_def, cand_vec)
-                    precomputed_entity_vecs[eid] = cand_vec
-                entity_map[eid] = (eid, best_name, merged_def)
-                entity_labels_to_upsert.append(
-                    (label_norm, eid, _label_kind_for(best_name, label_norm), mention_raw, chunk_id)
-                )
-                _record_sense_provenance(eid, chunk_id)
-                return eid
-
-        precomputed_entity_vecs[sense_id] = cand_vec
-        existing_senses.append((sense_id, canon_surface, clean_def, cand_vec))
+        existing_senses.append((sense_id, canon_surface, clean_def))
         entity_map[sense_id] = (sense_id, canon_surface, clean_def)
         entity_labels_to_upsert.append((label_norm, sense_id, "skos:prefLabel", mention_raw, chunk_id))
-        _record_sense_provenance(sense_id, chunk_id)
         homograph_splits += 1
         return sense_id
 
@@ -823,17 +443,21 @@ def materialize_entities_and_facts(
                 o_id: str | None = None
                 o_norm_key = str(text_processing(st.obj)) or st.obj.strip().lower()
                 is_self_literal = o_norm_key == s_norm_key
-                if not is_self_literal and not (st.obj_datatype.startswith("xsd:") and not st.obj_def.strip()):
+                eff_obj_dt = (
+                    st.obj_datatype
+                    if (st.obj_datatype and st.obj_datatype != "rdfs:Literal")
+                    else detect_scalar_literal(st.obj)[1]
+                )
+                if not is_self_literal and not (eff_obj_dt.startswith("xsd:") and not st.obj_def.strip()):
                     has_existing_sense = bool(senses_by_label.get(o_norm_key))
                     eff_obj_def = (
                         st.obj_def.strip()
                         if (st.obj_def.strip() or has_existing_sense)
                         else (st.spo_def.strip() or f"Literal value {st.obj}.")
                     )
-                    o_id = _resolve_mention_entity_id(st.obj, eff_obj_def, cid)
+                    o_id = _resolve_mention_entity_id(st.obj, eff_obj_def, cid, allow_sense_split=False)
                     resolved_in_chunk.add((o_norm_key, st.obj_def.strip().lower()))
                     chunk_to_entities[cid].add(o_id)
-                eff_obj_dt = st.obj_datatype or "rdfs:Literal"
                 fact_oid = o_id if (o_id is not None and o_id != s_id) else None
                 fid = compute_mdhash_id(
                     str((s_id, st.pred, f"literal:{st.obj}:{eff_obj_dt}:{st.obj_lang}")),
@@ -928,7 +552,6 @@ def materialize_entities_and_facts(
         fact_sources_batch=fact_sources_batch,
         edges_with_sources=edges_with_sources,
         fact_linked_pairs=fact_linked_pairs,
-        precomputed_entity_vecs=precomputed_entity_vecs,
         homograph_splits=homograph_splits,
     )
 
@@ -939,12 +562,16 @@ def prepare_synonym_candidates(
     *,
     synonymy_threshold: float,
     synonymy_top_k: int,
+    auto_merge_cosine_gate: float = 0.95,
+    auto_merge_difflib_gate: float = 0.96,
+    fact_linked_pairs: set[tuple[str, str]] | None = None,
+    rlm_stats: dict[str, Any] | None = None,
     progress_callback: Callable[[str], None] | None = None,
-) -> tuple[list[dict[str, Any]], dict[str, tuple[str, str]], int]:
-    """Filter valid SKOS concept entities and rank disambiguation candidate pairs."""
+) -> tuple[list[dict[str, Any]], dict[str, tuple[str, str]], int, list[tuple[str, str, str]]]:
+    """Filter valid SKOS concepts, apply the near-1 (cosine, difflib) auto-merge gate, and rank remaining pairs."""
     valid_entity_ids = filter_valid_concept_entity_ids(stage_conn, entity_nodes)
     if not valid_entity_ids:
-        return [], {}, 0
+        return [], {}, 0, []
     if progress_callback is not None:
         progress_callback(f"indexing: disambiguation candidate search ({len(valid_entity_ids)} changed entities)")
     raw_candidates = find_entity_disambiguation_candidates(
@@ -956,8 +583,65 @@ def prepare_synonym_candidates(
     cand_eids = list({eid for ea, eb, _, _ in raw_candidates for eid in (ea, eb)})
     cand_meta = get_entity_metadata_batch(stage_conn, cand_eids)
 
+    merged_into: dict[str, str] = {}
+    auto_merges: list[tuple[str, str, str]] = []
+    active_fact_pairs = fact_linked_pairs or set()
+
+    def _resolve_active_eid(eid: str) -> str:
+        curr = eid
+        visited: set[str] = set()
+        while curr in merged_into and curr not in visited:
+            visited.add(curr)
+            curr = merged_into[curr]
+        return curr
+
+    def _is_active_fact_pole(u: str, v: str) -> bool:
+        target_pair = (min(u, v), max(u, v))
+        for fa, fb in active_fact_pairs:
+            ra, rb = _resolve_active_eid(fa), _resolve_active_eid(fb)
+            if (min(ra, rb), max(ra, rb)) == target_pair:
+                return True
+        return False
+
+    with stage_conn:
+        for raw_a, raw_b, d_sim, l_sim in raw_candidates:
+            if float(d_sim) < auto_merge_cosine_gate or float(l_sim) < auto_merge_difflib_gate:
+                continue
+            ea = _resolve_active_eid(raw_a)
+            eb = _resolve_active_eid(raw_b)
+            if ea == eb:
+                continue
+            name_a, def_a = cand_meta.get(ea, (ea, ""))
+            name_b, def_b = cand_meta.get(eb, (eb, ""))
+            if text_processing(name_a) != text_processing(name_b) and _is_active_fact_pole(ea, eb):
+                continue
+            key_a = (len(def_a), -len(name_a), ea)
+            key_b = (len(def_b), -len(name_b), eb)
+            dst, src = (ea, eb) if key_a >= key_b else (eb, ea)
+            merge_entities(stage_conn, src, dst, label_kind="skos:altLabel")
+            auto_merges.append((src, dst, "skos:altLabel"))
+            merged_into[src] = dst
+            dst_name, dst_def = cand_meta.get(dst, (dst, ""))
+            src_name, src_def = cand_meta.get(src, (src, ""))
+            cand_meta[dst] = (dst_name or src_name, dst_def if len(dst_def) >= len(src_def) else src_def)
+            if rlm_stats is not None:
+                rlm_stats["merged_entities"] = int(rlm_stats.get("merged_entities", 0)) + 1
+
+    dedup_remaining: dict[tuple[str, str], tuple[float, float]] = {}
+    for raw_a, raw_b, d_sim, l_sim in raw_candidates:
+        ea = _resolve_active_eid(raw_a)
+        eb = _resolve_active_eid(raw_b)
+        if ea == eb:
+            continue
+        pkey = (min(ea, eb), max(ea, eb))
+        prev = dedup_remaining.get(pkey)
+        if prev is None:
+            dedup_remaining[pkey] = (float(d_sim), float(l_sim))
+        else:
+            dedup_remaining[pkey] = (max(prev[0], float(d_sim)), max(prev[1], float(l_sim)))
+
     candidates: list[dict[str, Any]] = []
-    for ea, eb, d_sim, l_sim in raw_candidates:
+    for (ea, eb), (d_sim, l_sim) in dedup_remaining.items():
         name_a, def_a = cand_meta.get(ea, (ea, ""))
         name_b, def_b = cand_meta.get(eb, (eb, ""))
         sim = max(float(d_sim), float(l_sim))
@@ -978,13 +662,13 @@ def prepare_synonym_candidates(
     candidates.sort(
         key=lambda c: (
             text_processing(str(c["name_a"])) == text_processing(str(c["name_b"])),
-            float(c["lexical_sim"]) >= 0.72,
+            float(c["lexical_sim"]) >= 0.70,
             0.5 * float(c["lexical_sim"]) + 0.5 * float(c["dense_sim"]),
             float(c["similarity"]),
         ),
         reverse=True,
     )
-    return candidates, cand_meta, len(raw_candidates)
+    return candidates, cand_meta, len(raw_candidates), auto_merges
 
 
 def apply_synonym_adjudication(
@@ -1050,7 +734,7 @@ def apply_synonym_adjudication(
             name_tgt, _ = cand_meta.get(tgt, cand_meta.get(raw_tgt, (tgt, "")))
 
             if rel in ("skos:altLabel", "skos:hiddenLabel", "exact_match"):
-                if _is_active_fact_pole(src, tgt):
+                if text_processing(name_src) != text_processing(name_tgt) and _is_active_fact_pole(src, tgt):
                     raw_semantic_batch.append((src, tgt, "skos:related", max(0.5, sim)))
                     continue
                 if canon and (
@@ -1331,49 +1015,28 @@ async def plan_graph_publication(
         )
         record_structured.append((cid, normalized_sts, ner_entities))
 
-    synthesize_copular_is_a_triples(
-        chunks,
-        record_structured,
-        all_norm_labels,
-        surface_by_norm,
-        chunk_surface_by_norm,
-    )
-
     sense_state = prepare_sense_resolution_state(
         chunks,
         record_structured,
         all_norm_labels,
         surface_by_norm,
-        fmt_entity=fmt_entity,
     )
-    prebatch_vec_by_text: dict[str, np.ndarray] = {}
-    if sense_state.prebatch_texts:
-        p_vecs = await _embed_strings(sense_state.prebatch_texts, stage="entity_embed")
-        for ct, pv in zip(sense_state.prebatch_texts, p_vecs, strict=True):
-            n_val = float(np.linalg.norm(pv))
-            prebatch_vec_by_text[ct] = pv / n_val if n_val > 0 else pv
-
     materialized = materialize_entities_and_facts(
         record_structured,
         surface_by_norm,
         chunk_surface_by_norm,
         sense_state,
-        prebatch_vec_by_text,
-        fmt_entity=fmt_entity,
-        same_sense_cosine_gate=settings.same_sense_cosine_gate,
         datatype_property_weight=settings.datatype_property_weight,
     )
     rlm_stats["homograph_splits"] += materialized.homograph_splits
     entity_nodes = materialized.entity_nodes
     fact_nodes = materialized.fact_nodes
-    precomputed_entity_vecs = materialized.precomputed_entity_vecs
 
-    missing_entities = [(eid, name, defn) for eid, name, defn in entity_nodes if eid not in precomputed_entity_vecs]
-    entity_vec_by_id: dict[str, np.ndarray] = dict(precomputed_entity_vecs)
-    if missing_entities:
-        e_texts = [fmt_entity(name, defn) for _, name, defn in missing_entities]
+    entity_vec_by_id: dict[str, np.ndarray] = {}
+    if entity_nodes:
+        e_texts = [fmt_entity(name, defn) for _, name, defn in entity_nodes]
         e_vecs = await _embed_strings(e_texts, stage="entity_embed")
-        for (eid, _, _), vec in zip(missing_entities, e_vecs, strict=True):
+        for (eid, _, _), vec in zip(entity_nodes, e_vecs, strict=True):
             entity_vec_by_id[eid] = vec
 
     fact_vec_by_id: dict[str, np.ndarray] = {}
@@ -1409,11 +1072,15 @@ async def plan_graph_publication(
             staging_conn.execute("BEGIN")
             apply_prepared_graph_rows(staging_conn, initial_rows)
 
-        candidates, cand_meta, raw_cand_count = prepare_synonym_candidates(
+        candidates, cand_meta, raw_cand_count, _auto_merges = prepare_synonym_candidates(
             staging_conn,
             entity_nodes,
             synonymy_threshold=settings.synonymy_threshold,
             synonymy_top_k=settings.synonymy_top_k,
+            auto_merge_cosine_gate=settings.auto_merge_cosine_gate,
+            auto_merge_difflib_gate=settings.auto_merge_difflib_gate,
+            fact_linked_pairs=materialized.fact_linked_pairs,
+            rlm_stats=rlm_stats,
         )
         rlm_stats["candidate_pairs"] += raw_cand_count
         if candidates or raw_cand_count:

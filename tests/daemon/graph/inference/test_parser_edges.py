@@ -12,8 +12,6 @@ from yaw.daemon.graph.inference.parsers import (
     compute_qa_em_f1,
     extract_entity_definitions,
     extract_structured_triples,
-    extract_triples,
-    filter_invalid_triples,
     match_facts_to_candidate_indices,
     parse_shacl_repairs,
     parse_synonym_decisions,
@@ -108,10 +106,11 @@ def test_same_label_different_senses_do_not_collapse_into_one_concept():
     definitions = json.loads(
         '[["Mercury", "A planet"], ["mercury", "An element"], ["Mercury", "A PLANET"], ["", ""], ["short"]]'
     )
-    result = extract_structured_triples([("Mercury", "differs from", "Mercury")], entity_definitions=definitions)
+    extracted = extract_entity_definitions(definitions)
+    assert extracted == (("Mercury", "A planet"), ("mercury", "An element"), ("short", ""))
+    result = extract_structured_triples([("Mercury", "orbits", "Sun")], entity_definitions=definitions)
     assert len(result) == 1
     assert result[0].subj_def == "A planet"
-    assert result[0].obj_def == "An element"
 
 
 @pytest.mark.parametrize(
@@ -170,7 +169,7 @@ def test_bare_and_wrapped_structured_triples_are_equivalent(payload):
 @pytest.mark.parametrize("payload", ["not JSON", '{"triples": "wrong type"}'])
 def test_plain_triple_parser_rejects_invalid_response_shapes(payload):
     with pytest.raises((ValueError, json.JSONDecodeError)):
-        extract_triples(payload)
+        extract_structured_triples(payload)
 
 
 @pytest.mark.parametrize(
@@ -203,14 +202,13 @@ def test_fact_envelopes_preserve_actual_candidates(envelope):
     assert coerce_generated_facts({"fact": "wrong type"}) == []
 
 
-def test_entity_definitions_mapping_and_normalize_keys():
+def test_entity_definitions_mapping_and_deduplication():
     assert extract_entity_definitions({"Ada Lovelace": "English mathematician", "Engine": None}) == (
         ("Ada Lovelace", "English mathematician"),
         ("Engine", ""),
     )
     assert extract_entity_definitions(
-        [("Ada Lovelace", ""), ("ada lovelace", "English mathematician")],
-        normalize_keys=True,
+        [("Ada Lovelace", ""), ("Ada Lovelace", "English mathematician")],
     ) == (("Ada Lovelace", "English mathematician"),)
 
 
@@ -226,7 +224,10 @@ def test_empty_answer_metrics_and_triple_filtering():
     assert compute_qa_em_f1("A", []) == (0.0, 0.0)
     assert compute_qa_em_f1("A B", ["B C"]) == (0.0, pytest.approx(2 / 3))
     assert text_processing(json.loads("12")) == "12"
-    assert filter_invalid_triples([{}, ["short"], StructuredTriple("A", pred="p", obj="B")]) == [["A", "p", "B"]]
+    assert [
+        list(t.as_tuple())
+        for t in extract_structured_triples([{}, ["short"], StructuredTriple("A", pred="p", obj="B")])
+    ] == [["A", "p", "B"]]
 
 
 @pytest.mark.parametrize("name", ['A"B', "A\\B"])

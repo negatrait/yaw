@@ -1027,7 +1027,7 @@ using all 5 bound REPL tools."""
                     {"prompt_tokens": 25, "completion_tokens": 15, "total_tokens": 40},
                 )
             req_str = str(prompt or messages or kwargs)
-            if "qwen_propose_shacl_repairs" in req_str:
+            if "llm_propose_shacl_repairs" in req_str:
                 repl_tool_events.append("shacl_healer_rlm_invoked")
                 code = (
                     "import json\n"
@@ -1036,7 +1036,7 @@ using all 5 bound REPL tools."""
                     "node_ctx = inspect_focus_node(focus_id)\n"
                     "chunk_text = hydrate_chunk(node_ctx['chunk_ids'][0])\n"
                     "assert 'Alan Turing formulated the Turing machine' in chunk_text\n"
-                    "repairs = qwen_propose_shacl_repairs(violations=violations, focus_context=chunk_text)\n"
+                    "repairs = llm_propose_shacl_repairs(violations=violations, focus_context=chunk_text)\n"
                     "SUBMIT(repairs=repairs)"
                 )
                 return [
@@ -1068,7 +1068,7 @@ using all 5 bound REPL tools."""
             if "[[ ## violations ## ]]" in req_str or "bounded closed-world SHACL repair" in req_str:
                 focus_matches = list(dict.fromkeys(re.findall(r"entity-[0-9a-f]+", req_str)))
                 for fn in focus_matches:
-                    repl_tool_events.append(f"qwen_propose_shacl_repairs:{fn}")
+                    repl_tool_events.append(f"llm_propose_shacl_repairs:{fn}")
                 return [
                     json.dumps(
                         {
@@ -1218,7 +1218,7 @@ using all 5 bound REPL tools."""
 
         # Verify all 5 REPL tools ran inside shacl_healer_rlm and healed both violations
         assert "shacl_healer_rlm_invoked" in repl_tool_events
-        assert sum(1 for ev in repl_tool_events if ev.startswith("qwen_propose_shacl_repairs:")) == 2
+        assert sum(1 for ev in repl_tool_events if ev.startswith("llm_propose_shacl_repairs:")) == 2
 
         # Verify exact non-double-counted token accounting:
         # Step 6 (direct GBNF synonym_judge) = 30 tokens on doc 2 (total 30 + 30 = 60 across doc 1 + doc 2)
@@ -2436,7 +2436,7 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
         assert len(ball_rows) >= 2
         ball_ids = {str(r[0]) for r in ball_rows}
 
-        # 4. Verify BOTH owl:differentFrom AND skos:related exist between 'a ball' homographs
+        # 4. Verify skos:related exists between 'a ball' senses without co-inserted owl:differentFrom
         ball_diff_edges = engine.conn.execute(
             """
             SELECT src_id, dst_id, weight FROM edges
@@ -2445,8 +2445,7 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
               AND dst_id IN (SELECT entity_id FROM entities WHERE name = 'a ball')
             """
         ).fetchall()
-        assert len(ball_diff_edges) >= 2
-        assert all(float(r[2]) == 0.0 for r in ball_diff_edges)
+        assert len(ball_diff_edges) == 0
 
         ball_rel_edges = engine.conn.execute(
             """
@@ -2459,28 +2458,32 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
         assert len(ball_rel_edges) >= 2
         assert all(float(r[2]) > 0.0 for r in ball_rel_edges)
 
-        # 5. Verify both permutations of 'a ball -> pred -> a ball' exist as distinct non-self-loop facts
-        ball_facts = engine.conn.execute(
+        # 5. Verify zero reflexive self-loop facts (subj_id = obj_id) while distinct-sense 'a ball' facts remain
+        reflexive_self_facts = engine.conn.execute("SELECT fact_id FROM facts WHERE subj_id = obj_id").fetchall()
+        assert len(reflexive_self_facts) == 0
+
+        distinct_sense_ball_facts = engine.conn.execute(
             """
-            SELECT fact_id, subj_id, pred, obj_id FROM facts
+            SELECT fact_id, subj_id, obj_id FROM facts
             WHERE subj_id IN (SELECT entity_id FROM entities WHERE name = 'a ball')
               AND obj_id IN (SELECT entity_id FROM entities WHERE name = 'a ball')
             """
         ).fetchall()
-        assert len(ball_facts) == 2
-        for fid, sid, pred, oid in ball_facts:
-            assert str(sid) != str(oid), f"Homograph triple collapsed into self-loop on {fid} ({pred})"
-            assert str(sid) in ball_ids and str(oid) in ball_ids
+        assert len(distinct_sense_ball_facts) == 2
+        assert all(str(r[1]) != str(r[2]) for r in distinct_sense_ball_facts)
 
-        # Verify the two permutations have reversed (subject_id, object_id) poles
-        fact_poles = {(str(r[1]), str(r[3])) for r in ball_facts}
-        assert len(fact_poles) == 2
-        pole_a, pole_b = list(fact_poles)
-        assert pole_a == (pole_b[1], pole_b[0])
+        ball_obj_facts = engine.conn.execute(
+            """
+            SELECT fact_id, subj_id, pred, obj_id FROM facts
+            WHERE obj_id IN (SELECT entity_id FROM entities WHERE name = 'a ball')
+            """
+        ).fetchall()
+        assert len(ball_obj_facts) >= 2
+        assert {str(r[3]) for r in ball_obj_facts} <= ball_ids
 
         # 6. Verify CSR topology includes skos:related + fact edges and excludes owl:differentFrom (weight 0)
         _, topo_entity_ids, topo_edges = load_graph_topology(engine.conn)
-        s0, o0 = pole_a
+        s0, o0 = str(ball_rel_edges[0][0]), str(ball_rel_edges[0][1])
         assert s0 in topo_entity_ids and o0 in topo_entity_ids
         topo_edge_map = {(u, v): w for u, v, w in topo_edges}
         assert topo_edge_map.get((s0, o0), 0.0) > 0.0

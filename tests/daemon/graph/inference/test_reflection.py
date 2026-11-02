@@ -207,7 +207,7 @@ def test_native_writer_and_complete_budget(provider):
     assert "source evidence" in result.new_instruction
     assert "Turing" in str(calls[-1])
     assert "qa.predict" in str(calls[-1])
-    assert prop.qwen_compressor.signature.output_fields.keys() == {"shortened_instruction"}
+    assert prop.llm_compressor.signature.output_fields.keys() == {"shortened_instruction"}
     prop.reflection_input_tokens = 10
     prop.worker_lm = prop.worker_lm.target
     prop.orchestrator_lm = prop.orchestrator_lm.target
@@ -244,7 +244,7 @@ def test_compression_and_demos_cannot_bypass_complete_request_budget(provider):
     with pytest.raises(ReflectionBudgetError):
         prop(component_name="qa.predict", current_instruction="OVERSIZED_DRAFT")
     assert len(calls) == 1  # The oversized compression request never reaches inference.
-    prop.qwen_proposer.demos = [
+    prop.llm_proposer.demos = [
         dspy.Example(
             current_instruction="Use evidence.",
             examples_with_feedback=[{"Feedback": "x" * 50000}],
@@ -398,7 +398,7 @@ def test_repeated_native_proposals_release_inputs_and_histories(provider):
     assert all(reference() is None for reference in retained)
     assert outer_trace == []
     assert prop.worker_lm.history == prop.worker_lm.target.history == []
-    assert prop.qwen_proposer.traces == prop.qwen_compressor.traces == []
+    assert prop.llm_proposer.traces == prop.llm_compressor.traces == []
     assert prop.worker_module.sub_telemetry == []
 
 
@@ -424,8 +424,8 @@ def test_completed_request_invalidates_when_learned_writer_changes(tmp_path, pro
         completed_calls = len(calls)
         assert prop(candidate, data, ["qa.predict"]) == first
         assert len(calls) == completed_calls
-        prop.qwen_proposer.signature = prop.qwen_proposer.signature.with_instructions(
-            prop.qwen_proposer.signature.instructions + "\nPreserve exact source names in task outputs."
+        prop.llm_proposer.signature = prop.llm_proposer.signature.with_instructions(
+            prop.llm_proposer.signature.instructions + "\nPreserve exact source names in task outputs."
         )
         assert prop(candidate, data, ["qa.predict"]) == first
         assert len(calls) == completed_calls + 1  # Evidence is reused; the new writer runs once.

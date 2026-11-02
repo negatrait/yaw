@@ -4,15 +4,16 @@ import tempfile
 import unittest
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from typing import Any
 
 from yaw.core.types import (
     ChunkPointer,
     HydratedPassage,
     OpenIERecord,
     RetrievalResult,
-    check_lexical_subsumption_inversion,
     compute_chunk_id,
     compute_mdhash_id,
+    detect_scalar_literal,
     inclusive_end_line,
     resolve_corpus_path,
     text_processing,
@@ -166,7 +167,20 @@ class TypesTests(unittest.TestCase):
             ["apple inc", "google llc", "c++", "c#"],
         )
 
-    def test_check_lexical_subsumption_inversion_preserves_technical_tokens(self):
-        self.assertFalse(check_lexical_subsumption_inversion("C", "C++"))
-        self.assertFalse(check_lexical_subsumption_inversion("C++", "C#"))
-        self.assertTrue(check_lexical_subsumption_inversion("C++", "C++ Standard Library"))
+    def test_detect_scalar_literal_xsd_datatypes(self):
+        self.assertEqual(detect_scalar_literal("true"), (True, "xsd:boolean"))
+        self.assertEqual(detect_scalar_literal("FALSE"), (True, "xsd:boolean"))
+        self.assertEqual(detect_scalar_literal("8080"), (True, "xsd:integer"))
+        self.assertEqual(detect_scalar_literal("-42"), (True, "xsd:integer"))
+        self.assertEqual(detect_scalar_literal("+100"), (True, "xsd:integer"))
+        self.assertEqual(detect_scalar_literal("3.14159"), (True, "xsd:decimal"))
+        self.assertEqual(detect_scalar_literal("-0.5"), (True, "xsd:decimal"))
+        self.assertEqual(detect_scalar_literal("2026-10-25"), (True, "xsd:date"))
+        self.assertEqual(detect_scalar_literal("2026-10-25T12:30:00Z"), (True, "xsd:dateTime"))
+        self.assertEqual(detect_scalar_literal("2026-10-25 12:30:00+02:00"), (True, "xsd:dateTime"))
+        self.assertEqual(detect_scalar_literal("v1.2.3"), (False, "xsd:string"))
+        self.assertEqual(detect_scalar_literal("99.9%"), (False, "xsd:string"))
+        self.assertEqual(detect_scalar_literal("NetSuite"), (False, "xsd:string"))
+        self.assertEqual(detect_scalar_literal(""), (False, "xsd:string"))
+        non_str: Any = None
+        self.assertEqual(detect_scalar_literal(non_str), (False, "xsd:string"))

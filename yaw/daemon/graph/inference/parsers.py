@@ -9,14 +9,27 @@ from collections.abc import Mapping, Sequence
 from typing import Any, Literal
 
 import dspy
-from dspy.evaluate.metrics import F1, normalize_text
+from dspy.evaluate.metrics import F1
 
-from yaw.core import StructuredTriple, compute_mdhash_id, detect_scalar_literal, text_processing
+from yaw.core import (
+    SYNONYM_RELATION_ALIASES,
+    VALID_SHACL_ACTIONS,
+    VALID_SYNONYM_RELATIONS,
+    VALUE_BEARING_SHACL_ACTIONS,
+    StructuredTriple,
+    clean_schema_definition,
+    compute_mdhash_id,
+    detect_scalar_literal,
+    text_processing,
+)
 
 
 def _nullable_text(value: Any) -> str:
     """Model null is missing text, never an entity or definition named 'None'."""
     return "" if value is None else str(value).strip()
+
+
+_clean_definition = clean_schema_definition
 
 
 def _parse_predicate_slot(raw_pred: Any) -> tuple[str, Literal["entity", "literal"] | None] | None:
@@ -161,32 +174,21 @@ def _coerce_structured_triple_item(
         return None
 
     # Check scalar literal constraints
-    s_is_lit, _ = detect_scalar_literal(subj)
     o_is_lit, o_lit_dt = detect_scalar_literal(obj)
-
-    if s_is_lit:
-        if not o_is_lit and obj_kind != "literal":
-            # Literals cannot be RDF subjects: swap subj and obj
-            subj, obj = obj, subj
-            subj_def, obj_def = obj_def, subj_def
-            s_is_lit, o_is_lit = False, True
-            obj_kind = "literal"
-            o_lit_dt = "rdfs:Literal"
-        else:
-            # Both endpoints are scalar literals: invalid RDF statement
-            return None
 
     if obj_kind == "literal" or (not has_explicit_kind and o_is_lit):
         obj_kind = "literal"
-        if not obj_datatype:
-            obj_datatype = o_lit_dt or "rdfs:Literal"
+        if not obj_datatype or obj_datatype == "rdfs:Literal":
+            obj_datatype = o_lit_dt
 
+    subj_def = _clean_definition(subj_def)
+    obj_def = _clean_definition(obj_def)
     if not spo_def:
         spo_def = f"{subj} {pred} {obj}."
     if not subj_def:
-        subj_def = lookup.get(subj) or lookup.get(str(text_processing(subj))) or ""
+        subj_def = _clean_definition(lookup.get(subj) or lookup.get(str(text_processing(subj))) or "")
     if not obj_def:
-        obj_def = lookup.get(obj) or lookup.get(str(text_processing(obj))) or ""
+        obj_def = _clean_definition(lookup.get(obj) or lookup.get(str(text_processing(obj))) or "")
 
     return StructuredTriple(
         subj=subj,
@@ -199,35 +201,6 @@ def _coerce_structured_triple_item(
         obj_datatype=obj_datatype if obj_kind == "literal" else "",
         obj_lang=obj_lang if obj_kind == "literal" else "",
     )
-
-
-def filter_invalid_triples(triples: Sequence[Any]) -> list[list[str]]:
-    """Filter out invalid and duplicate triples, preserving original order."""
-    unique_triples: set[tuple[str, str, str]] = set()
-    valid_triples: list[list[str]] = []
-
-    for triple in triples:
-        if isinstance(triple, (dict, StructuredTriple)):
-            st = _coerce_structured_triple_item(triple)
-            if st is None:
-                continue
-            valid_triple = [st.subj, st.pred, st.obj]
-        elif isinstance(triple, (list, tuple)) and len(triple) == 3:
-            if any(isinstance(x, (list, tuple, dict)) for x in triple):
-                st = _coerce_structured_triple_item(triple)
-                if st is None:
-                    continue
-                valid_triple = [st.subj, st.pred, st.obj]
-            else:
-                valid_triple = [str(item) for item in triple]
-        else:
-            continue
-        key = (valid_triple[0], valid_triple[1], valid_triple[2])
-        if key not in unique_triples:
-            unique_triples.add(key)
-            valid_triples.append(valid_triple)
-
-    return valid_triples
 
 
 def _extract_json_list_field(response: str, field_name: str) -> list[Any]:
@@ -266,12 +239,7 @@ def _parse_bare_json_list(response: str) -> list[Any] | None:
     return payload
 
 
-def extract_entity_definitions(
-    raw_input: Any,
-    *,
-    normalize_keys: bool = False,
-    exclude_scalars: bool = False,
-) -> tuple[tuple[str, str], ...]:
+def extract_entity_definitions(raw_input: Any) -> tuple[tuple[str, str], ...]:
     """Extract and deduplicate (entity_name, contextual_definition) pairs from Stage 1 NER, \
 DefineMissingEntities output, or {name: definition} mappings."""
     raw_list: Sequence[Any]
@@ -313,18 +281,17 @@ DefineMissingEntities output, or {name: definition} mappings."""
         elif isinstance(item, (list, tuple)) and len(item) >= 1:
             name = str(item[0]).strip()
             if len(item) >= 2 and item[1] is not None:
-                defn = str(item[1]).strip()
+                defn = _clean_definition(item[1])
         elif isinstance(item, dict):
             raw_name = item.get("name", item.get("entity", item.get("label", "")))
             raw_def = item.get("definition", item.get("def", item.get("skos:definition", "")))
             name = _nullable_text(raw_name)
-            defn = _nullable_text(raw_def)
-        if not name or (exclude_scalars and detect_scalar_literal(name)[0]):
+            defn = _clean_definition(raw_def)
+        if not name:
             continue
-        key = (str(text_processing(name)) or name.lower()) if normalize_keys else name
-        existing_idxs = indices_by_name.get(key)
+        existing_idxs = indices_by_name.get(name)
         if not existing_idxs:
-            indices_by_name[key] = [len(ordered_pairs)]
+            indices_by_name[name] = [len(ordered_pairs)]
             ordered_pairs.append((name, defn))
         elif not defn:
             continue
@@ -348,17 +315,6 @@ DefineMissingEntities output, or {name: definition} mappings."""
     return tuple(ordered_pairs)
 
 
-def extract_named_entities(response: Any, *, exclude_scalars: bool = False) -> tuple[str, ...]:
-    """Extract and deduplicate unique named entities from LLM response (supporting [name, def] pairs and 1D strings)."""
-    seen: set[str] = set()
-    names: list[str] = []
-    for name, _ in extract_entity_definitions(response, exclude_scalars=exclude_scalars):
-        if name not in seen:
-            seen.add(name)
-            names.append(name)
-    return tuple(names)
-
-
 def extract_structured_triples(
     raw_input: Any,
     *,
@@ -366,11 +322,10 @@ def extract_structured_triples(
 ) -> tuple[StructuredTriple, ...]:
     """Extract, validate, and deduplicate StructuredTriple records from raw list, dict, or JSON string."""
     def_lookup: dict[str, str] = {}
-    multi_defs: dict[str, list[str]] = {}
     if isinstance(entity_definitions, dict):
         for k, v in entity_definitions.items():
             clean_k = str(k).strip()
-            clean_v = str(v).strip()
+            clean_v = _clean_definition(v)
             if clean_k and clean_v:
                 def_lookup[clean_k] = clean_v
                 def_lookup[str(text_processing(clean_k))] = clean_v
@@ -378,17 +333,12 @@ def extract_structured_triples(
         for pair in entity_definitions:
             if isinstance(pair, (list, tuple)) and len(pair) >= 2:
                 clean_k = str(pair[0]).strip()
-                clean_v = str(pair[1]).strip()
+                clean_v = _clean_definition(pair[1])
                 if clean_k and clean_v:
                     norm_k = str(text_processing(clean_k))
                     def_lookup.setdefault(clean_k, clean_v)
                     if norm_k:
                         def_lookup.setdefault(norm_k, clean_v)
-                    for key_str in (clean_k, norm_k):
-                        if key_str:
-                            lst = multi_defs.setdefault(key_str, [])
-                            if all(d.lower() != clean_v.lower() for d in lst):
-                                lst.append(clean_v)
 
     raw_list: Sequence[Any]
     if isinstance(raw_input, str):
@@ -412,33 +362,6 @@ def extract_structured_triples(
         st = _coerce_structured_triple_item(item, def_lookup=def_lookup)
         if st is None:
             continue
-        s_norm = str(text_processing(st.subj))
-        o_norm = str(text_processing(st.obj))
-        if (
-            st.obj_kind == "entity"
-            and s_norm
-            and s_norm == o_norm
-            and st.subj_def
-            and st.obj_def
-            and st.subj_def.lower() == st.obj_def.lower()
-        ):
-            senses = multi_defs.get(s_norm) or multi_defs.get(st.subj) or []
-            if len(senses) >= 2:
-                alt_sense = next(
-                    (d for d in senses if d.lower() != st.subj_def.lower()),
-                    st.obj_def,
-                )
-                st = StructuredTriple(
-                    subj=st.subj,
-                    subj_def=st.subj_def,
-                    pred=st.pred,
-                    obj=st.obj,
-                    obj_def=alt_sense,
-                    spo_def=st.spo_def,
-                    obj_kind=st.obj_kind,
-                    obj_datatype=st.obj_datatype,
-                    obj_lang=st.obj_lang,
-                )
         key = (
             st.subj,
             st.subj_def.strip().lower(),
@@ -451,13 +374,6 @@ def extract_structured_triples(
             seen.add(key)
             results.append(st)
     return tuple(results)
-
-
-def extract_triples(response: str) -> tuple[tuple[str, str, str], ...]:
-    """Extract, validate, and deduplicate relation triples from LLM response."""
-    raw_list = _extract_json_list_field(response, "triples")
-    filtered = filter_invalid_triples(raw_list)
-    return tuple((t[0], t[1], t[2]) for t in filtered)
 
 
 def match_facts_to_candidate_indices(
@@ -521,11 +437,6 @@ def coerce_generated_facts(raw_output: Any) -> list[list[str]]:
             if isinstance(item, (list, tuple)) and len(item) == 3:
                 valid.append([str(x) for x in item])
     return valid
-
-
-def normalize_answer(answer: str) -> str:
-    """Normalize a given string for exact match and F1 comparison."""
-    return str(normalize_text(str(answer)))
 
 
 def compute_qa_em_f1(pred_str: str, gold_answers: Sequence[str]) -> tuple[float, float]:
@@ -652,59 +563,6 @@ def compute_answer_passage_match(
     return bool(dspy.evaluate.answer_passage_match(ex_apm, pred_apm))
 
 
-_SYNONYM_RELATION_ALIASES: dict[str, str] = {
-    "skos:altLabel": "skos:altLabel",
-    "altLabel": "skos:altLabel",
-    "exact_match": "skos:altLabel",
-    "skos:hiddenLabel": "skos:hiddenLabel",
-    "hiddenLabel": "skos:hiddenLabel",
-    "skos:related": "skos:related",
-    "related": "skos:related",
-    "skos:broader": "skos:broader",
-    "broader": "skos:broader",
-    "skos:narrower": "skos:narrower",
-    "narrower": "skos:narrower",
-    "owl:differentFrom": "owl:differentFrom",
-    "differentFrom": "owl:differentFrom",
-}
-VALID_SYNONYM_RELATIONS: frozenset[str] = frozenset(
-    {
-        "skos:altLabel",
-        "skos:hiddenLabel",
-        "skos:related",
-        "skos:broader",
-        "owl:differentFrom",
-    }
-)
-VALID_SHACL_ACTIONS: frozenset[str] = frozenset(
-    {
-        "set_definition",
-        "rewrite_definition",
-        "set_pref_label",
-        "demote_to_alt_label",
-        "merge_altLabel",
-        "merge_hiddenLabel",
-        "add_different_from",
-        "assert_differentFrom",
-        "assert_related",
-        "assert_broader",
-        "invert_broader",
-        "demote_sibling_to_related",
-        "remove_hierarchy_cycle",
-        "remove_conflicting_related",
-        "delete_dangling",
-        "delete_invalid_fact",
-    }
-)
-VALUE_BEARING_SHACL_ACTIONS: frozenset[str] = frozenset(
-    {
-        "set_definition",
-        "rewrite_definition",
-        "set_pref_label",
-    }
-)
-
-
 def parse_synonym_decisions(
     raw_output: Any,
     num_pairs: int | None = None,
@@ -732,7 +590,7 @@ def parse_synonym_decisions(
             continue
         pair_id = str(item.get("pair_id", "")).strip()
         raw_relation = str(item.get("relation", "")).strip()
-        relation = _SYNONYM_RELATION_ALIASES.get(raw_relation, "")
+        relation = SYNONYM_RELATION_ALIASES.get(raw_relation, "")
         canonical = str(item.get("canonical", "")).strip()
         if relation == "skos:narrower":
             relation = "skos:broader"
@@ -1323,12 +1181,8 @@ __all__ = [
     "doc_matches_gold",
     "evaluate_benchmark_gate",
     "extract_entity_definitions",
-    "extract_named_entities",
     "extract_structured_triples",
-    "extract_triples",
-    "filter_invalid_triples",
     "match_facts_to_candidate_indices",
-    "normalize_answer",
     "parse_shacl_repairs",
     "parse_synonym_decisions",
     "text_processing",
