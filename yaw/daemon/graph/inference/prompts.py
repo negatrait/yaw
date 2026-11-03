@@ -263,52 +263,71 @@ class DefineMissingEntities(dspy.Signature):
     )
 
 
-class JudgeSynonyms(dspy.Signature):
-    """Adjudicate the W3C SKOS / OWL 2 RL semantic relation in `decisions` for every candidate pair in \
-`candidate_pairs` using both concepts' `skos:prefLabel`, `skos:definition`, reified `rdf:Statement` assertions, \
-and source passages.
-    - Leibniz Substitutability Gate (`owl:sameAs` / SKOS S14): A `skos:Concept` has a single intensional identity. \
-Classify as `'skos:altLabel'` or `'skos:hiddenLabel'` ONLY when A and B are strictly coreferent (`owl:sameAs`) \
-such that substituting A for B across every `rdf:Statement` subject and object position preserves truth and \
-ontological sort (`rdf:type`) *salva veritate*. Never merge coordinate siblings, antonyms/opposites, distinct \
-telemetry metrics/headers, or numbered tiers/versions via `'skos:altLabel'` or `'skos:hiddenLabel'`.
-    - Ontological Sort, Mereological & Functional Role Disjointness (SKOS S13): If A and B have different \
-ontological classes (`rdf:type`), different mereological levels (whole system/platform vs component/module/artifact), \
-different causal or functional roles (an agent/platform/service vs an activity/job/process/execution; a \
-worker/job vs the event/snapshot/log/output it produces; a schema property/identifier key vs the data \
-records/collection it identifies; an operation/process vs its mapping/specification/rows), or participate as \
-subject and object of an `rdf:Statement` (`A --P--> B`), they fail Leibniz substitutability and MUST NOT be \
-merged as `'skos:altLabel'` or `'skos:hiddenLabel'`.
-    - For each `pair_id`, emit `{"pair_id": ..., "relation": ..., "canonical": ...}` selecting one relation and \
-the exact endpoint ID (`a.id` or `b.id`) as `canonical`:
-      1. `'skos:altLabel'`: Strictly coreferent `skos:Concept` (`owl:sameAs`) where one label is an acronym, \
-abbreviation, singular/plural inflection, or synonymous lexical variant of the exact same referent across \
-passages (`canonical` = more standard/complete `skos:prefLabel`).
-      2. `'skos:hiddenLabel'`: Strictly coreferent `skos:Concept` where the non-canonical label is an \
-orthographic typo, transcription error, or corrupted surface form (`canonical` = clean `skos:prefLabel`).
-      3. `'owl:differentFrom'`: Symmetric non-identity (`owl:AllDisjointClasses`) between any disjoint, \
-non-identical, or unrelated `skos:Concept` nodes (including polysemous homonyms, antonyms, and cross-domain \
-concepts that share no taxonomic `skos:broader` hierarchy and no direct domain `skos:related` interaction).
-      4. `'skos:broader'`: Strict asymmetric transitive subsumption (`skos:broaderTransitive` / `rdfs:subClassOf` \
-generic *is-a* or partitive *part-of* hierarchy) where one concept is a restricted/qualified taxonomic subtype \
-or sub-component of the broader parent concept (`canonical` = the broader parent `skos:Concept`).
-      5. `'skos:related'`: Non-hierarchical symmetric associative relation (SKOS S27: disjoint from \
-`skos:broaderTransitive`) linking distinct `skos:Concept` nodes that directly interact in the same domain, \
-occupy coupled functional roles (platform/process/mapping/row/field/artifact), participate in an `rdf:Statement`, \
-or are coordinate sibling concepts sharing a parent category."""
+SYNONYM_JUDGE_STAGE_NAMES: tuple[str, str, str] = (
+    "label_judge",
+    "hierarchy_judge",
+    "related_judge",
+)
+
+
+class JudgeLabels(dspy.Signature):
+    """Evaluate Stage 1 W3C SKOS concept equivalence and lexical identity (`skos:altLabel` and `skos:hiddenLabel`) \
+for candidate pairs in `candidate_pairs` using a 2-step conditional branching heuristic:
+    1. Concept Equivalence (`equivalent=true`): If `entity_a` and `entity_b` denote the same underlying concept or \
+duplicate entity (e.g., identical surface names across passages like 'Jira' and 'Jira' or 'Change Management Policy' \
+and 'Change Management Policy', or coreferent mentions of the exact same referent), emit `"equivalent": true` and \
+synthesize a unified, non-tautological `"definition"` string combining their context to collapse them into a single \
+concept.
+    2. Distinct or Lexical Variant (`equivalent=false`): Branch on `"alt_label"`:
+       - If one surface name is a valid alternative label, synonym, acronym, or abbreviation of the other \
+(`skos:altLabel`), emit `"equivalent": false, "alt_label": true` (do not emit `"hidden_label"`).
+       - Otherwise emit `"equivalent": false, "alt_label": false, "hidden_label": true` for a misspelling/typo \
+(`skos:hiddenLabel`), or `"equivalent": false, "alt_label": false, "hidden_label": false` when `entity_a` and \
+`entity_b` are distinct concepts advancing to Stage 2 hierarchy evaluation."""
 
     candidate_pairs: str = dspy.InputField(
+        desc="JSON object (`synonym-evidence-v2`) with inline definitions, facts, and source excerpts."
+    )
+    decisions: list[dict[str, Any]] = dspy.OutputField(
         desc=(
-            "Structured Markdown dossiers (or JSON list) of candidate entity/literal pairs with SKOS/RDF/OWL "
-            "profiles, reified rdf:Statement facts, source chunks, and similarity scores"
+            'List of branched decision objects: if equivalent=true, emit {"pair_id": "e0|e1", "reasoning": "...", '
+            '"equivalent": true, "definition": "<unified skos:definition>"}; '
+            'if equivalent=false and alt_label=true, emit {"pair_id": "e0|e1", "reasoning": "...", '
+            '"equivalent": false, "alt_label": true}; '
+            'if equivalent=false and alt_label=false, emit {"pair_id": "e0|e1", "reasoning": "...", '
+            '"equivalent": false, "alt_label": false, "hidden_label": bool}.'
         )
     )
-    decisions: list[dict[str, str]] = dspy.OutputField(
+
+
+class JudgeHierarchy(dspy.Signature):
+    """Evaluate Stage 2 W3C SKOS hierarchy (`skos:broader` and `skos:narrower`) for distinct concept pairs."""
+
+    candidate_pairs: str = dspy.InputField(
+        desc="JSON object (`synonym-evidence-v2`) with inline definitions, facts, and source excerpts."
+    )
+    decisions: list[dict[str, Any]] = dspy.OutputField(
         desc=(
-            'List of {"pair_id": "id_a|id_b", "relation": '
-            '"skos:altLabel|skos:hiddenLabel|skos:related|skos:broader|owl:differentFrom", '
-            '"canonical": "id_a_or_id_b"} decision objects'
+            'List of {"pair_id": "e0|e1", "reasoning": "...", "broader": bool, "narrower": bool} objects '
+            "where broader=True iff A is narrower subtype of broader B (`A skos:broader B`), "
+            "and narrower=True iff B is narrower subtype of broader A (`A skos:narrower B`)."
         )
+    )
+
+
+class JudgeRelated(dspy.Signature):
+    """Evaluate Stage 3 associative relation (`skos:related` vs `owl:differentFrom`) for non-hierarchical pairs.
+    - Associated Domain Concepts: If entity_a and entity_b are conceptually associated, interact in the same domain \
+workflow, or share semantic context without a taxonomic broader/narrower hierarchy, mark `related=True` \
+(`skos:related`).
+    - Disjoint / Unrelated Concepts: If entity_a and entity_b denote completely independent, disjoint, or \
+non-associated entities, mark `related=False` (`owl:differentFrom`)."""
+
+    candidate_pairs: str = dspy.InputField(
+        desc="JSON object (`synonym-evidence-v2`) with inline definitions, facts, and source excerpts."
+    )
+    decisions: list[dict[str, Any]] = dspy.OutputField(
+        desc='List of {"pair_id": "e0|e1", "reasoning": "...", "related": bool} objects.'
     )
 
 
@@ -647,7 +666,9 @@ __all__ = [
     "FactList",
     "FilterTriples",
     "HealSHACLViolations",
-    "JudgeSynonyms",
+    "JudgeHierarchy",
+    "JudgeLabels",
+    "JudgeRelated",
     "NER_DEMOS",
     "NER_ONE_SHOT_PARAGRAPH",
     "ProposeInstructionSignature",
@@ -655,6 +676,7 @@ __all__ = [
     "QA_DEMOS",
     "RAG_QA_DOCS",
     "ReflectiveInnerDistillerSignature",
+    "SYNONYM_JUDGE_STAGE_NAMES",
     "TRIPLE_DEMOS",
     "TRIPLE_FILTER_DEMOS",
     "best_dspy_prompt",

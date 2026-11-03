@@ -114,9 +114,9 @@ def test_dossiers_share_profiles_split_on_budget_and_keep_every_pair_evidence(tm
         batches = list(iter_synonym_evidence(conn, candidates, tmp_path))
         assert len(batches) == 1
         prompt = batches[0].payload
-        assert prompt.count("Unique definition 0") == 1
-        assert prompt.count("Grounded evidence for Concept 0.") == 1
-        assert prompt.count("Common evidence for all four entities.") == 1
+        assert prompt.count("Unique definition 0") == 3
+        assert prompt.count("Grounded evidence for Concept 0.") == 3
+        assert prompt.count("Common evidence for all four entities.") == 6
         for i in range(1, 4):
             assert f"Unique definition {i}" in prompt
             assert f"Grounded evidence for Concept {i}." in prompt
@@ -131,7 +131,7 @@ def test_dossiers_share_profiles_split_on_budget_and_keep_every_pair_evidence(tm
             assert len(text) <= limit
             assert "Unique definition 0" in text
             assert batch.candidates[0]["def_b"] in text
-            assert text.count("Common evidence for all four entities.") == 1
+            assert text.count("Common evidence for all four entities.") == 2
             index = json.loads(text)["pairs"]
             a, b = index[0]["pair_id"].split("|")
             assert f"{batch.identifiers[a]}|{batch.identifiers[b]}" == batch.candidates[0]["pair_id"]

@@ -19,7 +19,13 @@ from yaw.daemon.graph.inference.parsers import (
     extract_structured_triples,
     parse_shacl_repairs,
 )
-from yaw.daemon.graph.inference.prompts import ExtractTriples, JudgeSynonyms, ProposeSHACLRepairs
+from yaw.daemon.graph.inference.prompts import (
+    ExtractTriples,
+    JudgeHierarchy,
+    JudgeLabels,
+    JudgeRelated,
+    ProposeSHACLRepairs,
+)
 
 
 def test_typed_predicate_datatype_and_object_properties_preserve_definitions() -> None:
@@ -282,13 +288,14 @@ def test_relation_traversal_policy_datatype_property_and_aliases() -> None:
 
 
 def test_gbnf_and_prompts_typed_predicate_and_shacl_actions() -> None:
-    """Verify ExtractTriples, JudgeSynonyms, ProposeSHACLRepairs, GBNF grammars, and VALID_SHACL_ACTIONS contracts."""
+    """Verify ExtractTriples, JudgeLabels, JudgeHierarchy, JudgeRelated, ProposeSHACLRepairs,
+    GBNF grammars, and VALID_SHACL_ACTIONS contracts."""
     assert "owl:ObjectProperty" in ExtractTriples.instructions
     assert "owl:DatatypeProperty" in ExtractTriples.instructions
-    assert "singular/plural" in JudgeSynonyms.instructions
-    assert "Leibniz" in JudgeSynonyms.instructions
-    assert "owl:sameAs" in JudgeSynonyms.instructions
-    assert "skos:broaderTransitive" in JudgeSynonyms.instructions
+    assert "skos:altLabel" in JudgeLabels.instructions
+    assert "skos:hiddenLabel" in JudgeLabels.instructions
+    assert "skos:broader" in JudgeHierarchy.instructions
+    assert "skos:related" in JudgeRelated.instructions
     assert "pred-slot ::=" in DSPY_TRIPLES_GBNF_GRAMMAR
     assert "owl:ObjectProperty" in DSPY_TRIPLES_GBNF_GRAMMAR
     assert "owl:DatatypeProperty" in DSPY_TRIPLES_GBNF_GRAMMAR

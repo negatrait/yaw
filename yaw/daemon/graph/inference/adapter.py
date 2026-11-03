@@ -7,13 +7,15 @@ import dspy
 
 from .grammars import (
     DSPY_RERANK_GBNF_GRAMMAR,
+    build_dspy_hierarchy_judge_grammar,
     build_dspy_instruction_proposal_grammar,
+    build_dspy_label_judge_grammar,
     build_dspy_missing_entity_defs_grammar,
     build_dspy_ner_grammar,
     build_dspy_qa_grammar,
     build_dspy_query_intent_grammar,
+    build_dspy_related_judge_grammar,
     build_dspy_shacl_repair_grammar,
-    build_dspy_synonym_judge_grammar,
     build_dspy_triples_grammar,
     lm_supports_gbnf,
 )
@@ -56,8 +58,12 @@ class YawGBNFAdapter(dspy.JSONAdapter):
             return build_dspy_triples_grammar(self.max_triples)
         if sig_name == "DefineMissingEntities":
             return build_dspy_missing_entity_defs_grammar()
-        if sig_name == "JudgeSynonyms":
-            return build_dspy_synonym_judge_grammar(self.max_entities)
+        if sig_name == "JudgeLabels":
+            return build_dspy_label_judge_grammar(self.max_entities)
+        if sig_name == "JudgeHierarchy":
+            return build_dspy_hierarchy_judge_grammar(self.max_entities)
+        if sig_name == "JudgeRelated":
+            return build_dspy_related_judge_grammar(self.max_entities)
         if sig_name == "ProposeSHACLRepairs":
             return build_dspy_shacl_repair_grammar(self.max_entities)
         if sig_name == "ExtractQueryIntent":
@@ -81,7 +87,19 @@ class YawGBNFAdapter(dspy.JSONAdapter):
             if out_keys == ("entity_definitions",):
                 return build_dspy_missing_entity_defs_grammar()
             if out_keys == ("decisions",):
-                return build_dspy_synonym_judge_grammar(self.max_entities)
+                dec_field = out_fields["decisions"]
+                extra = getattr(dec_field, "json_schema_extra", None)
+                extra_desc = extra.get("desc") if isinstance(extra, Mapping) else None
+                dec_desc = str(getattr(dec_field, "description", None) or extra_desc or "")
+                sig_doc = str(getattr(signature, "__doc__", "") or getattr(signature, "instructions", ""))
+                combined = f"{dec_desc} {sig_doc}".lower()
+                if "alt_label" in combined or "hidden_label" in combined or "stage 1" in combined:
+                    return build_dspy_label_judge_grammar(self.max_entities)
+                if "broader" in combined or "narrower" in combined or "stage 2" in combined:
+                    return build_dspy_hierarchy_judge_grammar(self.max_entities)
+                if "related" in combined or "stage 3" in combined:
+                    return build_dspy_related_judge_grammar(self.max_entities)
+                return None
             if out_keys == ("repairs",) and "focus_context" in in_keys:
                 return build_dspy_shacl_repair_grammar(self.max_entities)
             if out_keys == ("new_instruction",):

@@ -14,7 +14,6 @@ from cocoindex.connectors.sqlite import connect as coco_sqlite_connect
 from yaw.core import text_processing
 
 SQL_BATCH_SIZE = 500
-type YawConnection = sqlite3.Connection
 
 _CREATE_SCHEMA_STATEMENTS: tuple[str, ...] = (
     """

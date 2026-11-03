@@ -88,10 +88,10 @@ def indexing_provider():
                 stage, result = "intent", {"query_intent": "Who wrote Notes?"}
             elif "fact_before_filter" in prompt:
                 stage, result = "filter", {"fact": [["ada", "wrote", "notes"]]}
+            elif "candidate_pairs" in prompt or "synonym-evidence" in prompt:
+                stage, result = "synonyms", {"decisions": []}
             elif "reasoning" in prompt.lower():
                 stage, result = "qa", {"reasoning": "The source states Ada wrote Notes.", "answer": "Answer: 'Ada'"}
-            elif "candidate_pairs" in prompt:
-                stage, result = "synonyms", {"decisions": []}
             elif "missing_entities" in prompt:
                 stage, result = (
                     "definitions",

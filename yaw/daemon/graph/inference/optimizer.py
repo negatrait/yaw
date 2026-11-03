@@ -22,6 +22,14 @@ from gepa.core.callbacks import CompositeCallback
 from yaw.core import ChunkPointer, YawRuntimeError, compute_mdhash_id, write_text_atomic
 
 from .chat import configure_yaw_dspy_cache, set_yaw_sleep_seconds
+from .diagnostics import (
+    extract_named_trace_entries,
+    hierarchy_judge_fingerprint,
+    judge_stage_fingerprint,
+    label_judge_fingerprint,
+    related_judge_fingerprint,
+    serialize_predictor_surface,
+)
 from .embedding import FACT_INSTRUCTION
 from .parsers import (
     compute_answer_passage_match,
@@ -222,45 +230,6 @@ class GraphOptimizationHooks:
     config: Any = None
 
 
-def serialize_predictor_surface(pred: Any) -> dict[str, Any]:
-    """Serialize a DSPy predictor's instruction, demos, field types, config, and LM cache identity."""
-    sig = getattr(pred, "signature", None)
-    instructions = str(getattr(sig, "instructions", "") or "")
-    in_fields = set(getattr(sig, "input_fields", {}) or {})
-    out_fields = set(getattr(sig, "output_fields", {}) or {})
-    demos_raw = getattr(pred, "demos", None) or ()
-    demos_repr: list[str] = []
-    for d in demos_raw:
-        d_dict = d.toDict() if hasattr(d, "toDict") else (dict(d) if isinstance(d, Mapping) else None)
-        if isinstance(d_dict, dict) and in_fields and out_fields:
-            if not (in_fields.issubset(d_dict.keys()) and out_fields.issubset(d_dict.keys())):
-                continue
-            filtered = {k: d_dict[k] for k in sorted(in_fields | out_fields)}
-            demos_repr.append(json.dumps(filtered, sort_keys=True, ensure_ascii=False, default=str))
-        else:
-            demos_repr.append(str(d_dict) if d_dict is not None else str(d))
-    lm = getattr(pred, "lm", None) or dspy.settings.lm
-    identity = getattr(lm, "cache_identity", None)
-    return {
-        "instructions": instructions,
-        "demos": demos_repr,
-        "fields": {name: str(f.annotation) for name, f in sig.fields.items()} if sig else {},
-        "config": getattr(pred, "config", {}),
-        "lm": identity()
-        if callable(identity)
-        else {
-            "model": getattr(lm, "model", None),
-            "model_type": getattr(lm, "model_type", None),
-            "context_window_tokens": getattr(lm, "_yaw_context_window_tokens", None),
-            "kwargs": {
-                key: value
-                for key, value in (getattr(lm, "kwargs", {}) or {}).items()
-                if key not in {"api_key", "api_token"}
-            },
-        },
-    }
-
-
 def prune_mismatching_demos(program: HippoRAGProgram) -> None:
     """Remove any few-shot demos whose keys do not cover their predictor's input and output fields."""
     if not hasattr(program, "named_predictors"):
@@ -293,16 +262,6 @@ def embed_fingerprint(program: Any, instruction: str = "") -> str:
     else:
         prefix = query_prefix
     payload = {"prefix": prefix}
-    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
-def synonym_fingerprint(program: HippoRAGProgram) -> str:
-    """Compute SHA-256 fingerprint for Stage 6 synonym judgment predictor surface."""
-    named = dict(program.named_predictors()) if hasattr(program, "named_predictors") else {}
-    payload = serialize_predictor_surface(named["synonym_judge"]) if "synonym_judge" in named else {}
-    payload["context_budget"] = [program.context_window_tokens, program.max_output_tokens]
-    payload["schema_version"] = "skos-shacl-v3"
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -349,7 +308,9 @@ def extraction_fingerprint(program: HippoRAGProgram) -> str:
         "ner",
         "triples",
         "entity_definer",
-        "synonym_judge",
+        "label_judge",
+        "hierarchy_judge",
+        "related_judge",
         "shacl_repair",
         "shacl_healer_rlm.generate_action",
         "shacl_healer_rlm.extract",
@@ -718,45 +679,6 @@ def compile_pareto_ensemble(
         program_path=program_path,
     )
     return dspy.Ensemble(reduce_fn=reduce_pareto_predictions).compile(programs)
-
-
-def extract_named_trace_entries(
-    program: HippoRAGProgram,
-    raw_trace: Sequence[Any],
-    *,
-    allowed_names: set[str] | None = None,
-) -> list[tuple[str, dict[str, Any], Any]]:
-    """Map raw DSPy trace tuples back to their named predictor names on `program`."""
-    named_preds = list(program.named_predictors()) if hasattr(program, "named_predictors") else []
-    captured: list[tuple[str, dict[str, Any], Any]] = []
-    for item in raw_trace:
-        if not isinstance(item, (list, tuple)) or len(item) < 3:
-            continue
-        pred_inst, inp, out = item[0], item[1], item[2]
-        matched_name: str | None = None
-        pred_sig = getattr(pred_inst, "signature", None)
-        for name, cand_pred in named_preds:
-            if pred_inst is cand_pred:
-                matched_name = name
-                break
-        if matched_name is None and pred_sig is not None:
-            pred_fields = tuple(getattr(pred_sig, "fields", {}).keys())
-            for name, cand_pred in named_preds:
-                cand_sig = getattr(cand_pred, "signature", None)
-                if cand_sig is not None:
-                    is_eq = cand_sig.equals(pred_sig) if hasattr(cand_sig, "equals") else cand_sig == pred_sig
-                    cand_fields = tuple(getattr(cand_sig, "fields", {}).keys())
-                    if is_eq or (pred_fields and pred_fields == cand_fields):
-                        matched_name = name
-                        break
-        if matched_name is not None:
-            if allowed_names is not None and not (
-                matched_name in allowed_names or any(matched_name.startswith(f"{a}.") for a in allowed_names)
-            ):
-                continue
-            inp_dict = dict(inp) if isinstance(inp, Mapping) else {"input": inp}
-            captured.append((matched_name, inp_dict, out))
-    return captured
 
 
 class ActiveTraceComponentSelector:
@@ -1178,12 +1100,13 @@ def evolve_program_prompts(
             return
         p_inc = Path(save_path)
         p_inc.parent.mkdir(parents=True, exist_ok=True)
+        cand_prog = hooks.last_hook_program() or active_program_ref
         inc_payload = {
             "graph_rlm_stats": dict(hooks.graph_rlm_stats()),
             "candidate_records": _candidate_records(),
             "eval_records": eval_history[-500:],
             "gepa_progress": gepa_progress.snapshot(),
-            **active_program_ref.dump_audit_trails(bounded=True, telemetry_key="program_telemetry"),
+            **cand_prog.dump_audit_trails(bounded=True, telemetry_key="program_telemetry"),
         }
         # Diagnostic write failures must not change optimization decisions.
         with contextlib.suppress(OSError):
@@ -1240,6 +1163,7 @@ def evolve_program_prompts(
         record: bool = True,
     ) -> dspy.Prediction:
         nonlocal eval_count, last_eval_ts, last_eval_fp
+        cand_prog = hooks.last_hook_program() or active_program_ref
         if record and pred_name is None:
             eval_count += 1
         gold_answers_raw = getattr(gold, "gold_answers", getattr(gold, "answer", None))
@@ -1269,7 +1193,7 @@ def evolve_program_prompts(
         has_retrieval_labels = gold_docs_raw is not None and len(gold_docs_raw) > 0
         if gold_docs_raw is not None and len(gold_docs_raw) > 0:
             top_20_cids = [c for c in retrieved_seq[:20] if c.startswith("chunk-")]
-            hydrated_by_cid = hooks.hydrate_top_chunks(top_20_cids, active_program_ref) if top_20_cids else {}
+            hydrated_by_cid = hooks.hydrate_top_chunks(top_20_cids, cand_prog) if top_20_cids else {}
             n_ranks = min(20, max(len(retrieved_seq), len(retrieved_texts_seq)))
             ranked_docs = [
                 hydrated_by_cid.get(retrieved_seq[i] if i < len(retrieved_seq) else "")
@@ -1313,11 +1237,9 @@ def evolve_program_prompts(
                         )
                     elif isinstance(model_usage, (int, float)):
                         usage_tokens += int(model_usage)
-        if usage_tokens <= 0 and hasattr(active_program_ref, "telemetry") and active_program_ref.telemetry:
+        if usage_tokens <= 0 and hasattr(cand_prog, "telemetry") and cand_prog.telemetry:
             usage_tokens = sum(
-                int(entry.get("tokens_used", 0))
-                for entry in active_program_ref.telemetry[-20:]
-                if isinstance(entry, dict)
+                int(entry.get("tokens_used", 0)) for entry in cand_prog.telemetry[-20:] if isinstance(entry, dict)
             )
         apm_hit: bool | None = None
         if gold_answers is not None and len(gold_answers) > 0:
@@ -1335,7 +1257,9 @@ def evolve_program_prompts(
             em=em_score,
             f1=f1_score,
             tokens=usage_tokens,
-            synonym_judge_tokens=int(q_stats.get("synonym_judge_tokens", 0)),
+            label_judge_tokens=int(q_stats.get("label_judge_tokens", 0)),
+            hierarchy_judge_tokens=int(q_stats.get("hierarchy_judge_tokens", 0)),
+            related_judge_tokens=int(q_stats.get("related_judge_tokens", 0)),
             shacl_healer_tokens=int(q_stats.get("shacl_healer_tokens", 0)),
             shacl_violations_initial=int(
                 q_stats.get(
@@ -1404,7 +1328,7 @@ def evolve_program_prompts(
                     f"F1={f1_val:.2f}, EM={em_val:.2f}, dt={dt_eval:.1f}s, tok={usage_tokens}"
                 )
         if record and pred_name is None:
-            hooks.persist_trails(active_program_ref)
+            hooks.persist_trails(cand_prog)
             _publish_optimization_audit()
         return score_pred
 
@@ -1768,15 +1692,18 @@ __all__ = [
     "evolve_program_prompts",
     "extract_named_trace_entries",
     "extraction_fingerprint",
+    "hierarchy_judge_fingerprint",
+    "judge_stage_fingerprint",
+    "label_judge_fingerprint",
     "openie_fingerprint",
     "promote_compiled_program",
     "prune_mismatching_demos",
     "query_retrieval_fingerprint",
     "reduce_pareto_predictions",
+    "related_judge_fingerprint",
     "rrf_fuse_passage_lists",
     "select_pareto_frontier_programs",
     "serialize_predictor_surface",
     "shacl_fingerprint",
     "sync_pareto_telemetry_siblings",
-    "synonym_fingerprint",
 ]

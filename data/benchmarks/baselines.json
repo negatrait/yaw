@@ -181,18 +181,18 @@
       "held_out": false,
       "allow_upstream_github_fallback": true,
       "category_quotas": {
-        "Basic": [35, 24],
-        "Semantic": [27, 18],
-        "Intra-Document Reasoning": [16, 11],
-        "Project Related": [16, 11],
-        "Constrained": [12, 8],
-        "Conflicting Info": [10, 6],
-        "Completeness": [10, 6],
-        "Miscellaneous": [9, 6],
-        "Info Not Found": [9, 6],
-        "High Level": [6, 4]
+        "Basic": [54, 5],
+        "Semantic": [41, 4],
+        "Intra-Document Reasoning": [24, 3],
+        "Project Related": [24, 3],
+        "Constrained": [18, 2],
+        "Conflicting Info": [14, 2],
+        "Completeness": [14, 2],
+        "Miscellaneous": [13, 2],
+        "Info Not Found": [13, 2],
+        "High Level": [8, 2]
       },
-      "train_partition_size": 150
+      "train_partition_size": 223
     }
   },
   "baselines": {

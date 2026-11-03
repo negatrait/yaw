@@ -35,16 +35,6 @@ string ::= "\"" char+ "\""
 char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
 """
 
-DSPY_SYNONYM_JUDGE_GBNF_GRAMMAR = (
-    'root ::= "{\\"decisions\\": " decision-list "}"\n'
-    'decision-list ::= "[]" | "[" decision (", " decision)* "]"\n'
-    'decision ::= "{\\"pair_id\\": " string ", \\"relation\\": " relation-kind ", \\"canonical\\": " string "}"\n'
-    'relation-kind ::= "\\"skos:altLabel\\"" | "\\"skos:hiddenLabel\\"" | "\\"skos:related\\"" | '
-    '"\\"skos:broader\\"" | "\\"owl:differentFrom\\""\n'
-    'string ::= "\\"" char+ "\\""\n'
-    'char ::= [^"\\\\\\x7F\\x00-\\x1F] | "\\\\" (["\\\\bfnrt] | "u" [0-9a-fA-F]{4})\n'
-)
-
 DSPY_SHACL_REPAIR_GBNF_GRAMMAR = (
     'root ::= "{\\"repairs\\": " repair-list "}"\n'
     'repair-list ::= "[]" | "[" repair (", " repair)* "]"\n'
@@ -192,47 +182,120 @@ def build_dspy_missing_entity_defs_grammar(
     )
 
 
-def build_dspy_synonym_judge_grammar(
-    max_decisions: int | None = None,
+def _build_pair_boolean_grammar(
+    bool_fields: Sequence[str],
     *,
     pair_ids: Sequence[str] | None = None,
+    max_decisions: int | None = None,
+    max_reasoning_chars: int | None = 240,
+    custom_suffix: str | None = None,
+    extra_rules: Sequence[str] = (),
 ) -> str:
-    """Build pure-JSON GBNF grammar for JudgeSynonyms (`{"decisions": [...]}`)."""
+    r_limit = f"{{1,{int(max_reasoning_chars)}}}" if max_reasoning_chars and max_reasoning_chars > 0 else "+"
+    bool_suffix = (
+        custom_suffix
+        if custom_suffix is not None
+        else " ".join(f"{gbnf_escape_literal(f', "{field}": ')} boolean" for field in bool_fields)
+    )
+    rules: list[str] = []
     if pair_ids is not None:
         if not pair_ids or len(set(pair_ids)) != len(pair_ids):
             raise ValueError("Synonym grammar requires nonempty, unique pair IDs")
-        sequence = ' ", " '.join(f"decision-{i}" for i in range(len(pair_ids)))
-        opening = gbnf_escape_literal('{"decisions": [')
-        closing = gbnf_escape_literal("]}")
-        rules = [f"root ::= {opening} {sequence} {closing}"]
         for i, pair_id in enumerate(pair_ids):
             ids = pair_id.split("|")
             if len(ids) != 2 or not all(ids) or ids[0] == ids[1]:
                 raise ValueError(f"Invalid synonym pair ID {pair_id!r}")
-            prefix = '{"pair_id": ' + json.dumps(pair_id) + ', "relation": '
-            middle = ', "canonical": '
-            choices = " | ".join(gbnf_escape_literal(json.dumps(eid)) for eid in ids)
-            rules.append(
-                f"decision-{i} ::= {gbnf_escape_literal(prefix)} relation-kind "
-                f"{gbnf_escape_literal(middle)} ({choices}) {gbnf_escape_literal('}')}"
+            prefix = gbnf_escape_literal('{"pair_id": ' + json.dumps(pair_id) + ', "reasoning": ')
+            rules.append(f"decision-{i} ::= {prefix} reasoning-str {bool_suffix} {gbnf_escape_literal('}')}")
+        seq = ' ", " '.join(f"decision-{i}" for i in range(len(pair_ids)))
+        rules.insert(0, f"root ::= {gbnf_escape_literal('{"decisions": [')} {seq} {gbnf_escape_literal(']}')}")
+    else:
+        dec_pfx = gbnf_escape_literal('{"pair_id": ')
+        dec_rsn = gbnf_escape_literal(', "reasoning": ')
+        dec_cls = gbnf_escape_literal("}")
+        dec_rule = f"decision ::= {dec_pfx} string {dec_rsn} reasoning-str {bool_suffix} {dec_cls}"
+        if max_decisions is not None and max_decisions > 0:
+            seq = "decision"
+            for _ in range(max_decisions - 1):
+                seq = f'decision (", " {seq})?'
+            rules.extend(
+                [
+                    'root ::= "{\\"decisions\\": [" decision-list "]}"',
+                    f"decision-list ::= ({seq})?",
+                    dec_rule,
+                ]
             )
-        rules.extend(
-            line for line in DSPY_SYNONYM_JUDGE_GBNF_GRAMMAR.splitlines() if line.startswith("relation-kind ::=")
-        )
-        return "\n".join(rules) + "\n"
-    if max_decisions is None or max_decisions <= 0:
-        return DSPY_SYNONYM_JUDGE_GBNF_GRAMMAR
-    seq = "decision"
-    for _ in range(max_decisions - 1):
-        seq = f'decision (", " {seq})?'
-    return (
-        'root ::= "{\\"decisions\\": [" decision-list "]}"\n'
-        f"decision-list ::= ({seq})?\n"
-        'decision ::= "{\\"pair_id\\": " string ", \\"relation\\": " relation-kind ", \\"canonical\\": " string "}"\n'
-        'relation-kind ::= "\\"skos:altLabel\\"" | "\\"skos:hiddenLabel\\"" | "\\"skos:related\\"" | '
-        '"\\"skos:broader\\"" | "\\"owl:differentFrom\\""\n'
-        'string ::= "\\"" char+ "\\""\n'
-        'char ::= [^"\\\\\\x7F\\x00-\\x1F] | "\\\\" (["\\\\bfnrt] | "u" [0-9a-fA-F]{4})\n'
+        else:
+            rules.extend(
+                [
+                    'root ::= "{\\"decisions\\": [" decision-list "]}"',
+                    'decision-list ::= (decision (", " decision)*)?',
+                    dec_rule,
+                ]
+            )
+        rules.append('string ::= "\\"" char+ "\\""')
+    rules.extend(extra_rules)
+    rules.extend(
+        [
+            f'reasoning-str ::= "\\"" char{r_limit} "\\""',
+            'boolean ::= "true" | "false"',
+            'char ::= [^"\\\\\\x7F\\x00-\\x1F] | "\\\\" (["\\\\bfnrt] | "u" [0-9a-fA-F]{4})',
+        ]
+    )
+    return "\n".join(rules) + "\n"
+
+
+def build_dspy_label_judge_grammar(
+    max_decisions: int | None = None,
+    *,
+    pair_ids: Sequence[str] | None = None,
+    max_reasoning_chars: int | None = 240,
+) -> str:
+    """Build pure-JSON GBNF grammar for JudgeLabels with conditional equivalent/alt_label/hidden_label branching."""
+    equiv_prefix = gbnf_escape_literal(', "equivalent": ')
+    def_key = gbnf_escape_literal('true, "definition": ')
+    alt_key = gbnf_escape_literal('false, "alt_label": ')
+    hid_key = gbnf_escape_literal('false, "hidden_label": ')
+    return _build_pair_boolean_grammar(
+        (),
+        pair_ids=pair_ids,
+        max_decisions=max_decisions,
+        max_reasoning_chars=max_reasoning_chars,
+        custom_suffix=f"{equiv_prefix} equiv-branch",
+        extra_rules=(
+            f"equiv-branch ::= {def_key} reasoning-str | {alt_key} alt-branch",
+            f'alt-branch ::= "true" | {hid_key} boolean',
+        ),
+    )
+
+
+def build_dspy_hierarchy_judge_grammar(
+    max_decisions: int | None = None,
+    *,
+    pair_ids: Sequence[str] | None = None,
+    max_reasoning_chars: int | None = 240,
+) -> str:
+    """Build pure-JSON GBNF grammar for JudgeHierarchy."""
+    return _build_pair_boolean_grammar(
+        ("broader", "narrower"),
+        pair_ids=pair_ids,
+        max_decisions=max_decisions,
+        max_reasoning_chars=max_reasoning_chars,
+    )
+
+
+def build_dspy_related_judge_grammar(
+    max_decisions: int | None = None,
+    *,
+    pair_ids: Sequence[str] | None = None,
+    max_reasoning_chars: int | None = 240,
+) -> str:
+    """Build pure-JSON GBNF grammar for JudgeRelated."""
+    return _build_pair_boolean_grammar(
+        ("related",),
+        pair_ids=pair_ids,
+        max_decisions=max_decisions,
+        max_reasoning_chars=max_reasoning_chars,
     )
 
 
@@ -329,7 +392,6 @@ __all__ = [
     "DSPY_NER_GBNF_GRAMMAR",
     "DSPY_TRIPLES_GBNF_GRAMMAR",
     "DSPY_MISSING_ENTITY_DEFS_GBNF_GRAMMAR",
-    "DSPY_SYNONYM_JUDGE_GBNF_GRAMMAR",
     "DSPY_SHACL_REPAIR_GBNF_GRAMMAR",
     "DSPY_RERANK_GBNF_GRAMMAR",
     "DSPY_QA_GBNF_GRAMMAR",
@@ -339,7 +401,9 @@ __all__ = [
     "build_dspy_ner_grammar",
     "build_dspy_triples_grammar",
     "build_dspy_missing_entity_defs_grammar",
-    "build_dspy_synonym_judge_grammar",
+    "build_dspy_hierarchy_judge_grammar",
+    "build_dspy_label_judge_grammar",
+    "build_dspy_related_judge_grammar",
     "build_dspy_shacl_repair_grammar",
     "build_dspy_qa_grammar",
     "build_dspy_instruction_proposal_grammar",

@@ -213,32 +213,32 @@ def test_enterprise_stratification_is_owned_by_loader_and_does_not_rewrite_rows(
     before = json.dumps(rows)
     selected = select_enterprise_questions(rows)
     assert len(selected) == 250 and selected == select_enterprise_questions(rows)
-    assert {r["question_id"] for r in selected[:150]}.isdisjoint({r["question_id"] for r in selected[150:]})
+    assert {r["question_id"] for r in selected[:223]}.isdisjoint({r["question_id"] for r in selected[223:]})
     for category, (nt, nv) in ENTERPRISE_CATEGORY_QUOTAS.items():
-        assert sum(r["question_type"] == category for r in selected[:150]) == nt
-        assert sum(r["question_type"] == category for r in selected[150:]) == nv
+        assert sum(r["question_type"] == category for r in selected[:223]) == nt
+        assert sum(r["question_type"] == category for r in selected[223:]) == nv
     assert before == json.dumps(rows)
     corpus, qa = inputs(tmp_path, questions=rows)
     prepare_dataset_bundle("enterprise_rag_bench", corpus, qa, tmp_path / "outputs/datasets")
     train, val, documents = load_dataset_splits(
-        ["enterprise_rag_bench"], workspace_root=tmp_path, max_queries=250, train_queries=150
+        ["enterprise_rag_bench"], workspace_root=tmp_path, max_queries=250, train_queries=223
     )
-    assert len(train) == 150 and len(val) == 100 and len(documents) == 2
+    assert len(train) == 223 and len(val) == 27 and len(documents) == 2
     assert train[0]["gold_answers"] == [selected[0]["gold_answer"]]
     assert not train[0]["item_docs"]
     small_train, small_val, _ = load_dataset_splits(
         ["enterprise_rag_bench"], workspace_root=tmp_path, max_queries=12, train_queries=7
     )
     assert [row["gold_answers"] for row in small_train] == [[r["gold_answer"]] for r in selected[:7]]
-    assert [row["gold_answers"] for row in small_val] == [[r["gold_answer"]] for r in selected[150:155]]
+    assert [row["gold_answers"] for row in small_val] == [[r["gold_answer"]] for r in selected[223:228]]
     for alias in ("2wiki", "naturalquestions", "nq_rear", "enterprise"):
         with pytest.raises(ValueError, match="Unknown dataset"):
             resolve_dataset_name(alias)
     with pytest.raises(YawRuntimeError, match="held-out"):
         load_dataset_splits(["nq"], workspace_root=tmp_path)
-    presplit = [dict(row, split="train" if i < 150 else "val") for i, row in enumerate(selected)]
+    presplit = [dict(row, split="train" if i < 223 else "val") for i, row in enumerate(selected)]
     assert select_enterprise_questions(presplit) == presplit
-    presplit[150]["question_id"] = presplit[0]["question_id"]
+    presplit[223]["question_id"] = presplit[0]["question_id"]
     with pytest.raises(ValueError, match="Duplicate Enterprise question"):
         select_enterprise_questions(presplit)
 

@@ -3,6 +3,7 @@
 import asyncio
 import json
 import sqlite3
+from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,6 +41,7 @@ from yaw.daemon.graph.storage import (
     PreparedGraphRows,
     apply_prepared_graph_rows,
     apply_shacl_repairs,
+    canonicalize_entity_labels_edc,
     deserialize_f32_vector,
     deserialize_openie_record,
     filter_valid_concept_entity_ids,
@@ -83,7 +85,9 @@ class GraphPlanResult:
     traces: tuple[PredictorTrace, ...] = ()
     telemetry: tuple[dict[str, Any], ...] = ()
     entity_def_audit_trail: tuple[dict[str, Any], ...] = ()
-    synonym_audit_trail: tuple[dict[str, Any], ...] = ()
+    label_judge_audit_trail: tuple[dict[str, Any], ...] = ()
+    hierarchy_judge_audit_trail: tuple[dict[str, Any], ...] = ()
+    related_judge_audit_trail: tuple[dict[str, Any], ...] = ()
     shacl_audit_trail: tuple[dict[str, Any], ...] = ()
     rlm_stats: dict[str, Any] = field(default_factory=dict)
 
@@ -567,7 +571,7 @@ def prepare_synonym_candidates(
     fact_linked_pairs: set[tuple[str, str]] | None = None,
     rlm_stats: dict[str, Any] | None = None,
     progress_callback: Callable[[str], None] | None = None,
-) -> tuple[list[dict[str, Any]], dict[str, tuple[str, str]], int, list[tuple[str, str, str]]]:
+) -> tuple[list[dict[str, Any]], dict[str, tuple[str, str]], int, list[tuple[str, str, str, str | None]]]:
     """Filter valid SKOS concepts, apply the near-1 (cosine, difflib) auto-merge gate, and rank remaining pairs."""
     valid_entity_ids = filter_valid_concept_entity_ids(stage_conn, entity_nodes)
     if not valid_entity_ids:
@@ -584,7 +588,7 @@ def prepare_synonym_candidates(
     cand_meta = get_entity_metadata_batch(stage_conn, cand_eids)
 
     merged_into: dict[str, str] = {}
-    auto_merges: list[tuple[str, str, str]] = []
+    auto_merges: list[tuple[str, str, str, str | None]] = []
     active_fact_pairs = fact_linked_pairs or set()
 
     def _resolve_active_eid(eid: str) -> str:
@@ -619,7 +623,7 @@ def prepare_synonym_candidates(
             key_b = (len(def_b), -len(name_b), eb)
             dst, src = (ea, eb) if key_a >= key_b else (eb, ea)
             merge_entities(stage_conn, src, dst, label_kind="skos:altLabel")
-            auto_merges.append((src, dst, "skos:altLabel"))
+            auto_merges.append((src, dst, "skos:altLabel", None))
             merged_into[src] = dst
             dst_name, dst_def = cand_meta.get(dst, (dst, ""))
             src_name, src_def = cand_meta.get(src, (src, ""))
@@ -680,10 +684,12 @@ def apply_synonym_adjudication(
     *,
     synonymy_threshold: float,
     rlm_stats: dict[str, Any],
-) -> tuple[list[tuple[str, str, str]], list[tuple[str, str, str, float]]]:
+    corpus_root: Path | str | None = None,
+) -> tuple[list[tuple[str, str, str, str | None]], list[tuple[str, str, str, float]]]:
     """Apply Stage 3 Gemma 4 synonym decisions on stage_conn with two-phase topological resolution."""
     _ = synonymy_threshold
     merged_into: dict[str, str] = {}
+    hidden_label_norms: dict[str, set[str]] = defaultdict(set)
 
     def _resolve_active_eid(eid: str) -> str:
         curr = eid
@@ -693,7 +699,7 @@ def apply_synonym_adjudication(
             curr = merged_into[curr]
         return curr
 
-    staged_merges: list[tuple[str, str, str]] = []
+    staged_merges: list[tuple[str, str, str, str | None]] = []
     raw_semantic_batch: list[tuple[str, str, str, float]] = []
     cand_by_pair: dict[tuple[str, str], dict[str, Any]] = {}
     for c in candidates:
@@ -711,14 +717,16 @@ def apply_synonym_adjudication(
     with stage_conn:
         for dec in decisions:
             pid = str(dec.get("pair_id", "")).strip()
-            if "|" in pid:
+            if dec.get("source_id") and dec.get("target_id"):
+                raw_src = str(dec["source_id"]).strip()
+                raw_tgt = str(dec["target_id"]).strip()
+            elif "|" in pid:
                 ea, eb = pid.split("|", 1)
                 raw_src, raw_tgt = ea.strip(), eb.strip()
             else:
                 raw_src = str(dec.get("source_id", "")).strip()
                 raw_tgt = str(dec.get("target_id", "")).strip()
             rel = str(dec.get("relation") or dec.get("decision") or "").strip()
-            canon = str(dec.get("canonical", "")).strip()
             if not raw_src or not raw_tgt:
                 continue
             pkey = (min(raw_src, raw_tgt), max(raw_src, raw_tgt))
@@ -737,15 +745,28 @@ def apply_synonym_adjudication(
                 if text_processing(name_src) != text_processing(name_tgt) and _is_active_fact_pole(src, tgt):
                     raw_semantic_batch.append((src, tgt, "skos:related", max(0.5, sim)))
                     continue
+                canon = str(dec.get("canonical", "") or "").strip()
+                canon_id = _resolve_active_eid(canon) if canon else ""
                 if canon and (
                     canon.upper() == "A"
                     or canon in (src, raw_src)
+                    or canon_id == src
                     or (
                         text_processing(canon) == text_processing(name_src)
                         and text_processing(canon) != text_processing(name_tgt)
                     )
                 ):
                     merge_src, merge_dst = tgt, src
+                elif canon and (
+                    canon.upper() == "B"
+                    or canon in (tgt, raw_tgt)
+                    or canon_id == tgt
+                    or (
+                        text_processing(canon) == text_processing(name_tgt)
+                        and text_processing(canon) != text_processing(name_src)
+                    )
+                ):
+                    merge_src, merge_dst = src, tgt
                 else:
                     merge_src, merge_dst = src, tgt
                 lkind = (
@@ -753,34 +774,30 @@ def apply_synonym_adjudication(
                     if rel == "skos:hiddenLabel" or str(dec.get("label_type", "")) == "hiddenLabel"
                     else "skos:altLabel"
                 )
-                merge_entities(stage_conn, merge_src, merge_dst, label_kind=lkind)
-                staged_merges.append((merge_src, merge_dst, lkind))
+                if lkind == "skos:hiddenLabel":
+                    typo_name = name_src if merge_src == src else name_tgt
+                    src_norm = str(text_processing(typo_name)) or typo_name.strip().lower()
+                    if src_norm:
+                        hidden_label_norms[merge_dst].add(src_norm)
+                if merge_src in hidden_label_norms:
+                    hidden_label_norms[merge_dst].update(hidden_label_norms.pop(merge_src))
+
+                merged_def = str(dec.get("definition", "") or "").strip() or None
+                merge_entities(
+                    stage_conn,
+                    merge_src,
+                    merge_dst,
+                    label_kind=lkind,
+                    corpus_root=corpus_root,
+                    merged_definition=merged_def,
+                )
+                staged_merges.append((merge_src, merge_dst, lkind, merged_def))
                 merged_into[merge_src] = merge_dst
-                rlm_stats["merged_entities"] += 1
+                rlm_stats["merged_entities"] = int(rlm_stats.get("merged_entities", 0)) + 1
             elif rel in ("owl:differentFrom", "different", "different_from"):
                 raw_semantic_batch.append((src, tgt, "owl:differentFrom", 0.0))
             elif rel == "skos:broader":
-                if canon and (
-                    canon.upper() == "A"
-                    or canon in (src, raw_src)
-                    or (
-                        text_processing(canon) == text_processing(name_src)
-                        and text_processing(canon) != text_processing(name_tgt)
-                    )
-                ):
-                    child_id, parent_id = tgt, src
-                elif canon and (
-                    canon.upper() == "B"
-                    or canon in (tgt, raw_tgt)
-                    or (
-                        text_processing(canon) == text_processing(name_tgt)
-                        and text_processing(canon) != text_processing(name_src)
-                    )
-                ):
-                    child_id, parent_id = src, tgt
-                else:
-                    raw_semantic_batch.append((src, tgt, "skos:related", max(0.5, sim)))
-                    continue
+                child_id, parent_id = src, tgt
                 raw_semantic_batch.append((child_id, parent_id, "skos:broader", max(0.5, sim)))
             elif rel in ("skos:related", "related"):
                 raw_semantic_batch.append((src, tgt, "skos:related", max(0.5, sim)))
@@ -807,14 +824,20 @@ def apply_synonym_adjudication(
         for s_act, o_act, r_kind, w in pair_edges.values():
             resolved_semantic_batch.append((s_act, o_act, r_kind, w))
             if r_kind == "owl:differentFrom":
-                rlm_stats["different_from_edges"] += 1
+                rlm_stats["different_from_edges"] = int(rlm_stats.get("different_from_edges", 0)) + 1
             elif r_kind == "skos:broader":
                 rlm_stats["broader_edges"] = int(rlm_stats.get("broader_edges", 0)) + 1
             elif r_kind == "skos:related":
-                rlm_stats["related_edges"] += 1
+                rlm_stats["related_edges"] = int(rlm_stats.get("related_edges", 0)) + 1
 
         if resolved_semantic_batch:
             upsert_semantic_edges(stage_conn, resolved_semantic_batch)
+
+        canonicalize_entity_labels_edc(
+            stage_conn,
+            corpus_root=corpus_root,
+            hidden_label_norms_by_entity=hidden_label_norms,
+        )
 
     return staged_merges, resolved_semantic_batch
 
@@ -872,14 +895,18 @@ async def plan_graph_publication(
     all_traces: list[PredictorTrace] = []
     all_telemetry: list[dict[str, Any]] = []
     entity_def_audit: list[dict[str, Any]] = []
-    synonym_audit: list[dict[str, Any]] = []
+    label_judge_audit: list[dict[str, Any]] = []
+    hierarchy_judge_audit: list[dict[str, Any]] = []
+    related_judge_audit: list[dict[str, Any]] = []
     shacl_audit: list[dict[str, Any]] = []
     rlm_stats: dict[str, Any] = {
         "missing_entity_defs_count": 0,
         "missing_entity_defs_tokens": 0,
         "homograph_splits": 0,
         "candidate_pairs": 0,
-        "synonym_judge_tokens": 0,
+        "label_judge_tokens": 0,
+        "hierarchy_judge_tokens": 0,
+        "related_judge_tokens": 0,
         "merged_entities": 0,
         "different_from_edges": 0,
         "broader_edges": 0,
@@ -1118,9 +1145,28 @@ async def plan_graph_publication(
                     decisions.extend(judged.decisions)
                     all_traces.extend(judged.traces)
                     all_telemetry.extend(judged.telemetry)
-                    synonym_audit.extend(judged.audit_trail)
-                    rlm_stats["synonym_judge_tokens"] += sum(
-                        int(x.get("tokens_used", 0)) for x in (judged.audit_trail or judged.telemetry)
+                    for entry in judged.audit_trail:
+                        pred_name = entry.get("predictor") or entry.get("stage")
+                        if pred_name == "hierarchy_judge":
+                            hierarchy_judge_audit.append(entry)
+                        elif pred_name == "related_judge":
+                            related_judge_audit.append(entry)
+                        else:
+                            label_judge_audit.append(entry)
+                    rlm_stats["label_judge_tokens"] += sum(
+                        int(x.get("tokens_used", 0))
+                        for x in (judged.audit_trail or judged.telemetry)
+                        if (x.get("predictor") or x.get("stage")) == "label_judge"
+                    )
+                    rlm_stats["hierarchy_judge_tokens"] += sum(
+                        int(x.get("tokens_used", 0))
+                        for x in (judged.audit_trail or judged.telemetry)
+                        if (x.get("predictor") or x.get("stage")) == "hierarchy_judge"
+                    )
+                    rlm_stats["related_judge_tokens"] += sum(
+                        int(x.get("tokens_used", 0))
+                        for x in (judged.audit_trail or judged.telemetry)
+                        if (x.get("predictor") or x.get("stage")) == "related_judge"
                     )
 
             apply_synonym_adjudication(
@@ -1131,6 +1177,7 @@ async def plan_graph_publication(
                 materialized.fact_linked_pairs,
                 synonymy_threshold=settings.synonymy_threshold,
                 rlm_stats=rlm_stats,
+                corpus_root=settings.corpus_root,
             )
 
         # 4. Closed-World SHACL Linting & RLM Healing on staging_conn
@@ -1289,7 +1336,9 @@ async def plan_graph_publication(
             traces=tuple(all_traces),
             telemetry=tuple(all_telemetry),
             entity_def_audit_trail=tuple(entity_def_audit),
-            synonym_audit_trail=tuple(synonym_audit),
+            label_judge_audit_trail=tuple(label_judge_audit),
+            hierarchy_judge_audit_trail=tuple(hierarchy_judge_audit),
+            related_judge_audit_trail=tuple(related_judge_audit),
             shacl_audit_trail=tuple(shacl_audit),
             rlm_stats=rlm_stats,
         )

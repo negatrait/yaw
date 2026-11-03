@@ -194,7 +194,7 @@ def test_candidate_stages_make_zero_requests_after_process_restart(tmp_path: Pat
                     )
                 elif "[[ ## candidate_pairs ## ]]" in user:
                     requests.append("synonym")
-                    content = json.dumps({"decisions": complete_decisions(candidate_rows(user), [])})
+                    content = json.dumps({"decisions": complete_decisions(candidate_rows(user), [], stage_text=prompt)})
                 elif "[[ ## named_entities ## ]]" in user:
                     requests.append("triples")
                     if "Bletchley Park" in user:

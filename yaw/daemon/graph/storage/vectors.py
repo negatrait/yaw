@@ -6,7 +6,7 @@ from collections.abc import Sequence
 
 import numpy as np
 
-from .db import YawConnection, batched, write_tx
+from .db import batched, write_tx
 
 _MAX_FTS_TERMS = 24
 FTS_STOPWORDS = frozenset(
@@ -88,7 +88,7 @@ def deserialize_f32_vector(blob: bytes) -> np.ndarray:
 
 
 def _upsert_vectors(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     kind: str,
     vectors: Sequence[tuple[str, np.ndarray | Sequence[float]]],
 ) -> None:
@@ -103,7 +103,7 @@ def _upsert_vectors(
 
 
 def _search_knn(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     kind: str,
     query_vec: np.ndarray | Sequence[float],
     top_k: int,
@@ -128,7 +128,7 @@ def _search_knn(
 
 
 def upsert_chunk_vectors(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     vectors: Sequence[tuple[str, np.ndarray | Sequence[float]]],
 ) -> None:
     """Upsert chunk embedding vectors into chunk_vec."""
@@ -136,7 +136,7 @@ def upsert_chunk_vectors(
 
 
 def upsert_entity_vectors(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     vectors: Sequence[tuple[str, np.ndarray | Sequence[float]]],
 ) -> None:
     """Upsert entity embedding vectors into entity_vec."""
@@ -144,7 +144,7 @@ def upsert_entity_vectors(
 
 
 def upsert_fact_vectors(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     vectors: Sequence[tuple[str, np.ndarray | Sequence[float]]],
 ) -> None:
     """Upsert fact embedding vectors into fact_vec."""
@@ -152,7 +152,7 @@ def upsert_fact_vectors(
 
 
 def search_chunk_vectors_knn(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     query_vec: np.ndarray | Sequence[float],
     top_k: int = 10,
 ) -> list[tuple[str, float]]:
@@ -161,7 +161,7 @@ def search_chunk_vectors_knn(
 
 
 def search_entity_vectors_knn(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     query_vec: np.ndarray | Sequence[float],
     top_k: int = 10,
 ) -> list[tuple[str, float]]:
@@ -170,7 +170,7 @@ def search_entity_vectors_knn(
 
 
 def search_fact_vectors_knn(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     query_vec: np.ndarray | Sequence[float],
     top_k: int = 10,
 ) -> list[tuple[str, float]]:
@@ -179,7 +179,7 @@ def search_fact_vectors_knn(
 
 
 def get_entity_vectors(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     entity_ids: Sequence[str],
 ) -> dict[str, np.ndarray]:
     """Load entity embedding vectors by entity_id in bounded SQL batches."""
@@ -210,7 +210,7 @@ def _extract_fts_terms(query: str) -> list[str]:
 
 
 def _search_fts_bm25(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     kind: str,
     query: str,
     top_k: int,
@@ -242,7 +242,7 @@ def _search_fts_bm25(
 
 
 def search_chunks_fts(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     query: str,
     top_k: int = 20,
 ) -> list[tuple[str, float]]:
@@ -251,7 +251,7 @@ def search_chunks_fts(
 
 
 def search_facts_fts(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     query: str,
     top_k: int = 50,
 ) -> list[tuple[str, float]]:

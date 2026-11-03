@@ -354,7 +354,7 @@ def select_enterprise_questions(
     seed: int = 42,
     quotas: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Select the existing 150/100 cohort without modifying any source row."""
+    """Select the configured Enterprise train/val cohort without modifying any source row."""
     effective_quotas: dict[str, tuple[int, int]] = {
         str(k): (int(v[0]), int(v[1])) if isinstance(v, Sequence) else (int(v) * 3 // 5, int(v) - int(v) * 3 // 5)
         for k, v in (quotas or ENTERPRISE_CATEGORY_QUOTAS).items()
@@ -363,11 +363,15 @@ def select_enterprise_questions(
     identities = [str(row.get("question_id", row.get("id", row["question"]))) for row in rows]
     if len(set(identities)) != len(identities):
         raise ValueError("Duplicate Enterprise question identities cannot form disjoint splits")
-    if len(rows) == total_cohort and all(row.get("split") in ("train", "val") for row in rows):
-        for category, (train_count, val_count) in effective_quotas.items():
-            for split, count in (("train", train_count), ("val", val_count)):
-                if sum(row["question_type"] == category and row["split"] == split for row in rows) != count:
-                    raise ValueError(f"Invalid Enterprise {category}/{split} split count")
+    if (
+        len(rows) == total_cohort
+        and all(row.get("split") in ("train", "val") for row in rows)
+        and all(
+            sum(row["question_type"] == category and row["split"] == split for row in rows) == count
+            for category, (train_count, val_count) in effective_quotas.items()
+            for split, count in (("train", train_count), ("val", val_count))
+        )
+    ):
         return [r for r in rows if r["split"] == "train"] + [r for r in rows if r["split"] == "val"]
     rng = random.Random(seed)
     train, val = [], []
@@ -420,7 +424,7 @@ def load_dataset_splits(
         rows, document_rows = bundle.read_inputs()
         if quotas := spec.get("category_quotas"):
             cohort = select_enterprise_questions(rows, quotas=quotas)
-            train_part = int(spec.get("train_partition_size", 150))
+            train_part = int(spec.get("train_partition_size", 223))
             rows = (
                 cohort[:train_part][query_offset : query_offset + train_queries]
                 + cohort[train_part:][query_offset : query_offset + max_queries - train_queries]

@@ -6,7 +6,6 @@ from typing import Any
 
 from yaw.core import (
     VALID_SHACL_ACTIONS,
-    VALID_SYNONYM_RELATIONS,
     VALUE_BEARING_SHACL_ACTIONS,
     StructuredTriple,
     text_processing,
@@ -58,10 +57,23 @@ STAGE_SCHEMA_CONTRACTS: dict[str, tuple[str, tuple[str, ...], str]] = {
         ("entity_definitions", "entity definitions"),
         "Populate `entity_definitions` with `[entity_name, contextual_definition]` pairs.",
     ),
-    "synonym_judge": (
+    "label_judge": (
         "decisions",
         ("decisions",),
-        'Populate `decisions` with `{"pair_id", "relation", "canonical"}` SKOS/OWL relation objects.',
+        (
+            'Populate `decisions` with branched `{"pair_id", "reasoning", "equivalent"}` objects '
+            '(`"definition"` when `equivalent=true`; `"alt_label"` and `"hidden_label"` when `equivalent=false`).'
+        ),
+    ),
+    "hierarchy_judge": (
+        "decisions",
+        ("decisions",),
+        'Populate `decisions` with `{"pair_id", "reasoning", "broader", "narrower"}` objects.',
+    ),
+    "related_judge": (
+        "decisions",
+        ("decisions",),
+        'Populate `decisions` with `{"pair_id", "reasoning", "related"}` objects.',
     ),
     "shacl_repair": (
         "repairs",
@@ -285,12 +297,12 @@ def validate_stage_invariants(
             f"[entity_definer] ConceptShape/definition missing or tautological for: {unrepaired}",
         )
 
-    if stage == "synonym_judge":
+    if stage in ("label_judge", "hierarchy_judge", "related_judge"):
         raw_decisions = getattr(prediction, "decisions", None)
         items = list(raw_decisions) if isinstance(raw_decisions, (list, tuple)) else []
         if not items:
-            return 0.0, "[synonym_judge] Empty decisions (EdgeShape/closedWorld)."
-        seen_pairs: dict[str, tuple[str, str]] = {}
+            return 0.0, f"[{stage}] Empty decisions (EdgeShape/closedWorld)."
+        seen_pairs: set[str] = set()
         issues = []
         packet = inputs.get("candidate_pairs", "")
         try:
@@ -299,36 +311,74 @@ def validate_stage_invariants(
             packet = None
         expected = (
             {pair["pair_id"] for pair in packet["pairs"]}
-            if isinstance(packet, dict) and packet.get("format") == "synonym-evidence-v1"
+            if isinstance(packet, dict)
+            and packet.get("format") == "synonym-evidence-v2"
+            and isinstance(packet.get("pairs"), list)
             else None
         )
+        bool_keys = {
+            "label_judge": (),
+            "hierarchy_judge": ("broader", "narrower"),
+            "related_judge": ("related",),
+        }[stage]
+
         for d in items:
             if not isinstance(d, Mapping):
                 issues.append("EdgeShape/closedWorld non-dict decision")
                 continue
             pair_id = str(d.get("pair_id", "") or "").strip()
-            rel = str(d.get("relation", "") or "").strip()
-            canon = str(d.get("canonical", "") or "").strip()
+            reasoning = str(d.get("reasoning", "") or "").strip()
+            if not reasoning:
+                issues.append(f"Empty reasoning string for {pair_id!r}")
             if expected is not None and (pair_id not in expected or pair_id in seen_pairs):
-                issues.append(f"Unknown or duplicate synonym pair {pair_id!r}")
+                issues.append(f"Unknown or duplicate pair {pair_id!r}")
             if "|" not in pair_id:
                 issues.append(f"EdgeShape/closedWorld invalid pair_id={pair_id!r}")
                 continue
             id_a, id_b = [p.strip() for p in pair_id.split("|", 1)]
             if not id_a or not id_b or id_a == id_b:
                 issues.append(f"EdgeShape/closedWorld self-loop or empty pair_id={pair_id!r}")
-            if rel not in VALID_SYNONYM_RELATIONS:
-                issues.append(f"ConceptShape/S13-disjointLabels invalid relation={rel!r}")
-            if canon not in ((id_a, id_b) if expected is not None else ("A", "B", id_a, id_b)):
-                issues.append(f"EdgeShape/closedWorld invalid canonical={canon!r} for {pair_id!r}")
-            if pair_id in seen_pairs and seen_pairs[pair_id] != (rel, canon):
-                issues.append(f"ConceptShape/homographDifferentFrom conflicting decisions for {pair_id!r}")
-            seen_pairs[pair_id] = (rel, canon)
-        if expected is not None and set(seen_pairs) != expected:
-            issues.append(f"Missing synonym pairs: {sorted(expected - set(seen_pairs))}")
+            if stage == "label_judge":
+                if "equivalent" not in d:
+                    issues.append(f"Missing boolean field 'equivalent' for {pair_id!r}")
+                elif not isinstance(d["equivalent"], bool):
+                    issues.append(f"Non-boolean value {d['equivalent']!r} for 'equivalent' in {pair_id!r}")
+                elif d["equivalent"] is True:
+                    raw_def = d.get("definition")
+                    if not isinstance(raw_def, str) or not raw_def.strip():
+                        issues.append(f"Missing or empty 'definition' for equivalent=True in {pair_id!r}")
+                    if d.get("alt_label") is True or d.get("hidden_label") is True:
+                        issues.append(f"Conflicting alt_label/hidden_label with equivalent=True in {pair_id!r}")
+                else:
+                    if "alt_label" not in d:
+                        issues.append(f"Missing boolean field 'alt_label' for {pair_id!r}")
+                    elif not isinstance(d["alt_label"], bool):
+                        issues.append(f"Non-boolean value {d['alt_label']!r} for 'alt_label' in {pair_id!r}")
+                    elif d["alt_label"] is True:
+                        if "hidden_label" in d and not isinstance(d["hidden_label"], bool):
+                            issues.append(f"Non-boolean value {d['hidden_label']!r} for 'hidden_label' in {pair_id!r}")
+                        elif d.get("hidden_label") is True:
+                            issues.append(f"Conflicting alt_label=True and hidden_label=True in {pair_id!r}")
+                    else:
+                        if "hidden_label" not in d:
+                            issues.append(f"Missing boolean field 'hidden_label' for {pair_id!r}")
+                        elif not isinstance(d["hidden_label"], bool):
+                            issues.append(f"Non-boolean value {d['hidden_label']!r} for 'hidden_label' in {pair_id!r}")
+            else:
+                for bk in bool_keys:
+                    if bk not in d:
+                        issues.append(f"Missing boolean field {bk!r} for {pair_id!r}")
+                    elif not isinstance(d[bk], bool):
+                        issues.append(f"Non-boolean value {d[bk]!r} for {bk!r} in {pair_id!r}")
+            if pair_id in seen_pairs:
+                issues.append(f"Duplicate pair_id={pair_id!r}")
+            seen_pairs.add(pair_id)
+
+        if expected is not None and seen_pairs != expected:
+            issues.append(f"Missing pairs: {sorted(expected - seen_pairs)}")
         if not issues:
-            return 1.0, "PASS [synonym_judge]"
-        return max(0.0, round(1.0 - 0.35 * len(issues), 4)), f"[synonym_judge] {'; '.join(issues)}"
+            return 1.0, f"PASS [{stage}]"
+        return max(0.0, round(1.0 - 0.35 * len(issues), 4)), f"[{stage}] {'; '.join(issues)}"
 
     if stage in ("shacl_repair", "shacl_healer_rlm"):
         raw_repairs = getattr(prediction, "repairs", None)
@@ -460,7 +510,7 @@ def validate_stage_invariants(
             return 1.0, f"PASS [{stage}]"
         return max(0.0, round(1.0 - 0.4 * len(issues), 4)), f"[{stage}] {'; '.join(issues)}"
 
-    return 1.0, f"PASS [{stage}]"
+    raise ValueError(f"Unknown stage contract for invariant validation: {stage!r}")
 
 
 __all__ = [

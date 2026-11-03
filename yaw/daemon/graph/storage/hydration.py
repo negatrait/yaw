@@ -22,6 +22,8 @@ from yaw.core import (
     resolve_corpus_path,
 )
 
+from .chunks import get_chunk_pointer
+
 _MAX_CHUNK_LINE_SPAN = 5000
 _DEFAULT_MAX_ISLAND_CHARS = 4000
 _DEFAULT_MAX_CONTEXT_CHARS = 32000
@@ -666,7 +668,6 @@ def make_chunk_hydrator(
     corpus_root: Path,
 ) -> Callable[[str], str]:
     """Create a callable `hydrate_chunk(chunk_id: str) -> str` tool for dspy.RLM passage inspection."""
-    from .graph_ops import get_chunk_pointer
 
     def hydrate_chunk(chunk_id: str) -> str:
         pointer = get_chunk_pointer(conn, chunk_id)
@@ -687,7 +688,6 @@ def make_ast_island_hydrator(
     max_chars: int = _DEFAULT_MAX_ISLAND_CHARS,
 ) -> Callable[[str], str]:
     """Create a callable `hydrate_ast_island(chunk_id: str) -> str` expanding 1 hop upwards in the document AST."""
-    from .graph_ops import get_chunk_pointer
 
     def hydrate_ast_island(chunk_id: str) -> str:
         pointer = get_chunk_pointer(conn, chunk_id)

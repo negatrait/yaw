@@ -39,7 +39,7 @@ class DummyEmbedder:
 
 
 class PipelineGateMockLM(dspy.LM):
-    """Deterministic multi-stage DSPy LM driving Stage 1 NER, Stage 2 Triples, Stage 3 JudgeSynonyms, and Retrieval."""
+    """Deterministic multi-stage DSPy LM driving Stage 1 NER, Stage 2 Triples, Stage 3 JudgeLabels, and Retrieval."""
 
     def __init__(self, *, mode: str = "gate") -> None:
         super().__init__(model="mock-lm")
@@ -105,7 +105,7 @@ class PipelineGateMockLM(dspy.LM):
                 )
             ]
 
-        # Stage 3: JudgeSynonyms
+        # Stage 3: JudgeLabels
         if "candidate_pairs" in full_text or '"pair_id"' in full_text:
             cands = self._parse_candidate_pairs_from_text(full_text)
             self.observed_synonym_candidates.extend(cands)
@@ -181,7 +181,7 @@ class PipelineGateMockLM(dspy.LM):
                                 "canonical": "A",
                             }
                         )
-            return [json.dumps({"decisions": complete_decisions(cands, decisions)})]
+            return [json.dumps({"decisions": complete_decisions(cands, decisions, stage_text=full_text)})]
 
         # Stage 2: ExtractTriples (has both `named_entities` input and `triples` output)
         if "triples" in full_text and "named_entities" in full_text:
@@ -314,7 +314,7 @@ def test_build_time_shacl_gate_success(synonym_token_counter, tmp_path: Path) ->
         indexed = engine.index_chunks([(chunk, text)])
         assert indexed == 1
 
-        # Verify Stage 3 JudgeSynonyms was invoked, all 3 adversarial pairs were adjudicated,
+        # Verify Stage 3 JudgeLabels was invoked, all 3 adversarial pairs were adjudicated,
         # and pure literals were excluded from candidate pairs
         assert len(mock_lm.observed_synonym_candidates) > 0
         observed_pair_sets = {

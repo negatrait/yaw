@@ -97,7 +97,9 @@ def main() -> None:
                     "tokens": {
                         key: engine._graph_rlm_stats[key]
                         for key in (
-                            "synonym_judge_tokens",
+                            "label_judge_tokens",
+                            "hierarchy_judge_tokens",
+                            "related_judge_tokens",
                             "shacl_healer_tokens",
                             "missing_entity_defs_tokens",
                         )
@@ -108,7 +110,9 @@ def main() -> None:
                         for cache in (
                             engine._text_vec_cache,
                             engine._openie_fp_cache,
-                            engine._synonym_fp_cache,
+                            engine._label_judge_fp_cache,
+                            engine._hierarchy_judge_fp_cache,
+                            engine._related_judge_fp_cache,
                             engine._shacl_fp_cache,
                         )
                     },

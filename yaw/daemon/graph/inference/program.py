@@ -15,13 +15,15 @@ from .adapter import YawGBNFAdapter, sum_usage_tokens
 from .chat import create_dspy_lm
 from .diagnostics import DiagnosticHistory, diagnostic_boundary
 from .grammars import (
+    build_dspy_hierarchy_judge_grammar,
+    build_dspy_label_judge_grammar,
     build_dspy_missing_entity_defs_grammar,
     build_dspy_ner_grammar,
     build_dspy_qa_grammar,
     build_dspy_query_intent_grammar,
+    build_dspy_related_judge_grammar,
     build_dspy_rerank_grammar,
     build_dspy_shacl_repair_grammar,
-    build_dspy_synonym_judge_grammar,
     build_dspy_triples_grammar,
     lm_supports_gbnf,
 )
@@ -31,8 +33,10 @@ from .parsers import (
     extract_entity_definitions,
     extract_structured_triples,
     match_facts_to_candidate_indices,
+    parse_hierarchy_decisions,
+    parse_label_decisions,
+    parse_related_decisions,
     parse_shacl_repairs,
-    parse_synonym_decisions,
     text_processing,
 )
 from .prompts import (
@@ -47,7 +51,9 @@ from .prompts import (
     ExtractTriples,
     FilterTriples,
     HealSHACLViolations,
-    JudgeSynonyms,
+    JudgeHierarchy,
+    JudgeLabels,
+    JudgeRelated,
     ProposeSHACLRepairs,
 )
 from .reflection import ServingTokenCounter
@@ -99,12 +105,14 @@ class HippoRAGProgram(dspy.Module):
     """Unified DSPy Module for HippoRAG 2 OpenIE, EDC/SKOS Schema Canon, SHACL Repair, Recognition Memory, and \
 Multi-Hop QA.
 
-    Exposes the 9 canonical runtime stage predictors (out of the 12 total DSPy signatures in YAW):
-    1. **8 Direct GBNF Predictors (configured chat model on `llama.cpp` GPU):**
+    Exposes the canonical runtime stage predictors (out of the 12 total DSPy signatures in YAW):
+    1. **Direct GBNF Predictors (configured chat model on `llama.cpp` GPU):**
        - `ner` (`ExtractEntities`)
        - `triples` (`ExtractTriples`)
        - `entity_definer` (`DefineMissingEntities`)
-       - `synonym_judge` (`JudgeSynonyms`)
+       - `label_judge` (`JudgeLabels`)
+       - `hierarchy_judge` (`JudgeHierarchy`)
+       - `related_judge` (`JudgeRelated`)
        - `shacl_repair` (`ProposeSHACLRepairs`)
        - `triple_filter` (`FilterTriples`)
        - `query_intent` (`ExtractQueryIntent`)
@@ -201,14 +209,18 @@ Deno/Pyodide WASM) with
         self.history = DiagnosticHistory()
         self.embedding_audit_trail: list[dict[str, Any]] = DiagnosticHistory()
         self.entity_def_audit_trail: list[dict[str, Any]] = DiagnosticHistory()
-        self.synonym_audit_trail: list[dict[str, Any]] = DiagnosticHistory()
+        self.label_judge_audit_trail: list[dict[str, Any]] = DiagnosticHistory()
+        self.hierarchy_judge_audit_trail: list[dict[str, Any]] = DiagnosticHistory()
+        self.related_judge_audit_trail: list[dict[str, Any]] = DiagnosticHistory()
         self.shacl_audit_trail: list[dict[str, Any]] = DiagnosticHistory()
 
-        # 8 Direct GBNF Predictors with distinct Signatures
+        # 10 Direct GBNF Predictors with distinct Signatures
         self.ner = dspy.Predict(ExtractEntities)
         self.triples = dspy.Predict(ExtractTriples)
         self.entity_definer = dspy.Predict(DefineMissingEntities)
-        self.synonym_judge = dspy.Predict(JudgeSynonyms)
+        self.label_judge = dspy.Predict(JudgeLabels)
+        self.hierarchy_judge = dspy.Predict(JudgeHierarchy)
+        self.related_judge = dspy.Predict(JudgeRelated)
         self.shacl_repair = dspy.Predict(ProposeSHACLRepairs)
         self.triple_filter = dspy.Predict(FilterTriples)
         self.query_intent = dspy.Predict(ExtractQueryIntent)
@@ -263,12 +275,14 @@ Deno/Pyodide WASM) with
         bounded: bool = True,
         telemetry_key: str = "telemetry",
     ) -> dict[str, list[dict[str, Any]]]:
-        """Return serialized copies of all 5 program telemetry and audit trails."""
+        """Return serialized copies of all program telemetry and audit trails."""
         limits = {
             "telemetry": 250,
             "embedding_audit_trail": 250,
             "entity_def_audit_trail": 250,
-            "synonym_audit_trail": 100,
+            "label_judge_audit_trail": 100,
+            "hierarchy_judge_audit_trail": 100,
+            "related_judge_audit_trail": 100,
             "shacl_audit_trail": 100,
         }
         out: dict[str, list[dict[str, Any]]] = {}
@@ -288,7 +302,9 @@ Deno/Pyodide WASM) with
                 self.ner,
                 self.triples,
                 self.entity_definer,
-                self.synonym_judge,
+                self.label_judge,
+                self.hierarchy_judge,
+                self.related_judge,
                 self.shacl_repair,
                 self.triple_filter,
                 self.query_intent,
@@ -299,12 +315,14 @@ Deno/Pyodide WASM) with
             self.shacl_healer_rlm.set_lm(orchestrator)
 
     def all_stage_predictors(self) -> list[tuple[str, Any]]:
-        """Return all 9 canonical stage predictors (8 direct GBNF + 1 SHACL RLM healer)."""
+        """Return all canonical stage predictors (10 direct GBNF + 1 SHACL RLM healer)."""
         return [
             ("ner", self.ner),
             ("triples", self.triples),
             ("entity_definer", self.entity_definer),
-            ("synonym_judge", self.synonym_judge),
+            ("label_judge", self.label_judge),
+            ("hierarchy_judge", self.hierarchy_judge),
+            ("related_judge", self.related_judge),
             ("shacl_repair", self.shacl_repair),
             ("shacl_healer_rlm", self.shacl_healer_rlm),
             ("triple_filter", self.triple_filter),
@@ -1036,7 +1054,7 @@ chunk."""
 
     def synonym_request_budget(self, lm: Any = None) -> SynonymRequestBudget:
         """Resolve a verified tokenizer for the active synonym LM, retaining one budget object."""
-        effective = lm or self.synonym_judge.lm or dspy.settings.lm
+        effective = lm or self.label_judge.lm or dspy.settings.lm
         if effective is None:
             raise ValueError("Synonym judgment requires an LM")
         counter = self.synonym_token_counter
@@ -1068,41 +1086,113 @@ chunk."""
 
     def synonym_batch_fits(self, batch: SynonymEvidenceBatch) -> bool:
         """Check a whole pair packet including signature, demos, output budget and chat template."""
-        lm = self.synonym_judge.lm or dspy.settings.lm
-        return self.synonym_request_budget(lm).fits(batch, self.synonym_judge, lm)
+        lm = self.label_judge.lm or dspy.settings.lm
+        return self.synonym_request_budget(lm).fits(batch, self.label_judge, lm)
 
-    def judge_synonyms(
+    def _run_judge_stage(
         self,
+        stage_name: Literal["label_judge", "hierarchy_judge", "related_judge"],
         batch: SynonymEvidenceBatch,
         *,
         lm: Any = None,
         use_gbnf: bool | None = None,
-    ) -> list[dict[str, str]]:
-        """Judge every packet pair and resolve local references before graph application."""
-        budget = self.synonym_request_budget(lm)
-        prev_telem_len = len(self.telemetry)
-        started = time.perf_counter()
-        pred = self._invoke_stage(
-            self.synonym_judge,
-            stage_name="synonym_judge",
-            is_rlm=False,
-            lm=lm,
-            use_gbnf=use_gbnf,
-            grammar_fn=lambda: build_dspy_synonym_judge_grammar(
-                pair_ids=[pair["pair_id"] for pair in json.loads(batch.payload)["pairs"]],
+        stage_cache: Any = None,
+        captured_traces: list[Any] | None = None,
+        rlm_stats: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Execute or retrieve cached decisions for a single synonym judgment stage."""
+        from .diagnostics import extract_named_trace_entries, judge_stage_fingerprint
+
+        if not batch.candidates:
+            return []
+
+        predictor_map = {
+            "label_judge": (
+                self.label_judge,
+                build_dspy_label_judge_grammar,
+                parse_label_decisions,
+                self.label_judge_audit_trail,
             ),
-            request_adapter=budget,
-            candidate_pairs=batch.payload,
-        )
-        elapsed = time.perf_counter() - started
+            "hierarchy_judge": (
+                self.hierarchy_judge,
+                build_dspy_hierarchy_judge_grammar,
+                parse_hierarchy_decisions,
+                self.hierarchy_judge_audit_trail,
+            ),
+            "related_judge": (
+                self.related_judge,
+                build_dspy_related_judge_grammar,
+                parse_related_decisions,
+                self.related_judge_audit_trail,
+            ),
+        }
+        predictor, grammar_fn, parser_fn, audit_trail = predictor_map[stage_name]
+        budget = self.synonym_request_budget(lm)
+        stage_fp = judge_stage_fingerprint(self, stage_name)
+        cache_key = (stage_fp, batch.cache_identity)
+
+        if stage_cache is not None:
+            cached = stage_cache.get(cache_key)
+            if cached is not None:
+                cached_decs, cached_tr, cached_tok = cached
+                if captured_traces is not None:
+                    captured_traces.extend(cached_tr)
+                if rlm_stats is not None:
+                    tok_key = f"{stage_name}_tokens"
+                    rlm_stats[tok_key] = int(rlm_stats.get(tok_key, 0)) + int(cached_tok)
+                self.telemetry.append(
+                    {
+                        "stage": stage_name,
+                        "mode": "cache",
+                        "cache_hit": True,
+                        "packet_id": batch.cache_identity,
+                        "pair_count": len(batch.candidates),
+                        "packet_chars": len(batch.payload),
+                        "tokens_used": 0,
+                        "construction_seconds": batch.construction_seconds,
+                        "inference_seconds": 0.0,
+                    }
+                )
+                audit_trail.append(
+                    {
+                        "mode": "cache",
+                        "predictor": stage_name,
+                        "tokens_used": cached_tok,
+                        "packet_id": batch.cache_identity,
+                        "pair_count": len(batch.candidates),
+                        "cache_hit": True,
+                        "decisions": cached_decs,
+                    }
+                )
+                return [dict(d) for d in cached_decs]
+
+        prev_telem_len = len(self.telemetry)
+        local_stage_trace: list[Any] = []
+        with dspy.context(trace=local_stage_trace, usage_tracker=None):
+            started = time.perf_counter()
+            pred = self._invoke_stage(
+                predictor,
+                stage_name=stage_name,
+                is_rlm=False,
+                lm=lm,
+                use_gbnf=use_gbnf,
+                grammar_fn=lambda: grammar_fn(
+                    pair_ids=[pair["pair_id"] for pair in json.loads(batch.payload)["pairs"]],
+                ),
+                request_adapter=budget,
+                candidate_pairs=batch.payload,
+            )
+            elapsed = time.perf_counter() - started
+
         score, feedback = validate_stage_invariants(
-            "synonym_judge",
+            stage_name,
             {"candidate_pairs": batch.payload},
             pred,
         )
         if score < 1.0:
             raise ValueError(feedback)
-        decisions = batch.resolve_decisions(parse_synonym_decisions(pred.decisions))
+
+        parsed_decs = parser_fn(pred.decisions)
         stage_tokens = int(self.telemetry[-1].get("tokens_used", 0)) if len(self.telemetry) > prev_telem_len else 0
         summary = {
             "packet_id": batch.cache_identity,
@@ -1115,17 +1205,202 @@ chunk."""
         }
         if len(self.telemetry) > prev_telem_len:
             self.telemetry[-1].update(summary)
-        self.synonym_audit_trail.append(
+
+        stage_traces = extract_named_trace_entries(
+            self,
+            local_stage_trace,
+            allowed_names={stage_name},
+        )
+        if captured_traces is not None:
+            captured_traces.extend(stage_traces)
+        if rlm_stats is not None:
+            tok_key = f"{stage_name}_tokens"
+            rlm_stats[tok_key] = int(rlm_stats.get(tok_key, 0)) + stage_tokens
+
+        audit_trail.append(
             {
                 "mode": "direct",
-                "predictor": "synonym_judge",
-                "signature": JudgeSynonyms.__name__,
+                "predictor": stage_name,
+                "signature": getattr(predictor.signature, "__name__", str(predictor.signature)),
                 "tokens_used": stage_tokens,
                 **summary,
-                "decisions": decisions,
+                "decisions": parsed_decs,
             }
         )
-        return decisions
+
+        if stage_cache is not None:
+            stage_cache[cache_key] = (
+                list(parsed_decs),
+                list(stage_traces),
+                stage_tokens,
+            )
+        return parsed_decs
+
+    def judge_synonyms(
+        self,
+        batch: SynonymEvidenceBatch,
+        *,
+        lm: Any = None,
+        use_gbnf: bool | None = None,
+        stage_caches: Mapping[str, Any] | None = None,
+        captured_traces: list[Any] | None = None,
+        rlm_stats: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Judge candidate pairs via short-circuiting 3-stage W3C semantic cascade."""
+        if not batch.candidates:
+            return []
+
+        payload_obj = json.loads(batch.payload)
+        pairs_list = payload_obj.get("pairs", [])
+        if not pairs_list:
+            return []
+
+        pairs_by_id = {p["pair_id"]: p for p in pairs_list}
+        resolved_decisions: list[dict[str, Any]] = []
+        unresolved_pids: list[str] = []
+
+        # 1. Rule W3: Transitive broader pre-gate (0 LLM calls)
+        for p in pairs_list:
+            pid = p["pair_id"]
+            tc = str(p.get("broader_tc", "") or "").strip()
+            if tc == "a_under_b":
+                ea, eb = pid.split("|", 1)
+                resolved_decisions.append(
+                    {
+                        "pair_id": pid,
+                        "reasoning": "Deterministic skos:broader via Rule W3 transitive closure (a_under_b)",
+                        "relation": "skos:broader",
+                        "source_id": ea,
+                        "target_id": eb,
+                    }
+                )
+            elif tc == "b_under_a":
+                ea, eb = pid.split("|", 1)
+                resolved_decisions.append(
+                    {
+                        "pair_id": pid,
+                        "reasoning": "Deterministic skos:broader via Rule W3 transitive closure (b_under_a)",
+                        "relation": "skos:broader",
+                        "source_id": eb,
+                        "target_id": ea,
+                    }
+                )
+            else:
+                unresolved_pids.append(pid)
+
+        if not unresolved_pids:
+            return batch.resolve_decisions(resolved_decisions)
+
+        # 2. Rule W1: Direct facts skip Stage 1 directly to Stage 2
+        stage1_pids: list[str] = []
+        stage2_pids: list[str] = []
+        for pid in unresolved_pids:
+            p = pairs_by_id[pid]
+            if p.get("direct_facts"):
+                stage2_pids.append(pid)
+            else:
+                stage1_pids.append(pid)
+
+        # 3. Stage 1: JudgeLabels (skos:altLabel / skos:hiddenLabel)
+        if stage1_pids:
+            stage1_batch = batch.subset(stage1_pids)
+            s1_decs = self._run_judge_stage(
+                "label_judge",
+                stage1_batch,
+                lm=lm,
+                use_gbnf=use_gbnf,
+                stage_cache=stage_caches.get("label_judge") if stage_caches else None,
+                captured_traces=captured_traces,
+                rlm_stats=rlm_stats,
+            )
+            for dec in s1_decs:
+                pid = dec["pair_id"]
+                equiv = bool(dec.get("equivalent"))
+                alt = bool(dec.get("alt_label"))
+                hidden = bool(dec.get("hidden_label"))
+                if equiv or alt:
+                    dec_copy = dict(dec)
+                    dec_copy["relation"] = "skos:altLabel"
+                    resolved_decisions.append(dec_copy)
+                elif hidden:
+                    dec_copy = dict(dec)
+                    dec_copy["relation"] = "skos:hiddenLabel"
+                    resolved_decisions.append(dec_copy)
+                else:
+                    stage2_pids.append(pid)
+
+        # 4. Stage 2: JudgeHierarchy (skos:broader / skos:narrower)
+        stage2_residuals: list[str] = []
+        if stage2_pids:
+            stage2_batch = batch.subset(stage2_pids)
+            s2_decs = self._run_judge_stage(
+                "hierarchy_judge",
+                stage2_batch,
+                lm=lm,
+                use_gbnf=use_gbnf,
+                stage_cache=stage_caches.get("hierarchy_judge") if stage_caches else None,
+                captured_traces=captured_traces,
+                rlm_stats=rlm_stats,
+            )
+            for dec in s2_decs:
+                pid = dec["pair_id"]
+                ea, eb = pid.split("|", 1)
+                broader = bool(dec.get("broader"))
+                narrower = bool(dec.get("narrower"))
+                if broader and not narrower:
+                    dec_copy = dict(dec)
+                    dec_copy["relation"] = "skos:broader"
+                    dec_copy["source_id"] = ea
+                    dec_copy["target_id"] = eb
+                    resolved_decisions.append(dec_copy)
+                elif not broader and narrower:
+                    dec_copy = dict(dec)
+                    dec_copy["relation"] = "skos:broader"
+                    dec_copy["source_id"] = eb
+                    dec_copy["target_id"] = ea
+                    resolved_decisions.append(dec_copy)
+                elif broader and narrower:
+                    dec_copy = dict(dec)
+                    dec_copy["relation"] = "skos:related"
+                    resolved_decisions.append(dec_copy)
+                else:
+                    stage2_residuals.append(pid)
+
+        # 5. Rule W1 / W2 on Stage 2 (False, False) pairs: direct facts or shared roles -> skos:related
+        stage3_pids: list[str] = []
+        for pid in stage2_residuals:
+            p = pairs_by_id[pid]
+            if p.get("direct_facts") or p.get("shared_role_facts"):
+                resolved_decisions.append(
+                    {
+                        "pair_id": pid,
+                        "reasoning": "Deterministic skos:related via Rule W1/W2 statement role / direct fact",
+                        "relation": "skos:related",
+                    }
+                )
+            else:
+                stage3_pids.append(pid)
+
+        # 6. Stage 3: JudgeRelated (skos:related vs owl:differentFrom)
+        if stage3_pids:
+            stage3_batch = batch.subset(stage3_pids)
+            s3_decs = self._run_judge_stage(
+                "related_judge",
+                stage3_batch,
+                lm=lm,
+                use_gbnf=use_gbnf,
+                stage_cache=stage_caches.get("related_judge") if stage_caches else None,
+                captured_traces=captured_traces,
+                rlm_stats=rlm_stats,
+            )
+            for dec in s3_decs:
+                dec_copy = dict(dec)
+                related = bool(dec.get("related"))
+                dec_copy["relation"] = "skos:related" if related else "owl:differentFrom"
+                resolved_decisions.append(dec_copy)
+
+        # 7. Aggregate all resolved decisions and return
+        return batch.resolve_decisions(resolved_decisions)
 
     def propose_shacl_repairs(
         self,

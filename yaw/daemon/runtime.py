@@ -40,9 +40,11 @@ from yaw.daemon.graph.inference import (
     compute_retrieval_recalls,
     create_dspy_rlm_pair,
     evaluate_benchmark_gate,
+    hierarchy_judge_fingerprint,
+    label_judge_fingerprint,
     openie_fingerprint,
+    related_judge_fingerprint,
     shacl_fingerprint,
-    synonym_fingerprint,
 )
 from yaw.daemon.graph.inference.components import (
     EMBEDDING_ENDPOINT,
@@ -265,7 +267,11 @@ class YawRuntime:
         embedder = self.engine.embedder
         prog_id = openie_fingerprint(program)
         emb_id = str(embedder.profile.index_identity)
-        syn_id = synonym_fingerprint(program)
+        syn_id = (
+            f"{label_judge_fingerprint(program)}:"
+            f"{hierarchy_judge_fingerprint(program)}:"
+            f"{related_judge_fingerprint(program)}"
+        )
         shacl_id = shacl_fingerprint(program)
         lm = getattr(program, "orchestrator_lm", None) or getattr(program, "rlm_sub_lm", None)
 
@@ -1136,13 +1142,21 @@ class YawRuntime:
                 raise YawRuntimeError("NOT_READY", "Graph engine is not initialized.")
             old_prog_id = openie_fingerprint(self.engine.program)
             old_emb_id = str(self.engine.embedder.profile.index_identity)
-            old_syn_id = synonym_fingerprint(self.engine.program)
+            old_syn_id = (
+                f"{label_judge_fingerprint(self.engine.program)}:"
+                f"{hierarchy_judge_fingerprint(self.engine.program)}:"
+                f"{related_judge_fingerprint(self.engine.program)}"
+            )
             old_shacl_id = shacl_fingerprint(self.engine.program)
             self.engine.program.load(str(p))
             self.engine.refresh_program_bindings()
             new_prog_id = openie_fingerprint(self.engine.program)
             new_emb_id = str(self.engine.embedder.profile.index_identity)
-            new_syn_id = synonym_fingerprint(self.engine.program)
+            new_syn_id = (
+                f"{label_judge_fingerprint(self.engine.program)}:"
+                f"{hierarchy_judge_fingerprint(self.engine.program)}:"
+                f"{related_judge_fingerprint(self.engine.program)}"
+            )
             new_shacl_id = shacl_fingerprint(self.engine.program)
             if self._openie_endpoint is not None:
                 self._openie_endpoint.program_identity = new_prog_id

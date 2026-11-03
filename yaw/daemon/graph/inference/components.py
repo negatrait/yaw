@@ -214,12 +214,19 @@ class OpenIEEndpoint:
             raise ValueError("OpenIE program identity does not match the bound program")
         program = self.program.deepcopy()
         program.telemetry.clear()
-        program.synonym_audit_trail.clear()
+        program.label_judge_audit_trail.clear()
+        program.hierarchy_judge_audit_trail.clear()
+        program.related_judge_audit_trail.clear()
         lm = self._resolve_lm()
         traces: list[Any] = []
         with dspy.context(lm=lm, trace=traces):
             decisions = program.judge_synonyms(request.batch, lm=lm)
         names = {id(predictor): name for src in (self.program, program) for name, predictor in src.named_predictors()}
+        audit_trail = [
+            *program.label_judge_audit_trail,
+            *program.hierarchy_judge_audit_trail,
+            *program.related_judge_audit_trail,
+        ]
         return JudgedSynonyms(
             tuple({str(k): str(v) for k, v in d.items()} for d in decisions),
             tuple(
@@ -228,7 +235,7 @@ class OpenIEEndpoint:
                 if id(predictor) in names
             ),
             tuple(dict(entry) for entry in program.telemetry),
-            tuple(dict(entry) for entry in program.synonym_audit_trail),
+            tuple(dict(entry) for entry in audit_trail),
         )
 
     @coco.fn.as_async

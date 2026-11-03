@@ -89,7 +89,9 @@ class GraphPlanSummary:
     traces: tuple[PredictorTrace, ...] = ()
     telemetry: tuple[dict[str, Any], ...] = ()
     entity_def_audit_trail: tuple[dict[str, Any], ...] = ()
-    synonym_audit_trail: tuple[dict[str, Any], ...] = ()
+    label_judge_audit_trail: tuple[dict[str, Any], ...] = ()
+    hierarchy_judge_audit_trail: tuple[dict[str, Any], ...] = ()
+    related_judge_audit_trail: tuple[dict[str, Any], ...] = ()
     shacl_audit_trail: tuple[dict[str, Any], ...] = ()
     rlm_stats: dict[str, Any] = field(default_factory=dict)
 
@@ -406,7 +408,9 @@ async def publish_graph(
         traces=plan.traces,
         telemetry=plan.telemetry,
         entity_def_audit_trail=plan.entity_def_audit_trail,
-        synonym_audit_trail=plan.synonym_audit_trail,
+        label_judge_audit_trail=plan.label_judge_audit_trail,
+        hierarchy_judge_audit_trail=plan.hierarchy_judge_audit_trail,
+        related_judge_audit_trail=plan.related_judge_audit_trail,
         shacl_audit_trail=plan.shacl_audit_trail,
         rlm_stats=dict(plan.rlm_stats),
     )

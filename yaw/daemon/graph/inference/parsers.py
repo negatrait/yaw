@@ -12,7 +12,6 @@ import dspy
 from dspy.evaluate.metrics import F1
 
 from yaw.core import (
-    SYNONYM_RELATION_ALIASES,
     VALID_SHACL_ACTIONS,
     VALID_SYNONYM_RELATIONS,
     VALUE_BEARING_SHACL_ACTIONS,
@@ -563,49 +562,151 @@ def compute_answer_passage_match(
     return bool(dspy.evaluate.answer_passage_match(ex_apm, pred_apm))
 
 
-def parse_synonym_decisions(
-    raw_output: Any,
-    num_pairs: int | None = None,
-) -> list[dict[str, str]]:
-    """Parse and validate SKOS/OWL disambiguation decisions from JudgeSynonyms or OrchestrateSynonymJudgment."""
-    items: Sequence[Any] = ()
+def _extract_decision_items(raw_output: Any) -> Sequence[Any]:
     if hasattr(raw_output, "decisions"):
         items = raw_output.decisions
-    elif isinstance(raw_output, dict) and "decisions" in raw_output:
+    elif isinstance(raw_output, Mapping) and "decisions" in raw_output:
         items = raw_output["decisions"]
     elif isinstance(raw_output, str):
         try:
             items = _extract_json_list_field(raw_output, "decisions")
         except ValueError:
             loaded = json.loads(raw_output)
-            if not isinstance(loaded, list):
+            if isinstance(loaded, list):
+                items = loaded
+            elif isinstance(loaded, Mapping) and "decisions" in loaded and isinstance(loaded["decisions"], list):
+                items = loaded["decisions"]
+            else:
                 raise
-            items = loaded
     elif isinstance(raw_output, Sequence):
         items = raw_output
+    else:
+        items = ()
+    return items if isinstance(items, Sequence) else ()
 
-    decisions: list[dict[str, str]] = []
-    for item in items:
-        if not isinstance(item, dict):
+
+def _extract_pair_id_and_reasoning(item: Mapping[str, Any]) -> tuple[str, str] | None:
+    pair_id = str(item.get("pair_id", "") or "").strip()
+    reasoning = str(item.get("reasoning", "") or "").strip()
+    if not pair_id or "|" not in pair_id or not reasoning:
+        return None
+    ids = pair_id.split("|")
+    if len(ids) != 2 or not all(ids) or ids[0] == ids[1]:
+        return None
+    return pair_id, reasoning
+
+
+def _parse_bool(val: Any) -> bool:
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return bool(val)
+    if isinstance(val, str):
+        return val.strip().lower() in ("true", "1", "yes", "t")
+    return bool(val)
+
+
+def parse_label_decisions(raw_output: Any) -> list[dict[str, Any]]:
+    """Parse and validate Stage 1 concept equivalence and lexical identity decisions from JudgeLabels."""
+    decisions: list[dict[str, Any]] = []
+    for item in _extract_decision_items(raw_output):
+        if not isinstance(item, Mapping):
             continue
-        pair_id = str(item.get("pair_id", "")).strip()
-        raw_relation = str(item.get("relation", "")).strip()
-        relation = SYNONYM_RELATION_ALIASES.get(raw_relation, "")
-        canonical = str(item.get("canonical", "")).strip()
-        if relation == "skos:narrower":
+        validated = _extract_pair_id_and_reasoning(item)
+        if validated is None:
+            continue
+        pair_id, reasoning = validated
+        equivalent = _parse_bool(item.get("equivalent"))
+        raw_def = item.get("definition")
+        definition = str(raw_def).strip() if isinstance(raw_def, str) else ""
+        if equivalent and not definition:
+            continue
+        alt_label = False if equivalent else _parse_bool(item.get("alt_label"))
+        hidden_label = False if (equivalent or alt_label) else _parse_bool(item.get("hidden_label"))
+        if equivalent or alt_label:
+            relation: str | None = "skos:altLabel"
+        elif hidden_label:
+            relation = "skos:hiddenLabel"
+        else:
+            relation = None
+        dec_entry: dict[str, Any] = {
+            "pair_id": pair_id,
+            "reasoning": reasoning,
+            "equivalent": equivalent,
+            "alt_label": alt_label,
+            "hidden_label": hidden_label,
+            "relation": relation,
+        }
+        if definition:
+            dec_entry["definition"] = definition
+        if "canonical" in item and item["canonical"]:
+            dec_entry["canonical"] = str(item["canonical"])
+        if "source_id" in item and item["source_id"]:
+            dec_entry["source_id"] = str(item["source_id"])
+        if "target_id" in item and item["target_id"]:
+            dec_entry["target_id"] = str(item["target_id"])
+        decisions.append(dec_entry)
+    return decisions
+
+
+def parse_hierarchy_decisions(raw_output: Any) -> list[dict[str, Any]]:
+    """Parse and validate Stage 2 taxonomic hierarchy decisions from JudgeHierarchy."""
+    decisions: list[dict[str, Any]] = []
+    for item in _extract_decision_items(raw_output):
+        if not isinstance(item, Mapping):
+            continue
+        validated = _extract_pair_id_and_reasoning(item)
+        if validated is None:
+            continue
+        pair_id, reasoning = validated
+        broader = _parse_bool(item.get("broader"))
+        narrower = _parse_bool(item.get("narrower"))
+        source_direction: str | None = None
+        if broader and not narrower:
+            relation: str | None = "skos:broader"
+            source_direction = "a_to_b"
+        elif not broader and narrower:
             relation = "skos:broader"
-            canonical = "B" if canonical in ("", "A") else "A"
-        if not pair_id or relation not in VALID_SYNONYM_RELATIONS:
-            continue
+            source_direction = "b_to_a"
+        elif broader and narrower:
+            relation = "skos:related"
+            source_direction = None
+        else:
+            relation = None
+            source_direction = None
         decisions.append(
             {
                 "pair_id": pair_id,
+                "reasoning": reasoning,
+                "broader": broader,
+                "narrower": narrower,
                 "relation": relation,
-                "canonical": canonical if relation == "skos:broader" else (canonical or "A"),
+                "source_direction": source_direction,
             }
         )
-        if num_pairs is not None and num_pairs > 0 and len(decisions) >= num_pairs:
-            break
+    return decisions
+
+
+def parse_related_decisions(raw_output: Any) -> list[dict[str, Any]]:
+    """Parse and validate Stage 3 associative relation decisions from JudgeRelated."""
+    decisions: list[dict[str, Any]] = []
+    for item in _extract_decision_items(raw_output):
+        if not isinstance(item, Mapping):
+            continue
+        validated = _extract_pair_id_and_reasoning(item)
+        if validated is None:
+            continue
+        pair_id, reasoning = validated
+        related = _parse_bool(item.get("related"))
+        relation = "skos:related" if related else "owl:differentFrom"
+        decisions.append(
+            {
+                "pair_id": pair_id,
+                "reasoning": reasoning,
+                "related": related,
+                "relation": relation,
+            }
+        )
     return decisions
 
 
@@ -1055,7 +1156,9 @@ def compute_task_quality_score(
     shacl_violations: int | None = None,
     shacl_violations_initial: int = 0,
     shacl_violations_remaining: int = 0,
-    synonym_judge_tokens: int = 0,
+    label_judge_tokens: int = 0,
+    hierarchy_judge_tokens: int = 0,
+    related_judge_tokens: int = 0,
     shacl_healer_tokens: int = 0,
     missing_entity_defs_count: int = 0,
     missing_entity_defs_tokens: int = 0,
@@ -1122,7 +1225,9 @@ def compute_task_quality_score(
         em=obj_scores.get("em"),
         f1=obj_scores.get("f1"),
         tokens=safe_tokens,
-        synonym_judge_tokens=max(0, int(synonym_judge_tokens)),
+        label_judge_tokens=max(0, int(label_judge_tokens)),
+        hierarchy_judge_tokens=max(0, int(hierarchy_judge_tokens)),
+        related_judge_tokens=max(0, int(related_judge_tokens)),
         shacl_healer_tokens=max(0, int(shacl_healer_tokens)),
         shacl_violations_initial=eff_v_init,
         shacl_violations_remaining=eff_v_rem,
@@ -1183,7 +1288,9 @@ __all__ = [
     "extract_entity_definitions",
     "extract_structured_triples",
     "match_facts_to_candidate_indices",
+    "parse_hierarchy_decisions",
+    "parse_label_decisions",
+    "parse_related_decisions",
     "parse_shacl_repairs",
-    "parse_synonym_decisions",
     "text_processing",
 ]

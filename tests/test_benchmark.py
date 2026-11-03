@@ -512,10 +512,10 @@ class DatasetSliceTests(unittest.TestCase):
             self.assertEqual(len(bundle.documents), len(documents))
             self.assertEqual(json.loads(bundle.evaluation_path.read_text(encoding="utf-8")), questions)
             train, val, corpus = _load_dataset_splits(
-                ["enterprise_rag_bench"], workspace_root=root, max_queries=250, train_queries=150
+                ["enterprise_rag_bench"], workspace_root=root, max_queries=250, train_queries=223
             )
             assert val is not None
-            self.assertEqual((len(train), len(val), len(corpus)), (150, 100, len(documents)))
+            self.assertEqual((len(train), len(val), len(corpus)), (223, 27, len(documents)))
 
 
 class EvaluationAndIntegrityTests(unittest.TestCase):

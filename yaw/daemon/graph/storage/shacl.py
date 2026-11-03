@@ -12,9 +12,9 @@ from yaw.core import (
     text_processing,
 )
 
-from .db import YawConnection, write_tx
+from .chunks import get_chunk_pointers
+from .db import write_tx
 from .graph_ops import (
-    get_chunk_pointers,
     get_existing_ids,
     get_pure_literal_entity_ids,
     merge_entities,
@@ -29,7 +29,7 @@ from .hydration import (
 
 
 def inspect_entity_or_fact(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     focus_node: str,
     corpus_root: Path | str | None = None,
 ) -> dict[str, Any]:
@@ -215,7 +215,7 @@ def inspect_entity_or_fact(
 
 
 def format_entity_skos_markdown(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     entity_id: str,
     corpus_root: Path | str | None = None,
     *,
@@ -384,7 +384,7 @@ def format_entity_skos_markdown(
 
 
 def format_pair_disambiguation_dossier(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     entity_a: str,
     entity_b: str,
     corpus_root: Path | str | None = None,
@@ -468,7 +468,7 @@ def format_pair_disambiguation_dossier(
 
 
 def inspect_focus_node(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     focus_node: str,
     corpus_root: Path | str | None = None,
     *,
@@ -529,7 +529,7 @@ def inspect_focus_node(
     return single
 
 
-def _scan_shacl_violations(conn: sqlite3.Connection | YawConnection) -> list[SHACLViolation]:
+def _scan_shacl_violations(conn: sqlite3.Connection) -> list[SHACLViolation]:
     violations: list[SHACLViolation] = []
 
     # 1. ConceptShape/prefLabel: Every entity must have exactly 1 distinct skos:prefLabel norm
@@ -1036,14 +1036,14 @@ def _scan_shacl_violations(conn: sqlite3.Connection | YawConnection) -> list[SHA
 
 
 def lint_graph_shacl(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
 ) -> list[SHACLViolation]:
     """Run read-only closed-world SQL SHACL validation shapes over yaw.db."""
     return _scan_shacl_violations(conn)
 
 
 def apply_shacl_repairs(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     repairs: Sequence[Mapping[str, Any]],
     *,
     merge_entities_fn: Callable[[str, str, str], bool] | None = None,
@@ -1510,7 +1510,7 @@ def _escape_turtle_literal(value: str) -> str:
 
 
 def serialize_graph_turtle(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     violations: Sequence[SHACLViolation] | None = None,
 ) -> str:
     """Serialize the yaw.db SKOS/RDF/OWL closed-world knowledge graph into W3C Turtle format."""

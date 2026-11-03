@@ -13,8 +13,8 @@ from yaw.daemon.graph.inference.parsers import (
     extract_entity_definitions,
     extract_structured_triples,
     match_facts_to_candidate_indices,
+    parse_label_decisions,
     parse_shacl_repairs,
-    parse_synonym_decisions,
     text_processing,
 )
 
@@ -244,22 +244,32 @@ def test_wrong_nested_response_envelopes_and_missing_filter_output_are_not_facts
     assert match_facts_to_candidate_indices([("A", "p", "B")], coerce_generated_facts("No structured response")) == []
 
 
-def test_invalid_synonym_items_cannot_displace_a_later_valid_decision():
+def test_invalid_label_items_cannot_displace_a_later_valid_decision():
     raw = [
         None,
-        {"pair_id": "", "relation": "related"},
-        {"pair_id": "0", "relation": "unknown"},
-        {"pair_id": "1", "relation": "related"},
+        {"pair_id": "", "reasoning": "valid", "equivalent": False, "alt_label": True},
+        {"pair_id": "0", "reasoning": "valid", "equivalent": False, "alt_label": True},
+        {"pair_id": "a|b", "reasoning": "", "equivalent": False, "alt_label": True},
+        {"pair_id": "a|b", "reasoning": "valid", "equivalent": False, "alt_label": True},
     ]
-    assert parse_synonym_decisions(raw) == [{"pair_id": "1", "relation": "skos:related", "canonical": "A"}]
+    assert parse_label_decisions(raw) == [
+        {
+            "pair_id": "a|b",
+            "reasoning": "valid",
+            "equivalent": False,
+            "alt_label": True,
+            "hidden_label": False,
+            "relation": "skos:altLabel",
+        }
+    ]
 
 
 @pytest.mark.parametrize("envelope", ["prediction", "dictionary", "json", "bare-json", "list"])
 def test_synonym_and_shacl_decisions_reject_unknown_actions(envelope):
     decisions = [
-        {"pair_id": "0", "relation": "related"},
-        {"pair_id": "1", "relation": "differentFrom"},
-        {"pair_id": "2", "relation": "unknown"},
+        {"pair_id": "a|b", "reasoning": "valid", "equivalent": False, "alt_label": True},
+        {"pair_id": "c|d", "reasoning": "valid", "equivalent": False, "alt_label": False, "hidden_label": True},
+        {"pair_id": "e", "reasoning": "invalid pair_id"},
         "invalid",
     ]
     repairs = [
@@ -277,13 +287,28 @@ def test_synonym_and_shacl_decisions_reject_unknown_actions(envelope):
             "list": value,
         }[envelope]
 
-    assert parse_synonym_decisions(wrap("decisions", decisions), num_pairs=1) == [
-        {"pair_id": "0", "relation": "skos:related", "canonical": "A"},
+    assert parse_label_decisions(wrap("decisions", decisions)) == [
+        {
+            "pair_id": "a|b",
+            "reasoning": "valid",
+            "equivalent": False,
+            "alt_label": True,
+            "hidden_label": False,
+            "relation": "skos:altLabel",
+        },
+        {
+            "pair_id": "c|d",
+            "reasoning": "valid",
+            "equivalent": False,
+            "alt_label": False,
+            "hidden_label": True,
+            "relation": "skos:hiddenLabel",
+        },
     ]
     assert parse_shacl_repairs(wrap("repairs", repairs)) == [
         {"focus_node": "A", "action": "set_definition", "value": "A concept"},
     ]
     with pytest.raises(json.JSONDecodeError):
-        parse_synonym_decisions("not JSON")
+        parse_label_decisions("not JSON")
     with pytest.raises(json.JSONDecodeError):
         parse_shacl_repairs("not JSON")

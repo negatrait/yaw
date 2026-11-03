@@ -635,11 +635,13 @@ tools."""
         # _retrieval_hook)
         direct_prog = HippoRAGProgram()
         direct_names = [name for name, _ in direct_prog.named_predictors()]
-        expected_canonical_9 = [
+        expected_canonical_predictors = [
             "ner",
             "triples",
             "entity_definer",
-            "synonym_judge",
+            "label_judge",
+            "hierarchy_judge",
+            "related_judge",
             "shacl_repair",
             "triple_filter",
             "query_intent",
@@ -647,10 +649,10 @@ tools."""
             "shacl_healer_rlm.generate_action",
             "shacl_healer_rlm.extract",
         ]
-        self.assertEqual(direct_names, expected_canonical_9)
+        self.assertEqual(direct_names, expected_canonical_predictors)
         direct_prog.set_retrieval_hook(lambda q: ("ctx", ("c1",), (1.0,)))
         hooked_names = [name for name, _ in direct_prog.named_predictors()]
-        self.assertEqual(hooked_names, expected_canonical_9)
+        self.assertEqual(hooked_names, expected_canonical_predictors)
 
     @staticmethod
     def _probe_live_lemonade_models(base_url: str) -> set[str]:
@@ -916,11 +918,11 @@ no frequency penalty."""
         from yaw.daemon.graph.inference import (
             DSPY_MISSING_ENTITY_DEFS_GBNF_GRAMMAR,
             DSPY_SHACL_REPAIR_GBNF_GRAMMAR,
-            DSPY_SYNONYM_JUDGE_GBNF_GRAMMAR,
             HippoRAGProgram,
             RLMInstructionProposer,
+            build_dspy_label_judge_grammar,
+            parse_label_decisions,
             parse_shacl_repairs,
-            parse_synonym_decisions,
         )
 
         primary_lm = CapabilityDummyLM([{"named_entities": [["Ada Lovelace", "English mathematician"]]}])
@@ -936,7 +938,11 @@ no frequency penalty."""
                         }
                     ]
                 },
-                {"decisions": [{"pair_id": "e0|e1", "relation": "skos:altLabel", "canonical": "e0"}]},
+                {
+                    "decisions": [
+                        {"pair_id": "e0|e1", "reasoning": "Standard synonym", "alt_label": True, "hidden_label": False}
+                    ]
+                },
                 {
                     "repairs": [
                         {
@@ -966,18 +972,20 @@ no frequency penalty."""
 
         stage_preds = prog.all_stage_predictors()
         refl_preds = proposer.all_reflection_predictors()
-        self.assertEqual(len(stage_preds), 9)
+        self.assertEqual(len(stage_preds), 11)
         self.assertEqual(len(refl_preds), 3)
 
-        all_12 = dict(stage_preds + refl_preds)
-        self.assertEqual(len(all_12), 12)
+        all_14 = dict(stage_preds + refl_preds)
+        self.assertEqual(len(all_14), 14)
         self.assertEqual(
-            list(all_12.keys()),
+            list(all_14.keys()),
             [
                 "ner",
                 "triples",
                 "entity_definer",
-                "synonym_judge",
+                "label_judge",
+                "hierarchy_judge",
+                "related_judge",
                 "shacl_repair",
                 "shacl_healer_rlm",
                 "triple_filter",
@@ -989,9 +997,9 @@ no frequency penalty."""
             ],
         )
 
-        # Pairwise-distinct Signature classes across all 12 canonical predictors
-        sig_classes = [p.signature for p in all_12.values()]
-        self.assertEqual(len(set(sig_classes)), 12)
+        # Pairwise-distinct Signature classes across all 14 canonical predictors
+        sig_classes = [p.signature for p in all_14.values()]
+        self.assertEqual(len(set(sig_classes)), 14)
 
         # Native role bindings share the actual LM, not artificial per-predictor
         # proxies. The native writer reads the worker's scoped rollout context.
@@ -1034,10 +1042,8 @@ no frequency penalty."""
         syn_batch = SynonymEvidenceBatch(
             payload=json.dumps(
                 {
-                    "format": "synonym-evidence-v1",
+                    "format": "synonym-evidence-v2",
                     "pairs": [{"pair_id": "e0|e1", "left": "e0", "right": "e1"}],
-                    "entities": {},
-                    "sources": {},
                 },
                 separators=(",", ":"),
             ),
@@ -1045,7 +1051,8 @@ no frequency penalty."""
             identifiers={"e0": "ent-1", "e1": "ent-2"},
         )
         decisions = prog.judge_synonyms(syn_batch)
-        self.assertEqual(decisions, [{"pair_id": "ent-1|ent-2", "relation": "skos:altLabel", "canonical": "ent-1"}])
+        self.assertEqual(decisions[0]["pair_id"], "ent-1|ent-2")
+        self.assertEqual(decisions[0]["relation"], "skos:altLabel")
 
         repairs = prog.propose_shacl_repairs(
             '[{"focus_node": "ent-1"}]',
@@ -1065,10 +1072,10 @@ no frequency penalty."""
 
         # Verify GBNF grammars and parser edge cases
         self.assertIn("entity_definitions", DSPY_MISSING_ENTITY_DEFS_GBNF_GRAMMAR)
-        self.assertIn("skos:altLabel", DSPY_SYNONYM_JUDGE_GBNF_GRAMMAR)
+        self.assertIn("alt_label", build_dspy_label_judge_grammar())
         self.assertIn("set_definition", DSPY_SHACL_REPAIR_GBNF_GRAMMAR)
         with self.assertRaises(json.JSONDecodeError):
-            parse_synonym_decisions("invalid json")
+            parse_label_decisions("invalid json")
         with self.assertRaises(json.JSONDecodeError):
             parse_shacl_repairs("invalid json")
 
@@ -1423,7 +1430,9 @@ repair, and Pareto penalty."""
             FilterTriples,
             HealSHACLViolations,
             HippoRAGProgram,
-            JudgeSynonyms,
+            JudgeHierarchy,
+            JudgeLabels,
+            JudgeRelated,
             ProposeInstructionSignature,
             ProposeSHACLRepairs,
             ReflectiveInnerDistillerSignature,
@@ -1445,7 +1454,9 @@ repair, and Pareto penalty."""
             ExtractEntities,
             ExtractTriples,
             DefineMissingEntities,
-            JudgeSynonyms,
+            JudgeLabels,
+            JudgeHierarchy,
+            JudgeRelated,
             ProposeSHACLRepairs,
             ExtractQueryIntent,
             FilterTriples,
@@ -1599,7 +1610,7 @@ repair, and Pareto penalty."""
         prog = HippoRAGProgram(orchestrator_lm=qa_lm, rlm_sub_lm=qa_lm)
         self.assertIsInstance(prog.rm, YawRM)
         self.assertIsInstance(prog.retriever, YawRetriever)
-        self.assertEqual(len(prog.named_predictors()), 10)
+        self.assertEqual(len(prog.named_predictors()), 12)
 
         prog.set_retrieval_hook(fake_hook)
         self.assertIs(prog.rm.hook, fake_hook)
@@ -1792,24 +1803,107 @@ repair, and Pareto penalty."""
         self.assertLess(ed_bad, 1.0)
         self.assertIn("ConceptShape/definition", ed_bad_fb)
 
-        # 4. Stage 4: synonym_judge (S13, homographDifferentFrom, EdgeShape/closedWorld)
-        syn_ok, _ = validate_stage_invariants(
-            "synonym_judge",
+        # 4. Stage 4: W3C cascade judges (EdgeShape/closedWorld)
+        # 4a. label_judge
+        lbl_ok, _ = validate_stage_invariants(
+            "label_judge",
             {"candidate_pairs": '[{"pair_id": "ent-1|ent-2"}]'},
-            dspy.Prediction(decisions=[{"pair_id": "ent-1|ent-2", "relation": "skos:altLabel", "canonical": "A"}]),
-        )
-        self.assertEqual(syn_ok, 1.0)
-        syn_bad, syn_bad_fb = validate_stage_invariants(
-            "synonym_judge",
-            {"candidate_pairs": '[{"pair_id": "ent-1|ent-1"}]'},
             dspy.Prediction(
                 decisions=[
-                    {"pair_id": "ent-1|ent-1", "relation": "skos:altLabel", "canonical": "Z"},
+                    {
+                        "pair_id": "ent-1|ent-2",
+                        "reasoning": "Identical synonyms",
+                        "alt_label": True,
+                        "hidden_label": False,
+                    }
                 ]
             ),
         )
-        self.assertLess(syn_bad, 1.0)
-        self.assertIn("EdgeShape/closedWorld", syn_bad_fb)
+        self.assertEqual(lbl_ok, 1.0)
+        lbl_bad, lbl_bad_fb = validate_stage_invariants(
+            "label_judge",
+            {"candidate_pairs": '[{"pair_id": "ent-1|ent-1"}]'},
+            dspy.Prediction(
+                decisions=[
+                    {
+                        "pair_id": "ent-1|ent-1",
+                        "reasoning": "Self loop",
+                        "alt_label": True,
+                        "hidden_label": False,
+                    }
+                ]
+            ),
+        )
+        self.assertLess(lbl_bad, 1.0)
+        self.assertIn("EdgeShape/closedWorld", lbl_bad_fb)
+
+        # 4b. hierarchy_judge
+        hier_ok, _ = validate_stage_invariants(
+            "hierarchy_judge",
+            {"candidate_pairs": '[{"pair_id": "ent-1|ent-2"}]'},
+            dspy.Prediction(
+                decisions=[
+                    {
+                        "pair_id": "ent-1|ent-2",
+                        "reasoning": "Taxonomic parent",
+                        "broader": True,
+                        "narrower": False,
+                    }
+                ]
+            ),
+        )
+        self.assertEqual(hier_ok, 1.0)
+        hier_bad, hier_bad_fb = validate_stage_invariants(
+            "hierarchy_judge",
+            {"candidate_pairs": '[{"pair_id": "ent-1|ent-1"}]'},
+            dspy.Prediction(
+                decisions=[
+                    {
+                        "pair_id": "ent-1|ent-1",
+                        "reasoning": "Self loop",
+                        "broader": True,
+                        "narrower": False,
+                    }
+                ]
+            ),
+        )
+        self.assertLess(hier_bad, 1.0)
+        self.assertIn("EdgeShape/closedWorld", hier_bad_fb)
+
+        # 4c. related_judge
+        rel_ok, _ = validate_stage_invariants(
+            "related_judge",
+            {"candidate_pairs": '[{"pair_id": "ent-1|ent-2"}]'},
+            dspy.Prediction(
+                decisions=[
+                    {
+                        "pair_id": "ent-1|ent-2",
+                        "reasoning": "Associative relation",
+                        "related": True,
+                    }
+                ]
+            ),
+        )
+        self.assertEqual(rel_ok, 1.0)
+        rel_bad, rel_bad_fb = validate_stage_invariants(
+            "related_judge",
+            {"candidate_pairs": '[{"pair_id": "ent-1|ent-1"}]'},
+            dspy.Prediction(
+                decisions=[
+                    {
+                        "pair_id": "ent-1|ent-1",
+                        "reasoning": "Self loop",
+                        "related": True,
+                    }
+                ]
+            ),
+        )
+        self.assertLess(rel_bad, 1.0)
+        self.assertIn("EdgeShape/closedWorld", rel_bad_fb)
+
+        # 4d. Unhandled stage raises ValueError
+        with self.assertRaises(ValueError):
+            validate_stage_invariants("unhandled_judge", {}, dspy.Prediction())
 
         # 5. Stage 5: shacl_repair & shacl_healer_rlm (6 Closed-World SHACL Shapes)
         shacl_ok, _ = validate_stage_invariants(
@@ -1950,8 +2044,8 @@ repair, and Pareto penalty."""
             question="What county is Erik Hort's birthplace a part of?",
         )
         self.assertEqual(qa_ens_pred.answer, "Rockland County")
-        self.assertEqual(len(prog1.named_predictors()), 10)
-        self.assertEqual(len(prog2.named_predictors()), 10)
+        self.assertEqual(len(prog1.named_predictors()), 12)
+        self.assertEqual(len(prog2.named_predictors()), 12)
 
         # Verify HippoRAGProgram.as_async()
         async_prog_lm = CapabilityDummyLM(
@@ -2011,17 +2105,22 @@ repair, and Pareto penalty."""
         )
         from yaw.daemon.graph.inference import (
             DSPY_SHACL_REPAIR_GBNF_GRAMMAR,
-            DSPY_SYNONYM_JUDGE_GBNF_GRAMMAR,
-            JudgeSynonyms,
+            JudgeHierarchy,
+            JudgeLabels,
+            JudgeRelated,
             ProposeSHACLRepairs,
+            build_dspy_hierarchy_judge_grammar,
+            build_dspy_label_judge_grammar,
+            build_dspy_related_judge_grammar,
             build_dspy_shacl_repair_grammar,
-            build_dspy_synonym_judge_grammar,
         )
 
-        for rel in VALID_SYNONYM_RELATIONS:
-            self.assertIn(rel, DSPY_SYNONYM_JUDGE_GBNF_GRAMMAR)
-            self.assertIn(rel, build_dspy_synonym_judge_grammar(max_decisions=2))
-            self.assertIn(rel, JudgeSynonyms.instructions)
+        self.assertIn("alt_label", build_dspy_label_judge_grammar(max_decisions=2))
+        self.assertIn("broader", build_dspy_hierarchy_judge_grammar(max_decisions=2))
+        self.assertIn("related", build_dspy_related_judge_grammar(max_decisions=2))
+        self.assertIn("skos:altLabel", JudgeLabels.instructions)
+        self.assertIn("skos:broader", JudgeHierarchy.instructions)
+        self.assertIn("skos:related", JudgeRelated.instructions)
 
         violations_in = {"violations": [{"focus_node": "entity-a"}, {"focus_node": "entity-b"}]}
         for action in VALID_SHACL_ACTIONS:
@@ -2175,7 +2274,9 @@ repair, and Pareto penalty."""
             prog.telemetry.append({"idx": i})
             prog.embedding_audit_trail.append({"idx": i})
             prog.entity_def_audit_trail.append({"idx": i})
-            prog.synonym_audit_trail.append({"idx": i})
+            prog.label_judge_audit_trail.append({"idx": i})
+            prog.hierarchy_judge_audit_trail.append({"idx": i})
+            prog.related_judge_audit_trail.append({"idx": i})
             prog.shacl_audit_trail.append({"idx": i})
         bounded_trails = prog.dump_audit_trails(bounded=True)
         self.assertEqual(
@@ -2184,14 +2285,18 @@ repair, and Pareto penalty."""
                 "telemetry",
                 "embedding_audit_trail",
                 "entity_def_audit_trail",
-                "synonym_audit_trail",
+                "label_judge_audit_trail",
+                "hierarchy_judge_audit_trail",
+                "related_judge_audit_trail",
                 "shacl_audit_trail",
             },
         )
         self.assertEqual(len(bounded_trails["telemetry"]), 250)
         self.assertEqual(len(bounded_trails["embedding_audit_trail"]), 250)
         self.assertEqual(len(bounded_trails["entity_def_audit_trail"]), 250)
-        self.assertEqual(len(bounded_trails["synonym_audit_trail"]), 100)
+        self.assertEqual(len(bounded_trails["label_judge_audit_trail"]), 100)
+        self.assertEqual(len(bounded_trails["hierarchy_judge_audit_trail"]), 100)
+        self.assertEqual(len(bounded_trails["related_judge_audit_trail"]), 100)
         self.assertEqual(len(bounded_trails["shacl_audit_trail"]), 100)
         aliased_trails = prog.dump_audit_trails(bounded=True, telemetry_key="program_telemetry")
         self.assertIn("program_telemetry", aliased_trails)

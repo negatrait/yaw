@@ -74,9 +74,10 @@ class DeterministicTestLM(dspy.LM):
                 self.model,
                 {"prompt_tokens": 32, "completion_tokens": 16, "total_tokens": 48},
             )
-        if "JudgeSynonyms" in req_str or "candidate_pairs_json" in req_str or "candidate_pairs" in req_str:
+        if "JudgeLabels" in req_str or "candidate_pairs_json" in req_str or "candidate_pairs" in req_str:
             packet_text = prompt or "\n".join(str(m.get("content", "")) for m in messages or [])
-            return [json.dumps({"decisions": complete_decisions(candidate_rows(packet_text), [])})]
+            decs = complete_decisions(candidate_rows(packet_text), [], stage_text=packet_text)
+            return [json.dumps({"decisions": decs})]
         if "ProposeSHACLRepairs" in req_str or "HealSHACLViolations" in req_str or "violations_json" in req_str:
             return ['{"repairs": []}']
         if "DefineMissingEntities" in req_str or "missing_entities" in req_str or "entity_definitions" in req_str:

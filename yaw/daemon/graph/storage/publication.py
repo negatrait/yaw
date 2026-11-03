@@ -13,9 +13,9 @@ from cocoindex.connectors.sqlite import ManagedConnection
 
 from yaw.core import ChunkPointer
 
+from .chunks import upsert_chunk_pointers
 from .graph_ops import (
     delete_chunks,
-    upsert_chunk_pointers,
     upsert_edges_with_sources,
     upsert_entities,
     upsert_entity_labels,

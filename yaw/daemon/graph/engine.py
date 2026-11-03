@@ -45,7 +45,6 @@ from yaw.daemon.graph.inference import (
     query_retrieval_fingerprint,
     set_yaw_sleep_seconds,
     shacl_fingerprint,
-    synonym_fingerprint,
     text_processing,
     trim_diagnostics,
 )
@@ -243,10 +242,24 @@ class YawGraphEngine:
             self._candidate_cache_namespace,
             sources=self._candidate_cache_sources,
         )
-        self._synonym_fp_cache = CandidateStageCache(
+        self._label_judge_fp_cache = CandidateStageCache(
             cache_store,
             self.managed_conn,
-            "synonym",
+            "label_judge",
+            self._candidate_cache_namespace,
+            sources=self._candidate_cache_sources,
+        )
+        self._hierarchy_judge_fp_cache = CandidateStageCache(
+            cache_store,
+            self.managed_conn,
+            "hierarchy_judge",
+            self._candidate_cache_namespace,
+            sources=self._candidate_cache_sources,
+        )
+        self._related_judge_fp_cache = CandidateStageCache(
+            cache_store,
+            self.managed_conn,
+            "related_judge",
             self._candidate_cache_namespace,
             sources=self._candidate_cache_sources,
         )
@@ -384,7 +397,9 @@ class YawGraphEngine:
                     for trail_attr in (
                         "telemetry",
                         "embedding_audit_trail",
-                        "synonym_audit_trail",
+                        "label_judge_audit_trail",
+                        "hierarchy_judge_audit_trail",
+                        "related_judge_audit_trail",
                         "shacl_audit_trail",
                         "entity_def_audit_trail",
                     ):
@@ -483,7 +498,9 @@ class YawGraphEngine:
                 )
                 est_openie_tok = float(max(64, len(est_json) // 4))
                 self._chunk_rlm_stats[cid] = {
-                    "synonym_judge_tokens": 0.0,
+                    "label_judge_tokens": 0.0,
+                    "hierarchy_judge_tokens": 0.0,
+                    "related_judge_tokens": 0.0,
                     "shacl_healer_tokens": 0.0,
                     "shacl_violations_initial": 0.0,
                     "shacl_violations_remaining": 0.0,
@@ -507,7 +524,9 @@ class YawGraphEngine:
             "shacl_violations_remaining": 0,
             "shacl_repairs_applied": 0,
             "shacl_conforms": True,
-            "synonym_judge_tokens": 0,
+            "label_judge_tokens": 0,
+            "hierarchy_judge_tokens": 0,
+            "related_judge_tokens": 0,
             "shacl_healer_tokens": 0,
             "missing_entity_defs_count": 0,
             "missing_entity_defs_tokens": 0,
@@ -1078,7 +1097,9 @@ class YawGraphEngine:
 
             if target_cids and any(cid in self._chunk_rlm_stats for cid in target_cids):
                 agg: dict[str, float] = {
-                    "synonym_judge_tokens": 0.0,
+                    "label_judge_tokens": 0.0,
+                    "hierarchy_judge_tokens": 0.0,
+                    "related_judge_tokens": 0.0,
                     "shacl_healer_tokens": 0.0,
                     "shacl_violations_initial": 0.0,
                     "shacl_violations_remaining": 0.0,
@@ -1091,7 +1112,9 @@ class YawGraphEngine:
                     c_stats = self._chunk_rlm_stats.get(cid)
                     if c_stats:
                         for k in (
-                            "synonym_judge_tokens",
+                            "label_judge_tokens",
+                            "hierarchy_judge_tokens",
+                            "related_judge_tokens",
                             "shacl_healer_tokens",
                             "shacl_violations_initial",
                             "shacl_violations_remaining",
@@ -1518,7 +1541,7 @@ class YawGraphEngine:
                 entity_vectors=tuple(entity_vec_pairs),
                 fact_vectors=tuple(fact_vec_pairs),
             )
-            staged_merges: list[tuple[str, str, str]] = []
+            staged_merges: list[tuple[str, str, str, str | None]] = []
             resolved_semantic_batch: list[tuple[str, str, str, float]] = []
             staged_repairs: list[Mapping[str, Any]] = []
             stage_conn = clone_graph_to_memory(self.conn)
@@ -1542,10 +1565,14 @@ class YawGraphEngine:
                 self._graph_rlm_stats["candidate_pairs"] += raw_cand_count
                 if candidates:
                     decisions: list[dict[str, str]] = []
-                    syn_fp = synonym_fingerprint(active_program)
                     batch_limit = max(1, scale_context_budget(8, active_program.context_window_tokens))
                     max_dossier_chars = min(40000, active_program._context_char_limit(12000))
                     completed_pairs = 0
+                    stage_caches = {
+                        "label_judge": self._label_judge_fp_cache,
+                        "hierarchy_judge": self._hierarchy_judge_fp_cache,
+                        "related_judge": self._related_judge_fp_cache,
+                    }
                     for evidence in iter_synonym_evidence(
                         stage_conn,
                         candidates,
@@ -1557,57 +1584,17 @@ class YawGraphEngine:
                     ):
                         if progress_callback is not None:
                             progress_callback(f"indexing: synonym judgment ({completed_pairs}/{len(candidates)} pairs)")
-                        # Include the actual evidence, not just entity IDs and similarity scores.
-                        pairs_fp = evidence.cache_identity
-                        cached_syn = self._synonym_fp_cache.get((syn_fp, pairs_fp))
                         completed_pairs += len(evidence.candidates)
-                        if cached_syn is not None:
-                            cached_decs, cached_syn_tr, cached_syn_tok = cached_syn
-                            decisions.extend(cached_decs)
-                            self._captured_graph_traces.extend(cached_syn_tr)
-                            self._graph_rlm_stats["synonym_judge_tokens"] += cached_syn_tok
-                            active_program.telemetry.append(
-                                {
-                                    "stage": "synonym_judge",
-                                    "mode": "cache",
-                                    "cache_hit": True,
-                                    "packet_id": pairs_fp,
-                                    "pair_count": len(evidence.candidates),
-                                    "packet_chars": len(evidence.payload),
-                                    "tokens_used": 0,
-                                    "construction_seconds": evidence.construction_seconds,
-                                    "inference_seconds": 0.0,
-                                }
-                            )
-                            continue
-                        syn_audit: list[dict[str, Any]] = getattr(active_program, "synonym_audit_trail", [])
-                        tel: list[dict[str, Any]] = getattr(active_program, "telemetry", [])
-                        prev_syn_audit_len = len(syn_audit)
-                        prev_tel_len = len(tel)
-                        local_syn_trace: list[Any] = []
-                        with dspy.context(trace=local_syn_trace, usage_tracker=None):
-                            synonym_started = time.perf_counter()
-                            batch_decs = active_program.judge_synonyms(evidence)
-                            synonym_seconds += time.perf_counter() - synonym_started
-                            if batch_decs:
-                                decisions.extend(batch_decs)
-                        syn_traces = extract_named_trace_entries(
-                            active_program,
-                            local_syn_trace,
-                            allowed_names={"synonym_judge"},
+                        synonym_started = time.perf_counter()
+                        batch_decs = active_program.judge_synonyms(
+                            evidence,
+                            stage_caches=stage_caches,
+                            captured_traces=self._captured_graph_traces,
+                            rlm_stats=self._graph_rlm_stats,
                         )
-                        self._captured_graph_traces.extend(syn_traces)
-                        syn_tok = 0
-                        if len(syn_audit) > prev_syn_audit_len:
-                            syn_tok = sum(int(x.get("tokens_used", 0)) for x in syn_audit[prev_syn_audit_len:])
-                        elif len(tel) > prev_tel_len:
-                            syn_tok = sum(int(x.get("tokens_used", 0)) for x in tel[prev_tel_len:])
-                        self._graph_rlm_stats["synonym_judge_tokens"] += syn_tok
-                        self._synonym_fp_cache[(syn_fp, pairs_fp)] = (
-                            list(batch_decs or []),
-                            list(syn_traces),
-                            syn_tok,
-                        )
+                        synonym_seconds += time.perf_counter() - synonym_started
+                        if batch_decs:
+                            decisions.extend(batch_decs)
                     if progress_callback is not None:
                         progress_callback(f"indexing: synonym judgment ({completed_pairs}/{len(candidates)} pairs)")
 
@@ -1619,11 +1606,15 @@ class YawGraphEngine:
                         materialized.fact_linked_pairs,
                         synonymy_threshold=self.synonymy_threshold,
                         rlm_stats=self._graph_rlm_stats,
+                        corpus_root=self.workspace_root,
                     )
                     staged_merges.extend(adjudicated_merges)
 
                 # Out-of-transaction Closed-World SHACL Linting & Bounded Self-Healing via shacl_healer_rlm
                 batch_node_ids = set(chunk_ids) | set(all_entity_ids) | set(all_fact_ids)
+                for m_src, m_dst, _, _ in staged_merges:
+                    batch_node_ids.add(m_src)
+                    batch_node_ids.add(m_dst)
                 if progress_callback is not None:
                     progress_callback("indexing: SHACL validation and repair")
                 _all_violations, violations, _focus_dossiers, focus_contexts = collect_shacl_violation_dossiers(
@@ -1733,8 +1724,14 @@ class YawGraphEngine:
             transaction_started = time.perf_counter()
             with self.managed_conn.transaction() as conn:
                 apply_prepared_graph_rows(conn, prepared_rows)
-                for merge_src, merge_dst, merge_lkind in staged_merges:
-                    merge_entities(conn, merge_src, merge_dst, label_kind=merge_lkind)
+                for merge_src, merge_dst, merge_lkind, merge_def in staged_merges:
+                    merge_entities(
+                        conn,
+                        merge_src,
+                        merge_dst,
+                        label_kind=merge_lkind,
+                        merged_definition=merge_def,
+                    )
                 if resolved_semantic_batch:
                     upsert_semantic_edges(conn, resolved_semantic_batch)
                 if staged_repairs:
@@ -1752,10 +1749,20 @@ class YawGraphEngine:
                     set_meta(conn, f"indexed_fp:{cid}", json.dumps([ext_fp, openie_fp]))
 
             n_batch = max(1, len(chunk_ids))
-            b_syn_tok = max(
+            b_label_tok = max(
                 0,
-                int(self._graph_rlm_stats.get("synonym_judge_tokens", 0))
-                - int(pre_batch_stats.get("synonym_judge_tokens", 0)),
+                int(self._graph_rlm_stats.get("label_judge_tokens", 0))
+                - int(pre_batch_stats.get("label_judge_tokens", 0)),
+            )
+            b_hier_tok = max(
+                0,
+                int(self._graph_rlm_stats.get("hierarchy_judge_tokens", 0))
+                - int(pre_batch_stats.get("hierarchy_judge_tokens", 0)),
+            )
+            b_rel_tok = max(
+                0,
+                int(self._graph_rlm_stats.get("related_judge_tokens", 0))
+                - int(pre_batch_stats.get("related_judge_tokens", 0)),
             )
             b_heal_tok = max(
                 0,
@@ -1774,7 +1781,9 @@ class YawGraphEngine:
             )
             for cid in chunk_ids:
                 self._chunk_rlm_stats[cid] = {
-                    "synonym_judge_tokens": b_syn_tok / n_batch,
+                    "label_judge_tokens": b_label_tok / n_batch,
+                    "hierarchy_judge_tokens": b_hier_tok / n_batch,
+                    "related_judge_tokens": b_rel_tok / n_batch,
                     "shacl_healer_tokens": b_heal_tok / n_batch,
                     "shacl_violations_initial": batch_shacl_before / n_batch,
                     "shacl_violations_remaining": batch_shacl_remaining / n_batch,
@@ -2327,6 +2336,7 @@ class YawGraphEngine:
         self.program = compiled
         self._bind_program_hooks()
         self._apply_program_embedding_prefixes()
+        self._hydrate_indexed_cids_from_db(compiled)
 
     def _rehydrate_sandbox_after_optimization(self, compiled: HippoRAGProgram) -> None:
         self._in_optimization = False

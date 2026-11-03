@@ -3,6 +3,7 @@
 import hashlib
 import json
 import re
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal, overload
@@ -86,33 +87,103 @@ class SynonymEvidenceBatch:
 
     @property
     def cache_identity(self) -> str:
-        value = ["synonym-evidence-v1", self.payload, self.identifiers, self.candidates]
+        value = ["synonym-evidence-v2", self.payload, self.identifiers, self.candidates]
         return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
-    def resolve_decisions(self, decisions: list[dict[str, str]]) -> list[dict[str, str]]:
+    def resolve_decisions(self, decisions: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
         """Validate exact pair coverage and resolve request-local IDs before graph writes."""
         pairs = {p["pair_id"] for p in json.loads(self.payload)["pairs"]}
         seen: set[str] = set()
-        result = []
+        result: list[dict[str, Any]] = []
         for decision in decisions:
-            pair = decision.get("pair_id", "")
-            if pair not in pairs or pair in seen:
+            pair = str(decision.get("pair_id", "") or "").strip()
+            if not pair or pair not in pairs or pair in seen:
                 raise ValueError(f"Unknown or duplicate synonym pair {pair!r}")
-            a, b = pair.split("|")
-            canonical = decision.get("canonical", "")
-            if canonical not in (a, b):
-                raise ValueError(f"Invalid canonical ID {canonical!r} for synonym pair {pair!r}")
-            result.append(
-                {
-                    "pair_id": f"{self.identifiers[a]}|{self.identifiers[b]}",
-                    "relation": decision["relation"],
-                    "canonical": self.identifiers[canonical],
-                }
-            )
+            if "|" not in pair:
+                raise ValueError(f"Invalid synonym pair ID {pair!r}")
+            a, b = pair.split("|", 1)
+            real_a = self.identifiers.get(a, a)
+            real_b = self.identifiers.get(b, b)
+            resolved_entry: dict[str, Any] = {
+                **decision,
+                "pair_id": f"{real_a}|{real_b}",
+            }
+            if "source_id" in decision and decision["source_id"]:
+                src = str(decision["source_id"])
+                if src not in (a, b):
+                    raise ValueError(f"Invalid source_id {src!r} for synonym pair {pair!r}")
+                resolved_entry["source_id"] = self.identifiers.get(src, src)
+            if "target_id" in decision and decision["target_id"]:
+                tgt = str(decision["target_id"])
+                if tgt not in (a, b):
+                    raise ValueError(f"Invalid target_id {tgt!r} for synonym pair {pair!r}")
+                resolved_entry["target_id"] = self.identifiers.get(tgt, tgt)
+            if "canonical" in decision and decision["canonical"]:
+                canonical = str(decision["canonical"])
+                if canonical not in (a, b):
+                    raise ValueError(f"Invalid canonical ID {canonical!r} for synonym pair {pair!r}")
+                resolved_entry["canonical"] = self.identifiers.get(canonical, canonical)
+            result.append(resolved_entry)
             seen.add(pair)
         if seen != pairs:
             raise ValueError(f"Missing synonym decisions for {sorted(pairs - seen)}")
         return result
+
+    def subset(self, pair_ids: Collection[str]) -> SynonymEvidenceBatch:
+        """Return a new SynonymEvidenceBatch containing only the requested pair IDs."""
+        target_ids = set(pair_ids)
+        parsed = json.loads(self.payload)
+        all_pairs = parsed.get("pairs", [])
+        filtered_pairs = []
+        for p in all_pairs:
+            alias_pair = p.get("pair_id", "")
+            if "|" in alias_pair:
+                a, b = alias_pair.split("|", 1)
+                real_pair = f"{self.identifiers.get(a, a)}|{self.identifiers.get(b, b)}"
+            else:
+                real_pair = alias_pair
+            if alias_pair in target_ids or real_pair in target_ids:
+                filtered_pairs.append(p)
+
+        filtered_pair_aliases = {p["pair_id"] for p in filtered_pairs}
+        filtered_pair_reals = {
+            f"{self.identifiers.get(p['pair_id'].split('|', 1)[0], p['pair_id'].split('|', 1)[0])}|"
+            f"{self.identifiers.get(p['pair_id'].split('|', 1)[1], p['pair_id'].split('|', 1)[1])}"
+            for p in filtered_pairs
+            if "|" in p.get("pair_id", "")
+        }
+
+        filtered_candidates = [
+            c
+            for c in self.candidates
+            if c.get("pair_id") in filtered_pair_aliases
+            or c.get("pair_id") in filtered_pair_reals
+            or f"{c.get('entity_a')}|{c.get('entity_b')}" in filtered_pair_reals
+            or f"{c.get('entity_a')}|{c.get('entity_b')}" in filtered_pair_aliases
+        ]
+
+        needed_aliases = {
+            part for p in filtered_pairs if "|" in p.get("pair_id", "") for part in p["pair_id"].split("|", 1)
+        }
+        filtered_identifiers = {k: v for k, v in self.identifiers.items() if k in needed_aliases}
+
+        ratio = (len(filtered_pairs) / len(all_pairs)) if all_pairs else 1.0
+        new_construction_seconds = self.construction_seconds * ratio
+
+        new_payload = json.dumps(
+            {
+                "format": "synonym-evidence-v2",
+                "pairs": filtered_pairs,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        return SynonymEvidenceBatch(
+            candidates=tuple(filtered_candidates),
+            payload=new_payload,
+            identifiers=filtered_identifiers,
+            construction_seconds=new_construction_seconds,
+        )
 
 
 @dataclass(slots=True, frozen=True)

@@ -5,6 +5,7 @@ import json
 import sqlite3
 from collections.abc import Iterator, Mapping, Sequence
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -12,14 +13,15 @@ import numpy as np
 from yaw.core import (
     LABEL_KIND_PRIORITY,
     SEMANTIC_EDGE_KINDS,
-    ChunkPointer,
     OpenIERecord,
     StructuredTriple,
     detect_scalar_literal,
+    resolve_corpus_path,
     text_processing,
 )
 
-from .db import YawConnection, batched, write_tx
+from .db import batched, write_tx
+from .hydration import normalize_json_passage_text, read_corpus_lines
 from .vectors import get_entity_vectors
 
 _EXISTING_ID_TABLES: dict[str, tuple[str, str]] = {
@@ -56,7 +58,7 @@ _INIT_DEL_TEMP_TABLES: tuple[str, ...] = (
 
 
 def get_pure_literal_entity_ids(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     *,
     exclude_shared_labels: bool = False,
 ) -> set[str]:
@@ -103,7 +105,7 @@ def get_pure_literal_entity_ids(
 
 
 def filter_valid_concept_entity_ids(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     entity_nodes: Sequence[tuple[str, str, str]],
 ) -> list[str]:
     """Filter entity nodes to valid SKOS concept candidates (excluding pure rdfs:Literal resources)."""
@@ -148,7 +150,7 @@ def _lexical_similarity_cascade(
 
 
 def find_entity_synonym_candidates(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     entity_ids: Sequence[str] | None = None,
     threshold: float = 0.8,
     top_k: int = 5,
@@ -213,7 +215,7 @@ def find_entity_synonym_candidates(
 
 
 def find_entity_disambiguation_candidates(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     entity_ids: Sequence[str] | None = None,
     *,
     dense_threshold: float = 0.75,
@@ -320,90 +322,6 @@ def find_entity_disambiguation_candidates(
     return results
 
 
-def upsert_chunk_pointers(
-    conn: sqlite3.Connection | YawConnection,
-    chunks: Sequence[tuple[ChunkPointer, str]],
-) -> None:
-    """Bulk upsert ChunkPointer metadata into chunks and index passage text in contentless chunk_fts."""
-    if not chunks:
-        return
-    with write_tx(conn):
-        conn.executemany(
-            "\n"
-            "            INSERT OR REPLACE INTO chunks (chunk_id, rel_posix_path, start_line, "
-            "end_line, title, ast_island_start, ast_island_end)\n"
-            "            VALUES (?, ?, ?, ?, ?, ?, ?)\n"
-            "            ",
-            (
-                (
-                    p.chunk_id,
-                    p.rel_posix_path,
-                    p.start_line,
-                    p.end_line,
-                    p.title,
-                    p.ast_island_start,
-                    p.ast_island_end,
-                )
-                for p, _ in chunks
-            ),
-        )
-        conn.executemany(
-            "DELETE FROM chunk_fts WHERE chunk_id = ?",
-            ((p.chunk_id,) for p, _ in chunks),
-        )
-        conn.executemany(
-            "INSERT INTO chunk_fts (chunk_id, title, body) VALUES (?, ?, ?)",
-            ((p.chunk_id, p.title, body) for p, body in chunks),
-        )
-
-
-def _row_to_chunk_pointer(row: sqlite3.Row) -> ChunkPointer:
-    keys = row.keys()
-    ast_s = int(row["ast_island_start"]) if "ast_island_start" in keys else 0
-    ast_e = int(row["ast_island_end"]) if "ast_island_end" in keys else 0
-    return ChunkPointer(
-        chunk_id=row["chunk_id"],
-        rel_posix_path=row["rel_posix_path"],
-        start_line=row["start_line"],
-        end_line=row["end_line"],
-        title=row["title"],
-        ast_island_start=ast_s,
-        ast_island_end=ast_e,
-    )
-
-
-def get_chunk_pointer(conn: sqlite3.Connection | YawConnection, chunk_id: str) -> ChunkPointer | None:
-    """Retrieve ChunkPointer metadata for a single chunk_id."""
-    row = conn.execute(
-        "SELECT chunk_id, rel_posix_path, start_line, end_line, title, ast_island_start, "
-        "ast_island_end FROM chunks WHERE chunk_id = ?",
-        (chunk_id,),
-    ).fetchone()
-    return _row_to_chunk_pointer(row) if row is not None else None
-
-
-def get_chunk_pointers(
-    conn: sqlite3.Connection | YawConnection,
-    chunk_ids: Sequence[str],
-) -> dict[str, ChunkPointer]:
-    """Batch retrieve ChunkPointer metadata for given chunk_ids."""
-    if not chunk_ids:
-        return {}
-    results: dict[str, ChunkPointer] = {}
-    for batch in batched(chunk_ids):
-        placeholders = ",".join("?" for _ in batch)
-        cursor = conn.execute(
-            f"""
-            SELECT chunk_id, rel_posix_path, start_line, end_line, title, ast_island_start, ast_island_end
-            FROM chunks WHERE chunk_id IN ({placeholders})
-            """,
-            tuple(batch),
-        )
-        for row in cursor:
-            results[row["chunk_id"]] = _row_to_chunk_pointer(row)
-    return results
-
-
 def deserialize_openie_record(
     raw_json: str | Mapping[str, Any],
     *,
@@ -462,7 +380,7 @@ def deserialize_openie_record(
 
 
 def get_openie_checkpoints(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     chunk_ids: Sequence[str],
 ) -> dict[str, OpenIERecord]:
     """Retrieve cached OpenIE extraction records for chunk_ids in bounded SQL batches."""
@@ -524,7 +442,7 @@ def _serialize_openie_entities(rec: OpenIERecord) -> str:
 
 
 def save_openie_checkpoints(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     records: Sequence[OpenIERecord],
 ) -> None:
     """Save OpenIE extraction records into openie_chunks for crash-resilient caching."""
@@ -565,7 +483,7 @@ def save_openie_checkpoints(
 
 
 def upsert_entities(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     entities: Sequence[tuple[str, str] | tuple[str, str, str]],
 ) -> None:
     """Upsert entity nodes (entity_id, name[, definition]) into entities and align existing SKOS labels."""
@@ -628,7 +546,7 @@ def upsert_entities(
 
 
 def upsert_entity_labels(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     labels: Sequence[tuple[str, str, str, str, str]],
 ) -> None:
     """Upsert SKOS entity labels while enforcing SKOS S13/S14 pairwise disjointness across all chunk_ids."""
@@ -751,7 +669,7 @@ def upsert_entity_labels(
 
 
 def get_entities_by_label_norm(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     label_norms: Sequence[str],
 ) -> dict[str, list[str]]:
     """Look up entity_ids matching each normalized label across skos:prefLabel, altLabel, and hiddenLabel."""
@@ -787,7 +705,7 @@ def get_entities_by_label_norm(
 
 
 def resolve_entity_labels(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     label_norms: Sequence[str],
     query_vec: np.ndarray | Sequence[float] | None = None,
 ) -> dict[str, list[str]]:
@@ -827,11 +745,291 @@ def resolve_entity_labels(
     return resolved
 
 
+def canonicalize_entity_labels_edc(
+    conn: sqlite3.Connection,
+    corpus_root: Path | str | None = None,
+    *,
+    entity_ids: Sequence[str] | None = None,
+    hidden_label_norms_by_entity: Mapping[str, set[str]] | None = None,
+) -> int:
+    """Run deterministic end-of-round Active EDC label canonicalization over entity_labels and entities.
+
+    For each candidate entity:
+    1. Demotes any label norm in `hidden_label_norms_by_entity` or absent verbatim from its hydrated
+       source chunk on disk (when `corpus_root` is available and chunk is non-stale) to `skos:hiddenLabel`.
+    2. Scores all eligible (`skos:prefLabel` / `skos:altLabel`) label norms by provenance tuple:
+       `(verbatim_in_source, in_ast_title, support_count, is_cased_or_multiword, -len(raw_label), label_norm)`.
+    3. Promotes the single winning norm to `skos:prefLabel` and updates `entities.name` to its best
+       surface `raw_label`; demotes all other non-hidden norms to `skos:altLabel` (enforcing SKOS S13 & S14).
+    Returns the number of entities whose canonical `skos:prefLabel` or `entities.name` was updated.
+    """
+    root_path = Path(corpus_root) if corpus_root is not None else None
+
+    with write_tx(conn):
+        if entity_ids is not None:
+            cand_eids = list(dict.fromkeys(str(eid) for eid in entity_ids if str(eid).strip()))
+        else:
+            cand_eids = [
+                str(r[0])
+                for r in conn.execute(
+                    """
+                    SELECT entity_id FROM entities
+                    UNION
+                    SELECT entity_id FROM entity_labels
+                    ORDER BY entity_id ASC
+                    """
+                )
+            ]
+
+        if not cand_eids:
+            return 0
+
+        updated_entities_count = 0
+        chunk_text_cache: dict[str, str | None] = {}
+
+        for batch in batched(cand_eids, 500):
+            batch_tuple = tuple(batch)
+            placeholders = ",".join("?" for _ in batch)
+
+            # 1. Fetch current entity names
+            entity_names: dict[str, str] = {}
+            for row in conn.execute(
+                f"SELECT entity_id, name FROM entities WHERE entity_id IN ({placeholders})",
+                batch_tuple,
+            ):
+                entity_names[str(row[0])] = str(row[1])
+
+            # 2. Fetch all entity_labels for batch
+            labels_by_eid: dict[str, dict[str, list[tuple[str, str, str]]]] = {eid: {} for eid in batch}
+            chunk_ids_to_fetch: set[str] = set()
+            for row in conn.execute(
+                f"""
+                SELECT entity_id, label_norm, label_kind, raw_label, chunk_id
+                FROM entity_labels
+                WHERE entity_id IN ({placeholders})
+                """,
+                batch_tuple,
+            ):
+                eid, lnorm, lkind, rlabel, cid = (
+                    str(row[0]),
+                    str(row[1]),
+                    str(row[2]),
+                    str(row[3]),
+                    str(row[4]),
+                )
+                if eid in labels_by_eid:
+                    labels_by_eid[eid].setdefault(lnorm, []).append((lkind, rlabel, cid))
+                    if not cid.startswith("__"):
+                        chunk_ids_to_fetch.add(cid)
+
+            # 3. Fetch incident facts for support counting
+            facts_by_eid: dict[str, list[tuple[str, str]]] = {eid: [] for eid in batch}
+            for row in conn.execute(
+                f"""
+                SELECT fact_id, subj_id, obj_id, raw_triple_json
+                FROM facts
+                WHERE subj_id IN ({placeholders}) OR obj_id IN ({placeholders})
+                """,
+                batch_tuple + batch_tuple,
+            ):
+                fid = str(row[0])
+                sid = str(row[1])
+                oid = str(row[2]) if row[2] is not None else ""
+                raw_json = str(row[3] or "").lower()
+                if sid in facts_by_eid:
+                    facts_by_eid[sid].append((fid, raw_json))
+                if oid in facts_by_eid and oid != sid:
+                    facts_by_eid[oid].append((fid, raw_json))
+
+            # 4. Fetch chunk metadata for AST titles and verbatim verification
+            chunks_meta: dict[str, tuple[str, int, int, str]] = {}
+            unseen_cids = [cid for cid in chunk_ids_to_fetch if cid not in chunk_text_cache]
+            if unseen_cids:
+                for c_batch in batched(unseen_cids, 500):
+                    c_placeholders = ",".join("?" for _ in c_batch)
+                    for row in conn.execute(
+                        f"""
+                        SELECT chunk_id, rel_posix_path, start_line, end_line, title
+                        FROM chunks
+                        WHERE chunk_id IN ({c_placeholders})
+                        """,
+                        tuple(c_batch),
+                    ):
+                        chunks_meta[str(row[0])] = (
+                            str(row[1]),
+                            int(row[2]),
+                            int(row[3]),
+                            str(row[4] or ""),
+                        )
+
+            def _get_chunk_content(cid: str, meta: dict[str, tuple[str, int, int, str]]) -> str | None:
+                if cid in chunk_text_cache:
+                    return chunk_text_cache[cid]
+                if root_path is None or cid not in meta:
+                    chunk_text_cache[cid] = None
+                    return None
+                rel_path, s_line, e_line, title = meta[cid]
+                target_path = resolve_corpus_path(root_path, rel_path)
+                try:
+                    if not target_path.is_file():
+                        chunk_text_cache[cid] = None
+                        return None
+                    text = read_corpus_lines(target_path, s_line, e_line)
+                    if text is not None and rel_path.lower().endswith((".json", ".jsonl", ".ndjson")):
+                        text = normalize_json_passage_text(text, default_title=title)
+                    chunk_text_cache[cid] = text
+                    return text
+                except OSError:
+                    chunk_text_cache[cid] = None
+                    return None
+
+            name_updates: list[tuple[str, str]] = []
+            label_updates: list[tuple[str, str, str]] = []
+
+            for eid in batch:
+                norms_map = labels_by_eid.get(eid, {})
+                curr_name = entity_names.get(eid, "")
+
+                # If entity has no labels but has a name, synthesize a prefLabel
+                if not norms_map and curr_name:
+                    synth_norm = str(text_processing(curr_name)) or curr_name.strip().lower()
+                    conn.execute(
+                        """
+                        INSERT INTO entity_labels (label_norm, entity_id, label_kind, raw_label, chunk_id)
+                        VALUES (?, ?, 'skos:prefLabel', ?, '__auto__')
+                        """,
+                        (synth_norm, eid, curr_name),
+                    )
+                    norms_map[synth_norm] = [("skos:prefLabel", curr_name, "__auto__")]
+
+                if not norms_map:
+                    continue
+
+                curr_pref_norms = {
+                    norm for norm, occs in norms_map.items() if any(occ[0] == "skos:prefLabel" for occ in occs)
+                }
+
+                raw_hidden = (
+                    hidden_label_norms_by_entity.get(eid, set()) if hidden_label_norms_by_entity is not None else set()
+                )
+                explicit_hidden = {str(n).strip().lower() for n in raw_hidden} | {
+                    str(text_processing(str(n))) for n in raw_hidden
+                }
+
+                eid_chunk_titles = [
+                    chunks_meta[cid][3].strip().lower()
+                    for occs in norms_map.values()
+                    for _, _, cid in occs
+                    if cid in chunks_meta and chunks_meta[cid][3].strip()
+                ]
+
+                norm_scores: dict[str, tuple[int, int, int, int, int, str]] = {}
+                best_raw_by_norm: dict[str, str] = {}
+                is_hidden_by_norm: dict[str, bool] = {}
+
+                for norm, occs in norms_map.items():
+                    raw_labels = list(dict.fromkeys(r[1].strip() for r in occs if r[1].strip()))
+                    if not raw_labels:
+                        raw_labels = [curr_name if curr_name.strip() else norm]
+
+                    def _surface_key(rl: str) -> tuple[int, int, str]:
+                        cased_or_multi = 1 if (any(c.isupper() for c in rl) or len(rl.split()) > 1) else 0
+                        return (cased_or_multi, -len(rl), rl)
+
+                    best_raw = max(raw_labels, key=_surface_key)
+                    best_raw_by_norm[norm] = best_raw
+                    is_cased_or_multiword = (
+                        1 if (any(c.isupper() for c in best_raw) or len(best_raw.split()) > 1) else 0
+                    )
+
+                    if root_path is None:
+                        verbatim_in_source = 1
+                    else:
+                        disk_grounded = 0
+                        disk_failed = 0
+                        for _, rlabel, cid in occs:
+                            lbl_to_check = (rlabel.strip() or best_raw).lower()
+                            if cid.startswith("__") or cid not in chunks_meta:
+                                continue
+                            c_text = _get_chunk_content(cid, chunks_meta)
+                            if c_text is None:
+                                disk_failed += 1
+                                continue
+                            if lbl_to_check in c_text.lower():
+                                disk_grounded += 1
+                            else:
+                                disk_failed += 1
+
+                        verbatim_in_source = 0 if (disk_failed > 0 and disk_grounded == 0) else 1
+
+                    in_ast_title = 1 if any(rl.lower() in t for rl in raw_labels for t in eid_chunk_titles) else 0
+
+                    chunk_count = len({cid for _, _, cid in occs})
+                    facts_matching = {
+                        fid
+                        for fid, f_json in facts_by_eid.get(eid, [])
+                        if any(rl.lower() in f_json for rl in raw_labels) or norm in f_json
+                    }
+                    support_count = chunk_count + len(facts_matching)
+
+                    is_hidden = (norm in explicit_hidden) or (verbatim_in_source == 0)
+                    is_hidden_by_norm[norm] = is_hidden
+
+                    norm_scores[norm] = (
+                        verbatim_in_source,
+                        in_ast_title,
+                        support_count,
+                        is_cased_or_multiword,
+                        -len(best_raw),
+                        norm,
+                    )
+
+                eligible_norms = [n for n in norms_map if not is_hidden_by_norm[n]]
+                hidden_norms = [n for n in norms_map if is_hidden_by_norm[n]]
+
+                if not eligible_norms:
+                    best_hidden = max(hidden_norms, key=lambda n: norm_scores[n])
+                    eligible_norms.append(best_hidden)
+                    hidden_norms.remove(best_hidden)
+
+                winning_norm = max(eligible_norms, key=lambda n: norm_scores[n])
+                winning_raw = best_raw_by_norm[winning_norm]
+
+                if winning_raw != curr_name or curr_pref_norms != {winning_norm}:
+                    updated_entities_count += 1
+
+                if winning_raw != curr_name:
+                    name_updates.append((winning_raw, eid))
+
+                for norm, occs in norms_map.items():
+                    if norm == winning_norm:
+                        target_kind = "skos:prefLabel"
+                    elif norm in hidden_norms:
+                        target_kind = "skos:hiddenLabel"
+                    else:
+                        target_kind = "skos:altLabel"
+
+                    if any(occ[0] != target_kind for occ in occs):
+                        label_updates.append((target_kind, eid, norm))
+
+            if name_updates:
+                conn.executemany("UPDATE entities SET name = ? WHERE entity_id = ?", name_updates)
+            if label_updates:
+                conn.executemany(
+                    "UPDATE entity_labels SET label_kind = ? WHERE entity_id = ? AND label_norm = ?",
+                    label_updates,
+                )
+
+        return updated_entities_count
+
+
 def merge_entities(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     src_id: str,
     dst_id: str,
     label_kind: str = "skos:altLabel",
+    corpus_root: Path | str | None = None,
+    merged_definition: str | None = None,
 ) -> None:
     "Atomically collapse src_id into dst_id, demoting src_id's prefLabel to label_kind and re-pointing all edges/facts."
     if src_id == dst_id:
@@ -849,8 +1047,14 @@ def merge_entities(
         dst_name, dst_def = str(dst_row[0]), str(dst_row[1])
         dst_raw_norm = dst_name.strip().lower()
         dst_pref_norm = str(text_processing(dst_name)) or dst_raw_norm
+        clean_merged_def = merged_definition.strip() if merged_definition else ""
 
-        if not dst_def.strip() and src_def.strip():
+        if clean_merged_def:
+            conn.execute(
+                "UPDATE entities SET definition = ? WHERE entity_id = ?",
+                (clean_merged_def, dst_id),
+            )
+        elif not dst_def.strip() and src_def.strip():
             conn.execute(
                 "UPDATE entities SET definition = ? WHERE entity_id = ?",
                 (src_def, dst_id),
@@ -1066,9 +1270,29 @@ def merge_entities(
         conn.execute("DELETE FROM entity_vec WHERE entity_id = ?", (src_id,))
         conn.execute("DELETE FROM entities WHERE entity_id = ?", (src_id,))
 
+        # 6. If corpus_root is provided, run Active EDC label canonicalization on dst_id
+        if corpus_root is not None:
+            src_norms = {str(text_processing(src_name)) or src_name.strip().lower()}
+            for sl in src_labels:
+                src_norms.add(str(sl[0]))
+            src_demote_norms = src_norms - {dst_pref_norm, dst_raw_norm}
+            hidden_map = {dst_id: src_demote_norms} if label_kind == "skos:hiddenLabel" else None
+            canonicalize_entity_labels_edc(
+                conn,
+                corpus_root=corpus_root,
+                entity_ids=[dst_id],
+                hidden_label_norms_by_entity=hidden_map,
+            )
+            if clean_merged_def:
+                conn.execute("UPDATE entities SET definition = ? WHERE entity_id = ?", (clean_merged_def, dst_id))
+            elif src_def.strip():
+                curr_dst_name = conn.execute("SELECT name FROM entities WHERE entity_id = ?", (dst_id,)).fetchone()
+                if curr_dst_name is not None and str(curr_dst_name[0]) == src_name:
+                    conn.execute("UPDATE entities SET definition = ? WHERE entity_id = ?", (src_def, dst_id))
+
 
 def upsert_fact_sources(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     fact_sources: Sequence[tuple[str, str]],
 ) -> None:
     """Bulk record (fact_id, chunk_id) provenance in fact_sources."""
@@ -1082,7 +1306,7 @@ def upsert_fact_sources(
 
 
 def upsert_facts(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     facts: Sequence[tuple[Any, ...]],
     *,
     fact_sources: Sequence[tuple[str, str]] | None = None,
@@ -1199,7 +1423,7 @@ def upsert_facts(
 
 
 def upsert_edges_with_sources(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     edges_with_sources: Sequence[tuple[str, str, str, float, str]],
 ) -> None:
     """Bulk upsert graph edges and record chunk provenance in edge_sources."""
@@ -1253,7 +1477,7 @@ def upsert_edges_with_sources(
 
 
 def get_existing_ids(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     table_kind: str,
     candidate_ids: Sequence[str],
 ) -> set[str]:
@@ -1276,7 +1500,7 @@ def get_existing_ids(
 
 
 def get_facts_by_ids(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     fact_ids: Sequence[str],
 ) -> dict[str, tuple[str, str, str]]:
     """Retrieve original (subj, pred, obj) triples for candidate fact_ids in bounded batches."""
@@ -1297,7 +1521,7 @@ def get_facts_by_ids(
 
 
 def get_facts_with_meta_by_ids(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     fact_ids: Sequence[str],
 ) -> dict[str, dict[str, Any]]:
     """Retrieve enriched fact records with statement, subject, object definitions, and literal metadata."""
@@ -1352,7 +1576,7 @@ def get_facts_with_meta_by_ids(
 
 
 def get_entity_doc_frequencies(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     entity_ids: Sequence[str],
 ) -> dict[str, int]:
     """Count number of passage edges incident to given entity_ids for PPR seed weighting."""
@@ -1376,7 +1600,7 @@ def get_entity_doc_frequencies(
 
 
 def get_entity_metadata_batch(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     entity_ids: Sequence[str],
 ) -> dict[str, tuple[str, str]]:
     """Fetch {entity_id: (name, definition)} in 900-parameter SQLite batches."""
@@ -1393,7 +1617,7 @@ def get_entity_metadata_batch(
     return results
 
 
-def get_graph_counts(conn: sqlite3.Connection | YawConnection) -> tuple[int, int, int, int, int]:
+def get_graph_counts(conn: sqlite3.Connection) -> tuple[int, int, int, int, int]:
     """Return (chunks_count, entities_count, facts_count, edges_count, openie_count) in a single query."""
     has_chunk_inference = (
         conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunk_inference' LIMIT 1").fetchone()
@@ -1420,7 +1644,7 @@ def get_graph_counts(conn: sqlite3.Connection | YawConnection) -> tuple[int, int
 
 
 def load_graph_topology(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     *,
     include_kinds: bool = False,
 ) -> tuple[tuple[str, ...], tuple[str, ...], list[Any]]:
@@ -1497,7 +1721,7 @@ def load_graph_topology(
 
 
 def upsert_semantic_edges(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     edges: Sequence[tuple[str, str, str, float]],
 ) -> None:
     """Bulk upsert symmetric skos:related / owl:differentFrom and directed skos:broader edges."""
@@ -1585,7 +1809,7 @@ def upsert_semantic_edges(
                         )
 
 
-def delete_chunks(conn: sqlite3.Connection | YawConnection, chunk_ids: Sequence[str]) -> None:
+def delete_chunks(conn: sqlite3.Connection, chunk_ids: Sequence[str]) -> None:
     """Atomically delete chunks and cascade removal strictly across affected edges, facts, labels, and entities."""
     if not chunk_ids:
         return

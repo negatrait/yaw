@@ -46,6 +46,45 @@ def reflection_token_counter(provider):
     return protocol_token_counter(url)
 
 
+def _extract_mock_pair_ids(
+    prompt: str | None = None,
+    messages: list[dict[str, Any]] | None = None,
+    req_str: str = "",
+) -> list[str]:
+    if messages:
+        for msg in reversed(messages):
+            content = str(msg.get("content", ""))
+            m = re.search(r'\{\s*"format"\s*:\s*"synonym-evidence-v2"', content)
+            if m:
+                try:
+                    payload, _ = json.JSONDecoder().raw_decode(content[m.start() :])
+                    pairs = payload.get("pairs", [])
+                    pids = [p["pair_id"] for p in pairs if "pair_id" in p]
+                    if pids:
+                        return pids
+                except Exception:
+                    pass
+    if prompt:
+        m = re.search(r'\{\s*"format"\s*:\s*"synonym-evidence-v2"', prompt)
+        if m:
+            try:
+                payload, _ = json.JSONDecoder().raw_decode(prompt[m.start() :])
+                pairs = payload.get("pairs", [])
+                pids = [p["pair_id"] for p in pairs if "pair_id" in p]
+                if pids:
+                    return pids
+            except Exception:
+                pass
+    pids = list(
+        dict.fromkeys(
+            re.findall(r"entity-[0-9a-f]+\|entity-[0-9a-f]+", req_str)
+            or [p for p in re.findall(r"e[0-9]+\|e[0-9]+", req_str) if p != "e0|e1"]
+            or re.findall(r"e[0-9]+\|e[0-9]+", req_str)
+        )
+    )
+    return pids
+
+
 class DeterministicMockLM(dspy.LM):
     """Deterministic offline LM for testing HippoRAGProgram and YawGraphEngine."""
 
@@ -63,19 +102,67 @@ class DeterministicMockLM(dspy.LM):
         req_str = str(prompt or messages or kwargs)
         if "ExtractQueryIntent" in req_str or "query_intent" in req_str:
             return [json.dumps({"query_intent": "Ada Lovelace" if "Lovelace" in req_str else "Alan Turing"})]
-        if (
-            "JudgeSynonyms" in req_str
-            or "OrchestrateSynonymJudgment" in req_str
-            or "candidate_pairs_json" in req_str
-            or "candidate_pairs" in req_str
-        ):
-            pair_ids = list(dict.fromkeys(re.findall(r"e[0-9]+\|e[0-9]+", req_str)))
+        pids = _extract_mock_pair_ids(prompt, messages, req_str)
+        if "alt_label" in req_str or "JudgeLabels" in req_str:
             return [
                 json.dumps(
                     {
                         "decisions": [
-                            {"pair_id": pid, "relation": "skos:related", "canonical": pid.split("|")[0]}
-                            for pid in pair_ids
+                            {
+                                "pair_id": pid,
+                                "reasoning": f"Deterministic label decision for {pid}",
+                                "equivalent": False,
+                                "alt_label": False,
+                                "hidden_label": False,
+                            }
+                            for pid in pids
+                        ]
+                    }
+                )
+            ]
+        req_lower = req_str.lower()
+        if "differentfrom" in req_lower or "judgerelated" in req_lower or "related_judge" in req_lower:
+            return [
+                json.dumps(
+                    {
+                        "decisions": [
+                            {
+                                "pair_id": pid,
+                                "reasoning": f"Deterministic related decision for {pid}",
+                                "related": True,
+                            }
+                            for pid in pids
+                        ]
+                    }
+                )
+            ]
+        if "narrower" in req_lower or "judgehierarchy" in req_lower or "broader" in req_lower:
+            return [
+                json.dumps(
+                    {
+                        "decisions": [
+                            {
+                                "pair_id": pid,
+                                "reasoning": f"Deterministic hierarchy decision for {pid}",
+                                "broader": False,
+                                "narrower": False,
+                            }
+                            for pid in pids
+                        ]
+                    }
+                )
+            ]
+        if "related" in req_lower:
+            return [
+                json.dumps(
+                    {
+                        "decisions": [
+                            {
+                                "pair_id": pid,
+                                "reasoning": f"Deterministic related decision for {pid}",
+                                "related": True,
+                            }
+                            for pid in pids
                         ]
                     }
                 )
@@ -719,9 +806,8 @@ def test_engine_query_intent_escalation_once_without_infinite_recursion(synonym_
 
 
 def test_engine_homograph_gate_edc_and_shacl_conformance(synonym_token_counter, tmp_path: Path) -> None:
-    """Verify Same-Label Homograph Gate splits conflicting senses via JudgeSynonyms and passes SHACL linting."""
+    """Verify Same-Label Homograph Gate splits conflicting senses via JudgeLabels and passes SHACL linting."""
     import json
-    import re
 
     class HomographGateLM(DeterministicMockLM):
         def __call__(
@@ -736,17 +822,22 @@ def test_engine_homograph_gate_edc_and_shacl_conformance(synonym_token_counter, 
                     {"prompt_tokens": 32, "completion_tokens": 16, "total_tokens": 48},
                 )
             req_str = str(prompt or messages or kwargs)
-            if "JudgeSynonyms" in req_str or "candidate_pairs" in req_str:
-                pair_ids = list(dict.fromkeys(re.findall(r"e[0-9]+\|e[0-9]+", req_str)))
-                decisions = [
-                    {
-                        "pair_id": pid,
-                        "relation": "owl:differentFrom",
-                        "canonical": pid.split("|", 1)[0],
-                    }
-                    for pid in pair_ids
+            if "related" in req_str or "JudgeRelated" in req_str:
+                pair_ids = _extract_mock_pair_ids(prompt, messages, req_str)
+                return [
+                    json.dumps(
+                        {
+                            "decisions": [
+                                {
+                                    "pair_id": pid,
+                                    "reasoning": f"Conflicting homograph senses for {pid}",
+                                    "related": False,
+                                }
+                                for pid in pair_ids
+                            ]
+                        }
+                    )
                 ]
-                return [json.dumps({"decisions": decisions})]
             if "ExtractTriples" in req_str or (
                 "triples" in req_str and "missing_entities" not in req_str and "fact_before_filter" not in req_str
             ):
@@ -852,10 +943,9 @@ def test_engine_same_label_provisional_split_merged_by_judge_synonyms_and_stage1
     synonym_token_counter,
     tmp_path: Path,
 ) -> None:
-    """Verify Hazard 2 (same-label cos < 0.85 merged back when JudgeSynonyms returns skos:altLabel) and Hazard 3 \
+    """Verify Hazard 2 (same-label cos < 0.85 merged back when JudgeLabels returns skos:altLabel) and Hazard 3 \
 Option A (standalone Stage 1 NER entities preserved with definitions)."""
     import json
-    import re
 
     class SynonymMergeAndStandaloneNerLM(DeterministicMockLM):
         def __call__(
@@ -870,19 +960,17 @@ Option A (standalone Stage 1 NER entities preserved with definitions)."""
                     {"prompt_tokens": 32, "completion_tokens": 16, "total_tokens": 48},
                 )
             req_str = str(prompt or messages or kwargs)
-            if "JudgeSynonyms" in req_str or "candidate_pairs" in req_str:
-                pair_ids = list(dict.fromkeys(re.findall(r"e[0-9]+\|e[0-9]+", req_str)))
-                decisions = []
-                for pid in pair_ids:
-                    ea, eb = pid.split("|", 1)
-                    # Merge same-label provisional sense back into canonical entity via skos:altLabel
-                    decisions.append(
-                        {
-                            "pair_id": pid,
-                            "relation": "skos:altLabel",
-                            "canonical": ea,
-                        }
-                    )
+            if "alt_label" in req_str or "JudgeLabels" in req_str:
+                pair_ids = _extract_mock_pair_ids(prompt, messages, req_str)
+                decisions = [
+                    {
+                        "pair_id": pid,
+                        "reasoning": f"Merge same-label sense back for {pid}",
+                        "equivalent": False,
+                        "alt_label": True,
+                    }
+                    for pid in pair_ids
+                ]
                 return [json.dumps({"decisions": decisions})]
             if "ExtractTriples" in req_str or (
                 "triples" in req_str and "missing_entities" not in req_str and "fact_before_filter" not in req_str
@@ -954,7 +1042,7 @@ Option A (standalone Stage 1 NER entities preserved with definitions)."""
         engine.index(["Apple manufactures the MacBook with the M3 Max chip."])
 
         # Hazard 2: Provisional sense split for "Apple" (since mock embedder cos < 0.85 for different defs)
-        # had NO premature owl:differentFrom edge in Step 4 and was merged back into 1 Apple entity by JudgeSynonyms!
+        # had NO premature owl:differentFrom edge in Step 4 and was merged back into 1 Apple entity by JudgeLabels!
         apple_rows = engine.conn.execute(
             "SELECT entity_id, name, definition FROM entities WHERE name = 'apple'"
         ).fetchall()
@@ -985,7 +1073,11 @@ Option A (standalone Stage 1 NER entities preserved with definitions)."""
         assert passage_edges_for_standalone == 2
 
         # Verify 0 SHACL violations (including ConceptShape/S13-disjointLabels across both chunks)
-        assert engine._graph_rlm_stats["synonym_judge_tokens"] == 48
+        assert (
+            engine._graph_rlm_stats["label_judge_tokens"]
+            + engine._graph_rlm_stats["hierarchy_judge_tokens"]
+            + engine._graph_rlm_stats["related_judge_tokens"]
+        ) == 48
         assert engine._graph_rlm_stats["embedding_calls"] > 0
         assert engine._graph_rlm_stats["embedding_tokens"] > 0
         assert len(program.embedding_audit_trail) > 0
@@ -1000,7 +1092,7 @@ def test_engine_step7_heal_shacl_violations_rlm_repl_tools_and_token_stats(
     synonym_token_counter,
     tmp_path: Path,
 ) -> None:
-    """Verify Step 6 direct GBNF synonym_judge_tokens and Step 7 heal_shacl_violations via shacl_healer_rlm \
+    """Verify Step 6 direct GBNF label_judge_tokens and Step 7 heal_shacl_violations via shacl_healer_rlm \
 using all 5 bound REPL tools."""
     import json
     import re
@@ -1084,17 +1176,66 @@ using all 5 bound REPL tools."""
                         }
                     )
                 ]
-            if "[[ ## candidate_pairs ## ]]" in req_str or "candidate_pairs" in req_str:
-                pair_ids = list(dict.fromkeys(re.findall(r"e[0-9]+\|e[0-9]+", req_str)))
+            pids = _extract_mock_pair_ids(prompt, messages, req_str)
+            if "alt_label" in req_str or "JudgeLabels" in req_str:
                 decisions = [
                     {
                         "pair_id": pid,
-                        "relation": "skos:related",
-                        "canonical": pid.split("|", 1)[0],
+                        "reasoning": "Not lexical label match",
+                        "equivalent": False,
+                        "alt_label": False,
+                        "hidden_label": False,
                     }
-                    for pid in pair_ids
+                    for pid in pids
                 ]
                 return [json.dumps({"decisions": decisions})]
+            req_lower = req_str.lower()
+            if "differentfrom" in req_lower or "judgerelated" in req_lower or "related_judge" in req_lower:
+                return [
+                    json.dumps(
+                        {
+                            "decisions": [
+                                {
+                                    "pair_id": pid,
+                                    "reasoning": "Associative related match",
+                                    "related": True,
+                                }
+                                for pid in pids
+                            ]
+                        }
+                    )
+                ]
+            if "narrower" in req_lower or "judgehierarchy" in req_lower or "broader" in req_lower:
+                return [
+                    json.dumps(
+                        {
+                            "decisions": [
+                                {
+                                    "pair_id": pid,
+                                    "reasoning": "Not hierarchical",
+                                    "broader": False,
+                                    "narrower": False,
+                                }
+                                for pid in pids
+                            ]
+                        }
+                    )
+                ]
+            if "related" in req_lower:
+                return [
+                    json.dumps(
+                        {
+                            "decisions": [
+                                {
+                                    "pair_id": pid,
+                                    "reasoning": "Associative related match",
+                                    "related": True,
+                                }
+                                for pid in pids
+                            ]
+                        }
+                    )
+                ]
             if "[[ ## named_entities ## ]]" in req_str or "Resource Description Framework" in req_str:
                 if "Bletchley" in req_str:
                     return [
@@ -1173,7 +1314,8 @@ using all 5 bound REPL tools."""
     try:
         # 1. Index first document so "alan turing" and "turing machine" are materialized and linked to chunk 1 on disk
         assert engine.index(["Alan Turing formulated the Turing machine in 1936."]) == 1
-        assert engine._graph_rlm_stats["synonym_judge_tokens"] == 30
+        assert engine._graph_rlm_stats["hierarchy_judge_tokens"] == 30
+        assert engine._graph_rlm_stats["label_judge_tokens"] == 0
 
         # Verify _apply_shacl_repairs ignores nonexistent focus nodes without inserting orphan labels
         with engine.managed_conn.transaction() as conn:
@@ -1207,11 +1349,11 @@ using all 5 bound REPL tools."""
         assert all(v["shape"] == "ConceptShape/definition" for v in pre_lint["violations"])
 
         # 2. Index second document:
-        #    - Step 6 runs direct GBNF synonym_judge on candidate pairs (30 tokens)
+        #    - Step 6 runs direct GBNF label_judge on candidate pairs (30 tokens)
         # - Step 7 runs shacl_healer_rlm using all 5 bound REPL tools (applying repair[0] in REPL + repair[1] post-
         # RLM)
         program.telemetry.clear()
-        program.synonym_audit_trail.clear()
+        program.label_judge_audit_trail.clear()
         program.shacl_audit_trail.clear()
 
         assert engine.index(["Alan M. Turing worked on cryptanalysis at Bletchley Park."]) == 1
@@ -1221,11 +1363,13 @@ using all 5 bound REPL tools."""
         assert sum(1 for ev in repl_tool_events if ev.startswith("llm_propose_shacl_repairs:")) == 2
 
         # Verify exact non-double-counted token accounting:
-        # Step 6 (direct GBNF synonym_judge) = 30 tokens on doc 2 (total 30 + 30 = 60 across doc 1 + doc 2)
-        assert len(program.synonym_audit_trail) == 1
-        assert program.synonym_audit_trail[0]["mode"] == "direct"
-        assert program.synonym_audit_trail[0]["tokens_used"] == 30
-        assert engine._graph_rlm_stats["synonym_judge_tokens"] == 60
+        # Step 6 (direct GBNF label_judge) = 30 tokens on doc 2 (hierarchy 30 on doc 1 + label 30 on doc 2 = 60 total)
+        assert len(program.label_judge_audit_trail) == 1
+        assert program.label_judge_audit_trail[0]["mode"] == "direct"
+        assert program.label_judge_audit_trail[0]["tokens_used"] == 30
+        assert engine._graph_rlm_stats["label_judge_tokens"] == 30
+        assert engine._graph_rlm_stats["hierarchy_judge_tokens"] == 60
+        assert engine._graph_rlm_stats["label_judge_tokens"] + engine._graph_rlm_stats["hierarchy_judge_tokens"] == 90
 
         # Step 7 (shacl_healer_rlm) = 40 orchestrator + 30 worker = 70 tokens
         assert len(program.shacl_audit_trail) == 2  # inner direct (30) + outer RLM (70)
@@ -1451,18 +1595,6 @@ traces into dspy.settings.trace, and emits per-predictor feedback."""
                             "entity_definitions": [
                                 ["Nowhere", "Unspecified place"],
                                 ["Bletchley Park", "British wartime codebreaking center"],
-                            ]
-                        }
-                    )
-                ]
-            if "JudgeSynonyms" in req_str or "candidate_pairs" in req_str:
-                pair_ids = list(dict.fromkeys(re.findall(r"e[0-9]+\|e[0-9]+", req_str)))
-                return [
-                    json.dumps(
-                        {
-                            "decisions": [
-                                {"pair_id": p, "relation": "skos:related", "canonical": p.split("|")[0]}
-                                for p in pair_ids
                             ]
                         }
                     )
@@ -1935,7 +2067,7 @@ minibatch q_stats lookup."""
     import json
     from types import SimpleNamespace
 
-    stage_call_counts = {"ner": 0, "synonym_judge": 0}
+    stage_call_counts = {"ner": 0, "label_judge": 0}
 
     class StageCountingMockLM(DeterministicMockLM):
         def __call__(
@@ -1952,14 +2084,19 @@ minibatch q_stats lookup."""
             req_str = str(prompt or messages or kwargs)
             if "ExtractEntities" in req_str or ("named_entities" in req_str and "triples" not in req_str):
                 stage_call_counts["ner"] += 1
-            elif "JudgeSynonyms" in req_str or "candidate_pairs" in req_str:
-                stage_call_counts["synonym_judge"] += 1
-                pair_ids = list(dict.fromkeys(re.findall(r"e[0-9]+\|e[0-9]+", req_str)))
+            elif "alt_label" in req_str or "JudgeLabels" in req_str:
+                stage_call_counts["label_judge"] += 1
+                pair_ids = _extract_mock_pair_ids(prompt, messages, req_str)
                 return [
                     json.dumps(
                         {
                             "decisions": [
-                                {"pair_id": p, "relation": "skos:related", "canonical": p.split("|")[0]}
+                                {
+                                    "pair_id": p,
+                                    "reasoning": "Lexical identity match",
+                                    "equivalent": False,
+                                    "alt_label": True,
+                                }
                                 for p in pair_ids
                             ]
                         }
@@ -2050,28 +2187,28 @@ minibatch q_stats lookup."""
                 assert score2_live.objective_scores["f1"] == 0.0
                 assert score2_live.objective_scores["recall_at_20"] == 1.0
 
-                # 2. Mutate QA only: OpenIE and SynonymJudge must hit stage caches (0 extra LLM calls)
+                # 2. Mutate QA only: OpenIE and LabelJudge must hit stage caches (0 extra LLM calls)
                 ner_before = stage_call_counts["ner"]
-                syn_before = stage_call_counts["synonym_judge"]
+                label_before = stage_call_counts["label_judge"]
                 cand_qa = student.deepcopy()
                 cand_qa.qa.predict.signature = cand_qa.qa.predict.signature.with_instructions("Mutated QA instruction")
                 with dspy.context(trace=[], track_usage=True):
                     pred1_cached = cand_qa(**ex1.inputs())
                 assert stage_call_counts["ner"] == ner_before
-                assert stage_call_counts["synonym_judge"] == syn_before
+                assert stage_call_counts["label_judge"] == label_before
                 score1_cached = self.metric(ex1, pred1_cached)
                 # Verify token accounting and score parity between live indexing and cache hit
                 assert abs(score1_live.score - score1_cached.score) < 1e-9
 
-                # 3. Mutate SynonymJudge only: OpenIE hits cache (0 extra NER calls), SynonymJudge runs live!
+                # 3. Mutate LabelJudge only: OpenIE hits cache (0 extra NER calls), LabelJudge runs live!
                 cand_syn = student.deepcopy()
-                cand_syn.synonym_judge.signature = cand_syn.synonym_judge.signature.with_instructions(
-                    "Mutated SynonymJudge instruction"
+                cand_syn.label_judge.signature = cand_syn.label_judge.signature.with_instructions(
+                    "Mutated LabelJudge instruction"
                 )
                 with dspy.context(trace=[], track_usage=True):
                     _ = cand_syn(**ex2.inputs())
                 assert stage_call_counts["ner"] == ner_before
-                assert stage_call_counts["synonym_judge"] > syn_before
+                assert stage_call_counts["label_judge"] > label_before
                 return cand_syn
 
         monkeypatch.setattr(dspy, "GEPA", VerifyingGEPA, raising=False)
@@ -2254,7 +2391,7 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
             **kwargs: Any,
         ) -> list[str]:
             req_str = str(prompt or messages or kwargs)
-            if "[[ ## candidate_pairs ## ]]" in req_str or "candidate_pairs" in req_str:
+            if "alt_label" in req_str or "JudgeLabels" in req_str:
                 decisions = []
                 packet_text = "\n".join(str(m.get("content", "")) for m in messages or [])
                 candidates = candidate_rows(packet_text)
@@ -2267,30 +2404,93 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
                         decisions.append(
                             {
                                 "pair_id": pid,
-                                "relation": "skos:hiddenLabel",
+                                "reasoning": "Hidden label typo variant",
+                                "equivalent": False,
+                                "alt_label": False,
+                                "hidden_label": True,
                                 "canonical": "A" if na == "cinderella" else "B",
                             }
                         )
-                    elif names == {"cinderella", "cindy real"} or names == {
-                        "cindarella",
-                        "cindy real",
-                    }:
+                    else:
                         decisions.append(
                             {
                                 "pair_id": pid,
-                                "relation": "owl:differentFrom",
-                                "canonical": "A",
+                                "reasoning": "Not lexical label match",
+                                "equivalent": False,
+                                "alt_label": False,
+                                "hidden_label": False,
                             }
                         )
-                    elif na == "a ball" and nb == "a ball":
+                return [json.dumps({"decisions": complete_decisions(candidates, decisions, stage_text=req_str)})]
+
+            req_lower = req_str.lower()
+            if "differentfrom" in req_lower or "judgerelated" in req_lower or "related_judge" in req_lower:
+                decisions = []
+                packet_text = "\n".join(str(m.get("content", "")) for m in messages or [])
+                candidates = candidate_rows(packet_text)
+                for p in candidates:
+                    pid = str(p.get("pair_id", ""))
+                    na = str(p.get("name_a", "")).lower()
+                    nb = str(p.get("name_b", "")).lower()
+                    if na == "a ball" and nb == "a ball":
                         decisions.append(
                             {
                                 "pair_id": pid,
-                                "relation": "skos:related",
-                                "canonical": "A",
+                                "reasoning": "Homograph senses related",
+                                "related": True,
                             }
                         )
-                return [json.dumps({"decisions": complete_decisions(candidates, decisions)})]
+                    else:
+                        decisions.append(
+                            {
+                                "pair_id": pid,
+                                "reasoning": "Distinct concepts",
+                                "related": False,
+                            }
+                        )
+                return [json.dumps({"decisions": decisions})]
+
+            if "narrower" in req_lower or "judgehierarchy" in req_lower or "broader" in req_lower:
+                decisions = []
+                packet_text = "\n".join(str(m.get("content", "")) for m in messages or [])
+                candidates = candidate_rows(packet_text)
+                for p in candidates:
+                    pid = str(p.get("pair_id", ""))
+                    decisions.append(
+                        {
+                            "pair_id": pid,
+                            "reasoning": "Not hierarchical",
+                            "broader": False,
+                            "narrower": False,
+                        }
+                    )
+                return [json.dumps({"decisions": decisions})]
+
+            if "related" in req_lower:
+                decisions = []
+                packet_text = "\n".join(str(m.get("content", "")) for m in messages or [])
+                candidates = candidate_rows(packet_text)
+                for p in candidates:
+                    pid = str(p.get("pair_id", ""))
+                    na = str(p.get("name_a", "")).lower()
+                    nb = str(p.get("name_b", "")).lower()
+                    if na == "a ball" and nb == "a ball":
+                        decisions.append(
+                            {
+                                "pair_id": pid,
+                                "reasoning": "Homograph senses related",
+                                "related": True,
+                            }
+                        )
+                    else:
+                        decisions.append(
+                            {
+                                "pair_id": pid,
+                                "reasoning": "Distinct concepts",
+                                "related": False,
+                            }
+                        )
+                return [json.dumps({"decisions": decisions})]
 
             if "[[ ## named_entities ## ]]" in req_str or "Resource Description Framework" in req_str:
                 if "Cindy Real" in req_str:
@@ -2613,7 +2813,40 @@ def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
             **kwargs: Any,
         ) -> list[str]:
             req_str = str(prompt or messages or kwargs)
-            if "[[ ## candidate_pairs ## ]]" in req_str or "candidate_pairs" in req_str:
+            if "alt_label" in req_str or "JudgeLabels" in req_str:
+                decisions = []
+                packet_text = "\n".join(str(m.get("content", "")) for m in messages or [])
+                candidates = candidate_rows(packet_text)
+                for p in candidates:
+                    pid = str(p.get("pair_id", ""))
+                    decisions.append(
+                        {
+                            "pair_id": pid,
+                            "reasoning": "Not lexical label match",
+                            "equivalent": False,
+                            "alt_label": False,
+                            "hidden_label": False,
+                        }
+                    )
+                return [json.dumps({"decisions": decisions})]
+
+            req_lower = req_str.lower()
+            if "differentfrom" in req_lower or "judgerelated" in req_lower or "related_judge" in req_lower:
+                decisions = []
+                packet_text = "\n".join(str(m.get("content", "")) for m in messages or [])
+                candidates = candidate_rows(packet_text)
+                for p in candidates:
+                    pid = str(p.get("pair_id", ""))
+                    decisions.append(
+                        {
+                            "pair_id": pid,
+                            "reasoning": "Associative relation",
+                            "related": True,
+                        }
+                    )
+                return [json.dumps({"decisions": decisions})]
+
+            if "narrower" in req_lower or "judgehierarchy" in req_lower or "broader" in req_lower:
                 decisions = []
                 packet_text = "\n".join(str(m.get("content", "")) for m in messages or [])
                 candidates = candidate_rows(packet_text)
@@ -2621,25 +2854,40 @@ def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
                     pid = str(p.get("pair_id", ""))
                     na = str(p.get("name_a", "")).lower()
                     nb = str(p.get("name_b", "")).lower()
-                    if not na or not nb:
-                        continue
                     if {na, nb} == {"cryptanalysis", "mathematics"}:
                         decisions.append(
                             {
                                 "pair_id": pid,
-                                "relation": "skos:broader",
-                                "canonical": "A" if na == "mathematics" else "B",
+                                "reasoning": "Cryptanalysis is narrower branch of broader mathematics",
+                                "broader": na == "cryptanalysis",
+                                "narrower": na == "mathematics",
                             }
                         )
                     else:
                         decisions.append(
                             {
                                 "pair_id": pid,
-                                "relation": "skos:related",
-                                "canonical": "A",
+                                "reasoning": "Not hierarchical",
+                                "broader": False,
+                                "narrower": False,
                             }
                         )
-                return [json.dumps({"decisions": complete_decisions(candidates, decisions)})]
+                return [json.dumps({"decisions": decisions})]
+
+            if "related" in req_lower:
+                decisions = []
+                packet_text = "\n".join(str(m.get("content", "")) for m in messages or [])
+                candidates = candidate_rows(packet_text)
+                for p in candidates:
+                    pid = str(p.get("pair_id", ""))
+                    decisions.append(
+                        {
+                            "pair_id": pid,
+                            "reasoning": "Associative relation",
+                            "related": True,
+                        }
+                    )
+                return [json.dumps({"decisions": decisions})]
             if "FilterTriples" in req_str or "fact_before_filter" in req_str:
                 return [json.dumps({"fact": [["alan turing", "was born on", "1912-06-23"]]})]
             if "ExtractTriples" in req_str or '"triples"' in req_str or "`triples`" in req_str:

@@ -31,13 +31,17 @@ def packet_provider():
     state = {"mode": "valid", "context": 131072}
 
     class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"
+
         def send(self, data):
             raw = json.dumps(data).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(raw)
+            self.close_connection = True
 
         def do_GET(self):
             if self.path.endswith("/health"):
@@ -70,14 +74,25 @@ def packet_provider():
                 self.send({"tokens": list(data["content"].encode("utf-8"))})
             else:
                 calls.append(data)
-                text = next(m["content"] for m in data["messages"] if '{"format":"synonym-evidence-v1"' in m["content"])
+                text = next(m["content"] for m in data["messages"] if '{"format":"synonym-evidence-v2"' in m["content"])
                 packet = json.JSONDecoder().raw_decode(text[text.index('{"format":') :])[0]
                 decisions = [
-                    {
-                        "pair_id": p["pair_id"],
-                        "relation": RELATIONS[i % 5],
-                        "canonical": p["pair_id"].split("|")[1 if i % 5 == 3 else 0],
-                    }
+                    (
+                        {
+                            "pair_id": p["pair_id"],
+                            "reasoning": f"Reasoning {i}",
+                            "equivalent": False,
+                            "alt_label": True,
+                        }
+                        if i % 2 == 0
+                        else {
+                            "pair_id": p["pair_id"],
+                            "reasoning": f"Reasoning {i}",
+                            "equivalent": False,
+                            "alt_label": False,
+                            "hidden_label": True,
+                        }
+                    )
                     for i, p in enumerate(packet["pairs"])
                 ]
                 if state["mode"] == "missing":
@@ -87,9 +102,9 @@ def packet_provider():
                 elif state["mode"] == "foreign":
                     decisions[0]["pair_id"] = "e999|e1000"
                 elif state["mode"] == "canonical":
-                    decisions[0]["canonical"] = "not-in-pair"
+                    decisions[0]["reasoning"] = ""
                 elif state["mode"] == "relation":
-                    decisions[0]["relation"] = "made-up"
+                    decisions[0]["alt_label"] = "not-a-bool"
                 self.send(
                     {
                         "id": "packet",
@@ -115,14 +130,17 @@ def packet_provider():
             pass
 
     with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+        server.daemon_threads = True
+        server.block_on_close = False
         url = f"http://127.0.0.1:{server.server_port}"
-        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
         worker.start()
         try:
             yield url, calls, rendered, state
         finally:
             server.shutdown()
-            worker.join(timeout=5)
+            server.server_close()
+            worker.join(timeout=0.5)
 
 
 def make_batch(tmp_path: Path, count: int = 5) -> SynonymEvidenceBatch:
@@ -168,14 +186,11 @@ def make_program(url: str, *, context: int = 131072) -> HippoRAGProgram:
 def test_shared_physical_sources_keep_origin_ids_and_directed_profiles(tmp_path):
     batch = make_batch(tmp_path)
     packet = json.loads(batch.payload)
-    assert len(packet["sources"]) == 1
-    assert len({s["chunk"] for e in packet["entities"].values() for s in e["sources"]}) == 6
-    assert "café" in next(iter(packet["sources"].values()))["text"]
-    profiles = {e["name"]: e for e in packet["entities"].values()}
-    assert "skos:narrower" in profiles["Concept 0"]["relations"]
-    assert "skos:broader" in profiles["Concept 1"]["relations"]
-    assert len([original for key, original in batch.identifiers.items() if key.startswith("c")]) == 6
-    changed_ids = replace(batch, identifiers={**batch.identifiers, "c0": "another-chunk"})
+    assert packet["format"] == "synonym-evidence-v2"
+    assert len(packet["pairs"]) == 5
+    assert "café" in packet["pairs"][0]["entity_a"]["sources"][0]["text"]
+    assert len([original for key, original in batch.identifiers.items() if key.startswith("e")]) == 6
+    changed_ids = replace(batch, identifiers={**batch.identifiers, "e0": "another-entity"})
     assert changed_ids.payload == batch.payload
     assert changed_ids.cache_identity != batch.cache_identity
 
@@ -186,33 +201,39 @@ def test_complete_native_request_and_original_id_decisions(tmp_path, packet_prov
     batch = make_batch(tmp_path)
     assert program.synonym_batch_fits(batch)
     decisions = program.judge_synonyms(batch)
-    assert [x["relation"] for x in decisions] == list(RELATIONS)
+    assert [x["relation"] for x in decisions] == [
+        "skos:broader",
+        "skos:altLabel",
+        "skos:hiddenLabel",
+        "skos:altLabel",
+        "skos:hiddenLabel",
+    ]
     assert [x["pair_id"] for x in decisions] == [x["pair_id"] for x in batch.candidates]
-    assert decisions[3]["canonical"] == batch.candidates[3]["entity_b"]
     assert len(calls) == 1
     assert rendered[-1] == calls[0]["messages"]
-    assert program.synonym_audit_trail[-1]["input_tokens"] == len(json.dumps(rendered[-1], ensure_ascii=False).encode())
-    assert "candidate_pairs" not in program.synonym_audit_trail[-1]
+    input_toks = len(json.dumps(rendered[-1], ensure_ascii=False).encode())
+    assert program.label_judge_audit_trail[-1]["input_tokens"] == input_toks
+    assert "candidate_pairs" not in program.label_judge_audit_trail[-1]
 
 
 def test_packet_specific_grammar_reaches_native_provider(tmp_path, packet_provider):
-    from yaw.daemon.graph.inference.grammars import build_dspy_synonym_judge_grammar
+    from yaw.daemon.graph.inference.grammars import build_dspy_label_judge_grammar
 
     url, calls, _, _ = packet_provider
     program = make_program(url)
     program.enable_gbnf = True
-    program.synonym_judge.lm._yaw_supports_gbnf = True
+    program.label_judge.lm._yaw_supports_gbnf = True
     batch = make_batch(tmp_path)
-    pairs = [p["pair_id"] for p in json.loads(batch.payload)["pairs"]]
+    pairs = [p["pair_id"] for p in json.loads(batch.payload)["pairs"] if not p.get("broader_tc")]
     program.judge_synonyms(batch)
     grammar = calls[0]["grammar"]
-    assert grammar == build_dspy_synonym_judge_grammar(pair_ids=pairs)
+    assert grammar == build_dspy_label_judge_grammar(pair_ids=pairs)
     root = grammar.splitlines()[0]
-    assert 'decision-0 ", " decision-1 ", " decision-2 ", " decision-3 ", " decision-4' in root
+    assert 'decision-0 ", " decision-1 ", " decision-2 ", " decision-3' in root
     assert "?" not in grammar
     assert len([line for line in grammar.splitlines() if line.startswith("decision-")]) == len(pairs)
     with pytest.raises(ValueError, match="unique"):
-        build_dspy_synonym_judge_grammar(pair_ids=[pairs[0], pairs[0]])
+        build_dspy_label_judge_grammar(pair_ids=[pairs[0], pairs[0]])
 
 
 @pytest.mark.parametrize("mode", ["missing", "duplicate", "foreign", "canonical", "relation"])
@@ -223,14 +244,14 @@ def test_bad_decisions_fail_before_graph_application(tmp_path, packet_provider, 
     with pytest.raises(ValueError):
         program.judge_synonyms(make_batch(tmp_path))
     assert len(calls) == 1
-    assert not program.synonym_audit_trail
+    assert not program.label_judge_audit_trail
 
 
 def test_complete_request_budget_counts_demos_and_never_generates_over_budget(tmp_path, packet_provider):
     url, calls, _, _ = packet_provider
     program = make_program(url, context=20000)
     batch = make_batch(tmp_path)
-    program.synonym_judge.demos = [dspy.Example(candidate_pairs="unabridged demo " * 2000, decisions=[])]
+    program.label_judge.demos = [dspy.Example(candidate_pairs="unabridged demo " * 2000, decisions=[])]
     assert not program.synonym_batch_fits(batch)
     with pytest.raises(ValueError, match="exceeds context"):
         program.judge_synonyms(batch)
@@ -246,10 +267,10 @@ def test_packet_splits_on_real_tokenizer_budget_without_losing_pairs(tmp_path, p
         guard = program.synonym_request_budget()
         counts = [
             guard.count(
-                program.synonym_judge.lm,
+                program.label_judge.lm,
                 {},
-                program.synonym_judge.signature,
-                program.synonym_judge.demos,
+                program.label_judge.signature,
+                program.label_judge.demos,
                 {"candidate_pairs": b.payload},
             )
             for b in singles
@@ -261,7 +282,7 @@ def test_packet_splits_on_real_tokenizer_budget_without_losing_pairs(tmp_path, p
                 conn,
                 batch.candidates,
                 tmp_path,
-                fits=lambda b: guard.fits(b, program.synonym_judge, program.synonym_judge.lm),
+                fits=lambda b: guard.fits(b, program.label_judge, program.label_judge.lm),
             )
         )
         assert len(packets) > 1
@@ -281,7 +302,7 @@ import json,sys
 from pathlib import Path
 from yaw.core import SynonymEvidenceBatch
 from yaw.daemon.graph.inference import (
- HippoRAGProgram,ServingTokenCounter,create_dspy_lm,configure_yaw_dspy_cache,synonym_fingerprint,
+ HippoRAGProgram,ServingTokenCounter,create_dspy_lm,configure_yaw_dspy_cache,label_judge_fingerprint,
 )
 from yaw.daemon.graph.storage import CandidateCacheStore,CandidateStageCache,open_managed_yaw_db
 root=Path(sys.argv[1]);url=sys.argv[2];crash=sys.argv[3]=='crash'
@@ -293,8 +314,8 @@ lm=create_dspy_lm('packet-model',base_url=url+'/v1',max_tokens=512,context_windo
 program=HippoRAGProgram(rlm_sub_lm=lm,synonym_token_counter=ServingTokenCounter(url+'/v1','packet-model'),max_output_tokens=512)
 managed=open_managed_yaw_db(root/'recovery.db')
 with managed.transaction() as conn:
- cache=CandidateStageCache(CandidateCacheStore(conn),managed,'synonym',lambda:'packet-test')
-key=(synonym_fingerprint(program),batch.cache_identity)
+ cache=CandidateStageCache(CandidateCacheStore(conn),managed,'label_judge',lambda:'packet-test')
+key=(label_judge_fingerprint(program),batch.cache_identity)
 try:
  with managed.transaction():
   decisions=cache.get(key)

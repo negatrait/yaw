@@ -11,7 +11,7 @@ import pytest
 from daemon.graph.synonym_protocol import candidate_rows, complete_decisions
 from yaw.core import ChunkPointer, OpenIERecord, RelationTraversalPolicy, StructuredTriple
 from yaw.daemon.graph.engine import YawGraphEngine
-from yaw.daemon.graph.inference import HippoRAGProgram, parse_synonym_decisions
+from yaw.daemon.graph.inference import HippoRAGProgram, parse_hierarchy_decisions
 from yaw.daemon.graph.planner import apply_synonym_adjudication
 from yaw.daemon.graph.ppr import build_transition_matrix
 from yaw.daemon.graph.storage import (
@@ -73,7 +73,11 @@ class DeterministicMockLM(dspy.LM):
         if "candidate_pairs" in full_text or '"pair_id"' in full_text:
             cands = self._parse_candidate_pairs_from_text(full_text)
             self.observed_candidates.extend(cands)
-            decisions = complete_decisions(cands, self._synonym_fn(cands) if self._synonym_fn is not None else [])
+            decisions = complete_decisions(
+                cands,
+                self._synonym_fn(cands) if self._synonym_fn is not None else [],
+                stage_text=full_text,
+            )
             return [json.dumps({"decisions": decisions})]
         if "triples" in full_text and "named_entities" in full_text and self._triples_json is not None:
             return [self._triples_json]
@@ -520,11 +524,12 @@ def test_skos_broader_rejects_missing_canonical(
     synonym_token_counter,
     tmp_path: Path,
 ) -> None:
-    """Verify that parse_synonym_decisions does not default missing canonical to 'A' on skos:broader
-    and that missing canonical is rejected as invalid model output."""
-    parsed = parse_synonym_decisions('{"decisions": [{"pair_id": 0, "relation": "skos:broader"}]}')
+    """Verify that parse_hierarchy_decisions extracts skos:broader and direction cleanly."""
+    payload = json.dumps({"decisions": [{"pair_id": "a|b", "reasoning": "valid", "broader": True, "narrower": False}]})
+    parsed = parse_hierarchy_decisions(payload)
     assert len(parsed) == 1
-    assert parsed[0]["canonical"] == ""
+    assert parsed[0]["relation"] == "skos:broader"
+    assert parsed[0]["source_direction"] == "a_to_b"
 
     def _judge_empty_canonical(candidates: list[dict[str, Any]]) -> list[dict[str, str]]:
         return [
@@ -932,7 +937,7 @@ def test_apply_synonym_adjudication_remaps_semantic_edges_after_later_merge() ->
             synonymy_threshold=0.8,
             rlm_stats=rlm_stats,
         )
-        assert staged_merges == [("ent-b", "ent-c", "skos:altLabel")]
+        assert staged_merges == [("ent-b", "ent-c", "skos:altLabel", None)]
         assert resolved_batch == [("ent-a", "ent-c", "skos:related", 0.85)]
         assert lint_graph_shacl(stage_conn) == []
     finally:
@@ -999,9 +1004,9 @@ def test_apply_synonym_adjudication_prevents_transitive_collapse_across_separate
             rlm_stats=rlm_stats,
         )
         assert staged_merges == [
-            ("ent-b", "ent-a", "skos:altLabel"),
-            ("ent-a", "ent-c", "skos:altLabel"),
-            ("ent-p1", "ent-alias", "skos:altLabel"),
+            ("ent-b", "ent-a", "skos:altLabel", None),
+            ("ent-a", "ent-c", "skos:altLabel", None),
+            ("ent-p1", "ent-alias", "skos:altLabel", None),
         ]
         assert resolved_batch == [("ent-alias", "ent-p2", "skos:related", 0.82)]
         surviving = {str(r[0]) for r in stage_conn.execute("SELECT entity_id FROM entities").fetchall()}
