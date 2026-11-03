@@ -1391,7 +1391,7 @@ class YawRuntime:
                         hippo_em += em_val
                         hippo_f1 += f1_val
 
-                        dpr_ctx_str = bench_engine.format_qa_context(dpr_hits[:5])
+                        dpr_ctx_str = bench_engine.format_qa_context(dpr_hits[:5], include_subgraph=False)
                         dpr_pred = (
                             prog.answer_question(context=dpr_ctx_str, question=q)
                             if hasattr(prog, "answer_question")

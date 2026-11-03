@@ -16,6 +16,7 @@ _PUBLIC_API: dict[str, str] = {
     "open_yaw_db": ".db",
     "open_readonly_yaw_db": ".db",
     "initialize_schema": ".db",
+    "migrate_edges_reasoning": ".db",
     "get_meta": ".db",
     "set_meta": ".db",
     # Vector serialization, bounded SQL cosine KNN & Contentless FTS5 lexical search
@@ -74,6 +75,7 @@ _PUBLIC_API: dict[str, str] = {
     "coalesce_chunk_spans": ".hydration",
     "coalesce_spans": ".hydration",
     "dehydrate_passage_ast": ".hydration",
+    "format_subgraph_for_qa": ".hydration",
     "hydrate_ast_parent_context": ".hydration",
     "hydrate_budgeted_passages": ".hydration",
     "hydrate_chunk_pointer": ".hydration",

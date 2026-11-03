@@ -77,6 +77,7 @@ from yaw.daemon.graph.storage import (
     apply_shacl_repairs,
     delete_chunks,
     format_pair_disambiguation_dossier,
+    format_subgraph_for_qa,
     get_chunk_pointers,
     get_entity_doc_frequencies,
     get_existing_ids,
@@ -654,7 +655,7 @@ class YawGraphEngine:
         if self._active_progress_callback is not None:
             q_preview = q_str.strip().replace("\n", " ")[:48]
             self._active_progress_callback(f"retrieving + QA: {q_preview!r}...")
-        hits = self.retrieve(
+        hits, kept_facts = self.retrieve_with_seeds(
             question,
             top_k=fetch_top_k,
             program=active_program,
@@ -667,7 +668,7 @@ class YawGraphEngine:
         texts = tuple(self._format_hydrated_passage(p, text) for p, _, text in hits)
         scores = tuple(float(s) for _, s, _ in hits)
         pids = tuple(p.chunk_id for p, _, _ in hits)
-        formatted_context = self.format_qa_context(hits[:qa_top_k])
+        formatted_context = self.format_qa_context(hits[:qa_top_k], seed_facts=kept_facts)
         res = (formatted_context, texts, scores, pids)
         if not self._in_optimization and not bool(item_docs):
             self._query_retrieval_memo[memo_key] = res
@@ -915,10 +916,12 @@ class YawGraphEngine:
         self,
         hits: Sequence[tuple[ChunkPointer, float, str]],
         *,
+        seed_facts: Sequence[tuple[str, str, str]] = (),
+        include_subgraph: bool = True,
         max_context_chars: int | None = None,
         max_characters: int | None = None,
     ) -> str:
-        """Pack top-k hydrated AST islands into QA context using budgeted AST-expansion and coalescence."""
+        """Pack induced SKOS/OWL/RDF subgraph header and top-k hydrated AST islands into QA context."""
         if not hits:
             return ""
         budget = (
@@ -926,14 +929,31 @@ class YawGraphEngine:
             if max_characters is not None
             else (max_context_chars if max_context_chars is not None else self.max_context_chars)
         )
+        subgraph_header = ""
+        passage_budget = budget
+        if include_subgraph and self.conn is not None:
+            max_subgraph = min(6000, max(0, budget // 4))
+            chunk_ids = [p.chunk_id for p, _, _ in hits]
+            subgraph_header = format_subgraph_for_qa(
+                self.conn,
+                chunk_ids=chunk_ids,
+                seed_facts=seed_facts,
+                max_subgraph_chars=max_subgraph,
+            )
+            if subgraph_header:
+                passage_budget = max(1000, budget - len(subgraph_header) - 2)
+
         ptrs_scores = [(p, s) for p, s, _ in hits]
         hydrated = hydrate_budgeted_passages(
             ptrs_scores,
             corpus_root=self.workspace_root,
-            max_context_chars=budget,
+            max_context_chars=passage_budget,
             max_expansion_hops=self.max_ast_expansion_hops,
         )
         blocks: list[str] = []
+        if subgraph_header:
+            blocks.append(subgraph_header)
+            blocks.append("### Retrieved Passages")
         for hp in hydrated:
             formatted = self._format_hydrated_passage(hp.pointer, hp.text)
             if formatted:
@@ -1542,7 +1562,7 @@ class YawGraphEngine:
                 fact_vectors=tuple(fact_vec_pairs),
             )
             staged_merges: list[tuple[str, str, str, str | None]] = []
-            resolved_semantic_batch: list[tuple[str, str, str, float]] = []
+            resolved_semantic_batch: list[tuple[str, str, str, float, str]] = []
             staged_repairs: list[Mapping[str, Any]] = []
             stage_conn = clone_graph_to_memory(self.conn)
             try:

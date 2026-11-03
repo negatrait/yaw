@@ -685,7 +685,7 @@ def apply_synonym_adjudication(
     synonymy_threshold: float,
     rlm_stats: dict[str, Any],
     corpus_root: Path | str | None = None,
-) -> tuple[list[tuple[str, str, str, str | None]], list[tuple[str, str, str, float]]]:
+) -> tuple[list[tuple[str, str, str, str | None]], list[tuple[str, str, str, float, str]]]:
     """Apply Stage 3 Gemma 4 synonym decisions on stage_conn with two-phase topological resolution."""
     _ = synonymy_threshold
     merged_into: dict[str, str] = {}
@@ -700,7 +700,7 @@ def apply_synonym_adjudication(
         return curr
 
     staged_merges: list[tuple[str, str, str, str | None]] = []
-    raw_semantic_batch: list[tuple[str, str, str, float]] = []
+    raw_semantic_batch: list[tuple[str, str, str, float, str]] = []
     cand_by_pair: dict[tuple[str, str], dict[str, Any]] = {}
     for c in candidates:
         ea, eb = str(c["entity_a"]), str(c["entity_b"])
@@ -741,9 +741,10 @@ def apply_synonym_adjudication(
             name_src, _ = cand_meta.get(src, cand_meta.get(raw_src, (src, "")))
             name_tgt, _ = cand_meta.get(tgt, cand_meta.get(raw_tgt, (tgt, "")))
 
+            reas = str(dec.get("reasoning", "") or "").strip()
             if rel in ("skos:altLabel", "skos:hiddenLabel", "exact_match"):
                 if text_processing(name_src) != text_processing(name_tgt) and _is_active_fact_pole(src, tgt):
-                    raw_semantic_batch.append((src, tgt, "skos:related", max(0.5, sim)))
+                    raw_semantic_batch.append((src, tgt, "skos:related", max(0.5, sim), reas))
                     continue
                 canon = str(dec.get("canonical", "") or "").strip()
                 canon_id = _resolve_active_eid(canon) if canon else ""
@@ -794,17 +795,18 @@ def apply_synonym_adjudication(
                 staged_merges.append((merge_src, merge_dst, lkind, merged_def))
                 merged_into[merge_src] = merge_dst
                 rlm_stats["merged_entities"] = int(rlm_stats.get("merged_entities", 0)) + 1
-            elif rel in ("owl:differentFrom", "different", "different_from"):
-                raw_semantic_batch.append((src, tgt, "owl:differentFrom", 0.0))
-            elif rel == "skos:broader":
-                child_id, parent_id = src, tgt
-                raw_semantic_batch.append((child_id, parent_id, "skos:broader", max(0.5, sim)))
-            elif rel in ("skos:related", "related"):
-                raw_semantic_batch.append((src, tgt, "skos:related", max(0.5, sim)))
+            else:
+                if rel in ("owl:differentFrom", "different", "different_from"):
+                    raw_semantic_batch.append((src, tgt, "owl:differentFrom", 0.0, reas))
+                elif rel == "skos:broader":
+                    child_id, parent_id = src, tgt
+                    raw_semantic_batch.append((child_id, parent_id, "skos:broader", max(0.5, sim), reas))
+                elif rel in ("skos:related", "related"):
+                    raw_semantic_batch.append((src, tgt, "skos:related", max(0.5, sim), reas))
 
         edge_priority = {"skos:related": 1, "skos:broader": 2, "owl:differentFrom": 3}
-        pair_edges: dict[tuple[str, str], tuple[str, str, str, float]] = {}
-        for s_raw, o_raw, r_kind, w in raw_semantic_batch:
+        pair_edges: dict[tuple[str, str], tuple[str, str, str, float, str]] = {}
+        for s_raw, o_raw, r_kind, w, r_reas in raw_semantic_batch:
             s_act = _resolve_active_eid(s_raw)
             o_act = _resolve_active_eid(o_raw)
             if s_act == o_act:
@@ -812,17 +814,17 @@ def apply_synonym_adjudication(
             upair = (min(s_act, o_act), max(s_act, o_act))
             prev = pair_edges.get(upair)
             if prev is None:
-                pair_edges[upair] = (s_act, o_act, r_kind, w)
+                pair_edges[upair] = (s_act, o_act, r_kind, w, r_reas)
             else:
-                _, _, prev_kind, prev_w = prev
+                _, _, prev_kind, prev_w, prev_reas = prev
                 if edge_priority[r_kind] > edge_priority[prev_kind] or (
                     edge_priority[r_kind] == edge_priority[prev_kind] and w > prev_w
                 ):
-                    pair_edges[upair] = (s_act, o_act, r_kind, w)
+                    pair_edges[upair] = (s_act, o_act, r_kind, w, r_reas or prev_reas)
 
-        resolved_semantic_batch: list[tuple[str, str, str, float]] = []
-        for s_act, o_act, r_kind, w in pair_edges.values():
-            resolved_semantic_batch.append((s_act, o_act, r_kind, w))
+        resolved_semantic_batch: list[tuple[str, str, str, float, str]] = []
+        for s_act, o_act, r_kind, w, r_reas in pair_edges.values():
+            resolved_semantic_batch.append((s_act, o_act, r_kind, w, r_reas))
             if r_kind == "owl:differentFrom":
                 rlm_stats["different_from_edges"] = int(rlm_stats.get("different_from_edges", 0)) + 1
             elif r_kind == "skos:broader":

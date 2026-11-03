@@ -815,3 +815,246 @@ if headroom permits.
 
     # 4. Hydrate exact line spans directly from disk
     return _hydrate_spans(final_spans, root_path)
+
+
+def format_subgraph_for_qa(
+    conn: sqlite3.Connection,
+    chunk_ids: Sequence[str],
+    seed_facts: Sequence[tuple[str, str, str]] = (),
+    *,
+    max_subgraph_chars: int = 6000,
+) -> str:
+    """Format the closed-world SKOS/OWL/RDF subgraph induced by `chunk_ids` and `seed_facts` for QA grounding."""
+    if not chunk_ids and not seed_facts:
+        return ""
+
+    active_entity_ids: set[str] = set()
+    seed_triples_set: set[tuple[str, str, str]] = set()
+
+    for item in seed_facts:
+        if len(item) >= 3:
+            s, p, o = str(item[0]).strip(), str(item[1]).strip(), str(item[2]).strip()
+            seed_triples_set.add((s, p, o))
+            active_entity_ids.add(s)
+            active_entity_ids.add(o)
+
+    chunk_list = list(dict.fromkeys(chunk_ids))
+    chunk_facts: list[tuple[str, str, str, str, str]] = []
+    if chunk_list:
+        ph = ",".join("?" for _ in chunk_list)
+        fact_rows = conn.execute(
+            f"""
+            SELECT f.fact_id, f.subj_id, f.pred, f.obj_kind, f.obj_id, f.obj_literal_lex, COALESCE(f.definition, '')
+            FROM facts f
+            JOIN fact_sources fs ON f.fact_id = fs.fact_id
+            WHERE fs.chunk_id IN ({ph})
+            """,
+            chunk_list,
+        ).fetchall()
+        for fid, subj, pred, obj_kind, obj_id, obj_lex, definition in fact_rows:
+            obj_val = str(obj_id) if obj_kind == "entity" and obj_id else str(obj_lex or "")
+            s_str, p_str, o_str = str(subj), str(pred), obj_val
+            chunk_facts.append((s_str, p_str, o_str, str(definition or "").strip(), str(fid)))
+            active_entity_ids.add(s_str)
+            if obj_kind == "entity" and obj_id:
+                active_entity_ids.add(str(obj_id))
+
+        ent_rows = conn.execute(
+            f"SELECT DISTINCT entity_id FROM entity_labels WHERE chunk_id IN ({ph})",
+            chunk_list,
+        ).fetchall()
+        for (eid,) in ent_rows:
+            active_entity_ids.add(str(eid))
+
+    if active_entity_ids:
+        ph_ent = ",".join("?" for _ in active_entity_ids)
+        mapped_rows = conn.execute(
+            f"SELECT entity_id, name FROM entities WHERE entity_id IN ({ph_ent}) OR name IN ({ph_ent})",
+            list(active_entity_ids) * 2,
+        ).fetchall()
+        for eid, _ in mapped_rows:
+            active_entity_ids.add(str(eid))
+
+    entity_names: dict[str, str] = {}
+    entity_defs: dict[str, str] = {}
+    if active_entity_ids:
+        ph_act = ",".join("?" for _ in active_entity_ids)
+        for eid, name, defn in conn.execute(
+            f"SELECT entity_id, name, COALESCE(definition, '') FROM entities WHERE entity_id IN ({ph_act})",
+            list(active_entity_ids),
+        ).fetchall():
+            entity_names[str(eid)] = str(name).strip() or str(eid)
+            if defn:
+                entity_defs[str(eid)] = str(defn).strip()
+
+    # SECTION 1: Knowledge Graph Statements (rdf:Statement)
+    statement_lines: list[str] = []
+    seen_statements: set[tuple[str, str, str]] = set()
+
+    for s, p, o in seed_triples_set:
+        fact_def_row = conn.execute(
+            """
+            SELECT definition FROM facts
+            WHERE subj_id = ? AND pred = ? AND (obj_id = ? OR obj_literal_lex = ?)
+            LIMIT 1
+            """,
+            (s, p, o, o),
+        ).fetchone()
+        f_def = str(fact_def_row[0] or "").strip() if fact_def_row is not None and fact_def_row[0] else ""
+        seen_statements.add((s, p, o))
+        if f_def:
+            statement_lines.append(f"- [{s}, {p}, {o}]: {f_def}")
+        else:
+            statement_lines.append(f"- [{s}, {p}, {o}]")
+
+    for s, p, o, f_def, _ in chunk_facts:
+        f_subj = entity_names.get(s, s)
+        f_obj = entity_names.get(o, o)
+        if (f_subj, p, f_obj) not in seen_statements:
+            seen_statements.add((f_subj, p, f_obj))
+            if f_def:
+                statement_lines.append(f"- [{f_subj}, {p}, {f_obj}]: {f_def}")
+            else:
+                statement_lines.append(f"- [{f_subj}, {p}, {f_obj}]")
+
+    # SECTION 2: Taxonomy & Disambiguation Trace (SKOS / OWL)
+    trace_lines: list[str] = []
+    if active_entity_ids:
+        ph_act = ",".join("?" for _ in active_entity_ids)
+        edge_rows = conn.execute(
+            f"""
+            SELECT src_id, dst_id, kind, weight, COALESCE(reasoning, '')
+            FROM edges
+            WHERE kind IN ('owl:differentFrom', 'skos:broader', 'skos:related')
+              AND (src_id IN ({ph_act}) OR dst_id IN ({ph_act}))
+            """,
+            list(active_entity_ids) * 2,
+        ).fetchall()
+
+        # Resolve names and definitions for 1-hop counterpart entities from other chunks
+        edge_endpoint_ids = {str(r[0]) for r in edge_rows} | {str(r[1]) for r in edge_rows}
+        missing_endpoint_ids = edge_endpoint_ids - set(entity_names.keys())
+        if missing_endpoint_ids:
+            ph_miss = ",".join("?" for _ in missing_endpoint_ids)
+            for eid, name, defn in conn.execute(
+                f"SELECT entity_id, name, COALESCE(definition, '') FROM entities WHERE entity_id IN ({ph_miss})",
+                list(missing_endpoint_ids),
+            ).fetchall():
+                entity_names[str(eid)] = str(name).strip() or str(eid)
+                if defn:
+                    entity_defs[str(eid)] = str(defn).strip()
+
+        kind_prio = {"owl:differentFrom": 0, "skos:broader": 1, "skos:related": 2}
+        seen_pairs: set[tuple[str, str, str]] = set()
+
+        sorted_edge_rows = sorted(
+            edge_rows,
+            key=lambda r: (
+                0 if (str(r[0]) in active_entity_ids and str(r[1]) in active_entity_ids) else 1,
+                kind_prio.get(str(r[2]), 9),
+            ),
+        )
+
+        for src, dst, kind, _, reasoning in sorted_edge_rows:
+            src_s, dst_s, kind_s, reas_s = str(src), str(dst), str(kind), str(reasoning or "").strip()
+            canon_pair = (
+                (min(src_s, dst_s), max(src_s, dst_s), kind_s) if kind_s != "skos:broader" else (src_s, dst_s, kind_s)
+            )
+            if canon_pair in seen_pairs:
+                continue
+            seen_pairs.add(canon_pair)
+
+            lbl_a = entity_names.get(src_s, src_s)
+            lbl_b = entity_names.get(dst_s, dst_s)
+
+            if kind_s == "owl:differentFrom":
+                def_a = entity_defs.get(src_s)
+                if not def_a:
+                    r = conn.execute("SELECT definition FROM entities WHERE entity_id = ?", (src_s,)).fetchone()
+                    def_a = str(r[0] or "").strip() if r is not None and r[0] else ""
+                def_b = entity_defs.get(dst_s)
+                if not def_b:
+                    r = conn.execute("SELECT definition FROM entities WHERE entity_id = ?", (dst_s,)).fetchone()
+                    def_b = str(r[0] or "").strip() if r is not None and r[0] else ""
+
+                pieces: list[str] = [f"- [DISJOINT] {lbl_a} owl:differentFrom {lbl_b}"]
+                if reas_s:
+                    pieces.append(f" — {reas_s}")
+                if def_a or def_b:
+                    pieces.append(f" ({lbl_a}: {def_a or 'N/A'} | {lbl_b}: {def_b or 'N/A'})")
+                trace_lines.append("".join(pieces))
+            elif kind_s == "skos:broader":
+                if reas_s:
+                    trace_lines.append(f"- [HIERARCHY] {lbl_a} skos:broader {lbl_b} — {reas_s}")
+                else:
+                    trace_lines.append(f"- [HIERARCHY] {lbl_a} skos:broader {lbl_b}")
+            elif kind_s == "skos:related":
+                if reas_s:
+                    trace_lines.append(f"- [RELATED] {lbl_a} skos:related {lbl_b} — {reas_s}")
+                else:
+                    trace_lines.append(f"- [RELATED] {lbl_a} skos:related {lbl_b}")
+
+    # SECTION 3: Concept Definitions & Aliases (skos:Concept)
+    concept_lines: list[str] = []
+    if active_entity_ids:
+        ph_act = ",".join("?" for _ in active_entity_ids)
+        concept_entities = conn.execute(
+            f"SELECT entity_id, name, COALESCE(definition, '') FROM entities WHERE entity_id IN ({ph_act})",
+            list(active_entity_ids),
+        ).fetchall()
+
+        labels_by_ent: dict[str, dict[str, list[str]]] = {}
+        for eid, lbl, lkind in conn.execute(
+            f"SELECT entity_id, raw_label, label_kind FROM entity_labels WHERE entity_id IN ({ph_act})",
+            list(active_entity_ids),
+        ).fetchall():
+            labels_by_ent.setdefault(str(eid), {}).setdefault(str(lkind), []).append(str(lbl))
+
+        sorted_concepts = sorted(
+            concept_entities,
+            key=lambda c: (
+                0 if str(c[0]) in {s for s, _, _ in seed_triples_set} | {o for _, _, o in seed_triples_set} else 1,
+                0 if str(c[2]).strip() else 1,
+                str(c[1]),
+            ),
+        )
+
+        for eid, name, defn in sorted_concepts:
+            eid_s = str(eid)
+            pref_name = str(name).strip() or eid_s
+            def_str = str(defn or "").strip()
+            ent_labels = labels_by_ent.get(eid_s, {})
+            alt_labels = sorted({lbl for lbl in ent_labels.get("skos:altLabel", ()) if lbl != pref_name})
+            hid_labels = sorted({lbl for lbl in ent_labels.get("skos:hiddenLabel", ()) if lbl != pref_name})
+
+            alias_parts: list[str] = []
+            if alt_labels:
+                alias_parts.append(f"altLabel: {', '.join(alt_labels)}")
+            if hid_labels:
+                alias_parts.append(f"hiddenLabel: {', '.join(hid_labels)}")
+
+            alias_clause = f" ({'; '.join(alias_parts)})" if alias_parts else ""
+            if def_str:
+                concept_lines.append(f"- **{pref_name}**{alias_clause}: {def_str}")
+            elif alias_clause:
+                concept_lines.append(f"- **{pref_name}**{alias_clause}")
+
+    sections: list[str] = []
+    if statement_lines:
+        sections.append("### Knowledge Graph Statements (rdf:Statement)\n" + "\n".join(statement_lines))
+    if trace_lines:
+        sections.append("### Taxonomy & Disambiguation Trace (SKOS / OWL)\n" + "\n".join(trace_lines))
+    if concept_lines:
+        sections.append("### Concept Definitions & Aliases (skos:Concept)\n" + "\n".join(concept_lines))
+
+    if not sections:
+        return ""
+
+    subgraph_text = "\n\n".join(sections)
+    if len(subgraph_text) > max_subgraph_chars:
+        truncated = subgraph_text[:max_subgraph_chars]
+        last_nl = truncated.rfind("\n")
+        if last_nl > 0:
+            truncated = truncated[:last_nl]
+        return truncated.rstrip()
+    return subgraph_text

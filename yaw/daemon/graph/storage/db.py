@@ -123,6 +123,7 @@ _CREATE_SCHEMA_STATEMENTS: tuple[str, ...] = (
         dst_id TEXT NOT NULL,
         kind TEXT NOT NULL CHECK (kind IN ('passage', 'fact', 'skos:related', 'skos:broader', 'owl:differentFrom')),
         weight REAL NOT NULL,
+        reasoning TEXT NOT NULL DEFAULT '',
         PRIMARY KEY (src_id, dst_id, kind)
     )
     """,
@@ -267,6 +268,13 @@ def open_readonly_yaw_db(
                 raise
             time.sleep(backoff[i])
     raise sqlite3.OperationalError(f"Failed to open read-only SQLite database: {resolved}")
+
+
+def migrate_edges_reasoning(conn: sqlite3.Connection) -> None:
+    """Ensure reasoning column exists on edges table (idempotent migration)."""
+    edges_cols = {str(r[1]).lower() for r in conn.execute("PRAGMA table_info(edges)").fetchall()}
+    if "reasoning" not in edges_cols and "src_id" in edges_cols:
+        conn.execute("ALTER TABLE edges ADD COLUMN reasoning TEXT NOT NULL DEFAULT ''")
 
 
 def initialize_schema(conn: sqlite3.Connection) -> None:
@@ -418,6 +426,9 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
             conn.execute("ALTER TABLE _edges_migrated RENAME TO edges")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_id, kind)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst_id, kind)")
+
+        # Ensure reasoning column exists on edges table (idempotent migration)
+        migrate_edges_reasoning(conn)
 
         # Auto-backfill fact_sources from edge_sources for legacy entity-object facts
         fact_sources_cnt = int(conn.execute("SELECT COUNT(*) FROM fact_sources").fetchone()[0])

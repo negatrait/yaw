@@ -5,6 +5,7 @@ import json
 import threading
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import dspy
 import numpy as np
@@ -428,5 +429,106 @@ def test_slice5_passages_json_shared_corpus_pools_and_unbounded_eval_hydration(t
             item_docs=engine._opt_docs_by_question["Gold Train Q0?"],
         )
         assert ensured_q0 == ["chunk-shared-000"]
+    finally:
+        engine.close()
+
+
+def test_format_qa_context_subgraph_and_dpr_separation(tmp_path: Path, indexing_provider) -> None:
+    """Verify format_qa_context prepends induced subgraph when enabled and preserves flat passages when disabled."""
+    from yaw.core import ChunkPointer
+    from yaw.daemon.graph.storage import (
+        upsert_chunk_pointers,
+        upsert_entities,
+        upsert_entity_labels,
+        upsert_fact_sources,
+        upsert_facts,
+        upsert_semantic_edges,
+    )
+
+    url, _ = indexing_provider
+    corpus_dir = tmp_path / "corpus"
+    corpus_dir.mkdir(parents=True)
+    doc_file = corpus_dir / "notes.txt"
+    doc_file.write_text("Line 1\nLine 2: Ada Lovelace wrote the first computer algorithm.\nLine 3\n", encoding="utf-8")
+
+    engine = make_engine(tmp_path, url)
+    try:
+        conn = engine.conn
+        assert conn is not None
+
+        ptr = ChunkPointer(
+            chunk_id="c_ada",
+            rel_posix_path="corpus/notes.txt",
+            start_line=2,
+            end_line=2,
+            title="Ada Notes",
+            ast_island_start=1,
+            ast_island_end=3,
+        )
+        upsert_chunk_pointers(conn, [(ptr, "Ada Lovelace wrote the first computer algorithm.")])
+        upsert_entities(
+            conn,
+            [
+                ("e_ada", "Ada Lovelace", "English mathematician and writer"),
+                ("e_algo", "Computer Algorithm", "Computational instruction sequence"),
+            ],
+        )
+        upsert_entity_labels(
+            conn,
+            [
+                ("ada lovelace", "e_ada", "skos:prefLabel", "Ada Lovelace", "c_ada"),
+                ("computer algorithm", "e_algo", "skos:prefLabel", "Computer Algorithm", "c_ada"),
+            ],
+        )
+        upsert_facts(
+            conn,
+            [
+                (
+                    "f_ada",
+                    "e_ada",
+                    "authored",
+                    "entity",
+                    "e_algo",
+                    None,
+                    "",
+                    "",
+                    '["Ada Lovelace", "authored", "Computer Algorithm"]',
+                    "Ada authored the algorithm.",
+                ),
+            ],
+        )
+        upsert_fact_sources(conn, [("f_ada", "c_ada")])
+        upsert_semantic_edges(
+            conn,
+            [
+                ("e_ada", "e_algo", "skos:related", 0.9, "Creator to invention association"),
+            ],
+        )
+
+        hits = [(ptr, 0.95, "Line 2: Ada Lovelace wrote the first computer algorithm.")]
+
+        # 1. GraphRAG QA Context (include_subgraph=True, default)
+        ctx_graph = engine.format_qa_context(
+            hits,
+            seed_facts=[("Ada Lovelace", "authored", "Computer Algorithm")],
+            include_subgraph=True,
+        )
+        assert "### Knowledge Graph Statements (rdf:Statement)" in ctx_graph
+        assert "[Ada Lovelace, authored, Computer Algorithm]" in ctx_graph
+        assert "### Taxonomy & Disambiguation Trace (SKOS / OWL)" in ctx_graph
+        assert "skos:related" in ctx_graph
+        assert "Creator to invention association" in ctx_graph
+        assert "### Retrieved Passages" in ctx_graph
+        assert "Ada Lovelace wrote the first computer algorithm" in ctx_graph
+
+        # 2. DPR QA Context (include_subgraph=False)
+        ctx_dpr = engine.format_qa_context(
+            hits,
+            include_subgraph=False,
+        )
+        assert "### Knowledge Graph Statements" not in ctx_dpr
+        assert "### Taxonomy & Disambiguation Trace" not in ctx_dpr
+        assert "### Retrieved Passages" not in ctx_dpr
+        assert "Ada Lovelace wrote the first computer algorithm" in ctx_dpr
     finally:
         engine.close()

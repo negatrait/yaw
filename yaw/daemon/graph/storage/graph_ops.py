@@ -1424,7 +1424,7 @@ def upsert_facts(
 
 def upsert_edges_with_sources(
     conn: sqlite3.Connection,
-    edges_with_sources: Sequence[tuple[str, str, str, float, str]],
+    edges_with_sources: Sequence[tuple[str, str, str, float, str] | tuple[str, str, str, float, str, str]],
 ) -> None:
     """Bulk upsert graph edges and record chunk provenance in edge_sources."""
     if not edges_with_sources:
@@ -1435,18 +1435,21 @@ def upsert_edges_with_sources(
             INSERT OR IGNORE INTO edge_sources (src_id, dst_id, kind, chunk_id)
             VALUES (?, ?, ?, ?)
             """,
-            ((src, dst, kind, cid) for src, dst, kind, _, cid in edges_with_sources),
+            ((row[0], row[1], row[2], row[4]) for row in edges_with_sources),
         )
         conn.executemany(
             """
-            INSERT INTO edges (src_id, dst_id, kind, weight)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(src_id, dst_id, kind) DO UPDATE SET weight = excluded.weight
+            INSERT INTO edges (src_id, dst_id, kind, weight, reasoning)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(src_id, dst_id, kind) DO UPDATE SET
+                weight = excluded.weight,
+                reasoning = CASE WHEN excluded.reasoning != '' THEN excluded.reasoning ELSE edges.reasoning END
             """,
-            ((src, dst, kind, weight) for src, dst, kind, weight, _ in edges_with_sources),
+            ((row[0], row[1], row[2], row[3], str(row[5]) if len(row) > 5 else "") for row in edges_with_sources),
         )
         fact_base_weights: dict[tuple[str, str], float] = {}
-        for src, dst, kind, weight, _ in edges_with_sources:
+        for row in edges_with_sources:
+            src, dst, kind, weight = str(row[0]), str(row[1]), str(row[2]), float(row[3])
             if kind == "fact":
                 pair = (src, dst)
                 fact_base_weights[pair] = max(fact_base_weights.get(pair, 0.0), float(weight))
@@ -1720,16 +1723,24 @@ def load_graph_topology(
     return chunk_ids, entity_ids, edges
 
 
+SemanticEdgeRow = tuple[str, str, str, float] | tuple[str, str, str, float, str]
+
+
 def upsert_semantic_edges(
     conn: sqlite3.Connection,
-    edges: Sequence[tuple[str, str, str, float]],
+    edges: Sequence[SemanticEdgeRow],
 ) -> None:
     """Bulk upsert symmetric skos:related / owl:differentFrom and directed skos:broader edges."""
     if not edges:
         return
     with write_tx(conn):
         pure_literals = get_pure_literal_entity_ids(conn)
-        for ent1, ent2, kind, weight in edges:
+        for row in edges:
+            ent1 = str(row[0])
+            ent2 = str(row[1])
+            kind = str(row[2])
+            weight = float(row[3])
+            reasoning = str(row[4]).strip() if len(row) > 4 and row[4] is not None else ""
             if ent1 == ent2:
                 continue
             if kind not in SEMANTIC_EDGE_KINDS:
@@ -1748,11 +1759,16 @@ def upsert_semantic_edges(
                 for s, d in ((ent1, ent2), (ent2, ent1)):
                     conn.execute(
                         """
-                        INSERT INTO edges (src_id, dst_id, kind, weight)
-                        VALUES (?, ?, 'owl:differentFrom', 0.0)
-                        ON CONFLICT(src_id, dst_id, kind) DO UPDATE SET weight = 0.0
+                        INSERT INTO edges (src_id, dst_id, kind, weight, reasoning)
+                        VALUES (?, ?, 'owl:differentFrom', 0.0, ?)
+                        ON CONFLICT(src_id, dst_id, kind) DO UPDATE SET
+                            weight = 0.0,
+                            reasoning = CASE
+                                WHEN excluded.reasoning != '' THEN excluded.reasoning
+                                ELSE edges.reasoning
+                            END
                         """,
-                        (s, d),
+                        (s, d, reasoning),
                     )
             elif kind == "skos:broader":
                 has_diff = conn.execute(
@@ -1780,11 +1796,16 @@ def upsert_semantic_edges(
                     broader_weight = max(float(weight), 1e-6)
                     conn.execute(
                         """
-                        INSERT INTO edges (src_id, dst_id, kind, weight)
-                        VALUES (?, ?, 'skos:broader', ?)
-                        ON CONFLICT(src_id, dst_id, kind) DO UPDATE SET weight = excluded.weight
+                        INSERT INTO edges (src_id, dst_id, kind, weight, reasoning)
+                        VALUES (?, ?, 'skos:broader', ?, ?)
+                        ON CONFLICT(src_id, dst_id, kind) DO UPDATE SET
+                            weight = excluded.weight,
+                            reasoning = CASE
+                                WHEN excluded.reasoning != '' THEN excluded.reasoning
+                                ELSE edges.reasoning
+                            END
                         """,
-                        (ent1, ent2, broader_weight),
+                        (ent1, ent2, broader_weight, reasoning),
                     )
             else:
                 has_conflict = conn.execute(
@@ -1801,11 +1822,16 @@ def upsert_semantic_edges(
                     for s, d in ((ent1, ent2), (ent2, ent1)):
                         conn.execute(
                             """
-                            INSERT INTO edges (src_id, dst_id, kind, weight)
-                            VALUES (?, ?, 'skos:related', ?)
-                            ON CONFLICT(src_id, dst_id, kind) DO UPDATE SET weight = excluded.weight
+                            INSERT INTO edges (src_id, dst_id, kind, weight, reasoning)
+                            VALUES (?, ?, 'skos:related', ?, ?)
+                            ON CONFLICT(src_id, dst_id, kind) DO UPDATE SET
+                                weight = excluded.weight,
+                                reasoning = CASE
+                                    WHEN excluded.reasoning != '' THEN excluded.reasoning
+                                    ELSE edges.reasoning
+                                END
                             """,
-                            (s, d, rel_weight),
+                            (s, d, rel_weight, reasoning),
                         )
 
 

@@ -609,7 +609,7 @@ def test_canonical_gemma4_synonym_adjudication_and_fact_pole_self_loop_guard(
     assert rlm_stats["merged_entities"] == 0
     assert rlm_stats["different_from_edges"] == 0
     assert rlm_stats["related_edges"] == 2
-    assert semantic_batch == [
+    assert [row[:4] for row in semantic_batch] == [
         ("ent-ats", "ent-audit", "skos:related", 0.88),
         ("ent-sec-a", "ent-sec-b", "skos:related", 0.92),
     ]
@@ -938,7 +938,7 @@ def test_apply_synonym_adjudication_remaps_semantic_edges_after_later_merge() ->
             rlm_stats=rlm_stats,
         )
         assert staged_merges == [("ent-b", "ent-c", "skos:altLabel", None)]
-        assert resolved_batch == [("ent-a", "ent-c", "skos:related", 0.85)]
+        assert [row[:4] for row in resolved_batch] == [("ent-a", "ent-c", "skos:related", 0.85)]
         assert lint_graph_shacl(stage_conn) == []
     finally:
         stage_conn.close()
@@ -1008,7 +1008,7 @@ def test_apply_synonym_adjudication_prevents_transitive_collapse_across_separate
             ("ent-a", "ent-c", "skos:altLabel", None),
             ("ent-p1", "ent-alias", "skos:altLabel", None),
         ]
-        assert resolved_batch == [("ent-alias", "ent-p2", "skos:related", 0.82)]
+        assert [row[:4] for row in resolved_batch] == [("ent-alias", "ent-p2", "skos:related", 0.82)]
         surviving = {str(r[0]) for r in stage_conn.execute("SELECT entity_id FROM entities").fetchall()}
         assert surviving == {"ent-c", "ent-alias", "ent-p2"}
         assert lint_graph_shacl(stage_conn) == []

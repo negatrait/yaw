@@ -63,18 +63,20 @@ def test_apply_synonym_adjudication_directed_broader(tmp_path: Path) -> None:
 
         assert not staged_merges
         assert len(semantic_batch) == 1
-        s_act, o_act, r_kind, _ = semantic_batch[0]
+        s_act, o_act, r_kind, _, reasoning = semantic_batch[0]
         assert s_act == "e_pilot"
         assert o_act == "e_tenants"
         assert r_kind == "skos:broader"
+        assert reasoning == "pilot tenants is a narrower subtype of tenants"
         assert rlm_stats.get("broader_edges") == 1
 
         # Check in SQLite edges table
-        edge = conn.execute("SELECT src_id, dst_id, kind FROM edges WHERE kind = 'skos:broader'").fetchone()
+        edge = conn.execute("SELECT src_id, dst_id, kind, reasoning FROM edges WHERE kind = 'skos:broader'").fetchone()
         assert edge is not None
         assert edge[0] == "e_pilot"
         assert edge[1] == "e_tenants"
         assert edge[2] == "skos:broader"
+        assert edge[3] == "pilot tenants is a narrower subtype of tenants"
     finally:
         conn.close()
 
@@ -214,12 +216,16 @@ def test_apply_synonym_adjudication_related_and_different_from(tmp_path: Path) -
         assert rlm_stats.get("related_edges") == 1
         assert rlm_stats.get("different_from_edges") == 1
 
-        rel_edge = conn.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'skos:related'").fetchone()
+        rel_edge = conn.execute("SELECT src_id, dst_id, reasoning FROM edges WHERE kind = 'skos:related'").fetchone()
         assert rel_edge is not None
-        assert set(rel_edge) == {"e1", "e2"}
+        assert set(rel_edge[:2]) == {"e1", "e2"}
+        assert rel_edge[2] == "Domain association between price and consumption"
 
-        diff_edge = conn.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'owl:differentFrom'").fetchone()
+        diff_edge = conn.execute(
+            "SELECT src_id, dst_id, reasoning FROM edges WHERE kind = 'owl:differentFrom'"
+        ).fetchone()
         assert diff_edge is not None
-        assert set(diff_edge) == {"e3", "e4"}
+        assert set(diff_edge[:2]) == {"e3", "e4"}
+        assert diff_edge[2] == "Distinct organizational functions"
     finally:
         conn.close()
