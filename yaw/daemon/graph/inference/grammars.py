@@ -1,7 +1,7 @@
 """Pure-JSON Context-Free Grammars (GBNF) for DSPy."""
 
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import dspy
@@ -71,6 +71,14 @@ DSPY_QUERY_INTENT_GBNF_GRAMMAR = r"""root ::= "{\"query_intent\": " string "}"
 string ::= "\"" char+ "\""
 char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
 """
+
+DSPY_CONCEPT_SCHEME_DEFS_GBNF_GRAMMAR: str = (
+    'root ::= "{\\"entity_definitions\\": [" scheme-list "]}"\n'
+    'scheme-list ::= (scheme-tuple (", " scheme-tuple)*)?\n'
+    'scheme-tuple ::= "[" string ", " string ", " string ", " string "]"\n'
+    'string ::= "\\"" char+ "\\""\n'
+    'char ::= [^"\\\\\\x7F\\x00-\\x1F] | "\\\\" (["\\\\bfnrt] | "u" [0-9a-fA-F]{4})\n'
+)
 
 
 def gbnf_escape_literal(text: str) -> str:
@@ -179,6 +187,42 @@ def build_dspy_missing_entity_defs_grammar(
         f"entity-name ::= {name_rule}\n"
         'string ::= "\\"" char+ "\\""\n'
         'char ::= [^"\\\\\\x7F\\x00-\\x1F] | "\\\\" (["\\\\bfnrt] | "u" [0-9a-fA-F]{4})\n'
+    )
+
+
+def build_dspy_concept_scheme_defs_grammar(
+    scheme_ids: Sequence[str] | Sequence[Mapping[str, Any]] | None = None,
+) -> str:
+    """Build pure-JSON GBNF grammar for DefineMissingEntities synthesizing concept schemes \
+(`{"entity_definitions": [[scheme_id, pref_label, definition, history_note], ...]}`)."""
+    extracted_ids: list[str] = []
+    if scheme_ids:
+        for item in scheme_ids:
+            if isinstance(item, str):
+                sid = item.strip()
+            elif isinstance(item, Mapping):
+                sid = str(item.get("scheme_id") or item.get("id") or "").strip()
+            else:
+                sid = str(item).strip()
+            if sid and sid not in extracted_ids:
+                extracted_ids.append(sid)
+    if not extracted_ids:
+        return DSPY_CONCEPT_SCHEME_DEFS_GBNF_GRAMMAR
+
+    rules: list[str] = []
+    tuple_names: list[str] = []
+    for i, sid in enumerate(extracted_ids):
+        sid_literal = gbnf_escape_literal(json.dumps(sid, ensure_ascii=False))
+        rules.append(f'scheme-tuple-{i} ::= "[" {sid_literal} ", " string ", " string ", " string "]"')
+        tuple_names.append(f"scheme-tuple-{i}")
+
+    seq = ' ", " '.join(tuple_names)
+    root_line = f'root ::= "{{\\"entity_definitions\\": [" {seq} "]}}"\n'
+    return (
+        root_line
+        + "\n".join(rules)
+        + '\nstring ::= "\\"" char+ "\\""\n'
+        + 'char ::= [^"\\\\\\x7F\\x00-\\x1F] | "\\\\" (["\\\\bfnrt] | "u" [0-9a-fA-F]{4})\n'
     )
 
 
@@ -392,6 +436,7 @@ __all__ = [
     "DSPY_NER_GBNF_GRAMMAR",
     "DSPY_TRIPLES_GBNF_GRAMMAR",
     "DSPY_MISSING_ENTITY_DEFS_GBNF_GRAMMAR",
+    "DSPY_CONCEPT_SCHEME_DEFS_GBNF_GRAMMAR",
     "DSPY_SHACL_REPAIR_GBNF_GRAMMAR",
     "DSPY_RERANK_GBNF_GRAMMAR",
     "DSPY_QA_GBNF_GRAMMAR",
@@ -401,6 +446,7 @@ __all__ = [
     "build_dspy_ner_grammar",
     "build_dspy_triples_grammar",
     "build_dspy_missing_entity_defs_grammar",
+    "build_dspy_concept_scheme_defs_grammar",
     "build_dspy_hierarchy_judge_grammar",
     "build_dspy_label_judge_grammar",
     "build_dspy_related_judge_grammar",

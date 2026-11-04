@@ -1,7 +1,8 @@
 import logging
+import math
 import os
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
@@ -355,3 +356,137 @@ def create_dspy_rlm_pair(
         max_tokens=max_tokens,
     )
     return orchestrator_lm, sub_lm
+
+
+def extract_completion_logprob_confidence(
+    response_or_history_entry: Any,
+    span_text: str | None = None,
+) -> float | None:
+    """Extract length-normalized token logprob probability confidence in (0, 1].
+
+    If token logprobs are absent or span_text is not found, returns None (strict honest unknown).
+    """
+    if response_or_history_entry is None:
+        return None
+
+    # Unwrap DSPy history entry or wrapper structures
+    curr = response_or_history_entry
+    if isinstance(curr, Mapping):
+        if "response" in curr:
+            curr = curr["response"]
+        elif "choices" not in curr and "logprobs" not in curr:
+            # Check for possible nested response under outputs/raw
+            curr = curr.get("raw") or curr.get("output") or curr
+    elif hasattr(curr, "response"):
+        curr = curr.response
+
+    # Extract choice
+    if isinstance(curr, Mapping):
+        choices = curr.get("choices")
+        choice = choices[0] if isinstance(choices, Sequence) and choices else curr
+    elif hasattr(curr, "choices"):
+        choices = getattr(curr, "choices", None)
+        choice = choices[0] if isinstance(choices, Sequence) and choices else curr
+    else:
+        choice = curr
+
+    # Extract logprobs structure from choice or parent
+    logprobs_obj = None
+    if isinstance(choice, Mapping):
+        logprobs_obj = choice.get("logprobs")
+    elif hasattr(choice, "logprobs"):
+        logprobs_obj = getattr(choice, "logprobs", None)
+
+    if logprobs_obj is None and hasattr(curr, "logprobs"):
+        logprobs_obj = getattr(curr, "logprobs", None)
+
+    if logprobs_obj is None:
+        return None
+
+    # Parse tokens and logprobs into pairs (token_str, logprob_val)
+    token_pairs: list[tuple[str, float]] = []
+
+    # Format 1: Chat Completion logprobs with "content" list
+    content_list = None
+    if isinstance(logprobs_obj, Mapping):
+        content_list = logprobs_obj.get("content")
+    elif hasattr(logprobs_obj, "content"):
+        content_list = getattr(logprobs_obj, "content", None)
+
+    if isinstance(content_list, Sequence):
+        for item in content_list:
+            t = None
+            lp = None
+            if isinstance(item, Mapping):
+                t = item.get("token")
+                lp = item.get("logprob")
+            elif hasattr(item, "token") and hasattr(item, "logprob"):
+                t = item.token
+                lp = item.logprob
+            if isinstance(t, str) and isinstance(lp, (int, float)):
+                token_pairs.append((t, float(lp)))
+
+    # Format 2: Completion logprobs with "tokens" and "token_logprobs"
+    if not token_pairs:
+        tokens = None
+        tlps = None
+        if isinstance(logprobs_obj, Mapping):
+            tokens = logprobs_obj.get("tokens")
+            tlps = logprobs_obj.get("token_logprobs")
+        elif hasattr(logprobs_obj, "tokens") and hasattr(logprobs_obj, "token_logprobs"):
+            tokens = getattr(logprobs_obj, "tokens", None)
+            tlps = getattr(logprobs_obj, "token_logprobs", None)
+
+        if isinstance(tokens, Sequence) and isinstance(tlps, Sequence) and len(tokens) == len(tlps):
+            for t, lp in zip(tokens, tlps, strict=False):
+                if isinstance(t, str) and isinstance(lp, (int, float)):
+                    token_pairs.append((t, float(lp)))
+
+    # Format 3: Direct sequence of token logprob items
+    if not token_pairs and isinstance(logprobs_obj, Sequence):
+        for item in logprobs_obj:
+            t = None
+            lp = None
+            if isinstance(item, Mapping):
+                t = item.get("token")
+                lp = item.get("logprob")
+            elif hasattr(item, "token") and hasattr(item, "logprob"):
+                t = item.token
+                lp = item.logprob
+            if isinstance(t, str) and isinstance(lp, (int, float)):
+                token_pairs.append((t, float(lp)))
+
+    if not token_pairs:
+        return None
+
+    # Handle span matching if requested
+    if span_text is not None:
+        trimmed_span = span_text.strip()
+        if not trimmed_span:
+            return None
+        full_text = "".join(t for t, _ in token_pairs)
+        idx = full_text.find(trimmed_span)
+        if idx == -1:
+            idx = full_text.lower().find(trimmed_span.lower())
+        if idx == -1:
+            return None
+
+        span_start = idx
+        span_end = idx + len(trimmed_span)
+        matched_lps: list[float] = []
+        char_pos = 0
+        for tok, lp in token_pairs:
+            tok_start = char_pos
+            tok_end = char_pos + len(tok)
+            char_pos = tok_end
+            if max(tok_start, span_start) < min(tok_end, span_end):
+                matched_lps.append(lp)
+        if not matched_lps:
+            return None
+        target_lps = matched_lps
+    else:
+        target_lps = [lp for _, lp in token_pairs]
+
+    mean_lp = sum(target_lps) / len(target_lps)
+    prob = math.exp(mean_lp)
+    return float(min(1.0, max(1e-6, prob)))

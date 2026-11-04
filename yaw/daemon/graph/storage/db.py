@@ -57,7 +57,8 @@ _CREATE_SCHEMA_STATEMENTS: tuple[str, ...] = (
     CREATE TABLE IF NOT EXISTS entities (
         entity_id TEXT PRIMARY KEY,
         name TEXT NOT NULL COLLATE NOCASE,
-        definition TEXT NOT NULL DEFAULT ''
+        definition TEXT NOT NULL DEFAULT '',
+        confidence REAL
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name)",
@@ -75,6 +76,17 @@ _CREATE_SCHEMA_STATEMENTS: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_entity_labels_entity ON entity_labels(entity_id)",
     "CREATE INDEX IF NOT EXISTS idx_entity_labels_chunk ON entity_labels(chunk_id)",
     """
+    CREATE TABLE IF NOT EXISTS entity_chunks (
+        entity_id TEXT NOT NULL,
+        chunk_id TEXT NOT NULL,
+        llm_prob REAL,
+        vec_coherence REAL,
+        atomic_confidence REAL,
+        PRIMARY KEY (entity_id, chunk_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_entity_chunks_chunk ON entity_chunks(chunk_id)",
+    """
     CREATE TABLE IF NOT EXISTS facts (
         fact_id TEXT PRIMARY KEY,
         subj_id TEXT NOT NULL,
@@ -86,6 +98,7 @@ _CREATE_SCHEMA_STATEMENTS: tuple[str, ...] = (
         obj_lang TEXT NOT NULL DEFAULT '',
         raw_triple_json TEXT NOT NULL,
         definition TEXT NOT NULL DEFAULT '',
+        confidence REAL,
         CHECK (
             (obj_kind = 'entity' AND obj_id IS NOT NULL AND TRIM(obj_id) != '' AND obj_literal_lex IS NULL)
             OR (
@@ -104,6 +117,9 @@ _CREATE_SCHEMA_STATEMENTS: tuple[str, ...] = (
     CREATE TABLE IF NOT EXISTS fact_sources (
         fact_id TEXT NOT NULL,
         chunk_id TEXT NOT NULL,
+        llm_prob REAL,
+        vec_coherence REAL,
+        atomic_confidence REAL,
         PRIMARY KEY (fact_id, chunk_id)
     )
     """,
@@ -121,7 +137,9 @@ _CREATE_SCHEMA_STATEMENTS: tuple[str, ...] = (
     CREATE TABLE IF NOT EXISTS edges (
         src_id TEXT NOT NULL,
         dst_id TEXT NOT NULL,
-        kind TEXT NOT NULL CHECK (kind IN ('passage', 'fact', 'skos:related', 'skos:broader', 'owl:differentFrom')),
+        kind TEXT NOT NULL CHECK (
+            kind IN ('passage', 'fact', 'skos:related', 'skos:broader', 'owl:differentFrom', 'skos:topConceptOf')
+        ),
         weight REAL NOT NULL,
         reasoning TEXT NOT NULL DEFAULT '',
         PRIMARY KEY (src_id, dst_id, kind)
@@ -135,10 +153,32 @@ _CREATE_SCHEMA_STATEMENTS: tuple[str, ...] = (
         dst_id TEXT NOT NULL,
         kind TEXT NOT NULL,
         chunk_id TEXT NOT NULL,
+        llm_prob REAL,
+        vec_coherence REAL,
+        atomic_confidence REAL,
         PRIMARY KEY (src_id, dst_id, kind, chunk_id)
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_edge_sources_chunk ON edge_sources(chunk_id)",
+    """
+    CREATE TABLE IF NOT EXISTS concept_schemes (
+        scheme_id TEXT PRIMARY KEY,
+        pref_label TEXT NOT NULL,
+        definition TEXT NOT NULL,
+        history_note TEXT NOT NULL DEFAULT '',
+        confidence REAL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS concept_scheme_members (
+        scheme_id TEXT NOT NULL,
+        entity_id TEXT NOT NULL,
+        is_top_concept INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (scheme_id, entity_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_csm_entity ON concept_scheme_members(entity_id)",
+    "CREATE INDEX IF NOT EXISTS idx_csm_scheme ON concept_scheme_members(scheme_id)",
     """
     CREATE TABLE IF NOT EXISTS chunk_vec (
         chunk_id TEXT PRIMARY KEY,
@@ -277,6 +317,27 @@ def migrate_edges_reasoning(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE edges ADD COLUMN reasoning TEXT NOT NULL DEFAULT ''")
 
 
+def migrate_epistemic_confidence_columns(conn: sqlite3.Connection) -> None:
+    """Ensure epistemic confidence columns exist across tables for existing databases."""
+    entity_cols = {str(row[1]).lower() for row in conn.execute("PRAGMA table_info(entities)").fetchall()}
+    if "confidence" not in entity_cols and "entity_id" in entity_cols:
+        conn.execute("ALTER TABLE entities ADD COLUMN confidence REAL")
+
+    fact_cols = {str(row[1]).lower() for row in conn.execute("PRAGMA table_info(facts)").fetchall()}
+    if "confidence" not in fact_cols and "fact_id" in fact_cols:
+        conn.execute("ALTER TABLE facts ADD COLUMN confidence REAL")
+
+    fact_src_cols = {str(row[1]).lower() for row in conn.execute("PRAGMA table_info(fact_sources)").fetchall()}
+    for col in ("llm_prob", "vec_coherence", "atomic_confidence"):
+        if col not in fact_src_cols and "fact_id" in fact_src_cols:
+            conn.execute(f"ALTER TABLE fact_sources ADD COLUMN {col} REAL")
+
+    edge_src_cols = {str(row[1]).lower() for row in conn.execute("PRAGMA table_info(edge_sources)").fetchall()}
+    for col in ("llm_prob", "vec_coherence", "atomic_confidence"):
+        if col not in edge_src_cols and "src_id" in edge_src_cols:
+            conn.execute(f"ALTER TABLE edge_sources ADD COLUMN {col} REAL")
+
+
 def initialize_schema(conn: sqlite3.Connection) -> None:
     """Initialize all unified schema tables and indices in yaw.db with in-place migrations."""
     with write_tx(conn):
@@ -392,10 +453,13 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_facts_obj ON facts(obj_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_facts_pair ON facts(subj_id, obj_id)")
 
-        # Auto-migrate edges CHECK constraint and legacy 'synonymy' kind -> 'skos:related', plus 'skos:broader'
+        # Auto-migrate edges CHECK constraint and legacy 'synonymy' kind -> 'skos:related',
+        # plus 'skos:broader' & 'skos:topConceptOf'
         edges_ddl_row = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'edges'").fetchone()
         if edges_ddl_row is not None and (
-            "skos:related" not in str(edges_ddl_row[0]) or "skos:broader" not in str(edges_ddl_row[0])
+            "skos:related" not in str(edges_ddl_row[0])
+            or "skos:broader" not in str(edges_ddl_row[0])
+            or "skos:topConceptOf" not in str(edges_ddl_row[0])
         ):
             conn.execute(
                 """
@@ -403,23 +467,31 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
                     src_id TEXT NOT NULL,
                     dst_id TEXT NOT NULL,
                     kind TEXT NOT NULL CHECK (
-                        kind IN ('passage', 'fact', 'skos:related', 'skos:broader', 'owl:differentFrom')
+                        kind IN (
+                            'passage', 'fact', 'skos:related', 'skos:broader',
+                            'owl:differentFrom', 'skos:topConceptOf'
+                        )
                     ),
                     weight REAL NOT NULL,
+                    reasoning TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY (src_id, dst_id, kind)
                 )
                 """
             )
             conn.execute(
                 """
-                INSERT OR REPLACE INTO _edges_migrated (src_id, dst_id, kind, weight)
+                INSERT OR REPLACE INTO _edges_migrated (src_id, dst_id, kind, weight, reasoning)
                 SELECT
                     src_id,
                     dst_id,
                     CASE WHEN kind = 'synonymy' THEN 'skos:related' ELSE kind END,
-                    weight
+                    weight,
+                    COALESCE(reasoning, '')
                 FROM edges
-                WHERE kind IN ('passage', 'fact', 'synonymy', 'skos:related', 'skos:broader', 'owl:differentFrom')
+                WHERE kind IN (
+                    'passage', 'fact', 'synonymy', 'skos:related',
+                    'skos:broader', 'owl:differentFrom', 'skos:topConceptOf'
+                )
                 """
             )
             conn.execute("DROP TABLE edges")
@@ -427,8 +499,36 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_id, kind)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst_id, kind)")
 
+        # Ensure concept_schemes and concept_scheme_members exist
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS concept_schemes (
+                scheme_id TEXT PRIMARY KEY,
+                pref_label TEXT NOT NULL,
+                definition TEXT NOT NULL,
+                history_note TEXT NOT NULL DEFAULT '',
+                confidence REAL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS concept_scheme_members (
+                scheme_id TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                is_top_concept INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (scheme_id, entity_id)
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_csm_entity ON concept_scheme_members(entity_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_csm_scheme ON concept_scheme_members(scheme_id)")
+
         # Ensure reasoning column exists on edges table (idempotent migration)
         migrate_edges_reasoning(conn)
+
+        # Ensure epistemic confidence columns exist across tables
+        migrate_epistemic_confidence_columns(conn)
 
         # Auto-backfill fact_sources from edge_sources for legacy entity-object facts
         fact_sources_cnt = int(conn.execute("SELECT COUNT(*) FROM fact_sources").fetchone()[0])

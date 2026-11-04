@@ -12,9 +12,10 @@ from yaw.core.config import DEFAULT_CONTEXT_WINDOW_TOKENS, YawConfig, context_ch
 from yaw.core.types import OpenIERecord, StructuredTriple, SynonymEvidenceBatch
 
 from .adapter import YawGBNFAdapter, sum_usage_tokens
-from .chat import create_dspy_lm
+from .chat import create_dspy_lm, extract_completion_logprob_confidence
 from .diagnostics import DiagnosticHistory, diagnostic_boundary
 from .grammars import (
+    build_dspy_concept_scheme_defs_grammar,
     build_dspy_hierarchy_judge_grammar,
     build_dspy_label_judge_grammar,
     build_dspy_missing_entity_defs_grammar,
@@ -30,6 +31,7 @@ from .grammars import (
 from .invariants import validate_stage_invariants
 from .parsers import (
     coerce_generated_facts,
+    extract_concept_scheme_definitions,
     extract_entity_definitions,
     extract_structured_triples,
     match_facts_to_candidate_indices,
@@ -868,6 +870,110 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
                     "tokens_used": stage_tokens,
                     "missing_entities": list(deduped),
                     "definitions": [[k, v] for k, v in resolved],
+                }
+            )
+        return tuple(resolved)
+
+    def define_concept_schemes(
+        self,
+        scheme_packets: Sequence[Mapping[str, Any]],
+        *,
+        lm: Any = None,
+        use_gbnf: bool | None = None,
+        _record_audit: bool = True,
+    ) -> tuple[tuple[str, str, str, str, float | None], ...]:
+        """Synthesize canonical title, definition, and history note for emergent skos:ConceptScheme clusters."""
+        if not scheme_packets:
+            return ()
+
+        scheme_ids: list[str] = []
+        dossier_lines: list[str] = []
+        for p in scheme_packets:
+            sid = str(p.get("scheme_id") or p.get("id") or "").strip()
+            if not sid:
+                continue
+            scheme_ids.append(sid)
+            dossier_lines.append(f"Scheme ID: {sid}")
+            pref = str(p.get("pref_label") or p.get("label") or "").strip()
+            if pref:
+                dossier_lines.append(f"Candidate Title: {pref}")
+            members = [str(m).strip() for m in (p.get("members") or p.get("member_names") or []) if str(m).strip()]
+            if members:
+                dossier_lines.append(f"Member concepts: {', '.join(members[:30])}")
+            roots = [
+                str(r).strip() for r in (p.get("taxonomic_roots") or p.get("top_concepts") or []) if str(r).strip()
+            ]
+            if roots:
+                dossier_lines.append(f"Top concepts (taxonomic roots): {', '.join(roots[:15])}")
+            edges = p.get("edges") or p.get("facts") or []
+            if edges:
+                dossier_lines.append("Taxonomic relations: " + "; ".join(str(e) for e in edges[:20]))
+            dossier = str(p.get("dossier") or "").strip()
+            if dossier:
+                dossier_lines.append(dossier)
+            dossier_lines.append("")
+
+        if not scheme_ids:
+            return ()
+
+        passage = "\n".join(dossier_lines).strip()
+        prev_telem_len = len(self.telemetry)
+
+        pred = self._invoke_stage(
+            self.entity_definer,
+            stage_name="entity_definer",
+            is_rlm=False,
+            lm=lm,
+            use_gbnf=use_gbnf,
+            grammar_fn=lambda: build_dspy_concept_scheme_defs_grammar(scheme_ids),
+            passage=passage,
+            missing_entities=scheme_ids,
+            triples=[],
+        )
+
+        effective_lm = (
+            lm or getattr(self.entity_definer, "lm", None) or self.orchestrator_lm or getattr(dspy.settings, "lm", None)
+        )
+        llm_prob: float | None = None
+        if effective_lm is not None and getattr(effective_lm, "history", None) and effective_lm.history:
+            llm_prob = extract_completion_logprob_confidence(effective_lm.history[-1])
+
+        raw_defs = getattr(pred, "entity_definitions", [])
+        parsed = extract_concept_scheme_definitions(raw_defs)
+        parsed_by_id = {sid: (pref, dfn, note) for sid, pref, dfn, note in parsed}
+
+        resolved: list[tuple[str, str, str, str, float | None]] = []
+        for idx, p in enumerate(scheme_packets):
+            sid = str(p.get("scheme_id") or p.get("id") or "").strip()
+            if not sid:
+                continue
+            if sid in parsed_by_id:
+                pref, dfn, note = parsed_by_id[sid]
+            elif idx < len(parsed):
+                _, pref, dfn, note = parsed[idx]
+            else:
+                pref = str(p.get("pref_label") or p.get("label") or sid).strip()
+                dfn = str(
+                    p.get("definition") or f"Concept scheme synthesizing {len(p.get('members', []))} concepts."
+                ).strip()
+                note = str(
+                    p.get("history_note") or "Emergent taxonomy cluster induced by Newman modularity maximization."
+                ).strip()
+
+            resolved.append((sid, pref, dfn, note, llm_prob))
+
+        stage_tokens = int(self.telemetry[-1].get("tokens_used", 0)) if len(self.telemetry) > prev_telem_len else 0
+        if _record_audit:
+            self.entity_def_audit_trail.append(
+                {
+                    "mode": "direct",
+                    "predictor": "entity_definer",
+                    "signature": DefineMissingEntities.__name__,
+                    "scheme_count": len(scheme_ids),
+                    "tokens": stage_tokens,
+                    "tokens_used": stage_tokens,
+                    "scheme_ids": scheme_ids,
+                    "definitions": [[s[0], s[1], s[2], s[3]] for s in resolved],
                 }
             )
         return tuple(resolved)

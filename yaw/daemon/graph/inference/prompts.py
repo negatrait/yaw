@@ -243,12 +243,12 @@ and use `"owl:DatatypeProperty"` (`rdfs:range rdfs:Literal`) when `"obj"` is a d
 
 
 class DefineMissingEntities(dspy.Signature):
-    """Synthesize a closed-world W3C `skos:definition` in `entity_definitions` for every `skos:Concept` in \
-`missing_entities` to satisfy SHACL `ConceptShape/definition` (`sh:minCount 1`).
-    - Derive each concept's intensional genus-differentia `skos:definition` from its `rdf:subject` and \
-`rdf:object` participation in the reified `rdf:Statement` `triples` and `passage`.
-    - Emit `[entity_name, contextual_definition]` for every requested concept using the exact string from \
-`missing_entities`; never emit an empty definition or repeat `entity_name` tautologically."""
+    """Synthesize concise, grounded genus-differentia contextual definitions for entities referenced in \
+`missing_entities` based on the passage text and extracted triples, or for emergent `skos:ConceptScheme` taxonomies:
+    - For missing entities: Emit `[entity_name, contextual_definition]` for every requested concept using the exact \
+string from `missing_entities`; never emit an empty definition or repeat `entity_name` tautologically.
+    - For emergent `skos:ConceptScheme` taxonomies: Emit `[scheme_id, pref_label, definition, history_note]` \
+synthesizing the scheme's canonical title, intensional domain definition, and ontological rationale."""
 
     passage: str = dspy.InputField(desc="Source passage text")
     missing_entities: list[str] = dspy.InputField(
@@ -258,8 +258,11 @@ class DefineMissingEntities(dspy.Signature):
         desc="Extracted relation triples referencing the missing entities",
         default=[],
     )
-    entity_definitions: list[list[str]] = dspy.OutputField(
-        desc="List of [entity_name, contextual_definition] pairs for every concept in missing_entities"
+    entity_definitions: list[list[Any]] = dspy.OutputField(
+        desc=(
+            "List of [entity_name, contextual_definition] pairs, or "
+            "[scheme_id, pref_label, definition, history_note] tuples"
+        )
     )
 
 
@@ -283,7 +286,10 @@ concept.
 (`skos:altLabel`), emit `"equivalent": false, "alt_label": true` (do not emit `"hidden_label"`).
        - Otherwise emit `"equivalent": false, "alt_label": false, "hidden_label": true` for a misspelling/typo \
 (`skos:hiddenLabel`), or `"equivalent": false, "alt_label": false, "hidden_label": false` when `entity_a` and \
-`entity_b` are distinct concepts advancing to Stage 2 hierarchy evaluation."""
+`entity_b` are distinct concepts advancing to Stage 2 hierarchy evaluation.
+    Head-Noun Preservation Rule: Never merge a system/proper noun `X` with a distinct component, role, or artifact \
+modified by `X` (such as `X Router`, `X secrets`, `XTenant`, or `CRDs`). A phrase with an additional head noun or \
+modifier is NOT an alternative label (`alt_label: false, equivalent: false`)."""
 
     candidate_pairs: str = dspy.InputField(
         desc="JSON object (`synonym-evidence-v2`) with inline definitions, facts, and source excerpts."
@@ -301,7 +307,15 @@ concept.
 
 
 class JudgeHierarchy(dspy.Signature):
-    """Evaluate Stage 2 W3C SKOS hierarchy (`skos:broader` and `skos:narrower`) for distinct concept pairs."""
+    """Evaluate Stage 2 W3C SKOS hierarchy (`skos:broader` and `skos:narrower`) for distinct concept pairs:
+    - Subsumption Axioms (W3C SKOS S19-S27): `broader=True` (`A skos:broader B`) holds only if every `A` is \
+necessarily a subtype/kind of `B` (`skos:broaderG`: 'Every A is a kind of B'), an individual instance of class/role \
+`B` (`skos:broaderI`: e.g. individual person under role/title, never role under person), \
+or an architectural component/part of whole system `B` (`skos:broaderP`).
+    - Cross-Category Disjointness: Never assert `skos:broader` across incompatible ontological categories (such as an \
+infrastructure cluster under a metric/event, role/class under person, or comparative/temporal metric states like \
+'Improved X' under 'Original X'). Cross-category pairs must emit `broader=False, narrower=False` to advance to \
+Stage 3 (`skos:related`)."""
 
     candidate_pairs: str = dspy.InputField(
         desc="JSON object (`synonym-evidence-v2`) with inline definitions, facts, and source excerpts."

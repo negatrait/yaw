@@ -504,6 +504,106 @@ def test_second_runtime_fails_fast_on_lock(tmp_path: Path, provider) -> None:
         rt2.stop()
 
 
+def test_runtime_live_ingests_files_without_sync_requests(tmp_path: Path, provider) -> None:
+    cfg, _ = _make_test_config(tmp_path)
+    program, embedder, _, _ = _make_program_and_embedder(provider[0])
+    cfg.corpus_root.mkdir(parents=True, exist_ok=True)
+    runtime = YawRuntime(cfg, program=program, embedder=embedder, auto_poll=True)
+    runtime.start()
+
+    def wait_for_count(expected: int) -> None:
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            assert runtime.engine is not None
+            with runtime.engine.managed_conn.readonly() as conn:
+                count = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+            if count == expected and runtime.stats().chunks == expected:
+                return
+            assert runtime.status().last_error is None
+            time.sleep(0.05)
+        raise AssertionError(f"Live runtime did not publish {expected} chunks")
+
+    try:
+        source = cfg.corpus_root / "live.md"
+        source.write_text("Ada Lovelace worked on the Analytical Engine.", encoding="utf-8")
+        wait_for_count(1)
+        source.unlink()
+        wait_for_count(0)
+        compiled = tmp_path / "live_program.json"
+        program.save(str(compiled))
+        signal = tmp_path / ".yaw" / "reload.signal"
+        signal.write_text(json.dumps({"req_id": "live-reload", "program_path": str(compiled)}), encoding="utf-8")
+        result_path = signal.with_name("reload.result")
+        deadline = time.monotonic() + 30
+        while not result_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        assert result["reloaded"] is True, result
+        assert result["req_id"] == "live-reload"
+        source.write_text("Ada Lovelace worked on the Analytical Engine.", encoding="utf-8")
+        wait_for_count(1)
+    finally:
+        runtime.stop()
+    assert not any(thread.name == "yaw-cocoindex-live" for thread in threading.enumerate())
+
+
+def test_live_parser_failure_stops_runtime_and_releases_resources(tmp_path: Path, provider) -> None:
+    cfg, _ = _make_test_config(tmp_path)
+    cfg = replace(cfg, included_patterns=("*.json",))
+    program, embedder, _, _ = _make_program_and_embedder(provider[0])
+    runtime = YawRuntime(cfg, program=program, embedder=embedder, auto_poll=True)
+    runtime.start()
+    try:
+        (cfg.corpus_root / "broken.json").write_text('{"body":', encoding="utf-8")
+        assert runtime.wait(15), "Live parser failure did not signal runtime shutdown"
+        with pytest.raises((ValueError, YawRuntimeError)):
+            runtime.stop()
+        assert runtime.engine is None
+        assert runtime.status().lifecycle == "stopped"
+        assert not runtime._file_lock.is_locked
+    finally:
+        runtime.stop()
+
+
+def test_stop_keeps_database_open_until_active_worker_exits(tmp_path: Path, provider) -> None:
+    cfg, _ = _make_test_config(tmp_path)
+    program, embedder, _, _ = _make_program_and_embedder(provider[0])
+    runtime = YawRuntime(cfg, program=program, embedder=embedder)
+    runtime.start(sync_on_start=False)
+    entered = threading.Event()
+    release = threading.Event()
+    stopped = threading.Event()
+
+    def operation():
+        entered.set()
+        assert release.wait(15)
+        assert runtime.engine is not None
+        return runtime.engine.conn.execute("SELECT 1").fetchone()[0]
+
+    def stop_runtime():
+        try:
+            runtime.stop()
+        finally:
+            stopped.set()
+
+    future = runtime.submit("drain_test", operation)
+    assert entered.wait(5)
+    stopper = threading.Thread(target=stop_runtime)
+    stopper.start()
+    try:
+        assert not stopped.wait(5.5), "Shutdown closed resources while the worker was still active"
+        assert runtime.engine is not None
+        release.set()
+        assert future.result(timeout=5) == 1
+        assert stopped.wait(5)
+        assert runtime.engine is None
+        assert runtime.status().lifecycle == "stopped"
+    finally:
+        release.set()
+        stopper.join(timeout=10)
+        runtime.stop()
+
+
 def test_bounded_32_slot_queue_overflow_and_non_blocking_status(tmp_path: Path, provider) -> None:
     """D1-A5 & E2-A3: 32-slot bounded queue overflows with BUSY on the 33rd queued item while status() stays <50ms."""
     cfg, _ = _make_test_config(tmp_path, queue_maxsize=32)

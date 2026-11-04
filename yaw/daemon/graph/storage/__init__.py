@@ -17,6 +17,7 @@ _PUBLIC_API: dict[str, str] = {
     "open_readonly_yaw_db": ".db",
     "initialize_schema": ".db",
     "migrate_edges_reasoning": ".db",
+    "write_tx": ".db",
     "get_meta": ".db",
     "set_meta": ".db",
     # Vector serialization, bounded SQL cosine KNN & Contentless FTS5 lexical search
@@ -34,8 +35,6 @@ _PUBLIC_API: dict[str, str] = {
     # Chunk metadata, OpenIE checkpoints, SKOS/RDF/OWL graph CRUD & candidate mining
     "canonicalize_entity_labels_edc": ".graph_ops",
     "deserialize_openie_record": ".graph_ops",
-    "filter_valid_concept_entity_ids": ".graph_ops",
-    "get_pure_literal_entity_ids": ".graph_ops",
     "find_entity_synonym_candidates": ".graph_ops",
     "find_entity_disambiguation_candidates": ".graph_ops",
     "upsert_chunk_pointers": ".chunks",
@@ -59,8 +58,16 @@ _PUBLIC_API: dict[str, str] = {
     "get_entity_metadata_batch": ".graph_ops",
     "get_graph_counts": ".graph_ops",
     "load_graph_topology": ".graph_ops",
+    "upsert_concept_schemes": ".graph_ops",
+    "upsert_concept_scheme_members": ".graph_ops",
+    "pool_confidences": ".graph_ops",
+    "bayesian_noisy_or": ".graph_ops",
     "delete_chunks": ".graph_ops",
     # Closed-world SQL SHACL linter, repair execution & W3C Turtle serializer
+    "W3C_PREFIX_HEADER": ".shacl",
+    "auto_heal_deterministic_shacl": ".shacl",
+    "format_subgraph_turtle": ".shacl",
+    "query_graph_provenance": ".shacl",
     "inspect_focus_node": ".shacl",
     "format_entity_skos_markdown": ".shacl",
     "format_pair_disambiguation_dossier": ".shacl",

@@ -11,15 +11,16 @@ Avoid these failure modes at all costs - deviation from the prime directives onl
 
 - Surface uncertainty, ambiguity, inconsistencies, and trade-offs.
 - Ask for clarification when ambiguity could affect the result.
-- Push back on incorrect claims when supported by evidence.
+- Push back on incorrect user claims when supported by evidence.
 
 ### Over-Engineering
 
-- Write the smallest clear, idiomatic implementation that satisfies the contract.
+- Write the smallest clear, idiomatic implementation that satisfies the contract. Always remove dead code.
 - Avoid unnecessary abstractions, fallbacks, branching, configurability, compatibility layers, and dead code.
-- Prefer a single source of truth and explicit failures.
+- Prefer a single source of truth and explicit failures. Never create competing code paths.
 - Every extra layer of code just degrades performance, makes the code harder for you to read and understand.
 - Never duplicate logic, never hand roll a solution for something that can be handled with a robust well regarded dependency - your custom solutions will be brittle.
+- When refactoring or adding logic, prefer replacements over layering on top of existing code.
 
 ### Masked Failures
 
@@ -33,8 +34,9 @@ YAW is not feature complete. Failing hard is required, because fallbacks at this
 ### Unintended Side Effects
 
 - Change only what the task requires.
-- Never alter code or comments you do not understand.
-- Avoid unrelated refactoring and clean up artifacts introduced by your work.
+- Never alter code or comments you do not fully understand.
+- Avoid unrelated refactoring.
+- Remove all fallback and legacy code introduced by newly generated code.
 
 ### Missing Goal
 
@@ -47,12 +49,11 @@ Read [the foundational laws](FOUNDATIONAL.md) first.
 
 YAW is a native HippoRAG 2-style graph and storage engine using:
 
-- One SQLite database: `yaw.db`
-- `sqlite-vec`
+- One `sqlite-vec` database: `yaw.db` managed by declarative CocoIndex `>=1.1.0` ingestion daemon.
 - Contentless FTS5
-- Sparse CSR and Forward-Push PPR
 - 1-indexed source-line hydration
-- CocoIndex `>=1.0.0` ingestion
+- Closed world W3C ontology / taxonomy graph.
+- Sparse CSR and Forward-Push PPR
 - Native DSPy inference
 - FastMCP over HTTP
 
@@ -147,6 +148,7 @@ Compare native YAW against these consolidated targets:
 - Rotate logs through `yaw/core/logger.py` using a 500-line FIFO.
 - Make clean breaking changes and update every caller and consumer.
 - Never add compatibility shims or fallback layers that mask failures or reduce performance.
+- Commit using conventional commits whenever you finish work and pass all the quality gates.
 
 ## Environment and Dependencies
 
@@ -187,3 +189,8 @@ uv run ruff format
 uv run pytest
 git diff --check
 ```
+
+## Running the app
+
+- `uv run yaw dspy optimize --resume`: launch GEPA optimization
+- `uv run watchdog`: launch the DSPy optimization watchdog

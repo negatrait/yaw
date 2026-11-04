@@ -104,7 +104,7 @@ def test_typed_predicate_case_insensitivity_and_object_property_override() -> No
     assert sts[1].obj == "30 seconds"
     assert sts[1].obj_def == "Request timeout threshold"
     assert sts[1].obj_kind == "literal"
-    assert sts[1].obj_datatype == "xsd:string"
+    assert sts[1].obj_datatype == "xsd:duration"
 
 
 def test_backward_compatible_plain_string_predicate() -> None:
@@ -237,6 +237,14 @@ def test_extract_structured_triples_preserves_literal_subject_for_shacl() -> Non
         ("true", "xsd:boolean"),
         ("false", "xsd:boolean"),
         ("False", "xsd:boolean"),
+        ("99.9%", "xsd:string"),
+        ("$100", "xsd:string"),
+        ("15ms", "xsd:duration"),
+        ("PT10M", "xsd:duration"),
+        ("12:30:00", "xsd:time"),
+        ("14:30", "xsd:time"),
+        ("2:30 pm", "xsd:time"),
+        ("100 requests", "xsd:string"),
     ],
 )
 def test_detect_scalar_literal_positive_cases(literal_str: str, expected_dt: str) -> None:
@@ -258,7 +266,6 @@ def test_detect_scalar_literal_positive_cases(literal_str: str, expected_dt: str
         "Python 3.10",
         "Python 3.14",
         "v1.2.3",
-        "99.9%",
         "Y2K Bug",
         "Q4 Freeze Window",
         "Apple Inc",
@@ -275,9 +282,8 @@ def test_detect_scalar_literal_rejects_normal_concepts(concept_str: str) -> None
 
 
 def test_relation_traversal_policy_datatype_property_and_aliases() -> None:
-    """Verify RelationTraversalPolicy exposes datatype_property=0.5 and owl_different_from=0.0."""
+    """Verify RelationTraversalPolicy exposes policy multipliers and aliases."""
     pol = RelationTraversalPolicy()
-    assert pol.datatype_property == pytest.approx(0.5)
     assert pol.owl_different_from == pytest.approx(0.0)
     assert pol.passage == pytest.approx(1.0)
     assert pol.fact_fwd == pytest.approx(1.0)

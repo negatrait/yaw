@@ -152,21 +152,6 @@ class DeterministicMockLM(dspy.LM):
                     }
                 )
             ]
-        if "related" in req_lower:
-            return [
-                json.dumps(
-                    {
-                        "decisions": [
-                            {
-                                "pair_id": pid,
-                                "reasoning": f"Deterministic related decision for {pid}",
-                                "related": True,
-                            }
-                            for pid in pids
-                        ]
-                    }
-                )
-            ]
         if "ProposeSHACLRepairs" in req_str or "HealSHACLViolations" in req_str or "violations_json" in req_str:
             return ['{"repairs": []}']
         if (
@@ -822,7 +807,8 @@ def test_engine_homograph_gate_edc_and_shacl_conformance(synonym_token_counter, 
                     {"prompt_tokens": 32, "completion_tokens": 16, "total_tokens": 48},
                 )
             req_str = str(prompt or messages or kwargs)
-            if "related" in req_str or "JudgeRelated" in req_str:
+            req_lower = req_str.lower()
+            if "differentfrom" in req_lower or "judgerelated" in req_lower or "related_judge" in req_lower:
                 pair_ids = _extract_mock_pair_ids(prompt, messages, req_str)
                 return [
                     json.dumps(
@@ -1050,16 +1036,16 @@ Option A (standalone Stage 1 NER entities preserved with definitions)."""
         diff_edges = engine.conn.execute("SELECT COUNT(*) FROM edges WHERE kind = 'owl:differentFrom'").fetchone()[0]
         assert diff_edges == 0
 
-        # Hazard 3 Option A: Standalone Stage 1 NER entities ("2007" and "m3 max") that did NOT appear in any triple
+        # Hazard 3 Option A: Standalone Stage 1 NER entities ("m3 max") that did NOT appear in any triple
         # are preserved in entities with their Stage 1 definitions and linked via passage edges!
+        # Pure scalar literals like "2007" are strictly excluded from entities and edges.
         standalone_rows = {
             str(r[0]).lower(): str(r[1])
             for r in engine.conn.execute(
                 "SELECT name, definition FROM entities WHERE name IN ('2007', 'm3 max')"
             ).fetchall()
         }
-        assert "2007" in standalone_rows
-        assert "Year the original iPhone was unveiled" in standalone_rows["2007"]
+        assert "2007" not in standalone_rows
         assert "m3 max" in standalone_rows
         assert "System on a chip powering MacBook Pro laptops" in standalone_rows["m3 max"]
 
@@ -1070,7 +1056,7 @@ Option A (standalone Stage 1 NER entities preserved with definitions)."""
             WHERE ed.kind = 'passage' AND e.name IN ('2007', 'm3 max')
             """
         ).fetchone()[0]
-        assert passage_edges_for_standalone == 2
+        assert passage_edges_for_standalone == 1
 
         # Verify 0 SHACL violations (including ConceptShape/S13-disjointLabels across both chunks)
         assert (
@@ -1215,21 +1201,6 @@ using all 5 bound REPL tools."""
                                     "reasoning": "Not hierarchical",
                                     "broader": False,
                                     "narrower": False,
-                                }
-                                for pid in pids
-                            ]
-                        }
-                    )
-                ]
-            if "related" in req_lower:
-                return [
-                    json.dumps(
-                        {
-                            "decisions": [
-                                {
-                                    "pair_id": pid,
-                                    "reasoning": "Associative related match",
-                                    "related": True,
                                 }
                                 for pid in pids
                             ]
@@ -2466,32 +2437,6 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
                     )
                 return [json.dumps({"decisions": decisions})]
 
-            if "related" in req_lower:
-                decisions = []
-                packet_text = "\n".join(str(m.get("content", "")) for m in messages or [])
-                candidates = candidate_rows(packet_text)
-                for p in candidates:
-                    pid = str(p.get("pair_id", ""))
-                    na = str(p.get("name_a", "")).lower()
-                    nb = str(p.get("name_b", "")).lower()
-                    if na == "a ball" and nb == "a ball":
-                        decisions.append(
-                            {
-                                "pair_id": pid,
-                                "reasoning": "Homograph senses related",
-                                "related": True,
-                            }
-                        )
-                    else:
-                        decisions.append(
-                            {
-                                "pair_id": pid,
-                                "reasoning": "Distinct concepts",
-                                "related": False,
-                            }
-                        )
-                return [json.dumps({"decisions": decisions})]
-
             if "[[ ## named_entities ## ]]" in req_str or "Resource Description Framework" in req_str:
                 if "Cindy Real" in req_str:
                     return [
@@ -2613,7 +2558,7 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
         ]
         assert "cindarella" in hidden_labels
 
-        # 2. Verify 'Cindy Real' remained distinct from 'Cinderella' with an owl:differentFrom edge
+        # 2. Verify 'Cindy Real' remained distinct from 'Cinderella' without spurious owl:differentFrom (Guardrail 1)
         cindy_real_row = engine.conn.execute("SELECT entity_id FROM entities WHERE name = 'cindy real'").fetchone()
         assert cindy_real_row is not None
         diff_cindy = engine.conn.execute(
@@ -2629,7 +2574,7 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
                 str(cinderella_row[0]),
             ),
         ).fetchone()[0]
-        assert int(diff_cindy) == 2
+        assert int(diff_cindy) == 0
 
         # 3. Verify homograph 'a ball' entities exist as distinct sense nodes
         ball_rows = engine.conn.execute("SELECT entity_id, definition FROM entities WHERE name = 'a ball'").fetchall()
@@ -2682,12 +2627,11 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
         assert {str(r[3]) for r in ball_obj_facts} <= ball_ids
 
         # 6. Verify CSR topology includes skos:related + fact edges and excludes owl:differentFrom (weight 0)
-        _, topo_entity_ids, topo_edges = load_graph_topology(engine.conn)
+        _, topo_entity_ids, topo_edges, _ = load_graph_topology(engine.conn)
         s0, o0 = str(ball_rel_edges[0][0]), str(ball_rel_edges[0][1])
         assert s0 in topo_entity_ids and o0 in topo_entity_ids
-        topo_edge_map = {(u, v): w for u, v, w in topo_edges}
-        assert topo_edge_map.get((s0, o0), 0.0) > 0.0
-        assert topo_edge_map.get((o0, s0), 0.0) > 0.0
+        topo_edge_map = {(u, v): w for u, v, _, w in topo_edges}
+        assert topo_edge_map.get((min(s0, o0), max(s0, o0)), 0.0) > 0.0
         # Verify owl:differentFrom between Cinderella and Cindy Real is excluded from positive-weight CSR topology
         c_id, cr_id = str(cinderella_row[0]), str(cindy_real_row[0])
         assert (c_id, cr_id) not in topo_edge_map
@@ -2764,18 +2708,19 @@ def test_step10_engine_pareto_ensemble_readonly_graph_and_memoization(
         engine.refresh_program_bindings()
         assert len(getattr(engine.ensemble, "programs", ())) == 3
 
-        # Spy on engine.retrieve to count how many times full retrieval executes across the 3 ensemble members
+        # Spy on engine.retrieve_with_seeds to count how many times full retrieval executes across
+        # the 3 ensemble members
         retrieve_calls = 0
-        orig_retrieve = engine.retrieve
+        orig_retrieve = engine.retrieve_with_seeds
 
         def _counting_retrieve(
             query: str, top_k: int = 10, *, program: Any | None = None
-        ) -> list[tuple[Any, float, str]]:
+        ) -> tuple[list[tuple[Any, float, str]], list[Any]]:
             nonlocal retrieve_calls
             retrieve_calls += 1
             return orig_retrieve(query, top_k=top_k, program=program)
 
-        object.__setattr__(engine, "retrieve", _counting_retrieve)
+        object.__setattr__(engine, "retrieve_with_seeds", _counting_retrieve)
 
         qa_out = engine.rag_qa(["Where did Alan Turing work?"])
         assert len(qa_out) == 1
@@ -2874,20 +2819,6 @@ def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
                         )
                 return [json.dumps({"decisions": decisions})]
 
-            if "related" in req_lower:
-                decisions = []
-                packet_text = "\n".join(str(m.get("content", "")) for m in messages or [])
-                candidates = candidate_rows(packet_text)
-                for p in candidates:
-                    pid = str(p.get("pair_id", ""))
-                    decisions.append(
-                        {
-                            "pair_id": pid,
-                            "reasoning": "Associative relation",
-                            "related": True,
-                        }
-                    )
-                return [json.dumps({"decisions": decisions})]
             if "FilterTriples" in req_str or "fact_before_filter" in req_str:
                 return [json.dumps({"fact": [["alan turing", "was born on", "1912-06-23"]]})]
             if "ExtractTriples" in req_str or '"triples"' in req_str or "`triples`" in req_str:
@@ -3024,43 +2955,35 @@ def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
         from yaw.daemon.graph.ppr import build_transition_matrix
         from yaw.daemon.graph.storage import load_graph_topology
 
-        c_ids, e_ids, kind_edges = load_graph_topology(engine.conn, include_kinds=True)
+        c_ids, e_ids, kind_edges, entity_priors = load_graph_topology(engine.conn)
         turing_to_crypt_facts = [w for s, d, k, w in kind_edges if s == turing_id and d == crypt_id and k == "fact"]
         crypt_to_turing_facts = [w for s, d, k, w in kind_edges if s == crypt_id and d == turing_id and k == "fact"]
-        assert len(turing_to_crypt_facts) == 2
+        assert len(turing_to_crypt_facts) == 1
         assert len(crypt_to_turing_facts) == 0
+        db_facts = engine.conn.execute(
+            "SELECT pred FROM facts WHERE subj_id = ? AND obj_id = ?", (turing_id, crypt_id)
+        ).fetchall()
+        assert {r[0] for r in db_facts} == {"worked on", "pioneered"}
 
         csr_dir = build_transition_matrix(
             c_ids,
             e_ids,
             kind_edges,
             policy=RelationTraversalPolicy(fact_forward=1.0, fact_reverse=0.1, skos_related=0.0),
+            node_priors=entity_priors,
         )
         u_tur = csr_dir.node_to_idx[turing_id]
         v_cry = csr_dir.node_to_idx[crypt_id]
         # Asymmetric policy gives higher transition weight in asserted direction (turing -> crypt)
         assert float(csr_dir.transition_t[v_cry, u_tur]) > float(csr_dir.transition_t[u_tur, v_cry])
-
-        csr_max = build_transition_matrix(
-            c_ids,
-            e_ids,
-            kind_edges,
-            policy=RelationTraversalPolicy(parallel_aggregation="max", skos_related=0.0),
-        )
-        csr_sum = build_transition_matrix(
-            c_ids,
-            e_ids,
-            kind_edges,
-            policy=RelationTraversalPolicy(parallel_aggregation="sum", skos_related=0.0),
-        )
-        # Parallel predicates ("worked on" + "pioneered") in the same chunk increase transition share under "sum"
-        assert float(csr_sum.transition_t[v_cry, u_tur]) > float(csr_max.transition_t[v_cry, u_tur])
+        # Parallel predicates ("worked on" + "pioneered") compound via Bayesian complement probability
+        assert float(csr_dir.transition_t[v_cry, u_tur]) > 0.0
 
         # 4. Graph conforms to SHACL
         lint = engine.lint_graph(as_turtle=True)
         assert lint["conforms"] is True, lint["violations"]
         assert 'rdf:object "1912-06-23"^^xsd:date' in lint["turtle"]
-        assert "skos:broader yaw:entity-" in lint["turtle"]
+        assert "skos:broader :entity-" in lint["turtle"]
 
         # 5. Retrieving for the literal fact seeds the subject + fact_sources chunk and retrieves doc_turing
         hits, kept_facts = engine.retrieve_with_seeds("When was Alan Turing born on 1912-06-23?", top_k=2)

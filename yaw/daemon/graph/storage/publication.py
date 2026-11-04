@@ -16,6 +16,8 @@ from yaw.core import ChunkPointer
 from .chunks import upsert_chunk_pointers
 from .graph_ops import (
     delete_chunks,
+    upsert_concept_scheme_members,
+    upsert_concept_schemes,
     upsert_edges_with_sources,
     upsert_entities,
     upsert_entity_labels,
@@ -32,14 +34,16 @@ type VectorRow = tuple[str, np.ndarray]
 @dataclass(frozen=True, slots=True)
 class PreparedGraphRows:
     chunks: tuple[tuple[ChunkPointer, str], ...]
-    entities: tuple[tuple[str, str, str], ...]
+    entities: tuple[tuple[str, str, str], ...] | tuple[tuple[str, str, str, float | None], ...]
     entity_labels: tuple[tuple[str, str, str, str, str], ...]
     facts: tuple[FactRow, ...]
-    fact_sources: tuple[tuple[str, str], ...]
+    fact_sources: tuple[tuple[str, str], ...] | tuple[tuple[str, str, float | None, float | None, float | None], ...]
     edges: tuple[tuple[str, str, str, float, str], ...]
     chunk_vectors: tuple[VectorRow, ...]
     entity_vectors: tuple[VectorRow, ...]
     fact_vectors: tuple[VectorRow, ...]
+    concept_schemes: tuple[tuple[str, str, str, str, float | None], ...] = ()
+    concept_scheme_members: tuple[tuple[str, str, int], ...] = ()
 
 
 def apply_prepared_graph_rows(conn: sqlite3.Connection, rows: PreparedGraphRows) -> None:
@@ -55,6 +59,10 @@ def apply_prepared_graph_rows(conn: sqlite3.Connection, rows: PreparedGraphRows)
     upsert_entity_vectors(conn, rows.entity_vectors)
     upsert_fact_vectors(conn, rows.fact_vectors)
     upsert_edges_with_sources(conn, rows.edges)
+    if rows.concept_schemes:
+        upsert_concept_schemes(conn, rows.concept_schemes)
+    if rows.concept_scheme_members:
+        upsert_concept_scheme_members(conn, rows.concept_scheme_members)
 
 
 GRAPH_DB = coco.ContextKey[ManagedConnection]("yaw/graph_db")
@@ -82,7 +90,8 @@ def contribution_fingerprints(rows: PreparedGraphRows) -> tuple[tuple[str, bytes
         chunk_id = label[4]
         if chunk_id in contributions:
             contributions[chunk_id].append(("label", label, entities.get(label[1]), entity_vectors.get(label[1])))
-    for fact_id, chunk_id in rows.fact_sources:
+    for fact_source_row in rows.fact_sources:
+        fact_id, chunk_id = str(fact_source_row[0]), str(fact_source_row[1])
         if chunk_id in contributions:
             contributions[chunk_id].append(("fact", facts[fact_id], fact_vectors.get(fact_id)))
     for edge in rows.edges:

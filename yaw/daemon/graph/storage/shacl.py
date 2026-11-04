@@ -1,6 +1,7 @@
 """Closed-world SQL SHACL linter, repair execution, focus-node inspection, and W3C Turtle serializer."""
 
 import json
+import math
 import sqlite3
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -8,6 +9,7 @@ from typing import Any
 
 from yaw.core import (
     SHACLViolation,
+    compute_mdhash_id,
     detect_scalar_literal,
     text_processing,
 )
@@ -16,8 +18,8 @@ from .chunks import get_chunk_pointers
 from .db import write_tx
 from .graph_ops import (
     get_existing_ids,
-    get_pure_literal_entity_ids,
     merge_entities,
+    pool_confidences,
     upsert_entity_labels,
     upsert_semantic_edges,
 )
@@ -25,6 +27,16 @@ from .hydration import (
     hydrate_ast_parent_context,
     hydrate_chunk_pointer,
     resolve_one_hop_upward_ast_bounds,
+)
+
+W3C_PREFIX_HEADER: str = (
+    "@prefix : <urn:graph:> .\n"
+    "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n"
+    "@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n"
+    "@prefix owl: <http://www.w3.org/2002/07/owl#> .\n"
+    "@prefix skos: <http://www.w3.org/2004/02/skos/core#> .\n"
+    "@prefix prov: <http://www.w3.org/ns/prov#> .\n"
+    "@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n"
 )
 
 
@@ -244,16 +256,6 @@ def format_entity_skos_markdown(
     alt_labels = sorted({f'"{it["raw_label"]}"' for it in labels if it["label_kind"] == "skos:altLabel"})
     hidden_labels = sorted({f'"{it["raw_label"]}"' for it in labels if it["label_kind"] == "skos:hiddenLabel"})
 
-    is_subj_or_ent_obj = any(
-        f["subj_id"] == eid or (f["obj_id"] == eid and f.get("obj_kind", "entity") == "entity") for f in facts
-    )
-    lit_facts_as_obj = [f for f in facts if f["obj_id"] == eid and f.get("obj_kind") == "literal"]
-    is_literal_node = bool(lit_facts_as_obj and not is_subj_or_ent_obj)
-    lit_datatypes = sorted(
-        {str(f.get("obj_datatype") or "rdfs:Literal") for f in lit_facts_as_obj if f.get("obj_datatype")}
-    )
-    lit_langs = sorted({str(f.get("obj_lang")) for f in lit_facts_as_obj if f.get("obj_lang")})
-
     broader_targets: list[str] = []
     narrower_sources: list[str] = []
     related_neighbors: list[str] = []
@@ -284,12 +286,7 @@ def format_entity_skos_markdown(
     lines: list[str] = [f"{heading_prefix}: `{ename}` (`{eid}`)"]
     lines.append("### SKOS / RDF / OWL Profile")
     lines.append("```turtle")
-    if is_literal_node:
-        dt_str = ", ".join(lit_datatypes) if lit_datatypes else "rdfs:Literal"
-        lang_str = f" @{','.join(lit_langs)}" if lit_langs else ""
-        lines.append(f"a rdfs:Literal ; # datatype: {dt_str}{lang_str}")
-    else:
-        lines.append("a skos:Concept ;")
+    lines.append("a skos:Concept ;")
     if pref_labels:
         lines.append(f"skos:prefLabel {', '.join(pref_labels[:4])} ;")
     else:
@@ -633,7 +630,6 @@ def _scan_shacl_violations(conn: sqlite3.Connection) -> list[SHACLViolation]:
 
     # 4. ConceptShape/homographDifferentFrom: Distinct concepts sharing a skos:prefLabel norm must either have
     # distinct definitions with an adjudicated semantic relation, or be merged if their definitions are identical.
-    pure_literal_ids = get_pure_literal_entity_ids(conn)
     for row in conn.execute(
         """
         SELECT a.entity_id, b.entity_id, a.label_norm,
@@ -677,8 +673,6 @@ def _scan_shacl_violations(conn: sqlite3.Connection) -> list[SHACLViolation]:
             str(row[4]),
             bool(row[5]),
         )
-        if ea in pure_literal_ids or eb in pure_literal_ids:
-            continue
         if def_a and def_a == def_b and has_diff:
             msg = (
                 f"Duplicate concepts {ea} and {eb} share prefLabel {lnorm!r} and identical definition "
@@ -1032,6 +1026,43 @@ def _scan_shacl_violations(conn: sqlite3.Connection) -> list[SHACLViolation]:
             )
         )
 
+    # 10. ProvenanceConfidenceShape: Epistemic confidence in entities, facts, and sources must be in (0.0, 1.0]
+    for row in conn.execute("SELECT entity_id, confidence FROM entities WHERE confidence IS NOT NULL"):
+        eid, conf = str(row[0]), float(row[1])
+        if conf <= 0.0 or conf > 1.0 or math.isnan(conf):
+            violations.append(
+                SHACLViolation(
+                    shape="ProvenanceConfidenceShape",
+                    focus_node=eid,
+                    result_path="prov:value",
+                    message=f"Entity {eid} confidence {conf} out of valid bounds (0.0, 1.0].",
+                )
+            )
+    for row in conn.execute("SELECT fact_id, confidence FROM facts WHERE confidence IS NOT NULL"):
+        fid, conf = str(row[0]), float(row[1])
+        if conf <= 0.0 or conf > 1.0 or math.isnan(conf):
+            violations.append(
+                SHACLViolation(
+                    shape="ProvenanceConfidenceShape",
+                    focus_node=fid,
+                    result_path="prov:value",
+                    message=f"Fact {fid} confidence {conf} out of valid bounds (0.0, 1.0].",
+                )
+            )
+    for row in conn.execute(
+        "SELECT fact_id, chunk_id, atomic_confidence FROM fact_sources WHERE atomic_confidence IS NOT NULL"
+    ):
+        fid, cid, conf = str(row[0]), str(row[1]), float(row[2])
+        if conf <= 0.0 or conf > 1.0 or math.isnan(conf):
+            violations.append(
+                SHACLViolation(
+                    shape="ProvenanceConfidenceShape",
+                    focus_node=f"{fid}@{cid}",
+                    result_path="prov:value",
+                    message=f"Fact source {fid}@{cid} atomic_confidence {conf} out of valid bounds (0.0, 1.0].",
+                )
+            )
+
     return violations
 
 
@@ -1284,10 +1315,15 @@ def apply_shacl_repairs(
             elif action == "invert_broader":
                 if "->" in focus:
                     s, d = (x.strip() for x in focus.split("->", 1))
+                    w_row = conn.execute(
+                        "SELECT weight FROM edges WHERE kind = 'skos:broader' AND src_id = ? AND dst_id = ?",
+                        (s, d),
+                    ).fetchone()
+                    w = float(w_row[0]) if w_row is not None and w_row[0] is not None else 0.8
                     conn.execute("DELETE FROM edges WHERE kind = 'skos:broader' AND src_id = ? AND dst_id = ?", (s, d))
                     conn.execute(
-                        "INSERT OR IGNORE INTO edges (src_id, dst_id, kind, weight) VALUES (?, ?, 'skos:broader', 0.5)",
-                        (d, s),
+                        "INSERT OR IGNORE INTO edges (src_id, dst_id, kind, weight) VALUES (?, ?, 'skos:broader', ?)",
+                        (d, s, w),
                     )
                     conn.execute(
                         """
@@ -1301,6 +1337,15 @@ def apply_shacl_repairs(
             elif action == "demote_sibling_to_related":
                 if "->" in focus:
                     s, d = (x.strip() for x in focus.split("->", 1))
+                    w_row = conn.execute(
+                        """
+                        SELECT weight FROM edges
+                        WHERE kind = 'skos:broader'
+                          AND ((src_id = ? AND dst_id = ?) OR (src_id = ? AND dst_id = ?))
+                        """,
+                        (s, d, d, s),
+                    ).fetchone()
+                    w = float(w_row[0]) if w_row is not None and w_row[0] is not None else 0.8
                     conn.execute(
                         """
                         DELETE FROM edges
@@ -1309,7 +1354,7 @@ def apply_shacl_repairs(
                         """,
                         (s, d, d, s),
                     )
-                    upsert_semantic_edges(conn, [(s, d, "skos:related", 0.5)])
+                    upsert_semantic_edges(conn, [(s, d, "skos:related", w)])
                     conn.execute(
                         """
                         UPDATE OR IGNORE edge_sources
@@ -1322,147 +1367,42 @@ def apply_shacl_repairs(
                     applied += 1
             elif action == "remove_scalar_entity":
                 ent_row = conn.execute(
-                    """
-                    SELECT
-                        e.name,
-                        EXISTS (SELECT 1 FROM facts f WHERE f.subj_id = e.entity_id) AS is_subj,
-                        EXISTS (
-                            SELECT 1 FROM facts f
-                            WHERE f.obj_id = e.entity_id AND COALESCE(f.obj_kind, 'entity') = 'entity'
-                        ) AS is_ent_obj,
-                        EXISTS (
-                            SELECT 1 FROM facts f
-                            WHERE f.obj_id = e.entity_id AND f.obj_kind = 'literal'
-                        ) AS has_lit_fact,
-                        EXISTS (
-                            SELECT 1 FROM edges ed
-                            WHERE (ed.src_id = e.entity_id OR ed.dst_id = e.entity_id)
-                              AND ed.kind = 'passage'
-                        ) AS has_passage_edge
-                    FROM entities e
-                    WHERE e.entity_id = ?
-                    """,
+                    "SELECT name FROM entities WHERE entity_id = ?",
                     (focus,),
                 ).fetchone()
                 if ent_row is not None:
                     ename = str(ent_row[0])
-                    is_subj, is_ent_obj, has_lit_fact, has_passage_edge = (
-                        bool(ent_row[1]),
-                        bool(ent_row[2]),
-                        bool(ent_row[3]),
-                        bool(ent_row[4]),
+                    conn.execute(
+                        """
+                        UPDATE facts
+                        SET obj_kind = 'literal',
+                            obj_id = NULL,
+                            obj_literal_lex = ?,
+                            obj_datatype = ?,
+                            obj_lang = ''
+                        WHERE obj_id = ?
+                        """,
+                        (
+                            ename,
+                            detect_scalar_literal(ename)[1],
+                            focus,
+                        ),
                     )
-                    if has_lit_fact and not is_subj and not is_ent_obj:
-                        conn.execute(
-                            "DELETE FROM edges WHERE (src_id = ? OR dst_id = ?) "
-                            "AND kind IN ('skos:broader', 'skos:related')",
-                            (focus, focus),
-                        )
-                        conn.execute(
-                            "DELETE FROM edge_sources WHERE (src_id = ? OR dst_id = ?) "
-                            "AND kind IN ('skos:broader', 'skos:related')",
-                            (focus, focus),
-                        )
-                    else:
-                        conn.execute(
-                            """
-                            UPDATE facts
-                            SET obj_kind = 'literal',
-                                obj_id = CASE WHEN ? AND subj_id != ? THEN ? ELSE NULL END,
-                                obj_literal_lex = ?,
-                                obj_datatype = ?,
-                                obj_lang = ''
-                            WHERE obj_id = ? AND COALESCE(obj_kind, 'entity') = 'entity'
-                            """,
-                            (
-                                1 if has_passage_edge else 0,
-                                focus,
-                                focus,
-                                ename,
-                                detect_scalar_literal(ename)[1],
-                                focus,
-                            ),
-                        )
-                        affected_fids = [
-                            str(r[0])
-                            for r in conn.execute("SELECT fact_id FROM facts WHERE subj_id = ?", (focus,)).fetchall()
-                        ]
-                        for fid in affected_fids:
-                            conn.execute("DELETE FROM fact_sources WHERE fact_id = ?", (fid,))
-                            conn.execute("DELETE FROM fact_vec WHERE fact_id = ?", (fid,))
-                            conn.execute("DELETE FROM fact_fts WHERE fact_id = ?", (fid,))
-                            conn.execute("DELETE FROM facts WHERE fact_id = ?", (fid,))
-                        conn.execute(
-                            "DELETE FROM edges WHERE (src_id = ? OR dst_id = ?) "
-                            "AND kind IN ('skos:broader', 'skos:related')",
-                            (focus, focus),
-                        )
-                        conn.execute(
-                            "DELETE FROM edge_sources WHERE (src_id = ? OR dst_id = ?) "
-                            "AND kind IN ('skos:broader', 'skos:related')",
-                            (focus, focus),
-                        )
-                        conn.execute(
-                            """
-                            DELETE FROM edges
-                            WHERE kind = 'fact'
-                              AND (src_id = ? OR dst_id = ?)
-                              AND NOT EXISTS (
-                                  SELECT 1 FROM facts f
-                                  WHERE f.subj_id = edges.src_id AND f.obj_id = edges.dst_id
-                              )
-                            """,
-                            (focus, focus),
-                        )
-                        conn.execute(
-                            """
-                            DELETE FROM edge_sources
-                            WHERE kind = 'fact'
-                              AND (src_id = ? OR dst_id = ?)
-                              AND NOT EXISTS (
-                                  SELECT 1 FROM facts f
-                                  WHERE f.subj_id = edge_sources.src_id AND f.obj_id = edge_sources.dst_id
-                              )
-                            """,
-                            (focus, focus),
-                        )
-                        conn.execute(
-                            """
-                            UPDATE edges
-                            SET weight = 0.5 * COALESCE(
-                                (
-                                    SELECT CASE WHEN COUNT(*) > 0 THEN COUNT(*) ELSE 1 END
-                                    FROM edge_sources es
-                                    WHERE es.src_id = edges.src_id
-                                      AND es.dst_id = edges.dst_id
-                                      AND es.kind = 'fact'
-                                ),
-                                1
-                            )
-                            WHERE kind = 'fact'
-                              AND dst_id = ?
-                              AND NOT EXISTS (
-                                  SELECT 1 FROM facts f
-                                  WHERE f.subj_id = edges.src_id
-                                    AND f.obj_id = edges.dst_id
-                                    AND COALESCE(f.obj_kind, 'entity') = 'entity'
-                              )
-                            """,
-                            (focus,),
-                        )
-                        rem_lit_fact = (
-                            conn.execute(
-                                "SELECT 1 FROM facts WHERE obj_id = ? AND obj_kind = 'literal' LIMIT 1",
-                                (focus,),
-                            ).fetchone()
-                            is not None
-                        )
-                        if not rem_lit_fact and not has_passage_edge:
-                            conn.execute("DELETE FROM edges WHERE src_id = ? OR dst_id = ?", (focus, focus))
-                            conn.execute("DELETE FROM edge_sources WHERE src_id = ? OR dst_id = ?", (focus, focus))
-                            conn.execute("DELETE FROM entity_labels WHERE entity_id = ?", (focus,))
-                            conn.execute("DELETE FROM entity_vec WHERE entity_id = ?", (focus,))
-                            conn.execute("DELETE FROM entities WHERE entity_id = ?", (focus,))
+                    affected_fids = [
+                        str(r[0])
+                        for r in conn.execute("SELECT fact_id FROM facts WHERE subj_id = ?", (focus,)).fetchall()
+                    ]
+                    for fid in affected_fids:
+                        conn.execute("DELETE FROM fact_sources WHERE fact_id = ?", (fid,))
+                        conn.execute("DELETE FROM fact_vec WHERE fact_id = ?", (fid,))
+                        conn.execute("DELETE FROM fact_fts WHERE fact_id = ?", (fid,))
+                        conn.execute("DELETE FROM facts WHERE fact_id = ?", (fid,))
+                    conn.execute("DELETE FROM edges WHERE src_id = ? OR dst_id = ?", (focus, focus))
+                    conn.execute("DELETE FROM edge_sources WHERE src_id = ? OR dst_id = ?", (focus, focus))
+                    conn.execute("DELETE FROM concept_scheme_members WHERE entity_id = ?", (focus,))
+                    conn.execute("DELETE FROM entity_labels WHERE entity_id = ?", (focus,))
+                    conn.execute("DELETE FROM entity_vec WHERE entity_id = ?", (focus,))
+                    conn.execute("DELETE FROM entities WHERE entity_id = ?", (focus,))
                     applied += 1
             elif action in ("delete_dangling", "delete_orphan", "delete_invalid_fact"):
                 if "->" in focus:
@@ -1518,14 +1458,14 @@ def serialize_graph_turtle(
         violations = _scan_shacl_violations(conn)
 
     lines: list[str] = [
+        "@prefix : <urn:graph:> .",
         "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .",
         "@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .",
-        "@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .",
         "@prefix owl: <http://www.w3.org/2002/07/owl#> .",
         "@prefix skos: <http://www.w3.org/2004/02/skos/core#> .",
-        "@prefix sh: <http://www.w3.org/ns/shacl#> .",
         "@prefix prov: <http://www.w3.org/ns/prov#> .",
-        "@prefix yaw: <https://yaw.local/vocab#> .",
+        "@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .",
+        "@prefix sh: <http://www.w3.org/ns/shacl#> .",
         "",
     ]
 
@@ -1554,8 +1494,37 @@ def serialize_graph_turtle(
     ):
         sem_edges_by_eid.setdefault(str(row[0]), []).append((str(row[1]), str(row[2])))
 
-    for row in conn.execute("SELECT entity_id, name, definition FROM entities ORDER BY entity_id ASC"):
-        eid, ename, edef = str(row[0]), str(row[1]), str(row[2])
+    scheme_members_by_eid: dict[str, list[tuple[str, int]]] = {}
+    top_concepts_by_scheme: dict[str, list[str]] = {}
+    for row in conn.execute(
+        "SELECT scheme_id, entity_id, is_top_concept FROM concept_scheme_members ORDER BY scheme_id ASC, entity_id ASC"
+    ):
+        sid, eid_m, is_top = str(row[0]), str(row[1]), int(row[2])
+        scheme_members_by_eid.setdefault(eid_m, []).append((sid, is_top))
+        if is_top == 1:
+            top_concepts_by_scheme.setdefault(sid, []).append(eid_m)
+
+    for row in conn.execute(
+        "SELECT scheme_id, pref_label, definition, history_note, confidence FROM concept_schemes ORDER BY scheme_id ASC"
+    ):
+        sid, pref, dfn, note, s_conf = str(row[0]), str(row[1]), str(row[2]), str(row[3]), row[4]
+        scheme_parts = ["a skos:ConceptScheme"]
+        scheme_parts.append(f"skos:prefLabel {_escape_turtle_literal(pref)}")
+        if dfn.strip():
+            scheme_parts.append(f"skos:definition {_escape_turtle_literal(dfn.strip())}")
+        if note.strip():
+            scheme_parts.append(f"skos:historyNote {_escape_turtle_literal(note.strip())}")
+        top_ents = top_concepts_by_scheme.get(sid, [])
+        if top_ents:
+            top_tokens = ", ".join(f":{t}" for t in top_ents)
+            scheme_parts.append(f"skos:topConceptOf {top_tokens}")
+        if s_conf is not None:
+            scheme_parts.append(f'prov:value "{float(s_conf):.6f}"^^xsd:double')
+        lines.append(f":{sid} " + " ;\n    ".join(scheme_parts) + " .")
+        lines.append("")
+
+    for row in conn.execute("SELECT entity_id, name, definition, confidence FROM entities ORDER BY entity_id ASC"):
+        eid, ename, edef, econf = str(row[0]), str(row[1]), str(row[2]), row[3]
         pred_objs: list[str] = ["a skos:Concept"]
         seen_labels: set[tuple[str, str]] = set()
         prov_chunks: set[str] = set()
@@ -1569,12 +1538,18 @@ def serialize_graph_turtle(
             pred_objs.append(f"skos:prefLabel {_escape_turtle_literal(ename)}")
         if edef.strip():
             pred_objs.append(f"skos:definition {_escape_turtle_literal(edef.strip())}")
+        if econf is not None:
+            pred_objs.append(f'prov:value "{float(econf):.6f}"^^xsd:double')
         for kind, dst_id in sem_edges_by_eid.get(eid, []):
-            pred_objs.append(f"{kind} yaw:{dst_id}")
+            pred_objs.append(f"{kind} :{dst_id}")
+        for sid, is_top in scheme_members_by_eid.get(eid, []):
+            pred_objs.append(f"skos:inScheme :{sid}")
+            if is_top == 1:
+                pred_objs.append(f"skos:topConceptOf :{sid}")
         for cid in sorted(prov_chunks):
-            pred_objs.append(f"prov:wasDerivedFrom yaw:{cid}")
+            pred_objs.append(f"prov:wasDerivedFrom :{cid}")
 
-        lines.append(f"yaw:{eid} " + " ;\n    ".join(pred_objs) + " .")
+        lines.append(f":{eid} " + " ;\n    ".join(pred_objs) + " .")
         lines.append("")
 
     for row in conn.execute(
@@ -1588,12 +1563,13 @@ def serialize_graph_turtle(
             COALESCE(obj_kind, 'entity'),
             obj_literal_lex,
             COALESCE(obj_datatype, ''),
-            COALESCE(obj_lang, '')
+            COALESCE(obj_lang, ''),
+            confidence
         FROM facts
         ORDER BY fact_id ASC
         """
     ):
-        fid, sid, pred, oid, fdef, okind, olex, odt, olang = (
+        fid, sid, pred, oid, fdef, okind, olex, odt, olang, fconf = (
             str(row[0]),
             str(row[1]),
             str(row[2]),
@@ -1603,6 +1579,7 @@ def serialize_graph_turtle(
             str(row[6]) if row[6] is not None else "",
             str(row[7]),
             str(row[8]),
+            row[9],
         )
         if okind == "literal":
             lit_token = _escape_turtle_literal(olex)
@@ -1613,23 +1590,25 @@ def serialize_graph_turtle(
                 lit_token = f"{lit_token}@{olang}"
             elif clean_odt and clean_odt not in ("", "rdfs:Literal", "xsd:string"):
                 if clean_odt.startswith(
-                    ("xsd:", "rdf:", "rdfs:", "owl:", "skos:", "prov:", "sh:", "yaw:")
+                    ("xsd:", "rdf:", "rdfs:", "owl:", "skos:", "prov:", "sh:")
                 ) and not clean_odt.startswith(("http://", "https://", "urn:")):
                     lit_token = f"{lit_token}^^{clean_odt}"
                 else:
                     lit_token = f"{lit_token}^^<{clean_odt}>"
             rdf_obj = lit_token
         else:
-            rdf_obj = f"yaw:{oid}"
+            rdf_obj = f":{oid}"
         stmt_parts = [
             "a rdf:Statement",
-            f"rdf:subject yaw:{sid}",
+            f"rdf:subject :{sid}",
             f"rdf:predicate {_escape_turtle_literal(pred)}",
             f"rdf:object {rdf_obj}",
         ]
         if fdef.strip():
             stmt_parts.append(f"skos:definition {_escape_turtle_literal(fdef.strip())}")
-        lines.append(f"yaw:{fid} " + " ;\n    ".join(stmt_parts) + " .")
+        if fconf is not None:
+            stmt_parts.append(f'prov:value "{float(fconf):.6f}"^^xsd:double')
+        lines.append(f":{fid} " + " ;\n    ".join(stmt_parts) + " .")
         lines.append("")
 
     conforms_str = "true" if len(violations) == 0 else "false"
@@ -1647,7 +1626,579 @@ def serialize_graph_turtle(
             f"sh:resultMessage {_escape_turtle_literal(v.message)} "
             "]"
         )
-    lines.append("yaw:ValidationReport " + " ;\n    ".join(report_parts) + " .")
+    lines.append(":ValidationReport " + " ;\n    ".join(report_parts) + " .")
     lines.append("")
 
     return "\n".join(lines).strip() + "\n"
+
+
+def format_subgraph_turtle(
+    conn: sqlite3.Connection,
+    chunk_ids: Sequence[str] = (),
+    seed_facts: Sequence[tuple[str, str, str]] = (),
+    *,
+    max_chars: int = 10000,
+) -> str:
+    """Format the closed-world SKOS/OWL/RDF subgraph induced by chunk_ids and seed_facts in W3C Turtle."""
+    active_entity_ids: set[str] = set()
+    for item in seed_facts:
+        if len(item) >= 3:
+            s, _, o = str(item[0]).strip(), str(item[1]).strip(), str(item[2]).strip()
+            active_entity_ids.add(s)
+            active_entity_ids.add(o)
+
+    chunk_list = list(dict.fromkeys(chunk_ids))
+    fact_rows: list[sqlite3.Row] = []
+    if chunk_list:
+        ph = ",".join("?" for _ in chunk_list)
+        fact_rows = conn.execute(
+            f"""
+            SELECT f.fact_id, f.subj_id, f.pred, f.obj_kind, f.obj_id, f.obj_literal_lex,
+                   COALESCE(f.definition, ''), COALESCE(f.obj_datatype, ''), COALESCE(f.obj_lang, ''), f.confidence
+            FROM facts f
+            JOIN fact_sources fs ON f.fact_id = fs.fact_id
+            WHERE fs.chunk_id IN ({ph})
+            ORDER BY f.fact_id ASC
+            """,
+            chunk_list,
+        ).fetchall()
+        for r in fact_rows:
+            active_entity_ids.add(str(r[1]))
+            if r[3] == "entity" and r[4]:
+                active_entity_ids.add(str(r[4]))
+
+        ent_rows = conn.execute(
+            f"SELECT DISTINCT entity_id FROM entity_labels WHERE chunk_id IN ({ph})",
+            chunk_list,
+        ).fetchall()
+        for (eid,) in ent_rows:
+            active_entity_ids.add(str(eid))
+
+    lines: list[str] = [W3C_PREFIX_HEADER.strip(), ""]
+
+    active_schemes: dict[str, tuple[str, str, str, float | None]] = {}
+    scheme_members_by_eid: dict[str, list[tuple[str, int]]] = {}
+    top_concepts_by_scheme: dict[str, list[str]] = {}
+
+    if active_entity_ids:
+        ph_ent = ",".join("?" for _ in active_entity_ids)
+        csm_rows = conn.execute(
+            f"""
+            SELECT csm.scheme_id, csm.entity_id, csm.is_top_concept,
+                   cs.pref_label, cs.definition, cs.history_note, cs.confidence
+            FROM concept_scheme_members csm
+            JOIN concept_schemes cs ON cs.scheme_id = csm.scheme_id
+            WHERE csm.entity_id IN ({ph_ent}) OR csm.scheme_id IN ({ph_ent})
+            ORDER BY csm.scheme_id ASC, csm.entity_id ASC
+            """,
+            list(active_entity_ids) * 2,
+        ).fetchall()
+        for r in csm_rows:
+            sid, eid_m, is_top = str(r[0]), str(r[1]), int(r[2])
+            pref, dfn, note, sconf = str(r[3]), str(r[4]), str(r[5]), r[6]
+            active_schemes[sid] = (pref, dfn, note, sconf)
+            if eid_m in active_entity_ids:
+                scheme_members_by_eid.setdefault(eid_m, []).append((sid, is_top))
+            if is_top == 1:
+                top_concepts_by_scheme.setdefault(sid, []).append(eid_m)
+
+    # Prepend active :scheme_* blocks at the top of the QA reader subgraph payload
+    for sid in sorted(active_schemes.keys()):
+        pref, dfn, note, sconf = active_schemes[sid]
+        scheme_parts = ["a skos:ConceptScheme"]
+        scheme_parts.append(f"skos:prefLabel {_escape_turtle_literal(pref)}")
+        if dfn.strip():
+            scheme_parts.append(f"skos:definition {_escape_turtle_literal(dfn.strip())}")
+        if note.strip():
+            scheme_parts.append(f"skos:historyNote {_escape_turtle_literal(note.strip())}")
+        top_ents = top_concepts_by_scheme.get(sid, [])
+        if top_ents:
+            top_tokens = ", ".join(f":{t}" for t in top_ents)
+            scheme_parts.append(f"skos:topConceptOf {top_tokens}")
+        if sconf is not None:
+            scheme_parts.append(f'prov:value "{float(sconf):.6f}"^^xsd:double')
+        lines.append(f":{sid} " + " ;\n    ".join(scheme_parts) + " .")
+        lines.append("")
+
+    if active_entity_ids:
+        ph_ent = ",".join("?" for _ in active_entity_ids)
+        entities_data = conn.execute(
+            f"""
+            SELECT entity_id, name, definition, confidence
+            FROM entities
+            WHERE entity_id IN ({ph_ent})
+            ORDER BY entity_id ASC
+            """,
+            list(active_entity_ids),
+        ).fetchall()
+
+        labels_data = conn.execute(
+            f"""
+            SELECT entity_id, label_kind, raw_label, label_norm
+            FROM entity_labels
+            WHERE entity_id IN ({ph_ent})
+            ORDER BY entity_id ASC, label_kind ASC
+            """,
+            list(active_entity_ids),
+        ).fetchall()
+        labels_by_eid: dict[str, list[tuple[str, str]]] = {}
+        for r in labels_data:
+            eid_l = str(r[0])
+            lbl = str(r[2]) if str(r[2]) else str(r[3])
+            labels_by_eid.setdefault(eid_l, []).append((str(r[1]), lbl))
+
+        sem_edges_data = conn.execute(
+            f"""
+            SELECT src_id, kind, dst_id
+            FROM edges
+            WHERE kind IN ('skos:related', 'skos:broader', 'owl:differentFrom')
+              AND (src_id IN ({ph_ent}) OR dst_id IN ({ph_ent}))
+            ORDER BY src_id ASC, kind ASC
+            """,
+            list(active_entity_ids) * 2,
+        ).fetchall()
+        edges_by_eid: dict[str, list[tuple[str, str]]] = {}
+        for r in sem_edges_data:
+            edges_by_eid.setdefault(str(r[0]), []).append((str(r[1]), str(r[2])))
+
+        for row in entities_data:
+            eid, ename, edef, econf = str(row[0]), str(row[1]), str(row[2]), row[3]
+            pred_objs = ["a skos:Concept"]
+            seen_lbls: set[tuple[str, str]] = set()
+            for lkind, lbl in labels_by_eid.get(eid, []):
+                if (lkind, lbl) not in seen_lbls:
+                    seen_lbls.add((lkind, lbl))
+                    pred_objs.append(f"{lkind} {_escape_turtle_literal(lbl)}")
+            if not seen_lbls:
+                pred_objs.append(f"skos:prefLabel {_escape_turtle_literal(ename)}")
+            if edef.strip():
+                pred_objs.append(f"skos:definition {_escape_turtle_literal(edef.strip())}")
+            if econf is not None:
+                pred_objs.append(f'prov:value "{float(econf):.6f}"^^xsd:double')
+            for k, d_id in edges_by_eid.get(eid, []):
+                pred_objs.append(f"{k} :{d_id}")
+            for sid, is_top in scheme_members_by_eid.get(eid, []):
+                pred_objs.append(f"skos:inScheme :{sid}")
+                if is_top == 1:
+                    pred_objs.append(f"skos:topConceptOf :{sid}")
+            lines.append(f":{eid} " + " ;\n    ".join(pred_objs) + " .")
+            lines.append("")
+
+    for r in fact_rows:
+        fid, sid, pred, okind, oid, olex, fdef, odt, olang, fconf = (
+            str(r[0]),
+            str(r[1]),
+            str(r[2]),
+            str(r[3]),
+            str(r[4] or ""),
+            str(r[5] or ""),
+            str(r[6]),
+            str(r[7]),
+            str(r[8]),
+            r[9],
+        )
+        if okind == "literal":
+            lit_token = _escape_turtle_literal(olex)
+            clean_odt = odt.strip()
+            if clean_odt.startswith("<") and clean_odt.endswith(">"):
+                clean_odt = clean_odt[1:-1].strip()
+            if olang:
+                lit_token = f"{lit_token}@{olang}"
+            elif clean_odt and clean_odt not in ("", "rdfs:Literal", "xsd:string"):
+                if clean_odt.startswith(("xsd:", "rdf:", "rdfs:", "owl:", "skos:", "prov:", "sh:")):
+                    lit_token = f"{lit_token}^^{clean_odt}"
+                else:
+                    lit_token = f"{lit_token}^^<{clean_odt}>"
+            rdf_obj = lit_token
+        else:
+            rdf_obj = f":{oid}"
+        stmt_parts = [
+            "a rdf:Statement",
+            f"rdf:subject :{sid}",
+            f"rdf:predicate {_escape_turtle_literal(pred)}",
+            f"rdf:object {rdf_obj}",
+        ]
+        if fdef.strip():
+            stmt_parts.append(f"skos:definition {_escape_turtle_literal(fdef.strip())}")
+        if fconf is not None:
+            stmt_parts.append(f'prov:value "{float(fconf):.6f}"^^xsd:double')
+        lines.append(f":{fid} " + " ;\n    ".join(stmt_parts) + " .")
+        lines.append("")
+
+    res = "\n".join(lines).strip() + "\n"
+    if len(res) > max_chars:
+        res = res[:max_chars]
+    return res
+
+
+def query_graph_provenance(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Query epistemic confidence statistics and provenance metadata across entities, facts, and edges."""
+    ent_stats = conn.execute(
+        """
+        SELECT
+            COUNT(*),
+            COUNT(confidence),
+            AVG(confidence),
+            MIN(confidence),
+            MAX(confidence)
+        FROM entities
+        """
+    ).fetchone() or (0, 0, None, None, None)
+
+    fact_stats = conn.execute(
+        """
+        SELECT
+            COUNT(*),
+            COUNT(confidence),
+            AVG(confidence),
+            MIN(confidence),
+            MAX(confidence)
+        FROM facts
+        """
+    ).fetchone() or (0, 0, None, None, None)
+
+    edge_stats = conn.execute(
+        """
+        SELECT
+            COUNT(*),
+            AVG(weight),
+            MIN(weight),
+            MAX(weight)
+        FROM edges
+        """
+    ).fetchone() or (0, None, None, None)
+
+    src_stats = conn.execute(
+        """
+        SELECT
+            (SELECT COUNT(*) FROM entity_chunks),
+            (SELECT COUNT(*) FROM fact_sources),
+            (SELECT COUNT(*) FROM edge_sources)
+        """
+    ).fetchone() or (0, 0, 0)
+
+    return {
+        "entities": {
+            "total": int(ent_stats[0]),
+            "calibrated": int(ent_stats[1]),
+            "avg_confidence": float(ent_stats[2]) if ent_stats[2] is not None else None,
+            "min_confidence": float(ent_stats[3]) if ent_stats[3] is not None else None,
+            "max_confidence": float(ent_stats[4]) if ent_stats[4] is not None else None,
+        },
+        "facts": {
+            "total": int(fact_stats[0]),
+            "calibrated": int(fact_stats[1]),
+            "avg_confidence": float(fact_stats[2]) if fact_stats[2] is not None else None,
+            "min_confidence": float(fact_stats[3]) if fact_stats[3] is not None else None,
+            "max_confidence": float(fact_stats[4]) if fact_stats[4] is not None else None,
+        },
+        "edges": {
+            "total": int(edge_stats[0]),
+            "avg_weight": float(edge_stats[1]) if edge_stats[1] is not None else None,
+            "min_weight": float(edge_stats[2]) if edge_stats[2] is not None else None,
+            "max_weight": float(edge_stats[3]) if edge_stats[3] is not None else None,
+        },
+        "provenance_sources": {
+            "entity_chunks": int(src_stats[0]),
+            "fact_sources": int(src_stats[1]),
+            "edge_sources": int(src_stats[2]),
+        },
+    }
+
+
+def auto_heal_deterministic_shacl(conn: sqlite3.Connection) -> int:
+    """Deterministically auto-heal closed-world SHACL violations on yaw.db without LLM inference.
+
+    Executes:
+    1. Prune scalar entities via remove_scalar_entity repair action.
+    2. Cut skos:broader cycles at the weakest empirical link.
+    3. Empirical Bayes S27 & Cagle resolution:
+       - Step 1: Existing fact check -> delete conflicting related edge.
+       - Step 2: Live empirical database means gate -> Cagle reification to fact.
+       - Step 3: Bayes Factor comparison:
+           - w_chain >= w_rel: delete skos:related edge.
+           - w_rel > w_chain: keep skos:related edge, delete weakest broader link,
+             and if k >= 2 convert it to skos:related preserving calibrated weight.
+    """
+    repaired = 0
+    with write_tx(conn):
+        # 1. Prune scalar entities
+        scalar_eids = [
+            str(r[0])
+            for r in conn.execute("SELECT entity_id, name FROM entities").fetchall()
+            if detect_scalar_literal(str(r[1]))[0]
+        ]
+        for eid in scalar_eids:
+            repaired += apply_shacl_repairs(conn, [{"focus_node": eid, "action": "remove_scalar_entity", "value": ""}])
+
+        # 2. Break skos:broader cycles at minimum-weight edge
+        cycle_nodes = [
+            str(r[0])
+            for r in conn.execute(
+                """
+                WITH RECURSIVE broader_tc(narrower_id, broader_id, path_str) AS (
+                    SELECT src_id, dst_id, src_id || '->' || dst_id
+                    FROM edges WHERE kind = 'skos:broader'
+                    UNION
+                    SELECT tc.narrower_id, e.dst_id, tc.path_str || '->' || e.dst_id
+                    FROM broader_tc tc
+                    JOIN edges e ON e.src_id = tc.broader_id AND e.kind = 'skos:broader'
+                    WHERE INSTR(tc.path_str, e.dst_id) = 0 OR e.dst_id = tc.narrower_id
+                    LIMIT 10000
+                )
+                SELECT DISTINCT narrower_id
+                FROM broader_tc
+                WHERE narrower_id = broader_id
+                """
+            ).fetchall()
+        ]
+        for cn in cycle_nodes:
+            cycle_edge = conn.execute(
+                """
+                WITH RECURSIVE cycle_path(src_id, dst_id, weight, depth) AS (
+                    SELECT src_id, dst_id, weight, 1
+                    FROM edges WHERE kind = 'skos:broader' AND src_id = ?
+                    UNION ALL
+                    SELECT e.src_id, e.dst_id, e.weight, cp.depth + 1
+                    FROM cycle_path cp
+                    JOIN edges e ON e.src_id = cp.dst_id AND e.kind = 'skos:broader'
+                    WHERE cp.depth < 10
+                )
+                SELECT src_id, dst_id, weight
+                FROM cycle_path
+                WHERE dst_id = ?
+                ORDER BY weight ASC
+                LIMIT 1
+                """,
+                (cn, cn),
+            ).fetchone()
+            if cycle_edge is not None:
+                c_src, c_dst = str(cycle_edge[0]), str(cycle_edge[1])
+                conn.execute(
+                    "DELETE FROM edges WHERE kind = 'skos:broader' AND src_id = ? AND dst_id = ?",
+                    (c_src, c_dst),
+                )
+                conn.execute(
+                    "DELETE FROM edge_sources WHERE kind = 'skos:broader' AND src_id = ? AND dst_id = ?",
+                    (c_src, c_dst),
+                )
+                repaired += 1
+
+        # 3. Empirical Bayes S27 & Cagle resolution
+        avg_b_row = conn.execute("SELECT AVG(weight) FROM edges WHERE kind = 'skos:broader'").fetchone()
+        avg_broader = float(avg_b_row[0]) if avg_b_row and avg_b_row[0] is not None else 0.5
+
+        avg_r_row = conn.execute("SELECT AVG(weight) FROM edges WHERE kind = 'skos:related'").fetchone()
+        avg_rel = float(avg_r_row[0]) if avg_r_row and avg_r_row[0] is not None else 0.5
+
+        avg_f_row = conn.execute("SELECT AVG(confidence) FROM facts WHERE confidence IS NOT NULL").fetchone()
+        avg_fact = float(avg_f_row[0]) if avg_f_row and avg_f_row[0] is not None else 0.5
+
+        s27_pairs = conn.execute(
+            """
+            WITH RECURSIVE broader_tc(narrower_id, broader_id) AS (
+                SELECT src_id, dst_id FROM edges WHERE kind = 'skos:broader'
+                UNION
+                SELECT tc.narrower_id, e.dst_id
+                FROM broader_tc tc
+                JOIN edges e ON e.src_id = tc.broader_id AND e.kind = 'skos:broader'
+                LIMIT 10000
+            )
+            SELECT DISTINCT tc.narrower_id, tc.broader_id
+            FROM broader_tc tc
+            INNER JOIN edges rel
+              ON rel.kind = 'skos:related'
+             AND (
+                 (rel.src_id = tc.narrower_id AND rel.dst_id = tc.broader_id)
+                 OR (rel.src_id = tc.broader_id AND rel.dst_id = tc.narrower_id)
+             )
+            WHERE tc.narrower_id != tc.broader_id
+            ORDER BY tc.narrower_id ASC, tc.broader_id ASC
+            """
+        ).fetchall()
+
+        for row in s27_pairs:
+            a_id, c_id = str(row[0]), str(row[1])
+
+            rel_row = conn.execute(
+                """
+                SELECT weight FROM edges
+                WHERE kind = 'skos:related'
+                  AND ((src_id = ? AND dst_id = ?) OR (src_id = ? AND dst_id = ?))
+                LIMIT 1
+                """,
+                (a_id, c_id, c_id, a_id),
+            ).fetchone()
+            w_rel = float(rel_row[0]) if rel_row and rel_row[0] is not None else 0.8
+
+            # Step 1: Existing fact check (Deterministic Cagle Short-Circuit)
+            fact_exists = (
+                conn.execute(
+                    """
+                SELECT 1 FROM facts
+                WHERE (subj_id = ? AND obj_id = ?) OR (subj_id = ? AND obj_id = ?)
+                LIMIT 1
+                """,
+                    (a_id, c_id, c_id, a_id),
+                ).fetchone()
+                is not None
+            )
+
+            if fact_exists:
+                conn.execute(
+                    """
+                    DELETE FROM edges
+                    WHERE kind = 'skos:related'
+                      AND ((src_id = ? AND dst_id = ?) OR (src_id = ? AND dst_id = ?))
+                    """,
+                    (a_id, c_id, c_id, a_id),
+                )
+                conn.execute(
+                    """
+                    DELETE FROM edge_sources
+                    WHERE kind = 'skos:related'
+                      AND ((src_id = ? AND dst_id = ?) OR (src_id = ? AND dst_id = ?))
+                    """,
+                    (a_id, c_id, c_id, a_id),
+                )
+                repaired += 1
+                continue
+
+            # Find path in skos:broader from A to C
+            path_row = conn.execute(
+                """
+                WITH RECURSIVE path_finder(curr_id, path_str, min_w, hop_count) AS (
+                    SELECT dst_id, src_id || '->' || dst_id, weight, 1
+                    FROM edges
+                    WHERE kind = 'skos:broader' AND src_id = ?
+                    UNION ALL
+                    SELECT e.dst_id, pf.path_str || '->' || e.dst_id, MIN(pf.min_w, e.weight), pf.hop_count + 1
+                    FROM path_finder pf
+                    JOIN edges e ON e.src_id = pf.curr_id AND e.kind = 'skos:broader'
+                    WHERE pf.hop_count < 10
+                )
+                SELECT path_str, hop_count
+                FROM path_finder
+                WHERE curr_id = ?
+                ORDER BY hop_count ASC
+                LIMIT 1
+                """,
+                (a_id, c_id),
+            ).fetchone()
+
+            if path_row is None:
+                continue
+
+            path_str = str(path_row[0])
+            nodes_in_path = path_str.split("->")
+            path_edges: list[tuple[str, str, float]] = []
+            for i in range(len(nodes_in_path) - 1):
+                u, v = nodes_in_path[i], nodes_in_path[i + 1]
+                ew_row = conn.execute(
+                    "SELECT weight FROM edges WHERE kind = 'skos:broader' AND src_id = ? AND dst_id = ?",
+                    (u, v),
+                ).fetchone()
+                ew = float(ew_row[0]) if ew_row and ew_row[0] is not None else 0.8
+                path_edges.append((u, v, ew))
+
+            w_chain = pool_confidences(*[ew for _, _, ew in path_edges]) or 0.8
+
+            # Step 2: Empirical Database Means Gate for Cagle Reification
+            above_avg = (w_chain >= avg_broader) and (w_rel >= avg_rel)
+            shared_chunk: str | None = None
+            if above_avg:
+                chunk_row = conn.execute(
+                    """
+                    SELECT c1.chunk_id
+                    FROM (
+                        SELECT chunk_id FROM entity_labels WHERE entity_id = ?
+                        UNION
+                        SELECT fs.chunk_id FROM fact_sources fs
+                        JOIN facts f ON f.fact_id = fs.fact_id WHERE f.subj_id = ? OR f.obj_id = ?
+                    ) c1
+                    INNER JOIN (
+                        SELECT chunk_id FROM entity_labels WHERE entity_id = ?
+                        UNION
+                        SELECT fs.chunk_id FROM fact_sources fs
+                        JOIN facts f ON f.fact_id = fs.fact_id WHERE f.subj_id = ? OR f.obj_id = ?
+                    ) c2 ON c1.chunk_id = c2.chunk_id
+                    LIMIT 1
+                    """,
+                    (a_id, a_id, a_id, c_id, c_id, c_id),
+                ).fetchone()
+                if chunk_row is not None:
+                    shared_chunk = str(chunk_row[0])
+
+            atomic_conf = pool_confidences(w_chain, w_rel) or 0.8
+            if above_avg and shared_chunk is not None and atomic_conf >= avg_fact:
+                new_fid = compute_mdhash_id(str((a_id, "relatedTo", c_id)), prefix="fact-")
+                raw_json = json.dumps([a_id, "relatedTo", c_id])
+                defn = f"Reified from high-confidence association between {a_id} and {c_id}."
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO facts
+                    (fact_id, subj_id, pred, obj_id, raw_triple_json, definition, obj_kind, confidence)
+                    VALUES (?, ?, 'relatedTo', ?, ?, ?, 'entity', ?)
+                    """,
+                    (new_fid, a_id, c_id, raw_json, defn, atomic_conf),
+                )
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO fact_sources (fact_id, chunk_id, atomic_confidence)
+                    VALUES (?, ?, ?)
+                    """,
+                    (new_fid, shared_chunk, atomic_conf),
+                )
+                conn.execute(
+                    """
+                    DELETE FROM edges
+                    WHERE kind = 'skos:related'
+                      AND ((src_id = ? AND dst_id = ?) OR (src_id = ? AND dst_id = ?))
+                    """,
+                    (a_id, c_id, c_id, a_id),
+                )
+                conn.execute(
+                    """
+                    DELETE FROM edge_sources
+                    WHERE kind = 'skos:related'
+                      AND ((src_id = ? AND dst_id = ?) OR (src_id = ? AND dst_id = ?))
+                    """,
+                    (a_id, c_id, c_id, a_id),
+                )
+                repaired += 1
+                continue
+
+            # Step 3: Direct Bayes Factor Comparison (w_chain vs w_rel)
+            if w_chain >= w_rel:
+                conn.execute(
+                    """
+                    DELETE FROM edges
+                    WHERE kind = 'skos:related'
+                      AND ((src_id = ? AND dst_id = ?) OR (src_id = ? AND dst_id = ?))
+                    """,
+                    (a_id, c_id, c_id, a_id),
+                )
+                conn.execute(
+                    """
+                    DELETE FROM edge_sources
+                    WHERE kind = 'skos:related'
+                      AND ((src_id = ? AND dst_id = ?) OR (src_id = ? AND dst_id = ?))
+                    """,
+                    (a_id, c_id, c_id, a_id),
+                )
+                repaired += 1
+            else:
+                weakest_u, weakest_v, min_w = min(path_edges, key=lambda e: e[2])
+                conn.execute(
+                    "DELETE FROM edges WHERE kind = 'skos:broader' AND src_id = ? AND dst_id = ?",
+                    (weakest_u, weakest_v),
+                )
+                conn.execute(
+                    "DELETE FROM edge_sources WHERE kind = 'skos:broader' AND src_id = ? AND dst_id = ?",
+                    (weakest_u, weakest_v),
+                )
+                if len(path_edges) >= 2:
+                    upsert_semantic_edges(conn, [(weakest_u, weakest_v, "skos:related", min_w)])
+                repaired += 1
+
+    return repaired

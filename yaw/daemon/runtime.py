@@ -172,6 +172,8 @@ class YawRuntime:
 
         self._coco_env: coco.Environment | None = None
         self._coco_app: coco.App[..., Any] | None = None
+        self._live_thread: threading.Thread | None = None
+        self._live_error: BaseException | None = None
         self._openie_endpoint: OpenIEEndpoint | None = None
         self._embedding_endpoint: EmbeddingEndpoint | None = None
         self.engine: YawGraphEngine | None = None
@@ -237,9 +239,17 @@ class YawRuntime:
             prog_path = data.get("program_path")
             if not prog_path:
                 return
-            res = self.reload_program(prog_path)
-            res["req_id"] = req_id
-            write_text_atomic(result_file, json.dumps(res, indent=2))
+            future = self._submit_program_reload(prog_path)
+
+            def publish_result(completed: Future[dict[str, Any]]) -> None:
+                try:
+                    res = completed.result()
+                    res["req_id"] = req_id
+                except Exception as exc:
+                    res = {"reloaded": False, "req_id": req_id, "error": str(exc), "pid": os.getpid()}
+                write_text_atomic(result_file, json.dumps(res, indent=2))
+
+            future.add_done_callback(publish_result)
         except Exception as exc:
             err_payload = {
                 "reloaded": False,
@@ -314,7 +324,6 @@ class YawRuntime:
             auto_merge_difflib_gate=self.engine.auto_merge_difflib_gate,
             synonymy_threshold=self.config.synonymy_threshold,
             synonymy_top_k=self.config.synonymy_top_k,
-            datatype_property_weight=0.5,
             ast_context_hops=self.config.ast_context_hops,
             context_window_tokens=self.config.context_window_tokens,
             max_output_tokens=self.config.max_output_tokens,
@@ -376,17 +385,80 @@ class YawRuntime:
             self._stats = stats
 
     def _close_components(self) -> None:
-        if self._coco_env is not None:
-            with contextlib.suppress(OSError, RuntimeError):
-                self._coco_env.close()
+        try:
+            with contextlib.ExitStack() as cleanup:
+                if self.engine is not None:
+                    cleanup.callback(self.engine.close)
+                if self._coco_env is not None:
+                    cleanup.callback(self._coco_env.close)
+                cleanup.callback(self._stop_live_update)
+        finally:
             self._coco_env = None
             self._coco_app = None
-        self._openie_endpoint = None
-        self._embedding_endpoint = None
-        if self.engine is not None:
-            with contextlib.suppress(OSError, sqlite3.Error, RuntimeError):
-                self.engine.close()
+            self._openie_endpoint = None
+            self._embedding_endpoint = None
             self.engine = None
+
+    def _start_live_update(self) -> None:
+        """Host the native live update; CocoIndex owns filesystem and inference work."""
+        if not self.auto_poll or self._stop_event.is_set() or self._live_thread is not None:
+            return
+        app = self._coco_app
+        if app is None:
+            raise YawRuntimeError("NOT_READY", "CocoIndex app is not initialized.")
+        ready: Future[None] = Future()
+
+        async def run() -> None:
+            handle = app.update(live=True)
+            async for event in handle.watch():
+                if event.stats.total.num_errors:
+                    if self.engine is not None:
+                        error = get_graph_delta_coordinator(self.engine.managed_conn).pop_error()
+                        if error is not None:
+                            raise error
+                    raise YawRuntimeError("CONSISTENCY_ERROR", "CocoIndex live update reported component errors.")
+                if event.stats.total.num_in_progress == 0:
+                    self._refresh_published_state()
+                if event.status == coco.UpdateStatus.READY and not ready.done():
+                    ready.set_result(None)
+
+        def serve() -> None:
+            try:
+                asyncio.run(run())
+            except BaseException as exc:
+                self._live_error = exc
+                if not ready.done():
+                    ready.set_exception(exc)
+                self._update_state(sync_state="error", last_error=str(exc)[:300])
+                self.request_stop()
+            finally:
+                if not ready.done():
+                    ready.set_exception(RuntimeError("Live update ended before readiness"))
+
+        self._live_thread = threading.Thread(target=serve, name="yaw-cocoindex-live", daemon=True)
+        self._live_thread.start()
+        ready.result()
+
+    def _stop_live_update(self) -> None:
+        """Transition the native app to catch-up and drain before resource changes."""
+        thread = self._live_thread
+        if thread is None:
+            return
+        app = self._coco_app
+        try:
+            if thread.is_alive() and app is not None:
+
+                async def drain() -> None:
+                    await app.update().result()
+
+                asyncio.run(drain())
+        finally:
+            thread.join()
+            self._live_thread = None
+        if self._live_error is not None:
+            error = self._live_error
+            self._live_error = None
+            raise error
 
     def _update_state(self, **kwargs: Any) -> None:
         with self._state_lock:
@@ -506,14 +578,17 @@ class YawRuntime:
             if self._stop_event.is_set():
                 self.stop()
                 return
+            self._start_live_update()
         except Exception:
             self._close_win32_stop_event()
             if self.config.lock_path is not None:
                 with self._active_lock:
                     self._active_instances.pop(self.config.lock_path.resolve(), None)
-            self._close_components()
-            if self._file_lock.is_locked:
-                self._file_lock.release()
+            try:
+                self._close_components()
+            finally:
+                if self._file_lock.is_locked:
+                    self._file_lock.release()
             raise
 
     def stop(self) -> None:
@@ -558,19 +633,24 @@ class YawRuntime:
         if self._worker_thread is not None and self._worker_thread.is_alive():
             with contextlib.suppress(queue.Full):
                 self._queue.put_nowait(None)
-            self._worker_thread.join(timeout=5.0)
+            # An in-flight provider call cannot be cancelled by abandoning its
+            # worker. Keep SQLite and CocoIndex alive until the operation exits
+            # under its configured provider timeout/retry policy.
+            self._worker_thread.join()
         self._worker_thread = None
 
-        self._close_components()
-        self._update_state(
-            lifecycle="stopped",
-            provider_ready=False,
-            sync_state="idle",
-            active_op=None,
-            pid=None,
-        )
-        if self._file_lock.is_locked:
-            self._file_lock.release()
+        try:
+            self._close_components()
+        finally:
+            self._update_state(
+                lifecycle="stopped",
+                provider_ready=False,
+                sync_state="idle",
+                active_op=None,
+                pid=None,
+            )
+            if self._file_lock.is_locked:
+                self._file_lock.release()
 
     def close(self) -> None:
         """Alias for stop()."""
@@ -658,8 +738,12 @@ class YawRuntime:
                 item.progress_callback("started")
 
             try:
+                self._stop_live_update()
                 result = item.fn()
+                self._start_live_update()
             except YawRuntimeError as err:
+                if self.auto_poll:
+                    self.request_stop()
                 if err.code == "MODEL_ERROR":
                     self._update_state(
                         lifecycle="ready",
@@ -672,6 +756,8 @@ class YawRuntime:
                     self._update_state(active_op=None, sync_state="idle")
                 item.future.set_exception(err)
             except Exception as exc:
+                if self.auto_poll:
+                    self.request_stop()
                 msg = f"{type(exc).__name__}: {exc}"
                 err_code: Literal["CONSISTENCY_ERROR", "MODEL_ERROR"] = (
                     "CONSISTENCY_ERROR" if isinstance(exc, sqlite3.DatabaseError) else "MODEL_ERROR"
@@ -741,6 +827,17 @@ class YawRuntime:
 
         with self.engine._lock:
             after_cids = {str(r[0]) for r in self.engine.conn.execute("SELECT chunk_id FROM chunks").fetchall()}
+        self._refresh_published_state()
+
+        added = tuple(sorted(after_cids - before_cids))
+        deleted = tuple(sorted(before_cids - after_cids))
+        return SyncOutcome(added_chunks=added, deleted_chunk_ids=deleted)
+
+    def _refresh_published_state(self) -> None:
+        """Invalidate retrieval state after native graph publication and refresh cached stats."""
+        if self.engine is None:
+            raise YawRuntimeError("NOT_READY", "Graph engine is not initialized.")
+        with self.engine._lock:
             self.engine._csr_graph = None
             self.engine._query_retrieval_memo.clear()
             self.engine._last_memo_question = None
@@ -749,10 +846,6 @@ class YawRuntime:
         new_stats = self.engine.get_stats(self.config.config_fingerprint())
         with self._state_lock:
             self._stats = new_stats
-
-        added = tuple(sorted(after_cids - before_cids))
-        deleted = tuple(sorted(before_cids - after_cids))
-        return SyncOutcome(added_chunks=added, deleted_chunk_ids=deleted)
 
     def request_sync(
         self,
@@ -1133,6 +1226,9 @@ class YawRuntime:
 
     def reload_program(self, program_path: Path | str) -> dict[str, Any]:
         """Hot-reload a compiled DSPy program into the running engine in-memory."""
+        return self._submit_program_reload(program_path).result()
+
+    def _submit_program_reload(self, program_path: Path | str) -> Future[dict[str, Any]]:
         p = Path(program_path).resolve()
         if not p.exists() or not p.is_file():
             raise YawRuntimeError("INVALID_INPUT", f"Compiled program file not found: {p}")
@@ -1177,7 +1273,7 @@ class YawRuntime:
                 "timestamp": time.time(),
             }
 
-        return self.submit("reload_program", _run_reload).result()
+        return self.submit("reload_program", _run_reload)
 
     def benchmark(
         self,

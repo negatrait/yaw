@@ -248,60 +248,39 @@ def test_datatype_property_literal_objects_stored_with_weighted_edges_and_exclud
 
     _index_chunk_with_record(engine, chunk, "YAW Service listens on port 8080 and generated $1.2B.", record)
 
-    # Verify both 8080 and non-scalar $1.2B are stored as literal nodes with no duplicate '1 2b' concept node
+    # Verify scalar and formatted literals NEVER enter entities
     all_entities = {
         r[1]: (r[0], r[2]) for r in conn.execute("SELECT entity_id, name, definition FROM entities").fetchall()
     }
-    assert "8080" in all_entities
-    assert "$1.2B" in all_entities
-    assert "1 2b" not in all_entities
-    lit_id = all_entities["8080"][0]
-    rev_id = all_entities["$1.2B"][0]
-    assert "Default HTTP listen port" in all_entities["8080"][1]
-    assert "Annual division revenue" in all_entities["$1.2B"][1]
+    assert "8080" not in all_entities
+    assert "$1.2B" not in all_entities
+    assert "YAW Service" in all_entities
+    subj_id = all_entities["YAW Service"][0]
 
-    # Verify facts table contains both literal facts with obj_id and obj_literal_lex
+    # Verify facts table contains both literal facts with obj_id=None and obj_literal_lex
     facts = conn.execute(
         "SELECT fact_id, subj_id, pred, obj_id, obj_kind, obj_literal_lex, obj_datatype FROM facts ORDER BY pred"
     ).fetchall()
     assert len(facts) == 2
-    subj_id = facts[0][1]
-    assert {f[3] for f in facts} == {lit_id, rev_id}
+    assert all(f[3] is None for f in facts)
     assert all(f[4] == "literal" for f in facts)
+    assert {f[5] for f in facts} == {"8080", "$1.2B"}
 
-    # Verify edges contains directed forward fact edges (subj_id -> lit_id, subj_id -> rev_id) with weight 0.5
-    fact_edges = {
-        (r[0], r[1]): float(r[3])
-        for r in conn.execute("SELECT src_id, dst_id, kind, weight FROM edges WHERE kind = 'fact'").fetchall()
-    }
-    assert fact_edges == {(subj_id, lit_id): 0.5, (subj_id, rev_id): 0.5}
+    # Verify edges contains zero fact edges to literal objects
+    fact_edges = conn.execute("SELECT src_id, dst_id, kind, weight FROM edges WHERE kind = 'fact'").fetchall()
+    assert len(fact_edges) == 0
 
-    # Verify passage edges connect chunk-1 to subj_id, lit_id, and rev_id
+    # Verify passage edges connect chunk-1 to subj_id only
     passage_edges = conn.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'passage'").fetchall()
     passage_pairs = {(r[0], r[1]) for r in passage_edges}
     assert ("chunk-1", subj_id) in passage_pairs
-    assert ("chunk-1", lit_id) in passage_pairs
-    assert ("chunk-1", rev_id) in passage_pairs
 
-    # Verify pure literals '8080' and '$1.2B' were excluded from SKOS disambiguation and have zero skos:* edges
+    # Verify pure literals '8080' and '$1.2B' were excluded from SKOS candidate discovery
     assert len(called_candidates) == 0
     skos_edges = conn.execute(
         "SELECT src_id, dst_id, kind FROM edges WHERE kind IN ('skos:broader', 'skos:related')"
     ).fetchall()
     assert len(skos_edges) == 0
-
-    # Verify even direct storage calls to upsert_semantic_edges reject pure literal endpoints
-    upsert_semantic_edges(
-        conn,
-        [
-            (subj_id, lit_id, "skos:related", 1.0),
-            (subj_id, rev_id, "skos:broader", 1.0),
-        ],
-    )
-    skos_after = conn.execute(
-        "SELECT src_id, dst_id, kind FROM edges WHERE kind IN ('skos:broader', 'skos:related')"
-    ).fetchall()
-    assert len(skos_after) == 0
 
 
 def test_dual_role_literal_promoted_to_concept_and_weight_preserved_across_merge_and_delete(
@@ -382,32 +361,22 @@ def test_dual_role_literal_promoted_to_concept_and_weight_preserved_across_merge
     ent_rows = {r[0].lower(): r[1] for r in conn.execute("SELECT name, entity_id FROM entities").fetchall()}
     alpha_id = ent_rows["gateway alpha"]
     beta_id = ent_rows["gateway beta"]
-    lit_id = ent_rows["8080"]
-    canary_id = ent_rows["canary"]
+    assert "8080" not in ent_rows
+    assert "canary" in ent_rows
 
-    # While 'canary' only participates in obj_kind='literal' facts, it cannot participate in SKOS edges
-    upsert_semantic_edges(conn, [(canary_id, alpha_id, "skos:related", 0.8)])
-    assert (
-        len(
-            conn.execute(
-                "SELECT src_id, dst_id FROM edges WHERE kind = 'skos:related' AND src_id = ? AND dst_id = ?",
-                (canary_id, alpha_id),
-            ).fetchall()
-        )
-        == 0
-    )
-
-    # Merge beta into alpha: fact edge (alpha -> 8080) has 2 literal facts across c1 and c2 -> weight = 0.5 * 2 = 1.0
-    # Delete chunk c2: remaining literal fact in c1 between alpha and 8080 must have weight 0.5 (not 1.0!)
+    # Merge beta into alpha: literal facts across c1 and c2 are merged
+    # Delete chunk c2: remaining literal fact in c1 between alpha and 8080 remains in facts
     merge_entities(conn, beta_id, alpha_id, label_kind="skos:altLabel")
     delete_chunks(conn, ["c2"])
     assert lint_graph_shacl(conn) == []
-    w_row = conn.execute(
-        "SELECT weight FROM edges WHERE src_id = ? AND dst_id = ? AND kind = 'fact'",
-        (alpha_id, lit_id),
+    lit_fact = conn.execute(
+        "SELECT subj_id, pred, obj_literal_lex, obj_kind, obj_id FROM facts WHERE obj_literal_lex = '8080'"
     ).fetchone()
-    assert w_row is not None
-    assert abs(float(w_row[0]) - 0.5) < 1e-6
+    assert lit_fact is not None
+    assert lit_fact[0] == alpha_id
+    assert lit_fact[1] == "uses port"
+    assert lit_fact[3] == "literal"
+    assert lit_fact[4] is None
 
     # Now promote 'canary' to a skos:Concept by referencing it in an ObjectProperty fact
     c3 = ChunkPointer("c3", "doc3.md", 1, 5, "Rollout Controller")
@@ -493,31 +462,38 @@ def test_forward_fact_edges_strictly_directed(synonym_token_counter, tmp_path: P
     ent_rows = {r[0].lower(): r[1] for r in conn.execute("SELECT name, entity_id FROM entities").fetchall()}
     s_id = ent_rows["yaw daemon"]
     o_id = ent_rows["sqlite engine"]
-    lit_id = ent_rows["8080"]
+    assert "8080" not in ent_rows
 
     fact_edges = {
         (r[0], r[1]): float(r[2])
         for r in conn.execute("SELECT src_id, dst_id, weight FROM edges WHERE kind = 'fact'").fetchall()
     }
-    # Must contain ONLY forward edges with 1.0 for ObjectProperty and 0.5 for DatatypeProperty
+    # Must contain ONLY forward edges for ObjectProperty (0.8) and ZERO edges for literal objects
     assert (s_id, o_id) in fact_edges
     assert (o_id, s_id) not in fact_edges
-    assert abs(fact_edges[(s_id, o_id)] - 1.0) < 1e-6
-    assert (s_id, lit_id) in fact_edges
-    assert (lit_id, s_id) not in fact_edges
-    assert abs(fact_edges[(s_id, lit_id)] - 0.5) < 1e-6
+    assert abs(fact_edges[(s_id, o_id)] - 0.8) < 1e-6
+    assert len(fact_edges) == 1
 
-    # Verify load_graph_topology and build_transition_matrix preserve 1.0 vs 0.5
-    chunk_ids, entity_ids, topo_edges = load_graph_topology(conn, include_kinds=True)
+    # Verify literal fact exists strictly in facts table
+    lit_fact = conn.execute(
+        "SELECT subj_id, pred, obj_literal_lex, obj_kind, obj_id FROM facts WHERE obj_literal_lex = '8080'"
+    ).fetchone()
+    assert lit_fact is not None
+    assert lit_fact[0] == s_id
+    assert lit_fact[1] == "uses port"
+    assert lit_fact[3] == "literal"
+    assert lit_fact[4] is None
+
+    # Verify load_graph_topology and build_transition_matrix preserve the fact edge
+    chunk_ids, entity_ids, topo_edges, _ = load_graph_topology(conn)
     topo_fact_weights = {(src, dst): float(w) for src, dst, k, w in topo_edges if k == "fact"}
-    assert abs(topo_fact_weights[(s_id, o_id)] - 1.0) < 1e-6
-    assert abs(topo_fact_weights[(s_id, lit_id)] - 0.5) < 1e-6
+    assert abs(topo_fact_weights[(s_id, o_id)] - 0.8) < 1e-6
+    assert len(topo_fact_weights) == 1
 
     policy = RelationTraversalPolicy()
     csr = build_transition_matrix(chunk_ids, entity_ids, topo_edges, policy=policy, directed=True)
     raw_s_to_o = float(csr.transition_t[csr.node_to_idx[o_id], csr.node_to_idx[s_id]])
-    raw_s_to_lit = float(csr.transition_t[csr.node_to_idx[lit_id], csr.node_to_idx[s_id]])
-    assert raw_s_to_o > raw_s_to_lit > 0.0
+    assert raw_s_to_o > 0.0
 
 
 def test_skos_broader_rejects_missing_canonical(

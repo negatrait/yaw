@@ -448,12 +448,12 @@ def test_high_load_batch_operations_exceeding_sqlite_variable_limits(tmp_path: P
         delete_chunks(conn, chunk_ids[:-1])
 
         assert conn.execute("SELECT COUNT(*) FROM chunks;").fetchone()[0] == 1
-        # Shared fact edge weight must decrement from 2.0 to 1.0
+        # Shared fact edge weight decrement under Bayesian complement aggregation
         edge_row = conn.execute(
             "SELECT weight FROM edges WHERE src_id = 'ent-0' AND dst_id = 'ent-1199' AND kind = 'fact';"
         ).fetchone()
         assert edge_row is not None
-        assert float(edge_row[0]) == pytest.approx(1.0)
+        assert float(edge_row[0]) == pytest.approx(1.0, abs=1e-4)
     finally:
         conn.close()
 
@@ -672,9 +672,9 @@ def test_merge_entities_and_semantic_edge_dominance(tmp_path: Path) -> None:
 
         # Now test semantic edges and owl:differentFrom dominance
         upsert_semantic_edges(conn, [("ent-nyc-canon", "ent-usa", "skos:related", 0.85)])
-        _, entity_ids, topo_edges = load_graph_topology(conn)
+        _, entity_ids, topo_edges, _ = load_graph_topology(conn)
         assert ("ent-nyc-canon" in entity_ids) and ("ent-usa" in entity_ids)
-        assert any(s == "ent-nyc-canon" and d == "ent-usa" for s, d, _ in topo_edges)
+        assert any(s == "ent-nyc-canon" and d == "ent-usa" for s, d, _, _ in topo_edges)
 
         # Asserting owl:differentFrom dominates and deletes skos:related
         upsert_semantic_edges(conn, [("ent-nyc-canon", "ent-usa", "owl:differentFrom", 0.90)])
@@ -688,10 +688,11 @@ def test_merge_entities_and_semantic_edge_dominance(tmp_path: Path) -> None:
         assert "owl:differentFrom" in edge_kinds
 
         # Verify load_graph_topology excludes owl:differentFrom (if we remove the fact edge, no edge remains)
+        conn.execute("DELETE FROM facts;")
         conn.execute("DELETE FROM edges WHERE kind = 'fact';")
         conn.commit()
-        _, _, topo_edges_after = load_graph_topology(conn)
-        assert not any({s, d} == {"ent-nyc-canon", "ent-usa"} for s, d, _ in topo_edges_after)
+        _, _, topo_edges_after, _ = load_graph_topology(conn)
+        assert not any({s, d} == {"ent-nyc-canon", "ent-usa"} for s, d, _, _ in topo_edges_after)
     finally:
         conn.close()
 

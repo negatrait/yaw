@@ -24,7 +24,12 @@ def test_invalid_edges_do_not_connect_or_duplicate_nodes():
     graph = build_transition_matrix(
         ["a", "a", "b"],
         ["a", "c", "c"],
-        [("a", "b", 0.0), ("b", "c", -1.0), ("a", "absent", 2.0), ("a", "a", 1.0)],
+        [
+            ("a", "b", "passage", 0.0),
+            ("b", "c", "passage", -1.0),
+            ("a", "absent", "passage", 2.0),
+            ("a", "a", "passage", 1.0),
+        ],
     )
     assert graph.node_ids == ("a", "b", "c")
     assert graph.transition_t.nnz == 0
@@ -34,7 +39,9 @@ def test_invalid_edges_do_not_connect_or_duplicate_nodes():
 
 
 def test_general_degree_normalization_matches_dense_definition():
-    graph = build_transition_matrix(["a", "b"], ["c"], [("a", "b", 2.0), ("b", "c", 1.0)], beta=0.3)
+    graph = build_transition_matrix(
+        ["a", "b"], ["c"], [("a", "b", "passage", 2.0), ("b", "c", "passage", 1.0)], beta=0.3
+    )
     adjacency = np.array([[0.0, 2.0, 0.0], [2.0, 0.0, 1.0], [0.0, 1.0, 0.0]])
     degrees = np.array([2.0, 3.0, 1.0])
     expected = degrees[:, None] ** -0.3 * adjacency * degrees[None, :] ** -0.7
@@ -42,7 +49,7 @@ def test_general_degree_normalization_matches_dense_definition():
 
 
 def test_array_reset_is_copied_normalized_and_shape_checked():
-    graph = build_transition_matrix(["a", "b"], [], [("a", "b", 1.0)], beta=0.0)
+    graph = build_transition_matrix(["a", "b"], [], [("a", "b", "passage", 1.0)], beta=0.0)
     reset = np.array([6.0, 2.0])
     scores = run_ppr(graph, reset, damping=0.0, activation="linear")
     np.testing.assert_allclose(scores, [0.75, 0.25])
@@ -54,7 +61,7 @@ def test_array_reset_is_copied_normalized_and_shape_checked():
 
 
 def test_nonlinear_renormalization_preserves_mass_and_zero_fixed_point():
-    graph = build_transition_matrix(["a", "b"], [], [("a", "b", 1.0)], beta=0.0)
+    graph = build_transition_matrix(["a", "b"], [], [("a", "b", "passage", 1.0)], beta=0.0)
     scores = run_ppr(graph, {"a": 1.0}, renormalize=True, dual_weight=None)
     assert np.isclose(scores.sum(), 1.0)
     zero = run_ppr(

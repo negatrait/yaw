@@ -75,6 +75,7 @@ from yaw.daemon.graph.storage import (
     PreparedGraphRows,
     apply_prepared_graph_rows,
     apply_shacl_repairs,
+    auto_heal_deterministic_shacl,
     delete_chunks,
     format_pair_disambiguation_dossier,
     format_subgraph_for_qa,
@@ -96,6 +97,7 @@ from yaw.daemon.graph.storage import (
     make_chunk_hydrator,
     merge_entities,
     open_managed_yaw_db,
+    pool_confidences,
     resolve_entity_labels,
     save_openie_checkpoints,
     search_chunk_vectors_knn,
@@ -841,17 +843,14 @@ class YawGraphEngine:
     def _ensure_csr_graph(self) -> CSRGraph:
         with self._lock:
             if self._csr_graph is None:
-                has_broader = (
-                    self.conn.execute("SELECT 1 FROM edges WHERE kind = 'skos:broader' LIMIT 1").fetchone() is not None
-                )
-                use_policy = self.traversal_policy is not None or has_broader
-                chunk_ids, entity_ids, edges = load_graph_topology(self.conn, include_kinds=use_policy)
+                chunk_ids, entity_ids, edges, entity_priors = load_graph_topology(self.conn)
                 self._csr_graph = build_transition_matrix(
                     chunk_ids,
                     entity_ids,
                     edges,
                     beta=self.beta,
-                    policy=(self.traversal_policy or RelationTraversalPolicy()) if use_policy else None,
+                    policy=self.traversal_policy or RelationTraversalPolicy(),
+                    node_priors=entity_priors,
                 )
             return self._csr_graph
 
@@ -1488,13 +1487,11 @@ class YawGraphEngine:
                 conn=self.conn,
             )
 
-            dt_weight = float(self.traversal_policy.datatype_property) if self.traversal_policy is not None else 0.5
             materialized = materialize_entities_and_facts(
                 record_structured,
                 surface_by_norm,
                 chunk_surface_by_norm,
                 sense_state,
-                datatype_property_weight=dt_weight,
             )
             self._graph_rlm_stats["homograph_splits"] += materialized.homograph_splits
             entity_nodes = materialized.entity_nodes
@@ -1730,6 +1727,10 @@ class YawGraphEngine:
 
                 remaining_violations = lint_graph_shacl(stage_conn)
                 if remaining_violations:
+                    auto_healed = auto_heal_deterministic_shacl(stage_conn)
+                    self._graph_rlm_stats["shacl_repairs_applied"] += auto_healed
+                    remaining_violations = lint_graph_shacl(stage_conn)
+                if remaining_violations:
                     raise YawRuntimeError(
                         "CONSISTENCY_ERROR",
                         f"Graph build left {len(remaining_violations)} SHACL violations: {remaining_violations[:3]}",
@@ -1757,6 +1758,9 @@ class YawGraphEngine:
                 if staged_repairs:
                     self._apply_shacl_repairs(conn, staged_repairs)
                 remaining_violations = lint_graph_shacl(conn)
+                if remaining_violations:
+                    auto_heal_deterministic_shacl(conn)
+                    remaining_violations = lint_graph_shacl(conn)
                 if remaining_violations:
                     raise YawRuntimeError(
                         "CONSISTENCY_ERROR",
@@ -1982,12 +1986,14 @@ class YawGraphEngine:
             else:
                 kept_fids = [fid for fid, _, _ in kept_facts_with_scores]
                 f_placeholders = ",".join("?" for _ in kept_fids)
-                fact_kind_by_fid: dict[str, str] = {
-                    str(r[0]): str(r[1])
-                    for r in self.conn.execute(
-                        f"SELECT fact_id, COALESCE(obj_kind, 'entity') FROM facts WHERE fact_id IN ({f_placeholders})",
-                        kept_fids,
-                    )
+                f_info_rows = self.conn.execute(
+                    f"SELECT fact_id, COALESCE(obj_kind, 'entity'), confidence "
+                    f"FROM facts WHERE fact_id IN ({f_placeholders})",
+                    kept_fids,
+                ).fetchall()
+                fact_kind_by_fid: dict[str, str] = {str(r[0]): str(r[1]) for r in f_info_rows}
+                fact_conf_by_fid: dict[str, float | None] = {
+                    str(r[0]): (float(r[2]) if r[2] is not None else None) for r in f_info_rows
                 }
                 fact_sources_by_fid: dict[str, list[str]] = {}
                 for r in self.conn.execute(
@@ -2006,29 +2012,45 @@ class YawGraphEngine:
                 seed_entities: dict[str, list[float]] = {}
                 literal_chunk_seeds: dict[str, list[float]] = {}
                 for fid, (s, _, o), score in kept_facts_with_scores:
+                    f_prior = fact_conf_by_fid.get(fid)
+                    pooled_score = pool_confidences(score, f_prior) or score
                     s_norm = str(text_processing(s))
                     s_ids = resolved_map.get(s_norm) or [compute_mdhash_id(s_norm, prefix="entity-")]
                     for s_id in s_ids:
-                        seed_entities.setdefault(s_id, []).append(score)
+                        seed_entities.setdefault(s_id, []).append(pooled_score)
                     if fact_kind_by_fid.get(fid, "entity") == "literal":
                         src_cids = fact_sources_by_fid.get(fid, ())
                         if src_cids:
-                            share = score / float(len(src_cids))
+                            share = pooled_score / float(len(src_cids))
                             for src_cid in src_cids:
                                 literal_chunk_seeds.setdefault(src_cid, []).append(share)
                     else:
                         o_norm = str(text_processing(o))
                         o_ids = resolved_map.get(o_norm) or [compute_mdhash_id(o_norm, prefix="entity-")]
                         for o_id in o_ids:
-                            seed_entities.setdefault(o_id, []).append(score)
+                            seed_entities.setdefault(o_id, []).append(pooled_score)
 
                 doc_freqs = get_entity_doc_frequencies(self.conn, list(seed_entities.keys()))
+
+                e_ids_list = list(seed_entities.keys())
+                ent_confs: dict[str, float | None] = {}
+                if e_ids_list:
+                    e_ph = ",".join("?" for _ in e_ids_list)
+                    ent_confs = {
+                        str(r[0]): (float(r[1]) if r[1] is not None else None)
+                        for r in self.conn.execute(
+                            f"SELECT entity_id, confidence FROM entities WHERE entity_id IN ({e_ph})",
+                            e_ids_list,
+                        ).fetchall()
+                    }
 
                 entity_reset_weights: list[tuple[str, float]] = []
                 for eid, scores in seed_entities.items():
                     mean_score = sum(scores) / len(scores)
                     df = max(1, doc_freqs.get(eid, 0))
-                    w_entity = mean_score / float(df)
+                    p_node = ent_confs.get(eid)
+                    calibrated_score = pool_confidences(mean_score, p_node) or mean_score
+                    w_entity = calibrated_score / float(df)
                     entity_reset_weights.append((eid, w_entity))
 
                 entity_reset_weights.sort(key=lambda kv: kv[1], reverse=True)

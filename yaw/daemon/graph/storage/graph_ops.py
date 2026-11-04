@@ -15,9 +15,14 @@ from yaw.core import (
     SEMANTIC_EDGE_KINDS,
     OpenIERecord,
     StructuredTriple,
-    detect_scalar_literal,
     resolve_corpus_path,
     text_processing,
+)
+from yaw.core import (
+    bayesian_noisy_or as bayesian_noisy_or,
+)
+from yaw.core import (
+    pool_confidences as pool_confidences,
 )
 
 from .db import batched, write_tx
@@ -55,62 +60,6 @@ _INIT_DEL_TEMP_TABLES: tuple[str, ...] = (
     "DELETE FROM temp._orphan_facts",
     "DELETE FROM temp._orphan_entities",
 )
-
-
-def get_pure_literal_entity_ids(
-    conn: sqlite3.Connection,
-    *,
-    exclude_shared_labels: bool = False,
-) -> set[str]:
-    """Return entity IDs that represent pure rdfs:Literal resources and must not participate in SKOS taxonomy."""
-    concept_participant_ids: set[str] = {
-        str(r[0])
-        for r in conn.execute(
-            """
-            SELECT subj_id FROM facts
-            UNION
-            SELECT obj_id FROM facts
-            WHERE COALESCE(obj_kind, 'entity') = 'entity' AND obj_id IS NOT NULL
-            """
-        )
-    }
-    if exclude_shared_labels:
-        concept_participant_ids.update(
-            str(r[0])
-            for r in conn.execute(
-                """
-                SELECT DISTINCT el1.entity_id
-                FROM entity_labels el1
-                JOIN entity_labels el2
-                  ON el1.label_norm = el2.label_norm
-                 AND el1.entity_id != el2.entity_id
-                """
-            )
-        )
-    pure_literal_ids: set[str] = {
-        str(r[0])
-        for r in conn.execute(
-            """
-            SELECT DISTINCT obj_id FROM facts
-            WHERE obj_kind = 'literal' AND obj_id IS NOT NULL
-            """
-        )
-        if str(r[0]) not in concept_participant_ids
-    }
-    for row in conn.execute("SELECT entity_id, name FROM entities"):
-        eid, name = str(row[0]), str(row[1])
-        if eid not in concept_participant_ids and detect_scalar_literal(name)[0]:
-            pure_literal_ids.add(eid)
-    return pure_literal_ids
-
-
-def filter_valid_concept_entity_ids(
-    conn: sqlite3.Connection,
-    entity_nodes: Sequence[tuple[str, str, str]],
-) -> list[str]:
-    """Filter entity nodes to valid SKOS concept candidates (excluding pure rdfs:Literal resources)."""
-    pure_literal_ids = get_pure_literal_entity_ids(conn, exclude_shared_labels=True)
-    return [eid for eid, name, _ in entity_nodes if bool(text_processing(name)) and eid not in pure_literal_ids]
 
 
 @lru_cache(maxsize=4096)
@@ -160,7 +109,6 @@ def find_entity_synonym_candidates(
         return []
     max_dist = max(0.0, 1.0 - threshold + 1e-6)
     pair_scores: dict[tuple[str, str], float] = {}
-    pure_literals = get_pure_literal_entity_ids(conn)
 
     adjudicated: set[tuple[str, str]] = {
         (str(r[0]), str(r[1])) if str(r[0]) < str(r[1]) else (str(r[1]), str(r[0]))
@@ -172,8 +120,6 @@ def find_entity_synonym_candidates(
     def _scan_entity_rows(rows_iter: Iterator[sqlite3.Row]) -> None:
         for row in rows_iter:
             src_id = str(row[0])
-            if src_id in pure_literals:
-                continue
             blob = row[1]
             knn_cursor = conn.execute(
                 """
@@ -191,8 +137,6 @@ def find_entity_synonym_candidates(
             )
             for hit in knn_cursor:
                 dst_id = str(hit[0])
-                if dst_id in pure_literals:
-                    continue
                 sim = float(hit[1])
                 if sim >= threshold:
                     key = (src_id, dst_id) if src_id < dst_id else (dst_id, src_id)
@@ -202,8 +146,7 @@ def find_entity_synonym_candidates(
     if entity_ids is None:
         _scan_entity_rows(conn.execute("SELECT entity_id, embedding FROM entity_vec"))
     elif entity_ids:
-        filtered_eids = [eid for eid in entity_ids if eid not in pure_literals]
-        for batch in batched(filtered_eids):
+        for batch in batched(entity_ids):
             placeholders = ",".join("?" for _ in batch)
             cursor = conn.execute(
                 f"SELECT entity_id, embedding FROM entity_vec WHERE entity_id IN ({placeholders})",
@@ -223,7 +166,6 @@ def find_entity_disambiguation_candidates(
     lexical_threshold: float = 0.70,
 ) -> list[tuple[str, str, float, float]]:
     """Two-channel candidate generation combining sqlite-vec dense kNN and 3-stage SequenceMatcher cascade."""
-    pure_literals = get_pure_literal_entity_ids(conn)
     adjudicated: set[tuple[str, str]] = {
         (str(r[0]), str(r[1])) if str(r[0]) < str(r[1]) else (str(r[1]), str(r[0]))
         for r in conn.execute(
@@ -231,20 +173,19 @@ def find_entity_disambiguation_candidates(
         )
     }
 
-    dense_pairs: dict[tuple[str, str], float] = {}
-    for a, b, sim in find_entity_synonym_candidates(
-        conn, entity_ids=entity_ids, threshold=dense_threshold, top_k=dense_top_k
-    ):
-        if a not in pure_literals and b not in pure_literals:
-            dense_pairs[(a, b)] = sim
+    dense_pairs: dict[tuple[str, str], float] = {
+        (a, b): sim
+        for a, b, sim in find_entity_synonym_candidates(
+            conn, entity_ids=entity_ids, threshold=dense_threshold, top_k=dense_top_k
+        )
+    }
 
     all_entities = [
         (str(r[0]), str(r[1]), str(r[1]).strip().lower())
         for r in conn.execute("SELECT entity_id, name FROM entities ORDER BY entity_id ASC")
-        if str(r[0]) not in pure_literals
     ]
     entity_names = {eid: name for eid, name, _ in all_entities}
-    target_set = (set(entity_ids) - pure_literals) if entity_ids is not None else None
+    target_set = set(entity_ids) if entity_ids is not None else None
 
     lexical_pairs: dict[tuple[str, str], float] = {}
     # Enumerate only pairs incident to the changed entities. The previous
@@ -284,8 +225,6 @@ def find_entity_disambiguation_candidates(
         """
     ):
         ea, eb = str(row[0]), str(row[1])
-        if ea in pure_literals or eb in pure_literals:
-            continue
         if target_set is not None and ea not in target_set and eb not in target_set:
             continue
         key = (ea, eb)
@@ -484,32 +423,36 @@ def save_openie_checkpoints(
 
 def upsert_entities(
     conn: sqlite3.Connection,
-    entities: Sequence[tuple[str, str] | tuple[str, str, str]],
+    entities: Sequence[tuple[str, str] | tuple[str, str, str] | tuple[str, str, str, float | None]],
 ) -> None:
-    """Upsert entity nodes (entity_id, name[, definition]) into entities and align existing SKOS labels."""
+    """Upsert entity nodes (entity_id, name[, definition, confidence]) into entities and align existing SKOS labels."""
     if not entities:
         return
-    normalized_rows: list[tuple[str, str, str]] = []
+    normalized_rows: list[tuple[str, str, str, float | None]] = []
     for item in entities:
         if len(item) == 2:
-            normalized_rows.append((item[0], item[1], ""))
+            normalized_rows.append((str(item[0]), str(item[1]), "", None))
+        elif len(item) == 3:
+            normalized_rows.append((str(item[0]), str(item[1]), str(item[2]), None))
         else:
-            normalized_rows.append((item[0], item[1], item[2]))
+            c = float(item[3]) if item[3] is not None else None
+            normalized_rows.append((str(item[0]), str(item[1]), str(item[2]), c))
     with write_tx(conn):
         conn.executemany(
             """
-            INSERT INTO entities (entity_id, name, definition)
-            VALUES (?, ?, ?)
+            INSERT INTO entities (entity_id, name, definition, confidence)
+            VALUES (?, ?, ?, ?)
             ON CONFLICT(entity_id) DO UPDATE SET
                 name = excluded.name,
                 definition = CASE
                     WHEN TRIM(excluded.definition) != '' THEN excluded.definition
                     ELSE entities.definition
-                END
+                END,
+                confidence = COALESCE(excluded.confidence, entities.confidence)
             """,
             normalized_rows,
         )
-        for eid, ename, _ in normalized_rows:
+        for eid, ename, _, _ in normalized_rows:
             raw_norm = ename.strip().lower()
             tok_norm = str(text_processing(ename))
             if not raw_norm and not tok_norm:
@@ -543,6 +486,47 @@ def upsert_entities(
                     """,
                     (eid, pref_norm),
                 )
+
+
+def upsert_concept_schemes(
+    conn: sqlite3.Connection,
+    schemes: Sequence[tuple[str, str, str, str, float | None]],
+) -> None:
+    """Insert or replace concept schemes inside a write transaction."""
+    if not schemes:
+        return
+    with write_tx(conn):
+        conn.executemany(
+            """
+            INSERT INTO concept_schemes (scheme_id, pref_label, definition, history_note, confidence)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(scheme_id) DO UPDATE SET
+                pref_label = excluded.pref_label,
+                definition = excluded.definition,
+                history_note = excluded.history_note,
+                confidence = excluded.confidence
+            """,
+            schemes,
+        )
+
+
+def upsert_concept_scheme_members(
+    conn: sqlite3.Connection,
+    members: Sequence[tuple[str, str, int]],
+) -> None:
+    """Insert or replace concept scheme memberships inside a write transaction."""
+    if not members:
+        return
+    with write_tx(conn):
+        conn.executemany(
+            """
+            INSERT INTO concept_scheme_members (scheme_id, entity_id, is_top_concept)
+            VALUES (?, ?, ?)
+            ON CONFLICT(scheme_id, entity_id) DO UPDATE SET
+                is_top_concept = excluded.is_top_concept
+            """,
+            members,
+        )
 
 
 def upsert_entity_labels(
@@ -1178,12 +1162,13 @@ def merge_entities(
         # 3. Re-point edge_sources
         conn.execute(
             """
-            INSERT OR IGNORE INTO edge_sources (src_id, dst_id, kind, chunk_id)
+            INSERT OR IGNORE INTO edge_sources (src_id, dst_id, kind, chunk_id, atomic_confidence)
             SELECT
                 CASE WHEN src_id = ? THEN ? ELSE src_id END,
                 CASE WHEN dst_id = ? THEN ? ELSE dst_id END,
                 kind,
-                chunk_id
+                chunk_id,
+                atomic_confidence
             FROM edge_sources
             WHERE (src_id = ? OR dst_id = ?)
               AND (CASE WHEN src_id = ? THEN ? ELSE src_id END) != (CASE WHEN dst_id = ? THEN ? ELSE dst_id END)
@@ -1222,46 +1207,31 @@ def merge_entities(
                     (new_src, new_dst, weight_val),
                 )
             elif kind_str == "fact":
-                prov_count = int(
-                    conn.execute(
-                        "SELECT COUNT(*) FROM edge_sources WHERE src_id = ? AND dst_id = ? AND kind = 'fact'",
-                        (new_src, new_dst),
-                    ).fetchone()[0]
-                )
-                has_ent_fact = (
-                    conn.execute(
-                        """
-                        SELECT 1 FROM facts
-                        WHERE ((subj_id = ? AND obj_id = ?) OR (subj_id = ? AND obj_id = ?))
-                          AND COALESCE(obj_kind, 'entity') = 'entity'
-                        LIMIT 1
-                        """,
-                        (new_src, new_dst, new_dst, new_src),
-                    ).fetchone()
-                    is not None
-                )
-                has_lit_fact = (
-                    conn.execute(
-                        """
-                        SELECT 1 FROM facts
-                        WHERE ((subj_id = ? AND obj_id = ?) OR (subj_id = ? AND obj_id = ?))
-                          AND obj_kind = 'literal'
-                        LIMIT 1
-                        """,
-                        (new_src, new_dst, new_dst, new_src),
-                    ).fetchone()
-                    is not None
-                )
-                base_mult = 0.5 if (has_lit_fact and not has_ent_fact) else 1.0
-                eff_weight = float(prov_count) * base_mult if prov_count > 0 else weight_val
                 conn.execute(
                     """
                     INSERT INTO edges (src_id, dst_id, kind, weight)
                     VALUES (?, ?, 'fact', ?)
                     ON CONFLICT(src_id, dst_id, kind) DO UPDATE SET
-                        weight = CASE WHEN ? > 0 THEN excluded.weight ELSE edges.weight + excluded.weight END
+                        weight = excluded.weight
                     """,
-                    (new_src, new_dst, eff_weight, prov_count),
+                    (new_src, new_dst, weight_val),
+                )
+                conn.execute(
+                    """
+                    UPDATE edges
+                    SET weight = COALESCE(
+                        (
+                            SELECT 1.0 - EXP(SUM(LN(MAX(
+                                1e-6, 1.0 - MIN(1.0 - 1e-6, COALESCE(es.atomic_confidence, 0.5))
+                            ))))
+                            FROM edge_sources es
+                            WHERE es.src_id = edges.src_id AND es.dst_id = edges.dst_id AND es.kind = edges.kind
+                        ),
+                        edges.weight
+                    )
+                    WHERE src_id = ? AND dst_id = ? AND kind = 'fact'
+                    """,
+                    (new_src, new_dst),
                 )
             elif kind_str in ("skos:related", "skos:broader", "owl:differentFrom"):
                 upsert_semantic_edges(conn, [(new_src, new_dst, kind_str, weight_val)])
@@ -1293,15 +1263,32 @@ def merge_entities(
 
 def upsert_fact_sources(
     conn: sqlite3.Connection,
-    fact_sources: Sequence[tuple[str, str]],
+    fact_sources: Sequence[tuple[str, str] | tuple[str, str, float | None, float | None, float | None]],
 ) -> None:
-    """Bulk record (fact_id, chunk_id) provenance in fact_sources."""
+    """Bulk record (fact_id, chunk_id[, llm_prob, vec_coherence, atomic_confidence]) provenance in fact_sources."""
     if not fact_sources:
         return
+    rows_to_insert: list[tuple[str, str, float | None, float | None, float | None]] = []
+    for item in fact_sources:
+        fid = str(item[0])
+        cid = str(item[1])
+        if not fid or not cid:
+            continue
+        p_llm = float(item[2]) if len(item) > 2 and item[2] is not None else None
+        s_vec = float(item[3]) if len(item) > 3 and item[3] is not None else None
+        c_atom = float(item[4]) if len(item) > 4 and item[4] is not None else None
+        rows_to_insert.append((fid, cid, p_llm, s_vec, c_atom))
     with write_tx(conn):
         conn.executemany(
-            "INSERT OR IGNORE INTO fact_sources (fact_id, chunk_id) VALUES (?, ?)",
-            ((str(fid), str(cid)) for fid, cid in fact_sources if fid and cid),
+            """
+            INSERT INTO fact_sources (fact_id, chunk_id, llm_prob, vec_coherence, atomic_confidence)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(fact_id, chunk_id) DO UPDATE SET
+                llm_prob = COALESCE(excluded.llm_prob, fact_sources.llm_prob),
+                vec_coherence = COALESCE(excluded.vec_coherence, fact_sources.vec_coherence),
+                atomic_confidence = COALESCE(excluded.atomic_confidence, fact_sources.atomic_confidence)
+            """,
+            rows_to_insert,
         )
 
 
@@ -1388,22 +1375,6 @@ def upsert_facts(
                 "INSERT OR IGNORE INTO fact_sources (fact_id, chunk_id) VALUES (?, ?)",
                 ((str(fid), str(cid)) for fid, cid in fact_sources if fid and cid),
             )
-        literal_oids = {
-            oid for _, _, _, okind, oid, _, _, _, _, _ in normalized_facts if okind == "literal" and oid
-        } & get_pure_literal_entity_ids(conn)
-        if literal_oids:
-            placeholders = ",".join("?" for _ in literal_oids)
-            params = (*literal_oids, *literal_oids)
-            conn.execute(
-                f"DELETE FROM edges WHERE kind IN ('skos:related', 'skos:broader') "
-                f"AND (src_id IN ({placeholders}) OR dst_id IN ({placeholders}))",
-                params,
-            )
-            conn.execute(
-                f"DELETE FROM edge_sources WHERE kind IN ('skos:related', 'skos:broader') "
-                f"AND (src_id IN ({placeholders}) OR dst_id IN ({placeholders}))",
-                params,
-            )
         conn.executemany(
             "DELETE FROM fact_fts WHERE fact_id = ?",
             ((fid,) for fid, _, _, _, _, _, _, _, _, _ in normalized_facts),
@@ -1426,16 +1397,18 @@ def upsert_edges_with_sources(
     conn: sqlite3.Connection,
     edges_with_sources: Sequence[tuple[str, str, str, float, str] | tuple[str, str, str, float, str, str]],
 ) -> None:
-    """Bulk upsert graph edges and record chunk provenance in edge_sources."""
+    """Bulk upsert graph edges and record chunk provenance in edge_sources with Bayesian weight aggregation."""
     if not edges_with_sources:
         return
     with write_tx(conn):
         conn.executemany(
             """
-            INSERT OR IGNORE INTO edge_sources (src_id, dst_id, kind, chunk_id)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO edge_sources (src_id, dst_id, kind, chunk_id, atomic_confidence)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(src_id, dst_id, kind, chunk_id) DO UPDATE SET
+                atomic_confidence = COALESCE(excluded.atomic_confidence, edge_sources.atomic_confidence)
             """,
-            ((row[0], row[1], row[2], row[4]) for row in edges_with_sources),
+            ((row[0], row[1], row[2], row[4], float(row[3])) for row in edges_with_sources),
         )
         conn.executemany(
             """
@@ -1447,36 +1420,22 @@ def upsert_edges_with_sources(
             """,
             ((row[0], row[1], row[2], row[3], str(row[5]) if len(row) > 5 else "") for row in edges_with_sources),
         )
-        fact_base_weights: dict[tuple[str, str], float] = {}
-        for row in edges_with_sources:
-            src, dst, kind, weight = str(row[0]), str(row[1]), str(row[2]), float(row[3])
-            if kind == "fact":
-                pair = (src, dst)
-                fact_base_weights[pair] = max(fact_base_weights.get(pair, 0.0), float(weight))
-        if fact_base_weights:
-            conn.executemany(
-                """
-                UPDATE edges
-                SET weight = MAX(
-                    ?,
-                    CASE
-                        WHEN EXISTS (
-                            SELECT 1 FROM facts f
-                            WHERE f.subj_id = edges.src_id
-                              AND f.obj_id = edges.dst_id
-                              AND COALESCE(f.obj_kind, 'entity') = 'entity'
-                        )
-                        THEN 1.0
-                        ELSE 0.0
-                    END
-                ) * (
-                    SELECT COUNT(*) FROM edge_sources es
-                    WHERE es.src_id = edges.src_id AND es.dst_id = edges.dst_id AND es.kind = 'fact'
-                )
-                WHERE src_id = ? AND dst_id = ? AND kind = 'fact'
-                """,
-                ((base_w, src, dst) for (src, dst), base_w in fact_base_weights.items()),
+        affected_edges = {(str(row[0]), str(row[1]), str(row[2])) for row in edges_with_sources}
+        conn.executemany(
+            """
+            UPDATE edges
+            SET weight = COALESCE(
+                (
+                    SELECT 1.0 - EXP(SUM(LN(MAX(1e-6, 1.0 - MIN(1.0 - 1e-6, COALESCE(es.atomic_confidence, 0.5))))))
+                    FROM edge_sources es
+                    WHERE es.src_id = edges.src_id AND es.dst_id = edges.dst_id AND es.kind = edges.kind
+                ),
+                edges.weight
             )
+            WHERE src_id = ? AND dst_id = ? AND kind = ?
+            """,
+            affected_edges,
+        )
 
 
 def get_existing_ids(
@@ -1649,78 +1608,79 @@ def get_graph_counts(conn: sqlite3.Connection) -> tuple[int, int, int, int, int]
 def load_graph_topology(
     conn: sqlite3.Connection,
     *,
-    include_kinds: bool = False,
-) -> tuple[tuple[str, ...], tuple[str, ...], list[Any]]:
-    """Load all active chunk IDs, entity IDs, and positive-weight edges from yaw.db to build the CSR graph."""
+    include_kinds: bool = True,
+) -> tuple[tuple[str, ...], tuple[str, ...], list[tuple[str, str, str, float]], dict[str, float | None]]:
+    """Load all active chunk IDs, entity IDs, typed edges, and entity priors from yaw.db."""
     chunk_cursor = conn.execute("SELECT chunk_id FROM chunks ORDER BY chunk_id ASC")
     chunk_ids = tuple(str(row[0]) for row in chunk_cursor)
 
-    entity_cursor = conn.execute("SELECT entity_id FROM entities ORDER BY entity_id ASC")
-    entity_ids = tuple(str(row[0]) for row in entity_cursor)
+    entity_cursor = conn.execute("SELECT entity_id, confidence FROM entities ORDER BY entity_id ASC")
+    entity_ids_list: list[str] = []
+    entity_priors: dict[str, float | None] = {}
+    for row in entity_cursor:
+        eid = str(row[0])
+        entity_ids_list.append(eid)
+        entity_priors[eid] = float(row[1]) if row[1] is not None else None
 
-    if include_kinds:
-        edge_cursor = conn.execute(
-            """
-            SELECT
-                f.subj_id AS src_id,
-                f.obj_id AS dst_id,
-                'fact' AS kind,
-                (CASE WHEN COALESCE(f.obj_kind, 'entity') = 'literal' THEN 0.5 ELSE 1.0 END)
-                * CAST(MAX(1, COUNT(DISTINCT fs.chunk_id)) AS REAL) AS weight
-            FROM facts f
-            LEFT JOIN fact_sources fs ON fs.fact_id = f.fact_id
-            WHERE f.obj_id IS NOT NULL
-              AND f.obj_id != ''
-              AND f.subj_id != f.obj_id
-            GROUP BY f.fact_id, f.subj_id, f.obj_id
-            UNION ALL
-            SELECT
-                e.src_id AS src_id,
-                e.dst_id AS dst_id,
-                e.kind AS kind,
-                e.weight AS weight
-            FROM edges e
-            WHERE e.src_id != e.dst_id
-              AND e.weight > 0.0
-              AND e.kind != 'owl:differentFrom'
-              AND (
-                  e.kind != 'fact'
-                  OR NOT EXISTS (
-                      SELECT 1 FROM facts f
-                      WHERE f.obj_id IS NOT NULL
-                        AND f.obj_id != ''
-                        AND ((f.subj_id = e.src_id AND f.obj_id = e.dst_id)
-                             OR (f.subj_id = e.dst_id AND f.obj_id = e.src_id))
-                  )
-              )
-              AND (
-                  e.kind NOT IN ('passage', 'skos:related', 'synonym')
-                  OR e.src_id < e.dst_id
-                  OR NOT EXISTS (
-                      SELECT 1 FROM edges rev
-                      WHERE rev.src_id = e.dst_id
-                        AND rev.dst_id = e.src_id
-                        AND rev.kind = e.kind
-                        AND rev.weight > 0.0
-                  )
-              )
-            ORDER BY src_id ASC, dst_id ASC, kind ASC
-            """
-        )
-        edges_with_kinds = [(str(row[0]), str(row[1]), str(row[2]), float(row[3])) for row in edge_cursor]
-        return chunk_ids, entity_ids, edges_with_kinds
+    # Include emergent skos:ConceptScheme nodes in topology and priors for CSR/PPR
+    try:
+        scheme_cursor = conn.execute("SELECT scheme_id, confidence FROM concept_schemes ORDER BY scheme_id ASC")
+        for row in scheme_cursor:
+            sid = str(row[0])
+            if sid not in entity_priors:
+                entity_ids_list.append(sid)
+                entity_priors[sid] = float(row[1]) if row[1] is not None else None
+    except sqlite3.OperationalError:
+        pass
+    entity_ids = tuple(entity_ids_list)
 
     edge_cursor = conn.execute(
         """
-        SELECT src_id, dst_id, MAX(weight)
-        FROM edges
-        WHERE src_id != dst_id AND weight > 0.0 AND kind != 'owl:differentFrom'
-        GROUP BY src_id, dst_id
+        SELECT
+            f.subj_id AS src_id,
+            f.obj_id AS dst_id,
+            'fact' AS kind,
+            COALESCE(
+                f.confidence,
+                (SELECT 1.0 - EXP(SUM(LN(MAX(1e-6, 1.0 - MIN(1.0 - 1e-6, COALESCE(fs.atomic_confidence, 0.5))))))
+                 FROM fact_sources fs WHERE fs.fact_id = f.fact_id),
+                0.5
+            ) AS weight
+        FROM facts f
+        WHERE f.obj_id IS NOT NULL
+          AND f.obj_id != ''
+          AND f.subj_id != f.obj_id
+          AND COALESCE(f.obj_kind, 'entity') = 'entity'
+          AND NOT EXISTS (
+              SELECT 1 FROM edges e
+              WHERE e.src_id = f.subj_id AND e.dst_id = f.obj_id AND e.kind = 'fact'
+          )
+        UNION ALL
+        SELECT
+            e.src_id AS src_id,
+            e.dst_id AS dst_id,
+            e.kind AS kind,
+            e.weight AS weight
+        FROM edges e
+        WHERE e.src_id != e.dst_id
+          AND e.weight > 0.0
+          AND e.kind != 'owl:differentFrom'
+          AND (
+              e.kind NOT IN ('passage', 'skos:related', 'synonym')
+              OR e.src_id < e.dst_id
+              OR NOT EXISTS (
+                  SELECT 1 FROM edges rev
+                  WHERE rev.src_id = e.dst_id
+                    AND rev.dst_id = e.src_id
+                    AND rev.kind = e.kind
+                    AND rev.weight > 0.0
+              )
+          )
+        ORDER BY src_id ASC, dst_id ASC, kind ASC
         """
     )
-    edges = [(str(row[0]), str(row[1]), float(row[2])) for row in edge_cursor]
-
-    return chunk_ids, entity_ids, edges
+    edges_with_kinds = [(str(row[0]), str(row[1]), str(row[2]), float(row[3])) for row in edge_cursor]
+    return chunk_ids, entity_ids, edges_with_kinds, entity_priors
 
 
 SemanticEdgeRow = tuple[str, str, str, float] | tuple[str, str, str, float, str]
@@ -1734,7 +1694,6 @@ def upsert_semantic_edges(
     if not edges:
         return
     with write_tx(conn):
-        pure_literals = get_pure_literal_entity_ids(conn)
         for row in edges:
             ent1 = str(row[0])
             ent2 = str(row[1])
@@ -1745,8 +1704,6 @@ def upsert_semantic_edges(
                 continue
             if kind not in SEMANTIC_EDGE_KINDS:
                 raise ValueError(f"Unsupported semantic edge kind: {kind!r}")
-            if kind in ("skos:related", "skos:broader") and (ent1 in pure_literals or ent2 in pure_literals):
-                continue
             if kind == "owl:differentFrom":
                 conn.execute(
                     """
@@ -1807,6 +1764,21 @@ def upsert_semantic_edges(
                         """,
                         (ent1, ent2, broader_weight, reasoning),
                     )
+            elif kind == "skos:topConceptOf":
+                tc_weight = max(float(weight), 1e-6)
+                conn.execute(
+                    """
+                    INSERT INTO edges (src_id, dst_id, kind, weight, reasoning)
+                    VALUES (?, ?, 'skos:topConceptOf', ?, ?)
+                    ON CONFLICT(src_id, dst_id, kind) DO UPDATE SET
+                        weight = excluded.weight,
+                        reasoning = CASE
+                            WHEN excluded.reasoning != '' THEN excluded.reasoning
+                            ELSE edges.reasoning
+                        END
+                    """,
+                    (ent1, ent2, tc_weight, reasoning),
+                )
             else:
                 has_conflict = conn.execute(
                     """
@@ -1927,31 +1899,17 @@ def delete_chunks(conn: sqlite3.Connection, chunk_ids: Sequence[str]) -> None:
         conn.execute(
             """
             UPDATE edges
-            SET weight = (
-                CASE
-                    WHEN EXISTS (
-                        SELECT 1 FROM facts f
-                        WHERE ((f.subj_id = edges.src_id AND f.obj_id = edges.dst_id)
-                               OR (f.subj_id = edges.dst_id AND f.obj_id = edges.src_id))
-                          AND f.obj_kind = 'literal'
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1 FROM facts f
-                        WHERE ((f.subj_id = edges.src_id AND f.obj_id = edges.dst_id)
-                               OR (f.subj_id = edges.dst_id AND f.obj_id = edges.src_id))
-                          AND COALESCE(f.obj_kind, 'entity') = 'entity'
-                    )
-                    THEN 0.5
-                    ELSE 1.0
-                END
-            ) * (
-                SELECT COUNT(*) FROM edge_sources es
-                WHERE es.src_id = edges.src_id
-                  AND es.dst_id = edges.dst_id
-                  AND es.kind = 'fact'
+            SET weight = COALESCE(
+                (
+                    SELECT 1.0 - EXP(SUM(LN(MAX(1e-6, 1.0 - MIN(1.0 - 1e-6, COALESCE(es.atomic_confidence, 0.5))))))
+                    FROM edge_sources es
+                    WHERE es.src_id = edges.src_id
+                      AND es.dst_id = edges.dst_id
+                      AND es.kind = edges.kind
+                ),
+                edges.weight
             )
-            WHERE kind = 'fact'
-              AND (src_id, dst_id, kind) IN (SELECT src_id, dst_id, kind FROM temp._affected_edges)
+            WHERE (src_id, dst_id, kind) IN (SELECT src_id, dst_id, kind FROM temp._affected_edges)
             """
         )
 

@@ -2,9 +2,10 @@
 
 import asyncio
 import json
+import re
 import sqlite3
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -41,10 +42,11 @@ from yaw.daemon.graph.storage import (
     PreparedGraphRows,
     apply_prepared_graph_rows,
     apply_shacl_repairs,
+    auto_heal_deterministic_shacl,
+    bayesian_noisy_or,
     canonicalize_entity_labels_edc,
     deserialize_f32_vector,
     deserialize_openie_record,
-    filter_valid_concept_entity_ids,
     find_entity_disambiguation_candidates,
     get_entities_by_label_norm,
     get_entity_metadata_batch,
@@ -53,8 +55,13 @@ from yaw.daemon.graph.storage import (
     lint_graph_shacl,
     merge_entities,
     open_yaw_db,
+    pool_confidences,
     resolve_chunk_text,
+    upsert_concept_scheme_members,
+    upsert_concept_schemes,
+    upsert_entity_vectors,
     upsert_semantic_edges,
+    write_tx,
 )
 from yaw.daemon.graph.storage.publication import GRAPH_DB
 
@@ -70,7 +77,6 @@ class GraphPlanSettings:
     auto_merge_difflib_gate: float = 0.96
     synonymy_threshold: float = 0.8
     synonymy_top_k: int = 5
-    datatype_property_weight: float = 0.5
     ast_context_hops: int = 1
     context_window_tokens: int = 32768
     max_output_tokens: int = 4096
@@ -174,19 +180,22 @@ def load_active_chunk_inferences(
 def clone_graph_to_memory(conn: sqlite3.Connection) -> sqlite3.Connection:
     """Clone an existing yaw.db graph and vector tables into an isolated in-memory SQLite database."""
     stage_conn = open_yaw_db(":memory:")
-    with stage_conn:
+    with write_tx(stage_conn):
         for table, cols in (
             ("chunks", "chunk_id, rel_posix_path, start_line, end_line, title, ast_island_start, ast_island_end"),
-            ("entities", "entity_id, name, definition"),
+            ("entities", "entity_id, name, definition, confidence"),
             ("entity_labels", "label_norm, entity_id, label_kind, raw_label, chunk_id"),
+            ("entity_chunks", "entity_id, chunk_id, llm_prob, vec_coherence, atomic_confidence"),
             (
                 "facts",
                 "fact_id, subj_id, pred, obj_id, raw_triple_json, definition, obj_kind, "
-                "obj_literal_lex, obj_datatype, obj_lang",
+                "obj_literal_lex, obj_datatype, obj_lang, confidence",
             ),
-            ("fact_sources", "fact_id, chunk_id"),
-            ("edges", "src_id, dst_id, kind, weight"),
-            ("edge_sources", "src_id, dst_id, kind, chunk_id"),
+            ("fact_sources", "fact_id, chunk_id, llm_prob, vec_coherence, atomic_confidence"),
+            ("edges", "src_id, dst_id, kind, weight, reasoning"),
+            ("edge_sources", "src_id, dst_id, kind, chunk_id, llm_prob, vec_coherence, atomic_confidence"),
+            ("concept_schemes", "scheme_id, pref_label, definition, history_note, confidence"),
+            ("concept_scheme_members", "scheme_id, entity_id, is_top_concept"),
             ("chunk_vec", "chunk_id, embedding"),
             ("entity_vec", "entity_id, embedding"),
             ("fact_vec", "fact_id, embedding"),
@@ -317,8 +326,6 @@ def materialize_entities_and_facts(
     surface_by_norm: Mapping[str, str],
     chunk_surface_by_norm: Mapping[tuple[str, str], str],
     sense_state: SenseResolutionState,
-    *,
-    datatype_property_weight: float = 0.5,
 ) -> MaterializedGraphBatch:
     """Resolve entity mentions with provisional sense-splitting and materialize reified facts and edges."""
     senses_by_label = sense_state.senses_by_label
@@ -443,26 +450,13 @@ def materialize_entities_and_facts(
             resolved_in_chunk.add((s_norm_key, st.subj_def.strip().lower()))
             chunk_to_entities[cid].add(s_id)
 
-            if st.obj_kind == "literal":
-                o_id: str | None = None
-                o_norm_key = str(text_processing(st.obj)) or st.obj.strip().lower()
-                is_self_literal = o_norm_key == s_norm_key
+            is_literal_obj = st.obj_kind == "literal" or detect_scalar_literal(st.obj)[0]
+            if is_literal_obj:
                 eff_obj_dt = (
                     st.obj_datatype
                     if (st.obj_datatype and st.obj_datatype != "rdfs:Literal")
                     else detect_scalar_literal(st.obj)[1]
                 )
-                if not is_self_literal and not (eff_obj_dt.startswith("xsd:") and not st.obj_def.strip()):
-                    has_existing_sense = bool(senses_by_label.get(o_norm_key))
-                    eff_obj_def = (
-                        st.obj_def.strip()
-                        if (st.obj_def.strip() or has_existing_sense)
-                        else (st.spo_def.strip() or f"Literal value {st.obj}.")
-                    )
-                    o_id = _resolve_mention_entity_id(st.obj, eff_obj_def, cid, allow_sense_split=False)
-                    resolved_in_chunk.add((o_norm_key, st.obj_def.strip().lower()))
-                    chunk_to_entities[cid].add(o_id)
-                fact_oid = o_id if (o_id is not None and o_id != s_id) else None
                 fid = compute_mdhash_id(
                     str((s_id, st.pred, f"literal:{st.obj}:{eff_obj_dt}:{st.obj_lang}")),
                     prefix="fact-",
@@ -474,7 +468,7 @@ def materialize_entities_and_facts(
                         fid,
                         s_id,
                         st.pred,
-                        fact_oid,
+                        None,  # obj_id is strictly None for scalar literals
                         raw_json,
                         st.spo_def,
                         st.subj_def,
@@ -485,9 +479,7 @@ def materialize_entities_and_facts(
                         st.obj_lang,
                     )
                 fact_sources_batch.append((fid, cid))
-                if fact_oid is not None:
-                    fact_linked_pairs.add((min(s_id, fact_oid), max(s_id, fact_oid)))
-                    edges_with_sources.append((s_id, fact_oid, "fact", datatype_property_weight, cid))
+                # Scalar literals NEVER create entities, entity_labels, or edges
             else:
                 o_norm_key = str(text_processing(st.obj)) or st.obj.strip().lower()
                 distinct_homograph_pole = (
@@ -531,9 +523,11 @@ def materialize_entities_and_facts(
                 fact_sources_batch.append((fid, cid))
                 if s_id != o_id:
                     fact_linked_pairs.add((min(s_id, o_id), max(s_id, o_id)))
-                    edges_with_sources.append((s_id, o_id, "fact", 1.0, cid))
+                    edges_with_sources.append((s_id, o_id, "fact", 0.8, cid))
 
         for e_raw_lbl, e_def in ner_entities:
+            if detect_scalar_literal(e_raw_lbl)[0]:
+                continue
             e_norm = str(text_processing(e_raw_lbl)) or e_raw_lbl.strip().lower()
             e_key = (e_norm, e_def.strip().lower())
             if e_key in resolved_in_chunk:
@@ -560,6 +554,62 @@ def materialize_entities_and_facts(
     )
 
 
+def _is_acronym(short_str: str, long_str: str) -> bool:
+    s = "".join(c for c in short_str if c.isalnum()).lower()
+    if not s or len(s) < 2:
+        return False
+    variants = [s]
+    if s.endswith("s") and len(s) > 2:
+        variants.append(s[:-1])
+    tokens = [w for w in re.split(r"[^a-zA-Z0-9]+", long_str) if w]
+    if len(tokens) < 2:
+        return False
+    acronym_initials = "".join(w[0].lower() for w in tokens)
+    return any(v == acronym_initials or acronym_initials.startswith(v) for v in variants)
+
+
+def is_modifier_head_specialization(name_a: str, name_b: str) -> bool:
+    """Return True if one concept name is a modifier prefix specialization of the other with a distinct head noun."""
+    norm_a = str(text_processing(name_a)).strip().lower()
+    norm_b = str(text_processing(name_b)).strip().lower()
+    if not norm_a or not norm_b or norm_a == norm_b:
+        return False
+
+    tokens_a = norm_a.split()
+    tokens_b = norm_b.split()
+
+    if len(tokens_a) != len(tokens_b):
+        shorter_toks, longer_toks = (tokens_a, tokens_b) if len(tokens_a) < len(tokens_b) else (tokens_b, tokens_a)
+        if len(shorter_toks) > 0 and longer_toks[: len(shorter_toks)] == shorter_toks:
+            return True
+
+    clean_a = name_a.strip()
+    clean_b = name_b.strip()
+    if clean_a.casefold() != clean_b.casefold():
+        short_name, long_name = (clean_a, clean_b) if len(clean_a) < len(clean_b) else (clean_b, clean_a)
+        if long_name.casefold().startswith(short_name.casefold()):
+            suffix = long_name[len(short_name) :]
+            if suffix and (suffix[0].isupper() or suffix.startswith(("_", "-", " "))):
+                return True
+
+    return False
+
+
+def _has_disjoint_non_acronym_tokens(name_a: str, name_b: str, lexical_sim: float = 0.0) -> bool:
+    """Return True if token sets are completely disjoint and neither is an acronym/initialism of the other."""
+    norm_a = str(text_processing(name_a)).strip().lower()
+    norm_b = str(text_processing(name_b)).strip().lower()
+    if not norm_a or not norm_b or norm_a == norm_b:
+        return False
+    tokens_a = set(norm_a.split())
+    tokens_b = set(norm_b.split())
+    if tokens_a & tokens_b:
+        return False
+    if _is_acronym(name_a, name_b) or _is_acronym(name_b, name_a):
+        return False
+    return lexical_sim < 0.85
+
+
 def prepare_synonym_candidates(
     stage_conn: sqlite3.Connection,
     entity_nodes: Sequence[tuple[str, str, str]],
@@ -573,7 +623,7 @@ def prepare_synonym_candidates(
     progress_callback: Callable[[str], None] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, tuple[str, str]], int, list[tuple[str, str, str, str | None]]]:
     """Filter valid SKOS concepts, apply the near-1 (cosine, difflib) auto-merge gate, and rank remaining pairs."""
-    valid_entity_ids = filter_valid_concept_entity_ids(stage_conn, entity_nodes)
+    valid_entity_ids = [eid for eid, name, _ in entity_nodes if bool(text_processing(name))]
     if not valid_entity_ids:
         return [], {}, 0, []
     if progress_callback is not None:
@@ -607,27 +657,46 @@ def prepare_synonym_candidates(
                 return True
         return False
 
-    with stage_conn:
+    with write_tx(stage_conn):
         for raw_a, raw_b, d_sim, l_sim in raw_candidates:
-            if float(d_sim) < auto_merge_cosine_gate or float(l_sim) < auto_merge_difflib_gate:
-                continue
             ea = _resolve_active_eid(raw_a)
             eb = _resolve_active_eid(raw_b)
             if ea == eb:
                 continue
             name_a, def_a = cand_meta.get(ea, (ea, ""))
             name_b, def_b = cand_meta.get(eb, (eb, ""))
+
+            # Guardrail 2: Never auto-merge modifier-head specializations or disjoint non-acronym concepts
+            if is_modifier_head_specialization(name_a, name_b):
+                continue
+            if _has_disjoint_non_acronym_tokens(name_a, name_b, float(l_sim)):
+                continue
+
+            # Guardrail 3: Case-insensitive identity consolidation before disambiguation
+            is_case_variant = (
+                text_processing(name_a) == text_processing(name_b) or name_a.casefold() == name_b.casefold()
+            )
+            meets_gate = (
+                is_case_variant and float(d_sim) >= synonymy_threshold and not _is_active_fact_pole(ea, eb)
+            ) or (float(d_sim) >= auto_merge_cosine_gate and float(l_sim) >= auto_merge_difflib_gate)
+            if not meets_gate:
+                continue
+
             if text_processing(name_a) != text_processing(name_b) and _is_active_fact_pole(ea, eb):
                 continue
-            key_a = (len(def_a), -len(name_a), ea)
-            key_b = (len(def_b), -len(name_b), eb)
+
+            casing_a = 1 if any(c.isupper() for c in name_a) else 0
+            casing_b = 1 if any(c.isupper() for c in name_b) else 0
+            key_a = (casing_a, len(def_a), -len(name_a), ea)
+            key_b = (casing_b, len(def_b), -len(name_b), eb)
             dst, src = (ea, eb) if key_a >= key_b else (eb, ea)
             merge_entities(stage_conn, src, dst, label_kind="skos:altLabel")
             auto_merges.append((src, dst, "skos:altLabel", None))
             merged_into[src] = dst
             dst_name, dst_def = cand_meta.get(dst, (dst, ""))
             src_name, src_def = cand_meta.get(src, (src, ""))
-            cand_meta[dst] = (dst_name or src_name, dst_def if len(dst_def) >= len(src_def) else src_def)
+            best_name = dst_name if (casing_a >= casing_b if dst == ea else casing_b >= casing_a) else src_name
+            cand_meta[dst] = (best_name, dst_def if len(dst_def) >= len(src_def) else src_def)
             if rlm_stats is not None:
                 rlm_stats["merged_entities"] = int(rlm_stats.get("merged_entities", 0)) + 1
 
@@ -706,6 +775,20 @@ def apply_synonym_adjudication(
         ea, eb = str(c["entity_a"]), str(c["entity_b"])
         cand_by_pair[(min(ea, eb), max(ea, eb))] = c
 
+    # Empirical mean lexical similarity of accepted skos:altLabel pairs
+    alt_label_sims: list[float] = []
+    for dec in decisions:
+        rel_check = str(dec.get("relation") or dec.get("decision") or "").strip()
+        if rel_check in ("skos:altLabel", "exact_match"):
+            pid_check = str(dec.get("pair_id", "")).strip()
+            if pid_check and "|" in pid_check:
+                r_src, r_tgt = pid_check.split("|", 1)
+                pk = (min(r_src.strip(), r_tgt.strip()), max(r_src.strip(), r_tgt.strip()))
+                c_item = cand_by_pair.get(pk)
+                if c_item:
+                    alt_label_sims.append(float(c_item.get("lexical_sim", 0.0)))
+    avg_alt_label_sim: float | None = sum(alt_label_sims) / len(alt_label_sims) if alt_label_sims else None
+
     def _is_active_fact_pole(u: str, v: str) -> bool:
         target_pair = (min(u, v), max(u, v))
         for fa, fb in fact_linked_pairs:
@@ -714,7 +797,7 @@ def apply_synonym_adjudication(
                 return True
         return False
 
-    with stage_conn:
+    with write_tx(stage_conn):
         for dec in decisions:
             pid = str(dec.get("pair_id", "")).strip()
             if dec.get("source_id") and dec.get("target_id"):
@@ -742,9 +825,22 @@ def apply_synonym_adjudication(
             name_tgt, _ = cand_meta.get(tgt, cand_meta.get(raw_tgt, (tgt, "")))
 
             reas = str(dec.get("reasoning", "") or "").strip()
+            dec_prob = dec.get("llm_prob")
+            dec_llm_prob = float(dec_prob) if dec_prob is not None else None
+            edge_weight = pool_confidences(dec_llm_prob, sim) or sim
             if rel in ("skos:altLabel", "skos:hiddenLabel", "exact_match"):
+                # Guardrail 2: Head-Noun & Proper-Noun Modifier Invariant
+                if is_modifier_head_specialization(name_src, name_tgt):
+                    child_id = src if len(name_src) >= len(name_tgt) else tgt
+                    parent_id = tgt if child_id == src else src
+                    raw_semantic_batch.append((child_id, parent_id, "skos:broader", edge_weight, reas))
+                    continue
+                if _has_disjoint_non_acronym_tokens(name_src, name_tgt, sim):
+                    raw_semantic_batch.append((src, tgt, "skos:related", edge_weight, reas))
+                    continue
+
                 if text_processing(name_src) != text_processing(name_tgt) and _is_active_fact_pole(src, tgt):
-                    raw_semantic_batch.append((src, tgt, "skos:related", max(0.5, sim), reas))
+                    raw_semantic_batch.append((src, tgt, "skos:related", edge_weight, reas))
                     continue
                 canon = str(dec.get("canonical", "") or "").strip()
                 canon_id = _resolve_active_eid(canon) if canon else ""
@@ -797,12 +893,17 @@ def apply_synonym_adjudication(
                 rlm_stats["merged_entities"] = int(rlm_stats.get("merged_entities", 0)) + 1
             else:
                 if rel in ("owl:differentFrom", "different", "different_from"):
-                    raw_semantic_batch.append((src, tgt, "owl:differentFrom", 0.0, reas))
+                    # Guardrail 1: Homograph-Only owl:differentFrom
+                    is_homograph = text_processing(name_src) == text_processing(name_tgt)
+                    lex_sim = float(cand_info.get("lexical_sim", 0.0))
+                    meets_homograph_boundary = avg_alt_label_sim is not None and lex_sim >= avg_alt_label_sim
+                    if is_homograph or meets_homograph_boundary:
+                        raw_semantic_batch.append((src, tgt, "owl:differentFrom", 0.0, reas))
                 elif rel == "skos:broader":
                     child_id, parent_id = src, tgt
-                    raw_semantic_batch.append((child_id, parent_id, "skos:broader", max(0.5, sim), reas))
+                    raw_semantic_batch.append((child_id, parent_id, "skos:broader", edge_weight, reas))
                 elif rel in ("skos:related", "related"):
-                    raw_semantic_batch.append((src, tgt, "skos:related", max(0.5, sim), reas))
+                    raw_semantic_batch.append((src, tgt, "skos:related", edge_weight, reas))
 
         edge_priority = {"skos:related": 1, "skos:broader": 2, "owl:differentFrom": 3}
         pair_edges: dict[tuple[str, str], tuple[str, str, str, float, str]] = {}
@@ -878,6 +979,279 @@ def collect_shacl_violation_dossiers(
             )
         focus_contexts.append(focus_dossiers[v.focus_node])
     return all_violations, violations, focus_dossiers, focus_contexts
+
+
+async def build_concept_schemes(
+    stage_conn: sqlite3.Connection,
+    *,
+    program: Any = None,
+    embed_fn: Callable[..., Awaitable[Sequence[np.ndarray]]] | None = None,
+    progress_callback: Callable[[str], None] | None = None,
+) -> list[dict[str, Any]]:
+    """Partition post-healing SKOS concepts into emergent skos:ConceptScheme taxonomies \
+via Newman Modularity Maximization without magic numbers."""
+    if progress_callback is not None:
+        progress_callback("indexing: inducing emergent skos:ConceptScheme modularity clusters")
+
+    entity_rows = stage_conn.execute(
+        "SELECT entity_id, name, definition, confidence FROM entities ORDER BY entity_id ASC"
+    ).fetchall()
+    if not entity_rows:
+        return []
+
+    entity_ids: list[str] = [str(r[0]) for r in entity_rows]
+    entity_names: dict[str, str] = {str(r[0]): str(r[1]) for r in entity_rows}
+    entity_priors: dict[str, float] = {str(r[0]): float(r[3]) if r[3] is not None else 1.0 for r in entity_rows}
+    n_entities = len(entity_ids)
+
+    vec_rows = stage_conn.execute("SELECT entity_id, embedding FROM entity_vec").fetchall()
+    vec_map: dict[str, np.ndarray] = {}
+    for eid, blob in vec_rows:
+        arr = np.frombuffer(blob, dtype=np.float32)
+        norm = float(np.linalg.norm(arr))
+        vec_map[str(eid)] = arr / norm if norm > 1e-9 else arr
+
+    dim = next((v.shape[0] for v in vec_map.values()), 384)
+    default_v = np.zeros(dim, dtype=np.float32)
+    default_v[0] = 1.0
+
+    edge_rows = stage_conn.execute("SELECT src_id, dst_id, kind, weight FROM edges WHERE weight > 0").fetchall()
+
+    different_pairs: set[tuple[str, str]] = set()
+    for s_id, d_id, kind, _ in edge_rows:
+        if kind == "owl:differentFrom":
+            different_pairs.add((min(s_id, d_id), max(s_id, d_id)))
+
+    pair_edge_weights: dict[tuple[str, str], list[float]] = defaultdict(list)
+    for s_id, d_id, kind, w in edge_rows:
+        if kind in ("skos:broader", "skos:related", "fact"):
+            pair_edge_weights[(min(s_id, d_id), max(s_id, d_id))].append(float(w))
+
+    fact_rows = stage_conn.execute(
+        "SELECT subj_id, obj_id, confidence FROM facts WHERE obj_kind = 'entity' AND obj_id IS NOT NULL"
+    ).fetchall()
+    for s_id, o_id, f_conf in fact_rows:
+        if s_id and o_id and s_id != o_id:
+            w = float(f_conf) if f_conf is not None else 0.5
+            pair_edge_weights[(min(s_id, o_id), max(s_id, o_id))].append(w)
+
+    id_to_idx = {eid: idx for idx, eid in enumerate(entity_ids)}
+    A = np.zeros((n_entities, n_entities), dtype=np.float64)
+
+    for (u, v), w_list in pair_edge_weights.items():
+        if (u, v) in different_pairs:
+            continue
+        idx_u = id_to_idx.get(u)
+        idx_v = id_to_idx.get(v)
+        if idx_u is None or idx_v is None or idx_u == idx_v:
+            continue
+        w_edge = bayesian_noisy_or(w_list) or 0.5
+        v_u = vec_map.get(u, default_v)
+        v_v = vec_map.get(v, default_v)
+        cos_sim = float(np.dot(v_u, v_v))
+        a_val = pool_confidences(w_edge, max(1e-6, min(1.0, cos_sim))) or 1e-6
+        A[idx_u, idx_v] = a_val
+        A[idx_v, idx_u] = a_val
+
+    degrees = np.sum(A, axis=1)
+    two_m = float(np.sum(degrees))
+
+    if two_m <= 0.0 or n_entities < 2:
+        communities: list[set[int]] = [{i} for i in range(n_entities)]
+    else:
+        comms: dict[int, set[int]] = {i: {i} for i in range(n_entities)}
+        a_vec: dict[int, float] = {i: float(degrees[i]) / two_m for i in range(n_entities)}
+        e_mat: dict[tuple[int, int], float] = {}
+        for i in range(n_entities):
+            for j in range(i + 1, n_entities):
+                if A[i, j] > 0.0:
+                    e_mat[(i, j)] = (2.0 * A[i, j]) / two_m
+
+        while len(comms) > 1:
+            best_pair: tuple[int, int] | None = None
+            best_delta_q = 0.0
+
+            for (ca, cb), e_ab in list(e_mat.items()):
+                if ca not in comms or cb not in comms:
+                    continue
+                delta_q = 2.0 * (e_ab - a_vec[ca] * a_vec[cb])
+                if delta_q > best_delta_q:
+                    best_delta_q = delta_q
+                    best_pair = (ca, cb)
+
+            if best_pair is None or best_delta_q <= 0.0:
+                break
+
+            ca, cb = best_pair
+            comms[ca].update(comms.pop(cb))
+            a_vec[ca] += a_vec.pop(cb)
+
+            for ck in list(comms.keys()):
+                if ck == ca:
+                    continue
+                pkey_b = (min(cb, ck), max(cb, ck))
+                e_b = e_mat.pop(pkey_b, 0.0)
+                if e_b > 0.0:
+                    pkey_a = (min(ca, ck), max(ca, ck))
+                    e_mat[pkey_a] = e_mat.get(pkey_a, 0.0) + e_b
+
+            e_mat.pop((min(ca, cb), max(ca, cb)), None)
+
+        communities = list(comms.values())
+
+    scheme_packets: list[dict[str, Any]] = []
+    community_meta: list[dict[str, Any]] = []
+
+    for comm_indices in communities:
+        c_eids = [entity_ids[idx] for idx in sorted(comm_indices)]
+        if not c_eids:
+            continue
+
+        ph_c = ",".join("?" for _ in c_eids)
+        internal_broader = stage_conn.execute(
+            f"""
+            SELECT src_id, dst_id, weight FROM edges
+            WHERE kind = 'skos:broader' AND src_id IN ({ph_c}) AND dst_id IN ({ph_c})
+            """,
+            c_eids + c_eids,
+        ).fetchall()
+
+        children_with_parents = {str(r[0]) for r in internal_broader}
+        R_m = [eid for eid in c_eids if eid not in children_with_parents]
+        if not R_m:
+            R_m = list(c_eids)
+
+        c_vecs = [vec_map.get(eid, default_v) for eid in c_eids]
+        mu_m = np.mean(c_vecs, axis=0)
+        norm_mu = float(np.linalg.norm(mu_m))
+        hat_mu_m = mu_m / norm_mu if norm_mu > 1e-9 else mu_m
+
+        root_scores: dict[str, float] = {}
+        for u in R_m:
+            idx_u = id_to_idx[u]
+            u_vec = vec_map.get(u, default_v)
+            cos_u = float(np.dot(u_vec, hat_mu_m))
+            within_affinities = [
+                float(A[idx_u, id_to_idx[v]]) for v in c_eids if v != u and A[idx_u, id_to_idx[v]] > 0.0
+            ]
+            ev_u = bayesian_noisy_or(within_affinities) if within_affinities else 0.5
+            p_u = entity_priors.get(u, 1.0)
+            s_top = pool_confidences(p_u, max(1e-6, min(1.0, cos_u)), ev_u) or 0.5
+            root_scores[u] = s_top
+
+        mean_s_top = sum(root_scores.values()) / max(1, len(root_scores))
+        T_m = [u for u in R_m if root_scores[u] >= mean_s_top]
+        if not T_m:
+            T_m = [max(R_m, key=lambda u: root_scores.get(u, 0.0))]
+
+        scheme_id = compute_mdhash_id("|".join(sorted(T_m)), prefix="scheme-")
+
+        internal_affinity = sum(float(A[id_to_idx[u], id_to_idx[v]]) for u in c_eids for v in c_eids if u != v)
+        comm_degree_sum = sum(float(degrees[id_to_idx[u]]) for u in c_eids)
+        c_mod = max(1e-6, min(1.0, internal_affinity / max(1e-6, comm_degree_sum))) if comm_degree_sum > 0 else 0.5
+
+        best_root = max(T_m, key=lambda u: root_scores.get(u, 0.0))
+        fallback_title = entity_names.get(best_root, best_root)
+        member_names = [entity_names.get(eid, eid) for eid in c_eids]
+        top_names = [entity_names.get(eid, eid) for eid in T_m]
+
+        packet = {
+            "scheme_id": scheme_id,
+            "pref_label": fallback_title,
+            "members": member_names,
+            "taxonomic_roots": top_names,
+            "top_concepts": T_m,
+            "definition": (
+                f"Domain concept scheme synthesizing {len(c_eids)} concepts "
+                f"including {', '.join(sorted(top_names)[:3])}."
+            ),
+            "history_note": "Emergent taxonomy cluster induced by Newman modularity maximization.",
+        }
+        scheme_packets.append(packet)
+        community_meta.append(
+            {
+                "scheme_id": scheme_id,
+                "members": c_eids,
+                "top_concepts": T_m,
+                "root_scores": root_scores,
+                "hat_mu_m": hat_mu_m,
+                "c_mod": c_mod,
+            }
+        )
+
+    defined_schemes: dict[str, tuple[str, str, str, float | None]] = {}
+    if program is not None and hasattr(program, "define_concept_schemes"):
+        res = program.define_concept_schemes(scheme_packets)
+        for s_id, p_lbl, dfn, note, llm_p in res:
+            defined_schemes[s_id] = (p_lbl, dfn, note, llm_p)
+
+    fmt_entity = DSPyEmbeddingAdapter.format_entity_for_embedding
+    texts_to_embed: list[tuple[str, str]] = []
+    for idx, meta in enumerate(community_meta):
+        s_id = meta["scheme_id"]
+        packet = scheme_packets[idx]
+        if s_id in defined_schemes:
+            pref_lbl, s_def, s_note, llm_prob = defined_schemes[s_id]
+        else:
+            pref_lbl = packet["pref_label"]
+            s_def = packet["definition"]
+            s_note = packet["history_note"]
+            llm_prob = None
+        texts_to_embed.append((s_id, fmt_entity(pref_lbl, s_def)))
+
+    embedded_vecs: dict[str, np.ndarray] = {}
+    if texts_to_embed and embed_fn is not None:
+        strings = [t[1] for t in texts_to_embed]
+        vecs = await embed_fn(strings, stage="entity_embed")
+        for (s_id, _), v in zip(texts_to_embed, vecs, strict=True):
+            norm = float(np.linalg.norm(v))
+            embedded_vecs[s_id] = v / norm if norm > 1e-9 else v
+
+    schemes_to_upsert: list[tuple[str, str, str, str, float | None]] = []
+    members_to_upsert: list[tuple[str, str, int]] = []
+    edges_to_upsert: list[tuple[str, str, str, float, str]] = []
+    scheme_vectors: list[tuple[str, np.ndarray]] = []
+
+    with write_tx(stage_conn):
+        for idx, meta in enumerate(community_meta):
+            s_id = meta["scheme_id"]
+            c_eids = meta["members"]
+            T_m = meta["top_concepts"]
+            root_scores = meta["root_scores"]
+            hat_mu_m = meta["hat_mu_m"]
+            c_mod = meta["c_mod"]
+
+            if s_id in defined_schemes:
+                pref_lbl, s_def, s_note, llm_prob = defined_schemes[s_id]
+            else:
+                packet = scheme_packets[idx]
+                pref_lbl = packet["pref_label"]
+                s_def = packet["definition"]
+                s_note = packet["history_note"]
+                llm_prob = None
+
+            s_vec = embedded_vecs.get(s_id, hat_mu_m)
+            cos_centroid = float(np.dot(s_vec, hat_mu_m))
+            scheme_conf = pool_confidences(llm_prob, max(1e-6, min(1.0, cos_centroid)), c_mod) or c_mod
+
+            schemes_to_upsert.append((s_id, pref_lbl, s_def, s_note, scheme_conf))
+
+            for eid in c_eids:
+                is_top = 1 if eid in T_m else 0
+                members_to_upsert.append((s_id, eid, is_top))
+
+            for top_eid in T_m:
+                s_top_val = root_scores.get(top_eid, 0.5)
+                edges_to_upsert.append((top_eid, s_id, "skos:topConceptOf", s_top_val, ""))
+
+            scheme_vectors.append((s_id, s_vec))
+
+        upsert_concept_schemes(stage_conn, schemes_to_upsert)
+        upsert_concept_scheme_members(stage_conn, members_to_upsert)
+        upsert_semantic_edges(stage_conn, edges_to_upsert)
+        upsert_entity_vectors(stage_conn, scheme_vectors)
+
+    return scheme_packets
 
 
 @coco.fn
@@ -1055,7 +1429,6 @@ async def plan_graph_publication(
         surface_by_norm,
         chunk_surface_by_norm,
         sense_state,
-        datatype_property_weight=settings.datatype_property_weight,
     )
     rlm_stats["homograph_splits"] += materialized.homograph_splits
     entity_nodes = materialized.entity_nodes
@@ -1182,7 +1555,11 @@ async def plan_graph_publication(
                 corpus_root=settings.corpus_root,
             )
 
-        # 4. Closed-World SHACL Linting & RLM Healing on staging_conn
+        # 4. Closed-World SHACL Deterministic Auto-Healing & RLM Healing on staging_conn
+        auto_healed = auto_heal_deterministic_shacl(staging_conn)
+        rlm_stats["shacl_deterministic_healed"] = auto_healed
+        rlm_stats["shacl_repairs_applied"] += auto_healed
+
         _, violations, focus_dossiers, _ = collect_shacl_violation_dossiers(
             staging_conn,
             settings.corpus_root,
@@ -1259,23 +1636,12 @@ async def plan_graph_publication(
                 "SELECT fact_id, chunk_id FROM fact_sources ORDER BY fact_id ASC, chunk_id ASC"
             ).fetchall()
         )
-        entity_fact_pairs = {
-            (str(r[0]), str(r[1]))
-            for r in staging_conn.execute(
-                "SELECT DISTINCT subj_id, obj_id FROM facts "
-                "WHERE COALESCE(obj_kind, 'entity') = 'entity' AND obj_id IS NOT NULL"
-            ).fetchall()
-        }
         final_edges = tuple(
             (
                 str(r[0]),
                 str(r[1]),
                 str(r[2]),
-                (
-                    (1.0 if (str(r[0]), str(r[1])) in entity_fact_pairs else settings.datatype_property_weight)
-                    if str(r[2]) == "fact"
-                    else float(r[3])
-                ),
+                float(r[3]),
                 str(r[4] or ""),
             )
             for r in staging_conn.execute(
@@ -1303,6 +1669,7 @@ async def plan_graph_publication(
             )
             for (eid, _, _), vec in zip(reembed_entities, re_vecs, strict=True):
                 entity_vec_by_id[eid] = vec
+            upsert_entity_vectors(staging_conn, [(eid, entity_vec_by_id[eid]) for eid, _, _ in reembed_entities])
 
         initial_fact_defs = {f_row[0]: f_row[5] for f_row in fact_nodes}
         reembed_facts = [
@@ -1319,8 +1686,57 @@ async def plan_graph_publication(
             for f_row, vec in zip(reembed_facts, rf_vecs, strict=True):
                 fact_vec_by_id[f_row[0]] = vec
 
-        final_entity_vectors = tuple((eid, entity_vec_by_id[eid]) for eid, _, _ in final_entities)
+        # Induce emergent skos:ConceptScheme taxonomies via Newman modularity maximization
+        await build_concept_schemes(
+            staging_conn,
+            program=extraction.program,
+            embed_fn=_embed_strings,
+            progress_callback=None,
+        )
+
+        final_concept_schemes = tuple(
+            (str(r[0]), str(r[1]), str(r[2]), str(r[3]), float(r[4]) if r[4] is not None else None)
+            for r in staging_conn.execute(
+                "SELECT scheme_id, pref_label, definition, history_note, confidence "
+                "FROM concept_schemes ORDER BY scheme_id ASC"
+            ).fetchall()
+        )
+        final_concept_scheme_members = tuple(
+            (str(r[0]), str(r[1]), int(r[2]))
+            for r in staging_conn.execute(
+                "SELECT scheme_id, entity_id, is_top_concept "
+                "FROM concept_scheme_members ORDER BY scheme_id ASC, entity_id ASC"
+            ).fetchall()
+        )
+
+        # Include both skos:Concept and skos:ConceptScheme vectors
+        final_entity_vectors = tuple(
+            (str(r[0]), np.frombuffer(r[1], dtype=np.float32))
+            for r in staging_conn.execute(
+                "SELECT entity_id, embedding FROM entity_vec ORDER BY entity_id ASC"
+            ).fetchall()
+        )
         final_fact_vectors = tuple((f_row[0], fact_vec_by_id[f_row[0]]) for f_row in final_facts)
+
+        # Re-fetch final_edges to include newly added skos:topConceptOf edges
+        final_edges = tuple(
+            (
+                str(r[0]),
+                str(r[1]),
+                str(r[2]),
+                float(r[3]),
+                str(r[4] or ""),
+            )
+            for r in staging_conn.execute(
+                """
+                SELECT e.src_id, e.dst_id, e.kind, e.weight, COALESCE(es.chunk_id, '')
+                FROM edges e
+                LEFT JOIN edge_sources es
+                  ON es.src_id = e.src_id AND es.dst_id = e.dst_id AND es.kind = e.kind
+                ORDER BY e.src_id ASC, e.dst_id ASC, e.kind ASC, COALESCE(es.chunk_id, '') ASC
+                """
+            ).fetchall()
+        )
 
         final_rows = PreparedGraphRows(
             chunks=tuple(chunks),
@@ -1332,6 +1748,8 @@ async def plan_graph_publication(
             chunk_vectors=tuple(chunk_vec_pairs),
             entity_vectors=final_entity_vectors,
             fact_vectors=final_fact_vectors,
+            concept_schemes=final_concept_schemes,
+            concept_scheme_members=final_concept_scheme_members,
         )
         return GraphPlanResult(
             rows=final_rows,

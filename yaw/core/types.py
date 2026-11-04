@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import math
 import re
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import asdict, dataclass
@@ -233,18 +234,17 @@ class StructuredTriple:
 
 @dataclass(slots=True, frozen=True)
 class RelationTraversalPolicy:
-    """Versioned relation-aware directed traversal policy for Personalized PageRank."""
+    """Relation-aware directed Markov transition multipliers for Personalized PageRank."""
 
     passage: float = 1.0
     fact_forward: float = 1.0
     fact_reverse: float = 1.0
-    datatype_property: float = 0.5
     skos_related: float = 1.0
     skos_broader_up: float = 1.0
     skos_broader_down: float = 0.5
+    skos_top_concept_up: float = 1.0
+    skos_top_concept_down: float = 0.8
     owl_different_from: float = 0.0
-    parallel_aggregation: Literal["max", "sum", "capped_sum"] = "max"
-    parallel_cap: float = 2.0
 
     @property
     def fact_fwd(self) -> float:
@@ -414,6 +414,25 @@ _XSD_DATETIME_RE = re.compile(
     re.IGNORECASE,
 )
 _XSD_DATE_RE = re.compile(r"^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])$")
+_XSD_TIME_RE = re.compile(
+    r"^(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z|[+-](?:[01]\d|2[0-3]):?[0-5]\d)?|(?:1[0-2]|0?[1-9]):[0-5]\d(?::[0-5]\d)?\s*(?:am|pm))$",
+    re.IGNORECASE,
+)
+_XSD_DURATION_RE = re.compile(
+    r"^-?P(?=\d|T\d)(?:(?:\d+Y)?(?:\d+M)?(?:\d+D)?)(?:T(?:\d+H)?(?:\d+M)?(?:\d+(?:\.\d+)?S)?)?$",
+    re.IGNORECASE,
+)
+_CURRENCY_PREFIX_RE = re.compile(
+    r"^[\$€£¥]\s*\d+(?:\.\d+)?(?:\s*[kKmMbBtT]|(?:\s*(?:thousand|million|billion|trillion)))?$",
+    re.IGNORECASE,
+)
+_CURRENCY_SUFFIX_RE = re.compile(r"^\d+(?:\.\d+)?\s*(?:USD|EUR|GBP|JPY|cents?|dollars?)$", re.IGNORECASE)
+_DURATION_LATENCY_RE = re.compile(
+    r"^(?:p\d+\s+)?\d+(?:\.\d+)?\s*(?:ns|µs|us|ms|s|sec|seconds?|min|minutes?|h|hours?|days?)$",
+    re.IGNORECASE,
+)
+_PERCENT_STORAGE_RE = re.compile(r"^\d+(?:\.\d+)?\s*(?:%|MB|GB|KB|TB|PB|bytes?)$", re.IGNORECASE)
+_QUANTIFIED_COUNT_RE = re.compile(r"^\d+\s+(?:events?|requests?|tokens?|queries|pods?|nodes?)$", re.IGNORECASE)
 
 
 def detect_scalar_literal(text: str, definition: str = "") -> tuple[bool, str]:
@@ -434,4 +453,45 @@ def detect_scalar_literal(text: str, definition: str = "") -> tuple[bool, str]:
         return (True, "xsd:dateTime")
     if _XSD_DATE_RE.match(val):
         return (True, "xsd:date")
+    if _XSD_TIME_RE.match(val):
+        return (True, "xsd:time")
+    if _XSD_DURATION_RE.match(val) or _DURATION_LATENCY_RE.match(val):
+        return (True, "xsd:duration")
+    if (
+        _CURRENCY_PREFIX_RE.match(val)
+        or _CURRENCY_SUFFIX_RE.match(val)
+        or _PERCENT_STORAGE_RE.match(val)
+        or _QUANTIFIED_COUNT_RE.match(val)
+    ):
+        return (True, "xsd:string")
     return (False, "xsd:string")
+
+
+def pool_confidences(*signals: float | None, eps: float = 1e-6) -> float | None:
+    """Logarithmic Opinion Pool (Geometric Mean) over non-None signals in [eps, 1 - eps], or None if all None.
+
+    Invariant: pool_confidences(p, p) == p, pool_confidences(p, None) == p,
+    pool_confidences(None, None) is None.
+    """
+    valid = [float(s) for s in signals if s is not None]
+    if not valid:
+        return None
+    clamped = [min(1.0 - eps, max(eps, s)) for s in valid]
+    log_sum = sum(math.log(s) for s in clamped)
+    return float(math.exp(log_sum / len(clamped)))
+
+
+def bayesian_noisy_or(confidences: Sequence[float | None], *, eps: float = 1e-6) -> float | None:
+    """Compute 1 - prod(1 - c_i) over non-None observations in [eps, 1 - eps], or None if all None.
+
+    Each observation contributes additive Shannon evidence: -log(1 - c_i).
+    """
+    valid = [float(c) for c in confidences if c is not None]
+    if not valid:
+        return None
+    clamped = [min(1.0 - eps, max(eps, c)) for c in valid]
+    prod_complement = 1.0
+    for c in clamped:
+        prod_complement *= 1.0 - c
+    res = 1.0 - prod_complement
+    return float(min(1.0 - eps, max(eps, res)))

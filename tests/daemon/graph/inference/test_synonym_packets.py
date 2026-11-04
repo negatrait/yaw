@@ -156,7 +156,10 @@ def make_batch(tmp_path: Path, count: int = 5) -> SynonymEvidenceBatch:
             upsert_chunk_pointers(conn, [(pointer, "Evidence")])
             upsert_edges_with_sources(conn, [(pointer.chunk_id, eid, "passage", 1.0, pointer.chunk_id)])
         # Seed an already validated directed relation; sibling demotion belongs to other tests.
-        conn.execute("INSERT INTO edges VALUES (?, ?, 'skos:broader', 1.0)", (entities[1][0], entities[0][0]))
+        conn.execute(
+            "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES (?, ?, 'skos:broader', 1.0)",
+            (entities[1][0], entities[0][0]),
+        )
         candidates = [
             {
                 "pair_id": f"{entities[0][0]}|{e[0]}",

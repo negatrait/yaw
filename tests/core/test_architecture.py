@@ -35,6 +35,7 @@ _CANONICAL_DOCS_INVENTORY = frozenset(
         "enterprise-rag-bench-training-plan.md",
         "epic-1-hipporag-daemon.md",
         "epic-2-fastmcp-http.md",
+        "epistemic-confidence-spec.md",
         "evaluation-graph-storage.md",
         "evaluation-inference.md",
         "evaluation-ingestion.md",

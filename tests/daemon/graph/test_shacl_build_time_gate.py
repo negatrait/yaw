@@ -336,13 +336,13 @@ def test_build_time_shacl_gate_success(synonym_token_counter, tmp_path: Path) ->
             assert "sh:conforms true" in ttl
             assert "@prefix xsd: <http://www.w3.org/2001/XMLSchema#> ." in ttl
 
-            # 2. owl:DatatypeProperty literal objects ("2026-10-25", "8080") ARE materialized in entities
+            # 2. Literal objects ("2026-10-25", "8080") are strictly excluded from entities and edges
             ent_by_name = {
                 str(r[1]).lower(): (str(r[0]), str(r[2]))
                 for r in conn.execute("SELECT entity_id, name, definition FROM entities").fetchall()
             }
-            assert "2026-10-25" in ent_by_name
-            assert "8080" in ent_by_name
+            assert "2026-10-25" not in ent_by_name
+            assert "8080" not in ent_by_name
             assert "yet another wiki" in ent_by_name
             assert "security engineering" in ent_by_name
             assert "engineering" in ent_by_name
@@ -362,49 +362,28 @@ def test_build_time_shacl_gate_success(synonym_token_counter, tmp_path: Path) ->
             assert ("yet another wiki", "skos:prefLabel") in yaw_labels
             assert ("yaw", "skos:altLabel") in yaw_labels
 
-            date_id = ent_by_name["2026-10-25"][0]
-            port_id = ent_by_name["8080"][0]
             sec_eng_id = ent_by_name["security engineering"][0]
             eng_id = ent_by_name["engineering"][0]
             h2_id = ent_by_name["http 2"][0]
             h3_id = ent_by_name["http 3"][0]
 
-            # Passage edges connect the chunk to both literal nodes
-            passage_pairs = {
-                (str(r[0]), str(r[1]))
-                for r in conn.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'passage'").fetchall()
-            }
-            assert (chunk.chunk_id, date_id) in passage_pairs
-            assert (chunk.chunk_id, port_id) in passage_pairs
-
-            # Fact edges from subject to literal nodes have weight == 0.5, while ObjectProperty fact edges have 1.0
+            # Literal nodes NEVER enter edges (no passage edges, no fact edges)
+            # Only concept entities have passage and fact edges
             fact_edges = {
                 (str(r[0]), str(r[1])): float(r[2])
                 for r in conn.execute("SELECT src_id, dst_id, weight FROM edges WHERE kind = 'fact'").fetchall()
             }
-            assert abs(fact_edges[(yaw_id, date_id)] - 0.5) < 1e-6
-            assert abs(fact_edges[(yaw_id, port_id)] - 0.5) < 1e-6
-            assert abs(fact_edges[(sec_eng_id, eng_id)] - 1.0) < 1e-6
-            assert abs(fact_edges[(h2_id, h3_id)] - 1.0) < 1e-6
+            assert abs(fact_edges[(sec_eng_id, eng_id)] - 0.8) < 1e-6
+            assert abs(fact_edges[(h2_id, h3_id)] - 0.8) < 1e-6
+            assert len(fact_edges) == 2
 
-            # Facts table records obj_kind == 'literal' and obj_id IS NOT NULL for both DatatypeProperty facts
+            # Facts table records obj_kind == 'literal' and obj_id IS NULL for both literal facts
             lit_facts = conn.execute(
                 "SELECT pred, obj_kind, obj_id, obj_literal_lex FROM facts WHERE obj_kind = 'literal' ORDER BY pred ASC"
             ).fetchall()
             assert len(lit_facts) == 2
-            assert {str(r[2]) for r in lit_facts} == {date_id, port_id}
+            assert all(r[2] is None for r in lit_facts)
             assert {str(r[3]) for r in lit_facts} == {"2026-10-25", "8080"}
-
-            # Literal nodes have zero skos:broader or skos:related edges
-            lit_skos_edges = conn.execute(
-                """
-                SELECT src_id, dst_id, kind FROM edges
-                WHERE kind IN ('skos:broader', 'skos:related')
-                  AND (src_id IN (?, ?) OR dst_id IN (?, ?))
-                """,
-                (date_id, port_id, date_id, port_id),
-            ).fetchall()
-            assert lit_skos_edges == []
 
             # 3. Verify security engineering -> engineering has properly oriented skos:broader edge
             broader_edges = {
@@ -423,19 +402,12 @@ def test_build_time_shacl_gate_success(synonym_token_counter, tmp_path: Path) ->
             }
             assert related_edges == {(h2_id, h3_id), (h3_id, h2_id)}
 
-        # 5. Verify YawGraphEngine.retrieve (PPR) traverses from the subject through the 0.5-weighted
-        # owl:DatatypeProperty literal edge to rank the chunk
+        # 5. Verify YawGraphEngine.retrieve (PPR) traverses between concepts and chunks
         csr = engine._ensure_csr_graph()
-        assert float(csr.transition_t[csr.node_to_idx[port_id], csr.node_to_idx[yaw_id]]) > 0.0
-        assert float(csr.transition_t[csr.node_to_idx[date_id], csr.node_to_idx[yaw_id]]) > 0.0
-        assert float(csr.transition_t[csr.node_to_idx[chunk.chunk_id], csr.node_to_idx[port_id]]) > 0.0
-        assert float(csr.transition_t[csr.node_to_idx[chunk.chunk_id], csr.node_to_idx[date_id]]) > 0.0
+        assert float(csr.transition_t[csr.node_to_idx[chunk.chunk_id], csr.node_to_idx[yaw_id]]) > 0.0
 
         ppr_from_subj = run_ppr(csr, {yaw_id: 1.0})
-        assert float(ppr_from_subj[csr.node_to_idx[port_id]]) > 0.0
-        assert float(ppr_from_subj[csr.node_to_idx[date_id]]) > 0.0
-        ppr_from_lit = run_ppr(csr, {port_id: 1.0})
-        assert float(ppr_from_lit[csr.node_to_idx[chunk.chunk_id]]) > 0.0
+        assert float(ppr_from_subj[csr.node_to_idx[chunk.chunk_id]]) > 0.0
 
         hits, kept_facts = engine.retrieve_with_seeds("What port does Yet Another Wiki listen on?", top_k=1)
         assert ("yet another wiki", "listens on port", "8080") in kept_facts

@@ -2,6 +2,54 @@
 
 Domain evaluation ledger for CocoIndex file/inference/graph targets, dataset bundle preparation, bounded overlap pilots, and Epic 2 runtime specification reconciliation. See the [Evaluation Index](evaluation.md) for all other domain ledgers.
 
+## Candidate cutover audit correction (2026-11-04)
+
+The October 31 full-cutover claim below is not supported by current source.
+Snapshot acquisition uses the native app, but `_canonical_retrieval_hook` still
+calls `_ensure_candidate_chunks_indexed` during optimization. That method and
+`_prepare_optimization_pools` retain manual eight-chunk loops; `index_chunks`
+executes chunk embeddings before OpenIE and owns direct graph persistence.
+Native daemon publication therefore coexists with the old candidate path.
+The consumer-update acceptance gate is reopened. Replacing candidate preparation
+and its writes through native components/targets remains required; removal of
+`EmbeddingLane` alone does not establish that requirement.
+
+## Runtime native live activation (2026-11-04)
+
+YawRuntime now hosts a persistent native live update when `auto_poll=True` and
+waits for native readiness. The existing bounded command worker transitions the
+app to catch-up before queued operations and restarts live mode after success.
+No filesystem polling loop or custom inference executor was introduced. Native
+publication invalidates cached retrieval state and refreshes runtime statistics.
+Reload callbacks enqueue their command without waiting inside a live component;
+completion writes the external result file, avoiding a callback/drain deadlock.
+Live failures signal shutdown and propagate through cleanup; resource close
+exceptions are no longer suppressed. SQLite closes only after active work exits.
+
+Full runtime module: 26 passed in 41.56 s. After the final cleanup edits, focused
+live/reload, parser-failure and worker-drain checks: 3 passed, 24 deselected in
+18.70 s. All used `--no-testmon`, real files, CocoIndex and SQLite with test
+inference providers; these are orchestration results, not model-quality evidence.
+Focused Ruff, format and ty passed. Rapid edit races, provider timeout shutdown,
+full repository gates and command catch-up overhead remain to be assessed.
+
+## Runtime lifecycle acceptance reopened (2026-11-04)
+
+Audit at `b658137` confirmed the native pipeline cutover but contradicted the
+claim that YawRuntime activates daemon live ingestion: its only update call is
+catch-up `app.update()` in `_execute_sync_worker`. Native component live tests
+do not cover this runtime activation gap. The progress checklist now records it.
+
+Shutdown also joined the command worker for only five seconds before closing
+CocoIndex and SQLite. Removed that timeout: resources now remain open until the
+active operation returns under its provider timeout/retry policy. A real runtime
+and SQLite regression holds work beyond 5.5 seconds, verifies shutdown remains
+pending, then releases the work and confirms its SQL query succeeds before final
+closure. Shutdown and runtime lock tests: 2 passed, 23 deselected (15.51 s).
+Native source/publication tests: 10 passed (1.98 s). Both used `--no-testmon`.
+Focused Ruff, format, ty and diff checks passed. No real-model pilot was launched;
+full quality gates and daemon live startup/readiness/draining remain outstanding.
+
 ## Native CocoIndex declarative cutover, dataset-agnostic catalog & bounded live pilot (2026-10-31)
 
 Completed the full cutover of `YawRuntime` (`start`, `sync_now`, `optimize`, `benchmark`) and `snapshot_dataset_bundle` onto the single declarative CocoIndex 1.0.26 pipeline (`indexing_app_main`), demolished all competing ingestion/caching/polling paths (`CorpusIngestor`, `sync_corpus_once`, `EmbeddingLane`, `indexing_overlap`, `YawRuntime._poll_loop`, `openie_cache`, `ReActV2` fallback, `"degraded"` lifecycle mode, and silent parser/proposer/RLM error swallowers), and extracted all dataset catalog metadata and baseline datapoints into `data/benchmarks/baselines.json` so `yaw/daemon/ingestion/datasets.py` contains zero hardcoded dataset branches.

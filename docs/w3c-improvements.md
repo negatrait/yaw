@@ -401,3 +401,177 @@ uv run --no-sync pytest -m "not live" --no-testmon -q
 uv run --no-sync pytest tests/daemon/graph/inference/test_prompts.py -m live --no-testmon -q
 git diff --check
 ```
+
+---
+
+# Epistemic Confidence Calculus & Bayesian Markov Graph Engine (Slice 5)
+
+## 7. Context & Root-Cause Problem Statement
+
+While Slices 1–4 resolve Stage 3 synonym/ontology decision cascades and Active EDC, edge traversal and fact representation across `yaw.db` still suffer from heuristic and fragile weighting:
+1. **Unbounded Linear Fact Weighting & Modulo Fragility**:
+   - `yaw/daemon/graph/storage/graph_ops.py` assigns hardcoded `1.0` (object property) or `0.5` (datatype property) multiplied linearly by `COUNT(edge_sources)`.
+   - `yaw/daemon/graph/ppr.py` guesses datatype properties via `abs((base_w % 1.0) - 0.5) < 1e-6`, silently misclassifying every datatype property mentioned an even number of times ($2 \times 0.5 = 1.0$).
+2. **Clamped & Token-Blind Taxonomic Weights**:
+   - `yaw/daemon/graph/planner.py` sets `skos:broader` and `skos:related` weights to `max(0.5, sim)`, ignoring inference-time token probability confidences and flattening low-similarity distinctions.
+3. **Blind SHACL S27 & Cycle Resolution (`CONSISTENCY_ERROR`)**:
+   - Because `skos:broader` and `skos:related` on a pair $(A, B)$ receive the exact same `max(0.5, sim)` weight, SHACL S27 (`ConceptShape/S27-disjointBroaderRelated`) and cycle (`ConceptShape/noBroaderCycles`) healing lacks an empirical tie-breaker.
+   - Combined with unexposed `remove_scalar_entity` repairs for `ConceptShape/noScalarLiterals`, `yaw/daemon/graph/engine.py` raises `YawRuntimeError: [CONSISTENCY_ERROR]`, zeroing out affected GEPA evaluations.
+4. **Hub Siphoning in PPR**:
+   - `ppr.py` normalizes only by raw node degree without destination node epistemic priors.
+
+---
+
+## 8. Unified Probability Mathematics (Strictly Two Canonical Operators)
+
+To make probability calculations **100% scale-invariant in $(0, 1)$**, every operation is governed by **two canonical operators** with **zero magic threshold constants**:
+
+```mermaid
+flowchart LR
+    subgraph Op1["Operator 1: pool_confidences (Logarithmic Opinion Pool)"]
+        P1["Extraction Atomic Confidence\ngeomean(p_llm, s_vec)"]
+        P2["Markov Step Transition\npi(k) * geomean(w_edge, p_node)"]
+        P3["Query Seed Prior p_0\ngeomean(s_vec(q, x), p_item)"]
+        P4["k-Hop Broader Chain Confidence\ngeomean(w_1, ..., w_k)"]
+    end
+
+    subgraph Op2["Operator 2: bayesian_noisy_or (Independent Evidence)"]
+        N1["Multi-Chunk Entity/Fact Prior\n1 - prod(1 - c_i)"]
+        N2["Multi-Fact / Parallel Edge Pooling\n1 - prod(1 - w_m)"]
+    end
+
+    subgraph S27["Empirical Bayes S27 & Cagle Resolution (Zero Magic Numbers)"]
+        B1["Compare w_chain vs w_rel\nBayes Factor BF = 1 Boundary"]
+        B2["Cagle Gate from yaw.db Stats\nw >= AVG(weight) in stage_conn"]
+    end
+
+    Op1 --> Op2 --> S27
+```
+
+### 8.1 Operator 1: `pool_confidences` — Logarithmic Opinion Pool (Geometric Mean)
+Whenever we combine $K$ confidence measurements $x_1, \dots, x_K \in (0, 1]$ of a **single assertion, state transition, query seed, or serial chain**, we use the **Logarithmic Opinion Pool** (geometric mean over the non-`None` known values $\mathcal{S} = \{x_k \mid x_k \neq \text{None}\}$):
+$$\text{pool\_confidences}(x_1, \dots, x_K) = \begin{cases} \exp\left(\frac{1}{|\mathcal{S}|} \sum_{x \in \mathcal{S}} \log x\right) = \left(\prod_{x \in \mathcal{S}} x\right)^{1 / |\mathcal{S}|} & \text{if } |\mathcal{S}| \ge 1 \\ \text{None} & \text{if } |\mathcal{S}| = 0 \end{cases}$$
+
+1. **Extraction-Time Mention Confidence ($c_i$)**:
+   $$c_i = \text{pool\_confidences}\big(p_{\text{llm}, i}, \, s_{\text{vec}, i}\big)$$
+   When `logprobs` are absent (`p_llm = None`), $c_i = s_{\text{vec}, i}$ remains on the exact same $(0, 1]$ scale as when both signals are present ($\sqrt{0.8 \times 0.8} = 0.80$).
+2. **Markov Transition Step ($u \xrightarrow{k} v$ in `ppr.py`)**:
+   $$A_{v, u}^{(k)} = \pi(k) \cdot \text{pool\_confidences}\big(w_{\text{edge}}(u, v, k), \, p_{\text{node}}(v)\big)$$
+   Keeps every Markov step calibrated on $(0, 1]$ without square-penalizing nodes with known priors.
+3. **Query Restart Seeding ($p_0$ in `retrieve_with_seeds`)**:
+   $$p_0(x) = \text{pool\_confidences}\big(s_{\text{vec}}(q, x), \, p_{\text{item}}(x)\big)$$
+4. **Serial $k$-Hop `skos:broader` Chain Confidence ($A \to^+ C$ in `shacl.py`)**:
+   $$w_{\text{chain}}(A \to^+ C) = \text{pool\_confidences}\big(w(e_1), \dots, w(e_k)\big) = \left(\prod_{e \in P} w_{\text{broader}}(e)\right)^{1/k}$$
+   Length-normalized log-probability puts a $k$-hop chain and a 1-hop edge on the exact same per-step probability scale.
+
+### 8.2 Operator 2: `bayesian_noisy_or` — Additive Shannon Evidence
+Whenever $m$ **independent parallel observations** $\{c_1, \dots, c_m\}$ corroborate the same entity, fact statement, or directed node pair $(u, v)$:
+$$P(\text{true} \mid c_1, \dots, c_m) = 1 - \prod_{i=1}^{m} (1 - c_i) \in (0, 1)$$
+Computes `entities.confidence`, `facts.confidence`, `edges.weight`, and parallel edge aggregation in `build_transition_matrix`.
+
+---
+
+## 9. Empirical Bayes SHACL S27 Resolution & Cagle Reification
+
+When `ConceptShape/S27-disjointBroaderRelated` detects that concept pair $(A, C)$ has both a `skos:broader` chain $P = (e_1, \dots, e_k)$ ($A \to^+ C$) with chain confidence $w_{\text{chain}} = \text{pool\_confidences}(w(e_1), \dots, w(e_k))$ and a direct `skos:related(A, C)` edge with confidence $w_{\text{rel}}(A, C)$:
+
+1. **Step 1: Check for Existing Reified Fact in `facts` (Deterministic Cagle Short-Circuit)**:
+   - Query `facts` for any existing `rdf:Statement` between $A$ and $C$.
+   - If a `fact` row already links $A$ and $C$, delete `skos:related(A, C)` (`remove_conflicting_related`) immediately with zero topological loss.
+2. **Step 2: Empirical Database Means Gate for Cagle Reification (`reify_related_to_fact`)**:
+   - Query live empirical means from `stage_conn`: $\bar{w}_{\text{broader}} = \text{AVG}(\text{weight})$, $\bar{w}_{\text{rel}} = \text{AVG}(\text{weight})$, $\bar{w}_{\text{fact}} = \text{AVG}(\text{confidence})$.
+   - Cagle Reification triggers if and only if:
+     - $w_{\text{chain}} \ge \bar{w}_{\text{broader}}$ and $w_{\text{rel}} \ge \bar{w}_{\text{rel}}$ (both have positive empirical Z-score in `stage_conn`).
+     - $A$ and $C$ co-occur in at least one shared chunk $c^* \in \mathcal{C}(A) \cap \mathcal{C}(C)$.
+     - The reified triple $f_{\text{new}} = (A, p, C)$ achieves atomic confidence $c(f_{\text{new}}, c^*) \ge \bar{w}_{\text{fact}}$.
+   - When all three hold, insert `rdf:Statement` $(A, p, C)$ with `prov:value` into `facts` and delete `skos:related(A, C)`.
+3. **Step 3: Direct Bayes Factor Comparison ($w_{\text{chain}}$ vs. $w_{\text{rel}}$)**:
+   - **Case A: $w_{\text{chain}} \ge w_{\text{rel}}$**: Delete `skos:related(A, C)` and `skos:related(C, A)` (`remove_conflicting_related`).
+   - **Case B: $w_{\text{rel}} > w_{\text{chain}}$**: Keep `skos:related(A, C)` intact at $w_{\text{rel}}$, delete `(u, v, 'skos:broader')` at the weakest link $e^* = \arg\min_{e \in P} w_{\text{broader}}(e)$, and if $k \ge 2$, convert $e^*$ to `skos:related(u, v)` preserving its calibrated weight $w(e^*)$.
+
+---
+
+## 10. Minimal Standard W3C Prefix Header
+
+Zero custom `yaw:` or `dct:` namespaces:
+```python
+W3C_PREFIX_HEADER: str = (
+    "@prefix : <urn:graph:> .\n"
+    "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n"
+    "@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n"
+    "@prefix owl: <http://www.w3.org/2002/07/owl#> .\n"
+    "@prefix skos: <http://www.w3.org/2004/02/skos/core#> .\n"
+    "@prefix prov: <http://www.w3.org/ns/prov#> .\n"
+    "@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n"
+)
+```
+
+---
+
+## 11. Oblivion Demolition Table (Slice 5)
+
+| Retired Symbol / Parameter | Previous Location | Replacement | Verification Gate |
+| :--- | :--- | :--- | :--- |
+| `datatype_property_weight` | `planner.py`, `engine.py` | Deleted; literals live exclusively in `facts` with `prov:value` | `git grep -w "datatype_property_weight"` $\to$ `0` matches |
+| `datatype_property`, `parallel_aggregation`, `parallel_cap` | `types.py`, `config.py` | Deleted; parallel edges aggregate via `bayesian_noisy_or` | `git grep -E "(parallel_aggregation|parallel_cap)" yaw/` $\to$ `0` matches |
+| `.5` modulo hack on edge weights | `ppr.py:149-150` | Deleted; single 4-tuple typed transition matrix | `git grep "base_w % 1.0" yaw/` $\to$ `0` matches |
+| `base_w * COUNT(*)` linear weight inflation | `graph_ops.py:1459-1479, 1929-1955` | `bayesian_noisy_or` complement aggregation | `git grep "COUNT(\*)" yaw/daemon/graph/storage/graph_ops.py` $\to$ `0` edge weight matches |
+| `get_graph_topology(typed=False)` | `graph_ops.py:1703-1731` | Single typed `(chunks, entities, typed_edges, entity_priors)` | `git grep "get_graph_topology(typed=" yaw/` $\to$ `0` matches |
+| `is_literal_node` (`a rdfs:Literal`) on `entities` | `shacl.py:250-255, 287-291` | Deleted; `entities` are strictly `skos:Concept` | `git grep "is_literal_node" yaw/` $\to$ `0` matches |
+
+---
+
+## 12. The Four W3C Semantic Guardrails (Preventing Empirical Graph Pathologies)
+
+1. **Guardrail 1: Homograph-Only `owl:differentFrom` (`apply_synonym_adjudication` in `planner.py`)**
+   - Under W3C OWL 2 RL (`owl:differentFrom`) and `ConceptShape/homographDifferentFrom`, `owl:differentFrom` is strictly a **polysemy / homograph disambiguation axiom** between two distinct concepts that share a normalized surface label (`text_processing(name_a) == text_processing(name_b)`) or have confusable lexical overlap at or above the empirical mean lexical similarity of accepted `skos:altLabel` pairs on `stage_conn` (`lexical_sim >= avg_alt_label_sim`).
+   - When Stage 3 (`related_judge`) returns `related: false` for a candidate pair $(A, B)$ that does **not** share a normalized surface label or meet the empirical homograph lexical boundary, emit **no edge** instead of polluting the graph with `owl:differentFrom`.
+
+2. **Guardrail 2: Head-Noun & Proper-Noun Modifier Invariant Against Mega-Hub `skos:altLabel` Collapse (`is_modifier_head_specialization` in `planner.py`)**
+   - Given normalized token sequences $T_a = \text{text\_processing}(A).\text{split}()$ and $T_b = \text{text\_processing}(B).\text{split}()$, if $T_a \neq T_b$ and one token sequence is a strict prefix of the other (`["redwood"]` vs. `["redwood", "router"]` or `["redwood", "secrets"]`) or a PascalCase/camelCase compound prefix (`Redwood` vs. `RedwoodTenant`), the longer phrase has a **distinct head noun** modified by the shorter proper noun.
+   - Similarly, if $T_a \cap T_b = \emptyset$ and neither is an acronym/initialism of the other (`Redwood` vs. `CRDs` or `missing CRDs`), they do not share lexical identity.
+   - Pairs where `is_modifier_head_specialization(name_a, name_b)` is `True` or where $T_a \cap T_b = \emptyset$ without acronym correspondence are forbidden from merging via `skos:altLabel` or `skos:hiddenLabel`; if Stage 1 (`JudgeLabels`) proposes an equivalence/label merge on a modifier-head specialization, `apply_synonym_adjudication` routes the edge to `skos:broader` (`Redwood Router skos:broader Redwood`) with weight `pool_confidences(dec_llm_prob, sim)`.
+
+3. **Guardrail 3: Case-Insensitive Identity Consolidation Before Disambiguation (`prepare_synonym_candidates` in `planner.py`)**
+   - Any candidate pair $(e_a, e_b)$ with identical normalized label `text_processing(name_a) == text_processing(name_b)` (such as `"canary"` and `"Canary"`) and dense definition similarity $d_{\text{sim}} \ge \text{synonymy\_threshold}$ that is not a distinct pole of the same reified fact (`not _is_active_fact_pole(ea, eb)`) is consolidated into a single `skos:Concept` (preferring the properly cased surface form as `skos:prefLabel` and retaining the richer definition).
+   - Case-only variants (`name_a.casefold() == name_b.casefold()`) with $d_{\text{sim}} \ge \text{synonymy\_threshold}$ are never emitted as `owl:differentFrom`.
+
+4. **Guardrail 4: Genus-Species & Part-Whole Falsification in `JudgeHierarchy` (`prompts.py`)**
+   - Emit `broader=True` (`A skos:broader B`) *only* if every `A` is necessarily a subtype/kind of `B` (`skos:broaderG`: *"Every A is a kind of B"*), an individual instance of class/role `B` (`skos:broaderI`: e.g., individual `Priya` is narrower than role `Frontend SWE`, **never** `Frontend SWE skos:broader Priya`), or an architectural component/part of whole system `B` (`skos:broaderP`).
+   - Never assert `skos:broader` across incompatible ontological categories (infrastructure cluster vs. cache metric/event, role/class vs. person, or comparative/temporal states like `'Improved X'` vs. `'Original X'`). Cross-category pairs must emit `broader=False, narrower=False` to advance to Stage 3 (`skos:related`).
+
+---
+
+## 13. Phase 2: Emergent `skos:ConceptScheme` Modularity Clustering, Definer, Seeding & QA Reader Integration
+
+1. **Bottom-Up Emergent Clustering via Newman Modularity Maximization ($Q$) — Zero Magic Numbers**:
+   - `skos:ConceptScheme` metaclasses are never guessed during per-chunk OpenIE; they emerge bottom-up in `build_concept_schemes` (`planner.py`) after entity consolidation (`apply_synonym_adjudication`) and SHACL healing (`auto_heal_deterministic_shacl` + `heal_shacl_violations`).
+   - Construct the symmetric **Entity Affinity Matrix** $A \in \mathbb{R}_{\ge 0}^{N \times N}$ over all post-healing `skos:Concept` nodes connected by positive edges (`kind IN ('skos:broader', 'skos:related', 'fact')`):
+     $$A_{uv} = \text{pool\_confidences}\!\left(w_{\text{edge}}(u, v),\; \max(\epsilon, \cos(\mathbf{v}_u, \mathbf{v}_v))\right)$$
+     (Pairs linked by `owl:differentFrom` have $A_{uv} = 0$).
+   - Partition the graph into $K^*$ communities $\mathcal{C} = \{C_1, \dots, C_{K^*}\}$ by greedy **Newman Modularity Maximization**:
+     $$Q(\mathcal{C}) = \frac{1}{2m} \sum_{c=1}^{K} \sum_{u, v \in C_c} \left(A_{uv} - \frac{d_u d_v}{2m}\right), \quad \Delta Q(C_a, C_b) = 2(e_{ab} - a_a a_b)$$
+     merging the pair $(C_a, C_b)$ with maximum $\Delta Q > 0$ until $\max_{a \neq b} \Delta Q(C_a, C_b) \le 0$.
+
+2. **Deterministic Post-Hoc `skos:topConceptOf` Synthesis on the `skos:ConceptScheme` (Never LLM-Guessed)**:
+   - Because top concepts are unknown at per-chunk entity extraction time, they are synthesized **deterministically post-hoc** as an intrinsic part of constructing each `skos:ConceptScheme` once community $C_m$ is known:
+     - Identify taxonomic roots $R_m = \{u \in C_m \mid \neg \exists v \in C_m : u \xrightarrow{\text{skos:broader}} v\}$ (or $C_m$ if $R_m = \emptyset$).
+     - Compute root prominence via `pool_confidences`:
+       $$s_{\text{top}}(u) = \text{pool\_confidences}\!\left(p_{\text{entity}}(u),\; \cos(\mathbf{v}_u, \boldsymbol{\mu}_m),\; \text{bayesian\_noisy\_or}(\{A_{uv} \mid v \in C_m \setminus \{u\}\})\right)$$
+     - Deterministically select all roots at or above the community's empirical mean prominence:
+       $$T_m = \left\{ u \in R_m \;\middle|\; s_{\text{top}}(u) \ge \frac{1}{|R_m|}\sum_{r \in R_m} s_{\text{top}}(r) \right\}$$
+     - Compute deterministic `scheme_id = compute_mdhash_id("|".join(sorted(T_m)), prefix="scheme-")`.
+     - Attach the `skos:topConceptOf` list $T_m$ directly to the `skos:ConceptScheme` (`concept_scheme_members(scheme_id, entity_id, is_top_concept=1)`) and emit typed `skos:topConceptOf` edges `(src_id=u, dst_id=scheme_id, kind='skos:topConceptOf', weight=s_top(u))` into `edges` (traversed in `ppr.py` with `policy.skos_top_concept_up = 1.0` and `policy.skos_top_concept_down = 0.8`).
+
+3. **Updating the Entity Definer (`DefineMissingEntities` / `entity_definer`) for `skos:ConceptScheme` Textual Metadata**:
+   - Extend `DefineMissingEntities` (`self.entity_definer` in `prompts.py`, `grammars.py`, `parsers.py`, `program.py`, and `components.py`) so `HippoRAGProgram.define_concept_schemes(scheme_packets, ...)` passes each emergent scheme's deterministic `skos:topConceptOf` list $T_m$ and taxonomy dossier to `self.entity_definer` with grammar `build_dspy_concept_scheme_defs_grammar(scheme_ids)`.
+   - The LLM does **not** guess top concepts; for each `scheme_id`, `self.entity_definer` outputs the 4-tuple `[scheme_id, pref_label, definition, history_note]`:
+     1. `skos:prefLabel` (`pref_label`): Concise canonical domain title for the `skos:ConceptScheme`.
+     2. `skos:definition` (`definition`): Intensional scope definition synthesizing the scheme's taxonomy.
+     3. `skos:historyNote` (`history_note`): Thinking trail and ontological rationale explaining why these top concepts and subtrees form a coherent domain scheme.
+   - Compute `concept_schemes.confidence` (`prov:value`) via `pool_confidences(p_llm, cos(v_scheme, mu_m), c_mod)`.
+
+4. **Embedding `skos:ConceptScheme` in `entity_vec` for Fallback Graph Seeding & Prepending to QA Reader**:
+   - Each `skos:ConceptScheme` is formatted via `fmt_entity(pref_label, definition)`, embedded via `_embed_strings(..., stage="entity_embed")`, and persisted in `entity_vec` under `entity_id = scheme_id` (`scheme-...`).
+   - `get_graph_topology` includes `scheme-*` nodes in `entity_ids` and `entity_priors` (`concept_schemes.confidence`), allowing `retrieve_with_seeds` (`engine.py`) to seed directly on `:scheme_*` when leaf concepts fail to match and flow mass through the reverse of `skos:topConceptOf` (`skos_top_concept_down`) into the scheme's top concepts and passages.
+   - `format_subgraph_turtle(conn, entity_ids, fact_ids)` (`shacl.py`) prepends active `:scheme_*` Turtle blocks (`a skos:ConceptScheme`, `skos:prefLabel`, `skos:definition`, `skos:historyNote`, `skos:topConceptOf :ent_1, :ent_2`, `prov:value`) at the top of the QA reader subgraph payload on every recall, and annotates each member `:ent_*` with `skos:inScheme :scheme_*` (and `skos:topConceptOf :scheme_*` for top concepts).

@@ -314,6 +314,68 @@ DefineMissingEntities output, or {name: definition} mappings."""
     return tuple(ordered_pairs)
 
 
+def extract_concept_scheme_definitions(raw_input: Any) -> tuple[tuple[str, str, str, str], ...]:
+    """Extract and deduplicate (scheme_id, pref_label, definition, history_note) tuples \
+from DefineMissingEntities concept scheme synthesis output."""
+    raw_list: Sequence[Any]
+    if isinstance(raw_input, str):
+        try:
+            raw_list = _extract_json_list_field(raw_input, "entity_definitions")
+        except ValueError:
+            bare = _parse_bare_json_list(raw_input)
+            if bare is None:
+                raise
+            raw_list = bare
+    elif isinstance(raw_input, Mapping):
+        if "entity_definitions" in raw_input and isinstance(raw_input["entity_definitions"], list):
+            raw_list = raw_input["entity_definitions"]
+        else:
+            raw_list = ()
+    elif isinstance(raw_input, Sequence):
+        raw_list = raw_input
+    else:
+        raw_list = ()
+
+    ordered_tuples: list[tuple[str, str, str, str]] = []
+    seen_scheme_ids: set[str] = set()
+
+    for item in raw_list:
+        scheme_id = ""
+        pref_label = ""
+        definition = ""
+        history_note = ""
+
+        if isinstance(item, (list, tuple)):
+            if len(item) >= 1 and item[0] is not None:
+                scheme_id = str(item[0]).strip()
+            if len(item) >= 2 and item[1] is not None:
+                pref_label = str(item[1]).strip()
+            if len(item) >= 3 and item[2] is not None:
+                definition = _clean_definition(item[2])
+            if len(item) >= 4 and item[3] is not None:
+                history_note = _clean_definition(item[3])
+        elif isinstance(item, Mapping):
+            raw_id = item.get("scheme_id", item.get("id", item.get("name", "")))
+            raw_label = item.get("pref_label", item.get("label", item.get("skos:prefLabel", "")))
+            raw_def = item.get("definition", item.get("def", item.get("skos:definition", "")))
+            raw_note = item.get("history_note", item.get("note", item.get("skos:historyNote", "")))
+            scheme_id = _nullable_text(raw_id)
+            pref_label = _nullable_text(raw_label)
+            definition = _clean_definition(raw_def)
+            history_note = _clean_definition(raw_note)
+
+        if not scheme_id:
+            continue
+        if not pref_label:
+            pref_label = scheme_id
+        if scheme_id in seen_scheme_ids:
+            continue
+        seen_scheme_ids.add(scheme_id)
+        ordered_tuples.append((scheme_id, pref_label, definition, history_note))
+
+    return tuple(ordered_tuples)
+
+
 def extract_structured_triples(
     raw_input: Any,
     *,
@@ -1285,6 +1347,7 @@ __all__ = [
     "detect_scalar_literal",
     "doc_matches_gold",
     "evaluate_benchmark_gate",
+    "extract_concept_scheme_definitions",
     "extract_entity_definitions",
     "extract_structured_triples",
     "match_facts_to_candidate_indices",
