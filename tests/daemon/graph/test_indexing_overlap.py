@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 from cocoindex.connectors import sqlite
 
+from daemon.graph.synonym_protocol import candidate_rows, complete_decisions
 from yaw.daemon.graph.inference import (
     DSPyEmbeddingAdapter,
     EmbeddingProfile,
@@ -45,6 +46,36 @@ from yaw.daemon.indexing import (
     indexing_app_main,
 )
 from yaw.daemon.ingestion.source_targets import SOURCE_DB, SOURCE_ROOT, SourceSettings
+
+
+def test_frozen_candidate_replay_uses_native_targets_and_original_text(tmp_path, provider):
+    from yaw.core import ChunkPointer
+    from yaw.daemon.graph.engine import YawGraphEngine
+    from yaw.daemon.indexing import bind_native_indexing
+
+    url, state = provider
+    source = tmp_path / "source.md"
+    original = "Ada studies Algebra."
+    source.write_text("Changed after the evaluation snapshot was frozen.", encoding="utf-8")
+    pointer = ChunkPointer("frozen", source.name, 1, 1, "source", 1, 1)
+    lm = create_dspy_lm("overlap", base_url=url + "/v1", cache=False, num_retries=0, max_tokens=512)
+    program = HippoRAGProgram(orchestrator_lm=lm, rlm_sub_lm=lm, enable_gbnf=False, max_output_tokens=512)
+    engine = bind_native_indexing(YawGraphEngine(tmp_path / "yaw.db", tmp_path, program, adapter(url)))
+    try:
+        assert engine.index_chunks([(pointer, original)]) == 1
+        assert [row[0] for row in engine.conn.execute("SELECT chunk_id FROM chunks")] == ["frozen"]
+        assert engine.conn.execute("SELECT COUNT(*) FROM chunk_inference").fetchone()[0] == 1
+        assert engine.conn.execute("SELECT COUNT(*) FROM openie_chunks").fetchone()[0] == 0
+        traces = engine._captured_chunk_traces["frozen"]
+        assert {name for name, _, _ in traces} == {"ner", "triples"}
+        assert all(inputs["passage"] == original for _, inputs, _ in traces)
+        calls = len(state["intervals"])
+        assert calls > 0
+        assert engine.index_chunks([(pointer, original)]) == 1
+        assert len(state["intervals"]) == calls, (state["intervals"][calls:], state["embedding_inputs"])
+        assert engine.lint_graph()["conforms"]
+    finally:
+        engine.close()
 
 
 @pytest.mark.parametrize("title_aware", [False, True])
@@ -318,14 +349,18 @@ def provider():
                 if "candidate_pairs" in text:
                     packet = json.JSONDecoder().raw_decode(text[text.index('{"format":') :])[0]
                     output = {
-                        "decisions": [
-                            {
-                                "pair_id": p["pair_id"],
-                                "relation": "skos:related",
-                                "canonical": p["pair_id"].split("|")[0],
-                            }
-                            for p in packet["pairs"]
-                        ]
+                        "decisions": complete_decisions(
+                            candidate_rows(text),
+                            [
+                                {
+                                    "pair_id": p["pair_id"],
+                                    "relation": "skos:related",
+                                    "canonical": p["pair_id"].split("|")[0],
+                                }
+                                for p in packet["pairs"]
+                            ],
+                            stage_text=json.dumps(data["messages"]),
+                        )
                     }
                 elif "missing_entities" in text:
                     output = (
@@ -498,7 +533,7 @@ def test_declarative_live_graph_publication_without_polling(tmp_path, provider):
             coordinator = get_graph_delta_coordinator(db)
             assert coordinator.last_plan_summary is not None
             assert len(coordinator.last_plan_summary.chunk_ids) == 1
-            assert {t.predictor for t in coordinator.last_plan_summary.traces} == {"ner", "triples"}
+            assert {t.predictor for t in coordinator.last_plan_summary.traces} == {"ner", "triples", "entity_definer"}
 
             (signal_dir / "reload.signal").write_text('{"program_path": "compiled.json"}', encoding="utf-8")
             assert await asyncio.to_thread(reload_event.wait, 10.0)
@@ -615,3 +650,31 @@ def test_publish_graph_shacl_violation_preserves_prior_graph_and_inference_rows(
     finally:
         env.close()
         db.close()
+
+
+def test_frozen_candidate_streaming_batches(tmp_path, provider):
+    from yaw.core import ChunkPointer
+    from yaw.daemon.graph.engine import YawGraphEngine
+    from yaw.daemon.indexing import bind_native_indexing
+
+    url, state = provider
+    lm = create_dspy_lm("overlap", base_url=url + "/v1", cache=False, num_retries=0, max_tokens=512)
+    program = HippoRAGProgram(orchestrator_lm=lm, rlm_sub_lm=lm, enable_gbnf=False, max_output_tokens=512)
+    engine = bind_native_indexing(
+        YawGraphEngine(tmp_path / "yaw.db", tmp_path, program, adapter(url)),
+        batch_size=2,
+    )
+    chunks = [
+        (ChunkPointer(f"c{i}", f"doc{i}.md", 1, 1, f"doc{i}", 1, 1), f"Entity{i} relates to Topic{i}.")
+        for i in range(5)
+    ]
+    try:
+        indexed = engine.index_chunks(chunks)
+        assert indexed == 5
+        assert engine.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 5
+        assert engine.conn.execute("SELECT COUNT(*) FROM chunk_inference").fetchone()[0] == 5
+        assert engine.conn.execute("SELECT COUNT(*) FROM source_chunks").fetchone()[0] == 5
+        assert engine.conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0] == 2
+        assert engine.lint_graph()["conforms"]
+    finally:
+        engine.close()

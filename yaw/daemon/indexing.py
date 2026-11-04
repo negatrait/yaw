@@ -8,7 +8,7 @@ import threading
 import uuid
 import weakref
 from collections.abc import AsyncIterator, Callable, Collection, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -19,16 +19,27 @@ from cocoindex.connectors import localfs, sqlite
 from cocoindex.resources.file import FileLike, PatternFilePathMatcher
 
 from yaw.core import ChunkPointer
-from yaw.daemon.graph.inference import DSPyEmbeddingAdapter, EmbeddingRequest
+from yaw.daemon.graph.engine import YawGraphEngine
+from yaw.daemon.graph.inference import (
+    DSPyEmbeddingAdapter,
+    EmbeddingRequest,
+    HippoRAGProgram,
+    hierarchy_judge_fingerprint,
+    label_judge_fingerprint,
+    openie_fingerprint,
+    related_judge_fingerprint,
+    shacl_fingerprint,
+)
 from yaw.daemon.graph.inference.components import (
     EMBEDDING_ENDPOINT,
     OPENIE_ENDPOINT,
+    EmbeddingEndpoint,
+    OpenIEEndpoint,
     OpenIEInput,
-    PredictorTrace,
     embed_text,
     extract_text,
 )
-from yaw.daemon.graph.planner import GraphPlanSettings, plan_graph_publication
+from yaw.daemon.graph.planner import GraphPlanSettings, GraphPlanSummary, plan_graph_publication, summarize_graph_plan
 from yaw.daemon.graph.storage.hydration import (
     hydrate_ast_parent_context,
     resolve_chunk_text,
@@ -81,19 +92,6 @@ class ChunkStateRecord(msgspec.Struct, frozen=True):
 class ChunkStateAction:
     chunk_id: str
     desired: ChunkStateRecord | coco.NonExistenceType
-
-
-@dataclass(frozen=True, slots=True)
-class GraphPlanSummary:
-    chunk_ids: tuple[str, ...]
-    traces: tuple[PredictorTrace, ...] = ()
-    telemetry: tuple[dict[str, Any], ...] = ()
-    entity_def_audit_trail: tuple[dict[str, Any], ...] = ()
-    label_judge_audit_trail: tuple[dict[str, Any], ...] = ()
-    hierarchy_judge_audit_trail: tuple[dict[str, Any], ...] = ()
-    related_judge_audit_trail: tuple[dict[str, Any], ...] = ()
-    shacl_audit_trail: tuple[dict[str, Any], ...] = ()
-    rlm_stats: dict[str, Any] = field(default_factory=dict)
 
 
 class GraphDeltaCoordinator:
@@ -253,6 +251,7 @@ async def process_chunk(
     target: sqlite.TableTarget[ChunkInference],
     identity: InferenceIdentity,
     settings: SourceSettings | None = None,
+    frozen_text: str | None = None,
 ) -> None:
     """Declare a complete inference artifact only after both operations succeed."""
     try:
@@ -274,12 +273,16 @@ async def process_chunk(
         )
         source_root = coco.use_context(SOURCE_ROOT)
         effective = settings if settings is not None else SourceSettings((), ())
-        chunk_text = resolve_chunk_text(
-            pointer,
-            source_root,
-            chunk_size=effective.chunk_size,
-            chunk_overlap=effective.chunk_overlap,
-            min_chunk_size=effective.min_chunk_size,
+        chunk_text = (
+            frozen_text
+            if frozen_text is not None
+            else resolve_chunk_text(
+                pointer,
+                source_root,
+                chunk_size=effective.chunk_size,
+                chunk_overlap=effective.chunk_overlap,
+                min_chunk_size=effective.min_chunk_size,
+            )
         )
         fmt_chunk = getattr(
             embeddings.adapter,
@@ -299,7 +302,7 @@ async def process_chunk(
                 stage="chunk_embed",
             )
         openie_passage = chunk_text
-        if pointer.start_line > 1:
+        if frozen_text is None and pointer.start_line > 1:
             ast_parent_ctx = hydrate_ast_parent_context(pointer, source_root, hops=1)
             if ast_parent_ctx:
                 openie_passage = (
@@ -398,22 +401,13 @@ async def publish_graph(
     settings: GraphPlanSettings,
     state_fingerprint: str,
     recovery_nonce: str = "",
+    frozen_text: dict[str, str] | None = None,
 ) -> GraphPlanSummary:
     """Plan and declare the atomic validated graph without storing vectors in LMDB memos."""
     _ = state_fingerprint, recovery_nonce
-    plan = await plan_graph_publication(settings)
+    plan = await plan_graph_publication(settings, frozen_text=frozen_text)
     declare_graph(plan.rows)
-    return GraphPlanSummary(
-        chunk_ids=tuple(sorted(row[0].chunk_id for row in plan.rows.chunks)),
-        traces=plan.traces,
-        telemetry=plan.telemetry,
-        entity_def_audit_trail=plan.entity_def_audit_trail,
-        label_judge_audit_trail=plan.label_judge_audit_trail,
-        hierarchy_judge_audit_trail=plan.hierarchy_judge_audit_trail,
-        related_judge_audit_trail=plan.related_judge_audit_trail,
-        shacl_audit_trail=plan.shacl_audit_trail,
-        rlm_stats=dict(plan.rlm_stats),
-    )
+    return summarize_graph_plan(plan)
 
 
 def _is_published_graph_aligned(conn: sqlite3.Connection, expected_chunk_ids: tuple[str, ...]) -> bool:
@@ -586,3 +580,136 @@ async def indexing_app_main(
             process_reload_signal,
             signal_files.items(),
         )
+
+
+@coco.fn
+async def process_frozen_chunk(
+    chunk: tuple[ChunkPointer, str],
+    sources: sqlite.TableTarget[SourceMetadata],
+    artifacts: sqlite.TableTarget[ChunkInference],
+    identity: InferenceIdentity,
+) -> None:
+    pointer, text = chunk
+    metadata = SourceMetadata(
+        pointer.chunk_id,
+        pointer.rel_posix_path,
+        hashlib.sha256(text.encode()).hexdigest(),
+        pointer.start_line,
+        pointer.end_line,
+        pointer.title,
+        pointer.ast_island_start,
+        pointer.ast_island_end,
+    )
+    sources.declare_row(row=metadata)
+    await process_chunk(metadata, artifacts, identity, frozen_text=text)
+
+
+class FrozenChunkStream:
+    """Dynamic chunk stream for batching frozen candidate indexing through a single CocoIndex app."""
+
+    __slots__ = ("chunks",)
+
+    def __init__(self, chunks: tuple[tuple[ChunkPointer, str], ...] = ()) -> None:
+        self.chunks = chunks
+
+
+@coco.fn
+async def frozen_indexing_app_main(
+    stream: FrozenChunkStream | tuple[tuple[ChunkPointer, str], ...],
+    settings: GraphPlanSettings,
+) -> GraphPlanSummary:
+    """Reconcile an explicit immutable candidate corpus through the native targets."""
+    active_chunks = stream.chunks if isinstance(stream, FrozenChunkStream) else stream
+    sources = await sqlite.mount_table_target(
+        SOURCE_DB,
+        table_name="source_chunks",
+        table_schema=await sqlite.TableSchema[SourceMetadata].from_class(SourceMetadata, primary_key=["chunk_id"]),
+    )
+    artifacts = await sqlite.mount_table_target(
+        SOURCE_DB,
+        table_name="chunk_inference",
+        table_schema=await sqlite.TableSchema[ChunkInference].from_class(ChunkInference, primary_key=["chunk_id"]),
+    )
+    identity = InferenceIdentity(settings.program_identity, settings.embedding_identity)
+    handles = [
+        await coco.mount(
+            coco.component_subpath("chunk", chunk[0].chunk_id),
+            process_frozen_chunk,
+            chunk,
+            sources,
+            artifacts,
+            identity,
+        )
+        for chunk in active_chunks
+    ]
+    for handle in handles:
+        await handle.ready()
+    coordinator = get_graph_delta_coordinator(coco.use_context(SOURCE_DB))
+    error = coordinator.pop_error()
+    if error is not None:
+        raise error
+    with coco.use_context(SOURCE_DB).readonly() as conn:
+        fingerprint = compute_active_inference_fingerprint(conn, settings.program_identity, settings.embedding_identity)
+    return await publish_graph(settings, fingerprint, frozen_text={p.chunk_id: text for p, text in active_chunks})
+
+
+def bind_native_indexing(engine: YawGraphEngine, *, batch_size: int = 64) -> YawGraphEngine:
+    """Compose frozen indexing at the daemon boundary; graph code owns no scheduler."""
+
+    def execute(chunks: Sequence[tuple[ChunkPointer, str]], program: HippoRAGProgram) -> GraphPlanSummary:
+        if not chunks:
+            return GraphPlanSummary(())
+        program_identity = openie_fingerprint(program)
+        embedding_identity = str(engine.embedder.profile.index_identity)
+        context = coco.ContextProvider()
+        context.provide(SOURCE_DB, engine.managed_conn)
+        context.provide(GRAPH_DB, engine.managed_conn)
+        context.provide(SOURCE_ROOT, engine.workspace_root)
+        context.provide(EMBEDDING_ENDPOINT, EmbeddingEndpoint(engine.embedder))
+        context.provide(OPENIE_ENDPOINT, OpenIEEndpoint(program, None, program_identity))
+        state_root = Path(engine.db_path).resolve().parent / "candidate_coco" / Path(engine.db_path).name
+        settings = GraphPlanSettings(
+            corpus_root=engine.workspace_root,
+            program_identity=program_identity,
+            embedding_identity=embedding_identity,
+            synonym_identity=":".join(
+                (
+                    label_judge_fingerprint(program),
+                    hierarchy_judge_fingerprint(program),
+                    related_judge_fingerprint(program),
+                )
+            ),
+            shacl_identity=shacl_fingerprint(program),
+            auto_merge_cosine_gate=engine.auto_merge_cosine_gate,
+            auto_merge_difflib_gate=engine.auto_merge_difflib_gate,
+            synonymy_threshold=engine.synonymy_threshold,
+            synonymy_top_k=engine.synonymy_top_k,
+            ast_context_hops=engine.ast_context_hops,
+            context_window_tokens=program.context_window_tokens,
+            max_output_tokens=program.max_output_tokens,
+        )
+        environment = coco.Environment(settings=coco.Settings.from_env(state_root), context_provider=context)
+        stream = FrozenChunkStream()
+        try:
+            app = coco.App(
+                coco.AppConfig(name="yaw_frozen_indexing", environment=environment, max_inflight_components=4),
+                frozen_indexing_app_main,
+                stream,
+                settings,
+            )
+
+            async def run_streaming() -> GraphPlanSummary:
+                all_chunks = tuple(chunks)
+                summary = GraphPlanSummary(())
+                for start in range(0, len(all_chunks), batch_size):
+                    end = min(len(all_chunks), start + batch_size)
+                    stream.chunks = all_chunks[:end]
+                    summary = await app.update().result()
+                return summary
+
+            return asyncio.run(run_streaming())
+        finally:
+            environment.close()
+
+    engine.indexing_runner = execute
+    return engine

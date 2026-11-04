@@ -28,10 +28,12 @@ from yaw.daemon.graph.inference import DSPyEmbeddingAdapter, EmbeddingRequest
 from yaw.daemon.graph.inference.components import (
     EMBEDDING_ENDPOINT,
     OPENIE_ENDPOINT,
+    ConceptSchemeInput,
     MissingEntityInput,
     PredictorTrace,
     SHACLHealInput,
     SynonymJudgeInput,
+    define_concept_schemes,
     define_missing_entities,
     embed_text,
     heal_shacl_violations,
@@ -96,6 +98,35 @@ class GraphPlanResult:
     related_judge_audit_trail: tuple[dict[str, Any], ...] = ()
     shacl_audit_trail: tuple[dict[str, Any], ...] = ()
     rlm_stats: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class GraphPlanSummary:
+    """Publication diagnostics without retaining a second copy of graph vectors."""
+
+    chunk_ids: tuple[str, ...]
+    traces: tuple[PredictorTrace, ...] = ()
+    telemetry: tuple[dict[str, Any], ...] = ()
+    entity_def_audit_trail: tuple[dict[str, Any], ...] = ()
+    label_judge_audit_trail: tuple[dict[str, Any], ...] = ()
+    hierarchy_judge_audit_trail: tuple[dict[str, Any], ...] = ()
+    related_judge_audit_trail: tuple[dict[str, Any], ...] = ()
+    shacl_audit_trail: tuple[dict[str, Any], ...] = ()
+    rlm_stats: dict[str, Any] = field(default_factory=dict)
+
+
+def summarize_graph_plan(plan: GraphPlanResult) -> GraphPlanSummary:
+    return GraphPlanSummary(
+        chunk_ids=tuple(sorted(row[0].chunk_id for row in plan.rows.chunks)),
+        traces=plan.traces,
+        telemetry=plan.telemetry,
+        entity_def_audit_trail=plan.entity_def_audit_trail,
+        label_judge_audit_trail=plan.label_judge_audit_trail,
+        hierarchy_judge_audit_trail=plan.hierarchy_judge_audit_trail,
+        related_judge_audit_trail=plan.related_judge_audit_trail,
+        shacl_audit_trail=plan.shacl_audit_trail,
+        rlm_stats=dict(plan.rlm_stats),
+    )
 
 
 @dataclass(slots=True)
@@ -984,7 +1015,8 @@ def collect_shacl_violation_dossiers(
 async def build_concept_schemes(
     stage_conn: sqlite3.Connection,
     *,
-    program: Any = None,
+    define_fn: Callable[[list[dict[str, Any]]], Awaitable[Sequence[tuple[str, str, str, str, float | None]]]]
+    | None = None,
     embed_fn: Callable[..., Awaitable[Sequence[np.ndarray]]] | None = None,
     progress_callback: Callable[[str], None] | None = None,
 ) -> list[dict[str, Any]]:
@@ -1180,8 +1212,8 @@ via Newman Modularity Maximization without magic numbers."""
         )
 
     defined_schemes: dict[str, tuple[str, str, str, float | None]] = {}
-    if program is not None and hasattr(program, "define_concept_schemes"):
-        res = program.define_concept_schemes(scheme_packets)
+    if define_fn is not None:
+        res = await define_fn(scheme_packets)
         for s_id, p_lbl, dfn, note, llm_p in res:
             defined_schemes[s_id] = (p_lbl, dfn, note, llm_p)
 
@@ -1258,6 +1290,7 @@ via Newman Modularity Maximization without magic numbers."""
 async def plan_graph_publication(
     settings: GraphPlanSettings,
     chunk_rows: Sequence[tuple[ChunkPointer, OpenIERecord]] | None = None,
+    frozen_text: Mapping[str, str] | None = None,
 ) -> GraphPlanResult:
     """Plan a complete SHACL-conformant PreparedGraphRows without holding any yaw.db write transaction."""
     embeddings = coco.use_context(EMBEDDING_ENDPOINT)
@@ -1313,7 +1346,7 @@ async def plan_graph_publication(
     chunks: list[tuple[ChunkPointer, str]] = []
     all_records: list[OpenIERecord] = []
     for ptr, rec, chunk_traces in active_items:
-        chunk_text = resolve_chunk_text(
+        chunk_text = (frozen_text.get(ptr.chunk_id) if frozen_text is not None else None) or resolve_chunk_text(
             ptr,
             settings.corpus_root,
             chunk_size=settings.chunk_size,
@@ -1686,10 +1719,16 @@ async def plan_graph_publication(
             for f_row, vec in zip(reembed_facts, rf_vecs, strict=True):
                 fact_vec_by_id[f_row[0]] = vec
 
-        # Induce emergent skos:ConceptScheme taxonomies via Newman modularity maximization
+        async def define_schemes(packets: list[dict[str, Any]]) -> Sequence[tuple[str, str, str, str, float | None]]:
+            result = await define_concept_schemes(ConceptSchemeInput(tuple(packets), settings.program_identity))
+            all_traces.extend(result.traces)
+            all_telemetry.extend(result.telemetry)
+            entity_def_audit.extend(result.audit_trail)
+            return result.definitions
+
         await build_concept_schemes(
             staging_conn,
-            program=extraction.program,
+            define_fn=define_schemes,
             embed_fn=_embed_strings,
             progress_callback=None,
         )
