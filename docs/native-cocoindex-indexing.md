@@ -66,7 +66,9 @@ must be read with these remaining gates.
 - [ ] Windows daemon live-ingestion lifecycle and failure tests.
   Live filesystem edit/rename/delete, `.yaw/reload.signal`, and live-to-catch-up shutdown pass
   on Windows.
-- [x] Ruff, ty, affected tests, architecture and diff checks.
+- [ ] Ruff, ty, affected tests, architecture and diff checks.
+  Revalidation at `06b35d2`: static checks pass; the engine/synonym regression
+  selection has eight failures (see the November 4 evaluation entry).
 - [x] Bounded live comparison and actual evidence in evaluation.md.
 
 ## Contract
@@ -199,6 +201,18 @@ class ConceptSchemeMemberTargetRow:
 
 ## Removal sequence
 
+### Active replacement packet (2026-11-04)
+
+Replace engine-owned `index_chunks` inference with a daemon-composed frozen
+CocoIndex update using the same chunk operations, graph planner and atomic target
+as live ingestion. Bind that operation explicitly to engines created for runtime,
+benchmark and test evaluation. Unbound retrieval engines must fail if indexing is
+requested. Frozen updates consume supplied chunk text and never rehydrate that
+text from a mutable file. Remove the sequential inference/write implementation
+in this packet; remaining query-triggered preparation and cache interfaces stay
+unchecked until their consumers are replaced. Acceptance requires native live
+and frozen graph equivalence, mutation/replay tests and all affected callers.
+
 Remove each old implementation alongside its replacement: EmbeddingLane and its
 executor/futures; indexing_overlap configuration; runtime polling thread; target
 callbacks that run inference; serialized pending-delta replay; duplicate indexing
@@ -299,3 +313,69 @@ each durability boundary. Report orchestration evidence separately from model
 quality. The optional available-provider pilot is limited to 16 frozen chunks
 and 20 minutes, uses disposable state, and never starts GEPA or stops another run.
 No automatic commit. Epic 1 D1-A6's Tier 2 gate remains outstanding.
+
+## Native CocoIndex Architectural Proposals (2026-11-04)
+
+Building on the measured 5x throughput gain from native CocoIndex component execution (`5.39 chunks/min`), the following five architectural proposals formalize the remaining cutover items and align production contracts with local resource bounds.
+
+### 1. Chunk-Stream Batching & Incremental Graph Publication (64 Chunks)
+
+- **Problem:** Currently, `frozen_indexing_app_main` queues the entire snapshot pool (e.g., 11,507 chunks) in a single pass. Graph publication (`publish_graph`) only triggers after *all* handles reach `.ready()`. Downstream readers, query interfaces, and evaluation harnesses are completely blocked from seeing graph entities, facts, or concept schemes until the final chunk extraction finishes. Production environments do not have static dataset splits or fixed validation chunk counts.
+- **Proposal:** Replace the monolithic all-chunks pass with a general chunk-stream batching contract:
+  - Chunks are dispatched in streaming batches of **64 chunks** (configurable via `indexing_batch_size`).
+  - Each batch completes inference into `chunk_inference` and triggers an incremental declarative target reconciliation and graph publication via `plan_graph_publication`.
+  - **Invariants:**
+    - Downstream query readers and evaluation loops can begin querying the incrementally published graph after the first 64 chunks land, drastically improving daemon responsiveness.
+    - SQLite write transactions remain short, atomic, and bounded, avoiding large memory staging trees and minimizing lock hold times.
+    - Zero benchmark-specific splits or heuristic constants in the ingestion engine.
+
+### 2. Universal Declarative Targets for SQLite and sqlite-vec (`TableSchema.from_class`)
+
+- **Problem:** While `source_chunks` and `chunk_inference` use CocoIndex's native `sqlite.TableTarget`, graph entities, facts, labels, edges, and concept schemes in `yaw/daemon/graph/storage/publication.py` are still written via manual imperative SQL helper functions (`upsert_entities`, `upsert_facts`, `upsert_edges`, etc.) inside a custom `GraphTargetHandler`. Hand-rolled DDL, manual schema versioning, and imperative upsert/deletion statements violate the single source of truth.
+- **Proposal:** Establish pure declarative target schemas for **everything** landing in `yaw.db` (`sqlite` and `sqlite-vec`):
+  - Every table is declared as a typed dataclass mounted via `sqlite.mount_table_target(..., table_schema=await TableSchema.from_class(...))`:
+    - `chunks` (`ChunkTargetRow`)
+    - `chunk_vec` (via `declare_vector_index` on `Annotated[NDArray, EMBEDDER]`)
+    - `entities` (`EntityTargetRow`)
+    - `entity_labels` (`EntityLabelTargetRow`)
+    - `entity_vec` (via vector index declaration)
+    - `facts` (`FactTargetRow`)
+    - `fact_sources` (`FactSourceTargetRow`)
+    - `fact_vec` (via vector index declaration)
+    - `edges` (`EdgeTargetRow`)
+    - `edge_sources` (`EdgeSourceTargetRow`)
+    - `concept_schemes` (`ConceptSchemeTargetRow`)
+    - `concept_scheme_members` (`ConceptSchemeMemberTargetRow`)
+  - **Invariants:**
+    - CocoIndex's reconciliation engine owns state diffing, insertions, deletions, and cleanup across both graph and vector tables.
+    - Closed-world SHACL linting (`lint_graph_shacl`) executes directly within the atomic target transaction, rolling back on invalid states.
+    - Zero imperative SQL DDL or manual schema migrations in `yaw/daemon/graph/storage/`.
+
+### 3. OpenIE Concurrency Contract & Local Resource Bounds
+
+- **Problem:** While `EmbeddingEndpoint.embed` uses `@coco.fn.as_async(batching=True, max_batch_size=64)` and `Semaphore(4)`, OpenIE extraction requires careful admission control. On developer workstations, local LLM backends (`llama.cpp` server) fit only a single concurrent execution slot (`parallel = 1`) without exceeding GPU VRAM or thrashing context windows.
+- **Proposal:** Establish an explicit runtime concurrency contract:
+  - Local developer execution defaults strictly to `admission = asyncio.Semaphore(1)` for `OpenIEEndpoint`.
+  - Expose `openie_parallel_slots: int = 1` in `YawConfig`. If connected to a multi-slot server (e.g., `llama.cpp --parallel N` or `vLLM` continuous batching), CocoIndex dynamically scales up to $N$ concurrent components without altering pipeline code.
+  - Embedding requests continue to leverage native batched tensor evaluation (`max_batch_size=64`) since GPU memory for embeddings is negligible compared to LLM autoregressive kv-caches.
+
+### 4. Native OS Event-Driven Live Ingestion (`localfs.walk_dir(..., live=True)`)
+
+- **Current State:** The low-level connector implementation (`localfs.walk_dir(..., live=True)` and `GraphDeltaCoordinator`) is implemented in `yaw/daemon/indexing.py`. However, its integration into the main `YawRuntime` lifecycle and complete removal of legacy polling loops remains an unchecked item on the restart checklist.
+- **Proposal:** Finalize the runtime live ingestion wiring:
+  - `YawRuntime` starts `localfs.walk_dir(corpus_root, live=True, rescan_interval=None)` as the primary source feed for corpus files, and monitors `.yaw/reload.signal` via the same native event-driven mechanism.
+  - On Windows, file creation, modification, rename, and deletion events are captured directly via OS file notifications (`ReadDirectoryChangesW`) through CocoIndex's `LiveMapView`.
+  - Completely remove all residual polling timers, `auto_refresh` intervals, and manual rescan logic from `YawRuntime`.
+  - Acceptance: Pass automated Windows integration tests demonstrating instant, event-driven ingestion upon file save with zero polling overhead.
+
+### 5. Persistent Content-Addressed Memoization Across Optimizer Runs
+
+- **Current State:** `embed_text` and `extract_text` already define `@coco.fn(memo=True)` keyed on `(source_hash, program_identity)`. However, `bind_native_indexing` currently derives the CocoIndex state root dynamically:
+  ```python
+  state_root = Path(engine.db_path).resolve().parent / "candidate_coco" / Path(engine.db_path).name
+  ```
+  Because each optimization run generates a new datestamped database (e.g., `yaw_optimize_20261104_132656.db`), the `state_root` directory is transient. A restarted optimizer run creates a fresh, empty CocoIndex database and fails to reuse memoized extractions from previous runs, despite the underlying texts and program signatures being identical.
+- **Proposal:** Decouple CocoIndex's persistent environment state root from transient sandbox DB names:
+  - Establish a shared, content-addressed cache directory: `.yaw/coco_inference_cache/`.
+  - Because CocoIndex memoization keys deterministically on `(input_data, function_code, program_identity, embedding_identity)`, sharing this state root across sandbox instances is cryptographically sound and safe against cache poisoning.
+  - When restarting optimization runs or evaluating candidate prompts that modify only QA/retrieval instructions without altering OpenIE extraction, 100% of chunk inferences hit the persistent memo cache instantly, consuming zero inference tokens and accelerating candidate cycles.
