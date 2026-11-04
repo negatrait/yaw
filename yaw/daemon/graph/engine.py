@@ -1,5 +1,6 @@
 """Native DSPy HippoRAG 2 Graph and Retrieval Engine backed by yaw.db and disk line hydration."""
 
+import asyncio
 import hashlib
 import importlib.metadata
 import json
@@ -52,6 +53,7 @@ from yaw.daemon.graph.normalization import normalize_openie_record
 from yaw.daemon.graph.planner import (
     apply_stage1_definitions,
     apply_synonym_adjudication,
+    build_concept_schemes,
     clone_graph_to_memory,
     collect_missing_entity_norms,
     collect_shacl_violation_dossiers,
@@ -1771,6 +1773,29 @@ class YawGraphEngine:
                 self._graph_rlm_stats["shacl_conforms"] = len(remaining_violations) == 0
                 for cid in chunk_ids:
                     set_meta(conn, f"indexed_fp:{cid}", json.dumps([ext_fp, openie_fp]))
+
+                # Induce emergent skos:ConceptScheme taxonomies
+                if hasattr(self, "embedder") and self.embedder is not None:
+
+                    async def _embed_engine(texts: Sequence[str], stage: str = "scheme_embed") -> Sequence[np.ndarray]:
+                        raw = (
+                            self.embedder.encode(list(texts), stage=stage)
+                            if hasattr(self.embedder, "encode")
+                            else self.embedder(list(texts))
+                        )
+                        return [np.asarray(v, dtype=np.float32) for v in raw]
+
+                    try:
+                        asyncio.run(build_concept_schemes(conn, program=active_program, embed_fn=_embed_engine))
+                    except RuntimeError:
+                        import concurrent.futures
+
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                            pool.submit(
+                                lambda: asyncio.run(
+                                    build_concept_schemes(conn, program=active_program, embed_fn=_embed_engine)
+                                )
+                            ).result()
 
             n_batch = max(1, len(chunk_ids))
             b_label_tok = max(

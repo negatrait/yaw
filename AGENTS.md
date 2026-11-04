@@ -192,5 +192,5 @@ git diff --check
 
 ## Running the app
 
-- `uv run yaw dspy optimize --resume`: launch GEPA optimization
-- `uv run watchdog`: launch the DSPy optimization watchdog
+- `uv run yaw dspy optimize --resume`: launch GEPA optimization with resume and default settings.
+- `$env:YAW_ARTIFACT_DIR = "<directory>"; uv run watchdog --watch 300`: launch the DSPy optimization watchdog outputting to a specified directory from which the user can see the dashboard.
