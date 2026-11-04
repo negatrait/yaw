@@ -7,6 +7,7 @@ import contextlib
 import json
 import math
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -35,7 +36,26 @@ if str(WORKSPACE_ROOT) not in sys.path:
 from yaw.core import write_text_atomic  # noqa: E402
 from yaw.daemon.graph.storage import get_graph_counts, open_readonly_yaw_db  # noqa: E402
 
-ARTIFACT_DIR = Path(os.environ.get("YAW_ARTIFACT_DIR") or (WORKSPACE_ROOT / "outputs" / "dashboard"))
+
+def _resolve_artifact_dir() -> Path:
+    if custom := os.environ.get("YAW_ARTIFACT_DIR"):
+        return Path(custom)
+    try:
+        brain = Path.home() / ".gemini" / "antigravity" / "brain"
+        if brain.exists():
+            reports = sorted(
+                brain.glob("*/benchmark_mobile_report.md"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if reports:
+                return reports[0].parent
+    except Exception:
+        pass
+    return WORKSPACE_ROOT / "outputs" / "dashboard"
+
+
+ARTIFACT_DIR = _resolve_artifact_dir()
 # Report figure order (Fig 1..5). Fig. 3 includes evaluation and candidate axes.
 FIG_FILES = (
     "knowledge_graph_extraction_dashboard.svg",
@@ -568,10 +588,35 @@ def get_active_sandbox_info() -> dict[str, Any]:
             ]
             related_assertions = recent_relation_assertions(conn, "skos:related")
             broader_assertions = recent_relation_assertions(conn, "skos:broader", limit=5)
-        rows = conn.execute(
-            "SELECT chunk_id, entities_json, triples_json, structured_triples_json "
-            "FROM openie_chunks ORDER BY rowid ASC"
-        ).fetchall()
+        has_chunk_inf = False
+        with contextlib.suppress(sqlite3.Error):
+            has_chunk_inf = (
+                conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunk_inference' LIMIT 1"
+                ).fetchone()
+                is not None
+            )
+
+        ci_rows = []
+        if has_chunk_inf:
+            with contextlib.suppress(sqlite3.Error):
+                ci_rows = conn.execute(
+                    "SELECT chunk_id, extraction_json FROM chunk_inference ORDER BY rowid ASC"
+                ).fetchall()
+
+        if ci_rows:
+            rows = []
+            for cid, ext_raw in ci_rows:
+                ext = json.loads(ext_raw or "{}") if ext_raw else {}
+                ej = json.dumps(ext.get("entities") or [])
+                tj = json.dumps(ext.get("triples") or [])
+                stj = json.dumps(ext.get("structured_triples") or [])
+                rows.append((cid, ej, tj, stj))
+        else:
+            rows = conn.execute(
+                "SELECT chunk_id, entities_json, triples_json, structured_triples_json "
+                "FROM openie_chunks ORDER BY rowid ASC"
+            ).fetchall()
 
         cum_e = cum_t = 0
         uniq_e, uniq_edges, preds, recent, raw_counts, triples_raw = (
@@ -2241,6 +2286,38 @@ def run_once(
                 flush=True,
             )
     generate_report_markdown(ARTIFACT_DIR / "benchmark_mobile_report.md", sb, cands, n_evals, legacy, badge)
+
+    # Mirror artifacts so both the active brain artifact directory and repo dashboard stay in sync
+    mirror_dirs: list[Path] = []
+    default_dir = WORKSPACE_ROOT / "outputs" / "dashboard"
+    if ARTIFACT_DIR.resolve() != default_dir.resolve():
+        mirror_dirs.append(default_dir)
+    try:
+        brain = Path.home() / ".gemini" / "antigravity" / "brain"
+        if brain.exists():
+            for r in brain.glob("*/benchmark_mobile_report.md"):
+                bp = r.parent
+                if bp.resolve() != ARTIFACT_DIR.resolve() and bp not in mirror_dirs:
+                    mirror_dirs.append(bp)
+    except Exception:
+        pass
+
+    for md in mirror_dirs:
+        with contextlib.suppress(Exception):
+            md.mkdir(parents=True, exist_ok=True)
+            for fname in FIG_FILES:
+                src_f = ARTIFACT_DIR / fname
+                if src_f.exists():
+                    shutil.copy2(src_f, md / fname)
+            rep_src = ARTIFACT_DIR / "benchmark_mobile_report.md"
+            if rep_src.exists():
+                content = rep_src.read_text(encoding="utf-8")
+                old_prefix = f"/{ARTIFACT_DIR.as_posix()}/"
+                new_prefix = f"/{md.as_posix()}/"
+                if old_prefix != new_prefix:
+                    content = content.replace(old_prefix, new_prefix)
+                write_text_atomic(md / "benchmark_mobile_report.md", content)
+
     return sb, cands, n_evals, badge
 
 
