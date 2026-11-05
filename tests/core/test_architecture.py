@@ -43,6 +43,7 @@ _CANONICAL_DOCS_INVENTORY = frozenset(
         "evaluation.md",
         "model-evaluation.md",
         "native-cocoindex-indexing.md",
+        "native-cocoindex-graph.md",
         "pre-epic2-memo.md",
         "w3c-improvements.md",
     }

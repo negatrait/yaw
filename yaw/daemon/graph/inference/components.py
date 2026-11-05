@@ -46,7 +46,9 @@ class EmbeddingEndpoint:
                     result = await self.adapter.aexecute_request(request)
                 else:
                     encode_fn = self.adapter.encode
-                    vecs = await asyncio.to_thread(encode_fn, list(request.texts), request.instruction or "")
+                    vecs = await asyncio.to_thread(
+                        encode_fn, list(request.texts), instruction=request.instruction or ""
+                    )
                     result = EmbeddingResult(
                         np.asarray(vecs, dtype=np.float32),
                         {"stage": request.stage or "embed", "tokens_used": 0},
@@ -106,20 +108,6 @@ class DefinedEntities:
 
 
 @dataclass(frozen=True, slots=True)
-class ConceptSchemeInput:
-    packets: tuple[dict[str, Any], ...]
-    program_identity: str
-
-
-@dataclass(frozen=True, slots=True)
-class DefinedSchemes:
-    definitions: tuple[tuple[str, str, str, str, float | None], ...]
-    traces: tuple[PredictorTrace, ...]
-    telemetry: tuple[dict[str, Any], ...]
-    audit_trail: tuple[dict[str, Any], ...]
-
-
-@dataclass(frozen=True, slots=True)
 class SynonymJudgeInput:
     batch: SynonymEvidenceBatch
     program_identity: str
@@ -161,28 +149,6 @@ class OpenIEEndpoint:
     def _resolve_lm(self) -> Any:
         active_lm = self.lm or getattr(dspy.settings, "lm", None)
         return active_lm.copy() if active_lm is not None and hasattr(active_lm, "copy") else active_lm
-
-    @coco.fn.as_async
-    def define_schemes(self, /, request: ConceptSchemeInput) -> DefinedSchemes:
-        if request.program_identity != self.program_identity:
-            raise ValueError("Concept-scheme program identity does not match the bound program")
-        program = self.program.deepcopy()
-        program.telemetry.clear()
-        program.entity_def_audit_trail.clear()
-        traces: list[Any] = []
-        with dspy.context(lm=self._resolve_lm(), trace=traces):
-            definitions = program.define_concept_schemes(list(request.packets))
-        names = {id(predictor): name for name, predictor in program.named_predictors()}
-        return DefinedSchemes(
-            tuple(definitions),
-            tuple(
-                PredictorTrace(names[id(predictor)], dict(inputs), dict(outputs))
-                for predictor, inputs, outputs in traces
-                if id(predictor) in names
-            ),
-            tuple(dict(entry) for entry in program.telemetry),
-            tuple(dict(entry) for entry in program.entity_def_audit_trail),
-        )
 
     @coco.fn.as_async
     def extract(self, /, request: OpenIEInput) -> ExtractedText:
@@ -290,6 +256,8 @@ class OpenIEEndpoint:
                 ).get("markdown_dossier", "")
             ),
             shacl_linter=lambda: [v.to_dict() for v in request.violations],
+            chunk_hydrator=program._chunk_hydrator,
+            ast_island_hydrator=program._ast_island_hydrator,
         )
         lm = self._resolve_lm()
         traces: list[Any] = []
@@ -312,13 +280,6 @@ class OpenIEEndpoint:
 
 
 OPENIE_ENDPOINT = coco.ContextKey[OpenIEEndpoint]("yaw/openie_endpoint")
-
-
-@coco.fn(memo=True)
-async def define_concept_schemes(request: ConceptSchemeInput) -> DefinedSchemes:
-    endpoint = coco.use_context(OPENIE_ENDPOINT)
-    async with endpoint.admission:
-        return await endpoint.define_schemes(request)
 
 
 @coco.fn(memo=True)

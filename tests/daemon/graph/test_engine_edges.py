@@ -172,42 +172,20 @@ def make_engine(tmp_path, url) -> YawGraphEngine:
     )
 
 
-@pytest.mark.parametrize(
-    "checkpoint_kind", ["structured", "triples-only", "missing-definitions", "structured-only", "invalid-statement"]
-)
-def test_committed_openie_survives_stage_cache_eviction_and_engine_restart(
-    tmp_path, indexing_provider, checkpoint_kind
-):
+def test_native_inference_survives_stage_cache_eviction_and_engine_restart(tmp_path, indexing_provider):
     url, calls = indexing_provider
     source = "Ada wrote Notes."
     (tmp_path / "source.txt").write_text(source, encoding="utf-8")
     pointer = ChunkPointer("source", "source.txt", 1, 1, "Source")
     first = make_engine(tmp_path, url)
     try:
-        assert first.index_chunks([]) == 0
         assert first.index_chunks([(pointer, source)]) == 1
-        assert calls.count("ner") == 1 and calls.count("triples") == 1
         assert first.conn.execute("SELECT count(*) FROM facts").fetchone()[0] == 1
-        fingerprints = [
-            tuple(row) for row in first.conn.execute("SELECT key,value FROM meta WHERE key LIKE '%fp:%' ORDER BY key")
-        ]
         with first.managed_conn.transaction() as conn:
             conn.execute("DELETE FROM candidate_stage_cache")
-            if checkpoint_kind in ("triples-only", "missing-definitions"):
-                conn.execute("UPDATE openie_chunks SET structured_triples_json='[]'")
-            if checkpoint_kind == "missing-definitions":
-                conn.execute("UPDATE openie_chunks SET entities_json=?", (json.dumps(["Ada", "Notes"]),))
-            if checkpoint_kind == "structured-only":
-                conn.execute("UPDATE openie_chunks SET entities_json='[]'")
-            if checkpoint_kind == "invalid-statement":
-                saved = json.loads(conn.execute("SELECT structured_triples_json FROM openie_chunks").fetchone()[0])
-                conn.execute(
-                    "UPDATE openie_chunks SET structured_triples_json=?",
-                    (json.dumps([{"subj": "", "pred": "invalid", "obj": "Notes"}, *saved]),),
-                )
         checkpoint = tuple(
             first.conn.execute(
-                "SELECT entities_json,triples_json,structured_triples_json FROM openie_chunks"
+                "SELECT program_identity, embedding_identity, extraction_json, traces_json FROM chunk_inference"
             ).fetchone()
         )
     finally:
@@ -216,22 +194,15 @@ def test_committed_openie_survives_stage_cache_eviction_and_engine_restart(
     second = make_engine(tmp_path, url)
     try:
         second.index_chunks([(pointer, source)])
-        assert calls.count("ner") == before.count("ner")
-        assert calls.count("triples") == before.count("triples")
-        assert calls.count("definitions") - before.count("definitions") == (
-            1 if checkpoint_kind == "missing-definitions" else 0
-        )
+        assert calls == before
         assert (
             tuple(
                 second.conn.execute(
-                    "SELECT entities_json,triples_json,structured_triples_json FROM openie_chunks"
+                    "SELECT program_identity, embedding_identity, extraction_json, traces_json FROM chunk_inference"
                 ).fetchone()
             )
             == checkpoint
         )
-        assert [
-            tuple(row) for row in second.conn.execute("SELECT key,value FROM meta WHERE key LIKE '%fp:%' ORDER BY key")
-        ] == fingerprints
         assert second.conn.execute("SELECT count(*) FROM facts").fetchone()[0] == 1
         assert second.retrieve_dpr("Ada", top_k=0) == []
     finally:

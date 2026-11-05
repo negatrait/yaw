@@ -154,26 +154,34 @@ class RelationTraversalPolicy:
    - Emit `owl:differentFrom` when Stage 3 (`related_judge`) returns `related: false` **only** if the pair shares a normalized surface label (`text_processing(name_a) == text_processing(name_b)`) or has confusable lexical overlap at or above the empirical mean lexical similarity of accepted `skos:altLabel` pairs on `stage_conn` (`lexical_sim >= avg_alt_label_sim`). Otherwise emit no edge.
 2. **Guardrail 2: Head-Noun & Proper-Noun Modifier Invariant Against Mega-Hub `skos:altLabel` Collapse (`is_modifier_head_specialization`)**:
    - Forbid `skos:altLabel` / `skos:hiddenLabel` merges when one label is a proper-noun modifier prefix of the other with a distinct head noun (`Redwood` vs. `Redwood Router`, `Redwood secrets`, `RedwoodTenant`) or when normalized token sets are disjoint without acronym correspondence (`Redwood` vs. `CRDs`, `missing CRDs`). Route modifier-head specializations proposed for merge in Stage 1 to `skos:broader` (`Redwood Router skos:broader Redwood`) with weight `pool_confidences(dec_llm_prob, sim)`.
-3. **Guardrail 3: Case-Insensitive Identity Consolidation Before Disambiguation (`prepare_synonym_candidates`)**:
-   - Consolidate candidate pairs with identical normalized labels (`text_processing(name_a) == text_processing(name_b)`, e.g. `"canary"` and `"Canary"`) and $d_{\text{sim}} \ge \text{synonymy\_threshold}$ (when not distinct poles of the same reified fact) into a single `skos:Concept`, preferring the properly cased surface form as `skos:prefLabel`.
+3. **Guardrail 3: Evidence-based identity across batches**:
+   - Label/case/cosine matches generate candidates. Reuse an unchanged accepted binding or obtain an evidence-keyed identity decision; preserve distinct senses and select canonical representatives independently of arrival order.
 4. **Guardrail 4: Genus-Species & Part-Whole Falsification in `JudgeHierarchy` (`prompts.py`)**:
    - Require strict `skos:broaderG` (*"Every A is a kind of B"*), `skos:broaderI` (individual `Priya` under role `Frontend SWE`, never `Frontend SWE skos:broader Priya`), or `skos:broaderP` (architectural part of whole system), and forbid cross-category hierarchy assertions (cluster vs. metric/event, comparative states `'Improved X'` vs. `'Original X'`).
 
 ---
 
-### 2.5 Emergent `skos:ConceptScheme` Modularity Clustering, Definer, Seeding & QA Reader Integration
+### 2.5 Scheme-free incremental confidence aggregation
 
-1. **Newman Modularity Maximization ($Q$) — Zero Magic Numbers**:
-   - Build symmetric Entity Affinity Matrix $A_{uv} = \text{pool\_confidences}(w_{\text{edge}}(u, v), \max(\epsilon, \cos(\mathbf{v}_u, \mathbf{v}_v)))$ over positive edges (`skos:broader`, `skos:related`, `fact`).
-   - Greedily merge communities $(C_a, C_b)$ maximizing $\Delta Q(C_a, C_b) = 2(e_{ab} - a_a a_b)$ until $\max_{a \neq b} \Delta Q \le 0$ to determine the emergent scheme count $K^*$ without magic numbers.
-2. **Deterministic Post-Hoc `skos:topConceptOf` Synthesis & Typed Edges**:
-   - Because top concepts are not available at entity extraction time, `skos:topConceptOf` is synthesized **deterministically post-hoc** as part of constructing each `skos:ConceptScheme` once community $C_m$ is known (never guessed by the LLM): select taxonomic roots $u \in R_m$ with prominence $s_{\text{top}}(u) = \text{pool\_confidences}(p_{\text{entity}}(u), \cos(\mathbf{v}_u, \boldsymbol{\mu}_m), \text{bayesian\_noisy\_or}(\{A_{uv}\})) \ge \text{mean}_{r \in R_m}(s_{\text{top}}(r))$ as top concepts $T_m$.
-   - Emit typed `skos:topConceptOf` edges `(u, scheme_id, 'skos:topConceptOf', s_top(u))` in `edges` (traversed via `skos_top_concept_up = 1.0` and `skos_top_concept_down = 0.8` in `ppr.py`).
-3. **Entity & ConceptScheme Definer (`DefineMissingEntities` / `entity_definer`)**:
-   - `YawProgram.define_concept_schemes` passes the deterministic `skos:topConceptOf` list $T_m$ and taxonomy packet of each emergent scheme to `self.entity_definer` with `build_dspy_concept_scheme_defs_grammar(scheme_ids)` to output the 4-tuple `[scheme_id, pref_label, definition, history_note]`, with `prov:value` computed via `pool_confidences(p_llm, cos(v_scheme, mu_m), c_mod)`.
-4. **Vector Embedding in `entity_vec` & QA Reader Subgraph Framing**:
-   - Embed each `skos:ConceptScheme` via `fmt_entity(pref_label, definition)` into `entity_vec` (`scheme-...`) so `retrieve_with_seeds` can seed directly on `:scheme_*` when leaf concepts miss.
-   - Prepend active `:scheme_*` Turtle blocks (`a skos:ConceptScheme`, `skos:prefLabel`, `skos:definition`, `skos:historyNote`, `skos:topConceptOf :ent_1, :ent_2`, `prov:value`) at the top of `format_subgraph_turtle` on every recall, and annotate each member `:ent_*` with `skos:inScheme :scheme_*` (and `skos:topConceptOf :scheme_*` for top concepts).
+The former ConceptScheme clustering/definer/seeding/QA proposal is removed.
+[Native graph publication](native-cocoindex-graph.md) owns scheme removal and
+batch independence; its paired 64+64/128 gates also apply to confidence inputs.
+Retain source-supported entity, fact and edge confidence with the existing two
+operators. There is no scheme confidence, centroid, embedding, membership or
+scheme QA block in the active target.
+
+Aggregate distinct surviving evidence IDs, not callback/memo-hit counts. Replaying
+an unchanged batch must not add support. Withdrawing one source recomputes shared
+confidence from survivors. For fixed evidence, paired arms must agree within
+1e-6 and retain identical source-support sets. Cache adjudications by canonical
+endpoints, evidence and policy revision; new evidence can reopen earlier decisions.
+Case/label/cosine equality alone never establishes identity. This supersedes the
+similarity-only consolidation shortcut in section 2.4; use the W3C evidence-based
+identity contract instead.
+
+Any future scheme experiment requires measured held-out Recall@N, EM or F1 gain
+against the scheme-free baseline and explicit compute/memory/other-quality costs.
+No speculative scheme code or dependency remains for such an experiment.
 
 ---
 
@@ -186,7 +194,7 @@ class RelationTraversalPolicy:
    Literals (`object_kind = 'literal'`) never create `entities`, `entity_labels`, or `edges` rows. They live strictly in `facts` with `object_kind = 'literal'` and `facts.confidence` (`prov:value`).
 3. **Closed-World Provenance & QA Payload Invariants**:
    - Validated by `ProvenanceConfidenceShape` in `lint_graph_shacl(conn)` and queryable via `query_graph_provenance(conn)`.
-   - `format_subgraph_turtle` emits `prov:value "..."^^xsd:double` on `:ent_*`, `:fact_*` (entity and literal objects), and `:scheme_*` directly into the QA prompt payload.
+   - `format_subgraph_turtle` emits `prov:value "..."^^xsd:double` on `:ent_*` and `:fact_*` (entity and literal objects) directly into the QA prompt payload.
 
 ### 3.2 Failure & Fallback Matrix
 

@@ -36,7 +36,6 @@ SEMANTIC_EDGE_KINDS: frozenset[str] = frozenset(
         "skos:related",
         "skos:broader",
         "owl:differentFrom",
-        "skos:topConceptOf",
     }
 )
 
@@ -52,9 +51,6 @@ SYNONYM_RELATION_ALIASES: dict[str, str] = {
     "broader": "skos:broader",
     "skos:narrower": "skos:narrower",
     "narrower": "skos:narrower",
-    "skos:topConceptOf": "skos:topConceptOf",
-    "topConceptOf": "skos:topConceptOf",
-    "top_concept_of": "skos:topConceptOf",
     "owl:differentFrom": "owl:differentFrom",
     "differentFrom": "owl:differentFrom",
 }

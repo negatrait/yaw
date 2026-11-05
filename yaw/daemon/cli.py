@@ -7,6 +7,8 @@ Grammar:
   yaw config {get|set} [--flags]
 """
 
+from __future__ import annotations
+
 import argparse
 import contextlib
 import json
@@ -19,9 +21,10 @@ import time
 import uuid
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import dspy
+if TYPE_CHECKING:
+    import dspy
 
 from yaw.core import (
     DaemonStatus,
@@ -509,6 +512,8 @@ def _load_dataset_splits(
     train_queries: int = 7,
     query_offset: int = 0,
 ) -> tuple[list[dspy.Example], list[dspy.Example] | None, list[str]]:
+    import dspy
+
     def _dspy_example_factory(*, _inputs: tuple[str, ...] = ("question", "item_docs"), **kwargs: Any) -> dspy.Example:
         return dspy.Example(**kwargs).with_inputs(*_inputs)
 
@@ -832,6 +837,8 @@ def handle_dspy_optimize(
     dataset_bundles = [resolve_dataset_bundle(arg, workspace_root=config.workspace_root) for arg in dataset_args]
 
     # Resolution order for sandbox: always isolate prompt compilation
+    import dspy
+
     dspy.settings.configure(provide_traceback=True)
     raw_sleep = getattr(args, "sleep_seconds", None)
     sleep_seconds = float(raw_sleep) if raw_sleep is not None else float(config.optimize_sleep_seconds or 0.0)

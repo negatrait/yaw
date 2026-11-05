@@ -48,13 +48,18 @@ class EmbeddingProfile:
         return "shared"
 
     @property
+    def index_contract(self):
+        """Exclude query-only prefixes from document/entity/fact vector work."""
+        return replace(self, query_prefix="", fact_query_prefix=None)
+
+    @property
     def index_identity(self):
-        payload = asdict(self)
-        if self.fact_query_prefix is None:
-            payload.pop("fact_query_prefix", None)
+        payload = asdict(self.index_contract)
+        payload.pop("fact_query_prefix")
+        payload.pop("query_prefix")
         if not self.parse_document_title:
             payload.pop("parse_document_title", None)
-        contract = {"adapter": "retrieval-prompts-v3", "normalization": "l2", **payload}
+        contract = {"adapter": "retrieval-prompts-v4", "normalization": "l2", **payload}
         return "yaw-embedding-v2:" + hashlib.sha256(json.dumps(contract, sort_keys=True).encode("utf-8")).hexdigest()
 
     def format(self, text, *, query, instruction=None, title: str | None = None):
@@ -394,13 +399,13 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
     def prepare_request(self, texts: Sequence[str], *, batch_size: int, stage: str) -> EmbeddingRequest:
         """Capture an immutable embedding contract on the engine owner thread."""
         return EmbeddingRequest(
-            tuple(texts), self.profile, self.task_mode, batch_size, self.max_batch_chars, stage=stage
+            tuple(texts), self.profile.index_contract, self.task_mode, batch_size, self.max_batch_chars, stage=stage
         )
 
     def execute_request(self, request: EmbeddingRequest, stop: Event | None = None) -> EmbeddingResult:
         """Execute without publishing history, invoking hooks or accessing storage."""
-        if (self.profile, self.task_mode, self.max_batch_chars) != (
-            request.profile,
+        if (self.profile.index_identity, self.task_mode, self.max_batch_chars) != (
+            request.profile.index_identity,
             request.task_mode,
             request.max_batch_chars,
         ):
@@ -446,8 +451,8 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
 
     async def aexecute_request(self, request: EmbeddingRequest) -> EmbeddingResult:
         """Execute on the native async provider without publishing shared state."""
-        if (self.profile, self.task_mode, self.max_batch_chars) != (
-            request.profile,
+        if (self.profile.index_identity, self.task_mode, self.max_batch_chars) != (
+            request.profile.index_identity,
             request.task_mode,
             request.max_batch_chars,
         ):

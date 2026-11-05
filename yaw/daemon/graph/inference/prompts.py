@@ -191,17 +191,17 @@ class FactList(BaseModel):
 
 
 class ExtractEntities(dspy.Signature):
-    """Extract all named entities (people, organizations, locations, systems, products, artifacts) and domain \
-concepts grounded in the body prose of `passage` into `named_entities`, as concise `skos:Concept` / `owl:NamedIndividual`. \
-Output only `[skos:prefLabel, skos:definition]` pairs. \
-    - `skos:Concept` & `owl:NamedIndividual` Scope (SKOS S14): Represent every prose-grounded named entity and \
-domain concept as a concise, canonical single word noun phrase (`skos:prefLabel`, never a full sentence, imperative \
-instruction, checklist clause, or document container/header metadata tag). Exclude bare scalar `rdfs:Literal` \
-values (numbers, percentages, dates, timestamps, durations, booleans, or version strings, which belong in \
-`owl:DatatypeProperty` object slots).
-    - Contextual `skos:definition` (`ConceptShape/definition`, `sh:minCount 1`): Pair each extracted entity with a \
-concise, one sentence, non-tautological `skos:definition` stating its ontological class (`rdf:type` / genus) \
-and distinguishing role in `passage` (never repeat `skos:prefLabel` verbatim as its own definition)."""
+    """Extract ALL named individuals and ALL general domain concepts explicitly mentioned in `passage` prose.
+    An `owl:NamedIndividual` is a particular person, organization, place, system, product or artifact.
+    A `skos:Concept` is a general domain concept or category, such as a role, process or kind of thing.
+    Output only deduplicated `[skos:prefLabel, skos:definition]` pairs. Use source-grounded noun phrases;
+    each definition identifies what the resource is and its distinguishing role in this passage.
+    Do not extract relationships, statements or document/header metadata. Do not extract `rdfs:Literal`
+    data values such as numbers, dates, percentages, durations, booleans or descriptive strings as resources.
+    A resource label is also a JSON string: a named person, place or concept is not a literal merely because
+    its label is textual. Include every such resource, including less prominent subjects and objects.
+    The fact extractor discovers those literal values while establishing relationships. Never use a label
+    as its own definition."""
 
     passage: str = dspy.InputField(desc="Source `passage` text")
     named_entities: list[Any] = dspy.OutputField(
@@ -210,26 +210,22 @@ and distinguishing role in `passage` (never repeat `skos:prefLabel` verbatim as 
 
 
 class ExtractTriples(dspy.Signature):
-    """Construct a closed-world W3C `rdf:Statement` graph in `triples` from `passage` and `named_entities`.
-    Each element in `triples` is a prose-grounded reified `rdf:Statement` object with keys `"sub"` \
-(`rdf:subject`), `"pred"` (`rdf:predicate` pair), `"obj"` (`rdf:object`), and `"def"` (statement-level \
-`skos:definition`):
-    - Closed-World Anchoring & Connectedness (`StatementShape/closedWorld`): Extract only factual assertions \
-grounded in `passage` prose (never fabricate triples from document container/header metadata tags or similar). \
-Resolve pronouns to canonical `skos:prefLabel` strings from `named_entities`, emit `"sub"` or `"obj"` as an exact \
-string when already defined in `named_entities` or as `[name, contextual_definition]` when introducing a \
-passage-grounded resource, and bridge extracted `skos:Concept` nodes into a connected subgraph.
-    - Statement Definition Integrity (`"def"`, `StatementShape/closedWorld`): `"def"` must concisely define the \
-relational assertion linking `"sub"`, `"pred"`, and `"obj"` in `passage`, and MUST NEVER copy `"sub"`'s or \
-`"obj"`'s entity `skos:definition` verbatim.
-    - `rdfs:domain` & Irreflexivity (`owl:IrreflexiveProperty`): `"sub"` must be a `skos:Concept` / \
-`owl:NamedIndividual` (never a bare `rdfs:Literal`), and `"sub"` and `"obj"` must never denote the same concept \
-(no reflexive self-loops).
-    - Property Range Typing (`"pred": ["predicate phrase", "owl:ObjectProperty" | "owl:DatatypeProperty"]`): \
-Use `"owl:ObjectProperty"` (`rdfs:range skos:Concept`) when `"obj"` is a domain concept or named individual, \
-and use `"owl:DatatypeProperty"` (`rdfs:range rdfs:Literal`) when `"obj"` is a data value or literal \
-(dates, timestamps, durations, quantities, percentages, ports, versions, or booleans) paired with its \
-`[value, contextual_definition]`."""
+    """Establish passage-supported `rdf:Statement` facts using only the supplied resources.
+    Resource discovery and definitions belong exclusively to the entity extractor. Never introduce,
+    rename or define a resource here. Subjects and resource objects are exact labels from `named_entities`,
+    which contains both general `skos:Concept` categories and particular `owl:NamedIndividual` resources.
+    If a label has multiple supplied definitions, select its exact supplied `[label, definition]` pair
+    as the endpoint to identify that sense. Copy it verbatim; never invent or rewrite its definition.
+    Emit objects with `"sub"` (`rdf:subject`), `"pred"` (`rdf:predicate`), `"obj"` (`rdf:object`) and `"def"`:
+    - Between supplied resources, use `"pred": ["predicate phrase", "owl:ObjectProperty"]` and an exact
+      supplied resource label as `"obj"`.
+    - For data-valued relationships, discover the literal in the passage. Use `"pred": ["predicate phrase",
+      "owl:DatatypeProperty"]` and `"obj": {"value": "lexical value", "datatype": "xsd:string", "lang": ""}`.
+      Choose the appropriate datatype or language tag. Literals need not occur in `named_entities`;
+      they are values, never new resources or `[name, definition]` pairs.
+    Subjects are always supplied resources, never literals. Resolve pronouns to supplied labels, preserve
+    predicate direction and literal meaning, and define each assertion in `"def"` without copying an entity
+    definition. Do not invent relationships to connect unrelated resources or use header metadata."""
 
     passage: str = dspy.InputField(desc="Source passage text")
     named_entities: list[Any] = dspy.InputField(
@@ -238,29 +234,26 @@ and use `"owl:DatatypeProperty"` (`rdfs:range rdfs:Literal`) when `"obj"` is a d
     triples: list[Any] = dspy.OutputField(
         desc='List of reified rdf:Statement objects {"sub", "pred", "obj", "def"} where "pred" is '
         '["predicate phrase", "owl:ObjectProperty" | "owl:DatatypeProperty"], known resources are '
-        "strings, and new resources are [name, contextual_definition] pairs"
+        "exact supplied labels (or exact supplied sense pairs for homographs); "
+        'literal values are {"value", "datatype", "lang"} objects'
     )
 
 
 class DefineMissingEntities(dspy.Signature):
     """Synthesize concise, grounded genus-differentia contextual definitions for entities referenced in \
-`missing_entities` based on the passage text and extracted triples, or for emergent `skos:ConceptScheme` taxonomies:
-    - For missing entities: Emit `[entity_name, contextual_definition]` for every requested concept using the exact \
-string from `missing_entities`; never emit an empty definition or repeat `entity_name` tautologically.
-    - For emergent `skos:ConceptScheme` taxonomies: Emit `{"scheme_id", "pref_label", "definition", "history_note"}` \
-synthesizing the scheme's canonical title, intensional domain definition, and ontological rationale."""
+`missing_entities` based on the passage text and extracted triples. These resources were already
+discovered by NER; never discover, add or rename resources during definition repair.
+Emit `[entity_name, contextual_definition]` for every requested concept using the exact string from \
+`missing_entities`; never emit an empty definition or repeat `entity_name` tautologically."""
 
-    passage: str = dspy.InputField(desc="Source passage text or taxonomic cluster dossiers")
-    missing_entities: list[str] = dspy.InputField(desc="Entity names or scheme IDs that require contextual definitions")
+    passage: str = dspy.InputField(desc="Source passage text")
+    missing_entities: list[str] = dspy.InputField(desc="Entity names that require contextual definitions")
     triples: list[Any] = dspy.InputField(
         desc="Extracted relation triples referencing the missing entities",
         default=[],
     )
     entity_definitions: list[Any] = dspy.OutputField(
-        desc=(
-            "List of [entity_name, contextual_definition] pairs for missing entities, or "
-            "list of {scheme_id, pref_label, definition, history_note} objects for concept schemes"
-        )
+        desc="List of [entity_name, contextual_definition] pairs for missing entities"
     )
 
 
@@ -512,6 +505,12 @@ _NER_DEMO_ENTITY_DEFINITIONS: list[list[str]] = [
         "PlanetRadiocity.com",
         "Music portal launched by Radio City in May 2008 offering music news, videos, and songs.",
     ],
+    ["private FM radio station", "Category of commercial FM radio station in India represented by Radio City."],
+    ["New Media", "Digital media sector entered by Radio City in May 2008."],
+    ["music portal", "Web portal category offering music news, videos, and songs."],
+    ["news", "Music-related news content offered on PlanetRadiocity.com."],
+    ["videos", "Music video content offered on PlanetRadiocity.com."],
+    ["songs", "Musical song tracks offered on PlanetRadiocity.com."],
 ]
 
 _TRIPLE_DEMO_TRIPLES: list[dict[str, Any]] = [
@@ -524,16 +523,13 @@ _TRIPLE_DEMO_TRIPLES: list[dict[str, Any]] = [
     {
         "sub": "Radio City",
         "pred": ["is", "owl:ObjectProperty"],
-        "obj": [
-            "private FM radio station",
-            "Category of commercial FM radio station in India represented by Radio City.",
-        ],
+        "obj": "private FM radio station",
         "def": "Radio City is India's first private FM radio station.",
     },
     {
         "sub": "Radio City",
         "pred": ["started on", "owl:DatatypeProperty"],
-        "obj": ["3 July 2001", "Date when Radio City was started."],
+        "obj": {"value": "2001-07-03", "datatype": "xsd:date", "lang": ""},
         "def": "Radio City started broadcasting on 3 July 2001.",
     },
     {
@@ -551,10 +547,7 @@ _TRIPLE_DEMO_TRIPLES: list[dict[str, Any]] = [
     {
         "sub": "Radio City",
         "pred": ["forayed into", "owl:ObjectProperty"],
-        "obj": [
-            "New Media",
-            "Digital media sector entered by Radio City in May 2008.",
-        ],
+        "obj": "New Media",
         "def": "Radio City forayed into New Media in May 2008.",
     },
     {
@@ -566,43 +559,31 @@ _TRIPLE_DEMO_TRIPLES: list[dict[str, Any]] = [
     {
         "sub": "PlanetRadiocity.com",
         "pred": ["launched in", "owl:DatatypeProperty"],
-        "obj": ["May 2008", "Month and year when Radio City launched PlanetRadiocity.com."],
+        "obj": {"value": "2008-05", "datatype": "xsd:gYearMonth", "lang": ""},
         "def": "PlanetRadiocity.com was launched in May 2008.",
     },
     {
         "sub": "PlanetRadiocity.com",
         "pred": ["is", "owl:ObjectProperty"],
-        "obj": [
-            "music portal",
-            "Web portal category offering music news, videos, and songs.",
-        ],
+        "obj": "music portal",
         "def": "PlanetRadiocity.com is an online music portal.",
     },
     {
         "sub": "PlanetRadiocity.com",
         "pred": ["offers", "owl:ObjectProperty"],
-        "obj": [
-            "news",
-            "Music-related news content offered on PlanetRadiocity.com.",
-        ],
+        "obj": "news",
         "def": "PlanetRadiocity.com offers music-related news.",
     },
     {
         "sub": "PlanetRadiocity.com",
         "pred": ["offers", "owl:ObjectProperty"],
-        "obj": [
-            "videos",
-            "Music video content offered on PlanetRadiocity.com.",
-        ],
+        "obj": "videos",
         "def": "PlanetRadiocity.com offers music videos.",
     },
     {
         "sub": "PlanetRadiocity.com",
         "pred": ["offers", "owl:ObjectProperty"],
-        "obj": [
-            "songs",
-            "Musical song tracks offered on PlanetRadiocity.com.",
-        ],
+        "obj": "songs",
         "def": "PlanetRadiocity.com offers songs.",
     },
 ]

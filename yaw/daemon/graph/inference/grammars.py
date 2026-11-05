@@ -1,7 +1,7 @@
 """Pure-JSON Context-Free Grammars (GBNF) for DSPy."""
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from typing import Any
 
 import dspy
@@ -21,9 +21,10 @@ DSPY_TRIPLES_GBNF_GRAMMAR = r"""root ::= "{\"triples\": " triple-list "}"
 triple-list ::= "[]" | "[" triple (", " triple)* "]"
 triple ::= "{\"sub\": " entity-slot ", \"pred\": " pred-slot ", \"obj\": " obj-slot ", \"def\": " string "}"
 pred-slot ::= string | "[" string ", " ("\"owl:ObjectProperty\"" | "\"owl:DatatypeProperty\"") "]"
-entity-slot ::= new-entity-pair | string
-obj-slot ::= entity-slot | string
-new-entity-pair ::= "[" string ", " string "]"
+entity-slot ::= string
+obj-slot ::= entity-slot | literal-slot
+literal-slot ::= "{\"value\": " string ", \"datatype\": " string ", \"lang\": " language "}"
+language ::= "\"" char* "\""
 string ::= "\"" char+ "\""
 char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
 """
@@ -72,15 +73,6 @@ string ::= "\"" char+ "\""
 char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
 """
 
-DSPY_CONCEPT_SCHEME_DEFS_GBNF_GRAMMAR: str = (
-    'root ::= "{\\"entity_definitions\\": [" scheme-list "]}"\n'
-    'scheme-list ::= (scheme-item (", " scheme-item)*)?\n'
-    'scheme-item ::= "{\\"scheme_id\\": " string ", \\"pref_label\\": " string '
-    '", \\"definition\\": " string ", \\"history_note\\": " string "}"\n'
-    'string ::= "\\"" char+ "\\""\n'
-    'char ::= [^"\\\\\\x7F\\x00-\\x1F] | "\\\\" (["\\\\bfnrt] | "u" [0-9a-fA-F]{4})\n'
-)
-
 
 def gbnf_escape_literal(text: str) -> str:
     escaped = (
@@ -109,8 +101,7 @@ def build_dspy_triples_grammar(
     max_triples: int | None = None,
     known_entities: Sequence[Any] | None = None,
 ) -> str:
-    """Build pure-JSON GBNF grammar for ExtractTriples, constraining known Stage 1 entities as bare strings and \
-novel entities as [name, def] pairs."""
+    """Pin resource endpoints to NER labels; only literal objects may introduce values."""
     deduped_known: list[str] = []
     if known_entities:
         for item in known_entities:
@@ -123,6 +114,8 @@ novel entities as [name, def] pairs."""
             if name and name not in deduped_known:
                 deduped_known.append(name)
 
+    if known_entities is not None and not deduped_known:
+        return 'root ::= "{\\"triples\\": []}"\n'
     if (max_triples is None or max_triples <= 0) and not deduped_known:
         return DSPY_TRIPLES_GBNF_GRAMMAR
 
@@ -142,25 +135,24 @@ novel entities as [name, def] pairs."""
         'pred-slot ::= string | "[" string ", " ("\\"owl:ObjectProperty\\"" | "\\"owl:DatatypeProperty\\"") "]"\n'
     )
     if deduped_known:
-        known_rule = " | ".join(gbnf_escape_literal(json.dumps(e, ensure_ascii=False)) for e in deduped_known)
-        slot_lines = (
-            "entity-slot ::= known-entity | new-entity-pair\n"
-            "obj-slot ::= entity-slot | string\n"
-            f"known-entity ::= {known_rule}\n"
-            'new-entity-pair ::= "[" string ", " string "]"\n'
-        )
+        endpoints: list[Any] = list(deduped_known)
+        pairs = [list(item[:2]) for item in known_entities or () if isinstance(item, (list, tuple)) and len(item) >= 2]
+        ambiguous = {name for name in deduped_known if len({pair[1] for pair in pairs if pair[0] == name}) > 1}
+        endpoints = [name for name in endpoints if name not in ambiguous]
+        endpoints.extend(pair for pair in pairs if pair[0] in ambiguous)
+        known_rule = " | ".join(gbnf_escape_literal(json.dumps(e, ensure_ascii=False)) for e in endpoints)
+        slot_lines = f"entity-slot ::= known-entity\nknown-entity ::= {known_rule}\n"
     else:
-        slot_lines = (
-            "entity-slot ::= new-entity-pair | string\n"
-            "obj-slot ::= entity-slot | string\n"
-            'new-entity-pair ::= "[" string ", " string "]"\n'
-        )
+        slot_lines = "entity-slot ::= string\n"
 
     return (
         root_line
         + list_line
         + triple_line
         + slot_lines
+        + "obj-slot ::= entity-slot | literal-slot\n"
+        + 'literal-slot ::= "{\\"value\\": " string ", \\"datatype\\": " string ", \\"lang\\": " language "}"\n'
+        + 'language ::= "\\"" char* "\\""\n'
         + 'string ::= "\\"" char+ "\\""\n'
         + 'char ::= [^"\\\\\\x7F\\x00-\\x1F] | "\\\\" (["\\\\bfnrt] | "u" [0-9a-fA-F]{4})\n'
     )
@@ -188,47 +180,6 @@ def build_dspy_missing_entity_defs_grammar(
         f"entity-name ::= {name_rule}\n"
         'string ::= "\\"" char+ "\\""\n'
         'char ::= [^"\\\\\\x7F\\x00-\\x1F] | "\\\\" (["\\\\bfnrt] | "u" [0-9a-fA-F]{4})\n'
-    )
-
-
-def build_dspy_concept_scheme_defs_grammar(
-    scheme_ids: Sequence[str] | Sequence[Mapping[str, Any]] | None = None,
-) -> str:
-    """Build pure-JSON GBNF grammar for DefineMissingEntities synthesizing concept schemes \
-(`{"entity_definitions": [{"scheme_id": ..., "pref_label": ..., "definition": ..., "history_note": ...}, ...]}`)."""
-    extracted_ids: list[str] = []
-    if scheme_ids:
-        for item in scheme_ids:
-            if isinstance(item, str):
-                sid = item.strip()
-            elif isinstance(item, Mapping):
-                sid = str(item.get("scheme_id") or item.get("id") or "").strip()
-            else:
-                sid = str(item).strip()
-            if sid and sid not in extracted_ids:
-                extracted_ids.append(sid)
-    if not extracted_ids:
-        return DSPY_CONCEPT_SCHEME_DEFS_GBNF_GRAMMAR
-
-    rules: list[str] = []
-    item_names: list[str] = []
-    for i, sid in enumerate(extracted_ids):
-        sid_literal = gbnf_escape_literal(json.dumps(sid, ensure_ascii=False))
-        rules.append(
-            f'scheme-item-{i} ::= "{{\\"scheme_id\\": " {sid_literal} '
-            f'", \\"pref_label\\": " string '
-            f'", \\"definition\\": " string '
-            f'", \\"history_note\\": " string "}}"'
-        )
-        item_names.append(f"scheme-item-{i}")
-
-    seq = ' ", " '.join(item_names)
-    root_line = f'root ::= "{{\\"entity_definitions\\": [" {seq} "]}}"\n'
-    return (
-        root_line
-        + "\n".join(rules)
-        + '\nstring ::= "\\"" char+ "\\""\n'
-        + 'char ::= [^"\\\\\\x7F\\x00-\\x1F] | "\\\\" (["\\\\bfnrt] | "u" [0-9a-fA-F]{4})\n'
     )
 
 
@@ -442,7 +393,6 @@ __all__ = [
     "DSPY_NER_GBNF_GRAMMAR",
     "DSPY_TRIPLES_GBNF_GRAMMAR",
     "DSPY_MISSING_ENTITY_DEFS_GBNF_GRAMMAR",
-    "DSPY_CONCEPT_SCHEME_DEFS_GBNF_GRAMMAR",
     "DSPY_SHACL_REPAIR_GBNF_GRAMMAR",
     "DSPY_RERANK_GBNF_GRAMMAR",
     "DSPY_QA_GBNF_GRAMMAR",
@@ -452,7 +402,6 @@ __all__ = [
     "build_dspy_ner_grammar",
     "build_dspy_triples_grammar",
     "build_dspy_missing_entity_defs_grammar",
-    "build_dspy_concept_scheme_defs_grammar",
     "build_dspy_hierarchy_judge_grammar",
     "build_dspy_label_judge_grammar",
     "build_dspy_related_judge_grammar",

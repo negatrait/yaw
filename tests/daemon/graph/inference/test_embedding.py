@@ -42,7 +42,7 @@ class EmbeddingTests(unittest.TestCase):
                     distinct_titled_profile.index_identity,
                 }
             ),
-            3,
+            2,
         )
 
         # Explicit Title: or Markdown #..###### heading on line 1 -> title: {heading} | text: {body}

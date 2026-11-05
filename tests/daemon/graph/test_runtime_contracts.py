@@ -13,7 +13,7 @@ from daemon.graph.inference.test_reflection import proposer
 from daemon.graph.inference.test_reflection import provider as provider
 from yaw.core import ChunkPointer, YawRuntimeError
 from yaw.daemon.graph.engine import YawGraphEngine
-from yaw.daemon.graph.inference import YawProgram, RLMInstructionProposer
+from yaw.daemon.graph.inference import RLMInstructionProposer, YawProgram
 from yaw.daemon.graph.inference.chat import YawDSPyLM, create_dspy_lm
 from yaw.daemon.graph.storage import CandidatePayloadCodec
 from yaw.daemon.indexing import bind_native_indexing

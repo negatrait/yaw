@@ -217,9 +217,7 @@ class GraphOptimizationHooks:
         ]
         | None
     ) = None
-    hydrate_top_chunks: Callable[[Sequence[str], YawProgram], dict[str, str]] = field(
-        default=lambda _cids, _prog: {}
-    )
+    hydrate_top_chunks: Callable[[Sequence[str], YawProgram], dict[str, str]] = field(default=lambda _cids, _prog: {})
     query_rlm_stats: Callable[[Sequence[str] | None], dict[str, Any]] = field(default=lambda _docs: {})
     graph_rlm_stats: Callable[[], dict[str, Any]] = field(default=dict)
     last_hook_program: Callable[[], YawProgram | None] = field(default=lambda: None)
@@ -280,7 +278,7 @@ def shacl_fingerprint(program: YawProgram) -> str:
         name: getattr(healer, name, None) for name in ("max_iters", "max_llm_calls", "max_output_chars")
     }
     payload["context_budget"] = [program.context_window_tokens, program.max_output_tokens]
-    payload["schema_version"] = "skos-shacl-v3"
+    payload["schema_version"] = "skos-shacl-v4-scheme-free"
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -295,7 +293,7 @@ def openie_fingerprint(program: YawProgram) -> str:
         "gbnf_max_entities": getattr(program, "gbnf_max_entities", None),
         "gbnf_max_triples": getattr(program, "gbnf_max_triples", None),
         "context_budget": [program.context_window_tokens, program.max_output_tokens],
-        "schema_version": "skos-shacl-v3",
+        "schema_version": "skos-shacl-v4-scheme-free",
     }
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -321,7 +319,7 @@ def extraction_fingerprint(program: YawProgram) -> str:
         "gbnf_max_triples": getattr(program, "gbnf_max_triples", None),
         "embedding_document_prefix": getattr(program, "embedding_document_prefix", None),
         "context_budget": [program.context_window_tokens, program.max_output_tokens],
-        "schema_version": "skos-shacl-v3",
+        "schema_version": "skos-shacl-v4-scheme-free",
     }
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -336,7 +334,7 @@ def candidate_fingerprint(program: YawProgram) -> str:
         "embedding_fact_prefix": getattr(program, "embedding_fact_prefix", None),
         "embedding_document_prefix": getattr(program, "embedding_document_prefix", None),
         "context_budget": [program.context_window_tokens, program.max_output_tokens],
-        "schema_version": "skos-shacl-v3",
+        "schema_version": "skos-shacl-v4-scheme-free",
     }
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]

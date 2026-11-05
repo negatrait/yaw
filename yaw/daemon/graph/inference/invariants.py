@@ -7,7 +7,6 @@ from typing import Any
 from yaw.core import (
     VALID_SHACL_ACTIONS,
     VALUE_BEARING_SHACL_ACTIONS,
-    StructuredTriple,
     text_processing,
 )
 
@@ -93,33 +92,6 @@ STAGE_SCHEMA_CONTRACTS: dict[str, tuple[str, tuple[str, ...], str]] = {
 }
 
 
-def _count_connected_components(triples: Sequence[StructuredTriple]) -> int:
-    adj: dict[str, set[str]] = {}
-    for st in triples:
-        u = str(text_processing(st.subj)) or st.subj.strip().lower()
-        v = str(text_processing(st.obj)) or st.obj.strip().lower()
-        if not u or not v:
-            continue
-        adj.setdefault(u, set()).add(v)
-        adj.setdefault(v, set()).add(u)
-    if not adj:
-        return 0
-    visited: set[str] = set()
-    components = 0
-    for node in adj:
-        if node in visited:
-            continue
-        components += 1
-        stack = [node]
-        while stack:
-            cur = stack.pop()
-            if cur in visited:
-                continue
-            visited.add(cur)
-            stack.extend(adj.get(cur, set()) - visited)
-    return components
-
-
 def validate_stage_invariants(
     stage_name: str,
     inputs: Mapping[str, Any],
@@ -127,7 +99,7 @@ def validate_stage_invariants(
     *,
     shacl_linter: Callable[[], Sequence[Mapping[str, Any]]] | None = None,
 ) -> tuple[float, str]:
-    """Validate all 9 stage contracts and 6 closed-world SHACL/SKOS/connected-node invariants.
+    """Validate stage contracts and closed-world SHACL/SKOS invariants.
 
     Returns `(score, feedback)` where `score` is in `[0.0, 1.0]` (`1.0` = full pass).
     """
@@ -208,16 +180,6 @@ def validate_stage_invariants(
                         stage1_defs[norm_e] = edef.lower()
 
         closed_world_norms = set(stage1_norms)
-        for st in structured:
-            if st.subj and st.subj_def and st.subj_def.strip().lower() != st.subj.strip().lower():
-                closed_world_norms.add(str(text_processing(st.subj)) or st.subj.lower())
-            if (
-                st.obj_kind != "literal"
-                and st.obj
-                and st.obj_def
-                and st.obj_def.strip().lower() != st.obj.strip().lower()
-            ):
-                closed_world_norms.add(str(text_processing(st.obj)) or st.obj.lower())
 
         unregistered: list[str] = []
         self_loops: list[str] = []
@@ -242,11 +204,10 @@ def validate_stage_invariants(
                 and (not s_def_clean or not o_def_clean or s_def_clean == o_def_clean)
             ):
                 self_loops.append(st.subj)
-            if stage1_norms:
-                if s_norm not in closed_world_norms:
-                    unregistered.append(st.subj)
-                if st.obj_kind != "literal" and o_norm not in closed_world_norms:
-                    unregistered.append(st.obj)
+            if s_norm not in closed_world_norms:
+                unregistered.append(st.subj)
+            if st.obj_kind != "literal" and o_norm not in closed_world_norms:
+                unregistered.append(st.obj)
 
         issues = []
         if incomplete:
@@ -254,16 +215,7 @@ def validate_stage_invariants(
         if self_loops:
             issues.append(f"Self-loop triple(s) on {self_loops}")
         if unregistered:
-            issues.append(
-                f"StatementShape/closedWorld unregistered novel entities without inline [name, def]: {unregistered}"
-            )
-
-        components = _count_connected_components(structured)
-        if len(structured) >= 2 and len(stage1_norms) >= 2 and components > 1:
-            issues.append(
-                f"Disconnected subgraph ({components} components across "
-                f"{len(structured)} triples; missing bridge predicates)"
-            )
+            issues.append(f"StatementShape/closedWorld resources absent from NER: {unregistered}")
 
         if not issues:
             return 1.0, "PASS [triples]"

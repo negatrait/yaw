@@ -376,7 +376,7 @@ def provider():
                         else {"repairs": []}
                     )
                 elif "[[ ## named_entities ## ]]" in text:
-                    if state["mode"] == "shacl_unrepaired" and "London" in text:
+                    if "visited London" in text:
                         output = {
                             "triples": [
                                 {"sub": "Ada", "pred": "visited", "obj": "London", "def": "Ada visited London."}
@@ -390,6 +390,10 @@ def provider():
                         }
                 elif state["mode"] == "shacl_unrepaired" and "London" in text:
                     output = {"named_entities": [["Ada", "A mathematician"]]}
+                elif "London" in text:
+                    output = {"named_entities": [["Ada", "A mathematician"], ["London", "A city in England"]]}
+                    if "Algebra" in text:
+                        output["named_entities"].append(["Algebra", "A mathematical discipline"])
                 else:
                     output = {"named_entities": [["Ada", "A mathematician"], ["Algebra", "A mathematical discipline"]]}
                 if state["mode"] == "chat":
@@ -533,7 +537,7 @@ def test_declarative_live_graph_publication_without_polling(tmp_path, provider):
             coordinator = get_graph_delta_coordinator(db)
             assert coordinator.last_plan_summary is not None
             assert len(coordinator.last_plan_summary.chunk_ids) == 1
-            assert {t.predictor for t in coordinator.last_plan_summary.traces} == {"ner", "triples", "entity_definer"}
+            assert {t.predictor for t in coordinator.last_plan_summary.traces} == {"ner", "triples"}
 
             (signal_dir / "reload.signal").write_text('{"program_path": "compiled.json"}', encoding="utf-8")
             assert await asyncio.to_thread(reload_event.wait, 10.0)
@@ -561,7 +565,7 @@ def test_declarative_live_graph_publication_without_polling(tmp_path, provider):
         db.close()
 
 
-def test_publish_graph_shacl_violation_preserves_prior_graph_and_inference_rows(tmp_path, provider):
+def test_invalid_resources_and_shacl_failure_preserve_prior_published_graph(tmp_path, provider):
     url, state = provider
     state["delay"] = 0.01
     root = tmp_path / "documents"
@@ -621,23 +625,22 @@ def test_publish_graph_shacl_violation_preserves_prior_graph_and_inference_rows(
         with db.readonly() as conn:
             assert conn.execute("SELECT entity_id, name, definition FROM entities").fetchall() == initial_entities
 
-        # Verify publish_graph failure on SHACL violation keeps source_chunks & chunk_inference intact
-        # while preserving prior published graph rows
+        # An unregistered resource aborts extraction before its artifact or graph is published.
         state["mode"] = "shacl_unrepaired"
         second = root / "second.md"
         second.write_text("Ada visited London.", encoding="utf-8")
         app.update_blocking()
-        err = get_graph_delta_coordinator(db).pop_error()
-        assert err is not None and "SHACL violations" in str(err)
+        error = get_graph_delta_coordinator(db).pop_error()
+        assert isinstance(error, ValueError) and "absent from NER" in str(error)
 
         with db.readonly() as conn:
             assert conn.execute("SELECT COUNT(*) FROM source_chunks").fetchone()[0] == 2
-            assert conn.execute("SELECT COUNT(*) FROM chunk_inference").fetchone()[0] == 2
+            assert conn.execute("SELECT COUNT(*) FROM chunk_inference").fetchone()[0] == 1
             assert conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 1
             assert conn.execute("SELECT COUNT(*) FROM chunk_vec").fetchone()[0] == 1
             assert conn.execute("SELECT entity_id, name, definition FROM entities").fetchall() == initial_entities
 
-        # Restoring valid repair mode publishes the 2nd chunk using existing chunk_inference rows
+        # Corrected extraction publishes the second chunk; the first artifact remains reusable.
         state["mode"] = "valid"
         get_graph_delta_coordinator(db).recovery_nonce = "recover-1"
         app.update_blocking()

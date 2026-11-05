@@ -29,8 +29,8 @@ from yaw.core import (
 )
 from yaw.daemon.cli import build_parser, inspect_status, main
 from yaw.daemon.graph.inference import (
-    YawProgram,
     ServingTokenCounter,
+    YawProgram,
     compute_task_quality_score,
     resolve_embedding_profile,
 )

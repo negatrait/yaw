@@ -26,8 +26,8 @@ from yaw.daemon.graph.inference import (
     PASSAGE_INSTRUCTION,
     DSPyEmbeddingAdapter,
     GraphOptimizationHooks,
-    YawProgram,
     RLMInstructionProposer,
+    YawProgram,
     YawRetriever,
     YawRM,
     compile_pareto_ensemble,
@@ -140,9 +140,7 @@ class YawGraphEngine:
         self.program = program
         self.embedder = embedder
         self.config: Any = None
-        self.indexing_runner: (
-            Callable[[Sequence[tuple[ChunkPointer, str]], YawProgram], GraphPlanSummary] | None
-        ) = None
+        self.indexing_runner: Callable[[Sequence[tuple[ChunkPointer, str]], YawProgram], GraphPlanSummary] | None = None
 
         self.max_context_chars = (
             max_context_chars

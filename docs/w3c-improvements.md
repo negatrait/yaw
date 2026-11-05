@@ -1,5 +1,11 @@
 # Technical Specification: W3C Semantic Cascade & Active EDC Canonicalization (`docs/w3c-improvements.md`)
 
+Current scope, 2026-11-05: section 13 replaces the former scheme phase and governs
+batch-independent identity/relations. The graph plan owns the paired 64+64/128
+time and graph gates. Sections 1-12 retain earlier analysis/proposals, not proof
+of current runtime behavior; graph-wide staging or similarity-only identity
+instructions there are superseded by the native graph contract.
+
 ## 1. Context & Root-Cause Problem Statement
 
 In [`benchmark_mobile_report.md`](file:///C:/Users/Harri.Ahokas/.gemini/antigravity/brain/705b1f4b-1f82-432f-af64-b480ab176de5/benchmark_mobile_report.md), the 4B model (`gemma-4-E4B-it-qat-q4_0`) systematically mixes semantic relations during Stage 3 synonym/ontology adjudication—classifying taxonomic subtypes as `skos:related` (e.g., `pilot tenants` $\leftrightarrow$ `tenants`, `telemetry points` $\leftrightarrow$ `telemetry`) and classifying both subtypes and domain-coupled concepts as `owl:differentFrom` (e.g., `seat` $\neq$ `consumption`, `Consumption price` $\neq$ `consumption`, `Finance` $\neq$ `Finance-Legal`). Because [`build_transition_matrix`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/ppr.py#L168-L183) treats `owl:differentFrom` as an active negative inhibitor ($\alpha_{\text{diff}} = 0.5$) that subtracts Personalized PageRank mass, false `owl:differentFrom` edges actively suppress relevant neighbors during multi-hop retrieval.
@@ -7,7 +13,7 @@ In [`benchmark_mobile_report.md`](file:///C:/Users/Harri.Ahokas/.gemini/antigrav
 Four concrete architectural defects cause this failure mode:
 1. **Pointer-Table Cognitive Overload (`synonym-evidence-v1`)**: [`_Packet`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/storage/synonyms.py#L19-L197) splits pair context across four separate lookup tables (`pairs`, `entities`, `facts`, `sources`) connected by synthetic pointer aliases (`e0`, `f0`, `s0`), forcing the 4B model to dereference multi-hop JSON pointers across batches of up to 64 pairs ([`planner.py`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/planner.py#L1086-L1094)).
 2. **Zero-Scratchpad 5-Way Single-Shot Ask**: [`JudgeSynonyms`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/inference/prompts.py#L266-L313) and [`build_dspy_synonym_judge_grammar`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/inference/grammars.py#L195-L237) force token `#1` of each decision to select one of five relations (`skos:altLabel`, `skos:hiddenLabel`, `skos:broader`, `skos:related`, `owl:differentFrom`) with zero thinking/reasoning tokens and an overloaded `"canonical"` string slot.
-3. **Ontological Conflation of `owl:differentFrom` and `skos:semanticRelation`**: In W3C OWL 2, *every* pair of distinct `skos:Concept` nodes satisfies $A \neq B$ (`owl:differentFrom`), whereas W3C SKOS S19–S27 defines `skos:broader`, `skos:narrower`, and `skos:related` strictly *between* distinct concepts. Presenting `owl:differentFrom` alongside `skos:broader` and `skos:related` in a single-shot prompt causes the model to emit `owl:differentFrom` whenever $A \neq B$.
+3. **Ontological Conflation of `owl:differentFrom` and `skos:semanticRelation`**: OWL does not infer `owl:differentFrom` merely from different IRIs. Entity distinctness and a supported SKOS relationship are separate assertions; a pair can be distinct and still related. Presenting `owl:differentFrom` alongside `skos:broader` and `skos:related` in a single-shot prompt causes the model to emit `owl:differentFrom` whenever $A \neq B$.
 4. **Missing End-of-Round Active EDC Canonicalization**: [`prepare_synonym_candidates`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/planner.py#L618-L626) and [`apply_synonym_adjudication`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/planner.py#L740-L755) select the surviving `skos:prefLabel` during pairwise merges using either LLM-emitted `"canonical"` strings or naive string-length tuples `(len(def_a), -len(name_a), ea)`, allowing 1-off extraction typos to usurp `skos:prefLabel`.
 
 ---
@@ -16,8 +22,8 @@ Four concrete architectural defects cause this failure mode:
 
 ```mermaid
 flowchart TD
-    P["Candidate Pair (A, B)\nFlat Denormalized Evidence (v2)"] --> W0{"W3C Pre-Gates (SQLite/Python)\n• Auto-merge (cos>=0.95 & lex>=0.96)?\n• Transitive broader_tc [Rule W3: S21/S27]?\n• Direct Fact (A --P--> B) [Rule W1]?"}
-    W0 -- "Auto-merge" --> MERGE["Union Concept Cluster (A, B)"]
+    P["Candidate Pair (A, B)\nFlat Denormalized Evidence (v2)"] --> W0{"W3C Pre-Gates (SQLite/Python)\n• Unchanged accepted identity binding?\n• Transitive broader_tc [Rule W3: S21/S27]?\n• Direct Fact (A --P--> B) [Rule W1]?"}
+    W0 -- "Validated binding reuse" --> MERGE["Union Concept Cluster (A, B)"]
     W0 -- "In broader_tc [W3]" --> E_TC["Keep Existing skos:broaderTransitive (0 LLM calls)"]
     W0 -- "Direct Fact [W1: Irreflexive]" --> S2
     W0 -- "Unresolved" --> S1["Stage 1: label_judge (JudgeLabels + GBNF Reasoning)\n{pair_id, reasoning, alt_label: bool, hidden_label: bool}"]
@@ -532,9 +538,9 @@ W3C_PREFIX_HEADER: str = (
    - Similarly, if $T_a \cap T_b = \emptyset$ and neither is an acronym/initialism of the other (`Redwood` vs. `CRDs` or `missing CRDs`), they do not share lexical identity.
    - Pairs where `is_modifier_head_specialization(name_a, name_b)` is `True` or where $T_a \cap T_b = \emptyset$ without acronym correspondence are forbidden from merging via `skos:altLabel` or `skos:hiddenLabel`; if Stage 1 (`JudgeLabels`) proposes an equivalence/label merge on a modifier-head specialization, `apply_synonym_adjudication` routes the edge to `skos:broader` (`Redwood Router skos:broader Redwood`) with weight `pool_confidences(dec_llm_prob, sim)`.
 
-3. **Guardrail 3: Case-Insensitive Identity Consolidation Before Disambiguation (`prepare_synonym_candidates` in `planner.py`)**
-   - Any candidate pair $(e_a, e_b)$ with identical normalized label `text_processing(name_a) == text_processing(name_b)` (such as `"canary"` and `"Canary"`) and dense definition similarity $d_{\text{sim}} \ge \text{synonymy\_threshold}$ that is not a distinct pole of the same reified fact (`not _is_active_fact_pole(ea, eb)`) is consolidated into a single `skos:Concept` (preferring the properly cased surface form as `skos:prefLabel` and retaining the richer definition).
-   - Case-only variants (`name_a.casefold() == name_b.casefold()`) with $d_{\text{sim}} \ge \text{synonymy\_threshold}$ are never emitted as `owl:differentFrom`.
+3. **Guardrail 3: Evidence-based identity across batches**
+   - Case/normalized-label and dense-similarity matches are candidates, not automatic identity. Reuse an unchanged accepted binding or obtain an evidence-keyed adjudication, preserving homographs and modifier/head distinctions.
+   - Canonical representatives and surviving support must be independent of batch/packet arrival. Later evidence reopens affected earlier decisions; no first-seen merge is permanent merely because it was previously published.
 
 4. **Guardrail 4: Genus-Species & Part-Whole Falsification in `JudgeHierarchy` (`prompts.py`)**
    - Emit `broader=True` (`A skos:broader B`) *only* if every `A` is necessarily a subtype/kind of `B` (`skos:broaderG`: *"Every A is a kind of B"*), an individual instance of class/role `B` (`skos:broaderI`: e.g., individual `Priya` is narrower than role `Frontend SWE`, **never** `Frontend SWE skos:broader Priya`), or an architectural component/part of whole system `B` (`skos:broaderP`).
@@ -542,36 +548,58 @@ W3C_PREFIX_HEADER: str = (
 
 ---
 
-## 13. Phase 2: Emergent `skos:ConceptScheme` Modularity Clustering, Definer, Seeding & QA Reader Integration
+## 13. Current scope: scheme-free, batch-independent semantics
 
-1. **Bottom-Up Emergent Clustering via Newman Modularity Maximization ($Q$) — Zero Magic Numbers**:
-   - `skos:ConceptScheme` metaclasses are never guessed during per-chunk OpenIE; they emerge bottom-up in `build_concept_schemes` (`planner.py`) after entity consolidation (`apply_synonym_adjudication`) and SHACL healing (`auto_heal_deterministic_shacl` + `heal_shacl_violations`).
-   - Construct the symmetric **Entity Affinity Matrix** $A \in \mathbb{R}_{\ge 0}^{N \times N}$ over all post-healing `skos:Concept` nodes connected by positive edges (`kind IN ('skos:broader', 'skos:related', 'fact')`):
-     $$A_{uv} = \text{pool\_confidences}\!\left(w_{\text{edge}}(u, v),\; \max(\epsilon, \cos(\mathbf{v}_u, \mathbf{v}_v))\right)$$
-     (Pairs linked by `owl:differentFrom` have $A_{uv} = 0$).
-   - Partition the graph into $K^*$ communities $\mathcal{C} = \{C_1, \dots, C_{K^*}\}$ by greedy **Newman Modularity Maximization**:
-     $$Q(\mathcal{C}) = \frac{1}{2m} \sum_{c=1}^{K} \sum_{u, v \in C_c} \left(A_{uv} - \frac{d_u d_v}{2m}\right), \quad \Delta Q(C_a, C_b) = 2(e_{ab} - a_a a_b)$$
-     merging the pair $(C_a, C_b)$ with maximum $\Delta Q > 0$ until $\max_{a \neq b} \Delta Q(C_a, C_b) \le 0$.
+The former emergent ConceptScheme phase is removed, not postponed behind a runtime
+switch. [Native graph publication](native-cocoindex-graph.md) is the controlling
+implementation and acceptance path. Remove clustering, scheme definitions and
+embeddings, scheme/member tables, top-concept membership, scheme PPR/QA integration
+and all schema/telemetry consumers together. Retain ordinary entity definitions,
+source-supported facts, labels, identity decisions and supported semantic edges.
 
-2. **Deterministic Post-Hoc `skos:topConceptOf` Synthesis on the `skos:ConceptScheme` (Never LLM-Guessed)**:
-   - Because top concepts are unknown at per-chunk entity extraction time, they are synthesized **deterministically post-hoc** as an intrinsic part of constructing each `skos:ConceptScheme` once community $C_m$ is known:
-     - Identify taxonomic roots $R_m = \{u \in C_m \mid \neg \exists v \in C_m : u \xrightarrow{\text{skos:broader}} v\}$ (or $C_m$ if $R_m = \emptyset$).
-     - Compute root prominence via `pool_confidences`:
-       $$s_{\text{top}}(u) = \text{pool\_confidences}\!\left(p_{\text{entity}}(u),\; \cos(\mathbf{v}_u, \boldsymbol{\mu}_m),\; \text{bayesian\_noisy\_or}(\{A_{uv} \mid v \in C_m \setminus \{u\}\})\right)$$
-     - Deterministically select all roots at or above the community's empirical mean prominence:
-       $$T_m = \left\{ u \in R_m \;\middle|\; s_{\text{top}}(u) \ge \frac{1}{|R_m|}\sum_{r \in R_m} s_{\text{top}}(r) \right\}$$
-     - Compute deterministic `scheme_id = compute_mdhash_id("|".join(sorted(T_m)), prefix="scheme-")`.
-     - Attach the `skos:topConceptOf` list $T_m$ directly to the `skos:ConceptScheme` (`concept_scheme_members(scheme_id, entity_id, is_top_concept=1)`) and emit typed `skos:topConceptOf` edges `(src_id=u, dst_id=scheme_id, kind='skos:topConceptOf', weight=s_top(u))` into `edges` (traversed in `ppr.py` with `policy.skos_top_concept_up = 1.0` and `policy.skos_top_concept_down = 0.8`).
+The semantic acceptance invariant is: for fixed evidence and adjudications,
+64+64 chunks and 128 chunks together yield identical canonical bindings, fact
+keys, typed edges, source supports and entity/fact/edge counts. Floating aggregate
+confidence may differ by at most 1e-6. The graph plan owns live-model tolerances
+and cumulative timing measurement; this document does not define another gate.
 
-3. **Updating the Entity Definer (`DefineMissingEntities` / `entity_definer`) for `skos:ConceptScheme` Textual Metadata**:
-   - Extend `DefineMissingEntities` (`self.entity_definer` in `prompts.py`, `grammars.py`, `parsers.py`, `program.py`, and `components.py`) so `YawProgram.define_concept_schemes(scheme_packets, ...)` passes each emergent scheme's deterministic `skos:topConceptOf` list $T_m$ and taxonomy dossier to `self.entity_definer` with grammar `build_dspy_concept_scheme_defs_grammar(scheme_ids)`.
-   - The LLM does **not** guess top concepts; for each `scheme_id`, `self.entity_definer` outputs the 4-tuple `[scheme_id, pref_label, definition, history_note]`:
-     1. `skos:prefLabel` (`pref_label`): Concise canonical domain title for the `skos:ConceptScheme`.
-     2. `skos:definition` (`definition`): Intensional scope definition synthesizing the scheme's taxonomy.
-     3. `skos:historyNote` (`history_note`): Thinking trail and ontological rationale explaining why these top concepts and subtrees form a coherent domain scheme.
-   - Compute `concept_schemes.confidence` (`prov:value`) via `pool_confidences(p_llm, cos(v_scheme, mu_m), c_mod)`.
+Necessary semantic changes:
 
-4. **Embedding `skos:ConceptScheme` in `entity_vec` for Fallback Graph Seeding & Prepending to QA Reader**:
-   - Each `skos:ConceptScheme` is formatted via `fmt_entity(pref_label, definition)`, embedded via `_embed_strings(..., stage="entity_embed")`, and persisted in `entity_vec` under `entity_id = scheme_id` (`scheme-...`).
-   - `get_graph_topology` includes `scheme-*` nodes in `entity_ids` and `entity_priors` (`concept_schemes.confidence`), allowing `retrieve_with_seeds` (`engine.py`) to seed directly on `:scheme_*` when leaf concepts fail to match and flow mass through the reverse of `skos:topConceptOf` (`skos_top_concept_down`) into the scheme's top concepts and passages.
-   - `format_subgraph_turtle(conn, entity_ids, fact_ids)` (`shacl.py`) prepends active `:scheme_*` Turtle blocks (`a skos:ConceptScheme`, `skos:prefLabel`, `skos:definition`, `skos:historyNote`, `skos:topConceptOf :ent_1, :ent_2`, `prov:value`) at the top of the QA reader subgraph payload on every recall, and annotates each member `:ent_*` with `skos:inScheme :scheme_*` (and `skos:topConceptOf :scheme_*` for top concepts).
+1. Batch/document boundaries do not scope identities or candidates. Normalize
+   occurrences consistently, reuse persisted accepted senses and include both
+   new-to-existing and new-to-new candidates. Late evidence invalidates affected
+   earlier negative decisions and merges.
+2. Candidate coverage and evidence dossiers must be independent of arrival.
+   A new endpoint can alter an old top-k neighborhood; handle its reverse
+   dependencies instead of assuming only new endpoints ever need a query.
+3. Pair/evidence/policy keys own decisions, including no-relation outcomes.
+   Merely finding a related/broader/different edge is not proof that a decision
+   remains applicable after evidence changes.
+4. Choose canonical identity deterministically from accepted equivalence, never
+   from arrival order or string similarity alone. Preserve raw arguments/supports
+   so a merge can be revised without losing source assertions. Label/cosine
+   matches generate candidates; they do not prove equivalence or distinctness.
+5. Apply relation conflicts and deterministic repairs in canonical order and
+   verify convergence on the same fixed evidence. Do not make packet composition
+   or first-seen judgment an irreversible semantic input.
+6. Retain provenance, literal typing, label consistency, supported hierarchy and
+   relation constraints. Validate their affected closure transactionally. Remove
+   scheme-membership constraints rather than inventing empty schemes to pass them.
+
+Semantic islands are allowed. W3C SKOS does not require global connectivity; SHACL
+validates declared constraints, not discovery completeness. A partial 64/128-chunk
+document is reported as incomplete, and only becomes semantically ready when all
+its desired chunks and affected decisions are committed. No fake connection or
+identity merge may be introduced simply to join components. Shared document
+provenance is not a semantic PPR edge.
+
+## 14. Evidence gate for any future scheme proposal
+
+Reintroduction requires a separate design/benchmark against the completed
+scheme-free baseline, with identical source/model/slice and predeclared Recall@N,
+Exact Match or F1 objective. Report all supported quality metrics, paired
+uncertainty, ingestion/publication cost, QA tokens and peak worker memory. A
+repeatable held-out gain must justify resource/maintenance cost without
+unacceptable regressions elsewhere. A richer-looking graph or extra node count
+is not evidence. No clustering dependency or dormant scheme code is introduced
+in the current refactor.

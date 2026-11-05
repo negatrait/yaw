@@ -13,8 +13,8 @@ from yaw.core.types import YawRuntimeError
 from yaw.daemon.graph.engine import YawGraphEngine
 from yaw.daemon.graph.inference import (
     DSPyEmbeddingAdapter,
-    YawProgram,
     RLMInstructionProposer,
+    YawProgram,
     create_dspy_lm,
     openie_fingerprint,
 )
@@ -172,7 +172,7 @@ def test_automatic_budgets_follow_context_and_explicit_overrides_remain_fixed(tm
     assert config.reflection_input_tokens == context // 4
     assert config.rlm_max_output_chars == scale_context_budget(10000, context)
     assert config.max_context_chars == context_char_limit(24000, context, context // 16)
-    assert config.rlm_max_iters == 10 and config.rlm_max_llm_calls == 20
+    assert config.rlm_max_iters == 20 and config.rlm_max_llm_calls == 50
     assert config.for_optimization().reflection_input_tokens == config.reflection_input_tokens
     pinned = YawConfig(
         workspace_root=tmp_path,

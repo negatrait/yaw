@@ -12,10 +12,9 @@ from yaw.core.config import DEFAULT_CONTEXT_WINDOW_TOKENS, YawConfig, context_ch
 from yaw.core.types import OpenIERecord, StructuredTriple, SynonymEvidenceBatch
 
 from .adapter import YawGBNFAdapter, sum_usage_tokens
-from .chat import create_dspy_lm, extract_completion_logprob_confidence
+from .chat import create_dspy_lm
 from .diagnostics import DiagnosticHistory, diagnostic_boundary
 from .grammars import (
-    build_dspy_concept_scheme_defs_grammar,
     build_dspy_hierarchy_judge_grammar,
     build_dspy_label_judge_grammar,
     build_dspy_missing_entity_defs_grammar,
@@ -31,7 +30,6 @@ from .grammars import (
 from .invariants import validate_stage_invariants
 from .parsers import (
     coerce_generated_facts,
-    extract_concept_scheme_definitions,
     extract_entity_definitions,
     extract_structured_triples,
     match_facts_to_candidate_indices,
@@ -73,34 +71,6 @@ def _bounded_prompt_json(items: Sequence[Any], max_items: int, max_chars: int) -
             return rendered
         selected.pop()
     return "[]"
-
-
-def _merge_openie_definitions(
-    entities: Sequence[str],
-    entity_definitions: Sequence[tuple[str, str]],
-    structured_triples: Sequence[StructuredTriple],
-) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
-    """Merge NER entities, NER definitions, and structured-triple inline definitions without duplicates."""
-    merged_entities: list[str] = list(entities)
-    seen_entity_names: set[str] = set(merged_entities)
-    seen_entity_norms: set[str] = {str(text_processing(name)) for name in merged_entities if str(text_processing(name))}
-    raw_pairs: list[tuple[str, str]] = list(entity_definitions)
-    for st in structured_triples:
-        mention_pairs = (
-            ((st.subj, st.subj_def),) if st.obj_kind == "literal" else ((st.subj, st.subj_def), (st.obj, st.obj_def))
-        )
-        for ent_name, ent_def in mention_pairs:
-            if not ent_name:
-                continue
-            ent_norm = str(text_processing(ent_name))
-            if ent_name not in seen_entity_names and (not ent_norm or ent_norm not in seen_entity_norms):
-                merged_entities.append(ent_name)
-                seen_entity_names.add(ent_name)
-                if ent_norm:
-                    seen_entity_norms.add(ent_norm)
-            raw_pairs.append((ent_name, ent_def))
-
-    return tuple(merged_entities), extract_entity_definitions(raw_pairs)
 
 
 class YawProgram(dspy.Module):
@@ -146,7 +116,7 @@ Deno/Pyodide WASM) with
         orchestrator_lm: Any = None,
         rlm_max_iters: int = 20,
         rlm_max_llm_calls: int = 50,
-        rlm_max_output_chars: int = 10000,
+        rlm_max_output_chars: int | None = None,
         rlm_sub_lm: Any = None,
         rlm_tools: list[Callable[..., Any]] | None = None,
         rlm_interpreter_factory: Callable[[], Any] = dspy.PythonInterpreter,
@@ -425,6 +395,7 @@ Deno/Pyodide WASM) with
         """Serialize all DSPy predictors/RLMs plus EmbeddingGemma prefixes and GBNF structural bounds."""
         state: dict[str, Any] = super().dump_state(*args, **kwargs)
         yaw_surface: dict[str, Any] = {
+            "graph_schema": "scheme-free-v1",
             "gbnf_max_entities": self.gbnf_max_entities,
             "gbnf_max_triples": self.gbnf_max_triples,
             "gbnf_max_facts": self.gbnf_max_facts,
@@ -443,6 +414,8 @@ Deno/Pyodide WASM) with
         state_copy = dict(state)
         state_copy.setdefault("retriever", {"k": getattr(self.retriever, "k", 10)})
         yaw_surface = state_copy.pop("yaw_surface", None)
+        if not isinstance(yaw_surface, dict) or yaw_surface.get("graph_schema") != "scheme-free-v1":
+            raise ValueError("Incompatible program graph schema; recompile against the scheme-free graph")
         deployment_lms = {name: predictor.lm for name, predictor in self.named_predictors() if predictor.lm is not None}
         # Missing legacy predictors retain constructor defaults. Explicitly
         # saved empty demo lists must survive loading without reseeding.
@@ -806,7 +779,7 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
         use_gbnf: bool | None = None,
         _record_audit: bool = True,
     ) -> tuple[tuple[str, str], ...]:
-        """Synthesize contextual definitions via DefineMissingEntities for triple entities lacking definitions."""
+        """Repair definitions of requested NER resources without discovering new resources."""
         deduped: list[str] = []
         for item in missing_entities:
             name = str(item).strip()
@@ -836,26 +809,21 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
         )
         raw_defs = getattr(pred, "entity_definitions", getattr(pred, "named_entities", []))
         parsed = extract_entity_definitions(raw_defs)
+        requested_norms = {str(text_processing(name)) for name in deduped}
         exact_map: dict[str, str] = {}
         norm_map: dict[str, str] = {}
         for ename, edef in parsed:
+            if str(text_processing(ename)) not in requested_norms:
+                raise ValueError("Definition repair introduced an unrequested resource")
             if ename and edef:
                 exact_map[ename] = edef
                 norm_map[str(text_processing(ename))] = edef
 
         resolved: list[tuple[str, str]] = []
-        seen_names: set[str] = set()
-        for idx, m_name in enumerate(deduped):
+        for m_name in deduped:
             defn = exact_map.get(m_name) or norm_map.get(str(text_processing(m_name))) or ""
-            if not defn and len(parsed) == len(deduped):
-                defn = parsed[idx][1]
             if defn:
                 resolved.append((m_name, defn))
-                seen_names.add(m_name)
-        for ename, edef in parsed:
-            if ename and edef and ename not in seen_names:
-                resolved.append((ename, edef))
-                seen_names.add(ename)
 
         stage_tokens = int(self.telemetry[-1].get("tokens_used", 0)) if len(self.telemetry) > prev_telem_len else 0
         if _record_audit:
@@ -874,132 +842,6 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
             )
         return tuple(resolved)
 
-    def define_concept_schemes(
-        self,
-        scheme_packets: Sequence[Mapping[str, Any]],
-        *,
-        lm: Any = None,
-        use_gbnf: bool | None = None,
-        _record_audit: bool = True,
-        batch_size: int = 1,
-    ) -> tuple[tuple[str, str, str, str, float | None], ...]:
-        """Synthesize canonical title, definition, and history note for emergent skos:ConceptScheme clusters."""
-        if not scheme_packets:
-            return ()
-
-        valid_packets = [p for p in scheme_packets if str(p.get("scheme_id") or p.get("id") or "").strip()]
-        if not valid_packets:
-            return ()
-
-        resolved: list[tuple[str, str, str, str, float | None]] = []
-        total_tokens = 0
-        effective_batch_size = max(1, batch_size)
-
-        for batch_start in range(0, len(valid_packets), effective_batch_size):
-            batch = valid_packets[batch_start : batch_start + effective_batch_size]
-            scheme_ids: list[str] = []
-            dossier_lines: list[str] = [
-                "Taxonomic Cluster Dossiers for emergent skos:ConceptScheme taxonomies.",
-                (
-                    "Synthesize pref_label (title), definition (domain scope), and history_note "
-                    "(taxonomic rationale) for each Scheme ID below:\n"
-                ),
-            ]
-            for p in batch:
-                sid = str(p.get("scheme_id") or p.get("id") or "").strip()
-                scheme_ids.append(sid)
-                dossier_lines.append(f"Scheme ID: {sid}")
-                pref = str(p.get("pref_label") or p.get("label") or "").strip()
-                if pref:
-                    dossier_lines.append(f"Candidate Title: {pref}")
-                members = [str(m).strip() for m in (p.get("members") or p.get("member_names") or []) if str(m).strip()]
-                if members:
-                    dossier_lines.append(f"Member concepts: {', '.join(members[:30])}")
-                roots = [
-                    str(r).strip() for r in (p.get("taxonomic_roots") or p.get("top_concepts") or []) if str(r).strip()
-                ]
-                if roots:
-                    dossier_lines.append(f"Top concepts (taxonomic roots): {', '.join(roots[:15])}")
-                edges = p.get("edges") or p.get("facts") or []
-                if edges:
-                    dossier_lines.append("Taxonomic relations: " + "; ".join(str(e) for e in edges[:20]))
-                dossier = str(p.get("dossier") or "").strip()
-                if dossier:
-                    dossier_lines.append(dossier)
-                dossier_lines.append("")
-
-            passage = "\n".join(dossier_lines).strip()
-            prev_telem_len = len(self.telemetry)
-
-            pred = self._invoke_stage(
-                self.entity_definer,
-                stage_name="entity_definer",
-                is_rlm=False,
-                lm=lm,
-                use_gbnf=use_gbnf,
-                grammar_fn=lambda ids=scheme_ids: build_dspy_concept_scheme_defs_grammar(ids),
-                passage=passage,
-                missing_entities=scheme_ids,
-                triples=[],
-            )
-
-            effective_lm = (
-                lm
-                or getattr(self.entity_definer, "lm", None)
-                or self.orchestrator_lm
-                or getattr(dspy.settings, "lm", None)
-            )
-            llm_prob: float | None = None
-            if effective_lm is not None and getattr(effective_lm, "history", None) and effective_lm.history:
-                llm_prob = extract_completion_logprob_confidence(effective_lm.history[-1])
-
-            raw_defs = getattr(pred, "entity_definitions", [])
-            parsed = extract_concept_scheme_definitions(raw_defs)
-            parsed_by_id = {sid: (pref, dfn, note) for sid, pref, dfn, note in parsed}
-
-            for idx, p in enumerate(batch):
-                sid = str(p.get("scheme_id") or p.get("id") or "").strip()
-                if sid in parsed_by_id:
-                    pref, dfn, note = parsed_by_id[sid]
-                elif idx < len(parsed):
-                    _, pref, dfn, note = parsed[idx]
-                else:
-                    pref = ""
-                    dfn = ""
-                    note = ""
-
-                fallback_pref = str(p.get("pref_label") or p.get("label") or sid).strip()
-                fallback_dfn = str(
-                    p.get("definition") or f"Domain concept scheme synthesizing {len(p.get('members', []))} concepts."
-                ).strip()
-                fallback_note = str(
-                    p.get("history_note") or "Emergent taxonomy cluster induced by Newman modularity maximization."
-                ).strip()
-
-                final_pref = pref if pref and not pref.startswith("scheme-") else fallback_pref
-                final_dfn = dfn if dfn and not dfn.startswith("scheme-") else fallback_dfn
-                final_note = note if note else fallback_note
-
-                resolved.append((sid, final_pref, final_dfn, final_note, llm_prob))
-
-            stage_tokens = int(self.telemetry[-1].get("tokens_used", 0)) if len(self.telemetry) > prev_telem_len else 0
-            total_tokens += stage_tokens
-
-        if _record_audit and resolved:
-            self.entity_def_audit_trail.append(
-                {
-                    "mode": "direct",
-                    "predictor": "entity_definer",
-                    "signature": DefineMissingEntities.__name__,
-                    "scheme_count": len(valid_packets),
-                    "tokens": total_tokens,
-                    "tokens_used": total_tokens,
-                    "scheme_ids": [p[0] for p in resolved],
-                    "definitions": [[s[0], s[1], s[2], s[3]] for s in resolved],
-                }
-            )
-        return tuple(resolved)
-
     def extract_structured_triples(
         self,
         passage: str,
@@ -1008,128 +850,34 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
         entity_definitions: Sequence[tuple[str, str]] | dict[str, str] | None = None,
         lm: Any = None,
         use_gbnf: bool | None = None,
-        _repair_missing_defs: bool = True,
     ) -> tuple[StructuredTriple, ...]:
-        """Run DSPy triple extraction and return structured triples with contextual definitions."""
-        merged_defs: dict[str, str] = {}
-        all_def_pairs: list[tuple[str, str]] = []
-        defined_entity_names: list[str] = []
-        if isinstance(entity_definitions, Mapping):
-            for k, v in entity_definitions.items():
-                ck = str(k).strip()
-                cv = str(v).strip()
-                if ck and cv:
-                    merged_defs[ck] = cv
-                    merged_defs[str(text_processing(ck))] = cv
-                    all_def_pairs.append((ck, cv))
-                    if ck not in defined_entity_names:
-                        defined_entity_names.append(ck)
-        elif isinstance(entity_definitions, Sequence):
-            for pair in entity_definitions:
-                if isinstance(pair, (list, tuple)) and len(pair) >= 2:
-                    ck = str(pair[0]).strip()
-                    cv = str(pair[1]).strip() if pair[1] is not None else ""
-                    if ck and cv:
-                        merged_defs[ck] = cv
-                        merged_defs[str(text_processing(ck))] = cv
-                        all_def_pairs.append((ck, cv))
-                        if ck not in defined_entity_names:
-                            defined_entity_names.append(ck)
-        for item in named_entities:
-            if isinstance(item, (list, tuple)) and len(item) >= 2:
-                k = str(item[0]).strip()
-                v = str(item[1]).strip() if item[1] is not None else ""
-                if k and v:
-                    merged_defs[k] = v
-                    merged_defs[str(text_processing(k))] = v
-                    all_def_pairs.append((k, v))
-                    if k not in defined_entity_names:
-                        defined_entity_names.append(k)
-
-        known_entities_for_grammar: list[str] = defined_entity_names or [
-            (str(x[0]).strip() if isinstance(x, (list, tuple)) and len(x) >= 1 else str(x).strip())
-            for x in named_entities
-            if (str(x[0]).strip() if isinstance(x, (list, tuple)) and len(x) >= 1 else str(x).strip())
+        """Link the NER catalog; only literal objects may introduce new values."""
+        names = [
+            str(item[0]).strip() if isinstance(item, (list, tuple)) else str(item).strip() for item in named_entities
         ]
-
+        if not names:
+            return ()
+        definitions = list(
+            entity_definitions.items() if isinstance(entity_definitions, dict) else entity_definitions or ()
+        )
+        definitions.extend(
+            (name, definition) for name, definition in extract_entity_definitions(named_entities) if definition
+        )
         pred = self._invoke_stage(
             self.triples,
             stage_name="triples",
             is_rlm=False,
             lm=lm,
             use_gbnf=use_gbnf,
-            grammar_fn=lambda: build_dspy_triples_grammar(
-                self.gbnf_max_triples,
-                known_entities=known_entities_for_grammar,
-            ),
+            grammar_fn=lambda: build_dspy_triples_grammar(self.gbnf_max_triples, known_entities=named_entities),
             passage=passage,
             named_entities=list(named_entities),
         )
-
-        raw_triples = getattr(pred, "triples", [])
-        structured = list(extract_structured_triples(raw_triples, entity_definitions=all_def_pairs or merged_defs))
-
-        # Propagate any inline [name, def] pairs across all triples in the same chunk first
-        for st in structured:
-            if st.subj and st.subj_def:
-                merged_defs[st.subj] = st.subj_def
-                merged_defs[str(text_processing(st.subj))] = st.subj_def
-            if st.obj and st.obj_def:
-                merged_defs[st.obj] = st.obj_def
-                merged_defs[str(text_processing(st.obj))] = st.obj_def
-
-        missing_names: list[str] = []
-        for idx, st in enumerate(structured):
-            s_def = st.subj_def or merged_defs.get(st.subj, "") or merged_defs.get(str(text_processing(st.subj)), "")
-            o_def = st.obj_def or merged_defs.get(st.obj, "") or merged_defs.get(str(text_processing(st.obj)), "")
-            if s_def != st.subj_def or o_def != st.obj_def:
-                structured[idx] = StructuredTriple(
-                    subj=st.subj,
-                    subj_def=s_def,
-                    pred=st.pred,
-                    obj=st.obj,
-                    obj_def=o_def,
-                    spo_def=st.spo_def,
-                    obj_kind=st.obj_kind,
-                    obj_datatype=st.obj_datatype,
-                    obj_lang=st.obj_lang,
-                )
-            if st.subj and not s_def and st.subj not in missing_names:
-                missing_names.append(st.subj)
-            if st.obj_kind != "literal" and st.obj and not o_def and st.obj not in missing_names:
-                missing_names.append(st.obj)
-
-        if _repair_missing_defs and missing_names:
-            repaired_defs = self.define_missing_entities(
-                passage,
-                missing_names,
-                triples=structured,
-                lm=lm,
-                use_gbnf=use_gbnf,
-            )
-            for ename, edef in repaired_defs:
-                if ename and edef:
-                    merged_defs[ename] = edef
-                    merged_defs[str(text_processing(ename))] = edef
-            for idx, st in enumerate(structured):
-                s_def = (
-                    st.subj_def or merged_defs.get(st.subj, "") or merged_defs.get(str(text_processing(st.subj)), "")
-                )
-                o_def = st.obj_def or merged_defs.get(st.obj, "") or merged_defs.get(str(text_processing(st.obj)), "")
-                if s_def != st.subj_def or o_def != st.obj_def:
-                    structured[idx] = StructuredTriple(
-                        subj=st.subj,
-                        subj_def=s_def,
-                        pred=st.pred,
-                        obj=st.obj,
-                        obj_def=o_def,
-                        spo_def=st.spo_def,
-                        obj_kind=st.obj_kind,
-                        obj_datatype=st.obj_datatype,
-                        obj_lang=st.obj_lang,
-                    )
-
-        return tuple(structured)
+        return extract_structured_triples(
+            getattr(pred, "triples", []),
+            entity_definitions=definitions,
+            known_entities=names,
+        )
 
     def extract_triples(
         self,
@@ -1156,7 +904,7 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
         lm: Any = None,
         use_gbnf: bool | None = None,
     ) -> OpenIERecord:
-        """Execute OpenIE (NER w/ definitions -> Structured Triples -> Missing Entity Definitions) for a passage \
+        """Execute OpenIE (NER-owned resources/definitions -> resource-closed statements) for a passage \
 chunk."""
         entities, entity_definitions = self._run_ner_stage(passage, lm=lm, use_gbnf=use_gbnf)
         has_nonempty_defs = any(defn for _, defn in entity_definitions)
@@ -1170,14 +918,13 @@ chunk."""
             lm=lm,
             use_gbnf=use_gbnf,
         )
-        merged_entities, merged_defs = _merge_openie_definitions(entities, entity_definitions, structured_triples)
         triples = tuple(st.as_tuple() for st in structured_triples)
         return OpenIERecord(
             chunk_id=chunk_id,
-            entities=merged_entities,
+            entities=entities,
             triples=triples,
             structured_triples=structured_triples,
-            entity_definitions=merged_defs,
+            entity_definitions=entity_definitions,
         )
 
     def synonym_request_budget(self, lm: Any = None) -> SynonymRequestBudget:

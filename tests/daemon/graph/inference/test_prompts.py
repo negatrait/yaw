@@ -222,6 +222,7 @@ class PromptsAndParsersParityTests(unittest.TestCase):
                     "named_entities": [
                         ["Alan Turing", "English mathematician and computer scientist"],
                         ["London", "Capital of the United Kingdom"],
+                        ["United Kingdom", "Sovereign country in Europe"],
                         ["Alan Turing", "English mathematician and computer scientist"],
                     ]
                 },
@@ -236,10 +237,9 @@ class PromptsAndParsersParityTests(unittest.TestCase):
                         {
                             "sub": "London",
                             "pred": "capital of",
-                            "obj": ["United Kingdom", "Sovereign country in Europe"],
+                            "obj": "United Kingdom",
                             "def": "London is the capital of the United Kingdom.",
                         },
-                        ["invalid", "only_two"],
                         {
                             "sub": "Alan Turing",
                             "pred": "born in",
@@ -868,7 +868,7 @@ tools."""
 
         orchestrator_calls = [request for lm, request in audit.calls if lm is orch_lm]
         self.assertGreaterEqual(len(orchestrator_calls), 1)
-        self.assertIsNone(orchestrator_calls[0].get("extra_body"))
+        self.assertNotIn("grammar", orchestrator_calls[0].get("extra_body") or {})
         self.assertEqual(orchestrator_calls[0].get("temperature"), 0.8)
         worker_calls = [request for lm, request in audit.calls if lm is worker_lm]
         self.assertGreaterEqual(len(worker_calls), 1)
@@ -926,14 +926,23 @@ no frequency penalty."""
         from yaw.daemon.graph.inference import (
             DSPY_MISSING_ENTITY_DEFS_GBNF_GRAMMAR,
             DSPY_SHACL_REPAIR_GBNF_GRAMMAR,
-            YawProgram,
             RLMInstructionProposer,
+            YawProgram,
             build_dspy_label_judge_grammar,
             parse_label_decisions,
             parse_shacl_repairs,
         )
 
-        primary_lm = CapabilityDummyLM([{"named_entities": [["Ada Lovelace", "English mathematician"]]}])
+        primary_lm = CapabilityDummyLM(
+            [
+                {
+                    "named_entities": [
+                        ["Ada Lovelace", "English mathematician"],
+                        ["Note G", "First computer algorithm"],
+                    ]
+                }
+            ]
+        )
         sub_lm = CapabilityDummyLM(
             [
                 {
@@ -941,7 +950,7 @@ no frequency penalty."""
                         {
                             "sub": "Ada Lovelace",
                             "pred": "wrote",
-                            "obj": ["Note G", "First computer algorithm"],
+                            "obj": "Note G",
                             "def": "Ada Lovelace wrote the Note G algorithm.",
                         }
                     ]
@@ -1042,7 +1051,7 @@ no frequency penalty."""
         # Test extract_structured_triples, judge_synonyms, propose_shacl_repairs
         structured = prog.extract_structured_triples(
             "Ada Lovelace wrote Note G.",
-            [["Ada Lovelace", "English mathematician"]],
+            [["Ada Lovelace", "English mathematician"], ["Note G", "First computer algorithm"]],
         )
         self.assertEqual(len(structured), 1)
         self.assertEqual(structured[0].subj, "Ada Lovelace")
@@ -1092,269 +1101,6 @@ no frequency penalty."""
             parse_label_decisions("invalid json")
         with self.assertRaises(json.JSONDecodeError):
             parse_shacl_repairs("invalid json")
-
-    def test_stage1_to_stage2_handoff_polymorphic_triples_and_define_missing_entities(self):
-        """Verify Stage 1 -> Stage 2 [[name, def], ...] handoff, dynamic known_entities GBNF, DefineMissingEntities \
-repair, and Pareto penalty."""
-        import dspy
-
-        from yaw.daemon.graph.inference import (
-            DefineMissingEntities,
-            YawProgram,
-            build_dspy_missing_entity_defs_grammar,
-            build_dspy_triples_grammar,
-            compute_task_quality_score,
-        )
-        from yaw.daemon.graph.inference.parsers import extract_structured_triples
-
-        self.assertTrue(issubclass(DefineMissingEntities, dspy.Signature))
-
-        # 1. Dynamic GBNF grammar for known_entities and missing_entity_defs
-        g_known = build_dspy_triples_grammar(
-            max_triples=3,
-            known_entities=[["Radio City", "FM station"], ["Bangalore", "City"]],
-        )
-        self.assertIn('known-entity ::= "\\"Radio City\\"" | "\\"Bangalore\\""', g_known)
-        self.assertIn("entity-slot ::= known-entity | new-entity-pair", g_known)
-        self.assertIn('triple-list ::= (triple (", " triple (", " triple)?)?)?', g_known)
-
-        g_unknown = build_dspy_triples_grammar(max_triples=None, known_entities=[])
-        self.assertNotIn("known-entity ::=", g_unknown)
-        self.assertIn("entity-slot ::= new-entity-pair | string", g_unknown)
-
-        g_missing = build_dspy_missing_entity_defs_grammar(["Note G", "Charles Babbage"])
-        self.assertIn('entity-name ::= "\\"Note G\\"" | "\\"Charles Babbage\\""', g_missing)
-
-        # 2. Parser returns empty string (never heuristic "(in statement: ...)") when definitions are omitted
-        parsed_bare = extract_structured_triples(
-            json.dumps(
-                {
-                    "triples": [
-                        {
-                            "sub": "Ada Lovelace",
-                            "pred": "collaborated with",
-                            "obj": "Charles Babbage",
-                            "def": "Ada Lovelace collaborated with Charles Babbage.",
-                        }
-                    ]
-                }
-            )
-        )
-        self.assertEqual(len(parsed_bare), 1)
-        self.assertEqual(parsed_bare[0].subj_def, "")
-        self.assertEqual(parsed_bare[0].obj_def, "")
-
-        # 3. Direct GBNF: Stage 1 defines "Ada Lovelace", Stage 2 introduces bare "Charles Babbage" without inline
-        # pair -> DefineMissingEntities repairs it
-        direct_lm = CapabilityDummyLM(
-            [
-                {
-                    "named_entities": [
-                        ["Ada Lovelace", "English mathematician and writer"],
-                    ]
-                },
-                {
-                    "triples": [
-                        {
-                            "sub": "Ada Lovelace",
-                            "pred": "collaborated with",
-                            "obj": "Charles Babbage",
-                            "def": "Ada Lovelace collaborated with Charles Babbage on the Analytical Engine.",
-                        }
-                    ]
-                },
-                {
-                    "entity_definitions": [
-                        ["Charles Babbage", "English polymath and mechanical computer pioneer"],
-                    ]
-                },
-            ],
-            adapter=dspy.JSONAdapter(),
-        )
-        direct_lm._yaw_recipe = "llamacpp"
-        direct_lm._yaw_supports_gbnf = True
-
-        prog_direct = YawProgram(
-            enable_gbnf=True,
-            rlm_sub_lm=direct_lm,
-        )
-        with dspy.context(track_usage=True):
-            rec = prog_direct.extract_openie(
-                "chunk-repair",
-                "Ada Lovelace collaborated with Charles Babbage on the Analytical Engine.",
-                lm=direct_lm,
-            )
-        self.assertEqual(len(direct_lm.history), 3)
-        # Call 1 (ExtractTriples) received [[name, def]] in named_entities
-        triples_prompt_str = str(direct_lm.history[1].get("messages") or direct_lm.history[1].get("prompt"))
-        self.assertIn("English mathematician and writer", triples_prompt_str)
-        # Call 2 (DefineMissingEntities) received dynamic GBNF locked to ["Charles Babbage"]
-        self.assertEqual(
-            direct_lm.history[2]["kwargs"].get("extra_body"),
-            {"grammar": build_dspy_missing_entity_defs_grammar(["Charles Babbage"])},
-        )
-        # Resulting OpenIERecord has both entities and definitions populated and audit trail recorded
-        self.assertEqual(rec.entities, ("Ada Lovelace", "Charles Babbage"))
-        self.assertEqual(
-            rec.entity_definitions,
-            (
-                ("Ada Lovelace", "English mathematician and writer"),
-                ("Charles Babbage", "English polymath and mechanical computer pioneer"),
-            ),
-        )
-        self.assertEqual(len(rec.structured_triples), 1)
-        self.assertEqual(rec.structured_triples[0].subj_def, "English mathematician and writer")
-        self.assertEqual(
-            rec.structured_triples[0].obj_def,
-            "English polymath and mechanical computer pioneer",
-        )
-        self.assertEqual(len(prog_direct.entity_def_audit_trail), 1)
-        self.assertEqual(prog_direct.entity_def_audit_trail[0]["missing_count"], 1)
-        self.assertEqual(prog_direct.entity_def_audit_trail[0]["repaired_count"], 1)
-
-        # 3b. Cross-chunk isolation: Chunk 2 referencing bare "Charles Babbage" must NOT leak Chunk 1's repaired
-        # definition
-        chunk2_lm = CapabilityDummyLM(
-            [
-                {
-                    "named_entities": [
-                        ["Difference Engine", "Early mechanical calculator"],
-                    ]
-                },
-                {
-                    "triples": [
-                        {
-                            "sub": "Charles Babbage",
-                            "pred": "designed",
-                            "obj": "Difference Engine",
-                            "def": "Charles Babbage designed the Difference Engine.",
-                        }
-                    ]
-                },
-                {
-                    "entity_definitions": [
-                        ["Charles Babbage", "19th-century inventor of the Difference Engine"],
-                    ]
-                },
-            ],
-            adapter=dspy.JSONAdapter(),
-        )
-        chunk2_lm._yaw_recipe = "llamacpp"
-        chunk2_lm._yaw_supports_gbnf = True
-        rec_chunk2 = prog_direct.extract_openie(
-            "chunk-2",
-            "Charles Babbage designed the Difference Engine.",
-            lm=chunk2_lm,
-        )
-        self.assertEqual(len(chunk2_lm.history), 3)
-        self.assertEqual(len(prog_direct.entity_def_audit_trail), 2)
-        self.assertEqual(
-            rec_chunk2.structured_triples[0].subj_def,
-            "19th-century inventor of the Difference Engine",
-        )
-
-        # 3c. Cinderella Stage 1 -> Stage 2 handoff: known entities as strings + inline new entity pair ["glass
-        # slipper", "..."]
-        cinderella_lm = CapabilityDummyLM(
-            [
-                {
-                    "named_entities": [
-                        [
-                            "Cinderella",
-                            "Young woman mistreated by her stepmother who attends the royal ball",
-                        ],
-                        ["a ball", "Royal dance hosted by the prince"],
-                    ]
-                },
-                {
-                    "triples": [
-                        {
-                            "sub": "Cinderella",
-                            "pred": "attended",
-                            "obj": "a ball",
-                            "def": "Cinderella attended the royal ball.",
-                        },
-                        {
-                            "sub": "Cinderella",
-                            "pred": "lost",
-                            "obj": [
-                                "glass slipper",
-                                "Delicate footwear lost by Cinderella at the ball",
-                            ],
-                            "def": "Cinderella lost her glass slipper while fleeing the ball.",
-                        },
-                        {
-                            "sub": "glass slipper",
-                            "pred": "fit",
-                            "obj": "Cinderella",
-                            "def": "The glass slipper fit Cinderella.",
-                        },
-                    ]
-                },
-            ],
-            adapter=dspy.JSONAdapter(),
-        )
-        cinderella_lm._yaw_recipe = "llamacpp"
-        cinderella_lm._yaw_supports_gbnf = True
-        prog_cinderella = YawProgram(
-            enable_gbnf=True,
-            rlm_sub_lm=cinderella_lm,
-        )
-        rec_cin = prog_cinderella.extract_openie(
-            "chunk-cinderella",
-            "Cinderella attended a ball and lost her glass slipper, which later fit Cinderella.",
-            lm=cinderella_lm,
-        )
-        # Only 2 LM calls (Stage 1 NER + Stage 2 Triples) — zero DefineMissingEntities needed
-        self.assertEqual(len(cinderella_lm.history), 2)
-        self.assertEqual(len(prog_cinderella.entity_def_audit_trail), 0)
-        self.assertEqual(
-            cinderella_lm.history[1]["kwargs"].get("extra_body"),
-            {
-                "grammar": build_dspy_triples_grammar(
-                    None,
-                    known_entities=["Cinderella", "a ball"],
-                )
-            },
-        )
-        self.assertEqual(rec_cin.entities, ("Cinderella", "a ball", "glass slipper"))
-        self.assertEqual(
-            rec_cin.entity_definitions,
-            (
-                (
-                    "Cinderella",
-                    "Young woman mistreated by her stepmother who attends the royal ball",
-                ),
-                ("a ball", "Royal dance hosted by the prince"),
-                ("glass slipper", "Delicate footwear lost by Cinderella at the ball"),
-            ),
-        )
-        self.assertEqual(len(rec_cin.structured_triples), 3)
-        # Third triple referencing plain "glass slipper" receives the inline definition propagated from the second
-        # triple
-        self.assertEqual(
-            rec_cin.structured_triples[2].subj_def,
-            "Delicate footwear lost by Cinderella at the ball",
-        )
-        self.assertEqual(
-            rec_cin.structured_triples[2].obj_def,
-            "Young woman mistreated by her stepmother who attends the royal ball",
-        )
-
-        # 4. Repairs are diagnostic and do not penalize task quality.
-        clean_pareto = compute_task_quality_score(0.80, tokens=100)
-        repair_pareto = compute_task_quality_score(
-            0.80,
-            tokens=100,
-            missing_entity_defs_count=2,
-            missing_entity_defs_tokens=60,
-        )
-        self.assertEqual(repair_pareto.score, clean_pareto.score)
-        self.assertEqual(repair_pareto.objective_scores, clean_pareto.objective_scores)
-        self.assertIn(
-            "[entity_definer] repaired 2 missing Stage-2 entity definition(s) (60 aux tokens)",
-            repair_pareto.feedback,
-        )
 
     def test_reflection_preserves_expected_training_answers(self):
         from yaw.daemon.graph.inference.reflection import (
@@ -1443,7 +1189,6 @@ repair, and Pareto penalty."""
             ExtractTriples,
             FilterTriples,
             HealSHACLViolations,
-            YawProgram,
             JudgeHierarchy,
             JudgeLabels,
             JudgeRelated,
@@ -1452,6 +1197,7 @@ repair, and Pareto penalty."""
             ReflectiveInnerDistillerSignature,
             RLMInstructionProposer,
             YawGBNFAdapter,
+            YawProgram,
             create_dspy_lm,
         )
 
@@ -1566,8 +1312,8 @@ repair, and Pareto penalty."""
 
         import yaw.daemon.graph.inference as inf_pkg
         from yaw.daemon.graph.inference import (
-            YawProgram,
             YawPassage,
+            YawProgram,
             YawRetriever,
             YawRM,
         )
@@ -1755,7 +1501,7 @@ repair, and Pareto penalty."""
         self.assertLess(triples_cw_score, 1.0)
         self.assertIn("StatementShape/closedWorld", triples_cw_fb)
 
-        # Novel entity WITH inline [name, def] satisfies StatementShape/closedWorld
+        # Inline definitions cannot grant Stage 2 authority to invent a resource.
         triples_inline_score, _ = validate_stage_invariants(
             "triples",
             {
@@ -1773,9 +1519,9 @@ repair, and Pareto penalty."""
                 ]
             ),
         )
-        self.assertEqual(triples_inline_score, 1.0)
+        self.assertLess(triples_inline_score, 1.0)
 
-        # Disconnected components across >= 2 entities violates connected-node topology
+        # Independently supported statements may remain disconnected.
         triples_disc_score, triples_disc_fb = validate_stage_invariants(
             "triples",
             {
@@ -1799,8 +1545,8 @@ repair, and Pareto penalty."""
                 ]
             ),
         )
-        self.assertLess(triples_disc_score, 1.0)
-        self.assertIn("Disconnected subgraph", triples_disc_fb)
+        self.assertEqual(triples_disc_score, 1.0)
+        self.assertEqual(triples_disc_fb, "PASS [triples]")
 
         # 3. Stage 3: entity_definer
         ed_ok, _ = validate_stage_invariants(

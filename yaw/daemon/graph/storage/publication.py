@@ -17,8 +17,6 @@ from yaw.core import ChunkPointer
 from .chunks import upsert_chunk_pointers
 from .graph_ops import (
     delete_chunks,
-    upsert_concept_scheme_members,
-    upsert_concept_schemes,
     upsert_edges_with_sources,
     upsert_entities,
     upsert_entity_labels,
@@ -43,20 +41,7 @@ class PreparedGraphRows:
     chunk_vectors: tuple[VectorRow, ...]
     entity_vectors: tuple[VectorRow, ...]
     fact_vectors: tuple[VectorRow, ...]
-    concept_schemes: tuple[tuple[str, str, str, str, float | None], ...] = ()
-    concept_scheme_members: tuple[tuple[str, str, int], ...] = ()
     input_fingerprints: tuple[tuple[str, str], ...] = ()
-
-
-def clear_concept_schemes(conn: sqlite3.Connection) -> None:
-    """Remove derived taxonomy before replacing it from current community membership."""
-    if not conn.in_transaction:
-        raise RuntimeError("Taxonomy replacement requires an active transaction")
-    conn.execute("DELETE FROM edge_sources WHERE kind='skos:topConceptOf'")
-    conn.execute("DELETE FROM edges WHERE kind='skos:topConceptOf'")
-    conn.execute("DELETE FROM entity_vec WHERE entity_id IN (SELECT scheme_id FROM concept_schemes)")
-    conn.execute("DELETE FROM concept_scheme_members")
-    conn.execute("DELETE FROM concept_schemes")
 
 
 def apply_prepared_graph_rows(conn: sqlite3.Connection, rows: PreparedGraphRows) -> None:
@@ -77,10 +62,6 @@ def apply_prepared_graph_rows(conn: sqlite3.Connection, rows: PreparedGraphRows)
     upsert_entity_vectors(conn, rows.entity_vectors)
     upsert_fact_vectors(conn, rows.fact_vectors)
     upsert_edges_with_sources(conn, rows.edges)
-    if rows.concept_schemes:
-        upsert_concept_schemes(conn, rows.concept_schemes)
-    if rows.concept_scheme_members:
-        upsert_concept_scheme_members(conn, rows.concept_scheme_members)
 
 
 GRAPH_DB = coco.ContextKey[ManagedConnection]("yaw/graph_db")
@@ -153,7 +134,6 @@ class GraphTargetHandler(coco.TargetHandler[PreparedGraphRows, GraphTrackingReco
                 if action.removed_chunks:
                     delete_chunks(conn, action.removed_chunks)
                 if action.rows is not None:
-                    clear_concept_schemes(conn)
                     apply_prepared_graph_rows(conn, action.rows)
                 else:
                     conn.execute("DELETE FROM meta WHERE key='graph_input_fingerprints'")

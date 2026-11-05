@@ -13,9 +13,9 @@ import pytest
 
 from yaw.daemon.graph.engine import YawGraphEngine
 from yaw.daemon.graph.inference import (
-    YawProgram,
     RLMInstructionProposer,
     ServingTokenCounter,
+    YawProgram,
     compute_qa_em_f1,
     compute_task_quality_score,
     create_dspy_lm,

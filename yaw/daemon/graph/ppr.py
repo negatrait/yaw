@@ -152,11 +152,6 @@ def build_transition_matrix(
             _add_transition(u, v, dst, base_w, pol.skos_broader_up)
             if not directed:
                 _add_transition(v, u, src, base_w, pol.skos_broader_down)
-        elif kind == "skos:topConceptOf":
-            is_asymmetric = True
-            _add_transition(u, v, dst, base_w, pol.skos_top_concept_up)
-            if not directed:
-                _add_transition(v, u, src, base_w, pol.skos_top_concept_down)
         elif kind == "fact":
             _add_transition(u, v, dst, base_w, pol.fact_forward)
             if not directed:

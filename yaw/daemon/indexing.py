@@ -396,7 +396,7 @@ def compute_active_inference_fingerprint(
     return hasher.hexdigest()
 
 
-@coco.fn(memo=True, version=2)
+@coco.fn(memo=True, version=3)
 async def publish_graph(
     settings: GraphPlanSettings,
     state_fingerprint: str,
@@ -666,7 +666,10 @@ def bind_native_indexing(engine: YawGraphEngine, *, batch_size: int = 64) -> Yaw
         context.provide(GRAPH_DB, engine.managed_conn)
         context.provide(SOURCE_ROOT, engine.workspace_root)
         context.provide(EMBEDDING_ENDPOINT, EmbeddingEndpoint(engine.embedder))
-        context.provide(OPENIE_ENDPOINT, OpenIEEndpoint(program, None, program_identity))
+        context.provide(
+            OPENIE_ENDPOINT,
+            OpenIEEndpoint(program, program.rlm_sub_lm or program.orchestrator_lm, program_identity),
+        )
         state_root = Path(engine.db_path).resolve().parent / "candidate_coco" / Path(engine.db_path).name
         settings = GraphPlanSettings(
             corpus_root=engine.workspace_root,

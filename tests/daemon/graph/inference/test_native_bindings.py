@@ -12,7 +12,7 @@ import dspy
 import pytest
 from dspy.utils.exceptions import AdapterParseError
 
-from yaw.daemon.graph.inference import YawProgram, RLMInstructionProposer, create_dspy_lm
+from yaw.daemon.graph.inference import RLMInstructionProposer, YawProgram, create_dspy_lm
 from yaw.daemon.graph.inference.adapter import YawGBNFAdapter
 from yaw.daemon.graph.inference.prompts import ExtractEntities
 

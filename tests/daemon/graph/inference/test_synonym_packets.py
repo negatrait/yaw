@@ -13,7 +13,7 @@ import dspy
 import pytest
 
 from yaw.core import ChunkPointer, SynonymEvidenceBatch
-from yaw.daemon.graph.inference import YawProgram, ServingTokenCounter, create_dspy_lm
+from yaw.daemon.graph.inference import ServingTokenCounter, YawProgram, create_dspy_lm
 from yaw.daemon.graph.storage import (
     iter_synonym_evidence,
     open_yaw_db,

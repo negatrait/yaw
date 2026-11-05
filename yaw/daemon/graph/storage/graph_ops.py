@@ -431,12 +431,12 @@ def upsert_entities(
     normalized_rows: list[tuple[str, str, str, float | None]] = []
     for item in entities:
         if len(item) == 2:
-            normalized_rows.append((str(item[0]), str(item[1]), "", None))
+            normalized_rows.append((item[0], item[1], "", None))
         elif len(item) == 3:
-            normalized_rows.append((str(item[0]), str(item[1]), str(item[2]), None))
+            normalized_rows.append((item[0], item[1], item[2], None))
         else:
             c = float(item[3]) if item[3] is not None else None
-            normalized_rows.append((str(item[0]), str(item[1]), str(item[2]), c))
+            normalized_rows.append((item[0], item[1], item[2], c))
     with write_tx(conn):
         conn.executemany(
             """
@@ -486,47 +486,6 @@ def upsert_entities(
                     """,
                     (eid, pref_norm),
                 )
-
-
-def upsert_concept_schemes(
-    conn: sqlite3.Connection,
-    schemes: Sequence[tuple[str, str, str, str, float | None]],
-) -> None:
-    """Insert or replace concept schemes inside a write transaction."""
-    if not schemes:
-        return
-    with write_tx(conn):
-        conn.executemany(
-            """
-            INSERT INTO concept_schemes (scheme_id, pref_label, definition, history_note, confidence)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(scheme_id) DO UPDATE SET
-                pref_label = excluded.pref_label,
-                definition = excluded.definition,
-                history_note = excluded.history_note,
-                confidence = excluded.confidence
-            """,
-            schemes,
-        )
-
-
-def upsert_concept_scheme_members(
-    conn: sqlite3.Connection,
-    members: Sequence[tuple[str, str, int]],
-) -> None:
-    """Insert or replace concept scheme memberships inside a write transaction."""
-    if not members:
-        return
-    with write_tx(conn):
-        conn.executemany(
-            """
-            INSERT INTO concept_scheme_members (scheme_id, entity_id, is_top_concept)
-            VALUES (?, ?, ?)
-            ON CONFLICT(scheme_id, entity_id) DO UPDATE SET
-                is_top_concept = excluded.is_top_concept
-            """,
-            members,
-        )
 
 
 def upsert_entity_labels(
@@ -1622,16 +1581,6 @@ def load_graph_topology(
         entity_ids_list.append(eid)
         entity_priors[eid] = float(row[1]) if row[1] is not None else None
 
-    # Include emergent skos:ConceptScheme nodes in topology and priors for CSR/PPR
-    try:
-        scheme_cursor = conn.execute("SELECT scheme_id, confidence FROM concept_schemes ORDER BY scheme_id ASC")
-        for row in scheme_cursor:
-            sid = str(row[0])
-            if sid not in entity_priors:
-                entity_ids_list.append(sid)
-                entity_priors[sid] = float(row[1]) if row[1] is not None else None
-    except sqlite3.OperationalError:
-        pass
     entity_ids = tuple(entity_ids_list)
 
     edge_cursor = conn.execute(
@@ -1764,21 +1713,6 @@ def upsert_semantic_edges(
                         """,
                         (ent1, ent2, broader_weight, reasoning),
                     )
-            elif kind == "skos:topConceptOf":
-                tc_weight = max(float(weight), 1e-6)
-                conn.execute(
-                    """
-                    INSERT INTO edges (src_id, dst_id, kind, weight, reasoning)
-                    VALUES (?, ?, 'skos:topConceptOf', ?, ?)
-                    ON CONFLICT(src_id, dst_id, kind) DO UPDATE SET
-                        weight = excluded.weight,
-                        reasoning = CASE
-                            WHEN excluded.reasoning != '' THEN excluded.reasoning
-                            ELSE edges.reasoning
-                        END
-                    """,
-                    (ent1, ent2, tc_weight, reasoning),
-                )
             else:
                 has_conflict = conn.execute(
                     """

@@ -16,6 +16,7 @@ from benchmark import (
     get_gold_docs,
     load_dataset_files,
 )
+from yaw.daemon.graph.inference import YawProgram
 from yaw.daemon.indexing import bind_native_indexing
 from yaw.daemon.ingestion import prepare_dataset_bundle, resolve_dataset_name, snapshot_dataset_bundle
 from yaw.daemon.ingestion.bundles import document_identity
@@ -826,9 +827,12 @@ class PaperParityGateTests(unittest.TestCase):
                 def batch_encode(self, texts, *, instruction="", batch_size=64):
                     return self.encode(texts, instruction=instruction)
 
-            class MinimalProgram:
+            class MinimalProgram(YawProgram):
                 context_window_tokens = 32768
                 max_output_tokens = 4096
+
+                def __init__(self):
+                    super().__init__(context_window_tokens=32768, max_output_tokens=4096, enable_gbnf=False)
 
                 def _context_char_limit(self, base_chars: int = 8000) -> int:
                     return base_chars
@@ -836,7 +840,7 @@ class PaperParityGateTests(unittest.TestCase):
                 def set_retrieval_hook(self, hook):
                     self.hook = hook
 
-                def extract_openie(self, chunk_id, text):
+                def extract_openie(self, chunk_id, text, **kwargs):
                     if "montebello" in text.lower():
                         return OpenIERecord(
                             chunk_id=chunk_id,

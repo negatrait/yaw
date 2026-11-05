@@ -279,10 +279,7 @@ def test_plan_graph_publication_keeps_yaw_db_outside_transaction_and_preserves_s
             assert [r[0] for r in conn.execute("SELECT chunk_id FROM chunks").fetchall()] == ["chunk_a"]
             assert [r[0] for r in conn.execute("SELECT chunk_id FROM chunk_vec").fetchall()] == ["chunk_a"]
             assert conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0] == 2
-            assert (
-                conn.execute("SELECT COUNT(*) FROM entity_vec WHERE entity_id NOT LIKE 'scheme-%'").fetchone()[0] == 2
-            )
-            assert conn.execute("SELECT COUNT(*) FROM entity_vec").fetchone()[0] == 3
+            assert conn.execute("SELECT COUNT(*) FROM entity_vec").fetchone()[0] == 2
             assert conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 1
             assert conn.execute("SELECT COUNT(*) FROM fact_vec").fetchone()[0] == 1
             assert [r[0] for r in conn.execute("SELECT chunk_id FROM fact_sources").fetchall()] == ["chunk_a"]

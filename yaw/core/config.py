@@ -164,7 +164,7 @@ class YawConfig:
     max_output_tokens: int | None = None
     rlm_max_iters: int = 20
     rlm_max_llm_calls: int = 50
-    rlm_max_output_chars: int = 10000
+    rlm_max_output_chars: int | None = None
     reflection_input_tokens: int | None = None
     reflection_tokenizer_url: str = ""
     enable_gbnf: bool = True

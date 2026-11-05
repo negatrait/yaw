@@ -242,8 +242,6 @@ class RelationTraversalPolicy:
     skos_related: float = 1.0
     skos_broader_up: float = 1.0
     skos_broader_down: float = 0.5
-    skos_top_concept_up: float = 1.0
-    skos_top_concept_down: float = 0.8
     owl_different_from: float = 0.0
 
     @property

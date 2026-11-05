@@ -119,31 +119,3 @@ def test_adapter_resolves_3_stage_grammars() -> None:
     g_rel = adapter.resolve_grammar(JudgeRelated)
     assert g_rel is not None
     assert "related" in g_rel
-
-
-def test_concept_scheme_defs_grammar_structure() -> None:
-    from yaw.daemon.graph.inference.grammars import (
-        DSPY_CONCEPT_SCHEME_DEFS_GBNF_GRAMMAR,
-        build_dspy_concept_scheme_defs_grammar,
-    )
-
-    grammar = build_dspy_concept_scheme_defs_grammar()
-    assert grammar == DSPY_CONCEPT_SCHEME_DEFS_GBNF_GRAMMAR
-    assert 'root ::= "{\\"entity_definitions\\": [" scheme-list "]}"' in grammar
-    assert '\\"scheme_id\\": " string' in grammar
-    assert '\\"pref_label\\": " string' in grammar
-    assert '\\"definition\\": " string' in grammar
-    assert '\\"history_note\\": " string' in grammar
-
-
-def test_concept_scheme_defs_grammar_pinned_ids() -> None:
-    from yaw.daemon.graph.inference.grammars import build_dspy_concept_scheme_defs_grammar
-
-    sids = ["scheme-048a06e0", "scheme-1f627afd"]
-    grammar = build_dspy_concept_scheme_defs_grammar(sids)
-    assert 'root ::= "{\\"entity_definitions\\": [" scheme-item-0 ", " scheme-item-1 "]}"' in grammar
-    assert 'scheme-item-0 ::= "{\\"scheme_id\\": " "\\"scheme-048a06e0\\""' in grammar
-    assert 'scheme-item-1 ::= "{\\"scheme_id\\": " "\\"scheme-1f627afd\\""' in grammar
-    assert ', \\"pref_label\\": " string' in grammar
-    assert ', \\"definition\\": " string' in grammar
-    assert ', \\"history_note\\": " string "}"' in grammar

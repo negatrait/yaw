@@ -20,6 +20,7 @@ from yaw.daemon.graph.inference import (
     YawProgram,
     extraction_fingerprint,
 )
+from yaw.daemon.graph.inference.embedding import EmbeddingProfile
 from yaw.daemon.indexing import bind_native_indexing
 
 
@@ -212,6 +213,7 @@ class DeterministicMockEmbedder:
 
     def __init__(self, dim: int = 64) -> None:
         self.dim = dim
+        self.profile = EmbeddingProfile("deterministic", "fixture-v1", dim, 2048, "mean", "", "")
         self.telemetry: list[dict[str, Any]] = []
         self._telemetry_hook: Any = None
 
@@ -304,8 +306,8 @@ def test_engine_index_and_caching(test_engine: YawGraphEngine, tmp_path: Path) -
     fts_hits = test_engine.conn.execute("SELECT chunk_id FROM chunk_fts WHERE chunk_fts MATCH 'Turing'").fetchall()
     assert len(fts_hits) == 1
 
-    # Check openie_chunks populated
-    openie_rows = test_engine.conn.execute("SELECT chunk_id FROM openie_chunks").fetchall()
+    # Native indexing owns extraction artifacts.
+    openie_rows = test_engine.conn.execute("SELECT chunk_id FROM chunk_inference").fetchall()
     assert len(openie_rows) == 2
 
     # Check entities and facts
@@ -320,57 +322,39 @@ def test_engine_index_and_caching(test_engine: YawGraphEngine, tmp_path: Path) -
 def test_openie_resume_reuses_matching_prompts_and_invalidates_mutations(tmp_path: Path) -> None:
     from yaw.daemon.graph.storage import get_chunk_pointers
 
-    class CountingProgram(YawProgram):
-        def __init__(self) -> None:
-            super().__init__(enable_gbnf=False)
-            self.openie_calls = 0
-
-        def extract_openie(self, chunk_id: str, passage: str) -> Any:
-            self.openie_calls += 1
-            return super().extract_openie(chunk_id, passage)
-
     dspy.settings.configure(lm=DeterministicMockLM())
     doc = "Alan Turing was an English mathematician and computer scientist."
     database = tmp_path / "resume.db"
-    first = CountingProgram()
-    engine = bind_native_indexing(
-        YawGraphEngine(
-            db_path=database,
-            workspace_root=tmp_path,
-            program=first,
-            embedder=DeterministicMockEmbedder(dim=64),
-        )
-    )
+    first = YawProgram(enable_gbnf=False)
+    engine = bind_native_indexing(YawGraphEngine(database, tmp_path, first, DeterministicMockEmbedder()))
     try:
-        engine.index([doc])
-        assert first.openie_calls == 1
+        assert engine.index([doc]) == 1
         ids = [str(row[0]) for row in engine.conn.execute("SELECT chunk_id FROM chunks")]
         pointers = get_chunk_pointers(engine.conn, ids)
         chunks = [(pointers[cid], doc) for cid in ids]
-        provenance = engine.conn.execute("SELECT value FROM meta WHERE key GLOB 'indexed_fp:*'").fetchall()
+        checkpoint = tuple(
+            engine.conn.execute("SELECT program_identity, extraction_json, traces_json FROM chunk_inference").fetchone()
+        )
     finally:
         engine.close()
-
-    # Recreate all Python objects: no in-memory stage cache can survive.
-    second = CountingProgram()
-    engine = bind_native_indexing(
-        YawGraphEngine(
-            db_path=database,
-            workspace_root=tmp_path,
-            program=second,
-            embedder=DeterministicMockEmbedder(dim=64),
-        )
-    )
+    second = YawProgram(enable_gbnf=False)
+    engine = bind_native_indexing(YawGraphEngine(database, tmp_path, second, DeterministicMockEmbedder()))
     try:
         engine.index_chunks(chunks)
-        assert second.openie_calls == 0
-        assert engine.conn.execute("SELECT value FROM meta WHERE key GLOB 'indexed_fp:*'").fetchall() == provenance
+        assert (
+            tuple(
+                engine.conn.execute(
+                    "SELECT program_identity, extraction_json, traces_json FROM chunk_inference"
+                ).fetchone()
+            )
+            == checkpoint
+        )
         second.ner.signature = second.ner.signature.with_instructions(
             second.ner.signature.instructions + " Include all explicitly named people."
         )
         engine.index_chunks(chunks, program=second)
-        assert second.openie_calls == 1
-        assert engine.conn.execute("SELECT value FROM meta WHERE key GLOB 'indexed_fp:*'").fetchall() != provenance
+        assert engine.conn.execute("SELECT program_identity FROM chunk_inference").fetchone()[0] != checkpoint[0]
+        assert engine.conn.execute("SELECT count(*) FROM facts").fetchone()[0] > 0
     finally:
         engine.close()
 
@@ -511,6 +495,7 @@ def test_engine_fact_score_weighting_and_thread_safe_retrieval(synonym_token_cou
     from concurrent.futures import ThreadPoolExecutor
 
     class ControlledFactEmbedder:
+        profile = EmbeddingProfile("controlled", "fixture-v1", 4, 2048, "mean", "", "")
         """Assigns high similarity to Turing fact and low similarity to Lovelace fact."""
 
         def encode(self, texts: Sequence[str], instruction: str = "") -> list[np.ndarray]:
@@ -668,6 +653,8 @@ def test_engine_evolve_prompts_miprov2_and_gepa_metric_contracts(
 def test_engine_hybrid_fact_candidate_retrieval(synonym_token_counter, tmp_path: Path) -> None:
     class HybridFactEmbedder:
         """Deterministic embedder: query is close to Turing in dense space."""
+
+        profile = EmbeddingProfile("hybrid", "fixture-v1", 4, 2048, "mean", "", "")
 
         def encode(self, texts: Sequence[str], instruction: str = "") -> list[np.ndarray]:
             vecs: list[np.ndarray] = []
@@ -1355,13 +1342,13 @@ using all 5 bound REPL tools."""
         assert sum(1 for ev in repl_tool_events if ev.startswith("llm_propose_shacl_repairs:")) == 2
 
         # Verify exact non-double-counted token accounting:
-        # Step 6 (direct GBNF label_judge) = 30 tokens on doc 2 (hierarchy 30 on doc 1 + label 30 on doc 2 = 60 total)
+        # Publication telemetry describes this update; it does not replay prior provider work.
         assert len(program.label_judge_audit_trail) == 1
         assert program.label_judge_audit_trail[0]["mode"] == "direct"
         assert program.label_judge_audit_trail[0]["tokens_used"] == 30
         assert engine._graph_rlm_stats["label_judge_tokens"] == 30
-        assert engine._graph_rlm_stats["hierarchy_judge_tokens"] == 60
-        assert engine._graph_rlm_stats["label_judge_tokens"] + engine._graph_rlm_stats["hierarchy_judge_tokens"] == 90
+        assert engine._graph_rlm_stats["hierarchy_judge_tokens"] == 30
+        assert engine._graph_rlm_stats["label_judge_tokens"] + engine._graph_rlm_stats["hierarchy_judge_tokens"] == 60
 
         # Step 7 (shacl_healer_rlm) = 40 orchestrator + 30 worker = 70 tokens
         assert len(program.shacl_audit_trail) == 2  # inner direct (30) + outer RLM (70)
@@ -1453,6 +1440,7 @@ uses heuristic fallbacks."""
                         {
                             "named_entities": [
                                 ["Ada Lovelace", "English mathematician and writer"],
+                                ["Charles Babbage", ""],
                             ]
                         }
                     )
@@ -1546,6 +1534,7 @@ traces into dspy.settings.trace, and emits per-predictor feedback."""
                         {
                             "named_entities": [
                                 ["Unknown Person", "Unspecified entity"],
+                                ["Nowhere", "Unspecified place"],
                             ]
                         }
                     )
@@ -1553,7 +1542,7 @@ traces into dspy.settings.trace, and emits per-predictor feedback."""
             if "ExtractTriples" in req_str or (
                 "triples" in req_str and "missing_entities" not in req_str and "fact_before_filter" not in req_str
             ):
-                if "Alan Turing" in req_str:
+                if "Unknown Person" not in str(messages[-1]["content"] if messages else prompt):
                     return [
                         json.dumps(
                             {
@@ -2705,9 +2694,7 @@ def test_step10_engine_pareto_ensemble_readonly_graph_and_memoization(
 
     lm = TrackingEnsembleLM()
     dspy.settings.configure(lm=lm)
-    prog = YawProgram(
-        synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm
-    )
+    prog = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
     embedder: Any = DeterministicMockEmbedder(dim=64)
     engine = bind_native_indexing(
         YawGraphEngine(
@@ -2943,9 +2930,7 @@ def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
 
     lm = Step11MockLM()
     dspy.settings.configure(lm=lm)
-    prog = YawProgram(
-        synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm
-    )
+    prog = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
     embedder: Any = DeterministicMockEmbedder(dim=64)
     engine = bind_native_indexing(
         YawGraphEngine(

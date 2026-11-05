@@ -138,7 +138,7 @@ _CREATE_SCHEMA_STATEMENTS: tuple[str, ...] = (
         src_id TEXT NOT NULL,
         dst_id TEXT NOT NULL,
         kind TEXT NOT NULL CHECK (
-            kind IN ('passage', 'fact', 'skos:related', 'skos:broader', 'owl:differentFrom', 'skos:topConceptOf')
+            kind IN ('passage', 'fact', 'skos:related', 'skos:broader', 'owl:differentFrom')
         ),
         weight REAL NOT NULL,
         reasoning TEXT NOT NULL DEFAULT '',
@@ -160,25 +160,6 @@ _CREATE_SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_edge_sources_chunk ON edge_sources(chunk_id)",
-    """
-    CREATE TABLE IF NOT EXISTS concept_schemes (
-        scheme_id TEXT PRIMARY KEY,
-        pref_label TEXT NOT NULL,
-        definition TEXT NOT NULL,
-        history_note TEXT NOT NULL DEFAULT '',
-        confidence REAL
-    )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS concept_scheme_members (
-        scheme_id TEXT NOT NULL,
-        entity_id TEXT NOT NULL,
-        is_top_concept INTEGER NOT NULL DEFAULT 0,
-        PRIMARY KEY (scheme_id, entity_id)
-    )
-    """,
-    "CREATE INDEX IF NOT EXISTS idx_csm_entity ON concept_scheme_members(entity_id)",
-    "CREATE INDEX IF NOT EXISTS idx_csm_scheme ON concept_scheme_members(scheme_id)",
     """
     CREATE TABLE IF NOT EXISTS chunk_vec (
         chunk_id TEXT PRIMARY KEY,
@@ -247,6 +228,11 @@ def open_managed_yaw_db(db_path: Path | str) -> ManagedConnection:
         Path(db_str).parent.mkdir(parents=True, exist_ok=True)
 
     managed = coco_sqlite_connect(db_str, timeout=30.0, load_vec=True)
+    try:
+        validate_graph_schema(managed._conn)
+    except ValueError:
+        managed.close()
+        raise
     _configure_connection_pragmas(managed._conn)
     with managed.transaction() as conn:
         initialize_schema(conn)
@@ -260,6 +246,11 @@ def open_yaw_db(db_path: Path | str) -> sqlite3.Connection:
         Path(db_str).parent.mkdir(parents=True, exist_ok=True)
 
     conn = sqlite3.connect(db_str, timeout=30.0, check_same_thread=False)
+    try:
+        validate_graph_schema(conn)
+    except ValueError:
+        conn.close()
+        raise
     conn.isolation_level = None
     _configure_connection_pragmas(
         conn,
@@ -299,7 +290,12 @@ def open_readonly_yaw_db(
             sqlite_vec.load(conn)
             conn.enable_load_extension(False)
             conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+            validate_graph_schema(conn)
             return conn
+        except ValueError:
+            if conn is not None:
+                conn.close()
+            raise
         except sqlite3.Error:
             if conn is not None:
                 with suppress(sqlite3.Error):
@@ -338,8 +334,19 @@ def migrate_epistemic_confidence_columns(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE edge_sources ADD COLUMN {col} REAL")
 
 
+def validate_graph_schema(conn: sqlite3.Connection) -> None:
+    """Reject retired graph stores before any persistent database change."""
+    retired = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name IN (?, ?)",
+        ("concept_schemes", "concept_scheme_members"),
+    ).fetchone()
+    if retired is not None:
+        raise ValueError("Obsolete graph schema: preserve this database and build a fresh scheme-free index")
+
+
 def initialize_schema(conn: sqlite3.Connection) -> None:
     """Initialize all unified schema tables and indices in yaw.db with in-place migrations."""
+    validate_graph_schema(conn)
     with write_tx(conn):
         for stmt in _CREATE_SCHEMA_STATEMENTS:
             conn.execute(stmt)
@@ -454,12 +461,11 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_facts_pair ON facts(subj_id, obj_id)")
 
         # Auto-migrate edges CHECK constraint and legacy 'synonymy' kind -> 'skos:related',
-        # plus 'skos:broader' & 'skos:topConceptOf'
+        # plus 'skos:broader'
+        migrate_edges_reasoning(conn)
         edges_ddl_row = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'edges'").fetchone()
         if edges_ddl_row is not None and (
-            "skos:related" not in str(edges_ddl_row[0])
-            or "skos:broader" not in str(edges_ddl_row[0])
-            or "skos:topConceptOf" not in str(edges_ddl_row[0])
+            "skos:related" not in str(edges_ddl_row[0]) or "skos:broader" not in str(edges_ddl_row[0])
         ):
             conn.execute(
                 """
@@ -469,7 +475,7 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
                     kind TEXT NOT NULL CHECK (
                         kind IN (
                             'passage', 'fact', 'skos:related', 'skos:broader',
-                            'owl:differentFrom', 'skos:topConceptOf'
+                            'owl:differentFrom'
                         )
                     ),
                     weight REAL NOT NULL,
@@ -490,7 +496,7 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
                 FROM edges
                 WHERE kind IN (
                     'passage', 'fact', 'synonymy', 'skos:related',
-                    'skos:broader', 'owl:differentFrom', 'skos:topConceptOf'
+                    'skos:broader', 'owl:differentFrom'
                 )
                 """
             )
@@ -498,31 +504,6 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
             conn.execute("ALTER TABLE _edges_migrated RENAME TO edges")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_id, kind)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst_id, kind)")
-
-        # Ensure concept_schemes and concept_scheme_members exist
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS concept_schemes (
-                scheme_id TEXT PRIMARY KEY,
-                pref_label TEXT NOT NULL,
-                definition TEXT NOT NULL,
-                history_note TEXT NOT NULL DEFAULT '',
-                confidence REAL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS concept_scheme_members (
-                scheme_id TEXT NOT NULL,
-                entity_id TEXT NOT NULL,
-                is_top_concept INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (scheme_id, entity_id)
-            )
-            """
-        )
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_csm_entity ON concept_scheme_members(entity_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_csm_scheme ON concept_scheme_members(scheme_id)")
 
         # Ensure reasoning column exists on edges table (idempotent migration)
         migrate_edges_reasoning(conn)

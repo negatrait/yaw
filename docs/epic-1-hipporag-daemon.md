@@ -4,6 +4,13 @@ Owner: [FOUNDATIONAL](../FOUNDATIONAL.md) | Results: [evaluation](evaluation.md)
 
 ## Hard Gates
 
+Graph target revision (2026-11-05): [native graph publication](native-cocoindex-graph.md)
+requires total scheme removal, comparable cumulative time for 64+64 versus 128
+chunks, and exact fixed-evidence canonical graph/count equality. It owns the
+paired thresholds and evidence gates; prior indexing checkmarks do not pass them.
+Schemes may return only with demonstrated held-out Recall@N, EM or F1 benefit and
+acceptable resource/other-quality costs. Implementation acceptance remains open.
+
 Accepted replacement packet (2026-10-28): [native CocoIndex indexing and live ingestion](native-cocoindex-indexing.md).
 Both inference and live-ingestion gates are required within unfinished D1-A6,
 superseding the earlier `EmbeddingLane` / `indexing_overlap` overlap packet.
@@ -65,7 +72,7 @@ Execute strictly in order `E1-S1` $\to$ `E1-S6`. Never start Sprint $k+1$ until 
 - **Files:** `yaw/core/{types.py, logger.py}`, empty `__init__.py` tree (`yaw/{core,daemon/{ingestion,graph/{storage,inference}}}/__init__.py`), `tests/core/test_architecture.py`.
 - **Allowed imports:** `stdlib` only (`dataclasses`, `logging`, `pathlib`, `typing`, `collections`).
 - **Copy/Adapt From:**
-  - Move current [`yaw/logger.py`](../yaw/logger.py) (`FIFOLineRotatingHandler(max_lines=500)`) $\to$ `yaw/core/logger.py`.
+  - Move legacy `yaw/logger.py` (`FIFOLineRotatingHandler(max_lines=500)`) $\to$ [`yaw/core/logger.py`](../yaw/core/logger.py).
   - Move current [`yaw/{models,embedding,chat}.py`](../yaw/) $\to$ `yaw/daemon/graph/inference/` and update imports in `benchmark.py` & `tests/`.
   - Adapt data structures from `git show d1bc65e:src/yaw/indexer/pipeline.py` (`MarkdownChunk`) and `hipporag/utils/misc_utils.py` (`Chunk`, `QuerySolution`, `NerRawOutput`, `TripleRawOutput`) into frozen `@dataclass(slots=True, frozen=True)` types in `yaw/core/types.py`:
     - `ChunkPointer(chunk_id, rel_posix_path, start_line, end_line, title, content_hash)`

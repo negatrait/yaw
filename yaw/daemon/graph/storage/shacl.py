@@ -1399,7 +1399,6 @@ def apply_shacl_repairs(
                         conn.execute("DELETE FROM facts WHERE fact_id = ?", (fid,))
                     conn.execute("DELETE FROM edges WHERE src_id = ? OR dst_id = ?", (focus, focus))
                     conn.execute("DELETE FROM edge_sources WHERE src_id = ? OR dst_id = ?", (focus, focus))
-                    conn.execute("DELETE FROM concept_scheme_members WHERE entity_id = ?", (focus,))
                     conn.execute("DELETE FROM entity_labels WHERE entity_id = ?", (focus,))
                     conn.execute("DELETE FROM entity_vec WHERE entity_id = ?", (focus,))
                     conn.execute("DELETE FROM entities WHERE entity_id = ?", (focus,))
@@ -1494,35 +1493,6 @@ def serialize_graph_turtle(
     ):
         sem_edges_by_eid.setdefault(str(row[0]), []).append((str(row[1]), str(row[2])))
 
-    scheme_members_by_eid: dict[str, list[tuple[str, int]]] = {}
-    top_concepts_by_scheme: dict[str, list[str]] = {}
-    for row in conn.execute(
-        "SELECT scheme_id, entity_id, is_top_concept FROM concept_scheme_members ORDER BY scheme_id ASC, entity_id ASC"
-    ):
-        sid, eid_m, is_top = str(row[0]), str(row[1]), int(row[2])
-        scheme_members_by_eid.setdefault(eid_m, []).append((sid, is_top))
-        if is_top == 1:
-            top_concepts_by_scheme.setdefault(sid, []).append(eid_m)
-
-    for row in conn.execute(
-        "SELECT scheme_id, pref_label, definition, history_note, confidence FROM concept_schemes ORDER BY scheme_id ASC"
-    ):
-        sid, pref, dfn, note, s_conf = str(row[0]), str(row[1]), str(row[2]), str(row[3]), row[4]
-        scheme_parts = ["a skos:ConceptScheme"]
-        scheme_parts.append(f"skos:prefLabel {_escape_turtle_literal(pref)}")
-        if dfn.strip():
-            scheme_parts.append(f"skos:definition {_escape_turtle_literal(dfn.strip())}")
-        if note.strip():
-            scheme_parts.append(f"skos:historyNote {_escape_turtle_literal(note.strip())}")
-        top_ents = top_concepts_by_scheme.get(sid, [])
-        if top_ents:
-            top_tokens = ", ".join(f":{t}" for t in top_ents)
-            scheme_parts.append(f"skos:topConceptOf {top_tokens}")
-        if s_conf is not None:
-            scheme_parts.append(f'prov:value "{float(s_conf):.6f}"^^xsd:double')
-        lines.append(f":{sid} " + " ;\n    ".join(scheme_parts) + " .")
-        lines.append("")
-
     for row in conn.execute("SELECT entity_id, name, definition, confidence FROM entities ORDER BY entity_id ASC"):
         eid, ename, edef, econf = str(row[0]), str(row[1]), str(row[2]), row[3]
         pred_objs: list[str] = ["a skos:Concept"]
@@ -1542,10 +1512,6 @@ def serialize_graph_turtle(
             pred_objs.append(f'prov:value "{float(econf):.6f}"^^xsd:double')
         for kind, dst_id in sem_edges_by_eid.get(eid, []):
             pred_objs.append(f"{kind} :{dst_id}")
-        for sid, is_top in scheme_members_by_eid.get(eid, []):
-            pred_objs.append(f"skos:inScheme :{sid}")
-            if is_top == 1:
-                pred_objs.append(f"skos:topConceptOf :{sid}")
         for cid in sorted(prov_chunks):
             pred_objs.append(f"prov:wasDerivedFrom :{cid}")
 
@@ -1676,50 +1642,6 @@ def format_subgraph_turtle(
 
     lines: list[str] = [W3C_PREFIX_HEADER.strip(), ""]
 
-    active_schemes: dict[str, tuple[str, str, str, float | None]] = {}
-    scheme_members_by_eid: dict[str, list[tuple[str, int]]] = {}
-    top_concepts_by_scheme: dict[str, list[str]] = {}
-
-    if active_entity_ids:
-        ph_ent = ",".join("?" for _ in active_entity_ids)
-        csm_rows = conn.execute(
-            f"""
-            SELECT csm.scheme_id, csm.entity_id, csm.is_top_concept,
-                   cs.pref_label, cs.definition, cs.history_note, cs.confidence
-            FROM concept_scheme_members csm
-            JOIN concept_schemes cs ON cs.scheme_id = csm.scheme_id
-            WHERE csm.entity_id IN ({ph_ent}) OR csm.scheme_id IN ({ph_ent})
-            ORDER BY csm.scheme_id ASC, csm.entity_id ASC
-            """,
-            list(active_entity_ids) * 2,
-        ).fetchall()
-        for r in csm_rows:
-            sid, eid_m, is_top = str(r[0]), str(r[1]), int(r[2])
-            pref, dfn, note, sconf = str(r[3]), str(r[4]), str(r[5]), r[6]
-            active_schemes[sid] = (pref, dfn, note, sconf)
-            if eid_m in active_entity_ids:
-                scheme_members_by_eid.setdefault(eid_m, []).append((sid, is_top))
-            if is_top == 1:
-                top_concepts_by_scheme.setdefault(sid, []).append(eid_m)
-
-    # Prepend active :scheme_* blocks at the top of the QA reader subgraph payload
-    for sid in sorted(active_schemes.keys()):
-        pref, dfn, note, sconf = active_schemes[sid]
-        scheme_parts = ["a skos:ConceptScheme"]
-        scheme_parts.append(f"skos:prefLabel {_escape_turtle_literal(pref)}")
-        if dfn.strip():
-            scheme_parts.append(f"skos:definition {_escape_turtle_literal(dfn.strip())}")
-        if note.strip():
-            scheme_parts.append(f"skos:historyNote {_escape_turtle_literal(note.strip())}")
-        top_ents = top_concepts_by_scheme.get(sid, [])
-        if top_ents:
-            top_tokens = ", ".join(f":{t}" for t in top_ents)
-            scheme_parts.append(f"skos:topConceptOf {top_tokens}")
-        if sconf is not None:
-            scheme_parts.append(f'prov:value "{float(sconf):.6f}"^^xsd:double')
-        lines.append(f":{sid} " + " ;\n    ".join(scheme_parts) + " .")
-        lines.append("")
-
     if active_entity_ids:
         ph_ent = ",".join("?" for _ in active_entity_ids)
         entities_data = conn.execute(
@@ -1777,10 +1699,6 @@ def format_subgraph_turtle(
                 pred_objs.append(f'prov:value "{float(econf):.6f}"^^xsd:double')
             for k, d_id in edges_by_eid.get(eid, []):
                 pred_objs.append(f"{k} :{d_id}")
-            for sid, is_top in scheme_members_by_eid.get(eid, []):
-                pred_objs.append(f"skos:inScheme :{sid}")
-                if is_top == 1:
-                    pred_objs.append(f"skos:topConceptOf :{sid}")
             lines.append(f":{eid} " + " ;\n    ".join(pred_objs) + " .")
             lines.append("")
 

@@ -58,8 +58,6 @@ _PUBLIC_API: dict[str, str] = {
     "get_entity_metadata_batch": ".graph_ops",
     "get_graph_counts": ".graph_ops",
     "load_graph_topology": ".graph_ops",
-    "upsert_concept_schemes": ".graph_ops",
-    "upsert_concept_scheme_members": ".graph_ops",
     "pool_confidences": ".graph_ops",
     "bayesian_noisy_or": ".graph_ops",
     "delete_chunks": ".graph_ops",

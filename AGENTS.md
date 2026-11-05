@@ -17,14 +17,14 @@
 
 Read [FOUNDATIONAL.md](FOUNDATIONAL.md) first. Verify checkout `C:\Users\Harri.Ahokas\Documents\yaw` on branch `dev`.
 
-- **Stack**: Single `sqlite-vec` DB (`yaw.db`) via declarative CocoIndex `>=1.1.0` targets (`TableSchema.from_class`), contentless FTS5, 1-indexed hydration, closed-world W3C taxonomy (`skos:ConceptScheme` -> `skos:Concept` -> `yaw:Entity`), sparse CSR + Forward-Push PPR, native DSPy (`dspy.LM`, `dspy.Embedder`, `dspy.Signatures`, `dspy.RLM`, `dspy.GEPA`), FastMCP over HTTP. Do not restore `rdflib`, OWL 2 RL, `pySHACL`, or spaCy without benchmark proof.
+- **Stack**: Single `sqlite-vec` DB (`yaw.db`) via declarative CocoIndex `>=1.1.0` targets (`TableSchema.from_class`), contentless FTS5, 1-indexed hydration, closed-world W3C concept/entity semantics without ConceptSchemes, sparse CSR + Forward-Push PPR, native DSPy (`dspy.LM`, `dspy.Embedder`, `dspy.Signatures`, `dspy.RLM`, `dspy.GEPA`), FastMCP over HTTP. Do not restore `rdflib`, OWL 2 RL, `pySHACL`, or spaCy without benchmark proof.
 - **Containment (`test_architecture.py`)**: Keep code in `yaw/core/` and `yaw/daemon/{ingestion,graph/{storage,inference}}/`. Zero `hipporag` imports anywhere. Package `P` imports only `P.*` and `yaw.core.*`. Never import another module's `_internal` or `__protected` names.
 - **Runtime & Ingestion**:
   - One CocoIndex runtime (`yaw/daemon/runtime.py`), one writer for `yaw.db`, event-driven live ingestion (`localfs.walk_dir(..., live=True)` in `yaw/daemon/ingestion/corpus.py`), and a thin adapter in `yaw/daemon/mcp_server.py`.
   - Stream ingestion and candidate indexing in dataset-agnostic micro-batches of `64` chunks per `app.update()` cycle; never encode train/val splits or benchmark presets in production code.
   - Default LLM admission strictly to `parallel = 1` (`Semaphore(1)`) for local `llama.cpp` (`http://localhost:13305/api/v1`); batch embeddings (`max_batch_size = 64`). Keep sampling temp >= 0.3 (default 0.35, up to 0.8 for reflection) to prevent small-model looping.
   - Point CocoIndex `coco.Settings(db_path=...)` at a persistent, content-addressed cache across runs—never tie memo state to transient timestamped DB filenames.
-  - Synthesize structural taxonomy links (`skos:topConceptOf`) deterministically post-hoc from community membership ($R_m$), never via single-chunk LLM guessing.
+  - Remove ConceptSchemes, clustering, scheme inference/embeddings/storage and all scheme consumers under [native graph publication](docs/native-cocoindex-graph.md). For fixed evidence, 64+64 and 128 chunks must yield identical canonical entity/fact/edge state with comparable cumulative compute. Permit legitimate semantic islands; never manufacture isolation from batch boundaries or fabricate links to force connectivity. Future schemes require measured Recall@N, EM or F1 improvement and acceptable resource/quality costs.
 
 ## Execution Order, Benchmarks & Safety
 
@@ -42,7 +42,7 @@ Read [FOUNDATIONAL.md](FOUNDATIONAL.md) first. Verify checkout `C:\Users\Harri.A
 ## Mandatory Quality Gates & Commands
 
 ```bash
-uv run ty
+uv run --locked ty check
 uv run ruff check --fix
 uv run ruff format
 uv run pytest

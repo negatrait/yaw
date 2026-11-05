@@ -197,20 +197,7 @@ def test_candidate_stages_make_zero_requests_after_process_restart(tmp_path: Pat
                     content = json.dumps({"decisions": complete_decisions(candidate_rows(user), [], stage_text=prompt)})
                 elif "[[ ## missing_entities ## ]]" in user:
                     requests.append("definition")
-                    ids = sorted(set(re.findall(r"scheme-[0-9a-f]+", user)))
-                    content = json.dumps(
-                        {
-                            "entity_definitions": [
-                                [
-                                    sid,
-                                    "Computing",
-                                    "Concepts concerning computing and its history.",
-                                    "Induced from evidence.",
-                                ]
-                                for sid in ids
-                            ]
-                        }
-                    )
+                    content = json.dumps({"entity_definitions": []})
                 elif "[[ ## named_entities ## ]]" in user:
                     requests.append("triples")
                     if "Bletchley Park" in user:

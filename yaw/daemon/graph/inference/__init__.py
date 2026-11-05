@@ -1,7 +1,16 @@
 """Inference leaf package: Native DSPy HippoRAG 2 engine, GBNF grammars, and legacy baseline adapters."""
 
 import importlib
+import os
+from pathlib import Path
 from typing import Any
+
+# Configure provider resources before lazy imports load DSPy/LiteLLM.
+os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+os.environ.setdefault("LITELLM_TELEMETRY", "False")
+_workspace_deno = Path(__file__).resolve().parents[4] / ".yaw" / "deno_dir"
+if _workspace_deno.exists():
+    os.environ.setdefault("DENO_DIR", str(_workspace_deno))
 
 # Single source of truth: only these symbols are exposed as the public package contract.
 _PUBLIC_API: dict[str, str] = {
@@ -69,7 +78,6 @@ _PUBLIC_API: dict[str, str] = {
     "compute_retrieval_recalls": ".parsers",
     "compute_answer_passage_match": ".parsers",
     "text_processing": ".parsers",
-    "extract_concept_scheme_definitions": ".parsers",
     "extract_entity_definitions": ".parsers",
     "extract_structured_triples": ".parsers",
     "parse_hierarchy_decisions": ".parsers",
@@ -106,7 +114,6 @@ _PUBLIC_API: dict[str, str] = {
     "build_dspy_ner_grammar": ".grammars",
     "build_dspy_triples_grammar": ".grammars",
     "build_dspy_missing_entity_defs_grammar": ".grammars",
-    "build_dspy_concept_scheme_defs_grammar": ".grammars",
     "build_dspy_hierarchy_judge_grammar": ".grammars",
     "build_dspy_label_judge_grammar": ".grammars",
     "build_dspy_related_judge_grammar": ".grammars",
@@ -118,7 +125,6 @@ _PUBLIC_API: dict[str, str] = {
     "DSPY_NER_GBNF_GRAMMAR": ".grammars",
     "DSPY_TRIPLES_GBNF_GRAMMAR": ".grammars",
     "DSPY_MISSING_ENTITY_DEFS_GBNF_GRAMMAR": ".grammars",
-    "DSPY_CONCEPT_SCHEME_DEFS_GBNF_GRAMMAR": ".grammars",
     "DSPY_SHACL_REPAIR_GBNF_GRAMMAR": ".grammars",
     "DSPY_RERANK_GBNF_GRAMMAR": ".grammars",
     "DSPY_QA_GBNF_GRAMMAR": ".grammars",

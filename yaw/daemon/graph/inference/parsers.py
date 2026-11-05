@@ -6,6 +6,7 @@ import json
 import math
 import re
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from typing import Any, Literal
 
 import dspy
@@ -282,13 +283,7 @@ DefineMissingEntities output, or {name: definition} mappings."""
             if len(item) >= 2 and item[1] is not None:
                 defn = _clean_definition(item[1])
         elif isinstance(item, dict):
-            raw_name = (
-                item.get("name")
-                or item.get("entity")
-                or item.get("label")
-                or item.get("scheme_id")
-                or item.get("pref_label", "")
-            )
+            raw_name = item.get("name") or item.get("entity") or item.get("label") or item.get("pref_label", "")
             raw_def = item.get("definition", item.get("def", item.get("skos:definition", "")))
             name = _nullable_text(raw_name)
             defn = _clean_definition(raw_def)
@@ -320,84 +315,11 @@ DefineMissingEntities output, or {name: definition} mappings."""
     return tuple(ordered_pairs)
 
 
-def extract_concept_scheme_definitions(raw_input: Any) -> tuple[tuple[str, str, str, str], ...]:
-    """Extract and deduplicate (scheme_id, pref_label, definition, history_note) tuples \
-from DefineMissingEntities concept scheme synthesis output."""
-    raw_list: Sequence[Any]
-    if isinstance(raw_input, str):
-        try:
-            raw_list = _extract_json_list_field(raw_input, "entity_definitions")
-        except ValueError:
-            bare = _parse_bare_json_list(raw_input)
-            if bare is None:
-                raise
-            raw_list = bare
-    elif isinstance(raw_input, Mapping):
-        if "entity_definitions" in raw_input and isinstance(raw_input["entity_definitions"], list):
-            raw_list = raw_input["entity_definitions"]
-        else:
-            raw_list = ()
-    elif isinstance(raw_input, Sequence):
-        raw_list = raw_input
-    else:
-        raw_list = ()
-
-    ordered_tuples: list[tuple[str, str, str, str]] = []
-    seen_scheme_ids: set[str] = set()
-
-    for item in raw_list:
-        scheme_id = ""
-        pref_label = ""
-        definition = ""
-        history_note = ""
-
-        if isinstance(item, (list, tuple)):
-            if len(item) == 4 and str(item[2]).strip().startswith("scheme-"):
-                sid0 = str(item[0]).strip() if item[0] is not None else ""
-                def0 = _clean_definition(item[1]) if item[1] is not None else ""
-                sid1 = str(item[2]).strip() if item[2] is not None else ""
-                def1 = _clean_definition(item[3]) if item[3] is not None else ""
-                for s, d in ((sid0, def0), (sid1, def1)):
-                    if s and s not in seen_scheme_ids:
-                        seen_scheme_ids.add(s)
-                        ordered_tuples.append((s, s, d, ""))
-                continue
-            if len(item) >= 1 and item[0] is not None:
-                scheme_id = str(item[0]).strip()
-            if len(item) >= 2 and item[1] is not None:
-                pref_label = str(item[1]).strip()
-            if len(item) >= 3 and item[2] is not None:
-                definition = _clean_definition(item[2])
-            if len(item) >= 4 and item[3] is not None:
-                history_note = _clean_definition(item[3])
-        elif isinstance(item, Mapping):
-            raw_id = item.get("scheme_id", item.get("id", item.get("name", "")))
-            raw_label = item.get("pref_label", item.get("label", item.get("skos:prefLabel", "")))
-            raw_def = item.get("definition", item.get("def", item.get("skos:definition", "")))
-            raw_note = item.get("history_note", item.get("note", item.get("skos:historyNote", "")))
-            scheme_id = _nullable_text(raw_id)
-            pref_label = _nullable_text(raw_label)
-            definition = _clean_definition(raw_def)
-            history_note = _clean_definition(raw_note)
-
-        if not scheme_id:
-            continue
-        if definition.startswith("scheme-"):
-            definition = ""
-        if not pref_label or pref_label.startswith("scheme-"):
-            pref_label = scheme_id
-        if scheme_id in seen_scheme_ids:
-            continue
-        seen_scheme_ids.add(scheme_id)
-        ordered_tuples.append((scheme_id, pref_label, definition, history_note))
-
-    return tuple(ordered_tuples)
-
-
 def extract_structured_triples(
     raw_input: Any,
     *,
     entity_definitions: Sequence[tuple[str, str]] | dict[str, str] | None = None,
+    known_entities: Sequence[str] | None = None,
 ) -> tuple[StructuredTriple, ...]:
     """Extract, validate, and deduplicate StructuredTriple records from raw list, dict, or JSON string."""
     def_lookup: dict[str, str] = {}
@@ -437,10 +359,47 @@ def extract_structured_triples(
 
     seen: set[tuple[str, str, str, str, str, str]] = set()
     results: list[StructuredTriple] = []
+    resources = set(known_entities) if known_entities is not None else None
+    catalog: dict[str, set[str]] = {}
+    definition_pairs = list(entity_definitions.items()) if isinstance(entity_definitions, dict) else entity_definitions
+    for name, definition in extract_entity_definitions(definition_pairs):
+        catalog.setdefault(name, set()).add(_clean_definition(definition))
+
+    def resolve_definition(name: str, supplied: str) -> str:
+        choices = catalog.get(name, set())
+        if supplied in choices:
+            return supplied
+        if len(choices) > 1:
+            raise ValueError("Ambiguous NER label requires an existing NER definition")
+        return def_lookup.get(name, "")
+
     for item in raw_list:
         st = _coerce_structured_triple_item(item, def_lookup=def_lookup)
         if st is None:
+            if resources is not None:
+                raise ValueError("Triple extraction returned a malformed statement")
             continue
+        if resources is not None:
+            if st.subj not in resources or (st.obj_kind == "entity" and st.obj not in resources):
+                raise ValueError("Triple extraction introduced a resource absent from NER")
+            if isinstance(item, dict):
+                raw_subj = item.get("sub", item.get("subj", item.get("subject")))
+                raw_obj = item.get("obj", item.get("object"))
+                for endpoint in (raw_subj, raw_obj) if st.obj_kind == "entity" else (raw_subj,):
+                    if not isinstance(endpoint, str) and (
+                        not isinstance(endpoint, (list, tuple))
+                        or len(endpoint) != 2
+                        or endpoint[1] not in catalog.get(endpoint[0], set())
+                    ):
+                        raise ValueError("Triple resource endpoints must identify existing NER resources")
+                parsed_pred = _parse_predicate_slot(item.get("pred", item.get("predicate")))
+                if parsed_pred is not None and parsed_pred[1] is not None and parsed_pred[1] != st.obj_kind:
+                    raise ValueError("Predicate property type conflicts with literal/resource object")
+            st = replace(
+                st,
+                subj_def=resolve_definition(st.subj, st.subj_def),
+                obj_def=resolve_definition(st.obj, st.obj_def) if st.obj_kind == "entity" else "",
+            )
         key = (
             st.subj,
             st.subj_def.strip().lower(),
@@ -1279,8 +1238,9 @@ def compute_task_quality_score(
 
     missed_str = f" Missed gold items: {list(missed_items)}." if missed_items else ""
     missing_defs_str = (
-        f" [entity_definer] repaired {eff_missing_defs} missing Stage-2 entity definition(s) "
-        f"({eff_missing_def_tokens} aux tokens); emit inline [name, def] pairs in Stage 2 or extract in Stage 1."
+        f" [entity_definer] repaired {eff_missing_defs} missing NER resource definition(s) "
+        f"({eff_missing_def_tokens} aux tokens); extract complete resource definitions in Stage 1. "
+        "Stage 2 must only select supplied resources or extract literal objects."
         if eff_missing_defs > 0
         else ""
     )
@@ -1365,7 +1325,6 @@ __all__ = [
     "detect_scalar_literal",
     "doc_matches_gold",
     "evaluate_benchmark_gate",
-    "extract_concept_scheme_definitions",
     "extract_entity_definitions",
     "extract_structured_triples",
     "match_facts_to_candidate_indices",

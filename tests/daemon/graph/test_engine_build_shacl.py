@@ -12,6 +12,7 @@ from daemon.graph.synonym_protocol import candidate_rows, complete_decisions
 from yaw.core import ChunkPointer, OpenIERecord, RelationTraversalPolicy, StructuredTriple
 from yaw.daemon.graph.engine import YawGraphEngine
 from yaw.daemon.graph.inference import YawProgram, parse_hierarchy_decisions
+from yaw.daemon.graph.inference.embedding import EmbeddingProfile
 from yaw.daemon.graph.planner import apply_synonym_adjudication
 from yaw.daemon.graph.ppr import build_transition_matrix
 from yaw.daemon.graph.storage import (
@@ -92,6 +93,7 @@ class DeterministicMockLM(dspy.LM):
 class DeterministicMockEmbedder:
     def __init__(self, dim: int = 64) -> None:
         self.dim = dim
+        self.profile = EmbeddingProfile("deterministic", "fixture-v1", dim, 2048, "mean", "", "")
 
     def encode(self, texts: Any, instruction: str = "", **kwargs: Any) -> np.ndarray:
         raw = np.ones((len(texts), self.dim), dtype=np.float32)
@@ -144,12 +146,16 @@ def _index_chunk_with_record(
         {
             "triples": [
                 {
-                    "sub": [st.subj, st.subj_def],
+                    "sub": st.subj,
                     "pred": [
                         st.pred,
                         "owl:DatatypeProperty" if st.obj_kind == "literal" else "owl:ObjectProperty",
                     ],
-                    "obj": [st.obj, st.obj_def],
+                    "obj": (
+                        {"value": st.obj, "datatype": st.obj_datatype, "lang": st.obj_lang}
+                        if st.obj_kind == "literal"
+                        else st.obj
+                    ),
                     "def": st.spo_def or f"{st.subj} {st.pred} {st.obj}.",
                 }
                 for st in record.structured_triples
@@ -166,16 +172,15 @@ def test_datatype_property_literal_objects_stored_with_weighted_edges_and_exclud
     synonym_token_counter,
     tmp_path: Path,
 ) -> None:
-    """Verify owl:DatatypeProperty literal objects are materialized in entities with contextual definitions,
-    connected via 0.5-weighted forward fact edges and passage edges, and excluded from SKOS disambiguation."""
-    # First verify YawProgram.extract_structured_triples preserves obj_def on obj_kind == 'literal'
+    """Literal objects belong to facts and never become entities or SKOS candidates."""
+    # Literal values are discovered by the fact extractor, not defined by NER.
     lm_triple_json = json.dumps(
         {
             "triples": [
                 {
-                    "sub": ["YAW Service", "A high performance knowledge graph daemon"],
+                    "sub": "YAW Service",
                     "pred": ["listens on port", "owl:DatatypeProperty"],
-                    "obj": ["8080", "Default HTTP listen port for YAW Service"],
+                    "obj": "8080",
                     "def": "YAW Service listens on port 8080.",
                 }
             ]
@@ -187,12 +192,11 @@ def test_datatype_property_literal_objects_stored_with_weighted_edges_and_exclud
         "YAW Service listens on port 8080.",
         [
             ("YAW Service", "A high performance knowledge graph daemon"),
-            ("8080", "Default HTTP listen port for YAW Service"),
         ],
     )
     assert len(extracted_sts) == 1
     assert extracted_sts[0].obj_kind == "literal"
-    assert extracted_sts[0].obj_def == "Default HTTP listen port for YAW Service"
+    assert extracted_sts[0].obj_def == ""
 
     called_candidates: list[dict[str, Any]] = []
 
@@ -800,6 +804,7 @@ def test_cased_literal_objects_and_same_doc_consecutive_chunks_never_produce_fal
         chunk_id="chunk-meet-2",
         entities=[
             ("Priya Nair", "A participant in the meeting."),
+            ("Pricing addendum", "Contract pricing document under review"),
             ("Ethan Cole", "A participant in the meeting."),
             ("Diego Morales", "A participant in the meeting."),
             ("Meeting", "Architecture and procurement sync meeting"),

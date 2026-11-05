@@ -11,6 +11,7 @@ from daemon.graph.synonym_protocol import candidate_rows, complete_decisions
 from yaw.core import ChunkPointer
 from yaw.daemon.graph.engine import YawGraphEngine
 from yaw.daemon.graph.inference import YawProgram
+from yaw.daemon.graph.inference.embedding import EmbeddingProfile
 from yaw.daemon.graph.ppr import run_ppr
 from yaw.daemon.graph.storage import (
     lint_graph_shacl,
@@ -25,6 +26,7 @@ class DummyEmbedder:
 
     def __init__(self, dim: int = 16) -> None:
         self.dim = dim
+        self.profile = EmbeddingProfile("dummy", "fixture-v1", dim, 2048, "mean", "", "")
 
     def __call__(self, texts: list[str]) -> list[list[float]]:
         res = []
@@ -192,15 +194,15 @@ class PipelineGateMockLM(dspy.LM):
                         {
                             "triples": [
                                 {
-                                    "sub": ["cryptanalysis", "Study of analyzing information systems"],
+                                    "sub": "cryptanalysis",
                                     "pred": ["applies", "owl:ObjectProperty"],
-                                    "obj": ["discrete mathematics", "Study of discrete mathematical structures"],
+                                    "obj": "discrete mathematics",
                                     "def": "Cryptanalysis applies discrete mathematics.",
                                 },
                                 {
-                                    "sub": ["discrete mathematics", "Study of discrete mathematical structures"],
+                                    "sub": "discrete mathematics",
                                     "pred": ["includes", "owl:ObjectProperty"],
-                                    "obj": ["number theory", "Branch of pure mathematics devoted to integers"],
+                                    "obj": "number theory",
                                     "def": "Discrete mathematics includes number theory.",
                                 },
                             ]
@@ -212,30 +214,27 @@ class PipelineGateMockLM(dspy.LM):
                     {
                         "triples": [
                             {
-                                "sub": ["Yet Another Wiki", "A graph retrieval daemon and wiki system"],
+                                "sub": "Yet Another Wiki",
                                 "pred": ["launched on", "owl:DatatypeProperty"],
-                                "obj": ["2026-10-25", "Release date of Yet Another Wiki"],
+                                "obj": "2026-10-25",
                                 "def": "Yet Another Wiki was launched on 2026-10-25.",
                             },
                             {
-                                "sub": ["Yet Another Wiki", "A graph retrieval daemon and wiki system"],
+                                "sub": "Yet Another Wiki",
                                 "pred": ["listens on port", "owl:DatatypeProperty"],
-                                "obj": ["8080", "Default TCP listen port of Yet Another Wiki"],
+                                "obj": "8080",
                                 "def": "Yet Another Wiki listens on port 8080.",
                             },
                             {
-                                "sub": [
-                                    "security engineering",
-                                    "Engineering domain focused on system security",
-                                ],
+                                "sub": "security engineering",
                                 "pred": ["branch of", "owl:ObjectProperty"],
-                                "obj": ["engineering", "General engineering discipline"],
+                                "obj": "engineering",
                                 "def": "Security engineering is a branch of engineering.",
                             },
                             {
-                                "sub": ["HTTP 2", "Version 2 of HTTP protocol"],
+                                "sub": "HTTP 2",
                                 "pred": ["version of", "owl:ObjectProperty"],
-                                "obj": ["HTTP 3", "Version 3 of HTTP protocol"],
+                                "obj": "HTTP 3",
                                 "def": "HTTP 2 and HTTP 3 are networking protocol versions.",
                             },
                         ]
@@ -427,8 +426,7 @@ def test_build_time_shacl_gate_success(synonym_token_counter, tmp_path: Path) ->
 
 
 def test_pre_rlm_deterministic_auto_heal_skips_rlm_healer(synonym_token_counter, tmp_path: Path) -> None:
-    """Verify that SHACL violations invoke the RLM healer first (without pre-emptive SQL auto_heal
-    clobbering), and that post-RLM fallback auto-healing guarantees a zero-violation build gate."""
+    """Supported hierarchy facts require no model repair when structural validation passes."""
     engine, mock_lm = _make_engine(synonym_token_counter, tmp_path, mode="pre_rlm_heal")
     try:
         text = "Cryptanalysis applies discrete mathematics.\nDiscrete mathematics includes number theory.\n"
@@ -444,10 +442,9 @@ def test_pre_rlm_deterministic_auto_heal_skips_rlm_healer(synonym_token_counter,
         indexed = engine.index_chunks([(chunk, text)])
         assert indexed == 1
 
-        # Structural S27 violation was routed to the RLM healer first (not clobbered pre-RLM)
-        assert int(engine._graph_rlm_stats.get("shacl_violations_before", 0)) >= 1
-        assert mock_lm.rlm_healer_called is True
-        assert len(engine.program.shacl_audit_trail) >= 1
+        assert int(engine._graph_rlm_stats.get("shacl_violations_before", 0)) == 0
+        assert mock_lm.rlm_healer_called is False
+        assert engine.program.shacl_audit_trail == []
         assert int(engine._graph_rlm_stats.get("shacl_violations_after", 0)) == 0
 
         with engine.managed_conn.readonly() as conn:

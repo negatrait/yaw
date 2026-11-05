@@ -398,4 +398,4 @@ def test_normalize_openie_record_filters_degenerate_self_loops_and_preserves_hom
     assert ("a ball", "Formal royal dance party.") in norm.entities
 
     dyn_g = build_dspy_triples_grammar(max_triples=2, known_entities=["Hyperslate"])
-    assert "obj-slot ::= entity-slot | string" in dyn_g
+    assert "obj-slot ::= entity-slot | literal-slot" in dyn_g

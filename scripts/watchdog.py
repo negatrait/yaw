@@ -481,7 +481,6 @@ def get_active_sandbox_info() -> dict[str, Any]:
         diff_from_rows: list[tuple[str, str, str, str, str, str]] = []
         related_rows: list[tuple[str, str]] = []
         broader_rows: list[tuple[str, str]] = []
-        concept_schemes: list[dict[str, Any]] = []
         related_assertions: list[tuple[str, str, str, str, str, str]] = []
         broader_assertions: list[tuple[str, str, str, str, str, str]] = []
         entity_details: dict[str, tuple[str, str, int]] = {}
@@ -489,28 +488,6 @@ def get_active_sandbox_info() -> dict[str, Any]:
         alt_label_cnt = 0
         largest_label_info: dict[str, Any] = {}
         with contextlib.suppress(sqlite3.Error):
-            cs_rows = conn.execute(
-                "SELECT scheme_id, pref_label, definition, history_note, confidence "
-                "FROM concept_schemes ORDER BY scheme_id ASC"
-            ).fetchall()
-            for sid, pl, df, hn, conf in cs_rows:
-                mem_rows = conn.execute(
-                    "SELECT entity_id, is_top_concept FROM concept_scheme_members WHERE scheme_id = ?",
-                    (str(sid),),
-                ).fetchall()
-                members = [str(r[0]) for r in mem_rows]
-                top_concepts = [str(r[0]) for r in mem_rows if r[1] == 1]
-                concept_schemes.append(
-                    {
-                        "scheme_id": str(sid),
-                        "pref_label": str(pl),
-                        "definition": str(df),
-                        "history_note": str(hn),
-                        "confidence": float(conf) if conf is not None else 1.0,
-                        "members": members,
-                        "top_concepts": top_concepts,
-                    }
-                )
             diff_from_rows = [
                 (str(r[0]), str(r[1]), str(r[2]), str(r[3]), str(r[4]), str(r[5]))
                 for r in conn.execute(
@@ -568,10 +545,6 @@ def get_active_sandbox_info() -> dict[str, Any]:
                 str(r[0]): (str(r[1]), str(r[2]), max(1, int(lbl_counts.get(r[0], 1))))
                 for r in conn.execute("SELECT entity_id, name, COALESCE(definition, '') FROM entities").fetchall()
             }
-            for cs in concept_schemes:
-                sid = cs["scheme_id"]
-                if sid not in entity_details:
-                    entity_details[sid] = (f"[Scheme] {cs['pref_label']}", cs["definition"], 6)
             largest_label_row = conn.execute(
                 """
                 SELECT e.entity_id, e.name, COUNT(DISTINCT el.label_norm) as lbl_cnt
@@ -610,8 +583,8 @@ def get_active_sandbox_info() -> dict[str, Any]:
                     """
                     SELECT src_id, dst_id, kind
                     FROM edges
-                    WHERE kind IN ('fact', 'skos:related', 'skos:broader', 'owl:differentFrom', 'skos:topConceptOf')
-                      AND (kind IN ('skos:broader', 'skos:topConceptOf') OR src_id < dst_id)
+                    WHERE kind IN ('fact', 'skos:related', 'skos:broader', 'owl:differentFrom')
+                      AND (kind = 'skos:broader' OR src_id < dst_id)
                     """
                 ).fetchall()
             ]
@@ -697,14 +670,12 @@ def get_active_sandbox_info() -> dict[str, Any]:
             "different_from_pairs": len(diff_from_rows),
             "related_pairs": len(related_rows),
             "broader_pairs": len(broader_rows),
-            "concept_schemes": len(concept_schemes),
             "synonym_merges": alt_label_cnt,
         }
         info["graph_cache"] = (raw_counts, triples_raw, diff_from_rows, related_rows, broader_rows)
         info["kg_graph"] = {
             "entities": entity_details,
             "edges": graph_edges,
-            "concept_schemes": concept_schemes,
             "diff_from_rows": diff_from_rows,
             "related_rows": related_rows,
             "broader_rows": broader_rows,
@@ -1040,11 +1011,11 @@ def largest_one_hop_neighborhood(edges: list[tuple[str, str, str]]) -> set[str]:
     adjacency: dict[str, set[str]] = defaultdict(set)
     seeds: set[str] = set()
     for u, v, kind in edges:
-        if kind not in {"fact", "skos:related", "owl:differentFrom", "skos:broader", "skos:topConceptOf"} or u == v:
+        if kind not in {"fact", "skos:related", "owl:differentFrom", "skos:broader"} or u == v:
             continue
         adjacency[u].add(v)
         adjacency[v].add(u)
-        if kind in {"skos:related", "owl:differentFrom", "skos:broader", "skos:topConceptOf"}:
+        if kind in {"skos:related", "owl:differentFrom", "skos:broader"}:
             seeds.update((u, v))
     selected = seeds | {node for seed in seeds for node in adjacency[seed]}
     remaining = set(selected)
@@ -1125,10 +1096,7 @@ def generate_graph_projection_svg(
         v for u, v, k in all_edges_tail if k == "skos:related"
     }
     broader_nodes: set[str] = {v for u, v, k in all_edges_tail if k == "skos:broader"}
-    scheme_nodes: set[str] = {v for u, v, k in all_edges_tail if k == "skos:topConceptOf"} | {
-        str(cs["scheme_id"]) for cs in kg_g.get("concept_schemes", []) if cs.get("scheme_id") in selected
-    }
-    base_nodes = diff_nodes | rel_nodes | broader_nodes | scheme_nodes
+    base_nodes = diff_nodes | rel_nodes | broader_nodes
 
     # Include all 1-hop connected rdf:Statement (fact) entities
     inc_fact: dict[str, set[str]] = defaultdict(set)
@@ -1142,7 +1110,6 @@ def generate_graph_projection_svg(
     nodes = sorted(
         selected,
         key=lambda x: (
-            x in scheme_nodes,
             x in diff_nodes,
             x in broader_nodes,
             x in rel_nodes,
@@ -1166,12 +1133,9 @@ def generate_graph_projection_svg(
     rel_segs = [[idx[u], idx[v]] for u, v, k in all_edges_tail if k == "skos:related" and u in idx and v in idx]
     fact_segs = [[idx[u], idx[v]] for u, v, k in all_edges_tail if k == "fact" and u in idx and v in idx]
     broader_segs = [[idx[u], idx[v]] for u, v, k in all_edges_tail if k == "skos:broader" and u in idx and v in idx]
-    top_concept_segs = [
-        [idx[u], idx[v]] for u, v, k in all_edges_tail if k == "skos:topConceptOf" and u in idx and v in idx
-    ]
     active_edge_arr = (
-        np.array(diff_segs + rel_segs + fact_segs + broader_segs + top_concept_segs, dtype=int)
-        if (diff_segs or rel_segs or fact_segs or broader_segs or top_concept_segs)
+        np.array(diff_segs + rel_segs + fact_segs + broader_segs, dtype=int)
+        if (diff_segs or rel_segs or fact_segs or broader_segs)
         else np.zeros((0, 2), dtype=int)
     )
 
@@ -1267,15 +1231,13 @@ def generate_graph_projection_svg(
         fontsize=14,
         fontweight="bold",
     )
-    scheme_cnt_str = f" • {len(scheme_nodes)} concept schemes" if scheme_nodes else ""
-    top_concept_str = f"{len(top_concept_segs)} skos:topConceptOf • " if top_concept_segs else ""
     fig.text(
         0.04,
         0.91,
         f"{n_cnt} entities • Largest 1-hop component • "
-        f"{len(diff_nodes)} ≠ endpoints • {len(broader_nodes)} broader concepts{scheme_cnt_str}\n"
+        f"{len(diff_nodes)} ≠ endpoints • {len(broader_nodes)} broader concepts\n"
         f"Edges: {len(fact_segs)} fact • {len(rel_segs)} skos:related • "
-        f"{len(broader_segs)} skos:broader • {top_concept_str}{len(diff_segs)} owl:differentFrom",
+        f"{len(broader_segs)} skos:broader • {len(diff_segs)} owl:differentFrom",
         fontsize=9,
         va="top",
         color="#38bdf8",
@@ -1334,19 +1296,6 @@ def generate_graph_projection_svg(
             )
         )
 
-    # 5. skos:topConceptOf Edges (emerald dashed line connecting top concept to scheme)
-    if top_concept_segs:
-        ax.add_collection(
-            LineCollection(
-                [[pos[u], pos[v]] for u, v in top_concept_segs],
-                colors="#10b981",
-                linewidths=1.5,
-                linestyles="dashed",
-                alpha=0.9,
-                zorder=3,
-            )
-        )
-
     # Compute node cardinality (degree of active edges in the view)
     deg_map: dict[str, int] = defaultdict(int)
     for u, v, _k in all_edges_tail:
@@ -1393,37 +1342,15 @@ def generate_graph_projection_svg(
             edgecolors.append("#0f172a")
             lws.append(0.5)
 
-    non_scheme_idx = [i for i, eid in enumerate(nodes) if eid not in scheme_nodes]
-    scheme_idx = [i for i, eid in enumerate(nodes) if eid in scheme_nodes]
-
-    if non_scheme_idx:
-        ns_pos = pos[non_scheme_idx]
-        ns_sizes = [sizes[i] for i in non_scheme_idx]
-        ns_colors = [colors[i] for i in non_scheme_idx]
-        ns_edges = [edgecolors[i] for i in non_scheme_idx]
-        ns_lws = [lws[i] for i in non_scheme_idx]
-        ax.scatter(
-            ns_pos[:, 0],
-            ns_pos[:, 1],
-            s=ns_sizes,
-            c=ns_colors,
-            edgecolors=ns_edges,
-            linewidths=ns_lws,
-            zorder=4,
-        )
-
-    if scheme_idx:
-        s_pos = pos[scheme_idx]
-        ax.scatter(
-            s_pos[:, 0],
-            s_pos[:, 1],
-            marker="D",
-            s=220.0,
-            c="#10b981",
-            edgecolors="#ffffff",
-            linewidths=1.5,
-            zorder=6,
-        )
+    ax.scatter(
+        pos[:, 0],
+        pos[:, 1],
+        s=sizes,
+        c=colors,
+        edgecolors=edgecolors,
+        linewidths=lws,
+        zorder=4,
+    )
 
     # Entity Name Labels:
     # Show entity names exclusively for both ends of owl:differentFrom disambiguation;
@@ -1471,27 +1398,6 @@ def generate_graph_projection_svg(
             zorder=5,
         )
 
-    # Emergent Concept Scheme Labels:
-    for sid in sorted(scheme_nodes):
-        if sid not in idx:
-            continue
-        i = idx[sid]
-        raw_name, _, _ = entities.get(sid, (sid, "", 1))
-        clean_lbl = raw_name.removeprefix("[Scheme] ").strip()
-        disp_label = f"[Scheme] {clean_lbl}"
-        ax.text(
-            pos[i, 0],
-            pos[i, 1] + 6.0,
-            f" {disp_label[:34]}",
-            fontsize=7.5,
-            fontweight="bold",
-            color="#a7f3d0",
-            va="bottom",
-            ha="center",
-            bbox=dict(boxstyle="round,pad=0.25", fc="#064e3b", ec="#10b981", lw=1.0, alpha=0.92),
-            zorder=7,
-        )
-
     # Legend explaining edge types and node sizing
     legend_elements = [
         Line2D(
@@ -1525,24 +1431,6 @@ def generate_graph_projection_svg(
             lw=1.0,
             ls="-",
             label=f"Fact relationships ({len(fact_segs)} edges)",
-        ),
-        Line2D(
-            [0],
-            [0],
-            color="#10b981",
-            lw=1.5,
-            ls="--",
-            label=f"skos:topConceptOf ({len(top_concept_segs)} taxonomy roots)",
-        ),
-        Line2D(
-            [0],
-            [0],
-            marker="D",
-            color="w",
-            markerfacecolor="#10b981",
-            markeredgecolor="#ffffff",
-            markersize=7,
-            label=f"skos:ConceptScheme ({len(scheme_nodes)} emergent schemes)",
         ),
         Line2D(
             [0],
@@ -1613,12 +1501,11 @@ def generate_graph_projection_svg(
             len(rel_segs),
             len(broader_segs),
             len(diff_segs),
-            len(top_concept_segs),
             int(sandbox.get("counts", {}).get("openie_chunks", 0)),
         )
         frame_name = (
-            f"frame_{state_key[6]:05d}_{state_key[0]:05d}_{state_key[1]:05d}_"
-            f"{state_key[2]:05d}_{state_key[3]:05d}_{state_key[4]:05d}_{state_key[5]:05d}.png"
+            f"frame_{state_key[5]:05d}_{state_key[0]:05d}_{state_key[1]:05d}_"
+            f"{state_key[2]:05d}_{state_key[3]:05d}_{state_key[4]:05d}.png"
         )
         frame_path = frame_dir / frame_name
         try:
@@ -1656,12 +1543,10 @@ def generate_graph_projection_svg(
     return {
         "nodes_rendered": n_cnt,
         "diff_nodes": len(diff_nodes),
-        "scheme_nodes": len(scheme_nodes),
         "active_edges": len(active_edge_arr),
         "diff_edges": len(diff_segs),
         "related_edges": len(rel_segs),
         "broader_edges": len(broader_segs),
-        "top_concept_edges": len(top_concept_segs),
         "fact_edges": len(fact_segs),
         "layout_iterations": layout_iterations,
     }
@@ -2142,7 +2027,6 @@ def generate_report_markdown(
             "Graph (sandbox DB)",
             f"**`{counts.get('entities', 0):,}` entities** • "
             f"**`{counts.get('facts', 0):,}` facts** • "
-            f"`{kg.get('concept_schemes', 0)}` `skos:ConceptScheme` • "
             f"`{kg.get('synonym_merges', 0)}` alt/hidden labels • "
             f"`{kg.get('broader_pairs', 0)}` `skos:broader` • "
             f"`{kg.get('related_pairs', 0)}` `skos:related` • "
@@ -2218,24 +2102,6 @@ def generate_report_markdown(
             "### Audit Trail: Largest Concept by SKOS Labels\n\n"
             f"**`{top_name}`** ({top_cnt} total unique labels):\n" + "\n".join(label_lines) + "\n\n"
         )
-    concept_schemes = kg_g.get("concept_schemes", [])
-    if concept_schemes:
-        cs_items = []
-        for cs in concept_schemes[:8]:
-            s_lbl = cs.get("pref_label", cs.get("scheme_id", ""))
-            s_def = cs.get("definition", "").strip()[:140] or "n/a"
-            tops = cs.get("top_concepts", [])
-            top_names = [kg_g.get("entities", {}).get(t, (t, "", 0))[0] for t in tops[:5]]
-            top_str = ", ".join(f"`{tn}`" for tn in top_names) if top_names else "none"
-            cs_items.append(f"- ◆ **`{s_lbl}`** (roots: {top_str})\n  - Definition: *{s_def}*")
-        total_cs = len(concept_schemes)
-        trunc_cs = f"\n*(Showing 8 of {total_cs} emergent concept schemes)*\n" if total_cs > 8 else "\n"
-        assertions_md += (
-            "### Emergent Concept Schemes (`skos:ConceptScheme`)\n\n"
-            "*Taxonomy clusters induced via Newman modularity maximization with "
-            "deterministic `skos:topConceptOf` roots.*\n\n" + "\n".join(cs_items) + f"\n{trunc_cs}\n"
-        )
-
     # Small image files referenced by path (no inline base64: that made the report multi-MB and
     # unrenderable on mobile). Fig. 2 is a compact PNG; the others are small SVGs.
     fig_titles = [
