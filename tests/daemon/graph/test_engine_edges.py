@@ -13,7 +13,7 @@ import pytest
 
 from yaw.core import ChunkPointer
 from yaw.daemon.graph.engine import YawGraphEngine
-from yaw.daemon.graph.inference import HippoRAGProgram
+from yaw.daemon.graph.inference import YawProgram
 from yaw.daemon.graph.inference.embedding import DSPyEmbeddingAdapter, create_dspy_embedder, resolve_embedding_profile
 from yaw.daemon.indexing import bind_native_indexing
 
@@ -156,7 +156,7 @@ def indexing_provider():
 
 def make_engine(tmp_path, url) -> YawGraphEngine:
     lm = dspy.LM("openai/indexing-contract", api_base=url, api_key="test", cache=False, num_retries=0)
-    program = HippoRAGProgram(include_demos=False, enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
+    program = YawProgram(include_demos=False, enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
 
     def embed(texts):
         return np.array(

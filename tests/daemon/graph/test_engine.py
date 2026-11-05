@@ -17,7 +17,7 @@ from yaw.core import ChunkPointer
 from yaw.daemon.graph.engine import YawGraphEngine
 from yaw.daemon.graph.inference import (
     ActiveTraceComponentSelector,
-    HippoRAGProgram,
+    YawProgram,
     extraction_fingerprint,
 )
 from yaw.daemon.indexing import bind_native_indexing
@@ -87,7 +87,7 @@ def _extract_mock_pair_ids(
 
 
 class DeterministicMockLM(dspy.LM):
-    """Deterministic offline LM for testing HippoRAGProgram and YawGraphEngine."""
+    """Deterministic offline LM for testing YawProgram and YawGraphEngine."""
 
     def __init__(self) -> None:
         super().__init__(model="mock-lm")
@@ -260,7 +260,7 @@ def test_engine(synonym_token_counter, tmp_path: Path) -> Iterator[YawGraphEngin
     mock_lm = DeterministicMockLM()
     dspy.settings.configure(lm=mock_lm)
 
-    program = HippoRAGProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
+    program = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
     engine = bind_native_indexing(
@@ -320,7 +320,7 @@ def test_engine_index_and_caching(test_engine: YawGraphEngine, tmp_path: Path) -
 def test_openie_resume_reuses_matching_prompts_and_invalidates_mutations(tmp_path: Path) -> None:
     from yaw.daemon.graph.storage import get_chunk_pointers
 
-    class CountingProgram(HippoRAGProgram):
+    class CountingProgram(YawProgram):
         def __init__(self) -> None:
             super().__init__(enable_gbnf=False)
             self.openie_calls = 0
@@ -409,7 +409,7 @@ def test_engine_end_to_end_trace_hook(test_engine: YawGraphEngine) -> None:
     ]
     test_engine.index(docs)
 
-    # Execute HippoRAGProgram.forward with only the question argument to exercise retrieval hook
+    # Execute YawProgram.forward with only the question argument to exercise retrieval hook
     pred = test_engine.program(question="Who designed the ACE?")
 
     assert hasattr(pred, "answer")
@@ -460,7 +460,7 @@ def test_engine_multi_batch_indexing_and_bounded_embedding_batches(synonym_token
 
     mock_lm = DeterministicMockLM()
     dspy.settings.configure(lm=mock_lm)
-    program = HippoRAGProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
+    program = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = TrackingEmbedder(dim=64)
 
     engine = bind_native_indexing(
@@ -541,7 +541,7 @@ def test_engine_fact_score_weighting_and_thread_safe_retrieval(synonym_token_cou
             return super().__call__(prompt=prompt, messages=messages, **kwargs)
 
     dspy.settings.configure(lm=KeepAllFactsLM())
-    program = HippoRAGProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
+    program = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = ControlledFactEmbedder()
 
     engine = bind_native_indexing(
@@ -698,7 +698,7 @@ def test_engine_hybrid_fact_candidate_retrieval(synonym_token_counter, tmp_path:
             return super().__call__(prompt=prompt, messages=messages, **kwargs)
 
     dspy.settings.configure(lm=InspectFilterLM())
-    program = HippoRAGProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
+    program = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = HybridFactEmbedder()
 
     engine = bind_native_indexing(
@@ -765,7 +765,7 @@ def test_engine_query_intent_escalation_once_without_infinite_recursion(synonym_
             return super().__call__(prompt=prompt, messages=messages, **kwargs)
 
     dspy.settings.configure(lm=IntentEscalationLM())
-    program = HippoRAGProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
+    program = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
     engine = bind_native_indexing(
@@ -902,7 +902,7 @@ def test_engine_homograph_gate_edc_and_shacl_conformance(synonym_token_counter, 
             return super().__call__(prompt=prompt, messages=messages, **kwargs)
 
     dspy.settings.configure(lm=HomographGateLM())
-    program = HippoRAGProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
+    program = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
     engine = bind_native_indexing(
@@ -1029,7 +1029,7 @@ Option A (standalone Stage 1 NER entities preserved with definitions)."""
             return super().__call__(prompt=prompt, messages=messages, **kwargs)
 
     dspy.settings.configure(lm=SynonymMergeAndStandaloneNerLM())
-    program = HippoRAGProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
+    program = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
     engine = bind_native_indexing(
@@ -1284,7 +1284,7 @@ using all 5 bound REPL tools."""
 
     orch_lm = RLMOrchestratorLM()
     worker_lm = QwenWorkerLM()
-    program = HippoRAGProgram(
+    program = YawProgram(
         synonym_token_counter=synonym_token_counter,
         enable_gbnf=True,
         orchestrator_lm=orch_lm,
@@ -1460,7 +1460,7 @@ uses heuristic fallbacks."""
             return super().__call__(prompt=prompt, messages=messages, **kwargs)
 
     dspy.settings.configure(lm=MissingEntityRepairLM())
-    program = HippoRAGProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
+    program = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
     engine = bind_native_indexing(
@@ -1597,7 +1597,7 @@ traces into dspy.settings.trace, and emits per-predictor feedback."""
 
     lm = CandidateSensitiveExtractionLM()
     dspy.settings.configure(lm=lm)
-    program = HippoRAGProgram(
+    program = YawProgram(
         synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm
     )
     embedder: Any = DeterministicMockEmbedder(dim=64)
@@ -1723,7 +1723,7 @@ compatibility."""
     from yaw.daemon.graph.inference import YawPassage, YawRetriever, YawRM
 
     dspy.settings.configure(lm=DeterministicMockLM())
-    program = HippoRAGProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
+    program = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
     engine = bind_native_indexing(
@@ -1841,7 +1841,7 @@ multi-hop fallback."""
 
     lm = ReActEngineMockLM()
     dspy.settings.configure(lm=lm)
-    program = HippoRAGProgram(
+    program = YawProgram(
         synonym_token_counter=synonym_token_counter,
         enable_gbnf=False,
         orchestrator_lm=lm,
@@ -1886,7 +1886,7 @@ def test_sprint3_engine_evaluate_and_pareto_frontier_export(
 
     lm = DeterministicMockLM()
     dspy.settings.configure(lm=lm)
-    program = HippoRAGProgram(
+    program = YawProgram(
         synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm
     )
     embedder: Any = DeterministicMockEmbedder(dim=64)
@@ -1960,7 +1960,7 @@ def test_sprint3_engine_evaluate_and_pareto_frontier_export(
         assert save_path.exists()
         assert (tmp_path / "compiled_sprint3_eval.json").exists()
 
-        reloaded = HippoRAGProgram(
+        reloaded = YawProgram(
             synonym_token_counter=synonym_token_counter,
             enable_gbnf=False,
             compiled_path=save_path,
@@ -1979,7 +1979,7 @@ def test_canonical_retrieval_hook_and_rag_qa_forward_unification(
     synonym_token_counter,
     tmp_path: Path,
 ) -> None:
-    """Verify _canonical_retrieval_hook unifies YawRM, YawRetriever, HippoRAGProgram.forward, and rag_qa with \
+    """Verify _canonical_retrieval_hook unifies YawRM, YawRetriever, YawProgram.forward, and rag_qa with \
 GEPA trace replay and Pareto support."""
 
     class UnifiedHookMockLM(DeterministicMockLM):
@@ -1998,7 +1998,7 @@ GEPA trace replay and Pareto support."""
 
     lm = UnifiedHookMockLM()
     dspy.settings.configure(lm=lm)
-    program = HippoRAGProgram(
+    program = YawProgram(
         synonym_token_counter=synonym_token_counter,
         enable_gbnf=False,
         orchestrator_lm=lm,
@@ -2110,7 +2110,7 @@ minibatch q_stats lookup."""
 
     lm = StageCountingMockLM()
     dspy.settings.configure(lm=lm)
-    program = HippoRAGProgram(
+    program = YawProgram(
         synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm
     )
     embedder: Any = DeterministicMockEmbedder(dim=64)
@@ -2305,7 +2305,7 @@ def test_evolve_prompts_real_unmocked_gepa_and_miprov2_with_context_limit_guard(
 
     lm = ContextGuardedRealOptLM()
     dspy.settings.configure(lm=lm)
-    program = HippoRAGProgram(
+    program = YawProgram(
         synonym_token_counter=synonym_token_counter,
         enable_gbnf=False,
         orchestrator_lm=lm,
@@ -2359,13 +2359,13 @@ def test_evolve_prompts_real_unmocked_gepa_and_miprov2_with_context_limit_guard(
             max_bootstrapped_demos=0,
             max_labeled_demos=0,
         )
-        assert isinstance(compiled, HippoRAGProgram)
+        assert isinstance(compiled, YawProgram)
         assert max_observed_prompt_chars < 32000
         assert save_path.exists()
         assert getattr(compiled, "detailed_results", None) is not None
         # Zero-shot optimization must remove seeded task demos, including SHACL's.
         # Verify the saved artifact preserves that contract as well.
-        restored = HippoRAGProgram(
+        restored = YawProgram(
             synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm
         )
         restored.load(str(save_path))
@@ -2562,7 +2562,7 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
             ]
 
     dspy.settings.configure(lm=HomographAndParonymLM())
-    program = HippoRAGProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
+    program = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
     engine = bind_native_indexing(
@@ -2705,7 +2705,7 @@ def test_step10_engine_pareto_ensemble_readonly_graph_and_memoization(
 
     lm = TrackingEnsembleLM()
     dspy.settings.configure(lm=lm)
-    prog = HippoRAGProgram(
+    prog = YawProgram(
         synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm
     )
     embedder: Any = DeterministicMockEmbedder(dim=64)
@@ -2943,7 +2943,7 @@ def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
 
     lm = Step11MockLM()
     dspy.settings.configure(lm=lm)
-    prog = HippoRAGProgram(
+    prog = YawProgram(
         synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm
     )
     embedder: Any = DeterministicMockEmbedder(dim=64)

@@ -228,7 +228,7 @@ Offline test suite: `uv run --locked python -m unittest discover -s tests -v` â€
    - Eliminated all `hipporag` runtime imports from `yaw/daemon/graph/inference/{models.py, embedding.py, chat.py, prompts.py}` while keeping `RetrievalEmbedding` and `LocalChat` 100% compatible with `benchmark.py`.
    - Added `create_dspy_embedder` and `DSPyEmbeddingAdapter` (`yaw/daemon/graph/inference/embedding.py`) wrapping `dspy.Embedder` for Lemonade (`openai/...`, `encoding_format="float"`) and Ollama (`ollama/...`) with `distinct-titled` formatting and L2 normalization.
    - Added `create_dspy_lm` (`yaw/daemon/graph/inference/chat.py`) wrapping `dspy.LM` for Lemonade (`openai/...`) and Ollama (`ollama_chat/...`), configured for our 3-slot stack (`Qwen3-4B-Instruct-2507-GGUF` on CUDA `llamacpp` with `8192â€“16384` context window, `temp=0.2`, `freq_penalty=0.5`, and `Mistral-7B-Instruct-v0.3-Hybrid` on Ryzen AI `ryzenai-llm` with `32786` context window).
-   - Implemented the 4 typed `dspy.Signature`s (`ExtractEntities`, `ExtractTriples`, `FilterFacts` with `FactList`, `AnswerQuestion`), seeded `dspy.Example` demos (`NER_DEMOS`, `TRIPLE_DEMOS`, `FACT_FILTER_DEMOS`, `QA_DEMOS`), and `HippoRAGProgram(dspy.Module)` (`yaw/daemon/graph/inference/prompts.py`) supporting `dspy.Predict`, `dspy.ChainOfThought`, `dspy.RLM(..., interpreter_factory=dspy.LocalInterpreter, sub_lm=...)`, and `.save()` / `.load()` for `dspy.GEPA`-compiled state.
+   - Implemented the 4 typed `dspy.Signature`s (`ExtractEntities`, `ExtractTriples`, `FilterFacts` with `FactList`, `AnswerQuestion`), seeded `dspy.Example` demos (`NER_DEMOS`, `TRIPLE_DEMOS`, `FACT_FILTER_DEMOS`, `QA_DEMOS`), and `YawProgram(dspy.Module)` (`yaw/daemon/graph/inference/prompts.py`) supporting `dspy.Predict`, `dspy.ChainOfThought`, `dspy.RLM(..., interpreter_factory=dspy.LocalInterpreter, sub_lm=...)`, and `.save()` / `.load()` for `dspy.GEPA`-compiled state.
    - Verification: `uv run --locked python -m unittest discover -s tests -v` â€” **67 tests passed** in 4.69s (including real `dspy.RLM` Python execution in `dspy.LocalInterpreter` and AST verification of `0` `hipporag` imports in `yaw/`).
 
 ## Pure-JSON GBNF (`dspy.JSONAdapter`), Sizecoding GEPA Pareto Metric, and Live Silicon Verification of Heterogeneous Mistral NPU + Qwen GPU RLM (2026-10-15)
@@ -270,7 +270,7 @@ Offline test suite: `uv run --locked python -m unittest discover -s tests -v` â€
    - Refactored `FIFOLineRotatingHandler` in `yaw/core/logger.py` to buffer writes (`flush_interval=50`, flushing immediately on `ERROR`/`CRITICAL` or `close()`) instead of rewriting and renaming the log file on every single log line.
 4. **Constricted Storage Public Facade & Simplified RLM Dispatch (`yaw/daemon/graph/storage/__init__.py`, `yaw/daemon/graph/inference/program.py`):**
    - Exposed declarative `_PUBLIC_API` with lazy `__getattr__` and `__dir__`, exporting 26 public functions (including `find_entity_synonym_candidates`) and 0 internal underscored symbols.
-   - Deduplicated `HippoRAGProgram` stage RLM wiring (`_make_stage_rlm`), stage dispatch (`_invoke_stage`), and `_PositionalSafeRLM` output normalization (`_normalize_rlm_field`).
+   - Deduplicated `YawProgram` stage RLM wiring (`_make_stage_rlm`), stage dispatch (`_invoke_stage`), and `_PositionalSafeRLM` output normalization (`_normalize_rlm_field`).
 5. **Real Unmocked Integration & High-Load Test Verification:**
    - Authored unmocked integration and high-load tests in `tests/daemon/graph/storage/{test_db.py, test_hydration.py}` and `tests/core/test_logger.py` (including 1,200-item batch lookups/deletes, in-DB synonymy mining, real BM25 proportional scoring, 200-token FTS5 query caps, staleness prefixes, and buffered FIFO log flushing).
    - Full test suite: `uv run --locked pytest -q` $\to$ **93 passed, 13 subtests passed**.
@@ -289,7 +289,7 @@ Offline test suite: `uv run --locked python -m unittest discover -s tests -v` â€
    - Converges in $<3\text{ ms}$ (verified $<1.5\text{ ms}$ on 1,000 nodes in `test_ppr.py`).
 
 3. **Native HippoRAG 2 Graph & Retrieval Engine (`yaw/daemon/graph/engine.py`, `yaw/daemon/graph/storage/db.py`):**
-   - Ported graph construction, indexing, and retrieval onto single `yaw.db` (`sqlite-vec` + FTS5) + `inference` (`HippoRAGProgram`, `DSPyEmbeddingAdapter`).
+   - Ported graph construction, indexing, and retrieval onto single `yaw.db` (`sqlite-vec` + FTS5) + `inference` (`YawProgram`, `DSPyEmbeddingAdapter`).
    - Raw passages appended to `workspace_root / corpus / passages.txt` with $O(1)$ B-tree indexed line-offset resolution (`idx_chunks_path_end`) and 1-indexed `(start_line, end_line)` spans. 1-indexed line hydration streams directly from disk with SHA-256 staleness checking and trailing newline normalization.
    - Self-healing crash-resilient checkpointing (`openie_chunks`, `chunk_vec`), bounded embedding micro-batches (`_encode_in_batches`, `embed_batch_size=64`), single-evaluation `vec_distance_cosine` synonymy mining, pre-aggregated SQL `GROUP BY src_id, dst_id` topology loading, and atomic cascading deletion (`delete_chunks`).
    - Real min-max normalized fact-score entity seeding ($w(e) = \text{mean\_fact\_score}(e) / \max(1, \text{doc\_freq}(e))$), `retrieve_with_seeds` returning `(hydrated_hits, kept_facts)`, and `retrieve_dpr` providing the Standard DPR dense KNN baseline.
@@ -515,7 +515,7 @@ Offline test suite: `uv run --locked python -m unittest discover -s tests -v` â€
     - Implemented `python -m yaw {run|start|status|sync|stop|rebuild|optimize} --config yaw.toml`.
   - **Composite Fitness Objective & Full Optimizable Surface (`yaw/daemon/graph/inference/{grammars.py,embedding.py,program.py}`, `yaw/daemon/graph/engine.py`):**
     - Upgraded `compute_task_quality_score` and `YawGraphEngine.evolve_prompts` to compute the full multiplicative quality curve $\prod_{k \in \{1,2,5,10,20\}} \text{Recall@}k \times \text{EM} \times \text{F1} / (\text{tokens} \times \text{wall\_clock\_seconds})$.
-    - Exposed and persisted all 5 optimizable surfaces (`EmbeddingGemma` prefixes, OpenIE Extraction RLM, `FilterFacts`/`ExtractQueryIntent`, Multi-Hop QA RLM, and parametric GBNF bounds) via `HippoRAGProgram.dump_state()` / `load_state()` and `DSPyEmbeddingAdapter.update_prefixes()`.
+    - Exposed and persisted all 5 optimizable surfaces (`EmbeddingGemma` prefixes, OpenIE Extraction RLM, `FilterFacts`/`ExtractQueryIntent`, Multi-Hop QA RLM, and parametric GBNF bounds) via `YawProgram.dump_state()` / `load_state()` and `DSPyEmbeddingAdapter.update_prefixes()`.
 
 - **Verification Status:**
   - `uv run --locked pytest -v` $\to$ **127 passed, 1 warning, 13 subtests passed in 32.13s** (including unmocked `tests/daemon/test_runtime.py` and live-silicon Lemonade Server tests).
@@ -564,7 +564,7 @@ Offline test suite: `uv run --locked python -m unittest discover -s tests -v` â€
      - Candidate accepted into Pareto frontier and saved to `.yaw/compiled_program_optimize_20261018_082953.json` with proposer telemetry and graph RLM audit trail.
   3. **Daemon Production Promotion:**
      - Promoted via `uv run yaw load-program .yaw/compiled_program_optimize_20261018_082953.json` to `.yaw/compiled_program.json`.
-     - Confirmed `HippoRAGProgram.from_config(config)` loads the optimized program and evolved instructions on initialization.
+     - Confirmed `YawProgram.from_config(config)` loads the optimized program and evolved instructions on initialization.
 
 - **Verification Status:**
   - `uv run --locked pytest -v` $\to$ **155 passed, 2 warnings in 50.74s**.
@@ -580,7 +580,7 @@ Offline test suite: `uv run --locked python -m unittest discover -s tests -v` â€
     - Sampled `2.0x` same-tool (`source_type`) hard distractors (`is_supporting: False`) per query with zero overlap (`0` gold-as-distractor leakage across `418` unique gold passages and `890` unique distractor passages = `1,308` corpus passages in `outputs/datasets/enterprise_rag_bench_corpus.json`).
     - Updated `yaw.toml` `[optimization]` defaults to `max_queries = 250` and `train_queries = 150`.
   - **Causal End-to-End Extraction & Graph Re-Indexing + Trace Injection (`yaw/daemon/cli.py`, `yaw/daemon/graph/inference/program.py`, `yaw/daemon/graph/engine.py`, `yaw/daemon/runtime.py`):**
-    - Attached `item_docs` (`gold` + `2.0x` distractors) to each `dspy.Example` with `.with_inputs("question", "item_docs")` and threaded `item_docs` through `HippoRAGProgram.forward` $\to$ `YawGraphEngine._program_retrieval_hook`.
+    - Attached `item_docs` (`gold` + `2.0x` distractors) to each `dspy.Example` with `.with_inputs("question", "item_docs")` and threaded `item_docs` through `YawProgram.forward` $\to$ `YawGraphEngine._program_retrieval_hook`.
     - Implemented two-level extraction/graph fingerprinting (`_openie_fingerprint` for `ner`, `triples`, `entity_definer` + `_extraction_fingerprint` adding `synonym_judge`, `shacl_repair`, `shacl_healer_rlm.*`, and `embedding_*_prefix`).
     - When a candidate mutates any extraction/graph predictor or embedding prefix, `_ensure_candidate_chunks_indexed` invalidates stale SQLite graph tables (and `openie_chunks` when `_openie_fingerprint` changes) via `_reset_sandbox_graph` and re-indexes the active candidate chunks under the candidate `program`.
     - Captured per-chunk OpenIE & `define_missing_entities` traces (`_captured_chunk_traces`) and graph-level `synonym_judge` & `shacl_healer_rlm` traces (`_captured_graph_traces`), injecting them bound to the candidate `program`'s predictor instances into `dspy.settings.trace` during `forward()` so `DspyAdapter.make_reflective_dataset` receives real execution traces for all 9 predictors.
@@ -608,7 +608,7 @@ Offline test suite: `uv run --locked python -m unittest discover -s tests -v` â€
     - Implemented `configure_yaw_dspy_cache(cache_dir, *, enable_disk_cache=True, enable_memory_cache=True, disk_size_limit_bytes=1_073_741_824, memory_max_entries=100_000, restrict_pickle=True, safe_types=None)` wrapping `dspy.configure_cache` and safely closing any prior `disk_cache` SQLite handle on Windows before reconfiguring.
   - **`YawGBNFAdapter` (`yaw/daemon/graph/inference/program.py`, `yaw/daemon/graph/inference/__init__.py`):**
     - Implemented `YawGBNFAdapter(YawJSONAdapter)` (`issubclass(YawGBNFAdapter, dspy.JSONAdapter)`) with `resolve_grammar(signature)` and `_prepare_gbnf_kwargs(lm, lm_kwargs, signature)` for automatic per-signature GBNF grammar injection in `__call__` and `acall` across all 10 direct Qwen signatures (`ExtractEntities`, `ExtractTriples`, `DefineMissingEntities`, `JudgeSynonyms`, `ProposeSHACLRepairs`, `ExtractQueryIntent`, `FilterTriples`, `AnswerQuestion`, `ProposeInstructionSignature`, `CompressInstructionSignature`) while returning `None` for the 2 RLM signatures (`HealSHACLViolations`, `ReflectiveInnerDistillerSignature`).
-    - Wired `YawGBNFAdapter` as the default `self.json_adapter` on both `HippoRAGProgram` and `RLMInstructionProposer`, synchronizing structural bounds on `load_state()`.
+    - Wired `YawGBNFAdapter` as the default `self.json_adapter` on both `YawProgram` and `RLMInstructionProposer`, synchronizing structural bounds on `load_state()`.
   - **Async `DSPyEmbeddingAdapter(dspy.Embedder)` (`yaw/daemon/graph/inference/embedding.py`):**
     - Subclassed `dspy.Embedder` directly on `DSPyEmbeddingAdapter` (`super().__init__(model=..., batch_size=..., caching=True, **kwargs)`) while preserving `super().__call__(...)` and `await super().acall(...)` delegation.
     - Implemented `_aencode_prepared` (using `await super().acall` for hosted models and `dspy.asyncify(self.model)` for custom callables, with recursive binary-split overflow recovery), `abatch_encode` (concurrent micro-batch dispatch via `anyio.create_task_group()`), `acall`, and `as_async()` (`dspy.asyncify(self)`).
@@ -627,16 +627,16 @@ Offline test suite: `uv run --locked python -m unittest discover -s tests -v` â€
   - **First-Class `dspy.Retrieve` / `dspy.RM` Adapter (`yaw/daemon/graph/inference/program.py`, `yaw/daemon/graph/inference/__init__.py`):**
     - Implemented `YawPassage(dspy.Prediction)` exposing `.long_text` (required by `dspy.Retrieve.forward`), `.pid`, `.score`, and `.rank`.
     - Implemented `YawRM` (`__call__(query_or_queries, k=None, **kwargs) -> list[YawPassage]`) compatible with `dspy.configure(rm=...)` / `dspy.context(rm=...)` so stock `dspy.Retrieve(k=...)` modules query YAW's hybrid PPR graph engine natively.
-    - Implemented `YawRetriever(dspy.Retrieve)` with backward-compatible `dump_state` / `load_state` (`state_copy.setdefault("retriever", {"k": ...})`) and wired `self.rm` and `self.retriever` onto `HippoRAGProgram` while preserving the 9-predictor `named_predictors()` invariant.
+    - Implemented `YawRetriever(dspy.Retrieve)` with backward-compatible `dump_state` / `load_state` (`state_copy.setdefault("retriever", {"k": ...})`) and wired `self.rm` and `self.retriever` onto `YawProgram` while preserving the 9-predictor `named_predictors()` invariant.
   - **Exhaustive Stage & Closed-World SHACL/SKOS/Connected-Node Invariants (`yaw/daemon/graph/inference/invariants.py`):**
     - Implemented `validate_stage_invariants(...)` and `is_abstaining_answer(...)`.
     - Enforces all 9 stage contracts (`ner`, `triples`, `entity_definer`, `synonym_judge`, `shacl_repair` / `shacl_healer_rlm`, `query_intent`, `triple_filter`, `qa`, `llm_proposer` / `llm_compressor`) and all 6 closed-world SHACL shapes (`ConceptShape/prefLabel`, `ConceptShape/definition`, `ConceptShape/S13-disjointLabels`, `ConceptShape/homographDifferentFrom`, `StatementShape/closedWorld`, `EdgeShape/closedWorld`), plus connected-node subgraph topology (`_count_connected_components`), closed-world candidate fact subset closure, and anti-leakage instruction validation.
-    - Wired feedback-guided self-correction retry (`max_invariant_retries = 1`) into `HippoRAGProgram._invoke_stage`, recording `invariant_score`, `invariant_feedback`, and `invariant_retries` in `self.telemetry`.
+    - Wired feedback-guided self-correction retry (`max_invariant_retries = 1`) into `YawProgram._invoke_stage`, recording `invariant_score`, `invariant_feedback`, and `invariant_retries` in `self.telemetry`.
   - **GEPA Pareto Frontier Ensembling (`yaw/daemon/graph/inference/program.py`):**
     - Implemented `ParetoProgramEnsemble(dspy.Module)` wrapping `dspy.Ensemble(reduce_fn=...)` with `self._compiled = True`, `from_frontier_states`, `reduce_ner_predictions`, `reduce_triple_predictions`, `reduce_qa_predictions`, `extract_openie`, `answer_question`, and `aanswer_question` (concurrent async dispatch via `prog.as_async()` + `anyio.create_task_group()`).
-    - Persisted and restored `pareto_frontier_states` in `HippoRAGProgram.dump_state()` / `load_state()`.
+    - Persisted and restored `pareto_frontier_states` in `YawProgram.dump_state()` / `load_state()`.
   - **Adaptive Multi-Hop Graph Exploration (`dspy.ReActV2`) & `as_async()` (`yaw/daemon/graph/inference/program.py`):**
-    - Added `set_graph_search_tool`, `_run_react_qa_fallback` using `dspy.ReActV2(AnswerQuestion, tools=[...], max_iters=3)` when initial QA returns `"Insufficient context"`, `_parse_react_v2_payload` in `YawJSONAdapter.parse`, and `HippoRAGProgram.as_async()`.
+    - Added `set_graph_search_tool`, `_run_react_qa_fallback` using `dspy.ReActV2(AnswerQuestion, tools=[...], max_iters=3)` when initial QA returns `"Insufficient context"`, `_parse_react_v2_payload` in `YawJSONAdapter.parse`, and `YawProgram.as_async()`.
 
 - **Verification Status:**
   - `uv run --locked pytest tests/core/test_architecture.py tests/daemon/graph/inference/test_prompts.py -k "not live_silicon" -q` $\to$ **40 passed, 2 deselected in 6.53s**.
@@ -674,10 +674,10 @@ Offline test suite: `uv run --locked python -m unittest discover -s tests -v` â€
   - **Canonical Retrieval Hook (`yaw/daemon/graph/engine.py`):**
     - Replaced `_rm_retrieval_hook` and `_program_retrieval_hook` with `YawGraphEngine._canonical_retrieval_hook(question, program=None, *, item_docs=None, k=None) -> tuple[str, tuple[str, ...], tuple[float, ...], tuple[str, ...]]`.
     - Ensures candidate chunks are indexed in the optimization sandbox, replays captured GEPA chunk/graph extraction traces (`_captured_chunk_traces`, `_captured_graph_traces`) into `dspy.settings.trace`, executes hybrid PPR retrieval, formats AST-budgeted QA context (`self.format_qa_context(hits[:qa_top_k])`), and returns the canonical 4-tuple `(formatted_context, texts, scores, pids)`.
-  - **`HippoRAGProgram.forward` & `YawRetriever.forward` Chunk ID Propagation (`yaw/daemon/graph/inference/program.py`):**
-    - Enriched `YawRetriever.forward` with `all_pids` and `HippoRAGProgram.forward` with `retrieved_chunk_ids=pids` alongside `retrieved_passages` (hydrated texts) and `retrieved_scores`.
+  - **`YawProgram.forward` & `YawRetriever.forward` Chunk ID Propagation (`yaw/daemon/graph/inference/program.py`):**
+    - Enriched `YawRetriever.forward` with `all_pids` and `YawProgram.forward` with `retrieved_chunk_ids=pids` alongside `retrieved_passages` (hydrated texts) and `retrieved_scores`.
   - **`rag_qa()` & `YawRuntime.rag_qa_async` Forward Routing (`yaw/daemon/graph/engine.py`, `yaw/daemon/runtime.py`):**
-    - Simplified `YawGraphEngine.rag_qa` and `YawRuntime.rag_qa_async` to invoke `self.program(question=...)` (`HippoRAGProgram.forward`), automatically inheriting AST-coalesced context formatting, `ParetoProgramEnsemble` consensus, `dspy.ReActV2` multi-hop fallback, and `track_usage()` telemetry.
+    - Simplified `YawGraphEngine.rag_qa` and `YawRuntime.rag_qa_async` to invoke `self.program(question=...)` (`YawProgram.forward`), automatically inheriting AST-coalesced context formatting, `ParetoProgramEnsemble` consensus, `dspy.ReActV2` multi-hop fallback, and `track_usage()` telemetry.
     - Added `YawGraphEngine.resolve_chunk_pointers(chunk_ids)` so `YawRuntime.rag_qa_async` resolves structured `ChunkPointer` evidence without protected attribute access (`_lock`) or cross-domain storage imports.
 
 - **Verification & Oblivion Gate Status:**

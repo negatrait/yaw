@@ -192,20 +192,20 @@ class FactList(BaseModel):
 
 class ExtractEntities(dspy.Signature):
     """Extract all named entities (people, organizations, locations, systems, products, artifacts) and domain \
-concepts grounded in the body prose of `passage` into `named_entities` as concise `[skos:prefLabel, \
-skos:definition]` pairs.
+concepts grounded in the body prose of `passage` into `named_entities`, as concise `skos:Concept` / `owl:NamedIndividual`. \
+Output only `[skos:prefLabel, skos:definition]` pairs. \
     - `skos:Concept` & `owl:NamedIndividual` Scope (SKOS S14): Represent every prose-grounded named entity and \
-domain concept as a concise canonical noun phrase (`skos:prefLabel`, never a full sentence, imperative \
+domain concept as a concise, canonical single word noun phrase (`skos:prefLabel`, never a full sentence, imperative \
 instruction, checklist clause, or document container/header metadata tag). Exclude bare scalar `rdfs:Literal` \
 values (numbers, percentages, dates, timestamps, durations, booleans, or version strings, which belong in \
 `owl:DatatypeProperty` object slots).
     - Contextual `skos:definition` (`ConceptShape/definition`, `sh:minCount 1`): Pair each extracted entity with a \
-concise, non-tautological `skos:definition` stating its ontological class (`rdf:type` / genus) and distinguishing \
-role in `passage` (never repeat `skos:prefLabel` verbatim as its own definition)."""
+concise, one sentence, non-tautological `skos:definition` stating its ontological class (`rdf:type` / genus) \
+and distinguishing role in `passage` (never repeat `skos:prefLabel` verbatim as its own definition)."""
 
-    passage: str = dspy.InputField(desc="Source passage text")
+    passage: str = dspy.InputField(desc="Source `passage` text")
     named_entities: list[Any] = dspy.OutputField(
-        desc="Deduplicated list of extracted [entity_name, contextual_definition] pairs"
+        desc="Deduplicated list of extracted `[skos:prefLabel, skos:definition]` pairs"
     )
 
 
@@ -215,9 +215,9 @@ class ExtractTriples(dspy.Signature):
 (`rdf:subject`), `"pred"` (`rdf:predicate` pair), `"obj"` (`rdf:object`), and `"def"` (statement-level \
 `skos:definition`):
     - Closed-World Anchoring & Connectedness (`StatementShape/closedWorld`): Extract only factual assertions \
-grounded in `passage` prose (never fabricate triples from document container/header metadata tags). Resolve \
-pronouns to canonical `skos:prefLabel` strings from `named_entities`, emit `"sub"` or `"obj"` as an exact string \
-when already defined in `named_entities` or as `[name, contextual_definition]` when introducing a \
+grounded in `passage` prose (never fabricate triples from document container/header metadata tags or similar). \
+Resolve pronouns to canonical `skos:prefLabel` strings from `named_entities`, emit `"sub"` or `"obj"` as an exact \
+string when already defined in `named_entities` or as `[name, contextual_definition]` when introducing a \
 passage-grounded resource, and bridge extracted `skos:Concept` nodes into a connected subgraph.
     - Statement Definition Integrity (`"def"`, `StatementShape/closedWorld`): `"def"` must concisely define the \
 relational assertion linking `"sub"`, `"pred"`, and `"obj"` in `passage`, and MUST NEVER copy `"sub"`'s or \
@@ -233,7 +233,7 @@ and use `"owl:DatatypeProperty"` (`rdfs:range rdfs:Literal`) when `"obj"` is a d
 
     passage: str = dspy.InputField(desc="Source passage text")
     named_entities: list[Any] = dspy.InputField(
-        desc="Extracted [entity_name, contextual_definition] pairs (or entity names) from Stage 1"
+        desc="Extracted `[skos:prefLabel, skos:definition]` pairs (or entity names) from Stage 1"
     )
     triples: list[Any] = dspy.OutputField(
         desc='List of reified rdf:Statement objects {"sub", "pred", "obj", "def"} where "pred" is '

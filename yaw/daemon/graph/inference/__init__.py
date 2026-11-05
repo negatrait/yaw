@@ -77,7 +77,7 @@ _PUBLIC_API: dict[str, str] = {
     "parse_related_decisions": ".parsers",
     "parse_shacl_repairs": ".parsers",
     # Native DSPy Program & 12 Canonical Signatures
-    "HippoRAGProgram": ".program",
+    "YawProgram": ".program",
     "RLMInstructionProposer": ".proposer",
     "ServingTokenCounter": ".reflection",
     "YawGBNFAdapter": ".adapter",

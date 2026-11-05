@@ -318,7 +318,7 @@ Remaining gaps and the final fresh complete-suite acceptance remain open.
 
 ## 42. Native engine recovery and reflection boundaries (2026-10-23)
 
-The new engine cases use native dspy.LM, HippoRAGProgram and dspy.Embedder,
+The new engine cases use native dspy.LM, YawProgram and dspy.Embedder,
 actual loopback HTTP chat responses, real source files and yaw.db. They first
 index a source, delete the bounded candidate-stage cache in a transaction,
 close the engine and recreate its objects. Structured, legacy triples-only,

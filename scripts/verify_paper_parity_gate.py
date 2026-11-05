@@ -1259,7 +1259,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--compiled-program",
         type=str,
         default=".yaw/compiled_program.json",
-        help="Path to compiled DSPy HippoRAGProgram JSON artifact (default: .yaw/compiled_program.json).",
+        help="Path to compiled DSPy YawProgram JSON artifact (default: .yaw/compiled_program.json).",
     )
     parser.add_argument(
         "--mode",

@@ -11,7 +11,7 @@ import pytest
 from daemon.graph.synonym_protocol import candidate_rows, complete_decisions
 from yaw.core import ChunkPointer, OpenIERecord, RelationTraversalPolicy, StructuredTriple
 from yaw.daemon.graph.engine import YawGraphEngine
-from yaw.daemon.graph.inference import HippoRAGProgram, parse_hierarchy_decisions
+from yaw.daemon.graph.inference import YawProgram, parse_hierarchy_decisions
 from yaw.daemon.graph.planner import apply_synonym_adjudication
 from yaw.daemon.graph.ppr import build_transition_matrix
 from yaw.daemon.graph.storage import (
@@ -111,7 +111,7 @@ def _make_engine(
     db_path = tmp_path / db_name
     mock_lm = DeterministicMockLM(synonym_fn=synonym_callback)
     dspy.settings.configure(lm=mock_lm)
-    program = HippoRAGProgram(
+    program = YawProgram(
         synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=mock_lm, rlm_sub_lm=mock_lm
     )
     embedder: Any = DeterministicMockEmbedder(dim=64)
@@ -168,7 +168,7 @@ def test_datatype_property_literal_objects_stored_with_weighted_edges_and_exclud
 ) -> None:
     """Verify owl:DatatypeProperty literal objects are materialized in entities with contextual definitions,
     connected via 0.5-weighted forward fact edges and passage edges, and excluded from SKOS disambiguation."""
-    # First verify HippoRAGProgram.extract_structured_triples preserves obj_def on obj_kind == 'literal'
+    # First verify YawProgram.extract_structured_triples preserves obj_def on obj_kind == 'literal'
     lm_triple_json = json.dumps(
         {
             "triples": [
@@ -182,7 +182,7 @@ def test_datatype_property_literal_objects_stored_with_weighted_edges_and_exclud
         }
     )
     dspy.settings.configure(lm=DeterministicMockLM([lm_triple_json]))
-    prog = HippoRAGProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
+    prog = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     extracted_sts = prog.extract_structured_triples(
         "YAW Service listens on port 8080.",
         [

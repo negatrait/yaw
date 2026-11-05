@@ -1,4 +1,4 @@
-"""Native DSPy HippoRAGProgram orchestrator."""
+"""Native DSPy YawProgram orchestrator."""
 
 import json
 import time
@@ -103,7 +103,7 @@ def _merge_openie_definitions(
     return tuple(merged_entities), extract_entity_definitions(raw_pairs)
 
 
-class HippoRAGProgram(dspy.Module):
+class YawProgram(dspy.Module):
     """Unified DSPy Module for HippoRAG 2 OpenIE, EDC/SKOS Schema Canon, SHACL Repair, Recognition Memory, and \
 Multi-Hop QA.
 
@@ -144,9 +144,9 @@ Deno/Pyodide WASM) with
         embedding_document_prefix: str | None = None,
         adapter: dspy.Adapter | None = None,
         orchestrator_lm: Any = None,
-        rlm_max_iters: int = 10,
-        rlm_max_llm_calls: int = 20,
-        rlm_max_output_chars: int | None = None,
+        rlm_max_iters: int = 20,
+        rlm_max_llm_calls: int = 50,
+        rlm_max_output_chars: int = 10000,
         rlm_sub_lm: Any = None,
         rlm_tools: list[Callable[..., Any]] | None = None,
         rlm_interpreter_factory: Callable[[], Any] = dspy.PythonInterpreter,
@@ -356,8 +356,8 @@ Deno/Pyodide WASM) with
         """Bind a graph fact search callback for multi-hop `dspy.ReActV2` fallback exploration."""
         self._graph_search_tool = search_fn
 
-    def copy_runtime_hooks_to(self, target: HippoRAGProgram) -> None:
-        """Copy runtime retrieval and graph tool hooks onto a sibling `HippoRAGProgram`."""
+    def copy_runtime_hooks_to(self, target: YawProgram) -> None:
+        """Copy runtime retrieval and graph tool hooks onto a sibling `YawProgram`."""
         target.set_retrieval_hook(self._retrieval_hook)
         target.set_graph_tools(
             node_inspector=self._node_inspector,
@@ -373,8 +373,8 @@ Deno/Pyodide WASM) with
             target.rm.default_k = self.rm.default_k
 
     @classmethod
-    def from_config(cls, config: YawConfig) -> HippoRAGProgram:
-        """Construct a HippoRAGProgram from a YawConfig."""
+    def from_config(cls, config: YawConfig) -> YawProgram:
+        """Construct a YawProgram from a YawConfig."""
         assert config.max_output_tokens is not None and config.rlm_max_output_chars is not None
         orch_lm = create_dspy_lm(
             config.qa_model,
@@ -487,7 +487,7 @@ Deno/Pyodide WASM) with
         self.loaded_from_path = Path(path).resolve()
         return super().load(str(path), *args, **kwargs)
 
-    def __deepcopy__(self, memo: dict[int, Any]) -> HippoRAGProgram:
+    def __deepcopy__(self, memo: dict[int, Any]) -> YawProgram:
         """Clone all DSPy predictors while preserving live LM clients and the engine retrieval hook."""
         import copy
 
@@ -1781,14 +1781,14 @@ chunk."""
                 if tokens and hasattr(res, "set_lm_usage"):
                     res.set_lm_usage(tokens)
                 return res
-            raise ValueError("context must be provided when no retrieval_hook is registered on HippoRAGProgram.")
-        raise ValueError("Either (context, question) or question must be provided to HippoRAGProgram.")
+            raise ValueError("context must be provided when no retrieval_hook is registered on YawProgram.")
+        raise ValueError("Either (context, question) or question must be provided to YawProgram.")
 
     def as_async(self) -> Any:
-        """Return a `dspy.asyncify`-wrapped async callable for this `HippoRAGProgram`."""
+        """Return a `dspy.asyncify`-wrapped async callable for this `YawProgram`."""
         return dspy.asyncify(self)
 
 
 __all__ = [
-    "HippoRAGProgram",
+    "YawProgram",
 ]

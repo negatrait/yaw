@@ -210,12 +210,12 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         self.assertEqual(len(QA_DEMOS), 2)
 
     def test_hipporag_program_openie_triple_filter_and_qa(self):
-        """Verify HippoRAGProgram executes OpenIE, triple filtering, and QA via dspy.JSONAdapter (pure JSON output)."""
+        """Verify YawProgram executes OpenIE, triple filtering, and QA via dspy.JSONAdapter (pure JSON output)."""
         import dspy
 
-        from yaw.daemon.graph.inference.program import HippoRAGProgram
+        from yaw.daemon.graph.inference.program import YawProgram
 
-        program = HippoRAGProgram()
+        program = YawProgram()
         lm = CapabilityDummyLM(
             [
                 {
@@ -324,7 +324,7 @@ tools."""
         import dspy
 
         from yaw.daemon.graph.inference.grammars import DSPY_SHACL_REPAIR_GBNF_GRAMMAR
-        from yaw.daemon.graph.inference.program import HippoRAGProgram
+        from yaw.daemon.graph.inference.program import YawProgram
 
         orch_lm = CapabilityDummyLM(
             [
@@ -355,7 +355,7 @@ tools."""
         sub_lm._yaw_recipe = "llamacpp"
         sub_lm._yaw_supports_gbnf = True
 
-        program = HippoRAGProgram(
+        program = YawProgram(
             enable_gbnf=True,
             orchestrator_lm=orch_lm,
             rlm_sub_lm=sub_lm,
@@ -387,17 +387,17 @@ tools."""
         )
 
     def test_hipporag_program_save_and_load_gepa_state(self):
-        """Verify HippoRAGProgram saves and reloads mutated GEPA instructions and demos cleanly."""
+        """Verify YawProgram saves and reloads mutated GEPA instructions and demos cleanly."""
         from pathlib import Path
         from tempfile import TemporaryDirectory
 
         import dspy
 
-        from yaw.daemon.graph.inference.program import HippoRAGProgram
+        from yaw.daemon.graph.inference.program import YawProgram
 
         with TemporaryDirectory() as tmp_dir:
             state_path = Path(tmp_dir) / "gepa_compiled.json"
-            prog1 = HippoRAGProgram()
+            prog1 = YawProgram()
             sig1: Any = prog1.ner.signature
             prog1.ner.signature = sig1.with_instructions("GEPA optimized NER instruction.")
             prog1.ner.demos = [
@@ -409,7 +409,7 @@ tools."""
             prog1.save(str(state_path))
             self.assertTrue(state_path.exists())
 
-            prog2 = HippoRAGProgram(compiled_path=state_path)
+            prog2 = YawProgram(compiled_path=state_path)
             sig2: Any = prog2.ner.signature
             self.assertEqual(
                 sig2.instructions,
@@ -419,7 +419,7 @@ tools."""
             self.assertEqual(prog2.ner.demos[0]["named_entities"], ["GEPA"])
 
     def test_hipporag_program_gbnf_grammar_forwarding(self):
-        """Verify HippoRAGProgram forwards pure-JSON static and dynamic GBNF grammars via extra_body."""
+        """Verify YawProgram forwards pure-JSON static and dynamic GBNF grammars via extra_body."""
         import dspy
 
         from yaw.daemon.graph.inference.grammars import (
@@ -429,9 +429,9 @@ tools."""
             build_dspy_rerank_grammar,
             build_dspy_triples_grammar,
         )
-        from yaw.daemon.graph.inference.program import HippoRAGProgram
+        from yaw.daemon.graph.inference.program import YawProgram
 
-        program = HippoRAGProgram(enable_gbnf=True)
+        program = YawProgram(enable_gbnf=True)
         stage1_pairs = [
             ["Alan Turing", "English mathematician"],
             ["London", "Capital of the United Kingdom"],
@@ -499,9 +499,9 @@ tools."""
             build_dspy_triples_grammar,
         )
         from yaw.daemon.graph.inference.parsers import compute_task_quality_score
-        from yaw.daemon.graph.inference.program import HippoRAGProgram
+        from yaw.daemon.graph.inference.program import YawProgram
 
-        program = HippoRAGProgram(
+        program = YawProgram(
             enable_gbnf=True,
             gbnf_max_entities=3,
             gbnf_max_triples=2,
@@ -633,7 +633,7 @@ tools."""
 
         # Full canonical 9-predictor surface visibility for GEPA (never hides OpenIE/EDC/SHACL predictors behind
         # _retrieval_hook)
-        direct_prog = HippoRAGProgram()
+        direct_prog = YawProgram()
         direct_names = [name for name, _ in direct_prog.named_predictors()]
         expected_canonical_predictors = [
             "ner",
@@ -668,7 +668,7 @@ tools."""
         import dspy
 
         from yaw.daemon.graph.inference.chat import create_dspy_lm
-        from yaw.daemon.graph.inference.program import HippoRAGProgram
+        from yaw.daemon.graph.inference.program import YawProgram
 
         config = load_config(Path(__file__).resolve().parents[4] / "yaw.toml")
         loaded = self._probe_live_lemonade_models(config.base_url)
@@ -688,7 +688,7 @@ tools."""
             context_window_tokens=config.context_window_tokens,
             cache=False,
         )
-        program = HippoRAGProgram(enable_gbnf=True, orchestrator_lm=direct_lm, rlm_sub_lm=direct_lm)
+        program = YawProgram(enable_gbnf=True, orchestrator_lm=direct_lm, rlm_sub_lm=direct_lm)
         audit = LMRequestAudit()
         with dspy.context(callbacks=[audit], disable_history=True):
             record = program.extract_openie("c-live-direct", passage, lm=direct_lm)
@@ -712,7 +712,7 @@ tools."""
         """Verify program, grammars, parsers, and prompts are cleanly modularized and accessible via facade."""
         import yaw.daemon.graph.inference.prompts as prompts_module
         from yaw.daemon.graph.inference import (
-            HippoRAGProgram as FacadeHippoRAGProgram,
+            YawProgram as FacadeYawProgram,
         )
         from yaw.daemon.graph.inference import (
             build_dspy_ner_grammar as FacadeBuildNer,
@@ -726,14 +726,14 @@ tools."""
         from yaw.daemon.graph.inference.parsers import (
             compute_task_quality_score as ParserTaskQuality,
         )
-        from yaw.daemon.graph.inference.program import HippoRAGProgram as ProgramHippoRAGProgram
+        from yaw.daemon.graph.inference.program import YawProgram as ProgramYawProgram
 
-        self.assertIs(ProgramHippoRAGProgram, FacadeHippoRAGProgram)
+        self.assertIs(ProgramYawProgram, FacadeYawProgram)
         self.assertIs(GrammarBuildNer, FacadeBuildNer)
         self.assertIs(ParserTaskQuality, FacadeTaskQuality)
 
         # Comfort cushions off: prompts.py does NOT re-export program, grammars, or parsers
-        self.assertFalse(hasattr(prompts_module, "HippoRAGProgram"))
+        self.assertFalse(hasattr(prompts_module, "YawProgram"))
         self.assertFalse(hasattr(prompts_module, "build_dspy_ner_grammar"))
         self.assertFalse(hasattr(prompts_module, "compute_task_quality_score"))
 
@@ -885,7 +885,7 @@ no frequency penalty."""
 
         from yaw.daemon.graph.inference import (
             DSPY_QUERY_INTENT_GBNF_GRAMMAR,
-            HippoRAGProgram,
+            YawProgram,
             build_dspy_query_intent_grammar,
         )
 
@@ -896,7 +896,7 @@ no frequency penalty."""
         llm_lm._yaw_recipe = "llamacpp"
         llm_lm._yaw_supports_gbnf = True
 
-        prog = HippoRAGProgram(
+        prog = YawProgram(
             enable_gbnf=True,
             rlm_sub_lm=llm_lm,
         )
@@ -926,7 +926,7 @@ no frequency penalty."""
         from yaw.daemon.graph.inference import (
             DSPY_MISSING_ENTITY_DEFS_GBNF_GRAMMAR,
             DSPY_SHACL_REPAIR_GBNF_GRAMMAR,
-            HippoRAGProgram,
+            YawProgram,
             RLMInstructionProposer,
             build_dspy_label_judge_grammar,
             parse_label_decisions,
@@ -972,7 +972,7 @@ no frequency penalty."""
         sub_lm._yaw_supports_gbnf = True
 
         dspy.settings.configure(lm=primary_lm)
-        prog = HippoRAGProgram(
+        prog = YawProgram(
             enable_gbnf=True,
             orchestrator_lm=primary_lm,
             rlm_sub_lm=sub_lm,
@@ -1024,7 +1024,7 @@ no frequency penalty."""
         self.assertIsNone(proposer.llm_proposer.lm)
         self.assertIsNone(proposer.llm_compressor.lm)
 
-        # Test first-class embedding telemetry trail on HippoRAGProgram
+        # Test first-class embedding telemetry trail on YawProgram
         prog.record_embedding_telemetry(
             {
                 "stage": "fact_embed",
@@ -1100,7 +1100,7 @@ repair, and Pareto penalty."""
 
         from yaw.daemon.graph.inference import (
             DefineMissingEntities,
-            HippoRAGProgram,
+            YawProgram,
             build_dspy_missing_entity_defs_grammar,
             build_dspy_triples_grammar,
             compute_task_quality_score,
@@ -1174,7 +1174,7 @@ repair, and Pareto penalty."""
         direct_lm._yaw_recipe = "llamacpp"
         direct_lm._yaw_supports_gbnf = True
 
-        prog_direct = HippoRAGProgram(
+        prog_direct = YawProgram(
             enable_gbnf=True,
             rlm_sub_lm=direct_lm,
         )
@@ -1296,7 +1296,7 @@ repair, and Pareto penalty."""
         )
         cinderella_lm._yaw_recipe = "llamacpp"
         cinderella_lm._yaw_supports_gbnf = True
-        prog_cinderella = HippoRAGProgram(
+        prog_cinderella = YawProgram(
             enable_gbnf=True,
             rlm_sub_lm=cinderella_lm,
         )
@@ -1443,7 +1443,7 @@ repair, and Pareto penalty."""
             ExtractTriples,
             FilterTriples,
             HealSHACLViolations,
-            HippoRAGProgram,
+            YawProgram,
             JudgeHierarchy,
             JudgeLabels,
             JudgeRelated,
@@ -1458,7 +1458,7 @@ repair, and Pareto penalty."""
         self.assertIn("YawGBNFAdapter", inf_pkg.__all__)
         self.assertTrue(issubclass(YawGBNFAdapter, dspy.JSONAdapter))
 
-        prog = HippoRAGProgram()
+        prog = YawProgram()
         proposer = RLMInstructionProposer()
         self.assertIsInstance(prog.json_adapter, YawGBNFAdapter)
         self.assertIsInstance(proposer.json_adapter, YawGBNFAdapter)
@@ -1566,7 +1566,7 @@ repair, and Pareto penalty."""
 
         import yaw.daemon.graph.inference as inf_pkg
         from yaw.daemon.graph.inference import (
-            HippoRAGProgram,
+            YawProgram,
             YawPassage,
             YawRetriever,
             YawRM,
@@ -1621,7 +1621,7 @@ repair, and Pareto penalty."""
 
         self.assertTrue(issubclass(YawRetriever, dspy.Retrieve))
         qa_lm = CapabilityDummyLM([{"reasoning": "Montebello is in Rockland County.", "answer": "Rockland County"}])
-        prog = HippoRAGProgram(orchestrator_lm=qa_lm, rlm_sub_lm=qa_lm)
+        prog = YawProgram(orchestrator_lm=qa_lm, rlm_sub_lm=qa_lm)
         self.assertIsInstance(prog.rm, YawRM)
         self.assertIsInstance(prog.retriever, YawRetriever)
         self.assertEqual(len(prog.named_predictors()), 12)
@@ -1640,7 +1640,7 @@ repair, and Pareto penalty."""
         dumped = prog.dump_state()
         self.assertIn("retriever", dumped)
         legacy_state = {k: v for k, v in dumped.items() if k != "retriever"}
-        prog2 = HippoRAGProgram(orchestrator_lm=qa_lm, rlm_sub_lm=qa_lm)
+        prog2 = YawProgram(orchestrator_lm=qa_lm, rlm_sub_lm=qa_lm)
         prog2.load_state(legacy_state)
         self.assertEqual(prog2.retriever.k, 10)
 
@@ -1649,7 +1649,7 @@ repair, and Pareto penalty."""
 
         import yaw.daemon.graph.inference as inf_pkg
         from yaw.daemon.graph.inference import (
-            HippoRAGProgram,
+            YawProgram,
             is_abstaining_answer,
             validate_stage_invariants,
         )
@@ -2026,7 +2026,7 @@ repair, and Pareto penalty."""
                 {"named_entities": [["Ada Lovelace", "English mathematician and writer"]]},
             ]
         )
-        prog = HippoRAGProgram(orchestrator_lm=single_lm, rlm_sub_lm=single_lm)
+        prog = YawProgram(orchestrator_lm=single_lm, rlm_sub_lm=single_lm)
         defs = prog.extract_entity_definitions("Ada Lovelace was an English mathematician and writer.")
         self.assertEqual(defs, (("Ada Lovelace", "English mathematician and writer"),))
         self.assertEqual(prog.telemetry[-1].get("invariant_score"), 1.0)
@@ -2035,7 +2035,7 @@ repair, and Pareto penalty."""
         import anyio
         import dspy
 
-        from yaw.daemon.graph.inference import HippoRAGProgram
+        from yaw.daemon.graph.inference import YawProgram
 
         lm1 = CapabilityDummyLM(
             [
@@ -2051,8 +2051,8 @@ repair, and Pareto penalty."""
             ]
         )
 
-        prog1 = HippoRAGProgram(orchestrator_lm=lm1, rlm_sub_lm=lm1)
-        prog2 = HippoRAGProgram(orchestrator_lm=lm2, rlm_sub_lm=lm2)
+        prog1 = YawProgram(orchestrator_lm=lm1, rlm_sub_lm=lm1)
+        prog2 = YawProgram(orchestrator_lm=lm2, rlm_sub_lm=lm2)
         ensemble = dspy.Ensemble(reduce_fn=dspy.majority).compile([prog1, prog2])
 
         qa_ens_pred = ensemble(
@@ -2063,11 +2063,11 @@ repair, and Pareto penalty."""
         self.assertEqual(len(prog1.named_predictors()), 12)
         self.assertEqual(len(prog2.named_predictors()), 12)
 
-        # Verify HippoRAGProgram.as_async()
+        # Verify YawProgram.as_async()
         async_prog_lm = CapabilityDummyLM(
             [{"reasoning": "Montebello is in Rockland County.", "answer": "Rockland County"}]
         )
-        async_prog = HippoRAGProgram(orchestrator_lm=async_prog_lm, rlm_sub_lm=async_prog_lm)
+        async_prog = YawProgram(orchestrator_lm=async_prog_lm, rlm_sub_lm=async_prog_lm)
         async_prog_fn = async_prog.as_async()
         async_res = anyio.run(
             lambda: async_prog_fn(
@@ -2084,7 +2084,7 @@ repair, and Pareto penalty."""
             VALID_SYNONYM_RELATIONS,
             VALUE_BEARING_SHACL_ACTIONS,
             DSPyEmbeddingAdapter,
-            HippoRAGProgram,
+            YawProgram,
             compute_answer_passage_match,
             compute_retrieval_recalls,
             doc_matches_gold,
@@ -2281,11 +2281,11 @@ repair, and Pareto penalty."""
             "Erik Hort born in Montebello",
         )
 
-        # 4. Verify HippoRAGProgram.dump_audit_trails bounded vs unbounded & custom telemetry_key
+        # 4. Verify YawProgram.dump_audit_trails bounded vs unbounded & custom telemetry_key
         import yaw.daemon.graph.inference.program as prog_mod
 
-        self.assertEqual(prog_mod.__all__, ["HippoRAGProgram"])
-        prog = HippoRAGProgram()
+        self.assertEqual(prog_mod.__all__, ["YawProgram"])
+        prog = YawProgram()
         for i in range(260):
             prog.telemetry.append({"idx": i})
             prog.embedding_audit_trail.append({"idx": i})
@@ -2328,7 +2328,7 @@ repair, and Pareto penalty."""
         from types import SimpleNamespace
 
         from yaw.daemon.graph.inference import (
-            HippoRAGProgram,
+            YawProgram,
             compile_pareto_ensemble,
             evaluate_program,
             query_retrieval_fingerprint,
@@ -2336,8 +2336,8 @@ repair, and Pareto penalty."""
             select_pareto_frontier_programs,
         )
 
-        # 1. Verify HippoRAGProgram.forward places 'answer' last & supports retrieve_only=True
-        prog1 = HippoRAGProgram()
+        # 1. Verify YawProgram.forward places 'answer' last & supports retrieve_only=True
+        prog1 = YawProgram()
         qa_calls: list[str] = []
         prog1.set_retrieval_hook(
             lambda q, _p=None, **_kw: (
@@ -2409,7 +2409,7 @@ repair, and Pareto penalty."""
         self.assertEqual(ret_fused_out.answer, "")
         self.assertEqual(list(ret_fused_out.keys())[-1], "answer")
 
-        # Verify None/empty answer handling in HippoRAGProgram.forward and reduce_pareto_predictions:
+        # Verify None/empty answer handling in YawProgram.forward and reduce_pareto_predictions:
         # Two abstaining members returning None or "" must not crash dspy.majority or outvote a valid answer.
         prog_none = copy.deepcopy(prog1)
         prog_none.answer_question = lambda context, question, **_kw: dspy.Prediction(  # type: ignore[method-assign]
@@ -2549,7 +2549,7 @@ repair, and Pareto penalty."""
             self.assertTrue((dst_telem_dir / "pareto_member_2.json").exists())
             self.assertTrue((dst_telem_dir / "pareto_frontier_manifest.json").exists())
 
-            fresh_prog = HippoRAGProgram(compiled_path=prog_file)
+            fresh_prog = YawProgram(compiled_path=prog_file)
             fresh_prog.set_retrieval_hook(prog1._retrieval_hook)
             fresh_prog.answer_question = prog1.answer_question  # type: ignore[method-assign]
             reloaded_ens = compile_pareto_ensemble(fresh_prog, program_path=prog_file)

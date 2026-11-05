@@ -13,7 +13,7 @@ import dspy
 import pytest
 
 from yaw.core import ChunkPointer, SynonymEvidenceBatch
-from yaw.daemon.graph.inference import HippoRAGProgram, ServingTokenCounter, create_dspy_lm
+from yaw.daemon.graph.inference import YawProgram, ServingTokenCounter, create_dspy_lm
 from yaw.daemon.graph.storage import (
     iter_synonym_evidence,
     open_yaw_db,
@@ -174,13 +174,13 @@ def make_batch(tmp_path: Path, count: int = 5) -> SynonymEvidenceBatch:
         return next(iter_synonym_evidence(conn, candidates, tmp_path))
 
 
-def make_program(url: str, *, context: int = 131072) -> HippoRAGProgram:
+def make_program(url: str, *, context: int = 131072) -> YawProgram:
     # Tests assert exact provider call counts; DSPy retries would add calls, so transport errors must fail directly.
     lm = create_dspy_lm(
         "packet-model", base_url=url + "/v1", max_tokens=512, context_window_tokens=context, num_retries=0, cache=False
     )
     counter = ServingTokenCounter(url + "/v1", "packet-model")
-    program = HippoRAGProgram(
+    program = YawProgram(
         rlm_sub_lm=lm, synonym_token_counter=counter, context_window_tokens=context, max_output_tokens=512
     )
     return program
@@ -305,7 +305,7 @@ import json,sys
 from pathlib import Path
 from yaw.core import SynonymEvidenceBatch
 from yaw.daemon.graph.inference import (
- HippoRAGProgram,ServingTokenCounter,create_dspy_lm,configure_yaw_dspy_cache,label_judge_fingerprint,
+ YawProgram,ServingTokenCounter,create_dspy_lm,configure_yaw_dspy_cache,label_judge_fingerprint,
 )
 from yaw.daemon.graph.storage import CandidateCacheStore,CandidateStageCache,open_managed_yaw_db
 root=Path(sys.argv[1]);url=sys.argv[2];crash=sys.argv[3]=='crash'
@@ -314,7 +314,7 @@ batch=SynonymEvidenceBatch(tuple(data['candidates']),data['payload'],data['ident
 configure_yaw_dspy_cache(root/'responses',enable_memory_cache=False)
 # len(calls) == 1 must count cache misses only; DSPy retries would add calls.
 lm=create_dspy_lm('packet-model',base_url=url+'/v1',max_tokens=512,context_window_tokens=131072,num_retries=0)
-program=HippoRAGProgram(rlm_sub_lm=lm,synonym_token_counter=ServingTokenCounter(url+'/v1','packet-model'),max_output_tokens=512)
+program=YawProgram(rlm_sub_lm=lm,synonym_token_counter=ServingTokenCounter(url+'/v1','packet-model'),max_output_tokens=512)
 managed=open_managed_yaw_db(root/'recovery.db')
 with managed.transaction() as conn:
  cache=CandidateStageCache(CandidateCacheStore(conn),managed,'label_judge',lambda:'packet-test')

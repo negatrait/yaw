@@ -13,7 +13,7 @@ from yaw.core.types import YawRuntimeError
 from yaw.daemon.graph.engine import YawGraphEngine
 from yaw.daemon.graph.inference import (
     DSPyEmbeddingAdapter,
-    HippoRAGProgram,
+    YawProgram,
     RLMInstructionProposer,
     create_dspy_lm,
     openie_fingerprint,
@@ -104,7 +104,7 @@ def test_serving_context_changes_real_extraction_truncation(provider):
     passage = "Aster is a project. " + "x" * 30000 + "TAIL_RETAINED_AT_64K"
     for context_tokens in (32768, 65536):
         lm = create_dspy_lm("budget-test", base_url=url, cache=False, context_window_tokens=context_tokens)
-        task = HippoRAGProgram(
+        task = YawProgram(
             enable_gbnf=False,
             include_demos=False,
             orchestrator_lm=lm,
@@ -124,7 +124,7 @@ def test_serving_context_changes_real_extraction_truncation(provider):
 
 @pytest.mark.parametrize("context_tokens", [65536, 131072])
 def test_configured_limits_override_old_compiled_deployment_settings(tmp_path, context_tokens):
-    old = HippoRAGProgram(enable_gbnf=False, context_window_tokens=32768, max_output_tokens=4096)
+    old = YawProgram(enable_gbnf=False, context_window_tokens=32768, max_output_tokens=4096)
     saved = tmp_path / "compiled.json"
     old.save(str(saved))
     config = YawConfig(
@@ -136,7 +136,7 @@ def test_configured_limits_override_old_compiled_deployment_settings(tmp_path, c
         rlm_max_llm_calls=25,
         rlm_max_output_chars=18000,
     )
-    program = HippoRAGProgram.from_config(config)
+    program = YawProgram.from_config(config)
     assert program.context_window_tokens == context_tokens
     assert program.max_output_tokens == 8192
     assert program.orchestrator_lm.kwargs["max_tokens"] == 8192
@@ -188,7 +188,7 @@ def test_automatic_budgets_follow_context_and_explicit_overrides_remain_fixed(tm
 
 def test_gemma_profile_config_and_standalone_program_share_128k_defaults(tmp_path):
     config = YawConfig(workspace_root=tmp_path)
-    program = HippoRAGProgram()
+    program = YawProgram()
     lm = create_dspy_lm("gemma-4-E4B-it-qat-q4_0-gguf-Q4_0")
     proposer = RLMInstructionProposer(worker_lm=lm, orchestrator_lm=lm)
     assert CHAT_MODELS[config.qa_model].expected_context == config.context_window_tokens == 131072
@@ -206,7 +206,7 @@ def test_gemma_profile_config_and_standalone_program_share_128k_defaults(tmp_pat
 def test_standalone_program_infers_context_and_output_capacity_from_bound_lm(provider):
     url, _requests = provider
     lm = create_dspy_lm("budget-test", base_url=url, context_window_tokens=65536)
-    program = HippoRAGProgram(orchestrator_lm=lm)
+    program = YawProgram(orchestrator_lm=lm)
     assert program.context_window_tokens == 65536
     assert program.max_output_tokens == 4096
     assert program.shacl_healer_rlm.max_output_chars == 10000
@@ -223,8 +223,8 @@ def test_toml_context_changes_recompute_unpinned_budgets(tmp_path):
 
 
 def test_hot_reload_does_not_restore_stale_context_or_completion_caps():
-    old = HippoRAGProgram(context_window_tokens=65536, max_output_tokens=4096)
-    current = HippoRAGProgram(context_window_tokens=131072, max_output_tokens=8192)
+    old = YawProgram(context_window_tokens=65536, max_output_tokens=4096)
+    current = YawProgram(context_window_tokens=131072, max_output_tokens=8192)
     current.load_state(old.dump_state())
     assert current.context_window_tokens == 131072
     assert current.max_output_tokens == 8192
@@ -237,7 +237,7 @@ def test_128k_retains_extraction_and_shacl_context_lost_at_64k(provider):
     focus = "Aster is a project. " + "x" * 40000 + "FOCUS_FOR_128K"
     for context in (65536, 131072):
         lm = create_dspy_lm("budget-test", base_url=url, cache=False, context_window_tokens=context)
-        program = HippoRAGProgram(orchestrator_lm=lm, rlm_sub_lm=lm, context_window_tokens=context)
+        program = YawProgram(orchestrator_lm=lm, rlm_sub_lm=lm, context_window_tokens=context)
         program.extract_entities(passage)
         assert ("TAIL_FOR_128K" in str(requests[-1]["messages"])) == (context == 131072)
         assert requests[-1].get("max_completion_tokens", requests[-1].get("max_tokens")) == context // 16
@@ -250,7 +250,7 @@ def test_128k_retains_extraction_and_shacl_context_lost_at_64k(provider):
 def test_standalone_engine_derives_hydration_budget_from_program(tmp_path, provider):
     url, _requests = provider
     config = YawConfig(workspace_root=tmp_path, base_url=url)
-    program = HippoRAGProgram.from_config(config)
+    program = YawProgram.from_config(config)
     engine = bind_native_indexing(
         YawGraphEngine(
             db_path=tmp_path / "context.db",
@@ -271,7 +271,7 @@ def test_structured_prompt_batches_scale_without_splitting_json_items(provider):
     violations = [{"focus_node": f"NODE_{index}", "source_shape": "ConceptShape"} for index in range(25)]
     for context in (65536, 131072):
         lm = create_dspy_lm("budget-test", base_url=url, cache=False, context_window_tokens=context)
-        program = HippoRAGProgram(orchestrator_lm=lm, rlm_sub_lm=lm)
+        program = YawProgram(orchestrator_lm=lm, rlm_sub_lm=lm)
         program.propose_shacl_repairs(violations, mode="direct")
         assert ("NODE_24" in str(requests[-1]["messages"])) == (context == 131072)
     large_violations = [{"focus_node": str(index), "message": "x" * 20000} for index in range(10)]

@@ -9,7 +9,7 @@ import dspy
 import numpy as np
 
 from yaw.daemon.graph.engine import YawGraphEngine
-from yaw.daemon.graph.inference import PASSAGE_INSTRUCTION, DSPyEmbeddingAdapter, HippoRAGProgram
+from yaw.daemon.graph.inference import PASSAGE_INSTRUCTION, DSPyEmbeddingAdapter, YawProgram
 from yaw.daemon.indexing import bind_native_indexing
 from yaw.daemon.ingestion import prepare_dataset_bundle, snapshot_dataset_bundle
 
@@ -29,7 +29,7 @@ def main() -> None:
         max_tokens=1000,
     )
     dspy.configure(lm=lm)
-    program = HippoRAGProgram(
+    program = YawProgram(
         enable_gbnf=False,
         orchestrator_lm=lm,
         rlm_sub_lm=lm,

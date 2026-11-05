@@ -225,7 +225,7 @@ def run_yaw_benchmark(
 
     from yaw.daemon.graph.engine import YawGraphEngine
     from yaw.daemon.graph.inference import (
-        HippoRAGProgram,
+        YawProgram,
         create_dspy_lm,
         create_dspy_rlm_pair,
     )
@@ -240,7 +240,7 @@ def run_yaw_benchmark(
         if qa_model != extraction_model
         else extraction_lm
     )
-    program = HippoRAGProgram(
+    program = YawProgram(
         orchestrator_lm=qa_lm,
         rlm_sub_lm=extraction_lm,
         enable_gbnf=enable_gbnf,
@@ -876,7 +876,7 @@ if __name__ == "__main__":
         "--compiled-program",
         type=str,
         default=None,
-        help="Path to load or save compiled HippoRAGProgram state.",
+        help="Path to load or save compiled YawProgram state.",
     )
     parser.add_argument(
         "--linking-top-k",

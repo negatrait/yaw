@@ -48,7 +48,7 @@ class YawGBNFAdapter(dspy.JSONAdapter):
         self.max_instruction_chars = max_instruction_chars
 
     def resolve_grammar(self, signature: Any) -> str | None:
-        """Resolve the pure-JSON GBNF grammar for any of the 10 direct Qwen signatures (or None for RLM signatures)."""
+        """Resolve the pure-JSON GBNF grammar for any of the 10 direct LM signatures (or None for RLM signatures)."""
         sig_name = getattr(signature, "__name__", str(signature))
         if sig_name in ("HealSHACLViolations", "ReflectiveInnerDistillerSignature"):
             return None

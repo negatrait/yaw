@@ -38,7 +38,7 @@ from .parsers import (
     compute_task_quality_score,
     doc_matches_gold,
 )
-from .program import HippoRAGProgram
+from .program import YawProgram
 from .proposer import RLMInstructionProposer
 from .reflection import (
     ActiveReflectionCheckpoint,
@@ -189,13 +189,13 @@ class GepaProgress:
 class GraphOptimizationHooks:
     """Explicit callback contract passed by `YawGraphEngine` into `optimizer.py` (zero horizontal imports)."""
 
-    persist_trails: Callable[[HippoRAGProgram], None]
+    persist_trails: Callable[[YawProgram], None]
     get_meta: Callable[[str], str | None]
     set_meta: Callable[[str, str | None], None]
     candidate_cache_namespace: Callable[[], str]
     candidate_cache_sources: Callable[[], dict[str, str]]
     retrieval_settings: Mapping[str, Any] = field(default_factory=dict)
-    bind_program_hooks: Callable[[HippoRAGProgram], None] = field(default=lambda _prog: None)
+    bind_program_hooks: Callable[[YawProgram], None] = field(default=lambda _prog: None)
     open_score_cache: Callable[[str], Any] = field(default=lambda _ctx: {})
     open_checkpoint_cache: Callable[[str], Any] = field(default=lambda _ctx: {})
     encode_payload: Callable[[Any], str] = field(
@@ -217,20 +217,20 @@ class GraphOptimizationHooks:
         ]
         | None
     ) = None
-    hydrate_top_chunks: Callable[[Sequence[str], HippoRAGProgram], dict[str, str]] = field(
+    hydrate_top_chunks: Callable[[Sequence[str], YawProgram], dict[str, str]] = field(
         default=lambda _cids, _prog: {}
     )
     query_rlm_stats: Callable[[Sequence[str] | None], dict[str, Any]] = field(default=lambda _docs: {})
     graph_rlm_stats: Callable[[], dict[str, Any]] = field(default=dict)
-    last_hook_program: Callable[[], HippoRAGProgram | None] = field(default=lambda: None)
+    last_hook_program: Callable[[], YawProgram | None] = field(default=lambda: None)
     clear_progress_callback: Callable[[], None] = field(default=lambda: None)
-    finalize_compiled_program: Callable[[HippoRAGProgram], None] = field(default=lambda _prog: None)
-    rehydrate_sandbox_after_optimization: Callable[[HippoRAGProgram], None] = field(default=lambda _prog: None)
+    finalize_compiled_program: Callable[[YawProgram], None] = field(default=lambda _prog: None)
+    rehydrate_sandbox_after_optimization: Callable[[YawProgram], None] = field(default=lambda _prog: None)
     dspy_cache_dir: Path | None = None
     config: Any = None
 
 
-def prune_mismatching_demos(program: HippoRAGProgram) -> None:
+def prune_mismatching_demos(program: YawProgram) -> None:
     """Remove any few-shot demos whose keys do not cover their predictor's input and output fields."""
     if not hasattr(program, "named_predictors"):
         return
@@ -266,7 +266,7 @@ def embed_fingerprint(program: Any, instruction: str = "") -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def shacl_fingerprint(program: HippoRAGProgram) -> str:
+def shacl_fingerprint(program: YawProgram) -> str:
     """Compute SHA-256 fingerprint for SHACL repair and RLM healer predictor surfaces."""
     named = dict(program.named_predictors()) if hasattr(program, "named_predictors") else {}
     shacl_keys = (
@@ -285,7 +285,7 @@ def shacl_fingerprint(program: HippoRAGProgram) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def openie_fingerprint(program: HippoRAGProgram) -> str:
+def openie_fingerprint(program: YawProgram) -> str:
     """Compute SHA-256 fingerprint for OpenIE extraction predictor surfaces."""
     named = dict(program.named_predictors()) if hasattr(program, "named_predictors") else {}
     payload = {
@@ -301,7 +301,7 @@ def openie_fingerprint(program: HippoRAGProgram) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def extraction_fingerprint(program: HippoRAGProgram) -> str:
+def extraction_fingerprint(program: YawProgram) -> str:
     """Compute SHA-256 fingerprint across all graph extraction, synonym, SHACL, and document embedding stages."""
     named = dict(program.named_predictors()) if hasattr(program, "named_predictors") else {}
     graph_stage_keys = (
@@ -327,7 +327,7 @@ def extraction_fingerprint(program: HippoRAGProgram) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def candidate_fingerprint(program: HippoRAGProgram) -> str:
+def candidate_fingerprint(program: YawProgram) -> str:
     """Identify an optimizer candidate by hashing every predictor surface and embedding prefix."""
     named = dict(program.named_predictors()) if hasattr(program, "named_predictors") else {}
     payload = {
@@ -342,7 +342,7 @@ def candidate_fingerprint(program: HippoRAGProgram) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
-def query_retrieval_fingerprint(program: HippoRAGProgram) -> str:
+def query_retrieval_fingerprint(program: YawProgram) -> str:
     """Compute SHA-256 fingerprint for query-time retrieval predictor surfaces (`query_intent`, `triple_filter`)."""
     named = dict(program.named_predictors()) if hasattr(program, "named_predictors") else {}
     payload = {
@@ -355,7 +355,7 @@ def query_retrieval_fingerprint(program: HippoRAGProgram) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
-def _query_qa_fingerprint(program: HippoRAGProgram) -> str:
+def _query_qa_fingerprint(program: YawProgram) -> str:
     """Compute SHA-256 fingerprint for query-time + QA predictor surfaces (`query_intent`, `triple_filter`, `qa`)."""
     named = dict(program.named_predictors()) if hasattr(program, "named_predictors") else {}
     qa_keys = ("query_intent", "triple_filter", "qa", "qa.predict")
@@ -370,16 +370,16 @@ def _query_qa_fingerprint(program: HippoRAGProgram) -> str:
 
 
 def select_pareto_frontier_programs(
-    compiled: HippoRAGProgram,
+    compiled: YawProgram,
     *,
     max_programs: int = 3,
     program_path: Path | str | None = None,
-) -> list[HippoRAGProgram]:
+) -> list[YawProgram]:
     """Select up to `max_programs` strictly non-dominated Pareto programs covering both `recall@N` and `QA (F1, EM)`."""
     if max_programs <= 1:
         return [compiled]
 
-    selected: list[HippoRAGProgram] = [compiled]
+    selected: list[YawProgram] = [compiled]
     seen_fps: set[str] = {_query_qa_fingerprint(compiled)}
 
     details = getattr(compiled, "detailed_results", None)
@@ -393,7 +393,7 @@ def select_pareto_frontier_programs(
         subscores_by_idx: dict[int, dict[str, float]] = {}
         scores_by_idx: dict[int, float] = {}
         for idx, cand in enumerate(raw_candidates):
-            if not isinstance(cand, HippoRAGProgram):
+            if not isinstance(cand, YawProgram):
                 continue
             sc = raw_scores[idx] if idx < len(raw_scores) else 0.0
             if sc <= 0.0 and idx != best_idx:
@@ -667,7 +667,7 @@ def promote_compiled_program(
 
 
 def compile_pareto_ensemble(
-    compiled: HippoRAGProgram,
+    compiled: YawProgram,
     *,
     max_programs: int = 3,
     program_path: Path | str | None = None,
@@ -684,7 +684,7 @@ def compile_pareto_ensemble(
 class ActiveTraceComponentSelector:
     """GEPA component selector that dynamically prioritizes predictors with active execution traces."""
 
-    def __init__(self, program: HippoRAGProgram) -> None:
+    def __init__(self, program: YawProgram) -> None:
         self.program = program
         self.cursor = 0
 
@@ -736,7 +736,7 @@ class ActiveTraceComponentSelector:
 
 def configure_simba_task_learning(
     proposer: RLMInstructionProposer,
-    template: HippoRAGProgram,
+    template: YawProgram,
     trainset: Sequence[Any],
     metric: Callable[[Any, Any], float],
     hooks: GraphOptimizationHooks,
@@ -972,7 +972,7 @@ def evaluate_program(
 
 @_optimization_history_scope
 def evolve_program_prompts(
-    program: HippoRAGProgram,
+    program: YawProgram,
     trainset: Sequence[Any],
     valset: Sequence[Any] | None = None,
     *,
@@ -990,7 +990,7 @@ def evolve_program_prompts(
     sleep_seconds: float = 0.0,
     max_bootstrapped_demos: int | None = None,
     max_labeled_demos: int | None = None,
-) -> HippoRAGProgram:
+) -> YawProgram:
     """Evolve DSPy prompts via MIPROv2, GEPA, or two-phase hybrid with composite Sizecoding feedback."""
     if not trainset:
         return program
@@ -1058,7 +1058,7 @@ def evolve_program_prompts(
     opt_phase = "gepa" if mode == "gepa" else "miprov2"
     last_eval_fp: str | None = None
     last_event_eval_count = 0
-    active_program_ref: HippoRAGProgram = program
+    active_program_ref: YawProgram = program
     _metric_keys = ("score", "r1", "r2", "r5", "r10", "r20", "em", "f1", "s_per_it", "tokens")
 
     def _record_candidate_eval(rec: dict[str, Any]) -> None:
@@ -1615,7 +1615,7 @@ def evolve_program_prompts(
                 account_cached_usage=True,
             )
 
-    assert isinstance(compiled, HippoRAGProgram)
+    assert isinstance(compiled, YawProgram)
     active_program_ref = compiled
 
     if save_path is not None:

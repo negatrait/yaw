@@ -26,7 +26,7 @@ from yaw.daemon.graph.inference import (
     PASSAGE_INSTRUCTION,
     DSPyEmbeddingAdapter,
     GraphOptimizationHooks,
-    HippoRAGProgram,
+    YawProgram,
     RLMInstructionProposer,
     YawRetriever,
     YawRM,
@@ -97,7 +97,7 @@ class YawGraphEngine:
         self,
         db_path: Path | str,
         workspace_root: Path | str,
-        program: HippoRAGProgram,
+        program: YawProgram,
         embedder: DSPyEmbeddingAdapter,
         *,
         linking_top_k: int = 8,
@@ -141,7 +141,7 @@ class YawGraphEngine:
         self.embedder = embedder
         self.config: Any = None
         self.indexing_runner: (
-            Callable[[Sequence[tuple[ChunkPointer, str]], HippoRAGProgram], GraphPlanSummary] | None
+            Callable[[Sequence[tuple[ChunkPointer, str]], YawProgram], GraphPlanSummary] | None
         ) = None
 
         self.max_context_chars = (
@@ -180,7 +180,7 @@ class YawGraphEngine:
         self._chunk_rlm_stats: dict[str, dict[str, float]] = {}
         self._active_query_rlm_stats: dict[str, int] | None = None
         self._active_progress_callback: Callable[[str], None] | None = None
-        self._last_hook_program: HippoRAGProgram | None = None
+        self._last_hook_program: YawProgram | None = None
         self._last_scope_by_cids: dict[tuple[str, ...], dict[str, int]] = {}
         self._active_extraction_fingerprint: str | None = None
         self._active_openie_fingerprint: str | None = None
@@ -284,7 +284,7 @@ class YawGraphEngine:
 
     def _hydrate_indexed_cids_from_db(
         self,
-        program: HippoRAGProgram | None = None,
+        program: YawProgram | None = None,
     ) -> None:
         """Populate _opt_indexed_cids, _chunk_indexed_ext_fp, and persisted DSPy trails from SQLite."""
         active_prog = program if program is not None else self.program
@@ -374,7 +374,7 @@ class YawGraphEngine:
 
     def _persist_dspy_trails_to_db(
         self,
-        program: HippoRAGProgram | None = None,
+        program: YawProgram | None = None,
     ) -> None:
         """Persist graph RLM stats, per-chunk RLM stats, and DSPy audit trails into SQLite meta."""
         active_prog = program if program is not None else self.program
@@ -440,7 +440,7 @@ class YawGraphEngine:
         if hasattr(self.program, "record_embedding_telemetry"):
             self.program.record_embedding_telemetry(entry)
 
-    def _bind_program_hooks(self, program: HippoRAGProgram | None = None) -> None:
+    def _bind_program_hooks(self, program: YawProgram | None = None) -> None:
         target = program if program is not None else self.program
         target_rm = getattr(target, "rm", None)
         if target_rm is not None:
@@ -489,7 +489,7 @@ class YawGraphEngine:
     def _canonical_retrieval_hook(
         self,
         question: str,
-        program: HippoRAGProgram | None = None,
+        program: YawProgram | None = None,
         *,
         item_docs: Sequence[str] | None = None,
         k: int | None = None,
@@ -655,7 +655,7 @@ class YawGraphEngine:
                 sections.append("Passages:\n" + "\n\n".join(passage_lines))
             return "\n\n".join(sections) if sections else "No matching graph facts or passages found."
 
-    def _apply_program_embedding_prefixes(self, program: HippoRAGProgram | None = None) -> None:
+    def _apply_program_embedding_prefixes(self, program: YawProgram | None = None) -> None:
         target = program if program is not None else self.program
         if hasattr(self.embedder, "update_prefixes"):
             self.embedder.update_prefixes(
@@ -914,7 +914,7 @@ class YawGraphEngine:
 
     def _ensure_candidate_chunks_indexed(
         self,
-        program: HippoRAGProgram,
+        program: YawProgram,
         item_docs: Sequence[str] | None = None,
     ) -> list[str]:
         with self._lock:
@@ -1059,7 +1059,7 @@ class YawGraphEngine:
         chunks: Sequence[tuple[ChunkPointer, str]],
         *,
         progress_callback: Callable[[str], None] | None = None,
-        program: HippoRAGProgram | None = None,
+        program: YawProgram | None = None,
     ) -> int:
         """Publish an explicit candidate snapshot through the bound native runtime."""
         if not chunks:
@@ -1125,7 +1125,7 @@ class YawGraphEngine:
         top_k: int = 10,
         *,
         allow_intent_path: bool = True,
-        program: HippoRAGProgram | None = None,
+        program: YawProgram | None = None,
     ) -> tuple[list[tuple[ChunkPointer, float, str]], list[tuple[str, str, str]]]:
         """Retrieve top-k chunks and return both hydrated hits and kept recognition-memory facts."""
         active_program = program if program is not None else self.program
@@ -1407,7 +1407,7 @@ class YawGraphEngine:
         query: str,
         top_k: int = 10,
         *,
-        program: HippoRAGProgram | None = None,
+        program: YawProgram | None = None,
     ) -> list[tuple[ChunkPointer, float, str]]:
         """Retrieve top-k chunks for query using hybrid PPR + 1-indexed line hydration."""
         hits, _ = self.retrieve_with_seeds(query, top_k=top_k, program=program)
@@ -1593,7 +1593,7 @@ class YawGraphEngine:
     def _hydrate_top_chunks_for_eval(
         self,
         top_20_cids: Sequence[str],
-        active_prog: HippoRAGProgram,
+        active_prog: YawProgram,
     ) -> dict[str, str]:
         hydrated_by_cid: dict[str, str] = {}
         if top_20_cids:
@@ -1622,13 +1622,13 @@ class YawGraphEngine:
             )
         return q_stats
 
-    def _finalize_compiled_program(self, compiled: HippoRAGProgram) -> None:
+    def _finalize_compiled_program(self, compiled: YawProgram) -> None:
         self.program = compiled
         self._bind_program_hooks()
         self._apply_program_embedding_prefixes()
         self._hydrate_indexed_cids_from_db(compiled)
 
-    def _rehydrate_sandbox_after_optimization(self, compiled: HippoRAGProgram) -> None:
+    def _rehydrate_sandbox_after_optimization(self, compiled: YawProgram) -> None:
         self._in_optimization = False
         self._query_retrieval_memo.clear()
         self._last_memo_question = None
@@ -1706,7 +1706,7 @@ class YawGraphEngine:
     def _configure_simba_task_learning(
         self,
         proposer: RLMInstructionProposer,
-        template: HippoRAGProgram,
+        template: YawProgram,
         trainset: Sequence[Any],
         metric: Callable[[Any, Any], float],
         *,
@@ -1742,7 +1742,7 @@ class YawGraphEngine:
         sleep_seconds: float = 0.0,
         max_bootstrapped_demos: int | None = None,
         max_labeled_demos: int | None = None,
-    ) -> HippoRAGProgram:
+    ) -> YawProgram:
         """Evolve DSPy prompts via MIPROv2, GEPA, or two-phase hybrid with composite Sizecoding feedback."""
         self._in_optimization = True
         try:
@@ -1783,7 +1783,7 @@ class YawGraphEngine:
         save_as_csv: str | Path | None = None,
         include_semantic_metrics: bool = False,
     ) -> dspy.evaluate.EvaluationResult:
-        """Evaluate the bound `HippoRAGProgram` (or Pareto `dspy.Ensemble`) on `devset` using `dspy.Evaluate`."""
+        """Evaluate the bound `YawProgram` (or Pareto `dspy.Ensemble`) on `devset` using `dspy.Evaluate`."""
         return evaluate_program(
             self.ensemble if self.ensemble is not None else self.program,
             devset,

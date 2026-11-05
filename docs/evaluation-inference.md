@@ -477,7 +477,7 @@ Domain evaluation ledger for DSPy signatures, GBNF worker vs unconstrained RLM o
   least one SHACL demo. It now explicitly requests zero bootstrapped/labeled
   task demos and verifies every task predictor is demo-free both immediately
   after optimization and after reloading the saved program.
-- The stronger check exposed a real loader defect: `HippoRAGProgram.load_state`
+- The stronger check exposed a real loader defect: `YawProgram.load_state`
   reinserted `QA_DEMOS` whenever the restored QA demo list was empty. Removed
   that reseeding. Explicitly saved empty/default/custom demo lists now survive
   JSON round trips. Missing legacy predictor state still inherits the chosen
@@ -804,7 +804,7 @@ Confirmed defects in disposable probes, with no resident inference calls:
 Additional integration risks: the LM proxy prefers ambient settings.lm over
 its bound target, unlike native Predict's explicit-binding precedence. A context
 probe resolved a bound predictor to the ambient model. Dedicated proxy identities
-also make HippoRAGProgram.get_lm report multiple LMs even when all roles use one
+also make YawProgram.get_lm report multiple LMs even when all roles use one
 underlying LM. These behaviors need explicit design decisions when replacing the
 proxy. DSPy 3.4 emits legacy LM/message deprecations; its documented 3.5 cutoff
 requires migrating custom integration to the native engine/request contract.
@@ -990,9 +990,9 @@ offline arithmetic task: it verifies monitoring/orchestration, not model quality
 
 Completed full-codebase SSOT/DRY canonicalization and legacy symbol retirement across `yaw/`, `benchmark.py`, `scripts/`, `tests/`, and `docs/`:
 
-- **Retired legacy symbols, dead wrappers, and duplicate helpers**: Removed legacy GBNF synonym-judgment grammar helpers, dead assertion/refine wrappers, unused entity-node/fact-flattening helpers, batch-overflow repackers, mutable delta-compiler setter (replaced with read-only `CorpusIngestor.on_delta` property), candidate-list partitioning and the residual `16`-candidate cap in `YawGraphEngine` synonym discovery/adjudication (so all unadjudicated candidate pairs with `dense_sim >= synonymy_threshold` emit `skos:related` fallback edges), dead model-recycling helper, unused `--index-batch-size` / `--qa-batch-size` flags in `benchmark.py`, 11 private staticmethod bindings on `YawGraphEngine`, duplicate `corpus/{cid}.md` materialization (consolidated into `YawGraphEngine._materialize_doc_chunk`), dead `HippoRAGProgram` repair aliases, duplicate `DEFAULT_CHAT` / `DEFAULT_BASE_URL` constants in `models.py` and `embedding.py`, and hardcoded user paths (`YAW_ARTIFACT_DIR` env var or workspace default used instead).
+- **Retired legacy symbols, dead wrappers, and duplicate helpers**: Removed legacy GBNF synonym-judgment grammar helpers, dead assertion/refine wrappers, unused entity-node/fact-flattening helpers, batch-overflow repackers, mutable delta-compiler setter (replaced with read-only `CorpusIngestor.on_delta` property), candidate-list partitioning and the residual `16`-candidate cap in `YawGraphEngine` synonym discovery/adjudication (so all unadjudicated candidate pairs with `dense_sim >= synonymy_threshold` emit `skos:related` fallback edges), dead model-recycling helper, unused `--index-batch-size` / `--qa-batch-size` flags in `benchmark.py`, 11 private staticmethod bindings on `YawGraphEngine`, duplicate `corpus/{cid}.md` materialization (consolidated into `YawGraphEngine._materialize_doc_chunk`), dead `YawProgram` repair aliases, duplicate `DEFAULT_CHAT` / `DEFAULT_BASE_URL` constants in `models.py` and `embedding.py`, and hardcoded user paths (`YAW_ARTIFACT_DIR` env var or workspace default used instead).
 - **Task quality & benchmark integrity**: Consolidated `compute_task_quality_score` in `parsers.py`. Added `check_benchmark_integrity(records, *, k_values=...)` in `parsers.py` and wired it into `benchmark.py` and `YawRuntime.benchmark` (`report["integrity"] = {"passed": ..., "errors": ...}`).
-- **Entity definition canonicalization**: Unified `extract_entity_definitions(raw_input, *, normalize_keys=False)` in `parsers.py` as the single parser for list/dict/tuple inputs and delegated `HippoRAGProgram._merge_openie_definitions` to `extract_entity_definitions(..., normalize_keys=True)`.
+- **Entity definition canonicalization**: Unified `extract_entity_definitions(raw_input, *, normalize_keys=False)` in `parsers.py` as the single parser for list/dict/tuple inputs and delegated `YawProgram._merge_openie_definitions` to `extract_entity_definitions(..., normalize_keys=True)`.
 - **SHACL action SSOT**: Synchronized `ProposeSHACLRepairs` docstring with `VALID_SHACL_ACTIONS` and `HealSHACLViolations` (all 11 canonical actions).
 - **Runtime & CLI canonicalization**: Prevented duplicate `_apply_delta` execution in `YawRuntime._execute_sync_worker` when `ingestor.on_delta` is bound, preserved pre-startup `stop()` signals across `start()`, drained queued `_WorkItem` futures on worker exit, renamed `handle_dspy_benchmark`, inlined single-use subparser parents, and enforced canonical CLI grammar (`yaw {daemon|graph|dspy|config} <action>`, `--db-path`, `--gate`) with `allow_abbrev=False` across all subparsers.
 
@@ -1001,7 +1001,7 @@ Verification: All 17 Oblivion Demolition Table `Test-Path` and repository-wide `
 ## 48. Step 10 & Step 11: External Pareto `dspy.Ensemble`, Dual-Perspective Reporting, and SKOS/RDF/OWL/PPR Hardening (2026-10-25)
 
 ### Step 10: Canonical External `dspy.Ensemble` & Dual-Perspective (`recall@N` + `QA (F1, EM)`) Reporting
-- **Prediction final-field invariant & `retrieve_only` mode (`yaw/daemon/graph/inference/program.py`)**: Enforced `answer` as the final keyword argument on `HippoRAGProgram.forward` predictions (`signature=None`) so `dspy.majority` resolves `field = "answer"` by default, and added `retrieve_only: bool = False` to execute `self.retriever(question, k=k)` while skipping `self.answer_question` (`answer=""`).
+- **Prediction final-field invariant & `retrieve_only` mode (`yaw/daemon/graph/inference/program.py`)**: Enforced `answer` as the final keyword argument on `YawProgram.forward` predictions (`signature=None`) so `dspy.majority` resolves `field = "answer"` by default, and added `retrieve_only: bool = False` to execute `self.retriever(question, k=k)` while skipping `self.answer_question` (`answer=""`).
 - **Dual-perspective Pareto frontier selection & reduction (`yaw/daemon/graph/inference/optimizer.py`)**:
   - `select_pareto_frontier_programs` filters strictly non-dominated candidates from `compiled.detailed_results`, deduplicates by query-time predictors (`query_intent`, `triple_filter`, `qa.predict`), and assigns Slot 0 (`best_candidate`), Slot 1 (`recall@N` Pareto leader), and Slot 2 (`QA (F1, EM)` Pareto leader), falling back to `<stem>_telemetry/pareto_member_*.json` when loaded from disk.
   - `reduce_pareto_predictions` delegates directly to `dspy.majority(list(predictions))` when any prediction has a non-empty `answer`, and fuses retrieval rankings via `rrf_fuse_passage_lists` (`1 / (60 + r)` + min-max normalized PPR scores) when all predictions have `answer == ""` (`retrieve_only=True`).

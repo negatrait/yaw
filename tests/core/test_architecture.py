@@ -285,7 +285,7 @@ class ArchitectureTests(unittest.TestCase):
         import yaw.daemon.graph.inference as inference
 
         self.assertTrue(hasattr(inference, "create_dspy_lm"))
-        self.assertTrue(hasattr(inference, "HippoRAGProgram"))
+        self.assertTrue(hasattr(inference, "YawProgram"))
         self.assertTrue(hasattr(inference, "DSPyEmbeddingAdapter"))
         self.assertTrue(hasattr(inference, "compute_task_quality_score"))
         self.assertTrue(hasattr(inference, "check_benchmark_integrity"))

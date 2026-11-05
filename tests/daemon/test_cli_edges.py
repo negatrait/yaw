@@ -20,7 +20,7 @@ from yaw.daemon.cli import (
     inspect_status,
     main,
 )
-from yaw.daemon.graph.inference import HippoRAGProgram
+from yaw.daemon.graph.inference import YawProgram
 from yaw.daemon.graph.storage import open_yaw_db
 
 
@@ -117,7 +117,7 @@ def test_remote_reload_correlates_actual_signal_acknowledgements(tmp_path, capsy
     config = configured_workspace(tmp_path)
     assert config.compiled_program_path is not None
     source = tmp_path / "candidate.json"
-    HippoRAGProgram(include_demos=False).save(str(source))
+    YawProgram(include_demos=False).save(str(source))
     folder = tmp_path / ".yaw"
     signal_file = folder / "reload.signal"
     result_file = folder / "reload.result"

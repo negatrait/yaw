@@ -13,14 +13,14 @@ from daemon.graph.inference.test_reflection import proposer
 from daemon.graph.inference.test_reflection import provider as provider
 from yaw.core import ChunkPointer, YawRuntimeError
 from yaw.daemon.graph.engine import YawGraphEngine
-from yaw.daemon.graph.inference import HippoRAGProgram, RLMInstructionProposer
+from yaw.daemon.graph.inference import YawProgram, RLMInstructionProposer
 from yaw.daemon.graph.inference.chat import YawDSPyLM, create_dspy_lm
 from yaw.daemon.graph.storage import CandidatePayloadCodec
 from yaw.daemon.indexing import bind_native_indexing
 
 
 def test_native_qa_predictor_state_survives_json_restore_and_deepcopy(tmp_path):
-    program = HippoRAGProgram(enable_gbnf=False)
+    program = YawProgram(enable_gbnf=False)
     assert type(program.qa) is dspy.ChainOfThought
     predictor = dict(program.named_predictors())["qa.predict"]
     assert dict(program.all_stage_predictors())["qa"] is predictor
@@ -34,7 +34,7 @@ def test_native_qa_predictor_state_survives_json_restore_and_deepcopy(tmp_path):
     program.qa.set_lm(None)
     saved = tmp_path / "qa.json"
     program.save(str(saved))
-    restored = HippoRAGProgram(enable_gbnf=False)
+    restored = YawProgram(enable_gbnf=False)
     restored.load(str(saved))
     assert type(restored.qa) is dspy.ChainOfThought
     assert restored.qa.predict.signature.instructions == "Use source names."
@@ -68,7 +68,7 @@ def test_rlm_tool_preserves_signature_binding_and_coroutine_identity(asynchronou
         return left + right
 
     function = async_add if asynchronous else add
-    program = HippoRAGProgram(enable_gbnf=False)
+    program = YawProgram(enable_gbnf=False)
     wrapped = program.shacl_healer_rlm._make_interpreter_tool(dspy.Tool(function))
     assert inspect.signature(wrapped) == inspect.signature(function)
     assert inspect.iscoroutinefunction(wrapped) is asynchronous
@@ -79,7 +79,7 @@ def test_rlm_tool_preserves_signature_binding_and_coroutine_identity(asynchronou
 @pytest.mark.parametrize("have_lm", [False, True])
 def test_bad_reflection_setup_preserves_existing_rows_before_indexing(tmp_path, have_lm):
     lm = create_dspy_lm("reflection-model", cache=False) if have_lm else None
-    program = HippoRAGProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
+    program = YawProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
     engine = bind_native_indexing(
         YawGraphEngine(tmp_path / "yaw.db", tmp_path, program, dspy.Embedder(lambda texts: []))
     )
@@ -123,7 +123,7 @@ def test_invalid_second_predictor_does_not_partially_restore_first():
 
 def learning(tmp_path, url, *, resume=False):
     prop = proposer(url, enable_simba=False)
-    task = HippoRAGProgram(enable_gbnf=False, orchestrator_lm=prop.worker_lm, rlm_sub_lm=prop.worker_lm)
+    task = YawProgram(enable_gbnf=False, orchestrator_lm=prop.worker_lm, rlm_sub_lm=prop.worker_lm)
     engine = bind_native_indexing(YawGraphEngine(tmp_path / "yaw.db", tmp_path, task, dspy.Embedder(lambda texts: [])))
     train = [dspy.Example(question="Who?", context="Source.").with_inputs("question", "context")]
     try:

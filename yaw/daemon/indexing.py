@@ -23,7 +23,7 @@ from yaw.daemon.graph.engine import YawGraphEngine
 from yaw.daemon.graph.inference import (
     DSPyEmbeddingAdapter,
     EmbeddingRequest,
-    HippoRAGProgram,
+    YawProgram,
     hierarchy_judge_fingerprint,
     label_judge_fingerprint,
     openie_fingerprint,
@@ -656,7 +656,7 @@ async def frozen_indexing_app_main(
 def bind_native_indexing(engine: YawGraphEngine, *, batch_size: int = 64) -> YawGraphEngine:
     """Compose frozen indexing at the daemon boundary; graph code owns no scheduler."""
 
-    def execute(chunks: Sequence[tuple[ChunkPointer, str]], program: HippoRAGProgram) -> GraphPlanSummary:
+    def execute(chunks: Sequence[tuple[ChunkPointer, str]], program: YawProgram) -> GraphPlanSummary:
         if not chunks:
             return GraphPlanSummary(())
         program_identity = openie_fingerprint(program)

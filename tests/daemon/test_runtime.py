@@ -29,7 +29,7 @@ from yaw.core import (
 )
 from yaw.daemon.cli import build_parser, inspect_status, main
 from yaw.daemon.graph.inference import (
-    HippoRAGProgram,
+    YawProgram,
     ServingTokenCounter,
     compute_task_quality_score,
     resolve_embedding_profile,
@@ -229,10 +229,10 @@ http_port = 13306
 
 def _make_program_and_embedder(
     tokenizer_url: str,
-) -> tuple[HippoRAGProgram, Any, DeterministicTestLM, DeterministicTestEmbedder]:
+) -> tuple[YawProgram, Any, DeterministicTestLM, DeterministicTestEmbedder]:
     lm = DeterministicTestLM()
     dspy.settings.configure(lm=lm)
-    prog = HippoRAGProgram(
+    prog = YawProgram(
         enable_gbnf=False,
         orchestrator_lm=lm,
         rlm_sub_lm=lm,
@@ -1260,7 +1260,7 @@ def test_cli_dspy_load_program_hot_reload_live_and_staged(tmp_path: Path, provid
     assert Path(cfg.compiled_program_path).exists()
 
     # 2. Boot daemon: verifies it loads staged program
-    rt = YawRuntime(cfg, program=HippoRAGProgram.from_config(cfg), embedder=emb)
+    rt = YawRuntime(cfg, program=YawProgram.from_config(cfg), embedder=emb)
     rt.start(sync_on_start=False)
     try:
         assert rt.engine is not None

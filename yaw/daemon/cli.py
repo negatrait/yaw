@@ -33,7 +33,7 @@ from yaw.core import (
     set_config_value,
     write_text_atomic,
 )
-from yaw.daemon.graph.inference import DSPyEmbeddingAdapter, HippoRAGProgram, promote_compiled_program
+from yaw.daemon.graph.inference import DSPyEmbeddingAdapter, YawProgram, promote_compiled_program
 from yaw.daemon.graph.storage import (
     get_graph_counts,
     lint_graph_shacl,
@@ -525,7 +525,7 @@ def _load_dataset_splits(
 def handle_daemon_run(
     config: YawConfig,
     *,
-    program: HippoRAGProgram | None = None,
+    program: YawProgram | None = None,
     embedder: DSPyEmbeddingAdapter | None = None,
     max_seconds: float | None = None,
 ) -> int:
@@ -679,7 +679,7 @@ def handle_daemon_stop(config: YawConfig) -> int:
 def handle_graph_build(
     config: YawConfig,
     *,
-    program: HippoRAGProgram | None = None,
+    program: YawProgram | None = None,
     embedder: DSPyEmbeddingAdapter | None = None,
 ) -> int:
     """Execute a standalone incremental CocoIndex corpus sync and graph index update."""
@@ -701,7 +701,7 @@ def handle_graph_build(
 def handle_graph_rebuild(
     config: YawConfig,
     *,
-    program: HippoRAGProgram | None = None,
+    program: YawProgram | None = None,
     embedder: DSPyEmbeddingAdapter | None = None,
 ) -> int:
     """Rebuild yaw.db and CocoIndex state from scratch."""
@@ -755,7 +755,7 @@ def handle_dspy_optimize(
     config: YawConfig,
     args: argparse.Namespace,
     *,
-    program: HippoRAGProgram | None = None,
+    program: YawProgram | None = None,
     embedder: DSPyEmbeddingAdapter | None = None,
 ) -> int:
     """Compile DSPy prompts in an isolated sandbox and save candidate JSON."""
@@ -1027,7 +1027,7 @@ def handle_dspy_benchmark(
     config: YawConfig,
     args: argparse.Namespace,
     *,
-    program: HippoRAGProgram | None = None,
+    program: YawProgram | None = None,
     embedder: DSPyEmbeddingAdapter | None = None,
 ) -> int:
     """Execute per-dataset HippoRAG 2 + DPR benchmark evaluation and optional gate verification."""
@@ -1102,7 +1102,7 @@ def handle_config_set(
 def main(
     argv: Sequence[str] | None = None,
     *,
-    program: HippoRAGProgram | None = None,
+    program: YawProgram | None = None,
     embedder: DSPyEmbeddingAdapter | None = None,
 ) -> int:
     """Main CLI dispatcher returning POSIX exit code."""

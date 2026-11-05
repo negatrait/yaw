@@ -114,7 +114,7 @@ def test_evaluate_program_uses_canonical_recall_and_gold_matching(tmp_path, monk
     import yaw.daemon.graph.inference.optimizer as optimizer_mod
     from yaw.daemon.graph.inference import (
         GraphOptimizationHooks,
-        HippoRAGProgram,
+        YawProgram,
         evaluate_program,
         evolve_program_prompts,
     )
@@ -186,7 +186,7 @@ def test_evaluate_program_uses_canonical_recall_and_gold_matching(tmp_path, monk
     monkeypatch.setattr(dspy, "MIPROv2", FakeMIPROv2)
 
     dummy_lm = dspy.LM("openai/dummy", api_base="http://127.0.0.1:9/v1", api_key="none")
-    prog = HippoRAGProgram(orchestrator_lm=dummy_lm, rlm_sub_lm=dummy_lm)
+    prog = YawProgram(orchestrator_lm=dummy_lm, rlm_sub_lm=dummy_lm)
     hooks = GraphOptimizationHooks(
         config=None,
         dspy_cache_dir=None,

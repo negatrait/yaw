@@ -20,7 +20,7 @@ from daemon.graph.synonym_protocol import candidate_rows, complete_decisions
 from yaw.daemon.graph.inference import (
     DSPyEmbeddingAdapter,
     EmbeddingProfile,
-    HippoRAGProgram,
+    YawProgram,
     create_dspy_lm,
 )
 from yaw.daemon.graph.inference.components import (
@@ -59,7 +59,7 @@ def test_frozen_candidate_replay_uses_native_targets_and_original_text(tmp_path,
     source.write_text("Changed after the evaluation snapshot was frozen.", encoding="utf-8")
     pointer = ChunkPointer("frozen", source.name, 1, 1, "source", 1, 1)
     lm = create_dspy_lm("overlap", base_url=url + "/v1", cache=False, num_retries=0, max_tokens=512)
-    program = HippoRAGProgram(orchestrator_lm=lm, rlm_sub_lm=lm, enable_gbnf=False, max_output_tokens=512)
+    program = YawProgram(orchestrator_lm=lm, rlm_sub_lm=lm, enable_gbnf=False, max_output_tokens=512)
     engine = bind_native_indexing(YawGraphEngine(tmp_path / "yaw.db", tmp_path, program, adapter(url)))
     try:
         assert engine.index_chunks([(pointer, original)]) == 1
@@ -87,7 +87,7 @@ def test_native_file_pipeline_owns_inference_rows(tmp_path, provider, title_awar
     source.write_text("Ada studies Algebra.", encoding="utf-8")
     db = sqlite.connect(tmp_path / "yaw.db", load_vec=False)
     lm = create_dspy_lm("overlap", base_url=url + "/v1", cache=False, num_retries=0, max_tokens=512)
-    program = HippoRAGProgram(rlm_sub_lm=lm, max_output_tokens=512)
+    program = YawProgram(rlm_sub_lm=lm, max_output_tokens=512)
     context = coco.ContextProvider()
     context.provide(SOURCE_DB, db)
     context.provide(SOURCE_ROOT, root)
@@ -164,7 +164,7 @@ import sys
 from pathlib import Path
 import cocoindex as coco
 from cocoindex.connectors import sqlite
-from yaw.daemon.graph.inference import DSPyEmbeddingAdapter, EmbeddingProfile, HippoRAGProgram, create_dspy_lm
+from yaw.daemon.graph.inference import DSPyEmbeddingAdapter, EmbeddingProfile, YawProgram, create_dspy_lm
 from yaw.daemon.graph.inference.components import EMBEDDING_ENDPOINT, OPENIE_ENDPOINT, EmbeddingEndpoint, OpenIEEndpoint
 from yaw.daemon.indexing import InferenceIdentity, indexing_app_main
 from yaw.daemon.ingestion.source_targets import SOURCE_DB, SOURCE_ROOT, SourceSettings
@@ -175,7 +175,7 @@ db = sqlite.connect(root / 'yaw.db', load_vec=False)
 profile = EmbeddingProfile('overlap', 'fixture', 4, 2048, 'mean', 'query: ', 'text: ')
 embedder = DSPyEmbeddingAdapter(profile, base_url=url + '/v1', batch_size=64)
 lm = create_dspy_lm('overlap', base_url=url + '/v1', cache=False, max_tokens=512)
-program = HippoRAGProgram(rlm_sub_lm=lm, max_output_tokens=512)
+program = YawProgram(rlm_sub_lm=lm, max_output_tokens=512)
 context = coco.ContextProvider()
 context.provide(SOURCE_DB, db)
 context.provide(SOURCE_ROOT, root / 'documents')
@@ -216,7 +216,7 @@ def test_native_openie_overlaps_embedding_and_restores_traces(tmp_path, provider
     url, state = provider
     state["rendezvous"] = True
     lm = create_dspy_lm("overlap", base_url=url + "/v1", cache=False, num_retries=0, max_tokens=512)
-    program = HippoRAGProgram(rlm_sub_lm=lm, max_output_tokens=512)
+    program = YawProgram(rlm_sub_lm=lm, max_output_tokens=512)
     embedder = adapter(url)
     context = coco.ContextProvider()
     context.provide(EMBEDDING_ENDPOINT, EmbeddingEndpoint(embedder, asyncio.Semaphore(1)))
@@ -468,7 +468,7 @@ def test_declarative_live_graph_publication_without_polling(tmp_path, provider):
 
     db = open_managed_yaw_db(tmp_path / "yaw.db")
     lm = create_dspy_lm("overlap", base_url=url + "/v1", cache=False, num_retries=0, max_tokens=512)
-    program = HippoRAGProgram(rlm_sub_lm=lm, max_output_tokens=512)
+    program = YawProgram(rlm_sub_lm=lm, max_output_tokens=512)
     embedder = adapter(url)
 
     signal_dir = tmp_path / ".yaw"
@@ -571,7 +571,7 @@ def test_publish_graph_shacl_violation_preserves_prior_graph_and_inference_rows(
 
     db = open_managed_yaw_db(tmp_path / "yaw.db")
     lm = create_dspy_lm("overlap", base_url=url + "/v1", cache=False, num_retries=0, max_tokens=512)
-    program = HippoRAGProgram(rlm_sub_lm=lm, max_output_tokens=512)
+    program = YawProgram(rlm_sub_lm=lm, max_output_tokens=512)
     embedder = adapter(url)
 
     context = coco.ContextProvider()
@@ -659,7 +659,7 @@ def test_frozen_candidate_streaming_batches(tmp_path, provider):
 
     url, state = provider
     lm = create_dspy_lm("overlap", base_url=url + "/v1", cache=False, num_retries=0, max_tokens=512)
-    program = HippoRAGProgram(orchestrator_lm=lm, rlm_sub_lm=lm, enable_gbnf=False, max_output_tokens=512)
+    program = YawProgram(orchestrator_lm=lm, rlm_sub_lm=lm, enable_gbnf=False, max_output_tokens=512)
     engine = bind_native_indexing(
         YawGraphEngine(tmp_path / "yaw.db", tmp_path, program, adapter(url)),
         batch_size=2,
@@ -699,7 +699,7 @@ def test_addition_preserves_adjudicated_graph_and_edit_invalidates_reuse(tmp_pat
     url, state = provider
     state["delay"] = 0.01
     lm = create_dspy_lm("overlap", base_url=url + "/v1", cache=False, num_retries=0, max_tokens=512)
-    program = HippoRAGProgram(orchestrator_lm=lm, rlm_sub_lm=lm, enable_gbnf=False, max_output_tokens=512)
+    program = YawProgram(orchestrator_lm=lm, rlm_sub_lm=lm, enable_gbnf=False, max_output_tokens=512)
     engine = bind_native_indexing(YawGraphEngine(tmp_path / "yaw.db", tmp_path, program, adapter(url)))
     first = (ChunkPointer("first", "first.md", 1, 1, "first", 1, 1), "Ada studies Algebra.")
     second = (ChunkPointer("second", "second.md", 1, 1, "second", 1, 1), "Ada studies Algebra again.")

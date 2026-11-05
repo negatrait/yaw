@@ -13,15 +13,30 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "AGENTS.md",
+                "file": ".agents/skills/dspy-gepa-optimizer/reference.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "AGENTS"
+              "title": "reference"
+            }
+          },
+          {
+            "id": "d559fa159cf3c425",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "docs/native-cocoindex-graph.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "native-cocoindex-graph"
             }
           }
-        ]
+        ],
+        "currentTab": 1
       }
     ],
     "direction": "vertical"
@@ -188,8 +203,14 @@
       "bases:Create new base": false
     }
   },
-  "active": "4281216c0e61954a",
+  "active": "d559fa159cf3c425",
   "lastOpenFiles": [
+    "docs/native-cocoindex-indexing.md",
+    "docs/native-cocoindex-graph.md",
+    ".agents/skills/dspy-gepa-optimizer/reference.md",
+    ".agents/skills/dspy-rlm-module/reference.md",
+    ".agents/skills/engineering-real-tests/SKILL.md",
+    "AGENTS.md",
     ".agents/skills/owl/03-OWL-CLASSES.md",
     ".agents/skills/skos/SKILL.md",
     ".agents/skills/skos/references/02-CONCEPT-SCHEMES.md",
@@ -203,7 +224,6 @@
     "outputs/dashboard/candidate_score_progress.svg",
     "outputs/dashboard/candidate_quality_metrics.svg",
     "outputs/dashboard/benchmark_mobile_report.md",
-    "AGENTS.md",
     ".yaw/dspy_cache/014/cache.db-shm",
     ".yaw/dspy_cache/014/cache.db-wal",
     ".yaw/dspy_cache/004/cache.db-shm",

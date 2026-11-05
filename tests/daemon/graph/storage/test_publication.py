@@ -181,7 +181,7 @@ def test_plan_graph_publication_keeps_yaw_db_outside_transaction_and_preserves_s
     import asyncio
 
     from yaw.core import OpenIERecord
-    from yaw.daemon.graph.inference import DSPyEmbeddingAdapter, HippoRAGProgram, create_dspy_lm
+    from yaw.daemon.graph.inference import DSPyEmbeddingAdapter, YawProgram, create_dspy_lm
     from yaw.daemon.graph.inference.components import (
         EMBEDDING_ENDPOINT,
         OPENIE_ENDPOINT,
@@ -214,7 +214,7 @@ def test_plan_graph_publication_keeps_yaw_db_outside_transaction_and_preserves_s
     url, state = provider
     state["delay"] = 0.01
     lm = create_dspy_lm("publication", base_url=url + "/v1", cache=False, num_retries=0, max_tokens=512)
-    program = HippoRAGProgram(orchestrator_lm=lm, rlm_sub_lm=lm, enable_gbnf=False, max_output_tokens=512)
+    program = YawProgram(orchestrator_lm=lm, rlm_sub_lm=lm, enable_gbnf=False, max_output_tokens=512)
 
     chunk_a = (
         ChunkPointer("chunk_a", "a.md", 1, 2, "Section A"),

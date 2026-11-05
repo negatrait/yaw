@@ -162,9 +162,9 @@ class YawConfig:
     qa_model: str = "gemma-4-E4B-it-qat-q4_0-gguf-Q4_0"
     context_window_tokens: int = DEFAULT_CONTEXT_WINDOW_TOKENS
     max_output_tokens: int | None = None
-    rlm_max_iters: int = 10
-    rlm_max_llm_calls: int = 20
-    rlm_max_output_chars: int | None = None
+    rlm_max_iters: int = 20
+    rlm_max_llm_calls: int = 50
+    rlm_max_output_chars: int = 10000
     reflection_input_tokens: int | None = None
     reflection_tokenizer_url: str = ""
     enable_gbnf: bool = True

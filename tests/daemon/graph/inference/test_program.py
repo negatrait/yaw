@@ -1,4 +1,4 @@
-"""Real-substrate tests for HippoRAGProgram 3-stage W3C semantic cascade."""
+"""Real-substrate tests for YawProgram 3-stage W3C semantic cascade."""
 
 import json
 from typing import Any
@@ -12,7 +12,7 @@ from yaw.daemon.graph.inference.optimizer import (
     label_judge_fingerprint,
     related_judge_fingerprint,
 )
-from yaw.daemon.graph.inference.program import HippoRAGProgram
+from yaw.daemon.graph.inference.program import YawProgram
 
 
 class CascadeMockLM(dspy.LM):
@@ -175,8 +175,8 @@ def _make_batch(pairs: list[dict[str, Any]]) -> SynonymEvidenceBatch:
     )
 
 
-def _make_program(lm: dspy.LM) -> HippoRAGProgram:
-    return HippoRAGProgram(
+def _make_program(lm: dspy.LM) -> YawProgram:
+    return YawProgram(
         orchestrator_lm=lm,
         rlm_sub_lm=lm,
         synonym_token_counter=lambda messages, **_kwargs: len(str(messages)) // 4,
@@ -185,7 +185,7 @@ def _make_program(lm: dspy.LM) -> HippoRAGProgram:
 
 
 def test_program_named_predictors_and_audit_trails() -> None:
-    """Verify HippoRAGProgram exposes 3 separate judges and per-stage DiagnosticHistory trails."""
+    """Verify YawProgram exposes 3 separate judges and per-stage DiagnosticHistory trails."""
     lm = CascadeMockLM()
     dspy.settings.configure(lm=lm)
     program = _make_program(lm)
@@ -546,7 +546,7 @@ def test_define_concept_schemes_batch_size_one_defaults() -> None:
     """Verify concept schemes synthesize in isolated micro-batches of 1 for 4B hardware bounds."""
     import dspy
 
-    from yaw.daemon.graph.inference.program import HippoRAGProgram
+    from yaw.daemon.graph.inference.program import YawProgram
 
     packets = [
         {
@@ -565,7 +565,7 @@ def test_define_concept_schemes_batch_size_one_defaults() -> None:
         },
     ]
 
-    program = HippoRAGProgram(enable_gbnf=False)
+    program = YawProgram(enable_gbnf=False)
     call_counts: list[list[str]] = []
 
     from yaw.daemon.graph.inference.prompts import DefineMissingEntities

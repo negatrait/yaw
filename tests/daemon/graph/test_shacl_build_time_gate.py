@@ -10,7 +10,7 @@ import dspy
 from daemon.graph.synonym_protocol import candidate_rows, complete_decisions
 from yaw.core import ChunkPointer
 from yaw.daemon.graph.engine import YawGraphEngine
-from yaw.daemon.graph.inference import HippoRAGProgram
+from yaw.daemon.graph.inference import YawProgram
 from yaw.daemon.graph.ppr import run_ppr
 from yaw.daemon.graph.storage import (
     lint_graph_shacl,
@@ -280,7 +280,7 @@ def _make_engine(
     mock_lm = PipelineGateMockLM(mode=mode)
     dspy.settings.configure(lm=mock_lm)
     embedder = DummyEmbedder(dim=16)
-    prog = HippoRAGProgram(
+    prog = YawProgram(
         synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=mock_lm, rlm_sub_lm=mock_lm
     )
     engine = bind_native_indexing(

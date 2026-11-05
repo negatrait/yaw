@@ -34,7 +34,7 @@ from yaw.core import (
 from yaw.daemon.graph.engine import YawGraphEngine
 from yaw.daemon.graph.inference import (
     DSPyEmbeddingAdapter,
-    HippoRAGProgram,
+    YawProgram,
     check_benchmark_integrity,
     compute_qa_em_f1,
     compute_retrieval_recalls,
@@ -147,7 +147,7 @@ class YawRuntime:
         self,
         config: YawConfig,
         *,
-        program: HippoRAGProgram | None = None,
+        program: YawProgram | None = None,
         embedder: DSPyEmbeddingAdapter | None = None,
         auto_poll: bool = False,
     ) -> None:
@@ -350,7 +350,7 @@ class YawRuntime:
             if self.config.compiled_program_path and Path(self.config.compiled_program_path).exists():
                 program.load(str(self.config.compiled_program_path))
         else:
-            program = HippoRAGProgram.from_config(self.config)
+            program = YawProgram.from_config(self.config)
 
         embedder = (
             self._custom_embedder
@@ -1403,7 +1403,7 @@ class YawRuntime:
                 min_chunk_size=1,
             )
 
-            prog = self._custom_program if self._custom_program is not None else HippoRAGProgram.from_config(bench_cfg)
+            prog = self._custom_program if self._custom_program is not None else YawProgram.from_config(bench_cfg)
             comp_p = compiled_program or compiled_program_path or bench_cfg.compiled_program_path
             if comp_p and Path(comp_p).exists() and hasattr(prog, "load"):
                 prog.load(str(comp_p))

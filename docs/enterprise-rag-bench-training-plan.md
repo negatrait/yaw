@@ -49,7 +49,7 @@ flowchart TD
         CLI_OPT --> SANDBOX["Persistent CocoIndex snapshot of documents only; isolated graph database"]
         SANDBOX --> GEPA["dspy.GEPA + existing task-quality metric"]
         GEPA --> PROPOSER["RLM evidence selection + native DSPy instruction proposer"]
-        PROPOSER --> TARGETS["Mutate ONLY Stratum A Runtime Predictors (HippoRAGProgram, Sigs 1–9)"]
+        PROPOSER --> TARGETS["Mutate ONLY Stratum A Runtime Predictors (YawProgram, Sigs 1–9)"]
         TARGETS --> ARTIFACT[".yaw/compiled_program_enterprise.json"]
     end
 
@@ -182,7 +182,7 @@ when adopting this breaking layout; no migration or legacy-layout discovery exis
 
 ### 3.4 Two-Stratum Separation of the Canonical 12 DSPy Signatures
 
-- **Stratum A (Signatures 1–9 in `HippoRAGProgram.named_predictors()`)**: `ExtractEntities` (`ner`), `ExtractTriples` (`triples`), `DefineMissingEntities` (`entity_definer`), `JudgeSynonyms` (`synonym_judge`), `ExtractQueryIntent` (`query_intent`), `FilterTriples` (`triple_filter`), `AnswerQuestion` (`qa`), `HealSHACLViolations` (`shacl_healer_rlm`), and `ProposeSHACLRepairs` (`shacl_repair`). Mutated by `dspy.GEPA` and saved in `compiled_program.json`.
+- **Stratum A (Signatures 1–9 in `YawProgram.named_predictors()`)**: `ExtractEntities` (`ner`), `ExtractTriples` (`triples`), `DefineMissingEntities` (`entity_definer`), `JudgeSynonyms` (`synonym_judge`), `ExtractQueryIntent` (`query_intent`), `FilterTriples` (`triple_filter`), `AnswerQuestion` (`qa`), `HealSHACLViolations` (`shacl_healer_rlm`), and `ProposeSHACLRepairs` (`shacl_repair`). Mutated by `dspy.GEPA` and saved in `compiled_program.json`.
 - **Stratum B (Signatures 10–12 in `RLMInstructionProposer`)**: `ReflectiveInnerDistillerSignature` (`inner_rlm`), `ProposeInstructionSignature` (`llm_proposer`), and `CompressInstructionSignature` (`llm_compressor`). Fixed meta-optimizer (`ProposalFn`) that reflects on Stratum A. Nothing reflects on Stratum B.
 
 ---
@@ -192,7 +192,7 @@ when adopting this breaking layout; no migration or legacy-layout discovery exis
 ### 4.1 Non-Negotiable Invariants
 1. **Zero Upstream `hipporag` Invariant**: `git grep -i "from hipporag"` and `git grep -i "import hipporag"` return `0` matches across the entire repository.
 2. **Dual-Target Parity Invariant**: Native YAW must match or beat `MONKEYPATCHED_HIPPORAG_BASELINES` ($\Delta_{\text{local}} \ge -0.02$) while marching toward `PAPER_BASELINES`.
-3. **One-Way Meta-Reflection Invariant**: `RLMInstructionProposer` (Stratum B, Signatures 10–12) reflects exclusively on `HippoRAGProgram.named_predictors()` (Stratum A, Signatures 1–9).
+3. **One-Way Meta-Reflection Invariant**: `RLMInstructionProposer` (Stratum B, Signatures 10–12) reflects exclusively on `YawProgram.named_predictors()` (Stratum A, Signatures 1–9).
 4. **Live Disk Sandbox Invariant During `optimize()`**: The sandbox corpus files remain on disk throughout `evolve_prompts(...)` so 1-indexed line hydration never encounters missing files.
 
 ### 4.2 Explicit Non-Goals (Anti-Invention Contract)

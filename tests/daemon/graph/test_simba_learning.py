@@ -13,7 +13,7 @@ import pytest
 
 from yaw.daemon.graph.engine import YawGraphEngine
 from yaw.daemon.graph.inference import (
-    HippoRAGProgram,
+    YawProgram,
     RLMInstructionProposer,
     ServingTokenCounter,
     compute_qa_em_f1,
@@ -132,7 +132,7 @@ def task_metric(gold, pred):
 def make_learning(root, url, *, resume=False, answer="Alan Turing"):
     task_lm = create_dspy_lm("task-model", base_url=url, api_key="test", cache=False)
     worker_lm = create_dspy_lm("worker-model", base_url=url, api_key="test", cache=False)
-    task = HippoRAGProgram(enable_gbnf=False, orchestrator_lm=task_lm, rlm_sub_lm=task_lm)
+    task = YawProgram(enable_gbnf=False, orchestrator_lm=task_lm, rlm_sub_lm=task_lm)
     task.qa.predict.signature = task.qa.predict.signature.with_instructions(BASE)
     # Context-only calibration exercises real QA without embedding/retrieval I/O.
     engine = bind_native_indexing(YawGraphEngine(root / "yaw.db", root, task, dspy.Embedder(lambda texts: [])))

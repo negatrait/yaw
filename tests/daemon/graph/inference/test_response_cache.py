@@ -131,7 +131,7 @@ def test_long_qa_run_bounds_diagnostics_preserves_cost_and_avoids_history(
     import dspy
     from dspy.clients.base_lm import GLOBAL_HISTORY
 
-    from yaw.daemon.graph.inference import HippoRAGProgram, create_dspy_lm
+    from yaw.daemon.graph.inference import YawProgram, create_dspy_lm
 
     url, requests = inference_server
     configure_yaw_dspy_cache(
@@ -140,7 +140,7 @@ def test_long_qa_run_bounds_diagnostics_preserves_cost_and_avoids_history(
         account_cached_usage=True,
     )
     lm = create_dspy_lm("retention-test", base_url=url, api_key="test", max_tokens=200)
-    program = HippoRAGProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
+    program = YawProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
     before_global = len(GLOBAL_HISTORY)
     total_tokens = 0
     # This is the same supported DSPy context used throughout engine evolution.

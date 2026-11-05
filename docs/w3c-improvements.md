@@ -182,16 +182,16 @@ def build_dspy_related_judge_grammar(
 ```
 
 ### 3.4 Complete Replacement of Legacy `synonym_*` Predictors, Fingerprints, Caches, Audit Trails & Token Counters
-1. **First-Class Predictors on `HippoRAGProgram` (`yaw/daemon/graph/inference/program.py`)**:
+1. **First-Class Predictors on `YawProgram` (`yaw/daemon/graph/inference/program.py`)**:
    - **Removes** `self.synonym_judge = dspy.Predict(JudgeSynonyms)`.
-   - **Replaces** it with three first-class predictors on `HippoRAGProgram`:
+   - **Replaces** it with three first-class predictors on `YawProgram`:
      - `self.label_judge = dspy.Predict(JudgeLabels)`
      - `self.hierarchy_judge = dspy.Predict(JudgeHierarchy)`
      - `self.related_judge = dspy.Predict(JudgeRelated)`
-   - Binds all three to `worker` LM in `_bind_predictor_lms`. Because they are `dspy.Predict` attributes on `HippoRAGProgram`, `program.named_predictors()` automatically exposes `"label_judge"`, `"hierarchy_judge"`, and `"related_judge"` to `dspy.GEPA`, `dspy.MIPROv2`, `ActiveTraceComponentSelector`, and `RLMInstructionProposer`.
+   - Binds all three to `worker` LM in `_bind_predictor_lms`. Because they are `dspy.Predict` attributes on `YawProgram`, `program.named_predictors()` automatically exposes `"label_judge"`, `"hierarchy_judge"`, and `"related_judge"` to `dspy.GEPA`, `dspy.MIPROv2`, `ActiveTraceComponentSelector`, and `RLMInstructionProposer`.
 2. **Replacement of `synonym_audit_trail` with Per-Stage Audit Trails (`program.py` & `diagnostics.py`)**:
    - **Removes** `self.synonym_audit_trail`.
-   - **Replaces** it with three stage-specific `DiagnosticHistory` trails on `HippoRAGProgram`:
+   - **Replaces** it with three stage-specific `DiagnosticHistory` trails on `YawProgram`:
      - `self.label_judge_audit_trail = DiagnosticHistory()`
      - `self.hierarchy_judge_audit_trail = DiagnosticHistory()`
      - `self.related_judge_audit_trail = DiagnosticHistory()`
@@ -200,7 +200,7 @@ def build_dspy_related_judge_grammar(
    - **Why Replace Instead of Update**: During GEPA optimization, [`ActiveTraceComponentSelector`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/inference/optimizer.py#L762-L813) mutates **one** predictor per iteration (`label_judge`, OR `hierarchy_judge`, OR `related_judge`). If all three judges shared a single `synonym_fingerprint`, mutating `related_judge` (Stage 3) would invalidate cached decisions and traces for Stage 1 (`label_judge`) and Stage 2 (`hierarchy_judge`).
    - **Removes** `synonym_fingerprint(program)` and `self._synonym_fp_cache`.
    - **Replaces** them with:
-     - `judge_stage_fingerprint(program: HippoRAGProgram, stage_name: Literal["label_judge", "hierarchy_judge", "related_judge"]) -> str` (plus convenience functions `label_judge_fingerprint`, `hierarchy_judge_fingerprint`, `related_judge_fingerprint`) in [`optimizer.py`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/inference/optimizer.py#L300-L330).
+     - `judge_stage_fingerprint(program: YawProgram, stage_name: Literal["label_judge", "hierarchy_judge", "related_judge"]) -> str` (plus convenience functions `label_judge_fingerprint`, `hierarchy_judge_fingerprint`, `related_judge_fingerprint`) in [`optimizer.py`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/inference/optimizer.py#L300-L330).
      - Three stage-isolated `CandidateStageCache` instances in [`HippoRAGEngine.__init__`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/engine.py#L246-L252):
        - `self._label_judge_fp_cache` (stage `"label_judge"`)
        - `self._hierarchy_judge_fp_cache` (stage `"hierarchy_judge"`)
@@ -338,7 +338,7 @@ Each slice below is scoped to 1–3 production files so a `flash` model can impl
   - `[MODIFY]` [`tests/daemon/graph/inference/test_prompts.py`](file:///c:/Users/Harri.Ahokas/Documents/yaw/tests/daemon/graph/inference/test_prompts.py)
 - **Scope**:
   1. **Replace predictor & audit trail in `program.py` and `diagnostics.py`**:
-     - Remove `self.synonym_judge` and `self.synonym_audit_trail` from [`HippoRAGProgram.__init__`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/inference/program.py#L204-L216), [`dump_audit_trails`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/inference/program.py#L260-L280), [`_bind_predictor_lms`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/inference/program.py#L282-L300), and [`trim_diagnostics`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/inference/diagnostics.py#L21-L34).
+     - Remove `self.synonym_judge` and `self.synonym_audit_trail` from [`YawProgram.__init__`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/inference/program.py#L204-L216), [`dump_audit_trails`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/inference/program.py#L260-L280), [`_bind_predictor_lms`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/inference/program.py#L282-L300), and [`trim_diagnostics`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/inference/diagnostics.py#L21-L34).
      - Register `self.label_judge = dspy.Predict(JudgeLabels)`, `self.hierarchy_judge = dspy.Predict(JudgeHierarchy)`, `self.related_judge = dspy.Predict(JudgeRelated)` and `self.label_judge_audit_trail`, `self.hierarchy_judge_audit_trail`, `self.related_judge_audit_trail`.
   2. **Replace `synonym_fingerprint` & `_synonym_fp_cache` with Per-Stage GEPA Fingerprints, Caches & Token Counters in `optimizer.py` and `engine.py`**:
      - Replace `synonym_fingerprint` in [`optimizer.py:300-330`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/inference/optimizer.py#L300-L330) with `judge_stage_fingerprint(program, stage_name)` (`label_judge_fingerprint`, `hierarchy_judge_fingerprint`, `related_judge_fingerprint`) and update `extraction_fingerprint` (`graph_stage_keys`) to hash `"label_judge"`, `"hierarchy_judge"`, and `"related_judge"`.
@@ -564,7 +564,7 @@ W3C_PREFIX_HEADER: str = (
      - Attach the `skos:topConceptOf` list $T_m$ directly to the `skos:ConceptScheme` (`concept_scheme_members(scheme_id, entity_id, is_top_concept=1)`) and emit typed `skos:topConceptOf` edges `(src_id=u, dst_id=scheme_id, kind='skos:topConceptOf', weight=s_top(u))` into `edges` (traversed in `ppr.py` with `policy.skos_top_concept_up = 1.0` and `policy.skos_top_concept_down = 0.8`).
 
 3. **Updating the Entity Definer (`DefineMissingEntities` / `entity_definer`) for `skos:ConceptScheme` Textual Metadata**:
-   - Extend `DefineMissingEntities` (`self.entity_definer` in `prompts.py`, `grammars.py`, `parsers.py`, `program.py`, and `components.py`) so `HippoRAGProgram.define_concept_schemes(scheme_packets, ...)` passes each emergent scheme's deterministic `skos:topConceptOf` list $T_m$ and taxonomy dossier to `self.entity_definer` with grammar `build_dspy_concept_scheme_defs_grammar(scheme_ids)`.
+   - Extend `DefineMissingEntities` (`self.entity_definer` in `prompts.py`, `grammars.py`, `parsers.py`, `program.py`, and `components.py`) so `YawProgram.define_concept_schemes(scheme_packets, ...)` passes each emergent scheme's deterministic `skos:topConceptOf` list $T_m$ and taxonomy dossier to `self.entity_definer` with grammar `build_dspy_concept_scheme_defs_grammar(scheme_ids)`.
    - The LLM does **not** guess top concepts; for each `scheme_id`, `self.entity_definer` outputs the 4-tuple `[scheme_id, pref_label, definition, history_note]`:
      1. `skos:prefLabel` (`pref_label`): Concise canonical domain title for the `skos:ConceptScheme`.
      2. `skos:definition` (`definition`): Intensional scope definition synthesizing the scheme's taxonomy.
