@@ -704,3 +704,37 @@ Offline test suite: `uv run --locked python -m unittest discover -s tests -v` â€
   - `uv run ruff check` -> **All checks passed!**
   - `uv run ty check` -> **All checks passed!**
   - `git diff --check` -> **Clean (0 errors)**.
+# 2026-11-05: Additions-first semantic publication
+
+- Scope: native CocoIndex publication now seeds additive plans from the validated
+  SQLite graph. Source/pointer/extraction/settings fingerprints commit atomically
+  with publication. Only new contributions enter sense resolution and candidate
+  search; retained vectors and adjudications survive expansion. Input changes or
+  removals deliberately require full semantic recomputation in this first packet.
+- Memory: synonym packets are awaited incrementally, and SQLite cloning streams
+  rows rather than building intermediate table-sized Python lists. Graph-wide
+  staging, hydration, target materialization, SHACL and dense community clustering
+  remain. No bounded-RAM or full-corpus speedup claim is established.
+- Derived taxonomy is replaced separately, keeping scheme vectors out of entity
+  candidate search. Re-publication uses per-source edge confidence rather than
+  feeding already-pooled aggregate weights back into pooling.
+- Verification: real SQLite, native CocoIndex and loopback DSPy tests cover
+  multi-batch reuse, preserved assertions/vectors, source-edit invalidation,
+  unchanged replay and atomic input-checkpoint rollback on SHACL failure. An
+  obsolete empty-program publication fixture was upgraded to real DSPy over the
+  existing loopback server.
+- Forced affected + architecture run: **37 passed, 1 failed** in 35.16 seconds;
+  failure is existing executable initialization in `yaw/__init__.py`, contrary to
+  the architecture contract. Testmon selection disabled for this run.
+- Final focused run: **23 passed** in 32.36 seconds with `--testmon-noselect`
+  across native indexing, publication and planner tests, including multi-source
+  confidence preservation. Upstream Pydantic ReadOnly warnings remain; earlier
+  runs also emitted LiteLLM pending logging-worker shutdown warnings.
+- Repository `pytest --maxfail=5` with configured testmon: **12 passed, 5 failed,
+  14 deselected** in 39.02 seconds. Four failures use legacy embedder fixtures
+  without `.profile`; the candidate-cache test still invalidates indexing after
+  query-only prefix changes (12 excess calls). Its unchanged fresh-process replay
+  made **zero provider calls**. Log: `outputs/incremental-publication-suite.log`.
+- Ruff check/format, `ty check` and `git diff --check` passed. No live provider
+  benchmark, optimizer restart, production database write or commit performed.
+  Epic 1 D1-A6 / Tier 2 acceptance remains open.

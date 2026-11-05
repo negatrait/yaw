@@ -1,11 +1,13 @@
 """Prepared graph publication is atomic across relational, vector and FTS rows."""
 
+import json
 from dataclasses import replace
 from pathlib import Path
 
 import cocoindex as coco
 import numpy as np
 import pytest
+from daemon.graph.test_indexing_overlap import provider as provider
 
 from yaw.core import ChunkPointer
 from yaw.daemon.graph.storage import PreparedGraphRows, apply_prepared_graph_rows, open_managed_yaw_db
@@ -30,13 +32,14 @@ def test_graph_sink_rejects_invalid_replacement_atomically(tmp_path):
         chunk_vectors=(("c", np.array([1, 0], dtype=np.float32)),),
         entity_vectors=(),
         fact_vectors=(),
+        input_fingerprints=(("c", "committed"),),
     )
     context = coco.ContextProvider()
     context.provide(GRAPH_DB, db)
     handler = GraphTargetHandler()
     try:
         handler.apply_actions(context, [GraphAction(rows, (), ())])
-        invalid = replace(rows, entities=(("e", "Entity", ""),))
+        invalid = replace(rows, entities=(("e", "Entity", ""),), input_fingerprints=(("c", "uncommitted"),))
         with pytest.raises(ValueError, match="Graph publication rejected"):
             handler.apply_actions(context, [GraphAction(invalid, ("c",), ())])
         with db.readonly() as conn:
@@ -45,6 +48,9 @@ def test_graph_sink_rejects_invalid_replacement_atomically(tmp_path):
                 == "A grounded definition"
             )
             assert conn.execute("SELECT COUNT(*) FROM chunk_vec").fetchone()[0] == 1
+            assert json.loads(
+                conn.execute("SELECT value FROM meta WHERE key='graph_input_fingerprints'").fetchone()[0]
+            ) == [["c", "committed"]]
             assert conn.execute("SELECT COUNT(*) FROM chunk_fts WHERE chunk_fts MATCH 'Valid'").fetchone()[0] == 1
         handler.apply_actions(context, [GraphAction(rows, ("c",), ())])
     finally:
@@ -169,11 +175,13 @@ def test_publication_requires_transaction_and_rolls_back_all_tables(tmp_path: Pa
         db.close()
 
 
-def test_plan_graph_publication_keeps_yaw_db_outside_transaction_and_preserves_shared_elements(tmp_path: Path) -> None:
+def test_plan_graph_publication_keeps_yaw_db_outside_transaction_and_preserves_shared_elements(
+    tmp_path: Path, provider
+) -> None:
     import asyncio
 
     from yaw.core import OpenIERecord
-    from yaw.daemon.graph.inference import DSPyEmbeddingAdapter
+    from yaw.daemon.graph.inference import DSPyEmbeddingAdapter, HippoRAGProgram, create_dspy_lm
     from yaw.daemon.graph.inference.components import (
         EMBEDDING_ENDPOINT,
         OPENIE_ENDPOINT,
@@ -203,8 +211,10 @@ def test_plan_graph_publication_keeps_yaw_db_outside_transaction_and_preserves_s
 
     adapter = DSPyEmbeddingAdapter(embedder=fake_embed_fn)
 
-    class StubProgram:
-        pass
+    url, state = provider
+    state["delay"] = 0.01
+    lm = create_dspy_lm("publication", base_url=url + "/v1", cache=False, num_retries=0, max_tokens=512)
+    program = HippoRAGProgram(orchestrator_lm=lm, rlm_sub_lm=lm, enable_gbnf=False, max_output_tokens=512)
 
     chunk_a = (
         ChunkPointer("chunk_a", "a.md", 1, 2, "Section A"),
@@ -250,7 +260,7 @@ def test_plan_graph_publication_keeps_yaw_db_outside_transaction_and_preserves_s
             context.provide(EMBEDDING_ENDPOINT, EmbeddingEndpoint(adapter, asyncio.Semaphore(4)))
             context.provide(
                 OPENIE_ENDPOINT,
-                OpenIEEndpoint(StubProgram(), StubProgram(), "prog_v1", asyncio.Semaphore(1)),
+                OpenIEEndpoint(program, lm, "prog_v1", asyncio.Semaphore(1)),
             )
             env = coco.Environment(settings=coco.Settings.from_env(tmp_path / "plan_state"), context_provider=context)
             app = coco.App(

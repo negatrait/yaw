@@ -52,6 +52,11 @@ yaw/
 
 ## 2. Sprint-by-Sprint Implementation Plan (One Node at a Time, Zero Spaghetti)
 
+2026-11-05 D1-A6 implementation scope: preserve validated graph contributions for
+append-only source growth, checkpoint input identities with atomic publication,
+and retain SHACL as the commit gate. Full delta handling for replacements/removals
+and graph-wide memory bounds remain open; this packet establishes no Tier 2 parity.
+
 Execute strictly in order `E1-S1` $\to$ `E1-S6`. Never start Sprint $k+1$ until Sprint $k$'s exit gate passes.
 
 ---

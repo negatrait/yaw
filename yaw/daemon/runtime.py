@@ -59,6 +59,7 @@ from yaw.daemon.indexing import (
     RELOAD_SIGNAL_ROOT,
     InferenceIdentity,
     SyncOutcome,
+    bind_native_indexing,
     get_graph_delta_coordinator,
     indexing_app_main,
 )
@@ -268,8 +269,7 @@ class YawRuntime:
         assert self.config.state_dir is not None
         assert self.config.workspace_root is not None
         if self._coco_env is not None:
-            with contextlib.suppress(OSError, RuntimeError):
-                self._coco_env.close()
+            self._coco_env.close()
             self._coco_env = None
             self._coco_app = None
 
@@ -359,22 +359,24 @@ class YawRuntime:
         )
 
         assert self.config.max_context_chars is not None
-        self.engine = YawGraphEngine(
-            db_path=self.config.db_path,
-            workspace_root=self.config.corpus_root,
-            program=program,
-            embedder=embedder,
-            linking_top_k=self.config.linking_top_k,
-            retrieval_top_k=self.config.retrieval_top_k,
-            damping=self.config.damping,
-            synonymy_threshold=self.config.synonymy_threshold,
-            synonymy_top_k=self.config.synonymy_top_k,
-            embed_batch_size=self.config.embed_batch_size,
-            max_context_chars=self.config.max_context_chars,
-            max_ast_expansion_hops=self.config.max_ast_expansion_hops,
-            ast_context_hops=self.config.ast_context_hops,
-            auto_merge_cosine_gate=self.config.auto_merge_cosine_gate,
-            auto_merge_difflib_gate=self.config.auto_merge_difflib_gate,
+        self.engine = bind_native_indexing(
+            YawGraphEngine(
+                db_path=self.config.db_path,
+                workspace_root=self.config.corpus_root,
+                program=program,
+                embedder=embedder,
+                linking_top_k=self.config.linking_top_k,
+                retrieval_top_k=self.config.retrieval_top_k,
+                damping=self.config.damping,
+                synonymy_threshold=self.config.synonymy_threshold,
+                synonymy_top_k=self.config.synonymy_top_k,
+                embed_batch_size=self.config.embed_batch_size,
+                max_context_chars=self.config.max_context_chars,
+                max_ast_expansion_hops=self.config.max_ast_expansion_hops,
+                ast_context_hops=self.config.ast_context_hops,
+                auto_merge_cosine_gate=self.config.auto_merge_cosine_gate,
+                auto_merge_difflib_gate=self.config.auto_merge_difflib_gate,
+            )
         )
         self.engine.config = self.config
         self._build_coco_app()
@@ -1412,20 +1414,22 @@ class YawRuntime:
                 else DSPyEmbeddingAdapter.from_config(bench_cfg)
             )
 
-            bench_engine = YawGraphEngine(
-                db_path=bench_cfg.db_path,
-                workspace_root=effective_corpus_root,
-                program=prog,
-                embedder=emb,
-                linking_top_k=bench_cfg.linking_top_k,
-                retrieval_top_k=bench_cfg.retrieval_top_k,
-                damping=bench_cfg.damping,
-                synonymy_threshold=bench_cfg.synonymy_threshold,
-                synonymy_top_k=bench_cfg.synonymy_top_k,
-                embed_batch_size=bench_cfg.embed_batch_size,
-                max_context_chars=bench_cfg.max_context_chars,
-                max_ast_expansion_hops=bench_cfg.max_ast_expansion_hops,
-                ast_context_hops=bench_cfg.ast_context_hops,
+            bench_engine = bind_native_indexing(
+                YawGraphEngine(
+                    db_path=bench_cfg.db_path,
+                    workspace_root=effective_corpus_root,
+                    program=prog,
+                    embedder=emb,
+                    linking_top_k=bench_cfg.linking_top_k,
+                    retrieval_top_k=bench_cfg.retrieval_top_k,
+                    damping=bench_cfg.damping,
+                    synonymy_threshold=bench_cfg.synonymy_threshold,
+                    synonymy_top_k=bench_cfg.synonymy_top_k,
+                    embed_batch_size=bench_cfg.embed_batch_size,
+                    max_context_chars=bench_cfg.max_context_chars,
+                    max_ast_expansion_hops=bench_cfg.max_ast_expansion_hops,
+                    ast_context_hops=bench_cfg.ast_context_hops,
+                )
             )
             try:
                 existing_cids = {str(r[0]) for r in bench_engine.conn.execute("SELECT chunk_id FROM chunks").fetchall()}

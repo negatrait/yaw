@@ -700,14 +700,13 @@ def test_shacl_auto_healing_complete(tmp_path: Path) -> None:
             is None
         )
 
-        # 8a. Pure literal node (ent-lit-port) is preserved in entities with its 0.5 fact edge,
-        # while its illegal skos:broader and skos:related edges were stripped
+        # 8a. Pure literal node (ent-lit-port) is removed from entities along with its edges
         port_ent = conn.execute("SELECT entity_id FROM entities WHERE entity_id = 'ent-lit-port'").fetchone()
-        assert port_ent is not None
+        assert port_ent is None
         port_fact_edge = conn.execute(
             "SELECT weight FROM edges WHERE src_id = 'ent-sys' AND dst_id = 'ent-lit-port' AND kind = 'fact'"
         ).fetchone()
-        assert port_fact_edge is not None and abs(float(port_fact_edge[0]) - 0.5) < 1e-6
+        assert port_fact_edge is None
         port_skos_edges = conn.execute(
             "SELECT 1 FROM edges WHERE (src_id = 'ent-lit-port' OR dst_id = 'ent-lit-port') "
             "AND kind IN ('skos:broader', 'skos:related')"
@@ -847,9 +846,9 @@ def test_serialize_graph_turtle_literal_datatypes_and_lang_tags(tmp_path: Path) 
         conn.close()
 
 
-def test_heal_8_scalar_entity_with_passage_edge_retains_obj_id_and_updates_fact_edge_weight(tmp_path: Path) -> None:
-    """Verify remove_scalar_entity converts obj_kind='entity' to 'literal' while retaining obj_id and updating
-    the fact edge weight from 1.0 to 0.5 when the scalar node is grounded by a passage edge."""
+def test_heal_8_scalar_entity_converts_to_literal_and_prunes_edges(tmp_path: Path) -> None:
+    """Verify remove_scalar_entity converts obj_kind='entity' to 'literal' with obj_id=None
+    and removes all graph edges connected to the scalar entity."""
     conn = open_yaw_db(tmp_path / "test_heal8_passage_scalar.db")
     try:
         upsert_chunk_pointers(
@@ -906,14 +905,13 @@ def test_heal_8_scalar_entity_with_passage_edge_retains_obj_id_and_updates_fact_
 
         f_meta = get_facts_with_meta_by_ids(conn, ["fact-date-1"])["fact-date-1"]
         assert f_meta["obj_kind"] == "literal"
-        assert f_meta["obj_id"] == "ent-date"
+        assert f_meta["obj_id"] is None
         assert f_meta["obj_literal_lex"] == "2026-10-25"
 
         edge_row = conn.execute(
             "SELECT weight FROM edges WHERE src_id = 'ent-sys' AND dst_id = 'ent-date' AND kind = 'fact'"
         ).fetchone()
-        assert edge_row is not None
-        assert abs(float(edge_row[0]) - 0.5) < 1e-6
+        assert edge_row is None
     finally:
         conn.close()
 

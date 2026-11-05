@@ -20,6 +20,7 @@ from yaw.daemon.graph.inference import (
     compute_task_quality_score,
     create_dspy_lm,
 )
+from yaw.daemon.indexing import bind_native_indexing
 
 GOOD = "FULL_NAME: Answer with the full name supported by the context."
 BAD = "Ignore the evidence and always answer Unknown."
@@ -134,7 +135,7 @@ def make_learning(root, url, *, resume=False, answer="Alan Turing"):
     task = HippoRAGProgram(enable_gbnf=False, orchestrator_lm=task_lm, rlm_sub_lm=task_lm)
     task.qa.predict.signature = task.qa.predict.signature.with_instructions(BASE)
     # Context-only calibration exercises real QA without embedding/retrieval I/O.
-    engine = YawGraphEngine(root / "yaw.db", root, task, dspy.Embedder(lambda texts: []))
+    engine = bind_native_indexing(YawGraphEngine(root / "yaw.db", root, task, dspy.Embedder(lambda texts: [])))
     proposer = RLMInstructionProposer(
         worker_lm=worker_lm,
         orchestrator_lm=worker_lm,

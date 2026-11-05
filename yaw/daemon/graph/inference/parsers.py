@@ -282,7 +282,13 @@ DefineMissingEntities output, or {name: definition} mappings."""
             if len(item) >= 2 and item[1] is not None:
                 defn = _clean_definition(item[1])
         elif isinstance(item, dict):
-            raw_name = item.get("name", item.get("entity", item.get("label", "")))
+            raw_name = (
+                item.get("name")
+                or item.get("entity")
+                or item.get("label")
+                or item.get("scheme_id")
+                or item.get("pref_label", "")
+            )
             raw_def = item.get("definition", item.get("def", item.get("skos:definition", "")))
             name = _nullable_text(raw_name)
             defn = _clean_definition(raw_def)
@@ -346,6 +352,16 @@ from DefineMissingEntities concept scheme synthesis output."""
         history_note = ""
 
         if isinstance(item, (list, tuple)):
+            if len(item) == 4 and str(item[2]).strip().startswith("scheme-"):
+                sid0 = str(item[0]).strip() if item[0] is not None else ""
+                def0 = _clean_definition(item[1]) if item[1] is not None else ""
+                sid1 = str(item[2]).strip() if item[2] is not None else ""
+                def1 = _clean_definition(item[3]) if item[3] is not None else ""
+                for s, d in ((sid0, def0), (sid1, def1)):
+                    if s and s not in seen_scheme_ids:
+                        seen_scheme_ids.add(s)
+                        ordered_tuples.append((s, s, d, ""))
+                continue
             if len(item) >= 1 and item[0] is not None:
                 scheme_id = str(item[0]).strip()
             if len(item) >= 2 and item[1] is not None:
@@ -366,7 +382,9 @@ from DefineMissingEntities concept scheme synthesis output."""
 
         if not scheme_id:
             continue
-        if not pref_label:
+        if definition.startswith("scheme-"):
+            definition = ""
+        if not pref_label or pref_label.startswith("scheme-"):
             pref_label = scheme_id
         if scheme_id in seen_scheme_ids:
             continue

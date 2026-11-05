@@ -12,6 +12,7 @@ from typing import Any
 
 import cocoindex as coco
 import numpy as np
+from cocoindex.connectorkits.fingerprint import fingerprint_object
 
 from yaw.core import (
     ChunkPointer,
@@ -52,6 +53,7 @@ from yaw.daemon.graph.storage import (
     find_entity_disambiguation_candidates,
     get_entities_by_label_norm,
     get_entity_metadata_batch,
+    get_meta,
     inspect_focus_node,
     iter_synonym_evidence,
     lint_graph_shacl,
@@ -65,7 +67,7 @@ from yaw.daemon.graph.storage import (
     upsert_semantic_edges,
     write_tx,
 )
-from yaw.daemon.graph.storage.publication import GRAPH_DB
+from yaw.daemon.graph.storage.publication import GRAPH_DB, clear_concept_schemes
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,13 +233,11 @@ def clone_graph_to_memory(conn: sqlite3.Connection) -> sqlite3.Connection:
             ("entity_vec", "entity_id, embedding"),
             ("fact_vec", "fact_id, embedding"),
         ):
-            rows = conn.execute(f"SELECT {cols} FROM {table}").fetchall()
-            if rows:
-                placeholders = ",".join("?" for _ in cols.split(","))
-                stage_conn.executemany(
-                    f"INSERT INTO {table} ({cols}) VALUES ({placeholders})",
-                    [tuple(r) for r in rows],
-                )
+            placeholders = ",".join("?" for _ in cols.split(","))
+            stage_conn.executemany(
+                f"INSERT INTO {table} ({cols}) VALUES ({placeholders})",
+                conn.execute(f"SELECT {cols} FROM {table}"),
+            )
     return stage_conn
 
 
@@ -1136,6 +1136,8 @@ via Newman Modularity Maximization without magic numbers."""
 
     for comm_indices in communities:
         c_eids = [entity_ids[idx] for idx in sorted(comm_indices)]
+        if len(c_eids) < 2 and len(entity_ids) > 1:
+            continue
         if not c_eids:
             continue
 
@@ -1213,9 +1215,11 @@ via Newman Modularity Maximization without magic numbers."""
 
     defined_schemes: dict[str, tuple[str, str, str, float | None]] = {}
     if define_fn is not None:
-        res = await define_fn(scheme_packets)
-        for s_id, p_lbl, dfn, note, llm_p in res:
-            defined_schemes[s_id] = (p_lbl, dfn, note, llm_p)
+        packets_to_define = [p for p in scheme_packets if len(p.get("members", [])) >= 2]
+        if packets_to_define:
+            res = await define_fn(packets_to_define)
+            for s_id, p_lbl, dfn, note, llm_p in res:
+                defined_schemes[s_id] = (p_lbl, dfn, note, llm_p)
 
     fmt_entity = DSPyEmbeddingAdapter.format_entity_for_embedding
     texts_to_embed: list[tuple[str, str]] = []
@@ -1357,6 +1361,37 @@ async def plan_graph_publication(
         all_records.append(rec)
         all_traces.extend(chunk_traces)
 
+    # Reuse only verified unchanged contributions. Edits, removals and semantic
+    # profile changes require recomputing their graph interpretation.
+    input_fingerprints = {
+        ptr.chunk_id: fingerprint_object((settings, ptr, text, record)).hex()
+        for (ptr, text), record in zip(chunks, all_records, strict=True)
+    }
+    with coco.use_context(GRAPH_DB).readonly() as ro_conn:
+        saved = get_meta(ro_conn, "graph_input_fingerprints")
+        published_inputs = dict(json.loads(saved)) if saved is not None else {}
+        published_ids = {row[0] for row in ro_conn.execute("SELECT chunk_id FROM chunks")}
+    incremental = (
+        bool(published_inputs)
+        and published_ids == published_inputs.keys()
+        and all(input_fingerprints.get(cid) == digest for cid, digest in published_inputs.items())
+    )
+    complete_chunks = tuple(chunks)
+    if incremental:
+        new_items = [
+            (chunk, record)
+            for chunk, record in zip(chunks, all_records, strict=True)
+            if chunk[0].chunk_id not in published_inputs
+        ]
+        chunks = [chunk for chunk, _ in new_items]
+        all_records = [record for _, record in new_items]
+        all_traces = [
+            trace for ptr, _, traces in active_items if ptr.chunk_id not in published_inputs for trace in traces
+        ]
+    rlm_stats["reused_chunks"] = len(published_inputs) if incremental else 0
+    rlm_stats["processed_chunks"] = len(chunks)
+    del active_items
+
     fmt_chunk = getattr(
         embeddings.adapter,
         "format_chunk_for_embedding",
@@ -1451,12 +1486,14 @@ async def plan_graph_publication(
         )
         record_structured.append((cid, normalized_sts, ner_entities))
 
-    sense_state = prepare_sense_resolution_state(
-        chunks,
-        record_structured,
-        all_norm_labels,
-        surface_by_norm,
-    )
+    with coco.use_context(GRAPH_DB).readonly() as ro_conn:
+        sense_state = prepare_sense_resolution_state(
+            chunks,
+            record_structured,
+            all_norm_labels,
+            surface_by_norm,
+            conn=ro_conn if incremental else None,
+        )
     materialized = materialize_entities_and_facts(
         record_structured,
         surface_by_norm,
@@ -1501,10 +1538,23 @@ async def plan_graph_publication(
     )
 
     # 3. Stage initial rows in an isolated in-memory SQLite database (zero yaw.db write lock)
-    staging_conn = open_yaw_db(":memory:")
+    with coco.use_context(GRAPH_DB).readonly() as ro_conn:
+        staging_conn = clone_graph_to_memory(ro_conn) if incremental else open_yaw_db(":memory:")
     try:
+        initial_entity_meta = {
+            eid: (name, definition)
+            for eid, name, definition in staging_conn.execute("SELECT entity_id, name, definition FROM entities")
+        }
+        initial_entity_meta.update({eid: (name, definition) for eid, name, definition in entity_nodes})
+        initial_fact_defs = dict(staging_conn.execute("SELECT fact_id, definition FROM facts"))
+        initial_fact_defs.update({row[0]: row[5] for row in fact_nodes})
+        for eid, blob in staging_conn.execute("SELECT entity_id, embedding FROM entity_vec"):
+            entity_vec_by_id.setdefault(eid, deserialize_f32_vector(blob))
+        for fid, blob in staging_conn.execute("SELECT fact_id, embedding FROM fact_vec"):
+            fact_vec_by_id.setdefault(fid, deserialize_f32_vector(blob))
         with staging_conn:
             staging_conn.execute("BEGIN")
+            clear_concept_schemes(staging_conn)
             apply_prepared_graph_rows(staging_conn, initial_rows)
 
         candidates, cand_meta, raw_cand_count, _auto_merges = prepare_synonym_candidates(
@@ -1526,30 +1576,23 @@ async def plan_graph_publication(
                     40000,
                     context_char_limit(12000, settings.context_window_tokens, settings.max_output_tokens),
                 )
-                evidence_batches = list(
-                    iter_synonym_evidence(
-                        staging_conn,
-                        candidates,
-                        settings.corpus_root,
-                        ast_context_hops=settings.ast_context_hops,
-                        batch_size=batch_limit,
-                        max_chars=max_dossier_chars,
-                        fits=extraction.program.synonym_batch_fits,
-                    )
+                evidence_batches = iter_synonym_evidence(
+                    staging_conn,
+                    candidates,
+                    settings.corpus_root,
+                    ast_context_hops=settings.ast_context_hops,
+                    batch_size=batch_limit,
+                    max_chars=max_dossier_chars,
+                    fits=extraction.program.synonym_batch_fits,
                 )
-                judged_batches = await asyncio.gather(
-                    *(
-                        judge_synonyms(
-                            SynonymJudgeInput(
-                                batch=ev,
-                                program_identity=settings.program_identity,
-                                synonym_identity=settings.synonym_identity,
-                            )
+                for ev in evidence_batches:
+                    judged = await judge_synonyms(
+                        SynonymJudgeInput(
+                            batch=ev,
+                            program_identity=settings.program_identity,
+                            synonym_identity=settings.synonym_identity,
                         )
-                        for ev in evidence_batches
                     )
-                )
-                for judged in judged_batches:
                     decisions.extend(judged.decisions)
                     all_traces.extend(judged.traces)
                     all_telemetry.extend(judged.telemetry)
@@ -1669,27 +1712,7 @@ async def plan_graph_publication(
                 "SELECT fact_id, chunk_id FROM fact_sources ORDER BY fact_id ASC, chunk_id ASC"
             ).fetchall()
         )
-        final_edges = tuple(
-            (
-                str(r[0]),
-                str(r[1]),
-                str(r[2]),
-                float(r[3]),
-                str(r[4] or ""),
-            )
-            for r in staging_conn.execute(
-                """
-                SELECT e.src_id, e.dst_id, e.kind, e.weight, COALESCE(es.chunk_id, '')
-                FROM edges e
-                LEFT JOIN edge_sources es
-                  ON es.src_id = e.src_id AND es.dst_id = e.dst_id AND es.kind = e.kind
-                ORDER BY e.src_id ASC, e.dst_id ASC, e.kind ASC, COALESCE(es.chunk_id, '') ASC
-                """
-            ).fetchall()
-        )
-
         # Ensure any entity/fact whose text changed during merge or SHACL repair is embedded
-        initial_entity_meta = {eid: (name, defn) for eid, name, defn in entity_nodes}
         reembed_entities = [
             (eid, name, defn)
             for eid, name, defn in final_entities
@@ -1704,7 +1727,6 @@ async def plan_graph_publication(
                 entity_vec_by_id[eid] = vec
             upsert_entity_vectors(staging_conn, [(eid, entity_vec_by_id[eid]) for eid, _, _ in reembed_entities])
 
-        initial_fact_defs = {f_row[0]: f_row[5] for f_row in fact_nodes}
         reembed_facts = [
             f_row
             for f_row in final_facts
@@ -1768,7 +1790,7 @@ async def plan_graph_publication(
             )
             for r in staging_conn.execute(
                 """
-                SELECT e.src_id, e.dst_id, e.kind, e.weight, COALESCE(es.chunk_id, '')
+                SELECT e.src_id, e.dst_id, e.kind, COALESCE(es.atomic_confidence, e.weight), COALESCE(es.chunk_id, '')
                 FROM edges e
                 LEFT JOIN edge_sources es
                   ON es.src_id = e.src_id AND es.dst_id = e.dst_id AND es.kind = e.kind
@@ -1778,13 +1800,17 @@ async def plan_graph_publication(
         )
 
         final_rows = PreparedGraphRows(
-            chunks=tuple(chunks),
+            chunks=complete_chunks,
             entities=final_entities,
             entity_labels=final_labels,
             facts=final_facts,
             fact_sources=final_fact_sources,
             edges=final_edges,
-            chunk_vectors=tuple(chunk_vec_pairs),
+            chunk_vectors=tuple(
+                (cid, deserialize_f32_vector(blob))
+                for cid, blob in staging_conn.execute("SELECT chunk_id, embedding FROM chunk_vec ORDER BY chunk_id")
+            ),
+            input_fingerprints=tuple(sorted(input_fingerprints.items())),
             entity_vectors=final_entity_vectors,
             fact_vectors=final_fact_vectors,
             concept_schemes=final_concept_schemes,

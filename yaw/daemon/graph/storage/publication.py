@@ -1,5 +1,6 @@
 """Prepared graph rows and persistence-only application within a caller transaction."""
 
+import json
 import sqlite3
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
@@ -44,12 +45,29 @@ class PreparedGraphRows:
     fact_vectors: tuple[VectorRow, ...]
     concept_schemes: tuple[tuple[str, str, str, str, float | None], ...] = ()
     concept_scheme_members: tuple[tuple[str, str, int], ...] = ()
+    input_fingerprints: tuple[tuple[str, str], ...] = ()
+
+
+def clear_concept_schemes(conn: sqlite3.Connection) -> None:
+    """Remove derived taxonomy before replacing it from current community membership."""
+    if not conn.in_transaction:
+        raise RuntimeError("Taxonomy replacement requires an active transaction")
+    conn.execute("DELETE FROM edge_sources WHERE kind='skos:topConceptOf'")
+    conn.execute("DELETE FROM edges WHERE kind='skos:topConceptOf'")
+    conn.execute("DELETE FROM entity_vec WHERE entity_id IN (SELECT scheme_id FROM concept_schemes)")
+    conn.execute("DELETE FROM concept_scheme_members")
+    conn.execute("DELETE FROM concept_schemes")
 
 
 def apply_prepared_graph_rows(conn: sqlite3.Connection, rows: PreparedGraphRows) -> None:
     """Apply prepared rows and FTS updates; never perform inference or commit."""
     if not conn.in_transaction:
         raise RuntimeError("Graph publication requires an active transaction")
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES ('graph_input_fingerprints', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (json.dumps(rows.input_fingerprints),),
+    )
     upsert_chunk_vectors(conn, rows.chunk_vectors)
     upsert_chunk_pointers(conn, rows.chunks)
     upsert_entities(conn, rows.entities)
@@ -135,7 +153,10 @@ class GraphTargetHandler(coco.TargetHandler[PreparedGraphRows, GraphTrackingReco
                 if action.removed_chunks:
                     delete_chunks(conn, action.removed_chunks)
                 if action.rows is not None:
+                    clear_concept_schemes(conn)
                     apply_prepared_graph_rows(conn, action.rows)
+                else:
+                    conn.execute("DELETE FROM meta WHERE key='graph_input_fingerprints'")
             violations = lint_graph_shacl(conn)
             if violations:
                 raise ValueError(f"Graph publication rejected {len(violations)} SHACL violations: {violations[:3]}")

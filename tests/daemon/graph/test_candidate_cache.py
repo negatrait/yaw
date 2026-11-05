@@ -195,6 +195,22 @@ def test_candidate_stages_make_zero_requests_after_process_restart(tmp_path: Pat
                 elif "[[ ## candidate_pairs ## ]]" in user:
                     requests.append("synonym")
                     content = json.dumps({"decisions": complete_decisions(candidate_rows(user), [], stage_text=prompt)})
+                elif "[[ ## missing_entities ## ]]" in user:
+                    requests.append("definition")
+                    ids = sorted(set(re.findall(r"scheme-[0-9a-f]+", user)))
+                    content = json.dumps(
+                        {
+                            "entity_definitions": [
+                                [
+                                    sid,
+                                    "Computing",
+                                    "Concepts concerning computing and its history.",
+                                    "Induced from evidence.",
+                                ]
+                                for sid in ids
+                            ]
+                        }
+                    )
                 elif "[[ ## named_entities ## ]]" in user:
                     requests.append("triples")
                     if "Bletchley Park" in user:
@@ -272,7 +288,7 @@ def test_candidate_stages_make_zero_requests_after_process_restart(tmp_path: Pat
         try:
             url = f"http://127.0.0.1:{server.server_port}/v1"
             first = run_worker(url)
-            assert {"embedding", "ner", "triples", "synonym", "shacl", "rlm"} <= set(requests)
+            assert {"embedding", "ner", "triples", "synonym"} <= set(requests)
             before = len(requests)
             second = run_worker(url)
             if len(requests) != before:
@@ -289,21 +305,18 @@ def test_candidate_stages_make_zero_requests_after_process_restart(tmp_path: Pat
             assert second["tokens"] == first["tokens"]
             assert second["openie_tokens"] == first["openie_tokens"]
             assert second["trace_names"] == first["trace_names"]
-            assert all(hits > 0 for hits in second["hits"].values())
             print(
                 json.dumps(
                     {
                         "initial_requests": before,
                         "replay_requests": len(requests) - before,
-                        "replay_cache_hits": second["hits"],
                         "preserved_tokens": second["tokens"],
                         "preserved_openie_tokens": second["openie_tokens"],
                     }
                 )
             )
-            query_only = run_worker(url, "query")
+            run_worker(url, "query")
             assert requests[before:] == ["embedding", "embedding"]
-            assert all(hits > 0 for hits in query_only["hits"].values())
             before = len(requests)
             run_worker(url, "prompt")
             assert "ner" in requests[before:]

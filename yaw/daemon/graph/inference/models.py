@@ -15,11 +15,13 @@ class ChatProfile:
     checkpoint: str
     recipe: str
     role: str = "both"  # "extraction", "qa", or "both"
-    default_temperature: float = 0.2
-    extraction_temperature: float = 0.2
-    qa_temperature: float = 0.2
+    default_temperature: float = 0.35
+    extraction_temperature: float = 0.35
+    qa_temperature: float = 0.35
     reflection_temperature: float = 0.8
     reflection_worker_temperature: float = 0.7
+    top_p: float | None = None
+    top_k: int | None = None
     expected_device: str | None = None
     expected_context: int | None = None
 
@@ -40,9 +42,9 @@ CHAT_MODELS = {
         checkpoint="unsloth/Phi-4-mini-instruct-GGUF:Phi-4-mini-instruct-Q4_K_M.gguf",
         recipe="llamacpp",
         role="extraction",
-        default_temperature=0.2,
-        extraction_temperature=0.2,
-        qa_temperature=0.2,
+        default_temperature=0.35,
+        extraction_temperature=0.35,
+        qa_temperature=0.35,
         expected_device="gpu",
         expected_context=16384,
     ),
@@ -50,9 +52,9 @@ CHAT_MODELS = {
         checkpoint="unsloth/Llama-3.2-3B-Instruct-GGUF:Llama-3.2-3B-Instruct-UD-Q4_K_XL.gguf",
         recipe="llamacpp",
         role="extraction",
-        default_temperature=0.2,
-        extraction_temperature=0.2,
-        qa_temperature=0.2,
+        default_temperature=0.35,
+        extraction_temperature=0.35,
+        qa_temperature=0.35,
         expected_device="gpu",
         expected_context=16384,
     ),
@@ -60,9 +62,9 @@ CHAT_MODELS = {
         checkpoint="unsloth/Qwen3-4B-Instruct-2507-GGUF:Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
         recipe="llamacpp",
         role="both",
-        default_temperature=0.2,
-        extraction_temperature=0.2,
-        qa_temperature=0.2,
+        default_temperature=0.35,
+        extraction_temperature=0.35,
+        qa_temperature=0.35,
         expected_device="gpu",
         expected_context=16384,
     ),
@@ -70,9 +72,13 @@ CHAT_MODELS = {
         checkpoint="unsloth/gemma-4-E4B-it-qat-q4_0-gguf-Q4_0:Q4_K_M",
         recipe="llamacpp",
         role="both",
-        default_temperature=0.2,
-        extraction_temperature=0.2,
-        qa_temperature=0.2,
+        default_temperature=1.0,
+        extraction_temperature=1.0,
+        qa_temperature=1.0,
+        reflection_temperature=1.0,
+        reflection_worker_temperature=1.0,
+        top_p=0.95,
+        top_k=64,
         expected_device="gpu",
         expected_context=DEFAULT_CONTEXT_WINDOW_TOKENS,
     ),
@@ -80,17 +86,21 @@ CHAT_MODELS = {
         checkpoint="gemma4-it:12b",
         recipe="flm",
         role="both",
-        default_temperature=0.2,
-        extraction_temperature=0.2,
-        qa_temperature=0.2,
+        default_temperature=1.0,
+        extraction_temperature=1.0,
+        qa_temperature=1.0,
+        reflection_temperature=1.0,
+        reflection_worker_temperature=1.0,
+        top_p=0.95,
+        top_k=64,
     ),
     "qwen3.5-9b-FLM": ChatProfile(
         checkpoint="qwen3.5:9b",
         recipe="flm",
         role="both",
-        default_temperature=0.2,
-        extraction_temperature=0.2,
-        qa_temperature=0.2,
+        default_temperature=0.35,
+        extraction_temperature=0.35,
+        qa_temperature=0.35,
     ),
 }
 DEFAULT_EXTRACTION_CHAT = "gemma-4-E4B-it-qat-q4_0-gguf-Q4_0"

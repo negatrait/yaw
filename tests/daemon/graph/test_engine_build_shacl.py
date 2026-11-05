@@ -24,6 +24,7 @@ from yaw.daemon.graph.storage import (
     upsert_entity_labels,
     upsert_semantic_edges,
 )
+from yaw.daemon.indexing import bind_native_indexing
 
 
 class DeterministicMockLM(dspy.LM):
@@ -114,11 +115,13 @@ def _make_engine(
         synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=mock_lm, rlm_sub_lm=mock_lm
     )
     embedder: Any = DeterministicMockEmbedder(dim=64)
-    engine = YawGraphEngine(
-        db_path=db_path,
-        workspace_root=tmp_path,
-        program=program,
-        embedder=embedder,
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=db_path,
+            workspace_root=tmp_path,
+            program=program,
+            embedder=embedder,
+        )
     )
     return engine, engine.conn
 

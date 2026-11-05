@@ -74,8 +74,9 @@ char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
 
 DSPY_CONCEPT_SCHEME_DEFS_GBNF_GRAMMAR: str = (
     'root ::= "{\\"entity_definitions\\": [" scheme-list "]}"\n'
-    'scheme-list ::= (scheme-tuple (", " scheme-tuple)*)?\n'
-    'scheme-tuple ::= "[" string ", " string ", " string ", " string "]"\n'
+    'scheme-list ::= (scheme-item (", " scheme-item)*)?\n'
+    'scheme-item ::= "{\\"scheme_id\\": " string ", \\"pref_label\\": " string '
+    '", \\"definition\\": " string ", \\"history_note\\": " string "}"\n'
     'string ::= "\\"" char+ "\\""\n'
     'char ::= [^"\\\\\\x7F\\x00-\\x1F] | "\\\\" (["\\\\bfnrt] | "u" [0-9a-fA-F]{4})\n'
 )
@@ -194,7 +195,7 @@ def build_dspy_concept_scheme_defs_grammar(
     scheme_ids: Sequence[str] | Sequence[Mapping[str, Any]] | None = None,
 ) -> str:
     """Build pure-JSON GBNF grammar for DefineMissingEntities synthesizing concept schemes \
-(`{"entity_definitions": [[scheme_id, pref_label, definition, history_note], ...]}`)."""
+(`{"entity_definitions": [{"scheme_id": ..., "pref_label": ..., "definition": ..., "history_note": ...}, ...]}`)."""
     extracted_ids: list[str] = []
     if scheme_ids:
         for item in scheme_ids:
@@ -210,13 +211,18 @@ def build_dspy_concept_scheme_defs_grammar(
         return DSPY_CONCEPT_SCHEME_DEFS_GBNF_GRAMMAR
 
     rules: list[str] = []
-    tuple_names: list[str] = []
+    item_names: list[str] = []
     for i, sid in enumerate(extracted_ids):
         sid_literal = gbnf_escape_literal(json.dumps(sid, ensure_ascii=False))
-        rules.append(f'scheme-tuple-{i} ::= "[" {sid_literal} ", " string ", " string ", " string "]"')
-        tuple_names.append(f"scheme-tuple-{i}")
+        rules.append(
+            f'scheme-item-{i} ::= "{{\\"scheme_id\\": " {sid_literal} '
+            f'", \\"pref_label\\": " string '
+            f'", \\"definition\\": " string '
+            f'", \\"history_note\\": " string "}}"'
+        )
+        item_names.append(f"scheme-item-{i}")
 
-    seq = ' ", " '.join(tuple_names)
+    seq = ' ", " '.join(item_names)
     root_line = f'root ::= "{{\\"entity_definitions\\": [" {seq} "]}}"\n'
     return (
         root_line

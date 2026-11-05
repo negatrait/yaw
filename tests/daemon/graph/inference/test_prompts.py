@@ -774,11 +774,19 @@ tools."""
         self.assertNotIn("frequency_penalty", llm_ref.kwargs)
         self.assertTrue(getattr(llm_ref, "_yaw_supports_gbnf", False))
 
-        orch_ref, worker_ref = create_dspy_rlm_pair(reflection=True)
+        orch_ref, worker_ref = create_dspy_rlm_pair(
+            "Qwen3-4B-Instruct-2507-GGUF", "Qwen3-4B-Instruct-2507-GGUF", reflection=True
+        )
         self.assertEqual(orch_ref.kwargs["temperature"], 0.8)
         self.assertEqual(worker_ref.kwargs["temperature"], 0.7)
         self.assertFalse(getattr(orch_ref, "_yaw_supports_gbnf", True))
         self.assertTrue(getattr(worker_ref, "_yaw_supports_gbnf", False))
+
+        orch_gemma, worker_gemma = create_dspy_rlm_pair(
+            "gemma-4-E4B-it-qat-q4_0-gguf-Q4_0", "gemma-4-E4B-it-qat-q4_0-gguf-Q4_0", reflection=True
+        )
+        self.assertEqual(orch_gemma.kwargs["temperature"], 1.0)
+        self.assertEqual(worker_gemma.kwargs["temperature"], 1.0)
 
     def test_rlm_instruction_proposer_contract_and_boundary_envelope(self):
         from yaw.daemon.graph.inference import RLMInstructionProposer
@@ -940,7 +948,13 @@ no frequency penalty."""
                 },
                 {
                     "decisions": [
-                        {"pair_id": "e0|e1", "reasoning": "Standard synonym", "alt_label": True, "hidden_label": False}
+                        {
+                            "pair_id": "e0|e1",
+                            "reasoning": "Standard synonym",
+                            "equivalent": False,
+                            "alt_label": True,
+                            "hidden_label": False,
+                        }
                     ]
                 },
                 {
@@ -1813,6 +1827,7 @@ repair, and Pareto penalty."""
                     {
                         "pair_id": "ent-1|ent-2",
                         "reasoning": "Identical synonyms",
+                        "equivalent": False,
                         "alt_label": True,
                         "hidden_label": False,
                     }
@@ -1828,6 +1843,7 @@ repair, and Pareto penalty."""
                     {
                         "pair_id": "ent-1|ent-1",
                         "reasoning": "Self loop",
+                        "equivalent": False,
                         "alt_label": True,
                         "hidden_label": False,
                     }

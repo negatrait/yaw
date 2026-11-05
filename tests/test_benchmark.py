@@ -16,6 +16,7 @@ from benchmark import (
     get_gold_docs,
     load_dataset_files,
 )
+from yaw.daemon.indexing import bind_native_indexing
 from yaw.daemon.ingestion import prepare_dataset_bundle, resolve_dataset_name, snapshot_dataset_bundle
 from yaw.daemon.ingestion.bundles import document_identity
 
@@ -875,12 +876,14 @@ class PaperParityGateTests(unittest.TestCase):
                 def heal_shacl_violations(self, violations, focus_context="", *args, **kwargs):
                     return []
 
-            engine = YawGraphEngine(
-                db_path=tmp_path / "yaw.db",
-                workspace_root=corpus_dir,
-                program=MinimalProgram(),
-                embedder=TitleCheckingEmbedder(profile),
-                retrieval_top_k=5,
+            engine = bind_native_indexing(
+                YawGraphEngine(
+                    db_path=tmp_path / "yaw.db",
+                    workspace_root=corpus_dir,
+                    program=MinimalProgram(),
+                    embedder=TitleCheckingEmbedder(profile),
+                    retrieval_top_k=5,
+                )
             )
             try:
                 engine.index_chunks(added_chunks)

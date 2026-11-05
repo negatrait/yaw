@@ -20,6 +20,7 @@ from yaw.daemon.graph.inference import (
 )
 from yaw.daemon.graph.inference.embedding import MODEL, resolve_embedding_profile
 from yaw.daemon.graph.inference.models import CHAT_MODELS
+from yaw.daemon.indexing import bind_native_indexing
 
 
 @pytest.fixture
@@ -250,11 +251,13 @@ def test_standalone_engine_derives_hydration_budget_from_program(tmp_path, provi
     url, _requests = provider
     config = YawConfig(workspace_root=tmp_path, base_url=url)
     program = HippoRAGProgram.from_config(config)
-    engine = YawGraphEngine(
-        db_path=tmp_path / "context.db",
-        workspace_root=tmp_path,
-        program=program,
-        embedder=DSPyEmbeddingAdapter.from_config(config),
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=tmp_path / "context.db",
+            workspace_root=tmp_path,
+            program=program,
+            embedder=DSPyEmbeddingAdapter.from_config(config),
+        )
     )
     try:
         assert engine.max_context_chars == config.max_context_chars

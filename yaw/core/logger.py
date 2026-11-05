@@ -100,6 +100,8 @@ def configure_logging(
 
     os.environ.setdefault("LITELLM_LOG", "WARNING")
     os.environ.setdefault("LITELLM_SUPPRESS_DEBUG_INFO", "True")
+    os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+    os.environ.setdefault("LITELLM_TELEMETRY", "False")
 
     if quiet_third_party:
         for name in (

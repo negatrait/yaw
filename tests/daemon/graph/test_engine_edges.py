@@ -15,6 +15,7 @@ from yaw.core import ChunkPointer
 from yaw.daemon.graph.engine import YawGraphEngine
 from yaw.daemon.graph.inference import HippoRAGProgram
 from yaw.daemon.graph.inference.embedding import DSPyEmbeddingAdapter, create_dspy_embedder, resolve_embedding_profile
+from yaw.daemon.indexing import bind_native_indexing
 
 
 @pytest.fixture
@@ -166,7 +167,9 @@ def make_engine(tmp_path, url) -> YawGraphEngine:
         replace(resolve_embedding_profile(), dimensions=8),
         create_dspy_embedder(embed, caching=False),
     )
-    return YawGraphEngine(db_path=tmp_path / "yaw.db", workspace_root=tmp_path, program=program, embedder=embedder)
+    return bind_native_indexing(
+        YawGraphEngine(db_path=tmp_path / "yaw.db", workspace_root=tmp_path, program=program, embedder=embedder)
+    )
 
 
 @pytest.mark.parametrize(

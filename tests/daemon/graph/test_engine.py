@@ -20,6 +20,7 @@ from yaw.daemon.graph.inference import (
     HippoRAGProgram,
     extraction_fingerprint,
 )
+from yaw.daemon.indexing import bind_native_indexing
 
 
 class ProtocolTokenCounter:
@@ -262,12 +263,14 @@ def test_engine(synonym_token_counter, tmp_path: Path) -> Iterator[YawGraphEngin
     program = HippoRAGProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
-    engine = YawGraphEngine(
-        db_path=db_path,
-        workspace_root=tmp_path,
-        program=program,
-        embedder=embedder,
-        retrieval_top_k=2,
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=db_path,
+            workspace_root=tmp_path,
+            program=program,
+            embedder=embedder,
+            retrieval_top_k=2,
+        )
     )
     yield engine
     engine.close()
@@ -330,11 +333,13 @@ def test_openie_resume_reuses_matching_prompts_and_invalidates_mutations(tmp_pat
     doc = "Alan Turing was an English mathematician and computer scientist."
     database = tmp_path / "resume.db"
     first = CountingProgram()
-    engine = YawGraphEngine(
-        db_path=database,
-        workspace_root=tmp_path,
-        program=first,
-        embedder=DeterministicMockEmbedder(dim=64),
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=database,
+            workspace_root=tmp_path,
+            program=first,
+            embedder=DeterministicMockEmbedder(dim=64),
+        )
     )
     try:
         engine.index([doc])
@@ -348,11 +353,13 @@ def test_openie_resume_reuses_matching_prompts_and_invalidates_mutations(tmp_pat
 
     # Recreate all Python objects: no in-memory stage cache can survive.
     second = CountingProgram()
-    engine = YawGraphEngine(
-        db_path=database,
-        workspace_root=tmp_path,
-        program=second,
-        embedder=DeterministicMockEmbedder(dim=64),
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=database,
+            workspace_root=tmp_path,
+            program=second,
+            embedder=DeterministicMockEmbedder(dim=64),
+        )
     )
     try:
         engine.index_chunks(chunks)
@@ -456,12 +463,14 @@ def test_engine_multi_batch_indexing_and_bounded_embedding_batches(synonym_token
     program = HippoRAGProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = TrackingEmbedder(dim=64)
 
-    engine = YawGraphEngine(
-        db_path=tmp_path / "yaw_batches.db",
-        workspace_root=tmp_path,
-        program=program,
-        embedder=embedder,
-        embed_batch_size=2,
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=tmp_path / "yaw_batches.db",
+            workspace_root=tmp_path,
+            program=program,
+            embedder=embedder,
+            embed_batch_size=2,
+        )
     )
     try:
         batch1 = [
@@ -535,12 +544,14 @@ def test_engine_fact_score_weighting_and_thread_safe_retrieval(synonym_token_cou
     program = HippoRAGProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = ControlledFactEmbedder()
 
-    engine = YawGraphEngine(
-        db_path=tmp_path / "yaw_scores.db",
-        workspace_root=tmp_path,
-        program=program,
-        embedder=embedder,
-        passage_node_weight=0.0,  # Isolate entity seed PPR contribution
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=tmp_path / "yaw_scores.db",
+            workspace_root=tmp_path,
+            program=program,
+            embedder=embedder,
+            passage_node_weight=0.0,  # Isolate entity seed PPR contribution
+        )
     )
     try:
         engine.index(
@@ -690,15 +701,17 @@ def test_engine_hybrid_fact_candidate_retrieval(synonym_token_counter, tmp_path:
     program = HippoRAGProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = HybridFactEmbedder()
 
-    engine = YawGraphEngine(
-        db_path=tmp_path / "yaw_hybrid.db",
-        workspace_root=tmp_path,
-        program=program,
-        embedder=embedder,
-        fact_candidate_pool_k=10,
-        fact_fts_pool_k=10,
-        fact_rrf_k=60,
-        linking_top_k=2,
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=tmp_path / "yaw_hybrid.db",
+            workspace_root=tmp_path,
+            program=program,
+            embedder=embedder,
+            fact_candidate_pool_k=10,
+            fact_fts_pool_k=10,
+            fact_rrf_k=60,
+            linking_top_k=2,
+        )
     )
     try:
         engine.index(
@@ -755,12 +768,14 @@ def test_engine_query_intent_escalation_once_without_infinite_recursion(synonym_
     program = HippoRAGProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
-    engine = YawGraphEngine(
-        db_path=tmp_path / "yaw_intent.db",
-        workspace_root=tmp_path,
-        program=program,
-        embedder=embedder,
-        retrieval_top_k=2,
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=tmp_path / "yaw_intent.db",
+            workspace_root=tmp_path,
+            program=program,
+            embedder=embedder,
+            retrieval_top_k=2,
+        )
     )
     try:
         engine.index(
@@ -890,12 +905,14 @@ def test_engine_homograph_gate_edc_and_shacl_conformance(synonym_token_counter, 
     program = HippoRAGProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
-    engine = YawGraphEngine(
-        db_path=tmp_path / "yaw_homograph.db",
-        workspace_root=tmp_path,
-        program=program,
-        embedder=embedder,
-        retrieval_top_k=2,
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=tmp_path / "yaw_homograph.db",
+            workspace_root=tmp_path,
+            program=program,
+            embedder=embedder,
+            retrieval_top_k=2,
+        )
     )
     try:
         # Index first passage: creates primary "Apple" entity (tech company)
@@ -1015,13 +1032,15 @@ Option A (standalone Stage 1 NER entities preserved with definitions)."""
     program = HippoRAGProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
-    engine = YawGraphEngine(
-        db_path=tmp_path / "yaw_hazard2_3.db",
-        workspace_root=tmp_path,
-        program=program,
-        embedder=embedder,
-        retrieval_top_k=2,
-        synonymy_threshold=0.99,  # Ensure only same-label candidate pair is surfaced
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=tmp_path / "yaw_hazard2_3.db",
+            workspace_root=tmp_path,
+            program=program,
+            embedder=embedder,
+            retrieval_top_k=2,
+            synonymy_threshold=0.99,  # Ensure only same-label candidate pair is surfaced
+        )
     )
     try:
         engine.index(["Apple designed the iPhone in 2007."])
@@ -1274,13 +1293,15 @@ using all 5 bound REPL tools."""
     )
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
-    engine = YawGraphEngine(
-        db_path=tmp_path / "yaw_step7_rlm.db",
-        workspace_root=tmp_path,
-        program=program,
-        embedder=embedder,
-        retrieval_top_k=2,
-        synonymy_threshold=-1.0,
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=tmp_path / "yaw_step7_rlm.db",
+            workspace_root=tmp_path,
+            program=program,
+            embedder=embedder,
+            retrieval_top_k=2,
+            synonymy_threshold=-1.0,
+        )
     )
     try:
         # 1. Index first document so "alan turing" and "turing machine" are materialized and linked to chunk 1 on disk
@@ -1442,12 +1463,14 @@ uses heuristic fallbacks."""
     program = HippoRAGProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
-    engine = YawGraphEngine(
-        db_path=tmp_path / "yaw_missing_defs.db",
-        workspace_root=tmp_path,
-        program=program,
-        embedder=embedder,
-        retrieval_top_k=2,
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=tmp_path / "yaw_missing_defs.db",
+            workspace_root=tmp_path,
+            program=program,
+            embedder=embedder,
+            retrieval_top_k=2,
+        )
     )
     try:
         with dspy.context(track_usage=True):
@@ -1579,13 +1602,15 @@ traces into dspy.settings.trace, and emits per-predictor feedback."""
     )
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
-    engine = YawGraphEngine(
-        db_path=tmp_path / "yaw_evo_extract.db",
-        workspace_root=tmp_path,
-        program=program,
-        embedder=embedder,
-        retrieval_top_k=2,
-        synonymy_threshold=-1.0,
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=tmp_path / "yaw_evo_extract.db",
+            workspace_root=tmp_path,
+            program=program,
+            embedder=embedder,
+            retrieval_top_k=2,
+            synonymy_threshold=-1.0,
+        )
     )
     try:
         doc_gold = "Alan Turing\nAlan Turing worked at Bletchley Park during World War II."
@@ -1701,12 +1726,14 @@ compatibility."""
     program = HippoRAGProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
-    engine = YawGraphEngine(
-        db_path=tmp_path / "yaw_rm_sprint3.db",
-        workspace_root=tmp_path,
-        program=program,
-        embedder=embedder,
-        retrieval_top_k=2,
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=tmp_path / "yaw_rm_sprint3.db",
+            workspace_root=tmp_path,
+            program=program,
+            embedder=embedder,
+            retrieval_top_k=2,
+        )
     )
     try:
         assert (tmp_path / "dspy_cache").exists()
@@ -1822,12 +1849,14 @@ multi-hop fallback."""
     )
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
-    engine = YawGraphEngine(
-        db_path=tmp_path / "yaw_react_sprint3.db",
-        workspace_root=tmp_path,
-        program=program,
-        embedder=embedder,
-        retrieval_top_k=2,
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=tmp_path / "yaw_react_sprint3.db",
+            workspace_root=tmp_path,
+            program=program,
+            embedder=embedder,
+            retrieval_top_k=2,
+        )
     )
     try:
         engine.index(
@@ -1862,12 +1891,14 @@ def test_sprint3_engine_evaluate_and_pareto_frontier_export(
     )
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
-    engine = YawGraphEngine(
-        db_path=tmp_path / "yaw_eval_sprint3.db",
-        workspace_root=tmp_path,
-        program=program,
-        embedder=embedder,
-        retrieval_top_k=2,
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=tmp_path / "yaw_eval_sprint3.db",
+            workspace_root=tmp_path,
+            program=program,
+            embedder=embedder,
+            retrieval_top_k=2,
+        )
     )
     try:
         doc = "Alan Turing designed the ACE and founded computer science."
@@ -1975,12 +2006,14 @@ GEPA trace replay and Pareto support."""
     )
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
-    engine = YawGraphEngine(
-        db_path=tmp_path / "yaw_unified_hook.db",
-        workspace_root=tmp_path,
-        program=program,
-        embedder=embedder,
-        retrieval_top_k=2,
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=tmp_path / "yaw_unified_hook.db",
+            workspace_root=tmp_path,
+            program=program,
+            embedder=embedder,
+            retrieval_top_k=2,
+        )
     )
     try:
         # 1. Oblivion verification: legacy dual hooks demolished, only _canonical_retrieval_hook bound
@@ -2082,13 +2115,15 @@ minibatch q_stats lookup."""
     )
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
-    engine = YawGraphEngine(
-        db_path=tmp_path / "yaw_hybrid_e2e.db",
-        workspace_root=tmp_path,
-        program=program,
-        embedder=embedder,
-        retrieval_top_k=2,
-        synonymy_threshold=-1.0,
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=tmp_path / "yaw_hybrid_e2e.db",
+            workspace_root=tmp_path,
+            program=program,
+            embedder=embedder,
+            retrieval_top_k=2,
+            synonymy_threshold=-1.0,
+        )
     )
     try:
         doc_q1 = "Alan Turing\nAlan Turing designed the Automatic Computing Engine in 1945."
@@ -2278,12 +2313,14 @@ def test_evolve_prompts_real_unmocked_gepa_and_miprov2_with_context_limit_guard(
     )
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
-    engine = YawGraphEngine(
-        db_path=tmp_path / "yaw_real_unmocked_opt.db",
-        workspace_root=tmp_path,
-        program=program,
-        embedder=embedder,
-        retrieval_top_k=2,
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=tmp_path / "yaw_real_unmocked_opt.db",
+            workspace_root=tmp_path,
+            program=program,
+            embedder=embedder,
+            retrieval_top_k=2,
+        )
     )
     try:
         doc_turing = "Alan Turing\nAlan Turing designed the Automatic Computing Engine in 1945."
@@ -2528,12 +2565,14 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
     program = HippoRAGProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
-    engine = YawGraphEngine(
-        db_path=tmp_path / "yaw_homograph_permutations.db",
-        workspace_root=tmp_path,
-        program=program,
-        embedder=embedder,
-        retrieval_top_k=5,
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=tmp_path / "yaw_homograph_permutations.db",
+            workspace_root=tmp_path,
+            program=program,
+            embedder=embedder,
+            retrieval_top_k=5,
+        )
     )
     try:
         n = engine.index(
@@ -2670,12 +2709,14 @@ def test_step10_engine_pareto_ensemble_readonly_graph_and_memoization(
         synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm
     )
     embedder: Any = DeterministicMockEmbedder(dim=64)
-    engine = YawGraphEngine(
-        db_path=tmp_path / "yaw_step10_ens.db",
-        workspace_root=tmp_path,
-        program=prog,
-        embedder=embedder,
-        retrieval_top_k=2,
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=tmp_path / "yaw_step10_ens.db",
+            workspace_root=tmp_path,
+            program=prog,
+            embedder=embedder,
+            retrieval_top_k=2,
+        )
     )
     try:
         doc_a = "Alan Turing\nAlan Turing worked at Bletchley Park during World War II."
@@ -2906,14 +2947,16 @@ def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
         synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm
     )
     embedder: Any = DeterministicMockEmbedder(dim=64)
-    engine = YawGraphEngine(
-        db_path=tmp_path / "yaw_step11_e2e.db",
-        workspace_root=tmp_path,
-        program=prog,
-        embedder=embedder,
-        retrieval_top_k=2,
-        synonymy_threshold=-1.0,
-        traversal_policy=RelationTraversalPolicy(skos_broader_up=1.0, skos_broader_down=0.25),
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=tmp_path / "yaw_step11_e2e.db",
+            workspace_root=tmp_path,
+            program=prog,
+            embedder=embedder,
+            retrieval_top_k=2,
+            synonymy_threshold=-1.0,
+            traversal_policy=RelationTraversalPolicy(skos_broader_up=1.0, skos_broader_down=0.25),
+        )
     )
     try:
         doc_turing = "Alan Turing\nAlan Turing was born on 1912-06-23 and worked on cryptanalysis."

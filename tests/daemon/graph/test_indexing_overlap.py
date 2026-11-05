@@ -675,6 +675,69 @@ def test_frozen_candidate_streaming_batches(tmp_path, provider):
         assert engine.conn.execute("SELECT COUNT(*) FROM chunk_inference").fetchone()[0] == 5
         assert engine.conn.execute("SELECT COUNT(*) FROM source_chunks").fetchone()[0] == 5
         assert engine.conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0] == 2
+        assert engine._graph_rlm_stats["reused_chunks"] == 4
+        assert engine._graph_rlm_stats["processed_chunks"] == 1
+        assert (
+            len(
+                json.loads(
+                    engine.conn.execute("SELECT value FROM meta WHERE key='graph_input_fingerprints'").fetchone()[0]
+                )
+            )
+            == 5
+        )
+        assert engine.lint_graph()["conforms"]
+    finally:
+        engine.close()
+
+
+def test_addition_preserves_adjudicated_graph_and_edit_invalidates_reuse(tmp_path, provider):
+    from yaw.core import ChunkPointer
+    from yaw.daemon.graph.engine import YawGraphEngine
+    from yaw.daemon.graph.storage import upsert_edges_with_sources, upsert_semantic_edges
+    from yaw.daemon.indexing import bind_native_indexing
+
+    url, state = provider
+    state["delay"] = 0.01
+    lm = create_dspy_lm("overlap", base_url=url + "/v1", cache=False, num_retries=0, max_tokens=512)
+    program = HippoRAGProgram(orchestrator_lm=lm, rlm_sub_lm=lm, enable_gbnf=False, max_output_tokens=512)
+    engine = bind_native_indexing(YawGraphEngine(tmp_path / "yaw.db", tmp_path, program, adapter(url)))
+    first = (ChunkPointer("first", "first.md", 1, 1, "first", 1, 1), "Ada studies Algebra.")
+    second = (ChunkPointer("second", "second.md", 1, 1, "second", 1, 1), "Ada studies Algebra again.")
+    try:
+        engine.index_chunks([first])
+        entities = [row[0] for row in engine.conn.execute("SELECT entity_id FROM entities ORDER BY entity_id")]
+        # A previously validated semantic assertion must survive expansion.
+        with engine.managed_conn.transaction() as conn:
+            upsert_semantic_edges(conn, [(entities[0], entities[1], "owl:differentFrom", 0.8, "Distinct concepts")])
+            upsert_edges_with_sources(
+                conn,
+                [
+                    (a, b, "owl:differentFrom", weight, cid)
+                    for a, b in (entities, entities[::-1])
+                    for weight, cid in ((0.9, "first"), (0.8, ""))
+                ],
+            )
+        assert engine.lint_graph()["conforms"]
+        previous = engine.conn.execute(
+            "SELECT src_id, dst_id, kind, weight FROM edges WHERE kind='owl:differentFrom'"
+        ).fetchall()
+        assert previous
+        vectors = engine.conn.execute("SELECT embedding FROM chunk_vec WHERE chunk_id='first'").fetchone()
+        engine.index_chunks([second])
+        assert engine._graph_rlm_stats["reused_chunks"] == 1
+        assert engine._graph_rlm_stats["processed_chunks"] == 1
+        assert (
+            engine.conn.execute(
+                "SELECT src_id, dst_id, kind, weight FROM edges WHERE kind='owl:differentFrom'"
+            ).fetchall()
+            == previous
+        )
+        assert engine.conn.execute("SELECT embedding FROM chunk_vec WHERE chunk_id='first'").fetchone() == vectors
+        assert engine.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 2
+        assert engine.lint_graph()["conforms"]
+        engine.index_chunks([(first[0], "Ada studies Algebra with a revised source.")])
+        assert engine._graph_rlm_stats["reused_chunks"] == 0
+        assert engine._graph_rlm_stats["processed_chunks"] == 2
         assert engine.lint_graph()["conforms"]
     finally:
         engine.close()

@@ -247,21 +247,19 @@ class DefineMissingEntities(dspy.Signature):
 `missing_entities` based on the passage text and extracted triples, or for emergent `skos:ConceptScheme` taxonomies:
     - For missing entities: Emit `[entity_name, contextual_definition]` for every requested concept using the exact \
 string from `missing_entities`; never emit an empty definition or repeat `entity_name` tautologically.
-    - For emergent `skos:ConceptScheme` taxonomies: Emit `[scheme_id, pref_label, definition, history_note]` \
+    - For emergent `skos:ConceptScheme` taxonomies: Emit `{"scheme_id", "pref_label", "definition", "history_note"}` \
 synthesizing the scheme's canonical title, intensional domain definition, and ontological rationale."""
 
-    passage: str = dspy.InputField(desc="Source passage text")
-    missing_entities: list[str] = dspy.InputField(
-        desc="Entity names referenced in triples that lack contextual definitions"
-    )
+    passage: str = dspy.InputField(desc="Source passage text or taxonomic cluster dossiers")
+    missing_entities: list[str] = dspy.InputField(desc="Entity names or scheme IDs that require contextual definitions")
     triples: list[Any] = dspy.InputField(
         desc="Extracted relation triples referencing the missing entities",
         default=[],
     )
-    entity_definitions: list[list[Any]] = dspy.OutputField(
+    entity_definitions: list[Any] = dspy.OutputField(
         desc=(
-            "List of [entity_name, contextual_definition] pairs, or "
-            "[scheme_id, pref_label, definition, history_note] tuples"
+            "List of [entity_name, contextual_definition] pairs for missing entities, or "
+            "list of {scheme_id, pref_label, definition, history_note} objects for concept schemes"
         )
     )
 

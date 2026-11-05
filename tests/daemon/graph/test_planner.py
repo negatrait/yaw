@@ -169,7 +169,7 @@ def test_apply_synonym_adjudication_related_and_different_from(tmp_path: Path) -
                 ("e1", "Consumption price", "Price per seat"),
                 ("e2", "consumption", "Usage of resources"),
                 ("e3", "Finance", "Financial department"),
-                ("e4", "Legal", "Legal department"),
+                ("e4", "Finance", "Financial academic study"),
             ],
         )
         candidates = [
@@ -180,7 +180,7 @@ def test_apply_synonym_adjudication_related_and_different_from(tmp_path: Path) -
             "e1": ("Consumption price", ""),
             "e2": ("consumption", ""),
             "e3": ("Finance", ""),
-            "e4": ("Legal", ""),
+            "e4": ("Finance", ""),
         }
         decisions = [
             {
@@ -195,7 +195,7 @@ def test_apply_synonym_adjudication_related_and_different_from(tmp_path: Path) -
                 "source_id": "e3",
                 "target_id": "e4",
                 "relation": "owl:differentFrom",
-                "reasoning": "Distinct organizational functions",
+                "reasoning": "Distinct homograph meanings",
             },
         ]
         rlm_stats: dict[str, int] = {}
@@ -226,6 +226,6 @@ def test_apply_synonym_adjudication_related_and_different_from(tmp_path: Path) -
         ).fetchone()
         assert diff_edge is not None
         assert set(diff_edge[:2]) == {"e3", "e4"}
-        assert diff_edge[2] == "Distinct organizational functions"
+        assert diff_edge[2] == "Distinct homograph meanings"
     finally:
         conn.close()

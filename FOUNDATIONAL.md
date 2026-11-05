@@ -28,8 +28,9 @@ YAW succeeds only when it demonstrates all of the following:
    - One database writer.
    - Explicit failures instead of silent degradation.
 5. **Traceable evidence**
-   - Evaluation records distinguish setup success from retrieval and inference correctness.
-   - Acceptance claims are supported by reproducible benchmark outputs.
+   - Evaluation records distinguish setup success from retrieval and inference correctness.
+   - Acceptance claims are supported by reproducible benchmark outputs.
+   - Architectural and schema cutovers are complete only when all runtime lifecycles, callers, and telemetry consumers (`scripts/watchdog.py`) are wired to the active schema and verified end-to-end.
 
 Passing unit tests alone does not establish benchmark parity or system acceptance.
 
@@ -59,21 +60,24 @@ A benchmark improvement must justify the additional dependency, complexity, runt
 YAW consists of five conceptual capabilities:
 
 1. **Ingestion**
-   - Observes corpus changes through CocoIndex.
-   - Coalesces changes into deterministic synchronization deltas.
-   - Submits each logical update through the sole database-writing path.
+   - Observes corpus changes through OS event-driven CocoIndex (`localfs.walk_dir(..., live=True)`).
+   - Streams ingestion and candidate indexing in dataset-agnostic, bounded micro-batches (`64` chunks per `app.update()` cycle) so heap/VRAM usage stays flat and `yaw.db` publishes incremental graph state every 64 chunks. Never encode benchmark presets or train/val splits in production ingestion.
+   - Persists CocoIndex LMDB memoization state (`coco.Settings(db_path=...)`) in a shared, content-addressed cache across runs—never tied to transient per-run database filenames.
 2. **Storage**
-   - Persists source metadata, text, graph data, vectors, and lexical indexes in `yaw.db`.
-   - Owns schema creation, migration, transactions, and storage-specific queries.
-3. **Retrieval**
-   - Produces lexical, vector, and graph-derived evidence.
-   - Uses sparse graph structures and Personalized PageRank where required by the retrieval contract.
+   - Additive semantic publication must reuse validated contributions and prior adjudications. Its input checkpoint commits with the graph; unresolved SHACL violations abort publication. The current additions-first implementation still performs graph-wide staging and taxonomy work, so bounded dispatch alone is not evidence of bounded memory.
+   - Persists source metadata, text, graph data, vectors, and lexical indexes in `yaw.db`.
+   - Declares every SQLite table and `sqlite-vec` `vec0` index through typed CocoIndex targets (`TableSchema.from_class`), with one writer and no competing imperative `upsert_*` sinks.
+3. **Retrieval & Ontology**
+   - Produces lexical, vector, and graph-derived evidence using sparse CSR matrices and Forward-Push Personalized PageRank.
+   - Maintains a closed-world W3C hierarchy (`skos:ConceptScheme` -> `skos:Concept` -> `yaw:Entity`).
+   - Synthesizes corpus- and community-level structural links (such as `skos:topConceptOf`) deterministically post-hoc from community membership ($R_m$), never via single-chunk LLM guessing, and surfaces all ontology layers in telemetry.
 4. **Inference**
-   - Uses native DSPy interfaces for language models, embeddings, signatures, recursive language-model behavior, and optimization.
-   - Treats model services as external dependencies.
+   - Uses native DSPy interfaces (`dspy.LM`, `dspy.Embedder`, `dspy.Signatures`, `dspy.RLM`, `dspy.GEPA`) and treats model services as external dependencies.
+   - Defaults LLM extraction and reasoning admission strictly to `parallel = 1` (`Semaphore(1)`) to respect local `llama.cpp` single-slot VRAM bounds, while batching dense embeddings (`max_batch_size = 64`).
+   - Enforces sampling temperatures $\ge 0.3$ (defaulting to $0.35$ for extraction and QA, up to $0.7$–$0.8$ for reflection) on small local models to avoid looping; temperatures below $0.3$ are prohibited.
 5. **Runtime**
-   - Coordinates ingestion, retrieval, inference, and source hydration.
-   - Exposes one application-level API used by transports and evaluation.
+   - Coordinates ingestion, retrieval, inference, and source hydration in `yaw/daemon/runtime.py`.
+   - Exposes one application-level API used by transports and evaluation.
 
 Transport adapters do not contain application logic.
 

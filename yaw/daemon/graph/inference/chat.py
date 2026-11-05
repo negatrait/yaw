@@ -1,6 +1,7 @@
 import logging
 import math
 import os
+import re
 import time
 from collections.abc import Mapping, Sequence
 from contextvars import ContextVar
@@ -157,6 +158,16 @@ __all__ = [
 ]
 
 
+_THINKING_CHANNEL_RE = re.compile(r"<\|channel\>thought.*?<channel\|>", re.DOTALL)
+
+
+def strip_thinking_channel(text: str) -> str:
+    """Strip Gemma 4 / thinking control blocks from model completions."""
+    if "<|channel>thought" in text:
+        text = _THINKING_CHANNEL_RE.sub("", text)
+    return text.lstrip()
+
+
 class YawDSPyLM(dspy.LM):
     """Native dspy.LM wrapper preserving recipe metadata across copies without overriding BaseLM.forward."""
 
@@ -166,6 +177,10 @@ class YawDSPyLM(dspy.LM):
 
     def __call__(self, prompt: Any = None, *, messages: Any = None, **kwargs: Any) -> Any:
         res = super().__call__(prompt=prompt, messages=messages, **kwargs)
+        if isinstance(res, list):
+            res = [strip_thinking_channel(item) if isinstance(item, str) else item for item in res]
+        elif isinstance(res, str):
+            res = strip_thinking_channel(res)
         sleep_sec = get_yaw_sleep_seconds()
         if sleep_sec > 0:
             time.sleep(sleep_sec)
@@ -199,6 +214,10 @@ def configure_yaw_dspy_cache(
         if enable_disk_cache:
             p.mkdir(parents=True, exist_ok=True)
         resolved_dir = str(p)
+    elif enable_disk_cache:
+        p = Path(".yaw") / "dspy_cache"
+        p.mkdir(parents=True, exist_ok=True)
+        resolved_dir = str(p)
     kwargs: dict[str, Any] = {
         "enable_disk_cache": bool(enable_disk_cache),
         "enable_memory_cache": bool(enable_memory_cache),
@@ -226,6 +245,8 @@ def create_dspy_lm(
     provider: str = "openai",
     role: str = "extraction",
     temperature: float | None = None,
+    top_p: float | None = None,
+    top_k: int | None = None,
     max_tokens: int | None = None,
     context_window_tokens: int | None = None,
     cache: bool = True,
@@ -237,8 +258,9 @@ def create_dspy_lm(
     Applies recipe-aware and role-aware defaults for our local hardware stack:
     - gemma-4-E4B-it-qat-q4_0-gguf-Q4_0 (llamacpp GPU): default chat/reflection model;
       direct/worker roles support GBNF, while RLM orchestrators generate plain code.
+      Standardized Gemma 4 sampling: temperature=1.0, top_p=0.95, top_k=64.
     - Qwen3-4B-Instruct-2507-GGUF (llamacpp on Vulkan GPU, 16384 ctx): supports GBNF for direct/worker
-      roles (`extraction`, `qa`, `reflection_worker`) with temp=0.2, and runs
+      roles (`extraction`, `qa`, `reflection_worker`) with temp=0.35, and runs
       unconstrained Python REPL code generation (`_yaw_supports_gbnf=False`) for RLM orchestrator roles
       (`rlm`, `reflection`).
     - gemma4-it-12b-FLM (flm): extra_body={"think": False}.
@@ -262,7 +284,12 @@ def create_dspy_lm(
         elif role in ("qa", "rlm") and profile is not None and profile.qa_temperature > 0:
             temperature = profile.qa_temperature
         else:
-            temperature = profile.default_temperature if profile is not None else 0.2
+            temperature = profile.default_temperature if profile is not None else 0.35
+
+    if top_p is None and profile is not None and profile.top_p is not None:
+        top_p = profile.top_p
+    if top_k is None and profile is not None and profile.top_k is not None:
+        top_k = profile.top_k
 
     context_tokens = (
         context_window_tokens if context_window_tokens is not None else profile.expected_context if profile else None
@@ -277,8 +304,17 @@ def create_dspy_lm(
         raise ValueError("Require 0 < max_tokens < context_window_tokens")
 
     lm_kwargs: dict[str, Any] = dict(kwargs)
+    if top_p is not None:
+        lm_kwargs.setdefault("top_p", top_p)
+    if top_k is not None:
+        lm_kwargs.setdefault("top_k", top_k)
+        extra = dict(lm_kwargs.get("extra_body") or {})
+        extra.setdefault("top_k", top_k)
+        lm_kwargs["extra_body"] = extra
     if recipe == "flm":
-        lm_kwargs.setdefault("extra_body", {"think": False})
+        extra = dict(lm_kwargs.get("extra_body") or {})
+        extra.setdefault("think", False)
+        lm_kwargs["extra_body"] = extra
 
     if provider == "ollama" or model_name.startswith(("ollama_chat/", "ollama/")):
         litellm_model = (

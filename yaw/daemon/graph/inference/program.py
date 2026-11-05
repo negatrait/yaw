@@ -707,7 +707,7 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
                 )
             else:
                 predictor = direct_mod.predict if isinstance(direct_mod, dspy.ChainOfThought) else direct_mod
-                effective_lm = lm or predictor.lm or dspy.settings.lm
+                effective_lm = lm or getattr(predictor, "lm", None) or dspy.settings.lm
                 direct_inputs = dict(inputs)
                 if isinstance(direct_inputs.get("passage"), str) and len(
                     direct_inputs["passage"]
@@ -881,98 +881,120 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
         lm: Any = None,
         use_gbnf: bool | None = None,
         _record_audit: bool = True,
+        batch_size: int = 1,
     ) -> tuple[tuple[str, str, str, str, float | None], ...]:
         """Synthesize canonical title, definition, and history note for emergent skos:ConceptScheme clusters."""
         if not scheme_packets:
             return ()
 
-        scheme_ids: list[str] = []
-        dossier_lines: list[str] = []
-        for p in scheme_packets:
-            sid = str(p.get("scheme_id") or p.get("id") or "").strip()
-            if not sid:
-                continue
-            scheme_ids.append(sid)
-            dossier_lines.append(f"Scheme ID: {sid}")
-            pref = str(p.get("pref_label") or p.get("label") or "").strip()
-            if pref:
-                dossier_lines.append(f"Candidate Title: {pref}")
-            members = [str(m).strip() for m in (p.get("members") or p.get("member_names") or []) if str(m).strip()]
-            if members:
-                dossier_lines.append(f"Member concepts: {', '.join(members[:30])}")
-            roots = [
-                str(r).strip() for r in (p.get("taxonomic_roots") or p.get("top_concepts") or []) if str(r).strip()
-            ]
-            if roots:
-                dossier_lines.append(f"Top concepts (taxonomic roots): {', '.join(roots[:15])}")
-            edges = p.get("edges") or p.get("facts") or []
-            if edges:
-                dossier_lines.append("Taxonomic relations: " + "; ".join(str(e) for e in edges[:20]))
-            dossier = str(p.get("dossier") or "").strip()
-            if dossier:
-                dossier_lines.append(dossier)
-            dossier_lines.append("")
-
-        if not scheme_ids:
+        valid_packets = [p for p in scheme_packets if str(p.get("scheme_id") or p.get("id") or "").strip()]
+        if not valid_packets:
             return ()
 
-        passage = "\n".join(dossier_lines).strip()
-        prev_telem_len = len(self.telemetry)
-
-        pred = self._invoke_stage(
-            self.entity_definer,
-            stage_name="entity_definer",
-            is_rlm=False,
-            lm=lm,
-            use_gbnf=use_gbnf,
-            grammar_fn=lambda: build_dspy_concept_scheme_defs_grammar(scheme_ids),
-            passage=passage,
-            missing_entities=scheme_ids,
-            triples=[],
-        )
-
-        effective_lm = (
-            lm or getattr(self.entity_definer, "lm", None) or self.orchestrator_lm or getattr(dspy.settings, "lm", None)
-        )
-        llm_prob: float | None = None
-        if effective_lm is not None and getattr(effective_lm, "history", None) and effective_lm.history:
-            llm_prob = extract_completion_logprob_confidence(effective_lm.history[-1])
-
-        raw_defs = getattr(pred, "entity_definitions", [])
-        parsed = extract_concept_scheme_definitions(raw_defs)
-        parsed_by_id = {sid: (pref, dfn, note) for sid, pref, dfn, note in parsed}
-
         resolved: list[tuple[str, str, str, str, float | None]] = []
-        for idx, p in enumerate(scheme_packets):
-            sid = str(p.get("scheme_id") or p.get("id") or "").strip()
-            if not sid:
-                continue
-            if sid in parsed_by_id:
-                pref, dfn, note = parsed_by_id[sid]
-            elif idx < len(parsed):
-                _, pref, dfn, note = parsed[idx]
-            else:
-                pref = str(p.get("pref_label") or p.get("label") or sid).strip()
-                dfn = str(
-                    p.get("definition") or f"Concept scheme synthesizing {len(p.get('members', []))} concepts."
+        total_tokens = 0
+        effective_batch_size = max(1, batch_size)
+
+        for batch_start in range(0, len(valid_packets), effective_batch_size):
+            batch = valid_packets[batch_start : batch_start + effective_batch_size]
+            scheme_ids: list[str] = []
+            dossier_lines: list[str] = [
+                "Taxonomic Cluster Dossiers for emergent skos:ConceptScheme taxonomies.",
+                (
+                    "Synthesize pref_label (title), definition (domain scope), and history_note "
+                    "(taxonomic rationale) for each Scheme ID below:\n"
+                ),
+            ]
+            for p in batch:
+                sid = str(p.get("scheme_id") or p.get("id") or "").strip()
+                scheme_ids.append(sid)
+                dossier_lines.append(f"Scheme ID: {sid}")
+                pref = str(p.get("pref_label") or p.get("label") or "").strip()
+                if pref:
+                    dossier_lines.append(f"Candidate Title: {pref}")
+                members = [str(m).strip() for m in (p.get("members") or p.get("member_names") or []) if str(m).strip()]
+                if members:
+                    dossier_lines.append(f"Member concepts: {', '.join(members[:30])}")
+                roots = [
+                    str(r).strip() for r in (p.get("taxonomic_roots") or p.get("top_concepts") or []) if str(r).strip()
+                ]
+                if roots:
+                    dossier_lines.append(f"Top concepts (taxonomic roots): {', '.join(roots[:15])}")
+                edges = p.get("edges") or p.get("facts") or []
+                if edges:
+                    dossier_lines.append("Taxonomic relations: " + "; ".join(str(e) for e in edges[:20]))
+                dossier = str(p.get("dossier") or "").strip()
+                if dossier:
+                    dossier_lines.append(dossier)
+                dossier_lines.append("")
+
+            passage = "\n".join(dossier_lines).strip()
+            prev_telem_len = len(self.telemetry)
+
+            pred = self._invoke_stage(
+                self.entity_definer,
+                stage_name="entity_definer",
+                is_rlm=False,
+                lm=lm,
+                use_gbnf=use_gbnf,
+                grammar_fn=lambda ids=scheme_ids: build_dspy_concept_scheme_defs_grammar(ids),
+                passage=passage,
+                missing_entities=scheme_ids,
+                triples=[],
+            )
+
+            effective_lm = (
+                lm
+                or getattr(self.entity_definer, "lm", None)
+                or self.orchestrator_lm
+                or getattr(dspy.settings, "lm", None)
+            )
+            llm_prob: float | None = None
+            if effective_lm is not None and getattr(effective_lm, "history", None) and effective_lm.history:
+                llm_prob = extract_completion_logprob_confidence(effective_lm.history[-1])
+
+            raw_defs = getattr(pred, "entity_definitions", [])
+            parsed = extract_concept_scheme_definitions(raw_defs)
+            parsed_by_id = {sid: (pref, dfn, note) for sid, pref, dfn, note in parsed}
+
+            for idx, p in enumerate(batch):
+                sid = str(p.get("scheme_id") or p.get("id") or "").strip()
+                if sid in parsed_by_id:
+                    pref, dfn, note = parsed_by_id[sid]
+                elif idx < len(parsed):
+                    _, pref, dfn, note = parsed[idx]
+                else:
+                    pref = ""
+                    dfn = ""
+                    note = ""
+
+                fallback_pref = str(p.get("pref_label") or p.get("label") or sid).strip()
+                fallback_dfn = str(
+                    p.get("definition") or f"Domain concept scheme synthesizing {len(p.get('members', []))} concepts."
                 ).strip()
-                note = str(
+                fallback_note = str(
                     p.get("history_note") or "Emergent taxonomy cluster induced by Newman modularity maximization."
                 ).strip()
 
-            resolved.append((sid, pref, dfn, note, llm_prob))
+                final_pref = pref if pref and not pref.startswith("scheme-") else fallback_pref
+                final_dfn = dfn if dfn and not dfn.startswith("scheme-") else fallback_dfn
+                final_note = note if note else fallback_note
 
-        stage_tokens = int(self.telemetry[-1].get("tokens_used", 0)) if len(self.telemetry) > prev_telem_len else 0
-        if _record_audit:
+                resolved.append((sid, final_pref, final_dfn, final_note, llm_prob))
+
+            stage_tokens = int(self.telemetry[-1].get("tokens_used", 0)) if len(self.telemetry) > prev_telem_len else 0
+            total_tokens += stage_tokens
+
+        if _record_audit and resolved:
             self.entity_def_audit_trail.append(
                 {
                     "mode": "direct",
                     "predictor": "entity_definer",
                     "signature": DefineMissingEntities.__name__,
-                    "scheme_count": len(scheme_ids),
-                    "tokens": stage_tokens,
-                    "tokens_used": stage_tokens,
-                    "scheme_ids": scheme_ids,
+                    "scheme_count": len(valid_packets),
+                    "tokens": total_tokens,
+                    "tokens_used": total_tokens,
+                    "scheme_ids": [p[0] for p in resolved],
                     "definitions": [[s[0], s[1], s[2], s[3]] for s in resolved],
                 }
             )

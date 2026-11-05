@@ -1,6 +1,5 @@
 """Native DSPy HippoRAG 2 Graph and Retrieval Engine backed by yaw.db and disk line hydration."""
 
-import asyncio
 import hashlib
 import importlib.metadata
 import json
@@ -19,11 +18,9 @@ from yaw.core import (
     ChunkPointer,
     IndexStats,
     RelationTraversalPolicy,
-    StructuredTriple,
-    YawRuntimeError,
     write_text_atomic,
 )
-from yaw.core.config import context_char_limit, scale_context_budget
+from yaw.core.config import context_char_limit
 from yaw.daemon.graph.inference import (
     FACT_INSTRUCTION,
     PASSAGE_INSTRUCTION,
@@ -40,27 +37,14 @@ from yaw.daemon.graph.inference import (
     embed_fingerprint,
     evaluate_program,
     evolve_program_prompts,
-    extract_named_trace_entries,
     extraction_fingerprint,
     openie_fingerprint,
     query_retrieval_fingerprint,
-    set_yaw_sleep_seconds,
-    shacl_fingerprint,
     text_processing,
     trim_diagnostics,
 )
-from yaw.daemon.graph.normalization import normalize_openie_record
 from yaw.daemon.graph.planner import (
-    apply_stage1_definitions,
-    apply_synonym_adjudication,
-    build_concept_schemes,
-    clone_graph_to_memory,
-    collect_missing_entity_norms,
-    collect_shacl_violation_dossiers,
-    materialize_entities_and_facts,
-    prepare_sense_resolution_state,
-    prepare_synonym_candidates,
-    record_surface_form,
+    GraphPlanSummary,
 )
 from yaw.daemon.graph.ppr import (
     CSRGraph,
@@ -74,10 +58,7 @@ from yaw.daemon.graph.storage import (
     CandidatePayloadCodec,
     CandidateStageCache,
     ManagedConnection,
-    PreparedGraphRows,
-    apply_prepared_graph_rows,
     apply_shacl_repairs,
-    auto_heal_deterministic_shacl,
     delete_chunks,
     format_pair_disambiguation_dossier,
     format_subgraph_for_qa,
@@ -87,28 +68,22 @@ from yaw.daemon.graph.storage import (
     get_facts_by_ids,
     get_graph_counts,
     get_meta,
-    get_openie_checkpoints,
-    hydrate_ast_parent_context,
     hydrate_budgeted_passages,
     hydrate_passages,
     inspect_focus_node,
-    iter_synonym_evidence,
     lint_graph_shacl,
     load_graph_topology,
     make_ast_island_hydrator,
     make_chunk_hydrator,
-    merge_entities,
     open_managed_yaw_db,
     pool_confidences,
     resolve_entity_labels,
-    save_openie_checkpoints,
     search_chunk_vectors_knn,
     search_chunks_fts,
     search_fact_vectors_knn,
     search_facts_fts,
     serialize_graph_turtle,
     set_meta,
-    upsert_semantic_edges,
 )
 
 _AUTO_MERGE_COSINE_GATE = 0.95
@@ -165,6 +140,9 @@ class YawGraphEngine:
         self.program = program
         self.embedder = embedder
         self.config: Any = None
+        self.indexing_runner: (
+            Callable[[Sequence[tuple[ChunkPointer, str]], HippoRAGProgram], GraphPlanSummary] | None
+        ) = None
 
         self.max_context_chars = (
             max_context_chars
@@ -240,41 +218,7 @@ class YawGraphEngine:
         self._text_vec_cache = CandidateStageCache(
             cache_store, self.managed_conn, "embedding", self._candidate_cache_namespace
         )
-        self._openie_fp_cache = CandidateStageCache(
-            cache_store,
-            self.managed_conn,
-            "openie",
-            self._candidate_cache_namespace,
-            sources=self._candidate_cache_sources,
-        )
-        self._label_judge_fp_cache = CandidateStageCache(
-            cache_store,
-            self.managed_conn,
-            "label_judge",
-            self._candidate_cache_namespace,
-            sources=self._candidate_cache_sources,
-        )
-        self._hierarchy_judge_fp_cache = CandidateStageCache(
-            cache_store,
-            self.managed_conn,
-            "hierarchy_judge",
-            self._candidate_cache_namespace,
-            sources=self._candidate_cache_sources,
-        )
-        self._related_judge_fp_cache = CandidateStageCache(
-            cache_store,
-            self.managed_conn,
-            "related_judge",
-            self._candidate_cache_namespace,
-            sources=self._candidate_cache_sources,
-        )
-        self._shacl_fp_cache = CandidateStageCache(
-            cache_store,
-            self.managed_conn,
-            "shacl",
-            self._candidate_cache_namespace,
-            sources=self._candidate_cache_sources,
-        )
+        self._candidate_cache_store = cache_store
 
         self._bind_program_hooks()
         self._apply_program_embedding_prefixes()
@@ -445,74 +389,17 @@ class YawGraphEngine:
         self,
         target_list: Sequence[tuple[ChunkPointer, str]],
     ) -> None:
-        """Reconstruct DSPy Stage 1/2 traces and per-chunk token stats from openie_chunks for seeded chunks."""
-        missing_cids = [
-            p.chunk_id
-            for p, _ in target_list
-            if p.chunk_id not in self._captured_chunk_traces or p.chunk_id not in self._chunk_rlm_stats
-        ]
-        if not missing_cids:
+        """Restore actual named DSPy traces from native inference target rows."""
+        wanted = {p.chunk_id for p, _ in target_list}
+        if not self.conn.execute("SELECT 1 FROM sqlite_master WHERE name='chunk_inference'").fetchone():
             return
-        cached_openie = get_openie_checkpoints(self.conn, missing_cids)
-        if not cached_openie:
-            return
-        text_by_cid = {p.chunk_id: t for p, t in target_list}
-        for cid, rec in cached_openie.items():
-            passage_text = text_by_cid.get(cid, "")
-            named_ents = [[str(ename), str(edef)] for ename, edef in (getattr(rec, "entity_definitions", None) or ())]
-            if not named_ents and getattr(rec, "entities", None):
-                named_ents = [
-                    [str(e[0]), str(e[1]) if len(e) >= 2 else ""]
-                    if isinstance(e, (list, tuple)) and e
-                    else [str(e), ""]
-                    for e in rec.entities
+        for cid, raw in self.conn.execute("SELECT chunk_id, traces_json FROM chunk_inference"):
+            if cid in wanted:
+                self._captured_chunk_traces[cid] = [
+                    (trace["predictor"], trace["inputs"], dspy.Prediction(**trace["outputs"]))
+                    for trace in json.loads(raw)
                 ]
-            triples_out = [
-                {
-                    "sub": st.subj,
-                    "pred": st.pred,
-                    "obj": st.obj,
-                    "def": st.spo_def,
-                }
-                for st in (getattr(rec, "structured_triples", None) or ())
-            ]
-            if cid not in self._captured_chunk_traces:
-                c_traces: list[tuple[str, dict[str, Any], Any]] = []
-                if named_ents:
-                    c_traces.append(
-                        (
-                            "ner",
-                            {"passage": passage_text},
-                            dspy.Prediction(named_entities=named_ents),
-                        )
-                    )
-                if triples_out:
-                    c_traces.append(
-                        (
-                            "triples",
-                            {"passage": passage_text, "named_entities": named_ents},
-                            dspy.Prediction(triples=triples_out),
-                        )
-                    )
-                if c_traces:
-                    self._captured_chunk_traces[cid] = c_traces
-            if cid not in self._chunk_rlm_stats:
-                est_json = json.dumps(
-                    {"named_entities": named_ents, "triples": triples_out},
-                    ensure_ascii=False,
-                )
-                est_openie_tok = float(max(64, len(est_json) // 4))
-                self._chunk_rlm_stats[cid] = {
-                    "label_judge_tokens": 0.0,
-                    "hierarchy_judge_tokens": 0.0,
-                    "related_judge_tokens": 0.0,
-                    "shacl_healer_tokens": 0.0,
-                    "shacl_violations_initial": 0.0,
-                    "shacl_violations_remaining": 0.0,
-                    "missing_entity_defs_count": 0.0,
-                    "missing_entity_defs_tokens": 0.0,
-                    "openie_tokens": est_openie_tok,
-                }
+                self._chunk_rlm_stats[cid] = {"openie_tokens": 0.0}
 
     @staticmethod
     def _empty_graph_rlm_stats() -> dict[str, Any]:
@@ -963,37 +850,6 @@ class YawGraphEngine:
 
     _apply_shacl_repairs = staticmethod(apply_shacl_repairs)
 
-    def _reset_sandbox_graph(self, *, clear_openie: bool = True) -> None:
-        """Clear graph tables in the sandbox DB when a candidate mutates extraction/graph prompts or query scope."""
-        with self._lock, self.managed_conn.transaction() as conn:
-            conn.execute("DELETE FROM meta WHERE key GLOB 'indexed_fp:*'")
-            conn.execute("DELETE FROM chunk_vec")
-            conn.execute("DELETE FROM chunk_fts")
-            conn.execute("DELETE FROM chunks")
-            conn.execute("DELETE FROM fact_sources")
-            conn.execute("DELETE FROM fact_vec")
-            conn.execute("DELETE FROM fact_fts")
-            conn.execute("DELETE FROM facts")
-            conn.execute("DELETE FROM edge_sources")
-            conn.execute("DELETE FROM edges")
-            conn.execute("DELETE FROM entity_labels")
-            conn.execute("DELETE FROM entity_vec")
-            conn.execute("DELETE FROM entities")
-            if clear_openie:
-                conn.execute("DELETE FROM openie_chunks")
-                conn.execute("DELETE FROM meta WHERE key GLOB 'openie_fp:*'")
-                self._captured_chunk_traces.clear()
-        self._captured_graph_traces.clear()
-        self._opt_indexed_cids.clear()
-        self._chunk_indexed_ext_fp.clear()
-        self._attempted_shacl_keys.clear()
-        self._chunk_rlm_stats.clear()
-        self._query_retrieval_memo.clear()
-        self._last_memo_question = None
-        self._active_query_rlm_stats = None
-        self._csr_graph = None
-        self._graph_rlm_stats = self._empty_graph_rlm_stats()
-
     def _resolve_chunks_for_docs(
         self,
         item_docs: Sequence[str] | None,
@@ -1062,57 +918,14 @@ class YawGraphEngine:
         item_docs: Sequence[str] | None = None,
     ) -> list[str]:
         with self._lock:
-            self._hydrate_indexed_cids_from_db(program)
             ext_fp = extraction_fingerprint(program)
-            req_chunks = self._resolve_chunks_for_docs(item_docs) if item_docs else []
-            pool_chunks = list(self._opt_val_chunks_pool) if self._opt_val_chunks_pool else list(self._opt_chunks_pool)
-            if not req_chunks and len(pool_chunks) > 64 and self._opt_docs_by_question:
-                indexed_pool = [
-                    (p, t)
-                    for p, t in pool_chunks
-                    if p.chunk_id in self._opt_indexed_cids and self._chunk_indexed_ext_fp.get(p.chunk_id) == ext_fp
-                ]
-                req_chunks = indexed_pool[:8] if indexed_pool else pool_chunks[:8]
-            if not req_chunks or len(pool_chunks) <= 64:
-                missing_pool = [(p, t) for p, t in pool_chunks if p.chunk_id not in self._opt_indexed_cids]
-                if missing_pool:
-                    for b_start in range(0, len(missing_pool), 8):
-                        self.index_chunks(
-                            missing_pool[b_start : b_start + 8],
-                            program=program,
-                            progress_callback=self._active_progress_callback,
-                        )
-
-            target_list = req_chunks if req_chunks else pool_chunks
-            stale_targets = [
-                (p, t)
-                for p, t in target_list
-                if p.chunk_id in self._opt_indexed_cids and self._chunk_indexed_ext_fp.get(p.chunk_id) != ext_fp
-            ]
-            if stale_targets:
-                stale_cids = [p.chunk_id for p, _ in stale_targets]
-                # A synonym/healing-only mutation still uses the same OpenIE.
-                # Preserve matching extraction checkpoints across graph rebuilds.
-                openie_records = get_openie_checkpoints(self.conn, stale_cids)
-                openie_fps = {cid: get_meta(self.conn, f"openie_fp:{cid}") for cid in stale_cids}
-                self.delete_chunks(stale_cids)
-                with self.managed_conn.transaction():
-                    save_openie_checkpoints(self.conn, list(openie_records.values()))
-                    for cid, fp in openie_fps.items():
-                        if fp is not None:
-                            set_meta(self.conn, f"openie_fp:{cid}", fp)
-                for cid in stale_cids:
-                    self._opt_indexed_cids.discard(cid)
-                    self._chunk_indexed_ext_fp.pop(cid, None)
-
-            missing_targets = [(p, t) for p, t in target_list if p.chunk_id not in self._opt_indexed_cids]
-            if missing_targets:
-                for b_start in range(0, len(missing_targets), 8):
-                    self.index_chunks(
-                        missing_targets[b_start : b_start + 8],
-                        program=program,
-                        progress_callback=self._active_progress_callback,
-                    )
+            if self._active_extraction_fingerprint != ext_fp or any(
+                p.chunk_id not in self._opt_indexed_cids for p, _ in self._opt_chunks_pool
+            ):
+                self.index_chunks(
+                    self._opt_chunks_pool, program=program, progress_callback=self._active_progress_callback
+                )
+            target_list = self._resolve_chunks_for_docs(item_docs) if item_docs else list(self._opt_chunks_pool)
             self._hydrate_chunk_traces_and_stats_from_db(target_list)
             target_cids = [p.chunk_id for p, _ in target_list]
 
@@ -1175,13 +988,8 @@ class YawGraphEngine:
             chunk_ids = [compute_mdhash_id(d, prefix="chunk-") for d in unique_docs]
             existing_chunks = get_existing_ids(self.conn, "chunk", chunk_ids)
             existing_vecs = get_existing_ids(self.conn, "chunk_vec", chunk_ids)
-            existing_openie = get_existing_ids(self.conn, "openie", chunk_ids)
 
-            incomplete_cids = [
-                cid
-                for cid in chunk_ids
-                if cid in existing_chunks and (cid not in existing_vecs or cid not in existing_openie)
-            ]
+            incomplete_cids = [cid for cid in chunk_ids if cid in existing_chunks and cid not in existing_vecs]
             new_docs = [d for d, cid in zip(unique_docs, chunk_ids, strict=False) if cid not in existing_chunks]
             if not new_docs and not incomplete_cids:
                 return 0
@@ -1253,617 +1061,44 @@ class YawGraphEngine:
         progress_callback: Callable[[str], None] | None = None,
         program: HippoRAGProgram | None = None,
     ) -> int:
-        """Incremental chunk indexing into yaw.db, sqlite-vec, SKOS schema, and sparse CSR graph."""
+        """Publish an explicit candidate snapshot through the bound native runtime."""
         if not chunks:
             return 0
-
-        opt_sleep = getattr(getattr(self, "config", None), "optimize_sleep_seconds", 0.0)
-        if opt_sleep > 0:
-            set_yaw_sleep_seconds(opt_sleep)
-
+        if self.indexing_runner is None:
+            raise RuntimeError("Indexing requires daemon composition with bind_native_indexing")
         active_program = program if program is not None else self.program
         with self._lock:
-            batch_started = time.perf_counter()
-            trim_diagnostics(active_program)
             self._bind_program_hooks(active_program)
             self._apply_program_embedding_prefixes(active_program)
-            openie_fp = openie_fingerprint(active_program)
-            ext_fp = extraction_fingerprint(active_program)
-
-            existing_pool_cids = {p.chunk_id for p, _ in self._opt_chunks_pool}
-            for ptr, text in chunks:
-                if ptr.chunk_id not in existing_pool_cids:
-                    self._opt_chunks_pool.append((ptr, text))
-                    existing_pool_cids.add(ptr.chunk_id)
-
-            chunk_ptrs = [ptr for ptr, _ in chunks]
-            chunk_ids = [ptr.chunk_id for ptr in chunk_ptrs]
-            self._captured_graph_traces.clear()
-            pre_batch_stats = dict(self._graph_rlm_stats)
-
-            fmt_chunk = getattr(
-                self.embedder,
-                "format_chunk_for_embedding",
-                lambda p, t: DSPyEmbeddingAdapter.format_chunk_for_embedding(self.embedder, p, t),
-            )
-            fmt_entity = getattr(
-                self.embedder,
-                "format_entity_for_embedding",
-                DSPyEmbeddingAdapter.format_entity_for_embedding,
-            )
-            fmt_fact = getattr(
-                self.embedder,
-                "format_fact_for_embedding",
-                DSPyEmbeddingAdapter.format_fact_for_embedding,
-            )
-
-            # 1. Chunk vector embeddings in bounded batches
-            existing_chunk_vecs = get_existing_ids(self.conn, "chunk_vec", chunk_ids)
-            missing_chunks = [(p, t) for p, t in chunks if p.chunk_id not in existing_chunk_vecs]
-            chunk_vec_pairs: list[tuple[str, np.ndarray]] = []
-            if missing_chunks:
-                if progress_callback is not None:
-                    progress_callback(f"indexing: embedding {len(missing_chunks)} chunk vectors")
-                texts_to_embed = [fmt_chunk(p, t) for p, t in missing_chunks]
-                vecs = self._encode_in_batches(texts_to_embed, instruction="", stage="chunk_embed")
-                chunk_vec_pairs = [(p.chunk_id, v) for (p, _), v in zip(missing_chunks, vecs, strict=True)]
-
-            # 2. Crash-resilient OpenIE extraction (persisted per-chunk immediately)
-            cached_openie = get_openie_checkpoints(self.conn, chunk_ids)
-            all_records: list[Any] = []
-            attempted_missing_by_cid: dict[str, set[str]] = {}
-            chunk_openie_tok_by_cid: dict[str, int] = {}
-            total_chunks = len(chunks)
-            openie_started = time.perf_counter()
-            for idx, (ptr, text) in enumerate(chunks, 1):
-                # The previous chunk's slices are already consumed. Do not trim
-                # inside extract_openie: its caller still needs the new records.
-                trim_diagnostics(active_program)
-                openie_key = (openie_fp, ptr.chunk_id, hashlib.sha256(text.encode()).hexdigest())
-                cached_stage = self._openie_fp_cache.get(openie_key, passage=text)
-                if cached_stage is not None:
-                    rec, cached_tr, cached_norms, m_cnt, m_tok, o_tok = cached_stage
-                    self._captured_chunk_traces[ptr.chunk_id] = list(cached_tr)
-                    attempted_missing_by_cid[ptr.chunk_id] = set(cached_norms)
-                    chunk_openie_tok_by_cid[ptr.chunk_id] = o_tok
-                    self._graph_rlm_stats["missing_entity_defs_count"] += m_cnt
-                    self._graph_rlm_stats["missing_entity_defs_tokens"] += m_tok
-                    with self.managed_conn.transaction():
-                        save_openie_checkpoints(self.conn, [rec])
-                        set_meta(self.conn, f"openie_fp:{ptr.chunk_id}", openie_fp)
-                    all_records.append(rec)
-                elif ptr.chunk_id in cached_openie and (get_meta(self.conn, f"openie_fp:{ptr.chunk_id}") == openie_fp):
-                    rec = cached_openie[ptr.chunk_id]
-                    if getattr(rec, "entity_definitions", None):
-                        cached_norms: set[str] = set()
-                        for raw_ent in getattr(rec, "entities", ()) or ():
-                            e_s = str(raw_ent[0]) if isinstance(raw_ent, (list, tuple)) and raw_ent else str(raw_ent)
-                            en = str(text_processing(e_s))
-                            if en:
-                                cached_norms.add(en)
-                        for st_item in getattr(rec, "structured_triples", ()) or ():
-                            sn = str(text_processing(str(getattr(st_item, "subj", ""))))
-                            if sn:
-                                cached_norms.add(sn)
-                            if getattr(st_item, "obj_kind", "entity") != "literal":
-                                on = str(text_processing(str(getattr(st_item, "obj", ""))))
-                                if on:
-                                    cached_norms.add(on)
-                        for t_item in getattr(rec, "triples", ()) or ():
-                            if len(t_item) >= 3:
-                                for side in (t_item[0], t_item[2]):
-                                    sn = str(text_processing(str(side)))
-                                    if sn:
-                                        cached_norms.add(sn)
-                        attempted_missing_by_cid[ptr.chunk_id] = cached_norms
-                    all_records.append(rec)
-                else:
-                    if progress_callback is not None:
-                        progress_callback(f"indexing: OpenIE extraction ({idx}/{total_chunks})")
-                    openie_passage = text
-                    if self.ast_context_hops > 0 and ptr.start_line > 1:
-                        ast_parent_ctx = hydrate_ast_parent_context(
-                            ptr,
-                            self.workspace_root,
-                            hops=self.ast_context_hops,
-                        )
-                        if ast_parent_ctx:
-                            openie_passage = (
-                                f"[Document AST Context ({ptr.rel_posix_path})]\n{ast_parent_ctx}\n\n"
-                                f"[Target Chunk]\n{text}"
-                            )
-                    prev_def_audit_len = len(getattr(active_program, "entity_def_audit_trail", ()))
-                    prev_telem_len = len(getattr(active_program, "telemetry", ()))
-                    chunk_raw_trace: list[Any] = []
-                    with dspy.context(trace=chunk_raw_trace, usage_tracker=None):
-                        rec = active_program.extract_openie(ptr.chunk_id, openie_passage)
-                    chunk_traces = extract_named_trace_entries(active_program, chunk_raw_trace)
-                    self._captured_chunk_traces[ptr.chunk_id] = chunk_traces
-                    new_telem_entries = list(getattr(active_program, "telemetry", ())[prev_telem_len:])
-                    raw_openie_tok = sum(
-                        int(t_entry.get("tokens_used", 0)) for t_entry in new_telem_entries if isinstance(t_entry, dict)
-                    )
-                    new_def_entries = list(getattr(active_program, "entity_def_audit_trail", ())[prev_def_audit_len:])
-                    attempted_norms: set[str] = set()
-                    chunk_m_cnt = 0
-                    chunk_m_tok = 0
-                    for entry in new_def_entries:
-                        if isinstance(entry, dict):
-                            c_cnt = int(entry.get("missing_count", 0))
-                            c_tok = int(entry.get("tokens", 0))
-                            chunk_m_cnt += c_cnt
-                            chunk_m_tok += c_tok
-                            self._graph_rlm_stats["missing_entity_defs_count"] += c_cnt
-                            self._graph_rlm_stats["missing_entity_defs_tokens"] += c_tok
-                            for m_ent in entry.get("missing_entities") or ():
-                                m_norm = str(text_processing(str(m_ent)))
-                                if m_norm:
-                                    attempted_norms.add(m_norm)
-                    chunk_openie_tok = max(0, raw_openie_tok - chunk_m_tok)
-                    chunk_openie_tok_by_cid[ptr.chunk_id] = chunk_openie_tok
-                    attempted_missing_by_cid[ptr.chunk_id] = attempted_norms
-                    self._openie_fp_cache[openie_key] = (
-                        rec,
-                        list(chunk_traces),
-                        set(attempted_norms),
-                        chunk_m_cnt,
-                        chunk_m_tok,
-                        chunk_openie_tok,
-                    )
-                    with self.managed_conn.transaction():
-                        save_openie_checkpoints(self.conn, [rec])
-                        set_meta(self.conn, f"openie_fp:{ptr.chunk_id}", openie_fp)
-                    all_records.append(rec)
-
-            openie_finished = time.perf_counter()
-            openie_seconds = openie_finished - openie_started
-            preparation_started = time.perf_counter()
-
-            # 3. Resolve Stage 1 NER Entities, Stage 2 StructuredTriples, Provisional Sense-Split Gate, and
-            # Contextual Embeddings
-            chunk_text_by_id = {ptr.chunk_id: text for ptr, text in chunks}
-            record_structured: list[tuple[str, list[StructuredTriple], list[tuple[str, str]]]] = []
-            all_norm_labels: set[str] = set()
-            surface_by_norm: dict[str, str] = {}
-            chunk_surface_by_norm: dict[tuple[str, str], str] = {}
-
-            for rec in all_records:
-                cid = rec.chunk_id
-                normalized = normalize_openie_record(rec)
-                normalized_sts = normalized.triples
-                ner_entities = normalized.entities
-                stage1_defs = normalized.definitions
-                all_norm_labels.update(normalized.labels)
-                for norm_key, surface in normalized.surfaces.items():
-                    record_surface_form(surface_by_norm, chunk_surface_by_norm, norm_key, surface, cid)
-
-                missing_norms = collect_missing_entity_norms(
-                    normalized_sts,
-                    ner_entities,
-                    stage1_defs,
-                    attempted_missing_by_cid.get(cid, set()),
-                )
-                repaired_pairs: Sequence[tuple[str, str]] = ()
-                if missing_norms and hasattr(active_program, "define_missing_entities"):
-                    prev_def_audit_len = len(getattr(active_program, "entity_def_audit_trail", ()))
-                    def_raw_trace: list[Any] = []
-                    with dspy.context(trace=def_raw_trace):
-                        repaired_pairs = active_program.define_missing_entities(
-                            chunk_text_by_id.get(cid, ""),
-                            missing_norms,
-                            [
-                                {
-                                    "sub": st.subj,
-                                    "pred": st.pred,
-                                    "obj": st.obj,
-                                    "def": st.spo_def,
-                                }
-                                for st in normalized_sts
-                            ],
-                        )
-                    self._captured_chunk_traces.setdefault(cid, []).extend(
-                        extract_named_trace_entries(active_program, def_raw_trace)
-                    )
-                    new_def_entries = list(getattr(active_program, "entity_def_audit_trail", ())[prev_def_audit_len:])
-                    for entry in new_def_entries:
-                        if isinstance(entry, dict):
-                            self._graph_rlm_stats["missing_entity_defs_count"] += int(entry.get("missing_count", 0))
-                            self._graph_rlm_stats["missing_entity_defs_tokens"] += int(entry.get("tokens", 0))
-
-                normalized_sts, ner_entities = apply_stage1_definitions(
-                    cid,
-                    normalized_sts,
-                    ner_entities,
-                    stage1_defs,
-                    repaired_pairs,
-                    surface_by_norm,
-                    chunk_surface_by_norm,
-                )
-                record_structured.append((cid, normalized_sts, ner_entities))
-
-            sense_state = prepare_sense_resolution_state(
-                chunks,
-                record_structured,
-                all_norm_labels,
-                surface_by_norm,
-                conn=self.conn,
-            )
-
-            materialized = materialize_entities_and_facts(
-                record_structured,
-                surface_by_norm,
-                chunk_surface_by_norm,
-                sense_state,
-            )
-            self._graph_rlm_stats["homograph_splits"] += materialized.homograph_splits
-            entity_nodes = materialized.entity_nodes
-            fact_nodes = materialized.fact_nodes
-
-            # Compute missing entity vectors using contextual `# {name}\n{definition}`
-            all_entity_ids = [eid for eid, _, _ in entity_nodes]
-            existing_entity_vecs = get_existing_ids(self.conn, "entity_vec", all_entity_ids)
-            missing_entities = [
-                (eid, name, defn) for eid, name, defn in entity_nodes if eid not in existing_entity_vecs
-            ]
-            entity_vec_pairs: list[tuple[str, np.ndarray]] = []
-            if missing_entities:
-                if progress_callback is not None:
-                    progress_callback(f"indexing: embedding {len(missing_entities)} entity vectors")
-                e_texts = [fmt_entity(name, defn) for _, name, defn in missing_entities]
-                e_vecs = self._encode_in_batches(e_texts, instruction="", stage="entity_embed")
-                entity_vec_pairs.extend((eid, v) for (eid, _, _), v in zip(missing_entities, e_vecs, strict=False))
-
-            # Compute missing fact vectors using contextual `# {s} {p} {o}\n{spo_def} | {subj_def} | {obj_def}`
-            all_fact_ids = [f_row[0] for f_row in fact_nodes]
-            existing_fact_vecs = get_existing_ids(self.conn, "fact_vec", all_fact_ids)
-            missing_facts = [f_row for f_row in fact_nodes if f_row[0] not in existing_fact_vecs]
-            fact_vec_pairs: list[tuple[str, np.ndarray]] = []
-            if missing_facts:
-                if progress_callback is not None:
-                    progress_callback(f"indexing: embedding {len(missing_facts)} fact vectors")
-                fact_texts: list[str] = []
-                for f_row in missing_facts:
-                    _, _s_id, pred, _o_id, raw_json, spo_d, subj_d, obj_d = f_row[:8]
-                    items = json.loads(raw_json)
-                    fact_texts.append(fmt_fact(items[0], pred, items[2], spo_d, subj_d, obj_d))
-                f_vecs = self._encode_in_batches(fact_texts, instruction="", stage="fact_embed")
-                fact_vec_pairs = [(f_row[0], v) for f_row, v in zip(missing_facts, f_vecs, strict=False)]
-
-            # 4. Out-of-transaction Staging (EDC Disambiguation + SHACL Self-Healing) + Atomic Publication
+            by_id = {pointer.chunk_id: (pointer, text) for pointer, text in self._opt_chunks_pool}
+            by_id.update({pointer.chunk_id: (pointer, text) for pointer, text in chunks})
+            self._opt_chunks_pool = list(by_id.values())
             if progress_callback is not None:
-                progress_callback("indexing: committing SKOS/RDF/OWL graph & SHACL validation")
-            synonym_seconds = 0.0
-            prepared_rows = PreparedGraphRows(
-                chunks=tuple(chunks),
-                entities=tuple(entity_nodes),
-                entity_labels=tuple(materialized.entity_labels_to_upsert),
-                facts=tuple(
-                    (fid, sid, pred, oid, raw, definition, kind, lexical, datatype, language)
-                    for (
-                        fid,
-                        sid,
-                        pred,
-                        oid,
-                        raw,
-                        definition,
-                        _sd,
-                        _od,
-                        kind,
-                        lexical,
-                        datatype,
-                        language,
-                    ) in fact_nodes
-                ),
-                fact_sources=tuple(materialized.fact_sources_batch),
-                edges=tuple(materialized.edges_with_sources),
-                chunk_vectors=tuple(chunk_vec_pairs),
-                entity_vectors=tuple(entity_vec_pairs),
-                fact_vectors=tuple(fact_vec_pairs),
-            )
-            staged_merges: list[tuple[str, str, str, str | None]] = []
-            resolved_semantic_batch: list[tuple[str, str, str, float, str]] = []
-            staged_repairs: list[Mapping[str, Any]] = []
-            stage_conn = clone_graph_to_memory(self.conn)
-            try:
-                with stage_conn:
-                    stage_conn.execute("BEGIN")
-                    apply_prepared_graph_rows(stage_conn, prepared_rows)
-
-                candidates, cand_meta, raw_cand_count, auto_merges = prepare_synonym_candidates(
-                    stage_conn,
-                    entity_nodes,
-                    synonymy_threshold=self.synonymy_threshold,
-                    synonymy_top_k=self.synonymy_top_k,
-                    auto_merge_cosine_gate=self.auto_merge_cosine_gate,
-                    auto_merge_difflib_gate=self.auto_merge_difflib_gate,
-                    fact_linked_pairs=materialized.fact_linked_pairs,
-                    rlm_stats=self._graph_rlm_stats,
-                    progress_callback=progress_callback,
-                )
-                staged_merges.extend(auto_merges)
-                self._graph_rlm_stats["candidate_pairs"] += raw_cand_count
-                if candidates:
-                    decisions: list[dict[str, str]] = []
-                    batch_limit = max(1, scale_context_budget(8, active_program.context_window_tokens))
-                    max_dossier_chars = min(40000, active_program._context_char_limit(12000))
-                    completed_pairs = 0
-                    stage_caches = {
-                        "label_judge": self._label_judge_fp_cache,
-                        "hierarchy_judge": self._hierarchy_judge_fp_cache,
-                        "related_judge": self._related_judge_fp_cache,
-                    }
-                    for evidence in iter_synonym_evidence(
-                        stage_conn,
-                        candidates,
-                        self.workspace_root,
-                        ast_context_hops=self.ast_context_hops,
-                        batch_size=batch_limit,
-                        max_chars=max_dossier_chars,
-                        fits=active_program.synonym_batch_fits,
-                    ):
-                        if progress_callback is not None:
-                            progress_callback(f"indexing: synonym judgment ({completed_pairs}/{len(candidates)} pairs)")
-                        completed_pairs += len(evidence.candidates)
-                        synonym_started = time.perf_counter()
-                        batch_decs = active_program.judge_synonyms(
-                            evidence,
-                            stage_caches=stage_caches,
-                            captured_traces=self._captured_graph_traces,
-                            rlm_stats=self._graph_rlm_stats,
-                        )
-                        synonym_seconds += time.perf_counter() - synonym_started
-                        if batch_decs:
-                            decisions.extend(batch_decs)
-                    if progress_callback is not None:
-                        progress_callback(f"indexing: synonym judgment ({completed_pairs}/{len(candidates)} pairs)")
-
-                    adjudicated_merges, resolved_semantic_batch = apply_synonym_adjudication(
-                        stage_conn,
-                        candidates,
-                        cand_meta,
-                        decisions,
-                        materialized.fact_linked_pairs,
-                        synonymy_threshold=self.synonymy_threshold,
-                        rlm_stats=self._graph_rlm_stats,
-                        corpus_root=self.workspace_root,
-                    )
-                    staged_merges.extend(adjudicated_merges)
-
-                # Out-of-transaction Closed-World SHACL Linting & Bounded Self-Healing via shacl_healer_rlm
-                batch_node_ids = set(chunk_ids) | set(all_entity_ids) | set(all_fact_ids)
-                for m_src, m_dst, _, _ in staged_merges:
-                    batch_node_ids.add(m_src)
-                    batch_node_ids.add(m_dst)
-                if progress_callback is not None:
-                    progress_callback("indexing: SHACL validation and repair")
-                _all_violations, violations, _focus_dossiers, focus_contexts = collect_shacl_violation_dossiers(
-                    stage_conn,
-                    self.workspace_root,
-                    ast_context_hops=self.ast_context_hops,
-                    context_window_tokens=active_program.context_window_tokens,
-                    attempted_keys=self._attempted_shacl_keys,
-                    batch_node_ids=batch_node_ids,
-                )
-                batch_shacl_before = len(violations)
-                self._graph_rlm_stats["shacl_violations_before"] += batch_shacl_before
-                self._graph_rlm_stats["shacl_violations_initial"] = self._graph_rlm_stats["shacl_violations_before"]
-                batch_attempted_keys: set[tuple[str, str]] = {(v.focus_node, v.shape) for v in violations}
-                if violations:
-                    self._attempted_shacl_keys.update(batch_attempted_keys)
-                    shacl_fp = shacl_fingerprint(active_program)
-                    viol_fp = hashlib.sha256(
-                        json.dumps(
-                            {
-                                "violations": [v.to_dict() for v in violations],
-                                "focus_contexts": focus_contexts,
-                                "graph_context": self._graph_cache_context(stage_conn),
-                            },
-                            sort_keys=True,
-                            ensure_ascii=False,
-                            default=str,
-                        ).encode("utf-8")
-                    ).hexdigest()
-                    cached_shacl = self._shacl_fp_cache.get((shacl_fp, viol_fp))
-                    if cached_shacl is not None:
-                        cached_reps, cached_shacl_tr, cached_shacl_tok = cached_shacl
-                        self._captured_graph_traces.extend(cached_shacl_tr)
-                        self._graph_rlm_stats["shacl_healer_tokens"] += cached_shacl_tok
-                        if cached_reps:
-                            staged_repairs = list(cached_reps)
-                            applied = self._apply_shacl_repairs(stage_conn, staged_repairs)
-                            self._graph_rlm_stats["shacl_repairs_applied"] += applied
-                    else:
-                        if hasattr(active_program, "set_graph_tools"):
-                            active_program.set_graph_tools(
-                                node_inspector=lambda eid: inspect_focus_node(
-                                    stage_conn,
-                                    eid,
-                                    corpus_root=self.workspace_root,
-                                    ast_context_hops=self.ast_context_hops,
-                                ),
-                                pair_inspector=lambda a, b: format_pair_disambiguation_dossier(
-                                    stage_conn,
-                                    a,
-                                    b,
-                                    corpus_root=self.workspace_root,
-                                    ast_context_hops=self.ast_context_hops,
-                                ),
-                                chunk_hydrator=make_chunk_hydrator(stage_conn, self.workspace_root),
-                                ast_island_hydrator=make_ast_island_hydrator(stage_conn, self.workspace_root),
-                                shacl_linter=lambda: [v.to_dict() for v in lint_graph_shacl(stage_conn)],
-                            )
-                        shacl_audit: list[dict[str, Any]] = getattr(active_program, "shacl_audit_trail", [])
-                        shacl_tel: list[dict[str, Any]] = getattr(active_program, "telemetry", [])
-                        prev_shacl_audit_len = len(shacl_audit)
-                        prev_tel_len = len(shacl_tel)
-                        local_shacl_trace: list[Any] = []
-                        with dspy.context(trace=local_shacl_trace, usage_tracker=None):
-                            repairs = active_program.heal_shacl_violations(
-                                violations,
-                                focus_context=json.dumps(focus_contexts, ensure_ascii=False),
-                            )
-                        shacl_traces = extract_named_trace_entries(
-                            active_program,
-                            local_shacl_trace,
-                            allowed_names={"shacl_repair", "shacl_healer_rlm"},
-                        )
-                        self._captured_graph_traces.extend(shacl_traces)
-                        shacl_tok = 0
-                        if len(shacl_audit) > prev_shacl_audit_len:
-                            shacl_tok = int(shacl_audit[-1].get("tokens_used", 0))
-                        elif len(shacl_tel) > prev_tel_len:
-                            shacl_tok = int(shacl_tel[-1].get("tokens_used", 0))
-                        self._graph_rlm_stats["shacl_healer_tokens"] += shacl_tok
-                        unapplied_repairs = [
-                            {str(k): str(v) for k, v in r.items()} for r in repairs if isinstance(r, Mapping)
-                        ]
-                        if unapplied_repairs:
-                            staged_repairs = list(unapplied_repairs)
-                            applied = self._apply_shacl_repairs(stage_conn, staged_repairs)
-                            self._graph_rlm_stats["shacl_repairs_applied"] += applied
-                        self._shacl_fp_cache[(shacl_fp, viol_fp)] = (
-                            unapplied_repairs,
-                            list(shacl_traces),
-                            shacl_tok,
-                        )
-
-                remaining_violations = lint_graph_shacl(stage_conn)
-                if remaining_violations:
-                    auto_healed = auto_heal_deterministic_shacl(stage_conn)
-                    self._graph_rlm_stats["shacl_repairs_applied"] += auto_healed
-                    remaining_violations = lint_graph_shacl(stage_conn)
-                if remaining_violations:
-                    raise YawRuntimeError(
-                        "CONSISTENCY_ERROR",
-                        f"Graph build left {len(remaining_violations)} SHACL violations: {remaining_violations[:3]}",
-                    )
-                batch_shacl_remaining = sum(
-                    1 for v in remaining_violations if (v.focus_node, v.shape) in batch_attempted_keys
-                )
-            finally:
-                self._bind_program_hooks(active_program)
-                stage_conn.close()
-
-            transaction_started = time.perf_counter()
-            with self.managed_conn.transaction() as conn:
-                apply_prepared_graph_rows(conn, prepared_rows)
-                for merge_src, merge_dst, merge_lkind, merge_def in staged_merges:
-                    merge_entities(
-                        conn,
-                        merge_src,
-                        merge_dst,
-                        label_kind=merge_lkind,
-                        merged_definition=merge_def,
-                    )
-                if resolved_semantic_batch:
-                    upsert_semantic_edges(conn, resolved_semantic_batch)
-                if staged_repairs:
-                    self._apply_shacl_repairs(conn, staged_repairs)
-                remaining_violations = lint_graph_shacl(conn)
-                if remaining_violations:
-                    auto_heal_deterministic_shacl(conn)
-                    remaining_violations = lint_graph_shacl(conn)
-                if remaining_violations:
-                    raise YawRuntimeError(
-                        "CONSISTENCY_ERROR",
-                        f"Graph build left {len(remaining_violations)} SHACL violations: {remaining_violations[:3]}",
-                    )
-                self._graph_rlm_stats["shacl_violations_after"] = len(remaining_violations)
-                self._graph_rlm_stats["shacl_violations_remaining"] = len(remaining_violations)
-                self._graph_rlm_stats["shacl_conforms"] = len(remaining_violations) == 0
-                for cid in chunk_ids:
-                    set_meta(conn, f"indexed_fp:{cid}", json.dumps([ext_fp, openie_fp]))
-
-                # Induce emergent skos:ConceptScheme taxonomies
-                if hasattr(self, "embedder") and self.embedder is not None:
-
-                    async def _embed_engine(texts: Sequence[str], stage: str = "scheme_embed") -> Sequence[np.ndarray]:
-                        raw = (
-                            self.embedder.encode(list(texts), stage=stage)
-                            if hasattr(self.embedder, "encode")
-                            else self.embedder(list(texts))
-                        )
-                        return [np.asarray(v, dtype=np.float32) for v in raw]
-
-                    try:
-                        asyncio.run(build_concept_schemes(conn, program=active_program, embed_fn=_embed_engine))
-                    except RuntimeError:
-                        import concurrent.futures
-
-                        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                            pool.submit(
-                                lambda: asyncio.run(
-                                    build_concept_schemes(conn, program=active_program, embed_fn=_embed_engine)
-                                )
-                            ).result()
-
-            n_batch = max(1, len(chunk_ids))
-            b_label_tok = max(
-                0,
-                int(self._graph_rlm_stats.get("label_judge_tokens", 0))
-                - int(pre_batch_stats.get("label_judge_tokens", 0)),
-            )
-            b_hier_tok = max(
-                0,
-                int(self._graph_rlm_stats.get("hierarchy_judge_tokens", 0))
-                - int(pre_batch_stats.get("hierarchy_judge_tokens", 0)),
-            )
-            b_rel_tok = max(
-                0,
-                int(self._graph_rlm_stats.get("related_judge_tokens", 0))
-                - int(pre_batch_stats.get("related_judge_tokens", 0)),
-            )
-            b_heal_tok = max(
-                0,
-                int(self._graph_rlm_stats.get("shacl_healer_tokens", 0))
-                - int(pre_batch_stats.get("shacl_healer_tokens", 0)),
-            )
-            b_def_cnt = max(
-                0,
-                int(self._graph_rlm_stats.get("missing_entity_defs_count", 0))
-                - int(pre_batch_stats.get("missing_entity_defs_count", 0)),
-            )
-            b_def_tok = max(
-                0,
-                int(self._graph_rlm_stats.get("missing_entity_defs_tokens", 0))
-                - int(pre_batch_stats.get("missing_entity_defs_tokens", 0)),
-            )
-            for cid in chunk_ids:
-                self._chunk_rlm_stats[cid] = {
-                    "label_judge_tokens": b_label_tok / n_batch,
-                    "hierarchy_judge_tokens": b_hier_tok / n_batch,
-                    "related_judge_tokens": b_rel_tok / n_batch,
-                    "shacl_healer_tokens": b_heal_tok / n_batch,
-                    "shacl_violations_initial": batch_shacl_before / n_batch,
-                    "shacl_violations_remaining": batch_shacl_remaining / n_batch,
-                    "missing_entity_defs_count": b_def_cnt / n_batch,
-                    "missing_entity_defs_tokens": b_def_tok / n_batch,
-                    "openie_tokens": float(chunk_openie_tok_by_cid.get(cid, 0)),
-                }
-
+                progress_callback("indexing: native frozen candidate preparation and graph publication")
+            summary = self.indexing_runner(self._opt_chunks_pool, active_program)
             self._csr_graph = None
             self._query_retrieval_memo.clear()
             self._last_memo_question = None
-            self._active_extraction_fingerprint = ext_fp
-            self._active_openie_fingerprint = openie_fp
-            self._opt_indexed_cids.update(chunk_ids)
-            for cid in chunk_ids:
-                self._chunk_indexed_ext_fp[cid] = ext_fp
-            self._persist_dspy_trails_to_db(active_program)
-            trim_diagnostics(active_program)
-            if hasattr(active_program, "telemetry"):
-                active_program.telemetry.append(
-                    {
-                        "stage": "indexing_batch",
-                        "tokens_used": 0,
-                        "chunks": len(chunks),
-                        "total_seconds": time.perf_counter() - batch_started,
-                        "openie_seconds": openie_seconds,
-                        "preparation_seconds": transaction_started - preparation_started,
-                        "transaction_seconds": time.perf_counter() - transaction_started,
-                        "synonym_seconds": synonym_seconds,
-                    }
-                )
+            self._active_extraction_fingerprint = extraction_fingerprint(active_program)
+            self._active_openie_fingerprint = openie_fingerprint(active_program)
+            self._opt_indexed_cids = set(summary.chunk_ids)
+            self._chunk_indexed_ext_fp = {cid: self._active_extraction_fingerprint for cid in summary.chunk_ids}
+            self._graph_rlm_stats.update(summary.rlm_stats)
+            self._captured_graph_traces = [
+                (trace.predictor, dict(trace.inputs), dspy.Prediction(**trace.outputs))
+                for trace in summary.traces
+                if trace.predictor not in {"ner", "triples"}
+            ]
+            self._captured_chunk_traces.clear()
+            self._hydrate_chunk_traces_and_stats_from_db(self._opt_chunks_pool)
+            for name in (
+                "entity_def_audit_trail",
+                "label_judge_audit_trail",
+                "hierarchy_judge_audit_trail",
+                "related_judge_audit_trail",
+                "shacl_audit_trail",
+            ):
+                getattr(active_program, name).extend(getattr(summary, name))
             trim_diagnostics(active_program)
             return len(chunks)
 
@@ -2353,19 +1588,7 @@ class YawGraphEngine:
             else []
         )
         if missing_val_pool:
-            total_val_missing = len(missing_val_pool)
-            for b_start in range(0, total_val_missing, 8):
-                batch_slice = missing_val_pool[b_start : b_start + 8]
-                if progress_callback is not None:
-                    progress_callback(
-                        f"indexing: validation passages "
-                        f"({min(b_start + len(batch_slice), total_val_missing)}/{total_val_missing})"
-                    )
-                self.index_chunks(
-                    batch_slice,
-                    program=self.program,
-                    progress_callback=progress_callback,
-                )
+            self.index_chunks(missing_val_pool, program=self.program, progress_callback=progress_callback)
 
     def _hydrate_top_chunks_for_eval(
         self,
@@ -2413,30 +1636,7 @@ class YawGraphEngine:
             len(self._opt_indexed_cids) < len(self._opt_chunks_pool)
             or self._active_extraction_fingerprint != extraction_fingerprint(compiled)
         ):
-            target_openie_fp = openie_fingerprint(compiled)
-            clear_openie = self._active_openie_fingerprint != target_openie_fp
-            self._reset_sandbox_graph(clear_openie=clear_openie)
-            if len(self._opt_chunks_pool) <= 32:
-                rehydrate_pool = list(self._opt_chunks_pool)
-            else:
-                val_cids = {p.chunk_id for p, _ in self._opt_val_chunks_pool}
-                cached_pool = [
-                    cp
-                    for cp in self._opt_chunks_pool
-                    if cp[0].chunk_id not in val_cids
-                    and (
-                        target_openie_fp,
-                        cp[0].chunk_id,
-                        hashlib.sha256(cp[1].encode()).hexdigest(),
-                    )
-                    in self._openie_fp_cache
-                ]
-                rehydrate_pool = list(self._opt_val_chunks_pool) + (
-                    cached_pool[: max(0, 64 - len(self._opt_val_chunks_pool))]
-                    if cached_pool
-                    else [cp for cp in self._opt_chunks_pool if cp[0].chunk_id not in val_cids][:16]
-                )
-            self.index_chunks(rehydrate_pool, program=compiled)
+            self.index_chunks(self._opt_chunks_pool, program=compiled)
         self._bind_program_hooks()
 
     def _build_optimization_hooks(self) -> GraphOptimizationHooks:
@@ -2476,13 +1676,13 @@ class YawGraphEngine:
             },
             bind_program_hooks=self._bind_program_hooks,
             open_score_cache=lambda ctx: CandidateStageCache(
-                self._openie_fp_cache.store,
+                self._candidate_cache_store,
                 self.managed_conn,
                 "simba_task_score",
                 lambda: ctx,
             ),
             open_checkpoint_cache=lambda ctx: CandidateStageCache(
-                self._openie_fp_cache.store,
+                self._candidate_cache_store,
                 self.managed_conn,
                 "reflection_checkpoint",
                 lambda: ctx,

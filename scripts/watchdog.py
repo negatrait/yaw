@@ -128,12 +128,17 @@ class PoolTelemetry:
     val_pool: int | None
     train_done: int | None
     train_pool: int | None
+    train_val_done: int | None
+    train_val_pool: int | None
+    background_done: int | None  # corpus chunks not in train or val query gold sets
+    background_pool: int | None
     corpus_done: int | None
     corpus_pool: int | None
     elapsed_hours: float  # wall-clock since the sandbox DB was created
     velocity: float | None  # chunks/min over the last measured window (telemetry samples)
     sec_per_chunk: float | None
     val_eta_min: float | None  # only while upfront val indexing is still running
+    corpus_eta_min: float | None  # ETA to index remaining corpus chunks
 
     @classmethod
     def from_sandbox(cls, sandbox: dict[str, Any]) -> PoolTelemetry:
@@ -153,9 +158,25 @@ class PoolTelemetry:
         train_ids = pools.get("train_chunk_ids")
         if isinstance(val_ids, list) and isinstance(train_ids, list) and (val_ids or train_ids):
             train_val_union = set(val_ids) | set(train_ids)
-            corpus_done, corpus_pool = len(indexed.intersection(train_val_union)), len(train_val_union)
+            train_val_done, train_val_pool = len(indexed.intersection(train_val_union)), len(train_val_union)
+        else:
+            train_val_done, train_val_pool = None, None
+
+        corpus_ids = pools.get("corpus_chunk_ids")
+        if isinstance(corpus_ids, list) and corpus_ids:
+            corpus_done, corpus_pool = len(indexed.intersection(set(corpus_ids))), len(corpus_ids)
+        elif train_val_pool is not None:
+            corpus_done, corpus_pool = train_val_done, train_val_pool
         else:
             corpus_done, corpus_pool = _split("corpus_chunk_ids")
+        if corpus_done is None:
+            corpus_done = cnt
+
+        background_done = None
+        background_pool = None
+        if corpus_pool is not None and train_val_pool is not None:
+            background_pool = max(0, corpus_pool - train_val_pool)
+            background_done = max(0, cnt - (train_val_done or 0))
 
         samples = sandbox.get("timeseries_samples", [])
         el_sec = max(
@@ -172,6 +193,9 @@ class PoolTelemetry:
         val_eta = None
         if vel and val_pool is not None and val_done is not None and val_done < val_pool:
             val_eta = (val_pool - val_done) / vel
+        corpus_eta = None
+        if vel and corpus_pool is not None and cnt < corpus_pool:
+            corpus_eta = (corpus_pool - cnt) / vel
 
         def _opt_int(key: str) -> int | None:
             v = pools.get(key)
@@ -186,12 +210,17 @@ class PoolTelemetry:
             val_pool=val_pool,
             train_done=train_done,
             train_pool=train_pool,
+            train_val_done=train_val_done,
+            train_val_pool=train_val_pool,
+            background_done=background_done,
+            background_pool=background_pool,
             corpus_done=corpus_done,
             corpus_pool=corpus_pool,
             elapsed_hours=el_sec / 3600.0,
             velocity=vel,
             sec_per_chunk=(60.0 / vel) if vel else None,
             val_eta_min=val_eta,
+            corpus_eta_min=corpus_eta,
         )
 
     @staticmethod
@@ -869,13 +898,15 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
     )
     rate = f"{pt.velocity:.2f}/m" if pt.velocity is not None else "n/a"
     tps = f"{lem['llm_tps']:.0f} tok/s" if lem.get("server_up") else "LLM metrics n/a"
+    eta_str = pt.duration(pt.corpus_eta_min if pt.corpus_eta_min is not None else pt.val_eta_min)
     fig.text(
         0.04,
         0.91,
-        f"Val chunks: {pt.frac(pt.val_done, pt.val_pool)} | "
-        f"Train chunks: {pt.frac(pt.train_done, pt.train_pool)} | "
-        f"Indexed: {pt.openie_cnt} | Rate (20 min): {rate} | {tps} | "
-        f"Val ETA: {pt.duration(pt.val_eta_min)}",
+        f"Corpus: {pt.frac(pt.openie_cnt, pt.corpus_pool)} | "
+        f"Train: {pt.frac(pt.train_done, pt.train_pool)} | "
+        f"Val: {pt.frac(pt.val_done, pt.val_pool)} | "
+        f"Rate (20 min): {rate} | {tps} | "
+        f"ETA: {eta_str}",
         fontsize=9,
         color="#38bdf8",
         fontweight="bold",
@@ -893,7 +924,7 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
         label=f"Indexed chunks ({pt.openie_cnt})",
     )
     proj_end = pt.elapsed_hours
-    if pt.val_eta_min is not None and pt.val_pool is not None and pt.val_done is not None:
+    if pt.val_eta_min is not None and pt.val_pool is not None and pt.val_done is not None and pt.val_done < pt.val_pool:
         # Projection uses the measured 20-minute rate; it only covers the upfront val pool.
         proj_end = pt.elapsed_hours + pt.val_eta_min / 60.0
         ax1.plot(
@@ -904,12 +935,25 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
             ls="--",
             label="Val-pool projection",
         )
+    elif pt.corpus_eta_min is not None and pt.corpus_pool is not None and pt.openie_cnt < pt.corpus_pool:
+        proj_end = pt.elapsed_hours + pt.corpus_eta_min / 60.0
+        ax1.plot(
+            [pt.elapsed_hours, proj_end],
+            [pt.openie_cnt, pt.corpus_pool],
+            color="#38bdf8",
+            lw=1.0,
+            ls="--",
+            label="Corpus projection",
+        )
     y_top = max(10.0, float(pt.openie_cnt))
+    seen_pools: set[int] = set()
     for pool, col, lbl in (
         (pt.val_pool, "#10b981", "Val pool"),
-        (pt.corpus_pool, "#f59e0b", "Train + val pool"),
+        (pt.train_val_pool, "#f59e0b", "Train + val pool"),
+        (pt.corpus_pool, "#64748b", "Full corpus"),
     ):
-        if pool:
+        if pool and pool not in seen_pools:
+            seen_pools.add(pool)
             ax1.axhline(pool, color=col, ls="--", lw=1.0, label=f"{lbl} ({pool})")
             y_top = max(y_top, float(pool))
     ax1_r.plot(
@@ -1690,7 +1734,7 @@ def _no_candidates_message(sandbox: dict[str, Any]) -> str:
     db = sandbox.get("db_name")
     if not sandbox.get("optimizer_alive"):
         return f"No candidate evaluations recorded for {db}\n(optimizer stopped)"
-    prog = f"Upfront Indexing: {pt.frac(pt.val_done, pt.val_pool)} validation chunks"
+    prog = f"Corpus Indexing: {pt.frac(pt.openie_cnt, pt.corpus_pool)} (Val: {pt.frac(pt.val_done, pt.val_pool)})"
     return f"{prog} • Candidate evolution begins once indexed\nActive: {op}"
 
 
@@ -2047,10 +2091,11 @@ def generate_report_markdown(
         ("Dataset Split", split),
         (
             "Indexing (OpenIE)",
-            f"Val chunks **`{pt.frac(pt.val_done, pt.val_pool)}`** • "
-            f"Train chunks **`{pt.frac(pt.train_done, pt.train_pool)}`** • "
-            f"Indexed **`{pt.openie_cnt}`** of `{_v(pt.corpus_pool)}` train+val chunks • "
-            f"Val ETA `{pt.duration(pt.val_eta_min)}`",
+            f"Corpus **`{pt.frac(pt.openie_cnt, pt.corpus_pool)}`** "
+            f"(Train gold **`{pt.frac(pt.train_done, pt.train_pool)}`** • "
+            f"Val gold **`{pt.frac(pt.val_done, pt.val_pool)}`** • "
+            f"Background **`{pt.frac(pt.background_done, pt.background_pool)}`**) • "
+            f"ETA `{pt.duration(pt.corpus_eta_min if pt.corpus_eta_min is not None else pt.val_eta_min)}`",
         ),
     ]
     if cands:

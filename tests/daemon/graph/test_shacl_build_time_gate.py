@@ -17,6 +17,7 @@ from yaw.daemon.graph.storage import (
     open_yaw_db,
     serialize_graph_turtle,
 )
+from yaw.daemon.indexing import bind_native_indexing
 
 
 class DummyEmbedder:
@@ -282,11 +283,13 @@ def _make_engine(
     prog = HippoRAGProgram(
         synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=mock_lm, rlm_sub_lm=mock_lm
     )
-    engine = YawGraphEngine(
-        db_path=db_path,
-        workspace_root=tmp_path,
-        program=prog,
-        embedder=embedder,
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=db_path,
+            workspace_root=tmp_path,
+            program=prog,
+            embedder=embedder,
+        )
     )
     return engine, mock_lm
 

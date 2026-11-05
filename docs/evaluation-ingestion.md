@@ -2,6 +2,26 @@
 
 Domain evaluation ledger for CocoIndex file/inference/graph targets, dataset bundle preparation, bounded overlap pilots, and Epic 2 runtime specification reconciliation. See the [Evaluation Index](evaluation.md) for all other domain ledgers.
 
+## Revalidation after intervening development (2026-11-04, `06b35d2`)
+
+The checkout is clean `dev` before this follow-up and now requires CocoIndex
+`>=1.1.0`. Earlier lifecycle edits and the synonym fixture SQL correction are
+already committed. Removed the remaining suppression of environment-close errors
+in `_build_coco_app`: a failed teardown must abort app replacement.
+
+Executed `uv run --locked pytest tests/daemon/graph/inference/test_synonym_packets.py
+tests/daemon/graph/test_engine.py --lf --tb=short -q`: 27 passed, eight failed in
+66.45 s. Failures include concept-scheme calls incompatible with test provider
+contracts, additional definition telemetry, and two candidate rebuilds returning
+scheme IDs from entity similarity search that have no entity metadata. These
+tests exercise the old direct engine indexing path; they do not establish native
+candidate indexing acceptance. They remain unresolved in this follow-up.
+
+Focused runtime tests (`-k 'live or stop_keeps' --no-testmon`): four passed,
+23 deselected in 13.82 s. Repository `ty check`, Ruff check with fixes, Ruff format
+(158 files unchanged), and `git diff --check` pass. No inference pilot or GEPA
+run was launched. The broader test gate remains open; no completion commit.
+
 ## Candidate cutover audit correction (2026-11-04)
 
 The October 31 full-cutover claim below is not supported by current source.

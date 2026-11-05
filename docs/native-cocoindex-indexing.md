@@ -320,6 +320,22 @@ Building on the measured 5x throughput gain from native CocoIndex component exec
 
 ### 1. Chunk-Stream Batching & Incremental Graph Publication (64 Chunks)
 
+2026-11-05 scoped implementation: additive semantic planning now reuses the
+validated graph when every previously published chunk's input fingerprint still
+matches. Fingerprints cover source text, pointer, extraction and semantic settings,
+and are committed atomically with the graph. New chunk contributions alone enter
+sense resolution and synonym candidate search; existing senses and adjudicated
+relations remain available. Derived community taxonomies are recomputed separately.
+Synonym evidence is consumed one packet at a time rather than gathering every
+packet and queued request in memory. The native publication memo version is 2.
+
+This is deliberately an additions-first step. Edits, deletions, semantic-setting
+changes and graphs without verified fingerprints require complete semantic
+recomputation. Graph cloning, source hydration, complete target declarations,
+SHACL validation and community clustering still scale with the published graph;
+64-chunk dispatch does not yet establish flat heap usage. The declarative per-table
+cutover below and Epic 1 D1-A6 remain unfinished.
+
 - **Problem:** Currently, `frozen_indexing_app_main` queues the entire snapshot pool (e.g., 11,507 chunks) in a single pass. Graph publication (`publish_graph`) only triggers after *all* handles reach `.ready()`. Downstream readers, query interfaces, and evaluation harnesses are completely blocked from seeing graph entities, facts, or concept schemes until the final chunk extraction finishes. Production environments do not have static dataset splits or fixed validation chunk counts.
 - **Proposal:** Replace the monolithic all-chunks pass with a general chunk-stream batching contract:
   - Chunks are dispatched in streaming batches of **64 chunks** (configurable via `indexing_batch_size`).

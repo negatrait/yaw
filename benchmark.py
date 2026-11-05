@@ -50,6 +50,7 @@ from yaw.daemon.graph.inference.models import (
     embedding_evidence,
     preflight,
 )
+from yaw.daemon.indexing import bind_native_indexing
 from yaw.daemon.ingestion import (
     DATASET_REGISTRY as DATASET_REGISTRY,
 )
@@ -253,27 +254,29 @@ def run_yaw_benchmark(
     index_dir.mkdir(parents=True, exist_ok=True)
     db_path = index_dir / "yaw.db"
 
-    yaw_engine = YawGraphEngine(
-        db_path=db_path,
-        workspace_root=PROJECT_ROOT,
-        program=program,
-        embedder=embedder,
-        retrieval_top_k=RETRIEVAL_TOP_K,
-        linking_top_k=linking_top_k,
-        fact_candidate_pool_k=fact_candidate_pool_k,
-        fact_fts_pool_k=fact_fts_pool_k,
-        fact_rrf_k=fact_rrf_k,
-        fact_fts_weight=fact_fts_weight,
-        passage_node_weight=passage_node_weight,
-        fts_weight=fts_weight,
-        damping=damping,
-        passage_seed_pool_k=passage_seed_pool_k,
-        fts_seed_pool_k=fts_seed_pool_k,
-        activation=graph_activation,
-        activation_param=graph_activation_param,
-        activation_renormalize=graph_activation_renormalize,
-        beta=graph_beta,
-        dual_weight=graph_dual_weight,
+    yaw_engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=db_path,
+            workspace_root=PROJECT_ROOT,
+            program=program,
+            embedder=embedder,
+            retrieval_top_k=RETRIEVAL_TOP_K,
+            linking_top_k=linking_top_k,
+            fact_candidate_pool_k=fact_candidate_pool_k,
+            fact_fts_pool_k=fact_fts_pool_k,
+            fact_rrf_k=fact_rrf_k,
+            fact_fts_weight=fact_fts_weight,
+            passage_node_weight=passage_node_weight,
+            fts_weight=fts_weight,
+            damping=damping,
+            passage_seed_pool_k=passage_seed_pool_k,
+            fts_seed_pool_k=fts_seed_pool_k,
+            activation=graph_activation,
+            activation_param=graph_activation_param,
+            activation_renormalize=graph_activation_renormalize,
+            beta=graph_beta,
+            dual_weight=graph_dual_weight,
+        )
     )
     try:
         index_start = perf_counter()

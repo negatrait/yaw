@@ -10,6 +10,7 @@ import numpy as np
 
 from yaw.daemon.graph.engine import YawGraphEngine
 from yaw.daemon.graph.inference import PASSAGE_INSTRUCTION, DSPyEmbeddingAdapter, HippoRAGProgram
+from yaw.daemon.indexing import bind_native_indexing
 from yaw.daemon.ingestion import prepare_dataset_bundle, snapshot_dataset_bundle
 
 
@@ -39,12 +40,14 @@ def main() -> None:
             program.ner.signature.instructions + " Preserve every named person."
         )
     embedder = DSPyEmbeddingAdapter(base_url=args.url, api_key="test", caching=False)
-    engine = YawGraphEngine(
-        db_path=args.root / "yaw.db",
-        workspace_root=args.root / "datasets",
-        program=program,
-        embedder=embedder,
-        synonymy_threshold=-1.0,
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=args.root / "yaw.db",
+            workspace_root=args.root / "datasets",
+            program=program,
+            embedder=embedder,
+            synonymy_threshold=-1.0,
+        )
     )
     try:
         if args.mutation == "query":
@@ -67,9 +70,6 @@ def main() -> None:
                     instruction=PASSAGE_INSTRUCTION,
                 )[0],
             )
-        # Force materialization from scratch while retaining only the disk stage
-        # cache. A second process cannot benefit from graph rows or Python RAM.
-        engine._reset_sandbox_graph(clear_openie=True)
         doc = "Alan Turing formulated the Turing machine in 1936."
         if args.mutation == "source":
             doc += " This source was edited after the previous run."
@@ -85,11 +85,7 @@ def main() -> None:
         )
         questions.write_text("[]", encoding="utf-8")
         bundle = prepare_dataset_bundle("cache_documents", source, questions, args.root / "datasets")
-        engine.index_chunks(snapshot_dataset_bundle(bundle, args.root / "coco_state", document_ids=["first"]))
-        with engine.managed_conn.transaction() as conn:
-            conn.execute("UPDATE entities SET definition = '' WHERE name IN ('alan turing', 'turing machine')")
-        assert not engine.lint_graph()["conforms"]
-        engine.index_chunks(snapshot_dataset_bundle(bundle, args.root / "coco_state", document_ids=["second"]))
+        engine.index_chunks(snapshot_dataset_bundle(bundle, args.root / "coco_state", document_ids=["first", "second"]))
         assert engine.lint_graph()["conforms"]
         print(
             json.dumps(
@@ -105,17 +101,6 @@ def main() -> None:
                         )
                     },
                     "openie_tokens": [stats["openie_tokens"] for _, stats in sorted(engine._chunk_rlm_stats.items())],
-                    "hits": {
-                        cache.stage: cache.hits
-                        for cache in (
-                            engine._text_vec_cache,
-                            engine._openie_fp_cache,
-                            engine._label_judge_fp_cache,
-                            engine._hierarchy_judge_fp_cache,
-                            engine._related_judge_fp_cache,
-                            engine._shacl_fp_cache,
-                        )
-                    },
                     "cache_rows": engine.conn.execute("SELECT COUNT(*) FROM candidate_stage_cache").fetchone()[0],
                     "trace_names": sorted({name for name, _, _ in engine._captured_graph_traces}),
                     "namespace": engine._candidate_cache_namespace(),

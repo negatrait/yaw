@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import json
+import os
 import re
 import time
 from collections.abc import Awaitable, Callable, Sequence
@@ -10,6 +11,9 @@ from concurrent.futures import CancelledError
 from dataclasses import asdict, dataclass, replace
 from threading import Event
 from typing import Any, cast
+
+os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+os.environ.setdefault("LITELLM_TELEMETRY", "False")
 
 import dspy
 import numpy as np
