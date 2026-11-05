@@ -590,7 +590,14 @@ async def process_frozen_chunk(
     identity: InferenceIdentity,
 ) -> None:
     pointer, text = chunk
-    metadata = SourceMetadata(
+    metadata = frozen_chunk_metadata(pointer, text)
+    sources.declare_row(row=metadata)
+    await process_chunk(metadata, artifacts, identity, frozen_text=text)
+
+
+def frozen_chunk_metadata(pointer: ChunkPointer, text: str) -> SourceMetadata:
+    """Use the same occurrence/revision key for admission and native declaration."""
+    return SourceMetadata(
         pointer.chunk_id,
         pointer.rel_posix_path,
         hashlib.sha256(text.encode()).hexdigest(),
@@ -600,8 +607,40 @@ async def process_frozen_chunk(
         pointer.ast_island_start,
         pointer.ast_island_end,
     )
-    sources.declare_row(row=metadata)
-    await process_chunk(metadata, artifacts, identity, frozen_text=text)
+
+
+def partition_frozen_chunks(
+    db: sqlite.ManagedConnection,
+    chunks: Sequence[tuple[ChunkPointer, str]],
+    identity: InferenceIdentity,
+) -> tuple[list[tuple[ChunkPointer, str]], list[tuple[ChunkPointer, str]]]:
+    """Keep unchanged native declarations present while admitting changed revisions."""
+    stored: dict[str, SourceMetadata] = {}
+    with db.readonly() as conn:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('source_chunks', 'chunk_inference')"
+            )
+        }
+        if tables == {"source_chunks", "chunk_inference"}:
+            for start in range(0, len(chunks), 64):
+                ids = [pointer.chunk_id for pointer, _ in chunks[start : start + 64]]
+                placeholders = ",".join("?" for _ in ids)
+                rows = conn.execute(
+                    "SELECT s.chunk_id, s.rel_posix_path, s.source_hash, s.start_line, s.end_line, s.title, "
+                    "s.ast_island_start, s.ast_island_end FROM source_chunks s JOIN chunk_inference ci "
+                    "ON ci.chunk_id=s.chunk_id AND ci.source_hash=s.source_hash "
+                    f"WHERE s.chunk_id IN ({placeholders}) AND ci.program_identity=? AND ci.embedding_identity=?",
+                    (*ids, identity.program, identity.embedding),
+                )
+                stored.update((row[0], SourceMetadata(*row)) for row in rows)
+    retained = []
+    changed = []
+    for pointer, text in chunks:
+        destination = retained if stored.get(pointer.chunk_id) == frozen_chunk_metadata(pointer, text) else changed
+        destination.append((pointer, text))
+    return retained, changed
 
 
 class FrozenChunkStream:
@@ -702,11 +741,15 @@ def bind_native_indexing(engine: YawGraphEngine, *, batch_size: int = 64) -> Yaw
             )
 
             async def run_streaming() -> GraphPlanSummary:
-                all_chunks = tuple(chunks)
+                retained, changed = partition_frozen_chunks(
+                    engine.managed_conn, chunks, InferenceIdentity(program_identity, embedding_identity)
+                )
+                if not changed:
+                    stream.chunks = tuple(retained)
+                    return await app.update().result()
                 summary = GraphPlanSummary(())
-                for start in range(0, len(all_chunks), batch_size):
-                    end = min(len(all_chunks), start + batch_size)
-                    stream.chunks = all_chunks[:end]
+                for start in range(0, len(changed), batch_size):
+                    stream.chunks = (*retained, *changed[: start + batch_size])
                     summary = await app.update().result()
                 return summary
 

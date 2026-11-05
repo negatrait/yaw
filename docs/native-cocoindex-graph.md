@@ -405,6 +405,13 @@ Do not launch optimization or restart live workers as part of a documentation ed
 
 G1 execution: [scheme removal restart record](reviews/concept-scheme-removal.md).
 
+Execution order update, 2026-11-05: [atomic incremental publication units](reviews/incremental-publication-work.md)
+now governs the next implementation slices. Defer live diagnostic pairs and
+baseline capture until fixed-evidence semantics and bounded publication pass.
+The verified scheme-free code checkpoint remains `c01f4aa`; its tests do not
+establish bounded incremental processing. G0-G6 below remain acceptance scope,
+not a requirement to spend live-model compute before repairing known global work.
+
 - [ ] **G0: capture the defect.** Build one paired harness with isolated B/tracking
   and frozen S. Record current counts, canonical graph diff, phase times and
   provider work. Add batch64/65 and final-chunk bridge fixtures before refactoring.

@@ -70,4 +70,6 @@ was restarted; this evidence does not claim an operational cutover or corpus par
 
 The 128-vs-64+64 timing/count baseline is not captured by these tests. G1 as a
 whole remains open until that artifact exists. The current code is the scheme-free
-checkpoint for its capture; graph-wide staging and later G2-G6 work remain open.
+checkpoint; baseline capture is now deferred until fixed-evidence equivalence and
+bounded publication pass under [atomic execution units](incremental-publication-work.md).
+Graph-wide staging and later G2-G6 work remain open.

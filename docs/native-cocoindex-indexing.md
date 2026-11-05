@@ -34,6 +34,14 @@ optimizer candidate preparation owns another sequential inference/write engine.
 Unbound retrieval engines fail when indexing is requested; retrieval never starts
 hidden candidate indexing.
 
+Frozen admission must retain unchanged occurrence/revision declarations while
+admitting changed chunks. Never replay a smaller prefix of an already completed
+snapshot and thereby withdraw valid chunks. Reopening the native tracking state
+must preserve this rule. Revision matching includes source pointer/AST bounds,
+source hash and extraction/embedding identities; matching IDs alone is insufficient.
+Implementation slices and remaining cutover work are tracked in
+[atomic incremental publication units](reviews/incremental-publication-work.md).
+
 CocoIndex owns change detection, dependency scheduling, memo and target tracking.
 No custom executor, polling loop, serialized pending-delta journal, synthetic
 acknowledgement scheduler or dataset-specific batching. Admit bounded source

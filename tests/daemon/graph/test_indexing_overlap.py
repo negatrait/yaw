@@ -334,8 +334,14 @@ def provider():
             time.sleep(state["delay"])
             if kind == "embedding":
                 rows: list[dict[str, Any]] = [
-                    {"object": "embedding", "index": i, "embedding": [1.0, 2.0, 3.0, 4.0]}
-                    for i, _ in enumerate(data["input"])
+                    {
+                        "object": "embedding",
+                        "index": i,
+                        "embedding": state["embedding_vector"](text)
+                        if "embedding_vector" in state
+                        else [1.0, 2.0, 3.0, 4.0],
+                    }
+                    for i, text in enumerate(data["input"])
                 ]
                 if state["mode"] == "count":
                     rows = rows[:-1]
@@ -354,7 +360,7 @@ def provider():
                             [
                                 {
                                     "pair_id": p["pair_id"],
-                                    "relation": "skos:related",
+                                    "relation": state.get("relation", "skos:related"),
                                     "canonical": p["pair_id"].split("|")[0],
                                 }
                                 for p in packet["pairs"]
@@ -362,6 +368,12 @@ def provider():
                             stage_text=json.dumps(data["messages"]),
                         )
                     }
+                elif "extractions" in state and "[[ ## passage ## ]]" in text:
+                    (passage,) = [source for source in state["extractions"] if source in text]
+                    field = "triples" if "[[ ## named_entities ## ]]" in text else "named_entities"
+                    output = {field: state["extractions"][passage][field]}
+                    with lock:
+                        state.setdefault("extraction_requests", []).append((field, passage))
                 elif "missing_entities" in text:
                     output = (
                         {"entity_definitions": []}
