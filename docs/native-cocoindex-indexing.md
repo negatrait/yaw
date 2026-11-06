@@ -58,6 +58,11 @@ SQLite copy, rather than additional JSON arrays or duplicate inference columns.
 For frozen input, use supplied text exactly. Missing input raises; never resolve
 it from a mutable file by using `supplied_text or hydrate_from_disk(...)`.
 Identical text at two source locations retains distinct occurrence provenance.
+The complete frozen source declaration owns liveness during publication; retired
+child rows can remain visible until CocoIndex finishes parent cleanup and must
+not keep withdrawn occurrences alive for another update. Require an inference
+artifact for every declared source and fail on incomplete coverage. Native
+filesystem catch-up must likewise publish the surviving source set in that update.
 No train/validation labels, benchmark presets or gold-data rules enter production
 indexing or semantic keys.
 

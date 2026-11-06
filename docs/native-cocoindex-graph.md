@@ -245,6 +245,18 @@ reserved scheme namespace in the new schema.
    canonical representative of the accepted equivalence class, not 'first seen'
    or an ID minted from a batch. If the representative changes when an earlier
    canonical member arrives, rewrite the affected bindings/facts/edges atomically.
+   A sense ID hashes normalized label and definition; a class uses the smallest
+   surviving sense ID. Display spelling and definition selection use total orders,
+   independently of arrival. Withdrawing the last support for a member removes it
+   from representative selection. Preserve raw source spellings and definitions.
+   Label support counts distinct source occurrences; canonical fact text must not
+   influence its own display-label selection through a circular matching score.
+   Statement identity includes original predicate, canonical endpoints and literal
+   lexical value, datatype and language. Deduplication must retain distinctions
+   between equal lexical values with different datatypes or languages.
+   Validate one class per sense, the minimum-member representative and matching
+   occurrence/revision ownership of each assertion's resource mentions before
+   committing the proposal. Raw assertion evidence is immutable through rebinding.
 2. Lookup normalized labels against all persisted senses and current proposals.
    Exact spelling, casefold equality or high cosine alone is not semantic identity.
    Keep homographs/modifier-head distinctions; accepted unchanged identity and

@@ -766,26 +766,7 @@ def canonicalize_entity_labels_edc(
                     if not cid.startswith("__"):
                         chunk_ids_to_fetch.add(cid)
 
-            # 3. Fetch incident facts for support counting
-            facts_by_eid: dict[str, list[tuple[str, str]]] = {eid: [] for eid in batch}
-            for row in conn.execute(
-                f"""
-                SELECT fact_id, subj_id, obj_id, raw_triple_json
-                FROM facts
-                WHERE subj_id IN ({placeholders}) OR obj_id IN ({placeholders})
-                """,
-                batch_tuple + batch_tuple,
-            ):
-                fid = str(row[0])
-                sid = str(row[1])
-                oid = str(row[2]) if row[2] is not None else ""
-                raw_json = str(row[3] or "").lower()
-                if sid in facts_by_eid:
-                    facts_by_eid[sid].append((fid, raw_json))
-                if oid in facts_by_eid and oid != sid:
-                    facts_by_eid[oid].append((fid, raw_json))
-
-            # 4. Fetch chunk metadata for AST titles and verbatim verification
+            # 3. Fetch chunk metadata for AST titles and verbatim verification
             chunks_meta: dict[str, tuple[str, int, int, str]] = {}
             unseen_cids = [cid for cid in chunk_ids_to_fetch if cid not in chunk_text_cache]
             if unseen_cids:
@@ -908,13 +889,8 @@ def canonicalize_entity_labels_edc(
 
                     in_ast_title = 1 if any(rl.lower() in t for rl in raw_labels for t in eid_chunk_titles) else 0
 
-                    chunk_count = len({cid for _, _, cid in occs})
-                    facts_matching = {
-                        fid
-                        for fid, f_json in facts_by_eid.get(eid, [])
-                        if any(rl.lower() in f_json for rl in raw_labels) or norm in f_json
-                    }
-                    support_count = chunk_count + len(facts_matching)
+                    # Canonical fact text is a result of label selection, not source support.
+                    support_count = len({cid for _, _, cid in occs})
 
                     is_hidden = (norm in explicit_hidden) or (verbatim_in_source == 0)
                     is_hidden_by_norm[norm] = is_hidden

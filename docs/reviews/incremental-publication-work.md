@@ -40,7 +40,7 @@ planning defect.
 ## Checkpoint
 
 - [x] U1: paired fixed-evidence harness and recorded result (fixture scope below).
-- [ ] U2: stable evidence/bindings and canonical identities.
+- [x] U2: stable evidence/bindings and canonical identities.
 - [ ] U3: candidate equivalence and invalidation.
 - [ ] U4: final-target atomicity proof.
 - [ ] U5: bounded planner/target cutover; global path deleted.
@@ -246,3 +246,127 @@ the U4 lifecycle/crash gates. That diagnostic requires separate lifecycle work.
 
 The next U2 unit remains occurrence replacement/retraction and canonical rebinding
 equivalence across restart. U2 and the bounded-planner cutover remain open.
+
+### U2 completion work (2026-11-06)
+
+Resumed from `dd0bcd0`. Definition of done for U2: the native CocoIndex source
+snapshot persists immutable occurrence-local evidence and explicit canonical
+bindings; fixed accepted equivalences converge under reversed arrival, late
+representatives, replacement, rename and withdrawal, including restart. Compare
+the resulting identities, typed/directed facts, source support, labels, vectors
+and FTS with a fresh reference for the same surviving evidence. No-op replay
+must preserve both provider-call count and SQLite row-change count.
+
+- [x] Native evidence replacement/withdrawal and duplicate-location contracts.
+- [x] Arrival-independent canonical metadata and typed literal identity contracts.
+- [x] Repair defects at their owner; keep final writes declarative and remove
+  superseded identity/binding code paths.
+- [x] Run the U1 paired harness and mandatory project gates; record results and
+  mark U2 only when its evidence contracts pass.
+
+Candidate completeness/decision receipts remain U3, connector lifecycle/crash
+proof remains U4, and global planner/staging removal remains U5. U2 tests drive
+the active native `FrozenChunkStream`/`app.update()` path; no manual graph writes
+or final-corpus rebuild is added to production to force equivalence.
+
+The completion contracts exposed and repaired five defects:
+
+1. Triple-parser deduplication omitted datatype/language, dropping distinct typed
+   assertions with equal literal lexical values. Both fields now participate in
+   the one deduplication key. Extraction schema identity is now
+   `skos-shacl-v6-evidence-identity`: old artifacts must be re-extracted because
+   omitted statements cannot be recovered from them. Existing experiment DBs
+   remain untouched; no compatibility reader or migration fallback was added.
+2. Canonical metadata depended on the first cased spelling encountered. One total
+   order now selects surface spellings in both normalization and materialization;
+   same-sense definitions use the same length/lexical order. The automatic
+   difflib/cosine admission policy is unchanged.
+3. Frozen publication saw withdrawn child rows before CocoIndex's parent cleanup,
+   retaining retired evidence for an update. The complete frozen source declaration
+   now determines liveness and requires complete inference-artifact coverage.
+   Supplied text is used exactly, including empty text; mutable-disk hydration is
+   no longer a fallback. Publication memo version advances from 4 to 5.
+4. Precommit validation accepted assertion owners/revisions inconsistent with
+   their resource mentions, split sense bindings and non-minimum representatives.
+   These proposals now raise within the existing shared native target transaction.
+5. Distinct-label alias permutations exposed circular Active EDC support scoring:
+   matches in canonical fact text reinforced the previous label choice. Removed
+   that query and score term; support now counts distinct source occurrences.
+   This deletes the competing derived-text signal rather than layering on a
+   correction. `w3c-improvements.md` now specifies the source-grounded score.
+
+New real-substrate coverage in `tests/daemon/graph/test_evidence_revisions.py`:
+
+- Nine frozen snapshots exercise duplicates at distinct locations, a late smaller
+  representative, replacement, withdrawal of that representative, rename, total
+  withdrawal and reintroduction. Both uninterrupted and restarted arms compare
+  every step to fresh native reference targets, including raw evidence, canonical
+  bindings, typed facts, support/confidence, directed edges, vectors and FTS.
+  Surviving assertion JSON is unchanged. No-op replay, including immediately after
+  restart, has zero provider calls and zero SQLite row changes.
+- All six arrival permutations of three accepted equivalent senses converge
+  through the native app, for both case variants and distinct alias labels.
+  A separate same-sense casing fixture covers deterministic
+  display metadata. No arbitrary negative decision overrides the fast merge gate.
+- The production filesystem app matches fresh filesystem indexes after create,
+  append, replacement, deletion, rename and complete withdrawal. This verifies
+  catch-up source ownership, without claiming continuous-watch/crash acceptance.
+- Four deliberately invalid proposals (wrong assertion owner/revision, wrong
+  representative, split sense binding) fail validation in real SQLite transactions
+  and roll back to unchanged committed graphs.
+
+Focused evidence: `outputs/graph-spec-review/U2-evidence-contracts.{log,xml}`:
+**12 passed**, 53.36 seconds, including U1's same-process/restarted 64+64 versus
+128 pair and low-level merge tests. Extended filesystem/restart contracts:
+`outputs/graph-spec-review/U2-filesystem-evidence.{log,xml}`: **nine passed**,
+15.12 seconds. Failing precursor logs `U2-evidence-red.log`,
+`U2-evidence-green-1.log`, `U2-ownership-red.log` and `U2-alias-expanded.log`
+preserve the actual defects. The final focused run, including both alias groups,
+storage invariants and U1 pairs: **27 passed**, 40.81 seconds; evidence:
+`outputs/graph-spec-review/U2-final-focused.{log,xml}`.
+
+The two governing plans now state typed literal identity, deterministic canonical
+metadata and source-declaration liveness. Final publication remains native typed
+target declarations and one shared managed SQLite sink; no imperative final writer
+was introduced. This unit does not retire the legacy additive engine adapter or
+global planner/staging (U5), prove candidate completeness (U3), establish `vec0`
+or crash/continuous-watch teardown (U4), or establish bounded compute/recall parity
+(U6 and later live acceptance). The SDK shutdown diagnostic recorded above remains
+separate unresolved lifecycle work.
+
+The first full run was superseded while extending alias coverage; stopped only
+its exact owned pytest worker (24920), leaving inference services running.
+The next unfiltered suite completed with **904 passed, one failed, three subtests
+passed, 80 warnings**, 661.83 seconds. Evidence:
+`outputs/graph-spec-review/U2-completion-final-full.{log,xml}`. Its sole failure
+was the build-time gate's previous display-label expectation: equal source support
+now selects `YAW` via the existing shorter-label tie-break, retaining
+`Yet Another Wiki` as `skos:altLabel`. Updated that exact expectation and its
+recognition-memory response to the canonical spelling; literal, graph traversal,
+SHACL and alias-retention assertions remain enforced. A final full-suite rerun
+is required before marking U2 and committing.
+
+Completion gate evidence:
+
+- `uv sync --locked`: 100 packages resolved/checked;
+  `outputs/graph-spec-review/U2-completion-sync.log`.
+- Final `uv run --locked ty check`, `uv run --locked ruff check --fix` and
+  `uv run --locked ruff format`: passed; format normalized one test file and left
+  170 files unchanged. Logs:
+  `outputs/graph-spec-review/U2-completion-release-{ty,ruff,format}.log`.
+- Corrected build-time gate plus all native evidence contracts: **12 passed**,
+  33.55 seconds; `outputs/graph-spec-review/U2-canonical-consumer.{log,xml}`.
+- `git diff --check`: passed before the full-suite completion checkpoint.
+
+Final unfiltered `uv run --locked pytest --no-testmon -q --tb=short
+-o junit_family=legacy --junitxml=outputs/graph-spec-review/U2-completion-release-full.xml`
+exited 0: **905 passed, three subtests passed, 79 warnings**, 812.96 seconds.
+No tests skipped or deselected. Evidence:
+`outputs/graph-spec-review/U2-completion-release-full.{log,xml}`. The log ends
+with the passing summary; the earlier SDK shutdown diagnostic did not recur in
+this run. That single observation does not close U4's lifecycle/crash proof.
+
+U2 is complete for the tested native source/evidence contracts. Final
+`git diff --check` passed. U3–U6 remain open with the limitations above; no
+bounded-processing or live baseline acceptance is claimed. Next implementation
+unit: U3's persisted candidate coverage and positive/negative decision dependencies.

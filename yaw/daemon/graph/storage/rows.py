@@ -196,10 +196,23 @@ def validate_graph_state(conn: sqlite3.Connection) -> None:
         "LEFT JOIN chunks c ON c.chunk_id=m.chunk_id WHERE e.entity_id IS NULL OR c.chunk_id IS NULL LIMIT 1"
     ).fetchone():
         raise ValueError("Dangling source mention binding")
+    if (
+        conn.execute(
+            "SELECT 1 FROM entity_mentions GROUP BY sense_id HAVING COUNT(DISTINCT entity_id)>1 LIMIT 1"
+        ).fetchone()
+        or conn.execute(
+            "SELECT 1 FROM entity_mentions GROUP BY entity_id HAVING entity_id!=MIN(sense_id) LIMIT 1"
+        ).fetchone()
+    ):
+        raise ValueError("Noncanonical source mention binding")
     if conn.execute(
         "SELECT 1 FROM fact_assertions a LEFT JOIN entity_mentions s ON s.mention_id=a.subject_mention_id "
         "LEFT JOIN entity_mentions o ON o.mention_id=a.object_mention_id LEFT JOIN facts f ON f.fact_id=a.fact_id "
-        "WHERE s.mention_id IS NULL OR (a.object_mention_id IS NOT NULL AND o.mention_id IS NULL) "
+        "LEFT JOIN chunks c ON c.chunk_id=a.chunk_id "
+        "WHERE c.chunk_id IS NULL OR s.mention_id IS NULL "
+        "OR a.chunk_id!=s.chunk_id OR a.source_revision!=s.source_revision "
+        "OR (a.object_mention_id IS NOT NULL AND (o.mention_id IS NULL "
+        "OR a.chunk_id!=o.chunk_id OR a.source_revision!=o.source_revision)) "
         "OR (a.fact_id IS NOT NULL AND f.fact_id IS NULL) LIMIT 1"
     ).fetchone():
-        raise ValueError("Dangling source assertion binding")
+        raise ValueError("Invalid source assertion binding")

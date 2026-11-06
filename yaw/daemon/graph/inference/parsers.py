@@ -357,7 +357,7 @@ def extract_structured_triples(
     else:
         raw_list = []
 
-    seen: set[tuple[str, str, str, str, str, str]] = set()
+    seen: set[tuple[str, ...]] = set()
     results: list[StructuredTriple] = []
     resources = set(known_entities) if known_entities is not None else None
     catalog: dict[str, set[str]] = {}
@@ -412,6 +412,8 @@ def extract_structured_triples(
             st.obj,
             st.obj_def.strip().lower(),
             st.obj_kind,
+            st.obj_datatype,
+            st.obj_lang,
         )
         if key not in seen:
             seen.add(key)

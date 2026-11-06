@@ -101,8 +101,8 @@ class PipelineGateMockLM(dspy.LM):
                 json.dumps(
                     {
                         "fact": [
-                            ["yet another wiki", "listens on port", "8080"],
-                            ["yet another wiki", "launched on", "2026-10-25"],
+                            ["yaw", "listens on port", "8080"],
+                            ["yaw", "launched on", "2026-10-25"],
                         ]
                     }
                 )
@@ -345,15 +345,15 @@ def test_build_time_shacl_gate_success(synonym_token_counter, tmp_path: Path) ->
             }
             assert "2026-10-25" not in ent_by_name
             assert "8080" not in ent_by_name
-            assert "yet another wiki" in ent_by_name
+            assert "yaw" in ent_by_name
             assert "security engineering" in ent_by_name
             assert "engineering" in ent_by_name
             assert "http 2" in ent_by_name
             assert "http 3" in ent_by_name
 
-            # Acronym "yaw" must have been merged into "yet another wiki" as skos:altLabel
-            assert "yaw" not in ent_by_name
-            yaw_id = ent_by_name["yet another wiki"][0]
+            # Equal source support selects the shorter cased label; both spellings survive.
+            assert "yet another wiki" not in ent_by_name
+            yaw_id = ent_by_name["yaw"][0]
             yaw_labels = {
                 (str(r[0]), str(r[1]))
                 for r in conn.execute(
@@ -361,8 +361,8 @@ def test_build_time_shacl_gate_success(synonym_token_counter, tmp_path: Path) ->
                     (yaw_id,),
                 ).fetchall()
             }
-            assert ("yet another wiki", "skos:prefLabel") in yaw_labels
-            assert ("yaw", "skos:altLabel") in yaw_labels
+            assert ("yet another wiki", "skos:altLabel") in yaw_labels
+            assert ("yaw", "skos:prefLabel") in yaw_labels
 
             sec_eng_id = ent_by_name["security engineering"][0]
             eng_id = ent_by_name["engineering"][0]
@@ -412,9 +412,7 @@ def test_build_time_shacl_gate_success(synonym_token_counter, tmp_path: Path) ->
         assert float(ppr_from_subj[csr.node_to_idx[chunk.chunk_id]]) > 0.0
 
         hits, kept_facts = engine.retrieve_with_seeds("What port does Yet Another Wiki listen on?", top_k=1)
-        assert any(
-            str(s).lower() == "yet another wiki" and p == "listens on port" and o == "8080" for s, p, o in kept_facts
-        )
+        assert any(str(s).lower() == "yaw" and p == "listens on port" and o == "8080" for s, p, o in kept_facts)
         assert len(hits) == 1
         assert hits[0][0].chunk_id == chunk.chunk_id
         assert "8080" in hits[0][2]

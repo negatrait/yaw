@@ -38,7 +38,7 @@ flowchart TD
     W2 -- "No" --> S3["Stage 3: related_judge (JudgeRelated + GBNF Reasoning)\n{pair_id, reasoning, related: bool}"]
     S3 -- "true" --> E_REL
     S3 -- "false" --> E_DIFF["Emit owl:differentFrom (A != B)"]
-    MERGE --> EDC["End-of-Round Active EDC Pass (graph_ops.py)\nScore labels by (verbatim_in_chunk, in_ast_title, chunk_count + fact_count)\nEnforce 1 skos:prefLabel + skos:altLabel / skos:hiddenLabel [S13/S14]"]
+    MERGE --> EDC["End-of-Round Active EDC Pass (graph_ops.py)\nScore labels by (verbatim_in_chunk, in_ast_title, chunk_count)\nEnforce 1 skos:prefLabel + skos:altLabel / skos:hiddenLabel [S13/S14]"]
     MERGE_H --> EDC
 ```
 
@@ -106,7 +106,7 @@ def canonicalize_entity_labels_edc(
     1. Demotes any label norm in `hidden_label_norms_by_entity` or absent verbatim from its hydrated
        source chunk on disk (when `corpus_root` is available and chunk is non-stale) to `skos:hiddenLabel`.
     2. Scores all eligible (`skos:prefLabel` / `skos:altLabel`) label norms by provenance tuple:
-       `(verbatim_in_source, in_ast_title, chunk_count + fact_count, is_cased_or_multiword, -len(raw_label), label_norm)`.
+       `(verbatim_in_source, in_ast_title, chunk_count, is_cased_or_multiword, -len(raw_label), label_norm)`.
     3. Promotes the single winning norm to `skos:prefLabel` and updates `entities.name` to its best
        surface `raw_label`; demotes all other non-hidden norms to `skos:altLabel` (enforcing SKOS S13 & S14).
     Returns the number of entities whose canonical `skos:prefLabel` or `entities.name` was updated.
@@ -291,14 +291,14 @@ Each slice below is scoped to 1–3 production files so a `flash` model can impl
   2. Compute provenance scores per `(entity_id, label_norm)` using:
       - `verbatim_in_source`: `1` if any `raw_label` for `(entity_id, label_norm)` appears case-insensitively in its hydrated chunk text on disk (or when `corpus_root is None` / chunk is synthetic `__*__`), `0` if the chunk exists on disk and `raw_label` is absent from the source span (demoting such extraction typos to `skos:hiddenLabel`).
       - `in_ast_title`: `1` if `raw_label` appears case-insensitively in `chunks.title` for any provenance chunk.
-      - `support_count`: `COUNT(DISTINCT chunk_id)` in `entity_labels` + `COUNT(DISTINCT fact_id)` in `facts` where the surface form appears in `raw_triple_json`.
+      - `support_count`: `COUNT(DISTINCT chunk_id)` in `entity_labels`. Canonical fact text is an output of label selection, so matching it would create a circular score that depends on earlier publication boundaries.
   3. Enforce SKOS S13 & S14: any label norm in `hidden_label_norms_by_entity` or failing verbatim grounding is set to `skos:hiddenLabel`; the highest-ranked eligible norm becomes `skos:prefLabel` (and updates `entities.name`), and all remaining eligible norms become `skos:altLabel`.
 - **Verifiable Goal**:
   - `uv run --no-sync pytest tests/daemon/graph/storage/test_storage.py -k "edc or merge_entities" --no-testmon -q` passes, proving that a 1-chunk typo (`"Neccessary"`) merged into or onto a multi-chunk/heading-backed entity (`"Necessary"`) is demoted to `skos:hiddenLabel`, `entities.name` becomes `"Necessary"`, and `lint_graph_shacl(conn)` reports `0` label violations.
 - **Critic Round**:
   - Delegate to `critic`: verify `canonicalize_entity_labels_edc` runs inside `write_tx(conn)`, handles entities with only 1 label safely (never leaving an entity with 0 `skos:prefLabel` rows), and introduces zero SHACL S13 regressions.
 - **Simplification Round**:
-  - Delegate to `simplifier`: streamline SQL aggregation of `chunk_count`, `fact_count`, and `chunks.title` into a single batched query.
+  - Delegate to `simplifier`: streamline SQL aggregation of `chunk_count` and `chunks.title` into a single batched query.
 - **Deprecated Code Removal**:
   - Remove redundant post-merge label fixup branches superseded by `canonicalize_entity_labels_edc`.
 

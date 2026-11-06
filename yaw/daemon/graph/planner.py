@@ -38,7 +38,7 @@ from yaw.daemon.graph.inference.components import (
     heal_shacl_violations,
     judge_synonyms,
 )
-from yaw.daemon.graph.normalization import normalize_openie_record
+from yaw.daemon.graph.normalization import normalize_openie_record, preferred_surface
 from yaw.daemon.graph.storage import (
     apply_shacl_repairs,
     auto_heal_deterministic_shacl,
@@ -311,13 +311,14 @@ def record_surface_form(
     clean_raw = raw_val.strip()
     if not norm_key or not clean_raw:
         return
-    prev = surface_by_norm.get(norm_key)
-    if prev is None or (prev == prev.lower() and clean_raw != clean_raw.lower()):
-        surface_by_norm[norm_key] = clean_raw
+    surface_by_norm[norm_key] = preferred_surface(
+        surface_by_norm.get(norm_key, clean_raw), clean_raw, label_norm=norm_key
+    )
     if cid_key:
-        prev_c = chunk_surface_by_norm.get((cid_key, norm_key))
-        if prev_c is None or (prev_c == prev_c.lower() and clean_raw != clean_raw.lower()):
-            chunk_surface_by_norm[(cid_key, norm_key)] = clean_raw
+        key = (cid_key, norm_key)
+        chunk_surface_by_norm[key] = preferred_surface(
+            chunk_surface_by_norm.get(key, clean_raw), clean_raw, label_norm=norm_key
+        )
 
 
 def collect_missing_entity_norms(
@@ -412,6 +413,9 @@ def materialize_entities_and_facts(
         candidate = sense_id(label_norm, clean_def)
         surface = surface_by_norm[label_norm]
         eid, name, definition = existing_bindings.get(candidate, (candidate, surface, clean_def))
+        previous = entity_map.get(eid, (eid, name, definition))
+        name = preferred_surface(name, previous[1], surface, label_norm=str(text_processing(name)))
+        definition = max((definition, previous[2], clean_def), key=lambda value: (len(value), value))
         entity_map[eid] = (eid, name, definition)
         mention_raw = chunk_surface_by_norm[(chunk_id, label_norm)]
         entity_labels_to_upsert.append((label_norm, eid, _label_kind_for(name, label_norm), mention_raw, chunk_id))
@@ -1008,18 +1012,29 @@ async def plan_graph_publication(
                 embedding_identity=settings.embedding_identity,
             )
 
+    if frozen_text is not None:
+        # Retired child targets may still exist until the parent finishes syncing.
+        # The declared frozen source set, rather than those old rows, owns liveness.
+        active_items = [item for item in active_items if item[0].chunk_id in frozen_text]
+        if {item[0].chunk_id for item in active_items} != frozen_text.keys():
+            raise ValueError("Frozen source snapshot has incomplete inference artifacts")
+
     if not active_items:
         return GraphPlanResult(tables=empty_graph_tables(), chunk_ids=(), rlm_stats=rlm_stats)
 
     chunks: list[tuple[ChunkPointer, str]] = []
     all_records: list[OpenIERecord] = []
     for ptr, rec, chunk_traces in active_items:
-        chunk_text = (frozen_text.get(ptr.chunk_id) if frozen_text is not None else None) or resolve_chunk_text(
-            ptr,
-            settings.corpus_root,
-            chunk_size=settings.chunk_size,
-            chunk_overlap=settings.chunk_overlap,
-            min_chunk_size=settings.min_chunk_size,
+        chunk_text = (
+            frozen_text[ptr.chunk_id]
+            if frozen_text is not None
+            else resolve_chunk_text(
+                ptr,
+                settings.corpus_root,
+                chunk_size=settings.chunk_size,
+                chunk_overlap=settings.chunk_overlap,
+                min_chunk_size=settings.min_chunk_size,
+            )
         )
         chunks.append((ptr, chunk_text))
         all_records.append(rec)

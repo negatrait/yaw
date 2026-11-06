@@ -21,6 +21,11 @@ class NormalizedRecord:
     surfaces: dict[str, str]
 
 
+def preferred_surface(*values: str, label_norm: str) -> str:
+    """Choose a display spelling by a total order, independently of arrival."""
+    return max(values, key=lambda value: (text_processing(value) == label_norm, value != value.lower(), value))
+
+
 def normalize_openie_record(rec: OpenIERecord) -> NormalizedRecord:
     """Preserve literal values and distinct senses while normalizing graph labels."""
     all_norm_labels: set[str] = set()
@@ -30,9 +35,7 @@ def normalize_openie_record(rec: OpenIERecord) -> NormalizedRecord:
         clean_raw = raw_val.strip()
         if not norm_key or not clean_raw:
             return
-        previous = surfaces.get(norm_key)
-        if previous is None or (previous == previous.lower() and clean_raw != clean_raw.lower()):
-            surfaces[norm_key] = clean_raw
+        surfaces[norm_key] = preferred_surface(surfaces.get(norm_key, clean_raw), clean_raw, label_norm=norm_key)
 
     raw_st_items = list(getattr(rec, "structured_triples", ()) or ())
     entity_role_raws: set[str] = set()
