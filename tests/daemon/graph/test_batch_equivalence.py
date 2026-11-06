@@ -65,13 +65,14 @@ def canonical_graph(conn):
     queries = {
         "entities": "SELECT entity_id, name, definition, confidence FROM entities ORDER BY entity_id",
         "labels": "SELECT * FROM entity_labels ORDER BY entity_id, label_norm, chunk_id",
-        "bindings": "SELECT * FROM entity_chunks ORDER BY entity_id, chunk_id",
+        "mentions": "SELECT * FROM entity_mentions ORDER BY mention_id",
+        "assertions": "SELECT * FROM fact_assertions ORDER BY assertion_id",
         "facts": (
             "SELECT fact_id, subj_id, pred, obj_kind, obj_id, obj_literal_lex, obj_datatype, obj_lang, "
             "raw_triple_json, definition, confidence FROM facts ORDER BY fact_id"
         ),
         "fact_sources": "SELECT * FROM fact_sources ORDER BY fact_id, chunk_id",
-        "edges": "SELECT src_id, dst_id, kind, weight FROM edges ORDER BY src_id, dst_id, kind",
+        "edges": "SELECT src_id, dst_id, kind, weight, reasoning FROM edges ORDER BY src_id, dst_id, kind",
         "edge_sources": "SELECT * FROM edge_sources ORDER BY src_id, dst_id, kind, chunk_id",
         "chunks": "SELECT * FROM chunks ORDER BY chunk_id",
         "chunk_fts": "SELECT chunk_id FROM chunk_fts ORDER BY chunk_id",
@@ -163,6 +164,11 @@ def test_fixed_evidence_64_plus_64_equals_128(tmp_path, provider, restart, recor
             assert connected(engine.conn, ids["Ada"], ids["Euler"])
             assert engine.conn.execute("SELECT COUNT(*) FROM entities WHERE name = 'Mercury'").fetchone()[0] == 2
             assert engine.conn.execute("SELECT COUNT(*) FROM facts WHERE obj_kind = 'literal'").fetchone()[0] == 128
+            assert engine.conn.execute("SELECT COUNT(*) FROM entity_mentions").fetchone()[0] == 256
+            assert (
+                engine.conn.execute("SELECT COUNT(*) FROM fact_assertions WHERE fact_id IS NOT NULL").fetchone()[0]
+                == 256
+            )
             assert not connected(engine.conn, ids["Ada"], ids["Sun"])
             results[arm] = canonical_graph(engine.conn)
             previous_calls = len(state["intervals"])

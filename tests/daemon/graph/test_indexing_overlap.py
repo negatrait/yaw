@@ -37,7 +37,9 @@ from yaw.daemon.graph.inference.components import (
 from yaw.daemon.graph.inference.embedding import EmbeddingRequest
 from yaw.daemon.graph.planner import GraphPlanSettings
 from yaw.daemon.graph.storage import open_managed_yaw_db
-from yaw.daemon.graph.storage.publication import GRAPH_DB, GraphAction, GraphTargetHandler, PreparedGraphRows
+from yaw.daemon.graph.storage.db import GRAPH_DB
+from yaw.daemon.graph.storage.managed_sqlite import VALIDATE_SQLITE
+from yaw.daemon.graph.storage.rows import validate_graph_state
 from yaw.daemon.indexing import (
     RELOAD_SIGNAL_HANDLER,
     RELOAD_SIGNAL_ROOT,
@@ -499,6 +501,7 @@ def test_declarative_live_graph_publication_without_polling(tmp_path, provider):
     context = coco.ContextProvider()
     context.provide(SOURCE_DB, db)
     context.provide(GRAPH_DB, db)
+    context.provide(VALIDATE_SQLITE, validate_graph_state)
     context.provide(SOURCE_ROOT, root)
     context.provide(RELOAD_SIGNAL_ROOT, signal_dir)
     context.provide(RELOAD_SIGNAL_HANDLER, on_reload_signal)
@@ -593,6 +596,7 @@ def test_invalid_resources_and_shacl_failure_preserve_prior_published_graph(tmp_
     context = coco.ContextProvider()
     context.provide(SOURCE_DB, db)
     context.provide(GRAPH_DB, db)
+    context.provide(VALIDATE_SQLITE, validate_graph_state)
     context.provide(SOURCE_ROOT, root)
     context.provide(EMBEDDING_ENDPOINT, EmbeddingEndpoint(embedder, asyncio.Semaphore(2)))
     context.provide(OPENIE_ENDPOINT, OpenIEEndpoint(program, lm, "fixture-v1", asyncio.Semaphore(2)))
@@ -619,23 +623,6 @@ def test_invalid_resources_and_shacl_failure_preserve_prior_published_graph(tmp_
             assert conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 1
             assert conn.execute("SELECT COUNT(*) FROM chunk_vec").fetchone()[0] == 1
             initial_entities = conn.execute("SELECT entity_id, name, definition FROM entities").fetchall()
-
-        # Verify GraphTargetHandler.apply_actions rolls back transaction on SHACL violation
-        invalid_rows = PreparedGraphRows(
-            chunks=(),
-            entities=(("entity-invalid", "broken", ""),),
-            entity_labels=(("broken", "entity-invalid", "skos:prefLabel", "Broken", ""),),
-            facts=(),
-            fact_sources=(),
-            edges=(),
-            chunk_vectors=(),
-            entity_vectors=(),
-            fact_vectors=(),
-        )
-        with pytest.raises(ValueError, match="SHACL violations"):
-            GraphTargetHandler().apply_actions(context, [GraphAction(invalid_rows, (), ())])
-        with db.readonly() as conn:
-            assert conn.execute("SELECT entity_id, name, definition FROM entities").fetchall() == initial_entities
 
         # An unregistered resource aborts extraction before its artifact or graph is published.
         state["mode"] = "shacl_unrepaired"

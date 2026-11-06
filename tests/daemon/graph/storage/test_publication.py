@@ -1,7 +1,7 @@
-"""Prepared graph publication is atomic across relational, vector and FTS rows."""
+"""Native typed graph targets publish and reconcile one coherent state."""
 
 import json
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import cocoindex as coco
@@ -10,169 +10,150 @@ import pytest
 from daemon.graph.test_indexing_overlap import provider as provider
 
 from yaw.core import ChunkPointer
-from yaw.daemon.graph.storage import PreparedGraphRows, apply_prepared_graph_rows, open_managed_yaw_db
-from yaw.daemon.graph.storage.publication import GRAPH_DB, GraphAction, GraphTargetHandler, declare_graph
+from yaw.daemon.graph.storage import open_managed_yaw_db, serialize_f32_vector
+from yaw.daemon.graph.storage.db import GRAPH_DB
+from yaw.daemon.graph.storage.managed_sqlite import VALIDATE_SQLITE
+from yaw.daemon.graph.storage.rows import (
+    ChunkRow,
+    ChunkText,
+    ChunkVector,
+    DesiredTable,
+    EdgeRow,
+    EdgeSourceRow,
+    EntityRow,
+    LabelRow,
+    MetaRow,
+    declare_tables,
+    empty_graph_tables,
+    validate_graph_state,
+)
+
+
+def desired_graph(
+    chunk="c", entity="e", text="Valid evidence", definition="A grounded definition", revision="committed"
+):
+    rows = {
+        "chunks": (ChunkRow(chunk, "source.md", 1, 1, "Evidence", 0, 0),),
+        "entities": (EntityRow(entity, "Entity", definition, None),),
+        "entity_labels": (LabelRow("entity", entity, "skos:prefLabel", "Entity", chunk),),
+        "edges": (EdgeRow(entity, chunk, "passage", 1.0, ""),),
+        "edge_sources": (EdgeSourceRow(entity, chunk, "passage", chunk, None, None, 1.0),),
+        "chunk_vec": (ChunkVector(chunk, serialize_f32_vector(np.array([1, 0], dtype=np.float32))),),
+        "chunk_fts": (ChunkText(chunk, "Evidence", text),),
+        "meta": (MetaRow("graph_input_fingerprints", json.dumps([[chunk, revision]])),),
+    }
+    return tuple(replace(table, rows=rows.get(table.name, table.rows)) for table in empty_graph_tables())
+
+
+@dataclass
+class DesiredGraph:
+    tables: tuple[DesiredTable, ...]
 
 
 @coco.fn
-async def graph_fixture(rows: PreparedGraphRows | None) -> None:
-    if rows is not None:
-        declare_graph(rows)
+async def graph_fixture(source: DesiredGraph) -> None:
+    await declare_tables(source.tables)
 
 
-def test_graph_sink_rejects_invalid_replacement_atomically(tmp_path):
+@pytest.fixture
+def graph_db(tmp_path):
     db = open_managed_yaw_db(tmp_path / "yaw.db")
-    rows = PreparedGraphRows(
-        chunks=((ChunkPointer("c", "source.md", 1, 1), "Valid evidence"),),
-        entities=(("e", "Entity", "A grounded definition"),),
-        entity_labels=(("entity", "e", "skos:prefLabel", "Entity", "c"),),
-        facts=(),
-        fact_sources=(),
-        edges=(("e", "c", "passage", 1.0, "c"),),
-        chunk_vectors=(("c", np.array([1, 0], dtype=np.float32)),),
-        entity_vectors=(),
-        fact_vectors=(),
-        input_fingerprints=(("c", "committed"),),
-    )
-    context = coco.ContextProvider()
-    context.provide(GRAPH_DB, db)
-    handler = GraphTargetHandler()
     try:
-        handler.apply_actions(context, [GraphAction(rows, (), ())])
-        invalid = replace(rows, entities=(("e", "Entity", ""),), input_fingerprints=(("c", "uncommitted"),))
-        with pytest.raises(ValueError, match="Graph publication rejected"):
-            handler.apply_actions(context, [GraphAction(invalid, ("c",), ())])
-        with db.readonly() as conn:
-            assert (
-                conn.execute("SELECT definition FROM entities WHERE entity_id='e'").fetchone()[0]
-                == "A grounded definition"
-            )
-            assert conn.execute("SELECT COUNT(*) FROM chunk_vec").fetchone()[0] == 1
-            assert json.loads(
-                conn.execute("SELECT value FROM meta WHERE key='graph_input_fingerprints'").fetchone()[0]
-            ) == [["c", "committed"]]
-            assert conn.execute("SELECT COUNT(*) FROM chunk_fts WHERE chunk_fts MATCH 'Valid'").fetchone()[0] == 1
-        handler.apply_actions(context, [GraphAction(rows, ("c",), ())])
+        yield db
     finally:
         db.close()
+
+
+@pytest.fixture
+def publication(tmp_path, graph_db):
+    source = DesiredGraph(desired_graph())
+    context = coco.ContextProvider()
+    context.provide(GRAPH_DB, graph_db)
+    context.provide(VALIDATE_SQLITE, validate_graph_state)
+    env = coco.Environment(settings=coco.Settings(db_path=tmp_path / "state"), context_provider=context)
+    app = coco.App(coco.AppConfig(name="graph", environment=env), graph_fixture, source)
+    try:
+        yield source, app
+    finally:
+        env.close()
+
+
+def graph_snapshot(db):
+    with db.readonly() as conn:
+        return {
+            table.name: sorted(tuple(row) for row in conn.execute(f"SELECT * FROM {table.name}"))
+            for table in empty_graph_tables()
+        }
+
+
+def test_graph_sink_rejects_invalid_replacement_atomically(graph_db, publication):
+    source, app = publication
+    app.update_blocking()
+    before = graph_snapshot(graph_db)
+    source.tables = desired_graph(chunk="replacement", text="Rejected replacement", definition="", revision="rejected")
+    with pytest.raises(ValueError, match="Graph publication rejected"):
+        app.update_blocking()
+    assert graph_snapshot(graph_db) == before
+    with graph_db.readonly() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM chunk_fts WHERE chunk_fts MATCH 'Valid'").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM chunk_fts WHERE chunk_fts MATCH 'Rejected'").fetchone()[0] == 0
+    source.tables = desired_graph(chunk="replacement", text="Accepted replacement", revision="accepted")
+    app.update_blocking()
+    with graph_db.readonly() as conn:
+        assert json.loads(
+            conn.execute("SELECT value FROM meta WHERE key='graph_input_fingerprints'").fetchone()[0]
+        ) == [["replacement", "accepted"]]
+        assert conn.execute("SELECT chunk_id FROM chunk_vec").fetchone()[0] == "replacement"
+        assert conn.execute("SELECT COUNT(*) FROM chunk_fts WHERE chunk_fts MATCH 'Accepted'").fetchone()[0] == 1
 
 
 @pytest.mark.parametrize("shared_source", [False, True])
-def test_native_target_withdraws_global_assertion_without_removing_sources(tmp_path, shared_source):
-    db = open_managed_yaw_db(tmp_path / "yaw.db")
-    rows = PreparedGraphRows(
-        chunks=((ChunkPointer("c", "source.md", 1, 1), "Evidence"),),
-        entities=(("a", "A", "First entity"), ("b", "B", "Second entity")),
-        entity_labels=(("a", "a", "skos:prefLabel", "A", "c"), ("b", "b", "skos:prefLabel", "B", "c")),
-        facts=(),
-        fact_sources=(),
-        edges=(("a", "b", "skos:related", 1.0, "c"), ("b", "a", "skos:related", 1.0, "c")) if shared_source else (),
-        chunk_vectors=(),
-        entity_vectors=(),
-        fact_vectors=(),
-    )
-    context = coco.ContextProvider()
-    context.provide(GRAPH_DB, db)
-    try:
-        for desired in (
-            replace(
-                rows, edges=(*rows.edges, ("a", "b", "skos:related", 1.0, ""), ("b", "a", "skos:related", 1.0, ""))
+def test_native_target_withdraws_global_assertion_without_removing_sources(graph_db, publication, shared_source):
+    source, app = publication
+    for has_global in (True, False):
+        edges = (EdgeRow("a", "b", "skos:related", 1.0, ""), EdgeRow("b", "a", "skos:related", 1.0, ""))
+        rows = {
+            "entities": (EntityRow("a", "A", "First entity", None), EntityRow("b", "B", "Second entity", None)),
+            "entity_labels": (
+                LabelRow("a", "a", "skos:prefLabel", "A", "c"),
+                LabelRow("b", "b", "skos:prefLabel", "B", "c"),
             ),
-            rows,
-        ):
-            env = coco.Environment(settings=coco.Settings.from_env(tmp_path / "state"), context_provider=context)
-            try:
-                app = coco.App(coco.AppConfig(name="global_edges", environment=env), graph_fixture, desired)
-                app.update_blocking()
-                app.update_blocking()
-            finally:
-                env.close()
-        with db.readonly() as conn:
-            assert conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 1
-            assert conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0] == 2 * int(shared_source)
-            assert conn.execute("SELECT COUNT(*) FROM edge_sources WHERE chunk_id=''").fetchone()[0] == 0
-            assert conn.execute("SELECT COUNT(*) FROM edge_sources WHERE chunk_id='c'").fetchone()[0] == 2 * int(
-                shared_source
-            )
-    finally:
-        db.close()
+            "edges": edges if has_global or shared_source else (),
+            "edge_sources": tuple(
+                EdgeSourceRow(edge.src_id, edge.dst_id, edge.kind, chunk, None, None, 1.0)
+                for edge in edges
+                for chunk in (("",) if has_global else ()) + (("c",) if shared_source else ())
+            ),
+        }
+        source.tables = tuple(replace(table, rows=rows.get(table.name, table.rows)) for table in desired_graph())
+        app.update_blocking()
+    with graph_db.readonly() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0] == 2 * int(shared_source)
+        assert conn.execute("SELECT COUNT(*) FROM edge_sources WHERE chunk_id=''").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM edge_sources WHERE chunk_id='c'").fetchone()[0] == 2 * int(
+            shared_source
+        )
 
 
-def test_native_graph_target_reconciles_replacement_and_removal(tmp_path: Path) -> None:
-    db = open_managed_yaw_db(tmp_path / "yaw.db")
-    try:
-        for chunk_id, entity_id in (("first", "old"), ("first", "new"), ("second", "new"), (None, None)):
-            rows = (
-                None
-                if chunk_id is None
-                else PreparedGraphRows(
-                    chunks=((ChunkPointer(chunk_id, "source.md", 1, 1), "Grounded evidence"),),
-                    entities=((entity_id, entity_id, "Grounded entity definition"),),
-                    entity_labels=((entity_id, entity_id, "skos:prefLabel", entity_id, chunk_id),),
-                    facts=(),
-                    fact_sources=(),
-                    edges=((entity_id, chunk_id, "passage", 1.0, chunk_id),),
-                    chunk_vectors=((chunk_id, np.array([1, 0], dtype=np.float32)),),
-                    entity_vectors=(),
-                    fact_vectors=(),
-                )
-            )
-            context = coco.ContextProvider()
-            context.provide(GRAPH_DB, db)
-            env = coco.Environment(settings=coco.Settings.from_env(tmp_path / "state"), context_provider=context)
-            app = coco.App(coco.AppConfig(name="graph", environment=env), graph_fixture, rows)
-            try:
-                app.update_blocking()
-                app.update_blocking()
-                with db.readonly() as conn:
-                    expected = [] if chunk_id is None else [(chunk_id,)]
-                    assert list(map(tuple, conn.execute("SELECT chunk_id FROM chunks"))) == expected
-                    assert list(map(tuple, conn.execute("SELECT chunk_id FROM chunk_vec"))) == expected
-                    assert conn.execute("SELECT COUNT(*) FROM chunk_fts").fetchone()[0] == len(expected)
-                    expected_entities = [] if entity_id is None else [(entity_id,)]
-                    assert list(map(tuple, conn.execute("SELECT entity_id FROM entities"))) == expected_entities
-            finally:
-                env.close()
-    finally:
-        db.close()
-
-
-def test_publication_requires_transaction_and_rolls_back_all_tables(tmp_path: Path) -> None:
-    db = open_managed_yaw_db(tmp_path / "yaw.db")
-    rows = PreparedGraphRows(
-        chunks=((ChunkPointer("c", "source.md", 1, 1, "Algebra"), "Ada studies algebra."),),
-        entities=(("e", "Ada", "A mathematician"),),
-        entity_labels=(("ada", "e", "skos:prefLabel", "Ada", "c"),),
-        facts=(),
-        fact_sources=(),
-        edges=(("e", "c", "passage", 1.0, "c"),),
-        chunk_vectors=(("c", np.array([1, 0], dtype=np.float32)),),
-        entity_vectors=(("e", np.array([0, 1], dtype=np.float32)),),
-        fact_vectors=(),
-    )
-    tables = ("chunks", "entities", "entity_labels", "edges", "edge_sources", "chunk_vec", "entity_vec", "chunk_fts")
-    try:
-        with db.readonly() as conn, pytest.raises(RuntimeError, match="active transaction"):
-            apply_prepared_graph_rows(conn, rows)
-        with pytest.raises(RuntimeError, match="abort publication"), db.transaction() as conn:
-            apply_prepared_graph_rows(conn, rows)
-            assert conn.execute("SELECT COUNT(*) FROM chunk_fts WHERE chunk_fts MATCH 'algebra'").fetchone()[0] == 1
-            raise RuntimeError("abort publication")
-        with db.readonly() as conn:
-            assert {
-                table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in tables
-            } == dict.fromkeys(tables, 0)
-        with db.transaction() as conn:
-            apply_prepared_graph_rows(conn, rows)
-        with db.readonly() as conn:
-            before = {table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in tables}
-        with db.transaction() as conn:
-            apply_prepared_graph_rows(conn, rows)
-        with db.readonly() as conn:
-            assert {table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in tables} == before
-            assert conn.execute("SELECT COUNT(*) FROM chunk_fts WHERE chunk_fts MATCH 'algebra'").fetchone()[0] == 1
-    finally:
-        db.close()
+def test_native_graph_target_reconciles_replacement_removal_and_noop(graph_db, publication):
+    source, app = publication
+    for chunk_id, entity_id in (("first", "old"), ("first", "new"), ("second", "new"), (None, None)):
+        source.tables = empty_graph_tables() if chunk_id is None else desired_graph(chunk_id, entity_id)
+        app.update_blocking()
+        before = graph_snapshot(graph_db)
+        with graph_db.readonly() as conn:
+            changes = conn.total_changes
+        app.update_blocking()
+        assert graph_snapshot(graph_db) == before
+        with graph_db.readonly() as conn:
+            assert conn.total_changes == changes
+            expected = [] if chunk_id is None else [(chunk_id,)]
+            assert list(map(tuple, conn.execute("SELECT chunk_id FROM chunks"))) == expected
+            assert list(map(tuple, conn.execute("SELECT chunk_id FROM chunk_vec"))) == expected
+            assert conn.execute("SELECT COUNT(*) FROM chunk_fts").fetchone()[0] == len(expected)
+            expected_entities = [] if entity_id is None else [(entity_id,)]
+            assert list(map(tuple, conn.execute("SELECT entity_id FROM entities"))) == expected_entities
 
 
 def test_plan_graph_publication_keeps_yaw_db_outside_transaction_and_preserves_shared_elements(
@@ -180,7 +161,7 @@ def test_plan_graph_publication_keeps_yaw_db_outside_transaction_and_preserves_s
 ) -> None:
     import asyncio
 
-    from yaw.core import OpenIERecord
+    from yaw.core import OpenIERecord, StructuredTriple
     from yaw.daemon.graph.inference import DSPyEmbeddingAdapter, YawProgram, create_dspy_lm
     from yaw.daemon.graph.inference.components import (
         EMBEDDING_ENDPOINT,
@@ -196,13 +177,14 @@ def test_plan_graph_publication_keeps_yaw_db_outside_transaction_and_preserves_s
     corpus_dir = tmp_path / "corpus"
     corpus_dir.mkdir()
     (corpus_dir / "a.md").write_text("# Section A\nAda Lovelace wrote the analytical engine notes.\n", encoding="utf-8")
-    (corpus_dir / "b.md").write_text("# Section B\nAda Lovelace collaborated with Charles Babbage.\n", encoding="utf-8")
+    (corpus_dir / "b.md").write_text("# Section B\nAda Lovelace wrote the analytical engine notes.\n", encoding="utf-8")
 
     db = open_managed_yaw_db(tmp_path / "yaw.db")
     in_tx_observations: list[bool] = []
 
     def fake_embed_fn(texts: list[str], **kwargs: object) -> np.ndarray:
-        in_tx_observations.append(db._conn.in_transaction)
+        with db.readonly() as conn:
+            in_tx_observations.append(conn.in_transaction)
         out = np.zeros((len(texts), 768), dtype=np.float32)
         for idx, text in enumerate(texts):
             out[idx, idx % 768] = 1.0
@@ -213,29 +195,51 @@ def test_plan_graph_publication_keeps_yaw_db_outside_transaction_and_preserves_s
 
     url, state = provider
     state["delay"] = 0.01
-    lm = create_dspy_lm("publication", base_url=url + "/v1", cache=False, num_retries=0, max_tokens=512)
+    lm = create_dspy_lm("publication", base_url=url + "/v1", cache=False, max_tokens=512)
     program = YawProgram(orchestrator_lm=lm, rlm_sub_lm=lm, enable_gbnf=False, max_output_tokens=512)
 
     chunk_a = (
         ChunkPointer("chunk_a", "a.md", 1, 2, "Section A"),
         OpenIERecord(
             chunk_id="chunk_a",
-            entities=[
+            entities=("Ada Lovelace", "Analytical Engine"),
+            entity_definitions=(
                 ("Ada Lovelace", "first computer programmer"),
                 ("Analytical Engine", "mechanical general-purpose computer"),
-            ],
-            triples=[("Ada Lovelace", "wrote notes on", "Analytical Engine")],
+            ),
+            triples=(("Ada Lovelace", "wrote notes on", "Analytical Engine"),),
+            structured_triples=(
+                StructuredTriple(
+                    subj="Ada Lovelace",
+                    subj_def="first computer programmer",
+                    pred="wrote notes on",
+                    obj="Analytical Engine",
+                    obj_def="mechanical general-purpose computer",
+                    spo_def="Ada Lovelace wrote the analytical engine notes.",
+                ),
+            ),
         ),
     )
     chunk_b = (
         ChunkPointer("chunk_b", "b.md", 1, 2, "Section B"),
         OpenIERecord(
             chunk_id="chunk_b",
-            entities=[
+            entities=("Ada Lovelace", "Analytical Engine"),
+            entity_definitions=(
                 ("Ada Lovelace", "first computer programmer"),
                 ("Analytical Engine", "mechanical general-purpose computer"),
-            ],
-            triples=[("Ada Lovelace", "wrote notes on", "Analytical Engine")],
+            ),
+            triples=(("Ada Lovelace", "wrote notes on", "Analytical Engine"),),
+            structured_triples=(
+                StructuredTriple(
+                    subj="Ada Lovelace",
+                    subj_def="first computer programmer",
+                    pred="wrote notes on",
+                    obj="Analytical Engine",
+                    obj_def="mechanical general-purpose computer",
+                    spo_def="Ada Lovelace wrote the analytical engine notes.",
+                ),
+            ),
         ),
     )
 
@@ -245,7 +249,7 @@ def test_plan_graph_publication_keeps_yaw_db_outside_transaction_and_preserves_s
         chunk_rows: tuple[tuple[ChunkPointer, OpenIERecord], ...],
     ) -> None:
         plan = await plan_graph_publication(settings, chunk_rows)
-        declare_graph(plan.rows)
+        await declare_tables(plan.tables)
 
     settings = GraphPlanSettings(
         corpus_root=corpus_dir,
@@ -257,6 +261,7 @@ def test_plan_graph_publication_keeps_yaw_db_outside_transaction_and_preserves_s
         for active_rows in ((chunk_a, chunk_b), (chunk_a,)):
             context = coco.ContextProvider()
             context.provide(GRAPH_DB, db)
+            context.provide(VALIDATE_SQLITE, validate_graph_state)
             context.provide(EMBEDDING_ENDPOINT, EmbeddingEndpoint(adapter, asyncio.Semaphore(4)))
             context.provide(
                 OPENIE_ENDPOINT,
@@ -283,5 +288,7 @@ def test_plan_graph_publication_keeps_yaw_db_outside_transaction_and_preserves_s
             assert conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 1
             assert conn.execute("SELECT COUNT(*) FROM fact_vec").fetchone()[0] == 1
             assert [r[0] for r in conn.execute("SELECT chunk_id FROM fact_sources").fetchall()] == ["chunk_a"]
+            assert conn.execute("SELECT COUNT(*) FROM entity_mentions").fetchone()[0] == 2
+            assert conn.execute("SELECT COUNT(*) FROM fact_assertions").fetchone()[0] == 1
     finally:
         db.close()

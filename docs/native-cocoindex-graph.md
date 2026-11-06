@@ -349,6 +349,16 @@ action ordering and rollback; do not invent a transaction-group API or import
 private connector internals. `uv.lock` currently pins CocoIndex 1.1.0; earlier
 1.0.26 lifecycle observations are not proof of locked-version behavior.
 
+The selected public connector boundary is one producing component and one shared
+`TargetActionSink` for its graph rows, canonical bindings, vectors, FTS and applied
+checkpoint. `storage/managed_sqlite.py` applies schema-driven row actions in one
+managed SQLite transaction; `storage/rows.py` validates the actual post-state
+before commit. Typed row schemas remain `TableSchema.from_class`. Separate
+components/sinks retain CocoIndex's convergent roll-forward behavior; neither
+sharing a connection nor completing `app.update()` makes their writes atomic.
+Ordinary-row/BLOB-vector/FTS rollback and no-op tests are implemented. This does
+not establish the remaining `vec0`, crash-window or bounded-owner-work gates.
+
 The group buffers only keyed affected-owner diffs outside a transaction, reaches
 an explicit publication barrier after dependent work, then uses one transaction:
 check base revision, apply diffs, validate actual post-state, advance applied

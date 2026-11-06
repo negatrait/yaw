@@ -98,6 +98,13 @@ Partial source discovery/parser failure cannot retire unseen valid sources.
 Native memo/tracking durability and `yaw.db` commit are separate; target actions
 must replay idempotently after a crash.
 
+Coherent graph rows and their applied checkpoint belong to one producing
+component and one shared transactional `TargetActionSink`. The schema-driven
+connector consumes typed row declarations and validates the SQLite post-state
+before commit. Independent sinks are not a transaction group. The chosen public
+boundary and remaining capability gates are specified in
+[graph publication §6.1](native-cocoindex-graph.md#61-atomic-declarative-publication-capability-gate).
+
 No production in-memory SQLite graph staging, graph cloning, full survivor target
 envelope or imperative graph sink remains after cutover. Before replacing the
 existing atomic sink, prove the locked connector's public grouping and validation
