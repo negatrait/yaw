@@ -1,7 +1,7 @@
 """Pure-JSON Context-Free Grammars (GBNF) for DSPy."""
 
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import dspy
@@ -58,9 +58,9 @@ DSPY_SHACL_REPAIR_GBNF_GRAMMAR = (
     'repair-list ::= "[]" | "[" repair (", " repair)* "]"\n'
     'repair ::= "{\\"focus_node\\": " string ", \\"action\\": " action-kind ", \\"value\\": " string '
     '"}"\n'
-    'action-kind ::= "\\"set_definition\\"" | "\\"rewrite_definition\\"" | "\\"set_pref_label\\"" | '
+    'action-kind ::= "\\"set_definition\\"" | "\\"set_pref_label\\"" | '
     '"\\"demote_to_alt_label\\"" | "\\"merge_altLabel\\"" | "\\"merge_hiddenLabel\\"" | '
-    '"\\"add_different_from\\"" | "\\"assert_differentFrom\\"" | "\\"assert_related\\"" | '
+    '"\\"add_different_from\\"" | "\\"assert_related\\"" | '
     '"\\"assert_broader\\"" | "\\"invert_broader\\"" | "\\"demote_sibling_to_related\\"" | '
     '"\\"remove_hierarchy_cycle\\"" | "\\"remove_conflicting_related\\"" | '
     '"\\"delete_dangling\\"" | "\\"delete_invalid_fact\\""\n'
@@ -315,8 +315,34 @@ def build_dspy_related_judge_grammar(
     )
 
 
-def build_dspy_shacl_repair_grammar(max_repairs: int | None = None) -> str:
+def build_dspy_shacl_repair_grammar(
+    max_repairs: int | None = None, *, allowed_actions: Mapping[str, set[str]] | None = None
+) -> str:
     """Build pure-JSON GBNF grammar for ProposeSHACLRepairs (`{"repairs": [...]}`)."""
+    if allowed_actions:
+        if max_repairs is not None:
+            raise ValueError("Report-bound repair coverage cannot use a generic repair-count cap")
+        branches = []
+        for i, (focus, actions) in enumerate(sorted(allowed_actions.items())):
+            choices = " | ".join(gbnf_escape_literal(json.dumps(action)) for action in sorted(actions))
+            branches.append(
+                f'repair-{i} ::= "{{\\"focus_node\\": " {gbnf_escape_literal(json.dumps(focus))} '
+                f'", \\"action\\": " ({choices}) ", \\"value\\": " string "}}"'
+            )
+        grammar = DSPY_SHACL_REPAIR_GBNF_GRAMMAR
+        coverage = ' ", " '.join(f'repair-{i} (", " repair-{i})*' for i in range(len(branches)))
+        return (
+            "\n".join(
+                "repair ::= " + " | ".join(f"repair-{i}" for i in range(len(branches)))
+                if line.startswith("repair ::=")
+                else f'repair-list ::= "[]" | "[" {coverage} "]"'
+                if line.startswith("repair-list ::=")
+                else line
+                for line in grammar.splitlines()
+            )
+            + "\n"
+            + "\n".join(branches)
+        )
     if max_repairs is None or max_repairs <= 0:
         return DSPY_SHACL_REPAIR_GBNF_GRAMMAR
     seq = "repair"
@@ -326,9 +352,9 @@ def build_dspy_shacl_repair_grammar(max_repairs: int | None = None) -> str:
         'root ::= "{\\"repairs\\": [" repair-list "]}"\n'
         f"repair-list ::= ({seq})?\n"
         'repair ::= "{\\"focus_node\\": " string ", \\"action\\": " action-kind ", \\"value\\": " string "}"\n'
-        'action-kind ::= "\\"set_definition\\"" | "\\"rewrite_definition\\"" | "\\"set_pref_label\\"" | '
+        'action-kind ::= "\\"set_definition\\"" | "\\"set_pref_label\\"" | '
         '"\\"demote_to_alt_label\\"" | "\\"merge_altLabel\\"" | "\\"merge_hiddenLabel\\"" | '
-        '"\\"add_different_from\\"" | "\\"assert_differentFrom\\"" | "\\"assert_related\\"" | '
+        '"\\"add_different_from\\"" | "\\"assert_related\\"" | '
         '"\\"assert_broader\\"" | "\\"invert_broader\\"" | "\\"demote_sibling_to_related\\"" | '
         '"\\"remove_hierarchy_cycle\\"" | "\\"remove_conflicting_related\\"" | '
         '"\\"delete_dangling\\"" | "\\"delete_invalid_fact\\""\n'

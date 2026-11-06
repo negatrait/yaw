@@ -303,7 +303,7 @@ async def judge_synonyms(request: SynonymJudgeInput) -> JudgedSynonyms:
         return await endpoint.judge_synonyms(request)
 
 
-@coco.fn(memo=True)
+@coco.fn(memo=True, version=3)
 async def heal_shacl_violations(request: SHACLHealInput) -> HealedSHACL:
     endpoint = coco.use_context(OPENIE_ENDPOINT)
     async with endpoint.admission:

@@ -386,11 +386,47 @@ def provider():
                     )
                 elif "violations" in text:
                     all_msg_text = json.dumps(data["messages"])
-                    output = (
-                        {"reasoning": "Leave violation unrepaired.", "code": "SUBMIT(repairs=[])"}
-                        if '"code"' in all_msg_text or "`code`" in all_msg_text
-                        else {"repairs": []}
-                    )
+                    if "healed_definition" in state:
+                        supervisor = '"code"' in all_msg_text or "`code`" in all_msg_text
+                        state.setdefault("healer_requests", []).append("rlm" if supervisor else "direct")
+                        if supervisor:
+                            output = {
+                                "reasoning": "Inspect the proposed statement and repair its description.",
+                                "code": (
+                                    "import json\n"
+                                    "v = json.loads(violations)\n"
+                                    "d = inspect_focus_node(v[0]['focus_node'])\n"
+                                    "assert d['focus_kind'] == 'fact'\n"
+                                    "repairs = propose_repairs()\n"
+                                    "SUBMIT(repairs=repairs)"
+                                ),
+                            }
+                        else:
+                            state.setdefault("healer_contexts", []).append(
+                                text.split("[[ ## focus_context ## ]]", 1)[1]
+                            )
+                            raw = text.split("[[ ## violations ## ]]", 1)[1].strip()
+                            violations, _ = json.JSONDecoder().raw_decode(raw)
+                            output = {
+                                "repairs": [
+                                    {
+                                        "focus_node": v["focus_node"],
+                                        "action": "set_pref_label"
+                                        if v["source_shape"] == "ConceptShape/noScalarLiterals"
+                                        else "set_definition",
+                                        "value": "Rate limit responses"
+                                        if v["source_shape"] == "ConceptShape/noScalarLiterals"
+                                        else state["healed_definition"],
+                                    }
+                                    for v in violations
+                                ]
+                            }
+                    else:
+                        output = (
+                            {"reasoning": "Leave violation unrepaired.", "code": "SUBMIT(repairs=[])"}
+                            if '"code"' in all_msg_text or "`code`" in all_msg_text
+                            else {"repairs": []}
+                        )
                 elif "[[ ## named_entities ## ]]" in text:
                     if "visited London" in text:
                         output = {

@@ -7,6 +7,7 @@ import sqlite3
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from itertools import batched
 from pathlib import Path
 from typing import Any
 
@@ -74,6 +75,7 @@ from yaw.daemon.graph.storage.evidence import (
     FactAssertion,
     bind_merged_evidence,
     build_evidence,
+    canonicalize_fact_definitions,
     canonicalize_fact_text,
     evidence_schemas,
     load_sense_bindings,
@@ -928,7 +930,6 @@ def collect_shacl_violation_dossiers(
     corpus_root: Path,
     *,
     ast_context_hops: int,
-    context_window_tokens: int,
     attempted_keys: set[tuple[str, str]] | None = None,
     batch_node_ids: set[str] | None = None,
 ) -> tuple[list[SHACLViolation], list[SHACLViolation], dict[str, dict[str, Any]], list[dict[str, Any]]]:
@@ -947,7 +948,7 @@ def collect_shacl_violation_dossiers(
         violations = list(all_violations)
     focus_dossiers: dict[str, dict[str, Any]] = {}
     focus_contexts: list[dict[str, Any]] = []
-    for v in violations[: scale_context_budget(16, context_window_tokens)]:
+    for v in violations:
         if v.focus_node not in focus_dossiers:
             focus_dossiers[v.focus_node] = inspect_focus_node(
                 stage_conn,
@@ -1324,6 +1325,7 @@ async def plan_graph_publication(
 
         for merged in merges:
             bind_merged_evidence(staging_conn, merged)
+        canonicalize_fact_definitions(staging_conn)
         canonicalize_fact_text(staging_conn)
 
         # 4. Closed-World SHACL Deterministic Auto-Healing & RLM Healing on staging_conn
@@ -1335,34 +1337,40 @@ async def plan_graph_publication(
             staging_conn,
             settings.corpus_root,
             ast_context_hops=settings.ast_context_hops,
-            context_window_tokens=settings.context_window_tokens,
         )
         rlm_stats["shacl_violations_before"] = len(violations)
         rlm_stats["shacl_violations_initial"] = len(violations)
         if violations:
-            healed = await heal_shacl_violations(
-                SHACLHealInput(
-                    violations=tuple(violations),
-                    focus_dossiers=focus_dossiers,
-                    focus_context=json.dumps(list(focus_dossiers.values()), ensure_ascii=False),
-                    program_identity=settings.program_identity,
-                    shacl_identity=settings.shacl_identity,
+            source_text = {ptr.chunk_id: text for ptr, text in complete_chunks}
+            for dossier in focus_dossiers.values():
+                dossier["source_passages"] = {cid: source_text[cid] for cid in dossier["chunk_ids"]}
+            repairs = []
+            for batch in batched(violations, scale_context_budget(4, settings.context_window_tokens), strict=False):
+                dossiers = {v.focus_node: focus_dossiers[v.focus_node] for v in batch}
+                healed = await heal_shacl_violations(
+                    SHACLHealInput(
+                        violations=batch,
+                        focus_dossiers=dossiers,
+                        focus_context=json.dumps(list(dossiers.values()), ensure_ascii=False),
+                        program_identity=settings.program_identity,
+                        shacl_identity=settings.shacl_identity,
+                    )
                 )
-            )
-            all_traces.extend(healed.traces)
-            all_telemetry.extend(healed.telemetry)
-            shacl_audit.extend(healed.audit_trail)
-            rlm_stats["shacl_healer_tokens"] += sum(
-                int(x.get("tokens_used", 0)) for x in healed.audit_trail if x.get("mode") == "rlm"
-            )
-            if healed.repairs:
+                repairs.extend(healed.repairs)
+                all_traces.extend(healed.traces)
+                all_telemetry.extend(healed.telemetry)
+                shacl_audit.extend(healed.audit_trail)
+                rlm_stats["shacl_healer_tokens"] += sum(
+                    int(x.get("tokens_used", 0)) for x in healed.audit_trail if x.get("mode") == "rlm"
+                )
+            if repairs:
 
                 def merge_repaired_entities(src: str, dst: str, kind: str) -> bool:
                     merged = merge_entities(staging_conn, src, dst, label_kind=kind)
                     bind_merged_evidence(staging_conn, merged)
                     return True
 
-                applied = apply_shacl_repairs(staging_conn, healed.repairs, merge_entities_fn=merge_repaired_entities)
+                applied = apply_shacl_repairs(staging_conn, repairs, merge_entities_fn=merge_repaired_entities)
                 canonicalize_fact_text(staging_conn)
                 rlm_stats["shacl_repairs_applied"] += applied
 

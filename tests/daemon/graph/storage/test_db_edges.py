@@ -253,10 +253,10 @@ def test_apply_shacl_repairs_executes_closed_world_actions_and_custom_merge_call
             [
                 {"focus_node": "", "action": "set_definition", "value": "ignored"},
                 {"focus_node": "entity-1", "action": "set_definition", "value": "Alpha definition"},
-                {"focus_node": "fact-1", "action": "rewrite_definition", "value": "Fact definition"},
+                {"focus_node": "fact-1", "action": "set_definition", "value": "Fact definition"},
                 {"focus_node": "entity-1", "action": "set_pref_label", "value": "Alpha Canonical"},
                 {"focus_node": "entity-2|entity-1", "action": "merge_altLabel", "target_node": "entity-1"},
-                {"focus_node": "entity-1|entity-3", "action": "assert_differentFrom"},
+                {"focus_node": "entity-1|entity-3", "action": "add_different_from"},
                 {"focus_node": "entity-orphan", "action": "delete_orphan"},
             ],
             merge_entities_fn=custom_merge,

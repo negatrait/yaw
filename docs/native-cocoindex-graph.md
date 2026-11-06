@@ -257,6 +257,26 @@ reserved scheme namespace in the new schema.
    Validate one class per sense, the minimum-member representative and matching
    occurrence/revision ownership of each assertion's resource mentions before
    committing the proposal. Raw assertion evidence is immutable through rebinding.
+   Choose canonical source statement descriptions before SHACL healing; display
+   text refresh must retain validated repaired descriptions. Supply every reported
+   violation's structured neighborhood to the healer in bounded, disjoint batches;
+   do not silently truncate reports or substitute Markdown-only entity context for
+   fact context, including endpoint profiles. RLM examples must delegate once and
+   submit proposals against the immutable snapshot, rather than re-linting it.
+   Bind generated repair focus/action choices to the report, and reject mismatches
+   in parsing: definition defects permit rewrites, never deletion of evidence.
+   A nonempty repair proposal must cover every reported focus; the grammar permits
+   complete coverage (including multiple actions per focus) or an empty abstention.
+   Empty proposals leave the strict validation failure intact.
+   `propose_repairs()` reads that bound report; the orchestrator cannot replace it.
+   Saved DSPy programs must identify this tool contract; reject older seeds.
+   Repair objects have typed `focus_node`, `action` and `value` fields. Supply the
+   actual frozen source passages alongside profiles; paths/line references alone
+   are insufficient grounding. The RLM tool takes no replacement context argument.
+   Use canonical `set_definition` and `add_different_from` actions; reject retired
+   action aliases rather than filtering or translating them.
+   Scalar-looking resources participating in statements need semantic
+   label repair, not automatic deletion of their source-supported statements.
    Retrieval seeds the stored subject and resource-object IDs of selected facts.
    It never re-resolves their display labels against a query vector or fabricates
    label-only IDs; a selected fact already identifies its canonical senses.
@@ -461,7 +481,7 @@ curves and reject acceptance if the designated corpus exceeds memory or paired
 work targets. Tests cannot infer asymptotic behavior from two timings.
 
 Provider settings stay native DSPy, default LLM `Semaphore(1)`, embedding batch
-<=64, temperature >=0.3 (default 0.35, reflection up to 0.8), and retries solely
+<=64, development temperature 1 per `AGENTS.md`, and retries solely
 through `dspy.LM(num_retries=...)`. No lower retries or extra degraded path to
 produce favorable timing.
 
@@ -510,6 +530,106 @@ Resume by checking branch/worktree, latest completed checkpoint, evidence artifa
 locked versions and unresolved gate. Update this checklist only from evidence.
 Implementation commits are conventional and include only assigned changes after
 required checks. A spec revision alone cannot close implementation checkpoints.
+
+### 9.1 Remaining cleanup after the 614-line retirement
+
+The supplied 2026-11-06 dead-code audit confirms that retiring the callers left
+callee-side cache plumbing and the schema migration/backfill stack behind.
+Its estimate is **about 403 further lines**: 228 in storage initialization,
+65 in judge-stage caching, 65 in cache codecs and 45 in engine helpers/imports.
+These are audit estimates against the earlier checkout, not a measured runtime
+gain or a deletion quota. Current source still contains the named symbols; line
+numbers have moved. The earlier U1/U2 result establishes its recorded contracts,
+not completion of this remaining cleanup.
+
+Execute these atomic slices in caller-to-callee order. Recheck production,
+scripts, benchmark and test consumers before removal; a test of an obsolete API
+does not justify retaining that API. No compatibility aliases or dual cache path.
+
+| Slice | Remove | Evidence required before completion |
+| --- | --- | --- |
+| C1: engine remnants | `_attempted_shacl_keys`, `_graph_cache_context`, `_encode_in_batches`, `_apply_shacl_repairs`, and imports made unused by their removal (`apply_shacl_repairs`, `pool_confidences`). | Confirm no active caller; keep query encoding and `EmbeddingEndpoint` batching. Verify current telemetry consumers and native indexing/retrieval tests. |
+| C2: judge-stage cache remnants | `_run_judge_stage(stage_cache=...)`, `judge_synonyms(stage_caches=...)`, dead cache hit/write blocks and their pass-through arguments. Remove the unconditional `judge_stage_fingerprint`/`batch.cache_identity` calculation when its only consumer is the retired cache key; remove newly unused helpers/imports after checking their callers. | Preserve native CocoIndex memoization, all three synonym stages, decisions, named traces and token accounting. Demonstrate that packets no longer serialize/hash predictor surfaces solely for an unused key. |
+| C3: cache codec remnants | `CandidatePayloadCodec`/`CandidateStageCache` passage arguments and tags for source-passage replacement, `OpenIERecord`, `StructuredTriple`, `dspy.Prediction` and `REPLHistory`, plus their unused imports. | Inventory actual optimizer checkpoint values before deleting tags. Preserve active embedding arrays (shape/dtype), scalar task scores, JSON checkpoints and real SQLite checkpoint/resume round trips. The active candidate cache itself is not retired by this slice. |
+| C4: migration/backfill stack | `migrate_edges_reasoning`, `migrate_epistemic_confidence_columns`, `initialize_schema` column alter/drop branches, `_entities_migrated`, `_facts_migrated`, `_edges_migrated`, duplicate migration calls, and `fact_sources`, `__legacy__` label and `fact_fts` backfills. | Keep explicit obsolete-schema rejection and required fresh/staging initialization; final graph tables remain declarative target-owned. Verify fresh SQLite/vec/FTS state, current-profile reopen, incompatible-schema rejection without mutation, and publication rollback. Do not migrate user experiment databases. |
+
+The audit's reported 16 redundant catalog/table scans per fresh staging database
+and remaining per-packet hashing are hypotheses to measure with actual SQL/call
+evidence. Its “zero-risk” and 30–45-minute estimates are not acceptance criteria.
+Each slice requires the mandatory project gates and an appended review checkpoint.
+None is complete merely because this plan lists it.
+For C3, distinguish the legacy `passage` sentinel from active `source`,
+`source_span` and `source_parts` compression: `CandidatePayloadCodec` is still
+constructed by the engine for reflection checkpoints. Preserve that live behavior;
+plain JSON checkpoint values can still contain embedded source text.
+
+The audit also identifies repeated chunk-vector work for **G3/G4 (U5)**:
+`process_chunk` discards the returned `EmbeddedText`, and the global planner
+reformats all active chunk inputs, calls `embed_text` again to recover memoized
+vectors, then stages/clones `chunk_vec`. Move final `chunk_vec` declaration to
+the per-chunk owner under §5.1; remove the planner's replay/staging/clone path
+when the replacement passes update/delete/restart and atomic publication gates.
+Do not replace native memoization with an engine cache or call this bounded while
+the global planner remains active. Measure this independently of C1–C4.
+
+### 9.2 Performance review: measured implementation units
+
+The supplied performance review identifies candidate discovery as the main
+remaining compute candidate: `find_entity_disambiguation_candidates` and
+`find_entity_synonym_candidates` in `storage/graph_ops.py`. It also identifies
+survivor hydration, whole-graph cloning, PPR topology construction and JSON
+serialization. Its 25–45-second batch cost, 80–100x candidate speedup, 23x PPR
+speedup and other timings are external review claims without reproduced evidence
+in this checkpoint. Revalidate symbol/caller locations against the current tree;
+do not adopt its code as a proven drop-in replacement.
+
+| Unit | Concrete work | Required evidence |
+| --- | --- | --- |
+| P0: capture costs and reference outputs | Record dense/vector scans, lexical normalization and matcher-index builds, alias-join rows, hydration/JSON work, clone work and topology construction by phase. Keep the existing scoring, automatic cosine/difflib merge gates, adjudication exclusions and candidate ordering as the reference. | Fixed evidence, actual configured vector dimensions, base sizes above 4,096 labels and up to the designated 100,000-entity corpus, changed-owner counts, CPU/wall time and whole-worker peak memory. Retain raw artifacts; estimates do not close a gate. |
+| P1: remove unused hydration and clone work (G3/G4/U5) | Determine changed/affected owners before hydrating evidence; do not hydrate survivors and then discard them. Remove the per-survivor joins/JSON reconstruction and full-table Python cloning through the final owner-based cutover, including the chunk-vector replay in §9.1. | Unchanged-owner hydration/inference/target mutations are zero unless explicit dependency invalidation requires them. Pass replacement, deletion, late evidence, restart, exact graph parity and atomic publication. |
+| P2: lexical invariants and alias scope | Precompute normalized/tokenized label attributes once per needed candidate projection. Avoid the 4,096-entry LRU scan-thrashing pattern. Reuse matcher indexing where invariant and push affected-owner filtering into the alias self-join instead of materializing global collisions. | Preserve final `SequenceMatcher` operand orientation, `autojunk` setting, normalization, digit rules, aliases, exclusions, thresholds, pair deduplication and deterministic ordering. Include changed IDs on either side of the canonical pair, new-to-new pairs, Unicode, long/repeated labels and threshold-edge cases. Upper-bound symmetry does not make final `ratio()` symmetric. |
+| P3: bounded dense candidate search | Eliminate repeated full vector scans/FFI work with a measured bounded strategy using existing dependencies. Reuse buffers and maintain global top-k/tie decisions across blocks; do not allocate the complete query-by-corpus score matrix or duplicate the whole vector corpus. | Exact candidate IDs, exclusions, cutoff/tie behavior and downstream merge/adjudication results against the reference. Floating-point score tolerances alone do not prove identity-decision parity. Include zero vectors, duplicate vectors, ties at k, near-threshold values, target subsets and the no-target/full-scan case. Pass <=1 GiB for the whole worker. |
+| P4: sparse PPR construction and lifecycle | Evaluate native sparse duplicate aggregation in place of Python tuple/dictionary accumulation, then retain topology only for the matching committed graph and traversal policy. | Preserve directional weights, probability functions, edge-kind semantics, normalization and isolated nodes. Validate retrieval/PPR and deterministic ranked results, including close ties. Cache by committed semantic revision plus schema/profile and weight policy; `PRAGMA data_version` alone cannot cover a connection's own writes. No uncommitted proposal may populate the retrieval cache. |
+| P5: serialization on surviving paths | After C3 and P1, measure remaining JSON work. Consider an already available native codec only where profiling still justifies it. | Preserve decoded types, UTF-8, numeric/null behavior, canonical hashing/ordering and checkpoint/resume semantics. No blind `json` substitution or new dependency is authorized by this plan. |
+
+The proposed dense SGEMM/cdist implementation is **not acceptable as written**
+under §8. A 100,000-by-100,000 float32 score matrix alone is about **37.3 GiB**.
+At 100,000 vectors with 768 dimensions, three full float32-equivalent vector
+buffers already occupy about **879 MiB**, before scores, Python rows, graph state
+and native allocations. Query/corpus tiling and measured lifetime accounting are
+required; `workers=-1` is not an established worker/thread budget.
+
+Likewise, these advertised equivalence claims require correction before adoption:
+
+- SGEMM normalization/rounding need not reproduce SQLite cosine scores bit for
+  bit. `argpartition` can choose arbitrary members at a tied top-k boundary;
+  sorting the selected subset stably does not recover excluded ties. Establish a
+  deterministic reference ordering and prove threshold/top-k decisions.
+- A clipped uint8 histogram is not automatically an exact character-count bound
+  for long or Unicode labels. Do not prune a valid lexical candidate through
+  counter saturation, UTF-8/code-point differences or float cutoff rounding.
+- RapidFuzz/LCS is only a proposed upper-bound prefilter, never a substitute for
+  the reference difflib score. Prove no false negatives with the actual
+  normalization, score precision and cutoff behavior. Adding `rapidfuzz` requires
+  a separately assigned dependency change and benchmark evidence; do not add an
+  optional-import acceleration/fallback pair.
+- `sqlite3.Connection.backup()` still copies the complete graph and vectors into
+  `:memory:`. It does not satisfy U5 or the resource boundary, so accelerating the
+  clone is not the target implementation. Remove the clone rather than adding a
+  second staging path. A diagnostic backup benchmark cannot close G3/G4.
+- Sparse native aggregation can change floating-point addition order. A reported
+  difference below 1e-15 is not proof of identical ranked results or traversal
+  decisions; verify the actual graph semantics and close-tie fixtures.
+
+Start with P0, retire dead work through C1–C4/P1, then optimize the remaining
+candidate hot paths P2/P3. P4/P5 are separate reviewable units. Every unit records
+before/after artifacts, source/work counters, output parity, memory and mandatory
+gate results. Faster whole-graph replay does not establish bounded incremental
+processing or close the 64+64 versus 128 acceptance gate.
+Include Open IE defect rates, healer abstentions, and separate RLM/worker tokens
+and wall time in P0. Preventing extraction defects can remove repair work; keep
+source faithfulness and retrieval/QA gates when comparing changed extraction
+profiles rather than treating fewer extracted facts as an improvement by itself.
 
 ## 10. Verification matrix and evidence
 

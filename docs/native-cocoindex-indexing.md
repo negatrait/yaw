@@ -153,6 +153,16 @@ admission; WAL and cached stats do not prove concurrent live reads.
 
 Follow G0-G6 in the graph plan. Native lifecycle integration adds these checks:
 
+The remaining caller-to-callee cleanup inventory and its gates are in the graph
+plan [§9.1](native-cocoindex-graph.md#91-remaining-cleanup-after-the-614-line-retirement).
+Complete C1–C4 without removing active candidate checkpoints or source evidence;
+the per-chunk `chunk_vec` ownership/replay removal remains G3/G4/U5 work.
+The implementation performance inventory and corrective gates are in graph plan
+[§9.2](native-cocoindex-graph.md#92-performance-review-measured-implementation-units):
+measure candidate scans, discarded survivor hydration, clone work and per-query
+topology construction. Dense all-pairs buffers and a faster `:memory:` clone do
+not satisfy the bounded owner-based architecture or its <=1-GiB worker budget.
+
 - [ ] Live filesystem and frozen/candidate indexing use identical component and
   semantic keys, with the same final target owner rules.
 - [ ] Runtime, `snapshot_dataset_bundle`, benchmark and optimizer candidate calls

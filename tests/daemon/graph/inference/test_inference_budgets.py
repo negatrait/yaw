@@ -231,7 +231,7 @@ def test_hot_reload_does_not_restore_stale_context_or_completion_caps():
     assert current.shacl_healer_rlm.max_output_chars == 20000
 
 
-def test_128k_retains_extraction_and_shacl_context_lost_at_64k(provider):
+def test_context_aware_extraction_preserves_complete_shacl_context(provider):
     url, requests = provider
     passage = "Aster is a project. " + "x" * 70000 + "TAIL_FOR_128K"
     focus = "Aster is a project. " + "x" * 40000 + "FOCUS_FOR_128K"
@@ -244,7 +244,7 @@ def test_128k_retains_extraction_and_shacl_context_lost_at_64k(provider):
         program.propose_shacl_repairs(
             '[{"focus_node": "Aster", "source_shape": "ConceptShape"}]', focus_context=focus, mode="direct"
         )
-        assert ("FOCUS_FOR_128K" in str(requests[-1]["messages"])) == (context == 131072)
+        assert "FOCUS_FOR_128K" in str(requests[-1]["messages"])
 
 
 def test_standalone_engine_derives_hydration_budget_from_program(tmp_path, provider):
@@ -266,17 +266,17 @@ def test_standalone_engine_derives_hydration_budget_from_program(tmp_path, provi
         engine.close()
 
 
-def test_structured_prompt_batches_scale_without_splitting_json_items(provider):
+def test_shacl_worker_preserves_every_submitted_json_item(provider):
     url, requests = provider
     violations = [{"focus_node": f"NODE_{index}", "source_shape": "ConceptShape"} for index in range(25)]
     for context in (65536, 131072):
         lm = create_dspy_lm("budget-test", base_url=url, cache=False, context_window_tokens=context)
         program = YawProgram(orchestrator_lm=lm, rlm_sub_lm=lm)
         program.propose_shacl_repairs(violations, mode="direct")
-        assert ("NODE_24" in str(requests[-1]["messages"])) == (context == 131072)
+        assert "NODE_24" in str(requests[-1]["messages"])
     large_violations = [{"focus_node": str(index), "message": "x" * 20000} for index in range(10)]
     program.propose_shacl_repairs(large_violations, mode="direct")
     content = requests[-1]["messages"][-1]["content"]
     serialized = content.split("[[ ## violations ## ]]\n", 1)[1].split("\n\n[[ ##", 1)[0]
-    assert len(serialized) <= program._context_char_limit(12000)
-    assert len(json.loads(serialized)) == 2
+    assert len(json.loads(serialized)) == len(large_violations)
+    assert {item["focus_node"] for item in json.loads(serialized)} == {str(index) for index in range(10)}

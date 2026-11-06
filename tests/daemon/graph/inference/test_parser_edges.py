@@ -305,7 +305,9 @@ def test_synonym_and_shacl_decisions_reject_unknown_actions(envelope):
             "relation": "skos:hiddenLabel",
         },
     ]
-    assert parse_shacl_repairs(wrap("repairs", repairs)) == [
+    with pytest.raises(ValueError, match="Invalid SHACL repair"):
+        parse_shacl_repairs(wrap("repairs", repairs))
+    assert parse_shacl_repairs(wrap("repairs", repairs[:1])) == [
         {"focus_node": "A", "action": "set_definition", "value": "A concept"},
     ]
     with pytest.raises(json.JSONDecodeError):

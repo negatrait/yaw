@@ -1094,7 +1094,7 @@ def test_statement_shape_closed_world_flags_and_repairs_duplicate_endpoint_defin
             [
                 {
                     "focus_node": "fact-dup-subj",
-                    "action": "rewrite_definition",
+                    "action": "set_definition",
                     "value": "NetSuite exports records to Snowflake.",
                 },
                 {

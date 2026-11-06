@@ -169,10 +169,7 @@ def test_candidate_stages_make_zero_requests_after_process_restart(tmp_path: Pat
                 user = str(messages[-1]["content"])
                 if "variables_info" in prompt and "repl_history" in prompt:
                     requests.append("rlm")
-                    code = (
-                        "repairs = llm_propose_shacl_repairs(violations=violations, "
-                        "focus_context='')\nSUBMIT(repairs=repairs)"
-                    )
+                    code = "repairs = propose_repairs()\nSUBMIT(repairs=repairs)"
                     content = (
                         "[[ ## reasoning ## ]]\nDelegate repairs to the worker.\n"
                         f"[[ ## code ## ]]\n```python\n{code}\n```\n[[ ## completed ## ]]"

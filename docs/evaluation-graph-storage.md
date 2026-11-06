@@ -525,6 +525,11 @@ Offline test suite: `uv run --locked python -m unittest discover -s tests -v` â€
 
 14. **Pre-Epic 2 Closed-World SKOS/SHACL Engine, 19-Predictor Separation, Geometric-Mean Pareto Metric, and Live-Silicon MIPROv2 & GEPA Prompt Optimization (2026-10-18):**
 
+This is a historical checkpoint. Its transaction-healing tools and triple-stage
+resource-discovery descriptions are superseded by the [native graph plan](native-cocoindex-graph.md):
+NER owns resources, and the current healer reads frozen evidence through
+`propose_repairs()` before declarative publication.
+
 - **Architecture & Implementation:**
   - **Closed-World SKOS/SHACL Semantic Engine (`yaw/daemon/graph/storage/db.py`, `yaw/daemon/graph/engine.py`):**
     - Extended single `yaw.db` with SKOS tables: `entity_labels` (`label_norm`, `entity_id`, `label_kind`, `raw_label`, `chunk_id`), `entity_redirects` (`alias_id`, `canonical_id`), and `entity_merge_lineage` (`src_id`, `dst_id`, `label_kind`, `timestamp`).

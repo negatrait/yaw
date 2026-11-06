@@ -37,6 +37,7 @@ from .parsers import (
     parse_label_decisions,
     parse_related_decisions,
     parse_shacl_repairs,
+    shacl_repair_actions,
     text_processing,
 )
 from .prompts import (
@@ -93,7 +94,7 @@ Multi-Hop QA.
        - `shacl_healer_rlm` (`HealSHACLViolations`) running inside `dspy.PythonInterpreter` (managed \
 Deno/Pyodide WASM) with
          bound graph inspection, hydration, repair, and SQL SHACL linting tools (`inspect_focus_node`,
-         `hydrate_chunk`, `llm_propose_shacl_repairs`, `lint_shacl`). Repairs are returned as proposals.
+         `hydrate_chunk`, `propose_repairs`, `lint_shacl`). Repairs are returned as proposals.
     3. **First-Class Embedding Trail (`record_embedding_telemetry` / `embedding_audit_trail`):**
        - Tracks every `DSPyEmbeddingAdapter` (`dspy.Embedder`) invocation and the 3 optimizable
          task prefixes (`embedding_query_prefix`, `embedding_fact_prefix`, `embedding_document_prefix`)
@@ -396,6 +397,7 @@ Deno/Pyodide WASM) with
         state: dict[str, Any] = super().dump_state(*args, **kwargs)
         yaw_surface: dict[str, Any] = {
             "graph_schema": "scheme-free-v1",
+            "shacl_tools": "canonical-report-v1",
             "gbnf_max_entities": self.gbnf_max_entities,
             "gbnf_max_triples": self.gbnf_max_triples,
             "gbnf_max_facts": self.gbnf_max_facts,
@@ -416,6 +418,8 @@ Deno/Pyodide WASM) with
         yaw_surface = state_copy.pop("yaw_surface", None)
         if not isinstance(yaw_surface, dict) or yaw_surface.get("graph_schema") != "scheme-free-v1":
             raise ValueError("Incompatible program graph schema; recompile against the scheme-free graph")
+        if yaw_surface.get("shacl_tools") != "canonical-report-v1":
+            raise ValueError("Incompatible SHACL tool contract; start a fresh optimization")
         deployment_lms = {name: predictor.lm for name, predictor in self.named_predictors() if predictor.lm is not None}
         # Missing legacy predictors retain constructor defaults. Explicitly
         # saved empty demo lists must survive loading without reseeding.
@@ -508,35 +512,14 @@ Deno/Pyodide WASM) with
     def _build_shacl_repl_tools(self) -> list[Callable[..., Any]]:
         """Build the closed-world SHACL healing tools exposed inside `shacl_healer_rlm`."""
 
-        def llm_propose_shacl_repairs(
-            violations: Any = None,
-            focus_context: str = "",
-            violations_json: Any = None,
-        ) -> list[dict[str, str]]:
-            """Propose bounded closed-world SHACL repairs using Qwen GPU GBNF."""
+        def propose_repairs() -> list[dict[str, str]]:
+            """Propose repairs for the actual batch report with complete structured focus context."""
+            if self._shacl_linter is None or self._node_inspector is None:
+                raise ValueError("SHACL repair requires a bound report and node inspector")
             worker_lm = self._resolve_worker_lm()
-            raw = violations if violations is not None else violations_json
-            resolved_context = str(focus_context or "")
-            if not resolved_context.strip() and self._node_inspector is not None and raw:
-                parsed_items = json.loads(raw) if isinstance(raw, str) else list(raw)
-                seen_fns: list[str] = []
-                for item in parsed_items:
-                    fn = (
-                        str(item.get("focus_node", "")).strip()
-                        if isinstance(item, Mapping)
-                        else str(getattr(item, "focus_node", "")).strip()
-                    )
-                    if fn and fn not in seen_fns:
-                        seen_fns.append(fn)
-                dossiers: list[str] = []
-                for fn in seen_fns[:8]:
-                    info = self._node_inspector(fn)
-                    if isinstance(info, Mapping):
-                        md = str(info.get("markdown_dossier", "")).strip()
-                        if md:
-                            dossiers.append(md)
-                if dossiers:
-                    resolved_context = "\n\n---\n\n".join(dossiers)
+            raw = self._shacl_linter()
+            foci = dict.fromkeys(str(item["focus_node"]) for item in raw)
+            resolved_context = json.dumps([self._node_inspector(fn) for fn in foci], ensure_ascii=False)
             return self.propose_shacl_repairs(
                 raw,
                 focus_context=resolved_context,
@@ -585,13 +568,13 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
             return str(self._graph_search_tool(str(query)))
 
         def lint_shacl() -> list[dict[str, str]]:
-            """Re-run closed-world SQL SHACL validation on the active in-transaction database connection."""
+            """Read the proposal's violations; repair proposals are applied only after SUBMIT."""
             if self._shacl_linter is None:
                 return []
             return list(self._shacl_linter())
 
         return [
-            llm_propose_shacl_repairs,
+            propose_repairs,
             inspect_focus_node,
             inspect_pair,
             hydrate_chunk,
@@ -1294,7 +1277,7 @@ chunk."""
         By default (`mode=None`), executes the single-level RLM Python REPL healer
         (`shacl_healer_rlm` / `HealSHACLViolations`), which inspects focus nodes,
         hydrates source chunks, and delegates structured repair synthesis to its
-        inner `llm_propose_shacl_repairs` tool (`mode="direct"` -> `shacl_repair` /
+        inner `propose_repairs` tool (`mode="direct"` -> `shacl_repair` /
         `ProposeSHACLRepairs` with pure-JSON GBNF).
         """
         if not violations:
@@ -1304,17 +1287,6 @@ chunk."""
             violations_json = violations.strip()
             if not violations_json or violations_json == "[]":
                 return []
-            if not is_rlm and len(violations_json) > self._context_char_limit(12000):
-                try:
-                    parsed_v = json.loads(violations_json)
-                    if isinstance(parsed_v, list):
-                        violations_json = _bounded_prompt_json(
-                            parsed_v,
-                            scale_context_budget(16, self.context_window_tokens),
-                            self._context_char_limit(12000),
-                        )
-                except json.JSONDecodeError, TypeError:
-                    violations_json = violations_json[: self._context_char_limit(12000)]
         else:
             serialized: list[dict[str, str]] = []
             for v in violations:
@@ -1340,19 +1312,14 @@ chunk."""
                     )
             if not serialized:
                 return []
-            violations_json = (
-                json.dumps(serialized, ensure_ascii=False)
-                if is_rlm
-                else _bounded_prompt_json(
-                    serialized, scale_context_budget(16, self.context_window_tokens), self._context_char_limit(12000)
-                )
-            )
+            violations_json = json.dumps(serialized, ensure_ascii=False)
         if violations_json == "[]":
             return []
 
         stage_inputs: dict[str, Any] = {"violations": violations_json}
+        allowed_actions = shacl_repair_actions(json.loads(violations_json))
         if not is_rlm:
-            stage_inputs["focus_context"] = focus_context[: self._context_char_limit(12000)]
+            stage_inputs["focus_context"] = focus_context
         prev_telem_len = len(self.telemetry)
         pred = self._invoke_stage(
             self.shacl_repair,
@@ -1361,11 +1328,11 @@ chunk."""
             is_rlm=is_rlm,
             lm=lm,
             use_gbnf=use_gbnf,
-            grammar_fn=build_dspy_shacl_repair_grammar,
+            grammar_fn=lambda: build_dspy_shacl_repair_grammar(allowed_actions=allowed_actions),
             **stage_inputs,
         )
         raw_repairs = getattr(pred, "repairs", [])
-        repairs = parse_shacl_repairs(raw_repairs)
+        repairs = parse_shacl_repairs(raw_repairs, allowed_actions=allowed_actions)
         stage_tokens = int(self.telemetry[-1].get("tokens_used", 0)) if len(self.telemetry) > prev_telem_len else 0
         self.shacl_audit_trail.append(
             {

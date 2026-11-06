@@ -193,20 +193,23 @@ def load_sense_bindings(conn: sqlite3.Connection, labels: Iterable[str]) -> dict
     return result
 
 
+def canonicalize_fact_definitions(conn: sqlite3.Connection) -> None:
+    """Select source descriptions deterministically before SHACL derives repairs."""
+    conn.execute(
+        "UPDATE facts SET definition=(SELECT json_extract(raw_json,'$.spo_def') FROM fact_assertions a "
+        "WHERE a.fact_id=facts.fact_id ORDER BY assertion_id LIMIT 1) "
+        "WHERE fact_id IN (SELECT fact_id FROM fact_assertions)"
+    )
+
+
 def canonicalize_fact_text(conn: sqlite3.Connection) -> None:
     rows = conn.execute(
-        "SELECT f.fact_id,s.name,f.pred,f.obj_kind,o.name,f.obj_literal_lex,f.definition "
+        "SELECT f.fact_id,s.name,f.pred,f.obj_kind,o.name,f.obj_literal_lex "
         "FROM facts f JOIN entities s ON s.entity_id=f.subj_id LEFT JOIN entities o ON o.entity_id=f.obj_id"
     ).fetchall()
-    for fid, subject, predicate, kind, obj, lexical, definition in rows:
+    for fid, subject, predicate, kind, obj, lexical in rows:
         raw = json.dumps([subject, predicate, obj if kind == "entity" else lexical])
-        representative = conn.execute(
-            "SELECT raw_json FROM fact_assertions WHERE fact_id=? ORDER BY assertion_id LIMIT 1",
-            (fid,),
-        ).fetchone()
-        if representative is not None:
-            definition = json.loads(representative[0])["spo_def"]
-        conn.execute("UPDATE facts SET raw_triple_json=?,definition=? WHERE fact_id=?", (raw, definition, fid))
+        conn.execute("UPDATE facts SET raw_triple_json=? WHERE fact_id=?", (raw, fid))
         conn.execute("DELETE FROM fact_fts WHERE fact_id=?", (fid,))
         conn.execute(
             "INSERT INTO fact_fts(fact_id,text) VALUES (?,?)", (fid, f"{subject} {predicate} {obj or lexical}")

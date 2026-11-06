@@ -1090,7 +1090,6 @@ def test_engine_step7_heal_shacl_violations_rlm_repl_tools_and_token_stats(
     """Verify Step 6 direct GBNF label_judge_tokens and Step 7 heal_shacl_violations via shacl_healer_rlm \
 using all 5 bound REPL tools."""
     import json
-    import re
 
     repl_tool_events: list[str] = []
 
@@ -1114,7 +1113,7 @@ using all 5 bound REPL tools."""
                     {"prompt_tokens": 25, "completion_tokens": 15, "total_tokens": 40},
                 )
             req_str = str(prompt or messages or kwargs)
-            if "llm_propose_shacl_repairs" in req_str:
+            if "propose_repairs" in req_str:
                 repl_tool_events.append("shacl_healer_rlm_invoked")
                 code = (
                     "import json\n"
@@ -1123,7 +1122,7 @@ using all 5 bound REPL tools."""
                     "node_ctx = inspect_focus_node(focus_id)\n"
                     "chunk_text = hydrate_chunk(node_ctx['chunk_ids'][0])\n"
                     "assert 'Alan Turing formulated the Turing machine' in chunk_text\n"
-                    "repairs = llm_propose_shacl_repairs(violations=violations, focus_context=chunk_text)\n"
+                    "repairs = propose_repairs()\n"
                     "SUBMIT(repairs=repairs)"
                 )
                 return [
@@ -1153,9 +1152,12 @@ using all 5 bound REPL tools."""
                 )
             req_str = str(prompt or messages or kwargs)
             if "[[ ## violations ## ]]" in req_str or "bounded closed-world SHACL repair" in req_str:
-                focus_matches = list(dict.fromkeys(re.findall(r"entity-[0-9a-f]+", req_str)))
+                text = str(messages[-1]["content"]) if messages else str(prompt)
+                raw = text.split("[[ ## violations ## ]]", 1)[1].strip()
+                violations, _ = json.JSONDecoder().raw_decode(raw)
+                focus_matches = list(dict.fromkeys(v["focus_node"] for v in violations))
                 for fn in focus_matches:
-                    repl_tool_events.append(f"llm_propose_shacl_repairs:{fn}")
+                    repl_tool_events.append(f"propose_repairs:{fn}")
                 return [
                     json.dumps(
                         {
@@ -1350,7 +1352,7 @@ using all 5 bound REPL tools."""
 
         # Verify all 5 REPL tools ran inside shacl_healer_rlm and healed both violations
         assert "shacl_healer_rlm_invoked" in repl_tool_events
-        assert sum(1 for ev in repl_tool_events if ev.startswith("llm_propose_shacl_repairs:")) == 2
+        assert sum(1 for ev in repl_tool_events if ev.startswith("propose_repairs:")) == 2
 
         # Verify exact non-double-counted token accounting:
         # Publication telemetry describes this update; it does not replay prior provider work.

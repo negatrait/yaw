@@ -14,21 +14,16 @@ STAGE_RLM_DELEGATION_RULES: dict[str, str] = {
         "RLM SHACL HEALING WORKFLOW:\n"
         "1. Parse `violations` (`import json; items = json.loads(violations)`) and inspect each unique "
         "`focus_node` using `inspect_focus_node(focus_node)` (which handles `'entity-a|entity-b'`, "
-        "`'entity-a->entity-b'`, `'fact-...'`, and `'entity-...'` and returns `'markdown_dossier'` with "
+        "`'entity-a->entity-b'`, `'fact-...'`, and `'entity-...'` and returns structured data with "
         "W3C SKOS/RDF/OWL profiles, reified `rdf:Statement` facts, and hydrated source chunks) to diagnose "
         "each violation's `source_shape` (`ConceptShape/definition`, `ConceptShape/prefLabel`, "
         "`ConceptShape/S13-disjointLabels`, `ConceptShape/homographDifferentFrom`, `ConceptShape/broaderCycle`, "
         "`ConceptShape/S27-disjointBroaderRelated`, `EdgeShape/closedWorld`, `StatementShape/closedWorld`). Use "
         "`inspect_pair(a, b)`, `hydrate_ast_island(chunk_id)`, `hydrate_chunk(chunk_id)`, or "
         "`search_graph(query)` if additional document or neighborhood context is needed.\n"
-        "2. Delegate structured repair synthesis with the gathered dossier context:\n"
+        "2. Delegate once; the tool supplies complete structured focus context automatically:\n"
         "```python\n"
-        "import json\n"
-        "items = json.loads(violations)\n"
-        "seen = list(dict.fromkeys(v['focus_node'] for v in items if v.get('focus_node')))\n"
-        "dossiers = [inspect_focus_node(fn).get('markdown_dossier', '') for fn in seen[:8]]\n"
-        "focus_context = '\\n\\n---\\n\\n'.join(d for d in dossiers if d)\n"
-        "repairs = llm_propose_shacl_repairs(violations=violations, focus_context=focus_context)\n"
+        "repairs = propose_repairs()\n"
         "SUBMIT(repairs=repairs)\n"
         "```"
     ),
@@ -57,17 +52,9 @@ def build_rlm_action_demos() -> dict[str, list[dspy.Example]]:
                 iteration="1/10",
                 reasoning=(
                     "Inspect the violating focus nodes to gather their SKOS/RDF/OWL profiles, reified facts, "
-                    "and source chunk dossiers, then delegate to Qwen worker with focus_context and submit."
+                    "and source chunks when needed, then delegate once and submit the repair proposals."
                 ),
-                code="```python\n"
-                "import json\n"
-                "items = json.loads(violations)\n"
-                "seen = list(dict.fromkeys(v['focus_node'] for v in items if v.get('focus_node')))\n"
-                "dossiers = [inspect_focus_node(fn).get('markdown_dossier', '') for fn in seen[:8]]\n"
-                "focus_context = '\\n\\n---\\n\\n'.join(d for d in dossiers if d)\n"
-                "repairs = llm_propose_shacl_repairs(violations=violations, focus_context=focus_context)\n"
-                "SUBMIT(repairs=repairs)\n"
-                "```",
+                code="```python\nrepairs = propose_repairs()\nSUBMIT(repairs=repairs)\n```",
             ).with_inputs("variables_info", "repl_history", "iteration")
         ],
         "instruction_proposer_inner": [],

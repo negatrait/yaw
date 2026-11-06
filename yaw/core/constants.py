@@ -68,13 +68,11 @@ VALID_SYNONYM_RELATIONS: frozenset[str] = frozenset(
 VALID_SHACL_ACTIONS: frozenset[str] = frozenset(
     {
         "set_definition",
-        "rewrite_definition",
         "set_pref_label",
         "demote_to_alt_label",
         "merge_altLabel",
         "merge_hiddenLabel",
         "add_different_from",
-        "assert_differentFrom",
         "assert_related",
         "assert_broader",
         "invert_broader",
@@ -89,7 +87,6 @@ VALID_SHACL_ACTIONS: frozenset[str] = frozenset(
 VALUE_BEARING_SHACL_ACTIONS: frozenset[str] = frozenset(
     {
         "set_definition",
-        "rewrite_definition",
         "set_pref_label",
     }
 )

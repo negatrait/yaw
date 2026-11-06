@@ -524,6 +524,14 @@ def inspect_focus_node(
         )
     else:
         single["focus_kind"] = "fact" if clean_focus.startswith("fact-") else "unknown"
+        single["endpoints"] = [
+            {"entity_id": eid, "name": name, "definition": definition}
+            for eid, name, definition in conn.execute(
+                "SELECT e.entity_id,e.name,e.definition FROM entities e JOIN facts f "
+                "ON e.entity_id=f.subj_id OR e.entity_id=f.obj_id WHERE f.fact_id=?",
+                (clean_focus,),
+            )
+        ]
     return single
 
 
@@ -1118,7 +1126,7 @@ def apply_shacl_repairs(
             target = str(rep.get("target_node", "")).strip() or val
             if not focus or not action:
                 continue
-            if action in ("set_definition", "rewrite_definition") and val:
+            if action == "set_definition" and val:
                 if focus.startswith("fact-"):
                     cur = conn.execute(
                         "UPDATE facts SET definition = ? WHERE fact_id = ?",
@@ -1246,7 +1254,7 @@ def apply_shacl_repairs(
                         if src_node in existing_pair and dst_node in existing_pair:
                             merge_entities(conn, src_node, dst_node, label_kind=lkind)
                             applied += 1
-            elif action in ("add_different_from", "assert_differentFrom"):
+            elif action == "add_different_from":
                 if "|" in focus:
                     ea, eb = (x.strip() for x in focus.split("|", 1))
                 elif "->" in focus:
@@ -1467,6 +1475,8 @@ def apply_shacl_repairs(
                     conn.execute("DELETE FROM entity_vec WHERE entity_id = ?", (focus,))
                     conn.execute("DELETE FROM entities WHERE entity_id = ?", (focus,))
                     applied += 1
+            else:
+                raise ValueError(f"Invalid SHACL repair action: {action!r}")
     return applied
 
 
@@ -1855,7 +1865,7 @@ def auto_heal_deterministic_shacl(conn: sqlite3.Connection) -> int:
     """Deterministically auto-heal closed-world SHACL violations on yaw.db without LLM inference.
 
     Executes:
-    1. Prune scalar entities via remove_scalar_entity repair action.
+    1. Prune scalar entities without resource roles; let the healer resolve resource labels.
     2. Cut skos:broader cycles at the weakest empirical link.
     3. Empirical Bayes S27 & Cagle resolution:
        - Step 1: Existing fact check -> delete conflicting related edge.
@@ -1867,10 +1877,14 @@ def auto_heal_deterministic_shacl(conn: sqlite3.Connection) -> int:
     """
     repaired = 0
     with write_tx(conn):
-        # 1. Prune scalar entities
+        # Resource roles need semantic label repair, not deletion of their statements.
         scalar_eids = [
             str(r[0])
-            for r in conn.execute("SELECT entity_id, name FROM entities").fetchall()
+            for r in conn.execute(
+                "SELECT entity_id,name FROM entities e WHERE NOT EXISTS "
+                "(SELECT 1 FROM facts f WHERE f.subj_id=e.entity_id "
+                "OR (f.obj_kind='entity' AND f.obj_id=e.entity_id))"
+            )
             if detect_scalar_literal(str(r[1]))[0]
         ]
         for eid in scalar_eids:

@@ -202,16 +202,10 @@ YAW replaces upstream HippoRAG 2's flat, unvalidated 7-file Parquet/Pickle/JSON 
   - `owl:differentFrom`: Symmetric contrastive non-identity links between distinct polysemous/homograph senses. These edges are strictly dominant over merging and are excluded from PPR random walks.
 - **Two-Channel Candidate Combiner & Provisional Sense-Split Gate:**
   `find_entity_disambiguation_candidates` surfaces candidate pairs using dense vector kNN, lexical `difflib` similarity, and unadjudicated surface matches. When two mentions share identical surface labels but have divergent definitions ($\cos < 0.85$), YAW allocates a provisional `sense_id` instead of colliding or prematurely asserting `owl:differentFrom`.
-- **In-Transaction Closed-World SHACL Validation (`lint_graph_shacl`):**
-  Enforces 6 deterministic W3C SHACL shapes natively in SQLite SQL CTEs in $<1\text{ ms}$:
-  1. `ConceptShape/prefLabel`: Exactly one `skos:prefLabel` per concept.
-  2. `ConceptShape/S13-DisjointLabels`: Pairwise disjointness across `prefLabel`, `altLabel`, and `hiddenLabel`.
-  3. `ConceptShape/definition`: Mandatory non-empty definition per concept.
-  4. `ConceptShape/ContrastiveDisjointness`: Mutual exclusion between `owl:differentFrom` and synonym identity.
-  5. `FactStatementShape/endpoints`: Subject and object must reference existing valid concepts.
-  6. `ProvenanceShape/edgeSources`: Structural edges must link to at least one valid source chunk.
+- **Closed-World SHACL Validation (`lint_graph_shacl`):**
+  Native SQLite checks enforce resource labels/definitions, SKOS label integrity, resource/literal endpoints, irreflexive statements, provenance, hierarchy/disjointness and confidence constraints. Validation runs during planning and before atomic publication; its cost must be measured against graph size.
 - **Autonomous DSPy RLM Self-Healing (`heal_shacl_violations`):**
-  When SHACL shape violations occur during indexing transactions, YAW triggers a self-healing loop powered by `shacl_healer_rlm` with interactive REPL inspection tools (`hydrate_chunk`, `inspect_focus_node`, `llm_propose_shacl_repairs`, `apply_shacl_repairs`) to heal the graph prior to transaction commit.
+  The read-only `shacl_healer_rlm` delegates bounded report batches through `propose_repairs()`. Its structured worker receives typed repair fields, the actual report, graph profiles and frozen source passages; error-specific GBNF binds focus IDs, actions and complete nonempty coverage. Repairs are applied to the proposal and validated before declarative CocoIndex targets commit. Unresolved violations abort publication and optimization; raw source evidence remains unchanged. See the [native graph plan](docs/native-cocoindex-graph.md).
 - **Zero-Dependency W3C Turtle 1.1 Export (`serialize_graph_turtle`):**
   `yaw graph lint --turtle` streams the entire closed-world graph directly to standard Turtle syntax with standard prefix namespaces (`rdf:`, `rdfs:`, `skos:`, `owl:`, `sh:`, `yaw:`).
 

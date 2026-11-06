@@ -398,7 +398,7 @@ def compute_active_inference_fingerprint(
     return hasher.hexdigest()
 
 
-@coco.fn(memo=True, version=5)
+@coco.fn(memo=True, version=7)
 async def publish_graph(
     settings: GraphPlanSettings,
     state_fingerprint: str,

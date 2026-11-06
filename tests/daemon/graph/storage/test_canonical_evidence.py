@@ -23,6 +23,7 @@ from yaw.daemon.graph.storage import (
 from yaw.daemon.graph.storage.evidence import (
     bind_merged_evidence,
     build_evidence,
+    canonicalize_fact_definitions,
     canonicalize_fact_text,
     evidence_schemas,
     fact_id,
@@ -165,6 +166,7 @@ def test_incremental_alias_permutations_preserve_raw_evidence_and_canonical_fact
                     else:
                         canonical = incoming
 
+                canonicalize_fact_definitions(conn)
                 canonicalize_fact_text(conn)
                 assert canonical == expected_id
                 facts = conn.execute(

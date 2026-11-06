@@ -323,14 +323,15 @@ class PromptsAndParsersParityTests(unittest.TestCase):
 tools."""
         import dspy
 
-        from yaw.daemon.graph.inference.grammars import DSPY_SHACL_REPAIR_GBNF_GRAMMAR
+        from yaw.daemon.graph.inference.grammars import build_dspy_shacl_repair_grammar
+        from yaw.daemon.graph.inference.parsers import shacl_repair_actions
         from yaw.daemon.graph.inference.program import YawProgram
 
         orch_lm = CapabilityDummyLM(
             [
                 {
-                    "reasoning": "Propose SHACL repairs via GBNF tool using keyword argument violations=violations.",
-                    "code": ("reps = llm_propose_shacl_repairs(violations=violations)\nSUBMIT(repairs=reps)"),
+                    "reasoning": "Delegate the actual bound report to the structured GBNF repair worker.",
+                    "code": ("reps = propose_repairs()\nSUBMIT(repairs=reps)"),
                 }
             ],
             adapter=dspy.ChatAdapter(),
@@ -363,9 +364,11 @@ tools."""
             rlm_max_llm_calls=5,
         )
         self.assertIsNotNone(program.shacl_healer_rlm.sub_lm)
+        report = [{"focus_node": "ent-1", "source_shape": "yaw:EntityConceptShape"}]
+        program.set_graph_tools(shacl_linter=lambda: report, node_inspector=lambda focus: {"focus_node": focus})
 
         repairs = program.propose_shacl_repairs(
-            '[{"focus_node": "ent-1", "source_shape": "yaw:EntityConceptShape"}]',
+            report,
             mode="rlm",
         )
         self.assertEqual(
@@ -383,7 +386,7 @@ tools."""
         self.assertEqual(len(sub_lm.history), 1)
         self.assertEqual(
             sub_lm.history[0]["kwargs"].get("extra_body"),
-            {"grammar": DSPY_SHACL_REPAIR_GBNF_GRAMMAR},
+            {"grammar": build_dspy_shacl_repair_grammar(allowed_actions=shacl_repair_actions(report))},
         )
 
     def test_hipporag_program_save_and_load_gepa_state(self):
@@ -1838,17 +1841,14 @@ no frequency penalty."""
         )
 
         # 1. Verify all VALID_SHACL_ACTIONS from parsers.py pass invariants
-        self.assertEqual(len(VALID_SHACL_ACTIONS), 16)
         self.assertEqual(
             {
                 "set_definition",
-                "rewrite_definition",
                 "set_pref_label",
                 "demote_to_alt_label",
                 "merge_altLabel",
                 "merge_hiddenLabel",
                 "add_different_from",
-                "assert_differentFrom",
                 "assert_related",
                 "assert_broader",
                 "invert_broader",
@@ -1863,7 +1863,7 @@ no frequency penalty."""
         self.assertEqual(len(VALID_SYNONYM_RELATIONS), 5)
         self.assertEqual(
             VALUE_BEARING_SHACL_ACTIONS,
-            {"set_definition", "rewrite_definition", "set_pref_label"},
+            {"set_definition", "set_pref_label"},
         )
         from yaw.daemon.graph.inference import (
             DSPY_SHACL_REPAIR_GBNF_GRAMMAR,

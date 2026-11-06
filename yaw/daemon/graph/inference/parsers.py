@@ -756,7 +756,24 @@ def parse_related_decisions(raw_output: Any) -> list[dict[str, Any]]:
     return decisions
 
 
-def parse_shacl_repairs(raw_output: Any) -> list[dict[str, str]]:
+def shacl_repair_actions(violations: Sequence[Mapping[str, Any]]) -> dict[str, set[str]]:
+    """Definition defects permit description repair, never removal of their evidence."""
+    actions: dict[str, set[str]] = {}
+    for violation in violations:
+        permitted = (
+            {"set_definition"}
+            if violation.get("result_path") == "skos:definition"
+            else {"set_pref_label"}
+            if violation.get("source_shape", violation.get("shape")) == "ConceptShape/noScalarLiterals"
+            else VALID_SHACL_ACTIONS
+        )
+        actions.setdefault(str(violation["focus_node"]), set()).update(permitted)
+    return actions
+
+
+def parse_shacl_repairs(
+    raw_output: Any, *, allowed_actions: Mapping[str, set[str]] | None = None
+) -> list[dict[str, str]]:
     """Parse and validate closed-world SHACL repair actions from ProposeSHACLRepairs or HealSHACLViolations."""
     items: Sequence[Any] = ()
     if hasattr(raw_output, "repairs"):
@@ -777,12 +794,14 @@ def parse_shacl_repairs(raw_output: Any) -> list[dict[str, str]]:
     repairs: list[dict[str, str]] = []
     for item in items:
         if not isinstance(item, dict):
-            continue
+            raise ValueError(f"Invalid SHACL repair: {item!r}")
         focus_node = str(item.get("focus_node", "")).strip()
         action = str(item.get("action", "")).strip()
         value = str(item.get("value", item.get("target_node", item.get("target", ""))) or "").strip()
         if not focus_node or action not in VALID_SHACL_ACTIONS:
-            continue
+            raise ValueError(f"Invalid SHACL repair: focus={focus_node!r}, action={action!r}")
+        if allowed_actions is not None and action not in allowed_actions.get(focus_node, ()):
+            raise ValueError(f"SHACL repair {action!r} is not permitted for {focus_node!r}")
         repairs.append(
             {
                 "focus_node": focus_node,
@@ -790,6 +809,10 @@ def parse_shacl_repairs(raw_output: Any) -> list[dict[str, str]]:
                 "value": value,
             }
         )
+    if repairs and allowed_actions is not None:
+        missing = set(allowed_actions) - {repair["focus_node"] for repair in repairs}
+        if missing:
+            raise ValueError(f"Incomplete SHACL repairs: missing {sorted(missing)}")
     return repairs
 
 

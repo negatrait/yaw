@@ -1,7 +1,7 @@
 """Native DSPy signatures and few-shot demonstration sets for HippoRAG 2."""
 
 import json
-from typing import Any
+from typing import Any, TypedDict
 
 import dspy
 from dspy.teleprompt.gepa.instruction_proposal import (
@@ -210,22 +210,23 @@ class ExtractEntities(dspy.Signature):
 
 
 class ExtractTriples(dspy.Signature):
-    """Establish passage-supported `rdf:Statement` facts using only the supplied resources.
-    Resource discovery and definitions belong exclusively to the entity extractor. Never introduce,
-    rename or define a resource here. Subjects and resource objects are exact labels from `named_entities`,
-    which contains both general `skos:Concept` categories and particular `owl:NamedIndividual` resources.
-    If a label has multiple supplied definitions, select its exact supplied `[label, definition]` pair
-    as the endpoint to identify that sense. Copy it verbatim; never invent or rewrite its definition.
-    Emit objects with `"sub"` (`rdf:subject`), `"pred"` (`rdf:predicate`), `"obj"` (`rdf:object`) and `"def"`:
-    - Between supplied resources, use `"pred": ["predicate phrase", "owl:ObjectProperty"]` and an exact
-      supplied resource label as `"obj"`.
-    - For data-valued relationships, discover the literal in the passage. Use `"pred": ["predicate phrase",
-      "owl:DatatypeProperty"]` and `"obj": {"value": "lexical value", "datatype": "xsd:string", "lang": ""}`.
-      Choose the appropriate datatype or language tag. Literals need not occur in `named_entities`;
-      they are values, never new resources or `[name, definition]` pairs.
-    Subjects are always supplied resources, never literals. Resolve pronouns to supplied labels, preserve
-    predicate direction and literal meaning, and define each assertion in `"def"` without copying an entity
-    definition. Do not invent relationships to connect unrelated resources or use header metadata."""
+    """Establish all passage-supported rdf:Statement facts between supplied resources or literal values.
+    Each `pred` is a short relationship phrase. Each separate `def` is a factual sentence stating
+    how the subject relates to the object through that predicate. Mention both endpoint names
+    or the literal value, and preserve source qualifiers. Describe the relationship, not what
+    either endpoint is. Never copy or paraphrase a resource definition into `pred` or `def`.
+    NER alone discovers resources and their resource definitions. Do not introduce, rename or
+    redefine resources. Subjects and resource objects must use exact supplied labels. For a
+    homograph, select the exact supplied [label, definition] pair as that endpoint; copying
+    this pair does not supply the statement's separate `def`.
+    Emit {sub, pred, obj, def}. For a resource object use pred=[relationship phrase,
+    owl:ObjectProperty] and an exact supplied label or sense pair as obj. For a data value,
+    discover its literal in the passage: pred=[relationship phrase, owl:DatatypeProperty],
+    obj={value: lexical value, datatype: appropriate datatype, lang: language tag or empty string}.
+    Literal objects need not occur in named_entities. Subjects are resources, never literals.
+    Resolve pronouns to supplied labels; preserve predicate direction and literal meaning.
+    Never invent relationships to connect unrelated resources or use header metadata.
+    """
 
     passage: str = dspy.InputField(desc="Source passage text")
     named_entities: list[Any] = dspy.InputField(
@@ -336,35 +337,43 @@ non-associated entities, mark `related=False` (`owl:differentFrom`)."""
     )
 
 
+class SHACLRepair(TypedDict):
+    focus_node: str
+    action: str
+    value: str
+
+
 class ProposeSHACLRepairs(dspy.Signature):
-    """Synthesize closed-world W3C SKOS/RDF/OWL repair actions in `repairs` (`{"focus_node", "action", "value"}`) \
-for the `sh:Violation` items in `violations` using `focus_context`:
-    - `ConceptShape/definition` (missing or tautological `skos:definition`): `'set_definition'` or \
-`'rewrite_definition'` (`value` = non-tautological genus-differentia definition).
-    - `ConceptShape/prefLabel` & `ConceptShape/S13-disjointLabels` (SKOS S13/S14 label integrity): \
-`'set_pref_label'` (`value` = canonical `skos:prefLabel`) or `'demote_to_alt_label'` (`value` = target \
-canonical entity ID).
-    - `ConceptShape/homographDifferentFrom` & Equivalence / Disjointness: `'merge_altLabel'` or \
-`'merge_hiddenLabel'` (`value` = canonical entity ID when coreferent `owl:sameAs`), or `'add_different_from'` / \
-`'assert_differentFrom'` (`value` = distinct homonym entity ID).
-    - `ConceptShape/broaderCycle` & \
-`ConceptShape/S27-disjointBroaderRelated` (SKOS S19-S27 hierarchy & association axioms): `'assert_broader'` \
-(`value` = broader parent entity ID), `'invert_broader'` (`value` = narrower/broader partner ID), \
-`'assert_related'` or `'demote_sibling_to_related'` (`value` = associative peer ID), \
-`'remove_hierarchy_cycle'` (`value` = cycle partner ID), or `'remove_conflicting_related'` (`value` = \
-conflicting relative ID).
-    - `EdgeShape/closedWorld` & `StatementShape/closedWorld` (referential, statement definition & literal \
-integrity): for missing or endpoint-duplicated statement definitions (`result_path="skos:definition"` on a \
-`fact-*` focus node), emit `'set_definition'` or `'rewrite_definition'` (`value` = relational statement \
-definition distinct from its subject/object entity definitions); for dangling endpoints or invalid facts, emit \
-`'delete_dangling'` or `'delete_invalid_fact'` (`value` = `""` or offending target ID)."""
+    """Repair only the reported graph defects using focus_context. Preserve source-supported
+    entities and statements; do not invent facts.
+    For a fact-* skos:definition defect, rewrite the rdf:Statement's definition as a factual
+    sentence stating its subject-predicate-object relationship. Mention the supplied subject
+    and object names and preserve the predicate's meaning. Describe the relationship, not an
+    endpoint's meaning. Do not copy or paraphrase endpoint definitions. Return set_definition
+    with that relational sentence as value.
+    The supplied statement already gives its subject, predicate and object: repair its
+    description, not its truth or endpoints. Use one concise sentence with endpoint names,
+    never internal IDs or extra explanations of what the endpoints mean.
+    For an entity definition defect, return set_definition with a non-tautological
+    genus-differentia description. For noScalarLiterals, return set_pref_label with a lexical
+    resource name grounded in its source/definition, or leave the defect unresolved.
+    For label integrity, use set_pref_label or demote_to_alt_label. For homographs, use
+    merge_altLabel/merge_hiddenLabel only when coreferent, otherwise add_different_from.
+    For hierarchy/association defects, use assert_broader, invert_broader, assert_related,
+    demote_sibling_to_related, remove_hierarchy_cycle or remove_conflicting_related as the
+    evidence warrants. Only genuinely dangling endpoints or invalid facts permit
+    delete_dangling/delete_invalid_fact; a defective definition never permits deletion.
+    Return repairs for every violation, not just the first. Do not omit focus nodes.
+    Each repair contains focus_node, action and value. If the batch cannot be repaired,
+    return an empty repairs list rather than inventing repairs.
+    """
 
     violations: str = dspy.InputField(desc="JSON list of SHACLViolation report items")
     focus_context: str = dspy.InputField(
         desc="Inspected neighborhood and hydrated source passage context for the focus nodes",
         default="",
     )
-    repairs: list[dict[str, Any]] = dspy.OutputField(
+    repairs: list[SHACLRepair] = dspy.OutputField(
         desc='List of {"focus_node": "...", "action": "...", "value": "..."} SHACL repair objects'
     )
 
@@ -420,14 +429,14 @@ class HealSHACLViolations(dspy.Signature):
     """As a Recursive Language Model (RLM) orchestrator for closed-world W3C SHACL graph healing, inspect \
 violating `sh:focusNode` items (`ConceptShape/*`, `StatementShape/closedWorld`, `EdgeShape/closedWorld`) \
 using `inspect_focus_node`, `inspect_pair`, `hydrate_chunk`, `hydrate_ast_island`, `search_graph`, \
-`llm_propose_shacl_repairs`, and `lint_shacl` read-only sandbox tools.
-    Gather the SKOS/RDF/OWL neighborhood and source chunk dossiers for the focus nodes, delegate structured \
-repair synthesis to `llm_propose_shacl_repairs`, and return the complete repair list in `repairs`."""
+`propose_repairs`, and `lint_shacl` read-only sandbox tools.
+    Gather needed source context, call `propose_repairs` once for the complete supplied batch, \
+and immediately SUBMIT its result as `repairs`.
+    Tools read an immutable proposal snapshot. Repairs are applied and validated only after you return; \
+repeated `lint_shacl` calls cannot reflect proposed repairs."""
 
     violations: str = dspy.InputField(desc="JSON list of SHACLViolation report items")
-    repairs: list[dict[str, Any]] = dspy.OutputField(
-        desc="List of structured repair actions to restore SHACL conformance"
-    )
+    repairs: list[SHACLRepair] = dspy.OutputField(desc="List of structured repair actions to restore SHACL conformance")
 
 
 # ---------------------------------------------------------------------------

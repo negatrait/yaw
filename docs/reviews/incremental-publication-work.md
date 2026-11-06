@@ -472,3 +472,26 @@ U3–U6 remain open: this does not prove candidate completeness, interruption/cr
 readiness, `vec0`, bounded planning or live benchmark quality. The global planner
 is still active code requiring replacement under U5, rather than a superseded
 path retained alongside its replacement.
+
+## 2026-11-06: supplied cleanup and performance audits added to the plan
+
+The later audit identifies remaining callee-side cache plumbing and migration/
+backfill code despite the earlier 614-line retirement. Current source search
+confirms the named symbols are still present. This narrows the earlier cleanup
+completion claim to its recorded contracts; the remaining inventory is open.
+
+Governing graph plan §9.1 now defines C1–C4: engine remnants, judge-stage cache
+arguments/branches and unused hashing, obsolete payload-codec variants, then the
+schema migration/backfill stack. Per-chunk vector ownership and removal of the
+planner's memo replay/clone remain U5/G3/G4, not a new engine cache.
+
+Graph plan §9.2 records P0–P5 for measurement, affected-owner hydration, lexical
+invariants/alias scope, bounded dense candidates, sparse PPR lifecycle and
+serialization on surviving paths. The indexing plan links both inventories.
+The supplied speedup/LOC/time estimates are not reproduced measurements or
+acceptance evidence. Reject the proposed dense all-pairs buffers, optional-import
+acceleration fallback and faster whole-graph `:memory:` clone as target designs;
+require memory, threshold/tie and committed-revision correctness gates.
+
+These are planning changes only. No audit cleanup/performance unit is marked
+complete, no new dependency is added, and no baseline/paired timing claim follows.
