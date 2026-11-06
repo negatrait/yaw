@@ -7,7 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 from yaw.daemon.graph.inference import YawProgram, create_dspy_lm
-from yaw.daemon.graph.inference.grammars import build_dspy_triples_grammar
+from yaw.daemon.graph.inference.grammars import DSPY_TRIPLES_GBNF_GRAMMAR, build_dspy_triples_grammar
 from yaw.daemon.graph.inference.parsers import extract_structured_triples
 
 RESOURCES = (("Ada", "A named individual who wrote notes."), ("mathematician", "A general category of scholars."))
@@ -54,6 +54,51 @@ def test_predicate_type_cannot_disguise_a_new_resource_as_a_literal():
         )
 
 
+@pytest.mark.parametrize(
+    "grammar",
+    [
+        DSPY_TRIPLES_GBNF_GRAMMAR,
+        build_dspy_triples_grammar(max_triples=2),
+        build_dspy_triples_grammar(known_entities=RESOURCES),
+        build_dspy_triples_grammar(max_triples=2, known_entities=RESOURCES),
+    ],
+)
+def test_grammar_admits_only_property_types_the_parser_accepts(grammar):
+    rules = dict(line.split(" ::= ", 1) for line in grammar.splitlines())
+    assert r"\"obj\"" not in rules["triple"]
+    if "pred-obj" in rules:
+        assert "resource-pred" in rules["pred-obj"]
+        assert "literal-statement" in rules["pred-obj"]
+    else:
+        assert any(k.startswith("subject-") for k in rules)
+    assert "owl:ObjectProperty" in rules["resource-pred"] and "owl:DatatypeProperty" not in rules["resource-pred"]
+    assert "owl:DatatypeProperty" in rules["literal-pred"] and "owl:ObjectProperty" not in rules["literal-pred"]
+
+
+@pytest.mark.parametrize("typed", [False, True])
+@pytest.mark.parametrize(
+    "obj,property_type,expected_kind",
+    [
+        ("mathematician", "owl:ObjectProperty", "entity"),
+        ({"value": "37", "datatype": "xsd:integer", "lang": ""}, "owl:DatatypeProperty", "literal"),
+        ({"value": "écrivaine", "datatype": "rdf:langString", "lang": "fr"}, "owl:DatatypeProperty", "literal"),
+    ],
+)
+def test_property_object_branches_parse_without_reinterpreting_the_object(typed, obj, property_type, expected_kind):
+    raw = statement(obj, property_type)
+    if not typed:
+        raw["pred"] = "has value"
+    (triple,) = extract_structured_triples(
+        json.dumps({"triples": [raw]}, ensure_ascii=False),
+        entity_definitions=RESOURCES,
+        known_entities=[name for name, _ in RESOURCES],
+    )
+    assert triple.obj_kind == expected_kind
+    assert triple.obj == (obj["value"] if isinstance(obj, dict) else obj)
+    assert triple.obj_datatype == (obj["datatype"] if isinstance(obj, dict) else "")
+    assert triple.obj_lang == (obj["lang"] if isinstance(obj, dict) else "")
+
+
 def test_homograph_senses_must_already_exist_in_ner():
     senses = (("ball", "A spherical toy."), ("ball", "A formal dance."))
     raw = {"sub": list(senses[0]), "pred": "appears at", "obj": list(senses[1]), "def": "A toy appears at a dance."}
@@ -82,9 +127,9 @@ def test_default_demonstrations_obey_resource_ownership():
 
 def test_grammar_has_no_new_resource_slot_and_empty_ner_has_no_statements():
     grammar = build_dspy_triples_grammar(known_entities=RESOURCES)
-    assert "entity-slot ::= known-entity\n" in grammar
     assert "new-entity" not in grammar
     assert "literal-slot" in grammar
+    assert "objects-0" in grammar
     assert build_dspy_triples_grammar(known_entities=[]) == 'root ::= "{\\"triples\\": []}"\n'
 
 

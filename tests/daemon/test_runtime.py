@@ -93,7 +93,7 @@ class DeterministicTestLM(dspy.LM):
                 ]
             return [
                 '{"entity_definitions": [["University of Southampton", "Public research university in '
-                'Southampton"], ["1862", "Founding year of the Hartley Institution"]]}'
+                'Southampton"], ["Hartley Institution", "Predecessor institution of the University of Southampton"]]}'
             ]
         if "FilterTriples" in req_str or "fact_before_filter" in req_str:
             if "Turing" in req_str:
@@ -113,7 +113,8 @@ class DeterministicTestLM(dspy.LM):
                     '"def": "Ada Lovelace programmed the Analytical Engine."}]}'
                 ]
             return [
-                '{"triples": [{"sub": "University of Southampton", "pred": "founded in", "obj": "1862", '
+                '{"triples": [{"sub": "University of Southampton", '
+                '"pred": ["founded in", "owl:DatatypeProperty"], "obj": "1862", '
                 '"def": "University of Southampton was founded in 1862."}]}'
             ]
         if "ExtractEntities" in req_str or "named_entities" in req_str:
@@ -129,7 +130,7 @@ class DeterministicTestLM(dspy.LM):
                 ]
             return [
                 '{"named_entities": [["University of Southampton", "Public research university in '
-                'Southampton"], ["1862", "Founding year of the Hartley Institution"]]}'
+                'Southampton"], ["Hartley Institution", "Predecessor institution of the University of Southampton"]]}'
             ]
         if "ExtractQueryIntent" in req_str or "query_intent" in req_str:
             return ['{"query_intent": "Alan Turing worked at Bletchley Park"}']

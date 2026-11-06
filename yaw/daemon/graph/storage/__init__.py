@@ -5,8 +5,6 @@ from typing import Any
 
 # Single source of truth: only these symbols are exposed as the public package contract.
 _PUBLIC_API: dict[str, str] = {
-    "PreparedGraphRows": ".publication",
-    "apply_prepared_graph_rows": ".publication",
     "CandidateCacheStore": ".candidate_cache",
     "CandidatePayloadCodec": ".candidate_cache",
     "CandidateStageCache": ".candidate_cache",

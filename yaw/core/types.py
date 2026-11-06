@@ -29,6 +29,14 @@ class YawRuntimeError(RuntimeError):
         self.message: str = message
 
 
+class FatalGraphPublicationError(BaseException):
+    """Fatal graph publication failure that aborts optimizer execution without being swallowed."""
+
+    def __init__(self, original: BaseException) -> None:
+        self.original = original
+        super().__init__(str(original))
+
+
 def json_document_fields(data: object, default_title: str = "") -> tuple[str, str]:
     """One rendering contract for decoded document objects and projected values."""
     if isinstance(data, str):
@@ -371,6 +379,24 @@ def text_processing(text: Any) -> str | list[Any]:
         else:
             out.append(" ")
     return " ".join("".join(out).split())
+
+
+def is_resource_label(label: str) -> bool:
+    """A NER resource label has lexical content: an ASCII letter or any non-ASCII character.
+
+    Mirrors the GBNF NER `label` rule (GBNF has no Unicode categories, so every non-ASCII
+    character counts). Punctuation, numbers, dates and other data values are literals.
+    """
+    return any(ch.isalpha() or not ch.isascii() for ch in label)
+
+
+def is_scalar_label(label: str) -> bool:
+    """Whether a label's normalized form is an XSD scalar literal.
+
+    The single downstream classification of NER labels: normalization, materialization and
+    evidence binding must agree on which labels bind as resources (native graph spec §5.3).
+    """
+    return detect_scalar_literal(text_processing(label))[0]
 
 
 def compute_chunk_id(rel_posix_path: str, start_line: int, end_line: int, text: str) -> str:

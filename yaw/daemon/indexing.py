@@ -40,11 +40,13 @@ from yaw.daemon.graph.inference.components import (
     extract_text,
 )
 from yaw.daemon.graph.planner import GraphPlanSettings, GraphPlanSummary, plan_graph_publication, summarize_graph_plan
+from yaw.daemon.graph.storage.db import GRAPH_DB
 from yaw.daemon.graph.storage.hydration import (
     hydrate_ast_parent_context,
     resolve_chunk_text,
 )
-from yaw.daemon.graph.storage.publication import GRAPH_DB, declare_graph
+from yaw.daemon.graph.storage.managed_sqlite import VALIDATE_SQLITE
+from yaw.daemon.graph.storage.rows import declare_tables, validate_graph_state
 from yaw.daemon.ingestion.source_targets import (
     SOURCE_DB,
     SOURCE_ROOT,
@@ -396,7 +398,7 @@ def compute_active_inference_fingerprint(
     return hasher.hexdigest()
 
 
-@coco.fn(memo=True, version=3)
+@coco.fn(memo=True, version=4)
 async def publish_graph(
     settings: GraphPlanSettings,
     state_fingerprint: str,
@@ -406,7 +408,7 @@ async def publish_graph(
     """Plan and declare the atomic validated graph without storing vectors in LMDB memos."""
     _ = state_fingerprint, recovery_nonce
     plan = await plan_graph_publication(settings, frozen_text=frozen_text)
-    declare_graph(plan.rows)
+    await declare_tables(plan.tables)
     return summarize_graph_plan(plan)
 
 
@@ -484,7 +486,9 @@ class GraphPublicationLiveComponent:
                 self._settings.embedding_identity,
             )
         try:
-            summary = await publish_graph(
+            summary = await coco.use_mount(
+                coco.component_subpath("publication"),
+                publish_graph,
                 self._settings,
                 state_fingerprint,
                 coordinator.recovery_nonce,
@@ -689,7 +693,13 @@ async def frozen_indexing_app_main(
         raise error
     with coco.use_context(SOURCE_DB).readonly() as conn:
         fingerprint = compute_active_inference_fingerprint(conn, settings.program_identity, settings.embedding_identity)
-    return await publish_graph(settings, fingerprint, frozen_text={p.chunk_id: text for p, text in active_chunks})
+    return await coco.use_mount(
+        coco.component_subpath("publication"),
+        publish_graph,
+        settings,
+        fingerprint,
+        frozen_text={p.chunk_id: text for p, text in active_chunks},
+    )
 
 
 def bind_native_indexing(engine: YawGraphEngine, *, batch_size: int = 64) -> YawGraphEngine:
@@ -703,6 +713,7 @@ def bind_native_indexing(engine: YawGraphEngine, *, batch_size: int = 64) -> Yaw
         context = coco.ContextProvider()
         context.provide(SOURCE_DB, engine.managed_conn)
         context.provide(GRAPH_DB, engine.managed_conn)
+        context.provide(VALIDATE_SQLITE, validate_graph_state)
         context.provide(SOURCE_ROOT, engine.workspace_root)
         context.provide(EMBEDDING_ENDPOINT, EmbeddingEndpoint(engine.embedder))
         context.provide(

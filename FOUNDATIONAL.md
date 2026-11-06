@@ -72,7 +72,9 @@ YAW consists of five conceptual capabilities:
    - Maintains closed-world W3C concept/entity semantics, source-supported facts and relations, and revisable canonical identities across documents and ingestion batches. Legitimate semantic islands are allowed; incomplete documents are not reported as semantically complete.
    - Removes `skos:ConceptScheme` and all scheme clustering, storage, inference, embeddings and retrieval/QA/telemetry consumers from the current implementation target. Reintroduction requires a separate experiment proving held-out Recall@N, EM or F1 improvement against the scheme-free baseline with acceptable compute, memory and other quality metrics.
 4. **Inference**
-   - NER alone discovers and defines resources: particular `owl:NamedIndividual` instances and general `skos:Concept` categories. Triple extraction selects existing NER resources as subjects/resource objects and discovers literal objects while expressing passage-supported `rdf:Statement` facts. It cannot add resources or redefine them; an ambiguous label requires selecting an existing NER sense. Unrelated supported statements need not form one connected component.
+   - NER alone discovers and defines resources: particular `owl:NamedIndividual` instances and general `skos:Concept` categories. Resource labels require lexical content (letters); pure numbers, codes, dates, and scalar measurements remain literals (`rdfs:Literal`).
+   - Triple extraction selects existing NER resources as subjects/resource objects and discovers literal objects while expressing passage-supported `rdf:Statement` facts. Triples may point to literals as objects (`owl:DatatypeProperty`), but `rdf:subject` can never be a literal. Statements are strictly irreflexive per resource sense.
+   - Three-layer parity: GBNF grammar, extraction parsers, and SQLite SHACL shapes enforce identical resource and statement contracts. Every parser-accepted record must normalize, bind, and publish without dropped statements.
    - Uses native DSPy interfaces (`dspy.LM`, `dspy.Embedder`, `dspy.Signatures`, `dspy.RLM`, `dspy.GEPA`) and treats model services as external dependencies.
    - Defaults LLM extraction and reasoning admission strictly to `parallel = 1` (`Semaphore(1)`) to respect local `llama.cpp` single-slot VRAM bounds, while batching dense embeddings (`max_batch_size = 64`).
    - Enforces sampling temperatures $\ge 0.3$ (defaulting to $0.35$ for extraction and QA, up to $0.7$–$0.8$ for reflection) on small local models to avoid looping; temperatures below $0.3$ are prohibited.
@@ -105,6 +107,7 @@ Until YAW is feature complete, every failure is a hard failure.
 
 - DSPy's native retry policy is the only retry mechanism for transient model-service errors.
 - When those retries are exhausted, or a model service is unavailable, the operation aborts with the original error. Nothing is skipped, defaulted or degraded.
+- Graph publication failures abort immediately: during optimization, publication errors escape evaluation wrappers (`FatalGraphPublicationError` subclasses `BaseException`) and abort the optimizer with the original exception rather than looping or repeatedly retrying failed indexing.
 - Fallbacks, degraded modes and recovery paths are out of scope until the core pipeline is complete. Each is then introduced as an explicit, scoped decision, with tests that exercise the failure it handles.
 
 At this stage a fallback hides defects and corrupts benchmark evidence. A visible failure is more useful than a run that completes.

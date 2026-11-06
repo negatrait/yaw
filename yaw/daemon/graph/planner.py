@@ -20,8 +20,8 @@ from yaw.core import (
     SHACLViolation,
     StructuredTriple,
     YawRuntimeError,
-    compute_mdhash_id,
     detect_scalar_literal,
+    is_scalar_label,
     text_processing,
 )
 from yaw.core.config import context_char_limit, scale_context_budget
@@ -40,15 +40,12 @@ from yaw.daemon.graph.inference.components import (
 )
 from yaw.daemon.graph.normalization import normalize_openie_record
 from yaw.daemon.graph.storage import (
-    PreparedGraphRows,
-    apply_prepared_graph_rows,
     apply_shacl_repairs,
     auto_heal_deterministic_shacl,
     canonicalize_entity_labels_edc,
     deserialize_f32_vector,
     deserialize_openie_record,
     find_entity_disambiguation_candidates,
-    get_entities_by_label_norm,
     get_entity_metadata_batch,
     get_meta,
     inspect_focus_node,
@@ -58,11 +55,36 @@ from yaw.daemon.graph.storage import (
     open_yaw_db,
     pool_confidences,
     resolve_chunk_text,
+    upsert_chunk_pointers,
+    upsert_chunk_vectors,
+    upsert_edges_with_sources,
+    upsert_entities,
+    upsert_entity_labels,
     upsert_entity_vectors,
+    upsert_fact_sources,
+    upsert_fact_vectors,
+    upsert_facts,
     upsert_semantic_edges,
     write_tx,
 )
-from yaw.daemon.graph.storage.publication import GRAPH_DB
+from yaw.daemon.graph.storage.db import GRAPH_DB
+from yaw.daemon.graph.storage.evidence import (
+    EntityMention,
+    EntityMerge,
+    FactAssertion,
+    bind_merged_evidence,
+    build_evidence,
+    canonicalize_fact_text,
+    evidence_schemas,
+    load_sense_bindings,
+    sense_id,
+    upsert_evidence,
+)
+from yaw.daemon.graph.storage.evidence import (
+    fact_id as canonical_fact_id,
+)
+from yaw.daemon.graph.storage.managed_sqlite import TableSpec, create_table
+from yaw.daemon.graph.storage.rows import DesiredTable, empty_graph_tables, graph_tables
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,9 +106,48 @@ class GraphPlanSettings:
     min_chunk_size: int = 50
 
 
+type FactRow = tuple[str, str, str, str | None, str, str, str, str | None, str | None, str | None]
+type VectorRow = tuple[str, np.ndarray]
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedGraphRows:
+    chunks: tuple[tuple[ChunkPointer, str], ...]
+    entities: tuple[tuple[str, str, str], ...] | tuple[tuple[str, str, str, float | None], ...]
+    entity_labels: tuple[tuple[str, str, str, str, str], ...]
+    facts: tuple[FactRow, ...]
+    fact_sources: tuple[tuple[str, str], ...] | tuple[tuple[str, str, float | None, float | None, float | None], ...]
+    edges: tuple[tuple[str, str, str, float, str], ...]
+    chunk_vectors: tuple[VectorRow, ...]
+    entity_vectors: tuple[VectorRow, ...]
+    fact_vectors: tuple[VectorRow, ...]
+    mentions: tuple[EntityMention, ...]
+    assertions: tuple[FactAssertion, ...]
+    input_fingerprints: tuple[tuple[str, str], ...] = ()
+
+
+def stage_graph_rows(conn: sqlite3.Connection, rows: PreparedGraphRows) -> None:
+    """Apply prepared rows and FTS updates; never perform inference or commit."""
+    if not conn.in_transaction:
+        raise RuntimeError("Graph publication requires an active transaction")
+    if conn.execute("PRAGMA database_list").fetchone()[2] != "":
+        raise ValueError("Staging must never write a persistent database")
+    upsert_chunk_vectors(conn, rows.chunk_vectors)
+    upsert_chunk_pointers(conn, rows.chunks)
+    upsert_entities(conn, rows.entities)
+    upsert_entity_labels(conn, rows.entity_labels)
+    upsert_facts(conn, rows.facts)
+    upsert_fact_sources(conn, rows.fact_sources)
+    upsert_entity_vectors(conn, rows.entity_vectors)
+    upsert_fact_vectors(conn, rows.fact_vectors)
+    upsert_edges_with_sources(conn, rows.edges)
+    upsert_evidence(conn, rows.mentions, rows.assertions)
+
+
 @dataclass(frozen=True, slots=True)
 class GraphPlanResult:
-    rows: PreparedGraphRows
+    tables: tuple[DesiredTable, ...]
+    chunk_ids: tuple[str, ...]
     traces: tuple[PredictorTrace, ...] = ()
     telemetry: tuple[dict[str, Any], ...] = ()
     entity_def_audit_trail: tuple[dict[str, Any], ...] = ()
@@ -114,7 +175,7 @@ class GraphPlanSummary:
 
 def summarize_graph_plan(plan: GraphPlanResult) -> GraphPlanSummary:
     return GraphPlanSummary(
-        chunk_ids=tuple(sorted(row[0].chunk_id for row in plan.rows.chunks)),
+        chunk_ids=plan.chunk_ids,
         traces=plan.traces,
         telemetry=plan.telemetry,
         entity_def_audit_trail=plan.entity_def_audit_trail,
@@ -127,11 +188,6 @@ def summarize_graph_plan(plan: GraphPlanResult) -> GraphPlanSummary:
 
 
 @dataclass(slots=True)
-class SenseResolutionState:
-    senses_by_label: dict[str, list[tuple[str, str, str]]]
-
-
-@dataclass(slots=True)
 class MaterializedGraphBatch:
     entity_nodes: list[tuple[str, str, str]]
     entity_labels_to_upsert: list[tuple[str, str, str, str, str]]
@@ -140,6 +196,7 @@ class MaterializedGraphBatch:
     edges_with_sources: list[tuple[str, str, str, float, str]]
     fact_linked_pairs: set[tuple[str, str]]
     homograph_splits: int
+    bindings: dict[tuple[str, str, str], tuple[str, str]]
 
 
 def load_active_chunk_inferences(
@@ -205,15 +262,24 @@ def load_active_chunk_inferences(
     return items
 
 
-def clone_graph_to_memory(conn: sqlite3.Connection) -> sqlite3.Connection:
+def clone_graph_to_memory(conn: sqlite3.Connection, schemas: tuple[TableSpec, ...]) -> sqlite3.Connection:
     """Clone an existing yaw.db graph and vector tables into an isolated in-memory SQLite database."""
     stage_conn = open_yaw_db(":memory:")
     with write_tx(stage_conn):
+        for schema in schemas:
+            create_table(stage_conn, schema)
         for table, cols in (
             ("chunks", "chunk_id, rel_posix_path, start_line, end_line, title, ast_island_start, ast_island_end"),
             ("entities", "entity_id, name, definition, confidence"),
             ("entity_labels", "label_norm, entity_id, label_kind, raw_label, chunk_id"),
-            ("entity_chunks", "entity_id, chunk_id, llm_prob, vec_coherence, atomic_confidence"),
+            (
+                "entity_mentions",
+                "mention_id, chunk_id, source_revision, sense_id, name, definition, resolved_definition, entity_id",
+            ),
+            (
+                "fact_assertions",
+                "assertion_id, chunk_id, source_revision, subject_mention_id, object_mention_id, raw_json, fact_id",
+            ),
             (
                 "facts",
                 "fact_id, subj_id, pred, obj_id, raw_triple_json, definition, obj_kind, "
@@ -314,49 +380,18 @@ def apply_stage1_definitions(
     return normalized_sts, ner_entities
 
 
-def prepare_sense_resolution_state(
-    chunks: Sequence[tuple[ChunkPointer, str]],
-    record_structured: Sequence[tuple[str, list[StructuredTriple], list[tuple[str, str]]]],
-    all_norm_labels: Iterable[str],
-    surface_by_norm: Mapping[str, str],
-    *,
-    conn: sqlite3.Connection | None = None,
-) -> SenseResolutionState:
-    """Prepare existing sense state for deterministic mention materialization."""
-    del chunks, record_structured
-    senses_by_label: dict[str, list[tuple[str, str, str]]] = {}
-
-    if conn is not None:
-        existing_by_label = get_entities_by_label_norm(conn, list(all_norm_labels))
-        all_existing_eids = list({eid for eids in existing_by_label.values() for eid in eids})
-        entity_info_by_id: dict[str, tuple[str, str]] = {}
-        if all_existing_eids:
-            entity_info_by_id = get_entity_metadata_batch(conn, all_existing_eids)
-        for lbl, eids in existing_by_label.items():
-            senses_by_label[lbl] = [
-                (
-                    eid,
-                    entity_info_by_id.get(eid, (surface_by_norm.get(lbl, lbl), ""))[0],
-                    entity_info_by_id.get(eid, (surface_by_norm.get(lbl, lbl), ""))[1],
-                )
-                for eid in eids
-            ]
-
-    return SenseResolutionState(senses_by_label=senses_by_label)
-
-
 def materialize_entities_and_facts(
     record_structured: Sequence[tuple[str, list[StructuredTriple], list[tuple[str, str]]]],
     surface_by_norm: Mapping[str, str],
     chunk_surface_by_norm: Mapping[tuple[str, str], str],
-    sense_state: SenseResolutionState,
+    existing_bindings: Mapping[str, tuple[str, str, str]],
 ) -> MaterializedGraphBatch:
     """Resolve entity mentions with provisional sense-splitting and materialize reified facts and edges."""
-    senses_by_label = sense_state.senses_by_label
+    bindings: dict[tuple[str, str, str], tuple[str, str]] = {}
+    definitions_by_label: dict[str, set[str]] = defaultdict(set)
 
     entity_map: dict[str, tuple[str, str, str]] = {}
     entity_labels_to_upsert: list[tuple[str, str, str, str, str]] = []
-    homograph_splits = 0
 
     def _label_kind_for(entity_name: str, lbl_norm: str) -> str:
         return (
@@ -369,92 +404,20 @@ def materialize_entities_and_facts(
             else "skos:altLabel"
         )
 
-    def _resolve_mention_entity_id(
-        raw_mention: str,
-        defn: str,
-        chunk_id: str,
-        *,
-        exclude_eid: str | None = None,
-        allow_sense_split: bool = True,
-    ) -> str:
-        nonlocal homograph_splits
-        raw_clean = str(raw_mention).strip()
-        label_norm = str(text_processing(raw_clean)) or raw_clean.lower()
+    def _resolve_mention_entity_id(raw_mention: str, defn: str, chunk_id: str) -> str:
+        label_norm = str(text_processing(raw_mention))
         clean_def = defn.strip()
-        canon_surface = (
-            surface_by_norm.get(label_norm)
-            or surface_by_norm.get(raw_clean)
-            or (raw_clean if raw_clean != raw_clean.lower() else label_norm)
-        )
-        mention_raw = (
-            chunk_surface_by_norm.get((chunk_id, label_norm))
-            or chunk_surface_by_norm.get((chunk_id, raw_clean))
-            or canon_surface
-        )
-        existing_senses = senses_by_label.get(label_norm, [])
-        if not existing_senses:
-            eid = compute_mdhash_id(label_norm, prefix="entity-")
-            senses_by_label[label_norm] = [(eid, canon_surface, clean_def)]
-            entity_map[eid] = (eid, canon_surface, clean_def)
-            entity_labels_to_upsert.append((label_norm, eid, "skos:prefLabel", mention_raw, chunk_id))
-            return eid
-
-        def _best_surface(curr_name: str) -> str:
-            if (
-                curr_name == curr_name.lower()
-                and canon_surface != canon_surface.lower()
-                and (str(text_processing(curr_name)) or curr_name.lower()) == label_norm
-            ):
-                return canon_surface
-            return curr_name
-
-        if not clean_def or not allow_sense_split:
-            for idx_s, (eid, name, prev_def) in enumerate(existing_senses):
-                if exclude_eid is not None and eid == exclude_eid:
-                    continue
-                best_name = _best_surface(name)
-                merged_def = prev_def or clean_def
-                if best_name != name or merged_def != prev_def:
-                    existing_senses[idx_s] = (eid, best_name, merged_def)
-                    entity_map[eid] = (eid, best_name, merged_def)
-                elif eid not in entity_map:
-                    entity_map[eid] = (eid, best_name, merged_def)
-                entity_labels_to_upsert.append(
-                    (label_norm, eid, _label_kind_for(best_name, label_norm), mention_raw, chunk_id)
-                )
-                return eid
-            eid, name, prev_def = existing_senses[0]
-            best_name = _best_surface(name)
-            merged_def = prev_def or clean_def
-            if best_name != name or merged_def != prev_def:
-                existing_senses[0] = (eid, best_name, merged_def)
-                entity_map[eid] = (eid, best_name, merged_def)
-            elif eid not in entity_map:
-                entity_map[eid] = (eid, best_name, merged_def)
-            entity_labels_to_upsert.append(
-                (label_norm, eid, _label_kind_for(best_name, label_norm), mention_raw, chunk_id)
-            )
-            return eid
-
-        for idx_s, (eid, name, prev_def) in enumerate(existing_senses):
-            if exclude_eid is not None and eid == exclude_eid:
-                continue
-            if not prev_def or prev_def.lower() == clean_def.lower():
-                best_name = _best_surface(name)
-                merged_def = clean_def if len(clean_def) > len(prev_def) else (prev_def or clean_def)
-                existing_senses[idx_s] = (eid, best_name, merged_def)
-                entity_map[eid] = (eid, best_name, merged_def)
-                entity_labels_to_upsert.append(
-                    (label_norm, eid, _label_kind_for(best_name, label_norm), mention_raw, chunk_id)
-                )
-                return eid
-
-        sense_id = compute_mdhash_id(f"{label_norm}::{clean_def.lower()}", prefix="entity-")
-        existing_senses.append((sense_id, canon_surface, clean_def))
-        entity_map[sense_id] = (sense_id, canon_surface, clean_def)
-        entity_labels_to_upsert.append((label_norm, sense_id, "skos:prefLabel", mention_raw, chunk_id))
-        homograph_splits += 1
-        return sense_id
+        if not label_norm or not clean_def:
+            raise ValueError("Entity materialization requires a NER label and resolved definition")
+        candidate = sense_id(label_norm, clean_def)
+        surface = surface_by_norm[label_norm]
+        eid, name, definition = existing_bindings.get(candidate, (candidate, surface, clean_def))
+        entity_map[eid] = (eid, name, definition)
+        mention_raw = chunk_surface_by_norm[(chunk_id, label_norm)]
+        entity_labels_to_upsert.append((label_norm, eid, _label_kind_for(name, label_norm), mention_raw, chunk_id))
+        bindings[(chunk_id, label_norm, clean_def.casefold())] = (eid, clean_def)
+        definitions_by_label[label_norm].add(clean_def.casefold())
+        return eid
 
     chunk_to_entities: dict[str, set[str]] = {}
     fact_nodes_map: dict[
@@ -474,17 +437,14 @@ def materialize_entities_and_facts(
             resolved_in_chunk.add((s_norm_key, st.subj_def.strip().lower()))
             chunk_to_entities[cid].add(s_id)
 
-            is_literal_obj = st.obj_kind == "literal" or detect_scalar_literal(st.obj)[0]
+            is_literal_obj = st.obj_kind == "literal"
             if is_literal_obj:
                 eff_obj_dt = (
                     st.obj_datatype
                     if (st.obj_datatype and st.obj_datatype != "rdfs:Literal")
                     else detect_scalar_literal(st.obj)[1]
                 )
-                fid = compute_mdhash_id(
-                    str((s_id, st.pred, f"literal:{st.obj}:{eff_obj_dt}:{st.obj_lang}")),
-                    prefix="fact-",
-                )
+                fid = canonical_fact_id(s_id, st.pred, "literal", st.obj, eff_obj_dt, st.obj_lang)
                 raw_json = json.dumps([st.subj, st.pred, st.obj])
                 prev_fact = fact_nodes_map.get(fid)
                 if prev_fact is None or (not prev_fact[5] and st.spo_def):
@@ -506,27 +466,11 @@ def materialize_entities_and_facts(
                 # Scalar literals NEVER create entities, entity_labels, or edges
             else:
                 o_norm_key = str(text_processing(st.obj)) or st.obj.strip().lower()
-                distinct_homograph_pole = (
-                    o_norm_key == s_norm_key
-                    and bool(st.subj_def.strip())
-                    and bool(st.obj_def.strip())
-                    and st.subj_def.strip().lower() != st.obj_def.strip().lower()
-                )
-                o_id = _resolve_mention_entity_id(
-                    st.obj,
-                    st.obj_def,
-                    cid,
-                    exclude_eid=s_id if distinct_homograph_pole else None,
-                )
+                o_id = _resolve_mention_entity_id(st.obj, st.obj_def, cid)
                 resolved_in_chunk.add((o_norm_key, st.obj_def.strip().lower()))
                 chunk_to_entities[cid].add(o_id)
 
-                base_s_id = compute_mdhash_id(s_norm_key, prefix="entity-")
-                base_o_id = compute_mdhash_id(o_norm_key, prefix="entity-")
-                if s_norm_key == o_norm_key or s_id != base_s_id or o_id != base_o_id:
-                    fid = compute_mdhash_id(str((s_id, st.pred, o_id)), prefix="fact-")
-                else:
-                    fid = compute_mdhash_id(str((st.subj, st.pred, st.obj)), prefix="fact-")
+                fid = canonical_fact_id(s_id, st.pred, "entity", o_id)
                 raw_json = json.dumps([st.subj, st.pred, st.obj])
                 prev_fact = fact_nodes_map.get(fid)
                 if prev_fact is None or (not prev_fact[5] and st.spo_def):
@@ -550,7 +494,7 @@ def materialize_entities_and_facts(
                     edges_with_sources.append((s_id, o_id, "fact", 0.8, cid))
 
         for e_raw_lbl, e_def in ner_entities:
-            if detect_scalar_literal(e_raw_lbl)[0]:
+            if is_scalar_label(e_raw_lbl):
                 continue
             e_norm = str(text_processing(e_raw_lbl)) or e_raw_lbl.strip().lower()
             e_key = (e_norm, e_def.strip().lower())
@@ -574,7 +518,8 @@ def materialize_entities_and_facts(
         fact_sources_batch=fact_sources_batch,
         edges_with_sources=edges_with_sources,
         fact_linked_pairs=fact_linked_pairs,
-        homograph_splits=homograph_splits,
+        homograph_splits=sum(max(0, len(values) - 1) for values in definitions_by_label.values()),
+        bindings=bindings,
     )
 
 
@@ -645,7 +590,7 @@ def prepare_synonym_candidates(
     fact_linked_pairs: set[tuple[str, str]] | None = None,
     rlm_stats: dict[str, Any] | None = None,
     progress_callback: Callable[[str], None] | None = None,
-) -> tuple[list[dict[str, Any]], dict[str, tuple[str, str]], int, list[tuple[str, str, str, str | None]]]:
+) -> tuple[list[dict[str, Any]], dict[str, tuple[str, str]], int, list[EntityMerge]]:
     """Filter valid SKOS concepts, apply the near-1 (cosine, difflib) auto-merge gate, and rank remaining pairs."""
     valid_entity_ids = [eid for eid, name, _ in entity_nodes if bool(text_processing(name))]
     if not valid_entity_ids:
@@ -662,7 +607,7 @@ def prepare_synonym_candidates(
     cand_meta = get_entity_metadata_batch(stage_conn, cand_eids)
 
     merged_into: dict[str, str] = {}
-    auto_merges: list[tuple[str, str, str, str | None]] = []
+    auto_merges: list[EntityMerge] = []
     active_fact_pairs = fact_linked_pairs or set()
 
     def _resolve_active_eid(eid: str) -> str:
@@ -714,13 +659,11 @@ def prepare_synonym_candidates(
             key_a = (casing_a, len(def_a), -len(name_a), ea)
             key_b = (casing_b, len(def_b), -len(name_b), eb)
             dst, src = (ea, eb) if key_a >= key_b else (eb, ea)
-            merge_entities(stage_conn, src, dst, label_kind="skos:altLabel")
-            auto_merges.append((src, dst, "skos:altLabel", None))
+            merged = merge_entities(stage_conn, src, dst, label_kind="skos:altLabel")
+            src, dst = merged.removed_id, merged.canonical_id
+            auto_merges.append(merged)
             merged_into[src] = dst
-            dst_name, dst_def = cand_meta.get(dst, (dst, ""))
-            src_name, src_def = cand_meta.get(src, (src, ""))
-            best_name = dst_name if (casing_a >= casing_b if dst == ea else casing_b >= casing_a) else src_name
-            cand_meta[dst] = (best_name, dst_def if len(dst_def) >= len(src_def) else src_def)
+            cand_meta.update(get_entity_metadata_batch(stage_conn, [dst]))
             if rlm_stats is not None:
                 rlm_stats["merged_entities"] = int(rlm_stats.get("merged_entities", 0)) + 1
 
@@ -778,9 +721,10 @@ def apply_synonym_adjudication(
     synonymy_threshold: float,
     rlm_stats: dict[str, Any],
     corpus_root: Path | str | None = None,
-) -> tuple[list[tuple[str, str, str, str | None]], list[tuple[str, str, str, float, str]]]:
+) -> tuple[list[EntityMerge], list[tuple[str, str, str, float, str]]]:
     """Apply Stage 3 Gemma 4 synonym decisions on stage_conn with two-phase topological resolution."""
     _ = synonymy_threshold
+    cand_meta = dict(cand_meta)
     merged_into: dict[str, str] = {}
     hidden_label_norms: dict[str, set[str]] = defaultdict(set)
 
@@ -792,7 +736,7 @@ def apply_synonym_adjudication(
             curr = merged_into[curr]
         return curr
 
-    staged_merges: list[tuple[str, str, str, str | None]] = []
+    staged_merges: list[EntityMerge] = []
     raw_semantic_batch: list[tuple[str, str, str, float, str]] = []
     cand_by_pair: dict[tuple[str, str], dict[str, Any]] = {}
     for c in candidates:
@@ -904,7 +848,7 @@ def apply_synonym_adjudication(
                     hidden_label_norms[merge_dst].update(hidden_label_norms.pop(merge_src))
 
                 merged_def = str(dec.get("definition", "") or "").strip() or None
-                merge_entities(
+                merged = merge_entities(
                     stage_conn,
                     merge_src,
                     merge_dst,
@@ -912,7 +856,13 @@ def apply_synonym_adjudication(
                     corpus_root=corpus_root,
                     merged_definition=merged_def,
                 )
-                staged_merges.append((merge_src, merge_dst, lkind, merged_def))
+                merge_src, merge_dst = merged.removed_id, merged.canonical_id
+                # Label preference and the stable resource representative are independent.
+                for owner in (src, tgt):
+                    if owner != merge_dst and owner in hidden_label_norms:
+                        hidden_label_norms[merge_dst].update(hidden_label_norms.pop(owner))
+                cand_meta.update(get_entity_metadata_batch(stage_conn, [merge_dst]))
+                staged_merges.append(merged)
                 merged_into[merge_src] = merge_dst
                 rlm_stats["merged_entities"] = int(rlm_stats.get("merged_entities", 0)) + 1
             else:
@@ -1059,8 +1009,7 @@ async def plan_graph_publication(
             )
 
     if not active_items:
-        empty_rows = PreparedGraphRows((), (), (), (), (), (), (), (), ())
-        return GraphPlanResult(rows=empty_rows, rlm_stats=rlm_stats)
+        return GraphPlanResult(tables=empty_graph_tables(), chunk_ids=(), rlm_stats=rlm_stats)
 
     chunks: list[tuple[ChunkPointer, str]] = []
     all_records: list[OpenIERecord] = []
@@ -1202,19 +1151,21 @@ async def plan_graph_publication(
         record_structured.append((cid, normalized_sts, ner_entities))
 
     with coco.use_context(GRAPH_DB).readonly() as ro_conn:
-        sense_state = prepare_sense_resolution_state(
-            chunks,
-            record_structured,
-            all_norm_labels,
-            surface_by_norm,
-            conn=ro_conn if incremental else None,
-        )
+        existing_bindings = load_sense_bindings(ro_conn, all_norm_labels) if incremental else {}
     materialized = materialize_entities_and_facts(
         record_structured,
         surface_by_norm,
         chunk_surface_by_norm,
-        sense_state,
+        existing_bindings,
     )
+    mentions: list[EntityMention] = []
+    assertions: list[FactAssertion] = []
+    for (pointer, text), record in zip(chunks, all_records, strict=True):
+        raw_mentions, raw_assertions = build_evidence(
+            pointer, text, settings.program_identity, record, materialized.bindings
+        )
+        mentions.extend(raw_mentions)
+        assertions.extend(raw_assertions)
     rlm_stats["homograph_splits"] += materialized.homograph_splits
     entity_nodes = materialized.entity_nodes
     fact_nodes = materialized.fact_nodes
@@ -1250,28 +1201,38 @@ async def plan_graph_publication(
         chunk_vectors=tuple(chunk_vec_pairs),
         entity_vectors=tuple(entity_vec_by_id.items()),
         fact_vectors=tuple(fact_vec_by_id.items()),
+        mentions=tuple(mentions),
+        assertions=tuple(assertions),
     )
+
+    schemas = await evidence_schemas()
 
     # 3. Stage initial rows in an isolated in-memory SQLite database (zero yaw.db write lock)
     with coco.use_context(GRAPH_DB).readonly() as ro_conn:
-        staging_conn = clone_graph_to_memory(ro_conn) if incremental else open_yaw_db(":memory:")
+        staging_conn = clone_graph_to_memory(ro_conn, schemas) if incremental else open_yaw_db(":memory:")
     try:
+        with write_tx(staging_conn):
+            for schema in schemas:
+                create_table(staging_conn, schema)
         initial_entity_meta = {
             eid: (name, definition)
             for eid, name, definition in staging_conn.execute("SELECT entity_id, name, definition FROM entities")
         }
         initial_entity_meta.update({eid: (name, definition) for eid, name, definition in entity_nodes})
-        initial_fact_defs = dict(staging_conn.execute("SELECT fact_id, definition FROM facts"))
-        initial_fact_defs.update({row[0]: row[5] for row in fact_nodes})
+        initial_fact_defs = {
+            row[0]: (row[1], row[2])
+            for row in staging_conn.execute("SELECT fact_id, raw_triple_json, definition FROM facts")
+        }
+        initial_fact_defs.update({row[0]: (row[4], row[5]) for row in fact_nodes})
         for eid, blob in staging_conn.execute("SELECT entity_id, embedding FROM entity_vec"):
             entity_vec_by_id.setdefault(eid, deserialize_f32_vector(blob))
         for fid, blob in staging_conn.execute("SELECT fact_id, embedding FROM fact_vec"):
             fact_vec_by_id.setdefault(fid, deserialize_f32_vector(blob))
         with staging_conn:
             staging_conn.execute("BEGIN")
-            apply_prepared_graph_rows(staging_conn, initial_rows)
+            stage_graph_rows(staging_conn, initial_rows)
 
-        candidates, cand_meta, raw_cand_count, _auto_merges = prepare_synonym_candidates(
+        candidates, cand_meta, raw_cand_count, merges = prepare_synonym_candidates(
             staging_conn,
             entity_nodes,
             synonymy_threshold=settings.synonymy_threshold,
@@ -1334,7 +1295,7 @@ async def plan_graph_publication(
                         if (x.get("predictor") or x.get("stage")) == "related_judge"
                     )
 
-            apply_synonym_adjudication(
+            judged_merges, _ = apply_synonym_adjudication(
                 staging_conn,
                 candidates,
                 cand_meta,
@@ -1344,6 +1305,11 @@ async def plan_graph_publication(
                 rlm_stats=rlm_stats,
                 corpus_root=settings.corpus_root,
             )
+            merges.extend(judged_merges)
+
+        for merged in merges:
+            bind_merged_evidence(staging_conn, merged)
+        canonicalize_fact_text(staging_conn)
 
         # 4. Closed-World SHACL Deterministic Auto-Healing & RLM Healing on staging_conn
         auto_healed = auto_heal_deterministic_shacl(staging_conn)
@@ -1375,7 +1341,14 @@ async def plan_graph_publication(
                 int(x.get("tokens_used", 0)) for x in healed.audit_trail if x.get("mode") == "rlm"
             )
             if healed.repairs:
-                applied = apply_shacl_repairs(staging_conn, healed.repairs)
+
+                def merge_repaired_entities(src: str, dst: str, kind: str) -> bool:
+                    merged = merge_entities(staging_conn, src, dst, label_kind=kind)
+                    bind_merged_evidence(staging_conn, merged)
+                    return True
+
+                applied = apply_shacl_repairs(staging_conn, healed.repairs, merge_entities_fn=merge_repaired_entities)
+                canonicalize_fact_text(staging_conn)
                 rlm_stats["shacl_repairs_applied"] += applied
 
         remaining_violations = lint_graph_shacl(staging_conn)
@@ -1393,13 +1366,6 @@ async def plan_graph_publication(
             (str(r[0]), str(r[1]), str(r[2]))
             for r in staging_conn.execute(
                 "SELECT entity_id, name, definition FROM entities ORDER BY entity_id ASC"
-            ).fetchall()
-        )
-        final_labels = tuple(
-            (str(r[0]), str(r[1]), str(r[2]), str(r[3]), str(r[4]))
-            for r in staging_conn.execute(
-                "SELECT label_norm, entity_id, label_kind, raw_label, chunk_id "
-                "FROM entity_labels ORDER BY entity_id ASC, label_norm ASC, chunk_id ASC"
             ).fetchall()
         )
         final_facts = tuple(
@@ -1420,12 +1386,6 @@ async def plan_graph_publication(
                 "obj_kind, obj_literal_lex, obj_datatype, obj_lang FROM facts ORDER BY fact_id ASC"
             ).fetchall()
         )
-        final_fact_sources = tuple(
-            (str(r[0]), str(r[1]))
-            for r in staging_conn.execute(
-                "SELECT fact_id, chunk_id FROM fact_sources ORDER BY fact_id ASC, chunk_id ASC"
-            ).fetchall()
-        )
         # Ensure any entity/fact whose text changed during merge or SHACL repair is embedded
         reembed_entities = [
             (eid, name, defn)
@@ -1444,7 +1404,7 @@ async def plan_graph_publication(
         reembed_facts = [
             f_row
             for f_row in final_facts
-            if f_row[0] not in fact_vec_by_id or initial_fact_defs.get(f_row[0]) != f_row[5]
+            if f_row[0] not in fact_vec_by_id or initial_fact_defs.get(f_row[0]) != (f_row[4], f_row[5])
         ]
         if reembed_facts:
             rf_texts: list[str] = []
@@ -1455,50 +1415,10 @@ async def plan_graph_publication(
             for f_row, vec in zip(reembed_facts, rf_vecs, strict=True):
                 fact_vec_by_id[f_row[0]] = vec
 
-        final_entity_vectors = tuple(
-            (str(r[0]), np.frombuffer(r[1], dtype=np.float32))
-            for r in staging_conn.execute(
-                "SELECT entity_id, embedding FROM entity_vec ORDER BY entity_id ASC"
-            ).fetchall()
-        )
-        final_fact_vectors = tuple((f_row[0], fact_vec_by_id[f_row[0]]) for f_row in final_facts)
-
-        final_edges = tuple(
-            (
-                str(r[0]),
-                str(r[1]),
-                str(r[2]),
-                float(r[3]),
-                str(r[4] or ""),
-            )
-            for r in staging_conn.execute(
-                """
-                SELECT e.src_id, e.dst_id, e.kind, COALESCE(es.atomic_confidence, e.weight), COALESCE(es.chunk_id, '')
-                FROM edges e
-                LEFT JOIN edge_sources es
-                  ON es.src_id = e.src_id AND es.dst_id = e.dst_id AND es.kind = e.kind
-                ORDER BY e.src_id ASC, e.dst_id ASC, e.kind ASC, COALESCE(es.chunk_id, '') ASC
-                """
-            ).fetchall()
-        )
-
-        final_rows = PreparedGraphRows(
-            chunks=complete_chunks,
-            entities=final_entities,
-            entity_labels=final_labels,
-            facts=final_facts,
-            fact_sources=final_fact_sources,
-            edges=final_edges,
-            chunk_vectors=tuple(
-                (cid, deserialize_f32_vector(blob))
-                for cid, blob in staging_conn.execute("SELECT chunk_id, embedding FROM chunk_vec ORDER BY chunk_id")
-            ),
-            input_fingerprints=tuple(sorted(input_fingerprints.items())),
-            entity_vectors=final_entity_vectors,
-            fact_vectors=final_fact_vectors,
-        )
+        upsert_fact_vectors(staging_conn, [(row[0], fact_vec_by_id[row[0]]) for row in final_facts])
         return GraphPlanResult(
-            rows=final_rows,
+            tables=graph_tables(staging_conn, complete_chunks, tuple(sorted(input_fingerprints.items()))),
+            chunk_ids=tuple(sorted(pointer.chunk_id for pointer, _ in complete_chunks)),
             traces=tuple(all_traces),
             telemetry=tuple(all_telemetry),
             entity_def_audit_trail=tuple(entity_def_audit),

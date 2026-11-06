@@ -277,6 +277,48 @@ sensitive merging confluent. If this cannot be established for a rule, simplify
 or replace that rule before claiming Goal B. Do not perform a full final-corpus
 rebuild to make the equality test pass: its work belongs in Goal A.
 
+### 5.3 Resource vocabulary and statement boundary
+
+Extraction is two-stage because the W3C roles are asymmetric. NER is the only
+producer of resources: `owl:NamedIndividual` particulars and `skos:Concept`
+categories. Its labels form the closed `rdf:subject` vocabulary for that chunk.
+Triple extraction emits `rdf:Statement`s whose subject is always one of those
+resources and whose object is either another resource (`owl:ObjectProperty`) or
+a newly discovered `rdfs:Literal` (`owl:DatatypeProperty`). A literal never
+becomes a subject or a resource. Status codes, numbers, percentages, dates and
+other data values are literal objects, never NER output.
+
+One boundary is enforced at three layers that must agree exactly:
+
+| Rule | GBNF (prevents generation) | Parser (rejects, fail fast) | SHACL (rejects published state) |
+| --- | --- | --- | --- |
+| A resource label has lexical content: at least one letter | NER `label` rule | NER stage raises | `ConceptShape/resourceLabel` |
+| Property type matches object kind | `pred-obj` coupling | statement parser raises | `StatementShape/closedWorld` |
+| Subjects and resource objects are NER resources | `known-entity` endpoints | statement parser raises | `StatementShape/closedWorld` |
+| A statement never relates a resource sense to itself | per-subject object alternatives | statement parser raises | `StatementShape/irreflexive` |
+
+A resource sense is `(text_processing(label), definition)`, the identity rule of
+section 5.2. Distinct homograph senses of one label may relate to each other;
+the same sense may not relate to itself, including through labels that differ
+only in normalized form. Whether a label containing letters is semantically a
+data value (`350ms`) stays with the existing `ConceptShape/noScalarLiterals`
+policy; the grammar cannot decide it and this boundary does not change it.
+
+Grammar and parser rules are a pair: the parser accepts everything the grammar
+can generate and rejects what the rule forbids (the grammar may be stricter, never
+looser), so a parser error under GBNF is an implementation defect, not a
+model behavior to absorb. Every parser-accepted extraction must normalize, bind
+and publish without error: normalization, materialization and evidence binding
+classify a label with one predicate over the same normalized form, and none of
+them drops a parser-accepted statement. Changing any rule changes the extraction
+contract and bumps the OpenIE program identity so incompatible memoized artifacts
+are re-extracted, not reused.
+
+Regression fixtures are verbatim model outputs that violated this boundary in a
+real run (template echoes such as `[", ", "]]}# note: ..."]`, truncated
+`[", ", ""]` pairs, `429` and `:429` labels, reflexive `HubSpot -> HubSpot`
+statements). Execution record: [resource vocabulary boundary](reviews/resource-vocabulary-boundary.md).
+
 ## 6. Incremental publication, retraction and failures
 
 Consume keyed native source transitions; same-ID edits require revision comparison,

@@ -7,6 +7,7 @@ from yaw.core import (
     StructuredTriple,
     clean_schema_definition,
     detect_scalar_literal,
+    is_scalar_label,
     text_processing,
 )
 
@@ -55,7 +56,7 @@ def normalize_openie_record(rec: OpenIERecord) -> NormalizedRecord:
     for raw_pair in getattr(rec, "entity_definitions", ()) or ():
         if isinstance(raw_pair, (list, tuple)) and len(raw_pair) >= 2:
             raw_e0 = str(raw_pair[0]).strip()
-            is_lit_norm = raw_e0 in literal_only_raws or detect_scalar_literal(raw_e0)[0]
+            is_lit_norm = raw_e0 in literal_only_raws or is_scalar_label(raw_e0)
             enorm = raw_e0 if is_lit_norm else str(text_processing(raw_e0))
             _record_surface(enorm, raw_e0)
             edef = clean_schema_definition(raw_pair[1])
@@ -76,7 +77,7 @@ def normalize_openie_record(rec: OpenIERecord) -> NormalizedRecord:
         else:
             e_str = str(raw_ent).strip()
             e_inline_def = ""
-        is_lit_norm = e_str in literal_only_raws or detect_scalar_literal(e_str)[0]
+        is_lit_norm = e_str in literal_only_raws or is_scalar_label(e_str)
         e_norm = e_str if is_lit_norm else str(text_processing(e_str))
         if not e_norm:
             continue
@@ -106,29 +107,6 @@ def normalize_openie_record(rec: OpenIERecord) -> NormalizedRecord:
                 ner_entities.append((enorm, edef))
 
     st_list: list[StructuredTriple] = list(raw_st_items)
-    if not st_list and getattr(rec, "triples", ()):
-        for t in rec.triples:
-            if len(t) >= 3:
-                s_raw, p_raw, o_raw = (
-                    str(t[0]).strip(),
-                    str(t[1]).strip(),
-                    str(t[2]).strip(),
-                )
-                spo_synth = f"{s_raw} {p_raw} {o_raw}."
-                s_raw_norm = str(text_processing(s_raw))
-                o_raw_norm = str(text_processing(o_raw))
-                s_def_val = stage1_defs.get(s_raw_norm, "")
-                o_def_val = stage1_defs.get(o_raw_norm, "")
-                st_list.append(
-                    StructuredTriple(
-                        subj=s_raw,
-                        subj_def=s_def_val,
-                        pred=p_raw,
-                        obj=o_raw,
-                        obj_def=o_def_val,
-                        spo_def=spo_synth,
-                    )
-                )
     normalized_sts: list[StructuredTriple] = []
     for st in st_list:
         s_raw_str = str(st.subj).strip()
@@ -153,7 +131,7 @@ def normalize_openie_record(rec: OpenIERecord) -> NormalizedRecord:
         raw_obj_d = clean_schema_definition(st.obj_def)
         obj_d = raw_obj_d or stage1_defs.get(o_val, "") or stage1_defs.get(o_tok_norm, "")
         if s_norm == o_tok_norm and not is_literal_obj and (not subj_d or not obj_d or subj_d.lower() == obj_d.lower()):
-            continue
+            raise ValueError(f"Statement relates a resource sense to itself: {s_raw_str!r} -> {o_raw_str!r}")
 
         _record_surface(s_norm, s_raw_str)
         _record_surface(o_val, o_raw_str)
@@ -175,7 +153,7 @@ def normalize_openie_record(rec: OpenIERecord) -> NormalizedRecord:
         normalized_sts.append(
             StructuredTriple(
                 subj=s_norm,
-                pred=p_norm,
+                pred=st.pred.strip(),
                 obj=o_val,
                 spo_def=spo_d,
                 subj_def=subj_d,

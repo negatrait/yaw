@@ -16,6 +16,7 @@ import numpy as np
 
 from yaw.core import (
     ChunkPointer,
+    FatalGraphPublicationError,
     IndexStats,
     RelationTraversalPolicy,
     write_text_atomic,
@@ -920,9 +921,14 @@ class YawGraphEngine:
             if self._active_extraction_fingerprint != ext_fp or any(
                 p.chunk_id not in self._opt_indexed_cids for p, _ in self._opt_chunks_pool
             ):
-                self.index_chunks(
-                    self._opt_chunks_pool, program=program, progress_callback=self._active_progress_callback
-                )
+                try:
+                    self.index_chunks(
+                        self._opt_chunks_pool, program=program, progress_callback=self._active_progress_callback
+                    )
+                except BaseException as exc:
+                    if isinstance(exc, FatalGraphPublicationError):
+                        raise
+                    raise FatalGraphPublicationError(exc) from exc
             target_list = self._resolve_chunks_for_docs(item_docs) if item_docs else list(self._opt_chunks_pool)
             self._hydrate_chunk_traces_and_stats_from_db(target_list)
             target_cids = [p.chunk_id for p, _ in target_list]
@@ -1763,6 +1769,8 @@ class YawGraphEngine:
                 max_bootstrapped_demos=max_bootstrapped_demos,
                 max_labeled_demos=max_labeled_demos,
             )
+        except FatalGraphPublicationError as f_err:
+            raise f_err.original from None
         finally:
             self._in_optimization = False
             self._bind_program_hooks()

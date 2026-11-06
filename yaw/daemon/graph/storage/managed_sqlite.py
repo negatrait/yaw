@@ -1,0 +1,197 @@
+"""Typed SQLite targets sharing one transactional sink per publication component.
+
+Uses CocoIndex's public container/child-handler pattern. Processing declares rows;
+only this connector applies reconciled row actions. No application-side writes.
+"""
+
+import re
+import sqlite3
+from collections.abc import Callable, Collection, Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any, cast
+
+import cocoindex as coco
+from cocoindex.connectorkits.fingerprint import fingerprint_object
+from cocoindex.connectors import sqlite
+
+from .db import GRAPH_DB
+
+VALIDATE_SQLITE = coco.ContextKey[Callable[[sqlite3.Connection], None]]("yaw/managed_sqlite/validate")
+
+
+def identifier(value: str) -> str:
+    if re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", value) is None:
+        raise ValueError(f"Invalid SQLite identifier: {value!r}")
+    return f'"{value}"'
+
+
+@dataclass(frozen=True)
+class TableSpec:
+    name: str
+    schema: sqlite.TableSchema[Any]
+    fts_unindexed: tuple[str, ...] | None = None
+    indexes: tuple[tuple[str, ...], ...] = ()
+
+
+@dataclass(frozen=True)
+class TableAction:
+    spec: TableSpec
+    delete: bool
+    create: bool
+
+
+@dataclass(frozen=True)
+class RowAction:
+    spec: TableSpec
+    key: tuple[Any, ...]
+    values: Mapping[str, Any] | None
+
+
+def create_table(conn: sqlite3.Connection, spec: TableSpec) -> None:
+    table = identifier(spec.name)
+    if spec.fts_unindexed is not None:
+        columns = ",".join(
+            identifier(name) + (" UNINDEXED" if name in spec.fts_unindexed else "") for name in spec.schema.columns
+        )
+        conn.execute(
+            f"CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING fts5("
+            f"{columns},content='',contentless_delete=1,contentless_unindexed=1)"
+        )
+    else:
+        columns = ",".join(
+            f"{identifier(name)} {col.type}" + ("" if col.nullable else " NOT NULL")
+            for name, col in spec.schema.columns.items()
+        )
+        primary_key = ",".join(identifier(name) for name in spec.schema.primary_key)
+        conn.execute(f"CREATE TABLE IF NOT EXISTS {table} ({columns},PRIMARY KEY ({primary_key}))")
+    for fields in spec.indexes:
+        name = identifier(spec.name + "_" + "_".join(fields))
+        columns = ",".join(identifier(field) for field in fields)
+        conn.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({columns})")
+
+
+@dataclass(frozen=True)
+class DatabaseSink:
+    def __call__(self, context: coco.ContextProvider, actions: Sequence[TableAction | RowAction]) -> None:
+        with context.get(GRAPH_DB).transaction() as conn:
+            for action in actions:
+                if isinstance(action, TableAction) and action.create:
+                    create_table(conn, action.spec)
+            for action in actions:
+                if not isinstance(action, RowAction):
+                    continue
+                table = identifier(action.spec.name)
+                pk = action.spec.schema.primary_key
+                where = " AND ".join(f"{identifier(name)}=?" for name in pk)
+                if action.values is None or action.spec.fts_unindexed is not None:
+                    conn.execute(f"DELETE FROM {table} WHERE {where}", action.key)
+                if action.values is not None:
+                    columns = tuple(action.spec.schema.columns)
+                    names = ",".join(identifier(name) for name in columns)
+                    placeholders = ",".join("?" for _ in columns)
+                    conflict = ""
+                    if action.spec.fts_unindexed is None:
+                        updates = ",".join(
+                            f"{identifier(name)}=excluded.{identifier(name)}" for name in columns if name not in pk
+                        )
+                        conflict = (
+                            " ON CONFLICT ("
+                            + ",".join(identifier(name) for name in pk)
+                            + ") DO "
+                            + ("UPDATE SET " + updates if updates else "NOTHING")
+                        )
+                    conn.execute(
+                        f"INSERT INTO {table} ({names}) VALUES ({placeholders}){conflict}",
+                        tuple(action.values[name] for name in columns),
+                    )
+            for action in actions:
+                if isinstance(action, TableAction) and action.delete:
+                    conn.execute(f"DROP TABLE {identifier(action.spec.name)}")
+            if any(isinstance(action, RowAction) for action in actions):
+                context.get(VALIDATE_SQLITE)(conn)
+
+
+@dataclass(frozen=True)
+class RowHandlerFactory:
+    def __call__(self, context: coco.ContextProvider, action: TableAction) -> RowHandler:
+        return RowHandler(action.spec)
+
+
+def shared_sink() -> coco.TargetActionSink[TableAction | RowAction]:
+    return coco.TargetActionSink.from_fn(DatabaseSink(), child_handler=RowHandlerFactory())
+
+
+@dataclass(frozen=True)
+class RowHandler(coco.TargetHandler[dict[str, Any], bytes, None]):
+    spec: TableSpec
+    tracks_value_fingerprint = True
+
+    def reconcile(
+        self,
+        key: coco.StableKey,
+        desired: dict[str, Any] | coco.NonExistenceType,
+        previous: Collection[bytes],
+        prev_may_be_missing: bool,
+        /,
+    ) -> coco.TargetReconcileOutput[TableAction | RowAction, bytes, None] | None:
+        if coco.is_non_existence(desired):
+            if not previous and not prev_may_be_missing:
+                return None
+            record = coco.NON_EXISTENCE
+            values = None
+        else:
+            record = fingerprint_object(desired)
+            if not prev_may_be_missing and previous and all(value == record for value in previous):
+                return None
+            values = desired
+        if not isinstance(key, tuple):
+            raise TypeError("SQLite row target requires a tuple primary key")
+        return coco.TargetReconcileOutput[TableAction | RowAction, bytes, None](
+            action=RowAction(self.spec, key, values), sink=shared_sink(), tracking_record=record
+        )
+
+
+class TableHandler(coco.TargetHandler[TableSpec, TableSpec, RowHandler]):
+    def reconcile(
+        self,
+        key: coco.StableKey,
+        desired: TableSpec | coco.NonExistenceType,
+        previous: Collection[TableSpec],
+        prev_may_be_missing: bool,
+        /,
+    ) -> coco.TargetReconcileOutput[TableAction | RowAction, TableSpec, RowHandler] | None:
+        if coco.is_non_existence(desired):
+            if not previous:
+                return None
+            (spec,) = previous
+            record = coco.NON_EXISTENCE
+            create = False
+        else:
+            spec = desired
+            record = desired
+            create = prev_may_be_missing or not previous
+            if previous and any(fingerprint_object(old) != fingerprint_object(spec) for old in previous):
+                raise ValueError("Changed graph table schema requires a fresh index")
+        return coco.TargetReconcileOutput[TableAction | RowAction, TableSpec, RowHandler](
+            action=TableAction(spec, coco.is_non_existence(desired), create), sink=shared_sink(), tracking_record=record
+        )
+
+
+TABLES = coco.register_root_target_states_provider("yaw/managed_sqlite/tables", TableHandler())
+
+
+async def mount_table[RowT](
+    name: str,
+    row_type: type[RowT],
+    primary_key: list[str],
+    *,
+    fts_unindexed: tuple[str, ...] | None = None,
+    indexes: tuple[tuple[str, ...], ...] = (),
+) -> sqlite.TableTarget[RowT]:
+    schema = await sqlite.TableSchema[RowT].from_class(row_type, primary_key=primary_key)
+    spec = TableSpec(name, sqlite.TableSchema(schema.columns, schema.primary_key), fts_unindexed, indexes)
+    # SDK inference includes the deletion sentinel in the row value type.
+    provider = cast(
+        coco.TargetStateProvider[dict[str, Any], None], await coco.mount_target(TABLES.target_state(name, spec))
+    )
+    return sqlite.TableTarget(provider, schema)

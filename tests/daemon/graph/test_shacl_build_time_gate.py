@@ -412,7 +412,9 @@ def test_build_time_shacl_gate_success(synonym_token_counter, tmp_path: Path) ->
         assert float(ppr_from_subj[csr.node_to_idx[chunk.chunk_id]]) > 0.0
 
         hits, kept_facts = engine.retrieve_with_seeds("What port does Yet Another Wiki listen on?", top_k=1)
-        assert ("yet another wiki", "listens on port", "8080") in kept_facts
+        assert any(
+            str(s).lower() == "yet another wiki" and p == "listens on port" and o == "8080" for s, p, o in kept_facts
+        )
         assert len(hits) == 1
         assert hits[0][0].chunk_id == chunk.chunk_id
         assert "8080" in hits[0][2]

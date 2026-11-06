@@ -6,28 +6,45 @@ from typing import Any
 
 import dspy
 
+from yaw.core import clean_schema_definition, text_processing
+
 # ---------------------------------------------------------------------------
 # Pure-JSON Context-Free Grammars (GBNF) for dspy.JSONAdapter on llama.cpp
 # ---------------------------------------------------------------------------
 
-DSPY_NER_GBNF_GRAMMAR = r"""root ::= "{\"named_entities\": " entity-list "}"
-entity-list ::= "[]" | "[" entity-pair (", " entity-pair)* "]"
-entity-pair ::= "[" string ", " string "]"
+# A resource label needs lexical content (yaw.core.is_resource_label): punctuation, numbers, dates and
+# other data values are literals, which only the triple stage may introduce as objects.
+_NER_PAIR_GBNF_RULES = r"""entity-pair ::= "[" label ", " string "]"
+label ::= "\"" non-letter* letter char* "\""
+letter ::= [a-zA-Z\x80-\U0010FFFF]
+non-letter ::= [\x20\x21\x23-\x40\x5B\x5D-\x60\x7B-\x7E]
 string ::= "\"" char+ "\""
 char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
 """
 
-DSPY_TRIPLES_GBNF_GRAMMAR = r"""root ::= "{\"triples\": " triple-list "}"
-triple-list ::= "[]" | "[" triple (", " triple)* "]"
-triple ::= "{\"sub\": " entity-slot ", \"pred\": " pred-slot ", \"obj\": " obj-slot ", \"def\": " string "}"
-pred-slot ::= string | "[" string ", " ("\"owl:ObjectProperty\"" | "\"owl:DatatypeProperty\"") "]"
-entity-slot ::= string
-obj-slot ::= entity-slot | literal-slot
+DSPY_NER_GBNF_GRAMMAR = (
+    'root ::= "{\\"named_entities\\": " entity-list "}"\n'
+    'entity-list ::= "[]" | "[" entity-pair (", " entity-pair)* "]"\n' + _NER_PAIR_GBNF_RULES
+)
+
+_STATEMENT_GBNF_RULES = r"""literal-statement ::= literal-pred ", \"obj\": " literal-slot
+resource-pred ::= string | "[" string ", \"owl:ObjectProperty\"]"
+literal-pred ::= string | "[" string ", \"owl:DatatypeProperty\"]"
 literal-slot ::= "{\"value\": " string ", \"datatype\": " string ", \"lang\": " language "}"
 language ::= "\"" char* "\""
 string ::= "\"" char+ "\""
 char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
 """
+
+_OPEN_TRIPLE_GBNF_RULES = (
+    'triple ::= "{\\"sub\\": " string ", \\"pred\\": " pred-obj ", \\"def\\": " string "}"\n'
+    'pred-obj ::= resource-pred ", \\"obj\\": " string | literal-statement\n' + _STATEMENT_GBNF_RULES
+)
+
+DSPY_TRIPLES_GBNF_GRAMMAR = (
+    'root ::= "{\\"triples\\": " triple-list "}"\n'
+    'triple-list ::= "[]" | "[" triple (", " triple)* "]"\n' + _OPEN_TRIPLE_GBNF_RULES
+)
 
 DSPY_MISSING_ENTITY_DEFS_GBNF_GRAMMAR = r"""root ::= "{\"entity_definitions\": " entity-list "}"
 entity-list ::= "[]" | "[" entity-pair (", " entity-pair)* "]"
@@ -88,13 +105,7 @@ def build_dspy_ner_grammar(max_entities: int | None = None) -> str:
     seq = "entity-pair"
     for _ in range(max_entities - 1):
         seq = f'entity-pair (", " {seq})?'
-    return (
-        'root ::= "{\\"named_entities\\": [" entity-list "]}"\n'
-        f"entity-list ::= ({seq})?\n"
-        'entity-pair ::= "[" string ", " string "]"\n'
-        'string ::= "\\"" char+ "\\""\n'
-        'char ::= [^"\\\\\\x7F\\x00-\\x1F] | "\\\\" (["\\\\bfnrt] | "u" [0-9a-fA-F]{4})\n'
-    )
+    return f'root ::= "{{\\"named_entities\\": [" entity-list "]}}"\nentity-list ::= ({seq})?\n' + _NER_PAIR_GBNF_RULES
 
 
 def build_dspy_triples_grammar(
@@ -129,33 +140,37 @@ def build_dspy_triples_grammar(
         root_line = 'root ::= "{\\"triples\\": [" triple-list "]}"\n'
         list_line = f"triple-list ::= ({seq})?\n"
 
-    triple_line = (
-        'triple ::= "{\\"sub\\": " entity-slot ", \\"pred\\": " pred-slot '
-        '", \\"obj\\": " obj-slot ", \\"def\\": " string "}"\n'
-        'pred-slot ::= string | "[" string ", " ("\\"owl:ObjectProperty\\"" | "\\"owl:DatatypeProperty\\"") "]"\n'
-    )
-    if deduped_known:
-        endpoints: list[Any] = list(deduped_known)
-        pairs = [list(item[:2]) for item in known_entities or () if isinstance(item, (list, tuple)) and len(item) >= 2]
-        ambiguous = {name for name in deduped_known if len({pair[1] for pair in pairs if pair[0] == name}) > 1}
-        endpoints = [name for name in endpoints if name not in ambiguous]
-        endpoints.extend(pair for pair in pairs if pair[0] in ambiguous)
-        known_rule = " | ".join(gbnf_escape_literal(json.dumps(e, ensure_ascii=False)) for e in endpoints)
-        slot_lines = f"entity-slot ::= known-entity\nknown-entity ::= {known_rule}\n"
-    else:
-        slot_lines = "entity-slot ::= string\n"
+    if not deduped_known:
+        return root_line + list_line + _OPEN_TRIPLE_GBNF_RULES
 
-    return (
-        root_line
-        + list_line
-        + triple_line
-        + slot_lines
-        + "obj-slot ::= entity-slot | literal-slot\n"
-        + 'literal-slot ::= "{\\"value\\": " string ", \\"datatype\\": " string ", \\"lang\\": " language "}"\n'
-        + 'language ::= "\\"" char* "\\""\n'
-        + 'string ::= "\\"" char+ "\\""\n'
-        + 'char ::= [^"\\\\\\x7F\\x00-\\x1F] | "\\\\" (["\\\\bfnrt] | "u" [0-9a-fA-F]{4})\n'
-    )
+    pairs = [list(item[:2]) for item in known_entities or () if isinstance(item, (list, tuple)) and len(item) >= 2]
+    ambiguous = {name for name in deduped_known if len({pair[1] for pair in pairs if pair[0] == name}) > 1}
+    endpoints: list[Any] = [name for name in deduped_known if name not in ambiguous]
+    endpoints.extend(pair for pair in pairs if pair[0] in ambiguous and pair not in endpoints)
+    definition_of = {pair[0]: pair[1] for pair in pairs if pair[0] not in ambiguous}
+
+    def sense(endpoint: Any) -> tuple[str, str]:
+        label, definition = (endpoint, definition_of.get(endpoint, "")) if isinstance(endpoint, str) else endpoint
+        return text_processing(label), clean_schema_definition(definition).strip().casefold()
+
+    # A statement never relates a resource sense to itself (native graph spec §5.3).
+    senses = [sense(endpoint) for endpoint in endpoints]
+    lines = [
+        root_line,
+        list_line,
+        'triple ::= "{\\"sub\\": " statement ", \\"def\\": " string "}"\n',
+        "statement ::= " + " | ".join(f"subject-{i}" for i in range(len(endpoints))) + "\n",
+    ]
+    for i, endpoint in enumerate(endpoints):
+        lines.append(f"endpoint-{i} ::= {gbnf_escape_literal(json.dumps(endpoint, ensure_ascii=False))}\n")
+        others = [f"endpoint-{j}" for j in range(len(endpoints)) if senses[j] != senses[i]]
+        if others:
+            lines.append(f"objects-{i} ::= {' | '.join(others)}\n")
+            branch = f'(resource-pred ", \\"obj\\": " objects-{i} | literal-statement)'
+        else:
+            branch = "literal-statement"
+        lines.append(f'subject-{i} ::= endpoint-{i} ", \\"pred\\": " {branch}\n')
+    return "".join(lines) + _STATEMENT_GBNF_RULES
 
 
 def build_dspy_missing_entity_defs_grammar(

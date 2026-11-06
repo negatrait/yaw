@@ -400,6 +400,11 @@ def extract_structured_triples(
                 subj_def=resolve_definition(st.subj, st.subj_def),
                 obj_def=resolve_definition(st.obj, st.obj_def) if st.obj_kind == "entity" else "",
             )
+            if st.obj_kind == "entity" and (text_processing(st.subj), st.subj_def.strip().casefold()) == (
+                text_processing(st.obj),
+                st.obj_def.strip().casefold(),
+            ):
+                raise ValueError("Statement relates a resource sense to itself")
         key = (
             st.subj,
             st.subj_def.strip().lower(),

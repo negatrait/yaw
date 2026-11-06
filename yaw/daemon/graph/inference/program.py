@@ -9,7 +9,7 @@ from typing import Any, Literal
 import dspy
 
 from yaw.core.config import DEFAULT_CONTEXT_WINDOW_TOKENS, YawConfig, context_char_limit, scale_context_budget
-from yaw.core.types import OpenIERecord, StructuredTriple, SynonymEvidenceBatch
+from yaw.core.types import OpenIERecord, StructuredTriple, SynonymEvidenceBatch, is_resource_label
 
 from .adapter import YawGBNFAdapter, sum_usage_tokens
 from .chat import create_dspy_lm
@@ -744,6 +744,9 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
         )
         raw_entities = getattr(pred, "named_entities", [])
         parsed_defs = extract_entity_definitions(raw_entities)
+        literals = [name for name, _ in parsed_defs if not is_resource_label(name)]
+        if literals:
+            raise ValueError(f"NER resource label lacks lexical content (literals are not resources): {literals!r}")
         entities = tuple(ename for ename, _ in parsed_defs)
         return entities, tuple(parsed_defs)
 

@@ -655,34 +655,37 @@ def test_merge_entities_and_semantic_edge_dominance(tmp_path: Path) -> None:
             ],
         )
 
-        # Merge src_id='ent-nyc-alias' into dst_id='ent-nyc-canon'
-        merge_entities(conn, "ent-nyc-alias", "ent-nyc-canon")
-
-        # Alias entity row is gone, its prefLabel "NYC" is now a skos:altLabel on ent-nyc-canon
-        assert conn.execute("SELECT COUNT(*) FROM entities WHERE entity_id = 'ent-nyc-alias';").fetchone()[0] == 0
+        upsert_entity_labels(
+            conn,
+            [
+                ("nyc", "ent-nyc-alias", "skos:prefLabel", "NYC", "c1"),
+                ("new york city", "ent-nyc-canon", "skos:prefLabel", "New York City", "c1"),
+            ],
+        )
+        merged = merge_entities(conn, "ent-nyc-alias", "ent-nyc-canon")
+        canonical = merged.canonical_id
+        assert canonical == "ent-nyc-alias"
+        assert conn.execute("SELECT COUNT(*) FROM entities WHERE entity_id=?", (merged.removed_id,)).fetchone()[0] == 0
         alt_rows = conn.execute(
-            "SELECT raw_label FROM entity_labels WHERE entity_id = 'ent-nyc-canon' AND label_kind = 'skos:altLabel';"
+            "SELECT raw_label FROM entity_labels WHERE entity_id=? AND label_kind='skos:altLabel'", (canonical,)
         ).fetchall()
         assert "NYC" in {r["raw_label"] for r in alt_rows}
 
-        # Fact and edges are redirected to ent-nyc-canon
-        fact_row = conn.execute("SELECT subj_id, obj_id FROM facts WHERE fact_id = 'fact-alias-usa';").fetchone()
-        assert fact_row["subj_id"] == "ent-nyc-canon"
+        fact_row = conn.execute("SELECT subj_id,obj_id FROM facts").fetchone()
+        assert fact_row["subj_id"] == canonical
         assert fact_row["obj_id"] == "ent-usa"
 
         # Now test semantic edges and owl:differentFrom dominance
-        upsert_semantic_edges(conn, [("ent-nyc-canon", "ent-usa", "skos:related", 0.85)])
+        upsert_semantic_edges(conn, [(canonical, "ent-usa", "skos:related", 0.85)])
         _, entity_ids, topo_edges, _ = load_graph_topology(conn)
-        assert ("ent-nyc-canon" in entity_ids) and ("ent-usa" in entity_ids)
-        assert any(s == "ent-nyc-canon" and d == "ent-usa" for s, d, _, _ in topo_edges)
+        assert (canonical in entity_ids) and ("ent-usa" in entity_ids)
+        assert any(s == canonical and d == "ent-usa" for s, d, _, _ in topo_edges)
 
         # Asserting owl:differentFrom dominates and deletes skos:related
-        upsert_semantic_edges(conn, [("ent-nyc-canon", "ent-usa", "owl:differentFrom", 0.90)])
+        upsert_semantic_edges(conn, [(canonical, "ent-usa", "owl:differentFrom", 0.90)])
         edge_kinds = {
             r["kind"]
-            for r in conn.execute(
-                "SELECT kind FROM edges WHERE src_id = 'ent-nyc-canon' AND dst_id = 'ent-usa';"
-            ).fetchall()
+            for r in conn.execute("SELECT kind FROM edges WHERE src_id=? AND dst_id='ent-usa'", (canonical,)).fetchall()
         }
         assert "skos:related" not in edge_kinds
         assert "owl:differentFrom" in edge_kinds
@@ -692,7 +695,7 @@ def test_merge_entities_and_semantic_edge_dominance(tmp_path: Path) -> None:
         conn.execute("DELETE FROM edges WHERE kind = 'fact';")
         conn.commit()
         _, _, topo_edges_after, _ = load_graph_topology(conn)
-        assert not any({s, d} == {"ent-nyc-canon", "ent-usa"} for s, d, _, _ in topo_edges_after)
+        assert not any({s, d} == {canonical, "ent-usa"} for s, d, _, _ in topo_edges_after)
     finally:
         conn.close()
 

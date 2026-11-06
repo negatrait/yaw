@@ -710,5 +710,5 @@ def test_w3c_guardrail_3_case_insensitive_consolidation(tmp_path: Path) -> None:
         assert len(auto_merges) == 1
         assert rlm_stats["merged_entities"] == 1
         # Prefers properly capitalized "Canary"
-        dst_id = auto_merges[0][1]
+        dst_id = auto_merges[0].canonical_id
         assert cand_meta[dst_id][0] == "Canary"

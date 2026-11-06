@@ -26,6 +26,7 @@ from yaw.core import (
 )
 
 from .db import batched, write_tx
+from .evidence import EntityMerge, fact_id
 from .hydration import normalize_json_passage_text, read_corpus_lines
 from .vectors import get_entity_vectors
 
@@ -973,164 +974,99 @@ def merge_entities(
     label_kind: str = "skos:altLabel",
     corpus_root: Path | str | None = None,
     merged_definition: str | None = None,
-) -> None:
-    "Atomically collapse src_id into dst_id, demoting src_id's prefLabel to label_kind and re-pointing all edges/facts."
-    if src_id == dst_id:
-        return
+) -> EntityMerge:
+    """Collapse equivalent resources to their smallest stable ID, preserving the preferred label."""
     if label_kind not in ("skos:altLabel", "skos:hiddenLabel"):
-        raise ValueError(f"merge_entities label_kind must be skos:altLabel or skos:hiddenLabel, got {label_kind!r}")
+        raise ValueError(f"Invalid merge label kind: {label_kind!r}")
+    if src_id == dst_id:
+        return EntityMerge(src_id, dst_id)
 
     with write_tx(conn):
-        src_row = conn.execute("SELECT name, definition FROM entities WHERE entity_id = ?", (src_id,)).fetchone()
-        dst_row = conn.execute("SELECT name, definition FROM entities WHERE entity_id = ?", (dst_id,)).fetchone()
-        if src_row is None or dst_row is None:
-            return
-
-        src_name, src_def = str(src_row[0]), str(src_row[1])
-        dst_name, dst_def = str(dst_row[0]), str(dst_row[1])
+        requested_src, requested_dst = src_id, dst_id
+        metadata = dict(
+            (row[0], (row[1], row[2]))
+            for row in conn.execute(
+                "SELECT entity_id,name,definition FROM entities WHERE entity_id IN (?,?)", (src_id, dst_id)
+            )
+        )
+        if set(metadata) != {src_id, dst_id}:
+            raise ValueError("Entity merge requires both resources to exist")
+        src_name, src_def = metadata[requested_src]
+        dst_name, dst_def = metadata[requested_dst]
+        dst_pref_norm = str(text_processing(dst_name))
         dst_raw_norm = dst_name.strip().lower()
-        dst_pref_norm = str(text_processing(dst_name)) or dst_raw_norm
-        clean_merged_def = merged_definition.strip() if merged_definition else ""
+        definition = max((src_def, dst_def, (merged_definition or "").strip()), key=lambda value: (len(value), value))
+        dst_id, src_id = sorted((src_id, dst_id))
+        conn.execute("UPDATE entities SET name=?,definition=? WHERE entity_id=?", (dst_name, definition, dst_id))
+        conn.execute(
+            "UPDATE entities SET confidence=(SELECT MAX(confidence) FROM entities WHERE entity_id IN (?,?)) "
+            "WHERE entity_id=?",
+            (src_id, dst_id, dst_id),
+        )
 
-        if clean_merged_def:
-            conn.execute(
-                "UPDATE entities SET definition = ? WHERE entity_id = ?",
-                (clean_merged_def, dst_id),
-            )
-        elif not dst_def.strip() and src_def.strip():
-            conn.execute(
-                "UPDATE entities SET definition = ? WHERE entity_id = ?",
-                (src_def, dst_id),
-            )
-
-        # 1. Re-point and demote src_id labels onto dst_id while maintaining SKOS S13
-        src_labels = conn.execute(
-            "SELECT label_norm, label_kind, raw_label, chunk_id FROM entity_labels WHERE entity_id = ?",
-            (src_id,),
+        labels = conn.execute(
+            "SELECT entity_id,label_norm,label_kind,raw_label,chunk_id FROM entity_labels "
+            "WHERE entity_id IN (?,?) ORDER BY entity_id,label_norm,chunk_id",
+            (src_id, dst_id),
         ).fetchall()
-        conn.execute("DELETE FROM entity_labels WHERE entity_id = ?", (src_id,))
-        labels_to_upsert: list[tuple[str, str, str, str, str]] = []
-        if src_labels:
-            for l_norm, l_kind, raw_lbl, cid in src_labels:
-                norm_str = str(l_norm)
-                new_kind = (
+        src_labels = [row[1:] for row in labels if row[0] == requested_src]
+        conn.execute("DELETE FROM entity_labels WHERE entity_id IN (?,?)", (src_id, dst_id))
+        upsert_entity_labels(
+            conn,
+            [
+                (
+                    norm,
+                    dst_id,
                     "skos:prefLabel"
-                    if norm_str in (dst_pref_norm, dst_raw_norm)
-                    else (label_kind if str(l_kind) == "skos:prefLabel" else str(l_kind))
+                    if norm in (dst_pref_norm, dst_raw_norm)
+                    else label_kind
+                    if owner == requested_src and kind == "skos:prefLabel"
+                    else kind,
+                    raw,
+                    chunk,
                 )
-                labels_to_upsert.append((norm_str, dst_id, new_kind, str(raw_lbl), str(cid)))
-        else:
-            norm_str = str(text_processing(src_name)) or src_name.strip().lower()
-            new_kind = "skos:prefLabel" if norm_str in (dst_pref_norm, dst_raw_norm) else label_kind
-            labels_to_upsert.append((norm_str, dst_id, new_kind, src_name, "__merged__"))
-        upsert_entity_labels(conn, labels_to_upsert)
+                for owner, norm, kind, raw, chunk in labels
+            ],
+        )
 
-        # 2. Re-point facts (subj_id and obj_id), prune self-loop entity facts, and deduplicate colliding facts
-        conn.execute(
-            """
-            UPDATE facts
-            SET subj_id = ?,
-                obj_id = CASE WHEN obj_kind = 'literal' AND obj_id = ? THEN NULL ELSE obj_id END
-            WHERE subj_id = ?
-            """,
-            (dst_id, dst_id, src_id),
-        )
-        conn.execute(
-            """
-            UPDATE facts
-            SET obj_id = CASE WHEN obj_kind = 'literal' AND subj_id = ? THEN NULL ELSE ? END
-            WHERE obj_id = ?
-            """,
-            (dst_id, dst_id, src_id),
-        )
-        self_loop_fids = [
-            str(r[0])
-            for r in conn.execute(
-                "SELECT fact_id FROM facts WHERE obj_kind = 'entity' AND subj_id = ? AND obj_id = ?",
-                (dst_id, dst_id),
-            ).fetchall()
+        affected_facts = [
+            row[0]
+            for row in conn.execute(
+                "SELECT fact_id FROM facts WHERE subj_id IN (?,?) OR obj_id IN (?,?)",
+                (src_id, dst_id, src_id, dst_id),
+            )
         ]
-        for fid in self_loop_fids:
-            conn.execute("DELETE FROM fact_sources WHERE fact_id = ?", (fid,))
-            conn.execute("DELETE FROM fact_vec WHERE fact_id = ?", (fid,))
-            conn.execute("DELETE FROM fact_fts WHERE fact_id = ?", (fid,))
-            conn.execute("DELETE FROM facts WHERE fact_id = ?", (fid,))
-
-        dup_fact_groups = conn.execute(
-            """
-            SELECT
-                MIN(fact_id) AS keep_fid,
-                subj_id,
-                pred,
-                obj_kind,
-                COALESCE(obj_id, '') AS oid,
-                COALESCE(obj_literal_lex, '') AS olex,
-                obj_datatype,
-                obj_lang
-            FROM facts
-            WHERE subj_id = ? OR obj_id = ?
-            GROUP BY
-                subj_id, pred, obj_kind,
-                COALESCE(obj_id, ''), COALESCE(obj_literal_lex, ''),
-                obj_datatype, obj_lang
-            HAVING COUNT(*) > 1
-            """,
-            (dst_id, dst_id),
-        ).fetchall()
-        for row in dup_fact_groups:
-            keep_fid = str(row[0])
-            dup_fids = [
-                str(r[0])
-                for r in conn.execute(
-                    """
-                    SELECT fact_id FROM facts
-                    WHERE fact_id != ?
-                      AND subj_id = ?
-                      AND pred = ?
-                      AND obj_kind = ?
-                      AND COALESCE(obj_id, '') = ?
-                      AND COALESCE(obj_literal_lex, '') = ?
-                      AND obj_datatype = ?
-                      AND obj_lang = ?
-                    """,
-                    (
-                        keep_fid,
-                        str(row[1]),
-                        str(row[2]),
-                        str(row[3]),
-                        str(row[4]),
-                        str(row[5]),
-                        str(row[6]),
-                        str(row[7]),
-                    ),
-                ).fetchall()
-            ]
-            for dfid in dup_fids:
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO fact_sources (fact_id, chunk_id)
-                    SELECT ?, chunk_id FROM fact_sources WHERE fact_id = ?
-                    """,
-                    (keep_fid, dfid),
-                )
-                conn.execute("DELETE FROM fact_sources WHERE fact_id = ?", (dfid,))
-                conn.execute("DELETE FROM fact_vec WHERE fact_id = ?", (dfid,))
-                conn.execute("DELETE FROM fact_fts WHERE fact_id = ?", (dfid,))
-                conn.execute("DELETE FROM facts WHERE fact_id = ?", (dfid,))
+        conn.execute(
+            "UPDATE facts SET subj_id=CASE WHEN subj_id=:src THEN :dst ELSE subj_id END, "
+            "obj_id=CASE WHEN obj_kind='literal' AND "
+            "(CASE WHEN obj_id=:src THEN :dst ELSE obj_id END)="
+            "(CASE WHEN subj_id=:src THEN :dst ELSE subj_id END) THEN NULL "
+            "WHEN obj_id=:src THEN :dst ELSE obj_id END WHERE subj_id=:src OR obj_id=:src",
+            {"src": src_id, "dst": dst_id},
+        )
+        fact_bindings = rekey_facts(conn, affected_facts)
 
         # 3. Re-point edge_sources
         conn.execute(
             """
-            INSERT OR IGNORE INTO edge_sources (src_id, dst_id, kind, chunk_id, atomic_confidence)
+            INSERT INTO edge_sources (src_id, dst_id, kind, chunk_id, llm_prob, vec_coherence, atomic_confidence)
             SELECT
                 CASE WHEN src_id = ? THEN ? ELSE src_id END,
                 CASE WHEN dst_id = ? THEN ? ELSE dst_id END,
                 kind,
                 chunk_id,
+                llm_prob,
+                vec_coherence,
                 atomic_confidence
             FROM edge_sources
             WHERE (src_id = ? OR dst_id = ?)
               AND (CASE WHEN src_id = ? THEN ? ELSE src_id END) != (CASE WHEN dst_id = ? THEN ? ELSE dst_id END)
+            ON CONFLICT(src_id,dst_id,kind,chunk_id) DO UPDATE SET
+                llm_prob=COALESCE(MAX(edge_sources.llm_prob,excluded.llm_prob),edge_sources.llm_prob,excluded.llm_prob),
+                vec_coherence=COALESCE(MAX(edge_sources.vec_coherence,excluded.vec_coherence),
+                                       edge_sources.vec_coherence,excluded.vec_coherence),
+                atomic_confidence=COALESCE(MAX(edge_sources.atomic_confidence,excluded.atomic_confidence),
+                                           edge_sources.atomic_confidence,excluded.atomic_confidence)
             """,
             (src_id, dst_id, src_id, dst_id, src_id, src_id, src_id, dst_id, src_id, dst_id),
         )
@@ -1141,14 +1077,14 @@ def merge_entities(
 
         # 4. Re-point edges (excluding self-loops)
         incident_edges = conn.execute(
-            "SELECT src_id, dst_id, kind, weight FROM edges WHERE src_id = ? OR dst_id = ?",
+            "SELECT src_id, dst_id, kind, weight, reasoning FROM edges WHERE src_id = ? OR dst_id = ?",
             (src_id, src_id),
         ).fetchall()
         conn.execute(
             "DELETE FROM edges WHERE src_id = ? OR dst_id = ?",
             (src_id, src_id),
         )
-        for e_src, e_dst, e_kind, e_weight in incident_edges:
+        for e_src, e_dst, e_kind, e_weight, reasoning in incident_edges:
             new_src = dst_id if str(e_src) == src_id else str(e_src)
             new_dst = dst_id if str(e_dst) == src_id else str(e_dst)
             kind_str = str(e_kind)
@@ -1158,22 +1094,24 @@ def merge_entities(
             if kind_str == "passage":
                 conn.execute(
                     """
-                    INSERT INTO edges (src_id, dst_id, kind, weight)
-                    VALUES (?, ?, 'passage', ?)
+                    INSERT INTO edges (src_id, dst_id, kind, weight, reasoning)
+                    VALUES (?, ?, 'passage', ?, ?)
                     ON CONFLICT(src_id, dst_id, kind) DO UPDATE SET
-                        weight = MAX(edges.weight, excluded.weight)
+                        weight = MAX(edges.weight, excluded.weight),
+                        reasoning = MAX(edges.reasoning, excluded.reasoning)
                     """,
-                    (new_src, new_dst, weight_val),
+                    (new_src, new_dst, weight_val, reasoning),
                 )
             elif kind_str == "fact":
                 conn.execute(
                     """
-                    INSERT INTO edges (src_id, dst_id, kind, weight)
-                    VALUES (?, ?, 'fact', ?)
+                    INSERT INTO edges (src_id, dst_id, kind, weight, reasoning)
+                    VALUES (?, ?, 'fact', ?, ?)
                     ON CONFLICT(src_id, dst_id, kind) DO UPDATE SET
-                        weight = excluded.weight
+                        weight = MAX(edges.weight, excluded.weight),
+                        reasoning = MAX(edges.reasoning, excluded.reasoning)
                     """,
-                    (new_src, new_dst, weight_val),
+                    (new_src, new_dst, weight_val, reasoning),
                 )
                 conn.execute(
                     """
@@ -1193,7 +1131,7 @@ def merge_entities(
                     (new_src, new_dst),
                 )
             elif kind_str in ("skos:related", "skos:broader", "owl:differentFrom"):
-                upsert_semantic_edges(conn, [(new_src, new_dst, kind_str, weight_val)])
+                upsert_semantic_edges(conn, [(new_src, new_dst, kind_str, weight_val, reasoning)])
 
         # 5. Remove src_id from entity_vec and entities
         conn.execute("DELETE FROM entity_vec WHERE entity_id = ?", (src_id,))
@@ -1212,12 +1150,59 @@ def merge_entities(
                 entity_ids=[dst_id],
                 hidden_label_norms_by_entity=hidden_map,
             )
-            if clean_merged_def:
-                conn.execute("UPDATE entities SET definition = ? WHERE entity_id = ?", (clean_merged_def, dst_id))
-            elif src_def.strip():
-                curr_dst_name = conn.execute("SELECT name FROM entities WHERE entity_id = ?", (dst_id,)).fetchone()
-                if curr_dst_name is not None and str(curr_dst_name[0]) == src_name:
-                    conn.execute("UPDATE entities SET definition = ? WHERE entity_id = ?", (src_def, dst_id))
+        return EntityMerge(src_id, dst_id, label_kind, merged_definition, fact_bindings)
+
+
+def rekey_facts(conn: sqlite3.Connection, ids: list[str]) -> tuple[tuple[str, str | None], ...]:
+    """Derive fact identities from canonical endpoints and return evidence redirects."""
+    redirects = []
+    for old_id in sorted(set(ids)):
+        row = conn.execute(
+            "SELECT subj_id,pred,obj_kind,obj_id,obj_literal_lex,obj_datatype,obj_lang,"
+            "raw_triple_json,definition,confidence "
+            "FROM facts WHERE fact_id=?",
+            (old_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Cannot canonicalize missing fact {old_id!r}")
+        subject, predicate, kind, obj, lexical, datatype, language, raw_json, definition, confidence = row
+        new_id = (
+            None
+            if kind == "entity" and subject == obj
+            else fact_id(subject, predicate, kind, obj if kind == "entity" else lexical, datatype, language)
+        )
+        if new_id == old_id:
+            continue
+        redirects.append((old_id, new_id))
+        if new_id is not None:
+            existing = conn.execute("SELECT definition FROM facts WHERE fact_id=?", (new_id,)).fetchone()
+            if existing is not None:
+                definition = max((definition, existing[0]), key=lambda value: (len(value), value))
+            upsert_facts(
+                conn, [(new_id, subject, predicate, obj, raw_json, definition, kind, lexical, datatype, language)]
+            )
+            conn.execute(
+                "UPDATE facts SET confidence=COALESCE(MAX(confidence,?),confidence,?) WHERE fact_id=?",
+                (confidence, confidence, new_id),
+            )
+            conn.execute(
+                "INSERT INTO fact_sources SELECT ?,chunk_id,llm_prob,vec_coherence,atomic_confidence "
+                "FROM fact_sources WHERE fact_id=? ON CONFLICT(fact_id,chunk_id) DO UPDATE SET "
+                + ",".join(
+                    f"{column}=COALESCE(MAX(fact_sources.{column},excluded.{column}),"
+                    f"fact_sources.{column},excluded.{column})"
+                    for column in ("llm_prob", "vec_coherence", "atomic_confidence")
+                ),
+                (new_id, old_id),
+            )
+            conn.execute(
+                "INSERT INTO fact_vec SELECT ?,embedding FROM fact_vec WHERE fact_id=? "
+                "ON CONFLICT(fact_id) DO UPDATE SET embedding=MIN(fact_vec.embedding,excluded.embedding)",
+                (new_id, old_id),
+            )
+        for table in ("fact_sources", "fact_vec", "fact_fts", "facts"):
+            conn.execute(f"DELETE FROM {table} WHERE fact_id=?", (old_id,))
+    return tuple(redirects)
 
 
 def upsert_fact_sources(

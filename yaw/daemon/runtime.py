@@ -24,6 +24,7 @@ import filelock
 
 from yaw.core import (
     DaemonStatus,
+    FatalGraphPublicationError,
     HydratedPassage,
     IndexStats,
     YawConfig,
@@ -53,7 +54,9 @@ from yaw.daemon.graph.inference.components import (
     OpenIEEndpoint,
 )
 from yaw.daemon.graph.planner import GraphPlanSettings
-from yaw.daemon.graph.storage.publication import GRAPH_DB
+from yaw.daemon.graph.storage.db import GRAPH_DB
+from yaw.daemon.graph.storage.managed_sqlite import VALIDATE_SQLITE
+from yaw.daemon.graph.storage.rows import validate_graph_state
 from yaw.daemon.indexing import (
     RELOAD_SIGNAL_HANDLER,
     RELOAD_SIGNAL_ROOT,
@@ -294,6 +297,7 @@ class YawRuntime:
         context = coco.ContextProvider()
         context.provide(SOURCE_DB, self.engine.managed_conn)
         context.provide(GRAPH_DB, self.engine.managed_conn)
+        context.provide(VALIDATE_SQLITE, validate_graph_state)
         context.provide(SOURCE_ROOT, Path(self.config.corpus_root).resolve())
         context.provide(EMBEDDING_ENDPOINT, self._embedding_endpoint)
         context.provide(OPENIE_ENDPOINT, self._openie_endpoint)
@@ -1089,22 +1093,25 @@ class YawRuntime:
             eff_sleep = (
                 sleep_seconds if sleep_seconds is not None else getattr(self.config, "optimize_sleep_seconds", 0.0)
             )
-            self.engine.evolve_prompts(
-                trainset=trainset,
-                valset=valset,
-                mode=mode,
-                save_path=target_path,
-                reflection_lm=eff_ref_lm,
-                reflection_worker_lm=eff_worker_lm,
-                auto=resolved_auto,
-                num_candidates=num_candidates,
-                num_trials=num_trials,
-                progress_callback=_progress,
-                opt_chunks=opt_chunks,
-                sleep_seconds=eff_sleep,
-                max_bootstrapped_demos=max_bootstrapped_demos,
-                max_labeled_demos=max_labeled_demos,
-            )
+            try:
+                self.engine.evolve_prompts(
+                    trainset=trainset,
+                    valset=valset,
+                    mode=mode,
+                    save_path=target_path,
+                    reflection_lm=eff_ref_lm,
+                    reflection_worker_lm=eff_worker_lm,
+                    auto=resolved_auto,
+                    num_candidates=num_candidates,
+                    num_trials=num_trials,
+                    progress_callback=_progress,
+                    opt_chunks=opt_chunks,
+                    sleep_seconds=eff_sleep,
+                    max_bootstrapped_demos=max_bootstrapped_demos,
+                    max_labeled_demos=max_labeled_demos,
+                )
+            except FatalGraphPublicationError as f_err:
+                raise f_err.original from None
             final_stats = self.engine.get_stats(self.config.config_fingerprint())
             with self._state_lock:
                 self._stats = final_stats

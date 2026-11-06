@@ -7,6 +7,7 @@ from collections.abc import Generator, Iterator, Sequence
 from contextlib import contextmanager, suppress
 from pathlib import Path
 
+import cocoindex as coco
 import sqlite_vec
 from cocoindex.connectors.sqlite import ManagedConnection
 from cocoindex.connectors.sqlite import connect as coco_sqlite_connect
@@ -14,6 +15,7 @@ from cocoindex.connectors.sqlite import connect as coco_sqlite_connect
 from yaw.core import text_processing
 
 SQL_BATCH_SIZE = 500
+GRAPH_DB = coco.ContextKey[ManagedConnection]("yaw/graph_db")
 
 _CREATE_SCHEMA_STATEMENTS: tuple[str, ...] = (
     """
@@ -75,17 +77,6 @@ _CREATE_SCHEMA_STATEMENTS: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_entity_labels_norm ON entity_labels(label_norm)",
     "CREATE INDEX IF NOT EXISTS idx_entity_labels_entity ON entity_labels(entity_id)",
     "CREATE INDEX IF NOT EXISTS idx_entity_labels_chunk ON entity_labels(chunk_id)",
-    """
-    CREATE TABLE IF NOT EXISTS entity_chunks (
-        entity_id TEXT NOT NULL,
-        chunk_id TEXT NOT NULL,
-        llm_prob REAL,
-        vec_coherence REAL,
-        atomic_confidence REAL,
-        PRIMARY KEY (entity_id, chunk_id)
-    )
-    """,
-    "CREATE INDEX IF NOT EXISTS idx_entity_chunks_chunk ON entity_chunks(chunk_id)",
     """
     CREATE TABLE IF NOT EXISTS facts (
         fact_id TEXT PRIMARY KEY,

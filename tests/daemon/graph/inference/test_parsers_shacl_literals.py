@@ -302,12 +302,12 @@ def test_gbnf_and_prompts_typed_predicate_and_shacl_actions() -> None:
     assert "skos:hiddenLabel" in JudgeLabels.instructions
     assert "skos:broader" in JudgeHierarchy.instructions
     assert "skos:related" in JudgeRelated.instructions
-    assert "pred-slot ::=" in DSPY_TRIPLES_GBNF_GRAMMAR
+    assert "pred-obj ::=" in DSPY_TRIPLES_GBNF_GRAMMAR
     assert "owl:ObjectProperty" in DSPY_TRIPLES_GBNF_GRAMMAR
     assert "owl:DatatypeProperty" in DSPY_TRIPLES_GBNF_GRAMMAR
 
     dyn_g = build_dspy_triples_grammar(max_triples=2, known_entities=["The Program"])
-    assert "pred-slot ::=" in dyn_g
+    assert "subject-0 ::=" in dyn_g
     assert "owl:ObjectProperty" in dyn_g
     assert "owl:DatatypeProperty" in dyn_g
 
@@ -345,11 +345,13 @@ def test_extract_entity_definitions_preserves_pairs_for_normalization() -> None:
 
 
 def test_normalize_openie_record_filters_degenerate_self_loops_and_preserves_homographs() -> None:
-    """Verify normalize_openie_record drops degenerate reflexive triples while keeping distinct homograph senses."""
+    """Verify normalize_openie_record rejects same-sense reflexive triples while keeping distinct homograph senses."""
+    import pytest
+
     from yaw.core import OpenIERecord, StructuredTriple
     from yaw.daemon.graph.normalization import normalize_openie_record
 
-    rec = OpenIERecord(
+    rec_reflexive = OpenIERecord(
         chunk_id="chunk-reflexive",
         entities=("Hyperslate", "a ball"),
         entity_definitions=(
@@ -367,6 +369,20 @@ def test_normalize_openie_record_filters_degenerate_self_loops_and_preserves_hom
                 spo_def="Hyperslate is trialing Hyperslate.",
                 obj_kind="entity",
             ),
+        ),
+    )
+    with pytest.raises(ValueError, match="Statement relates a resource sense to itself"):
+        normalize_openie_record(rec_reflexive)
+
+    rec_valid = OpenIERecord(
+        chunk_id="chunk-homograph",
+        entities=("Hyperslate", "a ball"),
+        entity_definitions=(
+            ("Hyperslate", "Enterprise customer evaluating KV-cache tiering."),
+            ("a ball", "Formal royal dance party."),
+        ),
+        triples=(),
+        structured_triples=(
             StructuredTriple(
                 subj="Hyperslate",
                 subj_def="Enterprise customer evaluating KV-cache tiering.",
@@ -387,7 +403,7 @@ def test_normalize_openie_record_filters_degenerate_self_loops_and_preserves_hom
             ),
         ),
     )
-    norm = normalize_openie_record(rec)
+    norm = normalize_openie_record(rec_valid)
     assert len(norm.triples) == 2
     assert norm.triples[0].obj_kind == "literal"
     assert norm.triples[0].obj_datatype == "xsd:string"
@@ -398,4 +414,6 @@ def test_normalize_openie_record_filters_degenerate_self_loops_and_preserves_hom
     assert ("a ball", "Formal royal dance party.") in norm.entities
 
     dyn_g = build_dspy_triples_grammar(max_triples=2, known_entities=["Hyperslate"])
-    assert "obj-slot ::= entity-slot | literal-slot" in dyn_g
+    assert "subject-0" in dyn_g
+    assert "literal-statement" in dyn_g
+    assert "objects-0" not in dyn_g

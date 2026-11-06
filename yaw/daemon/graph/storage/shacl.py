@@ -11,6 +11,7 @@ from yaw.core import (
     SHACLViolation,
     compute_mdhash_id,
     detect_scalar_literal,
+    is_resource_label,
     text_processing,
 )
 
@@ -776,6 +777,20 @@ def _scan_shacl_violations(conn: sqlite3.Connection) -> list[SHACLViolation]:
                 )
             )
 
+    # 5b. StatementShape/irreflexive: a statement never relates a resource sense to itself
+    for (fid,) in conn.execute(
+        "SELECT fact_id FROM facts WHERE COALESCE(obj_kind, 'entity') = 'entity' AND subj_id = obj_id "
+        "ORDER BY fact_id ASC"
+    ):
+        violations.append(
+            SHACLViolation(
+                shape="StatementShape/irreflexive",
+                focus_node=str(fid),
+                result_path="rdf:subject|rdf:object",
+                message=f"Fact {fid} relates a resource sense to itself.",
+            )
+        )
+
     # 6. EdgeShape/closedWorld: Endpoints exist, no skos:related + owl:differentFrom collision, symmetric semantic edges
     for row in conn.execute(
         """
@@ -1000,6 +1015,18 @@ def _scan_shacl_violations(conn: sqlite3.Connection) -> list[SHACLViolation]:
                     focus_node=eid,
                     result_path="skos:prefLabel",
                     message=msg,
+                )
+            )
+
+    # 8b. ConceptShape/resourceLabel: NER resources need lexical content; literals never become resources
+    for eid, ename in conn.execute("SELECT entity_id, name FROM entities ORDER BY entity_id ASC"):
+        if not is_resource_label(str(ename)):
+            violations.append(
+                SHACLViolation(
+                    shape="ConceptShape/resourceLabel",
+                    focus_node=str(eid),
+                    result_path="skos:prefLabel",
+                    message=f"Entity {eid} label {ename!r} has no lexical content; literals are not resources.",
                 )
             )
 
@@ -1789,7 +1816,7 @@ def query_graph_provenance(conn: sqlite3.Connection) -> dict[str, Any]:
     src_stats = conn.execute(
         """
         SELECT
-            (SELECT COUNT(*) FROM entity_chunks),
+            (SELECT COUNT(*) FROM entity_labels),
             (SELECT COUNT(*) FROM fact_sources),
             (SELECT COUNT(*) FROM edge_sources)
         """
@@ -1817,7 +1844,7 @@ def query_graph_provenance(conn: sqlite3.Connection) -> dict[str, Any]:
             "max_weight": float(edge_stats[3]) if edge_stats[3] is not None else None,
         },
         "provenance_sources": {
-            "entity_chunks": int(src_stats[0]),
+            "entity_labels": int(src_stats[0]),
             "fact_sources": int(src_stats[1]),
             "edge_sources": int(src_stats[2]),
         },

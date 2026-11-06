@@ -753,7 +753,16 @@ class ArchitectureTests(unittest.TestCase):
                 top = mod.split(".")[0]
                 self.assertNotIn(top, forbidden_storage_net, f"{rel}:{lineno} imports forbidden module '{mod}'")
 
-        canonical_storage_files = ("db.py", "vectors.py", "graph_ops.py", "publication.py", "hydration.py", "shacl.py")
+        canonical_storage_files = (
+            "db.py",
+            "vectors.py",
+            "graph_ops.py",
+            "managed_sqlite.py",
+            "rows.py",
+            "evidence.py",
+            "hydration.py",
+            "shacl.py",
+        )
         for storage_name in canonical_storage_files:
             storage_file = storage_dir / storage_name
             for lineno, mod in parse_module_imports(storage_file):
@@ -778,15 +787,15 @@ class ArchitectureTests(unittest.TestCase):
             top = mod.split(".")[0]
             self.assertIn(top, stdlib | {"yaw"}, f"shacl.py:{lineno} imports unexpected package '{mod}'")
 
-        # 3d. publication.py: apply_prepared_graph_rows must never call .commit()
-        pub_path = storage_dir / "publication.py"
+        # 3d. The target sink must use the managed transaction, never commit independently.
+        pub_path = storage_dir / "managed_sqlite.py"
         pub_tree = ast.parse(pub_path.read_text(encoding="utf-8"), filename=str(pub_path))
         for node in ast.walk(pub_tree):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
                 self.assertNotEqual(
                     node.func.attr,
                     "commit",
-                    f"publication.py:{node.lineno} must not call .commit() directly",
+                    f"managed_sqlite.py:{node.lineno} must not call .commit() directly",
                 )
 
         # 4. adapter.py & retriever.py: thin DSPy bridges (zero sqlite3, cocoindex, or raw HTTP imports;

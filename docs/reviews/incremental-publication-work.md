@@ -51,6 +51,41 @@ their source text, clones all graph/vector tables for additions and proposes a
 complete graph to the atomic sink. Scheme removal did not solve these issues.
 This is a source-verified limitation, not a benchmark result.
 
+### U2 incremental step: deterministic merge identities
+
+Implemented one identity rule: a resource sense is keyed by normalized label and
+resolved definition; an accepted equivalence class uses its smallest member ID.
+The preferred display label remains independent of that representative. Merges
+return explicit entity/fact binding changes, which the planner applies to
+source-owned evidence without rewriting raw mention or assertion fields.
+Affected fact IDs are derived from canonical endpoints, the original predicate
+and the typed object, including literal datatype/language. Colliding facts retain
+their source supports, confidence fields and vector ownership. Collapsed
+self-links retain their raw assertions with a null canonical fact binding.
+The cosine/difflib admission rules are unchanged. Missing merge endpoints raise.
+
+The native publication function is now mounted as a CocoIndex component because
+it declares child table targets; calling it as a memoized helper violated that
+SDK contract. Final publication remains typed row declarations through the
+shared sink. Isolated whole-graph planning/staging remains U5 debt.
+
+Verification, 2026-11-05: 73 focused tests passed in 9.23 seconds, including
+storage, synonym/inference contracts, graph integration, shared-sink recovery and
+architecture checks. The new real SQLite fixture compares all six arrival orders
+of three equivalent senses, in both merge directions, including a smaller
+representative arriving later. It checks exact state, raw evidence preservation,
+typed/directed facts, source confidence, vector keys/bytes and FTS ownership.
+Evidence: `outputs/graph-spec-review/U2-step-focused.{log,xml}`.
+
+`uv sync --locked` and production `ty check yaw` pass. The complete `ty check`
+still reports three diagnostics in obsolete publisher tests. The full pytest
+run stops at four collection errors importing the removed publisher/API
+(`test_publication`, `test_scheme_removal`, `test_indexing_overlap`, and the paired
+harness importing its fixture). Next atomic unit: migrate those tests to final
+typed declarations and restore full-suite collection, then verify occurrence
+replacement/retraction and canonical rebinding across restart. U2 remains open;
+no acceptance/baseline claim or commit is made with these gates failing.
+
 ### U1 result and first repair
 
 The native paired harness passes for a 128-chunk document with interleaved topics,
@@ -101,8 +136,26 @@ links are verified through labels and fact/edge support, not asserted as a compl
 raw-occurrence binding representation. U2 must establish that representation and
 remove superseded state when safe.
 
-U4 preparation: inspection of the locked connector shows a row handler/sink per
-table, each opening `ManagedConnection.transaction()`. Sharing a connection alone
-does not demonstrate multi-table atomicity. Real connector probes are still
-required before selecting the public grouping/validation mechanism; do not assume
-independent `mount_table_target` calls implement a semantic revision transaction.
+### U4 connector boundary established during U2
+
+The locked connector probe observed a node at revision 2 and its checkpoint at
+revision 1 after a checkpoint write failure. This is documented CocoIndex behavior,
+not an SDK defect: separate sinks are not one transaction. CocoIndex reconciles
+possible previous states on the next update instead of undoing external writes.
+See the upstream [processing component contract](https://github.com/cocoindex-io/cocoindex/blob/v1.1.0/docs/src/content/docs/programming_guide/processing_component.mdx)
+and [custom connector contract](https://github.com/cocoindex-io/cocoindex/blob/v1.1.0/docs/src/content/docs/advanced_topics/custom_target_connector.mdx).
+
+Coherent graph rows, canonical bindings and their applied input checkpoint must
+therefore be declared by one producing component through one shared
+`TargetActionSink`. Its connector applies the reconciled actions in one SQLite
+transaction and validates the proposed state before commit. Typed row schemas
+remain `TableSchema.from_class`; application processing declares desired rows.
+Independent components and sinks retain native convergent roll-forward behavior.
+Do not add application retry loops or assume an entire `app.update()` is atomic.
+
+The focused real SQLite/CocoIndex test
+`tests/daemon/graph/storage/test_managed_sqlite.py` passes: rejected revision 2
+rolls back both tables, the next update publishes both at revision 2, and a no-op
+performs zero row writes. This establishes the shared-sink mechanism only. U2
+integration, graph-wide failure/restart coverage and bounded publication remain
+unfinished; neither U2 nor U4 is marked complete.

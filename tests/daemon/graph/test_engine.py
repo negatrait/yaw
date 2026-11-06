@@ -102,7 +102,9 @@ class DeterministicMockLM(dspy.LM):
                 {"prompt_tokens": 32, "completion_tokens": 16, "total_tokens": 48},
             )
         req_str = str(prompt or messages or kwargs)
-        if "ExtractQueryIntent" in req_str or "query_intent" in req_str:
+        if "ExtractQueryIntent" in req_str or (
+            "query_intent" in req_str and "named_entities" not in req_str and "triples" not in req_str
+        ):
             return [json.dumps({"query_intent": "Ada Lovelace" if "Lovelace" in req_str else "Alan Turing"})]
         pids = _extract_mock_pair_ids(prompt, messages, req_str)
         if "alt_label" in req_str or "JudgeLabels" in req_str:
@@ -160,7 +162,6 @@ class DeterministicMockLM(dspy.LM):
             "DefineMissingEntities" in req_str
             or "OrchestrateMissingEntityDefinitions" in req_str
             or "missing_entities" in req_str
-            or "entity_definitions" in req_str
         ):
             if "Lovelace" in req_str:
                 return [
@@ -173,11 +174,11 @@ class DeterministicMockLM(dspy.LM):
             ]
         # Filter triples stage
         if "FilterTriples" in req_str or "fact_before_filter" in req_str:
-            if "Lovelace" in req_str:
+            if "lovelace" in req_str.lower() and "turing" not in req_str.lower():
                 return ['{"fact": [["Ada Lovelace", "worked on", "Analytical Engine"]]}']
             return ['{"fact": [["Alan Turing", "father of", "computer science"]]}']
         # Triples stage
-        if "ExtractTriples" in req_str or '"triples"' in req_str or "`triples`" in req_str:
+        if "ExtractTriples" in req_str or "[[ ## named_entities ## ]]" in req_str:
             if "Lovelace" in req_str:
                 return [
                     '{"triples": [{"sub": "Ada Lovelace", "pred": "worked on", "obj": "Analytical Engine", '
@@ -188,14 +189,14 @@ class DeterministicMockLM(dspy.LM):
                 '"def": "Alan Turing is the father of computer science."}]}'
             ]
         # NER stage
-        if "ExtractEntities" in req_str or "named_entities" in req_str:
+        if "ExtractEntities" in req_str or ("named_entities" in req_str and "missing_entities" not in req_str):
             if "Lovelace" in req_str:
                 return [
                     '{"named_entities": [["Ada Lovelace", "English mathematician"], ["Analytical Engine", '
                     '"Mechanical general-purpose computer"]]}'
                 ]
             return [
-                '{"named_entities": [["Alan Turing", "English mathematician and computer scientist"], '
+                '{"named_entities": [["Alan Turing", "English mathematician and cryptanalyst"], '
                 '["computer science", "Study of computation and information"]]}'
             ]
         # QA stage
@@ -993,7 +994,6 @@ Option A (standalone Stage 1 NER entities preserved with definitions)."""
                                 "named_entities": [
                                     ["Apple", "Consumer electronics maker founded by Steve Jobs"],
                                     ["iPhone", "Flagship smartphone line designed by Apple"],
-                                    ["2007", "Year the original iPhone was unveiled"],
                                 ]
                             }
                         )
@@ -1044,14 +1044,10 @@ Option A (standalone Stage 1 NER entities preserved with definitions)."""
 
         # Hazard 3 Option A: Standalone Stage 1 NER entities ("m3 max") that did NOT appear in any triple
         # are preserved in entities with their Stage 1 definitions and linked via passage edges!
-        # Pure scalar literals like "2007" are strictly excluded from entities and edges.
         standalone_rows = {
             str(r[0]).lower(): str(r[1])
-            for r in engine.conn.execute(
-                "SELECT name, definition FROM entities WHERE name IN ('2007', 'm3 max')"
-            ).fetchall()
+            for r in engine.conn.execute("SELECT name, definition FROM entities WHERE name = 'm3 max'").fetchall()
         }
-        assert "2007" not in standalone_rows
         assert "m3 max" in standalone_rows
         assert "System on a chip powering MacBook Pro laptops" in standalone_rows["m3 max"]
 
@@ -1059,7 +1055,7 @@ Option A (standalone Stage 1 NER entities preserved with definitions)."""
             """
             SELECT COUNT(*) FROM edges ed
             INNER JOIN entities e ON ed.src_id = e.entity_id
-            WHERE ed.kind = 'passage' AND e.name IN ('2007', 'm3 max')
+            WHERE ed.kind = 'passage' AND e.name = 'm3 max'
             """
         ).fetchone()[0]
         assert passage_edges_for_standalone == 1

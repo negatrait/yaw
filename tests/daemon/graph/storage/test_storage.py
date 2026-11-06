@@ -438,7 +438,8 @@ def test_canonicalize_entity_labels_edc_typo_merged_into(tmp_path: Path) -> None
     """Verify 1-chunk typo ('Neccessary') merged into multi-chunk entity is demoted to skos:hiddenLabel."""
     with closing(open_yaw_db(tmp_path / "edc_into.db")) as conn:
         good_id, typo_id = _setup_necessary_typo_graph(conn, tmp_path)
-        merge_entities(conn, src_id=typo_id, dst_id=good_id, corpus_root=tmp_path)
+        merged = merge_entities(conn, src_id=typo_id, dst_id=good_id, corpus_root=tmp_path)
+        good_id = merged.canonical_id
 
         # 1. Surviving entity name is 'Necessary'
         row = conn.execute("SELECT name FROM entities WHERE entity_id = ?", (good_id,)).fetchone()

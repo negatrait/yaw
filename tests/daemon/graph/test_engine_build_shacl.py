@@ -224,8 +224,6 @@ def test_datatype_property_literal_objects_stored_with_weighted_edges_and_exclud
         chunk_id="chunk-1",
         entities=[
             ("YAW Service", "A high performance knowledge graph daemon"),
-            ("8080", "Default HTTP listen port for YAW Service"),
-            ("$1.2B", "Annual division revenue"),
         ],
         triples=[
             ("YAW Service", "listens on port", "8080"),
@@ -239,7 +237,7 @@ def test_datatype_property_literal_objects_stored_with_weighted_edges_and_exclud
                 obj_kind="literal",
                 obj_datatype="rdfs:Literal",
                 subj_def="A high performance knowledge graph daemon",
-                obj_def="Default HTTP listen port for YAW Service",
+                obj_def="",
             ),
             StructuredTriple(
                 subj="YAW Service",
@@ -248,7 +246,7 @@ def test_datatype_property_literal_objects_stored_with_weighted_edges_and_exclud
                 obj_kind="literal",
                 obj_datatype="rdfs:Literal",
                 subj_def="A high performance knowledge graph daemon",
-                obj_def="Annual division revenue",
+                obj_def="",
             ),
         ],
     )
@@ -304,7 +302,6 @@ def test_dual_role_literal_promoted_to_concept_and_weight_preserved_across_merge
         entities=[
             ("Gateway Alpha", "Primary API gateway"),
             ("Gateway Beta", "Secondary API gateway alias"),
-            ("8080", "Listen port"),
             ("canary", "Rollout mode string"),
         ],
         triples=[
@@ -320,7 +317,7 @@ def test_dual_role_literal_promoted_to_concept_and_weight_preserved_across_merge
                 obj_kind="literal",
                 obj_datatype="rdfs:Literal",
                 subj_def="Primary API gateway",
-                obj_def="Listen port",
+                obj_def="",
             ),
             StructuredTriple(
                 subj="Gateway Beta",
@@ -329,7 +326,7 @@ def test_dual_role_literal_promoted_to_concept_and_weight_preserved_across_merge
                 obj_kind="literal",
                 obj_datatype="rdfs:Literal",
                 subj_def="Secondary API gateway alias",
-                obj_def="Listen port",
+                obj_def="",
             ),
             StructuredTriple(
                 subj="Gateway Alpha",
@@ -347,7 +344,6 @@ def test_dual_role_literal_promoted_to_concept_and_weight_preserved_across_merge
         chunk_id="c2",
         entities=[
             ("Gateway Alpha", "Primary API gateway"),
-            ("8080", "Listen port"),
         ],
         triples=[("Gateway Alpha", "fallback port", "8080")],
         structured_triples=[
@@ -358,7 +354,7 @@ def test_dual_role_literal_promoted_to_concept_and_weight_preserved_across_merge
                 obj_kind="literal",
                 obj_datatype="rdfs:Literal",
                 subj_def="Primary API gateway",
-                obj_def="Listen port",
+                obj_def="",
             )
         ],
     )
@@ -370,20 +366,6 @@ def test_dual_role_literal_promoted_to_concept_and_weight_preserved_across_merge
     beta_id = ent_rows["gateway beta"]
     assert "8080" not in ent_rows
     assert "canary" in ent_rows
-
-    # Merge beta into alpha: literal facts across c1 and c2 are merged
-    # Delete chunk c2: remaining literal fact in c1 between alpha and 8080 remains in facts
-    merge_entities(conn, beta_id, alpha_id, label_kind="skos:altLabel")
-    delete_chunks(conn, ["c2"])
-    assert lint_graph_shacl(conn) == []
-    lit_fact = conn.execute(
-        "SELECT subj_id, pred, obj_literal_lex, obj_kind, obj_id FROM facts WHERE obj_literal_lex = '8080'"
-    ).fetchone()
-    assert lit_fact is not None
-    assert lit_fact[0] == alpha_id
-    assert lit_fact[1] == "uses port"
-    assert lit_fact[3] == "literal"
-    assert lit_fact[4] is None
 
     # Now promote 'canary' to a skos:Concept by referencing it in an ObjectProperty fact
     c3 = ChunkPointer("c3", "doc3.md", 1, 5, "Rollout Controller")
@@ -418,6 +400,21 @@ def test_dual_role_literal_promoted_to_concept_and_weight_preserved_across_merge
     assert len(skos_rows) == 1
     assert lint_graph_shacl(conn) == []
 
+    # Merge beta into alpha: literal facts across c1 and c2 are merged
+    # Delete chunk c2: remaining literal fact in c1 between alpha and 8080 remains in facts
+    merged = merge_entities(conn, beta_id, alpha_id, label_kind="skos:altLabel")
+    alpha_id = merged.canonical_id
+    delete_chunks(conn, ["c2"])
+    assert lint_graph_shacl(conn) == []
+    lit_fact = conn.execute(
+        "SELECT subj_id, pred, obj_literal_lex, obj_kind, obj_id FROM facts WHERE obj_literal_lex = '8080'"
+    ).fetchone()
+    assert lit_fact is not None
+    assert lit_fact[0] == alpha_id
+    assert lit_fact[1] == "uses port"
+    assert lit_fact[3] == "literal"
+    assert lit_fact[4] is None
+
 
 def test_forward_fact_edges_strictly_directed(synonym_token_counter, tmp_path: Path) -> None:
     """Verify that entity-to-entity facts store ONLY forward (subj -> obj) edges with weight 1.0,
@@ -436,7 +433,6 @@ def test_forward_fact_edges_strictly_directed(synonym_token_counter, tmp_path: P
         entities=[
             ("YAW Daemon", "A service daemon"),
             ("SQLite Engine", "A database engine"),
-            ("8080", "Listen port"),
         ],
         triples=[
             ("YAW Daemon", "embeds", "SQLite Engine"),
@@ -458,7 +454,7 @@ def test_forward_fact_edges_strictly_directed(synonym_token_counter, tmp_path: P
                 obj_kind="literal",
                 obj_datatype="rdfs:Literal",
                 subj_def="A service daemon",
-                obj_def="Listen port",
+                obj_def="",
             ),
         ],
     )
@@ -921,8 +917,10 @@ def test_apply_synonym_adjudication_remaps_semantic_edges_after_later_merge() ->
             synonymy_threshold=0.8,
             rlm_stats=rlm_stats,
         )
-        assert staged_merges == [("ent-b", "ent-c", "skos:altLabel", None)]
-        assert [row[:4] for row in resolved_batch] == [("ent-a", "ent-c", "skos:related", 0.85)]
+        assert [(merge.removed_id, merge.canonical_id, merge.label_kind) for merge in staged_merges] == [
+            ("ent-c", "ent-b", "skos:altLabel")
+        ]
+        assert [row[:4] for row in resolved_batch] == [("ent-a", "ent-b", "skos:related", 0.85)]
         assert lint_graph_shacl(stage_conn) == []
     finally:
         stage_conn.close()
@@ -987,14 +985,14 @@ def test_apply_synonym_adjudication_prevents_transitive_collapse_across_separate
             synonymy_threshold=0.8,
             rlm_stats=rlm_stats,
         )
-        assert staged_merges == [
-            ("ent-b", "ent-a", "skos:altLabel", None),
-            ("ent-a", "ent-c", "skos:altLabel", None),
-            ("ent-p1", "ent-alias", "skos:altLabel", None),
+        assert [(merge.removed_id, merge.canonical_id, merge.label_kind) for merge in staged_merges] == [
+            ("ent-b", "ent-a", "skos:altLabel"),
+            ("ent-c", "ent-a", "skos:altLabel"),
+            ("ent-p1", "ent-alias", "skos:altLabel"),
         ]
         assert [row[:4] for row in resolved_batch] == [("ent-alias", "ent-p2", "skos:related", 0.82)]
         surviving = {str(r[0]) for r in stage_conn.execute("SELECT entity_id FROM entities").fetchall()}
-        assert surviving == {"ent-c", "ent-alias", "ent-p2"}
+        assert surviving == {"ent-a", "ent-alias", "ent-p2"}
         assert lint_graph_shacl(stage_conn) == []
     finally:
         stage_conn.close()

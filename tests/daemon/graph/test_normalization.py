@@ -6,11 +6,10 @@ from pathlib import Path
 
 import numpy as np
 
-from yaw.core import ChunkPointer, OpenIERecord, StructuredTriple
+from yaw.core import OpenIERecord, StructuredTriple, text_processing
 from yaw.daemon.graph.normalization import normalize_openie_record
 from yaw.daemon.graph.planner import (
     materialize_entities_and_facts,
-    prepare_sense_resolution_state,
     prepare_synonym_candidates,
 )
 from yaw.daemon.graph.storage import (
@@ -71,11 +70,6 @@ def test_provisional_senses_auto_merge_on_high_cosine_and_difflib_while_homograp
     def2 = "A metric for which no existing alert was present, contributing to the incident."
     def3 = "An unrelated financial hedging duplicate ratio in portfolio accounting."
 
-    chunks = [
-        (ChunkPointer("c1", "incidents/postmortem.md", 1, 10, "Postmortem", 1, 20), "chunk 1"),
-        (ChunkPointer("c2", "incidents/postmortem.md", 11, 20, "Postmortem", 1, 20), "chunk 2"),
-        (ChunkPointer("c3", "finance/portfolio.md", 1, 10, "Portfolio", 1, 10), "chunk 3"),
-    ]
     record_structured = [
         (
             "c1",
@@ -126,24 +120,18 @@ def test_provisional_senses_auto_merge_on_high_cosine_and_difflib_while_homograp
         "incident": "Incident",
         "portfolio": "Portfolio",
     }
+    surface_by_norm = {str(text_processing(label)): surface for label, surface in surface_by_norm.items()}
     chunk_surface_by_norm = {
-        ("c1", "hedge-duplicate-rate"): "Hedge-duplicate-rate",
-        ("c2", "hedge-duplicate-rate"): "Hedge-duplicate-rate",
-        ("c3", "hedge-duplicate-rate"): "Hedge-duplicate-rate",
+        (cid, str(text_processing(label))): surface_by_norm[str(text_processing(label))]
+        for cid, _, entities in record_structured
+        for label, _ in entities
     }
 
-    sense_state = prepare_sense_resolution_state(
-        conn=None,
-        chunks=chunks,
-        all_norm_labels=set(surface_by_norm),
-        record_structured=record_structured,
-        surface_by_norm=surface_by_norm,
-    )
     batch = materialize_entities_and_facts(
         record_structured=record_structured,
         surface_by_norm=surface_by_norm,
         chunk_surface_by_norm=chunk_surface_by_norm,
-        sense_state=sense_state,
+        existing_bindings={},
     )
     defs = {defn for _, name, defn in batch.entity_nodes if name == "Hedge-duplicate-rate"}
     assert defs == {def1, def2, def3}
