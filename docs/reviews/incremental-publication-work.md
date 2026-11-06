@@ -370,3 +370,105 @@ U2 is complete for the tested native source/evidence contracts. Final
 `git diff --check` passed. U3–U6 remain open with the limitations above; no
 bounded-processing or live baseline acceptance is claimed. Next implementation
 unit: U3's persisted candidate coverage and positive/negative decision dependencies.
+
+### U1/U2 cleanup follow-up (2026-11-06)
+
+Source audit after `3fe0dc8` found a remaining U2 consumer: retrieval resolved
+stored fact display labels again and fabricated label-only IDs on lookup failure.
+The engine adapter also silently accumulated source snapshots and retained an
+imperative deletion API alongside native target ownership.
+
+Definition of done for this cleanup:
+
+- Seed retrieval from persisted fact endpoints, preserving the selected sense;
+  remove label re-resolution and label-only identity fabrication.
+- Make frozen engine inputs complete desired snapshots, including empty input;
+  update benchmark, optimization and test consumers atomically. Withdrawals use
+  the same native target declarations; delete the obsolete imperative cascade.
+- Remove dead merge metadata and obsolete identity consumers/helpers. Retain the
+  active global planner until U3/U4 enable its U5 replacement; it is not yet a
+  superseded implementation and this cleanup makes no bounded-work claim.
+- Verify homographs, native withdrawal/reintroduction, shared fact support,
+  vector/FTS ownership and restart using real SQLite/native CocoIndex; run all
+  mandatory quality gates and record actual results before committing.
+
+Implemented the cleanup as replacements, without compatibility aliases:
+
+- Retrieval uses the selected fact's persisted canonical subject/object IDs.
+  Removed the label resolver, its unused lexical lookup helper and label-only
+  ID fabrication. The remaining `entity-` identity constructor is `sense_id`.
+- Both engine input adapters publish complete desired snapshots. Removed the
+  additive union, empty-input bypass and imperative deletion API, including its
+  temporary-table cascade. Benchmark callers now submit complete source sets;
+  optimization retains its explicit source catalog without legacy-row purging.
+- Removed the `openie_chunks` writer, serializer, schema creation and compatibility
+  migration. Checkpoint reads, resume readiness, counts and watchdog now use
+  `chunk_inference` alone. Readiness requires matching program/embedding profiles
+  and a chunk vector; a different program no longer inherits current provenance.
+  Old experiment databases are retained, without automatic conversion or deletion.
+- Removed unused merge-result label/definition metadata and a redundant schema
+  tuple/list conversion. Tests assert the persisted definitions/labels instead.
+- Retired obsolete cascade/resolver-only tests and their legacy cache fixtures.
+  Other storage, high-load lookup, FTS backfill and merge invariants remain tested.
+  New native contracts compare shared-support withdrawal, complete withdrawal,
+  reintroduction and no-op replay with fresh references through both engine APIs,
+  including restart. The homograph retrieval contract deliberately favors the
+  wrong sense in query-vector space while selecting the right stored fact; real
+  PPR must still return its document without querying `entity_labels`.
+- Migrated runtime/status fixtures to a real native typed artifact target. A
+  watchdog integration test reads non-zero artifacts and then an empty native
+  declaration, checking the count and observed source IDs without the retired
+  table or stale cached progress.
+
+Focused evidence:
+
+- `U2-cleanup-entrypoints.{log,xml}`: five native engine/retrieval tests passed,
+  28.83 seconds. The initial broader run recorded fixture/API migration defects;
+  none were suppressed or converted to skipped tests.
+- `U2-cleanup-focused-2.{log,xml}`: 270 passed, five fixture-construction failures,
+  232.91 seconds. All five failures were the same status fixture omitting required
+  empty `entities`/`triples` arguments; corrected the fixture constructor.
+- `U2-cleanup-runtime.{log,xml}`: **56 passed**, 92.62 seconds, covering runtime,
+  CLI status, watchdog, stale-profile rejection and both U1 paired arms.
+- `U2-cleanup-ty-3.log`: passed. Ruff fixed an import-order diagnostic and format
+  left 172 files unchanged. Final mandatory gates follow below.
+
+Evidence files are under `outputs/graph-spec-review/`. A host process check found
+no running optimizer or continuous watchdog with the old code loaded. Verification
+uses actual native updates/artifacts; no daemon/optimizer was restarted or live
+baseline run. Final source searches contain no obsolete deletion/resolution/cache
+writer symbols or legacy checkpoint table/metadata consumers in `yaw/` or
+`scripts/`. The active global planner/cloning remains explicitly U5 work; this
+cleanup retires the engine/cache consumers ahead of that bounded-planner cutover.
+
+Final review also removed the now write-only active-OpenIE fingerprint field;
+an AST comparison found no other newly unread engine attributes. Superseded the
+first full-suite attempt at that point and stopped only its exact owned pytest
+worker (15468), leaving inference services running. Final production changes
+remove **614 net lines** across `yaw/`, the benchmark entry point and watchdog.
+
+Completed mandatory static gates:
+
+- `uv sync --locked`: 100 packages resolved/checked;
+  `outputs/graph-spec-review/U2-cleanup-final-sync.log`.
+- `uv run --locked ty check`, `uv run --locked ruff check --fix` and
+  `uv run --locked ruff format`: passed; 172 files unchanged by the final format
+  pass. Evidence: `outputs/graph-spec-review/U2-cleanup-release-{ty,ruff,format}.log`.
+- `git diff --check`: passed. Final source search finds no retired checkpoint
+  table/writer, imperative chunk-deletion API, retrieval label resolver or obsolete
+  fingerprint fields in `yaw/` or `scripts/`.
+
+Final unfiltered `uv run --locked pytest --no-testmon -q --tb=short
+-o junit_family=legacy --junitxml=outputs/graph-spec-review/U2-cleanup-release-full.xml`
+exited 0: **909 passed, three subtests passed, 78 warnings**, 790.39 seconds.
+No tests skipped or deselected. Evidence:
+`outputs/graph-spec-review/U2-cleanup-release-full.{log,xml}`. The process exited
+cleanly after the passing summary; no SDK shutdown diagnostic appeared in this run.
+Final `git diff --check` passed.
+
+U1/U2 cleanup is complete for these source/consumer contracts. The removed
+interfaces have no compatibility aliases or remaining production consumers.
+U3–U6 remain open: this does not prove candidate completeness, interruption/crash
+readiness, `vec0`, bounded planning or live benchmark quality. The global planner
+is still active code requiring replacement under U5, rather than a superseded
+path retained alongside its replacement.

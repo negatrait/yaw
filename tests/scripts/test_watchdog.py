@@ -3,12 +3,39 @@
 import sqlite3
 from contextlib import closing
 
+from daemon.native_inference import publish_inference
+
+from scripts import watchdog
 from scripts.watchdog import (
     generate_graph_projection_svg,
     generate_report_markdown,
     largest_one_hop_neighborhood,
     recent_relation_assertions,
 )
+from yaw.core import OpenIERecord
+
+
+def test_watchdog_reads_native_artifacts_and_empty_withdrawal(tmp_path, monkeypatch):
+    monkeypatch.setattr(watchdog, "WORKSPACE_ROOT", tmp_path)
+    monkeypatch.setattr(watchdog, "ARTIFACT_DIR", tmp_path / "dashboard")
+    path = tmp_path / ".yaw" / "yaw_optimize_native.db"
+    records = [
+        OpenIERecord(chunk_id=cid, entities=("Mercury", "Sun"), triples=(("Mercury", "orbits", "Sun"),))
+        for cid in ("first", "second")
+    ]
+    publish_inference(path, records)
+    populated = watchdog.get_active_sandbox_info()
+    assert "error" not in populated
+    assert populated["counts"]["chunk_inference"] == 2
+    assert "openie_chunks" not in populated["counts"]
+    assert populated["indexed_chunk_ids"] == {"first", "second"}
+    assert populated["kg_metrics"]["total_entities"] == 4
+
+    publish_inference(path, [])
+    empty = watchdog.get_active_sandbox_info()
+    assert "error" not in empty
+    assert empty["counts"]["chunk_inference"] == 0
+    assert empty["indexed_chunk_ids"] == set()
 
 
 def test_largest_neighborhood_keeps_both_seeds_and_only_one_hop():
@@ -165,7 +192,7 @@ def test_kg_dashboard_throughput_entities_per_chunk_and_apng_projection(tmp_path
 
     kg_svg = tmp_path / "kg_dashboard.svg"
     sandbox_fig1 = {
-        "counts": {"openie_chunks": 10},
+        "counts": {"chunk_inference": 10},
         "kg_metrics": {"total_entities": 60, "total_triples": 45},
         "timeseries_samples": [
             {
@@ -198,7 +225,7 @@ def test_kg_dashboard_throughput_entities_per_chunk_and_apng_projection(tmp_path
     frame_dir = tmp_path / "frames"
     sandbox_step1 = {
         "frame_dir": str(frame_dir),
-        "counts": {"openie_chunks": 1},
+        "counts": {"chunk_inference": 1},
         "kg_graph": {
             "edges": [("a", "b", "skos:related")],
             "entities": {"a": ("Alpha", "Def A", 1), "b": ("Beta", "Def B", 1)},
@@ -206,7 +233,7 @@ def test_kg_dashboard_throughput_entities_per_chunk_and_apng_projection(tmp_path
     }
     sandbox_step2 = {
         "frame_dir": str(frame_dir),
-        "counts": {"openie_chunks": 2},
+        "counts": {"chunk_inference": 2},
         "kg_graph": {
             "edges": [("a", "b", "skos:related"), ("b", "c", "fact")],
             "entities": {

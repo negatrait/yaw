@@ -16,7 +16,6 @@ from yaw.daemon.graph.inference.embedding import EmbeddingProfile
 from yaw.daemon.graph.planner import apply_synonym_adjudication
 from yaw.daemon.graph.ppr import build_transition_matrix
 from yaw.daemon.graph.storage import (
-    delete_chunks,
     lint_graph_shacl,
     load_graph_topology,
     merge_entities,
@@ -165,7 +164,9 @@ def _index_chunk_with_record(
     mock_lm = engine.program.rlm_sub_lm
     assert isinstance(mock_lm, DeterministicMockLM)
     mock_lm.set_stage_responses(ner_json, triples_json)
-    engine.index_chunks([(chunk, text)])
+    snapshot = {ptr.chunk_id: (ptr, source) for ptr, source in engine._opt_chunks_pool}
+    snapshot[chunk.chunk_id] = (chunk, text)
+    engine.index_chunks(list(snapshot.values()))
 
 
 def test_datatype_property_literal_objects_stored_with_weighted_edges_and_excluded_from_skos(
@@ -288,12 +289,12 @@ def test_datatype_property_literal_objects_stored_with_weighted_edges_and_exclud
     assert len(skos_edges) == 0
 
 
-def test_dual_role_literal_promoted_to_concept_and_weight_preserved_across_merge_and_delete(
+def test_dual_role_literal_promoted_to_concept_and_weight_preserved_across_merge(
     synonym_token_counter,
     tmp_path: Path,
 ) -> None:
     """Verify a surface form used first as a literal and later as an ObjectProperty endpoint is promoted
-    to a skos:Concept, and merge_entities/delete_chunks preserve 0.5 weights on pure literal fact edges."""
+    to a skos:Concept, and merge_entities preserves 0.5 weights on pure literal fact edges."""
     engine, conn = _make_engine(synonym_token_counter, tmp_path, "test_dual_role.db")
 
     c1 = ChunkPointer("c1", "doc1.md", 1, 5, "Rollout")
@@ -401,10 +402,8 @@ def test_dual_role_literal_promoted_to_concept_and_weight_preserved_across_merge
     assert lint_graph_shacl(conn) == []
 
     # Merge beta into alpha: literal facts across c1 and c2 are merged
-    # Delete chunk c2: remaining literal fact in c1 between alpha and 8080 remains in facts
     merged = merge_entities(conn, beta_id, alpha_id, label_kind="skos:altLabel")
     alpha_id = merged.canonical_id
-    delete_chunks(conn, ["c2"])
     assert lint_graph_shacl(conn) == []
     lit_fact = conn.execute(
         "SELECT subj_id, pred, obj_literal_lex, obj_kind, obj_id FROM facts WHERE obj_literal_lex = '8080'"
@@ -917,9 +916,7 @@ def test_apply_synonym_adjudication_remaps_semantic_edges_after_later_merge() ->
             synonymy_threshold=0.8,
             rlm_stats=rlm_stats,
         )
-        assert [(merge.removed_id, merge.canonical_id, merge.label_kind) for merge in staged_merges] == [
-            ("ent-c", "ent-b", "skos:altLabel")
-        ]
+        assert [(merge.removed_id, merge.canonical_id) for merge in staged_merges] == [("ent-c", "ent-b")]
         assert [row[:4] for row in resolved_batch] == [("ent-a", "ent-b", "skos:related", 0.85)]
         assert lint_graph_shacl(stage_conn) == []
     finally:
@@ -985,10 +982,10 @@ def test_apply_synonym_adjudication_prevents_transitive_collapse_across_separate
             synonymy_threshold=0.8,
             rlm_stats=rlm_stats,
         )
-        assert [(merge.removed_id, merge.canonical_id, merge.label_kind) for merge in staged_merges] == [
-            ("ent-b", "ent-a", "skos:altLabel"),
-            ("ent-c", "ent-a", "skos:altLabel"),
-            ("ent-p1", "ent-alias", "skos:altLabel"),
+        assert [(merge.removed_id, merge.canonical_id) for merge in staged_merges] == [
+            ("ent-b", "ent-a"),
+            ("ent-c", "ent-a"),
+            ("ent-p1", "ent-alias"),
         ]
         assert [row[:4] for row in resolved_batch] == [("ent-alias", "ent-p2", "skos:related", 0.82)]
         surviving = {str(r[0]) for r in stage_conn.execute("SELECT entity_id FROM entities").fetchall()}

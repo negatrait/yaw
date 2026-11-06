@@ -60,7 +60,7 @@ def test_pool_telemetry_uses_observed_progress_and_labels_missing_values_honestl
     assert len(empty.badge(2, 10, True, "x" * 100)[0]) <= 96
     telemetry = watchdog.PoolTelemetry.from_sandbox(
         {
-            "counts": {"openie_chunks": 11},
+            "counts": {"chunk_inference": 11},
             "indexed_chunk_ids": {"a", "b"},
             "pools": {"val_chunk_ids": ["a", "c", "d"], "train_chunk_ids": ["b"], "train_queries": 150},
             "timeseries_samples": [{"time_sec": 0, "passages": 1}, {"time_sec": 600, "passages": 11}],
@@ -227,7 +227,7 @@ def test_indexing_dashboard_renders_measured_throughput_and_empty_state(tmp_path
     sandbox = {}
     if populated:
         sandbox = {
-            "counts": {"openie_chunks": 11},
+            "counts": {"chunk_inference": 11},
             "kg_metrics": {"total_entities": 20, "total_triples": 15},
             "indexed_chunk_ids": {"a"},
             "pools": {"val_chunk_ids": ["a", "b"], "corpus_chunk_ids": ["a", "b", "c"]},

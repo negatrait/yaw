@@ -120,11 +120,11 @@ def get_gpu_temperature() -> float | None:
 class PoolTelemetry:
     """Progress figures with a real source; any value without one stays None (rendered "n/a")."""
 
-    openie_cnt: int  # OpenIE-extracted chunks in the sandbox DB (openie_chunks)
+    openie_cnt: int  # OpenIE-extracted chunks in the sandbox DB (chunk_inference)
     train_queries: int | None  # from the engine's <stem>_pools.json manifest
     val_queries: int | None
     gepa_val_queries: int | None
-    val_done: int | None  # manifest val chunk ids ∩ openie_chunks
+    val_done: int | None  # manifest val chunk ids ∩ chunk_inference
     val_pool: int | None
     train_done: int | None
     train_pool: int | None
@@ -142,7 +142,7 @@ class PoolTelemetry:
 
     @classmethod
     def from_sandbox(cls, sandbox: dict[str, Any]) -> PoolTelemetry:
-        cnt = int(sandbox.get("counts", {}).get("openie_chunks", 0))
+        cnt = int(sandbox.get("counts", {}).get("chunk_inference", 0))
         pools = sandbox.get("pools") or {}
         indexed: set[str] = sandbox.get("indexed_chunk_ids") or set()
 
@@ -473,7 +473,7 @@ def get_active_sandbox_info() -> dict[str, Any]:
         with contextlib.suppress(sqlite3.Error):
             counts = dict(
                 zip(
-                    ("chunks", "entities", "facts", "edges", "openie_chunks"),
+                    ("chunks", "entities", "facts", "edges", "chunk_inference"),
                     get_graph_counts(conn),
                     strict=True,
                 )
@@ -606,19 +606,10 @@ def get_active_sandbox_info() -> dict[str, Any]:
                     "SELECT chunk_id, extraction_json FROM chunk_inference ORDER BY rowid ASC"
                 ).fetchall()
 
-        if ci_rows:
-            rows = []
-            for cid, ext_raw in ci_rows:
-                ext = json.loads(ext_raw or "{}") if ext_raw else {}
-                ej = json.dumps(ext.get("entities") or [])
-                tj = json.dumps(ext.get("triples") or [])
-                stj = json.dumps(ext.get("structured_triples") or [])
-                rows.append((cid, ej, tj, stj))
-        else:
-            rows = conn.execute(
-                "SELECT chunk_id, entities_json, triples_json, structured_triples_json "
-                "FROM openie_chunks ORDER BY rowid ASC"
-            ).fetchall()
+        rows = []
+        for cid, ext_raw in ci_rows:
+            ext = json.loads(ext_raw)
+            rows.append((cid, json.dumps(ext["entities"]), json.dumps(ext["triples"])))
 
         cum_e = cum_t = 0
         uniq_e, uniq_edges, preds, recent, raw_counts, triples_raw = (
@@ -629,7 +620,7 @@ def get_active_sandbox_info() -> dict[str, Any]:
             Counter(),
             [],
         )
-        for idx, (cid, ej, tj, _stj) in enumerate(rows):
+        for idx, (cid, ej, tj) in enumerate(rows):
             ents = json.loads(ej or "[]") if ej else []
             trips = json.loads(tj or "[]") if tj else []
             cum_e, cum_t = cum_e + len(ents), cum_t + len(trips)
@@ -1501,7 +1492,7 @@ def generate_graph_projection_svg(
             len(rel_segs),
             len(broader_segs),
             len(diff_segs),
-            int(sandbox.get("counts", {}).get("openie_chunks", 0)),
+            int(sandbox.get("counts", {}).get("chunk_inference", 0)),
         )
         frame_name = (
             f"frame_{state_key[5]:05d}_{state_key[0]:05d}_{state_key[1]:05d}_"

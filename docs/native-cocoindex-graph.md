@@ -257,6 +257,9 @@ reserved scheme namespace in the new schema.
    Validate one class per sense, the minimum-member representative and matching
    occurrence/revision ownership of each assertion's resource mentions before
    committing the proposal. Raw assertion evidence is immutable through rebinding.
+   Retrieval seeds the stored subject and resource-object IDs of selected facts.
+   It never re-resolves their display labels against a query vector or fabricates
+   label-only IDs; a selected fact already identifies its canonical senses.
 2. Lookup normalized labels against all persisted senses and current proposals.
    Exact spelling, casefold equality or high cosine alone is not semantic identity.
    Keep homographs/modifier-head distinctions; accepted unchanged identity and

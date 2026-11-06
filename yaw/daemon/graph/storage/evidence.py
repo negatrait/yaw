@@ -58,19 +58,17 @@ class FactAssertion:
 async def evidence_schemas() -> tuple[TableSpec, ...]:
     from cocoindex.connectors import sqlite
 
-    return tuple(
-        [
-            TableSpec(
-                "entity_mentions",
-                await sqlite.TableSchema[EntityMention].from_class(EntityMention, primary_key=["mention_id"]),
-                indexes=EVIDENCE_INDEXES["entity_mentions"],
-            ),
-            TableSpec(
-                "fact_assertions",
-                await sqlite.TableSchema[FactAssertion].from_class(FactAssertion, primary_key=["assertion_id"]),
-                indexes=EVIDENCE_INDEXES["fact_assertions"],
-            ),
-        ]
+    return (
+        TableSpec(
+            "entity_mentions",
+            await sqlite.TableSchema[EntityMention].from_class(EntityMention, primary_key=["mention_id"]),
+            indexes=EVIDENCE_INDEXES["entity_mentions"],
+        ),
+        TableSpec(
+            "fact_assertions",
+            await sqlite.TableSchema[FactAssertion].from_class(FactAssertion, primary_key=["assertion_id"]),
+            indexes=EVIDENCE_INDEXES["fact_assertions"],
+        ),
     )
 
 
@@ -219,8 +217,6 @@ def canonicalize_fact_text(conn: sqlite3.Connection) -> None:
 class EntityMerge:
     removed_id: str
     canonical_id: str
-    label_kind: str = "skos:altLabel"
-    definition: str | None = None
     fact_bindings: tuple[tuple[str, str | None], ...] = ()
 
 

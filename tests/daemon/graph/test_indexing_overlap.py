@@ -67,7 +67,7 @@ def test_frozen_candidate_replay_uses_native_targets_and_original_text(tmp_path,
         assert engine.index_chunks([(pointer, original)]) == 1
         assert [row[0] for row in engine.conn.execute("SELECT chunk_id FROM chunks")] == ["frozen"]
         assert engine.conn.execute("SELECT COUNT(*) FROM chunk_inference").fetchone()[0] == 1
-        assert engine.conn.execute("SELECT COUNT(*) FROM openie_chunks").fetchone()[0] == 0
+        assert engine.conn.execute("SELECT 1 FROM sqlite_master WHERE name='openie_chunks'").fetchone() is None
         traces = engine._captured_chunk_traces["frozen"]
         assert {name for name, _, _ in traces} == {"ner", "triples"}
         assert all(inputs["passage"] == original for _, inputs, _ in traces)
@@ -354,7 +354,9 @@ def provider():
                 body = {"object": "list", "data": rows, "model": "overlap", "usage": {"total_tokens": 7}}
             else:
                 text = data["messages"][-1]["content"]
-                if "candidate_pairs" in text:
+                if "[[ ## fact_before_filter ## ]]" in text:
+                    output = {"fact": state["selected_facts"]}
+                elif "candidate_pairs" in text:
                     packet = json.JSONDecoder().raw_decode(text[text.index('{"format":') :])[0]
                     output = {
                         "decisions": complete_decisions(
@@ -725,7 +727,7 @@ def test_addition_preserves_adjudicated_graph_and_edit_invalidates_reuse(tmp_pat
         ).fetchall()
         assert previous
         vectors = engine.conn.execute("SELECT embedding FROM chunk_vec WHERE chunk_id='first'").fetchone()
-        engine.index_chunks([second])
+        engine.index_chunks([first, second])
         assert engine._graph_rlm_stats["reused_chunks"] == 1
         assert engine._graph_rlm_stats["processed_chunks"] == 1
         assert (
@@ -737,7 +739,7 @@ def test_addition_preserves_adjudicated_graph_and_edit_invalidates_reuse(tmp_pat
         assert engine.conn.execute("SELECT embedding FROM chunk_vec WHERE chunk_id='first'").fetchone() == vectors
         assert engine.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 2
         assert engine.lint_graph()["conforms"]
-        engine.index_chunks([(first[0], "Ada studies Algebra with a revised source.")])
+        engine.index_chunks([(first[0], "Ada studies Algebra with a revised source."), second])
         assert engine._graph_rlm_stats["reused_chunks"] == 0
         assert engine._graph_rlm_stats["processed_chunks"] == 2
         assert engine.lint_graph()["conforms"]

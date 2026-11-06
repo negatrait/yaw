@@ -1,4 +1,4 @@
-"""SKOS/RDF/OWL graph CRUD, entity label resolution, entity merging, candidate mining, and cascading deletion."""
+"""SKOS/RDF/OWL graph staging, entity merging, candidate mining, and topology reads."""
 
 import difflib
 import json
@@ -37,30 +37,7 @@ _EXISTING_ID_TABLES: dict[str, tuple[str, str]] = {
     "entity_vec": ("entity_vec", "entity_id"),
     "fact": ("facts", "fact_id"),
     "fact_vec": ("fact_vec", "fact_id"),
-    "openie": ("openie_chunks", "chunk_id"),
 }
-
-_INIT_DEL_TEMP_TABLES: tuple[str, ...] = (
-    "CREATE TEMP TABLE IF NOT EXISTS _del_chunks (chunk_id TEXT PRIMARY KEY)",
-    """
-    CREATE TEMP TABLE IF NOT EXISTS _affected_edges (
-        src_id TEXT NOT NULL,
-        dst_id TEXT NOT NULL,
-        kind TEXT NOT NULL,
-        PRIMARY KEY (src_id, dst_id, kind)
-    )
-    """,
-    "CREATE TEMP TABLE IF NOT EXISTS _affected_facts (fact_id TEXT PRIMARY KEY)",
-    "CREATE TEMP TABLE IF NOT EXISTS _affected_entities (entity_id TEXT PRIMARY KEY)",
-    "CREATE TEMP TABLE IF NOT EXISTS _orphan_facts (fact_id TEXT PRIMARY KEY)",
-    "CREATE TEMP TABLE IF NOT EXISTS _orphan_entities (entity_id TEXT PRIMARY KEY)",
-    "DELETE FROM temp._del_chunks",
-    "DELETE FROM temp._affected_edges",
-    "DELETE FROM temp._affected_facts",
-    "DELETE FROM temp._affected_entities",
-    "DELETE FROM temp._orphan_facts",
-    "DELETE FROM temp._orphan_entities",
-)
 
 
 @lru_cache(maxsize=4096)
@@ -267,7 +244,7 @@ def deserialize_openie_record(
     *,
     chunk_id: str | None = None,
 ) -> OpenIERecord:
-    """Deserialize an OpenIERecord JSON payload or mapping from chunk_inference or openie_chunks."""
+    """Deserialize an OpenIERecord JSON payload or mapping from the native chunk_inference target."""
     data = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
     cid = str(chunk_id if chunk_id is not None else data.get("chunk_id", ""))
     raw_entities = data.get("entities") or ()
@@ -323,103 +300,16 @@ def get_openie_checkpoints(
     conn: sqlite3.Connection,
     chunk_ids: Sequence[str],
 ) -> dict[str, OpenIERecord]:
-    """Retrieve cached OpenIE extraction records for chunk_ids in bounded SQL batches."""
-    if not chunk_ids:
-        return {}
-    results: dict[str, OpenIERecord] = {}
+    """Read source extraction artifacts from their native CocoIndex target."""
+    records = {}
     for batch in batched(chunk_ids):
         placeholders = ",".join("?" for _ in batch)
-        cursor = conn.execute(
-            f"""
-            SELECT chunk_id, entities_json, triples_json, structured_triples_json
-            FROM openie_chunks WHERE chunk_id IN ({placeholders})
-            """,
+        for chunk_id, raw in conn.execute(
+            f"SELECT chunk_id, extraction_json FROM chunk_inference WHERE chunk_id IN ({placeholders})",
             tuple(batch),
-        )
-        for row in cursor:
-            cid = str(row[0])
-            results[cid] = deserialize_openie_record(
-                {
-                    "chunk_id": cid,
-                    "entities": json.loads(row[1]) if row[1] else (),
-                    "triples": json.loads(row[2]) if row[2] else (),
-                    "structured_triples": json.loads(row[3]) if row[3] else (),
-                },
-                chunk_id=cid,
-            )
-    missing_ids = [cid for cid in chunk_ids if cid not in results]
-    if (
-        missing_ids
-        and conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunk_inference' LIMIT 1").fetchone()
-        is not None
-    ):
-        for batch in batched(missing_ids):
-            placeholders = ",".join("?" for _ in batch)
-            cursor = conn.execute(
-                f"SELECT chunk_id, extraction_json FROM chunk_inference WHERE chunk_id IN ({placeholders})",
-                tuple(batch),
-            )
-            for row in cursor:
-                cid = str(row[0])
-                results[cid] = deserialize_openie_record(row[1] or "{}", chunk_id=cid)
-    return results
-
-
-def _serialize_openie_entities(rec: OpenIERecord) -> str:
-    if rec.entity_definitions and any(edef for _, edef in rec.entity_definitions):
-        def_map = {ename: edef for ename, edef in rec.entity_definitions}
-        out: list[list[str]] = []
-        seen: set[str] = set()
-        for ename in rec.entities:
-            seen.add(ename)
-            out.append([ename, def_map.get(ename, "")])
-        for ename, edef in rec.entity_definitions:
-            if ename not in seen:
-                seen.add(ename)
-                out.append([ename, edef])
-        return json.dumps(out)
-    return json.dumps(list(rec.entities))
-
-
-def save_openie_checkpoints(
-    conn: sqlite3.Connection,
-    records: Sequence[OpenIERecord],
-) -> None:
-    """Save OpenIE extraction records into openie_chunks for crash-resilient caching."""
-    if not records:
-        return
-    with write_tx(conn):
-        conn.executemany(
-            """
-            INSERT OR REPLACE INTO openie_chunks (
-                chunk_id, entities_json, triples_json, structured_triples_json
-            ) VALUES (?, ?, ?, ?)
-            """,
-            (
-                (
-                    rec.chunk_id,
-                    _serialize_openie_entities(rec),
-                    json.dumps([list(t) for t in rec.triples]),
-                    json.dumps(
-                        [
-                            {
-                                "subj": st.subj,
-                                "subj_def": st.subj_def,
-                                "pred": st.pred,
-                                "obj": st.obj,
-                                "obj_def": st.obj_def,
-                                "spo_def": st.spo_def,
-                                "obj_kind": st.obj_kind,
-                                "obj_datatype": st.obj_datatype,
-                                "obj_lang": st.obj_lang,
-                            }
-                            for st in rec.structured_triples
-                        ]
-                    ),
-                )
-                for rec in records
-            ),
-        )
+        ):
+            records[chunk_id] = deserialize_openie_record(raw, chunk_id=chunk_id)
+    return records
 
 
 def upsert_entities(
@@ -610,83 +500,6 @@ def upsert_entity_labels(
                     "UPDATE entity_labels SET label_kind = ? WHERE entity_id = ? AND label_norm = ?",
                     (best_kind, entity_id, norm),
                 )
-
-
-def get_entities_by_label_norm(
-    conn: sqlite3.Connection,
-    label_norms: Sequence[str],
-) -> dict[str, list[str]]:
-    """Look up entity_ids matching each normalized label across skos:prefLabel, altLabel, and hiddenLabel."""
-    if not label_norms:
-        return {}
-    clean_norms = list(dict.fromkeys(n.strip().lower() for n in label_norms if n.strip()))
-    if not clean_norms:
-        return {}
-    results: dict[str, list[str]] = {n: [] for n in clean_norms}
-    for batch in batched(clean_norms):
-        placeholders = ",".join("?" for _ in batch)
-        cursor = conn.execute(
-            f"""
-            SELECT label_norm, entity_id,
-                   MIN(CASE label_kind
-                       WHEN 'skos:prefLabel' THEN 1
-                       WHEN 'skos:altLabel' THEN 2
-                       ELSE 3
-                   END) AS prio
-            FROM entity_labels
-            WHERE label_norm IN ({placeholders})
-            GROUP BY label_norm, entity_id
-            ORDER BY label_norm ASC, prio ASC, entity_id ASC
-            """,
-            tuple(batch),
-        )
-        for row in cursor:
-            norm = str(row[0])
-            eid = str(row[1])
-            if eid not in results[norm]:
-                results[norm].append(eid)
-    return results
-
-
-def resolve_entity_labels(
-    conn: sqlite3.Connection,
-    label_norms: Sequence[str],
-    query_vec: np.ndarray | Sequence[float] | None = None,
-) -> dict[str, list[str]]:
-    """Resolve surface labels to entity_ids, disambiguating polysemous/homograph senses by query_vec cosine."""
-    by_norm = get_entities_by_label_norm(conn, label_norms)
-    if not by_norm:
-        return {}
-    if query_vec is None:
-        return by_norm
-
-    ambiguous_eids: list[str] = [eid for eids in by_norm.values() if len(eids) > 1 for eid in eids]
-    if not ambiguous_eids:
-        return by_norm
-
-    q_arr = np.asarray(query_vec, dtype=np.float32)
-    q_norm = float(np.linalg.norm(q_arr))
-    if q_norm <= 1e-12:
-        return by_norm
-
-    vecs = get_entity_vectors(conn, list(dict.fromkeys(ambiguous_eids)))
-    resolved: dict[str, list[str]] = {}
-    for norm, eids in by_norm.items():
-        if len(eids) <= 1:
-            resolved[norm] = eids
-            continue
-        scored: list[tuple[float, str]] = []
-        for eid in eids:
-            v = vecs.get(eid)
-            if v is not None and v.size == q_arr.size:
-                v_norm = float(np.linalg.norm(v))
-                sim = float(np.dot(q_arr, v) / (q_norm * v_norm)) if v_norm > 1e-12 else -1.0
-            else:
-                sim = -1.0
-            scored.append((sim, eid))
-        scored.sort(key=lambda item: (-item[0], item[1]))
-        resolved[norm] = [scored[0][1]]
-    return resolved
 
 
 def canonicalize_entity_labels_edc(
@@ -1126,7 +939,7 @@ def merge_entities(
                 entity_ids=[dst_id],
                 hidden_label_norms_by_entity=hidden_map,
             )
-        return EntityMerge(src_id, dst_id, label_kind, merged_definition, fact_bindings)
+        return EntityMerge(src_id, dst_id, fact_bindings)
 
 
 def rekey_facts(conn: sqlite3.Connection, ids: list[str]) -> tuple[tuple[str, str | None], ...]:
@@ -1505,11 +1318,7 @@ def get_graph_counts(conn: sqlite3.Connection) -> tuple[int, int, int, int, int]
         conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunk_inference' LIMIT 1").fetchone()
         is not None
     )
-    openie_expr = (
-        "MAX((SELECT COUNT(*) FROM openie_chunks), (SELECT COUNT(*) FROM chunk_inference))"
-        if has_chunk_inference
-        else "(SELECT COUNT(*) FROM openie_chunks)"
-    )
+    openie_expr = "(SELECT COUNT(*) FROM chunk_inference)" if has_chunk_inference else "0"
     row = conn.execute(
         f"""
         SELECT
@@ -1700,259 +1509,3 @@ def upsert_semantic_edges(
                             """,
                             (s, d, rel_weight, reasoning),
                         )
-
-
-def delete_chunks(conn: sqlite3.Connection, chunk_ids: Sequence[str]) -> None:
-    """Atomically delete chunks and cascade removal strictly across affected edges, facts, labels, and entities."""
-    if not chunk_ids:
-        return
-
-    with write_tx(conn):
-        for stmt in _INIT_DEL_TEMP_TABLES:
-            conn.execute(stmt)
-
-        conn.executemany(
-            "INSERT OR IGNORE INTO temp._del_chunks (chunk_id) VALUES (?)",
-            ((cid,) for cid in chunk_ids),
-        )
-
-        # 1. Capture only edges, facts, and entities incident to the deleted chunks before removing provenance
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO temp._affected_edges (src_id, dst_id, kind)
-            SELECT src_id, dst_id, kind
-            FROM edge_sources
-            WHERE chunk_id IN (SELECT chunk_id FROM temp._del_chunks)
-            """
-        )
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO temp._affected_facts (fact_id)
-            SELECT fact_id
-            FROM fact_sources
-            WHERE chunk_id IN (SELECT chunk_id FROM temp._del_chunks)
-            """
-        )
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO temp._affected_entities (entity_id)
-            SELECT dst_id FROM temp._affected_edges WHERE kind IN ('passage', 'fact')
-            UNION
-            SELECT src_id FROM temp._affected_edges WHERE kind = 'fact'
-            UNION
-            SELECT src_id FROM temp._affected_edges WHERE kind = 'passage'
-              AND src_id NOT IN (SELECT chunk_id FROM temp._del_chunks)
-            UNION
-            SELECT subj_id FROM facts WHERE fact_id IN (SELECT fact_id FROM temp._affected_facts)
-            UNION
-            SELECT obj_id FROM facts
-            WHERE obj_id IS NOT NULL AND fact_id IN (SELECT fact_id FROM temp._affected_facts)
-            UNION
-            SELECT entity_id FROM entity_labels
-            WHERE chunk_id IN (SELECT chunk_id FROM temp._del_chunks)
-            """
-        )
-        # Include semantic-linked neighbors of affected entities so isolated aliases are also checked
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO temp._affected_entities (entity_id)
-            SELECT dst_id FROM edges
-            WHERE kind IN ('skos:related', 'skos:broader', 'owl:differentFrom')
-              AND src_id IN (SELECT entity_id FROM temp._affected_entities)
-            UNION
-            SELECT src_id FROM edges
-            WHERE kind IN ('skos:related', 'skos:broader', 'owl:differentFrom')
-              AND dst_id IN (SELECT entity_id FROM temp._affected_entities)
-            """
-        )
-
-        # 2. Remove chunk rows, label provenance, fact provenance, and edge provenance
-        conn.executemany(
-            "DELETE FROM chunk_fts WHERE chunk_id = ?",
-            ((cid,) for cid in chunk_ids),
-        )
-        conn.execute("DELETE FROM chunk_vec WHERE chunk_id IN (SELECT chunk_id FROM temp._del_chunks)")
-        conn.execute("DELETE FROM openie_chunks WHERE chunk_id IN (SELECT chunk_id FROM temp._del_chunks)")
-        conn.execute("DELETE FROM chunks WHERE chunk_id IN (SELECT chunk_id FROM temp._del_chunks)")
-        conn.execute("DELETE FROM fact_sources WHERE chunk_id IN (SELECT chunk_id FROM temp._del_chunks)")
-        conn.execute("DELETE FROM edge_sources WHERE chunk_id IN (SELECT chunk_id FROM temp._del_chunks)")
-        conn.execute("DELETE FROM entity_labels WHERE chunk_id IN (SELECT chunk_id FROM temp._del_chunks)")
-
-        # 3. Prune affected passage/fact edges with zero remaining provenance and update surviving fact weights
-        conn.execute(
-            """
-            DELETE FROM edges
-            WHERE (src_id, dst_id, kind) IN (SELECT src_id, dst_id, kind FROM temp._affected_edges)
-              AND NOT EXISTS (
-                  SELECT 1 FROM edge_sources es
-                  WHERE es.src_id = edges.src_id
-                    AND es.dst_id = edges.dst_id
-                    AND es.kind = edges.kind
-              )
-            """
-        )
-        conn.execute(
-            """
-            UPDATE edges
-            SET weight = COALESCE(
-                (
-                    SELECT 1.0 - EXP(SUM(LN(MAX(1e-6, 1.0 - MIN(1.0 - 1e-6, COALESCE(es.atomic_confidence, 0.5))))))
-                    FROM edge_sources es
-                    WHERE es.src_id = edges.src_id
-                      AND es.dst_id = edges.dst_id
-                      AND es.kind = edges.kind
-                ),
-                edges.weight
-            )
-            WHERE (src_id, dst_id, kind) IN (SELECT src_id, dst_id, kind FROM temp._affected_edges)
-            """
-        )
-
-        # 4. Prune orphaned facts and fact_vec across both fact_sources and affected fact edges
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO temp._orphan_facts (fact_id)
-            SELECT af.fact_id
-            FROM temp._affected_facts af
-            WHERE NOT EXISTS (
-                SELECT 1 FROM fact_sources fs WHERE fs.fact_id = af.fact_id
-            )
-            """
-        )
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO temp._orphan_facts (fact_id)
-            SELECT f.fact_id
-            FROM facts f
-            INNER JOIN temp._affected_edges ae
-              ON ae.kind = 'fact' AND ae.src_id = f.subj_id AND ae.dst_id = f.obj_id
-            WHERE f.obj_kind = 'entity'
-              AND NOT EXISTS (
-                  SELECT 1 FROM edges e
-                  WHERE e.src_id = f.subj_id AND e.dst_id = f.obj_id AND e.kind = 'fact'
-              )
-              AND NOT EXISTS (
-                  SELECT 1 FROM fact_sources fs WHERE fs.fact_id = f.fact_id
-              )
-            """
-        )
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO temp._orphan_facts (fact_id)
-            SELECT f.fact_id
-            FROM facts f
-            WHERE f.obj_kind = 'literal'
-              AND NOT EXISTS (
-                  SELECT 1 FROM fact_sources fs WHERE fs.fact_id = f.fact_id
-              )
-            """
-        )
-        conn.execute("DELETE FROM fact_sources WHERE fact_id IN (SELECT fact_id FROM temp._orphan_facts)")
-        conn.execute("DELETE FROM fact_vec WHERE fact_id IN (SELECT fact_id FROM temp._orphan_facts)")
-        conn.execute("DELETE FROM fact_fts WHERE fact_id IN (SELECT fact_id FROM temp._orphan_facts)")
-        conn.execute("DELETE FROM facts WHERE fact_id IN (SELECT fact_id FROM temp._orphan_facts)")
-
-        # 5. Prune orphaned entities and entity_vec strictly among candidate entities using index seeks
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO temp._orphan_entities (entity_id)
-            SELECT ae.entity_id
-            FROM temp._affected_entities ae
-            WHERE NOT EXISTS (
-                SELECT 1 FROM edges e
-                WHERE e.src_id = ae.entity_id AND e.kind IN ('passage', 'fact')
-            )
-            AND NOT EXISTS (
-                SELECT 1 FROM edges e
-                WHERE e.dst_id = ae.entity_id AND e.kind IN ('passage', 'fact')
-            )
-            AND NOT EXISTS (
-                SELECT 1 FROM facts f
-                WHERE f.subj_id = ae.entity_id OR f.obj_id = ae.entity_id
-            )
-            """
-        )
-        conn.execute("DELETE FROM entity_labels WHERE entity_id IN (SELECT entity_id FROM temp._orphan_entities)")
-        conn.execute("DELETE FROM entity_vec WHERE entity_id IN (SELECT entity_id FROM temp._orphan_entities)")
-        conn.execute("DELETE FROM entities WHERE entity_id IN (SELECT entity_id FROM temp._orphan_entities)")
-
-        # 6. Prune semantic edges incident to deleted entities
-        conn.execute(
-            """
-            DELETE FROM edges
-            WHERE kind IN ('skos:related', 'skos:broader', 'owl:differentFrom')
-              AND (
-                  src_id IN (SELECT entity_id FROM temp._orphan_entities)
-                  OR dst_id IN (SELECT entity_id FROM temp._orphan_entities)
-              )
-            """
-        )
-
-        # 7. Promote a surviving label to skos:prefLabel for any surviving affected entity that lost its prefLabel
-        surviving_missing_pref = conn.execute(
-            """
-            SELECT e.entity_id, e.name
-            FROM entities e
-            INNER JOIN temp._affected_entities ae ON ae.entity_id = e.entity_id
-            WHERE NOT EXISTS (
-                SELECT 1 FROM entity_labels el
-                WHERE el.entity_id = e.entity_id AND el.label_kind = 'skos:prefLabel'
-            )
-            """
-        ).fetchall()
-        for r in surviving_missing_pref:
-            eid, ename = str(r[0]), str(r[1])
-            candidate_lbl = conn.execute(
-                """
-                SELECT label_norm, raw_label
-                FROM entity_labels
-                WHERE entity_id = ?
-                ORDER BY CASE label_kind WHEN 'skos:altLabel' THEN 1 ELSE 2 END ASC, label_norm ASC
-                LIMIT 1
-                """,
-                (eid,),
-            ).fetchone()
-            if candidate_lbl is not None:
-                lnorm, rlabel = str(candidate_lbl[0]), str(candidate_lbl[1])
-                conn.execute(
-                    "UPDATE entity_labels SET label_kind = 'skos:prefLabel' WHERE entity_id = ? AND label_norm = ?",
-                    (eid, lnorm),
-                )
-                if rlabel:
-                    conn.execute("UPDATE entities SET name = ? WHERE entity_id = ?", (rlabel, eid))
-                homograph_peers = [
-                    str(hr[0])
-                    for hr in conn.execute(
-                        """
-                        SELECT DISTINCT entity_id FROM entity_labels
-                        WHERE label_norm = ? AND label_kind = 'skos:prefLabel' AND entity_id != ?
-                        """,
-                        (lnorm, eid),
-                    ).fetchall()
-                ]
-                if homograph_peers:
-                    upsert_semantic_edges(
-                        conn,
-                        [(eid, peer_id, "owl:differentFrom", 0.0) for peer_id in homograph_peers],
-                    )
-            else:
-                surviving_chunk = conn.execute(
-                    """
-                    SELECT chunk_id FROM edge_sources
-                    WHERE src_id = ? OR dst_id = ?
-                    UNION ALL
-                    SELECT fs.chunk_id FROM fact_sources fs
-                    INNER JOIN facts f ON f.fact_id = fs.fact_id
-                    WHERE f.subj_id = ? OR f.obj_id = ?
-                    LIMIT 1
-                    """,
-                    (eid, eid, eid, eid),
-                ).fetchone()
-                cid = str(surviving_chunk[0]) if surviving_chunk is not None else "__survived__"
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO entity_labels (label_norm, entity_id, label_kind, raw_label, chunk_id)
-                    VALUES (?, ?, 'skos:prefLabel', ?, ?)
-                    """,
-                    (ename.strip().lower(), eid, ename, cid),
-                )

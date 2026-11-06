@@ -1439,13 +1439,7 @@ class YawRuntime:
                 )
             )
             try:
-                existing_cids = {str(r[0]) for r in bench_engine.conn.execute("SELECT chunk_id FROM chunks").fetchall()}
-                unindexed = [(ptr, txt) for ptr, txt in chunks if ptr.chunk_id not in existing_cids]
-                index_batches = (
-                    bench_engine.index_chunks(unindexed)
-                    if unindexed
-                    else int(bench_engine.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
-                )
+                index_batches = bench_engine.index_chunks(chunks)
 
                 if progress_callback is not None:
                     progress_callback(f"benchmarking {canonical_ds}: evaluating {len(queries)} queries")

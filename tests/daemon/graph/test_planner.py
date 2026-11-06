@@ -136,7 +136,6 @@ def test_apply_synonym_adjudication_hidden_label_and_edc_canonicalization(tmp_pa
         assert len(staged_merges) == 1
         assert staged_merges[0].removed_id == "e_typo"
         assert staged_merges[0].canonical_id == "e_good"
-        assert staged_merges[0].label_kind == "skos:hiddenLabel"
         assert rlm_stats.get("merged_entities") == 1
 
         # Check entity labels on e_good: 'necessary' must be skos:prefLabel, 'neccessary' must be skos:hiddenLabel

@@ -533,7 +533,6 @@ def test_equivalent_decision_updates_merged_entity_definition() -> None:
             rlm_stats=rlm_stats,
         )
         assert len(staged_merges) == 1
-        assert staged_merges[0].definition == "Unified Jira issue tracking and change management platform."
         rows = conn.execute("SELECT entity_id, name, definition FROM entities").fetchall()
         assert len(rows) == 1
         assert rows[0][1] == "Jira"

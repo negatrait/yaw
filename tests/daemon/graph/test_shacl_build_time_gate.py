@@ -312,7 +312,7 @@ def test_build_time_shacl_gate_success(synonym_token_counter, tmp_path: Path) ->
             title="Gate Test Doc",
         )
 
-        # Execute full pipeline end-to-end (no save_openie_checkpoints pre-seeding)
+        # Execute the complete native pipeline without pre-seeded extraction artifacts.
         indexed = engine.index_chunks([(chunk, text)])
         assert indexed == 1
 

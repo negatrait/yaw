@@ -11,13 +11,11 @@ from yaw.daemon.graph.storage import (
     apply_shacl_repairs,
     deserialize_f32_vector,
     find_entity_disambiguation_candidates,
-    get_entities_by_label_norm,
     get_entity_metadata_batch,
     get_facts_with_meta_by_ids,
     initialize_schema,
     open_readonly_yaw_db,
     open_yaw_db,
-    resolve_entity_labels,
     search_chunks_fts,
     search_entity_vectors_knn,
     search_facts_fts,
@@ -36,9 +34,6 @@ def test_legacy_schema_migrates_rows_labels_edges_and_fact_search_without_loss(t
             CREATE TABLE chunks(chunk_id TEXT PRIMARY KEY, rel_posix_path TEXT NOT NULL,
                 start_line INTEGER NOT NULL, end_line INTEGER NOT NULL, title TEXT NOT NULL, content_hash TEXT);
             INSERT INTO chunks VALUES ('chunk','source.md',1,2,'Source','legacy-hash');
-            CREATE TABLE openie_chunks(chunk_id TEXT PRIMARY KEY, entities_json TEXT NOT NULL,
-                triples_json TEXT NOT NULL);
-            INSERT INTO openie_chunks VALUES ('chunk','["Ada"]','[]');
             CREATE TABLE entities(entity_id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE);
             INSERT INTO entities VALUES ('ada','Ada');
             CREATE TABLE facts(fact_id TEXT PRIMARY KEY,subj_id TEXT NOT NULL,pred TEXT NOT NULL,
@@ -59,7 +54,6 @@ def test_legacy_schema_migrates_rows_labels_edges_and_fact_search_without_loss(t
             0,
             0,
         )
-        assert conn.execute("SELECT structured_triples_json FROM openie_chunks").fetchone()[0] == "[]"
         assert tuple(conn.execute("SELECT entity_id,name,definition FROM entities").fetchone()) == ("ada", "Ada", "")
         assert tuple(conn.execute("SELECT label_norm,label_kind,raw_label,chunk_id FROM entity_labels").fetchone()) == (
             "ada",
@@ -168,27 +162,6 @@ def test_label_priority_is_global_across_sources_even_before_entity_hydration(tm
         with pytest.raises(ValueError, match="Invalid SKOS label_kind"):
             upsert_entity_labels(conn, [("invalid", "pending", "invalid", "Invalid", "a")])
         assert conn.execute("SELECT count(*) FROM entity_labels").fetchone()[0] == before
-        assert get_entities_by_label_norm(conn, []) == {}
-        assert get_entities_by_label_norm(conn, [" "]) == {}
-
-
-def test_label_resolution_uses_available_vectors_and_deterministic_missing_vector_ties(tmp_path):
-    with closing(open_yaw_db(tmp_path / "sense.db")) as conn:
-        upsert_entities(conn, [("a", "Mercury", "Planet"), ("b", "Mercury", "Metal"), ("c", "Unique", "Unique")])
-        upsert_entity_labels(
-            conn,
-            [
-                ("mercury", "a", "skos:prefLabel", "Mercury", "one"),
-                ("mercury", "b", "skos:prefLabel", "Mercury", "two"),
-                ("unique", "c", "skos:prefLabel", "Unique", "three"),
-            ],
-        )
-        assert resolve_entity_labels(conn, []) == {}
-        assert resolve_entity_labels(conn, ["unique"], [1.0, 0.0]) == {"unique": ["c"]}
-        assert resolve_entity_labels(conn, ["mercury"], [0.0, 0.0]) == {"mercury": ["a", "b"]}
-        assert resolve_entity_labels(conn, ["mercury", "unique"], [1.0, 0.0]) == {"mercury": ["a"], "unique": ["c"]}
-        upsert_entity_vectors(conn, [("a", [0.0, 0.0]), ("b", [1.0, 0.0])])
-        assert resolve_entity_labels(conn, ["mercury"], [1.0, 0.0]) == {"mercury": ["b"]}
 
 
 @pytest.mark.parametrize(

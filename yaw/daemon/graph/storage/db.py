@@ -48,14 +48,6 @@ _CREATE_SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     """
-    CREATE TABLE IF NOT EXISTS openie_chunks (
-        chunk_id TEXT PRIMARY KEY,
-        entities_json TEXT NOT NULL,
-        triples_json TEXT NOT NULL,
-        structured_triples_json TEXT NOT NULL DEFAULT '[]'
-    )
-    """,
-    """
     CREATE TABLE IF NOT EXISTS entities (
         entity_id TEXT PRIMARY KEY,
         name TEXT NOT NULL COLLATE NOCASE,
@@ -350,11 +342,6 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
             conn.execute("ALTER TABLE chunks ADD COLUMN ast_island_start INTEGER NOT NULL DEFAULT 0")
         if "ast_island_end" not in chunk_cols:
             conn.execute("ALTER TABLE chunks ADD COLUMN ast_island_end INTEGER NOT NULL DEFAULT 0")
-
-        # Auto-migrate openie_chunks.structured_triples_json
-        openie_cols = {row[1] for row in conn.execute("PRAGMA table_info(openie_chunks)").fetchall()}
-        if "structured_triples_json" not in openie_cols:
-            conn.execute("ALTER TABLE openie_chunks ADD COLUMN structured_triples_json TEXT NOT NULL DEFAULT '[]'")
 
         # Auto-migrate entities.definition and drop legacy UNIQUE constraint on entities.name
         entity_cols = {row[1] for row in conn.execute("PRAGMA table_info(entities)").fetchall()}

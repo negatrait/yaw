@@ -41,7 +41,6 @@ from yaw.daemon.graph.inference import (
     extraction_fingerprint,
     openie_fingerprint,
     query_retrieval_fingerprint,
-    text_processing,
     trim_diagnostics,
 )
 from yaw.daemon.graph.planner import (
@@ -60,12 +59,10 @@ from yaw.daemon.graph.storage import (
     CandidateStageCache,
     ManagedConnection,
     apply_shacl_repairs,
-    delete_chunks,
     format_pair_disambiguation_dossier,
     format_subgraph_for_qa,
     get_chunk_pointers,
     get_entity_doc_frequencies,
-    get_existing_ids,
     get_facts_by_ids,
     get_graph_counts,
     get_meta,
@@ -78,7 +75,6 @@ from yaw.daemon.graph.storage import (
     make_chunk_hydrator,
     open_managed_yaw_db,
     pool_confidences,
-    resolve_entity_labels,
     search_chunk_vectors_knn,
     search_chunks_fts,
     search_fact_vectors_knn,
@@ -182,8 +178,6 @@ class YawGraphEngine:
         self._last_hook_program: YawProgram | None = None
         self._last_scope_by_cids: dict[tuple[str, ...], dict[str, int]] = {}
         self._active_extraction_fingerprint: str | None = None
-        self._active_openie_fingerprint: str | None = None
-        self._baseline_openie_fp: str | None = None
         self._chunk_indexed_ext_fp: dict[str, str] = {}
         self._opt_chunks_pool: list[tuple[ChunkPointer, str]] = []
         self._opt_val_chunks_pool: list[tuple[ChunkPointer, str]] = []
@@ -287,46 +281,26 @@ class YawGraphEngine:
     ) -> None:
         """Populate _opt_indexed_cids, _chunk_indexed_ext_fp, and persisted DSPy trails from SQLite."""
         active_prog = program if program is not None else self.program
-        provenance: dict[str, list[str]] = {}
-        rows = self.conn.execute(
-            "SELECT c.chunk_id, m.value, p.value FROM chunks c "
-            "INNER JOIN openie_chunks o ON c.chunk_id = o.chunk_id "
-            "INNER JOIN meta m ON m.key = 'indexed_fp:' || c.chunk_id "
-            "INNER JOIN meta p ON p.key = 'openie_fp:' || c.chunk_id"
-        ).fetchall()
-        for cid, raw, saved_openie_fp in rows:
-            recorded = json.loads(raw)
-            if recorded[1] == saved_openie_fp:
-                provenance[str(cid)] = recorded
-        if (
-            self.conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunk_inference' LIMIT 1"
-            ).fetchone()
-            is not None
-        ):
-            curr_ext_fp = extraction_fingerprint(active_prog)
-            curr_openie_fp = openie_fingerprint(active_prog)
-            inf_rows = self.conn.execute(
-                "SELECT c.chunk_id, i.program_identity FROM chunks c "
-                "INNER JOIN chunk_inference i ON c.chunk_id = i.chunk_id"
-            ).fetchall()
-            for cid, prog_id in inf_rows:
-                cid_str = str(cid)
-                if cid_str not in provenance:
-                    provenance[cid_str] = [curr_ext_fp, str(prog_id or curr_openie_fp)]
-        seeded_cids = list(provenance)
-        if not seeded_cids:
+        self._opt_indexed_cids.clear()
+        self._chunk_indexed_ext_fp.clear()
+        self._active_extraction_fingerprint = None
+        if not self.conn.execute("SELECT 1 FROM sqlite_master WHERE name='chunk_inference'").fetchone():
             return
-        vec_cids = get_existing_ids(self.conn, "chunk_vec", seeded_cids)
-        ready_cids = set(seeded_cids) & vec_cids
+        curr_ext_fp = extraction_fingerprint(active_prog)
+        curr_openie_fp = openie_fingerprint(active_prog)
+        ready_cids = {
+            str(row[0])
+            for row in self.conn.execute(
+                "SELECT c.chunk_id FROM chunks c JOIN chunk_inference i ON c.chunk_id=i.chunk_id "
+                "JOIN chunk_vec v ON v.chunk_id=c.chunk_id "
+                "WHERE i.program_identity=? AND i.embedding_identity=?",
+                (curr_openie_fp, self.embedder.profile.index_identity),
+            )
+        }
         if ready_cids:
-            self._opt_indexed_cids.update(ready_cids)
-            for cid in ready_cids:
-                self._chunk_indexed_ext_fp[cid] = provenance[cid][0]
-            if self._active_extraction_fingerprint is None:
-                self._active_extraction_fingerprint = provenance[next(iter(ready_cids))][0]
-            if self._active_openie_fingerprint is None:
-                self._active_openie_fingerprint = provenance[next(iter(ready_cids))][1]
+            self._opt_indexed_cids = ready_cids
+            self._chunk_indexed_ext_fp = dict.fromkeys(ready_cids, curr_ext_fp)
+            self._active_extraction_fingerprint = curr_ext_fp
 
             raw_trails = get_meta(self.conn, "dspy_trails_state")
             if raw_trails:
@@ -975,88 +949,36 @@ class YawGraphEngine:
         *,
         progress_callback: Callable[[str], None] | None = None,
     ) -> int:
-        """Raw document string ingestion adapter for CLI benchmarks and quick experimentation."""
-        if not docs:
-            return 0
-
+        """Publish a complete raw-document snapshot for benchmarks and experiments."""
         with self._lock:
-            unique_docs: list[str] = []
-            seen_docs: set[str] = set()
-            for d in docs:
-                if d and d not in seen_docs:
-                    seen_docs.add(d)
-                    unique_docs.append(d)
-            if not unique_docs:
-                return 0
-
-            chunk_ids = [compute_mdhash_id(d, prefix="chunk-") for d in unique_docs]
-            existing_chunks = get_existing_ids(self.conn, "chunk", chunk_ids)
-            existing_vecs = get_existing_ids(self.conn, "chunk_vec", chunk_ids)
-
-            incomplete_cids = [cid for cid in chunk_ids if cid in existing_chunks and cid not in existing_vecs]
-            new_docs = [d for d, cid in zip(unique_docs, chunk_ids, strict=False) if cid not in existing_chunks]
-            if not new_docs and not incomplete_cids:
-                return 0
-
-            chunks_to_index: list[tuple[ChunkPointer, str]] = []
-            if incomplete_cids:
-                existing_ptrs = get_chunk_pointers(self.conn, incomplete_cids)
-                doc_by_cid = dict(zip(chunk_ids, unique_docs, strict=False))
-                for cid in incomplete_cids:
-                    if cid in existing_ptrs and cid in doc_by_cid:
-                        chunks_to_index.append((existing_ptrs[cid], doc_by_cid[cid]))
-
-            if new_docs:
-                passages_path = self.workspace_root / "passages.json"
-                existing_records: list[dict[str, Any]] = []
-                if passages_path.is_file():
-                    loaded = json.loads(passages_path.read_text(encoding="utf-8"))
-                    if isinstance(loaded, list):
-                        existing_records = [r for r in loaded if isinstance(r, dict)]
-
-                all_records = list(existing_records)
-                seen_rec_ids = {str(r.get("id", "")) for r in all_records}
-                new_doc_items: list[tuple[str, str, str]] = []
-                for doc in new_docs:
-                    cid = compute_mdhash_id(doc, prefix="chunk-")
-                    first_line = doc.split("\n", 1)[0].strip()
-                    title = first_line if len(first_line) < 100 else ""
-                    new_doc_items.append((cid, title, doc))
-                    if cid not in seen_rec_ids:
-                        all_records.append({"id": cid, "title": title, "text": doc})
-                        seen_rec_ids.add(cid)
-
-                rendered_items: list[str] = []
-                span_by_cid: dict[str, tuple[int, int]] = {}
-                curr_line = 2
-                for rec in all_records:
-                    item_str = "\n".join("  " + ln for ln in json.dumps(rec, ensure_ascii=False, indent=2).splitlines())
-                    rendered_items.append(item_str)
-                    s_line = curr_line
-                    e_line = s_line + item_str.count("\n")
-                    rec_id = str(rec.get("id", ""))
-                    if rec_id:
-                        span_by_cid[rec_id] = (s_line, e_line)
-                    curr_line = e_line + 1
-
-                full_json = "[\n" + ",\n".join(rendered_items) + "\n]\n"
-                self.workspace_root.mkdir(parents=True, exist_ok=True)
-                write_text_atomic(passages_path, full_json)
-
-                for cid, title, doc in new_doc_items:
-                    s_line, e_line = span_by_cid[cid]
-                    ptr = ChunkPointer(
-                        chunk_id=cid,
-                        rel_posix_path="passages.json",
-                        start_line=s_line,
-                        end_line=e_line,
-                        title=title,
-                        ast_island_start=s_line,
-                        ast_island_end=e_line,
+            records = []
+            for doc in dict.fromkeys(docs):
+                if doc:
+                    title = doc.split("\n", 1)[0].strip()
+                    records.append(
+                        {
+                            "id": compute_mdhash_id(doc, prefix="chunk-"),
+                            "title": title if len(title) < 100 else "",
+                            "text": doc,
+                        }
                     )
-                    chunks_to_index.append((ptr, doc))
-
-            return self.index_chunks(chunks_to_index, progress_callback=progress_callback)
+            rendered = []
+            chunks = []
+            line = 2
+            for record in records:
+                item = "\n".join("  " + row for row in json.dumps(record, ensure_ascii=False, indent=2).splitlines())
+                end_line = line + item.count("\n")
+                chunks.append(
+                    (
+                        ChunkPointer(record["id"], "passages.json", line, end_line, record["title"], line, end_line),
+                        record["text"],
+                    )
+                )
+                rendered.append(item)
+                line = end_line + 1
+            self.workspace_root.mkdir(parents=True, exist_ok=True)
+            write_text_atomic(self.workspace_root / "passages.json", "[\n" + ",\n".join(rendered) + "\n]\n")
+            return self.index_chunks(chunks, progress_callback=progress_callback)
 
     def index_chunks(
         self,
@@ -1065,26 +987,21 @@ class YawGraphEngine:
         progress_callback: Callable[[str], None] | None = None,
         program: YawProgram | None = None,
     ) -> int:
-        """Publish an explicit candidate snapshot through the bound native runtime."""
-        if not chunks:
-            return 0
+        """Publish the complete desired snapshot, including empty input for withdrawal."""
         if self.indexing_runner is None:
             raise RuntimeError("Indexing requires daemon composition with bind_native_indexing")
         active_program = program if program is not None else self.program
         with self._lock:
             self._bind_program_hooks(active_program)
             self._apply_program_embedding_prefixes(active_program)
-            by_id = {pointer.chunk_id: (pointer, text) for pointer, text in self._opt_chunks_pool}
-            by_id.update({pointer.chunk_id: (pointer, text) for pointer, text in chunks})
-            self._opt_chunks_pool = list(by_id.values())
             if progress_callback is not None:
                 progress_callback("indexing: native frozen candidate preparation and graph publication")
-            summary = self.indexing_runner(self._opt_chunks_pool, active_program)
+            self._opt_chunks_pool = list(chunks)
+            summary = self.indexing_runner(chunks, active_program)
             self._csr_graph = None
             self._query_retrieval_memo.clear()
             self._last_memo_question = None
             self._active_extraction_fingerprint = extraction_fingerprint(active_program)
-            self._active_openie_fingerprint = openie_fingerprint(active_program)
             self._opt_indexed_cids = set(summary.chunk_ids)
             self._chunk_indexed_ext_fp = {cid: self._active_extraction_fingerprint for cid in summary.chunk_ids}
             self._graph_rlm_stats.update(summary.rlm_stats)
@@ -1105,23 +1022,6 @@ class YawGraphEngine:
                 getattr(active_program, name).extend(getattr(summary, name))
             trim_diagnostics(active_program)
             return len(chunks)
-
-    def delete_chunks(self, chunk_ids: Sequence[str]) -> None:
-        """Atomically delete chunks and cascade through affected edges, facts, and entities."""
-        if not chunk_ids:
-            return
-        with self._lock:
-            delete_chunks(self.conn, chunk_ids)
-            with self.managed_conn.transaction():
-                for cid in chunk_ids:
-                    set_meta(self.conn, f"indexed_fp:{cid}", None)
-                    set_meta(self.conn, f"openie_fp:{cid}", None)
-            for cid in chunk_ids:
-                self._opt_indexed_cids.discard(cid)
-                self._chunk_indexed_ext_fp.pop(cid, None)
-            self._csr_graph = None
-            self._query_retrieval_memo.clear()
-            self._last_memo_question = None
 
     def retrieve_with_seeds(
         self,
@@ -1251,7 +1151,7 @@ class YawGraphEngine:
                 kept_fids = [fid for fid, _, _ in kept_facts_with_scores]
                 f_placeholders = ",".join("?" for _ in kept_fids)
                 f_info_rows = self.conn.execute(
-                    f"SELECT fact_id, COALESCE(obj_kind, 'entity'), confidence "
+                    f"SELECT fact_id, obj_kind, confidence, subj_id, obj_id "
                     f"FROM facts WHERE fact_id IN ({f_placeholders})",
                     kept_fids,
                 ).fetchall()
@@ -1259,6 +1159,7 @@ class YawGraphEngine:
                 fact_conf_by_fid: dict[str, float | None] = {
                     str(r[0]): (float(r[2]) if r[2] is not None else None) for r in f_info_rows
                 }
+                endpoints_by_fid = {str(r[0]): (str(r[3]), r[4]) for r in f_info_rows}
                 fact_sources_by_fid: dict[str, list[str]] = {}
                 for r in self.conn.execute(
                     f"SELECT fact_id, chunk_id FROM fact_sources WHERE fact_id IN ({f_placeholders})",
@@ -1266,33 +1167,21 @@ class YawGraphEngine:
                 ):
                     fact_sources_by_fid.setdefault(str(r[0]), []).append(str(r[1]))
 
-                surface_mentions: list[str] = []
-                for fid, (s, _, o), _ in kept_facts_with_scores:
-                    surface_mentions.append(str(text_processing(s)))
-                    if fact_kind_by_fid.get(fid, "entity") != "literal":
-                        surface_mentions.append(str(text_processing(o)))
-                resolved_map = resolve_entity_labels(self.conn, surface_mentions, query_vec=query_fact_vec)
-
                 seed_entities: dict[str, list[float]] = {}
                 literal_chunk_seeds: dict[str, list[float]] = {}
-                for fid, (s, _, o), score in kept_facts_with_scores:
+                for fid, _, score in kept_facts_with_scores:
                     f_prior = fact_conf_by_fid.get(fid)
                     pooled_score = pool_confidences(score, f_prior) or score
-                    s_norm = str(text_processing(s))
-                    s_ids = resolved_map.get(s_norm) or [compute_mdhash_id(s_norm, prefix="entity-")]
-                    for s_id in s_ids:
-                        seed_entities.setdefault(s_id, []).append(pooled_score)
-                    if fact_kind_by_fid.get(fid, "entity") == "literal":
+                    subject, obj = endpoints_by_fid[fid]
+                    seed_entities.setdefault(subject, []).append(pooled_score)
+                    if fact_kind_by_fid[fid] == "literal":
                         src_cids = fact_sources_by_fid.get(fid, ())
                         if src_cids:
                             share = pooled_score / float(len(src_cids))
                             for src_cid in src_cids:
                                 literal_chunk_seeds.setdefault(src_cid, []).append(share)
                     else:
-                        o_norm = str(text_processing(o))
-                        o_ids = resolved_map.get(o_norm) or [compute_mdhash_id(o_norm, prefix="entity-")]
-                        for o_id in o_ids:
-                            seed_entities.setdefault(o_id, []).append(pooled_score)
+                        seed_entities.setdefault(str(obj), []).append(pooled_score)
 
                 doc_freqs = get_entity_doc_frequencies(self.conn, list(seed_entities.keys()))
 
@@ -1511,25 +1400,11 @@ class YawGraphEngine:
         self._resolved_docs_cache.clear()
         self._last_memo_question = None
         if opt_chunks is not None:
-            existing_cids = {p.chunk_id for p, _ in self._opt_chunks_pool}
-            for ptr, text in opt_chunks:
-                if ptr.chunk_id not in existing_cids:
-                    self._opt_chunks_pool.append((ptr, text))
-                    existing_cids.add(ptr.chunk_id)
+            self._opt_chunks_pool = list(opt_chunks)
 
         self._active_progress_callback = progress_callback
         self._last_hook_program = None
-        self._baseline_openie_fp = openie_fingerprint(self.program)
         self._hydrate_indexed_cids_from_db(self.program)
-        # Legacy rows have no durable prompt provenance. Never relabel them as
-        # results of the current seed; only verified checkpoints can be reused.
-        unverified_cids = [
-            str(cid)
-            for (cid,) in self.conn.execute("SELECT chunk_id FROM chunks")
-            if str(cid) not in self._opt_indexed_cids
-        ]
-        if unverified_cids:
-            self.delete_chunks(unverified_cids)
         self._opt_docs_by_question.clear()
         use_gold_docs = len(self._opt_chunks_pool) > 64
         val_slice = list(valset or trainset)
@@ -1592,7 +1467,7 @@ class YawGraphEngine:
             else []
         )
         if missing_val_pool:
-            self.index_chunks(missing_val_pool, program=self.program, progress_callback=progress_callback)
+            self.index_chunks(self._opt_chunks_pool, program=self.program, progress_callback=progress_callback)
 
     def _hydrate_top_chunks_for_eval(
         self,

@@ -317,7 +317,7 @@ def test_engine_index_and_caching(test_engine: YawGraphEngine, tmp_path: Path) -
 
     # Second index pass (idempotent re-index)
     reindexed = test_engine.index(docs)
-    assert reindexed == 0
+    assert reindexed == len(docs)
 
 
 def test_openie_resume_reuses_matching_prompts_and_invalidates_mutations(tmp_path: Path) -> None:
@@ -353,6 +353,8 @@ def test_openie_resume_reuses_matching_prompts_and_invalidates_mutations(tmp_pat
         second.ner.signature = second.ner.signature.with_instructions(
             second.ner.signature.instructions + " Include all explicitly named people."
         )
+        engine._hydrate_indexed_cids_from_db(second)
+        assert not engine._opt_indexed_cids
         engine.index_chunks(chunks, program=second)
         assert engine.conn.execute("SELECT program_identity FROM chunk_inference").fetchone()[0] != checkpoint[0]
         assert engine.conn.execute("SELECT count(*) FROM facts").fetchone()[0] > 0
@@ -405,7 +407,7 @@ def test_engine_end_to_end_trace_hook(test_engine: YawGraphEngine) -> None:
     assert len(pred.retrieved_passages) > 0
 
 
-def test_engine_delete_chunks_cascades_and_invalidates_csr(test_engine: YawGraphEngine) -> None:
+def test_engine_snapshot_withdrawal_invalidates_csr(test_engine: YawGraphEngine) -> None:
     docs = [
         "Chunk 1: Alan Turing.",
         "Chunk 2: Radio City.",
@@ -418,7 +420,7 @@ def test_engine_delete_chunks_cascades_and_invalidates_csr(test_engine: YawGraph
 
     # Delete chunk 1
     c1_id = graph1.chunk_ids[0]
-    test_engine.delete_chunks([c1_id])
+    test_engine.index_chunks([(ptr, text) for ptr, text in test_engine._opt_chunks_pool if ptr.chunk_id != c1_id])
 
     # Cached graph must be invalidated
     assert test_engine._csr_graph is None
@@ -469,7 +471,7 @@ def test_engine_multi_batch_indexing_and_bounded_embedding_batches(synonym_token
             "Doc 4 line 1\nDoc 4 line 2",
             "Doc 5 single line",
         ]
-        assert engine.index(batch2) == 2
+        assert engine.index([*batch1, *batch2]) == 5
 
         # Every embedder call must respect embed_batch_size=2
         assert all(sz <= 2 for sz in batch_sizes_seen)
@@ -908,8 +910,13 @@ def test_engine_homograph_gate_edc_and_shacl_conformance(synonym_token_counter, 
         assert n1 == 1
 
         # Index second passage: "Apple" with different inline definition triggers provisional sense split
-        n2 = engine.index(["The apple is an edible pome fruit harvested in orchard trees during Autumn."])
-        assert n2 == 1
+        n2 = engine.index(
+            [
+                "Apple is a technology company headquartered in Cupertino.",
+                "The apple is an edible pome fruit harvested in orchard trees during Autumn.",
+            ]
+        )
+        assert n2 == 2
 
         # Verify two distinct Apple entities exist, linked by owl:differentFrom and sharing prefLabel "apple"
         apple_entities = engine.conn.execute(
@@ -1031,7 +1038,7 @@ Option A (standalone Stage 1 NER entities preserved with definitions)."""
     )
     try:
         engine.index(["Apple designed the iPhone in 2007."])
-        engine.index(["Apple manufactures the MacBook with the M3 Max chip."])
+        engine.index(["Apple designed the iPhone in 2007.", "Apple manufactures the MacBook with the M3 Max chip."])
 
         # Hazard 2: Provisional sense split for "Apple" (since mock embedder cos < 0.85 for different defs)
         # had NO premature owl:differentFrom edge in Step 4 and was merged back into 1 Apple entity by JudgeLabels!
@@ -1331,7 +1338,15 @@ using all 5 bound REPL tools."""
         program.label_judge_audit_trail.clear()
         program.shacl_audit_trail.clear()
 
-        assert engine.index(["Alan M. Turing worked on cryptanalysis at Bletchley Park."]) == 1
+        assert (
+            engine.index(
+                [
+                    "Alan Turing formulated the Turing machine in 1936.",
+                    "Alan M. Turing worked on cryptanalysis at Bletchley Park.",
+                ]
+            )
+            == 2
+        )
 
         # Verify all 5 REPL tools ran inside shacl_healer_rlm and healed both violations
         assert "shacl_healer_rlm_invoked" in repl_tool_events
@@ -1652,7 +1667,7 @@ traces into dspy.settings.trace, and emits per-predictor feedback."""
                     _ = cand_qa(**ex.inputs())
                 assert len(ner_calls) == ner_count_after_base
 
-                # Evaluate NER-mutated candidate: MUST wipe openie_chunks and re-run NER extraction!
+                # Evaluate NER-mutated candidate: invalidate native artifacts and rerun NER extraction.
                 cand_ner = student.deepcopy()
                 cand_ner.ner.signature = cand_ner.ner.signature.with_instructions(
                     "MUTATED_NER_MARKER: Extract all entities with definitions."

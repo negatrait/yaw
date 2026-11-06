@@ -284,13 +284,9 @@ def run_yaw_benchmark(
         bundle = resolve_dataset_bundle(dataset, workspace_root=PROJECT_ROOT)
         yaw_engine.workspace_root = bundle.root.parent
         chunks_to_index = snapshot_dataset_bundle(bundle, index_dir / "coco_state", document_ids=document_ids)
-        report["index_batches"] = (
-            yaw_engine.index_chunks(
-                chunks_to_index,
-                progress_callback=lambda msg: print(f"[Native YAW] [{dataset}] {msg}", flush=True),
-            )
-            if chunks_to_index
-            else int(yaw_engine.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
+        report["index_batches"] = yaw_engine.index_chunks(
+            chunks_to_index,
+            progress_callback=lambda msg: print(f"[Native YAW] [{dataset}] {msg}", flush=True),
         )
         del document_ids
         gc.collect()

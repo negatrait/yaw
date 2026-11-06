@@ -706,8 +706,6 @@ def bind_native_indexing(engine: YawGraphEngine, *, batch_size: int = 64) -> Yaw
     """Compose frozen indexing at the daemon boundary; graph code owns no scheduler."""
 
     def execute(chunks: Sequence[tuple[ChunkPointer, str]], program: YawProgram) -> GraphPlanSummary:
-        if not chunks:
-            return GraphPlanSummary(())
         program_identity = openie_fingerprint(program)
         embedding_identity = str(engine.embedder.profile.index_identity)
         context = coco.ContextProvider()

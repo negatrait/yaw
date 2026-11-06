@@ -11,6 +11,7 @@ from daemon.graph.test_batch_equivalence import assert_same_graph, canonical_gra
 from daemon.graph.test_indexing_overlap import adapter
 from daemon.graph.test_indexing_overlap import provider as provider
 from yaw.core import ChunkPointer
+from yaw.daemon.graph.engine import YawGraphEngine
 from yaw.daemon.graph.inference import YawProgram, create_dspy_lm, openie_fingerprint
 from yaw.daemon.graph.inference.components import EMBEDDING_ENDPOINT, OPENIE_ENDPOINT, EmbeddingEndpoint, OpenIEEndpoint
 from yaw.daemon.graph.planner import GraphPlanSettings
@@ -19,7 +20,13 @@ from yaw.daemon.graph.storage.db import GRAPH_DB
 from yaw.daemon.graph.storage.evidence import sense_id
 from yaw.daemon.graph.storage.managed_sqlite import VALIDATE_SQLITE
 from yaw.daemon.graph.storage.rows import validate_graph_state
-from yaw.daemon.indexing import FrozenChunkStream, InferenceIdentity, frozen_indexing_app_main, indexing_app_main
+from yaw.daemon.indexing import (
+    FrozenChunkStream,
+    InferenceIdentity,
+    bind_native_indexing,
+    frozen_indexing_app_main,
+    indexing_app_main,
+)
 from yaw.daemon.ingestion.source_targets import SOURCE_DB, SOURCE_ROOT, SourceSettings
 
 
@@ -108,6 +115,99 @@ def fixed_vector(text):
 def publish(stream, app, chunks):
     stream.chunks = tuple(chunks)
     app.update_blocking()
+
+
+def native_engine(root, state_dir, url, **settings):
+    lm = create_dspy_lm("overlap", base_url=url + "/v1", cache=False, temperature=1.0, max_tokens=512)
+    program = YawProgram(orchestrator_lm=lm, rlm_sub_lm=lm, enable_gbnf=False, max_output_tokens=512)
+    return bind_native_indexing(
+        YawGraphEngine(state_dir / "yaw.db", root, program, adapter(url), synonymy_top_k=8, **settings), batch_size=2
+    )
+
+
+@pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize("raw_documents", [False, True])
+def test_engine_snapshots_withdraw_shared_support_and_reintroduce(tmp_path, provider, restart, raw_documents):
+    url, state = provider
+    state["delay"] = 0
+    state["embedding_vector"] = fixed_vector
+    texts = ("Orion first evidence.", "Orion second evidence.")
+    state["extractions"] = {text: extraction("Orion", "A telemetry service.") for text in texts}
+    chunks = [(ChunkPointer(str(index), f"{index}.md", 1, 1), text) for index, text in enumerate(texts)]
+    for ptr, text in chunks:
+        (tmp_path / ptr.rel_posix_path).write_text(text, encoding="utf-8")
+    engine = native_engine(tmp_path, tmp_path / "incremental", url)
+    try:
+        for step, desired in enumerate((chunks, chunks[1:], [], chunks[:1])):
+            inputs = [text for _, text in desired] if raw_documents else desired
+            publish_snapshot = engine.index if raw_documents else engine.index_chunks
+            assert publish_snapshot(inputs) == len(desired)
+            with engine.managed_conn.readonly() as conn:
+                actual = canonical_graph(conn)
+                assert conn.execute("SELECT COUNT(*) FROM fact_assertions").fetchone()[0] == 5 * len(desired)
+                assert conn.execute("SELECT COUNT(*) FROM fact_sources").fetchone()[0] == 5 * len(desired)
+                assert conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == (5 if desired else 0)
+                assert conn.execute("SELECT COUNT(*) FROM source_chunks").fetchone()[0] == len(desired)
+                assert conn.execute("SELECT COUNT(*) FROM chunk_inference").fetchone()[0] == len(desired)
+            reference = native_engine(tmp_path, tmp_path / f"reference-{step}", url)
+            try:
+                (reference.index if raw_documents else reference.index_chunks)(inputs)
+                with reference.managed_conn.readonly() as conn:
+                    assert_same_graph(actual, canonical_graph(conn))
+            finally:
+                reference.close()
+            if restart:
+                engine.close()
+                engine = native_engine(tmp_path, tmp_path / "incremental", url)
+            calls = len(state["intervals"])
+            changes = engine.conn.total_changes
+            (engine.index if raw_documents else engine.index_chunks)(inputs)
+            assert len(state["intervals"]) == calls
+            assert engine.conn.total_changes == changes
+    finally:
+        engine.close()
+
+
+def test_retrieval_seeds_selected_fact_endpoints_despite_homograph_vector_conflict(tmp_path, provider):
+    url, state = provider
+    state["delay"] = 0
+    planet_text = "Mercury is a planet that orbits Sun."
+    metal_text = "Mercury is a metal that has Conductivity."
+    state["extractions"] = {
+        planet_text: {
+            "named_entities": [["Mercury", "A planet."], ["Sun", "A star."]],
+            "triples": [{"sub": "Mercury", "pred": "orbits", "obj": "Sun", "def": "Mercury orbits Sun."}],
+        },
+        metal_text: {
+            "named_entities": [["Mercury", "A metal."], ["Conductivity", "A property."]],
+            "triples": [{"sub": "Mercury", "pred": "has", "obj": "Conductivity", "def": "Mercury conducts."}],
+        },
+    }
+    state["embedding_vector"] = lambda text: (
+        [1.0, 0.0, 0.0, 0.0]
+        if "planet" in text.casefold()
+        else [0.0, 0.0, 1.0, 0.0]
+        if "star" in text.casefold()
+        else [0.0, 0.0, 0.0, 1.0]
+        if "property" in text.casefold()
+        else [0.0, 1.0, 0.0, 0.0]
+    )
+    state["selected_facts"] = [["Mercury", "orbits", "Sun"]]
+    engine = native_engine(
+        tmp_path, tmp_path / "index", url, linking_top_k=1, fact_fts_weight=10.0, passage_node_weight=0.0
+    )
+    try:
+        engine.index([planet_text, metal_text])
+        assert engine.conn.execute("SELECT COUNT(*) FROM entities WHERE name='Mercury'").fetchone()[0] == 2
+        queries = []
+        engine.conn.set_trace_callback(queries.append)
+        hits, facts = engine.retrieve_with_seeds("Which body orbits Sun?", top_k=1, allow_intent_path=False)
+        engine.conn.set_trace_callback(None)
+        assert facts == [("Mercury", "orbits", "Sun")]
+        assert len(hits) == 1 and "planet" in hits[0][2]
+        assert not any("entity_labels" in sql for sql in queries)
+    finally:
+        engine.close()
 
 
 @pytest.mark.parametrize("restart", [False, True])

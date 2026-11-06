@@ -11,7 +11,8 @@ import psutil
 import pytest
 from filelock import FileLock
 
-from yaw.core import YawConfig, YawRuntimeError, load_config
+from daemon.native_inference import publish_inference
+from yaw.core import OpenIERecord, YawConfig, YawRuntimeError, load_config
 from yaw.daemon.cli import (
     handle_daemon_start,
     handle_daemon_stop,
@@ -32,11 +33,7 @@ def configured_workspace(tmp_path) -> YawConfig:
 
 
 def seed_openie(path, count):
-    with closing(open_yaw_db(path)) as conn:
-        conn.executemany(
-            "INSERT INTO openie_chunks(chunk_id,entities_json,triples_json) VALUES (?,'[]','[]')",
-            [(f"source-{i}",) for i in range(count)],
-        )
+    publish_inference(path, [OpenIERecord(chunk_id=f"source-{i}", entities=(), triples=()) for i in range(count)])
 
 
 def test_status_reads_only_held_optimizer_locks_and_merges_durable_progress(tmp_path):

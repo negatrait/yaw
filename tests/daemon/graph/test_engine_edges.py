@@ -220,7 +220,7 @@ def test_empty_engine_operations_do_not_call_inference_or_create_graph_rows(tmp_
         assert engine.retrieve_dpr("question") == []
         assert engine.rag_qa([]) == []
         assert engine.format_qa_context([]) == ""
-        engine.delete_chunks([])
+        assert engine.index_chunks([]) == 0
         assert calls == []
         assert engine.conn.execute("SELECT count(*) FROM chunks").fetchone()[0] == 0
     finally:
@@ -252,9 +252,17 @@ def test_slice5_passages_json_shared_corpus_pools_and_unbounded_eval_hydration(t
     assert not hasattr(YawGraphEngine, "_materialize_doc_chunk")
     engine = make_engine(tmp_path, url)
     try:
-        # 1. Incremental index() into passages.json preserves existing line spans and never creates corpus/chunk-*.md
+        # 1. Complete raw-document snapshots preserve unchanged spans without materializing corpus/chunk-*.md.
         assert engine.index(["First Title\nAda wrote Notes on the Analytical Engine."]) == 1
-        assert engine.index(["Second Title\nAda wrote Notes on Babbage's machine."]) == 1
+        assert (
+            engine.index(
+                [
+                    "First Title\nAda wrote Notes on the Analytical Engine.",
+                    "Second Title\nAda wrote Notes on Babbage's machine.",
+                ]
+            )
+            == 2
+        )
         assert not (tmp_path / "corpus").exists()
         passages_path = tmp_path / "passages.json"
         assert passages_path.is_file()
@@ -289,8 +297,6 @@ def test_slice5_passages_json_shared_corpus_pools_and_unbounded_eval_hydration(t
         assert not (tmp_path / "corpus").exists()
 
         # 3. Shared-corpus (>64 chunks) pool preservation in _prepare_optimization_pools & _ensure_candidate_chunks
-        from yaw.daemon.graph.inference import extraction_fingerprint, openie_fingerprint
-        from yaw.daemon.graph.storage import set_meta, upsert_chunk_pointers
 
         shared_records = [
             {
@@ -311,8 +317,6 @@ def test_slice5_passages_json_shared_corpus_pools_and_unbounded_eval_hydration(t
         engine._opt_val_chunks_pool.clear()
         # Leave _resolved_docs_cache populated so _prepare_optimization_pools is verified to clear it
         assert len(engine._resolved_docs_cache) > 0
-        ext_fp = extraction_fingerprint(engine.program)
-        oie_fp = openie_fingerprint(engine.program)
         shared_pairs: list[tuple[ChunkPointer, str]] = []
         curr_ln = 2
         for rec, item_s in zip(shared_records, rendered, strict=True):
@@ -321,16 +325,8 @@ def test_slice5_passages_json_shared_corpus_pools_and_unbounded_eval_hydration(t
             curr_ln = e_ln + 1
             ptr = ChunkPointer(rec["id"], "shared_corpus.json", s_ln, e_ln, rec["title"], s_ln, e_ln)
             shared_pairs.append((ptr, rec["text"]))
-            engine._opt_chunks_pool.append((ptr, rec["text"]))
-            engine._opt_indexed_cids.add(rec["id"])
-            engine._chunk_indexed_ext_fp[rec["id"]] = ext_fp
 
-        with engine.managed_conn.transaction() as conn:
-            conn.execute("DELETE FROM chunks")
-            upsert_chunk_pointers(conn, shared_pairs)
-            for ptr, _ in shared_pairs:
-                set_meta(conn, f"indexed_fp:{ptr.chunk_id}", ext_fp)
-                set_meta(conn, f"openie_fp:{ptr.chunk_id}", oie_fp)
+        engine.index_chunks(shared_pairs)
 
         shared_train = [dspy.Example(question=f"Question {i}?", item_docs=[]).with_inputs("question") for i in range(3)]
         shared_val = [

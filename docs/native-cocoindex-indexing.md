@@ -39,6 +39,12 @@ admitting changed chunks. Never replay a smaller prefix of an already completed
 snapshot and thereby withdraw valid chunks. Reopening the native tracking state
 must preserve this rule. Revision matching includes source pointer/AST bounds,
 source hash and extraction/embedding identities; matching IDs alone is insufficient.
+`index_chunks()` and the raw-document `index()` adapter receive complete desired
+snapshots, including empty input for complete withdrawal. Callers retain surviving
+inputs explicitly; the engine never silently unions new inputs with a previous
+snapshot. Removal uses the same native declarations, without an imperative delete
+API. Resume and progress readers use `chunk_inference` exclusively; no legacy
+OpenIE cache or legacy fingerprint metadata can authorize reuse.
 Implementation slices and remaining cutover work are tracked in
 [atomic incremental publication units](reviews/incremental-publication-work.md).
 

@@ -381,7 +381,7 @@ def test_cli_resume_real_gepa_checkpoint_and_custom_output(tmp_path: Path, provi
     state.save(str(telemetry), use_cloudpickle=True)
     custom_output.unlink()  # unfinished run need not have a final program
     with closing(sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True)) as conn:
-        initial_openie = conn.execute("SELECT * FROM openie_chunks").fetchall()
+        initial_openie = conn.execute("SELECT * FROM chunk_inference").fetchall()
     for selection in (["--resume"], ["--db-path", "latest"]):
         rc, output, errors = run_cli(selection, bare=True)
         assert rc == 0, errors
@@ -401,10 +401,10 @@ def test_cli_resume_real_gepa_checkpoint_and_custom_output(tmp_path: Path, provi
         pools = json.loads((tmp_path / "my_compiled_pools.json").read_text())
         assert pools["corpus_chunk_ids"]
         with closing(sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True)) as conn:
-            assert conn.execute("SELECT * FROM openie_chunks").fetchall() == initial_openie
+            assert conn.execute("SELECT * FROM chunk_inference").fetchall() == initial_openie
 
     # Metric/code upgrade with identical data, settings, mode, packages, and output path:
-    # preserves openie_chunks while invalidating stale pre-upgrade gepa_state.bin and simba scores.
+    # preserves chunk_inference while invalidating stale pre-upgrade gepa_state.bin and simba scores.
     with closing(sqlite3.connect(db_path)) as conn, conn:
         saved_meta = json.loads(conn.execute("SELECT value FROM meta WHERE key = 'optimization_run'").fetchone()[0])
         saved_meta["identity"]["metric"] = "task-quality-legacy-v1"
@@ -422,7 +422,7 @@ def test_cli_resume_real_gepa_checkpoint_and_custom_output(tmp_path: Path, provi
     assert rc == 0, errors
     assert "RESUMED_WINNER" not in custom_output.read_text(encoding="utf-8")
     with closing(sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True)) as conn:
-        assert conn.execute("SELECT * FROM openie_chunks").fetchall() == initial_openie
+        assert conn.execute("SELECT * FROM chunk_inference").fetchall() == initial_openie
         upgraded_meta = json.loads(conn.execute("SELECT value FROM meta WHERE key = 'optimization_run'").fetchone()[0])
         assert upgraded_meta["identity"]["metric"] == "task-quality-arithmetic-mean-v2"
         assert conn.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'simba_worker:%'").fetchone()[0] == 0
@@ -1162,19 +1162,14 @@ def test_cli_optimize_multi_dataset_interleaved_splits(
 
 def test_cli_status_reports_active_indexing_progress(tmp_path: Path, provider) -> None:
     """Verify yaw status inspects openie checkpoints and surfaces active indexing progress."""
+    from daemon.native_inference import publish_inference
     from yaw.core import OpenIERecord
     from yaw.daemon.cli import inspect_status
-    from yaw.daemon.graph.storage import open_yaw_db, save_openie_checkpoints
 
     cfg, _ = _make_test_config(tmp_path)
     assert cfg.db_path is not None
-    conn = open_yaw_db(cfg.db_path)
-    try:
-        # Seed 3 dummy openie records
-        records = [OpenIERecord(chunk_id=f"chunk-{i}", entities=("E",), triples=(("A", "r", "B"),)) for i in range(3)]
-        save_openie_checkpoints(conn, records)
-    finally:
-        conn.close()
+    records = [OpenIERecord(chunk_id=f"chunk-{i}", entities=("E",), triples=(("A", "r", "B"),)) for i in range(3)]
+    publish_inference(cfg.db_path, records)
 
     # Offline inspect
     offline_status = inspect_status(cfg)

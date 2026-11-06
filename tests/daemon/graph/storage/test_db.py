@@ -4,11 +4,11 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from daemon.native_inference import publish_inference
 
 from yaw.core import ChunkPointer, OpenIERecord
 from yaw.daemon.graph.storage import (
     apply_shacl_repairs,
-    delete_chunks,
     deserialize_f32_vector,
     find_entity_disambiguation_candidates,
     find_entity_synonym_candidates,
@@ -23,8 +23,6 @@ from yaw.daemon.graph.storage import (
     merge_entities,
     open_managed_yaw_db,
     open_yaw_db,
-    resolve_entity_labels,
-    save_openie_checkpoints,
     search_chunk_vectors_knn,
     search_chunks_fts,
     search_entity_vectors_knn,
@@ -64,7 +62,6 @@ def test_open_yaw_db_wal_and_schema_initialization(tmp_path: Path) -> None:
             "meta",
             "chunks",
             "chunk_fts",
-            "openie_chunks",
             "entities",
             "facts",
             "fact_fts",
@@ -222,7 +219,7 @@ def test_openie_checkpoints_cache(tmp_path: Path) -> None:
             triples=(("Radio City", "located in", "Bangalore"),),
         )
 
-        save_openie_checkpoints(conn, [rec1, rec2])
+        publish_inference(tmp_path / "test_openie.db", [rec1, rec2])
 
         loaded = get_openie_checkpoints(conn, ["c1", "c2", "missing"])
         assert len(loaded) == 2
@@ -232,7 +229,7 @@ def test_openie_checkpoints_cache(tmp_path: Path) -> None:
         conn.close()
 
 
-def test_graph_upserts_and_atomic_cascading_deletion(tmp_path: Path) -> None:
+def test_graph_upserts_preserve_chunk_vector_and_fact_owners(tmp_path: Path) -> None:
     conn = open_yaw_db(tmp_path / "test_cascade.db")
     try:
         # Setup 2 chunks
@@ -278,32 +275,6 @@ def test_graph_upserts_and_atomic_cascading_deletion(tmp_path: Path) -> None:
         assert conn.execute("SELECT COUNT(*) FROM chunks;").fetchone()[0] == 2
         assert conn.execute("SELECT COUNT(*) FROM facts;").fetchone()[0] == 2
 
-        # Delete c1
-        delete_chunks(conn, ["c1"])
-
-        # 1. c1 metadata and vectors removed
-        assert get_chunk_pointer(conn, "c1") is None
-        assert get_chunk_pointer(conn, "c2") is not None
-        assert conn.execute("SELECT COUNT(*) FROM chunk_vec WHERE chunk_id = 'c1';").fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM chunk_vec WHERE chunk_id = 'c2';").fetchone()[0] == 1
-
-        # 2. Fact F1 (exclusive to c1) is deleted, F2 (supported by c2) remains
-        remaining_facts = conn.execute("SELECT fact_id FROM facts;").fetchall()
-        assert [r[0] for r in remaining_facts] == ["f2"]
-        assert conn.execute("SELECT COUNT(*) FROM fact_vec WHERE fact_id = 'f1';").fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM fact_vec WHERE fact_id = 'f2';").fetchone()[0] == 1
-
-        # 3. Entity E1 (exclusive to c1) is deleted, E2 and E3 remain
-        remaining_entities = {r[0] for r in conn.execute("SELECT entity_id FROM entities;").fetchall()}
-        assert "e1" not in remaining_entities
-        assert "e2" in remaining_entities
-        assert "e3" in remaining_entities
-        assert conn.execute("SELECT COUNT(*) FROM entity_vec WHERE entity_id = 'e1';").fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM entity_vec WHERE entity_id = 'e2';").fetchone()[0] == 1
-
-        # 4. Synonymy edge incident to deleted e1 is pruned
-        syn_edges = conn.execute("SELECT * FROM edges WHERE kind = 'synonymy';").fetchall()
-        assert len(syn_edges) == 0
     finally:
         conn.close()
 
@@ -411,7 +382,7 @@ def test_high_load_batch_operations_exceeding_sqlite_variable_limits(tmp_path: P
             OpenIERecord(cid, (f"Entity {i}",), ((f"Entity {i}", "rel", f"Entity {i}"),))
             for i, cid in enumerate(chunk_ids)
         ]
-        save_openie_checkpoints(conn, records)
+        publish_inference(tmp_path / "test_high_load.db", records)
 
         # Batch lookups exceeding 1,000 IDs
         loaded_ptrs = get_chunk_pointers(conn, chunk_ids)
@@ -423,37 +394,6 @@ def test_high_load_batch_operations_exceeding_sqlite_variable_limits(tmp_path: P
         loaded_ckpts = get_openie_checkpoints(conn, chunk_ids)
         assert len(loaded_ckpts) == n_items
 
-        # Shared fact edge supported by chunk-0 and chunk-1199
-        upsert_facts(
-            conn,
-            [
-                (
-                    "f_shared",
-                    "ent-0",
-                    "linked_to",
-                    "ent-1199",
-                    '["Entity 0", "linked_to", "Entity 1199"]',
-                )
-            ],
-        )
-        upsert_edges_with_sources(
-            conn,
-            [
-                ("ent-0", "ent-1199", "fact", 2.0, "chunk-0"),
-                ("ent-0", "ent-1199", "fact", 2.0, "chunk-1199"),
-            ],
-        )
-
-        # Delete first 1,199 chunks in one batch call, keeping only chunk-1199
-        delete_chunks(conn, chunk_ids[:-1])
-
-        assert conn.execute("SELECT COUNT(*) FROM chunks;").fetchone()[0] == 1
-        # Shared fact edge weight decrement under Bayesian complement aggregation
-        edge_row = conn.execute(
-            "SELECT weight FROM edges WHERE src_id = 'ent-0' AND dst_id = 'ent-1199' AND kind = 'fact';"
-        ).fetchone()
-        assert edge_row is not None
-        assert float(edge_row[0]) == pytest.approx(1.0, abs=1e-4)
     finally:
         conn.close()
 
@@ -510,31 +450,13 @@ def test_fact_fts_indexing_search_and_backfill(tmp_path: Path) -> None:
         # 6. Non-matching query returns empty list
         assert search_facts_fts(conn, "nonexistentquerytoken123", top_k=5) == []
 
-        # 7. Cascade deletion via delete_chunks
-        p1 = ChunkPointer("c1", "p.txt", 1, 1, "T1")
-        p2 = ChunkPointer("c2", "p.txt", 2, 2, "T2")
-        upsert_chunk_pointers(conn, [(p1, "text1"), (p2, "text2")])
-        upsert_edges_with_sources(
-            conn,
-            [
-                ("ent-curie", "ent-radium", "fact", 1.0, "c1"),
-                ("ent-einstein", "ent-relativity", "fact", 1.0, "c2"),
-            ],
-        )
-        delete_chunks(conn, ["c1"])
-        # fact-1 should now be deleted from facts and fact_fts
-        assert conn.execute("SELECT COUNT(*) FROM facts WHERE fact_id = 'fact-1';").fetchone()[0] == 0
-        assert search_facts_fts(conn, "radium", top_k=5) == []
-        # fact-2 should still be intact
-        assert len(search_facts_fts(conn, "relativity", top_k=5)) == 1
-
         # 8. Test backfill: clear fact_fts and re-run initialize_schema
         conn.execute("INSERT INTO fact_fts(fact_fts) VALUES('delete-all');")
         conn.commit()
         assert conn.execute("SELECT COUNT(*) FROM fact_fts;").fetchone()[0] == 0
         initialize_schema(conn)
-        # Should be backfilled with remaining facts (fact-2 and fact-3)
-        assert conn.execute("SELECT COUNT(*) FROM fact_fts;").fetchone()[0] == 2
+        # All three declared facts are backfilled.
+        assert conn.execute("SELECT COUNT(*) FROM fact_fts;").fetchone()[0] == 3
         assert len(search_facts_fts(conn, "relativity", top_k=5)) == 1
     finally:
         conn.close()
@@ -591,18 +513,6 @@ def test_skos_labels_s13_disjointness_and_homograph_resolution(tmp_path: Path) -
             conn,
             [("ent-apple-inc", v_tech), ("ent-apple-fruit", v_fruit)],
         )
-
-        # Resolve "Apple" with a tech query vector -> selects ent-apple-inc
-        resolved_tech = resolve_entity_labels(
-            conn, ["Apple"], query_vec=np.array([0.95, 0.05, 0.0, 0.0], dtype=np.float32)
-        )
-        assert resolved_tech["apple"] == ["ent-apple-inc"]
-
-        # Resolve "Apple" with a fruit query vector -> selects ent-apple-fruit
-        resolved_fruit = resolve_entity_labels(
-            conn, ["Apple"], query_vec=np.array([0.05, 0.95, 0.0, 0.0], dtype=np.float32)
-        )
-        assert resolved_fruit["apple"] == ["ent-apple-fruit"]
 
         # 2-channel candidate generation finds lexical cousins even when cosine = 0.0
         upsert_entities(conn, [("ent-apple-corp", "Apple Corp.", "Record label founded by The Beatles")])
@@ -760,68 +670,6 @@ def test_closed_world_shacl_lint_auto_heal_and_turtle_export(tmp_path: Path) -> 
         assert "@prefix sh: <http://www.w3.org/ns/shacl#> ." in ttl
         assert "sh:conforms true" in ttl
         assert 'skos:prefLabel "Entity A"' in ttl
-    finally:
-        conn.close()
-
-
-def test_delete_chunks_homograph_promotion_preserves_owl_different_from(tmp_path: Path) -> None:
-    """Verify Hazard 1: promoting an altLabel to prefLabel during delete_chunks links surviving homographs via \
-owl:differentFrom."""
-    conn = open_yaw_db(tmp_path / "test_hazard1.db")
-    try:
-        upsert_chunk_pointers(
-            conn,
-            [
-                (ChunkPointer("c1", "doc.md", 1, 5, "Doc 1"), "Apple Inc in Cupertino."),
-                (ChunkPointer("c2", "doc.md", 6, 10, "Doc 2"), "Apple designs consumer hardware."),
-                (ChunkPointer("c3", "doc.md", 11, 15, "Doc 3"), "Apple is an orchard fruit."),
-            ],
-        )
-        upsert_entities(
-            conn,
-            [
-                ("ent-tech", "Apple Inc", "Consumer electronics company in Cupertino"),
-                ("ent-fruit", "Apple", "Edible pome fruit grown on orchard trees"),
-            ],
-        )
-        upsert_entity_labels(
-            conn,
-            [
-                ("apple inc", "ent-tech", "skos:prefLabel", "Apple Inc", "c1"),
-                ("apple", "ent-tech", "skos:altLabel", "Apple", "c2"),
-                ("apple", "ent-fruit", "skos:prefLabel", "Apple", "c3"),
-            ],
-        )
-        upsert_edges_with_sources(
-            conn,
-            [
-                ("c1", "ent-tech", "passage", 1.0, "c1"),
-                ("ent-tech", "c1", "passage", 1.0, "c1"),
-                ("c2", "ent-tech", "passage", 1.0, "c2"),
-                ("ent-tech", "c2", "passage", 1.0, "c2"),
-                ("c3", "ent-fruit", "passage", 1.0, "c3"),
-                ("ent-fruit", "c3", "passage", 1.0, "c3"),
-            ],
-        )
-        assert lint_graph_shacl(conn) == []
-
-        # Deleting c1 removes "apple inc" prefLabel from ent-tech and promotes "apple" (from c2) to skos:prefLabel.
-        # Step 7 in delete_chunks must link ent-tech and ent-fruit with symmetric owl:differentFrom (weight = 0.0).
-        delete_chunks(conn, ["c1"])
-
-        tech_name = conn.execute("SELECT name FROM entities WHERE entity_id = 'ent-tech'").fetchone()[0]
-        assert tech_name.lower() == "apple"
-
-        diff_rows = conn.execute(
-            """
-            SELECT src_id, dst_id, weight FROM edges
-            WHERE kind = 'owl:differentFrom'
-            ORDER BY src_id, dst_id
-            """
-        ).fetchall()
-        assert len(diff_rows) == 2
-        assert all(float(r[2]) == 0.0 for r in diff_rows)
-        assert lint_graph_shacl(conn) == []
     finally:
         conn.close()
 
@@ -991,12 +839,6 @@ def test_step11_literal_facts_check_constraints_fact_sources_and_merge_collision
         }
         assert src_chunks == {"c1", "c2"}
 
-        # 4. Deleting c1 keeps the fact alive (still supported by c2); deleting c2 prunes the orphaned literal fact
-        delete_chunks(conn, ["c1"])
-        assert conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 1
-        delete_chunks(conn, ["c2"])
-        assert conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM fact_sources").fetchone()[0] == 0
     finally:
         conn.close()
 
