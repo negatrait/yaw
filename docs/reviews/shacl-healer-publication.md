@@ -360,3 +360,11 @@ Audit of `.yaw/yaw_optimize_20261107_110501.db` and `.yaw/dspy_cache` (`16` `Fan
   - `tests/daemon/graph/test_shacl_publication.py`, `tests/daemon/graph/test_evidence_revisions.py`, `tests/daemon/graph/test_engine.py`, `tests/daemon/graph/inference/test_prompts.py`, `tests/daemon/graph/test_indexing_overlap.py`: Updated and added regression tests (`87 passed, 2 deselected` in `140.75s`).
 - **What it does not establish**:
   - Does not claim completion of the live full-corpus GEPA optimization run until all batches finish publishing and GEPA iterations converge.
+
+### Follow-up (2026-11-07): Resolve `YawRuntime.optimize._progress` Cross-Thread Lock Deadlock on Sub-Stage Callbacks
+
+- **Changed symbols & modules**:
+  - `yaw/daemon/runtime.py`: Guarded `self.engine.get_stats(...)` inside `YawRuntime.optimize._progress` with `threading.current_thread() is worker_thread` so sub-stage progress callbacks emitted from CocoIndex's background `_runner` thread inside `plan_graph_publication` do not contend for `self.engine._lock` held by `yaw-runtime-worker` during `YawGraphEngine.index_chunks`.
+  - `tests/daemon/test_runtime.py`: Verified `"[yaw optimize] indexing: disambiguation candidate search"` emission in `test_cli_dspy_optimize_sandbox_isolation_and_status` (`1 passed` in `9.69s`).
+- **What it does not establish**:
+  - Does not claim completion of the live full-corpus GEPA optimization run until all batches finish publishing and GEPA iterations converge.

@@ -605,3 +605,18 @@ Audit of `.yaw/yaw_optimize_20261107_110501.db` (`2,387` frozen `source_chunks`)
   - `meta['graph_input_fingerprints']` is persisted by `plan_graph_publication` as a sorted JSON list of `[chunk_id, digest]` pairs (`json.dumps(sorted(input_fingerprints.items()))`); `dict(json.loads(saved))` in `partition_frozen_chunks` normalizes both list-of-pairs and mapping representations.
 - **What it does not establish**:
   - Does not claim completion of the live full-corpus GEPA optimization run until all batches finish publishing and GEPA iterations converge.
+
+### Follow-up (2026-11-07): Resolve `YawRuntime.optimize._progress` Cross-Thread Lock Deadlock on Sub-Stage Callbacks
+
+- **Root cause of `yaw dspy optimize --resume` flatlining at `575/2387` (`511` published chunks)**:
+  - `YawGraphEngine.index_chunks` acquires `self._lock` (`threading.RLock`) on `yaw-runtime-worker` while awaiting `app.update().result()`.
+  - CocoIndex runs `@coco.fn` coroutines (`publish_graph` -> `plan_graph_publication`) on its internal background event-loop thread (`Thread-1 (_runner)`).
+  - When `plan_graph_publication` emitted its first `"indexing: disambiguation candidate search (...)"` callback on `Thread-1 (_runner)`, `YawRuntime.optimize._progress` matched `msg.startswith("indexing:")` and invoked `self.engine.get_stats(...)`, attempting to acquire `self.engine._lock` on `Thread-1 (_runner)` while `yaw-runtime-worker` held `self.engine._lock` waiting for `Thread-1 (_runner)` to finish `app.update().result()`.
+- **Changed symbols & modules**:
+  - `yaw/daemon/runtime.py`: Captured `worker_thread = threading.current_thread()` in `YawRuntime.optimize._run_optimize` and guarded `self.engine.get_stats(...)` inside `_progress` with `threading.current_thread() is worker_thread` so cross-thread sub-stage callbacks update `active_op` and notify `progress_callback` without acquiring `self.engine._lock`.
+  - `tests/daemon/test_runtime.py`: Updated `test_cli_dspy_optimize_sandbox_isolation_and_status` to assert that `"[yaw optimize] indexing: disambiguation candidate search"` is emitted to `stderr` during `yaw dspy optimize` without deadlocking.
+- **Gate results & evidence paths**:
+  - `uv run pytest tests/daemon/test_runtime.py -k test_cli_dspy_optimize_sandbox_isolation_and_status`: `1 passed` in `9.69s` (previously deadlocked indefinitely).
+  - Mandatory quality gates (`uv run ty check`, `uv run ruff check --fix`, `uv run ruff format`, `uv run pytest`, `git diff --check`): all passed.
+- **What it does not establish**:
+  - Does not claim completion of the live full-corpus GEPA optimization run until all batches finish publishing and GEPA iterations converge.

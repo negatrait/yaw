@@ -1058,9 +1058,14 @@ class YawRuntime:
                 raise YawRuntimeError("NOT_READY", "Graph engine is not initialized.")
 
             self.validate_optimization_run(target_path, trainset, valset, corpus_docs, mode, run_options)
+            worker_thread = threading.current_thread()
 
             def _progress(msg: str) -> None:
-                if msg.startswith("indexing:") and self.engine is not None:
+                if (
+                    msg.startswith("indexing:")
+                    and self.engine is not None
+                    and threading.current_thread() is worker_thread
+                ):
                     new_stats = self.engine.get_stats(self.config.config_fingerprint())
                     with self._state_lock:
                         self._stats = new_stats

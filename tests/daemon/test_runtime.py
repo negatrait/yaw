@@ -1329,7 +1329,8 @@ def test_cli_dspy_optimize_sandbox_isolation_and_status(
 
         # Run optimization concurrently while production daemon holds yaw.db.lock
         buf = io.StringIO()
-        with redirect_stdout(buf):
+        err_buf = io.StringIO()
+        with redirect_stdout(buf), redirect_stderr(err_buf):
             rc = main(
                 [
                     "dspy",
@@ -1349,6 +1350,7 @@ def test_cli_dspy_optimize_sandbox_isolation_and_status(
                 embedder=emb,
             )
         assert rc == 0
+        assert "[yaw optimize] indexing: disambiguation candidate search" in err_buf.getvalue()
         opt_out = json.loads(buf.getvalue())
         assert opt_out["optimized"] is True
         assert "yaw_optimize_" in opt_out["sandbox_db_path"]
