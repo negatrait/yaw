@@ -193,11 +193,10 @@ def test_evaluate_program_uses_canonical_recall_and_gold_matching(tmp_path, monk
         get_meta=lambda k: None,
         set_meta=lambda k, v: None,
         commit_active_checkpoint=None,
-        encode_payload=lambda v: b"",
+        encode_payload=lambda v: "",
         decode_payload=lambda b: {},
-        open_checkpoint_cache=lambda ctx: {},
-        candidate_cache_namespace=lambda: {},
-        candidate_cache_sources=lambda: [],
+        embedding_cache_namespace=lambda: "",
+        corpus_sources=lambda: {},
         prepare_optimization_pools=None,
         hydrate_top_chunks=lambda cids, p: {
             cid: (short_false_positive if cid == "chunk-short" else cropped_chunk) for cid in cids

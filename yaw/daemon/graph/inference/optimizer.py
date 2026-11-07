@@ -196,12 +196,10 @@ class GraphOptimizationHooks:
     persist_trails: Callable[[YawProgram], None]
     get_meta: Callable[[str], str | None]
     set_meta: Callable[[str, str | None], None]
-    candidate_cache_namespace: Callable[[], str]
-    candidate_cache_sources: Callable[[], dict[str, str]]
+    embedding_cache_namespace: Callable[[], str] = field(default=lambda: "")
+    corpus_sources: Callable[[], dict[str, str]] = field(default=dict)
     retrieval_settings: Mapping[str, Any] = field(default_factory=dict)
     bind_program_hooks: Callable[[YawProgram], None] = field(default=lambda _prog: None)
-    open_score_cache: Callable[[str], Any] = field(default=lambda _ctx: {})
-    open_checkpoint_cache: Callable[[str], Any] = field(default=lambda _ctx: {})
     encode_payload: Callable[[Any], str] = field(
         default=lambda val: json.dumps(val, sort_keys=True, ensure_ascii=False, default=str)
     )
@@ -759,11 +757,11 @@ def configure_simba_task_learning(
         "version": 1,
         "metric": "task-quality-arithmetic-mean-v2",
         "reflection_deployment": proposer.cache_identity(),
-        "namespace": hooks.candidate_cache_namespace(),
+        "namespace": hooks.embedding_cache_namespace(),
         "retrieval": dict(hooks.retrieval_settings),
         "template": candidate_fingerprint(template),
         "trainset": [{"data": ex.toDict(), "inputs": sorted(ex.inputs())} for ex in trainset],
-        "corpus": sorted(hooks.candidate_cache_sources()),
+        "corpus": sorted(hooks.corpus_sources()),
         "worker": serialize_predictor_surface(proposer.llm_proposer),
         "orchestrator": serialize_predictor_surface(proposer.inner_rlm.generate_action),
         "settings": [
@@ -784,13 +782,15 @@ def configure_simba_task_learning(
     context = hashlib.sha256(
         json.dumps(identity, sort_keys=True, default=str, ensure_ascii=False).encode("utf-8")
     ).hexdigest()
-    scores = hooks.open_score_cache(context)
 
     def score_candidate(instructions: Mapping[str, str]) -> float:
-        key = (json.dumps(dict(instructions), sort_keys=True, ensure_ascii=False),)
-        cached = scores.get(key)
+        score_digest = hashlib.sha256(
+            json.dumps([context, dict(instructions)], sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+        score_key = f"simba_task_score:{score_digest}"
+        cached = hooks.get_meta(score_key)
         if cached is not None:
-            return float(cached)
+            return float(json.loads(cached))
         task = template.deepcopy()
         named = dict(task.named_predictors())
         for name, instruction in instructions.items():
@@ -805,7 +805,7 @@ def configure_simba_task_learning(
                 prediction = task(**gold.inputs())
                 total += float(metric(gold, prediction))
         result = total / len(calibration)
-        scores[key] = result
+        hooks.set_meta(score_key, json.dumps(result))
         return result
 
     run = str(Path(save_path).resolve()) if save_path is not None else "default"
@@ -822,7 +822,6 @@ def configure_simba_task_learning(
             if saved.get("context") != context:
                 raise ValueError("SIMBA checkpoint does not match this run's task/model/data")
             saved_state = validate_simba_state(saved.get("state"))
-    checkpoints = hooks.open_checkpoint_cache(context)
     active_key = state_key + ":active_reflection"
     active_raw = hooks.get_meta(active_key) if resume else None
     active: ActiveReflectionCheckpoint | None = (
@@ -833,17 +832,23 @@ def configure_simba_task_learning(
     if saved_state is not None:
         proposer.load_simba_state(saved_state)
 
+    def _checkpoint_meta_key(key: str) -> str:
+        digest = hashlib.sha256(
+            json.dumps([context, key], sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+        return f"reflection_checkpoint:{digest}"
+
     def get_checkpoint(key: str) -> Any:
         if active is not None and key in active["records"]:
             return active["records"][key]
-        raw = checkpoints.get((key,))
+        raw = hooks.get_meta(_checkpoint_meta_key(key))
         return hooks.decode_payload(raw) if raw is not None else None
 
     def put_checkpoint(key: str, value: dict[str, Any]) -> None:
         nonlocal active
         if key.startswith("request:"):
             value = validate_request_checkpoint(value)
-        checkpoints[(key,)] = hooks.encode_payload(value)
+        hooks.set_meta(_checkpoint_meta_key(key), hooks.encode_payload(value))
         next_active: ActiveReflectionCheckpoint
         if key.startswith("request:") and value["phase"] == "collecting":
             next_active = {"context": context, "request": key, "records": {key: value}}
@@ -851,7 +856,6 @@ def configure_simba_task_learning(
             next_active = {**active, "records": {**active["records"], key: value}}
         else:
             return
-        # Pin only the active request, outside FIFO candidate-cache eviction.
         # Request state and the learned worker are committed in one transaction.
         encoded_active = hooks.encode_payload(next_active)
         encoded_state = (

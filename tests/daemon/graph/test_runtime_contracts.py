@@ -3,6 +3,7 @@
 import asyncio
 import copy
 import inspect
+import json
 import sqlite3
 from contextlib import closing
 
@@ -15,7 +16,6 @@ from yaw.core import ChunkPointer, YawRuntimeError
 from yaw.daemon.graph.engine import YawGraphEngine
 from yaw.daemon.graph.inference import RLMInstructionProposer, YawProgram
 from yaw.daemon.graph.inference.chat import YawDSPyLM, create_dspy_lm
-from yaw.daemon.graph.storage import CandidatePayloadCodec
 from yaw.daemon.indexing import bind_native_indexing
 
 
@@ -144,15 +144,16 @@ def test_malformed_active_sqlite_checkpoint_preserves_durable_bytes(tmp_path, pr
         prop.checkpoint_put("request:one", {"phase": "collecting", "state": prop.dump_simba_state()})
         prop.checkpoint_put("request:one", {"phase": "learning", "state": prop.dump_simba_state()})
         key = engine.conn.execute("SELECT key FROM meta WHERE key LIKE '%:active_reflection'").fetchone()[0]
-        codec = CandidatePayloadCodec(lambda: {})
-        active = codec.decode(engine.get_meta(key))
+        raw_meta = engine.get_meta(key)
+        assert raw_meta is not None
+        active = json.loads(raw_meta)
         if corrupt == "phase":
             active["records"]["request:one"]["phase"] = "mystery"
         elif corrupt == "state":
             active["records"]["request:one"]["state"] = "broken"
         else:
             active["request"] = "request:missing"
-        payload = codec.encode(active)
+        payload = json.dumps(active)
         engine.set_meta(key, payload)
     finally:
         engine.close()
@@ -171,7 +172,9 @@ def test_invalid_request_is_rejected_before_any_sqlite_write(tmp_path, provider)
         with pytest.raises(ValueError, match="phase"):
             prop.checkpoint_put("request:invalid", {"phase": "unknown", "state": prop.dump_simba_state()})
         assert engine.conn.total_changes == before
-        assert engine.conn.execute("SELECT COUNT(*) FROM candidate_stage_cache").fetchone()[0] == 0
+        assert (
+            engine.conn.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'reflection_checkpoint:%'").fetchone()[0] == 0
+        )
     finally:
         engine.close()
     assert calls == []
@@ -187,8 +190,9 @@ def test_corrupted_completed_proposals_fail_without_generation_or_writes(tmp_pat
         assert prop(candidate, data, ["qa.predict"])
         generated = len(calls)
         key = engine.conn.execute("SELECT key FROM meta WHERE key LIKE '%:active_reflection'").fetchone()[0]
-        codec = CandidatePayloadCodec(lambda: {})
-        active = codec.decode(engine.get_meta(key))
+        raw_meta = engine.get_meta(key)
+        assert raw_meta is not None
+        active = json.loads(raw_meta)
         record = active["records"][active["request"]]
         if corrupt == "instruction":
             record["proposals"] = {"qa.predict": None}
@@ -196,7 +200,7 @@ def test_corrupted_completed_proposals_fail_without_generation_or_writes(tmp_pat
             record["proposals"] = {"unknown": "Use evidence."}
         else:
             record["proposals"] = {"qa.predict": "x" * 2000}
-        payload = codec.encode(active)
+        payload = json.dumps(active)
         engine.set_meta(key, payload)
     finally:
         engine.close()

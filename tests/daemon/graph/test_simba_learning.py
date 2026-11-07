@@ -288,7 +288,7 @@ def test_active_request_survives_cache_eviction_with_atomic_worker_state(tmp_pat
         proposer._simba_steps = 1
         proposer.checkpoint_put("request:one", {"phase": "learned", "state": proposer.dump_simba_state()})
         with engine.managed_conn.transaction() as conn:
-            conn.execute("DELETE FROM candidate_stage_cache")
+            conn.execute("DELETE FROM meta WHERE key LIKE 'reflection_checkpoint:%'")
     finally:
         engine.close()
     engine, restored = make_learning(tmp_path, url, resume=True)

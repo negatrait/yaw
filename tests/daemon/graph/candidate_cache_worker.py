@@ -101,10 +101,8 @@ def main() -> None:
                         )
                     },
                     "openie_tokens": [stats["openie_tokens"] for _, stats in sorted(engine._chunk_rlm_stats.items())],
-                    "cache_rows": engine.conn.execute("SELECT COUNT(*) FROM candidate_stage_cache").fetchone()[0],
                     "trace_names": sorted({name for name, _, _ in engine._captured_graph_traces}),
-                    "namespace": engine._candidate_cache_namespace(),
-                    "code_fp": engine._candidate_cache_code_fp,
+                    "namespace": engine._embedding_cache_namespace(),
                     "embedding_kwargs": embedder.default_kwargs,
                     "implementation_root": str(Path(inspect.getfile(YawGraphEngine)).parent),
                 }

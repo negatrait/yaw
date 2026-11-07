@@ -21,10 +21,9 @@ from yaw.daemon.graph.inference.reflection import (
     resolve_evidence,
 )
 from yaw.daemon.graph.storage import (
-    CandidateCacheStore,
-    CandidatePayloadCodec,
-    CandidateStageCache,
+    get_meta,
     open_managed_yaw_db,
+    set_meta,
 )
 
 
@@ -177,25 +176,6 @@ def test_exact_evidence_and_training_answers():
         resolve_evidence(examples, selection)
 
 
-def test_snapshot_hydrates_source_excerpts_without_copying_corpus(tmp_path):
-    source = "Original corpus passage. " * 100
-    codec = CandidatePayloadCodec(lambda: {"source-identity": source})
-    snapshot = {"examples": [{"Inputs": {"passage": source}, "evidence": source[150:300]}]}
-    encoded = codec.encode(snapshot)
-    assert source[150:300] not in encoded
-    db = open_managed_yaw_db(tmp_path / "snapshot.db")
-    try:
-        with db.transaction() as conn:
-            conn.execute("CREATE TABLE snapshots(value TEXT)")
-            conn.execute("INSERT INTO snapshots VALUES (?)", (encoded,))
-            stored = conn.execute("SELECT value FROM snapshots").fetchone()[0]
-        assert codec.decode(stored) == snapshot
-        with pytest.raises(KeyError):
-            CandidatePayloadCodec(lambda: {}).decode(stored)
-    finally:
-        db.close()
-
-
 def test_native_writer_and_complete_budget(provider):
     url, calls = provider
     prop = proposer(url, enable_simba=False)
@@ -310,11 +290,10 @@ def test_proposal_checkpoint_survives_fresh_process(tmp_path, provider, interrup
     url, calls = provider
     prop = proposer(url, enable_simba=False)
     db = open_managed_yaw_db(tmp_path / "yaw.db")
-    with db.transaction() as conn:
-        store = CandidateCacheStore(conn)
-    cache = CandidateStageCache(store, db, "reflection", lambda: "test")
-    prop.checkpoint_get = lambda key: json.loads(cache.get((key,))) if cache.get((key,)) else None
-    prop.checkpoint_put = lambda key, value: cache.__setitem__((key,), json.dumps(value))
+    prop.checkpoint_get = lambda key: (
+        json.loads(raw) if (raw := get_meta(db._conn, f"reflection:{key}")) is not None else None
+    )
+    prop.checkpoint_put = lambda key, value: set_meta(db._conn, f"reflection:{key}", json.dumps(value))
     candidate = {"qa.predict": "Use evidence."}
     data = {"qa.predict": [{"Inputs": {"question": "Who?"}, "Feedback": "Expected Turing"}]}
     # Select and persist evidence through the actual DSPy sandbox first.
@@ -344,9 +323,7 @@ spec=importlib.util.spec_from_file_location('reflection_tests',sys.argv[1])
 module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
 p=module.proposer(sys.argv[2],enable_simba=False)
 db=module.open_managed_yaw_db(Path(sys.argv[3]))
-with db.transaction() as conn: store=module.CandidateCacheStore(conn)
-cache=module.CandidateStageCache(store,db,'reflection',lambda:'test')
-p.checkpoint_get=lambda key: json.loads(cache.get((key,))) if cache.get((key,)) else None
+p.checkpoint_get=lambda k: json.loads(r) if (r:=module.get_meta(db._conn,f'reflection:{k}')) is not None else None
 try:
  candidate={'qa.predict':'Use evidence.'}
  data={'qa.predict':[{'Inputs':{'question':'Who?'},'Feedback':'Expected Turing'}]}
@@ -407,17 +384,13 @@ def test_completed_request_invalidates_when_learned_writer_changes(tmp_path, pro
     prop = proposer(url, enable_simba=False)
     db = open_managed_yaw_db(tmp_path / "yaw.db")
     try:
-        with db.transaction() as conn:
-            store = CandidateCacheStore(conn)
-        cache = CandidateStageCache(store, db, "reflection", lambda: "test")
 
-        # CandidateStageCache uses tuple keys consistently on disk.
         def get(key):
-            raw = cache.get((key,))
+            raw = get_meta(db._conn, f"reflection:{key}")
             return json.loads(raw) if raw is not None else None
 
         prop.checkpoint_get = get
-        prop.checkpoint_put = lambda key, value: cache.__setitem__((key,), json.dumps(value))
+        prop.checkpoint_put = lambda key, value: set_meta(db._conn, f"reflection:{key}", json.dumps(value))
         candidate = {"qa.predict": "Use evidence."}
         data = {"qa.predict": [{"Inputs": {"question": "Who?"}, "Feedback": "Expected Turing"}]}
         first = prop(candidate, data, ["qa.predict"])

@@ -5,9 +5,6 @@ from typing import Any
 
 # Single source of truth: only these symbols are exposed as the public package contract.
 _PUBLIC_API: dict[str, str] = {
-    "CandidateCacheStore": ".candidate_cache",
-    "CandidatePayloadCodec": ".candidate_cache",
-    "CandidateStageCache": ".candidate_cache",
     # Database lifecycle & schema
     "ManagedConnection": ".db",
     "open_managed_yaw_db": ".db",

@@ -172,7 +172,7 @@ def make_engine(tmp_path, url) -> YawGraphEngine:
     )
 
 
-def test_native_inference_survives_stage_cache_eviction_and_engine_restart(tmp_path, indexing_provider):
+def test_native_inference_survives_query_cache_clear_and_engine_restart(tmp_path, indexing_provider):
     url, calls = indexing_provider
     source = "Ada wrote Notes."
     (tmp_path / "source.txt").write_text(source, encoding="utf-8")
@@ -181,8 +181,7 @@ def test_native_inference_survives_stage_cache_eviction_and_engine_restart(tmp_p
     try:
         assert first.index_chunks([(pointer, source)]) == 1
         assert first.conn.execute("SELECT count(*) FROM facts").fetchone()[0] == 1
-        with first.managed_conn.transaction() as conn:
-            conn.execute("DELETE FROM candidate_stage_cache")
+        first._encode_cached_text.cache_clear()
         checkpoint = tuple(
             first.conn.execute(
                 "SELECT program_identity, embedding_identity, extraction_json, traces_json FROM chunk_inference"

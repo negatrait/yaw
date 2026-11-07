@@ -1238,7 +1238,7 @@ class YawRuntime:
                     if metric_upgraded or code_upgraded:
                         tx.execute("DELETE FROM meta WHERE key LIKE 'simba_worker:%'")
                     if metric_upgraded:
-                        tx.execute("DELETE FROM candidate_stage_cache WHERE stage = 'simba_task_score'")
+                        tx.execute("DELETE FROM meta WHERE key LIKE 'simba_task_score:%'")
                     tx.execute(
                         "UPDATE meta SET value = ? WHERE key = 'optimization_run'",
                         (json.dumps(saved),),

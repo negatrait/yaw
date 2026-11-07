@@ -307,7 +307,7 @@ from yaw.core import SynonymEvidenceBatch
 from yaw.daemon.graph.inference import (
  YawProgram,ServingTokenCounter,create_dspy_lm,configure_yaw_dspy_cache,label_judge_fingerprint,
 )
-from yaw.daemon.graph.storage import CandidateCacheStore,CandidateStageCache,open_managed_yaw_db
+from yaw.daemon.graph.storage import open_managed_yaw_db
 root=Path(sys.argv[1]);url=sys.argv[2];crash=sys.argv[3]=='crash'
 data=json.loads((root/'batch.json').read_text(encoding='utf-8'))
 batch=SynonymEvidenceBatch(tuple(data['candidates']),data['payload'],data['identifiers'])
@@ -316,14 +316,14 @@ configure_yaw_dspy_cache(root/'responses',enable_memory_cache=False)
 lm=create_dspy_lm('packet-model',base_url=url+'/v1',max_tokens=512,context_window_tokens=131072,num_retries=0)
 program=YawProgram(rlm_sub_lm=lm,synonym_token_counter=ServingTokenCounter(url+'/v1','packet-model'),max_output_tokens=512)
 managed=open_managed_yaw_db(root/'recovery.db')
-with managed.transaction() as conn:
- cache=CandidateStageCache(CandidateCacheStore(conn),managed,'label_judge',lambda:'packet-test')
-key=(label_judge_fingerprint(program),batch.cache_identity)
+key=f"label_judge:{label_judge_fingerprint(program)}:{batch.cache_identity}"
 try:
- with managed.transaction():
-  decisions=cache.get(key)
+ with managed.transaction() as conn:
+  row=conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+  decisions=json.loads(row[0]) if row is not None else None
   if decisions is None:
-   decisions=program.judge_synonyms(batch);cache[key]=decisions
+   decisions=program.judge_synonyms(batch)
+   conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (key, json.dumps(decisions)))
   if crash:raise RuntimeError('interrupted before graph commit')
  print(json.dumps(decisions))
 except RuntimeError:

@@ -414,10 +414,7 @@ def test_cli_resume_real_gepa_checkpoint_and_custom_output(tmp_path: Path, provi
             (json.dumps(saved_meta),),
         )
         conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('simba_worker:stale', '{}')")
-        conn.execute(
-            "INSERT OR REPLACE INTO candidate_stage_cache(stage, cache_key, payload, size_bytes) "
-            "VALUES ('simba_task_score', 'stale-key', X'00', 1)"
-        )
+        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('simba_task_score:stale-key', '0.5')")
     rc, output, errors = run_cli(["--resume"], bare=True)
     assert rc == 0, errors
     assert "RESUMED_WINNER" not in custom_output.read_text(encoding="utf-8")
@@ -426,10 +423,7 @@ def test_cli_resume_real_gepa_checkpoint_and_custom_output(tmp_path: Path, provi
         upgraded_meta = json.loads(conn.execute("SELECT value FROM meta WHERE key = 'optimization_run'").fetchone()[0])
         assert upgraded_meta["identity"]["metric"] == "task-quality-arithmetic-mean-v2"
         assert conn.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'simba_worker:%'").fetchone()[0] == 0
-        assert (
-            conn.execute("SELECT COUNT(*) FROM candidate_stage_cache WHERE stage = 'simba_task_score'").fetchone()[0]
-            == 0
-        )
+        assert conn.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'simba_task_score:%'").fetchone()[0] == 0
 
     # Same length, different questions: reject before replacing the corpus or
     # touching the checkpoint, preserving both for inspection or recovery.

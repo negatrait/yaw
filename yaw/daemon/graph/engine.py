@@ -1,13 +1,13 @@
 """Native DSPy HippoRAG 2 Graph and Retrieval Engine backed by yaw.db and disk line hydration."""
 
 import hashlib
-import importlib.metadata
 import json
 import sqlite3
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, is_dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
 
@@ -54,9 +54,6 @@ from yaw.daemon.graph.ppr import (
     run_ppr,
 )
 from yaw.daemon.graph.storage import (
-    CandidateCacheStore,
-    CandidatePayloadCodec,
-    CandidateStageCache,
     ManagedConnection,
     format_pair_disambiguation_dossier,
     format_subgraph_for_qa,
@@ -193,40 +190,34 @@ class YawGraphEngine:
             tuple[str, tuple[str, ...], tuple[float, ...], tuple[str, ...]],
         ] = {}
         self.ensemble: dspy.Module = self.program
-        # One versioned, bounded disk cache in yaw.db. Candidate histories must
-        # not accumulate vectors, extraction records and RLM traces in RAM.
-        graph_dir = Path(__file__).parent
-        self._candidate_cache_code_fp = hashlib.sha256(
-            b"".join(
-                p.relative_to(graph_dir).as_posix().encode("utf-8") + b"\0" + p.read_bytes()
-                for p in sorted(graph_dir.rglob("*.py"))
+        self._active_embed_instruction: str = ""
+        self._active_embed_stage: str | None = None
+
+        @lru_cache(maxsize=4096)
+        def _encode_cached_text(namespace: str, text: str) -> np.ndarray:
+            encoded = self.embedder.encode(
+                [text],
+                instruction=self._active_embed_instruction,
+                stage=self._active_embed_stage,
             )
-            + importlib.metadata.version("dspy").encode()
-            + np.__version__.encode()
-        ).hexdigest()
-        with self.managed_conn.transaction():
-            cache_store = CandidateCacheStore(self.conn)
-        self._text_vec_cache = CandidateStageCache(
-            cache_store, self.managed_conn, "embedding", self._candidate_cache_namespace
-        )
-        self._candidate_cache_store = cache_store
+            return np.asarray(encoded[0], dtype=np.float32)
+
+        self._encode_cached_text = _encode_cached_text
 
         self._bind_program_hooks()
         self._apply_program_embedding_prefixes()
         self._hydrate_indexed_cids_from_db()
 
-    def _candidate_cache_namespace(self) -> str:
+    def _embedding_cache_namespace(self, instruction: str = "") -> str:
         profile = getattr(self.embedder, "profile", None)
         profile_identity = asdict(profile) if is_dataclass(profile) else str(profile)
-        if isinstance(profile_identity, dict):
-            # Query prefixes belong to query-vector keys, not document encoding
-            # or graph stages. Document prefix/model/endpoint remain dependencies.
+        if isinstance(profile_identity, dict) and not instruction:
             profile_identity.pop("query_prefix", None)
             profile_identity.pop("fact_query_prefix", None)
         payload = {
-            "codec": 1,
-            "implementation": self._candidate_cache_code_fp,
             "config": self.config.config_fingerprint() if self.config is not None else None,
+            "embed_fp": embed_fingerprint(profile or self.program, instruction),
+            "instruction": instruction,
             "embedder": {
                 "class": type(self.embedder).__module__ + "." + type(self.embedder).__qualname__,
                 "profile": profile_identity,
@@ -251,7 +242,7 @@ class YawGraphEngine:
             json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
         ).hexdigest()
 
-    def _candidate_cache_sources(self) -> dict[str, str]:
+    def _corpus_sources(self) -> dict[str, str]:
         return {hashlib.sha256(text.encode("utf-8")).hexdigest(): text for _, text in self._opt_chunks_pool}
 
     def _hydrate_indexed_cids_from_db(
@@ -705,26 +696,10 @@ class YawGraphEngine:
         if not texts:
             return []
         if hasattr(self.embedder, "bind_telemetry_hook"):
-            embed_fp = embed_fingerprint(getattr(self.embedder, "profile", None) or self.program, instruction)
-            missing_texts: list[str] = []
-            missing_keys: set[str] = set()
-            vectors: dict[str, np.ndarray] = {}
-            for t in texts:
-                ts = str(t)
-                if ts in vectors or ts in missing_keys:
-                    continue
-                cached = self._text_vec_cache.get((embed_fp, instruction, ts))
-                if cached is None:
-                    missing_texts.append(ts)
-                    missing_keys.add(ts)
-                else:
-                    vectors[ts] = cached
-            if missing_texts:
-                encoded = self.embedder.encode(missing_texts, instruction=instruction, stage=stage)
-                for ts, vec in zip(missing_texts, encoded, strict=False):
-                    vectors[ts] = np.asarray(vec, dtype=np.float32)
-                    self._text_vec_cache[(embed_fp, instruction, ts)] = vectors[ts]
-            return [vectors[str(t)] for t in texts]
+            namespace = self._embedding_cache_namespace(instruction)
+            self._active_embed_instruction = instruction
+            self._active_embed_stage = stage
+            return [self._encode_cached_text(namespace, str(t)) for t in texts]
         return self.embedder.encode(texts, instruction=instruction)
 
     @staticmethod
@@ -1495,13 +1470,12 @@ class YawGraphEngine:
         self._bind_program_hooks()
 
     def _build_optimization_hooks(self) -> GraphOptimizationHooks:
-        codec = CandidatePayloadCodec(self._candidate_cache_sources)
         return GraphOptimizationHooks(
             persist_trails=self._persist_dspy_trails_to_db,
             get_meta=self.get_meta,
             set_meta=self.set_meta,
-            candidate_cache_namespace=self._candidate_cache_namespace,
-            candidate_cache_sources=self._candidate_cache_sources,
+            embedding_cache_namespace=self._embedding_cache_namespace,
+            corpus_sources=self._corpus_sources,
             retrieval_settings={
                 name: getattr(self, name)
                 for name in (
@@ -1530,21 +1504,6 @@ class YawGraphEngine:
                 )
             },
             bind_program_hooks=self._bind_program_hooks,
-            open_score_cache=lambda ctx: CandidateStageCache(
-                self._candidate_cache_store,
-                self.managed_conn,
-                "simba_task_score",
-                lambda: ctx,
-            ),
-            open_checkpoint_cache=lambda ctx: CandidateStageCache(
-                self._candidate_cache_store,
-                self.managed_conn,
-                "reflection_checkpoint",
-                lambda: ctx,
-                sources=self._candidate_cache_sources,
-            ),
-            encode_payload=codec.encode,
-            decode_payload=codec.decode,
             commit_active_checkpoint=self._commit_active_reflection_checkpoint,
             prepare_optimization_pools=self._prepare_optimization_pools,
             hydrate_top_chunks=self._hydrate_top_chunks_for_eval,

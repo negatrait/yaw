@@ -1,4 +1,4 @@
-"""Typed disk-cache replay and actual inference requests across separate processes."""
+"""Single-owner CocoIndex LMDB memoization and bounded in-memory query embedding LRU cache."""
 
 import hashlib
 import json
@@ -8,89 +8,75 @@ import shutil
 import subprocess
 import sys
 import threading
-import zlib
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-import dspy
 import numpy as np
-from dspy.primitives.repl_types import REPLHistory
 
 from daemon.graph.synonym_protocol import candidate_rows, complete_decisions
-from yaw.core import OpenIERecord, StructuredTriple
-from yaw.daemon.graph.storage import CandidateCacheStore, CandidateStageCache, open_managed_yaw_db
+from yaw.daemon.graph.engine import YawGraphEngine
+from yaw.daemon.graph.inference import (
+    FACT_INSTRUCTION,
+    PASSAGE_INSTRUCTION,
+    DSPyEmbeddingAdapter,
+    YawProgram,
+    create_dspy_embedder,
+    resolve_embedding_profile,
+)
+from yaw.daemon.indexing import bind_native_indexing
 
 
-def test_stage_cache_roundtrips_typed_traces_without_storing_passage(tmp_path: Path) -> None:
-    managed = open_managed_yaw_db(tmp_path / "yaw.db")
+def test_query_embedding_lru_cache_and_absence_of_retired_cache_tables(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    def embed(texts: list[str]) -> np.ndarray:
+        calls.append(list(texts))
+        return np.array(
+            [[(b + 1) / 256 for b in hashlib.sha256(t.encode("utf-8")).digest()[:8]] for t in texts],
+            dtype=np.float32,
+        )
+
+    program = YawProgram(enable_gbnf=False)
+    embedder = DSPyEmbeddingAdapter(
+        replace(
+            resolve_embedding_profile(),
+            dimensions=8,
+            fact_query_prefix="task: fact search | query: ",
+        ),
+        create_dspy_embedder(embed, caching=False),
+    )
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=tmp_path / "yaw.db",
+            workspace_root=tmp_path,
+            program=program,
+            embedder=embedder,
+        )
+    )
     try:
-        # The test reads the actual serialized cache row, not a mocked serializer.
-        with managed.transaction() as conn:
-            store = CandidateCacheStore(conn)
-        cache = CandidateStageCache(store, managed, "openie", lambda: "version-one")
-        text = "Lähdeteksti: a source passage that must be hydrated.\nKeep the second line."
-        record = OpenIERecord(
-            "chunk",
-            ("Ada",),
-            (("Ada", "wrote", "Notes"),),
-            (StructuredTriple("Ada", "Author", "wrote", "Notes", "Publication", "Ada wrote Notes"),),
-            (("Ada", "Author"),),
-        )
-        value = (
-            record,
-            [("ner", {"passage": text}, dspy.Prediction(named_entities=["Ada"]))],
-            {"ada"},
-            1,
-            7,
-            30,
-        )
-        cache[("prompt", "source")] = value
-        row = conn.execute("SELECT payload FROM candidate_stage_cache").fetchone()
-        assert text not in zlib.decompress(row[0]).decode()
-        loaded = cache.get(("prompt", "source"), passage=text)
-        assert loaded[0] == record
-        assert loaded[1][0][1]["passage"] == text
-        assert loaded[1][0][2].named_entities == ["Ada"]
-        assert loaded[2:] == value[2:]
-        history = REPLHistory(max_output_chars=500).append(
-            code="print(source)",
-            output="Source text: " + text,
-        )
-        sources = {hashlib.sha256(text.encode()).hexdigest(): text}
-        replay = CandidateStageCache(
-            store,
-            managed,
-            "shacl",
-            lambda: "version-one",
-            sources=lambda: sources,
-        )
-        replay[("trace",)] = [
-            (
-                "shacl_healer_rlm.generate_action",
-                {
-                    "repl_history": history,
-                    "focus_context": json.dumps({"text": text}),
-                },
-                dspy.Prediction(code="SUBMIT(repairs=[])"),
-            )
-        ]
-        row = conn.execute("SELECT payload FROM candidate_stage_cache WHERE stage = 'shacl'").fetchone()
-        assert text not in zlib.decompress(row[0]).decode()
-        restored = replay[("trace",)]
-        assert restored[0][1]["repl_history"].format() == history.format()
-        assert restored[0][1]["focus_context"] == json.dumps({"text": text})
-        vector_cache = CandidateStageCache(store, managed, "embedding", lambda: "version-one")
-        vector_cache[("query",)] = np.array([0.1, 0.2], dtype=np.float32)
-        np.testing.assert_array_equal(vector_cache[("query",)], [np.float32(0.1), np.float32(0.2)])
-        changed = CandidateStageCache(store, managed, "openie", lambda: "version-two")
-        assert changed.get(("prompt", "source"), passage=text) is None
-        with managed.transaction() as conn:
-            conn.execute("UPDATE candidate_stage_cache SET payload = X'00' WHERE stage = 'openie'")
-        assert cache.get(("prompt", "source"), passage=text) is None
-        assert ("prompt", "source") not in cache
+        tables = {row[0] for row in engine.conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        assert {t for t in tables if "cache" in t} == set()
+        assert engine._encode_cached_text.cache_info().maxsize == 4096
+
+        v1 = engine._encode_texts(["Where did Turing work?"], instruction=PASSAGE_INSTRUCTION)[0]
+        v2 = engine._encode_texts(["Where did Turing work?"], instruction=PASSAGE_INSTRUCTION)[0]
+        np.testing.assert_array_equal(v1, v2)
+        assert len(calls) == 1
+        assert engine._encode_cached_text.cache_info().hits == 1
+
+        fact_vec = engine._encode_texts(["Where did Turing work?"], instruction=FACT_INSTRUCTION)[0]
+        assert len(calls) == 2
+        assert not np.array_equal(v1, fact_vec)
+
+        program.embedding_query_prefix = "task: custom query | query: "
+        engine._apply_program_embedding_prefixes(program)
+        v3 = engine._encode_texts(["Where did Turing work?"], instruction=PASSAGE_INSTRUCTION)[0]
+        assert len(calls) == 3
+        assert not np.array_equal(v1, v3)
     finally:
-        managed.close()
+        engine.close()
 
 
 def test_candidate_stages_make_zero_requests_after_process_restart(tmp_path: Path) -> None:
