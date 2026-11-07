@@ -28,6 +28,8 @@ from yaw.daemon.graph.planner import (
     record_surface_form,
 )
 from yaw.daemon.graph.storage import (
+    apply_shacl_repairs,
+    canonicalize_entity_labels_edc,
     lint_graph_shacl,
     open_yaw_db,
     upsert_chunk_pointers,
@@ -201,6 +203,27 @@ def test_shacl_rejects_letterless_resource_labels(tmp_path):
         )
         flagged = {v.focus_node for v in lint_graph_shacl(conn) if v.shape == "ConceptShape/resourceLabel"}
     assert flagged == {"ent-comma"}
+
+
+def test_shacl_set_pref_label_heals_non_resource_and_survives_edc(tmp_path):
+    doc_file = tmp_path / "doc.md"
+    doc_file.write_text("Admission broker configuration.\n", encoding="utf-8")
+    with closing(open_yaw_db(tmp_path / "labels_heal.db")) as conn:
+        upsert_chunk_pointers(conn, [(ChunkPointer("c1", "doc.md", 1, 1, "Doc"), "Admission broker configuration.")])
+        upsert_entities(conn, [("ent-comma", ",", "Punctuation artifact that needs a lexical concept label.")])
+        upsert_entity_labels(conn, [(",", "ent-comma", "skos:prefLabel", ",", "c1")])
+
+        with pytest.raises(ValueError):
+            apply_shacl_repairs(conn, [{"focus_node": "ent-comma", "action": "set_pref_label", "value": "---"}])
+
+        apply_shacl_repairs(
+            conn,
+            [{"focus_node": "ent-comma", "action": "set_pref_label", "value": "Comma delimiter"}],
+        )
+        canonicalize_entity_labels_edc(conn, corpus_root=tmp_path)
+        row = conn.execute("SELECT name FROM entities WHERE entity_id = 'ent-comma'").fetchone()
+        assert row is not None and row[0] == "Comma delimiter"
+        assert [v for v in lint_graph_shacl(conn) if v.focus_node == "ent-comma"] == []
 
 
 # --- V2: a statement never relates a resource sense to itself ------------------------------------

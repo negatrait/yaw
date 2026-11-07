@@ -1,5 +1,6 @@
 """Tests for W3C Semantic Cascade Slice 1: Denormalized Pair Evidence & Structural Queries."""
 
+import asyncio
 import inspect
 import json
 from contextlib import closing
@@ -10,6 +11,7 @@ import pytest
 
 from yaw.core import ChunkPointer
 from yaw.daemon.graph.storage import (
+    apply_shacl_repairs,
     canonicalize_entity_labels_edc,
     iter_synonym_evidence,
     lint_graph_shacl,
@@ -21,7 +23,16 @@ from yaw.daemon.graph.storage import (
     upsert_entity_labels,
     upsert_semantic_edges,
 )
+from yaw.daemon.graph.storage.evidence import (
+    EntityMention,
+    FactAssertion,
+    canonicalize_fact_definitions,
+    canonicalize_fact_text,
+    evidence_schemas,
+    upsert_evidence,
+)
 from yaw.daemon.graph.storage.graph_ops import upsert_facts
+from yaw.daemon.graph.storage.managed_sqlite import create_table
 from yaw.daemon.graph.storage.synonyms import (
     _Packet,
     query_broader_tc,
@@ -618,3 +629,562 @@ def test_canonicalize_entity_labels_edc_illegal_path_traversal_raises(tmp_path: 
 
         with pytest.raises(ValueError, match="Path traversal detected"):
             canonicalize_entity_labels_edc(conn, corpus_root=tmp_path, entity_ids=["ent-bad"])
+
+
+def test_canonicalize_fact_definitions_validity_precedence_and_repair_preservation(tmp_path: Path) -> None:
+    """Verify multi-assertion validity precedence, cross-batch repair preservation, and collision invalidation."""
+    with closing(open_yaw_db(tmp_path / "fact_defs.db")) as conn:
+        for schema in asyncio.run(evidence_schemas()):
+            create_table(conn, schema)
+        p1 = ChunkPointer("c1", "doc.md", 1, 1, "Doc")
+        p2 = ChunkPointer("c2", "doc.md", 2, 2, "Doc")
+        upsert_chunk_pointers(conn, [(p1, "Chunk 1 text."), (p2, "Chunk 2 text.")])
+        upsert_entities(
+            conn,
+            [
+                ("ent-subj", "Gateway", "An API gateway component."),
+                ("ent-obj", "Backend", "A backend service."),
+            ],
+        )
+        upsert_entity_labels(
+            conn,
+            [
+                ("gateway", "ent-subj", "skos:prefLabel", "Gateway", "c1"),
+                ("backend", "ent-obj", "skos:prefLabel", "Backend", "c1"),
+            ],
+        )
+
+        # 1. Multi-assertion validity precedence:
+        # assertion-001 (sorts first) has endpoint-duplicating spo_def; assertion-999 has valid spo_def.
+        upsert_facts(
+            conn,
+            [
+                (
+                    "fact-multi",
+                    "ent-subj",
+                    "routes to",
+                    "ent-obj",
+                    json.dumps(["Gateway", "routes to", "Backend"]),
+                    "An API gateway component.",
+                ),
+                (
+                    "fact-healed",
+                    "ent-subj",
+                    "monitors",
+                    "ent-obj",
+                    json.dumps(["Gateway", "monitors", "Backend"]),
+                    "An API gateway component.",
+                ),
+            ],
+            fact_sources=[("fact-multi", "c1"), ("fact-multi", "c2"), ("fact-healed", "c1")],
+        )
+        mentions = (
+            EntityMention(
+                "m-s",
+                "c1",
+                "rev-1",
+                "sense-s",
+                "Gateway",
+                "An API gateway component.",
+                "An API gateway component.",
+                "ent-subj",
+            ),
+            EntityMention(
+                "m-o", "c1", "rev-1", "sense-o", "Backend", "A backend service.", "A backend service.", "ent-obj"
+            ),
+        )
+        assertions = (
+            FactAssertion(
+                "assertion-001",
+                "c1",
+                "rev-1",
+                "m-s",
+                "m-o",
+                json.dumps({"spo_def": "An API gateway component."}),
+                "fact-multi",
+            ),
+            FactAssertion(
+                "assertion-999",
+                "c2",
+                "rev-1",
+                "m-s",
+                "m-o",
+                json.dumps({"spo_def": "Gateway forwards validated requests to Backend."}),
+                "fact-multi",
+            ),
+            FactAssertion(
+                "assertion-100",
+                "c1",
+                "rev-1",
+                "m-s",
+                "m-o",
+                json.dumps({"spo_def": "An API gateway component."}),
+                "fact-healed",
+            ),
+        )
+        upsert_evidence(conn, mentions, assertions)
+
+        updated = canonicalize_fact_definitions(conn)
+        assert updated == 1
+        row_multi = conn.execute("SELECT definition FROM facts WHERE fact_id = 'fact-multi'").fetchone()
+        assert row_multi is not None
+        assert row_multi[0] == "Gateway forwards validated requests to Backend."
+
+        # 2. Cross-batch repair preservation:
+        # Heal fact-healed via apply_shacl_repairs, then simulate next batch re-asserting fact-healed with invalid def
+        healed_def = "Gateway continuously monitors health of Backend."
+        apply_shacl_repairs(conn, [{"focus_node": "fact-healed", "action": "set_definition", "value": healed_def}])
+        prior_defs = {str(r[0]): str(r[1]) for r in conn.execute("SELECT fact_id, definition FROM facts")}
+        # Next batch upsert_facts overwrites facts.definition with unhealed duplicate definition
+        upsert_facts(
+            conn,
+            [
+                (
+                    "fact-healed",
+                    "ent-subj",
+                    "monitors",
+                    "ent-obj",
+                    json.dumps(["Gateway", "monitors", "Backend"]),
+                    "An API gateway component.",
+                )
+            ],
+            fact_sources=[("fact-healed", "c2")],
+        )
+        upsert_evidence(
+            conn,
+            (),
+            (
+                FactAssertion(
+                    "assertion-050",
+                    "c2",
+                    "rev-2",
+                    "m-s",
+                    "m-o",
+                    json.dumps({"spo_def": ""}),
+                    "fact-healed",
+                ),
+            ),
+        )
+        canonicalize_fact_definitions(conn, prior_definitions=prior_defs)
+        row_healed = conn.execute("SELECT definition FROM facts WHERE fact_id = 'fact-healed'").fetchone()
+        assert row_healed is not None
+        assert row_healed[0] == healed_def
+        fact_violations = [v for v in lint_graph_shacl(conn) if v.focus_node == "fact-healed"]
+        assert fact_violations == []
+
+        # Calling canonicalize_fact_definitions(conn) without prior_definitions also preserves valid current definition
+        assert canonicalize_fact_definitions(conn) == 0
+        row_healed_again = conn.execute("SELECT definition FROM facts WHERE fact_id = 'fact-healed'").fetchone()
+        assert row_healed_again is not None
+        assert row_healed_again[0] == healed_def
+
+        # 2b. Re-keyed fact ID not present in prior_definitions falls back to valid current_def:
+        conn.execute("UPDATE facts SET definition = ? WHERE fact_id = 'fact-healed'", (healed_def,))
+        conn.commit()
+        assert canonicalize_fact_definitions(conn, prior_definitions={"other-fact": "Unrelated."}) == 0
+        row_rekeyed = conn.execute("SELECT definition FROM facts WHERE fact_id = 'fact-healed'").fetchone()
+        assert row_rekeyed is not None
+        assert row_rekeyed[0] == healed_def
+
+        # 3. Endpoint definition collision invalidation:
+        # Update ent-obj definition to collide with healed_def -> valid_spo_def becomes False -> falls back to assertion
+        conn.execute("UPDATE entities SET definition = ? WHERE entity_id = 'ent-obj'", (healed_def,))
+        conn.commit()
+        changed_on_collision = canonicalize_fact_definitions(conn, prior_definitions=prior_defs)
+        assert changed_on_collision == 1
+        row_collided = conn.execute("SELECT definition FROM facts WHERE fact_id = 'fact-healed'").fetchone()
+        assert row_collided is not None
+        assert row_collided[0] == "An API gateway component."
+        flagged = [
+            v
+            for v in lint_graph_shacl(conn)
+            if v.focus_node == "fact-healed" and v.shape == "StatementShape/closedWorld"
+        ]
+        assert len(flagged) == 1
+
+
+def test_canonicalize_fact_text_delta_only(tmp_path: Path) -> None:
+    """Verify canonicalize_fact_text updates only facts whose canonical surface triple changed."""
+    with closing(open_yaw_db(tmp_path / "fact_text.db")) as conn:
+        p1 = ChunkPointer("c1", "doc.md", 1, 1, "Doc")
+        upsert_chunk_pointers(conn, [(p1, "Text.")])
+        upsert_entities(
+            conn,
+            [
+                ("ent-s", "Gateway", "An API gateway."),
+                ("ent-o", "Backend", "A backend service."),
+            ],
+        )
+        upsert_facts(
+            conn,
+            [
+                (
+                    "fact-1",
+                    "ent-s",
+                    "routes to",
+                    "ent-o",
+                    json.dumps(["gateway", "routes to", "backend"]),
+                    "Gateway routes traffic to Backend.",
+                ),
+                (
+                    "fact-2",
+                    "ent-s",
+                    "uses port",
+                    None,
+                    json.dumps(["Gateway", "uses port", "8080"]),
+                    "Gateway listens on port 8080.",
+                    "literal",
+                    "8080",
+                    "xsd:integer",
+                    "",
+                ),
+            ],
+            fact_sources=[("fact-1", "c1"), ("fact-2", "c1")],
+        )
+
+        # First call: fact-1 raw_triple_json changes ("gateway" -> "Gateway") and both need FTS sync
+        updated_first = canonicalize_fact_text(conn)
+        assert updated_first >= 1
+        row_f1 = conn.execute("SELECT raw_triple_json FROM facts WHERE fact_id = 'fact-1'").fetchone()
+        assert row_f1 is not None
+        assert json.loads(row_f1[0]) == ["Gateway", "routes to", "Backend"]
+
+        # Second call on already-canonical facts: 0 updates and 0 SQLite row modifications
+        before_changes = conn.total_changes
+        updated_second = canonicalize_fact_text(conn)
+        assert updated_second == 0
+        assert conn.total_changes == before_changes
+
+
+def test_apply_shacl_repairs_set_pref_label_healed_provenance_survives_edc(tmp_path: Path) -> None:
+    """Verify set_pref_label stores '__healed__', demotes scalar label to hiddenLabel, and survives EDC."""
+    with closing(open_yaw_db(tmp_path / "healed_label.db")) as conn:
+        doc_file = tmp_path / "status.md"
+        doc_file.write_text("The gateway returned 429 during peak traffic.\n", encoding="utf-8")
+        p1 = ChunkPointer("c-status", doc_file.name, 1, 1, "Traffic Status")
+        upsert_chunk_pointers(conn, [(p1, "The gateway returned 429 during peak traffic.")])
+
+        upsert_entities(
+            conn,
+            [
+                ("ent-status", "429", "HTTP status code indicating too many requests."),
+                ("ent-gateway", "Gateway", "Edge routing service."),
+            ],
+        )
+        upsert_entity_labels(
+            conn,
+            [
+                ("429", "ent-status", "skos:prefLabel", "429", "c-status"),
+                ("gateway", "ent-gateway", "skos:prefLabel", "Gateway", "c-status"),
+            ],
+        )
+        upsert_facts(
+            conn,
+            [
+                (
+                    "fact-status",
+                    "ent-gateway",
+                    "returned",
+                    "ent-status",
+                    json.dumps(["Gateway", "returned", "429"]),
+                    "The gateway returned HTTP 429 during peak traffic.",
+                )
+            ],
+            fact_sources=[("fact-status", "c-status")],
+        )
+
+        initial_violations = [v for v in lint_graph_shacl(conn) if v.focus_node == "ent-status"]
+        assert any(v.shape == "ConceptShape/noScalarLiterals" for v in initial_violations)
+
+        # Reject scalar or non-resource repair values
+        for bad_val in ("429", "---"):
+            with pytest.raises(ValueError):
+                apply_shacl_repairs(
+                    conn,
+                    [{"focus_node": "ent-status", "action": "set_pref_label", "value": bad_val}],
+                )
+
+        # Apply valid lexical set_pref_label repair
+        applied = apply_shacl_repairs(
+            conn,
+            [{"focus_node": "ent-status", "action": "set_pref_label", "value": "HTTP 429 Too Many Requests"}],
+        )
+        assert applied == 1
+
+        # Verify __healed__ provenance and hiddenLabel demotion of '429'
+        label_rows = conn.execute(
+            "SELECT label_norm, label_kind, raw_label, chunk_id FROM entity_labels WHERE entity_id = 'ent-status'"
+        ).fetchall()
+        by_norm = {str(r[0]): (str(r[1]), str(r[2]), str(r[3])) for r in label_rows}
+        assert by_norm["429"] == ("skos:hiddenLabel", "429", "c-status")
+        assert by_norm["http 429 too many requests"] == (
+            "skos:prefLabel",
+            "HTTP 429 Too Many Requests",
+            "__healed__",
+        )
+
+        # Subsequent canonicalize_entity_labels_edc with real corpus_root must preserve the healed label
+        canonicalize_entity_labels_edc(conn, corpus_root=tmp_path, entity_ids=["ent-status"])
+        ent_row = conn.execute("SELECT name FROM entities WHERE entity_id = 'ent-status'").fetchone()
+        assert ent_row is not None
+        assert ent_row[0] == "HTTP 429 Too Many Requests"
+        assert [v for v in lint_graph_shacl(conn) if v.focus_node == "ent-status"] == []
+
+
+def test_apply_shacl_repairs_maintains_validate_graph_state_across_actions(tmp_path: Path) -> None:
+    """Verify delete_invalid_fact, remove_scalar_entity, delete_dangling, and merge_altLabel keep evidence valid."""
+    from yaw.daemon.graph.storage.evidence import fact_id, sense_id
+    from yaw.daemon.graph.storage.rows import validate_graph_state
+
+    with closing(open_yaw_db(tmp_path / "shacl_evidence_state.db")) as conn:
+        for schema in asyncio.run(evidence_schemas()):
+            create_table(conn, schema)
+        doc_file = tmp_path / "doc.md"
+        doc_file.write_text("Gateway, Gateway Alias, Backend, 429, and Orphan.\n", encoding="utf-8")
+        p1 = ChunkPointer("c1", doc_file.name, 1, 1, "Doc")
+        upsert_chunk_pointers(conn, [(p1, "Gateway, Gateway Alias, Backend, 429, and Orphan.")])
+
+        e_subj = sense_id("Gateway", "Edge API gateway.")
+        e_dup = sense_id("Gateway Alias", "Secondary edge gateway label.")
+        e_obj = sense_id("Backend", "Core backend service.")
+        e_scalar = sense_id("429", "Numeric status literal.")
+        e_orphan = sense_id("Orphan", "Isolated concept node.")
+
+        upsert_entities(
+            conn,
+            [
+                (e_subj, "Gateway", "Edge API gateway."),
+                (e_dup, "Gateway Alias", "Secondary edge gateway label."),
+                (e_obj, "Backend", "Core backend service."),
+                (e_scalar, "429", "Numeric status literal."),
+                (e_orphan, "Orphan", "Isolated concept node."),
+            ],
+        )
+        upsert_entity_labels(
+            conn,
+            [
+                ("gateway", e_subj, "skos:prefLabel", "Gateway", "c1"),
+                ("gateway alias", e_dup, "skos:prefLabel", "Gateway Alias", "c1"),
+                ("backend", e_obj, "skos:prefLabel", "Backend", "c1"),
+                ("429", e_scalar, "skos:prefLabel", "429", "c1"),
+                ("orphan", e_orphan, "skos:prefLabel", "Orphan", "c1"),
+            ],
+        )
+        upsert_edges_with_sources(
+            conn,
+            [
+                ("c1", e_subj, "passage", 1.0, "c1"),
+                ("c1", e_dup, "passage", 1.0, "c1"),
+                ("c1", e_obj, "passage", 1.0, "c1"),
+                ("c1", e_scalar, "passage", 1.0, "c1"),
+                ("c1", e_orphan, "passage", 1.0, "c1"),
+            ],
+        )
+
+        f_keep = fact_id(e_subj, "routes to", "entity", e_obj)
+        f_dup = fact_id(e_dup, "routes to", "entity", e_obj)
+        f_invalid = fact_id(e_subj, " drops ", "entity", e_obj)
+        f_scalar_obj = fact_id(e_subj, "returned", "entity", e_scalar)
+        f_scalar_subj = fact_id(e_scalar, "indicates", "entity", e_obj)
+        f_orphan = fact_id(e_orphan, "monitors", "entity", e_obj)
+
+        upsert_facts(
+            conn,
+            [
+                (
+                    f_keep,
+                    e_subj,
+                    "routes to",
+                    e_obj,
+                    json.dumps(["Gateway", "routes to", "Backend"]),
+                    "Gateway routes requests to Backend.",
+                ),
+                (
+                    f_dup,
+                    e_dup,
+                    "routes to",
+                    e_obj,
+                    json.dumps(["Gateway Alias", "routes to", "Backend"]),
+                    "Gateway Alias routes requests to Backend.",
+                ),
+                (
+                    f_invalid,
+                    e_subj,
+                    " drops ",
+                    e_obj,
+                    json.dumps(["Gateway", " drops ", "Backend"]),
+                    "Invalid fact to be deleted.",
+                ),
+                (
+                    f_scalar_obj,
+                    e_subj,
+                    "returned",
+                    e_scalar,
+                    json.dumps(["Gateway", "returned", "429"]),
+                    "Gateway returned status code 429.",
+                ),
+                (
+                    f_scalar_subj,
+                    e_scalar,
+                    "indicates",
+                    e_obj,
+                    json.dumps(["429", "indicates", "Backend"]),
+                    "Status 429 indicates Backend overload.",
+                ),
+                (
+                    f_orphan,
+                    e_orphan,
+                    "monitors",
+                    e_obj,
+                    json.dumps(["Orphan", "monitors", "Backend"]),
+                    "Orphan monitors Backend.",
+                ),
+            ],
+            fact_sources=[
+                (f_keep, "c1"),
+                (f_dup, "c1"),
+                (f_invalid, "c1"),
+                (f_scalar_obj, "c1"),
+                (f_scalar_subj, "c1"),
+                (f_orphan, "c1"),
+            ],
+        )
+
+        mentions = (
+            EntityMention("m-subj", "c1", "rev-1", e_subj, "Gateway", "Edge API gateway.", "Edge API gateway.", e_subj),
+            EntityMention(
+                "m-dup",
+                "c1",
+                "rev-1",
+                e_dup,
+                "Gateway Alias",
+                "Secondary edge gateway label.",
+                "Secondary edge gateway label.",
+                e_dup,
+            ),
+            EntityMention(
+                "m-obj", "c1", "rev-1", e_obj, "Backend", "Core backend service.", "Core backend service.", e_obj
+            ),
+            EntityMention(
+                "m-scalar",
+                "c1",
+                "rev-1",
+                e_scalar,
+                "429",
+                "Numeric status literal.",
+                "Numeric status literal.",
+                e_scalar,
+            ),
+            EntityMention(
+                "m-orphan",
+                "c1",
+                "rev-1",
+                e_orphan,
+                "Orphan",
+                "Isolated concept node.",
+                "Isolated concept node.",
+                e_orphan,
+            ),
+        )
+        assertions = (
+            FactAssertion(
+                "a-keep",
+                "c1",
+                "rev-1",
+                "m-subj",
+                "m-obj",
+                json.dumps({"spo_def": "Gateway routes requests to Backend."}),
+                f_keep,
+            ),
+            FactAssertion(
+                "a-dup",
+                "c1",
+                "rev-1",
+                "m-dup",
+                "m-obj",
+                json.dumps({"spo_def": "Gateway Alias routes requests to Backend."}),
+                f_dup,
+            ),
+            FactAssertion(
+                "a-invalid",
+                "c1",
+                "rev-1",
+                "m-subj",
+                "m-obj",
+                json.dumps({"spo_def": "Invalid fact to be deleted."}),
+                f_invalid,
+            ),
+            FactAssertion(
+                "a-scalar-obj",
+                "c1",
+                "rev-1",
+                "m-subj",
+                "m-scalar",
+                json.dumps({"spo_def": "Gateway returned status code 429."}),
+                f_scalar_obj,
+            ),
+            FactAssertion(
+                "a-scalar-subj",
+                "c1",
+                "rev-1",
+                "m-scalar",
+                "m-obj",
+                json.dumps({"spo_def": "Status 429 indicates Backend overload."}),
+                f_scalar_subj,
+            ),
+            FactAssertion(
+                "a-orphan",
+                "c1",
+                "rev-1",
+                "m-orphan",
+                "m-obj",
+                json.dumps({"spo_def": "Orphan monitors Backend."}),
+                f_orphan,
+            ),
+        )
+        upsert_evidence(conn, mentions, assertions)
+
+        # Execute all 4 repair actions:
+        # 1) delete_invalid_fact on f_invalid
+        # 2) remove_scalar_entity on e_scalar (literalizes f_scalar_obj; deletes f_scalar_subj & m-scalar)
+        # 3) delete_dangling on e_orphan (deletes f_orphan, a-orphan, and m-orphan)
+        # 4) merge_altLabel on e_dup|e_subj (merges entities and binds merged evidence)
+        repairs = [
+            {"focus_node": f_invalid, "action": "delete_invalid_fact", "value": ""},
+            {"focus_node": e_scalar, "action": "remove_scalar_entity", "value": ""},
+            {"focus_node": e_orphan, "action": "delete_dangling", "value": ""},
+            {"focus_node": f"{e_dup}|{e_subj}", "action": "merge_altLabel", "value": e_subj},
+        ]
+        applied = apply_shacl_repairs(conn, repairs)
+        assert applied == 4
+
+        # Verify a-invalid has fact_id = NULL
+        row_inv = conn.execute("SELECT fact_id FROM fact_assertions WHERE assertion_id = 'a-invalid'").fetchone()
+        assert row_inv is not None and row_inv[0] is None
+
+        # Verify a-scalar-obj was literalized (object_mention_id = NULL) and re-keyed to canonical literal fact_id
+        canonical_winner = min(e_subj, e_dup)
+        expected_lit_fid = fact_id(canonical_winner, "returned", "literal", "429", "xsd:integer", "")
+        row_sc_obj = conn.execute(
+            "SELECT object_mention_id, fact_id FROM fact_assertions WHERE assertion_id = 'a-scalar-obj'"
+        ).fetchone()
+        assert row_sc_obj is not None
+        assert row_sc_obj[0] is None
+        assert row_sc_obj[1] == expected_lit_fid
+
+        # Verify scalar and orphan entity mentions and subject assertions were removed
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM entity_mentions WHERE entity_id IN (?, ?)", (e_scalar, e_orphan)
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM fact_assertions WHERE assertion_id IN ('a-scalar-subj', 'a-orphan')"
+            ).fetchone()[0]
+            == 0
+        )
+
+        # Verify full graph state and SHACL conformance pass without any dangling/noncanonical bindings
+        validate_graph_state(conn)

@@ -92,7 +92,7 @@ def test_native_shacl_healer_definition_survives_publication(tmp_path, provider,
             return
         publish(stream, app, [(pointer, text)])
         assert "rlm" in state["healer_requests"] and "direct" in state["healer_requests"]
-        assert all('"focus_kind": "fact"' in context for context in state["healer_contexts"])
+        assert any('"focus_kind": "fact"' in context for context in state["healer_contexts"])
         contexts = [json.JSONDecoder().raw_decode(context.strip())[0] for context in state["healer_contexts"]]
         assert all(text in info["source_passages"].values() for context in contexts for info in context)
         assert all(info.get("focus_kind") in {"fact", "entity"} for context in contexts for info in context)

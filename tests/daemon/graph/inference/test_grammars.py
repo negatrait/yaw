@@ -3,9 +3,11 @@
 import pytest
 
 from yaw.daemon.graph.inference.grammars import (
+    DSPY_SHACL_REPAIR_GBNF_GRAMMAR,
     build_dspy_hierarchy_judge_grammar,
     build_dspy_label_judge_grammar,
     build_dspy_related_judge_grammar,
+    build_dspy_shacl_repair_grammar,
 )
 
 
@@ -119,3 +121,33 @@ def test_adapter_resolves_3_stage_grammars() -> None:
     g_rel = adapter.resolve_grammar(JudgeRelated)
     assert g_rel is not None
     assert "related" in g_rel
+
+
+def _parse_gbnf_rules(grammar: str) -> dict[str, str]:
+    rules: dict[str, str] = {}
+    for line in grammar.splitlines():
+        name, body = line.split(" ::= ", 1)
+        rules[name] = body
+    return rules
+
+
+def test_shacl_repair_grammar_lexical_label_branch_and_abstention() -> None:
+    base_rules = _parse_gbnf_rules(DSPY_SHACL_REPAIR_GBNF_GRAMMAR)
+    assert base_rules["label"] == '"\\"" non-letter* letter char* "\\""'
+    assert base_rules["letter"] == "[a-zA-Z\\x80-\\U0010FFFF]"
+    assert base_rules["non-letter"] == "[\\x20\\x21\\x23-\\x40\\x5B\\x5D-\\x60\\x7B-\\x7E]"
+
+    grammar = build_dspy_shacl_repair_grammar(
+        allowed_actions={"entity-1": {"set_pref_label"}, "fact-1": {"set_definition"}}
+    )
+    rules = _parse_gbnf_rules(grammar)
+    assert rules["repair-list"] == '"[]" | "[" repair-0 (", " repair-0)* ", " repair-1 (", " repair-1)* "]"'
+    assert rules["repair-0"] == (
+        '"{\\"focus_node\\": " "\\"entity-1\\"" ", \\"action\\": " ("\\"set_pref_label\\"") ", \\"value\\": " label "}"'
+    )
+    assert rules["repair-1"] == (
+        '"{\\"focus_node\\": " "\\"fact-1\\"" ", \\"action\\": " ("\\"set_definition\\"") ", \\"value\\": " string "}"'
+    )
+    assert rules["label"] == '"\\"" non-letter* letter char* "\\""'
+    assert rules["letter"] == "[a-zA-Z\\x80-\\U0010FFFF]"
+    assert rules["non-letter"] == "[\\x20\\x21\\x23-\\x40\\x5B\\x5D-\\x60\\x7B-\\x7E]"

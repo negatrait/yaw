@@ -1,7 +1,17 @@
 # Native CocoIndex indexing and live ingestion
 
-Status: revised target contract, 2026-11-05. Earlier acceptance on 2026-10-28 was
-reopened for lifecycle work on 2026-11-04; this rewrite does not close those gates.
+Status: revised target contract, 2026-11-07. Earlier acceptance on 2026-10-28 was
+reopened for lifecycle work on 2026-11-04; this rewrite does not close those gates. Pinned code: `c6fa080`.
+
+| Relation | Links |
+| --- | --- |
+| Governed by | [FOUNDATIONAL.md](../FOUNDATIONAL.md), [AGENTS.md](../AGENTS.md), [epic-1-hipporag-daemon.md](epic-1-hipporag-daemon.md) |
+| Rules | [daemon.md](../.agents/rules/daemon.md): `yaw/daemon/*.py`, `yaw/daemon/ingestion/*.py`; [graph-storage.md](../.agents/rules/graph-storage.md): `yaw/daemon/graph/*.py`, `yaw/daemon/graph/storage/*.py`; [inference.md](../.agents/rules/inference.md): `yaw/daemon/graph/inference/*.py`; [tests.md](../.agents/rules/tests.md): `tests/**/*.py`; [docs.md](../.agents/rules/docs.md): `docs/**/*.md` |
+| Owns code | `yaw/daemon/runtime.py`, `yaw/daemon/indexing.py`, `yaw/daemon/ingestion/corpus.py`, `yaw/daemon/ingestion/chunker.py`, `yaw/daemon/graph/storage/hydration.py` |
+| Peers | [native-cocoindex-graph.md](native-cocoindex-graph.md): owns graph identity, `publish_graph` publication semantics, SHACL healing, and the paired `64 + 64` vs. `128` acceptance gate; [w3c-improvements.md](w3c-improvements.md): constrains SKOS/OWL/SHACL closed-world shapes and Active EDC label canonicalization (`§3.2`); [epistemic-confidence-spec.md](epistemic-confidence-spec.md): constrains Bayesian confidence pooling; [dspy-improvements.md](dspy-improvements.md): constrains GBNF adapter and RLM healer architecture |
+| References | [arxiv-2502.14802v1-hipporag2.md](arxiv-2502.14802v1-hipporag2.md): anchors HippoRAG 2 indexing and retrieval parity; [model-evaluation.md](model-evaluation.md): anchors local `llama.cpp` serving constraints (`parallel = 1` `[target]`) |
+| Supersedes / superseded by | Supersedes earlier `skos:ConceptScheme` indexing hooks and unscoped per-batch re-embedding / label re-canonicalization during `64`-chunk micro-batch updates |
+| Records | [incremental-publication-work.md](reviews/incremental-publication-work.md), [shacl-healer-publication.md](reviews/shacl-healer-publication.md), [resource-vocabulary-boundary.md](reviews/resource-vocabulary-boundary.md), [evaluation-ingestion.md](evaluation-ingestion.md), [evaluation-graph-storage.md](evaluation-graph-storage.md) |
 
 ## 1. Outcome and division of responsibility
 
@@ -84,6 +94,23 @@ Keep expensive pure inference memoized through native components with exact
 source/text and program/model/profile keys. Separate extraction and embedding
 identities so changing one does not unnecessarily invalidate the other. Memo hits
 retain named DSPy traces but consume no new provider tokens.
+For each `64`-chunk micro-batch publication (`publish_graph` `@coco.fn(memo=True, version=8)`),
+per-batch work is delta-scoped to avoid reprocessing unmodified prior-batch state:
+- `heal_shacl_violations` (`@coco.fn(memo=True, version=4)`) receives focus-isolated
+  `SHACLHealInput` payloads grouped by `focus_node` (`focus_node ASC`) with
+  deterministically ordered SQLite dossiers (`inspect_entity_or_fact`,
+  `inspect_focus_node`), so newly introduced violations in Batch $k$ do not shift
+  slice boundaries or invalidate memo entries for earlier focus nodes.
+- `canonicalize_fact_definitions(conn, prior_definitions=prior_fact_definitions)`
+  preserves valid prior-batch `set_definition` repairs and `apply_shacl_repairs`
+  records `set_pref_label` with `chunk_id = "__healed__"` so healed facts and
+  entity labels do not relapse into SHACL violations on subsequent `64`-chunk
+  batches ([native-cocoindex-graph.md §5.2, §5.3](native-cocoindex-graph.md#52-batch-independent-identity-and-candidate-discovery)).
+- `plan_graph_publication` initializes `fact_nodes` with cased endpoint names,
+  passes `fact_vectors=()` on initial staging, runs delta-only
+  `canonicalize_fact_text`, scopes `canonicalize_entity_labels_edc` to
+  `entity_ids=sorted(touched_entity_ids)`, and embeds/upserts `fact_vec` in a
+  single post-canonicalization pass at step 5 for `reembed_facts` only.
 
 Point `coco.Settings(db_path=...)` at persistent state independent of transient
 experiment DB basenames. One database's target ownership/tracking must never be
@@ -201,3 +228,8 @@ QA-only datasets omit unsupported Recall@N rather than reporting zero. Preserve
 actual baselines and optimizer checkpoints; never rewrite them to pass the new
 paired graph comparison. The graph plan's project-gate section governs commands,
 resolved baseline artifacts and reported Recall@N/EM/F1 evidence.
+
+## Decisions
+
+- 2026-11-06: "Step 4 should be included in this unit, but obviously, you can implement one unit at a time according to whichever spec you write into @[docs/native-cocoindex-graph.md] or @[docs/native-cocoindex-indexing.md] , also sounds like you'll need to update our rules and tests to prevent these kinds of failures surfacing again." (User). Specs are promoted into `docs/native-cocoindex-graph.md` and `docs/native-cocoindex-indexing.md` and executed one checkpoint unit at a time with regression tests.
+- 2026-11-07: "Audit and review for root cause for batch indexing regressing back to exponential time behavior. Incremental indexing and graph publication was designed and tested to be near-constant time for 64 + 64 chunk batches vs 128 chunk batchless indexing." / "It’s a SHACL Violation CONSISTENCY_ERROR" / "you will need to /spec first." (User). Enforces delta-scoped `64`-chunk batch publication (`publish_graph` `version=8`, focus-isolated `heal_shacl_violations` `version=4`, repair-preserving `canonicalize_fact_definitions`, `"__healed__"` label provenance, `touched_entity_ids`-scoped Active EDC, delta-only `canonicalize_fact_text`, and single-pass post-canonicalization `reembed_facts` embedding).

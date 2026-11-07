@@ -1,9 +1,11 @@
 # SHACL healer publication repair
 
-Started 2026-11-06 on `dev`, after `d566a42`.
+Started 2026-11-06 on `dev`, after `d566a42`; multi-batch extension started 2026-11-07 from `c6fa080`.
+Controlling contracts: [native graph publication §5.2, §5.3](../native-cocoindex-graph.md#52-batch-independent-identity-and-candidate-discovery), [native indexing](../native-cocoindex-indexing.md), [W3C improvements §3.2](../w3c-improvements.md#32-end-of-round-active-edc-canonicalizer-yawdaemongraphstoragegraph_opspy). Peer records: [incremental publication](incremental-publication-work.md), [resource vocabulary boundary](resource-vocabulary-boundary.md).
 
 Goal: a closed-world statement violation reaches the native DSPy healer and its
-validated repair survives canonicalization and declarative publication. Retain
+validated repair survives canonicalization and declarative publication across
+both single-batch and incremental multi-batch (`64 + 64`) updates. Retain
 raw extraction evidence; unresolved violations still abort with the original
 error. No custom retries, relaxed shapes or alternative publisher.
 
@@ -291,3 +293,37 @@ recall/EM/F1. No complete fresh-corpus GEPA run, 64+64/128 timing comparison,
 <=1-GiB scaling acceptance or U3–U6 completion is claimed. The requested C1–C4 and
 P0–P5 plans remain open; no acceleration dependency or alternate writer was added.
 Older saved healer contracts require a fresh optimization rather than migration.
+
+## 2026-11-07: Incremental multi-batch SHACL repair persistence & focus-isolated healer memoization (from `c6fa080`)
+
+Audit of `.yaw/yaw_optimize_20261106_221811.db` at Batch 7 (`384` published chunks across `6` batches of `64` chunks, `448` extracted chunks `[measured: .yaw/yaw_optimize_20261106_221811.db, c6fa080]`) established that the 2026-11-06 single-batch `canonicalize_fact_definitions` implementation (`ORDER BY assertion_id LIMIT 1` across all rows in `facts`) is superseded: across multiple `64`-chunk batches, `clone_graph_to_memory` copies repaired `facts.definition` rows alongside immutable `fact_assertions` whose `raw_json` retains the original unhealed `$.spo_def`, causing `42` of `42` (`100%`) prior-batch repaired facts to relapse into `StatementShape/closedWorld` violations on the next batch. In addition, `apply_shacl_repairs` copied a corpus `chunk_id` onto `set_pref_label` rows (causing `canonicalize_entity_labels_edc` to demote healed labels on the next batch), fixed-width multi-focus `batched(violations, ...)` slicing shifted `SHACLHealInput` memo keys whenever an earlier-sorting `fact-<md5>` violation arrived, and `plan_graph_publication` double-embedded new cased facts while re-upserting all `fact_vec` rows.
+
+The single-batch unconditional `canonicalize_fact_definitions` overwrite from the 2026-11-06 unit above is superseded by the 3-tier validity-ordered, `prior_definitions`-preserving contract in [native-cocoindex-graph.md §5.2, §5.3, §9.2](../native-cocoindex-graph.md#52-batch-independent-identity-and-candidate-discovery), [native-cocoindex-indexing.md §3](../native-cocoindex-indexing.md#3-revision-identity-memo-and-target-isolation), and [w3c-improvements.md §3.2](../w3c-improvements.md#32-end-of-round-active-edc-canonicalizer-yawdaemongraphstoragegraph_opspy) ([Decisions](../native-cocoindex-graph.md#decisions)).
+
+### Checkpoints (2026-11-07)
+
+- [x] **C1**: Promote contracts, Tier 2 opening navigation blocks, `## Decisions` sections, and backlinks into [native-cocoindex-graph.md](../native-cocoindex-graph.md), [native-cocoindex-indexing.md](../native-cocoindex-indexing.md), and [w3c-improvements.md](../w3c-improvements.md), and append the 2026-11-07 checkpoint plan to [shacl-healer-publication.md](shacl-healer-publication.md) and [incremental-publication-work.md](incremental-publication-work.md) (verified: `uv run --locked pytest tests/core/test_architecture.py` and `git diff --check`).
+- [x] **C2**: TDD tests and implementation for Cross-Batch SHACL Repair Persistence & Lexical Repair Parity (`canonicalize_fact_definitions` 3-tier validity precedence & `prior_definitions` preservation, `apply_shacl_repairs` `"__healed__"` provenance & scalar demotion, `canonicalize_entity_labels_edc` scalar/non-resource hiding, `shacl_repair_actions`, `build_dspy_shacl_repair_grammar` lexical `label` branch, and `parse_shacl_repairs` value/lexical validation).
+- [x] **C3**: TDD tests and implementation for Focus-Isolated Healer Memoization & Single-Pass/Delta-Scoped Incremental Publication (`inspect_entity_or_fact` / `inspect_focus_node` deterministic `ORDER BY`, per-focus `SHACLHealInput` in `plan_graph_publication`, single-pass post-canonicalization `reembed_facts` embedding & vector upsert, delta-only `canonicalize_fact_text`, `touched_entity_ids`-scoped `canonicalize_entity_labels_edc`, SQL-scoped `entity_labels` self-join in `find_entity_disambiguation_candidates`, and `@coco.fn` version bumps `heal_shacl_violations` `version=4` / `publish_graph` `version=8`).
+- [x] **C4**: Real-substrate verification on `64 + 64` vs. `128` paired benchmark and snapshot verification on `.yaw/yaw_optimize_20261106_221811.db`, recording measurements in [evaluation-graph-storage.md](../evaluation-graph-storage.md) and [evaluation-ingestion.md](../evaluation-ingestion.md).
+
+### Completed Implementation Units (2026-11-07)
+
+- **Changed symbols & modules**:
+  - `yaw/daemon/graph/storage/evidence.py`: `canonicalize_fact_definitions(conn, prior_definitions=...)` (3-tier closed-world validity precedence), `canonicalize_fact_text(conn)` (delta-only `raw != f.raw_triple_json` check + `executemany`).
+  - `yaw/daemon/graph/inference/grammars.py` & `yaw/daemon/graph/inference/parsers.py`: `build_dspy_shacl_repair_grammar`, `shacl_repair_actions`, `parse_shacl_repairs` (lexical `label` rule on `set_pref_label`, `ConceptShape/resourceLabel` mapping, empty abstention `{"repairs": []}` preserved, partial/empty/scalar repairs rejected).
+  - `yaw/daemon/graph/storage/shacl.py`: `inspect_entity_or_fact` and `inspect_focus_node` deterministic `ORDER BY` clauses, `apply_shacl_repairs` `"__healed__"` provenance on `set_pref_label`, scalar demotion, `entity_mentions`/`fact_assertions` binding maintenance on `remove_scalar_entity`/`delete_dangling`/`delete_orphan`/`delete_invalid_fact`/`merge_altLabel`/`merge_hiddenLabel`, and `auto_heal_deterministic_shacl` canonical `fact_id(a_id, "relatedTo", "entity", c_id)` and `SUBSTR(el.chunk_id, 1, 2) != '__'`.
+  - `yaw/daemon/graph/storage/graph_ops.py`: `canonicalize_entity_labels_edc(conn, corpus_root, touched_entity_ids=...)` (`is_hidden = True` for scalar/non-resource labels and delta-scoped entity scan), `find_entity_disambiguation_candidates` SQL-scoped `entity_labels` self-join, and `@lru_cache(maxsize=65536)` on `_lexical_name_parts`.
+  - `yaw/daemon/graph/planner.py`: `materialize_entities_and_facts` cased `fact_nodes` initialization, `apply_synonym_adjudication` `touched_entity_ids` scoping, `plan_graph_publication` `prior_fact_definitions` propagation across `merged.fact_bindings`, per-focus `SHACLHealInput` grouping (`focus_node ASC`), and single-pass post-canonicalization `reembed_facts` embedding/upsert.
+  - `yaw/daemon/graph/inference/components.py` & `yaw/daemon/indexing.py`: `heal_shacl_violations` `@coco.fn(memo=True, version=4)` and `publish_graph` `@coco.fn(memo=True, version=8)`.
+- **Gate results & evidence paths** (full evaluation entries in [evaluation-graph-storage.md](../evaluation-graph-storage.md#2026-11-07-cross-batch-shacl-repair-persistence-focus-isolated-healer-memoization-and-single-pass-incremental-publication) and [evaluation-ingestion.md](../evaluation-ingestion.md#2026-11-07-cross-batch-shacl-repair-persistence-focus-isolated-healer-memoization-and-single-pass-incremental-publication); decisions in [native-cocoindex-graph.md §Decisions](../native-cocoindex-graph.md#decisions), [native-cocoindex-indexing.md §Decisions](../native-cocoindex-indexing.md#decisions), and [w3c-improvements.md §Decisions](../w3c-improvements.md#decisions)):
+  - `outputs/benchmarks/batch_equivalence_c4.xml` (`2 passed in 26.30s`, $R_{\text{time}} = 1.0909$ same-process, $R_{\text{time}} = 1.1270$ restart-between-batches, `100%` 15-table canonical equality `[measured: outputs/benchmarks/batch_equivalence_c4.xml, c6fa080]`).
+  - `.yaw/yaw_optimize_20261106_221811.db` read-only snapshot clone check (`healed_before=42 preserved=42` `[measured: .yaw/yaw_optimize_20261106_221811.db, c6fa080]`).
+  - `tests/core/test_architecture.py` (`15 passed`), `tests/daemon/graph/test_evidence_revisions.py` (`18 passed`), `tests/daemon/graph/storage/test_storage.py` + `tests/daemon/graph/test_resource_vocabulary.py` + `tests/daemon/graph/inference/test_grammars.py` + `tests/daemon/graph/inference/test_parsers.py` (`73 passed`), full suite (`938 passed, 3 subtests passed` `[measured: pytest -o addopts=""]`).
+  - §7 removal inventory exit checks: `0` matches across all 4 retired patterns `[measured: c6fa080]`.
+- **Discoveries during implementation**:
+  - Cross-batch `prior_fact_definitions` must be propagated across `merged.fact_bindings` when `bind_merged_evidence` or `merge_repaired_entities` re-keys a fact's `fact_id` after an endpoint entity merge, and `canonicalize_fact_definitions` must consult `current_def` when `fid` was newly created in the current batch.
+  - SQLite `LIKE '__%'` treats `_` as a single-character wildcard, matching any 2+ character `chunk_id`; `SUBSTR(el.chunk_id, 1, 2) != '__'` is required to filter synthetic provenance markers (`__healed__`, `__seed__`).
+  - `apply_shacl_repairs` destructive/merge actions (`remove_scalar_entity`, `delete_dangling`, `delete_orphan`, `delete_invalid_fact`, `merge_altLabel`, `merge_hiddenLabel`) must update `entity_mentions` and `fact_assertions` bindings alongside `entities`/`facts` to satisfy `validate_graph_state`.
+- **What it does not establish**:
+  - Does not claim completion of open U3–U6 architectural items (`vec0`, removing `:memory:` clone), nor full-corpus GEPA optimization convergence or Tier 2 benchmark acceptance.

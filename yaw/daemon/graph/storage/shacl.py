@@ -9,18 +9,20 @@ from typing import Any
 
 from yaw.core import (
     SHACLViolation,
-    compute_mdhash_id,
     detect_scalar_literal,
     is_resource_label,
+    is_scalar_label,
     text_processing,
 )
 
 from .chunks import get_chunk_pointers
 from .db import write_tx
+from .evidence import bind_merged_evidence, fact_id
 from .graph_ops import (
     get_existing_ids,
     merge_entities,
     pool_confidences,
+    rekey_facts,
     upsert_entity_labels,
     upsert_semantic_edges,
 )
@@ -86,7 +88,8 @@ def inspect_entity_or_fact(
             "chunk_id": str(r[3]),
         }
         for r in conn.execute(
-            "SELECT label_norm, label_kind, raw_label, chunk_id FROM entity_labels WHERE entity_id = ?",
+            "SELECT label_norm, label_kind, raw_label, chunk_id FROM entity_labels "
+            "WHERE entity_id = ? ORDER BY label_norm ASC, label_kind ASC, chunk_id ASC",
             (eid,),
         )
     ]
@@ -106,6 +109,7 @@ def inspect_entity_or_fact(
             COALESCE(obj_lang, '')
         FROM facts
         WHERE fact_id = ? OR subj_id = ? OR obj_id = ?
+        ORDER BY fact_id ASC
         """,
         (focus_node, eid, eid),
     ).fetchall()
@@ -139,7 +143,8 @@ def inspect_entity_or_fact(
     ]
 
     raw_edges = conn.execute(
-        "SELECT src_id, dst_id, kind, weight FROM edges WHERE src_id IN (?, ?) OR dst_id IN (?, ?)",
+        "SELECT src_id, dst_id, kind, weight FROM edges WHERE src_id IN (?, ?) OR dst_id IN (?, ?) "
+        "ORDER BY src_id ASC, dst_id ASC, kind ASC",
         (focus_node, eid, focus_node, eid),
     ).fetchall()
 
@@ -528,7 +533,8 @@ def inspect_focus_node(
             {"entity_id": eid, "name": name, "definition": definition}
             for eid, name, definition in conn.execute(
                 "SELECT e.entity_id,e.name,e.definition FROM entities e JOIN facts f "
-                "ON e.entity_id=f.subj_id OR e.entity_id=f.obj_id WHERE f.fact_id=?",
+                "ON e.entity_id=f.subj_id OR e.entity_id=f.obj_id WHERE f.fact_id=? "
+                "ORDER BY e.entity_id ASC",
                 (clean_focus,),
             )
         ]
@@ -1119,6 +1125,13 @@ def apply_shacl_repairs(
         return 0
     applied = 0
     with write_tx(conn):
+        has_evidence = (
+            conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type = 'table' AND name IN ('entity_mentions', 'fact_assertions')"
+            ).fetchone()[0]
+            == 2
+        )
         for rep in repairs:
             focus = str(rep.get("focus_node", "")).strip()
             action = str(rep.get("action", "")).strip()
@@ -1142,18 +1155,41 @@ def apply_shacl_repairs(
                     if cur.rowcount > 0:
                         applied += 1
             elif action == "set_pref_label" and val and not focus.startswith("fact-"):
+                if not is_resource_label(val) or is_scalar_label(val):
+                    raise ValueError(
+                        f"SHACL set_pref_label value {val!r} for {focus!r} must be a non-scalar resource label"
+                    )
                 cur = conn.execute(
                     "UPDATE entities SET name = ? WHERE entity_id = ?",
                     (val, focus),
                 )
                 if cur.rowcount > 0:
                     norm_val = str(text_processing(val)) or val.strip().lower()
-                    cid_row = conn.execute(
-                        "SELECT chunk_id FROM entity_labels WHERE entity_id = ? AND chunk_id != '' LIMIT 1",
+                    existing_labels = conn.execute(
+                        "SELECT DISTINCT label_norm, raw_label FROM entity_labels WHERE entity_id = ?",
                         (focus,),
-                    ).fetchone()
-                    cid = str(cid_row[0]) if cid_row is not None and str(cid_row[0]) else "__healed__"
-                    upsert_entity_labels(conn, [(norm_val, focus, "skos:prefLabel", val, cid)])
+                    ).fetchall()
+                    invalid_norms = {
+                        str(r[0])
+                        for r in existing_labels
+                        if not is_resource_label(str(r[1]))
+                        or is_scalar_label(str(r[1]))
+                        or not is_resource_label(str(r[0]))
+                        or is_scalar_label(str(r[0]))
+                    }
+                    for inv_norm in invalid_norms:
+                        if inv_norm != norm_val:
+                            conn.execute(
+                                "UPDATE entity_labels SET label_kind = 'skos:hiddenLabel' "
+                                "WHERE entity_id = ? AND label_norm = ?",
+                                (focus, inv_norm),
+                            )
+                    conn.execute(
+                        "UPDATE entity_labels SET label_kind = 'skos:altLabel' "
+                        "WHERE entity_id = ? AND label_kind = 'skos:prefLabel' AND label_norm != ?",
+                        (focus, norm_val),
+                    )
+                    upsert_entity_labels(conn, [(norm_val, focus, "skos:prefLabel", val, "__healed__")])
                     applied += 1
             elif action in ("demote_to_alt_label", "demote_label") and not focus.startswith("fact-"):
                 ent_row = conn.execute("SELECT name FROM entities WHERE entity_id = ?", (focus,)).fetchone()
@@ -1246,13 +1282,15 @@ def apply_shacl_repairs(
                     src_node, dst_node = focus, target
                 lkind = "skos:hiddenLabel" if action == "merge_hiddenLabel" else "skos:altLabel"
                 if src_node and dst_node and src_node != dst_node:
-                    if merge_entities_fn is not None:
-                        if merge_entities_fn(src_node, dst_node, lkind):
-                            applied += 1
-                    else:
-                        existing_pair = get_existing_ids(conn, "entity", [src_node, dst_node])
-                        if src_node in existing_pair and dst_node in existing_pair:
-                            merge_entities(conn, src_node, dst_node, label_kind=lkind)
+                    existing_pair = get_existing_ids(conn, "entity", [src_node, dst_node])
+                    if src_node in existing_pair and dst_node in existing_pair:
+                        if merge_entities_fn is not None:
+                            if merge_entities_fn(src_node, dst_node, lkind):
+                                applied += 1
+                        else:
+                            merged = merge_entities(conn, src_node, dst_node, label_kind=lkind)
+                            if has_evidence:
+                                bind_merged_evidence(conn, merged)
                             applied += 1
             elif action == "add_different_from":
                 if "|" in focus:
@@ -1407,6 +1445,9 @@ def apply_shacl_repairs(
                 ).fetchone()
                 if ent_row is not None:
                     ename = str(ent_row[0])
+                    literalized_fids = [
+                        str(r[0]) for r in conn.execute("SELECT fact_id FROM facts WHERE obj_id = ?", (focus,))
+                    ]
                     conn.execute(
                         """
                         UPDATE facts
@@ -1423,15 +1464,38 @@ def apply_shacl_repairs(
                             focus,
                         ),
                     )
+                    if has_evidence:
+                        conn.execute(
+                            "UPDATE fact_assertions SET object_mention_id = NULL "
+                            "WHERE object_mention_id IN (SELECT mention_id FROM entity_mentions WHERE entity_id = ?)",
+                            (focus,),
+                        )
+                    if literalized_fids:
+                        bindings = rekey_facts(conn, literalized_fids)
+                        if has_evidence and bindings:
+                            conn.executemany(
+                                "UPDATE fact_assertions SET fact_id = ? WHERE fact_id = ?",
+                                ((new_id, old_id) for old_id, new_id in bindings),
+                            )
                     affected_fids = [
                         str(r[0])
                         for r in conn.execute("SELECT fact_id FROM facts WHERE subj_id = ?", (focus,)).fetchall()
                     ]
                     for fid in affected_fids:
+                        if has_evidence:
+                            conn.execute("UPDATE fact_assertions SET fact_id = NULL WHERE fact_id = ?", (fid,))
                         conn.execute("DELETE FROM fact_sources WHERE fact_id = ?", (fid,))
                         conn.execute("DELETE FROM fact_vec WHERE fact_id = ?", (fid,))
                         conn.execute("DELETE FROM fact_fts WHERE fact_id = ?", (fid,))
                         conn.execute("DELETE FROM facts WHERE fact_id = ?", (fid,))
+                    if has_evidence:
+                        conn.execute(
+                            "DELETE FROM fact_assertions WHERE subject_mention_id IN "
+                            "(SELECT mention_id FROM entity_mentions WHERE entity_id = ?) "
+                            "OR object_mention_id IN (SELECT mention_id FROM entity_mentions WHERE entity_id = ?)",
+                            (focus, focus),
+                        )
+                        conn.execute("DELETE FROM entity_mentions WHERE entity_id = ?", (focus,))
                     conn.execute("DELETE FROM edges WHERE src_id = ? OR dst_id = ?", (focus, focus))
                     conn.execute("DELETE FROM edge_sources WHERE src_id = ? OR dst_id = ?", (focus, focus))
                     conn.execute("DELETE FROM entity_labels WHERE entity_id = ?", (focus,))
@@ -1459,10 +1523,20 @@ def apply_shacl_repairs(
                         ).fetchall()
                     ]
                     for fid in affected_fids:
+                        if has_evidence:
+                            conn.execute("UPDATE fact_assertions SET fact_id = NULL WHERE fact_id = ?", (fid,))
                         conn.execute("DELETE FROM fact_sources WHERE fact_id = ?", (fid,))
                         conn.execute("DELETE FROM fact_vec WHERE fact_id = ?", (fid,))
                         conn.execute("DELETE FROM fact_fts WHERE fact_id = ?", (fid,))
                         conn.execute("DELETE FROM facts WHERE fact_id = ?", (fid,))
+                    if has_evidence and not focus.startswith("fact-"):
+                        conn.execute(
+                            "DELETE FROM fact_assertions WHERE subject_mention_id IN "
+                            "(SELECT mention_id FROM entity_mentions WHERE entity_id = ?) "
+                            "OR object_mention_id IN (SELECT mention_id FROM entity_mentions WHERE entity_id = ?)",
+                            (focus, focus),
+                        )
+                        conn.execute("DELETE FROM entity_mentions WHERE entity_id = ?", (focus,))
                     conn.execute(
                         "DELETE FROM edges WHERE src_id = ? OR dst_id = ?",
                         (focus, focus),
@@ -2070,13 +2144,15 @@ def auto_heal_deterministic_shacl(conn: sqlite3.Connection) -> int:
                     """
                     SELECT c1.chunk_id
                     FROM (
-                        SELECT chunk_id FROM entity_labels WHERE entity_id = ?
+                        SELECT el.chunk_id FROM entity_labels el
+                        WHERE el.entity_id = ? AND el.chunk_id != '' AND SUBSTR(el.chunk_id, 1, 2) != '__'
                         UNION
                         SELECT fs.chunk_id FROM fact_sources fs
                         JOIN facts f ON f.fact_id = fs.fact_id WHERE f.subj_id = ? OR f.obj_id = ?
                     ) c1
                     INNER JOIN (
-                        SELECT chunk_id FROM entity_labels WHERE entity_id = ?
+                        SELECT el.chunk_id FROM entity_labels el
+                        WHERE el.entity_id = ? AND el.chunk_id != '' AND SUBSTR(el.chunk_id, 1, 2) != '__'
                         UNION
                         SELECT fs.chunk_id FROM fact_sources fs
                         JOIN facts f ON f.fact_id = fs.fact_id WHERE f.subj_id = ? OR f.obj_id = ?
@@ -2090,7 +2166,7 @@ def auto_heal_deterministic_shacl(conn: sqlite3.Connection) -> int:
 
             atomic_conf = pool_confidences(w_chain, w_rel) or 0.8
             if above_avg and shared_chunk is not None and atomic_conf >= avg_fact:
-                new_fid = compute_mdhash_id(str((a_id, "relatedTo", c_id)), prefix="fact-")
+                new_fid = fact_id(a_id, "relatedTo", "entity", c_id)
                 raw_json = json.dumps([a_id, "relatedTo", c_id])
                 defn = f"Reified from high-confidence association between {a_id} and {c_id}."
                 conn.execute(

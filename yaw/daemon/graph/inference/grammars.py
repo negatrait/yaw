@@ -64,6 +64,9 @@ DSPY_SHACL_REPAIR_GBNF_GRAMMAR = (
     '"\\"assert_broader\\"" | "\\"invert_broader\\"" | "\\"demote_sibling_to_related\\"" | '
     '"\\"remove_hierarchy_cycle\\"" | "\\"remove_conflicting_related\\"" | '
     '"\\"delete_dangling\\"" | "\\"delete_invalid_fact\\""\n'
+    'label ::= "\\"" non-letter* letter char* "\\""\n'
+    "letter ::= [a-zA-Z\\x80-\\U0010FFFF]\n"
+    "non-letter ::= [\\x20\\x21\\x23-\\x40\\x5B\\x5D-\\x60\\x7B-\\x7E]\n"
     'string ::= "\\"" char+ "\\""\n'
     'char ::= [^"\\\\\\x7F\\x00-\\x1F] | "\\\\" (["\\\\bfnrt] | "u" [0-9a-fA-F]{4})\n'
 )
@@ -325,9 +328,10 @@ def build_dspy_shacl_repair_grammar(
         branches = []
         for i, (focus, actions) in enumerate(sorted(allowed_actions.items())):
             choices = " | ".join(gbnf_escape_literal(json.dumps(action)) for action in sorted(actions))
+            value_rule = "label" if actions == {"set_pref_label"} else "string"
             branches.append(
                 f'repair-{i} ::= "{{\\"focus_node\\": " {gbnf_escape_literal(json.dumps(focus))} '
-                f'", \\"action\\": " ({choices}) ", \\"value\\": " string "}}"'
+                f'", \\"action\\": " ({choices}) ", \\"value\\": " {value_rule} "}}"'
             )
         grammar = DSPY_SHACL_REPAIR_GBNF_GRAMMAR
         coverage = ' ", " '.join(f'repair-{i} (", " repair-{i})*' for i in range(len(branches)))

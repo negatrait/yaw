@@ -1,6 +1,16 @@
 # Native CocoIndex graph: batch-independent incremental publication
 
-Status: specification, 2026-11-05; implementation and acceptance remain open.
+Status: specification, 2026-11-07; implementation and acceptance remain open. Pinned code: `c6fa080`.
+
+| Relation | Links |
+| --- | --- |
+| Governed by | [FOUNDATIONAL.md](../FOUNDATIONAL.md), [AGENTS.md](../AGENTS.md), [epic-1-hipporag-daemon.md](epic-1-hipporag-daemon.md) |
+| Rules | [graph-storage.md](../.agents/rules/graph-storage.md): `yaw/daemon/graph/*.py`, `yaw/daemon/graph/storage/*.py`; [daemon.md](../.agents/rules/daemon.md): `yaw/daemon/*.py`; [inference.md](../.agents/rules/inference.md): `yaw/daemon/graph/inference/*.py`; [tests.md](../.agents/rules/tests.md): `tests/**/*.py`; [docs.md](../.agents/rules/docs.md): `docs/**/*.md` |
+| Owns code | `yaw/daemon/indexing.py:publish_graph`, `yaw/daemon/graph/planner.py`, `yaw/daemon/graph/normalization.py`, `yaw/daemon/graph/storage/db.py`, `yaw/daemon/graph/storage/evidence.py`, `yaw/daemon/graph/storage/graph_ops.py`, `yaw/daemon/graph/storage/managed_sqlite.py`, `yaw/daemon/graph/storage/rows.py`, `yaw/daemon/graph/storage/shacl.py`, `yaw/daemon/graph/storage/vectors.py`, `yaw/daemon/graph/inference/components.py:heal_shacl_violations` |
+| Peers | [native-cocoindex-indexing.md](native-cocoindex-indexing.md): owns `64`-chunk micro-batch source scheduling and runtime lifecycle; [w3c-improvements.md](w3c-improvements.md): constrains SKOS/OWL/SHACL closed-world shapes and Active EDC label canonicalization (`§3.2`); [epistemic-confidence-spec.md](epistemic-confidence-spec.md): constrains Bayesian confidence pooling; [dspy-improvements.md](dspy-improvements.md): constrains GBNF adapter and RLM healer architecture |
+| References | [arxiv-2502.14802v1-hipporag2.md](arxiv-2502.14802v1-hipporag2.md): anchors HippoRAG 2 retrieval parity; [model-evaluation.md](model-evaluation.md): anchors local `llama.cpp` serving constraints (`parallel = 1` `[target]`) |
+| Supersedes / superseded by | Supersedes all earlier `skos:ConceptScheme` / clustering proposals and the single-batch unconditional `canonicalize_fact_definitions` overwrite in [shacl-healer-publication.md](reviews/shacl-healer-publication.md) (`c6fa080`) |
+| Records | [shacl-healer-publication.md](reviews/shacl-healer-publication.md), [incremental-publication-work.md](reviews/incremental-publication-work.md), [resource-vocabulary-boundary.md](reviews/resource-vocabulary-boundary.md), [concept-scheme-removal.md](reviews/concept-scheme-removal.md), [evaluation-graph-storage.md](evaluation-graph-storage.md), [evaluation-ingestion.md](evaluation-ingestion.md) |
 
 ## 1. Mission and controlling decisions
 
@@ -257,9 +267,33 @@ reserved scheme namespace in the new schema.
    Validate one class per sense, the minimum-member representative and matching
    occurrence/revision ownership of each assertion's resource mentions before
    committing the proposal. Raw assertion evidence is immutable through rebinding.
-   Choose canonical source statement descriptions before SHACL healing; display
-   text refresh must retain validated repaired descriptions. Supply every reported
-   violation's structured neighborhood to the healer in bounded, disjoint batches;
+   Choose canonical source statement descriptions before SHACL healing via
+   `canonicalize_fact_definitions(conn, prior_definitions=prior_fact_definitions)`:
+   before `stage_graph_rows` runs on `staging_conn`, `plan_graph_publication`
+   snapshots `prior_fact_definitions: dict[str, str]` from the cloned `facts`
+   table (`SELECT fact_id, definition FROM facts`) so `upsert_facts` cannot
+   overwrite a prior batch's healed `facts.definition` on re-assertion. For each
+   fact $f$ with subject definition `es.definition` and (when `obj_kind == 'entity'`)
+   object definition `eo.definition`, a candidate statement definition $d$ is
+   closed-world valid (`valid_spo_def(d, f)`) iff `trim(d) != ''`,
+   `lower(trim(d)) != lower(trim(es.definition))`, and (when `obj_kind == 'entity'`)
+   `lower(trim(d)) != lower(trim(eo.definition))`. `canonicalize_fact_definitions`
+   resolves $d^*(f)$ by 3-tier precedence: (1) closed-world valid `fact_assertions`
+   row with `MIN(assertion_id)`, (2) closed-world valid `prior_definitions[fact_id]`
+   tested against current `es.definition` and `eo.definition`, or (3) fallback
+   `fact_assertions` row with `MIN(TRIM(spo_def)=='', assertion_id)`, updating
+   `facts.definition` only when `f.definition != d^*(f)`. Display text refresh via
+   `canonicalize_fact_text(conn)` updates `facts.raw_triple_json` and `fact_fts`
+   via `executemany` only when `raw != f.raw_triple_json` (plus any fact missing
+   from `fact_fts` on initial staging) and retains validated repaired descriptions.
+   Group reported violations by `focus_node` (`focus_node ASC`) so each
+   `heal_shacl_violations` call (`@coco.fn(memo=True, version=4)`, with
+   `publish_graph` at `@coco.fn(memo=True, version=8)`) receives a single
+   focus-isolated `SHACLHealInput` whose dossier queries in
+   `inspect_entity_or_fact` and `inspect_focus_node` are deterministically ordered
+   (`ORDER BY label_norm ASC, label_kind ASC, chunk_id ASC` on `entity_labels`;
+   `ORDER BY fact_id ASC` on `facts`; `ORDER BY src_id ASC, dst_id ASC, kind ASC`
+   on `edges`; `ORDER BY e.entity_id ASC` on `endpoints`);
    do not silently truncate reports or substitute Markdown-only entity context for
    fact context, including endpoint profiles. RLM examples must delegate once and
    submit proposals against the immutable snapshot, rather than re-linting it.
@@ -297,13 +331,24 @@ reserved scheme namespace in the new schema.
    pair/evidence keys across batches. Evidence includes relevant old/new supports
    and their revisions; it must not depend on request packet neighbors. Packing
    changes may alter request counts, never silently change semantic inputs.
+   In `apply_synonym_adjudication`, scope `canonicalize_entity_labels_edc` to
+   `entity_ids=sorted(touched_entity_ids)` (entities materialized in the current
+   batch, canonical targets of `auto_merges` and `staged_merges`, and entities in
+   `hidden_label_norms`).
 6. Reuse decisions only while endpoint/evidence/program/policy digests match.
    Reopen affected earlier no-match/merge/relation judgments after new evidence.
    Existing `related`, `broader` or `differentFrom` edges alone are not decision
    receipts. No provisional merge is made irreversible for performance.
 7. Aggregate confidence from surviving distinct evidence with existing operators;
    replay/memo hits do not add support. Re-embed only changed exact text/profile
-   keys, including changed aggregate definitions.
+   keys, including changed aggregate definitions: `materialize_entities_and_facts`
+   initializes `fact_nodes` `raw_json` with resolved cased endpoint names
+   (`entity_map[s_id][1]` and `entity_map[o_id][1]`), `plan_graph_publication`
+   passes `fact_vectors=()` in `initial_rows`, and computes/upserts `fact_vec`
+   once at step 5 (after synonym merges, `canonicalize_fact_definitions`,
+   `apply_shacl_repairs`, and `canonicalize_fact_text`) for
+   `reembed_facts = [f_row for f_row in final_facts if f_row[0] not in published_fact_vec_ids or published_fact_defs.get(f_row[0]) != (f_row[4], f_row[5])]`
+   only.
 
 Canonicalization, relation conflict resolution and SHACL repairs must converge
 to the same supported state regardless of packet/arrival order. Test fixed points
@@ -327,7 +372,7 @@ One boundary is enforced at three layers that must agree exactly:
 
 | Rule | GBNF (prevents generation) | Parser (rejects, fail fast) | SHACL (rejects published state) |
 | --- | --- | --- | --- |
-| A resource label has lexical content: at least one letter | NER `label` rule | NER stage raises | `ConceptShape/resourceLabel` |
+| A resource label has lexical content: at least one letter | NER `label` rule & SHACL `set_pref_label` `label` rule | NER stage & `parse_shacl_repairs` raise | `ConceptShape/resourceLabel` |
 | Property type matches object kind | `pred-obj` coupling | statement parser raises | `StatementShape/closedWorld` |
 | Subjects and resource objects are NER resources | `known-entity` endpoints | statement parser raises | `StatementShape/closedWorld` |
 | A statement never relates a resource sense to itself | per-subject object alternatives | statement parser raises | `StatementShape/irreflexive` |
@@ -338,6 +383,34 @@ the same sense may not relate to itself, including through labels that differ
 only in normalized form. Whether a label containing letters is semantically a
 data value (`350ms`) stays with the existing `ConceptShape/noScalarLiterals`
 policy; the grammar cannot decide it and this boundary does not change it.
+
+Lexical `set_pref_label` parity is enforced across the SHACL repair grammar,
+parser, and storage application:
+- `shacl_repair_actions(violations)` maps both `ConceptShape/noScalarLiterals`
+  and `ConceptShape/resourceLabel` to `{"set_pref_label"}` and
+  `result_path == "skos:definition"` to `{"set_definition"}`.
+- `build_dspy_shacl_repair_grammar(allowed_actions=...)` preserves the empty
+  abstention `"[]"` (`repair-list ::= "[]" | "[" {coverage} "]"`) while binding
+  the `"value"` slot on `set_pref_label` branches to the lexical `label` rule
+  (`label ::= "\"" non-letter* letter char* "\""`) instead of unconstrained
+  `string`.
+- `parse_shacl_repairs(raw_output, *, allowed_actions=None)` preserves empty
+  abstention `{"repairs": []}` pass-through (so unhealed violations fail fast at
+  post-healer `lint_graph_shacl`) while raising `ValueError` on any non-empty
+  repair list that omits a reported focus node in `allowed_actions`, supplies an
+  empty `value` on `VALUE_BEARING_SHACL_ACTIONS`
+  (`{"set_definition", "set_pref_label", "ground_fact_source", "set_fact_source"}`),
+  or supplies `not is_resource_label(value) or is_scalar_label(value)` on
+  `set_pref_label`.
+- `apply_shacl_repairs` validates `is_resource_label(val) and not is_scalar_label(val)`
+  on `set_pref_label` (raising `ValueError` otherwise), demotes existing
+  `entity_labels` rows on `focus` that fail `is_resource_label` or match
+  `is_scalar_label` to `'skos:hiddenLabel'`, demotes all other existing
+  `skos:prefLabel` rows with `label_norm != norm_val` to `'skos:altLabel'`, and
+  upserts `(norm_val, focus, "skos:prefLabel", val, "__healed__")` with
+  unconditional `chunk_id = "__healed__"` provenance (never copying a corpus
+  `chunk_id`), so `canonicalize_entity_labels_edc` ([w3c-improvements.md §3.2](w3c-improvements.md#32-end-of-round-active-edc-canonicalizer-yawdaemongraphstoragegraph_opspy))
+  retains the repaired label across subsequent batches.
 
 Grammar and parser rules are a pair: the parser accepts everything the grammar
 can generate and rejects what the rule forbids (the grammar may be stricter, never
@@ -587,7 +660,7 @@ do not adopt its code as a proven drop-in replacement.
 | --- | --- | --- |
 | P0: capture costs and reference outputs | Record dense/vector scans, lexical normalization and matcher-index builds, alias-join rows, hydration/JSON work, clone work and topology construction by phase. Keep the existing scoring, automatic cosine/difflib merge gates, adjudication exclusions and candidate ordering as the reference. | Fixed evidence, actual configured vector dimensions, base sizes above 4,096 labels and up to the designated 100,000-entity corpus, changed-owner counts, CPU/wall time and whole-worker peak memory. Retain raw artifacts; estimates do not close a gate. |
 | P1: remove unused hydration and clone work (G3/G4/U5) | Determine changed/affected owners before hydrating evidence; do not hydrate survivors and then discard them. Remove the per-survivor joins/JSON reconstruction and full-table Python cloning through the final owner-based cutover, including the chunk-vector replay in §9.1. | Unchanged-owner hydration/inference/target mutations are zero unless explicit dependency invalidation requires them. Pass replacement, deletion, late evidence, restart, exact graph parity and atomic publication. |
-| P2: lexical invariants and alias scope | Precompute normalized/tokenized label attributes once per needed candidate projection. Avoid the 4,096-entry LRU scan-thrashing pattern. Reuse matcher indexing where invariant and push affected-owner filtering into the alias self-join instead of materializing global collisions. | Preserve final `SequenceMatcher` operand orientation, `autojunk` setting, normalization, digit rules, aliases, exclusions, thresholds, pair deduplication and deterministic ordering. Include changed IDs on either side of the canonical pair, new-to-new pairs, Unicode, long/repeated labels and threshold-edge cases. Upper-bound symmetry does not make final `ratio()` symmetric. |
+| P2: lexical invariants and alias scope | Precompute normalized/tokenized label attributes once per needed candidate projection (`_lexical_name_parts` `@lru_cache(maxsize=65536)`). Avoid the 4,096-entry LRU scan-thrashing pattern. Reuse matcher indexing where invariant, push affected-owner filtering (`entity_ids`) into the `entity_labels` alias self-join in `find_entity_disambiguation_candidates` instead of materializing global collisions, scope `canonicalize_entity_labels_edc` in `apply_synonym_adjudication` to `entity_ids=sorted(touched_entity_ids)`, execute delta-only `canonicalize_fact_text`, and perform single-pass post-canonicalization `reembed_facts` embedding/upsert in `plan_graph_publication`. | Preserve final `SequenceMatcher` operand orientation, `autojunk` setting, normalization, digit rules, aliases, exclusions, thresholds, pair deduplication and deterministic ordering. Include changed IDs on either side of the canonical pair, new-to-new pairs, Unicode, long/repeated labels and threshold-edge cases. Upper-bound symmetry does not make final `ratio()` symmetric. |
 | P3: bounded dense candidate search | Eliminate repeated full vector scans/FFI work with a measured bounded strategy using existing dependencies. Reuse buffers and maintain global top-k/tie decisions across blocks; do not allocate the complete query-by-corpus score matrix or duplicate the whole vector corpus. | Exact candidate IDs, exclusions, cutoff/tie behavior and downstream merge/adjudication results against the reference. Floating-point score tolerances alone do not prove identity-decision parity. Include zero vectors, duplicate vectors, ties at k, near-threshold values, target subsets and the no-target/full-scan case. Pass <=1 GiB for the whole worker. |
 | P4: sparse PPR construction and lifecycle | Evaluate native sparse duplicate aggregation in place of Python tuple/dictionary accumulation, then retain topology only for the matching committed graph and traversal policy. | Preserve directional weights, probability functions, edge-kind semantics, normalization and isolated nodes. Validate retrieval/PPR and deterministic ranked results, including close ties. Cache by committed semantic revision plus schema/profile and weight policy; `PRAGMA data_version` alone cannot cover a connection's own writes. No uncommitted proposal may populate the retrieval cache. |
 | P5: serialization on surviving paths | After C3 and P1, measure remaining JSON work. Consider an already available native codec only where profiling still justifies it. | Preserve decoded types, UTF-8, numeric/null behavior, canonical hashing/ordering and checkpoint/resume semantics. No blind `json` substitution or new dependency is authorized by this plan. |
@@ -715,3 +788,9 @@ measurements beyond log rotation. Documentation checks do not pass runtime gates
   do not require a globally connected scheme layer.
 - [W3C SHACL](https://www.w3.org/TR/shacl/): conformance applies to declared shapes;
   it is not proof that discovery found every possible semantic relationship.
+
+## Decisions
+
+- 2026-11-06: "Should stay literals, NER is only allowed to capture skos:Concept and owl:NamedIndividual, triple extraction can point the rdf:Statement to rdf:object = rdfs:Literal but never rdf:subject = rdfs:Literal! This is why it's two stage. NER creates the allowed rdf:subject vocabulary, with predicates able to point towards literals but never the other way around - that's the W3C ontology rules and should be in our allowed SHACL shapes." (User). Enforced across GBNF grammars, extraction/repair parsers, and closed-world SQLite SHACL shapes (§5.3).
+- 2026-11-06: "Step 4 should be included in this unit, but obviously, you can implement one unit at a time according to whichever spec you write into @[docs/native-cocoindex-graph.md] or @[docs/native-cocoindex-indexing.md] , also sounds like you'll need to update our rules and tests to prevent these kinds of failures surfacing again." (User). Specs are promoted into `docs/native-cocoindex-graph.md` and `docs/native-cocoindex-indexing.md` and executed one checkpoint unit at a time with regression tests.
+- 2026-11-07: "Audit and review for root cause for batch indexing regressing back to exponential time behavior. Incremental indexing and graph publication was designed and tested to be near-constant time for 64 + 64 chunk batches vs 128 chunk batchless indexing." / "It’s a SHACL Violation CONSISTENCY_ERROR" / "you will need to /spec first." (User). Supersedes the single-batch unconditional `canonicalize_fact_definitions` overwrite from [shacl-healer-publication.md](reviews/shacl-healer-publication.md) (`c6fa080`) with validity-ordered, repair-preserving `canonicalize_fact_definitions`, `"__healed__"` label provenance, focus-isolated `SHACLHealInput` memoization (`heal_shacl_violations` `version=4`, `publish_graph` `version=8`), single-pass post-canonicalization fact embedding, and delta-scoped table updates (§5.2, §5.3, §9.2).

@@ -1363,13 +1363,13 @@ using all 5 bound REPL tools."""
         assert engine._graph_rlm_stats["hierarchy_judge_tokens"] == 30
         assert engine._graph_rlm_stats["label_judge_tokens"] + engine._graph_rlm_stats["hierarchy_judge_tokens"] == 60
 
-        # Step 7 (shacl_healer_rlm) = 40 orchestrator + 30 worker = 70 tokens
-        assert len(program.shacl_audit_trail) == 2  # inner direct (30) + outer RLM (70)
+        # Step 7 (shacl_healer_rlm) = 2 focus nodes * (40 orchestrator + 30 worker) = 140 tokens
+        assert len(program.shacl_audit_trail) == 4  # 2 focus nodes * (inner direct (30) + outer RLM (70))
         assert program.shacl_audit_trail[0]["mode"] == "direct"
         assert program.shacl_audit_trail[0]["tokens_used"] == 30
         assert program.shacl_audit_trail[-1]["mode"] == "rlm"
         assert program.shacl_audit_trail[-1]["tokens_used"] == 70
-        assert engine._graph_rlm_stats["shacl_healer_tokens"] == 70
+        assert engine._graph_rlm_stats["shacl_healer_tokens"] == 140
 
         # Verify Step 7 SHACL violation and deduplicated repair stats (1 in REPL + 1 post-RLM = 2, not 3)
         assert engine._graph_rlm_stats["shacl_violations_initial"] > 0

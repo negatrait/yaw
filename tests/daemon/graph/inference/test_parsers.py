@@ -2,11 +2,16 @@
 
 import json
 
+import pytest
+
+from yaw.core import VALUE_BEARING_SHACL_ACTIONS
 from yaw.daemon.graph.inference.parsers import (
     compute_task_quality_score,
     parse_hierarchy_decisions,
     parse_label_decisions,
     parse_related_decisions,
+    parse_shacl_repairs,
+    shacl_repair_actions,
 )
 
 
@@ -232,3 +237,77 @@ def test_stage_invariants_hierarchy_and_related_judges() -> None:
     pred_r = dspy.Prediction(decisions=[{"pair_id": "cat|dog", "reasoning": "Co-occurring pets", "related": True}])
     score_r, feedback_r = validate_stage_invariants("related_judge", inputs_r, pred_r)
     assert score_r == 1.0
+
+
+def test_shacl_repair_actions_maps_scalar_and_resource_label_shapes() -> None:
+    violations = [
+        {"focus_node": "entity-scalar", "shape": "ConceptShape/noScalarLiterals", "result_path": "skos:prefLabel"},
+        {"focus_node": "entity-res-shape", "shape": "ConceptShape/resourceLabel", "result_path": "skos:prefLabel"},
+        {
+            "focus_node": "entity-res-source",
+            "shape": "OtherShape",
+            "source_shape": "ConceptShape/resourceLabel",
+            "result_path": "skos:prefLabel",
+        },
+        {"focus_node": "fact-def", "shape": "StatementShape/closedWorld", "result_path": "skos:definition"},
+    ]
+    actions = shacl_repair_actions(violations)
+    assert actions["entity-scalar"] == {"set_pref_label"}
+    assert actions["entity-res-shape"] == {"set_pref_label"}
+    assert actions["entity-res-source"] == {"set_pref_label"}
+    assert actions["fact-def"] == {"set_definition"}
+
+
+def test_parse_shacl_repairs_abstention_coverage_and_lexical_validation() -> None:
+    allowed = {"entity-1": {"set_pref_label"}, "fact-1": {"set_definition"}}
+
+    # 1. Empty abstention is permitted and returns []
+    assert parse_shacl_repairs({"repairs": []}, allowed_actions=allowed) == []
+
+    # 2. Non-empty partial repair list missing a focus node raises ValueError
+    with pytest.raises(ValueError, match="Incomplete SHACL repairs"):
+        parse_shacl_repairs(
+            {
+                "repairs": [
+                    {"focus_node": "entity-1", "action": "set_pref_label", "value": "HTTP 429 Too Many Requests"}
+                ]
+            },
+            allowed_actions=allowed,
+        )
+
+    # 3. Empty or whitespace-only value on value-bearing actions raises ValueError
+    for action in (*VALUE_BEARING_SHACL_ACTIONS, "ground_fact_source", "set_fact_source"):
+        for empty_val in ("", "   "):
+            with pytest.raises(ValueError):
+                parse_shacl_repairs([{"focus_node": "node-1", "action": action, "value": empty_val}])
+
+    # 4. Scalar or non-resource labels on set_pref_label raise ValueError
+    for invalid_label in ("429", "2024-01-01", "100%", "---"):
+        with pytest.raises(ValueError):
+            parse_shacl_repairs(
+                [{"focus_node": "entity-1", "action": "set_pref_label", "value": invalid_label}],
+                allowed_actions={"entity-1": {"set_pref_label"}},
+            )
+
+    # 5. Valid lexical label on set_pref_label is accepted
+    parsed = parse_shacl_repairs(
+        {
+            "repairs": [
+                {"focus_node": "entity-1", "action": "set_pref_label", "value": "HTTP 429 Too Many Requests"},
+                {
+                    "focus_node": "fact-1",
+                    "action": "set_definition",
+                    "value": "The gateway rate-limits excess client traffic with HTTP 429.",
+                },
+            ]
+        },
+        allowed_actions=allowed,
+    )
+    assert parsed == [
+        {"focus_node": "entity-1", "action": "set_pref_label", "value": "HTTP 429 Too Many Requests"},
+        {
+            "focus_node": "fact-1",
+            "action": "set_definition",
+            "value": "The gateway rate-limits excess client traffic with HTTP 429.",
+        },
+    ]

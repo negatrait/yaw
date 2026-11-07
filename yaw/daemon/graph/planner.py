@@ -7,7 +7,6 @@ import sqlite3
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from itertools import batched
 from pathlib import Path
 from typing import Any
 
@@ -451,7 +450,7 @@ def materialize_entities_and_facts(
                     else detect_scalar_literal(st.obj)[1]
                 )
                 fid = canonical_fact_id(s_id, st.pred, "literal", st.obj, eff_obj_dt, st.obj_lang)
-                raw_json = json.dumps([st.subj, st.pred, st.obj])
+                raw_json = json.dumps([entity_map[s_id][1], st.pred, st.obj])
                 prev_fact = fact_nodes_map.get(fid)
                 if prev_fact is None or (not prev_fact[5] and st.spo_def):
                     fact_nodes_map[fid] = (
@@ -477,7 +476,7 @@ def materialize_entities_and_facts(
                 chunk_to_entities[cid].add(o_id)
 
                 fid = canonical_fact_id(s_id, st.pred, "entity", o_id)
-                raw_json = json.dumps([st.subj, st.pred, st.obj])
+                raw_json = json.dumps([entity_map[s_id][1], st.pred, entity_map[o_id][1]])
                 prev_fact = fact_nodes_map.get(fid)
                 if prev_fact is None or (not prev_fact[5] and st.spo_def):
                     fact_nodes_map[fid] = (
@@ -727,6 +726,7 @@ def apply_synonym_adjudication(
     synonymy_threshold: float,
     rlm_stats: dict[str, Any],
     corpus_root: Path | str | None = None,
+    touched_entity_ids: Sequence[str] | None = None,
 ) -> tuple[list[EntityMerge], list[tuple[str, str, str, float, str]]]:
     """Apply Stage 3 Gemma 4 synonym decisions on stage_conn with two-phase topological resolution."""
     _ = synonymy_threshold
@@ -916,8 +916,24 @@ def apply_synonym_adjudication(
         if resolved_semantic_batch:
             upsert_semantic_edges(stage_conn, resolved_semantic_batch)
 
+        if touched_entity_ids is not None:
+            active_touched: list[str] | None = sorted(
+                {_resolve_active_eid(eid) for eid in touched_entity_ids}
+                | {_resolve_active_eid(m.canonical_id) for m in staged_merges}
+                | {_resolve_active_eid(eid) for eid in hidden_label_norms}
+            )
+        else:
+            active_touched = (
+                sorted(
+                    {_resolve_active_eid(eid) for c in candidates for eid in (str(c["entity_a"]), str(c["entity_b"]))}
+                    | {_resolve_active_eid(m.canonical_id) for m in staged_merges}
+                    | {_resolve_active_eid(eid) for eid in hidden_label_norms}
+                )
+                or None
+            )
         canonicalize_entity_labels_edc(
             stage_conn,
+            entity_ids=active_touched,
             corpus_root=corpus_root,
             hidden_label_norms_by_entity=hidden_label_norms,
         )
@@ -1193,17 +1209,6 @@ async def plan_graph_publication(
         for (eid, _, _), vec in zip(entity_nodes, e_vecs, strict=True):
             entity_vec_by_id[eid] = vec
 
-    fact_vec_by_id: dict[str, np.ndarray] = {}
-    if fact_nodes:
-        fact_texts: list[str] = []
-        for f_row in fact_nodes:
-            _, _s_id, pred, _o_id, raw_json, spo_d, subj_d, obj_d = f_row[:8]
-            items = json.loads(raw_json)
-            fact_texts.append(fmt_fact(items[0], pred, items[2], spo_d, subj_d, obj_d))
-        f_vecs = await _embed_strings(fact_texts, stage="fact_embed")
-        for f_row, vec in zip(fact_nodes, f_vecs, strict=True):
-            fact_vec_by_id[f_row[0]] = vec
-
     initial_rows = PreparedGraphRows(
         chunks=tuple(chunks),
         entities=tuple(entity_nodes),
@@ -1216,7 +1221,7 @@ async def plan_graph_publication(
         edges=tuple(materialized.edges_with_sources),
         chunk_vectors=tuple(chunk_vec_pairs),
         entity_vectors=tuple(entity_vec_by_id.items()),
-        fact_vectors=tuple(fact_vec_by_id.items()),
+        fact_vectors=(),
         mentions=tuple(mentions),
         assertions=tuple(assertions),
     )
@@ -1230,20 +1235,20 @@ async def plan_graph_publication(
         with write_tx(staging_conn):
             for schema in schemas:
                 create_table(staging_conn, schema)
+        prior_fact_definitions = {
+            str(r[0]): str(r[1]) for r in staging_conn.execute("SELECT fact_id, definition FROM facts")
+        }
+        published_entity_vec_ids = {str(r[0]) for r in staging_conn.execute("SELECT entity_id FROM entity_vec")}
         initial_entity_meta = {
-            eid: (name, definition)
-            for eid, name, definition in staging_conn.execute("SELECT entity_id, name, definition FROM entities")
+            str(r[0]): (str(r[1]), str(r[2]))
+            for r in staging_conn.execute("SELECT entity_id, name, definition FROM entities")
         }
         initial_entity_meta.update({eid: (name, definition) for eid, name, definition in entity_nodes})
+        published_fact_vec_ids = {str(r[0]) for r in staging_conn.execute("SELECT fact_id FROM fact_vec")}
         initial_fact_defs = {
-            row[0]: (row[1], row[2])
-            for row in staging_conn.execute("SELECT fact_id, raw_triple_json, definition FROM facts")
+            str(r[0]): (str(r[1]), str(r[2]))
+            for r in staging_conn.execute("SELECT fact_id, raw_triple_json, definition FROM facts")
         }
-        initial_fact_defs.update({row[0]: (row[4], row[5]) for row in fact_nodes})
-        for eid, blob in staging_conn.execute("SELECT entity_id, embedding FROM entity_vec"):
-            entity_vec_by_id.setdefault(eid, deserialize_f32_vector(blob))
-        for fid, blob in staging_conn.execute("SELECT fact_id, embedding FROM fact_vec"):
-            fact_vec_by_id.setdefault(fid, deserialize_f32_vector(blob))
         with staging_conn:
             staging_conn.execute("BEGIN")
             stage_graph_rows(staging_conn, initial_rows)
@@ -1259,6 +1264,7 @@ async def plan_graph_publication(
             rlm_stats=rlm_stats,
         )
         rlm_stats["candidate_pairs"] += raw_cand_count
+        touched_eids = [*(eid for eid, _, _ in entity_nodes), *(m.canonical_id for m in merges)]
         if candidates or raw_cand_count:
             decisions: list[dict[str, str]] = []
             if candidates:
@@ -1320,16 +1326,30 @@ async def plan_graph_publication(
                 synonymy_threshold=settings.synonymy_threshold,
                 rlm_stats=rlm_stats,
                 corpus_root=settings.corpus_root,
+                touched_entity_ids=touched_eids,
             )
             merges.extend(judged_merges)
+        elif touched_eids:
+            canonicalize_entity_labels_edc(
+                staging_conn,
+                entity_ids=sorted(set(touched_eids)),
+                corpus_root=settings.corpus_root,
+            )
 
         for merged in merges:
             bind_merged_evidence(staging_conn, merged)
-        canonicalize_fact_definitions(staging_conn)
+            for old_fid, new_fid in merged.fact_bindings:
+                if new_fid is not None and old_fid in prior_fact_definitions:
+                    prev_def = prior_fact_definitions[old_fid]
+                    existing_def = prior_fact_definitions.get(new_fid, "")
+                    prior_fact_definitions[new_fid] = max((prev_def, existing_def), key=lambda v: (len(v), v))
+        canonicalize_fact_definitions(staging_conn, prior_definitions=prior_fact_definitions)
         canonicalize_fact_text(staging_conn)
 
         # 4. Closed-World SHACL Deterministic Auto-Healing & RLM Healing on staging_conn
         auto_healed = auto_heal_deterministic_shacl(staging_conn)
+        if auto_healed > 0:
+            canonicalize_fact_text(staging_conn)
         rlm_stats["shacl_deterministic_healed"] = auto_healed
         rlm_stats["shacl_repairs_applied"] += auto_healed
 
@@ -1345,13 +1365,17 @@ async def plan_graph_publication(
             for dossier in focus_dossiers.values():
                 dossier["source_passages"] = {cid: source_text[cid] for cid in dossier["chunk_ids"]}
             repairs = []
-            for batch in batched(violations, scale_context_budget(4, settings.context_window_tokens), strict=False):
-                dossiers = {v.focus_node: focus_dossiers[v.focus_node] for v in batch}
+            violations_by_focus: dict[str, list[SHACLViolation]] = {}
+            for v in violations:
+                violations_by_focus.setdefault(v.focus_node, []).append(v)
+            for focus_node in sorted(violations_by_focus):
+                focus_batch = tuple(violations_by_focus[focus_node])
+                dossiers = {focus_node: focus_dossiers[focus_node]}
                 healed = await heal_shacl_violations(
                     SHACLHealInput(
-                        violations=batch,
+                        violations=focus_batch,
                         focus_dossiers=dossiers,
-                        focus_context=json.dumps(list(dossiers.values()), ensure_ascii=False),
+                        focus_context=json.dumps([focus_dossiers[focus_node]], ensure_ascii=False),
                         program_identity=settings.program_identity,
                         shacl_identity=settings.shacl_identity,
                     )
@@ -1368,9 +1392,21 @@ async def plan_graph_publication(
                 def merge_repaired_entities(src: str, dst: str, kind: str) -> bool:
                     merged = merge_entities(staging_conn, src, dst, label_kind=kind)
                     bind_merged_evidence(staging_conn, merged)
+                    for old_fid, new_fid in merged.fact_bindings:
+                        if new_fid is not None and old_fid in prior_fact_definitions:
+                            prev_def = prior_fact_definitions[old_fid]
+                            existing_def = prior_fact_definitions.get(new_fid, "")
+                            prior_fact_definitions[new_fid] = max((prev_def, existing_def), key=lambda v: (len(v), v))
                     return True
 
                 applied = apply_shacl_repairs(staging_conn, repairs, merge_entities_fn=merge_repaired_entities)
+                for rep in repairs:
+                    if str(rep.get("action", "")).strip() == "set_definition":
+                        f_node = str(rep.get("focus_node", "")).strip()
+                        f_val = str(rep.get("value", "")).strip()
+                        if f_node.startswith("fact-") and f_val:
+                            prior_fact_definitions[f_node] = f_val
+                canonicalize_fact_definitions(staging_conn, prior_definitions=prior_fact_definitions)
                 canonicalize_fact_text(staging_conn)
                 rlm_stats["shacl_repairs_applied"] += applied
 
@@ -1413,7 +1449,8 @@ async def plan_graph_publication(
         reembed_entities = [
             (eid, name, defn)
             for eid, name, defn in final_entities
-            if eid not in entity_vec_by_id or initial_entity_meta.get(eid) != (name, defn)
+            if (eid not in published_entity_vec_ids and eid not in entity_vec_by_id)
+            or initial_entity_meta.get(eid) != (name, defn)
         ]
         if reembed_entities:
             re_vecs = await _embed_strings(
@@ -1427,7 +1464,7 @@ async def plan_graph_publication(
         reembed_facts = [
             f_row
             for f_row in final_facts
-            if f_row[0] not in fact_vec_by_id or initial_fact_defs.get(f_row[0]) != (f_row[4], f_row[5])
+            if f_row[0] not in published_fact_vec_ids or initial_fact_defs.get(f_row[0]) != (f_row[4], f_row[5])
         ]
         if reembed_facts:
             rf_texts: list[str] = []
@@ -1435,10 +1472,10 @@ async def plan_graph_publication(
                 items = json.loads(f_row[4])
                 rf_texts.append(fmt_fact(items[0], f_row[2], items[2], f_row[5]))
             rf_vecs = await _embed_strings(rf_texts, stage="fact_embed")
-            for f_row, vec in zip(reembed_facts, rf_vecs, strict=True):
-                fact_vec_by_id[f_row[0]] = vec
-
-        upsert_fact_vectors(staging_conn, [(row[0], fact_vec_by_id[row[0]]) for row in final_facts])
+            upsert_fact_vectors(
+                staging_conn,
+                [(f_row[0], vec) for f_row, vec in zip(reembed_facts, rf_vecs, strict=True)],
+            )
         return GraphPlanResult(
             tables=graph_tables(staging_conn, complete_chunks, tuple(sorted(input_fingerprints.items()))),
             chunk_ids=tuple(sorted(pointer.chunk_id for pointer, _ in complete_chunks)),

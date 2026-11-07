@@ -15,6 +15,8 @@ from yaw.core import (
     SEMANTIC_EDGE_KINDS,
     OpenIERecord,
     StructuredTriple,
+    is_resource_label,
+    is_scalar_label,
     resolve_corpus_path,
     text_processing,
 )
@@ -40,7 +42,7 @@ _EXISTING_ID_TABLES: dict[str, tuple[str, str]] = {
 }
 
 
-@lru_cache(maxsize=4096)
+@lru_cache(maxsize=65536)
 def _lexical_name_parts(name: str) -> tuple[str, str]:
     return (
         name.strip().lower(),
@@ -193,18 +195,39 @@ def find_entity_disambiguation_candidates(
             if best_ratio >= lexical_threshold:
                 lexical_pairs[key] = best_ratio
 
-    for row in conn.execute(
-        """
-        SELECT DISTINCT a.entity_id, b.entity_id
-        FROM entity_labels a
-        INNER JOIN entity_labels b
-          ON a.label_norm = b.label_norm
-         AND a.entity_id < b.entity_id
-        """
-    ):
+    if target_set is None:
+        label_pair_rows = conn.execute(
+            """
+            SELECT DISTINCT a.entity_id, b.entity_id
+            FROM entity_labels a
+            INNER JOIN entity_labels b
+              ON a.label_norm = b.label_norm
+             AND a.entity_id < b.entity_id
+            """
+        ).fetchall()
+    elif target_set:
+        label_pair_rows = []
+        for batch in batched(sorted(target_set)):
+            placeholders = ",".join("?" for _ in batch)
+            b_tuple = tuple(batch)
+            label_pair_rows.extend(
+                conn.execute(
+                    f"""
+                    SELECT DISTINCT a.entity_id, b.entity_id
+                    FROM entity_labels a
+                    INNER JOIN entity_labels b
+                      ON a.label_norm = b.label_norm
+                     AND a.entity_id < b.entity_id
+                    WHERE a.entity_id IN ({placeholders}) OR b.entity_id IN ({placeholders})
+                    """,
+                    (*b_tuple, *b_tuple),
+                ).fetchall()
+            )
+    else:
+        label_pair_rows = []
+
+    for row in label_pair_rows:
         ea, eb = str(row[0]), str(row[1])
-        if target_set is not None and ea not in target_set and eb not in target_set:
-            continue
         key = (ea, eb)
         if key not in adjudicated:
             lexical_pairs[key] = 1.0
@@ -680,7 +703,9 @@ def canonicalize_entity_labels_edc(
                         1 if (any(c.isupper() for c in best_raw) or len(best_raw.split()) > 1) else 0
                     )
 
-                    if root_path is None:
+                    if not is_resource_label(best_raw) or is_scalar_label(best_raw):
+                        verbatim_in_source = 0
+                    elif root_path is None:
                         verbatim_in_source = 1
                     else:
                         disk_grounded = 0
@@ -705,7 +730,12 @@ def canonicalize_entity_labels_edc(
                     # Canonical fact text is a result of label selection, not source support.
                     support_count = len({cid for _, _, cid in occs})
 
-                    is_hidden = (norm in explicit_hidden) or (verbatim_in_source == 0)
+                    is_hidden = (
+                        (norm in explicit_hidden)
+                        or (verbatim_in_source == 0)
+                        or not is_resource_label(best_raw)
+                        or is_scalar_label(best_raw)
+                    )
                     is_hidden_by_norm[norm] = is_hidden
 
                     norm_scores[norm] = (

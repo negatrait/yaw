@@ -20,6 +20,8 @@ from yaw.core import (
     clean_schema_definition,
     compute_mdhash_id,
     detect_scalar_literal,
+    is_resource_label,
+    is_scalar_label,
     text_processing,
 )
 
@@ -760,11 +762,12 @@ def shacl_repair_actions(violations: Sequence[Mapping[str, Any]]) -> dict[str, s
     """Definition defects permit description repair, never removal of their evidence."""
     actions: dict[str, set[str]] = {}
     for violation in violations:
+        shape = violation.get("source_shape", violation.get("shape"))
         permitted = (
             {"set_definition"}
             if violation.get("result_path") == "skos:definition"
             else {"set_pref_label"}
-            if violation.get("source_shape", violation.get("shape")) == "ConceptShape/noScalarLiterals"
+            if shape in ("ConceptShape/noScalarLiterals", "ConceptShape/resourceLabel")
             else VALID_SHACL_ACTIONS
         )
         actions.setdefault(str(violation["focus_node"]), set()).update(permitted)
@@ -800,6 +803,10 @@ def parse_shacl_repairs(
         value = str(item.get("value", item.get("target_node", item.get("target", ""))) or "").strip()
         if not focus_node or action not in VALID_SHACL_ACTIONS:
             raise ValueError(f"Invalid SHACL repair: focus={focus_node!r}, action={action!r}")
+        if action in VALUE_BEARING_SHACL_ACTIONS and not value:
+            raise ValueError(f"SHACL repair {action!r} for {focus_node!r} requires a non-empty value")
+        if action == "set_pref_label" and (not is_resource_label(value) or is_scalar_label(value)):
+            raise ValueError(f"SHACL set_pref_label {value!r} for {focus_node!r} is not a lexical resource label")
         if allowed_actions is not None and action not in allowed_actions.get(focus_node, ()):
             raise ValueError(f"SHACL repair {action!r} is not permitted for {focus_node!r}")
         repairs.append(

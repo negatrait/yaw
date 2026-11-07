@@ -396,7 +396,7 @@ def provider():
                                     "import json\n"
                                     "v = json.loads(violations)\n"
                                     "d = inspect_focus_node(v[0]['focus_node'])\n"
-                                    "assert d['focus_kind'] == 'fact'\n"
+                                    "assert d['focus_kind'] in {'fact', 'entity'}\n"
                                     "repairs = propose_repairs()\n"
                                     "SUBMIT(repairs=repairs)"
                                 ),

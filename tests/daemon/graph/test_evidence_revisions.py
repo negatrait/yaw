@@ -459,3 +459,305 @@ def test_source_evidence_bindings_are_validated_before_commit(tmp_path, provider
             validate_graph_state(conn)
         with db.readonly() as conn:
             assert_same_graph(canonical_graph(conn), before)
+
+
+def test_cross_batch_fact_definition_repair_persists_and_invalidates_on_endpoint_collision(tmp_path, provider):
+    import asyncio
+    import sqlite3
+    from pathlib import Path
+
+    from yaw.daemon.graph.planner import clone_graph_to_memory
+    from yaw.daemon.graph.storage import lint_graph_shacl
+    from yaw.daemon.graph.storage.evidence import canonicalize_fact_definitions, evidence_schemas
+
+    url, state = provider
+    state["delay"] = 0
+    state["embedding_vector"] = lambda text: (
+        [1.0, 0.0, 0.0, 0.0] if text.casefold().startswith("text: # orion") else [0.0, 1.0, 0.0, 0.0]
+    )
+    healed_v1 = "Orion routes telemetry traffic through the Anchor service."
+    state["healed_definition"] = healed_v1
+
+    orion_def_hi = "A telemetry service for cluster routing."
+    orion_def_lo = next(
+        d
+        for d in ("A telemetry service.", "Telemetry node.", "Core router.", "Edge service.")
+        if sense_id("orion", d) < sense_id("orion", orion_def_hi)
+    )
+    assert len(orion_def_hi) > len(orion_def_lo)
+
+    c1_text = "Orion routes via Anchor in batch one."
+    c2_text = "Orion routes via Anchor again and Beacon monitors Pulse in batch two."
+    anchor_def = "A telemetry anchor service."
+    state["extractions"] = {
+        c1_text: {
+            "named_entities": [
+                ["Orion", orion_def_hi],
+                ["Anchor", anchor_def],
+            ],
+            "triples": [
+                {
+                    "sub": "Orion",
+                    "pred": ["routes Via", "owl:ObjectProperty"],
+                    "obj": "Anchor",
+                    "def": orion_def_hi,
+                }
+            ],
+        },
+        c2_text: {
+            "named_entities": [
+                ["Orion", orion_def_lo],
+                ["Anchor", anchor_def],
+                ["Beacon", "A monitoring agent."],
+                ["Pulse", "A health signal."],
+            ],
+            "triples": [
+                {
+                    "sub": "Orion",
+                    "pred": ["routes Via", "owl:ObjectProperty"],
+                    "obj": "Anchor",
+                    "def": orion_def_hi,
+                },
+                {
+                    "sub": "Beacon",
+                    "pred": ["monitors", "owl:ObjectProperty"],
+                    "obj": "Pulse",
+                    "def": "Beacon monitors the Pulse health signal.",
+                },
+            ],
+        },
+    }
+    c1 = (ChunkPointer("c1", "c1.md", 1, 1), c1_text)
+    c2 = (ChunkPointer("c2", "c2.md", 1, 1), c2_text)
+    for ptr, text in (c1, c2):
+        (tmp_path / ptr.rel_posix_path).write_text(text + "\n", encoding="utf-8")
+
+    with native_corpus(tmp_path, tmp_path / "inc", url) as (db, stream, app):
+        publish(stream, app, [c1])
+        healer_calls_batch1 = len(state.get("healer_requests", []))
+        assert healer_calls_batch1 == 3
+        with db.readonly() as conn:
+            assert lint_graph_shacl(conn) == []
+            fid_b1 = conn.execute("SELECT fact_id FROM facts WHERE pred = 'routes Via'").fetchone()[0]
+            defs_b1 = dict(conn.execute("SELECT pred, definition FROM facts").fetchall())
+            assert defs_b1 == {"routes Via": healed_v1}
+
+        publish(stream, app, [c1, c2])
+        assert len(state.get("healer_requests", [])) == healer_calls_batch1
+        with db.readonly() as conn:
+            assert lint_graph_shacl(conn) == []
+            fid_b2 = conn.execute("SELECT fact_id FROM facts WHERE pred = 'routes Via'").fetchone()[0]
+            assert fid_b2 != fid_b1
+            defs_b2 = dict(conn.execute("SELECT pred, definition FROM facts").fetchall())
+            assert defs_b2["routes Via"] == healed_v1
+            assert defs_b2["monitors"] == "Beacon monitors the Pulse health signal."
+
+        healed_v2 = "Orion forwards telemetry packets to the Anchor endpoint."
+        state["healed_definition"] = healed_v2
+        c3_text = "Anchor endpoint description update."
+        state["extractions"][c3_text] = {
+            "named_entities": [
+                ["Anchor", healed_v1],
+                ["Pulse", "A health signal."],
+            ],
+            "triples": [
+                {
+                    "sub": "Anchor",
+                    "pred": ["emits", "owl:ObjectProperty"],
+                    "obj": "Pulse",
+                    "def": "Anchor emits the Pulse health signal.",
+                }
+            ],
+        }
+        c3 = (ChunkPointer("c3", "c3.md", 1, 1), c3_text)
+        (tmp_path / c3[0].rel_posix_path).write_text(c3_text + "\n", encoding="utf-8")
+        publish(stream, app, [c1, c2, c3])
+        assert len(state.get("healer_requests", [])) > healer_calls_batch1
+        with db.readonly() as conn:
+            assert lint_graph_shacl(conn) == []
+            defs_b3 = dict(conn.execute("SELECT pred, definition FROM facts").fetchall())
+            assert defs_b3["routes Via"] == healed_v2
+
+    opt_db = Path(".yaw/yaw_optimize_20261106_221811.db")
+    if opt_db.exists():
+        schemas = asyncio.run(evidence_schemas())
+        ro_conn = sqlite3.connect(f"file:{opt_db.resolve().as_posix()}?mode=ro", uri=True)
+        try:
+            mem_conn = clone_graph_to_memory(ro_conn, schemas)
+        finally:
+            ro_conn.close()
+        try:
+            prior_defs = {str(r[0]): str(r[1]) for r in mem_conn.execute("SELECT fact_id, definition FROM facts")}
+            healed_before = mem_conn.execute(
+                """
+                SELECT COUNT(*) FROM facts f
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM fact_assertions a
+                    WHERE a.fact_id = f.fact_id
+                      AND COALESCE(json_extract(a.raw_json, '$.spo_def'), '') = f.definition
+                )
+                """
+            ).fetchone()[0]
+            assert healed_before == 42
+            canonicalize_fact_definitions(mem_conn, prior_definitions=prior_defs)
+            healed_after = mem_conn.execute(
+                """
+                SELECT COUNT(*) FROM facts f
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM fact_assertions a
+                    WHERE a.fact_id = f.fact_id
+                      AND COALESCE(json_extract(a.raw_json, '$.spo_def'), '') = f.definition
+                )
+                """
+            ).fetchone()[0]
+            assert healed_after == 42
+            closed_world_violations = [v for v in lint_graph_shacl(mem_conn) if v.shape == "StatementShape/closedWorld"]
+            assert closed_world_violations == []
+        finally:
+            mem_conn.close()
+
+
+def test_focus_isolated_shacl_memo_reuses_healed_focus_when_earlier_violation_added(tmp_path, provider):
+    from yaw.daemon.graph.storage import lint_graph_shacl
+    from yaw.daemon.graph.storage.evidence import fact_id as canonical_fact_id
+
+    url, state = provider
+    state["delay"] = 0
+    state["embedding_vector"] = fixed_vector
+    state["healed_definition"] = "A distinct non-colliding statement definition."
+
+    specs = [
+        ("Alpha", "Alpha node.", "Beta", "Beta node."),
+        ("Gamma", "Gamma node.", "Delta", "Delta node."),
+        ("Epsilon", "Epsilon node.", "Zeta", "Zeta node."),
+    ]
+    ranked = sorted(
+        specs,
+        key=lambda item: canonical_fact_id(
+            sense_id(item[0].lower(), item[1]),
+            "links to",
+            "entity",
+            sense_id(item[2].lower(), item[3]),
+        ),
+    )
+    chunks = []
+    state["extractions"] = {}
+    for idx, (s_lbl, s_def, o_lbl, o_def) in enumerate(ranked):
+        text = f"Passage {idx}: {s_lbl} links to {o_lbl}."
+        ptr = ChunkPointer(f"m{idx}", f"m{idx}.md", 1, 1)
+        (tmp_path / ptr.rel_posix_path).write_text(text + "\n", encoding="utf-8")
+        chunks.append((ptr, text))
+        state["extractions"][text] = {
+            "named_entities": [[s_lbl, s_def], [o_lbl, o_def]],
+            "triples": [
+                {
+                    "sub": s_lbl,
+                    "pred": ["links To", "owl:ObjectProperty"],
+                    "obj": o_lbl,
+                    "def": s_def,
+                }
+            ],
+        }
+
+    ephemeral_text = "Passage ephemeral: Beacon monitors Pulse."
+    ephemeral_ptr = ChunkPointer("m_ephemeral", "m_ephemeral.md", 1, 1)
+    (tmp_path / ephemeral_ptr.rel_posix_path).write_text(ephemeral_text + "\n", encoding="utf-8")
+    state["extractions"][ephemeral_text] = {
+        "named_entities": [["Beacon", "A monitoring agent."], ["Pulse", "A health signal."]],
+        "triples": [
+            {
+                "sub": "Beacon",
+                "pred": ["monitors", "owl:ObjectProperty"],
+                "obj": "Pulse",
+                "def": "Beacon monitors the Pulse health signal.",
+            }
+        ],
+    }
+    chunk_ephemeral = (ephemeral_ptr, ephemeral_text)
+    chunk_lo, chunk_hi_1, chunk_hi_2 = chunks
+    with native_corpus(tmp_path, tmp_path / "memo", url) as (db, stream, app):
+        publish(stream, app, [chunk_ephemeral, chunk_hi_1, chunk_hi_2])
+        healer_calls_after_first = len(state.get("healer_requests", []))
+        direct_calls_after_first = state.get("healer_requests", []).count("direct")
+        assert healer_calls_after_first == 6
+        assert direct_calls_after_first == 2
+
+        publish(stream, app, [chunk_lo, chunk_hi_1, chunk_hi_2])
+        assert len(state.get("healer_requests", [])) - healer_calls_after_first == 3
+        assert state.get("healer_requests", []).count("direct") - direct_calls_after_first == 1
+        with db.readonly() as conn:
+            assert lint_graph_shacl(conn) == []
+            assert conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 3
+
+
+def test_single_pass_fact_embedding_and_delta_scoped_batch_publication(tmp_path, provider):
+    url, state = provider
+    state["delay"] = 0
+    state["embedding_vector"] = fixed_vector
+
+    c1_text = "Orion routes via Anchor."
+    c2_text = "Vega links to Sirius."
+    state["extractions"] = {
+        c1_text: {
+            "named_entities": [
+                ["Orion", "A telemetry service."],
+                ["Anchor", "A telemetry anchor service."],
+            ],
+            "triples": [
+                {
+                    "sub": "Orion",
+                    "pred": ["routes Via", "owl:ObjectProperty"],
+                    "obj": "Anchor",
+                    "def": "The service routes via Anchor.",
+                }
+            ],
+        },
+        c2_text: {
+            "named_entities": [
+                ["Vega", "A relay node."],
+                ["Sirius", "A core router."],
+            ],
+            "triples": [
+                {
+                    "sub": "Vega",
+                    "pred": ["links To", "owl:ObjectProperty"],
+                    "obj": "Sirius",
+                    "def": "Vega links to the Sirius router.",
+                }
+            ],
+        },
+    }
+    c1 = (ChunkPointer("c1", "c1.md", 1, 1), c1_text)
+    c2 = (ChunkPointer("c2", "c2.md", 1, 1), c2_text)
+    for ptr, text in (c1, c2):
+        (tmp_path / ptr.rel_posix_path).write_text(text + "\n", encoding="utf-8")
+
+    with native_corpus(tmp_path, tmp_path / "inc_embed", url) as (db, stream, app):
+        publish(stream, app, [c1])
+        batch1_embeds = list(state.get("embedding_inputs", []))
+        orion_fact_embeds_b1 = [
+            s
+            for s in batch1_embeds
+            if "routes via" in s.casefold() and "the service routes via anchor." in s.casefold()
+        ]
+        assert len(orion_fact_embeds_b1) == 1
+        assert "Orion routes Via Anchor." in orion_fact_embeds_b1[0]
+
+        publish(stream, app, [c1, c2])
+        batch2_new_embeds = state.get("embedding_inputs", [])[len(batch1_embeds) :]
+        orion_fact_embeds_b2 = [s for s in batch2_new_embeds if "routes via" in s.casefold()]
+        vega_fact_embeds_b2 = [
+            s
+            for s in batch2_new_embeds
+            if "links to" in s.casefold() and "vega links to the sirius router." in s.casefold()
+        ]
+        assert orion_fact_embeds_b2 == []
+        assert len(vega_fact_embeds_b2) == 1
+        assert "Vega links To Sirius." in vega_fact_embeds_b2[0]
+        with db.readonly() as conn:
+            actual = canonical_graph(conn)
+
+    with native_corpus(tmp_path, tmp_path / "ref_embed", url) as (ref_db, ref_stream, ref_app):
+        publish(ref_stream, ref_app, [c1, c2])
+        with ref_db.readonly() as conn:
+            assert_same_graph(actual, canonical_graph(conn))

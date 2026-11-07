@@ -15,7 +15,7 @@ from yaw.core import (
     text_processing,
 )
 
-from .db import batched
+from .db import batched, write_tx
 from .managed_sqlite import TableSpec
 
 EVIDENCE_INDEXES = {
@@ -193,27 +193,99 @@ def load_sense_bindings(conn: sqlite3.Connection, labels: Iterable[str]) -> dict
     return result
 
 
-def canonicalize_fact_definitions(conn: sqlite3.Connection) -> None:
-    """Select source descriptions deterministically before SHACL derives repairs."""
-    conn.execute(
-        "UPDATE facts SET definition=(SELECT json_extract(raw_json,'$.spo_def') FROM fact_assertions a "
-        "WHERE a.fact_id=facts.fact_id ORDER BY assertion_id LIMIT 1) "
-        "WHERE fact_id IN (SELECT fact_id FROM fact_assertions)"
-    )
+def canonicalize_fact_definitions(
+    conn: sqlite3.Connection,
+    prior_definitions: Mapping[str, str] | None = None,
+) -> int:
+    """Resolve facts.definition deterministically from valid source assertions or valid prior repairs."""
+    fact_rows = conn.execute(
+        """
+        SELECT
+            f.fact_id,
+            COALESCE(f.definition, ''),
+            COALESCE(f.obj_kind, 'entity'),
+            LOWER(TRIM(COALESCE(es.definition, ''))),
+            LOWER(TRIM(COALESCE(eo.definition, '')))
+        FROM facts f
+        LEFT JOIN entities es ON es.entity_id = f.subj_id
+        LEFT JOIN entities eo ON eo.entity_id = f.obj_id
+        """
+    ).fetchall()
+    if not fact_rows:
+        return 0
+
+    assertions_by_fact: dict[str, list[tuple[str, str]]] = {}
+    for row in conn.execute(
+        """
+        SELECT fact_id, assertion_id, COALESCE(json_extract(raw_json, '$.spo_def'), '')
+        FROM fact_assertions
+        WHERE fact_id IS NOT NULL
+        ORDER BY assertion_id ASC
+        """
+    ):
+        assertions_by_fact.setdefault(str(row[0]), []).append((str(row[1]), str(row[2])))
+
+    def _is_valid_spo_def(cand: str, subj_def_norm: str, obj_kind: str, obj_def_norm: str) -> bool:
+        norm = cand.strip().lower()
+        if not norm or norm == subj_def_norm:
+            return False
+        return not (obj_kind == "entity" and norm == obj_def_norm)
+
+    updates: list[tuple[str, str]] = []
+    for row in fact_rows:
+        fid = str(row[0])
+        current_def = str(row[1])
+        obj_kind = str(row[2])
+        subj_def_norm = str(row[3])
+        obj_def_norm = str(row[4])
+
+        assertions = assertions_by_fact.get(fid, ())
+        valid_assertions = [
+            spo_def for _, spo_def in assertions if _is_valid_spo_def(spo_def, subj_def_norm, obj_kind, obj_def_norm)
+        ]
+        if valid_assertions:
+            resolved_def = valid_assertions[0]
+        else:
+            prior_cand = (prior_definitions.get(fid) or current_def) if prior_definitions is not None else current_def
+            if _is_valid_spo_def(prior_cand, subj_def_norm, obj_kind, obj_def_norm):
+                resolved_def = prior_cand
+            elif _is_valid_spo_def(current_def, subj_def_norm, obj_kind, obj_def_norm):
+                resolved_def = current_def
+            elif assertions:
+                _, resolved_def = min(assertions, key=lambda item: (item[1].strip() == "", item[0]))
+            else:
+                resolved_def = current_def
+
+        if resolved_def != current_def:
+            updates.append((resolved_def, fid))
+
+    if updates:
+        with write_tx(conn):
+            conn.executemany("UPDATE facts SET definition = ? WHERE fact_id = ?", updates)
+    return len(updates)
 
 
-def canonicalize_fact_text(conn: sqlite3.Connection) -> None:
+def canonicalize_fact_text(conn: sqlite3.Connection) -> int:
+    """Update raw_triple_json and fact_fts only for facts whose canonical surface triple changed."""
     rows = conn.execute(
-        "SELECT f.fact_id,s.name,f.pred,f.obj_kind,o.name,f.obj_literal_lex "
+        "SELECT f.fact_id,s.name,f.pred,f.obj_kind,o.name,f.obj_literal_lex,f.raw_triple_json "
         "FROM facts f JOIN entities s ON s.entity_id=f.subj_id LEFT JOIN entities o ON o.entity_id=f.obj_id"
     ).fetchall()
-    for fid, subject, predicate, kind, obj, lexical in rows:
+    updates: list[tuple[str, str]] = []
+    fts_deletes: list[tuple[str]] = []
+    fts_inserts: list[tuple[str, str]] = []
+    for fid, subject, predicate, kind, obj, lexical, current_raw in rows:
         raw = json.dumps([subject, predicate, obj if kind == "entity" else lexical])
-        conn.execute("UPDATE facts SET raw_triple_json=? WHERE fact_id=?", (raw, fid))
-        conn.execute("DELETE FROM fact_fts WHERE fact_id=?", (fid,))
-        conn.execute(
-            "INSERT INTO fact_fts(fact_id,text) VALUES (?,?)", (fid, f"{subject} {predicate} {obj or lexical}")
-        )
+        if raw != current_raw:
+            updates.append((raw, fid))
+            fts_deletes.append((fid,))
+            fts_inserts.append((fid, f"{subject} {predicate} {obj or lexical}"))
+    if updates:
+        with write_tx(conn):
+            conn.executemany("UPDATE facts SET raw_triple_json=? WHERE fact_id=?", updates)
+            conn.executemany("DELETE FROM fact_fts WHERE fact_id=?", fts_deletes)
+            conn.executemany("INSERT INTO fact_fts(fact_id,text) VALUES (?,?)", fts_inserts)
+    return len(updates)
 
 
 @dataclass(frozen=True)

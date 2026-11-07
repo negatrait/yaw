@@ -1,10 +1,20 @@
 # Technical Specification: W3C Semantic Cascade & Active EDC Canonicalization (`docs/w3c-improvements.md`)
 
-Current scope, 2026-11-05: section 13 replaces the former scheme phase and governs
+Current scope, 2026-11-07: section 13 replaces the former scheme phase and governs
 batch-independent identity/relations. The graph plan owns the paired 64+64/128
 time and graph gates. Sections 1-12 retain earlier analysis/proposals, not proof
 of current runtime behavior; graph-wide staging or similarity-only identity
-instructions there are superseded by the native graph contract.
+instructions there are superseded by the native graph contract. Pinned code: `c6fa080`.
+
+| Relation | Links |
+| --- | --- |
+| Governed by | [FOUNDATIONAL.md](../FOUNDATIONAL.md), [AGENTS.md](../AGENTS.md), [epic-1-hipporag-daemon.md](epic-1-hipporag-daemon.md) |
+| Rules | [graph-storage.md](../.agents/rules/graph-storage.md): `yaw/daemon/graph/*.py`, `yaw/daemon/graph/storage/*.py`; [inference.md](../.agents/rules/inference.md): `yaw/daemon/graph/inference/*.py`; [tests.md](../.agents/rules/tests.md): `tests/**/*.py`; [docs.md](../.agents/rules/docs.md): `docs/**/*.md` |
+| Owns code | `yaw/daemon/graph/storage/synonyms.py`, `yaw/daemon/graph/storage/graph_ops.py:canonicalize_entity_labels_edc`, `yaw/daemon/graph/inference/prompts.py:JudgeLabels`, `yaw/daemon/graph/inference/prompts.py:JudgeHierarchy`, `yaw/daemon/graph/inference/prompts.py:JudgeRelated` |
+| Peers | [native-cocoindex-graph.md](native-cocoindex-graph.md): owns native CocoIndex graph publication, closed-world resource/statement boundary (`§5.3`), and the paired `64 + 64` vs. `128` acceptance gate; [native-cocoindex-indexing.md](native-cocoindex-indexing.md): owns `64`-chunk micro-batch source scheduling and runtime lifecycle; [epistemic-confidence-spec.md](epistemic-confidence-spec.md): owns `pool_confidences` and `bayesian_noisy_or` confidence aggregation; [dspy-improvements.md](dspy-improvements.md): constrains GBNF adapter and RLM healer architecture |
+| References | [arxiv-2502.14802v1-hipporag2.md](arxiv-2502.14802v1-hipporag2.md): anchors HippoRAG 2 retrieval parity; [model-evaluation.md](model-evaluation.md): anchors local `llama.cpp` serving constraints (`parallel = 1` `[target]`) |
+| Supersedes / superseded by | Supersedes `synonym-evidence-v1`, single-shot `JudgeSynonyms`, and `skos:ConceptScheme` membership; graph-wide staging instructions in §§1–12 are superseded by [native-cocoindex-graph.md](native-cocoindex-graph.md) |
+| Records | [shacl-healer-publication.md](reviews/shacl-healer-publication.md), [incremental-publication-work.md](reviews/incremental-publication-work.md), [resource-vocabulary-boundary.md](reviews/resource-vocabulary-boundary.md), [concept-scheme-removal.md](reviews/concept-scheme-removal.md), [evaluation-graph-storage.md](evaluation-graph-storage.md), [evaluation-inference.md](evaluation-inference.md) |
 
 ## 1. Context & Root-Cause Problem Statement
 
@@ -103,8 +113,12 @@ def canonicalize_entity_labels_edc(
     """Run deterministic end-of-round Active EDC label canonicalization over entity_labels and entities.
 
     For each candidate entity:
-    1. Demotes any label norm in `hidden_label_norms_by_entity` or absent verbatim from its hydrated
-       source chunk on disk (when `corpus_root` is available and chunk is non-stale) to `skos:hiddenLabel`.
+    1. Demotes any label norm in `hidden_label_norms_by_entity`, any label norm whose `best_raw` fails
+       `is_resource_label(best_raw)` or matches `is_scalar_label(best_raw)`, or any label norm absent
+       verbatim from its hydrated source chunk on disk (when `corpus_root` is available and chunk is
+       non-stale) to `skos:hiddenLabel` (`is_hidden = True`, `verbatim_in_source = 0`). SHACL-healed
+       labels (`set_pref_label`) are stored with `chunk_id = "__healed__"` (`cid.startswith("__")` ->
+       `verbatim_in_source = 1`, `is_hidden = False`).
     2. Scores all eligible (`skos:prefLabel` / `skos:altLabel`) label norms by provenance tuple:
        `(verbatim_in_source, in_ast_title, chunk_count, is_cased_or_multiword, -len(raw_label), label_norm)`.
     3. Promotes the single winning norm to `skos:prefLabel` and updates `entities.name` to its best
@@ -112,6 +126,8 @@ def canonicalize_entity_labels_edc(
     Returns the number of entities whose canonical `skos:prefLabel` or `entities.name` was updated.
     """
 ```
+
+In `apply_synonym_adjudication`, `canonicalize_entity_labels_edc` is scoped to `entity_ids=sorted(touched_entity_ids)` (`entity_ids=()` is an immediate no-op touching `0` rows). When `apply_shacl_repairs` executes `set_pref_label`, it validates `is_resource_label(val) and not is_scalar_label(val)`, demotes existing scalar/non-resource `entity_labels` rows on the focus entity to `skos:hiddenLabel`, and upserts the repaired label with `chunk_id = "__healed__"` unconditionally ([native-cocoindex-graph.md §5.3](native-cocoindex-graph.md#53-resource-vocabulary-and-statement-boundary)), preserving the 6-tuple `norm_scores: dict[str, tuple[int, int, int, int, int, str]]` across subsequent batches.
 
 ### 3.3 3-Stage Paired-Boolean Signatures & Grammars (`yaw/daemon/graph/inference/prompts.py` & `grammars.py`)
 
@@ -603,3 +619,8 @@ repeatable held-out gain must justify resource/maintenance cost without
 unacceptable regressions elsewhere. A richer-looking graph or extra node count
 is not evidence. No clustering dependency or dormant scheme code is introduced
 in the current refactor.
+
+## Decisions
+
+- 2026-11-06: "Should stay literals, NER is only allowed to capture skos:Concept and owl:NamedIndividual, triple extraction can point the rdf:Statement to rdf:object = rdfs:Literal but never rdf:subject = rdfs:Literal! This is why it's two stage. NER creates the allowed rdf:subject vocabulary, with predicates able to point towards literals but never the other way around - that's the W3C ontology rules and should be in our allowed SHACL shapes." (User). Enforced across GBNF grammars, extraction/repair parsers, Active EDC label canonicalization (§3.2), and closed-world SQLite SHACL shapes.
+- 2026-11-07: "Audit and review for root cause for batch indexing regressing back to exponential time behavior. Incremental indexing and graph publication was designed and tested to be near-constant time for 64 + 64 chunk batches vs 128 chunk batchless indexing." / "It’s a SHACL Violation CONSISTENCY_ERROR" / "you will need to /spec first." (User). Preserves SHACL-healed entity labels across incremental batches via `chunk_id = "__healed__"` (`cid.startswith("__")` -> `verbatim_in_source = 1`, `is_hidden = False`), marks scalar/non-resource labels `is_hidden = True` in `canonicalize_entity_labels_edc`, and scopes Active EDC to `touched_entity_ids` (§3.2).
