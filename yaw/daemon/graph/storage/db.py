@@ -2,6 +2,7 @@
 
 import sqlite3
 import time
+import uuid
 from collections.abc import Generator, Iterator, Sequence
 from contextlib import contextmanager, suppress
 from pathlib import Path
@@ -296,12 +297,52 @@ def validate_graph_schema(conn: sqlite3.Connection) -> None:
         raise ValueError("Obsolete graph schema: preserve this database and build a fresh scheme-free index")
 
 
+def resolve_coco_state_root(state_dir: Path | str) -> Path:
+    """Return the single persistent CocoIndex LMDB directory (<state_dir>/coco_lmdb).
+
+    Never append transient per-candidate SQLite filenames.
+    """
+    resolved = Path(state_dir).resolve()
+    if resolved.name == "coco_lmdb":
+        return resolved
+    if resolved.suffix in {".db", ".sqlite", ".sqlite3"} or resolved.is_file():
+        return resolved.parent / "coco_lmdb"
+    return resolved / "coco_lmdb"
+
+
+def resolve_db_identity(conn: sqlite3.Connection, db_path: Path | str | None = None) -> str:
+    """Return stable '<canonical_db_path>:<db_nonce>' stored in meta['db_identity']
+    so recreated SQLite files at the same path never collide with stale LMDB target state.
+    """
+    has_meta = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone()
+    if has_meta is not None:
+        row = conn.execute("SELECT value FROM meta WHERE key = 'db_identity'").fetchone()
+        if row is not None and str(row[0]).strip():
+            return str(row[0])
+    if db_path is not None and str(db_path) != ":memory:":
+        canonical_path = Path(db_path).resolve().as_posix()
+    else:
+        db_rows = conn.execute("PRAGMA database_list").fetchall()
+        main_file = next((str(r[2]) for r in db_rows if str(r[1]) == "main" and r[2]), "")
+        canonical_path = Path(main_file).resolve().as_posix() if main_file and main_file != ":memory:" else ":memory:"
+    identity = f"{canonical_path}:{uuid.uuid4().hex[:12]}"
+    with write_tx(conn):
+        conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('db_identity', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (identity,),
+        )
+    return identity
+
+
 def initialize_schema(conn: sqlite3.Connection) -> None:
     """Initialize all unified schema tables and indices in yaw.db."""
     validate_graph_schema(conn)
     with write_tx(conn):
         for stmt in _CREATE_SCHEMA_STATEMENTS:
             conn.execute(stmt)
+        resolve_db_identity(conn)
 
 
 def get_meta(conn: sqlite3.Connection, key: str) -> str | None:

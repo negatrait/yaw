@@ -118,46 +118,52 @@ def resolve_db_identity(conn: sqlite3.Connection, db_path: Path) -> str:
 
 @coco.fn
 async def process_chunk(
-    db_identity: str,
     pointer: ChunkPointer,
     text: str,
     identity: InferenceIdentity,
     source_lock: Path | None = None,
+    *,
+    artifacts: TableTarget[ChunkInference] | None = None,
+    db_identity: str = "",
 ) -> ChunkProcessOutput:
     """Run memoized extract_text and embed_text in parallel; declare ChunkInference
-    to chunk_inference via mount_table(db_identity, 'chunk_inference', ...);
+    to chunk_inference via mount_table('chunk_inference', ..., db_identity=db_identity);
     and return ChunkProcessOutput (with vector_f32) to the caller via coco.use_mount.
     """
 
 
 @coco.fn
 async def process_frozen_chunk(
-    db_identity: str,
     chunk: tuple[ChunkPointer, str],
     identity: InferenceIdentity,
+    sources: TableTarget[SourceMetadata],
+    artifacts: TableTarget[ChunkInference],
+    db_identity: str = "",
 ) -> ChunkProcessOutput:
-    """Declare ChunkPointer to source_chunks via mount_table(db_identity, 'source_chunks', ...)
-    and return await process_chunk(db_identity, pointer, text, identity).
+    """Declare SourceMetadata to source_chunks via mount_table('source_chunks', ..., db_identity=db_identity)
+    and return await process_chunk(pointer, text, identity, artifacts=artifacts, db_identity=db_identity).
     """
 
 
 @coco.fn
 async def publish_graph(
-    db_identity: str,
     settings: GraphPlanSettings,
     active_chunks: tuple[ChunkProcessOutput, ...],
+    db_identity: str = "",
 ) -> GraphPlanSummary:
-    """Single atomic graph publication component mounted via coco.use_mount at
-    coco.component_subpath(db_identity, 'publication').
+    """Single atomic graph publication component mounted via coco.use_mount at DB-invariant
+    coco.component_subpath('publication') (so @coco.fn(memo=True) calls inside plan_graph_publication
+    retain an identical parent StablePath across databases in TABLES.memoization while passing
+    db_identity as a component argument forces component body execution per database in TABLES.components).
     Delegates to plan_graph_publication(settings, active_chunks) and
-    declare_tables(db_identity, plan.tables) over shared_sink, returning GraphPlanSummary.
+    declare_tables(plan.tables, db_identity=db_identity) over shared_sink, returning GraphPlanSummary.
     """
 ```
 
 - **Frozen micro-batch scheduling (`bind_native_indexing`)**:
   - `partition_frozen_chunks(db, chunks, identity, settings=settings)` partitions the caller's complete snapshot into `(retained, changed)` by comparing `(ChunkPointer, InferenceIdentity, settings)` against committed `chunks` and `meta['graph_input_fingerprints']` in `yaw.db`.
-  - Each `app.update()` cycle mounts `retained + changed[:64]` (`<= 64` `[target]` changed chunks) via `await asyncio.gather(*(coco.use_mount(coco.component_subpath(db_identity, "chunk", m.chunk_id), process_frozen_chunk, db_identity, (m, text), identity) for m, text in active_slice))` and passes the resulting `tuple[ChunkProcessOutput, ...]` directly to `summary = await coco.use_mount(coco.component_subpath(db_identity, "publication"), publish_graph, db_identity, settings, active_chunks)`, then reports `engine.report_indexing_batch(summary, len(active_slice))`.
-  - Unchanged chunks in `retained` hit their `@coco.fn(memo=True)` `extract_text` and `embed_text` memos in `TABLES.memoization` across databases with `0` `[target]` provider calls, and `source_chunks`/`chunk_inference` use `mount_table(db_identity, ...)` (`RowHandler.tracks_value_fingerprint = True`) so unchanged rows incur `0` `[target]` SQLite writes.
+  - Each `app.update()` cycle mounts `retained + changed[:64]` (`<= 64` `[target]` changed chunks) at DB-invariant `coco.component_subpath("chunk", m.chunk_id)` via `await asyncio.gather(*(coco.use_mount(coco.component_subpath("chunk", m.chunk_id), process_frozen_chunk, (m, text), identity, sources, artifacts, db_identity) for m, text in active_slice))` and passes the resulting `tuple[ChunkProcessOutput, ...]` directly to `summary = await coco.use_mount(coco.component_subpath("publication"), publish_graph, settings, active_chunks, db_identity)`, then reports `engine.report_indexing_batch(summary, len(active_slice))`.
+  - Because `cocoindex == 1.1.0` (`function.py:1463-1465`) keys `TABLES.memoization` by `(app_name, parent_ctx.stable_path, memo_fp)` while `coco.mount` keys `TABLES.components` by `fingerprint((StablePath, args))`, keeping `coco.component_subpath("chunk", m.chunk_id)` and `coco.component_subpath("publication")` DB-invariant while passing `db_identity` as a component argument ensures `process_frozen_chunk` and `publish_graph` execute their component bodies for each target DB (declaring rows for `TableKey(db_identity, name)`) while hitting `100%` `[target]` of `TABLES.memoization` across databases with `0` `[target]` duplicate provider calls. Unchanged `source_chunks`/`chunk_inference` rows use `mount_table(..., db_identity=db_identity)` (`RowHandler.tracks_value_fingerprint = True`) so unchanged rows incur `0` `[target]` SQLite writes.
 
 Open:
 - **Question**: Can `localfs.walk_dir(..., live=True)` (`LiveItems`) in `indexing_app_main` collect per-file/per-chunk `ChunkProcessOutput` return values directly into `publish_graph` using public `cocoindex == 1.1.0` component primitives (`coco.use_mount` / `LiveComponent`), or does `coco.mount_each` over `LiveItems` require a thin in-memory reactive trigger to invoke `publish_graph`?

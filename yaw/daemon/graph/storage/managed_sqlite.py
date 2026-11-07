@@ -8,13 +8,13 @@ import re
 import sqlite3
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
 import cocoindex as coco
 from cocoindex.connectorkits.fingerprint import fingerprint_object
 from cocoindex.connectors import sqlite
 
-from .db import GRAPH_DB
+from .db import GRAPH_DB, ManagedConnection, resolve_db_identity
 
 VALIDATE_SQLITE = coco.ContextKey[Callable[[sqlite3.Connection], None]]("yaw/managed_sqlite/validate")
 
@@ -25,12 +25,18 @@ def identifier(value: str) -> str:
     return f'"{value}"'
 
 
+class TableKey(NamedTuple):
+    db_identity: str
+    name: str
+
+
 @dataclass(frozen=True)
 class TableSpec:
     name: str
     schema: sqlite.TableSchema[Any]
     fts_unindexed: tuple[str, ...] | None = None
     indexes: tuple[tuple[str, ...], ...] = ()
+    db_identity: str = ""
 
 
 @dataclass(frozen=True)
@@ -73,7 +79,19 @@ def create_table(conn: sqlite3.Connection, spec: TableSpec) -> None:
 @dataclass(frozen=True)
 class DatabaseSink:
     def __call__(self, context: coco.ContextProvider, actions: Sequence[TableAction | RowAction]) -> None:
-        with context.get(GRAPH_DB).transaction() as conn:
+        try:
+            managed_db = context.get(GRAPH_DB)
+        except LookupError:
+            managed_db = context.get("yaw/source_db", ManagedConnection)
+        with managed_db.transaction() as conn:
+            active_db_identity = resolve_db_identity(conn)
+            actions = [
+                action
+                for action in actions
+                if not action.spec.db_identity or action.spec.db_identity == active_db_identity
+            ]
+            if not actions:
+                return
             for action in actions:
                 if isinstance(action, TableAction) and action.create:
                     create_table(conn, action.spec)
@@ -107,7 +125,10 @@ class DatabaseSink:
             for action in actions:
                 if isinstance(action, TableAction) and action.delete:
                     conn.execute(f"DROP TABLE {identifier(action.spec.name)}")
-            if any(isinstance(action, RowAction) for action in actions):
+            if any(
+                isinstance(action, RowAction) and action.spec.name not in {"source_chunks", "chunk_inference"}
+                for action in actions
+            ):
                 context.get(VALIDATE_SQLITE)(conn)
 
 
@@ -183,15 +204,23 @@ TABLES = coco.register_root_target_states_provider("yaw/managed_sqlite/tables", 
 async def mount_table[RowT](
     name: str,
     row_type: type[RowT],
-    primary_key: list[str],
+    primary_key: Sequence[str],
     *,
     fts_unindexed: tuple[str, ...] | None = None,
     indexes: tuple[tuple[str, ...], ...] = (),
+    db_identity: str = "",
 ) -> sqlite.TableTarget[RowT]:
-    schema = await sqlite.TableSchema[RowT].from_class(row_type, primary_key=primary_key)
-    spec = TableSpec(name, sqlite.TableSchema(schema.columns, schema.primary_key), fts_unindexed, indexes)
+    schema = await sqlite.TableSchema[RowT].from_class(row_type, primary_key=list(primary_key))
+    spec = TableSpec(
+        name,
+        sqlite.TableSchema(schema.columns, schema.primary_key),
+        fts_unindexed,
+        indexes,
+        db_identity=db_identity,
+    )
     # SDK inference includes the deletion sentinel in the row value type.
     provider = cast(
-        coco.TargetStateProvider[dict[str, Any], None], await coco.mount_target(TABLES.target_state(name, spec))
+        coco.TargetStateProvider[dict[str, Any], None],
+        await coco.mount_target(TABLES.target_state(TableKey(db_identity, name), spec)),
     )
     return sqlite.TableTarget(provider, schema)

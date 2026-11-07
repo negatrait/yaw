@@ -1019,15 +1019,17 @@ async def plan_graph_publication(
         "shacl_conforms": True,
     }
 
-    if chunk_rows is not None:
-        active_items = [(ptr, rec, ()) for ptr, rec in sorted(chunk_rows, key=lambda item: item[0].chunk_id)]
-    else:
-        with coco.use_context(GRAPH_DB).readonly() as ro_conn:
-            active_items = load_active_chunk_inferences(
+    with coco.use_context(GRAPH_DB).readonly() as ro_conn:
+        db_identity = get_meta(ro_conn, "db_identity") or ""
+        active_items = (
+            [(ptr, rec, ()) for ptr, rec in sorted(chunk_rows, key=lambda item: item[0].chunk_id)]
+            if chunk_rows is not None
+            else load_active_chunk_inferences(
                 ro_conn,
                 program_identity=settings.program_identity,
                 embedding_identity=settings.embedding_identity,
             )
+        )
 
     if frozen_text is not None:
         # Retired child targets may still exist until the parent finishes syncing.
@@ -1037,7 +1039,7 @@ async def plan_graph_publication(
             raise ValueError("Frozen source snapshot has incomplete inference artifacts")
 
     if not active_items:
-        return GraphPlanResult(tables=empty_graph_tables(), chunk_ids=(), rlm_stats=rlm_stats)
+        return GraphPlanResult(tables=empty_graph_tables(db_identity=db_identity), chunk_ids=(), rlm_stats=rlm_stats)
 
     chunks: list[tuple[ChunkPointer, str]] = []
     all_records: list[OpenIERecord] = []
@@ -1491,7 +1493,12 @@ async def plan_graph_publication(
                 [(f_row[0], vec) for f_row, vec in zip(reembed_facts, rf_vecs, strict=True)],
             )
         return GraphPlanResult(
-            tables=graph_tables(staging_conn, complete_chunks, tuple(sorted(input_fingerprints.items()))),
+            tables=graph_tables(
+                staging_conn,
+                complete_chunks,
+                tuple(sorted(input_fingerprints.items())),
+                db_identity=db_identity,
+            ),
             chunk_ids=tuple(sorted(pointer.chunk_id for pointer, _ in complete_chunks)),
             traces=tuple(all_traces),
             telemetry=tuple(all_telemetry),

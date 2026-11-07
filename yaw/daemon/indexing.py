@@ -42,12 +42,12 @@ from yaw.daemon.graph.inference.components import (
 )
 from yaw.daemon.graph.planner import GraphPlanSettings, GraphPlanSummary, plan_graph_publication, summarize_graph_plan
 from yaw.daemon.graph.storage import deserialize_openie_record
-from yaw.daemon.graph.storage.db import GRAPH_DB, get_meta
+from yaw.daemon.graph.storage.db import GRAPH_DB, get_meta, resolve_coco_state_root, resolve_db_identity
 from yaw.daemon.graph.storage.hydration import (
     hydrate_ast_parent_context,
     resolve_chunk_text,
 )
-from yaw.daemon.graph.storage.managed_sqlite import VALIDATE_SQLITE
+from yaw.daemon.graph.storage.managed_sqlite import VALIDATE_SQLITE, mount_table
 from yaw.daemon.graph.storage.rows import declare_tables, validate_graph_state
 from yaw.daemon.ingestion.source_targets import (
     SOURCE_DB,
@@ -232,8 +232,9 @@ class ChunkStateTargetHandler(coco.TargetHandler[ChunkStateRecord, ChunkStateRec
         )
         if change is None:
             return None
+        chunk_id = str(key[1]) if isinstance(key, tuple) and len(key) == 2 else str(key)
         return coco.TargetReconcileOutput(
-            action=ChunkStateAction(str(key), record),
+            action=ChunkStateAction(chunk_id, record),
             sink=self.sink,
             tracking_record=record,
         )
@@ -245,8 +246,20 @@ CHUNK_STATE_TARGET = coco.register_root_target_states_provider(
 )
 
 
-def declare_chunk_state(record: ChunkStateRecord) -> None:
-    coco.declare_target_state(CHUNK_STATE_TARGET.target_state(record.chunk_id, record))
+def declare_chunk_state(record: ChunkStateRecord, *, db_identity: str = "") -> None:
+    state_key: coco.StableKey = (db_identity, record.chunk_id) if db_identity else record.chunk_id
+    coco.declare_target_state(CHUNK_STATE_TARGET.target_state(state_key, record))
+
+
+def _managed_db_identity(db: sqlite.ManagedConnection) -> str:
+    with db.readonly() as conn:
+        has_meta = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone()
+        if has_meta is not None:
+            existing = get_meta(conn, "db_identity")
+            if existing:
+                return existing
+    with db.transaction() as conn:
+        return resolve_db_identity(conn)
 
 
 @coco.fn
@@ -256,6 +269,7 @@ async def process_chunk(
     identity: InferenceIdentity,
     settings: SourceSettings | None = None,
     frozen_text: str | None = None,
+    db_identity: str = "",
 ) -> None:
     """Declare a complete inference artifact only after both operations succeed."""
     try:
@@ -333,7 +347,8 @@ async def process_chunk(
                 metadata.source_hash,
                 extraction.program_identity,
                 embeddings.adapter.profile.index_identity,
-            )
+            ),
+            db_identity=db_identity,
         )
     except BaseException as exc:
         get_graph_delta_coordinator(coco.use_context(SOURCE_DB)).record_error(exc)
@@ -347,6 +362,7 @@ async def process_file(
     artifacts: sqlite.TableTarget[ChunkInference],
     settings: SourceSettings,
     identity: InferenceIdentity,
+    db_identity: str = "",
 ) -> None:
     try:
         chunking_settings = normalize_chunking_settings(settings)
@@ -359,6 +375,8 @@ async def process_file(
                 artifacts,
                 identity,
                 chunking_settings,
+                None,
+                db_identity,
             )
     except BaseException as exc:
         get_graph_delta_coordinator(coco.use_context(SOURCE_DB)).record_error(exc)
@@ -406,11 +424,12 @@ async def publish_graph(
     state_fingerprint: str,
     recovery_nonce: str = "",
     frozen_text: dict[str, str] | None = None,
+    db_identity: str = "",
 ) -> GraphPlanSummary:
     """Plan and declare the atomic validated graph without storing vectors in LMDB memos."""
-    _ = state_fingerprint, recovery_nonce
+    _ = state_fingerprint, recovery_nonce, db_identity
     plan = await plan_graph_publication(settings, frozen_text=frozen_text)
-    await declare_tables(plan.tables)
+    await declare_tables(plan.tables, db_identity=db_identity)
     return summarize_graph_plan(plan)
 
 
@@ -472,8 +491,9 @@ class _DeltaNotifyingLiveItems:
 class GraphPublicationLiveComponent:
     """Event-driven LiveComponent that publishes the validated graph when chunk state transitions commit."""
 
-    def __init__(self, settings: GraphPlanSettings) -> None:
+    def __init__(self, settings: GraphPlanSettings, db_identity: str = "") -> None:
         self._settings = settings
+        self._db_identity = db_identity
 
     async def process(self) -> None:
         db = coco.use_context(GRAPH_DB)
@@ -481,6 +501,7 @@ class GraphPublicationLiveComponent:
         err = coordinator.consume_cycle_error()
         if err is not None:
             raise err
+        db_identity = self._db_identity or _managed_db_identity(db)
         with db.readonly() as conn:
             state_fingerprint = compute_active_inference_fingerprint(
                 conn,
@@ -494,6 +515,7 @@ class GraphPublicationLiveComponent:
                 self._settings,
                 state_fingerprint,
                 coordinator.recovery_nonce,
+                db_identity=db_identity,
             )
         except BaseException as exc:
             coordinator.record_error(exc)
@@ -539,17 +561,11 @@ async def indexing_app_main(
     graph_settings: GraphPlanSettings | None = None,
     watch_reload_signal: bool = False,
 ) -> None:
-    sources = await sqlite.mount_table_target(
-        SOURCE_DB,
-        table_name="source_chunks",
-        table_schema=await sqlite.TableSchema[SourceMetadata].from_class(SourceMetadata, primary_key=["chunk_id"]),
-    )
-    artifacts = await sqlite.mount_table_target(
-        SOURCE_DB,
-        table_name="chunk_inference",
-        table_schema=await sqlite.TableSchema[ChunkInference].from_class(ChunkInference, primary_key=["chunk_id"]),
-    )
-    coordinator = get_graph_delta_coordinator(coco.use_context(SOURCE_DB))
+    source_db = coco.use_context(SOURCE_DB)
+    db_identity = _managed_db_identity(source_db)
+    sources = await mount_table("source_chunks", SourceMetadata, ["chunk_id"], db_identity=db_identity)
+    artifacts = await mount_table("chunk_inference", ChunkInference, ["chunk_id"], db_identity=db_identity)
+    coordinator = get_graph_delta_coordinator(source_db)
     files = localfs.walk_dir(
         SOURCE_ROOT,
         recursive=True,
@@ -564,6 +580,7 @@ async def indexing_app_main(
         artifacts,
         settings,
         identity,
+        db_identity,
     )
     if graph_settings is not None:
         await files_handle.ready()
@@ -571,6 +588,7 @@ async def indexing_app_main(
             coco.component_subpath("graph"),
             GraphPublicationLiveComponent,
             graph_settings,
+            db_identity,
         )
         await graph_handle.ready()
     if watch_reload_signal:
@@ -594,11 +612,12 @@ async def process_frozen_chunk(
     sources: sqlite.TableTarget[SourceMetadata],
     artifacts: sqlite.TableTarget[ChunkInference],
     identity: InferenceIdentity,
+    db_identity: str = "",
 ) -> None:
     pointer, text = chunk
     metadata = frozen_chunk_metadata(pointer, text)
     sources.declare_row(row=metadata)
-    await process_chunk(metadata, artifacts, identity, frozen_text=text)
+    await process_chunk(metadata, artifacts, identity, frozen_text=text, db_identity=db_identity)
 
 
 def frozen_chunk_metadata(pointer: ChunkPointer, text: str) -> SourceMetadata:
@@ -689,16 +708,10 @@ async def frozen_indexing_app_main(
 ) -> GraphPlanSummary:
     """Reconcile an explicit immutable candidate corpus through the native targets."""
     active_chunks = stream.chunks if isinstance(stream, FrozenChunkStream) else stream
-    sources = await sqlite.mount_table_target(
-        SOURCE_DB,
-        table_name="source_chunks",
-        table_schema=await sqlite.TableSchema[SourceMetadata].from_class(SourceMetadata, primary_key=["chunk_id"]),
-    )
-    artifacts = await sqlite.mount_table_target(
-        SOURCE_DB,
-        table_name="chunk_inference",
-        table_schema=await sqlite.TableSchema[ChunkInference].from_class(ChunkInference, primary_key=["chunk_id"]),
-    )
+    source_db = coco.use_context(SOURCE_DB)
+    db_identity = _managed_db_identity(source_db)
+    sources = await mount_table("source_chunks", SourceMetadata, ["chunk_id"], db_identity=db_identity)
+    artifacts = await mount_table("chunk_inference", ChunkInference, ["chunk_id"], db_identity=db_identity)
     identity = InferenceIdentity(settings.program_identity, settings.embedding_identity)
     handles = [
         await coco.mount(
@@ -708,16 +721,17 @@ async def frozen_indexing_app_main(
             sources,
             artifacts,
             identity,
+            db_identity,
         )
         for chunk in active_chunks
     ]
     for handle in handles:
         await handle.ready()
-    coordinator = get_graph_delta_coordinator(coco.use_context(SOURCE_DB))
+    coordinator = get_graph_delta_coordinator(source_db)
     error = coordinator.pop_error()
     if error is not None:
         raise error
-    with coco.use_context(SOURCE_DB).readonly() as conn:
+    with source_db.readonly() as conn:
         fingerprint = compute_active_inference_fingerprint(conn, settings.program_identity, settings.embedding_identity)
     return await coco.use_mount(
         coco.component_subpath("publication"),
@@ -725,10 +739,16 @@ async def frozen_indexing_app_main(
         settings,
         fingerprint,
         frozen_text={p.chunk_id: text for p, text in active_chunks},
+        db_identity=db_identity,
     )
 
 
-def bind_native_indexing(engine: YawGraphEngine, *, batch_size: int = 64) -> YawGraphEngine:
+def bind_native_indexing(
+    engine: YawGraphEngine,
+    *,
+    batch_size: int = 64,
+    state_root: Path | None = None,
+) -> YawGraphEngine:
     """Compose frozen indexing at the daemon boundary; graph code owns no scheduler."""
 
     def execute(chunks: Sequence[tuple[ChunkPointer, str]], program: YawProgram) -> GraphPlanSummary:
@@ -749,7 +769,7 @@ def bind_native_indexing(engine: YawGraphEngine, *, batch_size: int = 64) -> Yaw
                 progress_callback=engine.emit_indexing_progress,
             ),
         )
-        state_root = Path(engine.db_path).resolve().parent / "candidate_coco" / Path(engine.db_path).name
+        resolved_state_root = resolve_coco_state_root(state_root if state_root is not None else engine.db_path)
         settings = GraphPlanSettings(
             corpus_root=engine.workspace_root,
             program_identity=program_identity,
@@ -770,7 +790,7 @@ def bind_native_indexing(engine: YawGraphEngine, *, batch_size: int = 64) -> Yaw
             context_window_tokens=program.context_window_tokens,
             max_output_tokens=program.max_output_tokens,
         )
-        environment = coco.Environment(settings=coco.Settings.from_env(state_root), context_provider=context)
+        environment = coco.Environment(settings=coco.Settings.from_env(resolved_state_root), context_provider=context)
         stream = FrozenChunkStream()
         try:
             app = coco.App(

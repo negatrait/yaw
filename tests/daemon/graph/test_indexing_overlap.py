@@ -372,18 +372,18 @@ def provider():
                             stage_text=json.dumps(data["messages"]),
                         )
                     }
-                elif "extractions" in state and "[[ ## passage ## ]]" in text:
-                    (passage,) = [source for source in state["extractions"] if source in text]
-                    field = "triples" if "[[ ## named_entities ## ]]" in text else "named_entities"
-                    output = {field: state["extractions"][passage][field]}
-                    with lock:
-                        state.setdefault("extraction_requests", []).append((field, passage))
                 elif "missing_entities" in text:
                     output = (
                         {"entity_definitions": []}
                         if state["mode"] == "shacl_unrepaired"
                         else {"entity_definitions": [["London", "Capital of England"]]}
                     )
+                elif "extractions" in state and "[[ ## passage ## ]]" in text:
+                    (passage,) = [source for source in state["extractions"] if source in text]
+                    field = "triples" if "[[ ## named_entities ## ]]" in text else "named_entities"
+                    output = {field: state["extractions"][passage][field]}
+                    with lock:
+                        state.setdefault("extraction_requests", []).append((field, passage))
                 elif "violations" in text:
                     all_msg_text = json.dumps(data["messages"])
                     if "healed_definition" in state:
@@ -902,3 +902,160 @@ def test_partition_frozen_chunks_requires_published_graph_and_emits_substage_pro
         assert [ptr.chunk_id for ptr, _ in changed_after_tamper] == ["c0", "c2", "c3"]
     finally:
         engine.close()
+
+
+def test_shared_lmdb_cross_db_memo_reuse_and_target_isolation(tmp_path, provider):
+    from yaw.core import ChunkPointer
+    from yaw.daemon.graph.engine import YawGraphEngine
+    from yaw.daemon.graph.storage import resolve_coco_state_root, resolve_db_identity
+    from yaw.daemon.indexing import bind_native_indexing
+
+    url, state = provider
+    state["delay"] = 0
+    state["healed_definition"] = "Ada Lovelace collaborated with Ada M. Lovelace on analytical algebra."
+    chunks = [
+        (
+            ChunkPointer(f"c{i:02d}", f"doc{i:02d}.md", 1, 1, f"doc{i:02d}", 1, 1),
+            f"Passage {i:02d}: Ada Lovelace collaborated with Ada M. Lovelace in London.",
+        )
+        for i in range(64)
+    ]
+    state["extractions"] = {
+        text: (
+            {
+                "named_entities": [
+                    ["Ada Lovelace", "English mathematician"],
+                    ["Ada M. Lovelace", "British mathematician and analyst"],
+                    ["London", ""],
+                ],
+                "triples": [
+                    {
+                        "sub": "Ada Lovelace",
+                        "pred": "collaborated with",
+                        "obj": "Ada M. Lovelace",
+                        "def": "English mathematician",
+                    },
+                    {
+                        "sub": "Ada Lovelace",
+                        "pred": "visited",
+                        "obj": "London",
+                        "def": "Ada Lovelace visited London during her research.",
+                    },
+                ],
+            }
+            if idx == 0
+            else {
+                "named_entities": [
+                    ["Ada Lovelace", "English mathematician"],
+                    ["Ada M. Lovelace", "British mathematician and analyst"],
+                ],
+                "triples": [
+                    {
+                        "sub": "Ada Lovelace",
+                        "pred": "collaborated with",
+                        "obj": "Ada M. Lovelace",
+                        "def": "English mathematician",
+                    }
+                ],
+            }
+        )
+        for idx, (_, text) in enumerate(chunks)
+    }
+
+    db_a_path = tmp_path / "db_a.sqlite"
+    db_b_path = tmp_path / "db_b.sqlite"
+    assert resolve_coco_state_root(db_a_path) == tmp_path / "coco_lmdb"
+    assert resolve_coco_state_root(db_b_path) == tmp_path / "coco_lmdb"
+
+    tracked_tables = (
+        "source_chunks",
+        "chunk_inference",
+        "chunks",
+        "entities",
+        "entity_labels",
+        "facts",
+        "fact_sources",
+        "edges",
+        "edge_sources",
+        "chunk_vec",
+        "entity_vec",
+        "fact_vec",
+        "entity_mentions",
+        "fact_assertions",
+    )
+
+    def snapshot_db(conn) -> dict[str, list[tuple[Any, ...]]]:
+        snap: dict[str, list[tuple[Any, ...]]] = {
+            table: conn.execute(f"SELECT * FROM {table} ORDER BY 1, 2").fetchall() for table in tracked_tables
+        }
+        snap["chunk_fts"] = conn.execute("SELECT rowid, chunk_id FROM chunk_fts ORDER BY chunk_id").fetchall()
+        snap["fact_fts"] = conn.execute("SELECT rowid, fact_id FROM fact_fts ORDER BY fact_id").fetchall()
+        snap["meta"] = conn.execute("SELECT key, value FROM meta WHERE key != 'db_identity' ORDER BY key").fetchall()
+        return snap
+
+    lm = create_dspy_lm("overlap", base_url=url + "/v1", cache=False, num_retries=0, max_tokens=512)
+    program = YawProgram(orchestrator_lm=lm, rlm_sub_lm=lm, enable_gbnf=False, max_output_tokens=512)
+    embedder = adapter(url)
+
+    engine_a = bind_native_indexing(
+        YawGraphEngine(
+            db_a_path,
+            tmp_path,
+            program,
+            embedder,
+            synonymy_top_k=5,
+            synonymy_threshold=-1.0,
+        ),
+        batch_size=64,
+    )
+    try:
+        assert engine_a.index_chunks(chunks) == 64
+        assert engine_a.lint_graph()["conforms"]
+        id_a = resolve_db_identity(engine_a.conn, db_a_path)
+        assert engine_a.conn.execute("SELECT value FROM meta WHERE key = 'db_identity'").fetchone()[0] == id_a
+        snap_a_initial = snapshot_db(engine_a.conn)
+        assert len(snap_a_initial["source_chunks"]) == 64
+        assert len(snap_a_initial["chunk_inference"]) == 64
+        assert len(snap_a_initial["chunks"]) == 64
+        assert len(snap_a_initial["chunk_vec"]) == 64
+        assert len(snap_a_initial["entities"]) >= 2
+        assert len(snap_a_initial["facts"]) >= 2
+
+        calls_after_a = len(state["intervals"])
+        extractions_after_a = len(state.get("extraction_requests", []))
+        embeddings_after_a = len(state.get("embedding_inputs", []))
+        healers_after_a = len(state.get("healer_requests", []))
+        assert calls_after_a > 0
+        assert extractions_after_a == 128
+        assert embeddings_after_a > 0
+        assert healers_after_a > 0
+
+        engine_b = bind_native_indexing(
+            YawGraphEngine(
+                db_b_path,
+                tmp_path,
+                program,
+                embedder,
+                synonymy_top_k=5,
+                synonymy_threshold=-1.0,
+            ),
+            batch_size=64,
+        )
+        try:
+            assert engine_b.index_chunks(chunks) == 64
+            assert engine_b.lint_graph()["conforms"]
+            id_b = resolve_db_identity(engine_b.conn, db_b_path)
+            assert id_b != id_a
+            assert engine_b.conn.execute("SELECT value FROM meta WHERE key = 'db_identity'").fetchone()[0] == id_b
+            assert len(state["intervals"]) == calls_after_a
+            assert len(state.get("extraction_requests", [])) == extractions_after_a
+            assert len(state.get("embedding_inputs", [])) == embeddings_after_a
+            assert len(state.get("healer_requests", [])) == healers_after_a
+
+            snap_b = snapshot_db(engine_b.conn)
+            assert snap_b == snap_a_initial
+            assert snapshot_db(engine_a.conn) == snap_a_initial
+        finally:
+            engine_b.close()
+    finally:
+        engine_a.close()

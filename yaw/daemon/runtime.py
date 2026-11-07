@@ -54,7 +54,7 @@ from yaw.daemon.graph.inference.components import (
     OpenIEEndpoint,
 )
 from yaw.daemon.graph.planner import GraphPlanSettings
-from yaw.daemon.graph.storage.db import GRAPH_DB
+from yaw.daemon.graph.storage.db import GRAPH_DB, resolve_coco_state_root
 from yaw.daemon.graph.storage.managed_sqlite import VALIDATE_SQLITE
 from yaw.daemon.graph.storage.rows import validate_graph_state
 from yaw.daemon.indexing import (
@@ -304,7 +304,7 @@ class YawRuntime:
         context.provide(RELOAD_SIGNAL_ROOT, yaw_dir)
         context.provide(RELOAD_SIGNAL_HANDLER, self._on_reload_signal)
 
-        state_dir = Path(self.config.state_dir).resolve() / "indexing_coco"
+        state_dir = resolve_coco_state_root(self.config.state_dir)
         self._coco_env = coco.Environment(
             settings=coco.Settings.from_env(state_dir),
             context_provider=context,

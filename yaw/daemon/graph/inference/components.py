@@ -114,6 +114,10 @@ class SynonymJudgeInput:
     program_identity: str
     synonym_identity: str = ""
 
+    def __post_init__(self) -> None:
+        if self.batch.construction_seconds != 0.0:
+            object.__setattr__(self, "batch", replace(self.batch, construction_seconds=0.0))
+
 
 @dataclass(frozen=True, slots=True)
 class JudgedSynonyms:

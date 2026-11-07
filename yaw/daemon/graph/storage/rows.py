@@ -135,7 +135,11 @@ GRAPH_TABLES = (
 
 
 def graph_tables(
-    conn: sqlite3.Connection, chunks: Sequence[tuple[ChunkPointer, str]], fingerprints: Sequence[tuple[str, str]]
+    conn: sqlite3.Connection,
+    chunks: Sequence[tuple[ChunkPointer, str]],
+    fingerprints: Sequence[tuple[str, str]],
+    *,
+    db_identity: str = "",
 ) -> tuple[DesiredTable, ...]:
     tables = []
     for name, row_type, key in GRAPH_TABLES:
@@ -156,22 +160,26 @@ def graph_tables(
         subject, _, obj = json.loads(raw)
         facts.append(FactText(fid, f"{subject} {predicate} {obj}"))
     tables.append(DesiredTable("fact_fts", FactText, ("fact_id",), tuple(facts), ("fact_id",)))
-    tables.append(
-        DesiredTable("meta", MetaRow, ("key",), (MetaRow("graph_input_fingerprints", json.dumps(tuple(fingerprints))),))
-    )
+    meta_rows: list[MetaRow] = [MetaRow("graph_input_fingerprints", json.dumps(tuple(fingerprints)))]
+    if db_identity:
+        meta_rows.append(MetaRow("db_identity", db_identity))
+    tables.append(DesiredTable("meta", MetaRow, ("key",), tuple(meta_rows)))
     return tuple(tables)
 
 
-def empty_graph_tables() -> tuple[DesiredTable, ...]:
+def empty_graph_tables(*, db_identity: str = "") -> tuple[DesiredTable, ...]:
+    meta_rows: list[MetaRow] = [MetaRow("graph_input_fingerprints", "[]")]
+    if db_identity:
+        meta_rows.append(MetaRow("db_identity", db_identity))
     return (
         *(DesiredTable(name, row_type, key, ()) for name, row_type, key in GRAPH_TABLES),
         DesiredTable("chunk_fts", ChunkText, ("chunk_id",), (), ("chunk_id",)),
         DesiredTable("fact_fts", FactText, ("fact_id",), (), ("fact_id",)),
-        DesiredTable("meta", MetaRow, ("key",), (MetaRow("graph_input_fingerprints", "[]"),)),
+        DesiredTable("meta", MetaRow, ("key",), tuple(meta_rows)),
     )
 
 
-async def declare_tables(tables: tuple[DesiredTable, ...]) -> None:
+async def declare_tables(tables: tuple[DesiredTable, ...], *, db_identity: str = "") -> None:
     targets = [
         await mount_table(
             table.name,
@@ -179,12 +187,15 @@ async def declare_tables(tables: tuple[DesiredTable, ...]) -> None:
             list(table.primary_key),
             fts_unindexed=table.fts_unindexed,
             indexes=EVIDENCE_INDEXES.get(table.name, ()),
+            db_identity=db_identity,
         )
         for table in tables
     ]
     for target, table in zip(targets, tables, strict=True):
         for row in table.rows:
             target.declare_row(row=row)
+        if table.name == "meta" and db_identity and not any(row.key == "db_identity" for row in table.rows):
+            target.declare_row(row=MetaRow("db_identity", db_identity))
 
 
 def validate_graph_state(conn: sqlite3.Connection) -> None:
