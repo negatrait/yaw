@@ -424,7 +424,7 @@ def load_dataset_splits(
         rows, document_rows = bundle.read_inputs()
         if quotas := spec.get("category_quotas"):
             cohort = select_enterprise_questions(rows, quotas=quotas)
-            train_part = int(spec.get("train_partition_size", 223))
+            train_part = int(spec.get("train_partition_size", 135))
             rows = (
                 cohort[:train_part][query_offset : query_offset + train_queries]
                 + cohort[train_part:][query_offset : query_offset + max_queries - train_queries]
@@ -454,7 +454,8 @@ def load_dataset_splits(
             examples.append(example_factory(_inputs=("question", "item_docs"), **values) if example_factory else values)
         trains.append(examples[:train_queries])
         vals.append(examples[train_queries:])
-        docs.extend(by_id.values())
+        cohort_docs = [doc for references in gold_lists for doc in references]
+        docs.extend(cohort_docs if cohort_docs else by_id.values())
     train = [group[i] for i in range(max(map(len, trains))) for group in trains if i < len(group)]
     val = [group[i] for i in range(max(map(len, vals))) for group in vals if i < len(group)]
     return train, val, list(dict.fromkeys(docs))

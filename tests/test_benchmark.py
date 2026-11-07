@@ -514,10 +514,11 @@ class DatasetSliceTests(unittest.TestCase):
             self.assertEqual(len(bundle.documents), len(documents))
             self.assertEqual(json.loads(bundle.evaluation_path.read_text(encoding="utf-8")), questions)
             train, val, corpus = _load_dataset_splits(
-                ["enterprise_rag_bench"], workspace_root=root, max_queries=250, train_queries=223
+                ["enterprise_rag_bench"], workspace_root=root, max_queries=162, train_queries=135
             )
             assert val is not None
-            self.assertEqual((len(train), len(val), len(corpus)), (223, 27, len(documents)))
+            self.assertEqual((len(train), len(val), len(corpus)), (135, 27, 162))
+            self.assertTrue(all("Distractor" not in doc for doc in corpus))
 
 
 class EvaluationAndIntegrityTests(unittest.TestCase):

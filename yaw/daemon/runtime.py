@@ -1077,11 +1077,21 @@ class YawRuntime:
                 if len(roots) != 1:
                     raise ValueError("Dataset bundles must share one dataset directory")
                 self.engine.workspace_root = next(iter(roots))
+                selected_corpus = set(corpus_docs) if corpus_docs else None
                 for bundle in dataset_bundles:
+                    doc_ids: list[str] | None = None
+                    if selected_corpus:
+                        by_id = bundle.corpus_by_id()
+                        matched_ids = [
+                            doc.document_id for doc in bundle.documents if by_id.get(doc.document_id) in selected_corpus
+                        ]
+                        if matched_ids:
+                            doc_ids = matched_ids
                     opt_chunks.extend(
                         snapshot_dataset_bundle(
                             bundle,
                             Path(self.config.state_dir) / "optimize_coco" / bundle.dataset,
+                            document_ids=doc_ids,
                             chunk_size=self.config.chunk_size,
                             chunk_overlap=self.config.chunk_overlap,
                             min_chunk_size=self.config.min_chunk_size,

@@ -41,12 +41,12 @@ flowchart TD
     subgraph DataCuration ["2. Faithful prepared bundle"]
         INPUTS["Configured corpus JSON + original question JSON"] --> PREP["scripts/download-datasets.py: copy every document"]
         PREP --> OUT_DS["documents/*.json + evaluation/questions.json + manifest.json"]
-        OUT_DS --> STRAT["Evaluation loader: seed 42, category quotas, 150 train / 100 validation"]
+        OUT_DS --> STRAT["Evaluation loader: seed 42, category quotas, 135 train / 27 validation"]
     end
 
     subgraph NativeCLI ["3. Native CLI Sandbox Optimization (yaw dspy optimize)"]
-        STRAT --> CLI_OPT["yaw dspy optimize --dataset enterprise_rag_bench<br/>--max-queries 250 --train-queries 150 --mode gepa --auto heavy"]
-        CLI_OPT --> SANDBOX["Persistent CocoIndex snapshot of documents only; isolated graph database"]
+        STRAT --> CLI_OPT["yaw dspy optimize --dataset enterprise_rag_bench<br/>--max-queries 162 --train-queries 135 --mode gepa --auto light"]
+        CLI_OPT --> SANDBOX["Persistent CocoIndex snapshot of gold cohort documents only; isolated graph database"]
         SANDBOX --> GEPA["dspy.GEPA + existing task-quality metric"]
         GEPA --> PROPOSER["RLM evidence selection + native DSPy instruction proposer"]
         PROPOSER --> TARGETS["Mutate ONLY Stratum A Runtime Predictors (YawProgram, Sigs 1–9)"]
@@ -150,20 +150,20 @@ Reports evaluate native YAW with side-by-side delta comparisons:
 
 The downloader copies the complete configured corpus and original QA bytes.
 It does not fetch the upstream document table or sample documents using QA labels.
-The evaluation loader owns the following 250-query policy (`150` Train / `100` Validation):
+The evaluation loader owns the following 162-query policy (`135` Train / `27` Validation) and restricts optimization corpus snapshots to the selected gold-document cohort union (zero extra background distractors):
 
 ```python
 ENTERPRISE_CATEGORY_QUOTAS: dict[str, tuple[int, int]] = {
-    "Basic": (35, 24),
-    "Semantic": (27, 18),
-    "Intra-Document Reasoning": (16, 11),
-    "Project Related": (16, 11),
-    "Constrained": (12, 8),
-    "Conflicting Info": (10, 6),
-    "Completeness": (10, 6),
-    "Miscellaneous": (9, 6),
-    "Info Not Found": (9, 6),
-    "High Level": (6, 4),
+    "Basic": (33, 5),
+    "Semantic": (25, 4),
+    "Intra-Document Reasoning": (15, 3),
+    "Project Related": (15, 3),
+    "Constrained": (11, 2),
+    "Conflicting Info": (8, 2),
+    "Completeness": (8, 2),
+    "Miscellaneous": (8, 2),
+    "Info Not Found": (8, 2),
+    "High Level": (4, 2),
 }
 ```
 
@@ -242,7 +242,7 @@ when adopting this breaking layout; no migration or legacy-layout discovery exis
    ```
 3. **CLI Optimization & Hot-Reload Promotion**:
    ```powershell
-   uv run --locked yaw dspy optimize --dataset enterprise_rag_bench --max-queries 250 --train-queries 150 --mode gepa --auto heavy --output .yaw/compiled_program_enterprise.json
+   uv run --locked yaw dspy optimize --dataset enterprise_rag_bench --max-queries 162 --train-queries 135 --mode gepa --auto light --output .yaw/compiled_program_enterprise.json
    uv run --locked yaw dspy load-program .yaw/compiled_program_enterprise.json
    ```
 4. **Dual-Target Parity Gate Evaluation**:

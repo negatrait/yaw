@@ -973,7 +973,7 @@ Tier 2 anti-overfitting guard."""
             assert opt_cfg.db_path is not None
             assert not list((opt_cfg.corpus_root / "corpus").glob("*.md"))
             pools = json.loads((tmp_path / "custom_compiled_pools.json").read_text(encoding="utf-8"))
-            assert len(pools["corpus_chunk_ids"]) >= 6
+            assert len(pools["corpus_chunk_ids"]) == 6
             with closing(sqlite3.connect(opt_cfg.db_path.as_uri() + "?mode=ro", uri=True)) as conn:
                 db_chunks = conn.execute("SELECT rel_posix_path FROM chunks").fetchall()
             assert len(db_chunks) >= 4
@@ -1027,7 +1027,7 @@ Tier 2 anti-overfitting guard."""
     assert not list((opt_cfg_after.corpus_root / "corpus").glob("*.md"))
     with closing(sqlite3.connect(opt_cfg_after.db_path.as_uri() + "?mode=ro", uri=True)) as conn:
         db_chunks_after = conn.execute("SELECT rel_posix_path FROM chunks").fetchall()
-    assert len(db_chunks_after) >= 6
+    assert len(db_chunks_after) == 6
     assert all("/documents/" in row[0] for row in db_chunks_after)
     opt_out = json.loads(buf.getvalue())
     assert opt_out["optimized"] is True
@@ -1037,7 +1037,7 @@ Tier 2 anti-overfitting guard."""
     assert opt_out["val_queries"] == 2
     assert Path(opt_out["compiled_program_path"]).exists()
     assert Path(opt_out["proposer_telemetry_path"]).exists()
-    assert opt_out["stats"]["chunks"] >= 6
+    assert opt_out["stats"]["chunks"] == 6
     assert captured_gepa["trainset_len"] == 4
     assert captured_gepa["valset_len"] == 2
     assert captured_gepa["auto"] == "light"
