@@ -1,6 +1,5 @@
 """Unified yaw.db SQLite connection lifecycle, schema DDL, and metadata key-value store."""
 
-import json
 import sqlite3
 import time
 from collections.abc import Generator, Iterator, Sequence
@@ -11,8 +10,6 @@ import cocoindex as coco
 import sqlite_vec
 from cocoindex.connectors.sqlite import ManagedConnection
 from cocoindex.connectors.sqlite import connect as coco_sqlite_connect
-
-from yaw.core import text_processing
 
 SQL_BATCH_SIZE = 500
 GRAPH_DB = coco.ContextKey[ManagedConnection]("yaw/graph_db")
@@ -289,34 +286,6 @@ def open_readonly_yaw_db(
     raise sqlite3.OperationalError(f"Failed to open read-only SQLite database: {resolved}")
 
 
-def migrate_edges_reasoning(conn: sqlite3.Connection) -> None:
-    """Ensure reasoning column exists on edges table (idempotent migration)."""
-    edges_cols = {str(r[1]).lower() for r in conn.execute("PRAGMA table_info(edges)").fetchall()}
-    if "reasoning" not in edges_cols and "src_id" in edges_cols:
-        conn.execute("ALTER TABLE edges ADD COLUMN reasoning TEXT NOT NULL DEFAULT ''")
-
-
-def migrate_epistemic_confidence_columns(conn: sqlite3.Connection) -> None:
-    """Ensure epistemic confidence columns exist across tables for existing databases."""
-    entity_cols = {str(row[1]).lower() for row in conn.execute("PRAGMA table_info(entities)").fetchall()}
-    if "confidence" not in entity_cols and "entity_id" in entity_cols:
-        conn.execute("ALTER TABLE entities ADD COLUMN confidence REAL")
-
-    fact_cols = {str(row[1]).lower() for row in conn.execute("PRAGMA table_info(facts)").fetchall()}
-    if "confidence" not in fact_cols and "fact_id" in fact_cols:
-        conn.execute("ALTER TABLE facts ADD COLUMN confidence REAL")
-
-    fact_src_cols = {str(row[1]).lower() for row in conn.execute("PRAGMA table_info(fact_sources)").fetchall()}
-    for col in ("llm_prob", "vec_coherence", "atomic_confidence"):
-        if col not in fact_src_cols and "fact_id" in fact_src_cols:
-            conn.execute(f"ALTER TABLE fact_sources ADD COLUMN {col} REAL")
-
-    edge_src_cols = {str(row[1]).lower() for row in conn.execute("PRAGMA table_info(edge_sources)").fetchall()}
-    for col in ("llm_prob", "vec_coherence", "atomic_confidence"):
-        if col not in edge_src_cols and "src_id" in edge_src_cols:
-            conn.execute(f"ALTER TABLE edge_sources ADD COLUMN {col} REAL")
-
-
 def validate_graph_schema(conn: sqlite3.Connection) -> None:
     """Reject retired graph stores before any persistent database change."""
     retired = conn.execute(
@@ -328,220 +297,11 @@ def validate_graph_schema(conn: sqlite3.Connection) -> None:
 
 
 def initialize_schema(conn: sqlite3.Connection) -> None:
-    """Initialize all unified schema tables and indices in yaw.db with in-place migrations."""
+    """Initialize all unified schema tables and indices in yaw.db."""
     validate_graph_schema(conn)
     with write_tx(conn):
         for stmt in _CREATE_SCHEMA_STATEMENTS:
             conn.execute(stmt)
-
-        # Auto-migrate legacy content_hash column on chunks if present
-        chunk_cols = {row[1] for row in conn.execute("PRAGMA table_info(chunks)").fetchall()}
-        if "content_hash" in chunk_cols:
-            conn.execute("ALTER TABLE chunks DROP COLUMN content_hash")
-        if "ast_island_start" not in chunk_cols:
-            conn.execute("ALTER TABLE chunks ADD COLUMN ast_island_start INTEGER NOT NULL DEFAULT 0")
-        if "ast_island_end" not in chunk_cols:
-            conn.execute("ALTER TABLE chunks ADD COLUMN ast_island_end INTEGER NOT NULL DEFAULT 0")
-
-        # Auto-migrate entities.definition and drop legacy UNIQUE constraint on entities.name
-        entity_cols = {row[1] for row in conn.execute("PRAGMA table_info(entities)").fetchall()}
-        if "definition" not in entity_cols:
-            conn.execute("ALTER TABLE entities ADD COLUMN definition TEXT NOT NULL DEFAULT ''")
-        entity_ddl_row = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'entities'"
-        ).fetchone()
-        if entity_ddl_row is not None and (
-            "UNIQUE" in str(entity_ddl_row[0]).upper() or "COLLATE NOCASE" not in str(entity_ddl_row[0]).upper()
-        ):
-            conn.execute(
-                """
-                CREATE TABLE _entities_migrated (
-                    entity_id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL COLLATE NOCASE,
-                    definition TEXT NOT NULL DEFAULT ''
-                )
-                """
-            )
-            conn.execute(
-                "INSERT INTO _entities_migrated (entity_id, name, definition) SELECT entity_id, name, "
-                "definition FROM entities"
-            )
-            conn.execute("DROP TABLE entities")
-            conn.execute("ALTER TABLE _entities_migrated RENAME TO entities")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name)")
-
-        # Auto-migrate facts table to support mutually exclusive entity vs literal objects
-        fact_cols = {row[1] for row in conn.execute("PRAGMA table_info(facts)").fetchall()}
-        if "definition" not in fact_cols:
-            conn.execute("ALTER TABLE facts ADD COLUMN definition TEXT NOT NULL DEFAULT ''")
-        facts_ddl_row = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'facts'").fetchone()
-        if facts_ddl_row is not None and (
-            "obj_kind" not in fact_cols
-            or "obj_literal_lex" not in str(facts_ddl_row[0])
-            or "obj_id != subj_id" not in str(facts_ddl_row[0])
-        ):
-            conn.execute(
-                """
-                CREATE TABLE _facts_migrated (
-                    fact_id TEXT PRIMARY KEY,
-                    subj_id TEXT NOT NULL,
-                    pred TEXT NOT NULL,
-                    obj_kind TEXT NOT NULL DEFAULT 'entity' CHECK (obj_kind IN ('entity', 'literal')),
-                    obj_id TEXT,
-                    obj_literal_lex TEXT,
-                    obj_datatype TEXT NOT NULL DEFAULT '',
-                    obj_lang TEXT NOT NULL DEFAULT '',
-                    raw_triple_json TEXT NOT NULL,
-                    definition TEXT NOT NULL DEFAULT '',
-                    CHECK (
-                        (obj_kind = 'entity' AND obj_id IS NOT NULL AND TRIM(obj_id) != '' AND obj_literal_lex IS NULL)
-                        OR (
-                            obj_kind = 'literal'
-                            AND (obj_id IS NULL OR (TRIM(obj_id) != '' AND obj_id != subj_id))
-                            AND obj_literal_lex IS NOT NULL
-                            AND TRIM(obj_literal_lex) != ''
-                        )
-                    )
-                )
-                """
-            )
-            if "obj_kind" in fact_cols and "obj_literal_lex" in fact_cols:
-                conn.execute(
-                    """
-                    INSERT INTO _facts_migrated (
-                        fact_id, subj_id, pred, obj_kind, obj_id, obj_literal_lex,
-                        obj_datatype, obj_lang, raw_triple_json, definition
-                    )
-                    SELECT
-                        fact_id, subj_id, pred, COALESCE(obj_kind, 'entity'), obj_id, obj_literal_lex,
-                        COALESCE(obj_datatype, ''), COALESCE(obj_lang, ''), raw_triple_json, COALESCE(definition, '')
-                    FROM facts
-                    """
-                )
-            else:
-                conn.execute(
-                    """
-                    INSERT INTO _facts_migrated (
-                        fact_id, subj_id, pred, obj_kind, obj_id, obj_literal_lex,
-                        obj_datatype, obj_lang, raw_triple_json, definition
-                    )
-                    SELECT
-                        fact_id, subj_id, pred, 'entity', obj_id, NULL,
-                        '', '', raw_triple_json, COALESCE(definition, '')
-                    FROM facts
-                    WHERE obj_id IS NOT NULL
-                    """
-                )
-            conn.execute("DROP TABLE facts")
-            conn.execute("ALTER TABLE _facts_migrated RENAME TO facts")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_facts_subj ON facts(subj_id)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_facts_obj ON facts(obj_id)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_facts_pair ON facts(subj_id, obj_id)")
-
-        # Auto-migrate edges CHECK constraint and legacy 'synonymy' kind -> 'skos:related',
-        # plus 'skos:broader'
-        migrate_edges_reasoning(conn)
-        edges_ddl_row = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'edges'").fetchone()
-        if edges_ddl_row is not None and (
-            "skos:related" not in str(edges_ddl_row[0]) or "skos:broader" not in str(edges_ddl_row[0])
-        ):
-            conn.execute(
-                """
-                CREATE TABLE _edges_migrated (
-                    src_id TEXT NOT NULL,
-                    dst_id TEXT NOT NULL,
-                    kind TEXT NOT NULL CHECK (
-                        kind IN (
-                            'passage', 'fact', 'skos:related', 'skos:broader',
-                            'owl:differentFrom'
-                        )
-                    ),
-                    weight REAL NOT NULL,
-                    reasoning TEXT NOT NULL DEFAULT '',
-                    PRIMARY KEY (src_id, dst_id, kind)
-                )
-                """
-            )
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO _edges_migrated (src_id, dst_id, kind, weight, reasoning)
-                SELECT
-                    src_id,
-                    dst_id,
-                    CASE WHEN kind = 'synonymy' THEN 'skos:related' ELSE kind END,
-                    weight,
-                    COALESCE(reasoning, '')
-                FROM edges
-                WHERE kind IN (
-                    'passage', 'fact', 'synonymy', 'skos:related',
-                    'skos:broader', 'owl:differentFrom'
-                )
-                """
-            )
-            conn.execute("DROP TABLE edges")
-            conn.execute("ALTER TABLE _edges_migrated RENAME TO edges")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_id, kind)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst_id, kind)")
-
-        # Ensure reasoning column exists on edges table (idempotent migration)
-        migrate_edges_reasoning(conn)
-
-        # Ensure epistemic confidence columns exist across tables
-        migrate_epistemic_confidence_columns(conn)
-
-        # Auto-backfill fact_sources from edge_sources for legacy entity-object facts
-        fact_sources_cnt = int(conn.execute("SELECT COUNT(*) FROM fact_sources").fetchone()[0])
-        if fact_sources_cnt == 0:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO fact_sources (fact_id, chunk_id)
-                SELECT f.fact_id, es.chunk_id
-                FROM facts f
-                INNER JOIN edge_sources es
-                  ON es.kind = 'fact' AND es.src_id = f.subj_id AND es.dst_id = f.obj_id
-                WHERE f.obj_kind = 'entity' AND f.obj_id IS NOT NULL
-                """
-            )
-
-        # Auto-backfill entity_labels for any legacy entities without labels
-        missing_label_rows = conn.execute(
-            """
-            SELECT e.entity_id, e.name
-            FROM entities e
-            WHERE NOT EXISTS (
-                SELECT 1 FROM entity_labels el WHERE el.entity_id = e.entity_id
-            )
-            """
-        ).fetchall()
-        if missing_label_rows:
-            conn.executemany(
-                """
-                INSERT OR IGNORE INTO entity_labels (label_norm, entity_id, label_kind, raw_label, chunk_id)
-                VALUES (?, ?, 'skos:prefLabel', ?, '__legacy__')
-                """,
-                (
-                    (str(text_processing(r[1])) or str(r[1]).strip().lower(), str(r[0]), str(r[1]))
-                    for r in missing_label_rows
-                ),
-            )
-
-        # Auto-backfill fact_fts if facts exist but fact_fts is empty
-        fact_count = int(conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0])
-        if fact_count > 0:
-            fts_count = int(conn.execute("SELECT COUNT(*) FROM fact_fts").fetchone()[0])
-            if fts_count == 0:
-                rows = conn.execute("SELECT fact_id, pred, raw_triple_json FROM facts").fetchall()
-                fts_items: list[tuple[str, str]] = []
-                for row in rows:
-                    fid = str(row[0])
-                    pred = str(row[1])
-                    try:
-                        items = json.loads(row[2])
-                        fts_items.append((fid, f"{items[0]} {pred} {items[2]}"))
-                    except json.JSONDecodeError, TypeError, IndexError:
-                        fts_items.append((fid, pred))
-                if fts_items:
-                    conn.executemany("INSERT INTO fact_fts (fact_id, text) VALUES (?, ?)", fts_items)
 
 
 def get_meta(conn: sqlite3.Connection, key: str) -> str | None:

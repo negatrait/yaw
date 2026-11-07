@@ -14,7 +14,6 @@ _PUBLIC_API: dict[str, str] = {
     "open_yaw_db": ".db",
     "open_readonly_yaw_db": ".db",
     "initialize_schema": ".db",
-    "migrate_edges_reasoning": ".db",
     "write_tx": ".db",
     "get_meta": ".db",
     "set_meta": ".db",

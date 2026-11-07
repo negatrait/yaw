@@ -1,760 +1,276 @@
 # Native CocoIndex graph: batch-independent incremental publication
 
-Status: specification, 2026-11-07; implementation and acceptance remain open. Pinned code: `c6fa080`.
+Status: draft, 2026-11-07. Pinned code: `50be17d`.
 
 | Relation | Links |
 | --- | --- |
 | Governed by | [FOUNDATIONAL.md](../FOUNDATIONAL.md), [AGENTS.md](../AGENTS.md), [epic-1-hipporag-daemon.md](epic-1-hipporag-daemon.md) |
 | Rules | [graph-storage.md](../.agents/rules/graph-storage.md): `yaw/daemon/graph/*.py`, `yaw/daemon/graph/storage/*.py`; [daemon.md](../.agents/rules/daemon.md): `yaw/daemon/*.py`; [inference.md](../.agents/rules/inference.md): `yaw/daemon/graph/inference/*.py`; [tests.md](../.agents/rules/tests.md): `tests/**/*.py`; [docs.md](../.agents/rules/docs.md): `docs/**/*.md` |
-| Owns code | `yaw/daemon/indexing.py:publish_graph`, `yaw/daemon/graph/planner.py`, `yaw/daemon/graph/normalization.py`, `yaw/daemon/graph/storage/db.py`, `yaw/daemon/graph/storage/evidence.py`, `yaw/daemon/graph/storage/graph_ops.py`, `yaw/daemon/graph/storage/managed_sqlite.py`, `yaw/daemon/graph/storage/rows.py`, `yaw/daemon/graph/storage/shacl.py`, `yaw/daemon/graph/storage/vectors.py`, `yaw/daemon/graph/inference/components.py:heal_shacl_violations` |
-| Peers | [native-cocoindex-indexing.md](native-cocoindex-indexing.md): owns `64`-chunk micro-batch source scheduling and runtime lifecycle; [w3c-improvements.md](w3c-improvements.md): constrains SKOS/OWL/SHACL closed-world shapes and Active EDC label canonicalization (`§3.2`); [epistemic-confidence-spec.md](epistemic-confidence-spec.md): constrains Bayesian confidence pooling; [dspy-improvements.md](dspy-improvements.md): constrains GBNF adapter and RLM healer architecture |
+| Owns code | `yaw/daemon/graph/planner.py`, `yaw/daemon/graph/normalization.py`, `yaw/daemon/graph/engine.py`, `yaw/daemon/graph/ppr.py`, `yaw/daemon/graph/storage/chunks.py`, `yaw/daemon/graph/storage/db.py`, `yaw/daemon/graph/storage/evidence.py`, `yaw/daemon/graph/storage/graph_ops.py` (except `canonicalize_entity_labels_edc`), `yaw/daemon/graph/storage/hydration.py`, `yaw/daemon/graph/storage/managed_sqlite.py`, `yaw/daemon/graph/storage/rows.py`, `yaw/daemon/graph/storage/shacl.py`, `yaw/daemon/graph/storage/vectors.py`, `yaw/daemon/graph/storage/candidate_cache.py`, `yaw/daemon/graph/inference/components.py` (`define_missing_entities`, `judge_synonyms`, `heal_shacl_violations`) |
+| Peers | [native-cocoindex-indexing.md](native-cocoindex-indexing.md): owns `64`-chunk `[target]` micro-batch source scheduling, `publish_graph` component mounting, shared `<state_dir>/coco_lmdb` lifecycle, and direct `ChunkProcessOutput` `coco.use_mount` handoff; [w3c-improvements.md](w3c-improvements.md): owns `yaw/daemon/graph/storage/synonyms.py` and `yaw/daemon/graph/storage/graph_ops.py:canonicalize_entity_labels_edc` (`§3.2`) and constrains SKOS/OWL/SHACL closed-world shapes; [epistemic-confidence-spec.md](epistemic-confidence-spec.md): constrains Bayesian confidence pooling; [dspy-improvements.md](dspy-improvements.md): constrains GBNF adapter and RLM healer architecture |
 | References | [arxiv-2502.14802v1-hipporag2.md](arxiv-2502.14802v1-hipporag2.md): anchors HippoRAG 2 retrieval parity; [model-evaluation.md](model-evaluation.md): anchors local `llama.cpp` serving constraints (`parallel = 1` `[target]`) |
-| Supersedes / superseded by | Supersedes all earlier `skos:ConceptScheme` / clustering proposals and the single-batch unconditional `canonicalize_fact_definitions` overwrite in [shacl-healer-publication.md](reviews/shacl-healer-publication.md) (`c6fa080`) |
+| Supersedes / superseded by | Supersedes all earlier `skos:ConceptScheme` / clustering proposals, the single-batch unconditional `canonicalize_fact_definitions` overwrite in [shacl-healer-publication.md](reviews/shacl-healer-publication.md) (`c6fa080`), the `§5.1/§9.1` per-chunk `chunk_vec` target declaration split (`c6fa080`), and the `§9.1 C3` exemption retaining `CandidateStageCache` (`c6fa080`) |
 | Records | [shacl-healer-publication.md](reviews/shacl-healer-publication.md), [incremental-publication-work.md](reviews/incremental-publication-work.md), [resource-vocabulary-boundary.md](reviews/resource-vocabulary-boundary.md), [concept-scheme-removal.md](reviews/concept-scheme-removal.md), [evaluation-graph-storage.md](evaluation-graph-storage.md), [evaluation-ingestion.md](evaluation-ingestion.md) |
 
-## 1. Mission and controlling decisions
+## 1. Scope
 
-For the same 128 source chunks, indexing and publishing 64 + 64 must cost roughly
-as much total compute as indexing and publishing 128 together, and must produce
-roughly the same entity, fact and typed-edge counts. These are the two acceptance
-goals. Counts alone cannot prove the same graph, so compare canonical connections
-and provenance as well. Sections 2 and 3 define the measurements and tolerances.
+In scope: Documentation contract for batch-independent canonical entity/fact/edge identity, resource-vs-literal W3C boundaries, focus-isolated SHACL repair (`heal_shacl_violations`), affected-owner incremental graph planning without `:memory:` cloning or full-table survivor `SELECT *` hydration, single-component atomic `DatabaseSink` target reconciliation (`RowHandler.tracks_value_fingerprint = True`), `db_identity`-scoped target state tracking, `sqlite-vec` `vec0` virtual table storage (`chunk_vec`, `entity_vec`, `fact_vec`), retirement of `CandidateStageCache` / `candidate_stage_cache`, sparse CSR Personalized PageRank (PPR), and the paired `64 + 64` vs. `128` `[target]` acceptance gate.
 
-Remove `skos:ConceptScheme` completely from the active implementation: no scheme
-nodes, tables, memberships, clustering, generated definitions, embeddings, PPR
-seeds, traversal settings, QA blocks, telemetry or dormant feature switch. Do not
-replace schemes with another clustering algorithm, universal hub or similarity
-backbone. Shared identities and supported semantic relationships connect chunks.
-Genuinely separate topics may remain disconnected.
+Non-goals: Source file discovery, `localfs.walk_dir` scheduling, and runtime worker thread lifecycle (owned by [native-cocoindex-indexing.md](native-cocoindex-indexing.md)); `skos:ConceptScheme` nodes, tables, clustering, or traversal (permanently removed); adding new third-party dependencies beyond locked `cocoindex == 1.1.0` `[measured: uv.lock:330-331, 50be17d]` and `sqlite-vec == 0.1.9` `[measured: uv.lock:2221-2222, 50be17d]`; restarting live processes during this specification turn.
 
-Resource discovery belongs exclusively to NER: it identifies and defines named
-individuals and general concepts. Triple extraction establishes statements from
-those resources to other supplied resources or newly extracted literal values.
-It must never create a missing resource or rewrite its definition. Homographs
-require selecting an existing NER sense, not merging definitions by label.
-The parser rejects resource endpoints outside that catalog; the grammar enforces
-the same boundary. A statement set need not connect unrelated topics.
+Depends on decisions: [2026-11-06: two-stage NER resource vocabulary & literal object boundary](#decisions), [2026-11-06: Step 4 atomic units](#decisions), [2026-11-07: validity-ordered repair-preserving fact definitions & focus-isolated SHACL healing](#decisions), [2026-11-07: direct pre-hydrated `shacl_repair` dispatch](#decisions), [2026-11-07: remedy gaps 1–5 across indexing and graph specs](#decisions), [native-cocoindex-indexing.md decisions](native-cocoindex-indexing.md#decisions).
 
-Schemes may return only through a separate experiment demonstrating Recall@N,
-Exact Match (EM) or F1 improvement against this scheme-free baseline, without
-unacceptable regressions in the other quality metrics, compute and memory.
-No speculative scheme implementation belongs in this refactor.
+## 2. Problem, with evidence
 
-This document owns graph semantics, publication and the paired acceptance gate.
-[Native indexing](native-cocoindex-indexing.md) owns source scheduling and runtime
-lifecycle. [W3C improvements](w3c-improvements.md) owns semantic guardrails;
-[confidence](epistemic-confidence-spec.md) owns confidence aggregation.
-[FOUNDATIONAL.md](../FOUNDATIONAL.md) governs architecture and failure policy.
-This revision replaces all earlier scheme/clustering proposals in these plans.
-The latest user decision supersedes the former mandatory scheme layer.
+At pinned commit `50be17d`, the graph planning and storage layer exhibits five architectural defects (`Gaps 1–5`) alongside remaining cleanup and scaling bottlenecks:
 
-Scope now is documentation, not runtime modification or process restart. Existing
-code is not declared conformant. Keep Epic 1 acceptance before Epic 2, preserve
-sources/experiments and add no dependencies for this refactor.
+- **Gap 1 (Contradiction between partial per-owner target declarations and single-component `TargetActionSink` atomicity + `chunk_vec` replay)**:
+  - `yaw/daemon/graph/planner.py:plan_graph_publication` (`L1099–1127` at `50be17d`) rebuilds `EmbeddingRequest` via `_prepare_embed_req` and re-invokes `embed_text` for every active chunk to populate `chunk_vec` because `process_chunk` discarded `EmbeddedText.vector_f32` `[observed: yaw/daemon/indexing.py:316-319, yaw/daemon/graph/planner.py:1099-1127, 50be17d]`.
+  - Earlier sections of this spec proposed moving `chunk_vec` declaration into `process_chunk` and having `publish_graph` omit unaffected survivor rows from `declare_tables`. In `cocoindex == 1.1.0`, target row ownership (`owner_component_path: StablePath`) is tracked per mounted component (`cocoindex/_internal/target_state.py:614–629`), and non-mounted `@coco.fn(memo=True)` cache hits only call `join_cached_target_provider_deps` without replaying child `declare_target_state` calls (`cocoindex/_internal/function.py:891–910, 1493–1512`) `[observed: cocoindex/_internal/target_state.py:614-629, function.py:1493-1512, cocoindex 1.1.0]`. Consequently, declaring only affected rows in `publish_graph` causes CocoIndex to reconcile every omitted survivor primary key as `coco.NON_EXISTENCE` (`target_state.py:324–335`) and delete all prior-batch rows, while moving `chunk_vec` to `process_chunk` commits `chunk_vec` outside `DatabaseSink.__call__`'s single SQLite transaction (`yaw/daemon/graph/storage/managed_sqlite.py:75–112` at `50be17d`).
+- **Gap 2 (Unscoped `TABLES.target_state` table keys across candidate DBs)**:
+  - `yaw/daemon/graph/storage/managed_sqlite.py:mount_table` (`L183–197` at `50be17d`) calls `TABLES.target_state(name, spec)` (`L195` at `50be17d`) keyed solely by `name: str` (e.g., `"chunks"`, `"entities"`) `[observed: yaw/daemon/graph/storage/managed_sqlite.py:180-197, 50be17d]`. When `2` `[target]` SQLite databases share a persistent CocoIndex `Environment` (`<state_dir>/coco_lmdb`), LMDB treats rows tracked for Database A as already present in Database B, skipping `INSERT`/`UPSERT` on unchanged fingerprints and issuing `DELETE` actions on Database B for keys absent from Database B's slice `[observed: cocoindex/_internal/target_state.py:310-335, cocoindex 1.1.0]`.
+- **Gap 3 (Planner SQLite polling via `load_active_chunk_inferences` & full-graph `:memory:` cloning via `clone_graph_to_memory`)**:
+  - `yaw/daemon/graph/planner.py:load_active_chunk_inferences` (`L203–263`, called at `L1026` at `50be17d`) executes `SELECT ... FROM source_chunks JOIN chunk_inference` from SQLite and re-hydrates all source passages on every batch instead of consuming typed `ChunkProcessOutput` records directly from `publish_graph` `[observed: yaw/daemon/graph/planner.py:203-263, 1026, 50be17d]`.
+  - `yaw/daemon/graph/planner.py:clone_graph_to_memory` (`L266–301`, called at `L1233` at `50be17d`) copies all `12` `[observed: yaw/daemon/graph/storage/rows.py:121-134, 50be17d]` `GRAPH_TABLES` into a fresh `:memory:` SQLite connection on every incremental batch, and `yaw/daemon/graph/storage/rows.py:graph_tables` (`L137–162` at `50be17d`) runs `SELECT *` across all `12` `[observed: yaw/daemon/graph/storage/rows.py:137-162, 50be17d]` tables from `:memory:`.
+- **Gap 4 (`chunk_vec`, `entity_vec`, and `fact_vec` implemented as ordinary `BLOB` tables instead of `sqlite-vec` `vec0` virtual tables)**:
+  - `yaw/daemon/graph/storage/db.py` (`L147–163` at `50be17d`), `yaw/daemon/graph/storage/managed_sqlite.py:_create_table` (`L50–70` at `50be17d`), and `yaw/daemon/graph/storage/rows.py` (`L81–94, 129–131` at `50be17d`) create ordinary `CREATE TABLE IF NOT EXISTS ... (<pk> TEXT PRIMARY KEY, embedding BLOB NOT NULL)` tables with `0` `[observed: yaw/daemon/graph/storage/managed_sqlite.py:50-70, 50be17d]` `USING vec0(...)` branches.
+  - `yaw/daemon/graph/storage/vectors.py:_search_knn` (`L105–128` at `50be17d`) and `yaw/daemon/graph/storage/graph_ops.py:find_entity_synonym_candidates` (`L104–117` at `50be17d`) execute full-table scalar scans (`SELECT ..., vec_distance_cosine(embedding, ?) AS dist FROM ...`), and `yaw/daemon/graph/storage/graph_ops.py:rekey_facts` (`L1018–1023` at `50be17d`) uses `ON CONFLICT(fact_id) DO UPDATE`, which SQLite virtual tables (`vec0`) reject `[observed: yaw/daemon/graph/storage/vectors.py:105-128, graph_ops.py:104-117, 1018-1023, 50be17d]`.
+- **Gap 5 (Triple-redundant caching across CocoIndex LMDB, `CandidateStageCache` / `candidate_stage_cache`, and `.yaw/dspy_cache`)**:
+  - `yaw/daemon/graph/storage/candidate_cache.py` (`L1–321` at `50be17d`) maintains a `256 MiB` (`256 * 1024 * 1024` bytes `[observed: yaw/daemon/graph/storage/candidate_cache.py:263, 50be17d]`) SQLite table `candidate_stage_cache` + `candidate_cache_size` (`L33–61` at `50be17d`), `CandidatePayloadCodec` (`L227–246` at `50be17d`), and `CandidateStageCache` (`L248–321` at `50be17d`) alongside CocoIndex LMDB (`TABLES.memoization`) and DSPy's `.yaw/dspy_cache` (`FanoutCache`). At `50be17d`, `CandidateStageCache` is only called for query-time `_text_vec_cache` (`yaw/daemon/graph/engine.py:211, 737, 747` at `50be17d`) and SIMBA `open_score_cache` / `open_checkpoint_cache` (`yaw/daemon/graph/engine.py:1573–1585`, `yaw/daemon/graph/inference/optimizer.py:203–204, 787–846` at `50be17d`, where active reflection state is already persisted in `yaw.db`'s `meta` table at `optimizer.py:826–865` at `50be17d`).
+- **Remaining dead-code & migration debt (`C1`, `C2`, `C4`)**: `yaw/daemon/graph/engine.py` retains dead helpers (`_attempted_shacl_keys`, `_graph_cache_context`, `_encode_in_batches`, `_apply_shacl_repairs`); `yaw/daemon/graph/inference/program.py` (`L966, 1001–1002, 1098–1099, 1112, 1179, 1208, 1259` at `50be17d`) retains unused `stage_cache`/`stage_caches` arguments; and `yaw/daemon/graph/storage/db.py` retains legacy `ALTER TABLE` migration/backfill branches (`migrate_edges_reasoning`, `migrate_epistemic_confidence_columns`, `_entities_migrated`, `_facts_migrated`, `_edges_migrated`) `[observed: yaw/daemon/graph/storage/db.py, engine.py, program.py:966-1259, 50be17d]`.
+- **Unknown**: How `managed_sqlite.py` should scope `RowHandler` / `TableHandler` target reconciliation so `publish_graph` declares only affected-owner row mutations (and deleted keys) on Batch 2 without hydrating all unaffected survivor rows via `SELECT *` from `yaw.db` into Python (probed by `CG-GRAPH-2` in §6).
 
-## 2. Goal A: equal cumulative work, explicit timing comparison
+## 3. Goals
 
-### 2.1 Paired experiment
+### Goal A: Comparable cumulative compute for `64 + 64` vs. `128` chunks
+- **Measure**: End-to-end wall time $T_I = T_{\text{first64}} + T_{\text{second64}} + T_{\text{outstanding\_semantics}}$ vs. $T_R = T_{\text{all128}}$, graph-planning-through-publication critical-path wall time $T_{\text{graph},I}$ vs. $T_{\text{graph},R}$ (excluding chunk extraction and chunk embedding), process CPU seconds, provider call/token counts, SQLite rows read and written per table, and whole-worker peak resident memory (RSS) across `>= 20` `[target]` paired fixed-evidence trials and `>= 5` `[target]` paired real-model trials with alternated arm order.
+- **Reference**: Reference arm $R$ publishing the identical `128`-chunk `[target]` snapshot $S$ against the identical initial base graph $B$ in a single publication boundary, with identical `Semaphore(1)` (`parallel = 1` `[target]`) LLM admission and `<= 64` `[target]` embedding batch size.
+- **Passes when**:
+  - $0.80 \le R_{\text{time}} = \text{median}(T_I) / \text{median}(T_R) \le 1.25$ `[target]` and $0.80 \le R_{\text{graph}} = \text{median}(T_{\text{graph},I}) / \text{median}(T_{\text{graph},R}) \le 1.25$ `[target]` in both cold-memo and warm-memo scenarios (`R_time = 1.0909` `[measured: outputs/benchmarks/batch_equivalence_c4.xml, c6fa080, n=1, loopback deterministic fixture, warm memo]` and `R_time = 1.1270` `[measured: outputs/benchmarks/batch_equivalence_c4.xml, c6fa080, n=1, loopback deterministic fixture, restart-between-batches]` on the `128`-chunk `[target]` controlled fixture; `R_graph` remains to be measured separately).
+  - Unchanged first-batch chunks (`S[0:64]`) incur `0` `[target]` additional `extract_text`, `embed_text`, or `define_missing_entities` calls and `0` `[target]` SQLite row writes during the second batch (`S[64:128]`), and unaffected base-graph ($B$) entities/facts are not hydrated via full-table `SELECT *` into Python.
+  - Whole-worker peak resident memory stays `<= 1 GiB` `[target]`.
+- **Fails if / does not count**:
+  - Comparing only `T_second64` against `T_R`, or running $R$ cold and $I$ against $R$'s newly warmed memo.
+  - Reference arm $R$ secretly delegates to `64 + 64` `[target]` internally.
+  - Replacing `clone_graph_to_memory` / `sqlite3.Connection.backup()` with full-table `SELECT *` survivor hydration into Python lists/dicts (`rows.py:graph_tables`) so that every `64`-chunk `[target]` batch still reads and hashes all $O(|G|)$ existing graph rows.
+  - Replaying `embed_text` for chunk vectors in `planner.py`, or allocating dense $N \times N$ (`100,000` $\times$ `100,000` float32 = `37.3 GiB` `[measured: arithmetic]`) score matrices.
+  - Skipping or narrowing `lint_graph_shacl` validation without proving affected-closure equivalence.
 
-Let S be a frozen 128-chunk source revision, with stable document/occurrence IDs,
-chunk boundaries, ordering and semantic/model/embedding profiles. Let B be the
-identical initial graph, either empty or a specified existing corpus snapshot.
+### Goal B: Exact batch-independent canonical graph (`64 + 64` == `128`)
+- **Measure**: Canonical entity count, fact count, counts by edge kind (`fact`, `skos:broader`, `skos:related`, `owl:differentFrom`), canonical sense ID sets, occurrence-to-entity bindings (`entity_mentions`), fact semantic keys and assertion bindings (`fact_assertions`), `entity_labels` (`skos:prefLabel`, `skos:altLabel`, `skos:hiddenLabel`), `vec0` keys/bytes (`chunk_vec`, `entity_vec`, `fact_vec`), FTS5 rowids (`chunk_fts`, `fact_fts`), and aggregated epistemic confidences.
+- **Reference**: Canonical `15`-table `[target]` SQLite state produced by Reference arm $R$ (`canonical_graph(R(B, all128))`).
+- **Passes when**:
+  - **Fixed-evidence harness (including entity count $> \text{top\_k}$ `[target]`)**: `canonical_graph(I(B, first64, last64)) == canonical_graph(R(B, all128))` with `0` `[target]` difference in entity, fact, and per-kind edge counts, `100%` `[target]` exact set equality on canonical IDs, bindings, labels, vectors, and FTS rows, and `<= 1e-6` `[target]` numeric difference on pooled confidence floats.
+  - **Live stochastic model trials (`>= 5` `[target]` paired runs)**: Entity, fact, and per-kind edge count differences `<= 2%` `[target]` relative to `max(1, reference_count)`, set Jaccard `>= 0.98` `[target]` for canonical entities, facts, and edges individually, and `0` `[target]` missing required bridge facts or false homograph merges.
+- **Fails if / does not count**:
+  - Executing a hidden full-corpus rebuild on the final batch to make outputs match.
+  - Testing candidate equivalence only on fixtures where total entities $\le \text{top\_k}$ (which hides asymmetric KNN top-$k$ eviction and reverse-neighbor invalidation).
+  - Graph isomorphism up to renamed IDs (canonical IDs themselves must match).
+  - Row-count equality alone while canonical sets or provenance bindings differ.
 
-- **Incremental arm I:** apply S[0:64], publish, then apply S[64:128], publish and
-  finish all semantic work affected by the complete S.
-- **Reference arm R:** apply the same S through the same transforms, resolving
-  against B plus all 128 proposed contributions, and publish once.
+Thresholds are not loosened after seeing a run.
 
-The reference is a test-harness publication boundary, not a second production
-planner or a 128-chunk production preset. Extraction/embedding admission remains
-bounded identically in both arms. Production still dispatches at most 64 changed
-chunks per update cycle. The reference must not secretly call the 64+64 path
-internally for semantic planning: it must expose all 128 contributions together,
-otherwise this comparison cannot detect a batch-boundary defect.
+## 4. Semantics and invariants
 
-Start timing before admitting the first chunk and stop after final validated
-publication and completion of affected semantic work. Exclude only identical,
-explicitly measured fixture/environment setup. Include source hydration,
-inference waits, embeddings, candidate search, adjudication, repairs, target
-reconciliation, validation, both incremental commits, and any deferred work.
-There is no unmeasured finalization job. Record first-retrieval CSR construction
-separately so it cannot be mistaken for ingestion cost.
+<a id="52-batch-independent-identity-and-candidate-discovery"></a>
+<a id="53-resource-vocabulary-and-statement-boundary"></a>
 
-`T_I = T_first64 + T_second64 + T_outstanding_semantics`
-
-`R_time = median(T_I) / median(T_R)`
-
-Initial acceptance band: **0.80 <= R_time <= 1.25**, in each predeclared scenario.
-This operationalizes 'roughly the same'; it is a target, not measured evidence.
-A ratio outside either boundary needs investigation, not silent threshold changes.
-Two publications have real fixed overhead. Expose it instead of excluding it or
-claiming exactly equal runtimes. Do not compare the second 64 alone with 128.
-
-Apply the same band separately to cumulative graph planning-through-publication
-time (`R_graph`), including entity/fact definition/embedding, adjudication, repair,
-validation and commits, but excluding source extraction/chunk embeddings. Long
-unchanged extraction must not mask a graph-publishing regression. Use phase
-critical-path wall time rather than summing overlapping intervals; also report
-process CPU seconds and provider-token work so a wall-time win cannot conceal
-extra computation. Both `R_time` and `R_graph` must pass.
-
-### 2.2 Work accounting prevents misleading timing wins
-
-Record work by dependency key, not just callback count:
-
-- Extraction and embedding cache misses, provider calls, input/output tokens and
-  request payloads. Request batch counts may differ; semantic input work may not
-  double merely because publication happened twice.
-- Candidate queries, canonical candidate pairs, evidence revisions, judgments,
-  unchanged decision reuse, affected older decisions and deterministic repairs.
-- Rows read/declared/inserted/changed/deleted per table, validation scope/time,
-  target reconciliation time, write-lock duration and peak process memory.
-- Reused/recomputed source occurrences, entities/facts, and applied checkpoints.
-
-Unchanged dependency keys incur zero additional provider work. A new chunk must
-not re-extract/re-embed the first 64. A decision can legitimately change when new
-support changes its evidence digest; count that extra work rather than treating
-an outdated decision as reusable. First-half relations can be reconsidered, but
-only through explicit affected dependencies. If that work breaks the timing
-band, the implementation has not met Goal A even if the final graph is correct.
-
-Cold and warm memo are separate paired scenarios. Clone equivalent initial graph
-and target-tracking state from quiescent snapshots into isolated arms; never copy
-a running SQLite/LMDB pair independently or run R cold and I against its
-newly warmed memo. Keep endpoint admission, model settings and machine fixed.
-Never clear the user's persistent cache to manufacture a cold experiment.
-
-## 3. Goal B: equal semantic graph, not merely similar totals
-
-For fixed chunk extraction artifacts, deterministic semantic policy and identical
-adjudication results for identical evidence keys:
-
-`canonical_graph(I(B, first64, last64)) == canonical_graph(R(B, all128))`
-
-Require **zero difference** in entity count, fact count and counts by edge kind.
-Also require exact sets of canonical bindings, fact semantic keys, typed edge
-endpoints and source-support IDs. Numeric confidence values may differ by at most
-1e-6 from floating aggregation order; presentation order, graph revision numbers,
-transaction timestamps and trace scheduling are excluded. Canonical IDs themselves
-must be stable; graph isomorphism cannot excuse first-seen ID selection.
-
-Canonical comparison includes:
-
-- Entity/sense identity, selected canonical ID and occurrence-to-entity bindings.
-- Fact subject, original predicate, entity versus literal object, lexical value,
-  datatype/language and source provenance; normalized display text alone is not
-  a fact identity.
-- Edge `(source, destination, kind)` with its supporting evidence and confidence;
-  symmetric edges have a canonical storage orientation.
-- Labels, shared evidence liveness, vector text/profile keys and FTS ownership.
-
-For independent real-model runs, extraction/adjudication is stochastic. Keep the
-exact fixed-evidence test mandatory, and additionally use initial live tolerances:
-entity/fact/each-edge-kind count difference <=2% relative to `max(1, reference
-count)`, and Jaccard >=0.98 for canonical entity, fact and edge sets individually.
-Compare against source-derived semantic signatures as well as stored IDs to
-separate ID instability from extraction differences. Report duplicate senses,
-missing bridge facts and false merges explicitly. Any missing required bridge or
-incorrect homograph merge fails regardless of favorable aggregate statistics.
-These thresholds are predeclared acceptance targets, not claims of achieved
-small-model reproducibility; do not loosen them after seeing a run.
-
-### 3.1 Islands and document readiness
-
-A 128-chunk document after its first publication is partial, not a complete
-semantic island. Track source revision, completed enumeration, discovered chunk
-IDs, published chunk revisions and outstanding affected semantic work through
-native source/tracking plus minimal committed graph metadata. A document is
-ready only at its completed semantic watermark, never merely after extraction
-handles become ready. Edits invalidate readiness for the previous source revision.
-
-All batches use the same document/occurrence namespace and existing sense state.
-Candidate discovery spans both earlier documents and the current proposed batch.
-Late evidence revisits affected older bindings/negative decisions. Same-document
-membership is provenance, not an instruction to add a semantic PPR edge.
-
-Disconnected components are allowed. Report 'no supported connection found under
-policy P at corpus revision R', not 'proven unrelated'. Neither SHACL conformance
-nor a closed-world vocabulary proves semantic discovery completeness. Do not add
-links simply to reach one component. Retrieval can seed multiple components.
-
-## 4. Starting point and why the current path fails these goals
-
-Inspected `dev` worktree on 2026-11-05, including then-existing uncommitted work;
-these are symbol references, not immutable line numbers or performance results.
-
-| Current area | Defect to remove |
-| --- | --- |
-| `planner.py:plan_graph_publication` | Hydrates/fingerprints active corpus before reuse detection; additions fast path does not cover general replacement/deletion. |
-| `planner.py:clone_graph_to_memory` | Clones all graph/vector tables for additions; otherwise starts blank `:memory:`. Both introduce work unrelated to the new 64 chunks. |
-| `planner.py:prepare_sense_resolution_state` | Published senses are available only when the existing incremental branch is selected; identity must instead follow semantic dependencies. |
-| `planner.py:prepare_synonym_candidates` | Changed endpoints are scoped, but similarity-driven merges and edge-presence decision reuse need evidence-sensitive review. |
-| `storage/graph_ops.py:find_entity_disambiguation_candidates` | Lexical changed-to-all scans and scalar cosine/sort over ordinary vector tables still grow with corpus size. |
-| `planner.py:build_concept_schemes` | Dense affinity, community merging, scheme LLM calls/embeddings and scheme rebuilding contribute no proven quality benefit. Remove entirely. |
-| `storage/publication.py:GraphTargetHandler` | Whole-graph envelope, fingerprints, scheme clearing and imperative graph helpers reprocess survivors. Preserve atomicity while replacing ownership. |
-| PPR, serializers, inference exports, watchdog | Still consume scheme IDs/metadata and traversal settings; removal must cover all consumers. |
-
-Earlier 61/301/1,505-second observations and 3-4.5-hour forecasts are not acceptance
-evidence. Original logs, phase boundaries, versions and cache states are required.
-There is no absolute throughput promise in this revision: the primary performance
-claim is the measured paired ratio, plus scaling/memory guards in section 8.
-
-## 5. Target pipeline: final declarations, persistent semantic identity
-
-```mermaid
-flowchart TD
-    S["Live filesystem / immutable frozen chunks"]
-    X["Stable keyed native components\nDSPy extraction + batched embeddings"]
-    M["Raw source contributions + occurrence identities"]
-    D["Affected senses, candidate decisions and facts\ncommitted state plus bounded typed proposal"]
-    V["Validate desired affected-owner states"]
-    T["Final typed CocoIndex SQLite targets\nrows + vec0 + contentless FTS + checkpoints"]
-    DB[("yaw.db: atomic committed semantic revision")]
-    Q["Read-only retrieval, QA and watchdog"]
-    C[("Persistent CocoIndex memo / native tracking")]
-    S --> X --> M --> D --> V --> T --> DB --> Q
-    C -. "reuse exact dependency keys" .-> X
-    DB -. "indexed affected identity/evidence reads" .-> D
-```
-
-All target tables are the destination of this computation, not intermediate
-storage scanned by a second ETL planner. Persist source/inference artifacts only
-as final provenance/memo outputs of the same native components. One runtime, app
-per environment, writer and authoritative graph DB. Native tracking owns source
-change/target reconciliation; no hand-rolled pending-work scheduler or journal.
-
-### 5.1 Minimal state and ownership
-
-Use stable source occurrence IDs distinct from content digests: identical text in
-two locations has distinct provenance. Revision keys include content, source
-pointer/AST bounds, parser/chunker, and semantic profile. Embeddings key exact
-formatted text plus formatting/model/task/dimension. Inference keys exclude batch
-number, pool name, publication time and transient experiment DB basename.
-
-| Final state | Single logical owner |
-| --- | --- |
-| Chunk metadata, inference artifact, chunk vector and FTS row | Source occurrence/revision; one float32 vector copy and stable FTS rowid mapping. |
-| Raw mentions/fact arguments and confidence signals | Stable occurrence-local evidence ID; retain original extraction for retraction. |
-| Mention bindings, entity labels and entity/chunk support | Occurrence evidence, with explicit canonical entity/sense binding. |
-| Entity metadata and vector | Entity aggregate, never competing declarations from multiple chunk components. |
-| Reified facts, vectors and lexical rows | Fact aggregate with unambiguous entity/literal semantic key. |
-| Fact/edge source contributions | Source evidence or explicitly identified inference decision. |
-| Typed edge aggregates | `(src_id, dst_id, kind)`, derived once from surviving distinct evidence. |
-| Positive/negative identity and relation judgments | Canonical endpoint/evidence/policy dependency key; explicit no-relation results are durable. |
-| Applied source/profile digests and semantic revision/watermark | Publication owner, committed with affected graph rows. |
-
-Named typed classes and `TableSchema.from_class` own ordinary schemas, vector
-configuration owns `vec0`, and declarative attachments own FTS/index/constraint
-setup. No manual schema compatibility migration stack. A fresh ignored `outputs/`
-index is the cutover target; retain old experiment DBs. No scheme tables or
-reserved scheme namespace in the new schema.
-
-### 5.2 Batch-independent identity and candidate discovery
-
-1. Preserve raw occurrence evidence before canonicalizing. Use a deterministic
-   canonical representative of the accepted equivalence class, not 'first seen'
-   or an ID minted from a batch. If the representative changes when an earlier
-   canonical member arrives, rewrite the affected bindings/facts/edges atomically.
-   A sense ID hashes normalized label and definition; a class uses the smallest
-   surviving sense ID. Display spelling and definition selection use total orders,
-   independently of arrival. Withdrawing the last support for a member removes it
-   from representative selection. Preserve raw source spellings and definitions.
-   Label support counts distinct source occurrences; canonical fact text must not
-   influence its own display-label selection through a circular matching score.
-   Statement identity includes original predicate, canonical endpoints and literal
-   lexical value, datatype and language. Deduplication must retain distinctions
-   between equal lexical values with different datatypes or languages.
-   Validate one class per sense, the minimum-member representative and matching
-   occurrence/revision ownership of each assertion's resource mentions before
-   committing the proposal. Raw assertion evidence is immutable through rebinding.
-   Choose canonical source statement descriptions before SHACL healing via
-   `canonicalize_fact_definitions(conn, prior_definitions=prior_fact_definitions)`:
-   before `stage_graph_rows` runs on `staging_conn`, `plan_graph_publication`
-   snapshots `prior_fact_definitions: dict[str, str]` from the cloned `facts`
-   table (`SELECT fact_id, definition FROM facts`) so `upsert_facts` cannot
-   overwrite a prior batch's healed `facts.definition` on re-assertion. For each
-   fact $f$ with subject definition `es.definition` and (when `obj_kind == 'entity'`)
-   object definition `eo.definition`, a candidate statement definition $d$ is
-   closed-world valid (`valid_spo_def(d, f)`) iff `trim(d) != ''`,
-   `lower(trim(d)) != lower(trim(es.definition))`, and (when `obj_kind == 'entity'`)
-   `lower(trim(d)) != lower(trim(eo.definition))`. `canonicalize_fact_definitions`
-   resolves $d^*(f)$ by 3-tier precedence: (1) closed-world valid `fact_assertions`
-   row with `MIN(assertion_id)`, (2) closed-world valid `prior_definitions[fact_id]`
-   tested against current `es.definition` and `eo.definition`, or (3) fallback
-   `fact_assertions` row with `MIN(TRIM(spo_def)=='', assertion_id)`, updating
-   `facts.definition` only when `f.definition != d^*(f)`. Display text refresh via
-   `canonicalize_fact_text(conn)` updates `facts.raw_triple_json` and `fact_fts`
-   via `executemany` only when `raw != f.raw_triple_json` (plus any fact missing
-   from `fact_fts` on initial staging) and retains validated repaired descriptions.
-   Group reported violations by `focus_node` (`focus_node ASC`) so each
-   `heal_shacl_violations` call (`@coco.fn(memo=True, version=5)`, with
-   `publish_graph` at `@coco.fn(memo=True, version=9)`) receives a single
-   focus-isolated `SHACLHealInput` whose dossier queries in
-   `inspect_entity_or_fact` and `inspect_focus_node` are deterministically ordered
-   (`ORDER BY label_norm ASC, label_kind ASC, chunk_id ASC` on `entity_labels`;
-   `ORDER BY fact_id ASC` on `facts`; `ORDER BY src_id ASC, dst_id ASC, kind ASC`
-   on `edges`; `ORDER BY e.entity_id ASC` on `endpoints`). When `SHACLHealInput.focus_context`
-   is pre-hydrated (`focus_dossiers` + `source_passages`), `OpenIEEndpoint.heal_shacl`
-   and `YawProgram.propose_shacl_repairs` dispatch directly to the GBNF-constrained
-   worker `YawProgram.shacl_repair` (`ProposeSHACLRepairs`, `mode="direct"`),
-   eliminating redundant RLM REPL subprocesses and orchestrator turns; when
-   `mode="rlm"` is requested explicitly (or `focus_context` is empty),
-   `STAGE_RLM_DELEGATION_RULES["shacl_repair"]`, `build_rlm_action_demos()["shacl_repair"]`,
-   and `HealSHACLViolations` enforce single-step delegation (`repairs = propose_repairs(); SUBMIT(repairs=repairs)`)
-   reusing bound `self._focus_context` when present;
-   do not silently truncate reports or substitute Markdown-only entity context for
-   fact context, including endpoint profiles. RLM examples must delegate once and
-   submit proposals against the immutable snapshot, rather than re-linting it.
-   Bind generated repair focus/action choices to the report, and reject mismatches
-   in parsing: definition defects permit rewrites, never deletion of evidence.
-   A nonempty repair proposal must cover every reported focus; the grammar permits
-   complete coverage (including multiple actions per focus) or an empty abstention.
-   Empty proposals leave the strict validation failure intact.
-   `propose_repairs()` reads that bound report; the orchestrator cannot replace it.
-   Saved DSPy programs must identify this tool contract; reject older seeds.
-   Repair objects have typed `focus_node`, `action` and `value` fields. Supply the
-   actual frozen source passages alongside profiles; paths/line references alone
-   are insufficient grounding. The RLM tool takes no replacement context argument.
-   Use canonical `set_definition` and `add_different_from` actions; reject retired
-   action aliases rather than filtering or translating them.
-   Scalar-looking resources participating in statements need semantic
-   label repair, not automatic deletion of their source-supported statements.
-   Retrieval seeds the stored subject and resource-object IDs of selected facts.
-   It never re-resolves their display labels against a query vector or fabricates
-   label-only IDs; a selected fact already identifies its canonical senses.
-2. Lookup normalized labels against all persisted senses and current proposals.
-   Exact spelling, casefold equality or high cosine alone is not semantic identity.
-   Keep homographs/modifier-head distinctions; accepted unchanged identity and
-   trusted validated identifiers can be reused deterministically.
-3. Discover changed-to-existing and changed-to-changed candidates using the same
-   versioned lexical/vector policy. Replace full lexical comparisons with indexed
-   candidates and scalar-distance scans with typed `vec0` where supported. Do not
-   claim KNN is O(1) or candidate limits prove semantic completeness.
-4. Make final candidate coverage independent of arrival: top-k neighborhoods can
-   change for old endpoints when new nodes arrive. Either propagate those reverse
-   dependencies exactly or use a candidate rule whose incremental coverage is
-   demonstrably identical to the reference. A new-endpoints-only top-k query is
-   not proof. Resolve this with the candidate-equivalence fixture before tuning.
-5. Judge canonical pairs against deterministic evidence dossiers, deduplicating
-   pair/evidence keys across batches. Evidence includes relevant old/new supports
-   and their revisions; it must not depend on request packet neighbors. Packing
-   changes may alter request counts, never silently change semantic inputs.
-   In `apply_synonym_adjudication`, scope `canonicalize_entity_labels_edc` to
-   `entity_ids=sorted(touched_entity_ids)` (entities materialized in the current
-   batch, canonical targets of `auto_merges` and `staged_merges`, and entities in
-   `hidden_label_norms`).
-6. Reuse decisions only while endpoint/evidence/program/policy digests match.
-   Reopen affected earlier no-match/merge/relation judgments after new evidence.
-   Existing `related`, `broader` or `differentFrom` edges alone are not decision
-   receipts. No provisional merge is made irreversible for performance.
-7. Aggregate confidence from surviving distinct evidence with existing operators;
-   replay/memo hits do not add support. Re-embed only changed exact text/profile
-   keys, including changed aggregate definitions: `materialize_entities_and_facts`
-   initializes `fact_nodes` `raw_json` with resolved cased endpoint names
-   (`entity_map[s_id][1]` and `entity_map[o_id][1]`), `plan_graph_publication`
-   passes `fact_vectors=()` in `initial_rows`, and computes/upserts `fact_vec`
-   once at step 5 (after synonym merges, `canonicalize_fact_definitions`,
-   `apply_shacl_repairs`, and `canonicalize_fact_text`) for
-   `reembed_facts = [f_row for f_row in final_facts if f_row[0] not in published_fact_vec_ids or published_fact_defs.get(f_row[0]) != (f_row[4], f_row[5])]`
-   only.
-
-Canonicalization, relation conflict resolution and SHACL repairs must converge
-to the same supported state regardless of packet/arrival order. Test fixed points
-on controlled fixtures; do not assume deterministic hashing alone makes history-
-sensitive merging confluent. If this cannot be established for a rule, simplify
-or replace that rule before claiming Goal B. Do not perform a full final-corpus
-rebuild to make the equality test pass: its work belongs in Goal A.
-
-### 5.3 Resource vocabulary and statement boundary
-
-Extraction is two-stage because the W3C roles are asymmetric. NER is the only
-producer of resources: `owl:NamedIndividual` particulars and `skos:Concept`
-categories. Its labels form the closed `rdf:subject` vocabulary for that chunk.
-Triple extraction emits `rdf:Statement`s whose subject is always one of those
-resources and whose object is either another resource (`owl:ObjectProperty`) or
-a newly discovered `rdfs:Literal` (`owl:DatatypeProperty`). A literal never
-becomes a subject or a resource. Status codes, numbers, percentages, dates and
-other data values are literal objects, never NER output.
-
-One boundary is enforced at three layers that must agree exactly:
+- **Equality and batch-independent identity**:
+  - **Resource sense identity**: Keyed deterministically by `(text_processing(label), resolved_definition)`. An accepted equivalence class selects its minimum surviving member sense ID (`MIN(sense_id)`) as the canonical representative, never first-seen arrival order. When a smaller representative arrives in a later batch, `bind_merged_evidence` and `rekey_facts` rewrite affected `entity_mentions`, `fact_assertions`, `facts`, `fact_sources`, `edges`, `edge_sources`, `entity_vec`, and `fact_vec` atomically while preserving raw occurrence fields (`raw_entity_id`, `raw_sub_id`, `raw_obj_id`).
+  - **Reverse top-$k$ candidate completeness**: Candidate discovery across `find_entity_disambiguation_candidates` and `find_entity_synonym_candidates` must produce the identical candidate pair set for `64 + 64` `[target]` and `128` `[target]` even when total entities exceed `top_k` (`> 10` `[target]` entities in a shared subspace), accounting for new Batch 2 entities entering an existing Batch 1 entity's top-$k$ neighborhood or invalidating a prior neighborhood boundary.
+  - **Fact semantic key**: Derived from `(canonical_sub_id, original_predicate, obj_kind, canonical_obj_id_or_literal_value, literal_datatype, literal_lang)`. Equal lexical strings with different datatypes or languages remain distinct facts. Collapsed self-loop assertions (`canonical_sub_id == canonical_obj_id` for `obj_kind == 'entity'`) retain their raw `fact_assertions` row with `fact_id = NULL`.
+  - **Validity-ordered, repair-preserving `canonicalize_fact_definitions`**: For each fact $f$ with subject definition `es.definition` and (when `obj_kind == 'entity'`) object definition `eo.definition`, a candidate definition $d$ satisfies `valid_spo_def(d, f)` iff `trim(d) != ''`, `lower(trim(d)) != lower(trim(es.definition))`, and (when `obj_kind == 'entity'`) `lower(trim(d)) != lower(trim(eo.definition))`. `canonicalize_fact_definitions(conn, prior_definitions=prior_fact_definitions)` propagates `prior_fact_definitions` across `merged.fact_bindings` and selects $d^*(f)$ by `3`-tier `[target]` precedence:
+    1. Closed-world valid `fact_assertions` row with `MIN(assertion_id)`.
+    2. Closed-world valid `prior_definitions[fact_id]` (or `f.definition` for newly created facts) tested against current `es.definition` and `eo.definition`.
+    3. Fallback `fact_assertions` row with `MIN(TRIM(spo_def) == '', assertion_id)`.
+  - **Three-layer resource vocabulary and statement boundary**:
 
 | Rule | GBNF (prevents generation) | Parser (rejects, fail fast) | SHACL (rejects published state) |
 | --- | --- | --- | --- |
-| A resource label has lexical content: at least one letter | NER `label` rule & SHACL `set_pref_label` `label` rule | NER stage & `parse_shacl_repairs` raise | `ConceptShape/resourceLabel` |
-| Property type matches object kind | `pred-obj` coupling | statement parser raises | `StatementShape/closedWorld` |
-| Subjects and resource objects are NER resources | `known-entity` endpoints | statement parser raises | `StatementShape/closedWorld` |
-| A statement never relates a resource sense to itself | per-subject object alternatives | statement parser raises | `StatementShape/irreflexive` |
+| Resource label has lexical content (`>= 1` `[target]` letter; bounded `char{1,512}` `[target]`) | NER `label` rule & SHACL `set_pref_label` `label` rule | NER stage & `parse_shacl_repairs` raise `ValueError` | `ConceptShape/resourceLabel` & `ConceptShape/noScalarLiterals` |
+| Property type matches object kind (`owl:ObjectProperty` vs. `owl:DatatypeProperty`) | `pred-obj` coupling | Statement parser raises `ValueError` | `StatementShape/closedWorld` |
+| `rdf:subject` and resource `rdf:object` belong to chunk NER catalog (`<= 40` `[target]` entities/triples per chunk) | `known-entity` endpoints | Statement parser raises `ValueError` | `StatementShape/closedWorld` |
+| Statements are strictly irreflexive per resource sense | Per-subject object alternatives | Statement parser raises `ValueError` | `StatementShape/irreflexive` |
 
-A resource sense is `(text_processing(label), definition)`, the identity rule of
-section 5.2. Distinct homograph senses of one label may relate to each other;
-the same sense may not relate to itself, including through labels that differ
-only in normalized form. Whether a label containing letters is semantically a
-data value (`350ms`) stays with the existing `ConceptShape/noScalarLiterals`
-policy; the grammar cannot decide it and this boundary does not change it.
+- **State and cache ownership**:
 
-Lexical `set_pref_label` parity is enforced across the SHACL repair grammar,
-parser, and storage application:
-- `shacl_repair_actions(violations)` maps both `ConceptShape/noScalarLiterals`
-  and `ConceptShape/resourceLabel` to `{"set_pref_label"}` and
-  `result_path == "skos:definition"` to `{"set_definition"}`.
-- `build_dspy_shacl_repair_grammar(allowed_actions=...)` preserves the empty
-  abstention `"[]"` (`repair-list ::= "[]" | "[" {coverage} "]"`) while binding
-  the `"value"` slot on `set_pref_label` branches to the lexical `label` rule
-  (`label ::= "\"" non-letter* letter char* "\""`) instead of unconstrained
-  `string`.
-- `parse_shacl_repairs(raw_output, *, allowed_actions=None)` preserves empty
-  abstention `{"repairs": []}` pass-through (so unhealed violations fail fast at
-  post-healer `lint_graph_shacl`) while raising `ValueError` on any non-empty
-  repair list that omits a reported focus node in `allowed_actions`, supplies an
-  empty `value` on `VALUE_BEARING_SHACL_ACTIONS`
-  (`{"set_definition", "set_pref_label", "ground_fact_source", "set_fact_source"}`),
-  or supplies `not is_resource_label(value) or is_scalar_label(value)` on
-  `set_pref_label`.
-- `apply_shacl_repairs` validates `is_resource_label(val) and not is_scalar_label(val)`
-  on `set_pref_label` (raising `ValueError` otherwise), demotes existing
-  `entity_labels` rows on `focus` that fail `is_resource_label` or match
-  `is_scalar_label` to `'skos:hiddenLabel'`, demotes all other existing
-  `skos:prefLabel` rows with `label_norm != norm_val` to `'skos:altLabel'`, and
-  upserts `(norm_val, focus, "skos:prefLabel", val, "__healed__")` with
-  unconditional `chunk_id = "__healed__"` provenance (never copying a corpus
-  `chunk_id`), so `canonicalize_entity_labels_edc` ([w3c-improvements.md §3.2](w3c-improvements.md#32-end-of-round-active-edc-canonicalizer-yawdaemongraphstoragegraph_opspy))
-  retains the repaired label across subsequent batches.
-
-Grammar and parser rules are a pair: the parser accepts everything the grammar
-can generate and rejects what the rule forbids (the grammar may be stricter, never
-looser), so a parser error under GBNF is an implementation defect, not a
-model behavior to absorb. Every parser-accepted extraction must normalize, bind
-and publish without error: normalization, materialization and evidence binding
-classify a label with one predicate over the same normalized form, and none of
-them drops a parser-accepted statement. Changing any rule changes the extraction
-contract and bumps the OpenIE program identity so incompatible memoized artifacts
-are re-extracted, not reused.
-
-Regression fixtures are verbatim model outputs that violated this boundary in a
-real run (template echoes such as `[", ", "]]}# note: ..."]`, truncated
-`[", ", ""]` pairs, `429` and `:429` labels, reflexive `HubSpot -> HubSpot`
-statements). Execution record: [resource vocabulary boundary](reviews/resource-vocabulary-boundary.md).
-
-## 6. Incremental publication, retraction and failures
-
-Consume keyed native source transitions; same-ID edits require revision comparison,
-not set difference on chunk IDs. Incomplete enumeration, parser failure or stopped
-watching never implies all unseen chunks were deleted. Frozen callers supply
-immutable text; missing text is an error, never a truthiness-based disk rehydrate.
-
-Capture base semantic revision and indexed affected rows in a short read section,
-release locks, then perform inference against a bounded typed read view overlaying
-replacements/tombstones on committed state. No `:memory:`, graph clone, SQLite
-backup staging, full survivor hydration or full-graph proposal/fingerprint payload.
-RLM inspection reads that proposed view and returns typed repairs; it cannot write
-the published graph. No database lock spans a provider call.
-
-Each affected owner declares its complete desired state; absence means retirement
-only inside that explicitly recomputed owner. Shared entities/facts survive until
-their final support disappears. Remove withdrawn labels, sources, vectors and FTS
-rows atomically and recompute aggregates from surviving evidence. Retain original
-arguments and bindings so removing evidence can reverse a prior merge. A dependency
-closure can exceed 64 chunks; report that cost rather than silently truncate it.
-
-### 6.1 Atomic declarative publication capability gate
-
-Independent per-table declarations do not prove multi-table atomicity. First probe
-the locked CocoIndex SQLite connector for grouped ordinary-row, `vec0`, FTS and
-checkpoint reconciliation with pre-commit validation. Verify actual public APIs,
-action ordering and rollback; do not invent a transaction-group API or import
-private connector internals. `uv.lock` currently pins CocoIndex 1.1.0; earlier
-1.0.26 lifecycle observations are not proof of locked-version behavior.
-
-The selected public connector boundary is one producing component and one shared
-`TargetActionSink` for its graph rows, canonical bindings, vectors, FTS and applied
-checkpoint. `storage/managed_sqlite.py` applies schema-driven row actions in one
-managed SQLite transaction; `storage/rows.py` validates the actual post-state
-before commit. Typed row schemas remain `TableSchema.from_class`. Separate
-components/sinks retain CocoIndex's convergent roll-forward behavior; neither
-sharing a connection nor completing `app.update()` makes their writes atomic.
-Ordinary-row/BLOB-vector/FTS rollback and no-op tests are implemented. This does
-not establish the remaining `vec0`, crash-window or bounded-owner-work gates.
-
-The group buffers only keyed affected-owner diffs outside a transaction, reaches
-an explicit publication barrier after dependent work, then uses one transaction:
-check base revision, apply diffs, validate actual post-state, advance applied
-checkpoints/revision/watermark and commit. Failed validation or stale base aborts;
-serialized coordination prevents normal overlapping plans. No custom retry loop.
-An unchanged replay must not advance semantic revision merely because a sink ran.
-
-If the public connector lacks grouping, implement the smallest schema-driven
-connector extension using public CocoIndex target interfaces before replacing the
-working atomic sink. It must consume row declarations, not rename the whole-graph
-`PreparedGraphRows` envelope or wrap legacy imperative graph upserts. Prove that
-waiting for the barrier cannot deadlock components awaiting target completion.
-If public APIs cannot satisfy it, stop this cutover and amend the design with
-specific evidence; no visible partial graph or second writer is acceptable.
-
-A final published flag after independently committed mutable tables cannot hide
-partial rows from readers. Verify managed-connection lock behavior on Windows;
-WAL alone does not prove concurrent shared-connection reads.
-
-CocoIndex tracking/memo and SQLite are separate durability stores. Crash after DB
-commit/before target acknowledgement must replay the same desired keys idempotently,
-without duplicate support or another semantic revision. Crash before commit leaves
-graph and checkpoints unchanged. Memoized inference can survive failure without
-being counted as published evidence.
-
-### 6.2 Validation scope
-
-Unresolved SHACL violations abort. Source-local checks can be bounded, but hierarchy
-cycles/disjointness may require reverse dependency and ancestor/descendant closure.
-Until incremental validation is demonstrated equivalent to the full validator,
-full post-state `lint_graph_shacl` remains mandatory. Measure its repeated cost
-in both arms; do not call it delta-constant or hide it from the ratio. Replace it
-only after affected-closure equivalence tests, not by skipping checks for speed.
-
-SHACL validates configured constraints, not semantic completeness. Remove any shape
-requiring scheme membership/top concepts; keep label, literal, provenance, sense
-and supported hierarchy/relation constraints. Identity decisions cannot be inferred
-from distinct IRIs alone: OWL does not make a unique-name assumption.
-
-## 7. Complete scheme removal and consumer cutover
-
-This is deletion, not `define_fn=None`, an empty-table mode, or a feature flag.
-Remove each implementation with all callers/tests/telemetry in the same cutover.
-Keep entity-definition inference, source facts and supported concept relations.
-
-| Surface | Removal / retained behavior |
+| State | Single owner |
 | --- | --- |
-| `graph/planner.py` | Delete `build_concept_schemes`, clustering/affinity/centroid/root work, scheme inference/embedding calls and staged scheme extraction. Replace global staging and survivor serialization with affected-owner planning. |
-| `storage/publication.py`, `graph_ops.py`, exports | Delete scheme row fields, clear/upsert/member helpers and single complete-graph tracking/envelope once grouped rows replace it. Retain one atomic writer. |
-| `storage/db.py` | No scheme/member table or scheme relation in new schema. Explicitly reject obsolete schema/profile; preserve old DBs for comparison. |
-| Inference `components.py`, `program.py`, `prompts.py`, `grammars.py`, `parsers.py`, exports | Remove `ConceptSchemeInput`, scheme outputs, `define_concept_schemes`, scheme grammar/parser/prompt branches and scheme trace handling. Keep ordinary missing-entity definitions. |
-| `core/constants.py`, `core/types.py`, PPR | Remove scheme constants/types and `skos_top_concept_up/down` settings, scheme node priors/seeds and scheme edge dispatch. Supported passage/fact/semantic traversal remains. |
-| `storage/shacl.py`, QA | Remove scheme shape/query/serializer blocks, membership requirements and scheme prompt framing. Keep MaxP source passages, retained seed facts, source provenance and existing supported subgraph formatting. No new path-explanation feature in this refactor. |
-| `scripts/watchdog.py` and CLI | Remove scheme SQL, counts, node palettes/legend and edge rendering. Report current entity/fact/edge counts, semantic readiness and phase costs. Obsolete consumers must fail rather than show fabricated zeros. |
-| Optimizer artifacts and memo identities | Bump affected program/schema/profile identities. Reject incompatible artifacts explicitly; no silent reuse of a program expecting scheme context. |
-| Tests | Remove scheme behavior expectations in grammar/parser/program/confidence/watchdog suites; replace with absence, schema rejection and paired invariance coverage. |
+| `12` `[target]` relational/vector `GRAPH_TABLES` (`chunks`, `entities`, `entity_labels`, `facts`, `fact_sources`, `edges`, `edge_sources`, `chunk_vec`, `entity_vec`, `fact_vec`, `entity_mentions`, `fact_assertions`) + `chunk_fts` + `fact_fts` + `meta` (`15` `[target]` tables total) | Single `publish_graph` component (`yaw/daemon/indexing.py`) writing via `shared_sink` (`DatabaseSink.__call__` in `yaw/daemon/graph/storage/managed_sqlite.py`) in `1` `[target]` SQLite transaction validated pre-commit by `validate_graph_state` (`yaw/daemon/graph/storage/rows.py`). |
+| `chunk_vec`, `entity_vec`, `fact_vec` storage format | `sqlite-vec == 0.1.9` `[measured: uv.lock:2221-2222, 50be17d]` `vec0` virtual tables (`USING vec0(<pk_col> TEXT PRIMARY KEY, embedding float[N] distance_metric=cosine)` where `<pk_col>` is `chunk_id`, `entity_id`, `fact_id`), owned by `managed_sqlite.py` / `db.py` / `vectors.py`. |
+| Target row fingerprint tracking (`TABLES.target_state`) | CocoIndex LMDB (`<state_dir>/coco_lmdb`) keyed by `TableKey(db_identity: str, name: str)` with `RowHandler.tracks_value_fingerprint = True` (`managed_sqlite.py`). |
+| Indexing & graph-publication LLM/embedder memoization (`extract_text`, `embed_text`, `define_missing_entities`, `judge_synonyms`, `heal_shacl_violations`) | CocoIndex LMDB `TABLES.memoization` (`<state_dir>/coco_lmdb`), keyed by `(fn_version, model_identity, prompt_fingerprint, input_payload)`. |
+| Non-CocoIndex DSPy LM completions (query-time QA, RLM query exploration, GEPA reflection prompts) | `.yaw/dspy_cache` (`dspy.cache` `FanoutCache` with `_UsageAccountingCache` rejecting `finish_reason == "length"`). |
+| Query-time embedding reuse (`YawGraphEngine._encode_texts`) | Bounded in-memory `functools.lru_cache(maxsize=4096)` `[target]` on `YawGraphEngine`, replacing `CandidateStageCache` (`_text_vec_cache`). |
+| Optimizer reflection checkpoints & SIMBA task scores | `yaw.db` `meta` table (`get_meta` / `set_meta`), replacing `CandidateStageCache` (`open_checkpoint_cache` / `open_score_cache`). |
 
-Use `rg` to enumerate all `ConceptScheme`, `concept_scheme`, `scheme-`,
-`topConceptOf`, `hasTopConcept`, scheme-specific `inScheme` and traversal setting
-references in `yaw/`, `scripts/` and `tests/`. No active production path survives;
-negative removal assertions and explicit obsolete-schema rejection are allowed
-in tests/diagnostics. Inspect names and behavior, not just grep counts. Update
-`FOUNDATIONAL.md`, `AGENTS.md`, native indexing, W3C and confidence plans together.
-Historical papers may describe schemes; they do not govern this architecture.
+- **Boundaries**:
+  - **Single-Component Atomic Publication vs. Affected-Owner Planning (Gap 1 Resolution)**:
+    - `publish_graph` is the sole component declaring rows to `shared_sink`. `process_chunk` never declares `chunk_vec` directly; instead, `process_chunk` returns `ChunkProcessOutput` (carrying `vector_f32`) to `publish_graph`, and `plan_graph_publication` emits `ChunkVector(chunk_id, pack_f32(out.vector_f32))` without calling `embed_text`.
+    - `plan_graph_publication` executes candidate discovery, synonym adjudication (`JudgeLabels`, `JudgeHierarchy`, `JudgeRelated`), Active EDC (`canonicalize_entity_labels_edc` scoped to `entity_ids=sorted(touched_entity_ids)`), SHACL healing (`heal_shacl_violations`), and `reembed_facts` embedding **only for affected owners**, without cloning the existing database into `:memory:` or running `SELECT *` over unaffected survivor rows.
+  - **SHACL Healing & Fail-Fast Validation**:
+    - Violations are grouped by `focus_node` (`focus_node ASC`) into focus-isolated `SHACLHealInput` payloads (`heal_shacl_violations` `@coco.fn(memo=True, version=5)` `[observed: yaw/daemon/graph/inference/components.py:309, 50be17d]`) with deterministically ordered SQLite dossiers (`inspect_entity_or_fact`, `inspect_focus_node`). Pre-hydrated `focus_context` dispatches directly to `YawProgram.shacl_repair` (`mode="direct"`, GBNF-constrained `ProposeSHACLRepairs`).
+    - `apply_shacl_repairs` records `set_pref_label` with `chunk_id = "__healed__"` provenance (filtered via `SUBSTR(el.chunk_id, 1, 2) != '__'` in `auto_heal_deterministic_shacl`) and updates `entity_mentions`/`fact_assertions` on destructive/merge repairs.
+    - Before the `DatabaseSink` transaction commits, `validate_graph_state` runs `lint_graph_shacl(conn, auto_heal=False)` and structural binding checks. Any remaining violation rolls back the SQLite transaction and raises `FatalGraphPublicationError` (`BaseException`), aborting optimization immediately.
 
-## 8. Resource and scaling constraints
+## 5. Design (current state)
 
-Peak resident memory for the whole YAW worker must be **<=1 GiB**, including Python,
-native allocations, SQLite caches, proposal and retrieval state. External model
-weights are measured separately. The graph remains sparse and vectors are loaded
-only for needed work. No dense N-by-N arrays, corpus graph copy, custom community
-heap, streamed centroid subsystem or new graph-clustering dependency.
+```mermaid
+flowchart TD
+    CI["Active ChunkProcessOutput tuple from coco.use_mount\n(pointer, text, ChunkInference, vector_f32)"]
+    P["plan_graph_publication (planner.py)\nIndexed affected-owner reads from yaw.db + zero chunk embed_text replay"]
+    S["Affected-owner candidate discovery & JudgeLabels / JudgeHierarchy / JudgeRelated\n+ touched_entity_ids Active EDC + single-pass reembed_facts"]
+    H["Focus-isolated heal_shacl_violations (mode='direct')"]
+    D["declare_tables(db_identity, plan.tables)\nDelta-scoped target reconciliation over shared_sink"]
+    SINK["DatabaseSink.__call__ (managed_sqlite.py)\nSingle BEGIN IMMEDIATE transaction: relational + vec0 + FTS5 + validate_graph_state"]
+    DB[("yaw.db: 15 tables (ordinary + vec0 + fts5)")]
+    CI --> P --> S --> H --> D --> SINK --> DB
+    DB -. "indexed affected-owner reads only" .-> P
+```
 
-This is an acceptance measurement, not a speculative 768/256-MiB accounting
-framework. Record peak RSS and private/committed memory on Windows to expose
-paging. Failure preserves prior valid graph; never discard candidates or replace
-supported edges to meet a budget.
+Decided:
 
-After the initial pair passes, repeat 128-chunk additions against larger fixed
-base graphs and include high-degree updates. Separate candidate-search/validation
-cost growth from accidental old-chunk inference or whole-graph publication. Exact
-KNN/full validation may still scale with corpus size. The spec promises neither
-O(1) updates nor universal runtime equality for arbitrary topology. Report measured
-curves and reject acceptance if the designated corpus exceeds memory or paired
-work targets. Tests cannot infer asymptotic behavior from two timings.
+```python
+@dataclass(frozen=True)
+class TableSpec:
+    schema: sqlite.TableSchema[Any]
+    primary_key: list[str]
+    fts_unindexed: tuple[str, ...] | None = None
+    indexes: tuple[tuple[str, ...], ...] = ()
+    vec0_dimension: int | None = None
+    vec0_metric: Literal["cosine"] | None = None
 
-Provider settings stay native DSPy, default LLM `Semaphore(1)`, embedding batch
-<=64, development temperature 1 per `AGENTS.md`, and retries solely
-through `dspy.LM(num_retries=...)`. No lower retries or extra degraded path to
-produce favorable timing.
 
-## 9. Path to the two goals and restart checklist
+@dataclass(frozen=True)
+class TableKey:
+    db_identity: str
+    name: str
 
-Each checkpoint produces a reviewable artifact. An unchecked item is not complete.
-Do not launch optimization or restart live workers as part of a documentation edit.
 
-G1 execution: [scheme removal restart record](reviews/concept-scheme-removal.md).
+async def mount_table[RowT](
+    db_identity: str,
+    name: str,
+    spec: TableSpec,
+) -> sqlite.TableTarget[RowT]:
+    """Mount a table target scoped by TableKey(db_identity, name) so shared
+    <state_dir>/coco_lmdb never collides across distinct yaw.db files.
+    """
 
-Execution order update, 2026-11-05: [atomic incremental publication units](reviews/incremental-publication-work.md)
-now governs the next implementation slices. Defer live diagnostic pairs and
-baseline capture until fixed-evidence semantics and bounded publication pass.
-The verified scheme-free code checkpoint remains `c01f4aa`; its tests do not
-establish bounded incremental processing. G0-G6 below remain acceptance scope,
-not a requirement to spend live-model compute before repairing known global work.
 
-- [ ] **G0: capture the defect.** Build one paired harness with isolated B/tracking
-  and frozen S. Record current counts, canonical graph diff, phase times and
-  provider work. Add batch64/65 and final-chunk bridge fixtures before refactoring.
-  Record this as legacy evidence, not the scheme-free baseline.
-- [ ] **G1: delete schemes.** Remove the entire inventory in section 7, update every
-  consumer and identity, retain source experiments, and establish the scheme-free
-  baseline through the existing atomic path. A staging path at this checkpoint
-  remains an explicit incomplete cutover, not accepted final architecture.
-- [ ] **G2: make semantics independent of arrival.** Stable raw contributions,
-  canonical bindings, cross-batch/new-to-new candidates, reverse candidate/evidence
-  invalidation, negative decisions and deterministic conflict/repair ordering.
-  Pass exact controlled graph equality before claiming counts are comparable.
-- [ ] **G3: remove repeated work.** Replace full hydration, in-memory clone and
-  survivor proposal with indexed affected-owner reads and native memo/tracking.
-  Prove unchanged keys cause no inference or target mutations. Include replacement,
-  deletion and late evidence, not just additions.
-- [ ] **G4: declarative atomic cutover.** Pass locked-connector grouping/rollback/
-  crash probes, then replace complete-graph sink with typed final targets. Do not
-  remove the working atomic path before proving its replacement. Only one path
-  survives this checkpoint; no compatibility layer or dual writer remains.
-- [ ] **G5: prove the pair.** Run fixed-evidence equality/work tests and real-model
-  paired trials in section 10, producing raw data and gate verdicts. Investigate
-  any inflated phase or graph family; do not merely compare total row counts.
-- [ ] **G6: broaden acceptance.** Larger-base scaling, source mutations, restart,
-  Windows live lifecycle, all consumers and Tier 1/Tier 2 retrieval/QA gates.
-  Document executed checks, limitations and actual active schema/profile.
+async def plan_graph_publication(
+    settings: GraphPlanSettings,
+    active_chunks: Sequence[ChunkProcessOutput],
+) -> GraphPlanResult:
+    """Compute affected-owner mutations across the 15 graph tables from in-memory
+    active_chunks and indexed yaw.db lookups without calling
+    load_active_chunk_inferences, clone_graph_to_memory, or embed_text on chunk texts.
+    """
+```
 
-Resume by checking branch/worktree, latest completed checkpoint, evidence artifact,
-locked versions and unresolved gate. Update this checklist only from evidence.
-Implementation commits are conventional and include only assigned changes after
-required checks. A spec revision alone cannot close implementation checkpoints.
+- **`sqlite-vec` `vec0` DDL, Upserts, and KNN Queries (`managed_sqlite.py`, `db.py`, `vectors.py`, `graph_ops.py`)**:
+  - When `spec.vec0_dimension is not None` (with `pk_col = spec.primary_key[0]`, i.e., `"chunk_id"`, `"entity_id"`, `"fact_id"`), `_create_table` executes:
+    ```sql
+    CREATE VIRTUAL TABLE IF NOT EXISTS "{name}" USING vec0(
+        "{pk_col}" TEXT PRIMARY KEY,
+        embedding float[{spec.vec0_dimension}] distance_metric=cosine
+    )
+    ```
+  - Because `vec0` and `fts5` virtual tables do not support `INSERT ... ON CONFLICT DO UPDATE`, `DatabaseSink.__call__` (`managed_sqlite.py`) executes `DELETE FROM "{table}" WHERE "{pk_col}" = ?` followed by `INSERT INTO "{table}" ("{pk_col}", embedding) VALUES (?, ?)` whenever `spec.fts_unindexed is not None or spec.vec0_dimension is not None`. Likewise, `rekey_facts` (`graph_ops.py:1018–1023` at `50be17d`) replaces `ON CONFLICT(fact_id) DO UPDATE` on `fact_vec` with `DELETE` + `INSERT`.
+  - Both `vectors.py:_search_knn` (`L105–128` at `50be17d`) and `graph_ops.py:find_entity_synonym_candidates` (`L104–117` at `50be17d`) execute `vec0` `MATCH` KNN queries with deterministic tie-breaking, returning `(1.0 - distance) AS similarity` in `_search_knn` and `distance AS dist` in `find_entity_synonym_candidates`:
+    ```sql
+    SELECT {id_col}, (1.0 - distance) AS similarity
+    FROM {table}
+    WHERE embedding MATCH ? AND k = ?
+    ORDER BY distance ASC, {id_col} ASC
+    ```
+- **Single-Owner Cache Cutover (`engine.py`, `optimizer.py`, `candidate_cache.py`)**:
+  - `yaw/daemon/graph/storage/candidate_cache.py` (`CandidateCacheStore`, `CandidateStageCache`, `CandidatePayloadCodec`, and its `candidate_stage_cache` / `candidate_cache_size` tables) is deleted completely.
+  - `YawGraphEngine._encode_texts` caches query-time embeddings via an instance-scoped bounded LRU cache keyed by `(self._embedding_cache_namespace(), text)` (`maxsize=4096` `[target]`).
+  - `GraphOptimizationHooks` stores SIMBA task scores and reflection checkpoints in `yaw.db`'s `meta` table via `get_meta` / `set_meta`.
 
-### 9.1 Remaining cleanup after the 614-line retirement
+Open:
+- **Question**: How should `managed_sqlite.py` (`TableHandler` / `RowHandler` / `DatabaseSink`) reconcile affected-owner mutations in `publish_graph` without calling `SELECT *` on unaffected survivor rows in `yaw.db` while preventing `cocoindex == 1.1.0` from treating omitted survivor keys in `/publication` as `coco.NON_EXISTENCE`?
+  - **Constraint**: Must execute all `15` `[target]` table mutations inside `1` `[target]` `DatabaseSink` transaction with pre-commit `validate_graph_state`, perform `0` `[target]` full-table `SELECT *` survivor scans in `planner.py`/`rows.py`, keep worker RSS `<= 1 GiB` `[target]`, and never delete unaffected rows on Batch 2.
+  - **Resolved by**: Capability Gate `CG-GRAPH-2` probe testing whether `publish_graph` mounts per-owner child `@coco.fn(memo=True)` components that feed the single shared `DatabaseSink` barrier or `DesiredTable` carries explicit `(upserts, deleted_keys)` reconciled by `TableHandler`.
 
-The supplied 2026-11-06 dead-code audit confirms that retiring the callers left
-callee-side cache plumbing and the schema migration/backfill stack behind.
-Its estimate is **about 403 further lines**: 228 in storage initialization,
-65 in judge-stage caching, 65 in cache codecs and 45 in engine helpers/imports.
-These are audit estimates against the earlier checkout, not a measured runtime
-gain or a deletion quota. Current source still contains the named symbols; line
-numbers have moved. The earlier U1/U2 result establishes its recorded contracts,
-not completion of this remaining cleanup.
+## 6. Capability gates
 
-Execute these atomic slices in caller-to-callee order. Recheck production,
-scripts, benchmark and test consumers before removal; a test of an obsolete API
-does not justify retaining that API. No compatibility aliases or dual cache path.
+<a id="61-atomic-declarative-publication-capability-gate"></a>
 
-| Slice | Remove | Evidence required before completion |
-| --- | --- | --- |
-| C1: engine remnants | `_attempted_shacl_keys`, `_graph_cache_context`, `_encode_in_batches`, `_apply_shacl_repairs`, and imports made unused by their removal (`apply_shacl_repairs`, `pool_confidences`). | Confirm no active caller; keep query encoding and `EmbeddingEndpoint` batching. Verify current telemetry consumers and native indexing/retrieval tests. |
-| C2: judge-stage cache remnants | `_run_judge_stage(stage_cache=...)`, `judge_synonyms(stage_caches=...)`, dead cache hit/write blocks and their pass-through arguments. Remove the unconditional `judge_stage_fingerprint`/`batch.cache_identity` calculation when its only consumer is the retired cache key; remove newly unused helpers/imports after checking their callers. | Preserve native CocoIndex memoization, all three synonym stages, decisions, named traces and token accounting. Demonstrate that packets no longer serialize/hash predictor surfaces solely for an unused key. |
-| C3: cache codec remnants | `CandidatePayloadCodec`/`CandidateStageCache` passage arguments and tags for source-passage replacement, `OpenIERecord`, `StructuredTriple`, `dspy.Prediction` and `REPLHistory`, plus their unused imports. | Inventory actual optimizer checkpoint values before deleting tags. Preserve active embedding arrays (shape/dtype), scalar task scores, JSON checkpoints and real SQLite checkpoint/resume round trips. The active candidate cache itself is not retired by this slice. |
-| C4: migration/backfill stack | `migrate_edges_reasoning`, `migrate_epistemic_confidence_columns`, `initialize_schema` column alter/drop branches, `_entities_migrated`, `_facts_migrated`, `_edges_migrated`, duplicate migration calls, and `fact_sources`, `__legacy__` label and `fact_fts` backfills. | Keep explicit obsolete-schema rejection and required fresh/staging initialization; final graph tables remain declarative target-owned. Verify fresh SQLite/vec/FTS state, current-profile reopen, incompatible-schema rejection without mutation, and publication rollback. Do not migrate user experiment databases. |
+| Behavior relied on | Locked version | Probe | Pass criterion | Stop rule |
+| --- | --- | --- | --- | --- |
+| `CG-GRAPH-1`: `sqlite-vec` `vec0` virtual tables with `TEXT PRIMARY KEY`, `distance_metric=cosine`, `DELETE`+`INSERT` upserts inside `ManagedConnection` transaction, rollback on `validate_graph_state` failure, and `WHERE embedding MATCH ? AND k = ?` KNN parity in `vectors.py` and `graph_ops.py` | `sqlite-vec == 0.1.9` `[measured: uv.lock:2221-2222, 50be17d]`, `cocoindex == 1.1.0` `[measured: uv.lock:330-331, 50be17d]` | `tests/daemon/graph/storage/test_vectors.py::test_vec0_managed_transaction_upsert_rollback_and_knn_parity` | `chunk_vec`, `entity_vec`, `fact_vec` report `USING vec0` in `sqlite_master`; `DatabaseSink` upserts/deletes/rekeys succeed and roll back atomically on SHACL failure; `MATCH` top-$k$ IDs and `(1.0 - distance)` similarity scores match exact cosine reference within `1e-6` `[target]` | Stop and amend this spec with the evidence |
+| `CG-GRAPH-2`: Bounded affected-owner planning and `DatabaseSink` reconciliation without `clone_graph_to_memory` or full-table `SELECT *` survivor hydration preserves unaffected rows across `64 + 64` `[target]` batches within `<= 1 GiB` `[target]` worker RSS | `cocoindex == 1.1.0` `[measured: uv.lock:330-331, 50be17d]` | `tests/daemon/graph/test_batch_equivalence.py::test_incremental_publication_without_memory_clone_or_full_survivor_scan` | `clone_graph_to_memory` is absent; Batch 2 executes `0` `[target]` SQLite writes and `0` `[target]` unindexed full-table `SELECT *` survivor reads for unaffected Batch 1 rows; `canonical_graph(64+64) == canonical_graph(128)` | Stop and amend this spec with the evidence |
 
-The audit's reported 16 redundant catalog/table scans per fresh staging database
-and remaining per-packet hashing are hypotheses to measure with actual SQL/call
-evidence. Its “zero-risk” and 30–45-minute estimates are not acceptance criteria.
-Each slice requires the mandatory project gates and an appended review checkpoint.
-None is complete merely because this plan lists it.
-For C3, distinguish the legacy `passage` sentinel from active `source`,
-`source_span` and `source_parts` compression: `CandidatePayloadCodec` is still
-constructed by the engine for reflection checkpoints. Preserve that live behavior;
-plain JSON checkpoint values can still contain embedded source text.
+## 7. Removal inventory
 
-The audit also identifies repeated chunk-vector work for **G3/G4 (U5)**:
-`process_chunk` discards the returned `EmbeddedText`, and the global planner
-reformats all active chunk inputs, calls `embed_text` again to recover memoized
-vectors, then stages/clones `chunk_vec`. Move final `chunk_vec` declaration to
-the per-chunk owner under §5.1; remove the planner's replay/staging/clone path
-when the replacement passes update/delete/restart and atomic publication gates.
-Do not replace native memoization with an engine cache or call this bounded while
-the global planner remains active. Measure this independently of C1–C4.
+<a id="91-remaining-cleanup-after-the-614-line-retirement"></a>
 
-### 9.2 Performance review: measured implementation units
+| Retired item | Location | Replacement or "none" | Exit check |
+| --- | --- | --- | --- |
+| Dead engine helpers (`C1`): `_attempted_shacl_keys`, `_graph_cache_context`, `_encode_in_batches`, `_apply_shacl_repairs` | `yaw/daemon/graph/engine.py` (`50be17d`) | Direct `EmbeddingEndpoint` batching and `publish_graph` SHACL healing | `git grep -n -e "_attempted_shacl_keys" -e "_graph_cache_context" -e "_encode_in_batches" -e "_apply_shacl_repairs" yaw/ scripts/ tests/` has `0` `[target]` matches |
+| Dead judge-stage cache parameters (`C2`): `stage_cache` and `stage_caches` in `program.py` | `yaw/daemon/graph/inference/program.py:966, 1001–1002, 1098–1099, 1112, 1179, 1208, 1259` (`50be17d`) | `@coco.fn(memo=True)` on `judge_synonyms` in `<state_dir>/coco_lmdb` (retaining active `judge_stage_fingerprint` in `diagnostics.py` and `cache_identity` in `types.py`/`proposer.py`) | `git grep -n -w -e "stage_cache" -e "stage_caches" yaw/ scripts/ tests/` has `0` `[target]` matches |
+| Legacy schema migrations & backfills (`C4`): `migrate_edges_reasoning`, `migrate_epistemic_confidence_columns`, `_entities_migrated`, `_facts_migrated`, `_edges_migrated`, `__legacy__` backfill | `yaw/daemon/graph/storage/db.py` (`50be17d`) | Declarative `sqlite.TableSchema.from_class` + explicit obsolete-schema rejection | `git grep -n -e "migrate_edges_reasoning" -e "migrate_epistemic_confidence_columns" -e "_entities_migrated" -e "_facts_migrated" -e "_edges_migrated" yaw/ scripts/ tests/` has `0` `[target]` matches |
+| `CandidateStageCache` subsystem (`C3 + C5`): `candidate_cache.py`, `CandidateCacheStore`, `CandidateStageCache`, `CandidatePayloadCodec`, `candidate_stage_cache` / `candidate_cache_size` DDL, `_text_vec_cache`, `open_score_cache`, `open_checkpoint_cache` | `yaw/daemon/graph/storage/candidate_cache.py` (`L1–321`), `yaw/daemon/graph/storage/__init__.py` (`L14`), `yaw/daemon/graph/engine.py` (`L38, 206–233, 737, 747, 1538, 1573–1585`), `yaw/daemon/graph/inference/optimizer.py` (`L203–204, 787–846`) (`50be17d`) | Shared `<state_dir>/coco_lmdb` (`TABLES.memoization`), in-memory `lru_cache(maxsize=4096)` `[target]` for query embeddings, and `yaw.db` `meta` table (`get_meta`/`set_meta`) for optimizer state | `git grep -n -e "CandidateStageCache" -e "CandidateCacheStore" -e "CandidatePayloadCodec" -e "candidate_stage_cache" -e "_text_vec_cache" yaw/ scripts/ tests/` has `0` `[target]` active production matches |
+| Planner SQLite polling & chunk `embed_text` replay (`Gap 1 & Gap 3`): `load_active_chunk_inferences` and `_prepare_embed_req` / `embed_text` chunk loop in `plan_graph_publication` | `yaw/daemon/graph/planner.py:203–263, 1026, 1099–1127` (`50be17d`) | Direct `Sequence[ChunkProcessOutput]` parameter (including `vector_f32`) passed from `publish_graph` | `git grep -n -e "load_active_chunk_inferences" -e "_prepare_embed_req" yaw/ scripts/ tests/` has `0` `[target]` matches |
+| In-memory graph cloning & full-table survivor scans (`Gap 1 & P1`): `clone_graph_to_memory` and full-table `SELECT *` in `rows.py:graph_tables` | `yaw/daemon/graph/planner.py:266–301, 1233`, `yaw/daemon/graph/storage/rows.py:137–162` (`50be17d`) | Indexed affected-owner reads from `yaw.db` and delta-scoped target reconciliation (`CG-GRAPH-2`) | `git grep -n -e "clone_graph_to_memory" yaw/ scripts/ tests/` has `0` `[target]` matches |
+| Ordinary `BLOB` vector tables & brute-force scalar `vec_distance_cosine` KNN (`Gap 4`): `CREATE TABLE IF NOT EXISTS chunk_vec/entity_vec/fact_vec` and `vec_distance_cosine` SQL queries | `yaw/daemon/graph/storage/db.py:147–163`, `managed_sqlite.py:50–70`, `vectors.py:105–128`, `graph_ops.py:104–117` (`50be17d`) | `CREATE VIRTUAL TABLE ... USING vec0(...)` and `WHERE embedding MATCH ? AND k = ?` (`CG-GRAPH-1`) | `git grep -n -e "vec_distance_cosine" -e "CREATE TABLE IF NOT EXISTS chunk_vec" -e "CREATE TABLE IF NOT EXISTS entity_vec" -e "CREATE TABLE IF NOT EXISTS fact_vec" yaw/` has `0` `[target]` matches |
 
-The supplied performance review identifies candidate discovery as the main
-remaining compute candidate: `find_entity_disambiguation_candidates` and
-`find_entity_synonym_candidates` in `storage/graph_ops.py`. It also identifies
-survivor hydration, whole-graph cloning, PPR topology construction and JSON
-serialization. Its 25–45-second batch cost, 80–100x candidate speedup, 23x PPR
-speedup and other timings are external review claims without reproduced evidence
-in this checkpoint. Revalidate symbol/caller locations against the current tree;
-do not adopt its code as a proven drop-in replacement.
+Consumers updated in the same change: `yaw/daemon/graph/engine.py`, `yaw/daemon/graph/planner.py`, `yaw/daemon/graph/inference/{components,optimizer,program}.py`, `yaw/daemon/graph/storage/{__init__,db,graph_ops,managed_sqlite,rows,vectors}.py`, `yaw/daemon/indexing.py`, `yaw/daemon/runtime.py`, `scripts/watchdog.py`, and `tests/daemon/graph/**`.
 
-| Unit | Concrete work | Required evidence |
-| --- | --- | --- |
-| P0: capture costs and reference outputs | Record dense/vector scans, lexical normalization and matcher-index builds, alias-join rows, hydration/JSON work, clone work and topology construction by phase. Keep the existing scoring, automatic cosine/difflib merge gates, adjudication exclusions and candidate ordering as the reference. | Fixed evidence, actual configured vector dimensions, base sizes above 4,096 labels and up to the designated 100,000-entity corpus, changed-owner counts, CPU/wall time and whole-worker peak memory. Retain raw artifacts; estimates do not close a gate. |
-| P1: remove unused hydration and clone work (G3/G4/U5) | Determine changed/affected owners before hydrating evidence; do not hydrate survivors and then discard them. Remove the per-survivor joins/JSON reconstruction and full-table Python cloning through the final owner-based cutover, including the chunk-vector replay in §9.1. | Unchanged-owner hydration/inference/target mutations are zero unless explicit dependency invalidation requires them. Pass replacement, deletion, late evidence, restart, exact graph parity and atomic publication. |
-| P2: lexical invariants and alias scope | Precompute normalized/tokenized label attributes once per needed candidate projection (`_lexical_name_parts` `@lru_cache(maxsize=65536)`). Avoid the 4,096-entry LRU scan-thrashing pattern. Reuse matcher indexing where invariant, push affected-owner filtering (`entity_ids`) into the `entity_labels` alias self-join in `find_entity_disambiguation_candidates` instead of materializing global collisions, scope `canonicalize_entity_labels_edc` in `apply_synonym_adjudication` to `entity_ids=sorted(touched_entity_ids)`, execute delta-only `canonicalize_fact_text`, and perform single-pass post-canonicalization `reembed_facts` embedding/upsert in `plan_graph_publication`. | Preserve final `SequenceMatcher` operand orientation, `autojunk` setting, normalization, digit rules, aliases, exclusions, thresholds, pair deduplication and deterministic ordering. Include changed IDs on either side of the canonical pair, new-to-new pairs, Unicode, long/repeated labels and threshold-edge cases. Upper-bound symmetry does not make final `ratio()` symmetric. |
-| P3: bounded dense candidate search | Eliminate repeated full vector scans/FFI work with a measured bounded strategy using existing dependencies. Reuse buffers and maintain global top-k/tie decisions across blocks; do not allocate the complete query-by-corpus score matrix or duplicate the whole vector corpus. | Exact candidate IDs, exclusions, cutoff/tie behavior and downstream merge/adjudication results against the reference. Floating-point score tolerances alone do not prove identity-decision parity. Include zero vectors, duplicate vectors, ties at k, near-threshold values, target subsets and the no-target/full-scan case. Pass <=1 GiB for the whole worker. |
-| P4: sparse PPR construction and lifecycle | Evaluate native sparse duplicate aggregation in place of Python tuple/dictionary accumulation, then retain topology only for the matching committed graph and traversal policy. | Preserve directional weights, probability functions, edge-kind semantics, normalization and isolated nodes. Validate retrieval/PPR and deterministic ranked results, including close ties. Cache by committed semantic revision plus schema/profile and weight policy; `PRAGMA data_version` alone cannot cover a connection's own writes. No uncommitted proposal may populate the retrieval cache. |
-| P5: serialization on surviving paths | After C3 and P1, measure remaining JSON work. Consider an already available native codec only where profiling still justifies it. | Preserve decoded types, UTF-8, numeric/null behavior, canonical hashing/ordering and checkpoint/resume semantics. No blind `json` substitution or new dependency is authorized by this plan. |
+## 8. Checkpoints
 
-The proposed dense SGEMM/cdist implementation is **not acceptable as written**
-under §8. A 100,000-by-100,000 float32 score matrix alone is about **37.3 GiB**.
-At 100,000 vectors with 768 dimensions, three full float32-equivalent vector
-buffers already occupy about **879 MiB**, before scores, Python rows, graph state
-and native allocations. Query/corpus tiling and measured lifetime accounting are
-required; `workers=-1` is not an established worker/thread budget.
+<a id="92-performance-review-measured-implementation-units"></a>
 
-Likewise, these advertised equivalence claims require correction before adoption:
+Status is tracked in [incremental-publication-work.md](reviews/incremental-publication-work.md).
 
-- SGEMM normalization/rounding need not reproduce SQLite cosine scores bit for
-  bit. `argpartition` can choose arbitrary members at a tied top-k boundary;
-  sorting the selected subset stably does not recover excluded ties. Establish a
-  deterministic reference ordering and prove threshold/top-k decisions.
-- A clipped uint8 histogram is not automatically an exact character-count bound
-  for long or Unicode labels. Do not prune a valid lexical candidate through
-  counter saturation, UTF-8/code-point differences or float cutoff rounding.
-- RapidFuzz/LCS is only a proposed upper-bound prefilter, never a substitute for
-  the reference difflib score. Prove no false negatives with the actual
-  normalization, score precision and cutoff behavior. Adding `rapidfuzz` requires
-  a separately assigned dependency change and benchmark evidence; do not add an
-  optional-import acceleration/fallback pair.
-- `sqlite3.Connection.backup()` still copies the complete graph and vectors into
-  `:memory:`. It does not satisfy U5 or the resource boundary, so accelerating the
-  clone is not the target implementation. Remove the clone rather than adding a
-  second staging path. A diagnostic backup benchmark cannot close G3/G4.
-- Sparse native aggregation can change floating-point addition order. A reported
-  difference below 1e-15 is not proof of identical ranked results or traversal
-  decisions; verify the actual graph semantics and close-tie fixtures.
+### Subagent Orchestration Protocol (Context Protection)
 
-Start with P0, retire dead work through C1–C4/P1, then optimize the remaining
-candidate hot paths P2/P3. P4/P5 are separate reviewable units. Every unit records
-before/after artifacts, source/work counters, output parity, memory and mandatory
-gate results. Faster whole-graph replay does not establish bounded incremental
-processing or close the 64+64 versus 128 acceptance gate.
-Include Open IE defect rates, healer abstentions, and separate RLM/worker tokens
-and wall time in P0. Preventing extraction defects can remove repair work; keep
-source faithfulness and retrieval/QA gates when comparing changed extraction
-profiles rather than treating fewer extracted facts as an improvement by itself.
+To keep the parent agent's context window lean across multi-slice execution, the parent agent never performs bulk file reads, multi-file edits, or full test-suite runs directly. Instead, each checkpoint unit is executed through a deterministic subagent pipeline (`Workspace="inherit"` for sequential code-writing units; parallel read-only `research`/`ontologist`/`critic` invocations where independent):
 
-## 10. Verification matrix and evidence
+| Role | Subagent `TypeName` | `Model` | `Workspace` | Responsibility per Checkpoint |
+| --- | --- | --- | --- | --- |
+| Read-only caller & SDK discovery | `research` | `inherit` | `inherit` | Maps exact `path:symbol` call graphs, test fixtures, and `cocoindex == 1.1.0` / `sqlite-vec == 0.1.9` `[measured: uv.lock, 50be17d]` behaviors before code edits. |
+| W3C SKOS/OWL/SHACL & identity verification | `ontologist` | `inherit` | `inherit` | Audits `vec0` + `fts5` + relational SHACL rollback invariants (`G4-VEC0`), affected-owner sense/fact rekeying (`G3/G4/U5/P1`), and reverse top-$k$ candidate completeness (`U3`). |
+| Red-Green-Refactor TDD & atomic deletion | `simplifier` | `inherit` | `inherit` | Writes failing real-substrate tests first (`CG-GRAPH-1`, `CG-GRAPH-2`), implements minimal code (`1` `[target]` checkpoint slice per invocation), runs all `6` `[target]` mandatory quality gates and §7 `git grep` exit checks, and records results in [incremental-publication-work.md](reviews/incremental-publication-work.md). |
+| Pre-commit architectural & shortcut audit | `critic` | `flash` | `inherit` | Audits the diff after `simplifier` completes to reject verification shortcuts (e.g., hidden `SELECT *` survivor scans, relocated SQLite polling, unremoved dead symbols, or broken similarity orientation) before the parent commits. |
 
-### 10.1 Required real-substrate fixtures
+### Ordered Slices
 
-Use on-disk SQLite, native CocoIndex tracking, sqlite-vec, files and subprocess
-restart. Fixed typed extraction/judgment fixtures or loopback providers isolate
-orchestration; they are not evidence of real-model semantic quality.
+- **C1–C2 (Dead engine & `program.py` `stage_cache` remnants)**:
+  - *Orchestration*: `simplifier` deletes `_attempted_shacl_keys`, `_graph_cache_context`, `_encode_in_batches`, `_apply_shacl_repairs` in `engine.py` and unused `stage_cache`/`stage_caches` parameters in `program.py` (`L966–1259` at `50be17d`) and runs quality gates -> `critic (Model="flash")` verifies `0` `[target]` matches in §7 `git grep` checks while confirming active `judge_stage_fingerprint` and `cache_identity` remain intact.
+  - *Artifact & exit gate*: `outputs/benchmarks/c1_c2_dead_code_removal.xml`; zero matches in `git grep` exit checks and full `pytest` pass.
+- **C4 (Legacy schema migration & backfill removal)**:
+  - *Orchestration*: `simplifier` deletes `migrate_edges_reasoning`, `migrate_epistemic_confidence_columns`, `_entities_migrated`, `_facts_migrated`, `_edges_migrated`, and legacy backfills in `db.py` while retaining explicit obsolete-schema rejection -> `critic (Model="flash")` verifies `0` `[target]` migration remnants and clean rollback tests.
+  - *Artifact & exit gate*: `outputs/benchmarks/c4_schema_migration_removal.xml`; zero matches in `git grep` exit checks and `tests/daemon/graph/storage/test_db.py` pass.
+- **C5 (Gap 5 — Retire `CandidateStageCache`, `candidate_stage_cache`, and `_text_vec_cache`)**:
+  - *Orchestration*: `simplifier` replaces query-time `_text_vec_cache` with bounded in-memory `lru_cache(maxsize=4096)` `[target]`, routes SIMBA score/reflection checkpoints to `yaw.db` `meta`, deletes `yaw/daemon/graph/storage/candidate_cache.py`, and removes `candidate_stage_cache` SQL in `runtime.py:1240–1241` (`I3` in [native-cocoindex-indexing.md §8](native-cocoindex-indexing.md#8-checkpoints)) -> `critic (Model="flash")` verifies single-owner cache boundaries and `0` `[target]` active matches for `CandidateStageCache` / `candidate_stage_cache`.
+  - *Artifact & exit gate*: `outputs/benchmarks/c5_candidate_cache_retirement.xml`; zero active matches for `CandidateStageCache` / `candidate_stage_cache` across `yaw/`, `scripts/`, and `tests/`.
+- **G4-VEC0 (Gap 4 — `sqlite-vec` `vec0` virtual tables in `managed_sqlite.py`, `db.py`, `vectors.py`, `graph_ops.py`)**:
+  - *Orchestration*: `ontologist` confirms `validate_graph_state` SHACL rollback invariants across `vec0` virtual tables -> `simplifier` writes and passes `CG-GRAPH-1` (`test_vec0_managed_transaction_upsert_rollback_and_knn_parity`), switches `chunk_vec`, `entity_vec`, and `fact_vec` to `USING vec0(<pk_col> TEXT PRIMARY KEY, embedding float[N] distance_metric=cosine)` with `DELETE`+`INSERT` upserts in `DatabaseSink` and `rekey_facts`, and switches `vectors.py:_search_knn` (`(1.0 - distance) AS similarity`) and `graph_ops.py:find_entity_synonym_candidates` to `WHERE embedding MATCH ? AND k = ?` -> `critic (Model="flash")` verifies `0` `[target]` matches for `vec_distance_cosine` in `yaw/` and exact similarity orientation.
+  - *Artifact & exit gate*: `outputs/benchmarks/g4_vec0_cutover.xml`; `CG-GRAPH-1` probe, `0` `[target]` matches for `vec_distance_cosine` in `yaw/`, and full vector/storage suite pass.
+- **G3/G4/U5/P1 (Gap 1, Gap 2 & Gap 3 — `TableKey(db_identity, name)`, direct `ChunkProcessOutput` input, and affected-owner planning without `clone_graph_to_memory` or `SELECT *` survivor scans)**:
+  - *Orchestration*: After `I1` and `I2` ([native-cocoindex-indexing.md §8](native-cocoindex-indexing.md#8-checkpoints)), `research` and `ontologist` verify affected-owner closure queries and `TableHandler` reconciliation -> `simplifier` writes and passes `CG-GRAPH-2`, removes `load_active_chunk_inferences`, `_prepare_embed_req`/chunk `embed_text` replay, `clone_graph_to_memory`, and full-table `SELECT *` survivor scans from `planner.py`/`rows.py` -> `critic (Model="flash")` audits against Shortcut 2 (hidden $O(|G|)$ `SELECT *` survivor hydration in Python) and Shortcut 1 (relocated SQLite polling).
+  - *Artifact & exit gate*: `outputs/benchmarks/u5_bounded_planner_cutover.xml`; `0` `[target]` matches for `load_active_chunk_inferences` and `clone_graph_to_memory`, and `64 + 64` vs. `128` `[target]` parity passes.
+- **U3/P3–P4 & G5–G6 (Reverse top-$k$ candidate completeness, sparse CSR PPR caching, and paired live/scaling acceptance)**:
+  - *Orchestration*: `ontologist` specifies the $> \text{top\_k}$ (`> 10` `[target]` entities) reverse-neighbor invalidation fixture -> `simplifier` implements `U3`/`P3` (reverse-neighbor candidate equivalence and tiled/`vec0` candidate search within `<= 1 GiB` `[target]` RSS), `P4` (sparse CSR topology caching keyed by committed semantic revision), `G5` (`>= 20` `[target]` fixed-evidence and `>= 5` `[target]` live-model paired trials reporting both `R_time` and `R_graph`), and `G6` (Tier 1 / Tier 2 benchmark parity gates) -> `critic (Model="flash")` audits raw benchmark artifacts and memory profiles.
+  - *Artifact & exit gate*: `outputs/benchmarks/g5_g6_acceptance.json`; Goal A (`0.80 <= R_time, R_graph <= 1.25` `[target]`) and Goal B pass on real hardware.
+
+## 9. Verification
 
 | Fixture | Required result |
 | --- | --- |
-| Empty B, 64+64 vs 128 | Exact controlled canonical graph and counts; equivalent source support/vector keys. |
-| Existing B, same pair | Earlier B contributions stay unchanged unless explicit new evidence affects them; no old extraction replay. |
-| One document spanning chunk64/65 | Reuse a supported entity/fact across the boundary; first64 is partial, final128 ready. |
-| Last-chunk bridge / later document | Required prior-island connection appears in both arms after affected decisions settle. |
-| Homographs/unrelated topics | No forced merge/bridge; legitimate isolation survives both arms. |
-| New-to-new / reverse top-k | Same candidates/accepted bindings as reference, including new evidence changing an older neighborhood. |
-| Same-ID edit / rename / deletion | Retire correct occurrences; shared support survives, last-support deletion removes orphans. |
-| Merge reversal / order permutation | Canonical IDs, raw facts and supported relations converge; no first-seen or packet-position dependence. |
-| Confidence replay | No duplicate evidence; confidence equals fresh aggregation within 1e-6. |
-| No-op / fresh-process restart | Zero new provider work/graph mutations; stable revision and no drift from saved target tracking. |
-| Crash before/after commit acknowledgement | Atomic rows/vector/FTS/checkpoints; idempotent replay without double confidence. |
-| Failed parser/scan / stale plan / SHACL violation | Prior graph preserved; no unseen-source deletion or partial publication; original error propagated. |
-| Runtime/benchmark/candidate/watchdog | Same committed schema/profile; no scheme consumers or query-time hidden indexing. |
+| Empty $B$, `64 + 64` vs. `128` `[target]` controlled evidence (same-process & restart-between-batches) | `100%` `[target]` canonical `15`-table `[target]` equality; `0` `[target]` entity/fact/edge count difference; confidence difference `<= 1e-6` `[target]`; $0.80 \le R_{\text{time}}, R_{\text{graph}} \le 1.25$ `[target]`. |
+| Existing base graph $B$, `64 + 64` vs. `128` `[target]` addition (`CG-GRAPH-2`) | Unchanged $B$ owners incur `0` `[target]` provider calls, `0` `[target]` `DatabaseSink` row writes, and `0` `[target]` full-table `SELECT *` survivor reads; no `clone_graph_to_memory` execution. |
+| Reverse top-$k$ neighborhood invalidation across batches (`> 10` `[target]` entities in shared subspace, `> top_k`) | Batch 2 entity entering a Batch 1 entity's top-$k$ neighborhood yields `100%` `[target]` identical candidate pairs and canonical merges in `64 + 64` `[target]` and `128` `[target]`. |
+| Cross-batch entity merge & smaller canonical sense ID arriving in Batch 2 | Representative re-keys to `MIN(sense_id)`; `prior_fact_definitions` and `"__healed__"` `skos:prefLabel` survive across `merged.fact_bindings`; raw `entity_mentions` and `fact_assertions` preserved. |
+| `vec0` virtual table transaction, rekey, rollback, and KNN parity (`CG-GRAPH-1`) | `chunk_vec`, `entity_vec`, `fact_vec` use `USING vec0`; SHACL failure rolls back all relational, `vec0`, and `fts5` mutations atomically; `MATCH` KNN in `vectors.py` (`1.0 - distance`) and `graph_ops.py` matches exact cosine top-$k$ within `1e-6` `[target]`. |
+| Shared `<state_dir>/coco_lmdb` with `TableKey(db_identity, name)` across `2` `[target]` candidate DBs (`CG-INDEX-1`) | Second DB reuses `TABLES.memoization` (`0` `[target]` provider calls on overlapping inputs) while materializing all `15` `[target]` tables independently. |
+| Single-owner cache cutover (`C5`) | `CandidateStageCache` and `candidate_stage_cache` are absent; query-time `_encode_texts` hits in-memory LRU cache; SIMBA reflection/score checkpoints round-trip via `yaw.db` `meta`. |
+| Same-ID edit, deletion, and crash before/after commit acknowledgement | Withdrawn occurrences retract support; shared entities/facts survive; last-support deletion removes orphans; crash replay is idempotent without double confidence pooling. |
+| Unresolved SHACL violation or parser boundary failure | Transaction rolls back preserving prior committed graph; `FatalGraphPublicationError` (`BaseException`) propagates immediately without fallback. |
 
-### 10.2 Timing and live evidence
-
-Use at least 20 paired fixed-evidence trials for timing distributions, with arm
-order alternated. Use at least 5 paired real-model trials for median and range;
-do not claim stable p95 from five samples. Measure cold and warm scenarios
-separately, logging all results and failures. Predeclare chunk workloads, B, source
-and profile digests, hardware and thresholds. Preserve endpoint state controls
-and account for startup; do not assign all first-run costs to one arm.
-
-Report `T_I`, `T_R`, `R_time`, `R_graph`, per-phase costs, CPU/provider-input work, final E/F/typed-edge
-counts, count differences, semantic set hashes/Jaccard, required-bridge results,
-peak memory and commit/readiness revisions. A fast run with false merges or
-missing facts fails. A matching final graph obtained by a hidden global rebuild
-fails the work/timing goal.
-
-### 10.3 Quality and project gates
-
-Run locked environment checks when implementing:
-
+Quality gates:
 ```powershell
 uv sync --locked
 uv run --locked ty check
@@ -764,42 +280,13 @@ uv run --locked pytest
 git diff --check
 ```
 
-Run `benchmark.py` and `scripts/verify_paper_parity_gate.py` using the actual
-configured `MONKEYPATCHED_HIPPORAG_BASELINES` and `PAPER_BASELINES` artifacts.
-Record resolved paths/digests; AGENTS references historical consolidated outputs
-while dataset code/plans also reference `data/benchmarks/baselines.json`. Never
-silently substitute a baseline or dataset slice. Tier 1 is development evidence;
-Tier 2 full-corpus acceptance remains mandatory. Report Recall@N, EM and F1
-separately where the dataset supports them; unsupported metrics are omitted with
-a reason, never fabricated. Compare scheme-free quality with prior evidence and
-retain failures rather than force acceptance through graph-count equality.
-
-Future scheme experiments must use this same source/model/slice, named baseline
-and predeclared metric, with paired uncertainty estimates and runtime/memory/
-token costs. Only repeatable held-out Recall@N, EM or F1 improvement with acceptable
-other metrics/resources can justify a new design. No scheme toggle is retained
-now for that hypothetical experiment.
-
-Save machine-readable evidence under ignored `outputs/` with command, code
-revision/dirty digest, versions, source/profile/baseline identities and raw samples.
-Runtime logs use `yaw/core/logger.py` (500-line FIFO); result artifacts preserve
-measurements beyond log rotation. Documentation checks do not pass runtime gates.
-
-## 11. Primary constraints
-
-- [CocoIndex programming model](https://cocoindex.io/docs/getting_started/overview/):
-  native incremental transforms and declarative final targets; verify APIs with
-  the locked package rather than assuming web documentation matches it.
-- [SQLite connector source](https://github.com/cocoindex-io/cocoindex/blob/main/python/cocoindex/connectors/sqlite/_target.py):
-  target/transaction behavior to probe before replacing the atomic sink.
-- [W3C SKOS](https://www.w3.org/TR/skos-reference/): semantic relations and labeling
-  do not require a globally connected scheme layer.
-- [W3C SHACL](https://www.w3.org/TR/shacl/): conformance applies to declared shapes;
-  it is not proof that discovery found every possible semantic relationship.
+Measurements recorded in: [evaluation-graph-storage.md](evaluation-graph-storage.md) and [evaluation-ingestion.md](evaluation-ingestion.md). Work notes: [incremental-publication-work.md](reviews/incremental-publication-work.md) and [shacl-healer-publication.md](reviews/shacl-healer-publication.md).
 
 ## Decisions
 
-- 2026-11-06: "Should stay literals, NER is only allowed to capture skos:Concept and owl:NamedIndividual, triple extraction can point the rdf:Statement to rdf:object = rdfs:Literal but never rdf:subject = rdfs:Literal! This is why it's two stage. NER creates the allowed rdf:subject vocabulary, with predicates able to point towards literals but never the other way around - that's the W3C ontology rules and should be in our allowed SHACL shapes." (User). Enforced across GBNF grammars, extraction/repair parsers, and closed-world SQLite SHACL shapes (§5.3).
-- 2026-11-06: "Step 4 should be included in this unit, but obviously, you can implement one unit at a time according to whichever spec you write into @[docs/native-cocoindex-graph.md] or @[docs/native-cocoindex-indexing.md] , also sounds like you'll need to update our rules and tests to prevent these kinds of failures surfacing again." (User). Specs are promoted into `docs/native-cocoindex-graph.md` and `docs/native-cocoindex-indexing.md` and executed one checkpoint unit at a time with regression tests.
-- 2026-11-07: "Audit and review for root cause for batch indexing regressing back to exponential time behavior. Incremental indexing and graph publication was designed and tested to be near-constant time for 64 + 64 chunk batches vs 128 chunk batchless indexing." / "It’s a SHACL Violation CONSISTENCY_ERROR" / "you will need to /spec first." (User). Supersedes the single-batch unconditional `canonicalize_fact_definitions` overwrite from [shacl-healer-publication.md](reviews/shacl-healer-publication.md) (`c6fa080`) with validity-ordered, repair-preserving `canonicalize_fact_definitions`, `"__healed__"` label provenance, focus-isolated `SHACLHealInput` memoization (`heal_shacl_violations` `version=4`, `publish_graph` `version=8`), single-pass post-canonicalization fact embedding, and delta-scoped table updates (§5.2, §5.3, §9.2).
-- 2026-11-07: "SHACL healing is taking extremely long - what is the performance bottleneck here?" / "/spec please spec the remedy for your debug audit above." (User). Routes pre-hydrated focus-isolated `SHACLHealInput` payloads directly to `YawProgram.shacl_repair` (`mode="direct"`, `ProposeSHACLRepairs` with GBNF; `heal_shacl_violations` `version=5`, `publish_graph` `version=9`), aligns `STAGE_RLM_DELEGATION_RULES["shacl_repair"]`, `build_rlm_action_demos()["shacl_repair"]`, and `HealSHACLViolations` with single-step zero-argument `propose_repairs()` delegation and bound `self._focus_context` reuse, and wires `OpenIEEndpoint.progress_callback` from `YawGraphEngine.emit_indexing_progress` for intra-batch synonym adjudication and SHACL healing progress telemetry (§5.2).
+- 2026-11-06: "Should stay literals, NER is only allowed to capture skos:Concept and owl:NamedIndividual, triple extraction can point the rdf:Statement to rdf:object = rdfs:Literal but never rdf:subject = rdfs:Literal! This is why it's two stage. NER creates the allowed rdf:subject vocabulary, with predicates able to point towards literals but never the other way around - that's the W3C ontology rules and should be in our allowed SHACL shapes." (User). Enforced across GBNF grammars, extraction/repair parsers, and closed-world SQLite SHACL shapes (§4).
+- 2026-11-06: "Step 4 should be included in this unit, but obviously, you can implement one unit at a time according to whichever spec you write into @[docs/native-cocoindex-graph.md] or @[docs/native-cocoindex-indexing.md] , also sounds like you'll need to update our rules and tests to prevent these kinds of failures surfacing again." (User). Specs are promoted into `docs/native-cocoindex-graph.md` and `docs/native-cocoindex-indexing.md` and executed `1` `[target]` checkpoint unit at a time with regression tests.
+- 2026-11-07: "Audit and review for root cause for batch indexing regressing back to exponential time behavior. Incremental indexing and graph publication was designed and tested to be near-constant time for 64 + 64 chunk batches vs 128 chunk batchless indexing." / "It’s a SHACL Violation CONSISTENCY_ERROR" / "you will need to /spec first." (User). Supersedes the single-batch unconditional `canonicalize_fact_definitions` overwrite from [shacl-healer-publication.md](reviews/shacl-healer-publication.md) (`c6fa080`) with validity-ordered (`3`-tier `[target]`), repair-preserving `canonicalize_fact_definitions`, `"__healed__"` label provenance, focus-isolated `SHACLHealInput` memoization (`heal_shacl_violations` `version=4` `[observed: commit c6fa080]`, `publish_graph` `version=8` `[observed: commit c6fa080]`), single-pass post-canonicalization fact embedding, and delta-scoped table updates (§4, §5).
+- 2026-11-07: "SHACL healing is taking extremely long - what is the performance bottleneck here?" / "/spec please spec the remedy for your debug audit above." (User). Routes pre-hydrated focus-isolated `SHACLHealInput` payloads directly to `YawProgram.shacl_repair` (`mode="direct"`, `ProposeSHACLRepairs` with GBNF; `heal_shacl_violations` `version=5` `[observed: yaw/daemon/graph/inference/components.py:309, 50be17d]`, `publish_graph` `version=9` `[observed: yaw/daemon/indexing.py:403, 50be17d]`), aligns `STAGE_RLM_DELEGATION_RULES["shacl_repair"]`, `build_rlm_action_demos()["shacl_repair"]`, and `HealSHACLViolations` with single-step zero-argument `propose_repairs()` delegation and bound `self._focus_context` reuse, and wires `OpenIEEndpoint.progress_callback` from `YawGraphEngine.emit_indexing_progress` for intra-batch synonym adjudication and SHACL healing progress telemetry (§4, §5).
+- 2026-11-07: "/spec remedy gaps 1-5 in @[docs/native-cocoindex-indexing.md] and @[docs/native-cocoindex-graph.md] - remember the separation of concerns, one is for indexing and the other is for graphing. Use subagents to protect your own context from bloat." (User). Remedies Gaps 1–5 in the graph specification: (1) resolves the per-owner declaration vs. single-component atomicity contradiction by keeping `publish_graph` (`DatabaseSink.__call__`) as the sole atomic producer for all `15` `[target]` graph tables (including `chunk_vec` populated from `ChunkProcessOutput.vector_f32` with `0` `[target]` planner `embed_text` calls) while `plan_graph_publication` retires `clone_graph_to_memory` and full-table `SELECT *` survivor scans (`CG-GRAPH-2`); (2) keys `managed_sqlite.py:mount_table` by `TableKey(db_identity, name)` so shared `<state_dir>/coco_lmdb` never collides across candidate DBs; (3) retires `load_active_chunk_inferences` in favor of direct `Sequence[ChunkProcessOutput]` input from `publish_graph`; (4) specifies `sqlite-vec == 0.1.9` `[measured: uv.lock:2221-2222, 50be17d]` `vec0` virtual tables (`USING vec0(<pk_col> TEXT PRIMARY KEY, embedding float[N] distance_metric=cosine)`), `DELETE`+`INSERT` virtual-table upserts, and `WHERE embedding MATCH ? AND k = ?` KNN queries in `vectors.py` and `graph_ops.py` (`CG-GRAPH-1`); and (5) supersedes the `C3` exemption to retire `CandidateStageCache`, `candidate_stage_cache`, and `_text_vec_cache` completely (`C5`).
+- 2026-11-07: "Plan doesn’t take subagent orchestration into account, should be explicitly defined." (User). Defines the mandatory subagent orchestration pipeline (`research` -> `ontologist` -> `simplifier` -> `critic (Model="flash")`) across §8 Checkpoints so the parent agent orchestrates slices without context bloat.

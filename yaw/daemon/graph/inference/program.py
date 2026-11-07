@@ -963,12 +963,11 @@ chunk."""
         *,
         lm: Any = None,
         use_gbnf: bool | None = None,
-        stage_cache: Any = None,
         captured_traces: list[Any] | None = None,
         rlm_stats: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        """Execute or retrieve cached decisions for a single synonym judgment stage."""
-        from .diagnostics import extract_named_trace_entries, judge_stage_fingerprint
+        """Execute a single synonym judgment stage."""
+        from .diagnostics import extract_named_trace_entries
 
         if not batch.candidates:
             return []
@@ -995,43 +994,6 @@ chunk."""
         }
         predictor, grammar_fn, parser_fn, audit_trail = predictor_map[stage_name]
         budget = self.synonym_request_budget(lm)
-        stage_fp = judge_stage_fingerprint(self, stage_name)
-        cache_key = (stage_fp, batch.cache_identity)
-
-        if stage_cache is not None:
-            cached = stage_cache.get(cache_key)
-            if cached is not None:
-                cached_decs, cached_tr, cached_tok = cached
-                if captured_traces is not None:
-                    captured_traces.extend(cached_tr)
-                if rlm_stats is not None:
-                    tok_key = f"{stage_name}_tokens"
-                    rlm_stats[tok_key] = int(rlm_stats.get(tok_key, 0)) + int(cached_tok)
-                self.telemetry.append(
-                    {
-                        "stage": stage_name,
-                        "mode": "cache",
-                        "cache_hit": True,
-                        "packet_id": batch.cache_identity,
-                        "pair_count": len(batch.candidates),
-                        "packet_chars": len(batch.payload),
-                        "tokens_used": 0,
-                        "construction_seconds": batch.construction_seconds,
-                        "inference_seconds": 0.0,
-                    }
-                )
-                audit_trail.append(
-                    {
-                        "mode": "cache",
-                        "predictor": stage_name,
-                        "tokens_used": cached_tok,
-                        "packet_id": batch.cache_identity,
-                        "pair_count": len(batch.candidates),
-                        "cache_hit": True,
-                        "decisions": cached_decs,
-                    }
-                )
-                return [dict(d) for d in cached_decs]
 
         prev_telem_len = len(self.telemetry)
         local_stage_trace: list[Any] = []
@@ -1095,12 +1057,6 @@ chunk."""
             }
         )
 
-        if stage_cache is not None:
-            stage_cache[cache_key] = (
-                list(parsed_decs),
-                list(stage_traces),
-                stage_tokens,
-            )
         return parsed_decs
 
     def judge_synonyms(
@@ -1109,7 +1065,6 @@ chunk."""
         *,
         lm: Any = None,
         use_gbnf: bool | None = None,
-        stage_caches: Mapping[str, Any] | None = None,
         captured_traces: list[Any] | None = None,
         rlm_stats: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
@@ -1176,7 +1131,6 @@ chunk."""
                 stage1_batch,
                 lm=lm,
                 use_gbnf=use_gbnf,
-                stage_cache=stage_caches.get("label_judge") if stage_caches else None,
                 captured_traces=captured_traces,
                 rlm_stats=rlm_stats,
             )
@@ -1205,7 +1159,6 @@ chunk."""
                 stage2_batch,
                 lm=lm,
                 use_gbnf=use_gbnf,
-                stage_cache=stage_caches.get("hierarchy_judge") if stage_caches else None,
                 captured_traces=captured_traces,
                 rlm_stats=rlm_stats,
             )
@@ -1256,7 +1209,6 @@ chunk."""
                 stage3_batch,
                 lm=lm,
                 use_gbnf=use_gbnf,
-                stage_cache=stage_caches.get("related_judge") if stage_caches else None,
                 captured_traces=captured_traces,
                 rlm_stats=rlm_stats,
             )

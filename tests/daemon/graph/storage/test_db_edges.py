@@ -27,51 +27,32 @@ from yaw.daemon.graph.storage import (
 )
 
 
-def test_legacy_schema_migrates_rows_labels_edges_and_fact_search_without_loss(tmp_path):
-    path = tmp_path / "legacy.db"
-    with closing(sqlite3.connect(path)) as legacy:
-        legacy.executescript("""
-            CREATE TABLE chunks(chunk_id TEXT PRIMARY KEY, rel_posix_path TEXT NOT NULL,
-                start_line INTEGER NOT NULL, end_line INTEGER NOT NULL, title TEXT NOT NULL, content_hash TEXT);
-            INSERT INTO chunks VALUES ('chunk','source.md',1,2,'Source','legacy-hash');
-            CREATE TABLE entities(entity_id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE);
-            INSERT INTO entities VALUES ('ada','Ada');
-            CREATE TABLE facts(fact_id TEXT PRIMARY KEY,subj_id TEXT NOT NULL,pred TEXT NOT NULL,
-                obj_id TEXT NOT NULL,raw_triple_json TEXT NOT NULL);
-            INSERT INTO facts VALUES ('fact','ada','wrote','notes','["Ada","wrote","Notes"]');
-            INSERT INTO facts VALUES ('broken','ada','legacyPredicate','notes','not json');
-            CREATE TABLE edges(src_id TEXT NOT NULL,dst_id TEXT NOT NULL,kind TEXT NOT NULL,
-                weight REAL NOT NULL,PRIMARY KEY(src_id,dst_id,kind));
-            INSERT INTO edges VALUES ('ada','notes','synonymy',0.8);
-            INSERT INTO edges VALUES ('ada','orphan','retired-kind',0.2);
-        """)
+def test_initialize_schema_creates_fresh_tables_without_legacy_migrations_or_backfills(tmp_path):
+    path = tmp_path / "fresh.db"
     with closing(open_yaw_db(path)) as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(chunks)")}
         assert "content_hash" not in columns
         assert {"ast_island_start", "ast_island_end"} <= columns
-        assert tuple(conn.execute("SELECT chunk_id,ast_island_start,ast_island_end FROM chunks").fetchone()) == (
-            "chunk",
-            0,
-            0,
-        )
-        assert tuple(conn.execute("SELECT entity_id,name,definition FROM entities").fetchone()) == ("ada", "Ada", "")
-        assert tuple(conn.execute("SELECT label_norm,label_kind,raw_label,chunk_id FROM entity_labels").fetchone()) == (
-            "ada",
-            "skos:prefLabel",
-            "Ada",
-            "__legacy__",
-        )
-        assert [tuple(row) for row in conn.execute("SELECT src_id,dst_id,kind,weight FROM edges")] == [
-            ("ada", "notes", "skos:related", 0.8),
-        ]
-        assert search_facts_fts(conn, "Ada")[0][0] == "fact"
-        assert search_facts_fts(conn, "legacyPredicate")[0][0] == "broken"
-        # The old UNIQUE(name) constraint must be removed for distinct senses.
-        upsert_entities(conn, [("ada-sense-two", "Ada", "Different entity")])
+
+        # Distinct senses with identical names are supported natively without UNIQUE(name)
+        upsert_entities(conn, [("ada-1", "Ada", "Mathematician"), ("ada-2", "Ada", "Programming language")])
         assert conn.execute("SELECT count(*) FROM entities WHERE name='Ada'").fetchone()[0] == 2
-        before = conn.execute("SELECT count(*) FROM fact_fts").fetchone()[0]
+
+        # Direct table inserts without labels, fact_sources, or fact_fts are not backfilled by initialize_schema
+        conn.execute("INSERT INTO entities (entity_id, name, definition) VALUES ('unlabeled', 'Unlabeled', '')")
+        conn.execute(
+            "INSERT INTO facts (fact_id, subj_id, pred, obj_kind, obj_id, raw_triple_json, definition) "
+            "VALUES ('f-raw', 'ada-1', 'inspired', 'entity', 'ada-2', '[\"Ada\",\"inspired\",\"Ada\"]', '')"
+        )
+        conn.execute(
+            "INSERT INTO edge_sources (src_id, dst_id, kind, chunk_id) VALUES ('ada-1', 'ada-2', 'fact', 'c-1')"
+        )
+        conn.commit()
+
         initialize_schema(conn)
-        assert conn.execute("SELECT count(*) FROM fact_fts").fetchone()[0] == before
+        assert conn.execute("SELECT count(*) FROM entity_labels WHERE entity_id = 'unlabeled'").fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM fact_sources WHERE fact_id = 'f-raw'").fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM fact_fts WHERE fact_id = 'f-raw'").fetchone()[0] == 0
 
 
 def test_failed_owned_transaction_rolls_back_partial_writes_and_outer_owner_retains_control(tmp_path):
@@ -213,7 +194,7 @@ def test_get_entity_metadata_batch_handles_empty_and_multi_batch_queries(tmp_pat
         assert "entity-missing" not in fetched
 
 
-def test_apply_shacl_repairs_executes_closed_world_actions_and_custom_merge_callback(tmp_path):
+def test_shacl_repairs_executes_closed_world_actions_and_custom_merge_callback(tmp_path):
     with closing(open_yaw_db(tmp_path / "repairs.db")) as conn:
         assert apply_shacl_repairs(conn, []) == 0
         upsert_entities(

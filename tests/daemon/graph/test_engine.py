@@ -21,6 +21,7 @@ from yaw.daemon.graph.inference import (
     extraction_fingerprint,
 )
 from yaw.daemon.graph.inference.embedding import EmbeddingProfile
+from yaw.daemon.graph.storage import apply_shacl_repairs
 from yaw.daemon.indexing import bind_native_indexing
 
 
@@ -1301,9 +1302,9 @@ using all 5 bound REPL tools."""
         assert engine._graph_rlm_stats["hierarchy_judge_tokens"] == 30
         assert engine._graph_rlm_stats["label_judge_tokens"] == 0
 
-        # Verify _apply_shacl_repairs ignores nonexistent focus nodes without inserting orphan labels
+        # Verify apply_shacl_repairs ignores nonexistent focus nodes without inserting orphan labels
         with engine.managed_conn.transaction() as conn:
-            noop_cnt = engine._apply_shacl_repairs(
+            noop_cnt = apply_shacl_repairs(
                 conn,
                 [
                     {

@@ -58,7 +58,6 @@ from yaw.daemon.graph.storage import (
     CandidatePayloadCodec,
     CandidateStageCache,
     ManagedConnection,
-    apply_shacl_repairs,
     format_pair_disambiguation_dossier,
     format_subgraph_for_qa,
     get_chunk_pointers,
@@ -171,7 +170,6 @@ class YawGraphEngine:
 
         self._csr_graph: CSRGraph | None = None
         self._graph_rlm_stats: dict[str, Any] = self._empty_graph_rlm_stats()
-        self._attempted_shacl_keys: set[tuple[str, str]] = set()
         self._chunk_rlm_stats: dict[str, dict[str, float]] = {}
         self._active_query_rlm_stats: dict[str, int] | None = None
         self._active_progress_callback: Callable[[str], None] | None = None
@@ -255,25 +253,6 @@ class YawGraphEngine:
 
     def _candidate_cache_sources(self) -> dict[str, str]:
         return {hashlib.sha256(text.encode("utf-8")).hexdigest(): text for _, text in self._opt_chunks_pool}
-
-    def _graph_cache_context(self, conn: sqlite3.Connection | None = None) -> str:
-        """Hash the graph visible to SHACL's inspection/repair tools, in bounded rows."""
-        active_conn = conn if conn is not None else self.conn
-        digest = hashlib.sha256()
-        for table, order in (
-            ("entities", "entity_id"),
-            ("facts", "fact_id"),
-            ("fact_sources", "fact_id, chunk_id"),
-            ("edges", "src_id, dst_id, kind"),
-            ("entity_labels", "label_norm, entity_id, label_kind, chunk_id"),
-            ("edge_sources", "src_id, dst_id, kind, chunk_id"),
-            ("chunks", "chunk_id"),
-        ):
-            digest.update(table.encode())
-            for row in active_conn.execute(f"SELECT * FROM {table} ORDER BY {order}"):
-                digest.update(json.dumps(tuple(row), ensure_ascii=False).encode("utf-8"))
-        digest.update(json.dumps(sorted(self._candidate_cache_sources())).encode())
-        return digest.hexdigest()
 
     def _hydrate_indexed_cids_from_db(
         self,
@@ -748,23 +727,6 @@ class YawGraphEngine:
             return [vectors[str(t)] for t in texts]
         return self.embedder.encode(texts, instruction=instruction)
 
-    def _encode_in_batches(
-        self,
-        texts: Sequence[str],
-        instruction: str = "",
-        *,
-        stage: str | None = None,
-    ) -> list[np.ndarray]:
-        """Encode texts in bounded micro-batches to prevent HTTP/VRAM OOM on large corpora."""
-        if not texts:
-            return []
-        results: list[np.ndarray] = []
-        step = max(1, self.embed_batch_size)
-        for i in range(0, len(texts), step):
-            batch = texts[i : i + step]
-            results.extend(self._encode_texts(batch, instruction=instruction, stage=stage))
-        return results
-
     @staticmethod
     def _format_hydrated_passage(p: ChunkPointer, text: str) -> str:
         if not p.title:
@@ -820,8 +782,6 @@ class YawGraphEngine:
             if formatted:
                 blocks.append(formatted)
         return "\n\n".join(blocks)
-
-    _apply_shacl_repairs = staticmethod(apply_shacl_repairs)
 
     def _resolve_chunks_for_docs(
         self,

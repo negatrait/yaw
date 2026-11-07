@@ -856,7 +856,7 @@ def test_canonicalize_fact_text_delta_only(tmp_path: Path) -> None:
         assert conn.total_changes == before_changes
 
 
-def test_apply_shacl_repairs_set_pref_label_healed_provenance_survives_edc(tmp_path: Path) -> None:
+def test_shacl_repairs_set_pref_label_healed_provenance_survives_edc(tmp_path: Path) -> None:
     """Verify set_pref_label stores '__healed__', demotes scalar label to hiddenLabel, and survives EDC."""
     with closing(open_yaw_db(tmp_path / "healed_label.db")) as conn:
         doc_file = tmp_path / "status.md"
@@ -931,7 +931,7 @@ def test_apply_shacl_repairs_set_pref_label_healed_provenance_survives_edc(tmp_p
         assert [v for v in lint_graph_shacl(conn) if v.focus_node == "ent-status"] == []
 
 
-def test_apply_shacl_repairs_maintains_validate_graph_state_across_actions(tmp_path: Path) -> None:
+def test_shacl_repairs_maintains_validate_graph_state_across_actions(tmp_path: Path) -> None:
     """Verify delete_invalid_fact, remove_scalar_entity, delete_dangling, and merge_altLabel keep evidence valid."""
     from yaw.daemon.graph.storage.evidence import fact_id, sense_id
     from yaw.daemon.graph.storage.rows import validate_graph_state

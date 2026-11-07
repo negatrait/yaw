@@ -398,7 +398,14 @@ def test_high_load_batch_operations_exceeding_sqlite_variable_limits(tmp_path: P
         conn.close()
 
 
-def test_fact_fts_indexing_search_and_backfill(tmp_path: Path) -> None:
+def test_fact_fts_indexing_and_lexical_search(tmp_path: Path) -> None:
+    import yaw.daemon.graph.storage as storage_pkg
+    import yaw.daemon.graph.storage.db as db_mod
+
+    for retired_fn in ("migrate_edges_" + "reasoning", "migrate_epistemic_" + "confidence_columns"):
+        assert not hasattr(storage_pkg, retired_fn)
+        assert not hasattr(db_mod, retired_fn)
+
     conn = open_yaw_db(tmp_path / "test_fact_fts.db")
     try:
         # 1. Upsert facts with triples
@@ -450,14 +457,13 @@ def test_fact_fts_indexing_search_and_backfill(tmp_path: Path) -> None:
         # 6. Non-matching query returns empty list
         assert search_facts_fts(conn, "nonexistentquerytoken123", top_k=5) == []
 
-        # 8. Test backfill: clear fact_fts and re-run initialize_schema
+        # 7. initialize_schema is purely DDL and never backfills deleted fact_fts rows behind the sink
         conn.execute("INSERT INTO fact_fts(fact_fts) VALUES('delete-all');")
         conn.commit()
         assert conn.execute("SELECT COUNT(*) FROM fact_fts;").fetchone()[0] == 0
         initialize_schema(conn)
-        # All three declared facts are backfilled.
-        assert conn.execute("SELECT COUNT(*) FROM fact_fts;").fetchone()[0] == 3
-        assert len(search_facts_fts(conn, "relativity", top_k=5)) == 1
+        assert conn.execute("SELECT COUNT(*) FROM fact_fts;").fetchone()[0] == 0
+        assert search_facts_fts(conn, "relativity", top_k=5) == []
     finally:
         conn.close()
 
