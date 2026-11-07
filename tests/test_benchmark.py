@@ -492,7 +492,7 @@ class DatasetSliceTests(unittest.TestCase):
 
         questions, documents = [], []
         for category, (nt, nv) in ENTERPRISE_CATEGORY_QUOTAS.items():
-            for i in range(nt + nv + 1):
+            for i in range(nt + nv + 2):
                 did = f"{category}-{i}"
                 documents.append({"idx": did, "title": did, "text": "Original text"})
                 questions.append(
@@ -504,6 +504,11 @@ class DatasetSliceTests(unittest.TestCase):
                         "expected_doc_ids": [did],
                     }
                 )
+        # Couple 10 question pairs via shared doc IDs so naive shuffling splits pairs across train/val/holdout
+        for k in range(10):
+            shared = [questions[2 * k]["question_id"], questions[2 * k + 1]["question_id"]]
+            questions[2 * k]["expected_doc_ids"] = shared
+            questions[2 * k + 1]["expected_doc_ids"] = shared
         documents.extend({"idx": f"d-{i}", "title": f"Distractor {i}", "text": "Noise"} for i in range(100))
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
@@ -519,6 +524,14 @@ class DatasetSliceTests(unittest.TestCase):
             assert val is not None
             self.assertEqual((len(train), len(val), len(corpus)), (135, 27, 162))
             self.assertTrue(all("Distractor" not in doc for doc in corpus))
+            train_dids = {did for ex in train for did in ex.expected_doc_ids}
+            val_dids = {did for ex in val for did in ex.expected_doc_ids}
+            selected_qids = {ex.question for ex in [*train, *val]}
+            holdout_dids = {
+                did for q in questions if q["question_id"] not in selected_qids for did in q["expected_doc_ids"]
+            }
+            self.assertTrue(train_dids.isdisjoint(val_dids))
+            self.assertTrue((train_dids | val_dids).isdisjoint(holdout_dids))
 
 
 class EvaluationAndIntegrityTests(unittest.TestCase):

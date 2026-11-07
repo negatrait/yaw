@@ -552,11 +552,11 @@ Audit of `.yaw/yaw_optimize_20261106_221811.db` at Batch 7 (`384` published chun
 - **Changed symbols & modules**:
   - `yaw.toml`: Updated `[optimization]` defaults to `max_queries = 162` and `train_queries = 135` (`27` validation queries).
   - `data/benchmarks/baselines.json` & `docs/enterprise-rag-bench-training-plan.md`: Updated `enterprise_rag_bench` `category_quotas` to a `135` train / `27` val (`5:1`) stratified cohort (`train_partition_size = 135`).
-  - `yaw/daemon/ingestion/datasets.py`: Updated `load_dataset_splits` default `train_partition_size` to `135` and restricted returned `corpus_docs` to the selected cohort's gold document union (`cohort_docs`) when gold references exist, eliminating unreferenced background distractors.
-  - `yaw/daemon/runtime.py`: Updated `YawRuntime.optimize()` to filter `snapshot_dataset_bundle` via `document_ids` matching `corpus_docs` so candidate indexing only snapshots and indexes the active cohort's gold document union (`269` documents on `enterprise_rag_bench` instead of all `1,308` bundle documents).
-  - `tests/daemon/ingestion/test_datasets.py`, `tests/test_benchmark.py`, `tests/daemon/test_runtime.py`: Updated EnterpriseRAG stratification (`135/27`) and zero-background-distractor corpus assertions.
+  - `yaw/daemon/ingestion/datasets.py`: Updated `select_enterprise_questions` to group coupled questions sharing any `expected_doc_ids` into `train` so `train`, `val`, and unselected `holdout` partitions are strictly document-disjoint (`0` shared documents), updated `load_dataset_splits` default `train_partition_size` to `135`, and restricted returned `corpus_docs` to the selected cohort's gold document union (`cohort_docs`) when gold references exist, eliminating unreferenced background distractors.
+  - `yaw/daemon/runtime.py`: Updated `YawRuntime.optimize()` to filter `snapshot_dataset_bundle` via `document_ids` matching `corpus_docs` so candidate indexing only snapshots and indexes the active cohort's gold document union (`272` documents on `enterprise_rag_bench` instead of all `1,308` bundle documents).
+  - `tests/daemon/ingestion/test_datasets.py`, `tests/test_benchmark.py`, `tests/daemon/test_runtime.py`: Updated EnterpriseRAG stratification (`135/27`), strict `train`/`val`/`holdout` document-disjointness, and zero-background-distractor corpus assertions.
 - **Gate results & evidence paths**:
-  - Live `enterprise_rag_bench` bundle verification: `train=135`, `val=27`, `corpus_docs=269`, `matched_bundle_ids=269` (down from `1,308` documents / `11,507` chunks).
+  - Live `enterprise_rag_bench` bundle verification: `train=135` (`227` gold docs), `val=27` (`45` gold docs), `holdout=88` (`146` gold docs), `0` shared documents across `train`/`val`/`holdout`, `corpus_docs=272`, `matched_bundle_ids=272` (down from `1,308` documents / `11,507` chunks).
   - Mandatory quality gates (`ty check`, `ruff check --fix`, `ruff format`, `pytest`, `git diff --check`): all passed.
 - **What it does not establish**:
   - Does not launch or claim completion of a live GEPA optimization run on the updated `135/27` cohort.

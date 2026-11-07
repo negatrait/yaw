@@ -385,6 +385,41 @@ def select_enterprise_questions(
         rng.shuffle(pool)
         train.extend(pool[:nt])
         val.extend(pool[nt : nt + nv])
+    doc_to_qids: dict[str, set[str]] = {}
+    for r in rows:
+        qid = str(r.get("question_id", r.get("id", r["question"])))
+        for did in r.get("expected_doc_ids") or ():
+            doc_to_qids.setdefault(str(did), set()).add(qid)
+    coupled_qids = {qid for qids in doc_to_qids.values() if 1 < len(qids) < len(rows) for qid in qids}
+    if coupled_qids:
+        selected_ids = {str(r.get("question_id", r.get("id", r["question"]))) for r in [*train, *val]}
+        holdout = [r for r in rows if str(r.get("question_id", r.get("id", r["question"]))) not in selected_ids]
+        for idx, r in enumerate(val):
+            if str(r.get("question_id", r.get("id", r["question"]))) in coupled_qids:
+                swap_idx = next(
+                    (
+                        i
+                        for i, tr in enumerate(train)
+                        if tr["question_type"] == r["question_type"]
+                        and str(tr.get("question_id", tr.get("id", tr["question"]))) not in coupled_qids
+                    ),
+                    None,
+                )
+                if swap_idx is not None:
+                    val[idx], train[swap_idx] = train[swap_idx], val[idx]
+        for h in holdout:
+            if str(h.get("question_id", h.get("id", h["question"]))) in coupled_qids:
+                swap_idx = next(
+                    (
+                        i
+                        for i, tr in enumerate(train)
+                        if tr["question_type"] == h["question_type"]
+                        and str(tr.get("question_id", tr.get("id", tr["question"]))) not in coupled_qids
+                    ),
+                    None,
+                )
+                if swap_idx is not None:
+                    train[swap_idx] = h
     rng.shuffle(train)
     rng.shuffle(val)
     return train + val
