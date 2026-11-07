@@ -556,7 +556,21 @@ Audit of `.yaw/yaw_optimize_20261106_221811.db` at Batch 7 (`384` published chun
   - `yaw/daemon/runtime.py`: Updated `YawRuntime.optimize()` to filter `snapshot_dataset_bundle` via `document_ids` matching `corpus_docs` so candidate indexing only snapshots and indexes the active cohort's gold document union (`272` documents on `enterprise_rag_bench` instead of all `1,308` bundle documents).
   - `tests/daemon/ingestion/test_datasets.py`, `tests/test_benchmark.py`, `tests/daemon/test_runtime.py`: Updated EnterpriseRAG stratification (`135/27`), strict `train`/`val`/`holdout` document-disjointness, and zero-background-distractor corpus assertions.
 - **Gate results & evidence paths**:
-  - Live `enterprise_rag_bench` bundle verification: `train=135` (`227` gold docs), `val=27` (`45` gold docs), `holdout=88` (`146` gold docs), `0` shared documents across `train`/`val`/`holdout`, `corpus_docs=272`, `matched_bundle_ids=272` (down from `1,308` documents / `11,507` chunks).
+  - Live `enterprise_rag_bench` bundle verification: `train=135` (`227` gold docs), `val=27` (`46` gold docs), `holdout=88` (`145` gold docs), `0` shared documents across `train`/`val`/`holdout`, `corpus_docs=273`, `matched_bundle_ids=273` (down from `1,308` documents / `11,507` chunks).
   - Mandatory quality gates (`ty check`, `ruff check --fix`, `ruff format`, `pytest`, `git diff --check`): all passed.
 - **What it does not establish**:
   - Does not launch or claim completion of a live GEPA optimization run on the updated `135/27` cohort.
+
+### Follow-up (2026-11-07): Bounded GBNF Quantifiers for OpenIE & Length-Truncated Cache Rejection
+
+- **Root cause of Batch 6 (`chunk-13ddffd437599165ae4517cf580866ab`) failure in `.yaw/yaw_optimize_20261107_110501.db`**:
+  - Across all `383` extracted chunks in `.yaw/yaw_optimize_20261107_110501.db`, entity counts had `p99=32, max=38` and structured triple counts had `p99=23, max=33`. On chunk `342` (`chunk-13ddffd437599165ae4517cf580866ab`, an ASCII phase-portrait table), `ExtractTriples` emitted ~40 triples and then entered a repetition loop under the unbounded GBNF rule `triple-list ::= "[]" | "[" triple (", " triple)* "]"` and `string ::= "\"" char+ "\""`, hitting `max_tokens=8192` (`finish_reason == "length"`) mid-string (`... [ 1.0k ] * rw-34b fastpath p90=58ms [ 1.7k ]`). `dspy.JSONAdapter` ran `json_repair.loads` on the truncated output, turning `[ 1.0k ]` and `[ 1.7k ]` into bare string items in `pred.triples` and raising `ValueError("Triple extraction returned a malformed statement")`.
+- **Changed symbols & modules**:
+  - `yaw/daemon/graph/inference/grammars.py`: Bounded `entity-list` (`(", " entity-pair){0,39}`), `triple-list` (`(", " triple){0,39}`), and `string` (`char{1,512}`) in `_NER_PAIR_GBNF_RULES`, `DSPY_NER_GBNF_GRAMMAR`, `_STATEMENT_GBNF_RULES`, `DSPY_TRIPLES_GBNF_GRAMMAR`, and `build_dspy_triples_grammar` so any repetition loop deterministically closes JSON well below `max_output_tokens = 8192` without altering `openie_fingerprint`.
+  - `yaw/daemon/graph/inference/chat.py`: Added `_UsageAccountingCache._is_truncated` so LM completions with `finish_reason == "length"` are never stored on `_put` or returned from `_get`.
+  - `tests/daemon/graph/inference/test_grammars.py` & `tests/daemon/graph/inference/test_response_cache.py`: Added regression tests for bounded NER/triple GBNF rules and length-truncated response cache rejection.
+- **Gate results & evidence paths**:
+  - Live `llama.cpp` verification on `chunk-13ddffd437599165ae4517cf580866ab`: Stage 1 (`13` entities) + Stage 2 (`15` structured triples) completed in `24.73s` with `finish_reason == "stop"`.
+  - Mandatory quality gates (`ty check`, `ruff check --fix`, `ruff format`, `pytest`, `git diff --check`): all passed.
+- **What it does not establish**:
+  - Does not claim completion of the resumed full-corpus GEPA optimization run until it finishes.

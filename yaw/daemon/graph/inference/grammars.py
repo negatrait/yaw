@@ -18,13 +18,13 @@ _NER_PAIR_GBNF_RULES = r"""entity-pair ::= "[" label ", " string "]"
 label ::= "\"" non-letter* letter char* "\""
 letter ::= [a-zA-Z\x80-\U0010FFFF]
 non-letter ::= [\x20\x21\x23-\x40\x5B\x5D-\x60\x7B-\x7E]
-string ::= "\"" char+ "\""
+string ::= "\"" char{1,512} "\""
 char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
 """
 
 DSPY_NER_GBNF_GRAMMAR = (
     'root ::= "{\\"named_entities\\": " entity-list "}"\n'
-    'entity-list ::= "[]" | "[" entity-pair (", " entity-pair)* "]"\n' + _NER_PAIR_GBNF_RULES
+    'entity-list ::= "[]" | "[" entity-pair (", " entity-pair){0,39} "]"\n' + _NER_PAIR_GBNF_RULES
 )
 
 _STATEMENT_GBNF_RULES = r"""literal-statement ::= literal-pred ", \"obj\": " literal-slot
@@ -32,7 +32,7 @@ resource-pred ::= string | "[" string ", \"owl:ObjectProperty\"]"
 literal-pred ::= string | "[" string ", \"owl:DatatypeProperty\"]"
 literal-slot ::= "{\"value\": " string ", \"datatype\": " string ", \"lang\": " language "}"
 language ::= "\"" char* "\""
-string ::= "\"" char+ "\""
+string ::= "\"" char{1,512} "\""
 char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
 """
 
@@ -43,7 +43,7 @@ _OPEN_TRIPLE_GBNF_RULES = (
 
 DSPY_TRIPLES_GBNF_GRAMMAR = (
     'root ::= "{\\"triples\\": " triple-list "}"\n'
-    'triple-list ::= "[]" | "[" triple (", " triple)* "]"\n' + _OPEN_TRIPLE_GBNF_RULES
+    'triple-list ::= "[]" | "[" triple (", " triple){0,39} "]"\n' + _OPEN_TRIPLE_GBNF_RULES
 )
 
 DSPY_MISSING_ENTITY_DEFS_GBNF_GRAMMAR = r"""root ::= "{\"entity_definitions\": " entity-list "}"
@@ -135,7 +135,7 @@ def build_dspy_triples_grammar(
 
     if max_triples is None or max_triples <= 0:
         root_line = 'root ::= "{\\"triples\\": " triple-list "}"\n'
-        list_line = 'triple-list ::= "[]" | "[" triple (", " triple)* "]"\n'
+        list_line = 'triple-list ::= "[]" | "[" triple (", " triple){0,39} "]"\n'
     else:
         seq = "triple"
         for _ in range(max_triples - 1):

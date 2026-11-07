@@ -3,11 +3,14 @@
 import pytest
 
 from yaw.daemon.graph.inference.grammars import (
+    DSPY_NER_GBNF_GRAMMAR,
     DSPY_SHACL_REPAIR_GBNF_GRAMMAR,
+    DSPY_TRIPLES_GBNF_GRAMMAR,
     build_dspy_hierarchy_judge_grammar,
     build_dspy_label_judge_grammar,
     build_dspy_related_judge_grammar,
     build_dspy_shacl_repair_grammar,
+    build_dspy_triples_grammar,
 )
 
 
@@ -151,3 +154,18 @@ def test_shacl_repair_grammar_lexical_label_branch_and_abstention() -> None:
     assert rules["label"] == '"\\"" non-letter* letter char* "\\""'
     assert rules["letter"] == "[a-zA-Z\\x80-\\U0010FFFF]"
     assert rules["non-letter"] == "[\\x20\\x21\\x23-\\x40\\x5B\\x5D-\\x60\\x7B-\\x7E]"
+
+
+def test_ner_and_triples_grammars_bound_repetition_and_string_length() -> None:
+    ner_rules = _parse_gbnf_rules(DSPY_NER_GBNF_GRAMMAR)
+    assert ner_rules["entity-list"] == '"[]" | "[" entity-pair (", " entity-pair){0,39} "]"'
+    assert ner_rules["string"] == '"\\"" char{1,512} "\\""'
+    assert ner_rules["label"] == '"\\"" non-letter* letter char* "\\""'
+
+    open_triples = _parse_gbnf_rules(DSPY_TRIPLES_GBNF_GRAMMAR)
+    assert open_triples["triple-list"] == '"[]" | "[" triple (", " triple){0,39} "]"'
+    assert open_triples["string"] == '"\\"" char{1,512} "\\""'
+
+    pinned_triples = _parse_gbnf_rules(build_dspy_triples_grammar(None, [["HubSpot", "CRM platform."]]))
+    assert pinned_triples["triple-list"] == '"[]" | "[" triple (", " triple){0,39} "]"'
+    assert pinned_triples["string"] == '"\\"" char{1,512} "\\""'

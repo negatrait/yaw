@@ -55,6 +55,15 @@ class _UsageAccountingCache:
         return str(request.get("_fn_identifier", "")).startswith(("dspy.clients.lm.", "dspy.clients.lm15."))
 
     @staticmethod
+    def _is_truncated(record: Any) -> bool:
+        choices = record.get("choices") if isinstance(record, Mapping) else getattr(record, "choices", None)
+        if not isinstance(choices, Sequence) or not choices:
+            return False
+        first = choices[0]
+        reason = first.get("finish_reason") if isinstance(first, Mapping) else getattr(first, "finish_reason", None)
+        return reason == "length"
+
+    @staticmethod
     def _ignored(ignored: list[str] | None) -> list[str]:
         # DSPy excludes endpoints by default; local servers may serve different
         # weights under the same model name. Retain endpoints in YAW cache keys.
@@ -76,7 +85,11 @@ class _UsageAccountingCache:
     def _get(self, request: dict[str, Any], ignored_args_for_cache_key: list[str] | None) -> Any:
         ignored_args_for_cache_key = self._ignored(ignored_args_for_cache_key)
         record = self.backend.get(request, ignored_args_for_cache_key)
-        if record is None or not self.account_cached_usage or not self._is_lm_request(request):
+        if record is None or not self._is_lm_request(request):
+            return record
+        if self._is_truncated(record):
+            return None
+        if not self.account_cached_usage:
             return record
         if isinstance(record, dict) and "_dspy_format" in record:
             usage = record.get("usage")
@@ -122,6 +135,8 @@ class _UsageAccountingCache:
         ignored_args_for_cache_key: list[str] | None,
         enable_memory_cache: bool,
     ) -> None:
+        if self._is_lm_request(request) and self._is_truncated(value):
+            return
         ignored_args_for_cache_key = self._ignored(ignored_args_for_cache_key)
         self.backend.put(request, value, ignored_args_for_cache_key, enable_memory_cache)
         if not self.account_cached_usage or not self._is_lm_request(request):

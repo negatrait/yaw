@@ -304,3 +304,30 @@ def test_worker_cache_handles_close_without_losing_persisted_entries(tmp_path: P
             assert dspy.cache.get(request) == {"answer": index}
     finally:
         configure_yaw_dspy_cache(enable_disk_cache=False, enable_memory_cache=False)
+
+
+def test_response_cache_rejects_length_truncated_lm_completions(tmp_path: Path) -> None:
+    import dspy
+
+    configure_yaw_dspy_cache(
+        tmp_path,
+        enable_memory_cache=False,
+        account_cached_usage=True,
+    )
+    try:
+        request = {"_fn_identifier": "dspy.clients.lm.litellm_completion", "model": "test"}
+        truncated = {
+            "_dspy_format": "truncated-test",
+            "choices": [{"index": 0, "finish_reason": "length", "message": {"content": '{"triples": ['}}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 8192, "total_tokens": 8292},
+        }
+        dspy.cache.put(request, truncated)
+        assert dspy.cache.get(request) is None
+        assert dspy.cache.cache_hits == 0
+
+        # Pre-existing poisoned entry in backend disk cache must also be rejected on get().
+        dspy.cache.backend.put(request, truncated, [])
+        assert dspy.cache.get(request) is None
+        assert dspy.cache.cache_hits == 0
+    finally:
+        configure_yaw_dspy_cache(enable_disk_cache=False, enable_memory_cache=False)
