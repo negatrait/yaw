@@ -1262,6 +1262,7 @@ async def plan_graph_publication(
             auto_merge_difflib_gate=settings.auto_merge_difflib_gate,
             fact_linked_pairs=materialized.fact_linked_pairs,
             rlm_stats=rlm_stats,
+            progress_callback=extraction.progress_callback,
         )
         rlm_stats["candidate_pairs"] += raw_cand_count
         touched_eids = [*(eid for eid, _, _ in entity_nodes), *(m.canonical_id for m in merges)]
@@ -1273,16 +1274,23 @@ async def plan_graph_publication(
                     40000,
                     context_char_limit(12000, settings.context_window_tokens, settings.max_output_tokens),
                 )
-                evidence_batches = iter_synonym_evidence(
-                    staging_conn,
-                    candidates,
-                    settings.corpus_root,
-                    ast_context_hops=settings.ast_context_hops,
-                    batch_size=batch_limit,
-                    max_chars=max_dossier_chars,
-                    fits=extraction.program.synonym_batch_fits,
+                evidence_batches = list(
+                    iter_synonym_evidence(
+                        staging_conn,
+                        candidates,
+                        settings.corpus_root,
+                        ast_context_hops=settings.ast_context_hops,
+                        batch_size=batch_limit,
+                        max_chars=max_dossier_chars,
+                        fits=extraction.program.synonym_batch_fits,
+                    )
                 )
-                for ev in evidence_batches:
+                for batch_idx, ev in enumerate(evidence_batches, start=1):
+                    if extraction.progress_callback is not None:
+                        extraction.progress_callback(
+                            f"indexing: synonym adjudication ({batch_idx}/{len(evidence_batches)} batches, "
+                            f"{len(candidates)} candidate pairs)"
+                        )
                     judged = await judge_synonyms(
                         SynonymJudgeInput(
                             batch=ev,
@@ -1368,7 +1376,11 @@ async def plan_graph_publication(
             violations_by_focus: dict[str, list[SHACLViolation]] = {}
             for v in violations:
                 violations_by_focus.setdefault(v.focus_node, []).append(v)
-            for focus_node in sorted(violations_by_focus):
+            for focus_idx, focus_node in enumerate(sorted(violations_by_focus), start=1):
+                if extraction.progress_callback is not None:
+                    extraction.progress_callback(
+                        f"indexing: SHACL healing ({focus_idx}/{len(violations_by_focus)} focus nodes)"
+                    )
                 focus_batch = tuple(violations_by_focus[focus_node])
                 dossiers = {focus_node: focus_dossiers[focus_node]}
                 healed = await heal_shacl_violations(
@@ -1384,9 +1396,11 @@ async def plan_graph_publication(
                 all_traces.extend(healed.traces)
                 all_telemetry.extend(healed.telemetry)
                 shacl_audit.extend(healed.audit_trail)
-                rlm_stats["shacl_healer_tokens"] += sum(
-                    int(x.get("tokens_used", 0)) for x in healed.audit_trail if x.get("mode") == "rlm"
+                rlm_tokens = sum(int(x.get("tokens_used", 0)) for x in healed.audit_trail if x.get("mode") == "rlm")
+                direct_tokens = sum(
+                    int(x.get("tokens_used", 0)) for x in healed.audit_trail if x.get("mode") == "direct"
                 )
+                rlm_stats["shacl_healer_tokens"] += rlm_tokens if rlm_tokens > 0 else direct_tokens
             if repairs:
 
                 def merge_repaired_entities(src: str, dst: str, kind: str) -> bool:

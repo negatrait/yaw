@@ -91,7 +91,7 @@ def test_native_shacl_healer_definition_survives_publication(tmp_path, provider,
                 assert conn.execute("SELECT 1 FROM sqlite_master WHERE name='fact_assertions'").fetchone() is None
             return
         publish(stream, app, [(pointer, text)])
-        assert "rlm" in state["healer_requests"] and "direct" in state["healer_requests"]
+        assert set(state["healer_requests"]) == {"direct"}
         assert any('"focus_kind": "fact"' in context for context in state["healer_contexts"])
         contexts = [json.JSONDecoder().raw_decode(context.strip())[0] for context in state["healer_contexts"]]
         assert all(text in info["source_passages"].values() for context in contexts for info in context)

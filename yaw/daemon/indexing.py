@@ -15,6 +15,7 @@ from typing import Any
 import cocoindex as coco
 import msgspec
 from cocoindex.connectorkits import statediff
+from cocoindex.connectorkits.fingerprint import fingerprint_object
 from cocoindex.connectors import localfs, sqlite
 from cocoindex.resources.file import FileLike, PatternFilePathMatcher
 
@@ -40,7 +41,8 @@ from yaw.daemon.graph.inference.components import (
     extract_text,
 )
 from yaw.daemon.graph.planner import GraphPlanSettings, GraphPlanSummary, plan_graph_publication, summarize_graph_plan
-from yaw.daemon.graph.storage.db import GRAPH_DB
+from yaw.daemon.graph.storage import deserialize_openie_record
+from yaw.daemon.graph.storage.db import GRAPH_DB, get_meta
 from yaw.daemon.graph.storage.hydration import (
     hydrate_ast_parent_context,
     resolve_chunk_text,
@@ -398,7 +400,7 @@ def compute_active_inference_fingerprint(
     return hasher.hexdigest()
 
 
-@coco.fn(memo=True, version=8)
+@coco.fn(memo=True, version=9)
 async def publish_graph(
     settings: GraphPlanSettings,
     state_fingerprint: str,
@@ -617,32 +619,56 @@ def partition_frozen_chunks(
     db: sqlite.ManagedConnection,
     chunks: Sequence[tuple[ChunkPointer, str]],
     identity: InferenceIdentity,
+    settings: GraphPlanSettings | None = None,
 ) -> tuple[list[tuple[ChunkPointer, str]], list[tuple[ChunkPointer, str]]]:
-    """Keep unchanged native declarations present while admitting changed revisions."""
-    stored: dict[str, SourceMetadata] = {}
+    """Keep published, unchanged native declarations in retained while admitting unpublished or revised chunks."""
+    stored: dict[str, tuple[SourceMetadata, str]] = {}
+    published_inputs: dict[str, str] | None = None
     with db.readonly() as conn:
         tables = {
             row[0]
             for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('source_chunks', 'chunk_inference')"
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name IN ('source_chunks', 'chunk_inference', 'chunks')"
             )
         }
-        if tables == {"source_chunks", "chunk_inference"}:
+        if tables == {"source_chunks", "chunk_inference", "chunks"}:
+            if settings is not None:
+                has_meta = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone()
+                if has_meta is not None:
+                    saved = get_meta(conn, "graph_input_fingerprints")
+                    published_inputs = dict(json.loads(saved)) if saved is not None else {}
+                else:
+                    published_inputs = {}
             for start in range(0, len(chunks), 64):
                 ids = [pointer.chunk_id for pointer, _ in chunks[start : start + 64]]
                 placeholders = ",".join("?" for _ in ids)
                 rows = conn.execute(
                     "SELECT s.chunk_id, s.rel_posix_path, s.source_hash, s.start_line, s.end_line, s.title, "
-                    "s.ast_island_start, s.ast_island_end FROM source_chunks s JOIN chunk_inference ci "
-                    "ON ci.chunk_id=s.chunk_id AND ci.source_hash=s.source_hash "
+                    "s.ast_island_start, s.ast_island_end, ci.extraction_json "
+                    "FROM source_chunks s "
+                    "JOIN chunk_inference ci ON ci.chunk_id=s.chunk_id AND ci.source_hash=s.source_hash "
+                    "JOIN chunks c ON c.chunk_id=s.chunk_id "
+                    "AND c.rel_posix_path=s.rel_posix_path AND c.start_line=s.start_line "
+                    "AND c.end_line=s.end_line AND c.title=s.title "
+                    "AND c.ast_island_start=s.ast_island_start AND c.ast_island_end=s.ast_island_end "
                     f"WHERE s.chunk_id IN ({placeholders}) AND ci.program_identity=? AND ci.embedding_identity=?",
                     (*ids, identity.program, identity.embedding),
                 )
-                stored.update((row[0], SourceMetadata(*row)) for row in rows)
+                stored.update((row[0], (SourceMetadata(*row[:8]), str(row[8]))) for row in rows)
     retained = []
     changed = []
     for pointer, text in chunks:
-        destination = retained if stored.get(pointer.chunk_id) == frozen_chunk_metadata(pointer, text) else changed
+        entry = stored.get(pointer.chunk_id)
+        is_retained = False
+        if entry is not None and entry[0] == frozen_chunk_metadata(pointer, text):
+            if settings is None or published_inputs is None:
+                is_retained = True
+            else:
+                record = deserialize_openie_record(entry[1], chunk_id=pointer.chunk_id)
+                expected_fp = fingerprint_object((settings, pointer, text, record)).hex()
+                is_retained = published_inputs.get(pointer.chunk_id) == expected_fp
+        destination = retained if is_retained else changed
         destination.append((pointer, text))
     return retained, changed
 
@@ -716,7 +742,12 @@ def bind_native_indexing(engine: YawGraphEngine, *, batch_size: int = 64) -> Yaw
         context.provide(EMBEDDING_ENDPOINT, EmbeddingEndpoint(engine.embedder))
         context.provide(
             OPENIE_ENDPOINT,
-            OpenIEEndpoint(program, program.rlm_sub_lm or program.orchestrator_lm, program_identity),
+            OpenIEEndpoint(
+                program,
+                program.rlm_sub_lm or program.orchestrator_lm,
+                program_identity,
+                progress_callback=engine.emit_indexing_progress,
+            ),
         )
         state_root = Path(engine.db_path).resolve().parent / "candidate_coco" / Path(engine.db_path).name
         settings = GraphPlanSettings(
@@ -751,7 +782,10 @@ def bind_native_indexing(engine: YawGraphEngine, *, batch_size: int = 64) -> Yaw
 
             async def run_streaming() -> GraphPlanSummary:
                 retained, changed = partition_frozen_chunks(
-                    engine.managed_conn, chunks, InferenceIdentity(program_identity, embedding_identity)
+                    engine.managed_conn,
+                    chunks,
+                    InferenceIdentity(program_identity, embedding_identity),
+                    settings=settings,
                 )
                 if not changed:
                     stream.chunks = tuple(retained)

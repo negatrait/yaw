@@ -1332,10 +1332,16 @@ using all 5 bound REPL tools."""
         assert pre_lint["violation_count"] == 2
         assert all(v["shape"] == "ConceptShape/definition" for v in pre_lint["violations"])
 
+        # Verify explicit mode="rlm" exercises shacl_healer_rlm and all bound REPL tools on the engine snapshot
+        rlm_repairs = program.propose_shacl_repairs(pre_lint["violations"], mode="rlm")
+        assert len(rlm_repairs) == 2
+        assert "shacl_healer_rlm_invoked" in repl_tool_events
+        assert sum(1 for ev in repl_tool_events if ev.startswith("propose_repairs:")) == 2
+
         # 2. Index second document:
         #    - Step 6 runs direct GBNF label_judge on candidate pairs (30 tokens)
-        # - Step 7 runs shacl_healer_rlm using all 5 bound REPL tools (applying repair[0] in REPL + repair[1] post-
-        # RLM)
+        #    - Step 7 runs direct GBNF shacl_repair on pre-hydrated focus_context (2 * 30 = 60 tokens)
+        repl_tool_events.clear()
         program.telemetry.clear()
         program.label_judge_audit_trail.clear()
         program.shacl_audit_trail.clear()
@@ -1350,8 +1356,8 @@ using all 5 bound REPL tools."""
             == 2
         )
 
-        # Verify all 5 REPL tools ran inside shacl_healer_rlm and healed both violations
-        assert "shacl_healer_rlm_invoked" in repl_tool_events
+        # Pre-hydrated plan_graph_publication dispatches directly to shacl_repair (0 RLM orchestrator calls)
+        assert "shacl_healer_rlm_invoked" not in repl_tool_events
         assert sum(1 for ev in repl_tool_events if ev.startswith("propose_repairs:")) == 2
 
         # Verify exact non-double-counted token accounting:
@@ -1363,13 +1369,10 @@ using all 5 bound REPL tools."""
         assert engine._graph_rlm_stats["hierarchy_judge_tokens"] == 30
         assert engine._graph_rlm_stats["label_judge_tokens"] + engine._graph_rlm_stats["hierarchy_judge_tokens"] == 60
 
-        # Step 7 (shacl_healer_rlm) = 2 focus nodes * (40 orchestrator + 30 worker) = 140 tokens
-        assert len(program.shacl_audit_trail) == 4  # 2 focus nodes * (inner direct (30) + outer RLM (70))
-        assert program.shacl_audit_trail[0]["mode"] == "direct"
-        assert program.shacl_audit_trail[0]["tokens_used"] == 30
-        assert program.shacl_audit_trail[-1]["mode"] == "rlm"
-        assert program.shacl_audit_trail[-1]["tokens_used"] == 70
-        assert engine._graph_rlm_stats["shacl_healer_tokens"] == 140
+        # Step 7 (direct shacl_repair on pre-hydrated focus_context) = 2 focus nodes * 30 worker tokens = 60 tokens
+        assert len(program.shacl_audit_trail) == 2
+        assert all(x["mode"] == "direct" and x["tokens_used"] == 30 for x in program.shacl_audit_trail)
+        assert engine._graph_rlm_stats["shacl_healer_tokens"] == 60
 
         # Verify Step 7 SHACL violation and deduplicated repair stats (1 in REPL + 1 post-RLM = 2, not 3)
         assert engine._graph_rlm_stats["shacl_violations_initial"] > 0

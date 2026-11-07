@@ -94,13 +94,24 @@ Keep expensive pure inference memoized through native components with exact
 source/text and program/model/profile keys. Separate extraction and embedding
 identities so changing one does not unnecessarily invalidate the other. Memo hits
 retain named DSPy traces but consume no new provider tokens.
-For each `64`-chunk micro-batch publication (`publish_graph` `@coco.fn(memo=True, version=8)`),
+For each `64`-chunk micro-batch publication (`publish_graph` `@coco.fn(memo=True, version=9)`),
 per-batch work is delta-scoped to avoid reprocessing unmodified prior-batch state:
-- `heal_shacl_violations` (`@coco.fn(memo=True, version=4)`) receives focus-isolated
+- `partition_frozen_chunks(db, chunks, identity, settings=settings)` places a
+  chunk in `retained` if and only if it is present with matching `SourceMetadata`
+  and `InferenceIdentity` in `source_chunks`, `chunk_inference`, and published
+  `chunks` (and, when `settings` is provided, its `meta['graph_input_fingerprints']`
+  digest matches `fingerprint_object((settings, pointer, text, record)).hex()`),
+  so chunks extracted into `chunk_inference` before an interruption—or revised in
+  place—remain in `changed` and are published in strict `64`-chunk slices on
+  `--resume` while reusing committed `extract_text` / `embed_text` `@coco.fn(memo=True)`
+  memos.
+- `heal_shacl_violations` (`@coco.fn(memo=True, version=5)`) receives focus-isolated
   `SHACLHealInput` payloads grouped by `focus_node` (`focus_node ASC`) with
   deterministically ordered SQLite dossiers (`inspect_entity_or_fact`,
-  `inspect_focus_node`), so newly introduced violations in Batch $k$ do not shift
-  slice boundaries or invalidate memo entries for earlier focus nodes.
+  `inspect_focus_node`) and dispatches pre-hydrated `focus_context` payloads
+  directly to `YawProgram.shacl_repair` (`mode="direct"`), while `OpenIEEndpoint.progress_callback`
+  (wired from `YawGraphEngine.emit_indexing_progress`) emits live sub-stage
+  progress during candidate search, synonym adjudication, and SHACL healing.
 - `canonicalize_fact_definitions(conn, prior_definitions=prior_fact_definitions)`
   preserves valid prior-batch `set_definition` repairs and `apply_shacl_repairs`
   records `set_pref_label` with `chunk_id = "__healed__"` so healed facts and
@@ -233,3 +244,4 @@ resolved baseline artifacts and reported Recall@N/EM/F1 evidence.
 
 - 2026-11-06: "Step 4 should be included in this unit, but obviously, you can implement one unit at a time according to whichever spec you write into @[docs/native-cocoindex-graph.md] or @[docs/native-cocoindex-indexing.md] , also sounds like you'll need to update our rules and tests to prevent these kinds of failures surfacing again." (User). Specs are promoted into `docs/native-cocoindex-graph.md` and `docs/native-cocoindex-indexing.md` and executed one checkpoint unit at a time with regression tests.
 - 2026-11-07: "Audit and review for root cause for batch indexing regressing back to exponential time behavior. Incremental indexing and graph publication was designed and tested to be near-constant time for 64 + 64 chunk batches vs 128 chunk batchless indexing." / "It’s a SHACL Violation CONSISTENCY_ERROR" / "you will need to /spec first." (User). Enforces delta-scoped `64`-chunk batch publication (`publish_graph` `version=8`, focus-isolated `heal_shacl_violations` `version=4`, repair-preserving `canonicalize_fact_definitions`, `"__healed__"` label provenance, `touched_entity_ids`-scoped Active EDC, delta-only `canonicalize_fact_text`, and single-pass post-canonicalization `reembed_facts` embedding).
+- 2026-11-07: "SHACL healing is taking extremely long - what is the performance bottleneck here?" / "/spec please spec the remedy for your debug audit above." (User). Requires published `chunks` membership and `meta['graph_input_fingerprints']` matching in `partition_frozen_chunks` so unpublished or revised `chunk_inference` rows remain in `changed` and are published in strict `64`-chunk batches on `--resume` (`publish_graph` `version=9`, `heal_shacl_violations` `version=5`), dispatches pre-hydrated `SHACLHealInput` directly to `YawProgram.shacl_repair` (`mode="direct"`), and wires `OpenIEEndpoint.progress_callback` from `YawGraphEngine.emit_indexing_progress` (§3).

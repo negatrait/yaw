@@ -177,6 +177,7 @@ Deno/Pyodide WASM) with
         self._chunk_hydrator: Callable[[str], str] | None = None
         self._ast_island_hydrator: Callable[[str], str] | None = None
         self._shacl_linter: Callable[[], list[dict[str, str]]] | None = None
+        self._focus_context: str = ""
         self._graph_search_tool: Callable[[str], str] | None = None
         self.telemetry: list[dict[str, Any]] = DiagnosticHistory()
         self.history = DiagnosticHistory()
@@ -479,6 +480,7 @@ Deno/Pyodide WASM) with
                 "_chunk_hydrator",
                 "_ast_island_hydrator",
                 "_shacl_linter",
+                "_focus_context",
                 "_graph_search_tool",
                 "orchestrator_lm",
                 "rlm_sub_lm",
@@ -514,12 +516,16 @@ Deno/Pyodide WASM) with
 
         def propose_repairs() -> list[dict[str, str]]:
             """Propose repairs for the actual batch report with complete structured focus context."""
-            if self._shacl_linter is None or self._node_inspector is None:
+            if self._shacl_linter is None or (not self._focus_context.strip() and self._node_inspector is None):
                 raise ValueError("SHACL repair requires a bound report and node inspector")
             worker_lm = self._resolve_worker_lm()
             raw = self._shacl_linter()
-            foci = dict.fromkeys(str(item["focus_node"]) for item in raw)
-            resolved_context = json.dumps([self._node_inspector(fn) for fn in foci], ensure_ascii=False)
+            if self._focus_context.strip():
+                resolved_context = self._focus_context
+            else:
+                assert self._node_inspector is not None
+                foci = dict.fromkeys(str(item["focus_node"]) for item in raw)
+                resolved_context = json.dumps([self._node_inspector(fn) for fn in foci], ensure_ascii=False)
             return self.propose_shacl_repairs(
                 raw,
                 focus_context=resolved_context,
@@ -1274,15 +1280,13 @@ chunk."""
     ) -> list[dict[str, str]]:
         """Propose bounded closed-world SHACL repair actions for the given violations.
 
-        By default (`mode=None`), executes the single-level RLM Python REPL healer
-        (`shacl_healer_rlm` / `HealSHACLViolations`), which inspects focus nodes,
-        hydrates source chunks, and delegates structured repair synthesis to its
-        inner `propose_repairs` tool (`mode="direct"` -> `shacl_repair` /
-        `ProposeSHACLRepairs` with pure-JSON GBNF).
+        By default (`mode=None`), dispatches directly to `shacl_repair` (`ProposeSHACLRepairs`
+        with pure-JSON GBNF) when `focus_context` is pre-hydrated, and otherwise executes the
+        single-level RLM Python REPL healer (`shacl_healer_rlm` / `HealSHACLViolations`).
         """
         if not violations:
             return []
-        is_rlm = True if mode is None else (mode == "rlm")
+        is_rlm = (not bool(focus_context.strip())) if mode is None else (mode == "rlm")
         if isinstance(violations, str):
             violations_json = violations.strip()
             if not violations_json or violations_json == "[]":
@@ -1321,16 +1325,23 @@ chunk."""
         if not is_rlm:
             stage_inputs["focus_context"] = focus_context
         prev_telem_len = len(self.telemetry)
-        pred = self._invoke_stage(
-            self.shacl_repair,
-            self.shacl_healer_rlm,
-            stage_name="shacl_repair",
-            is_rlm=is_rlm,
-            lm=lm,
-            use_gbnf=use_gbnf,
-            grammar_fn=lambda: build_dspy_shacl_repair_grammar(allowed_actions=allowed_actions),
-            **stage_inputs,
-        )
+        prev_focus_context = self._focus_context
+        if is_rlm:
+            self._focus_context = focus_context
+        try:
+            pred = self._invoke_stage(
+                self.shacl_repair,
+                self.shacl_healer_rlm,
+                stage_name="shacl_repair",
+                is_rlm=is_rlm,
+                lm=lm,
+                use_gbnf=use_gbnf,
+                grammar_fn=lambda: build_dspy_shacl_repair_grammar(allowed_actions=allowed_actions),
+                **stage_inputs,
+            )
+        finally:
+            if is_rlm:
+                self._focus_context = prev_focus_context
         raw_repairs = getattr(pred, "repairs", [])
         repairs = parse_shacl_repairs(raw_repairs, allowed_actions=allowed_actions)
         stage_tokens = int(self.telemetry[-1].get("tokens_used", 0)) if len(self.telemetry) > prev_telem_len else 0

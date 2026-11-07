@@ -535,7 +535,8 @@ def test_cross_batch_fact_definition_repair_persists_and_invalidates_on_endpoint
     with native_corpus(tmp_path, tmp_path / "inc", url) as (db, stream, app):
         publish(stream, app, [c1])
         healer_calls_batch1 = len(state.get("healer_requests", []))
-        assert healer_calls_batch1 == 3
+        assert state.get("healer_requests", []) == ["direct"]
+        assert healer_calls_batch1 == 1
         with db.readonly() as conn:
             assert lint_graph_shacl(conn) == []
             fid_b1 = conn.execute("SELECT fact_id FROM facts WHERE pred = 'routes Via'").fetchone()[0]
@@ -679,11 +680,11 @@ def test_focus_isolated_shacl_memo_reuses_healed_focus_when_earlier_violation_ad
         publish(stream, app, [chunk_ephemeral, chunk_hi_1, chunk_hi_2])
         healer_calls_after_first = len(state.get("healer_requests", []))
         direct_calls_after_first = state.get("healer_requests", []).count("direct")
-        assert healer_calls_after_first == 6
+        assert healer_calls_after_first == 2
         assert direct_calls_after_first == 2
 
         publish(stream, app, [chunk_lo, chunk_hi_1, chunk_hi_2])
-        assert len(state.get("healer_requests", [])) - healer_calls_after_first == 3
+        assert len(state.get("healer_requests", [])) - healer_calls_after_first == 1
         assert state.get("healer_requests", []).count("direct") - direct_calls_after_first == 1
         with db.readonly() as conn:
             assert lint_graph_shacl(conn) == []

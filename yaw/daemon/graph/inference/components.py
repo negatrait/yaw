@@ -1,6 +1,7 @@
 """CocoIndex-owned inference operations; no graph or database side effects."""
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any
 from uuid import uuid4
@@ -145,6 +146,7 @@ class OpenIEEndpoint:
     lm: Any = None
     program_identity: str = ""
     admission: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(1))
+    progress_callback: Callable[[str], None] | None = None
 
     def _resolve_lm(self) -> Any:
         active_lm = self.lm or getattr(dspy.settings, "lm", None)
@@ -265,6 +267,7 @@ class OpenIEEndpoint:
             repairs = program.heal_shacl_violations(
                 request.violations,
                 focus_context=request.focus_context,
+                mode="direct" if request.focus_context.strip() else "rlm",
             )
         names = {id(predictor): name for src in (self.program, program) for name, predictor in src.named_predictors()}
         return HealedSHACL(
@@ -303,7 +306,7 @@ async def judge_synonyms(request: SynonymJudgeInput) -> JudgedSynonyms:
         return await endpoint.judge_synonyms(request)
 
 
-@coco.fn(memo=True, version=4)
+@coco.fn(memo=True, version=5)
 async def heal_shacl_violations(request: SHACLHealInput) -> HealedSHACL:
     endpoint = coco.use_context(OPENIE_ENDPOINT)
     async with endpoint.admission:

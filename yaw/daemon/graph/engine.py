@@ -980,12 +980,16 @@ class YawGraphEngine:
             write_text_atomic(self.workspace_root / "passages.json", "[\n" + ",\n".join(rendered) + "\n]\n")
             return self.index_chunks(chunks, progress_callback=progress_callback)
 
+    def emit_indexing_progress(self, message: str) -> None:
+        """Emit a sub-stage progress update during indexing or graph publication."""
+        if self._active_progress_callback is not None:
+            self._active_progress_callback(message)
+
     def report_indexing_batch(self, summary: GraphPlanSummary, total_chunks: int) -> None:
         """Record an incrementally published batch summary and emit progress telemetry."""
         self._opt_indexed_cids = set(summary.chunk_ids)
         self._graph_rlm_stats.update(summary.rlm_stats)
-        if self._active_progress_callback is not None:
-            self._active_progress_callback(f"indexing: {len(summary.chunk_ids)}/{total_chunks} chunks published")
+        self.emit_indexing_progress(f"indexing: {len(summary.chunk_ids)}/{total_chunks} chunks published")
 
     def index_chunks(
         self,

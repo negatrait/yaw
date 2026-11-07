@@ -320,19 +320,33 @@ class PromptsAndParsersParityTests(unittest.TestCase):
 
     def test_shacl_healer_rlm_executes_in_python_interpreter_with_sub_lm_and_kwargs_tools(self):
         """Verify shacl_healer_rlm executes Python REPL code in dspy.PythonInterpreter with sub_lm wired and kwargs \
-tools."""
+tools, and mode=None routes pre-hydrated focus_context directly to shacl_repair."""
         import dspy
 
         from yaw.daemon.graph.inference.grammars import build_dspy_shacl_repair_grammar
         from yaw.daemon.graph.inference.parsers import shacl_repair_actions
         from yaw.daemon.graph.inference.program import YawProgram
+        from yaw.daemon.graph.inference.prompts import HealSHACLViolations
+        from yaw.daemon.graph.inference.rlm import STAGE_RLM_DELEGATION_RULES, build_rlm_action_demos
+
+        self.assertIn("SINGLE-STEP DELEGATION", STAGE_RLM_DELEGATION_RULES["shacl_repair"])
+        self.assertNotIn("inspect_focus_node(focus_node)", STAGE_RLM_DELEGATION_RULES["shacl_repair"])
+        self.assertIn(
+            "Delegate once to propose_repairs()",
+            build_rlm_action_demos()["shacl_repair"][0].reasoning,
+        )
+        self.assertIn("propose_repairs()", HealSHACLViolations.__doc__ or "")
 
         orch_lm = CapabilityDummyLM(
             [
                 {
                     "reasoning": "Delegate the actual bound report to the structured GBNF repair worker.",
                     "code": ("reps = propose_repairs()\nSUBMIT(repairs=reps)"),
-                }
+                },
+                {
+                    "reasoning": "Delegate once with pre-hydrated focus_context.",
+                    "code": ("reps = propose_repairs()\nSUBMIT(repairs=reps)"),
+                },
             ],
             adapter=dspy.ChatAdapter(),
         )
@@ -349,7 +363,25 @@ tools."""
                             "value": "Repaired entity definition from GBNF sub-model.",
                         }
                     ]
-                }
+                },
+                {
+                    "repairs": [
+                        {
+                            "focus_node": "ent-1",
+                            "action": "set_definition",
+                            "value": "Repaired entity definition reusing bound focus_context.",
+                        }
+                    ]
+                },
+                {
+                    "repairs": [
+                        {
+                            "focus_node": "ent-1",
+                            "action": "set_definition",
+                            "value": "Repaired entity definition from direct default dispatch.",
+                        }
+                    ]
+                },
             ],
             adapter=dspy.JSONAdapter(),
         )
@@ -365,7 +397,11 @@ tools."""
         )
         self.assertIsNotNone(program.shacl_healer_rlm.sub_lm)
         report = [{"focus_node": "ent-1", "source_shape": "yaw:EntityConceptShape"}]
-        program.set_graph_tools(shacl_linter=lambda: report, node_inspector=lambda focus: {"focus_node": focus})
+        inspector_calls: list[str] = []
+        program.set_graph_tools(
+            shacl_linter=lambda: report,
+            node_inspector=lambda focus: inspector_calls.append(focus) or {"focus_node": focus},
+        )
 
         repairs = program.propose_shacl_repairs(
             report,
@@ -381,6 +417,7 @@ tools."""
                 }
             ],
         )
+        self.assertEqual(inspector_calls, ["ent-1"])
         self.assertEqual(len(orch_lm.history), 1)
         self.assertIsNone(orch_lm.history[0]["kwargs"].get("extra_body"))
         self.assertEqual(len(sub_lm.history), 1)
@@ -388,6 +425,34 @@ tools."""
             sub_lm.history[0]["kwargs"].get("extra_body"),
             {"grammar": build_dspy_shacl_repair_grammar(allowed_actions=shacl_repair_actions(report))},
         )
+
+        # Explicit mode="rlm" with non-empty focus_context reuses bound focus_context (0 node_inspector calls)
+        inspector_calls.clear()
+        repairs_bound = program.propose_shacl_repairs(
+            report,
+            focus_context='[{"focus_node": "ent-1", "pre_hydrated": true}]',
+            mode="rlm",
+        )
+        self.assertEqual(inspector_calls, [])
+        self.assertEqual(
+            repairs_bound[0]["value"],
+            "Repaired entity definition reusing bound focus_context.",
+        )
+        self.assertEqual(len(orch_lm.history), 2)
+        self.assertEqual(len(sub_lm.history), 2)
+
+        # Default mode=None with non-empty focus_context dispatches directly to shacl_repair (0 orchestrator calls)
+        repairs_direct = program.propose_shacl_repairs(
+            report,
+            focus_context='[{"focus_node": "ent-1", "pre_hydrated": true}]',
+        )
+        self.assertEqual(
+            repairs_direct[0]["value"],
+            "Repaired entity definition from direct default dispatch.",
+        )
+        self.assertEqual(len(orch_lm.history), 2)
+        self.assertEqual(len(sub_lm.history), 3)
+        self.assertEqual(program.shacl_audit_trail[-1]["mode"], "direct")
 
     def test_hipporag_program_save_and_load_gepa_state(self):
         """Verify YawProgram saves and reloads mutated GEPA instructions and demos cleanly."""

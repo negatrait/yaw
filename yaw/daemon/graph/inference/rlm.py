@@ -11,17 +11,12 @@ from .parsers import parse_shacl_repairs
 
 STAGE_RLM_DELEGATION_RULES: dict[str, str] = {
     "shacl_repair": (
-        "RLM SHACL HEALING WORKFLOW:\n"
-        "1. Parse `violations` (`import json; items = json.loads(violations)`) and inspect each unique "
-        "`focus_node` using `inspect_focus_node(focus_node)` (which handles `'entity-a|entity-b'`, "
-        "`'entity-a->entity-b'`, `'fact-...'`, and `'entity-...'` and returns structured data with "
-        "W3C SKOS/RDF/OWL profiles, reified `rdf:Statement` facts, and hydrated source chunks) to diagnose "
-        "each violation's `source_shape` (`ConceptShape/definition`, `ConceptShape/prefLabel`, "
-        "`ConceptShape/S13-disjointLabels`, `ConceptShape/homographDifferentFrom`, `ConceptShape/broaderCycle`, "
-        "`ConceptShape/S27-disjointBroaderRelated`, `EdgeShape/closedWorld`, `StatementShape/closedWorld`). Use "
-        "`inspect_pair(a, b)`, `hydrate_ast_island(chunk_id)`, `hydrate_chunk(chunk_id)`, or "
-        "`search_graph(query)` if additional document or neighborhood context is needed.\n"
-        "2. Delegate once; the tool supplies complete structured focus context automatically:\n"
+        "RLM SHACL HEALING WORKFLOW (SINGLE-STEP DELEGATION):\n"
+        "`propose_repairs()` takes zero arguments and automatically supplies the complete structured "
+        "`inspect_focus_node` dossiers, W3C SKOS/RDF/OWL profiles, endpoint entities, and hydrated "
+        "`source_passages` for every reported violation in `violations`. Do NOT spend an iteration "
+        "printing `violations` or calling `inspect_focus_node` before `propose_repairs()`. In Iteration 1, "
+        "delegate once and submit immediately:\n"
         "```python\n"
         "repairs = propose_repairs()\n"
         "SUBMIT(repairs=repairs)\n"
@@ -51,8 +46,8 @@ def build_rlm_action_demos() -> dict[str, list[dspy.Example]]:
                 repl_history=empty_history,
                 iteration="1/10",
                 reasoning=(
-                    "Inspect the violating focus nodes to gather their SKOS/RDF/OWL profiles, reified facts, "
-                    "and source chunks when needed, then delegate once and submit the repair proposals."
+                    "Delegate once to propose_repairs(), which supplies the complete structured focus dossiers "
+                    "and source passages automatically, and immediately submit its repair proposals."
                 ),
                 code="```python\nrepairs = propose_repairs()\nSUBMIT(repairs=repairs)\n```",
             ).with_inputs("variables_info", "repl_history", "iteration")

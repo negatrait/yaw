@@ -781,3 +781,124 @@ def test_addition_preserves_adjudicated_graph_and_edit_invalidates_reuse(tmp_pat
         assert engine.lint_graph()["conforms"]
     finally:
         engine.close()
+
+
+def test_partition_frozen_chunks_requires_published_graph_and_emits_substage_progress(tmp_path, provider):
+    from yaw.core import ChunkPointer
+    from yaw.daemon.graph.engine import YawGraphEngine
+    from yaw.daemon.graph.inference.optimizer import (
+        hierarchy_judge_fingerprint,
+        label_judge_fingerprint,
+        openie_fingerprint,
+        related_judge_fingerprint,
+        shacl_fingerprint,
+    )
+    from yaw.daemon.indexing import InferenceIdentity, bind_native_indexing, partition_frozen_chunks
+
+    url, state = provider
+    state["delay"] = 0
+    state["healed_definition"] = "Ada Lovelace collaborated with Ada M. Lovelace on algebra."
+    chunks = [
+        (
+            ChunkPointer(f"c{i}", f"doc{i}.md", 1, 1, f"doc{i}", 1, 1),
+            f"Passage {i}: Ada Lovelace collaborated with Ada M. Lovelace.",
+        )
+        for i in range(4)
+    ]
+    state["extractions"] = {
+        text: {
+            "named_entities": [
+                ["Ada Lovelace", "English mathematician"],
+                ["Ada M. Lovelace", "British mathematician and analyst"],
+            ],
+            "triples": [
+                {
+                    "sub": "Ada Lovelace",
+                    "pred": "collaborated with",
+                    "obj": "Ada M. Lovelace",
+                    "def": "English mathematician",
+                }
+            ],
+        }
+        for _, text in chunks
+    }
+    lm = create_dspy_lm("overlap", base_url=url + "/v1", cache=False, num_retries=0, max_tokens=512)
+    program = YawProgram(orchestrator_lm=lm, rlm_sub_lm=lm, enable_gbnf=False, max_output_tokens=512)
+    embedder = adapter(url)
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            tmp_path / "yaw.db",
+            tmp_path,
+            program,
+            embedder,
+            synonymy_top_k=5,
+            synonymy_threshold=-1.0,
+        ),
+        batch_size=2,
+    )
+    try:
+        events: list[str] = []
+        assert engine.index_chunks(chunks, progress_callback=events.append) == 4
+        assert any("indexing: disambiguation candidate search" in ev for ev in events)
+        assert any("indexing: synonym adjudication (" in ev for ev in events)
+        assert any("indexing: SHACL healing (" in ev for ev in events)
+
+        program_identity = openie_fingerprint(program)
+        embedding_identity = str(embedder.profile.index_identity)
+        identity = InferenceIdentity(program_identity, embedding_identity)
+        settings = GraphPlanSettings(
+            corpus_root=engine.workspace_root,
+            program_identity=program_identity,
+            embedding_identity=embedding_identity,
+            synonym_identity=":".join(
+                (
+                    label_judge_fingerprint(program),
+                    hierarchy_judge_fingerprint(program),
+                    related_judge_fingerprint(program),
+                )
+            ),
+            shacl_identity=shacl_fingerprint(program),
+            auto_merge_cosine_gate=engine.auto_merge_cosine_gate,
+            auto_merge_difflib_gate=engine.auto_merge_difflib_gate,
+            synonymy_threshold=engine.synonymy_threshold,
+            synonymy_top_k=engine.synonymy_top_k,
+            ast_context_hops=engine.ast_context_hops,
+            context_window_tokens=program.context_window_tokens,
+            max_output_tokens=program.max_output_tokens,
+        )
+
+        # Simulate a mid-batch crash after c2 and c3 were extracted into source_chunks/chunk_inference
+        # but before publish_graph committed c2 and c3 into chunks and meta['graph_input_fingerprints'].
+        with engine.managed_conn.transaction() as conn:
+            conn.execute("DELETE FROM chunks WHERE chunk_id IN ('c2', 'c3')")
+            fps = dict(
+                json.loads(conn.execute("SELECT value FROM meta WHERE key='graph_input_fingerprints'").fetchone()[0])
+            )
+            fps.pop("c2", None)
+            fps.pop("c3", None)
+            conn.execute(
+                "UPDATE meta SET value=? WHERE key='graph_input_fingerprints'",
+                (json.dumps(sorted(fps.items())),),
+            )
+
+        retained, changed = partition_frozen_chunks(engine.managed_conn, chunks, identity, settings=settings)
+        assert [ptr.chunk_id for ptr, _ in retained] == ["c0", "c1"]
+        assert [ptr.chunk_id for ptr, _ in changed] == ["c2", "c3"]
+
+        # Tampering with c0's published input fingerprint forces c0 into changed even though c0 is in chunks.
+        with engine.managed_conn.transaction() as conn:
+            fps = dict(
+                json.loads(conn.execute("SELECT value FROM meta WHERE key='graph_input_fingerprints'").fetchone()[0])
+            )
+            fps["c0"] = "0" * 64
+            conn.execute(
+                "UPDATE meta SET value=? WHERE key='graph_input_fingerprints'",
+                (json.dumps(sorted(fps.items())),),
+            )
+        retained_after_tamper, changed_after_tamper = partition_frozen_chunks(
+            engine.managed_conn, chunks, identity, settings=settings
+        )
+        assert [ptr.chunk_id for ptr, _ in retained_after_tamper] == ["c1"]
+        assert [ptr.chunk_id for ptr, _ in changed_after_tamper] == ["c0", "c2", "c3"]
+    finally:
+        engine.close()

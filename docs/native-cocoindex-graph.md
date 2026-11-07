@@ -287,13 +287,21 @@ reserved scheme namespace in the new schema.
    via `executemany` only when `raw != f.raw_triple_json` (plus any fact missing
    from `fact_fts` on initial staging) and retains validated repaired descriptions.
    Group reported violations by `focus_node` (`focus_node ASC`) so each
-   `heal_shacl_violations` call (`@coco.fn(memo=True, version=4)`, with
-   `publish_graph` at `@coco.fn(memo=True, version=8)`) receives a single
+   `heal_shacl_violations` call (`@coco.fn(memo=True, version=5)`, with
+   `publish_graph` at `@coco.fn(memo=True, version=9)`) receives a single
    focus-isolated `SHACLHealInput` whose dossier queries in
    `inspect_entity_or_fact` and `inspect_focus_node` are deterministically ordered
    (`ORDER BY label_norm ASC, label_kind ASC, chunk_id ASC` on `entity_labels`;
    `ORDER BY fact_id ASC` on `facts`; `ORDER BY src_id ASC, dst_id ASC, kind ASC`
-   on `edges`; `ORDER BY e.entity_id ASC` on `endpoints`);
+   on `edges`; `ORDER BY e.entity_id ASC` on `endpoints`). When `SHACLHealInput.focus_context`
+   is pre-hydrated (`focus_dossiers` + `source_passages`), `OpenIEEndpoint.heal_shacl`
+   and `YawProgram.propose_shacl_repairs` dispatch directly to the GBNF-constrained
+   worker `YawProgram.shacl_repair` (`ProposeSHACLRepairs`, `mode="direct"`),
+   eliminating redundant RLM REPL subprocesses and orchestrator turns; when
+   `mode="rlm"` is requested explicitly (or `focus_context` is empty),
+   `STAGE_RLM_DELEGATION_RULES["shacl_repair"]`, `build_rlm_action_demos()["shacl_repair"]`,
+   and `HealSHACLViolations` enforce single-step delegation (`repairs = propose_repairs(); SUBMIT(repairs=repairs)`)
+   reusing bound `self._focus_context` when present;
    do not silently truncate reports or substitute Markdown-only entity context for
    fact context, including endpoint profiles. RLM examples must delegate once and
    submit proposals against the immutable snapshot, rather than re-linting it.
@@ -794,3 +802,4 @@ measurements beyond log rotation. Documentation checks do not pass runtime gates
 - 2026-11-06: "Should stay literals, NER is only allowed to capture skos:Concept and owl:NamedIndividual, triple extraction can point the rdf:Statement to rdf:object = rdfs:Literal but never rdf:subject = rdfs:Literal! This is why it's two stage. NER creates the allowed rdf:subject vocabulary, with predicates able to point towards literals but never the other way around - that's the W3C ontology rules and should be in our allowed SHACL shapes." (User). Enforced across GBNF grammars, extraction/repair parsers, and closed-world SQLite SHACL shapes (§5.3).
 - 2026-11-06: "Step 4 should be included in this unit, but obviously, you can implement one unit at a time according to whichever spec you write into @[docs/native-cocoindex-graph.md] or @[docs/native-cocoindex-indexing.md] , also sounds like you'll need to update our rules and tests to prevent these kinds of failures surfacing again." (User). Specs are promoted into `docs/native-cocoindex-graph.md` and `docs/native-cocoindex-indexing.md` and executed one checkpoint unit at a time with regression tests.
 - 2026-11-07: "Audit and review for root cause for batch indexing regressing back to exponential time behavior. Incremental indexing and graph publication was designed and tested to be near-constant time for 64 + 64 chunk batches vs 128 chunk batchless indexing." / "It’s a SHACL Violation CONSISTENCY_ERROR" / "you will need to /spec first." (User). Supersedes the single-batch unconditional `canonicalize_fact_definitions` overwrite from [shacl-healer-publication.md](reviews/shacl-healer-publication.md) (`c6fa080`) with validity-ordered, repair-preserving `canonicalize_fact_definitions`, `"__healed__"` label provenance, focus-isolated `SHACLHealInput` memoization (`heal_shacl_violations` `version=4`, `publish_graph` `version=8`), single-pass post-canonicalization fact embedding, and delta-scoped table updates (§5.2, §5.3, §9.2).
+- 2026-11-07: "SHACL healing is taking extremely long - what is the performance bottleneck here?" / "/spec please spec the remedy for your debug audit above." (User). Routes pre-hydrated focus-isolated `SHACLHealInput` payloads directly to `YawProgram.shacl_repair` (`mode="direct"`, `ProposeSHACLRepairs` with GBNF; `heal_shacl_violations` `version=5`, `publish_graph` `version=9`), aligns `STAGE_RLM_DELEGATION_RULES["shacl_repair"]`, `build_rlm_action_demos()["shacl_repair"]`, and `HealSHACLViolations` with single-step zero-argument `propose_repairs()` delegation and bound `self._focus_context` reuse, and wires `OpenIEEndpoint.progress_callback` from `YawGraphEngine.emit_indexing_progress` for intra-batch synonym adjudication and SHACL healing progress telemetry (§5.2).

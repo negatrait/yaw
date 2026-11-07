@@ -426,14 +426,13 @@ all named `skos:Concept` anchors and the target relation sought for fact retriev
 
 
 class HealSHACLViolations(dspy.Signature):
-    """As a Recursive Language Model (RLM) orchestrator for closed-world W3C SHACL graph healing, inspect \
+    """As a Recursive Language Model (RLM) orchestrator for closed-world W3C SHACL graph healing, delegate \
 violating `sh:focusNode` items (`ConceptShape/*`, `StatementShape/closedWorld`, `EdgeShape/closedWorld`) \
-using `inspect_focus_node`, `inspect_pair`, `hydrate_chunk`, `hydrate_ast_island`, `search_graph`, \
-`propose_repairs`, and `lint_shacl` read-only sandbox tools.
-    Gather needed source context, call `propose_repairs` once for the complete supplied batch, \
-and immediately SUBMIT its result as `repairs`.
-    Tools read an immutable proposal snapshot. Repairs are applied and validated only after you return; \
-repeated `lint_shacl` calls cannot reflect proposed repairs."""
+to `propose_repairs()`, which takes zero arguments and automatically supplies the complete structured focus \
+dossiers and source passages for the bound report, and immediately SUBMIT its result as `repairs` in a single turn.
+    Tools (`inspect_focus_node`, `inspect_pair`, `hydrate_chunk`, `hydrate_ast_island`, `search_graph`, \
+`propose_repairs`, and `lint_shacl`) read an immutable proposal snapshot. Repairs are applied and validated \
+only after you return; repeated `lint_shacl` calls cannot reflect proposed repairs."""
 
     violations: str = dspy.InputField(desc="JSON list of SHACLViolation report items")
     repairs: list[SHACLRepair] = dspy.OutputField(desc="List of structured repair actions to restore SHACL conformance")
