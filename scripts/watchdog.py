@@ -35,6 +35,7 @@ if str(WORKSPACE_ROOT) not in sys.path:
 
 from yaw.core import write_text_atomic  # noqa: E402
 from yaw.daemon.graph.storage import get_graph_counts, open_readonly_yaw_db  # noqa: E402
+from yaw.daemon.runtime import is_file_locked  # noqa: E402
 
 
 def _resolve_artifact_dir() -> Path:
@@ -415,16 +416,14 @@ def _read_status(status_file: Path) -> dict[str, Any]:
     return {}
 
 
-def _pid_alive(pid: Any) -> bool:
-    with contextlib.suppress(TypeError, ValueError, psutil.Error):
-        return int(pid) > 0 and psutil.pid_exists(int(pid))
-    return False
-
-
 def get_active_sandbox_info() -> dict[str, Any]:
     yaw_dir = WORKSPACE_ROOT / ".yaw"
     dbs = (
-        sorted(yaw_dir.glob("yaw_optimize_*.db"), key=lambda p: p.stat().st_mtime, reverse=True)
+        sorted(
+            yaw_dir.glob("yaw_optimize_*.db"),
+            key=lambda p: (is_file_locked(Path(f"{p}.lock")), p.stat().st_mtime, p.name),
+            reverse=True,
+        )
         if yaw_dir.exists()
         else []
     )
@@ -434,7 +433,7 @@ def get_active_sandbox_info() -> dict[str, Any]:
     ds_str = latest_db.stem.removeprefix("yaw_optimize_")
     status = _read_status(yaw_dir / f"status_optimize_{ds_str}.json")
     active_op = str(status.get("active_op") or "")
-    optimizer_alive = _pid_alive(status.get("pid")) and status.get("lifecycle") not in (
+    optimizer_alive = is_file_locked(Path(f"{latest_db}.lock")) and status.get("lifecycle") not in (
         "stopped",
         "failed",
     )
@@ -584,7 +583,7 @@ def get_active_sandbox_info() -> dict[str, Any]:
                     SELECT src_id, dst_id, kind
                     FROM edges
                     WHERE kind IN ('fact', 'skos:related', 'skos:broader', 'owl:differentFrom')
-                      AND (kind = 'skos:broader' OR src_id < dst_id)
+                      AND (kind IN ('fact', 'skos:broader') OR src_id < dst_id)
                     """
                 ).fetchall()
             ]
@@ -1075,11 +1074,11 @@ def generate_graph_projection_svg(
         )
         return {}
 
-    # Slice to 1000 edges to limit graph size
-    all_edges_tail = all_edges[-1000:]
-    selected = largest_one_hop_neighborhood(all_edges_tail)
+    selected = largest_one_hop_neighborhood(all_edges)
     # Counts and colors describe only the connected neighborhood actually shown.
-    all_edges_tail = [(u, v, k) for u, v, k in all_edges_tail if u in selected and v in selected]
+    all_edges_tail = [(u, v, k) for u, v, k in all_edges if u in selected and v in selected][-1000:]
+    if len(all_edges_tail) == 1000:
+        selected = {u for u, v, _ in all_edges_tail} | {v for u, v, _ in all_edges_tail}
     diff_nodes: set[str] = {u for u, v, k in all_edges_tail if k == "owl:differentFrom"} | {
         v for u, v, k in all_edges_tail if k == "owl:differentFrom"
     }
@@ -1502,6 +1501,10 @@ def generate_graph_projection_svg(
         try:
             if not frame_path.exists():
                 _atomic_write(frame_path, lambda t: fig.savefig(t, format="png", dpi=110))
+            for stale_f in frame_dir.glob(f"frame_{state_key[5]:05d}_*.png"):
+                if stale_f != frame_path:
+                    with contextlib.suppress(OSError):
+                        stale_f.unlink(missing_ok=True)
         finally:
             plt.close(fig)
         frame_files = sorted(frame_dir.glob("frame_*.png"))
@@ -1935,6 +1938,16 @@ def generate_pareto_svg(
     _save(fig, dest)
 
 
+def _truncate_def(text: str, limit: int = 120) -> str:
+    s = " ".join(text.strip().split())
+    if not s:
+        return "n/a"
+    if len(s) <= limit:
+        return s
+    cut = s[: max(1, limit - 1)].rsplit(" ", 1)[0].rstrip(".,;:")
+    return f"{cut or s[: max(1, limit - 1)]}…"
+
+
 def generate_report_markdown(
     dest: Path,
     sandbox: dict[str, Any],
@@ -2036,8 +2049,8 @@ def generate_report_markdown(
         # Mobile-friendly: a narrow bullet list instead of a wide multi-column table.
         items = []
         for _ea, na, da, _eb, nb, db in diff_from_rows[:10]:
-            da_s = da.strip()[:110] or "n/a"
-            db_s = db.strip()[:110] or "n/a"
+            da_s = _truncate_def(da)
+            db_s = _truncate_def(db)
             items.append(f"- **`{na}`** ≠ **`{nb}`**\n  - A: *{da_s}*\n  - B: *{db_s}*")
         total_pairs = len(diff_from_rows)
         trunc = f"\n*(Showing 10 of {total_pairs} active disambiguation pairs)*\n" if total_pairs > 10 else "\n"
@@ -2049,8 +2062,8 @@ def generate_report_markdown(
     if broader_assertions:
         broader_items = []
         for _ea, na, da, _eb, nb, db in broader_assertions[:5]:
-            da_s = da.strip()[:110] or "n/a"
-            db_s = db.strip()[:110] or "n/a"
+            da_s = _truncate_def(da)
+            db_s = _truncate_def(db)
             broader_items.append(
                 f"- **`{na}`** (narrower) → **`{nb}`** (broader)\n  - Narrower: *{da_s}*\n  - Broader: *{db_s}*"
             )
@@ -2064,7 +2077,7 @@ def generate_report_markdown(
         related_items = []
         for _ea, na, da, _eb, nb, db in related_assertions:
             related_items.append(
-                f"- **`{na}`** ↔ **`{nb}`**\n  - A: *{da.strip()[:110] or 'n/a'}*\n  - B: *{db.strip()[:110] or 'n/a'}*"
+                f"- **`{na}`** ↔ **`{nb}`**\n  - A: *{_truncate_def(da)}*\n  - B: *{_truncate_def(db)}*"
             )
         assertions_md += (
             "### Most Recent `skos:related` Assertions\n\n"

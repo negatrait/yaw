@@ -755,11 +755,14 @@ def bind_native_indexing(engine: YawGraphEngine, *, batch_size: int = 64) -> Yaw
                 )
                 if not changed:
                     stream.chunks = tuple(retained)
-                    return await app.update().result()
+                    summary = await app.update().result()
+                    engine.report_indexing_batch(summary, len(chunks))
+                    return summary
                 summary = GraphPlanSummary(())
                 for start in range(0, len(changed), batch_size):
                     stream.chunks = (*retained, *changed[: start + batch_size])
                     summary = await app.update().result()
+                    engine.report_indexing_batch(summary, len(chunks))
                 return summary
 
             return asyncio.run(run_streaming())

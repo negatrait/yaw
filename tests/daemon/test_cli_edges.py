@@ -251,6 +251,34 @@ def test_detached_empty_daemon_starts_and_stops_without_leaking_process_handles(
                 continue
 
 
+def test_graph_lint_db_path_latest_and_active_optimization_status_counts(tmp_path, capsys):
+    config = configured_workspace(tmp_path)
+    opt_cfg = config.for_optimization(datestamp="20261107_120000")
+    assert opt_cfg.db_path is not None and opt_cfg.lock_path is not None
+    seed_openie(opt_cfg.db_path, 3)
+    with closing(open_yaw_db(opt_cfg.db_path)) as conn:
+        conn.execute("INSERT INTO entities(entity_id, name, definition) VALUES ('entity-1', 'Alpha', 'First entity')")
+        conn.execute(
+            "INSERT INTO entity_labels(label_norm, entity_id, label_kind, raw_label, chunk_id) "
+            "VALUES ('alpha', 'entity-1', 'skos:prefLabel', 'Alpha', 'c0')"
+        )
+        conn.commit()
+
+    assert handle_graph_lint(config, db_path="latest") == 0
+    lint_out = json.loads(capsys.readouterr().out)
+    assert lint_out["conforms"] is True
+    assert lint_out["db_path"] == str(opt_cfg.db_path.resolve())
+    assert lint_out["stats"]["entities"] == 1
+    assert lint_out["stats"]["openie_checkpoints"] == 3
+    assert lint_out["label_counts"] == {"skos:prefLabel": 1}
+
+    with FileLock(str(opt_cfg.lock_path)):
+        status_out = inspect_status(config)
+    assert status_out["active_optimization"]["active"] is True
+    assert status_out["active_optimization"]["entities"] == 1
+    assert status_out["active_optimization"]["openie_checkpoints"] == 3
+
+
 def test_cli_canonical_dspy_benchmark_handler_and_config_set_no_abbrev():
     from yaw.daemon import cli
 

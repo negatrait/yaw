@@ -759,7 +759,11 @@ class YawRuntime:
                         last_error=err.message[:300],
                     )
                 else:
-                    self._update_state(active_op=None, sync_state="idle")
+                    self._update_state(
+                        active_op=None,
+                        sync_state="error" if item.op_name == "sync" else "idle",
+                        last_error=err.message[:300],
+                    )
                 item.future.set_exception(err)
             except Exception as exc:
                 if self.auto_poll:
@@ -777,6 +781,15 @@ class YawRuntime:
                     last_error=msg[:300],
                 )
                 item.future.set_exception(wrapped)
+            except BaseException as exc:
+                self.request_stop()
+                self._update_state(
+                    active_op=None,
+                    sync_state="idle",
+                    last_error=f"{type(exc).__name__}: {exc}"[:300],
+                )
+                item.future.set_exception(exc)
+                raise
             else:
                 if item.progress_callback is not None:
                     item.progress_callback("ready")
@@ -1047,6 +1060,10 @@ class YawRuntime:
             self.validate_optimization_run(target_path, trainset, valset, corpus_docs, mode, run_options)
 
             def _progress(msg: str) -> None:
+                if msg.startswith("indexing:") and self.engine is not None:
+                    new_stats = self.engine.get_stats(self.config.config_fingerprint())
+                    with self._state_lock:
+                        self._stats = new_stats
                 self._update_state(active_op=msg)
                 if progress_callback is not None:
                     progress_callback(msg)

@@ -980,6 +980,13 @@ class YawGraphEngine:
             write_text_atomic(self.workspace_root / "passages.json", "[\n" + ",\n".join(rendered) + "\n]\n")
             return self.index_chunks(chunks, progress_callback=progress_callback)
 
+    def report_indexing_batch(self, summary: GraphPlanSummary, total_chunks: int) -> None:
+        """Record an incrementally published batch summary and emit progress telemetry."""
+        self._opt_indexed_cids = set(summary.chunk_ids)
+        self._graph_rlm_stats.update(summary.rlm_stats)
+        if self._active_progress_callback is not None:
+            self._active_progress_callback(f"indexing: {len(summary.chunk_ids)}/{total_chunks} chunks published")
+
     def index_chunks(
         self,
         chunks: Sequence[tuple[ChunkPointer, str]],
@@ -994,10 +1001,15 @@ class YawGraphEngine:
         with self._lock:
             self._bind_program_hooks(active_program)
             self._apply_program_embedding_prefixes(active_program)
+            prev_cb = self._active_progress_callback
             if progress_callback is not None:
+                self._active_progress_callback = progress_callback
                 progress_callback("indexing: native frozen candidate preparation and graph publication")
             self._opt_chunks_pool = list(chunks)
-            summary = self.indexing_runner(chunks, active_program)
+            try:
+                summary = self.indexing_runner(chunks, active_program)
+            finally:
+                self._active_progress_callback = prev_cb
             self._csr_graph = None
             self._query_retrieval_memo.clear()
             self._last_memo_question = None

@@ -532,3 +532,17 @@ Audit of `.yaw/yaw_optimize_20261106_221811.db` at Batch 7 (`384` published chun
   - `apply_shacl_repairs` destructive/merge actions (`remove_scalar_entity`, `delete_dangling`, `delete_orphan`, `delete_invalid_fact`, `merge_altLabel`, `merge_hiddenLabel`) must update `entity_mentions` and `fact_assertions` bindings alongside `entities`/`facts` to satisfy `validate_graph_state`.
 - **What it does not establish**:
   - Does not claim completion of open U3–U6 architectural items (`vec0`, removing `:memory:` clone), nor full-corpus GEPA optimization convergence or Tier 2 benchmark acceptance.
+
+### Follow-up (2026-11-07): Watchdog telemetry, per-batch progress reporting, and `yaw graph lint --db-path`
+
+- **Changed symbols & modules**:
+  - `scripts/watchdog.py`: `get_active_sandbox_info` (`is_file_locked` lock check replacing stale PID fallback, and preserving directed `fact` edges where `src_id > dst_id`), `generate_graph_projection_svg` (running `largest_one_hop_neighborhood(all_edges)` before the 1,000-edge display cap and pruning stale same-step APNG frames), and `_truncate_def` (word-boundary definition truncation in `generate_report_markdown`).
+  - `yaw/daemon/graph/engine.py`, `yaw/daemon/indexing.py`, `yaw/daemon/runtime.py`: `YawGraphEngine.report_indexing_batch`, per-batch `status_optimize_<ds>.json` stats refresh on `indexing:` callbacks, and `YawRuntimeError` / `BaseException` status error recording in `YawRuntime._worker_loop`.
+  - `yaw/daemon/cli.py`: `yaw graph lint --db-path` (including `latest`) with `"db_path"`, `"stats"`, `"edge_counts"`, and `"label_counts"`, plus full graph counts in `_inspect_active_optimization`.
+  - `tests/daemon/graph/storage/test_shacl_complete.py`, `tests/scripts/test_watchdog.py`, `tests/daemon/test_cli_edges.py`: Updated rekeyed literal `fact_id` assertions after `remove_scalar_entity` and added regression coverage for directed fact edges, word-boundary truncation, and `yaw graph lint --db-path latest`.
+- **Gate results & evidence paths**:
+  - `uv run yaw graph lint --db-path latest` on `.yaw/yaw_optimize_20261107_071711.db`: `conforms: true`, `128` published chunks (`192` OpenIE checkpoints), `568` entities, `452` facts, `1,941` edges.
+  - Refreshed `benchmark_mobile_report.md` and `knowledge_graph_2d_projection.png`: Fig. 2 largest 1-hop component expanded from `22` entities / `14` fact edges to `179` entities / `175` fact edges / `36` `skos:related` / `36` `skos:broader` / `3` `owl:differentFrom`.
+  - Mandatory quality gates (`ty check`, `ruff check --fix`, `ruff format`, `pytest`, `git diff --check`): all passed.
+- **What it does not establish**:
+  - Does not resume or modify any user optimization run or claim benchmark parity.

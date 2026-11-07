@@ -716,10 +716,15 @@ def test_shacl_auto_healing_complete(tmp_path: Path) -> None:
         # 8b. Orphan scalar entity (ent-date) was removed from entities and fact-date-1 converted to literal
         date_ent = conn.execute("SELECT entity_id FROM entities WHERE entity_id = 'ent-date'").fetchone()
         assert date_ent is None
-        fact_meta = get_facts_with_meta_by_ids(conn, ["fact-date-1"])
-        assert fact_meta["fact-date-1"]["obj_kind"] == "literal"
-        assert fact_meta["fact-date-1"]["obj_id"] is None
-        assert fact_meta["fact-date-1"]["obj_literal_lex"] == "2026-10-25"
+        date_fid_row = conn.execute(
+            "SELECT fact_id FROM facts WHERE subj_id = 'ent-sys' AND pred = 'released on'"
+        ).fetchone()
+        assert date_fid_row is not None
+        date_fid = str(date_fid_row[0])
+        fact_meta = get_facts_with_meta_by_ids(conn, [date_fid])
+        assert fact_meta[date_fid]["obj_kind"] == "literal"
+        assert fact_meta[date_fid]["obj_id"] is None
+        assert fact_meta[date_fid]["obj_literal_lex"] == "2026-10-25"
 
         # 9. Inverted broader edge was inverted: security engineering -> engineering
         eng_broader = conn.execute(
@@ -903,7 +908,12 @@ def test_heal_8_scalar_entity_converts_to_literal_and_prunes_edges(tmp_path: Pat
         rem_v = lint_graph_shacl(conn)
         assert rem_v == []
 
-        f_meta = get_facts_with_meta_by_ids(conn, ["fact-date-1"])["fact-date-1"]
+        date_fid_row = conn.execute(
+            "SELECT fact_id FROM facts WHERE subj_id = 'ent-sys' AND pred = 'released on'"
+        ).fetchone()
+        assert date_fid_row is not None
+        date_fid = str(date_fid_row[0])
+        f_meta = get_facts_with_meta_by_ids(conn, [date_fid])[date_fid]
         assert f_meta["obj_kind"] == "literal"
         assert f_meta["obj_id"] is None
         assert f_meta["obj_literal_lex"] == "2026-10-25"

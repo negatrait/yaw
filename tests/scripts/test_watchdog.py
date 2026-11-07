@@ -126,6 +126,51 @@ def test_projection_renders_only_largest_seeded_component(tmp_path):
     assert "Largest 1-hop component" in output.read_text(encoding="utf-8")
 
 
+def test_watchdog_preserves_directed_fact_edges_and_word_boundary_truncation(tmp_path, monkeypatch):
+    import json
+    import os
+
+    from yaw.daemon.graph.storage import open_yaw_db
+
+    monkeypatch.setattr(watchdog, "WORKSPACE_ROOT", tmp_path)
+    yaw_dir = tmp_path / ".yaw"
+    yaw_dir.mkdir(parents=True, exist_ok=True)
+    db_path = yaw_dir / "yaw_optimize_20261107_120000.db"
+    status_path = yaw_dir / "status_optimize_20261107_120000.json"
+    status_path.write_text(
+        json.dumps({"status": {"lifecycle": "ready", "pid": os.getpid(), "active_op": "indexing: stale"}}),
+        encoding="utf-8",
+    )
+    with closing(open_yaw_db(db_path)) as conn:
+        conn.executemany(
+            "INSERT INTO entities(entity_id, name, definition) VALUES (?, ?, ?)",
+            [
+                ("entity-z", "Zeta", "A very long definition that should truncate cleanly on a word boundary " * 3),
+                ("entity-a", "Alpha", "Short definition"),
+                ("entity-m", "Mu", "Connected only via directed fact where src_id > dst_id"),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO edges(src_id, dst_id, kind, weight) VALUES (?, ?, ?, 1.0)",
+            [
+                ("entity-a", "entity-z", "owl:differentFrom"),
+                ("entity-z", "entity-a", "owl:differentFrom"),
+                ("entity-z", "entity-m", "fact"),
+            ],
+        )
+        conn.commit()
+
+    info = watchdog.get_active_sandbox_info()
+    assert info["optimizer_alive"] is False
+    assert ("entity-z", "entity-m", "fact") in info["kg_graph"]["edges"]
+    assert largest_one_hop_neighborhood(info["kg_graph"]["edges"]) == {"entity-a", "entity-z", "entity-m"}
+
+    report = tmp_path / "report.md"
+    generate_report_markdown(report, info, [], 0, False, ("TEST", "#38bdf8"))
+    report_text = report.read_text(encoding="utf-8")
+    assert any(tok in report_text for tok in ("boundary…", "cleanly…", "truncate…", "should…"))
+
+
 def test_open_ro_sqlite_backoff_and_dark_figure_candidate_svgs(tmp_path):
     import threading
     import time

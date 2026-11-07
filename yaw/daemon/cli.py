@@ -129,6 +129,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Emit W3C Turtle (RDF/SKOS/OWL/SHACL) serialization instead of JSON",
     )
+    p_lint.add_argument(
+        "--db-path",
+        default=None,
+        help="Inspect a specific SQLite DB or 'latest' optimization sandbox instead of config.db_path",
+    )
 
     # -------------------------------------------------------------------------
     # 3. yaw dspy {optimize|load-program|benchmark}
@@ -392,13 +397,13 @@ def _inspect_active_optimization(config: YawConfig) -> dict[str, Any] | None:
             status_file = base_dir / f"status_optimize_{ds}.json"
             opt_db = base_dir / f"yaw_optimize_{ds}.db"
 
-            openie = 0
+            opt_chunks = opt_entities = opt_facts = opt_edges = openie = 0
             if opt_db.exists():
                 with (
                     contextlib.suppress(sqlite3.Error),
                     contextlib.closing(open_readonly_yaw_db(opt_db, timeout=1.0)) as conn,
                 ):
-                    _, _, _, _, openie = get_graph_counts(conn)
+                    opt_chunks, opt_entities, opt_facts, opt_edges, openie = get_graph_counts(conn)
 
             snap: dict[str, Any] = {}
             if status_file.exists():
@@ -421,6 +426,10 @@ def _inspect_active_optimization(config: YawConfig) -> dict[str, Any] | None:
                 "active": True,
                 "datestamp": ds,
                 "sandbox_db": str(opt_db),
+                "chunks": max(opt_chunks, _nonnegative_status_count(stats.get("chunks"))),
+                "entities": max(opt_entities, _nonnegative_status_count(stats.get("entities"))),
+                "facts": max(opt_facts, _nonnegative_status_count(stats.get("facts"))),
+                "edges": max(opt_edges, _nonnegative_status_count(stats.get("edges"))),
                 "openie_checkpoints": max(openie, _nonnegative_status_count(stats.get("openie_checkpoints"))),
                 "active_op": active_op,
                 "status": status,
@@ -728,9 +737,11 @@ def handle_graph_lint(
     config: YawConfig,
     *,
     as_turtle: bool = False,
+    db_path: str | Path | None = None,
 ) -> int:
     """Validate closed-world SHACL graph shapes or emit W3C Turtle over a read-only WAL snapshot."""
-    db_file = Path(config.db_path).resolve() if config.db_path else None
+    target_cfg = config.for_optimization(db_override=db_path) if db_path is not None else config
+    db_file = Path(target_cfg.db_path).resolve() if target_cfg.db_path else None
     if db_file is not None and db_file.exists() and db_file.stat().st_size > 0:
         conn = open_readonly_yaw_db(db_file, timeout=5.0)
     else:
@@ -745,10 +756,34 @@ def handle_graph_lint(
                 ttl += "\n"
             sys.stdout.write(ttl)
         else:
+            chunks, entities, facts, edges, openie = get_graph_counts(conn)
+            label_row = conn.execute("SELECT COUNT(*) FROM entity_labels").fetchone()
+            entity_labels = int(label_row[0]) if label_row else 0
+            edge_counts = {
+                str(r[0]): int(r[1])
+                for r in conn.execute("SELECT kind, COUNT(*) FROM edges GROUP BY kind ORDER BY kind").fetchall()
+            }
+            label_counts = {
+                str(r[0]): int(r[1])
+                for r in conn.execute(
+                    "SELECT label_kind, COUNT(*) FROM entity_labels GROUP BY label_kind ORDER BY label_kind"
+                ).fetchall()
+            }
             payload = {
+                "db_path": str(db_file) if db_file is not None else ":memory:",
                 "conforms": len(violations) == 0,
                 "violation_count": len(violations),
                 "violations": [v.to_dict() for v in violations],
+                "stats": {
+                    "chunks": chunks,
+                    "entities": entities,
+                    "facts": facts,
+                    "edges": edges,
+                    "openie_checkpoints": openie,
+                    "entity_labels": entity_labels,
+                },
+                "edge_counts": edge_counts,
+                "label_counts": label_counts,
             }
             sys.stdout.write(json.dumps(payload, indent=2) + "\n")
         return 0
@@ -1146,7 +1181,11 @@ def main(
             if action == "rebuild":
                 return handle_graph_rebuild(config, program=program, embedder=embedder)
             if action == "lint":
-                return handle_graph_lint(config, as_turtle=bool(getattr(args, "turtle", False)))
+                return handle_graph_lint(
+                    config,
+                    as_turtle=bool(getattr(args, "turtle", False)),
+                    db_path=getattr(args, "db_path", None),
+                )
 
         # 3. yaw dspy {optimize|load-program|benchmark}
         if domain == "dspy":
