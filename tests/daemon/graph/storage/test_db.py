@@ -19,6 +19,7 @@ from yaw.daemon.graph.storage import (
     initialize_schema,
     inspect_focus_node,
     lint_graph_shacl,
+    load_affected_neighborhood,
     load_graph_topology,
     merge_entities,
     open_managed_yaw_db,
@@ -1036,4 +1037,109 @@ def test_find_entity_synonym_candidates_blas_vectorized_without_match_loops(tmp_
         rev_e3_pairs = {(a, b) for a, b, _ in rev_e3}
         assert rev_e3_pairs == {("e1", "e3"), ("e3", "e4")}
     finally:
+        conn.close()
+
+
+def test_quick_fixes_blas_neighborhood_lexical_pruning_and_zero_copy_vectors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+    import difflib
+
+    import yaw.daemon.graph.storage.graph_ops as graph_ops
+    from yaw.daemon.graph.storage.evidence import evidence_schemas
+    from yaw.daemon.graph.storage.managed_sqlite import create_table
+
+    # (a) Zero-copy deserialize_f32_vector
+    blob = serialize_f32_vector([1.0, 2.0, 3.0])
+    arr = deserialize_f32_vector(blob)
+    assert arr.base is blob
+    assert not arr.flags.writeable
+    np.testing.assert_allclose(arr, np.array([1.0, 2.0, 3.0], dtype=np.float32))
+
+    # (b) Upper-bound length pruning & pre-tokenized lexical disambiguation
+    conn = open_yaw_db(tmp_path / "quick_fixes.db")
+    stage_conn = open_yaw_db(":memory:")
+    try:
+        for schema in asyncio.run(evidence_schemas()):
+            create_table(conn, schema)
+            create_table(stage_conn, schema)
+        long_name = "International Federation of Information Processing Societies"
+        upsert_entities(
+            conn,
+            [
+                ("e_short", "Ada"),
+                ("e_long", long_name),
+                ("e_match", "Adax"),
+                ("e_far", "Zeta"),
+            ],
+        )
+        upsert_entity_labels(
+            conn,
+            [
+                ("ada", "e_short", "skos:prefLabel", "Ada", "c1"),
+                (long_name.lower(), "e_long", "skos:prefLabel", long_name, "c1"),
+                ("adax", "e_match", "skos:prefLabel", "Adax", "c1"),
+                ("zeta", "e_far", "skos:prefLabel", "Zeta", "c1"),
+            ],
+        )
+        upsert_entity_vectors(
+            conn,
+            [
+                ("e_short", [1.0, 0.0, 0.0]),
+                ("e_long", [0.0, 1.0, 0.0]),
+                ("e_match", [0.95, 0.31225, 0.0]),
+                ("e_far", [0.0, 0.0, 1.0]),
+            ],
+        )
+
+        seq1_inputs: list[str] = []
+        orig_set_seq1 = difflib.SequenceMatcher.set_seq1
+
+        def tracking_set_seq1(self: difflib.SequenceMatcher, a: str) -> None:
+            seq1_inputs.append(str(a))
+            orig_set_seq1(self, a)
+
+        monkeypatch.setattr(difflib.SequenceMatcher, "set_seq1", tracking_set_seq1)
+
+        assert graph_ops._lexical_similarity_cascade("Ada", long_name, 0.70) == 0.0
+        assert seq1_inputs == []
+
+        cands = find_entity_disambiguation_candidates(
+            conn,
+            entity_ids=["e_short"],
+            dense_threshold=0.99,
+            lexical_threshold=0.70,
+        )
+        assert long_name.lower() not in seq1_inputs
+        assert {(a, b) for a, b, _, _ in cands} == {("e_match", "e_short")}
+
+        # (c) Single-pass BLAS KNN seed discovery in load_affected_neighborhood without vec0 MATCH loops
+        ro_sql: list[str] = []
+        conn.set_trace_callback(ro_sql.append)
+        try:
+            affected = load_affected_neighborhood(
+                conn,
+                stage_conn,
+                seed_entity_ids=("e_short",),
+                seed_label_norms=("ada",),
+                delta_entity_vectors={"e_new": serialize_f32_vector([1.0, 0.0, 0.0])},
+                delta_entity_names={"e_new": "Ada"},
+                synonymy_threshold=0.8,
+                synonymy_top_k=2,
+            )
+        finally:
+            conn.set_trace_callback(None)
+
+        assert "e_short" in affected
+        assert "e_match" in affected
+        assert not any("EMBEDDING MATCH" in sql.upper() for sql in ro_sql)
+        entity_vec_selects = [
+            sql.strip() for sql in ro_sql if sql.lstrip().upper().startswith("SELECT") and "ENTITY_VEC" in sql.upper()
+        ]
+        assert any("ORDER BY ENTITY_ID ASC" in sql.upper() for sql in entity_vec_selects)
+        assert all("WHERE" in sql.upper() for sql in entity_vec_selects)
+    finally:
+        stage_conn.close()
         conn.close()

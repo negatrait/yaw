@@ -1129,22 +1129,23 @@ class YawGraphEngine:
             else:
                 kept_fids = [fid for fid, _, _ in kept_facts_with_scores]
                 f_placeholders = ",".join("?" for _ in kept_fids)
-                f_info_rows = self.conn.execute(
-                    f"SELECT fact_id, obj_kind, confidence, subj_id, obj_id "
-                    f"FROM facts WHERE fact_id IN ({f_placeholders})",
-                    kept_fids,
-                ).fetchall()
-                fact_kind_by_fid: dict[str, str] = {str(r[0]): str(r[1]) for r in f_info_rows}
-                fact_conf_by_fid: dict[str, float | None] = {
-                    str(r[0]): (float(r[2]) if r[2] is not None else None) for r in f_info_rows
-                }
-                endpoints_by_fid = {str(r[0]): (str(r[3]), r[4]) for r in f_info_rows}
+                fact_kind_by_fid: dict[str, str] = {}
+                fact_conf_by_fid: dict[str, float | None] = {}
+                endpoints_by_fid: dict[str, tuple[str, Any]] = {}
                 fact_sources_by_fid: dict[str, list[str]] = {}
                 for r in self.conn.execute(
-                    f"SELECT fact_id, chunk_id FROM fact_sources WHERE fact_id IN ({f_placeholders})",
+                    f"SELECT f.fact_id, f.obj_kind, f.confidence, f.subj_id, f.obj_id, s.chunk_id "
+                    f"FROM facts f LEFT JOIN fact_sources s ON f.fact_id = s.fact_id "
+                    f"WHERE f.fact_id IN ({f_placeholders})",
                     kept_fids,
                 ):
-                    fact_sources_by_fid.setdefault(str(r[0]), []).append(str(r[1]))
+                    fid = str(r[0])
+                    if fid not in fact_kind_by_fid:
+                        fact_kind_by_fid[fid] = str(r[1])
+                        fact_conf_by_fid[fid] = float(r[2]) if r[2] is not None else None
+                        endpoints_by_fid[fid] = (str(r[3]), r[4])
+                    if r[5] is not None:
+                        fact_sources_by_fid.setdefault(fid, []).append(str(r[5]))
 
                 seed_entities: dict[str, list[float]] = {}
                 literal_chunk_seeds: dict[str, list[float]] = {}

@@ -84,7 +84,7 @@ def deserialize_f32_vector(blob: bytes) -> np.ndarray:
     """Deserialize float32 bytes back into a 1D numpy array."""
     if len(blob) % 4 != 0 or len(blob) == 0:
         raise ValueError(f"Invalid float32 byte buffer length: {len(blob)}")
-    return np.frombuffer(blob, dtype=np.float32).copy()
+    return np.frombuffer(blob, dtype=np.float32)
 
 
 def _upsert_vectors(

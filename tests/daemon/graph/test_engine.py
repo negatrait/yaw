@@ -548,9 +548,16 @@ def test_engine_fact_score_weighting_and_thread_safe_retrieval(synonym_token_cou
             ]
         )
 
-        hits, kept_facts = engine.retrieve_with_seeds("query_target", top_k=2)
+        executed_sql: list[str] = []
+        engine.conn.set_trace_callback(executed_sql.append)
+        try:
+            hits, kept_facts = engine.retrieve_with_seeds("query_target", top_k=2)
+        finally:
+            engine.conn.set_trace_callback(None)
         assert len(kept_facts) == 2
         assert len(hits) == 2
+        assert any("FROM facts f LEFT JOIN fact_sources s ON f.fact_id = s.fact_id" in sql for sql in executed_sql)
+        assert not any("FROM fact_sources WHERE" in sql for sql in executed_sql)
         # Because Turing fact has higher normalized similarity score than Lovelace fact,
         # the Turing passage must strictly outrank the Lovelace passage under PPR.
         assert "Alan Turing" in hits[0][2]
