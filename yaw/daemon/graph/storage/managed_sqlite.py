@@ -45,6 +45,7 @@ class TableSpec:
     indexes: tuple[tuple[str, ...], ...] = ()
     db_identity: str = ""
     vec: VecSpec | None = None
+    is_delta: bool = False
 
 
 @dataclass(frozen=True)
@@ -52,6 +53,18 @@ class TableAction:
     spec: TableSpec
     delete: bool
     create: bool
+
+
+DELETE_ROW: dict[str, Any] = {"__yaw_delete_row__": True}
+_DELETE_RECORD: bytes = fingerprint_object(DELETE_ROW)
+
+
+def _schema_base(spec: TableSpec, *, ignore_vec_dim: bool = False) -> TableSpec:
+    return replace(
+        spec,
+        vec=replace(spec.vec, dim=None) if (ignore_vec_dim and spec.vec is not None) else spec.vec,
+        is_delta=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -109,6 +122,9 @@ class DatabaseSink:
                 if not action.spec.db_identity or action.spec.db_identity == active_db_identity
             ]
             if not actions:
+                return
+            has_work = any(isinstance(action, RowAction) or action.create or action.delete for action in actions)
+            if not has_work:
                 return
             for action in actions:
                 if isinstance(action, TableAction) and action.create:
@@ -185,9 +201,18 @@ class RowHandler(coco.TargetHandler[dict[str, Any], bytes, None]):
         /,
     ) -> coco.TargetReconcileOutput[TableAction | RowAction, bytes, None] | None:
         if coco.is_non_existence(desired):
-            if not previous and not prev_may_be_missing:
+            if (
+                self.spec.is_delta
+                or (not previous and not prev_may_be_missing)
+                or (previous and all(value == _DELETE_RECORD for value in previous))
+            ):
                 return None
             record = coco.NON_EXISTENCE
+            values = None
+        elif desired == DELETE_ROW:
+            if not prev_may_be_missing and previous and all(value == _DELETE_RECORD for value in previous):
+                return None
+            record = _DELETE_RECORD
             values = None
         else:
             record = fingerprint_object(desired)
@@ -222,12 +247,9 @@ class TableHandler(coco.TargetHandler[TableSpec, TableSpec, RowHandler]):
             create = prev_may_be_missing or not previous
             if previous:
                 if desired.vec is not None:
-                    desired_base = replace(desired, vec=replace(desired.vec, dim=None))
+                    desired_base = _schema_base(desired, ignore_vec_dim=True)
                     if any(
-                        fingerprint_object(
-                            replace(old, vec=replace(old.vec, dim=None) if old.vec is not None else None)
-                        )
-                        != fingerprint_object(desired_base)
+                        fingerprint_object(_schema_base(old, ignore_vec_dim=True)) != fingerprint_object(desired_base)
                         for old in previous
                     ):
                         raise ValueError("Changed graph table schema requires a fresh index")
@@ -236,10 +258,14 @@ class TableHandler(coco.TargetHandler[TableSpec, TableSpec, RowHandler]):
                         record = spec
                     elif any(old.vec is None or old.vec.dim != desired.vec.dim for old in previous):
                         create = True
-                elif any(fingerprint_object(old) != fingerprint_object(spec) for old in previous):
+                elif any(
+                    fingerprint_object(_schema_base(old)) != fingerprint_object(_schema_base(spec)) for old in previous
+                ):
                     raise ValueError("Changed graph table schema requires a fresh index")
         return coco.TargetReconcileOutput[TableAction | RowAction, TableSpec, RowHandler](
-            action=TableAction(spec, coco.is_non_existence(desired), create), sink=shared_sink(), tracking_record=record
+            action=TableAction(spec, coco.is_non_existence(desired), create),
+            sink=shared_sink(),
+            tracking_record=record,
         )
 
 
@@ -255,6 +281,7 @@ async def mount_table[RowT](
     indexes: tuple[tuple[str, ...], ...] = (),
     db_identity: str = "",
     vec: VecSpec | None = None,
+    is_delta: bool = False,
 ) -> sqlite.TableTarget[RowT]:
     schema = await sqlite.TableSchema[RowT].from_class(row_type, primary_key=list(primary_key))
     spec = TableSpec(
@@ -264,6 +291,7 @@ async def mount_table[RowT](
         indexes,
         db_identity=db_identity,
         vec=vec,
+        is_delta=is_delta,
     )
     # SDK inference includes the deletion sentinel in the row value type.
     provider = cast(

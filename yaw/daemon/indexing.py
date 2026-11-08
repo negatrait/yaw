@@ -3,18 +3,12 @@
 import asyncio
 import hashlib
 import json
-import sqlite3
-import threading
-import uuid
-import weakref
-from collections.abc import AsyncIterator, Callable, Collection, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 import cocoindex as coco
-import msgspec
-from cocoindex.connectorkits import statediff
 from cocoindex.connectorkits.fingerprint import fingerprint_object
 from cocoindex.connectors import localfs, sqlite
 from cocoindex.resources.file import FileLike, PatternFilePathMatcher
@@ -34,6 +28,8 @@ from yaw.daemon.graph.inference import (
 from yaw.daemon.graph.inference.components import (
     EMBEDDING_ENDPOINT,
     OPENIE_ENDPOINT,
+    ChunkInference,
+    ChunkProcessOutput,
     EmbeddingEndpoint,
     OpenIEEndpoint,
     OpenIEInput,
@@ -41,7 +37,6 @@ from yaw.daemon.graph.inference.components import (
     extract_text,
 )
 from yaw.daemon.graph.planner import GraphPlanSettings, GraphPlanSummary, plan_graph_publication, summarize_graph_plan
-from yaw.daemon.graph.storage import deserialize_openie_record
 from yaw.daemon.graph.storage.db import GRAPH_DB, get_meta, resolve_coco_state_root, resolve_db_identity
 from yaw.daemon.graph.storage.hydration import (
     hydrate_ast_parent_context,
@@ -61,6 +56,7 @@ from yaw.daemon.ingestion.source_targets import (
 
 RELOAD_SIGNAL_ROOT = coco.ContextKey[Path]("yaw/reload_signal_root", detect_change=True)
 RELOAD_SIGNAL_HANDLER = coco.ContextKey[Callable[[str], None]]("yaw/reload_signal_handler")
+INDEXING_ERROR_SINK = coco.ContextKey[Callable[[BaseException], None] | None]("yaw/indexing_error_sink")
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,182 +69,6 @@ class SyncOutcome:
 class InferenceIdentity:
     program: str
     embedding: str
-
-
-@dataclass(frozen=True, slots=True)
-class ChunkInference:
-    chunk_id: str
-    source_hash: str
-    program_identity: str
-    embedding_identity: str
-    extraction_json: str
-    traces_json: str
-
-
-class ChunkStateRecord(msgspec.Struct, frozen=True):
-    chunk_id: str
-    source_hash: str
-    program_identity: str
-    embedding_identity: str
-
-
-@dataclass(frozen=True, slots=True)
-class ChunkStateAction:
-    chunk_id: str
-    desired: ChunkStateRecord | coco.NonExistenceType
-
-
-class GraphDeltaCoordinator:
-    """Event-driven state-diff coordinator for declarative live graph publication (zero polling)."""
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._dirty_generation = 0
-        self._flushed_generation = 0
-        self._ready_epoch = 0
-        self._consumed_epoch = 0
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._event: asyncio.Event | None = None
-        self.last_transitions: tuple[ChunkStateAction, ...] = ()
-        self.last_plan_summary: GraphPlanSummary | None = None
-        self.recovery_nonce: str = ""
-        self.last_error: BaseException | None = None
-        self._cycle_error: BaseException | None = None
-
-    def record_error(self, exc: BaseException) -> None:
-        with self._lock:
-            self.last_error = exc
-            self._cycle_error = exc
-
-    def consume_cycle_error(self) -> BaseException | None:
-        with self._lock:
-            err = self._cycle_error
-            self._cycle_error = None
-            return err
-
-    def pop_error(self) -> BaseException | None:
-        with self._lock:
-            err = self.last_error
-            self.last_error = None
-            self._cycle_error = None
-            return err
-
-    def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
-        with self._lock:
-            if self._loop is not loop or self._event is None:
-                self._loop = loop
-                self._event = asyncio.Event()
-                if self._ready_epoch > self._consumed_epoch:
-                    self._event.set()
-
-    def record_transitions(self, actions: Sequence[ChunkStateAction]) -> None:
-        if not actions:
-            return
-        with self._lock:
-            self.last_transitions = tuple(actions)
-            self._dirty_generation += 1
-
-    def notify_external_change(self) -> None:
-        with self._lock:
-            self._dirty_generation += 1
-        self.flush_ready()
-
-    def flush_ready(self) -> None:
-        with self._lock:
-            if self._dirty_generation <= self._flushed_generation:
-                return
-            self._flushed_generation = self._dirty_generation
-            self._ready_epoch += 1
-            loop = self._loop
-            event = self._event
-        if loop is not None and event is not None and not loop.is_closed():
-            loop.call_soon_threadsafe(event.set)
-
-    def mark_published(self, summary: GraphPlanSummary) -> None:
-        with self._lock:
-            self.last_plan_summary = summary
-            self._flushed_generation = self._dirty_generation
-            self._consumed_epoch = self._ready_epoch
-            if self._event is not None:
-                self._event.clear()
-
-    async def wait_for_delta(self) -> None:
-        loop = asyncio.get_running_loop()
-        self.bind_loop(loop)
-        while True:
-            with self._lock:
-                if self._ready_epoch > self._consumed_epoch:
-                    self._consumed_epoch = self._ready_epoch
-                    if self._event is not None:
-                        self._event.clear()
-                    return
-                event = self._event
-            assert event is not None
-            await event.wait()
-
-
-_COORDINATOR_LOCK = threading.Lock()
-_COORDINATORS: dict[int, GraphDeltaCoordinator] = {}
-
-
-def get_graph_delta_coordinator(db: sqlite.ManagedConnection) -> GraphDeltaCoordinator:
-    db_id = id(db)
-    with _COORDINATOR_LOCK:
-        coordinator = _COORDINATORS.get(db_id)
-        if coordinator is None:
-            coordinator = GraphDeltaCoordinator()
-            _COORDINATORS[db_id] = coordinator
-            weakref.finalize(db, _COORDINATORS.pop, db_id, None)
-        return coordinator
-
-
-class ChunkStateTargetHandler(coco.TargetHandler[ChunkStateRecord, ChunkStateRecord]):
-    """Declarative state-diff handler that triggers graph publication when chunk state changes."""
-
-    def __init__(self) -> None:
-        self.sink = coco.TargetActionSink.from_fn(self.apply_actions)
-
-    def apply_actions(self, context: coco.ContextProvider, actions: Sequence[ChunkStateAction]) -> None:
-        if not actions:
-            return
-        db = context.get(SOURCE_DB)
-        get_graph_delta_coordinator(db).record_transitions(actions)
-
-    def reconcile(
-        self,
-        key: coco.StableKey,
-        desired: ChunkStateRecord | coco.NonExistenceType,
-        previous: Collection[ChunkStateRecord],
-        prev_may_be_missing: bool,
-        /,
-    ) -> coco.TargetReconcileOutput[Any, Any, Any] | None:
-        record = coco.NON_EXISTENCE if coco.is_non_existence(desired) else desired
-        change = statediff.diff(
-            statediff.TrackingRecordTransition(
-                desired=record,
-                prev=previous,
-                prev_may_be_missing=prev_may_be_missing,
-            )
-        )
-        if change is None:
-            return None
-        chunk_id = str(key[1]) if isinstance(key, tuple) and len(key) == 2 else str(key)
-        return coco.TargetReconcileOutput(
-            action=ChunkStateAction(chunk_id, record),
-            sink=self.sink,
-            tracking_record=record,
-        )
-
-
-CHUNK_STATE_TARGET = coco.register_root_target_states_provider(
-    "yaw/indexing/chunk_state",
-    ChunkStateTargetHandler(),
-)
-
-
-def declare_chunk_state(record: ChunkStateRecord, *, db_identity: str = "") -> None:
-    state_key: coco.StableKey = (db_identity, record.chunk_id) if db_identity else record.chunk_id
-    coco.declare_target_state(CHUNK_STATE_TARGET.target_state(state_key, record))
 
 
 def _managed_db_identity(db: sqlite.ManagedConnection) -> str:
@@ -270,89 +90,81 @@ async def process_chunk(
     settings: SourceSettings | None = None,
     frozen_text: str | None = None,
     db_identity: str = "",
-) -> None:
+) -> ChunkProcessOutput:
     """Declare a complete inference artifact only after both operations succeed."""
-    try:
-        embeddings = coco.use_context(EMBEDDING_ENDPOINT)
-        extraction = coco.use_context(OPENIE_ENDPOINT)
-        if (
-            identity.program != extraction.program_identity
-            or identity.embedding != embeddings.adapter.profile.index_identity
-        ):
-            raise ValueError("Indexing identity does not match the bound inference resources")
-        pointer = ChunkPointer(
-            metadata.chunk_id,
-            metadata.rel_posix_path,
-            metadata.start_line,
-            metadata.end_line,
-            metadata.title,
-            metadata.ast_island_start,
-            metadata.ast_island_end,
+    _ = db_identity
+    embeddings = coco.use_context(EMBEDDING_ENDPOINT)
+    extraction = coco.use_context(OPENIE_ENDPOINT)
+    if (
+        identity.program != extraction.program_identity
+        or identity.embedding != embeddings.adapter.profile.index_identity
+    ):
+        raise ValueError("Indexing identity does not match the bound inference resources")
+    pointer = ChunkPointer(
+        metadata.chunk_id,
+        metadata.rel_posix_path,
+        metadata.start_line,
+        metadata.end_line,
+        metadata.title,
+        metadata.ast_island_start,
+        metadata.ast_island_end,
+    )
+    source_root = coco.use_context(SOURCE_ROOT)
+    effective = settings if settings is not None else SourceSettings((), ())
+    chunk_text = (
+        frozen_text
+        if frozen_text is not None
+        else resolve_chunk_text(
+            pointer,
+            source_root,
+            chunk_size=effective.chunk_size,
+            chunk_overlap=effective.chunk_overlap,
+            min_chunk_size=effective.min_chunk_size,
         )
-        source_root = coco.use_context(SOURCE_ROOT)
-        effective = settings if settings is not None else SourceSettings((), ())
-        chunk_text = (
-            frozen_text
-            if frozen_text is not None
-            else resolve_chunk_text(
-                pointer,
-                source_root,
-                chunk_size=effective.chunk_size,
-                chunk_overlap=effective.chunk_overlap,
-                min_chunk_size=effective.min_chunk_size,
+    )
+    fmt_chunk = getattr(
+        embeddings.adapter,
+        "format_chunk_for_embedding",
+        lambda p, t: DSPyEmbeddingAdapter.format_chunk_for_embedding(embeddings.adapter, p, t),
+    )
+    embedding_text = fmt_chunk(pointer, chunk_text)
+    if hasattr(embeddings.adapter, "prepare_request"):
+        embed_req = embeddings.adapter.prepare_request([embedding_text], batch_size=64, stage="chunk_embed")
+    else:
+        embed_req = EmbeddingRequest(
+            texts=(embedding_text,),
+            profile=embeddings.adapter.profile,
+            task_mode=getattr(embeddings.adapter, "task_mode", "distinct-titled"),
+            batch_size=64,
+            max_batch_chars=getattr(embeddings.adapter, "max_batch_chars", 3500),
+            stage="chunk_embed",
+        )
+    openie_passage = chunk_text
+    if frozen_text is None and pointer.start_line > 1:
+        ast_parent_ctx = hydrate_ast_parent_context(pointer, source_root, hops=1)
+        if ast_parent_ctx:
+            openie_passage = (
+                f"[Document AST Context ({pointer.rel_posix_path})]\n{ast_parent_ctx}\n\n[Target Chunk]\n{chunk_text}"
             )
-        )
-        fmt_chunk = getattr(
-            embeddings.adapter,
-            "format_chunk_for_embedding",
-            lambda p, t: DSPyEmbeddingAdapter.format_chunk_for_embedding(embeddings.adapter, p, t),
-        )
-        embedding_text = fmt_chunk(pointer, chunk_text)
-        if hasattr(embeddings.adapter, "prepare_request"):
-            embed_req = embeddings.adapter.prepare_request([embedding_text], batch_size=64, stage="chunk_embed")
-        else:
-            embed_req = EmbeddingRequest(
-                texts=(embedding_text,),
-                profile=embeddings.adapter.profile,
-                task_mode=getattr(embeddings.adapter, "task_mode", "distinct-titled"),
-                batch_size=64,
-                max_batch_chars=getattr(embeddings.adapter, "max_batch_chars", 3500),
-                stage="chunk_embed",
-            )
-        openie_passage = chunk_text
-        if frozen_text is None and pointer.start_line > 1:
-            ast_parent_ctx = hydrate_ast_parent_context(pointer, source_root, hops=1)
-            if ast_parent_ctx:
-                openie_passage = (
-                    f"[Document AST Context ({pointer.rel_posix_path})]\n{ast_parent_ctx}\n\n"
-                    f"[Target Chunk]\n{chunk_text}"
-                )
-        _, record = await asyncio.gather(
-            embed_text(embed_req),
-            extract_text(OpenIEInput(metadata.chunk_id, openie_passage, extraction.program_identity)),
-        )
-        target.declare_row(
-            row=ChunkInference(
-                metadata.chunk_id,
-                metadata.source_hash,
-                extraction.program_identity,
-                embeddings.adapter.profile.index_identity,
-                json.dumps(asdict(record.record)),
-                json.dumps([asdict(trace) for trace in record.traces]),
-            )
-        )
-        declare_chunk_state(
-            ChunkStateRecord(
-                metadata.chunk_id,
-                metadata.source_hash,
-                extraction.program_identity,
-                embeddings.adapter.profile.index_identity,
-            ),
-            db_identity=db_identity,
-        )
-    except BaseException as exc:
-        get_graph_delta_coordinator(coco.use_context(SOURCE_DB)).record_error(exc)
-        raise
+    embedded, record = await asyncio.gather(
+        embed_text(embed_req),
+        extract_text(OpenIEInput(metadata.chunk_id, openie_passage, extraction.program_identity)),
+    )
+    row = ChunkInference(
+        metadata.chunk_id,
+        metadata.source_hash,
+        extraction.program_identity,
+        embeddings.adapter.profile.index_identity,
+        json.dumps(asdict(record.record)),
+        json.dumps([asdict(trace) for trace in record.traces]),
+    )
+    target.declare_row(row=row)
+    return ChunkProcessOutput(
+        pointer=pointer,
+        text=chunk_text,
+        inference=row,
+        embedding=embedded.vector_f32,
+    )
 
 
 @coco.fn
@@ -363,12 +175,18 @@ async def process_file(
     settings: SourceSettings,
     identity: InferenceIdentity,
     db_identity: str = "",
-) -> None:
-    try:
-        chunking_settings = normalize_chunking_settings(settings)
-        metadata_rows = await declare_source_file(file, sources, chunking_settings)
-        for metadata in metadata_rows:
-            await coco.mount(
+) -> tuple[ChunkProcessOutput, ...]:
+    chunking_settings = normalize_chunking_settings(settings)
+    metadata_rows = await coco.use_mount(
+        coco.component_subpath("source"),
+        declare_source_file,
+        file,
+        sources,
+        chunking_settings,
+    )
+    outputs = await asyncio.gather(
+        *(
+            coco.use_mount(
                 coco.component_subpath("chunk", metadata.chunk_id),
                 process_chunk,
                 metadata,
@@ -378,171 +196,134 @@ async def process_file(
                 None,
                 db_identity,
             )
-    except BaseException as exc:
-        get_graph_delta_coordinator(coco.use_context(SOURCE_DB)).record_error(exc)
-        raise
+            for metadata in metadata_rows
+        )
+    )
+    return tuple(outputs)
 
 
-def compute_active_inference_fingerprint(
-    conn: sqlite3.Connection,
-    program_identity: str,
-    embedding_identity: str,
-) -> str:
-    """Compute a deterministic digest of all active source + inference rows in yaw.db."""
-    hasher = hashlib.sha256()
-    hasher.update(f"{program_identity}\0{embedding_identity}\n".encode())
-    tables = {
-        row[0]
-        for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('source_chunks', 'chunk_inference')"
-        ).fetchall()
-    }
-    if {"source_chunks", "chunk_inference"} <= tables:
-        rows = conn.execute(
-            """
-            SELECT s.chunk_id, s.rel_posix_path, s.source_hash, s.start_line, s.end_line,
-                   s.title, s.ast_island_start, s.ast_island_end,
-                   i.program_identity, i.embedding_identity, i.extraction_json
-            FROM source_chunks s
-            JOIN chunk_inference i ON i.chunk_id = s.chunk_id
-            WHERE i.source_hash = s.source_hash
-              AND i.program_identity = ?
-              AND i.embedding_identity = ?
-            ORDER BY s.chunk_id
-            """,
-            (program_identity, embedding_identity),
-        ).fetchall()
-        for row in rows:
-            hasher.update(json.dumps(tuple(row), ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-            hasher.update(b"\n")
-    return hasher.hexdigest()
-
-
-@coco.fn(memo=True, version=9)
+@coco.fn
 async def publish_graph(
     settings: GraphPlanSettings,
-    state_fingerprint: str,
-    recovery_nonce: str = "",
-    frozen_text: dict[str, str] | None = None,
+    chunk_outputs: tuple[ChunkProcessOutput, ...],
     db_identity: str = "",
 ) -> GraphPlanSummary:
     """Plan and declare the atomic validated graph without storing vectors in LMDB memos."""
-    _ = state_fingerprint, recovery_nonce, db_identity
-    plan = await plan_graph_publication(settings, frozen_text=frozen_text)
+    plan = await plan_graph_publication(settings, chunk_outputs, db_identity=db_identity)
     await declare_tables(plan.tables, db_identity=db_identity)
     return summarize_graph_plan(plan)
 
 
-def _is_published_graph_aligned(conn: sqlite3.Connection, expected_chunk_ids: tuple[str, ...]) -> bool:
-    table_exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks'").fetchone()
-    if table_exists is None:
-        return not expected_chunk_ids
-    actual = tuple(row[0] for row in conn.execute("SELECT chunk_id FROM chunks ORDER BY chunk_id").fetchall())
-    return actual == expected_chunk_ids
+class _CompletedHandle:
+    async def ready(self) -> None:
+        return None
 
 
-class _SubscriberProxy:
-    """Forwards LiveMapSubscriber calls and flushes committed state-diff transitions to the coordinator."""
+class _CorpusFeedSubscriber:
+    """Forwards live localfs file events into serialized CorpusIndexingLiveComponent updates."""
 
-    def __init__(self, inner: Any, coordinator: GraphDeltaCoordinator) -> None:
-        self._inner = inner
-        self._coordinator = coordinator
+    def __init__(self, operator: coco.LiveComponentOperator) -> None:
+        self._operator = operator
+        self._lock = asyncio.Lock()
+
+    async def _refresh(self) -> None:
+        async with self._lock:
+            await self._operator.update_full()
 
     async def update_all(self) -> None:
-        await self._inner.update_all()
-        self._coordinator.flush_ready()
+        await self._refresh()
 
     async def mark_ready(self) -> None:
-        await self._inner.mark_ready()
+        await self._operator.mark_ready()
 
     async def update(self, key: Any, value: Any) -> Any:
-        handle = await self._inner.update(key, value)
-        await handle.ready()
-        self._coordinator.flush_ready()
-        return handle
+        _ = key, value
+        await self._refresh()
+        return _CompletedHandle()
 
     async def delete(self, key: Any) -> Any:
-        handle = await self._inner.delete(key)
-        await handle.ready()
-        self._coordinator.flush_ready()
-        return handle
+        _ = key
+        await self._refresh()
+        return _CompletedHandle()
 
     async def read_committed_state(self, key: Any) -> Any:
-        return await self._inner.read_committed_state(key)
+        _ = key
+        return coco.NON_EXISTENCE
 
     async def write_committed_state(self, key: Any, value: Any) -> None:
-        await self._inner.write_committed_state(key, value)
+        _ = key, value
 
 
-class _DeltaNotifyingLiveItems:
-    """Wraps a LiveMapView so state-diff transitions flush after file components commit."""
+class CorpusIndexingLiveComponent:
+    """Native LiveComponent that coordinates file indexing and direct ChunkProcessOutput publication."""
 
-    def __init__(self, inner: Any, coordinator: GraphDeltaCoordinator) -> None:
-        self._inner = inner
-        self._coordinator = coordinator
-
-    def __aiter__(self) -> AsyncIterator[tuple[str, FileLike]]:
-        return self._inner.__aiter__()
-
-    async def watch(self, subscriber: Any) -> None:
-        await self._inner.watch(_SubscriberProxy(subscriber, self._coordinator))
-
-
-class GraphPublicationLiveComponent:
-    """Event-driven LiveComponent that publishes the validated graph when chunk state transitions commit."""
-
-    def __init__(self, settings: GraphPlanSettings, db_identity: str = "") -> None:
+    def __init__(
+        self,
+        files: Any,
+        sources: sqlite.TableTarget[SourceMetadata],
+        artifacts: sqlite.TableTarget[ChunkInference],
+        settings: SourceSettings,
+        identity: InferenceIdentity,
+        graph_settings: GraphPlanSettings | None = None,
+        db_identity: str = "",
+        live: bool = True,
+    ) -> None:
+        self._files = files
+        self._sources = sources
+        self._artifacts = artifacts
         self._settings = settings
+        self._identity = identity
+        self._graph_settings = graph_settings
         self._db_identity = db_identity
+        self._live = live
+        self.last_summary: GraphPlanSummary | None = None
 
-    async def process(self) -> None:
-        db = coco.use_context(GRAPH_DB)
-        coordinator = get_graph_delta_coordinator(coco.use_context(SOURCE_DB))
-        err = coordinator.consume_cycle_error()
-        if err is not None:
-            raise err
-        db_identity = self._db_identity or _managed_db_identity(db)
-        with db.readonly() as conn:
-            state_fingerprint = compute_active_inference_fingerprint(
-                conn,
-                self._settings.program_identity,
-                self._settings.embedding_identity,
-            )
+    async def process(self) -> GraphPlanSummary | None:
         try:
-            summary = await coco.use_mount(
+            entries = [item async for item in self._files.items()]
+            file_batches = await asyncio.gather(
+                *(
+                    coco.use_mount(
+                        coco.component_subpath("process_file", rel_path),
+                        process_file,
+                        file,
+                        self._sources,
+                        self._artifacts,
+                        self._settings,
+                        self._identity,
+                        self._db_identity,
+                    )
+                    for rel_path, file in entries
+                )
+            )
+            chunk_outputs = tuple(out for batch in file_batches for out in batch)
+            if self._graph_settings is None:
+                self.last_summary = None
+                return None
+            self.last_summary = await coco.use_mount(
                 coco.component_subpath("publication"),
                 publish_graph,
-                self._settings,
-                state_fingerprint,
-                coordinator.recovery_nonce,
-                db_identity=db_identity,
+                self._graph_settings,
+                chunk_outputs,
+                self._db_identity,
             )
+            return self.last_summary
         except BaseException as exc:
-            coordinator.record_error(exc)
+            try:
+                sink = coco.use_context(INDEXING_ERROR_SINK)
+            except KeyError:
+                sink = None
+            if sink is not None:
+                sink(exc)
             raise
-        coordinator.mark_published(summary)
-
-    async def _update_and_verify(self, operator: coco.LiveComponentOperator) -> None:
-        await operator.update_full()
-        db = coco.use_context(GRAPH_DB)
-        coordinator = get_graph_delta_coordinator(coco.use_context(SOURCE_DB))
-        summary = coordinator.last_plan_summary
-        if summary is None:
-            return
-        with db.readonly() as conn:
-            aligned = _is_published_graph_aligned(conn, summary.chunk_ids)
-        if not aligned:
-            coordinator.recovery_nonce = uuid.uuid4().hex
-            await operator.update_full()
 
     async def process_live(self, operator: coco.LiveComponentOperator) -> None:
-        coordinator = get_graph_delta_coordinator(coco.use_context(SOURCE_DB))
-        coordinator.bind_loop(asyncio.get_running_loop())
-        await self._update_and_verify(operator)
-        await operator.mark_ready()
-        while True:
-            await coordinator.wait_for_delta()
-            await self._update_and_verify(operator)
+        items = self._files.items()
+        if not self._live or not isinstance(items, coco.LiveMapView):
+            await operator.update_full()
+            await operator.mark_ready()
+            return
+        await items.watch(_CorpusFeedSubscriber(operator))
 
 
 @coco.fn
@@ -560,37 +341,32 @@ async def indexing_app_main(
     identity: InferenceIdentity,
     graph_settings: GraphPlanSettings | None = None,
     watch_reload_signal: bool = False,
+    live: bool = True,
 ) -> None:
     source_db = coco.use_context(SOURCE_DB)
     db_identity = _managed_db_identity(source_db)
     sources = await mount_table("source_chunks", SourceMetadata, ["chunk_id"], db_identity=db_identity)
     artifacts = await mount_table("chunk_inference", ChunkInference, ["chunk_id"], db_identity=db_identity)
-    coordinator = get_graph_delta_coordinator(source_db)
     files = localfs.walk_dir(
         SOURCE_ROOT,
         recursive=True,
-        live=True,
+        live=live,
         path_matcher=build_source_path_matcher(settings),
         rescan_interval=None,
     )
-    files_handle = await coco.mount_each(
-        process_file,
-        _DeltaNotifyingLiveItems(files.items(), coordinator),
+    corpus_handle = await coco.mount(
+        coco.component_subpath("corpus"),
+        CorpusIndexingLiveComponent,
+        files,
         sources,
         artifacts,
         settings,
         identity,
+        graph_settings,
         db_identity,
+        live,
     )
-    if graph_settings is not None:
-        await files_handle.ready()
-        graph_handle = await coco.mount(
-            coco.component_subpath("graph"),
-            GraphPublicationLiveComponent,
-            graph_settings,
-            db_identity,
-        )
-        await graph_handle.ready()
+    await corpus_handle.ready()
     if watch_reload_signal:
         signal_files = localfs.walk_dir(
             RELOAD_SIGNAL_ROOT,
@@ -613,11 +389,11 @@ async def process_frozen_chunk(
     artifacts: sqlite.TableTarget[ChunkInference],
     identity: InferenceIdentity,
     db_identity: str = "",
-) -> None:
+) -> ChunkProcessOutput:
     pointer, text = chunk
     metadata = frozen_chunk_metadata(pointer, text)
     sources.declare_row(row=metadata)
-    await process_chunk(metadata, artifacts, identity, frozen_text=text, db_identity=db_identity)
+    return await process_chunk(metadata, artifacts, identity, frozen_text=text, db_identity=db_identity)
 
 
 def frozen_chunk_metadata(pointer: ChunkPointer, text: str) -> SourceMetadata:
@@ -684,8 +460,7 @@ def partition_frozen_chunks(
             if settings is None or published_inputs is None:
                 is_retained = True
             else:
-                record = deserialize_openie_record(entry[1], chunk_id=pointer.chunk_id)
-                expected_fp = fingerprint_object((settings, pointer, text, record)).hex()
+                expected_fp = fingerprint_object((settings, pointer, text, entry[1])).hex()
                 is_retained = published_inputs.get(pointer.chunk_id) == expected_fp
         destination = retained if is_retained else changed
         destination.append((pointer, text))
@@ -704,42 +479,48 @@ class FrozenChunkStream:
 @coco.fn
 async def frozen_indexing_app_main(
     stream: FrozenChunkStream | tuple[tuple[ChunkPointer, str], ...],
-    settings: GraphPlanSettings,
-) -> GraphPlanSummary:
+    settings: GraphPlanSettings | None = None,
+    identity: InferenceIdentity | None = None,
+) -> GraphPlanSummary | None:
     """Reconcile an explicit immutable candidate corpus through the native targets."""
     active_chunks = stream.chunks if isinstance(stream, FrozenChunkStream) else stream
     source_db = coco.use_context(SOURCE_DB)
     db_identity = _managed_db_identity(source_db)
     sources = await mount_table("source_chunks", SourceMetadata, ["chunk_id"], db_identity=db_identity)
     artifacts = await mount_table("chunk_inference", ChunkInference, ["chunk_id"], db_identity=db_identity)
-    identity = InferenceIdentity(settings.program_identity, settings.embedding_identity)
-    handles = [
-        await coco.mount(
-            coco.component_subpath("chunk", chunk[0].chunk_id),
-            process_frozen_chunk,
-            chunk,
-            sources,
-            artifacts,
-            identity,
-            db_identity,
+    effective_identity = (
+        identity
+        if identity is not None
+        else (
+            InferenceIdentity(settings.program_identity, settings.embedding_identity)
+            if settings is not None
+            else InferenceIdentity("", "")
         )
-        for chunk in active_chunks
-    ]
-    for handle in handles:
-        await handle.ready()
-    coordinator = get_graph_delta_coordinator(source_db)
-    error = coordinator.pop_error()
-    if error is not None:
-        raise error
-    with source_db.readonly() as conn:
-        fingerprint = compute_active_inference_fingerprint(conn, settings.program_identity, settings.embedding_identity)
+    )
+    chunk_outputs = tuple(
+        await asyncio.gather(
+            *(
+                coco.use_mount(
+                    coco.component_subpath("chunk", chunk[0].chunk_id),
+                    process_frozen_chunk,
+                    chunk,
+                    sources,
+                    artifacts,
+                    effective_identity,
+                    db_identity,
+                )
+                for chunk in active_chunks
+            )
+        )
+    )
+    if settings is None:
+        return None
     return await coco.use_mount(
         coco.component_subpath("publication"),
         publish_graph,
         settings,
-        fingerprint,
-        frozen_text={p.chunk_id: text for p, text in active_chunks},
-        db_identity=db_identity,
+        chunk_outputs,
+        db_identity,
     )
 
 
@@ -809,13 +590,13 @@ def bind_native_indexing(
                 )
                 if not changed:
                     stream.chunks = tuple(retained)
-                    summary = await app.update().result()
+                    summary = await app.update().result() or GraphPlanSummary(())
                     engine.report_indexing_batch(summary, len(chunks))
                     return summary
                 summary = GraphPlanSummary(())
                 for start in range(0, len(changed), batch_size):
                     stream.chunks = (*retained, *changed[: start + batch_size])
-                    summary = await app.update().result()
+                    summary = await app.update().result() or GraphPlanSummary(())
                     engine.report_indexing_batch(summary, len(chunks))
                 return summary
 

@@ -160,12 +160,17 @@ def test_plan_graph_publication_keeps_yaw_db_outside_transaction_and_preserves_s
     tmp_path: Path, provider
 ) -> None:
     import asyncio
+    import hashlib
+    import json
+    from dataclasses import asdict
 
     from yaw.core import OpenIERecord, StructuredTriple
     from yaw.daemon.graph.inference import DSPyEmbeddingAdapter, YawProgram, create_dspy_lm
     from yaw.daemon.graph.inference.components import (
         EMBEDDING_ENDPOINT,
         OPENIE_ENDPOINT,
+        ChunkInference,
+        ChunkProcessOutput,
         EmbeddingEndpoint,
         OpenIEEndpoint,
     )
@@ -176,8 +181,10 @@ def test_plan_graph_publication_keeps_yaw_db_outside_transaction_and_preserves_s
 
     corpus_dir = tmp_path / "corpus"
     corpus_dir.mkdir()
-    (corpus_dir / "a.md").write_text("# Section A\nAda Lovelace wrote the analytical engine notes.\n", encoding="utf-8")
-    (corpus_dir / "b.md").write_text("# Section B\nAda Lovelace wrote the analytical engine notes.\n", encoding="utf-8")
+    text_a = "# Section A\nAda Lovelace wrote the analytical engine notes."
+    text_b = "# Section B\nAda Lovelace wrote the analytical engine notes."
+    (corpus_dir / "a.md").write_text(text_a + "\n", encoding="utf-8")
+    (corpus_dir / "b.md").write_text(text_b + "\n", encoding="utf-8")
 
     db = open_managed_yaw_db(tmp_path / "yaw.db")
     in_tx_observations: list[bool] = []
@@ -198,57 +205,78 @@ def test_plan_graph_publication_keeps_yaw_db_outside_transaction_and_preserves_s
     lm = create_dspy_lm("publication", base_url=url + "/v1", cache=False, max_tokens=512)
     program = YawProgram(orchestrator_lm=lm, rlm_sub_lm=lm, enable_gbnf=False, max_output_tokens=512)
 
-    chunk_a = (
-        ChunkPointer("chunk_a", "a.md", 1, 2, "Section A"),
-        OpenIERecord(
-            chunk_id="chunk_a",
-            entities=("Ada Lovelace", "Analytical Engine"),
-            entity_definitions=(
-                ("Ada Lovelace", "first computer programmer"),
-                ("Analytical Engine", "mechanical general-purpose computer"),
-            ),
-            triples=(("Ada Lovelace", "wrote notes on", "Analytical Engine"),),
-            structured_triples=(
-                StructuredTriple(
-                    subj="Ada Lovelace",
-                    subj_def="first computer programmer",
-                    pred="wrote notes on",
-                    obj="Analytical Engine",
-                    obj_def="mechanical general-purpose computer",
-                    spo_def="Ada Lovelace wrote the analytical engine notes.",
-                ),
+    rec_a = OpenIERecord(
+        chunk_id="chunk_a",
+        entities=("Ada Lovelace", "Analytical Engine"),
+        entity_definitions=(
+            ("Ada Lovelace", "first computer programmer"),
+            ("Analytical Engine", "mechanical general-purpose computer"),
+        ),
+        triples=(("Ada Lovelace", "wrote notes on", "Analytical Engine"),),
+        structured_triples=(
+            StructuredTriple(
+                subj="Ada Lovelace",
+                subj_def="first computer programmer",
+                pred="wrote notes on",
+                obj="Analytical Engine",
+                obj_def="mechanical general-purpose computer",
+                spo_def="Ada Lovelace wrote the analytical engine notes.",
             ),
         ),
     )
-    chunk_b = (
-        ChunkPointer("chunk_b", "b.md", 1, 2, "Section B"),
-        OpenIERecord(
-            chunk_id="chunk_b",
-            entities=("Ada Lovelace", "Analytical Engine"),
-            entity_definitions=(
-                ("Ada Lovelace", "first computer programmer"),
-                ("Analytical Engine", "mechanical general-purpose computer"),
-            ),
-            triples=(("Ada Lovelace", "wrote notes on", "Analytical Engine"),),
-            structured_triples=(
-                StructuredTriple(
-                    subj="Ada Lovelace",
-                    subj_def="first computer programmer",
-                    pred="wrote notes on",
-                    obj="Analytical Engine",
-                    obj_def="mechanical general-purpose computer",
-                    spo_def="Ada Lovelace wrote the analytical engine notes.",
-                ),
+    rec_b = OpenIERecord(
+        chunk_id="chunk_b",
+        entities=("Ada Lovelace", "Analytical Engine"),
+        entity_definitions=(
+            ("Ada Lovelace", "first computer programmer"),
+            ("Analytical Engine", "mechanical general-purpose computer"),
+        ),
+        triples=(("Ada Lovelace", "wrote notes on", "Analytical Engine"),),
+        structured_triples=(
+            StructuredTriple(
+                subj="Ada Lovelace",
+                subj_def="first computer programmer",
+                pred="wrote notes on",
+                obj="Analytical Engine",
+                obj_def="mechanical general-purpose computer",
+                spo_def="Ada Lovelace wrote the analytical engine notes.",
             ),
         ),
+    )
+    vec_bytes = np.ones((768,), dtype="<f4").tobytes()
+    chunk_a = ChunkProcessOutput(
+        pointer=ChunkPointer("chunk_a", "a.md", 1, 2, "Section A"),
+        text=text_a,
+        inference=ChunkInference(
+            chunk_id="chunk_a",
+            source_hash=hashlib.sha256(text_a.encode()).hexdigest(),
+            program_identity="prog_v1",
+            embedding_identity=adapter.profile.index_identity,
+            extraction_json=json.dumps(asdict(rec_a)),
+            traces_json="[]",
+        ),
+        embedding=vec_bytes,
+    )
+    chunk_b = ChunkProcessOutput(
+        pointer=ChunkPointer("chunk_b", "b.md", 1, 2, "Section B"),
+        text=text_b,
+        inference=ChunkInference(
+            chunk_id="chunk_b",
+            source_hash=hashlib.sha256(text_b.encode()).hexdigest(),
+            program_identity="prog_v1",
+            embedding_identity=adapter.profile.index_identity,
+            extraction_json=json.dumps(asdict(rec_b)),
+            traces_json="[]",
+        ),
+        embedding=vec_bytes,
     )
 
     @coco.fn
     async def planned_graph_app(
         settings: GraphPlanSettings,
-        chunk_rows: tuple[tuple[ChunkPointer, OpenIERecord], ...],
+        chunk_outputs: tuple[ChunkProcessOutput, ...],
     ) -> None:
-        plan = await plan_graph_publication(settings, chunk_rows)
+        plan = await plan_graph_publication(settings, chunk_outputs)
         await declare_tables(plan.tables)
 
     settings = GraphPlanSettings(
@@ -291,4 +319,59 @@ def test_plan_graph_publication_keeps_yaw_db_outside_transaction_and_preserves_s
             assert conn.execute("SELECT COUNT(*) FROM entity_mentions").fetchone()[0] == 2
             assert conn.execute("SELECT COUNT(*) FROM fact_assertions").fetchone()[0] == 1
     finally:
+        db.close()
+
+
+def test_delta_declare_tables_preserves_survivors_and_applies_deletions(tmp_path: Path) -> None:
+    from yaw.daemon.graph.storage.rows import DesiredTable, MetaRow
+
+    db = open_managed_yaw_db(tmp_path / "delta_yaw.db")
+
+    class StateHolder:
+        tables: tuple[DesiredTable, ...] = ()
+
+    holder = StateHolder()
+
+    @coco.fn
+    async def delta_app(h: StateHolder) -> None:
+        await declare_tables(h.tables)
+
+    context = coco.ContextProvider()
+    context.provide(GRAPH_DB, db)
+    context.provide(VALIDATE_SQLITE, lambda _conn: None)
+    env = coco.Environment(settings=coco.Settings.from_env(tmp_path / "delta_state"), context_provider=context)
+    app = coco.App(coco.AppConfig(name="delta_test", environment=env), delta_app, holder)
+    try:
+        # Run 1 (is_delta=False): declare k1 and k2
+        holder.tables = (
+            DesiredTable(
+                "meta",
+                MetaRow,
+                ("key",),
+                (MetaRow("k1", "v1"), MetaRow("k2", "v2")),
+                is_delta=False,
+            ),
+        )
+        app.update_blocking()
+        with db.readonly() as conn:
+            rows = dict(conn.execute("SELECT key, value FROM meta WHERE key IN ('k1', 'k2', 'k3')").fetchall())
+            assert rows == {"k1": "v1", "k2": "v2"}
+
+        # Run 2 (is_delta=True): omit k1 (survivor), delete k2, insert k3
+        holder.tables = (
+            DesiredTable(
+                "meta",
+                MetaRow,
+                ("key",),
+                (MetaRow("k3", "v3"),),
+                deleted_keys=(("k2",),),
+                is_delta=True,
+            ),
+        )
+        app.update_blocking()
+        with db.readonly() as conn:
+            rows = dict(conn.execute("SELECT key, value FROM meta WHERE key IN ('k1', 'k2', 'k3')").fetchall())
+            assert rows == {"k1": "v1", "k3": "v3"}
+    finally:
+        env.close()
         db.close()

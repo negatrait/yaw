@@ -53,6 +53,7 @@ _PUBLIC_API: dict[str, str] = {
     "get_entity_doc_frequencies": ".graph_ops",
     "get_entity_metadata_batch": ".graph_ops",
     "get_graph_counts": ".graph_ops",
+    "load_affected_neighborhood": ".graph_ops",
     "load_graph_topology": ".graph_ops",
     "pool_confidences": ".graph_ops",
     "bayesian_noisy_or": ".graph_ops",

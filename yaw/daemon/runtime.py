@@ -58,12 +58,12 @@ from yaw.daemon.graph.storage.db import GRAPH_DB, resolve_coco_state_root
 from yaw.daemon.graph.storage.managed_sqlite import VALIDATE_SQLITE
 from yaw.daemon.graph.storage.rows import validate_graph_state
 from yaw.daemon.indexing import (
+    INDEXING_ERROR_SINK,
     RELOAD_SIGNAL_HANDLER,
     RELOAD_SIGNAL_ROOT,
     InferenceIdentity,
     SyncOutcome,
     bind_native_indexing,
-    get_graph_delta_coordinator,
     indexing_app_main,
 )
 from yaw.daemon.ingestion import (
@@ -178,6 +178,7 @@ class YawRuntime:
         self._coco_app: coco.App[..., Any] | None = None
         self._live_thread: threading.Thread | None = None
         self._live_error: BaseException | None = None
+        self._last_indexing_error: BaseException | None = None
         self._openie_endpoint: OpenIEEndpoint | None = None
         self._embedding_endpoint: EmbeddingEndpoint | None = None
         self.engine: YawGraphEngine | None = None
@@ -266,6 +267,17 @@ class YawRuntime:
             with contextlib.suppress(OSError):
                 signal_file.unlink(missing_ok=True)
 
+    def _record_indexing_error(self, exc: BaseException) -> None:
+        with self._state_lock:
+            if self._last_indexing_error is None:
+                self._last_indexing_error = exc
+
+    def _pop_indexing_error(self) -> BaseException | None:
+        with self._state_lock:
+            err = self._last_indexing_error
+            self._last_indexing_error = None
+            return err
+
     def _build_coco_app(self) -> None:
         assert self.engine is not None
         assert self.config.corpus_root is not None
@@ -303,6 +315,7 @@ class YawRuntime:
         context.provide(OPENIE_ENDPOINT, self._openie_endpoint)
         context.provide(RELOAD_SIGNAL_ROOT, yaw_dir)
         context.provide(RELOAD_SIGNAL_HANDLER, self._on_reload_signal)
+        context.provide(INDEXING_ERROR_SINK, self._record_indexing_error)
 
         state_dir = resolve_coco_state_root(self.config.state_dir)
         self._coco_env = coco.Environment(
@@ -415,13 +428,13 @@ class YawRuntime:
         ready: Future[None] = Future()
 
         async def run() -> None:
+            self._pop_indexing_error()
             handle = app.update(live=True)
             async for event in handle.watch():
+                err = self._pop_indexing_error()
+                if err is not None:
+                    raise err
                 if event.stats.total.num_errors:
-                    if self.engine is not None:
-                        error = get_graph_delta_coordinator(self.engine.managed_conn).pop_error()
-                        if error is not None:
-                            raise error
                     raise YawRuntimeError("CONSISTENCY_ERROR", "CocoIndex live update reported component errors.")
                 if event.stats.total.num_in_progress == 0:
                     self._refresh_published_state()
@@ -822,9 +835,6 @@ class YawRuntime:
             raise YawRuntimeError("NOT_READY", "Engine or CocoIndex app is not initialized.")
 
         self._update_state(active_op="syncing corpus via CocoIndex", sync_state="syncing")
-        coordinator = get_graph_delta_coordinator(self.engine.managed_conn)
-        coordinator.pop_error()
-
         with self.engine._lock:
             before_cids = {str(r[0]) for r in self.engine.conn.execute("SELECT chunk_id FROM chunks").fetchall()}
 
@@ -833,11 +843,12 @@ class YawRuntime:
             await handle.result()
             return handle.stats()
 
+        self._pop_indexing_error()
         update_stats = asyncio.run(_run_coco_update(self._coco_app))
-
-        err = coordinator.pop_error()
+        err = self._pop_indexing_error()
         if err is not None:
             raise err
+
         if update_stats is not None and update_stats.total.num_errors > 0:
             raise YawRuntimeError(
                 "CONSISTENCY_ERROR",

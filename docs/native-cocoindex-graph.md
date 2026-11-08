@@ -200,10 +200,11 @@ async def plan_graph_publication(
   - `YawGraphEngine._encode_texts` caches query-time embeddings via an instance-scoped bounded LRU cache keyed by `(self._embedding_cache_namespace(), text)` (`maxsize=4096` `[target]`).
   - `GraphOptimizationHooks` stores SIMBA task scores and reflection checkpoints in `yaw.db`'s `meta` table via `get_meta` / `set_meta`.
 
-Open:
-- **Question**: How should `managed_sqlite.py` (`TableHandler` / `RowHandler` / `DatabaseSink`) reconcile affected-owner mutations in `publish_graph` without calling `SELECT *` on unaffected survivor rows in `yaw.db` while preventing `cocoindex == 1.1.0` from treating omitted survivor keys in `/publication` as `coco.NON_EXISTENCE`?
-  - **Constraint**: Must execute all `15` `[target]` table mutations inside `1` `[target]` `DatabaseSink` transaction with pre-commit `validate_graph_state`, perform `0` `[target]` full-table `SELECT *` survivor scans in `planner.py`/`rows.py`, keep worker RSS `<= 1 GiB` `[target]`, and never delete unaffected rows on Batch 2.
-  - **Resolved by**: Capability Gate `CG-GRAPH-2` probe testing whether `publish_graph` mounts per-owner child `@coco.fn(memo=True)` components that feed the single shared `DatabaseSink` barrier or `DesiredTable` carries explicit `(upserts, deleted_keys)` reconciled by `TableHandler`.
+- **Bounded Affected-Owner Planning & Delta Reconciliation (`planner.py`, `graph_ops.py`, `rows.py`, `managed_sqlite.py`)**:
+  - `load_affected_neighborhood(ro_conn, stage_conn, ...)` seeds `:memory:` `stage_conn` using only indexed `WHERE ... IN (...)`, `WHERE label_norm >= ? AND label_norm < ?`, and `vec0` `MATCH` queries on `ro_conn` (zero full-table `SELECT *` survivor scans) and snapshots `seeded_rows_by_table = snapshot_table_rows(stage_conn)`.
+  - `graph_tables(..., seeded_rows_by_table=seeded_rows_by_table)` emits `DesiredTable(rows=changed_rows, deleted_keys=deleted_keys, is_delta=True)`; `declare_tables` declares `DELETE_ROW` target states for `deleted_keys`, while `RowHandler.reconcile` ignores `coco.NON_EXISTENCE` when `spec.is_delta=True` and emits `RowAction(spec, key, None)` for `DELETE_ROW`, committing all `15` `[target]` table upserts and deletions inside `1` `[target]` `DatabaseSink` transaction.
+
+Open: None.
 
 ## 6. Capability gates
 

@@ -2,14 +2,16 @@
 
 import json
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, NamedTuple
+
+import cocoindex as coco
 
 from yaw.core import ChunkPointer
 
 from .evidence import EVIDENCE_INDEXES, EntityMention, FactAssertion
-from .managed_sqlite import VecSpec, mount_table
+from .managed_sqlite import DELETE_ROW, VecSpec, mount_table
 from .shacl import lint_graph_shacl
 
 
@@ -117,6 +119,8 @@ class DesiredTable:
     rows: tuple[Any, ...]
     fts_unindexed: tuple[str, ...] | None = None
     vec: VecSpec | None = None
+    deleted_keys: tuple[tuple[Any, ...], ...] = ()
+    is_delta: bool = False
 
 
 _VEC_TABLE_NAMES = frozenset({"chunk_vec", "entity_vec", "fact_vec"})
@@ -137,14 +141,35 @@ GRAPH_TABLES = (
 )
 
 
+def _row_pk(row: Any, key: tuple[str, ...]) -> tuple[Any, ...]:
+    return tuple(getattr(row, col) for col in key)
+
+
+def snapshot_table_rows(conn: sqlite3.Connection) -> dict[str, dict[tuple[Any, ...], Any]]:
+    """Snapshot seeded rows in a staging connection before delta mutations."""
+    existing_tables = {str(r[0]) for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    snap: dict[str, dict[tuple[Any, ...], Any]] = {}
+    for name, row_type, key in GRAPH_TABLES:
+        if name not in existing_tables:
+            snap[name] = {}
+            continue
+        columns = ",".join(row_type.__annotations__)
+        rows = (row_type(*row) for row in conn.execute(f"SELECT {columns} FROM {name} ORDER BY {','.join(key)}"))
+        snap[name] = {_row_pk(r, key): r for r in rows}
+    return snap
+
+
 def graph_tables(
     conn: sqlite3.Connection,
     chunks: Sequence[tuple[ChunkPointer, str]],
     fingerprints: Sequence[tuple[str, str]],
     *,
+    seeded_rows_by_table: Mapping[str, Mapping[tuple[Any, ...], Any]] | None = None,
     db_identity: str = "",
 ) -> tuple[DesiredTable, ...]:
+    is_delta = seeded_rows_by_table is not None
     tables = []
+    deleted_chunk_fts: tuple[tuple[Any, ...], ...] = ()
     for name, row_type, key in GRAPH_TABLES:
         columns = ",".join(row_type.__annotations__)
         values = tuple(row_type(*row) for row in conn.execute(f"SELECT {columns} FROM {name} ORDER BY {','.join(key)}"))
@@ -158,7 +183,18 @@ def graph_tables(
             if name in _VEC_TABLE_NAMES
             else None
         )
-        tables.append(DesiredTable(name, row_type, key, values, vec=vec))
+        if seeded_rows_by_table is None:
+            tables.append(DesiredTable(name, row_type, key, values, vec=vec))
+        else:
+            seeded = seeded_rows_by_table.get(name, {})
+            current_map = {_row_pk(r, key): r for r in values}
+            changed_rows = tuple(r for pk, r in current_map.items() if seeded.get(pk) != r)
+            deleted_keys = tuple(sorted(pk for pk in seeded if pk not in current_map))
+            if name == "chunks":
+                deleted_chunk_fts = deleted_keys
+            tables.append(
+                DesiredTable(name, row_type, key, changed_rows, vec=vec, deleted_keys=deleted_keys, is_delta=True)
+            )
     tables.append(
         DesiredTable(
             "chunk_fts",
@@ -166,13 +202,36 @@ def graph_tables(
             ("chunk_id",),
             tuple(ChunkText(pointer.chunk_id, pointer.title, text) for pointer, text in chunks),
             ("chunk_id",),
+            deleted_keys=deleted_chunk_fts,
+            is_delta=is_delta,
         )
     )
     facts = []
     for fid, predicate, raw in conn.execute("SELECT fact_id,pred,raw_triple_json FROM facts ORDER BY fact_id"):
         subject, _, obj = json.loads(raw)
         facts.append(FactText(fid, f"{subject} {predicate} {obj}"))
-    tables.append(DesiredTable("fact_fts", FactText, ("fact_id",), tuple(facts), ("fact_id",)))
+    if seeded_rows_by_table is None:
+        tables.append(DesiredTable("fact_fts", FactText, ("fact_id",), tuple(facts), ("fact_id",)))
+    else:
+        seeded_facts = seeded_rows_by_table.get("facts", {})
+        seeded_fact_fts: dict[tuple[Any, ...], FactText] = {}
+        for pk, f_row in seeded_facts.items():
+            s_lbl, _, o_lbl = json.loads(f_row.raw_triple_json)
+            seeded_fact_fts[pk] = FactText(f_row.fact_id, f"{s_lbl} {f_row.pred} {o_lbl}")
+        current_fact_fts = {(r.fact_id,): r for r in facts}
+        changed_fact_fts = tuple(r for pk, r in current_fact_fts.items() if seeded_fact_fts.get(pk) != r)
+        deleted_fact_fts = tuple(sorted(pk for pk in seeded_fact_fts if pk not in current_fact_fts))
+        tables.append(
+            DesiredTable(
+                "fact_fts",
+                FactText,
+                ("fact_id",),
+                changed_fact_fts,
+                ("fact_id",),
+                deleted_keys=deleted_fact_fts,
+                is_delta=True,
+            )
+        )
     meta_rows: list[MetaRow] = [MetaRow("graph_input_fingerprints", json.dumps(tuple(fingerprints)))]
     if db_identity:
         meta_rows.append(MetaRow("db_identity", db_identity))
@@ -180,8 +239,12 @@ def graph_tables(
     return tuple(tables)
 
 
-def empty_graph_tables(*, db_identity: str = "") -> tuple[DesiredTable, ...]:
-    meta_rows: list[MetaRow] = [MetaRow("graph_input_fingerprints", "[]")]
+def empty_delta_graph_tables(
+    fingerprints: Sequence[tuple[str, str]],
+    *,
+    db_identity: str = "",
+) -> tuple[DesiredTable, ...]:
+    meta_rows: list[MetaRow] = [MetaRow("graph_input_fingerprints", json.dumps(tuple(fingerprints)))]
     if db_identity:
         meta_rows.append(MetaRow("db_identity", db_identity))
     return (
@@ -192,18 +255,54 @@ def empty_graph_tables(*, db_identity: str = "") -> tuple[DesiredTable, ...]:
                 key,
                 (),
                 vec=VecSpec("embedding", None) if name in _VEC_TABLE_NAMES else None,
+                is_delta=True,
             )
             for name, row_type, key in GRAPH_TABLES
         ),
-        DesiredTable("chunk_fts", ChunkText, ("chunk_id",), (), ("chunk_id",)),
-        DesiredTable("fact_fts", FactText, ("fact_id",), (), ("fact_id",)),
+        DesiredTable("chunk_fts", ChunkText, ("chunk_id",), (), ("chunk_id",), is_delta=True),
+        DesiredTable("fact_fts", FactText, ("fact_id",), (), ("fact_id",), is_delta=True),
+        DesiredTable("meta", MetaRow, ("key",), tuple(meta_rows)),
+    )
+
+
+def empty_graph_tables(
+    *,
+    seeded_rows_by_table: Mapping[str, Mapping[tuple[Any, ...], Any]] | None = None,
+    db_identity: str = "",
+) -> tuple[DesiredTable, ...]:
+    meta_rows: list[MetaRow] = [MetaRow("graph_input_fingerprints", "[]")]
+    if db_identity:
+        meta_rows.append(MetaRow("db_identity", db_identity))
+    deleted_chunks = tuple(sorted(seeded_rows_by_table.get("chunks", {}))) if seeded_rows_by_table is not None else ()
+    deleted_facts = tuple(sorted(seeded_rows_by_table.get("facts", {}))) if seeded_rows_by_table is not None else ()
+    return (
+        *(
+            DesiredTable(
+                name,
+                row_type,
+                key,
+                (),
+                vec=VecSpec("embedding", None) if name in _VEC_TABLE_NAMES else None,
+                deleted_keys=(
+                    tuple(sorted(seeded_rows_by_table.get(name, {}))) if seeded_rows_by_table is not None else ()
+                ),
+            )
+            for name, row_type, key in GRAPH_TABLES
+        ),
+        DesiredTable("chunk_fts", ChunkText, ("chunk_id",), (), ("chunk_id",), deleted_keys=deleted_chunks),
+        DesiredTable("fact_fts", FactText, ("fact_id",), (), ("fact_id",), deleted_keys=deleted_facts),
         DesiredTable("meta", MetaRow, ("key",), tuple(meta_rows)),
     )
 
 
 async def declare_tables(tables: tuple[DesiredTable, ...], *, db_identity: str = "") -> None:
     shared_vec_dim = next(
-        (len(t.rows[0].embedding) // 4 for t in tables if (t.vec is not None or t.name in _VEC_TABLE_NAMES) and t.rows),
+        (
+            (len(t.rows[0].embedding) // 4 if t.rows else (t.vec.dim if t.vec is not None else None))
+            for t in tables
+            if (t.vec is not None or t.name in _VEC_TABLE_NAMES)
+            and (t.rows or (t.vec is not None and t.vec.dim is not None))
+        ),
         None,
     )
     targets = [
@@ -223,12 +322,15 @@ async def declare_tables(tables: tuple[DesiredTable, ...], *, db_identity: str =
             )
             if (table.vec is not None or table.name in _VEC_TABLE_NAMES)
             else None,
+            is_delta=table.is_delta,
         )
         for table in tables
     ]
     for target, table in zip(targets, tables, strict=True):
         for row in table.rows:
             target.declare_row(row=row)
+        for key in table.deleted_keys:
+            coco.declare_target_state(target._provider.target_state(key, DELETE_ROW))
         if table.name == "meta" and db_identity and not any(row.key == "db_identity" for row in table.rows):
             target.declare_row(row=MetaRow("db_identity", db_identity))
 

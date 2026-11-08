@@ -27,7 +27,7 @@ from yaw.core import (
     pool_confidences as pool_confidences,
 )
 
-from .db import batched, write_tx
+from .db import batched, ensure_vec0_table, vec0_table_dimension, write_tx
 from .evidence import EntityMerge, fact_id
 from .hydration import normalize_json_passage_text, read_corpus_lines
 from .vectors import get_entity_vectors
@@ -97,7 +97,11 @@ def find_entity_synonym_candidates(
         )
     }
 
-    def _scan_entity_rows(rows_iter: Iterator[sqlite3.Row]) -> None:
+    def _scan_entity_rows(
+        rows_iter: Iterator[sqlite3.Row],
+        *,
+        allowed_targets: set[str] | None = None,
+    ) -> None:
         rows = list(rows_iter)
         if not rows:
             return
@@ -123,6 +127,8 @@ def find_entity_synonym_candidates(
             )
             for hit in knn_cursor:
                 dst_id = str(hit[0])
+                if allowed_targets is not None and dst_id not in allowed_targets:
+                    continue
                 sim = float(hit[1])
                 if sim >= threshold:
                     key = (src_id, dst_id) if src_id < dst_id else (dst_id, src_id)
@@ -132,13 +138,39 @@ def find_entity_synonym_candidates(
     if entity_ids is None:
         _scan_entity_rows(conn.execute("SELECT entity_id, embedding FROM entity_vec"))
     elif entity_ids:
-        for batch in batched(entity_ids):
+        target_set = {str(eid) for eid in entity_ids}
+        target_rows: list[sqlite3.Row] = []
+        for batch in batched(sorted(target_set)):
             placeholders = ",".join("?" for _ in batch)
             cursor = conn.execute(
                 f"SELECT entity_id, embedding FROM entity_vec WHERE entity_id IN ({placeholders})",
                 tuple(batch),
             )
-            _scan_entity_rows(cursor)
+            batch_rows = list(cursor)
+            target_rows.extend(batch_rows)
+            _scan_entity_rows(iter(batch_rows))
+        reverse_candidate_ids: set[str] = set()
+        k_wide = min(max(int(top_k) * 8, 64), 4096)
+        for row in target_rows:
+            blob = row[1]
+            for hit in conn.execute(
+                """
+                SELECT entity_id
+                FROM entity_vec
+                WHERE embedding MATCH ? AND k = ? AND distance <= ?
+                """,
+                (blob, k_wide, max_dist),
+            ):
+                cand_id = str(hit[0])
+                if cand_id not in target_set:
+                    reverse_candidate_ids.add(cand_id)
+        for batch in batched(sorted(reverse_candidate_ids)):
+            placeholders = ",".join("?" for _ in batch)
+            cursor = conn.execute(
+                f"SELECT entity_id, embedding FROM entity_vec WHERE entity_id IN ({placeholders})",
+                tuple(batch),
+            )
+            _scan_entity_rows(cursor, allowed_targets=target_set)
 
     return [(a, b, sim) for (a, b), sim in sorted(pair_scores.items())]
 
@@ -1550,3 +1582,405 @@ def upsert_semantic_edges(
                             """,
                             (s, d, rel_weight, reasoning),
                         )
+
+
+def load_affected_neighborhood(
+    ro_conn: sqlite3.Connection,
+    stage_conn: sqlite3.Connection,
+    *,
+    seed_entity_ids: Sequence[str],
+    seed_label_norms: Sequence[str],
+    delta_entity_vectors: Mapping[str, bytes],
+    delta_entity_names: Mapping[str, str],
+    synonymy_threshold: float = 0.8,
+    synonymy_top_k: int = 5,
+) -> set[str]:
+    """Seed stage_conn with the bounded affected neighborhood from ro_conn using only indexed queries."""
+    has_entities = (
+        ro_conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='entities'").fetchone() is not None
+    )
+    if not has_entities:
+        return set()
+
+    core_entity_ids: set[str] = set()
+
+    # 1a. Existing entity IDs directly referenced by the delta batch or sense bindings
+    for batch in batched(sorted({str(eid) for eid in seed_entity_ids if eid})):
+        placeholders = ",".join("?" for _ in batch)
+        for row in ro_conn.execute(
+            f"SELECT entity_id FROM entities WHERE entity_id IN ({placeholders})",
+            tuple(batch),
+        ):
+            core_entity_ids.add(str(row[0]))
+
+    # 1b. Existing entities sharing a normalized label or token norm with the delta batch
+    norm_candidates = {str(n) for n in seed_label_norms if n}
+    for name in delta_entity_names.values():
+        norm_a, tok_a = _lexical_name_parts(name)
+        if norm_a:
+            norm_candidates.add(norm_a)
+        if tok_a:
+            norm_candidates.add(tok_a)
+    for batch in batched(sorted(norm_candidates)):
+        placeholders = ",".join("?" for _ in batch)
+        for row in ro_conn.execute(
+            f"SELECT DISTINCT entity_id FROM entity_labels WHERE label_norm IN ({placeholders})",
+            tuple(batch),
+        ):
+            core_entity_ids.add(str(row[0]))
+
+    # 1c. Bounded prefix scan on entity_labels primary key for lexical similarity candidates (>= 0.70)
+    prefixes: set[str] = set()
+    for name in delta_entity_names.values():
+        norm_a, tok_a = _lexical_name_parts(name)
+        for item in (norm_a, tok_a, *norm_a.split(), *tok_a.split()):
+            if len(item) >= 3 and not item.isdigit():
+                prefixes.add(item[:3])
+    prefix_hit_eids: set[str] = set()
+    for pfx in sorted(prefixes):
+        upper = pfx[:-1] + chr(ord(pfx[-1]) + 1)
+        for row in ro_conn.execute(
+            "SELECT DISTINCT entity_id, raw_label FROM entity_labels WHERE label_norm >= ? AND label_norm < ?",
+            (pfx, upper),
+        ):
+            cand_eid = str(row[0])
+            raw_lbl = str(row[1])
+            if cand_eid in core_entity_ids:
+                continue
+            if any(_lexical_similarity_cascade(name, raw_lbl, 0.70) >= 0.70 for name in delta_entity_names.values()):
+                prefix_hit_eids.add(cand_eid)
+    core_entity_ids.update(prefix_hit_eids)
+
+    # 1d. Dense KNN candidate partners in ro_conn.entity_vec + reverse top-k neighbors
+    has_entity_vec = (
+        ro_conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='entity_vec'").fetchone() is not None
+    )
+    if has_entity_vec and delta_entity_vectors and synonymy_top_k > 0:
+        eff_threshold = min(float(synonymy_threshold), 0.75)
+        max_dist = max(0.0, 1.0 - eff_threshold + 1e-6)
+        k_wide = min(max(int(synonymy_top_k) * 8, 64), 4096)
+        knn_seed_ids: set[str] = set()
+        for blob in delta_entity_vectors.values():
+            for row in ro_conn.execute(
+                """
+                SELECT entity_id
+                FROM entity_vec
+                WHERE embedding MATCH ? AND k = ? AND distance <= ?
+                """,
+                (blob, k_wide, max_dist),
+            ):
+                knn_seed_ids.add(str(row[0]))
+        core_entity_ids.update(knn_seed_ids)
+        # Seed each KNN candidate's own top-k neighbors in ro_conn so reverse top-k rank is exact
+        k_self = min(int(synonymy_top_k) + 1, 4096)
+        for batch in batched(sorted(knn_seed_ids)):
+            placeholders = ",".join("?" for _ in batch)
+            cand_blobs = ro_conn.execute(
+                f"SELECT entity_id, embedding FROM entity_vec WHERE entity_id IN ({placeholders})",
+                tuple(batch),
+            ).fetchall()
+            for _, cand_blob in cand_blobs:
+                for hit in ro_conn.execute(
+                    """
+                    SELECT entity_id
+                    FROM entity_vec
+                    WHERE embedding MATCH ? AND k = ? AND distance <= ?
+                    """,
+                    (cand_blob, k_self, max_dist),
+                ):
+                    core_entity_ids.add(str(hit[0]))
+
+    if not core_entity_ids:
+        return set()
+
+    # 2a. Expand transitive skos:broader ancestors and descendants
+    ancestors = set(core_entity_ids)
+    frontier = set(core_entity_ids)
+    while frontier:
+        next_frontier: set[str] = set()
+        for batch in batched(sorted(frontier)):
+            placeholders = ",".join("?" for _ in batch)
+            for row in ro_conn.execute(
+                f"SELECT dst_id FROM edges WHERE src_id IN ({placeholders}) AND kind = 'skos:broader'",
+                tuple(batch),
+            ):
+                dst_id = str(row[0])
+                if dst_id not in ancestors:
+                    ancestors.add(dst_id)
+                    next_frontier.add(dst_id)
+        frontier = next_frontier
+
+    descendants = set(core_entity_ids)
+    frontier = set(core_entity_ids)
+    while frontier:
+        next_frontier = set()
+        for batch in batched(sorted(frontier)):
+            placeholders = ",".join("?" for _ in batch)
+            for row in ro_conn.execute(
+                f"SELECT src_id FROM edges WHERE dst_id IN ({placeholders}) AND kind = 'skos:broader'",
+                tuple(batch),
+            ):
+                src_id = str(row[0])
+                if src_id not in descendants:
+                    descendants.add(src_id)
+                    next_frontier.add(src_id)
+        frontier = next_frontier
+
+    core_entity_ids.update(ancestors)
+    core_entity_ids.update(descendants)
+
+    # 2b. Co-hyponym siblings sharing a skos:broader parent (ConceptShape/siblingNotBroader)
+    parent_ids: set[str] = set()
+    for batch in batched(sorted(core_entity_ids)):
+        placeholders = ",".join("?" for _ in batch)
+        for row in ro_conn.execute(
+            f"SELECT dst_id FROM edges WHERE src_id IN ({placeholders}) AND kind = 'skos:broader'",
+            tuple(batch),
+        ):
+            parent_ids.add(str(row[0]))
+    for batch in batched(sorted(parent_ids)):
+        placeholders = ",".join("?" for _ in batch)
+        for row in ro_conn.execute(
+            f"SELECT src_id FROM edges WHERE dst_id IN ({placeholders}) AND kind = 'skos:broader'",
+            tuple(batch),
+        ):
+            core_entity_ids.add(str(row[0]))
+
+    # 2c. 1-hop skos:related / owl:differentFrom neighbors of core_entity_ids
+    sem_neighbors: set[str] = set()
+    for batch in batched(sorted(core_entity_ids)):
+        placeholders = ",".join("?" for _ in batch)
+        b_tuple = tuple(batch)
+        for row in ro_conn.execute(
+            f"""
+            SELECT dst_id FROM edges
+            WHERE src_id IN ({placeholders}) AND kind IN ('skos:related', 'owl:differentFrom')
+            UNION
+            SELECT src_id FROM edges
+            WHERE dst_id IN ({placeholders}) AND kind IN ('skos:related', 'owl:differentFrom')
+            """,
+            (*b_tuple, *b_tuple),
+        ):
+            sem_neighbors.add(str(row[0]))
+    core_entity_ids.update(sem_neighbors)
+
+    affected_entity_ids = set(core_entity_ids)
+    affected_fact_ids: set[str] = set()
+
+    # 2d. Incident facts and their entity endpoints
+    for batch in batched(sorted(core_entity_ids)):
+        placeholders = ",".join("?" for _ in batch)
+        b_tuple = tuple(batch)
+        for row in ro_conn.execute(
+            f"""
+            SELECT fact_id, subj_id, obj_id, obj_kind
+            FROM facts
+            WHERE subj_id IN ({placeholders}) OR obj_id IN ({placeholders})
+            """,
+            (*b_tuple, *b_tuple),
+        ):
+            affected_fact_ids.add(str(row[0]))
+            affected_entity_ids.add(str(row[1]))
+            if str(row[3] or "entity") == "entity" and row[2]:
+                affected_entity_ids.add(str(row[2]))
+
+    # 2e. Incident edges and their entity endpoints
+    incident_edges: list[tuple[Any, ...]] = []
+    incident_edge_keys: set[tuple[str, str, str]] = set()
+    for batch in batched(sorted(core_entity_ids)):
+        placeholders = ",".join("?" for _ in batch)
+        b_tuple = tuple(batch)
+        for row in ro_conn.execute(
+            f"""
+            SELECT src_id, dst_id, kind, weight, reasoning
+            FROM edges
+            WHERE src_id IN ({placeholders}) OR dst_id IN ({placeholders})
+            """,
+            (*b_tuple, *b_tuple),
+        ):
+            ekey = (str(row[0]), str(row[1]), str(row[2]))
+            if ekey not in incident_edge_keys:
+                incident_edge_keys.add(ekey)
+                incident_edges.append(tuple(row))
+                affected_entity_ids.add(ekey[0])
+                affected_entity_ids.add(ekey[1])
+
+    # Ensure vec0 dimensions match ro_conn before inserting vectors into stage_conn
+    for vtable, pk_col in (("chunk_vec", "chunk_id"), ("entity_vec", "entity_id"), ("fact_vec", "fact_id")):
+        vdim = vec0_table_dimension(ro_conn, vtable)
+        if vdim is not None:
+            ensure_vec0_table(stage_conn, vtable, pk_col, vdim)
+
+    seed_chunk_ids: set[str] = set()
+
+    with write_tx(stage_conn):
+        # 3a. Copy entities, entity_vec, entity_labels, entity_mentions
+        for batch in batched(sorted(affected_entity_ids)):
+            placeholders = ",".join("?" for _ in batch)
+            b_tuple = tuple(batch)
+            ent_rows = ro_conn.execute(
+                f"SELECT entity_id, name, definition, confidence FROM entities WHERE entity_id IN ({placeholders})",
+                b_tuple,
+            ).fetchall()
+            if ent_rows:
+                stage_conn.executemany(
+                    "INSERT OR REPLACE INTO entities (entity_id, name, definition, confidence) VALUES (?, ?, ?, ?)",
+                    ent_rows,
+                )
+            if has_entity_vec:
+                evec_rows = ro_conn.execute(
+                    f"SELECT entity_id, embedding FROM entity_vec WHERE entity_id IN ({placeholders})",
+                    b_tuple,
+                ).fetchall()
+                for eid, emb in evec_rows:
+                    stage_conn.execute("DELETE FROM entity_vec WHERE entity_id = ?", (eid,))
+                    stage_conn.execute("INSERT INTO entity_vec (entity_id, embedding) VALUES (?, ?)", (eid, emb))
+            lbl_rows = ro_conn.execute(
+                f"SELECT label_norm, entity_id, label_kind, raw_label, chunk_id "
+                f"FROM entity_labels WHERE entity_id IN ({placeholders})",
+                b_tuple,
+            ).fetchall()
+            if lbl_rows:
+                stage_conn.executemany(
+                    "INSERT OR REPLACE INTO entity_labels (label_norm, entity_id, label_kind, raw_label, chunk_id) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    lbl_rows,
+                )
+                for row in lbl_rows:
+                    cid = str(row[4])
+                    if cid and not cid.startswith("__"):
+                        seed_chunk_ids.add(cid)
+            mention_rows = ro_conn.execute(
+                f"SELECT mention_id, chunk_id, source_revision, sense_id, name, definition, "
+                f"resolved_definition, entity_id "
+                f"FROM entity_mentions WHERE entity_id IN ({placeholders})",
+                b_tuple,
+            ).fetchall()
+            if mention_rows:
+                stage_conn.executemany(
+                    "INSERT OR REPLACE INTO entity_mentions "
+                    "(mention_id, chunk_id, source_revision, sense_id, name, definition, "
+                    "resolved_definition, entity_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    mention_rows,
+                )
+                for row in mention_rows:
+                    cid = str(row[1])
+                    if cid and not cid.startswith("__"):
+                        seed_chunk_ids.add(cid)
+
+        # 3b. Copy facts, fact_vec, fact_sources, fact_assertions, fact_fts
+        has_fact_vec = (
+            ro_conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='fact_vec'").fetchone() is not None
+        )
+        for batch in batched(sorted(affected_fact_ids)):
+            placeholders = ",".join("?" for _ in batch)
+            b_tuple = tuple(batch)
+            fact_rows = ro_conn.execute(
+                f"SELECT fact_id, subj_id, pred, obj_kind, obj_id, obj_literal_lex, obj_datatype, obj_lang, "
+                f"raw_triple_json, definition, confidence FROM facts WHERE fact_id IN ({placeholders})",
+                b_tuple,
+            ).fetchall()
+            if fact_rows:
+                stage_conn.executemany(
+                    "INSERT OR REPLACE INTO facts "
+                    "(fact_id, subj_id, pred, obj_kind, obj_id, obj_literal_lex, obj_datatype, obj_lang, "
+                    "raw_triple_json, definition, confidence) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    fact_rows,
+                )
+                fts_rows: list[tuple[str, str]] = []
+                for f_row in fact_rows:
+                    fid = str(f_row[0])
+                    pred = str(f_row[2])
+                    raw_json = str(f_row[8])
+                    s_lbl, _, o_lbl = json.loads(raw_json)
+                    fts_rows.append((fid, f"{s_lbl} {pred} {o_lbl}"))
+                stage_conn.executemany(
+                    "DELETE FROM fact_fts WHERE fact_id = ?",
+                    ((fid,) for fid, _ in fts_rows),
+                )
+                stage_conn.executemany(
+                    "INSERT INTO fact_fts (fact_id, text) VALUES (?, ?)",
+                    fts_rows,
+                )
+            if has_fact_vec:
+                fvec_rows = ro_conn.execute(
+                    f"SELECT fact_id, embedding FROM fact_vec WHERE fact_id IN ({placeholders})",
+                    b_tuple,
+                ).fetchall()
+                for fid, emb in fvec_rows:
+                    stage_conn.execute("DELETE FROM fact_vec WHERE fact_id = ?", (fid,))
+                    stage_conn.execute("INSERT INTO fact_vec (fact_id, embedding) VALUES (?, ?)", (fid, emb))
+            fsrc_rows = ro_conn.execute(
+                f"SELECT fact_id, chunk_id, llm_prob, vec_coherence, atomic_confidence "
+                f"FROM fact_sources WHERE fact_id IN ({placeholders})",
+                b_tuple,
+            ).fetchall()
+            if fsrc_rows:
+                stage_conn.executemany(
+                    "INSERT OR REPLACE INTO fact_sources "
+                    "(fact_id, chunk_id, llm_prob, vec_coherence, atomic_confidence) VALUES (?, ?, ?, ?, ?)",
+                    fsrc_rows,
+                )
+                for row in fsrc_rows:
+                    cid = str(row[1])
+                    if cid and not cid.startswith("__"):
+                        seed_chunk_ids.add(cid)
+            fassert_rows = ro_conn.execute(
+                f"SELECT assertion_id, chunk_id, source_revision, subject_mention_id, object_mention_id, "
+                f"raw_json, fact_id FROM fact_assertions WHERE fact_id IN ({placeholders})",
+                b_tuple,
+            ).fetchall()
+            if fassert_rows:
+                stage_conn.executemany(
+                    "INSERT OR REPLACE INTO fact_assertions "
+                    "(assertion_id, chunk_id, source_revision, subject_mention_id, object_mention_id, "
+                    "raw_json, fact_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    fassert_rows,
+                )
+                for row in fassert_rows:
+                    cid = str(row[1])
+                    if cid and not cid.startswith("__"):
+                        seed_chunk_ids.add(cid)
+
+        # 3c. Copy incident edges and edge_sources
+        if incident_edges:
+            stage_conn.executemany(
+                "INSERT OR REPLACE INTO edges (src_id, dst_id, kind, weight, reasoning) VALUES (?, ?, ?, ?, ?)",
+                incident_edges,
+            )
+            for batch in batched(sorted({ekey[0] for ekey in incident_edge_keys})):
+                placeholders = ",".join("?" for _ in batch)
+                for row in ro_conn.execute(
+                    f"SELECT src_id, dst_id, kind, chunk_id, llm_prob, vec_coherence, atomic_confidence "
+                    f"FROM edge_sources WHERE src_id IN ({placeholders})",
+                    tuple(batch),
+                ):
+                    ekey = (str(row[0]), str(row[1]), str(row[2]))
+                    if ekey in incident_edge_keys:
+                        stage_conn.execute(
+                            "INSERT OR REPLACE INTO edge_sources "
+                            "(src_id, dst_id, kind, chunk_id, llm_prob, vec_coherence, atomic_confidence) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            tuple(row),
+                        )
+                        cid = str(row[3])
+                        if cid and not cid.startswith("__"):
+                            seed_chunk_ids.add(cid)
+
+        # 3d. Copy referenced chunks metadata for provenance & Active EDC checks
+        for batch in batched(sorted(seed_chunk_ids)):
+            placeholders = ",".join("?" for _ in batch)
+            chunk_rows = ro_conn.execute(
+                f"SELECT chunk_id, rel_posix_path, start_line, end_line, title, ast_island_start, ast_island_end "
+                f"FROM chunks WHERE chunk_id IN ({placeholders})",
+                tuple(batch),
+            ).fetchall()
+            if chunk_rows:
+                stage_conn.executemany(
+                    "INSERT OR REPLACE INTO chunks "
+                    "(chunk_id, rel_posix_path, start_line, end_line, title, ast_island_start, ast_island_end) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    chunk_rows,
+                )
+
+    return affected_entity_ids

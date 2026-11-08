@@ -29,6 +29,7 @@ from yaw.daemon.graph.inference import DSPyEmbeddingAdapter, EmbeddingRequest
 from yaw.daemon.graph.inference.components import (
     EMBEDDING_ENDPOINT,
     OPENIE_ENDPOINT,
+    ChunkProcessOutput,
     MissingEntityInput,
     PredictorTrace,
     SHACLHealInput,
@@ -51,10 +52,10 @@ from yaw.daemon.graph.storage import (
     inspect_focus_node,
     iter_synonym_evidence,
     lint_graph_shacl,
+    load_affected_neighborhood,
     merge_entities,
     open_yaw_db,
     pool_confidences,
-    resolve_chunk_text,
     upsert_chunk_pointers,
     upsert_chunk_vectors,
     upsert_edges_with_sources,
@@ -67,7 +68,7 @@ from yaw.daemon.graph.storage import (
     upsert_semantic_edges,
     write_tx,
 )
-from yaw.daemon.graph.storage.db import GRAPH_DB, ensure_vec0_table, vec0_table_dimension
+from yaw.daemon.graph.storage.db import GRAPH_DB
 from yaw.daemon.graph.storage.evidence import (
     EntityMention,
     EntityMerge,
@@ -84,8 +85,14 @@ from yaw.daemon.graph.storage.evidence import (
 from yaw.daemon.graph.storage.evidence import (
     fact_id as canonical_fact_id,
 )
-from yaw.daemon.graph.storage.managed_sqlite import TableSpec, create_table
-from yaw.daemon.graph.storage.rows import DesiredTable, empty_graph_tables, graph_tables
+from yaw.daemon.graph.storage.managed_sqlite import create_table
+from yaw.daemon.graph.storage.rows import (
+    DesiredTable,
+    empty_delta_graph_tables,
+    empty_graph_tables,
+    graph_tables,
+    snapshot_table_rows,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,113 +205,6 @@ class MaterializedGraphBatch:
     fact_linked_pairs: set[tuple[str, str]]
     homograph_splits: int
     bindings: dict[tuple[str, str, str], tuple[str, str]]
-
-
-def load_active_chunk_inferences(
-    conn: sqlite3.Connection,
-    *,
-    program_identity: str,
-    embedding_identity: str,
-) -> list[tuple[ChunkPointer, OpenIERecord, tuple[PredictorTrace, ...]]]:
-    """Read active source_chunks joined with chunk_inference on a read-only snapshot."""
-    tables = {
-        str(r[0])
-        for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('chunk_inference', 'source_chunks')"
-        ).fetchall()
-    }
-    if tables != {"chunk_inference", "source_chunks"}:
-        return []
-    rows = conn.execute(
-        """
-        SELECT
-            s.chunk_id,
-            s.rel_posix_path,
-            s.start_line,
-            s.end_line,
-            s.title,
-            s.ast_island_start,
-            s.ast_island_end,
-            ci.extraction_json,
-            ci.traces_json
-        FROM source_chunks s
-        JOIN chunk_inference ci
-          ON ci.chunk_id = s.chunk_id
-         AND ci.source_hash = s.source_hash
-        WHERE ci.program_identity = ?
-          AND ci.embedding_identity = ?
-        ORDER BY s.chunk_id ASC
-        """,
-        (program_identity, embedding_identity),
-    ).fetchall()
-    items: list[tuple[ChunkPointer, OpenIERecord, tuple[PredictorTrace, ...]]] = []
-    for r in rows:
-        ptr = ChunkPointer(
-            chunk_id=str(r[0]),
-            rel_posix_path=str(r[1]),
-            start_line=int(r[2]),
-            end_line=int(r[3]),
-            title=str(r[4] or ""),
-            ast_island_start=int(r[5] or 0),
-            ast_island_end=int(r[6] or 0),
-        )
-        rec = deserialize_openie_record(str(r[7]), chunk_id=str(r[0]))
-        raw_traces = json.loads(str(r[8] or "[]"))
-        traces = tuple(
-            PredictorTrace(
-                predictor=str(t.get("predictor", "")),
-                inputs=dict(t.get("inputs") or {}),
-                outputs=dict(t.get("outputs") or {}),
-            )
-            for t in raw_traces
-            if isinstance(t, Mapping)
-        )
-        items.append((ptr, rec, traces))
-    return items
-
-
-def clone_graph_to_memory(conn: sqlite3.Connection, schemas: tuple[TableSpec, ...]) -> sqlite3.Connection:
-    """Clone an existing yaw.db graph and vector tables into an isolated in-memory SQLite database."""
-    stage_conn = open_yaw_db(":memory:")
-    with write_tx(stage_conn):
-        for schema in schemas:
-            create_table(stage_conn, schema)
-        for vec_table, pk_col in (
-            ("chunk_vec", "chunk_id"),
-            ("entity_vec", "entity_id"),
-            ("fact_vec", "fact_id"),
-        ):
-            ensure_vec0_table(stage_conn, vec_table, pk_col, vec0_table_dimension(conn, vec_table))
-        for table, cols in (
-            ("chunks", "chunk_id, rel_posix_path, start_line, end_line, title, ast_island_start, ast_island_end"),
-            ("entities", "entity_id, name, definition, confidence"),
-            ("entity_labels", "label_norm, entity_id, label_kind, raw_label, chunk_id"),
-            (
-                "entity_mentions",
-                "mention_id, chunk_id, source_revision, sense_id, name, definition, resolved_definition, entity_id",
-            ),
-            (
-                "fact_assertions",
-                "assertion_id, chunk_id, source_revision, subject_mention_id, object_mention_id, raw_json, fact_id",
-            ),
-            (
-                "facts",
-                "fact_id, subj_id, pred, obj_id, raw_triple_json, definition, obj_kind, "
-                "obj_literal_lex, obj_datatype, obj_lang, confidence",
-            ),
-            ("fact_sources", "fact_id, chunk_id, llm_prob, vec_coherence, atomic_confidence"),
-            ("edges", "src_id, dst_id, kind, weight, reasoning"),
-            ("edge_sources", "src_id, dst_id, kind, chunk_id, llm_prob, vec_coherence, atomic_confidence"),
-            ("chunk_vec", "chunk_id, embedding"),
-            ("entity_vec", "entity_id, embedding"),
-            ("fact_vec", "fact_id, embedding"),
-        ):
-            placeholders = ",".join("?" for _ in cols.split(","))
-            stage_conn.executemany(
-                f"INSERT INTO {table} ({cols}) VALUES ({placeholders})",
-                conn.execute(f"SELECT {cols} FROM {table}"),
-            )
-    return stage_conn
 
 
 def record_surface_form(
@@ -985,8 +885,9 @@ def collect_shacl_violation_dossiers(
 @coco.fn
 async def plan_graph_publication(
     settings: GraphPlanSettings,
-    chunk_rows: Sequence[tuple[ChunkPointer, OpenIERecord]] | None = None,
-    frozen_text: Mapping[str, str] | None = None,
+    chunk_outputs: Sequence[ChunkProcessOutput] = (),
+    *,
+    db_identity: str = "",
 ) -> GraphPlanResult:
     """Plan a complete SHACL-conformant PreparedGraphRows without holding any yaw.db write transaction."""
     embeddings = coco.use_context(EMBEDDING_ENDPOINT)
@@ -1025,116 +926,102 @@ async def plan_graph_publication(
         "shacl_conforms": True,
     }
 
+    ordered_outputs = tuple(sorted(chunk_outputs, key=lambda item: item.chunk_id))
     with coco.use_context(GRAPH_DB).readonly() as ro_conn:
-        db_identity = get_meta(ro_conn, "db_identity") or ""
-        active_items = (
-            [(ptr, rec, ()) for ptr, rec in sorted(chunk_rows, key=lambda item: item[0].chunk_id)]
-            if chunk_rows is not None
-            else load_active_chunk_inferences(
-                ro_conn,
-                program_identity=settings.program_identity,
-                embedding_identity=settings.embedding_identity,
-            )
+        resolved_db_identity = db_identity or get_meta(ro_conn, "db_identity") or ""
+        has_chunks_table = (
+            ro_conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks'").fetchone() is not None
         )
+        saved = get_meta(ro_conn, "graph_input_fingerprints") if has_chunks_table else None
+        published_inputs = dict(json.loads(saved)) if saved is not None else {}
 
-    if frozen_text is not None:
-        # Retired child targets may still exist until the parent finishes syncing.
-        # The declared frozen source set, rather than those old rows, owns liveness.
-        active_items = [item for item in active_items if item[0].chunk_id in frozen_text]
-        if {item[0].chunk_id for item in active_items} != frozen_text.keys():
-            raise ValueError("Frozen source snapshot has incomplete inference artifacts")
-
-    if not active_items:
-        return GraphPlanResult(tables=empty_graph_tables(db_identity=db_identity), chunk_ids=(), rlm_stats=rlm_stats)
-
-    chunks: list[tuple[ChunkPointer, str]] = []
-    all_records: list[OpenIERecord] = []
-    for ptr, rec, chunk_traces in active_items:
-        chunk_text = (
-            frozen_text[ptr.chunk_id]
-            if frozen_text is not None
-            else resolve_chunk_text(
-                ptr,
-                settings.corpus_root,
-                chunk_size=settings.chunk_size,
-                chunk_overlap=settings.chunk_overlap,
-                min_chunk_size=settings.min_chunk_size,
-            )
+    if not ordered_outputs:
+        prior_rows: dict[str, dict[tuple[Any, ...], Any]] | None = None
+        if published_inputs and has_chunks_table:
+            with coco.use_context(GRAPH_DB).readonly() as ro_conn:
+                prior_rows = snapshot_table_rows(ro_conn)
+        return GraphPlanResult(
+            tables=empty_graph_tables(seeded_rows_by_table=prior_rows, db_identity=resolved_db_identity),
+            chunk_ids=(),
+            rlm_stats=rlm_stats,
         )
-        chunks.append((ptr, chunk_text))
-        all_records.append(rec)
-        all_traces.extend(chunk_traces)
 
     # Reuse only verified unchanged contributions. Edits, removals and semantic
     # profile changes require recomputing their graph interpretation.
     input_fingerprints = {
-        ptr.chunk_id: fingerprint_object((settings, ptr, text, record)).hex()
-        for (ptr, text), record in zip(chunks, all_records, strict=True)
+        out.chunk_id: fingerprint_object((settings, out.pointer, out.text, out.inference.extraction_json)).hex()
+        for out in ordered_outputs
     }
-    with coco.use_context(GRAPH_DB).readonly() as ro_conn:
-        saved = get_meta(ro_conn, "graph_input_fingerprints")
-        published_inputs = dict(json.loads(saved)) if saved is not None else {}
-        published_ids = {row[0] for row in ro_conn.execute("SELECT chunk_id FROM chunks")}
     incremental = (
         bool(published_inputs)
-        and published_ids == published_inputs.keys()
+        and has_chunks_table
         and all(input_fingerprints.get(cid) == digest for cid, digest in published_inputs.items())
     )
-    complete_chunks = tuple(chunks)
-    if incremental:
-        new_items = [
-            (chunk, record)
-            for chunk, record in zip(chunks, all_records, strict=True)
-            if chunk[0].chunk_id not in published_inputs
-        ]
-        chunks = [chunk for chunk, _ in new_items]
-        all_records = [record for _, record in new_items]
-        all_traces = [
-            trace for ptr, _, traces in active_items if ptr.chunk_id not in published_inputs for trace in traces
-        ]
-    rlm_stats["reused_chunks"] = len(published_inputs) if incremental else 0
-    rlm_stats["processed_chunks"] = len(chunks)
-    del active_items
-
-    fmt_chunk = getattr(
-        embeddings.adapter,
-        "format_chunk_for_embedding",
-        lambda p, t: DSPyEmbeddingAdapter.format_chunk_for_embedding(embeddings.adapter, p, t),
+    complete_chunks = tuple((out.pointer, out.text) for out in ordered_outputs)
+    outputs_to_process = (
+        tuple(out for out in ordered_outputs if out.chunk_id not in published_inputs)
+        if incremental
+        else ordered_outputs
     )
+    rlm_stats["reused_chunks"] = len(published_inputs) if incremental else 0
+    rlm_stats["processed_chunks"] = len(outputs_to_process)
+
+    if incremental and not outputs_to_process:
+        return GraphPlanResult(
+            tables=empty_delta_graph_tables(
+                tuple(sorted(input_fingerprints.items())),
+                db_identity=resolved_db_identity,
+            ),
+            chunk_ids=tuple(out.chunk_id for out in ordered_outputs),
+            rlm_stats=rlm_stats,
+        )
+
+    chunks: list[tuple[ChunkPointer, str]] = []
+    all_records: list[OpenIERecord] = []
+    chunk_vec_pairs: list[tuple[str, np.ndarray]] = []
+    for out in outputs_to_process:
+        chunks.append((out.pointer, out.text))
+        all_records.append(deserialize_openie_record(out.inference.extraction_json, chunk_id=out.chunk_id))
+        raw_traces = json.loads(out.inference.traces_json or "[]")
+        for t in raw_traces:
+            if isinstance(t, Mapping):
+                all_traces.append(
+                    PredictorTrace(
+                        predictor=str(t.get("predictor", "")),
+                        inputs=dict(t.get("inputs") or {}),
+                        outputs=dict(t.get("outputs") or {}),
+                    )
+                )
+        chunk_vec_pairs.append((out.chunk_id, deserialize_f32_vector(out.vector_f32)))
+
     fmt_entity = DSPyEmbeddingAdapter.format_entity_for_embedding
     fmt_fact = DSPyEmbeddingAdapter.format_fact_for_embedding
-
-    def _prepare_embed_req(text: str, stage: str) -> EmbeddingRequest:
-        if hasattr(embeddings.adapter, "prepare_request"):
-            return embeddings.adapter.prepare_request([text], batch_size=64, stage=stage)
-        return EmbeddingRequest(
-            texts=(text,),
-            profile=embeddings.adapter.profile,
-            task_mode=getattr(embeddings.adapter, "task_mode", "distinct-titled"),
-            batch_size=64,
-            max_batch_chars=getattr(embeddings.adapter, "max_batch_chars", 3500),
-            stage=stage,
-        )
 
     async def _embed_strings(texts: Sequence[str], *, stage: str) -> list[np.ndarray]:
         if not texts:
             return []
         unique_texts = list(dict.fromkeys(texts))
-        embedded_unique = await asyncio.gather(*(embed_text(_prepare_embed_req(t, stage)) for t in unique_texts))
+        requests = [
+            embeddings.adapter.prepare_request([t], batch_size=64, stage=stage)
+            if hasattr(embeddings.adapter, "prepare_request")
+            else EmbeddingRequest(
+                texts=(t,),
+                profile=embeddings.adapter.profile,
+                task_mode=getattr(embeddings.adapter, "task_mode", "distinct-titled"),
+                batch_size=64,
+                max_batch_chars=getattr(embeddings.adapter, "max_batch_chars", 3500),
+                stage=stage,
+            )
+            for t in unique_texts
+        ]
+        embedded_unique = await asyncio.gather(*(embed_text(req) for req in requests))
         vec_by_text: dict[str, np.ndarray] = {}
         for t, emb in zip(unique_texts, embedded_unique, strict=True):
             vec_by_text[t] = deserialize_f32_vector(emb.vector_f32)
             all_telemetry.append(dict(emb.telemetry))
         return [vec_by_text[t] for t in texts]
 
-    # 1. Chunk dense vectors (hits @coco.fn(memo=True) from process_chunk when already computed)
-    chunk_embed_texts = [fmt_chunk(ptr, text) for ptr, text in chunks]
-    chunk_vecs = await _embed_strings(chunk_embed_texts, stage="chunk_embed")
-    chunk_vec_pairs: list[tuple[str, np.ndarray]] = [
-        (ptr.chunk_id, vec) for (ptr, _), vec in zip(chunks, chunk_vecs, strict=True)
-    ]
-
-    # 2. Normalize OpenIE records & synthesize missing entity definitions via memoized define_missing_entities
+    # 1. Normalize OpenIE records & synthesize missing entity definitions via memoized define_missing_entities
     chunk_text_by_id = {ptr.chunk_id: text for ptr, text in chunks}
     record_structured: list[tuple[str, list[StructuredTriple], list[tuple[str, str]]]] = []
     all_norm_labels: set[str] = set()
@@ -1236,13 +1123,39 @@ async def plan_graph_publication(
 
     schemas = await evidence_schemas()
 
-    # 3. Stage initial rows in an isolated in-memory SQLite database (zero yaw.db write lock)
-    with coco.use_context(GRAPH_DB).readonly() as ro_conn:
-        staging_conn = clone_graph_to_memory(ro_conn, schemas) if incremental else open_yaw_db(":memory:")
+    # 2. Seed bounded affected neighborhood in an isolated in-memory SQLite database (zero full-graph clone)
+    staging_conn = open_yaw_db(":memory:")
     try:
         with write_tx(staging_conn):
             for schema in schemas:
                 create_table(staging_conn, schema)
+        seeded_rows_by_table: dict[str, dict[tuple[Any, ...], Any]] | None = None
+        if incremental:
+            seed_entity_ids = tuple(
+                {
+                    *existing_bindings.values(),
+                    *(eid for eid, _, _ in entity_nodes),
+                }
+            )
+            delta_entity_vectors = {
+                eid: vec.astype("<f4", copy=False).tobytes() for eid, vec in entity_vec_by_id.items()
+            }
+            delta_entity_names = {eid: name for eid, name, _ in entity_nodes}
+            with coco.use_context(GRAPH_DB).readonly() as ro_conn:
+                load_affected_neighborhood(
+                    ro_conn,
+                    staging_conn,
+                    seed_entity_ids=seed_entity_ids,
+                    seed_label_norms=tuple(all_norm_labels),
+                    delta_entity_vectors=delta_entity_vectors,
+                    delta_entity_names=delta_entity_names,
+                    synonymy_threshold=settings.synonymy_threshold,
+                    synonymy_top_k=settings.synonymy_top_k,
+                )
+            seeded_rows_by_table = snapshot_table_rows(staging_conn)
+        elif published_inputs and has_chunks_table:
+            with coco.use_context(GRAPH_DB).readonly() as ro_conn:
+                seeded_rows_by_table = snapshot_table_rows(ro_conn)
         prior_fact_definitions = {
             str(r[0]): str(r[1]) for r in staging_conn.execute("SELECT fact_id, definition FROM facts")
         }
@@ -1362,7 +1275,7 @@ async def plan_graph_publication(
         canonicalize_fact_definitions(staging_conn, prior_definitions=prior_fact_definitions)
         canonicalize_fact_text(staging_conn)
 
-        # 4. Closed-World SHACL Deterministic Auto-Healing & RLM Healing on staging_conn
+        # 3. Closed-World SHACL Deterministic Auto-Healing & RLM Healing on staging_conn
         auto_healed = auto_heal_deterministic_shacl(staging_conn)
         if auto_healed > 0:
             canonicalize_fact_text(staging_conn)
@@ -1442,7 +1355,7 @@ async def plan_graph_publication(
                 f"Graph build left {len(remaining_violations)} SHACL violations: {remaining_violations[:3]}",
             )
 
-        # 5. Extract final post-merge, post-SHACL-repair PreparedGraphRows from staging_conn
+        # 4. Extract final post-merge, post-SHACL-repair PreparedGraphRows from staging_conn
         final_entities = tuple(
             (str(r[0]), str(r[1]), str(r[2]))
             for r in staging_conn.execute(
@@ -1501,11 +1414,12 @@ async def plan_graph_publication(
         return GraphPlanResult(
             tables=graph_tables(
                 staging_conn,
-                complete_chunks,
+                chunks if incremental else complete_chunks,
                 tuple(sorted(input_fingerprints.items())),
-                db_identity=db_identity,
+                seeded_rows_by_table=seeded_rows_by_table,
+                db_identity=resolved_db_identity,
             ),
-            chunk_ids=tuple(sorted(pointer.chunk_id for pointer, _ in complete_chunks)),
+            chunk_ids=tuple(out.chunk_id for out in ordered_outputs),
             traces=tuple(all_traces),
             telemetry=tuple(all_telemetry),
             entity_def_audit_trail=tuple(entity_def_audit),

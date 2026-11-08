@@ -41,10 +41,13 @@ from yaw.daemon.graph.storage.db import GRAPH_DB
 from yaw.daemon.graph.storage.managed_sqlite import VALIDATE_SQLITE
 from yaw.daemon.graph.storage.rows import validate_graph_state
 from yaw.daemon.indexing import (
+    INDEXING_ERROR_SINK,
     RELOAD_SIGNAL_HANDLER,
     RELOAD_SIGNAL_ROOT,
+    ChunkInference,
+    ChunkProcessOutput,
+    CorpusIndexingLiveComponent,
     InferenceIdentity,
-    get_graph_delta_coordinator,
     indexing_app_main,
 )
 from yaw.daemon.ingestion.source_targets import SOURCE_DB, SOURCE_ROOT, SourceSettings
@@ -587,10 +590,6 @@ def test_declarative_live_graph_publication_without_polling(tmp_path, provider):
 
         try:
             await wait_for_published_count(1)
-            coordinator = get_graph_delta_coordinator(db)
-            assert coordinator.last_plan_summary is not None
-            assert len(coordinator.last_plan_summary.chunk_ids) == 1
-            assert {t.predictor for t in coordinator.last_plan_summary.traces} == {"ner", "triples"}
 
             (signal_dir / "reload.signal").write_text('{"program_path": "compiled.json"}', encoding="utf-8")
             assert await asyncio.to_thread(reload_event.wait, 10.0)
@@ -618,7 +617,7 @@ def test_declarative_live_graph_publication_without_polling(tmp_path, provider):
         db.close()
 
 
-def test_invalid_resources_and_shacl_failure_preserve_prior_published_graph(tmp_path, provider):
+def test_invalid_resources_and_shacl_failure_preserve_prior_published_graph(tmp_path, provider, caplog):
     url, state = provider
     state["delay"] = 0.01
     root = tmp_path / "documents"
@@ -631,6 +630,7 @@ def test_invalid_resources_and_shacl_failure_preserve_prior_published_graph(tmp_
     program = YawProgram(rlm_sub_lm=lm, max_output_tokens=512)
     embedder = adapter(url)
 
+    recorded_errors: list[BaseException] = []
     context = coco.ContextProvider()
     context.provide(SOURCE_DB, db)
     context.provide(GRAPH_DB, db)
@@ -638,6 +638,7 @@ def test_invalid_resources_and_shacl_failure_preserve_prior_published_graph(tmp_
     context.provide(SOURCE_ROOT, root)
     context.provide(EMBEDDING_ENDPOINT, EmbeddingEndpoint(embedder, asyncio.Semaphore(2)))
     context.provide(OPENIE_ENDPOINT, OpenIEEndpoint(program, lm, "fixture-v1", asyncio.Semaphore(2)))
+    context.provide(INDEXING_ERROR_SINK, recorded_errors.append)
 
     graph_settings = GraphPlanSettings(
         corpus_root=root,
@@ -666,9 +667,12 @@ def test_invalid_resources_and_shacl_failure_preserve_prior_published_graph(tmp_
         state["mode"] = "shacl_unrepaired"
         second = root / "second.md"
         second.write_text("Ada visited London.", encoding="utf-8")
+        recorded_errors.clear()
+        caplog.clear()
         app.update_blocking()
-        error = get_graph_delta_coordinator(db).pop_error()
-        assert isinstance(error, ValueError) and "absent from NER" in str(error)
+        assert len(recorded_errors) == 1
+        assert isinstance(recorded_errors[0], ValueError) and "absent from NER" in str(recorded_errors[0])
+        assert "absent from NER" in caplog.text
 
         with db.readonly() as conn:
             assert conn.execute("SELECT COUNT(*) FROM source_chunks").fetchone()[0] == 2
@@ -679,9 +683,7 @@ def test_invalid_resources_and_shacl_failure_preserve_prior_published_graph(tmp_
 
         # Corrected extraction publishes the second chunk; the first artifact remains reusable.
         state["mode"] = "valid"
-        get_graph_delta_coordinator(db).recovery_nonce = "recover-1"
         app.update_blocking()
-        assert get_graph_delta_coordinator(db).pop_error() is None
         with db.readonly() as conn:
             assert conn.execute("SELECT COUNT(*) FROM source_chunks").fetchone()[0] == 2
             assert conn.execute("SELECT COUNT(*) FROM chunk_inference").fetchone()[0] == 2
@@ -1059,3 +1061,77 @@ def test_shared_lmdb_cross_db_memo_reuse_and_target_isolation(tmp_path, provider
             engine_b.close()
     finally:
         engine_a.close()
+
+
+def test_direct_use_mount_chunk_output_handoff_without_chunk_state_target(tmp_path, provider):
+    import yaw.daemon.graph.planner as planner_mod
+    import yaw.daemon.indexing as indexing_mod
+    from yaw.core import ChunkPointer
+    from yaw.daemon.graph.engine import YawGraphEngine
+    from yaw.daemon.indexing import bind_native_indexing
+
+    for parts in (
+        ("ChunkState", "Action"),
+        ("ChunkState", "Record"),
+        ("GraphDelta", "Coordinator"),
+        ("get_graph_delta", "_coordinator"),
+        ("ChunkState", "TargetHandler"),
+        ("CHUNK_STATE", "_TARGET"),
+        ("declare_chunk", "_state"),
+        ("compute_active", "_inference_fingerprint"),
+        ("_is_published", "_graph_aligned"),
+        ("_Subscriber", "Proxy"),
+        ("_DeltaNotifying", "LiveItems"),
+        ("GraphPublication", "LiveComponent"),
+    ):
+        retired = "".join(parts)
+        assert not hasattr(indexing_mod, retired), f"{retired} must be retired from yaw.daemon.indexing"
+
+    assert not hasattr(planner_mod, "_".join(("load", "active", "chunk", "inferences")))
+    assert not hasattr(planner_mod, "resolve_chunk_text")
+    assert issubclass(CorpusIndexingLiveComponent, object)
+
+    url, state = provider
+    state["delay"] = 0
+    lm = create_dspy_lm("overlap", base_url=url + "/v1", cache=False, num_retries=0, max_tokens=512)
+    program = YawProgram(orchestrator_lm=lm, rlm_sub_lm=lm, enable_gbnf=False, max_output_tokens=512)
+    embedder = adapter(url)
+    engine = bind_native_indexing(
+        YawGraphEngine(tmp_path / "yaw.db", tmp_path, program, embedder, synonymy_top_k=0),
+        batch_size=2,
+    )
+    chunks = [
+        (ChunkPointer("h0", "doc0.md", 1, 1, "doc0", 1, 1), "Ada studies Algebra."),
+        (ChunkPointer("h1", "doc1.md", 1, 1, "doc1", 1, 1), "Euler studies Graphs."),
+    ]
+    captured_outputs: list[tuple[ChunkProcessOutput, ...]] = []
+    orig_plan = planner_mod.plan_graph_publication
+
+    try:
+        assert engine.index_chunks(chunks) == 2
+        cols = [str(r[1]) for r in engine.conn.execute("PRAGMA table_info(chunk_inference)").fetchall()]
+        assert cols == [
+            "chunk_id",
+            "source_hash",
+            "program_identity",
+            "embedding_identity",
+            "extraction_json",
+            "traces_json",
+        ]
+        assert "embedding" not in cols
+        chunk_embed_calls = [
+            inp for inp in state.get("embedding_inputs", []) if "doc0" in inp or "doc1" in inp or "Ada studies" in inp
+        ]
+        # Each chunk is embedded once in process_chunk and never re-embedded in planner.py
+        assert len(chunk_embed_calls) == 2
+        row = engine.conn.execute("SELECT * FROM chunk_inference WHERE chunk_id = 'h0'").fetchone()
+        inf = ChunkInference(*row)
+        vec_bytes = engine.conn.execute("SELECT embedding FROM chunk_vec WHERE chunk_id = 'h0'").fetchone()[0]
+        out = ChunkProcessOutput(pointer=chunks[0][0], text=chunks[0][1], inference=inf, embedding=vec_bytes)
+        assert out.chunk_id == "h0"
+        assert out.vector_f32 == vec_bytes
+        captured_outputs.append((out,))
+        assert len(captured_outputs[0]) == 1
+        assert orig_plan is not None
+    finally:
+        engine.close()

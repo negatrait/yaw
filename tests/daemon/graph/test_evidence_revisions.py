@@ -462,13 +462,7 @@ def test_source_evidence_bindings_are_validated_before_commit(tmp_path, provider
 
 
 def test_cross_batch_fact_definition_repair_persists_and_invalidates_on_endpoint_collision(tmp_path, provider):
-    import asyncio
-    import sqlite3
-    from pathlib import Path
-
-    from yaw.daemon.graph.planner import clone_graph_to_memory
     from yaw.daemon.graph.storage import lint_graph_shacl
-    from yaw.daemon.graph.storage.evidence import canonicalize_fact_definitions, evidence_schemas
 
     url, state = provider
     state["delay"] = 0
@@ -578,44 +572,6 @@ def test_cross_batch_fact_definition_repair_persists_and_invalidates_on_endpoint
             assert lint_graph_shacl(conn) == []
             defs_b3 = dict(conn.execute("SELECT pred, definition FROM facts").fetchall())
             assert defs_b3["routes Via"] == healed_v2
-
-    opt_db = Path(".yaw/yaw_optimize_20261106_221811.db")
-    if opt_db.exists():
-        schemas = asyncio.run(evidence_schemas())
-        ro_conn = sqlite3.connect(f"file:{opt_db.resolve().as_posix()}?mode=ro", uri=True)
-        try:
-            mem_conn = clone_graph_to_memory(ro_conn, schemas)
-        finally:
-            ro_conn.close()
-        try:
-            prior_defs = {str(r[0]): str(r[1]) for r in mem_conn.execute("SELECT fact_id, definition FROM facts")}
-            healed_before = mem_conn.execute(
-                """
-                SELECT COUNT(*) FROM facts f
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM fact_assertions a
-                    WHERE a.fact_id = f.fact_id
-                      AND COALESCE(json_extract(a.raw_json, '$.spo_def'), '') = f.definition
-                )
-                """
-            ).fetchone()[0]
-            assert healed_before == 42
-            canonicalize_fact_definitions(mem_conn, prior_definitions=prior_defs)
-            healed_after = mem_conn.execute(
-                """
-                SELECT COUNT(*) FROM facts f
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM fact_assertions a
-                    WHERE a.fact_id = f.fact_id
-                      AND COALESCE(json_extract(a.raw_json, '$.spo_def'), '') = f.definition
-                )
-                """
-            ).fetchone()[0]
-            assert healed_after == 42
-            closed_world_violations = [v for v in lint_graph_shacl(mem_conn) if v.shape == "StatementShape/closedWorld"]
-            assert closed_world_violations == []
-        finally:
-            mem_conn.close()
 
 
 def test_focus_isolated_shacl_memo_reuses_healed_focus_when_earlier_violation_added(tmp_path, provider):

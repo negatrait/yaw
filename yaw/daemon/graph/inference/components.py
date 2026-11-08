@@ -10,7 +10,7 @@ import cocoindex as coco
 import dspy
 import numpy as np
 
-from yaw.core import OpenIERecord, SHACLViolation, SynonymEvidenceBatch
+from yaw.core import ChunkPointer, OpenIERecord, SHACLViolation, SynonymEvidenceBatch
 
 from .embedding import DSPyEmbeddingAdapter, EmbeddingRequest, EmbeddingResult
 
@@ -20,6 +20,32 @@ class EmbeddedText:
     vector_f32: bytes
     request_id: str
     telemetry: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class ChunkInference:
+    chunk_id: str
+    source_hash: str
+    program_identity: str
+    embedding_identity: str
+    extraction_json: str
+    traces_json: str
+
+
+@dataclass(frozen=True, slots=True)
+class ChunkProcessOutput:
+    pointer: ChunkPointer
+    text: str
+    inference: ChunkInference
+    embedding: bytes
+
+    @property
+    def chunk_id(self) -> str:
+        return self.pointer.chunk_id
+
+    @property
+    def vector_f32(self) -> bytes:
+        return self.embedding
 
 
 @dataclass

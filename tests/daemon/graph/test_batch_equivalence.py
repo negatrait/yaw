@@ -183,3 +183,55 @@ def test_fixed_evidence_64_plus_64_equals_128(tmp_path, provider, restart, recor
         "graph_row_counts", json.dumps({arm: {k: len(v) for k, v in rows.items()} for arm, rows in results.items()})
     )
     assert_same_graph(results["incremental"], results["reference"])
+
+
+def test_incremental_publication_without_memory_clone_or_full_survivor_scan(tmp_path, provider):
+    import re
+
+    import yaw.daemon.graph.planner as planner_mod
+
+    assert not hasattr(planner_mod, "_".join(("clone", "graph", "to", "memory")))
+    assert not hasattr(planner_mod, "_".join(("load", "active", "chunk", "inferences")))
+
+    url, state = provider
+    state["delay"] = 0
+    state["relation"] = "owl:differentFrom"
+    state["embedding_vector"] = fixture_vector
+    chunks, state["extractions"] = frozen_document(tmp_path)
+
+    lm = create_dspy_lm("overlap", base_url=url + "/v1", cache=False, max_tokens=512)
+    program = YawProgram(orchestrator_lm=lm, rlm_sub_lm=lm, enable_gbnf=False, max_output_tokens=512)
+    engine = bind_native_indexing(
+        YawGraphEngine(tmp_path / "inc_bounded" / "yaw.db", tmp_path, program, adapter(url)),
+        batch_size=64,
+    )
+    try:
+        engine.index_chunks(chunks[:64])
+        embeds_after_b1 = len(state.get("embedding_inputs", []))
+        readonly_selects: list[str] = []
+
+        def trace_sql(stmt: str) -> None:
+            norm = " ".join(stmt.strip().split())
+            if not engine.conn.in_transaction and norm.upper().startswith("SELECT "):
+                readonly_selects.append(norm)
+
+        engine.conn.set_trace_callback(trace_sql)
+        try:
+            engine.index_chunks(chunks)
+        finally:
+            engine.conn.set_trace_callback(None)
+
+        unbounded_pattern = re.compile(
+            r"^SELECT\b(?!.*\bWHERE\b).*\bFROM\s+\"?(entities|facts|edges|chunk_vec|entity_vec|fact_vec|entity_mentions|fact_assertions)\"?\b",
+            re.IGNORECASE,
+        )
+        unbounded_hits = [sql for sql in readonly_selects if unbounded_pattern.search(sql)]
+        assert unbounded_hits == [], f"Unexpected unbounded full-table SELECTs on ro_conn: {unbounded_hits}"
+
+        b2_embeds = state.get("embedding_inputs", [])[embeds_after_b1:]
+        # Batch 2 must not re-embed any Batch 1 chunk (Evidence 0..63)
+        reembedded_b1_chunks = [inp for inp in b2_embeds if any(f"Evidence {i}:" in inp for i in range(64))]
+        assert reembedded_b1_chunks == []
+        assert engine.lint_graph()["conforms"]
+    finally:
+        engine.close()

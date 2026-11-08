@@ -96,12 +96,20 @@ class ChunkInference:
     traces_json: str
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ChunkProcessOutput:
     pointer: ChunkPointer
     text: str
     inference: ChunkInference
-    vector_f32: tuple[float, ...]  # returned in-memory from embed_text; never stored in chunk_inference
+    embedding: bytes  # returned in-memory from embed_text; never stored in chunk_inference
+
+    @property
+    def chunk_id(self) -> str:
+        return self.pointer.chunk_id
+
+    @property
+    def vector_f32(self) -> bytes:
+        return self.embedding
 
 
 def resolve_coco_state_root(state_dir: Path) -> Path:
@@ -165,17 +173,17 @@ async def publish_graph(
   - Each `app.update()` cycle mounts `retained + changed[:64]` (`<= 64` `[target]` changed chunks) at DB-invariant `coco.component_subpath("chunk", m.chunk_id)` via `await asyncio.gather(*(coco.use_mount(coco.component_subpath("chunk", m.chunk_id), process_frozen_chunk, (m, text), identity, sources, artifacts, db_identity) for m, text in active_slice))` and passes the resulting `tuple[ChunkProcessOutput, ...]` directly to `summary = await coco.use_mount(coco.component_subpath("publication"), publish_graph, settings, active_chunks, db_identity)`, then reports `engine.report_indexing_batch(summary, len(active_slice))`.
   - Because `cocoindex == 1.1.0` (`function.py:1463-1465`) keys `TABLES.memoization` by `(app_name, parent_ctx.stable_path, memo_fp)` while `coco.mount` keys `TABLES.components` by `fingerprint((StablePath, args))`, keeping `coco.component_subpath("chunk", m.chunk_id)` and `coco.component_subpath("publication")` DB-invariant while passing `db_identity` as a component argument ensures `process_frozen_chunk` and `publish_graph` execute their component bodies for each target DB (declaring rows for `TableKey(db_identity, name)`) while hitting `100%` `[target]` of `TABLES.memoization` across databases with `0` `[target]` duplicate provider calls. Unchanged `source_chunks`/`chunk_inference` rows use `mount_table(..., db_identity=db_identity)` (`RowHandler.tracks_value_fingerprint = True`) so unchanged rows incur `0` `[target]` SQLite writes.
 
-Open:
-- **Question**: Can `localfs.walk_dir(..., live=True)` (`LiveItems`) in `indexing_app_main` collect per-file/per-chunk `ChunkProcessOutput` return values directly into `publish_graph` using public `cocoindex == 1.1.0` component primitives (`coco.use_mount` / `LiveComponent`), or does `coco.mount_each` over `LiveItems` require a thin in-memory reactive trigger to invoke `publish_graph`?
-  - **Constraint**: Neither `indexing_app_main`, `publish_graph`, nor `plan_graph_publication` may use `source_chunks JOIN chunk_inference` as a SQLite polling bus to re-embed chunks or discover graph deltas, and all `15` `[target]` graph tables must still commit in `1` `[target]` atomic `DatabaseSink` transaction.
-  - **Resolved by**: Capability Gate `CG-INDEX-2` probe on `cocoindex == 1.1.0` before deleting `GraphPublicationLiveComponent`.
+- **Live corpus handoff (`CorpusIndexingLiveComponent` & `_CorpusFeedSubscriber`)**:
+  - `indexing_app_main` mounts `CorpusIndexingLiveComponent` at `coco.component_subpath("corpus")`, which iterates `self._files.items()`, mounts `process_file` per relative path via `coco.use_mount(coco.component_subpath("process_file", rel_path), process_file, ...)`, flattens the returned `tuple[ChunkProcessOutput, ...]` batches in memory, and mounts `publish_graph` at `coco.component_subpath("publication")` via `coco.use_mount`. In live mode, `items.watch(_CorpusFeedSubscriber(operator))` serializes `await operator.update_full()` across filesystem create/modify/delete notifications under an `asyncio.Lock()`.
+
+Open: None.
 
 ## 6. Capability gates
 
 | Behavior relied on | Locked version | Probe | Pass criterion | Stop rule |
 | --- | --- | --- | --- | --- |
 | `CG-INDEX-1`: Shared `coco.Settings(db_path=...)` LMDB reuses `@coco.fn(memo=True)` memos across `2` `[target]` distinct SQLite DBs when component mounts and target states are keyed by `db_identity` | `cocoindex == 1.1.0` `[measured: uv.lock:330-331, 50be17d]` | `tests/daemon/graph/test_indexing_overlap.py::test_shared_lmdb_cross_db_memo_reuse_and_target_isolation` | Indexing `64` `[target]` chunks into `db_a.sqlite` then indexing an overlapping `64`-chunk `[target]` set into fresh `db_b.sqlite` sharing `1` `[target]` `state_root` makes `0` `[target]` duplicate `extract_text`/`embed_text` calls for overlapping chunks and populates all `15` `[target]` graph tables in both DBs without withdrawing `db_a.sqlite` rows | Stop and amend this spec with the evidence |
-| `CG-INDEX-2`: `coco.use_mount` returns typed `ChunkProcessOutput` payloads directly to `publish_graph` in both frozen (`frozen_indexing_app_main`) and live (`indexing_app_main`) flows without SQLite table polling | `cocoindex == 1.1.0` `[measured: uv.lock:330-331, 50be17d]` | `tests/daemon/ingestion/test_source_targets.py::test_direct_use_mount_chunk_inference_handoff` | `publish_graph` receives `tuple[ChunkProcessOutput, ...]` (including `vector_f32`) directly in memory; `0` `[target]` `SELECT` queries run against `source_chunks` or `chunk_inference` inside `publish_graph` or `planner.py` | Stop and amend this spec with the evidence |
+| `CG-INDEX-2`: `coco.use_mount` returns typed `ChunkProcessOutput` payloads directly to `publish_graph` in both frozen (`frozen_indexing_app_main`) and live (`indexing_app_main`) flows without SQLite table polling | `cocoindex == 1.1.0` `[measured: uv.lock:330-331, 50be17d]` | `tests/daemon/graph/test_indexing_overlap.py::test_direct_use_mount_chunk_output_handoff_without_chunk_state_target` | `publish_graph` receives `tuple[ChunkProcessOutput, ...]` (including `vector_f32`) directly in memory; `0` `[target]` `SELECT` queries run against `source_chunks` or `chunk_inference` inside `publish_graph` or `planner.py` | Stop and amend this spec with the evidence |
 
 ## 7. Removal inventory
 
