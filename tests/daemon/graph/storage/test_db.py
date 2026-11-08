@@ -72,6 +72,13 @@ def test_open_yaw_db_wal_and_schema_initialization(tmp_path: Path) -> None:
             "fact_vec",
         }
         assert expected_tables.issubset(table_names)
+        for vec_table in ("chunk_vec", "entity_vec", "fact_vec"):
+            ddl_row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                (vec_table,),
+            ).fetchone()
+            assert ddl_row is not None
+            assert "USING vec0" in str(ddl_row["sql"])
     finally:
         conn.close()
 

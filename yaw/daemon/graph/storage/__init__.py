@@ -6,13 +6,16 @@ from typing import Any
 # Single source of truth: only these symbols are exposed as the public package contract.
 _PUBLIC_API: dict[str, str] = {
     # Database lifecycle & schema
+    "DEFAULT_VEC_DIMENSION": ".db",
     "ManagedConnection": ".db",
+    "ensure_vec0_table": ".db",
     "open_managed_yaw_db": ".db",
     "open_yaw_db": ".db",
     "open_readonly_yaw_db": ".db",
     "initialize_schema": ".db",
     "resolve_coco_state_root": ".db",
     "resolve_db_identity": ".db",
+    "vec0_table_dimension": ".db",
     "write_tx": ".db",
     "get_meta": ".db",
     "set_meta": ".db",

@@ -67,7 +67,7 @@ from yaw.daemon.graph.storage import (
     upsert_semantic_edges,
     write_tx,
 )
-from yaw.daemon.graph.storage.db import GRAPH_DB
+from yaw.daemon.graph.storage.db import GRAPH_DB, ensure_vec0_table, vec0_table_dimension
 from yaw.daemon.graph.storage.evidence import (
     EntityMention,
     EntityMerge,
@@ -269,6 +269,12 @@ def clone_graph_to_memory(conn: sqlite3.Connection, schemas: tuple[TableSpec, ..
     with write_tx(stage_conn):
         for schema in schemas:
             create_table(stage_conn, schema)
+        for vec_table, pk_col in (
+            ("chunk_vec", "chunk_id"),
+            ("entity_vec", "entity_id"),
+            ("fact_vec", "fact_id"),
+        ):
+            ensure_vec0_table(stage_conn, vec_table, pk_col, vec0_table_dimension(conn, vec_table))
         for table, cols in (
             ("chunks", "chunk_id, rel_posix_path, start_line, end_line, title, ast_island_start, ast_island_end"),
             ("entities", "entity_id, name, definition, confidence"),

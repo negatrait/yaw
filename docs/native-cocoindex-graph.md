@@ -132,13 +132,20 @@ Decided:
 
 ```python
 @dataclass(frozen=True)
+class VecSpec:
+    column: str = "embedding"
+    dim: int | None = None
+    distance_metric: str = "cosine"
+
+
+@dataclass(frozen=True)
 class TableSpec:
+    name: str
     schema: sqlite.TableSchema[Any]
-    primary_key: list[str]
     fts_unindexed: tuple[str, ...] | None = None
     indexes: tuple[tuple[str, ...], ...] = ()
-    vec0_dimension: int | None = None
-    vec0_metric: Literal["cosine"] | None = None
+    db_identity: str = ""
+    vec: VecSpec | None = None
 
 
 @dataclass(frozen=True)
@@ -168,19 +175,24 @@ async def plan_graph_publication(
 ```
 
 - **`sqlite-vec` `vec0` DDL, Upserts, and KNN Queries (`managed_sqlite.py`, `db.py`, `vectors.py`, `graph_ops.py`)**:
-  - When `spec.vec0_dimension is not None` (with `pk_col = spec.primary_key[0]`, i.e., `"chunk_id"`, `"entity_id"`, `"fact_id"`), `_create_table` executes:
+  - When `spec.vec is not None` (with `pk_col = spec.schema.primary_key[0]`, i.e., `"chunk_id"`, `"entity_id"`, `"fact_id"`), `create_table` delegates to `ensure_vec0_table`, which validates identifiers and executes (with unquoted column names inside `USING vec0(...)` because `sqlite-vec == 0.1.9` rejects double-quoted column names inside `USING vec0(...)`):
     ```sql
     CREATE VIRTUAL TABLE IF NOT EXISTS "{name}" USING vec0(
-        "{pk_col}" TEXT PRIMARY KEY,
-        embedding float[{spec.vec0_dimension}] distance_metric=cosine
+        {pk_col} TEXT PRIMARY KEY,
+        {spec.vec.column} float[{spec.vec.dim}] distance_metric={spec.vec.distance_metric}
     )
     ```
-  - Because `vec0` and `fts5` virtual tables do not support `INSERT ... ON CONFLICT DO UPDATE`, `DatabaseSink.__call__` (`managed_sqlite.py`) executes `DELETE FROM "{table}" WHERE "{pk_col}" = ?` followed by `INSERT INTO "{table}" ("{pk_col}", embedding) VALUES (?, ?)` whenever `spec.fts_unindexed is not None or spec.vec0_dimension is not None`. Likewise, `rekey_facts` (`graph_ops.py:1018–1023` at `50be17d`) replaces `ON CONFLICT(fact_id) DO UPDATE` on `fact_vec` with `DELETE` + `INSERT`.
-  - Both `vectors.py:_search_knn` (`L105–128` at `50be17d`) and `graph_ops.py:find_entity_synonym_candidates` (`L104–117` at `50be17d`) execute `vec0` `MATCH` KNN queries with deterministic tie-breaking, returning `(1.0 - distance) AS similarity` in `_search_knn` and `distance AS dist` in `find_entity_synonym_candidates`:
+  - Because `vec0` and `fts5` virtual tables do not support `INSERT ... ON CONFLICT DO UPDATE`, `DatabaseSink.__call__` (`managed_sqlite.py`) ensures the `vec0` table dimension matches `len(blob) // 4`, executes `DELETE FROM "{table}" WHERE "{pk_col}" = ?`, and then executes `INSERT INTO "{table}" ("{pk_col}", "embedding") VALUES (?, ?)` whenever `spec.fts_unindexed is not None or spec.vec is not None`. Likewise, `rekey_facts` (`graph_ops.py:1018–1023` at `50be17d`) replaces `ON CONFLICT(fact_id) DO UPDATE` on `fact_vec` with `DELETE` + `INSERT`.
+  - Both `vectors.py:_search_knn` (`L105–128` at `50be17d`) and `graph_ops.py:find_entity_synonym_candidates` (`L104–117` at `50be17d`) execute `vec0` `MATCH` KNN queries with `k = min(int(top_k), 4096)` (and `min(int(top_k) + 1, 4096)` for self-excluding entity neighborhood search) and deterministic tie-breaking via `WITH knn AS MATERIALIZED`, returning `(1.0 - distance) AS similarity`:
     ```sql
+    WITH knn AS MATERIALIZED (
+        SELECT {id_col}, distance
+        FROM {table}
+        WHERE embedding MATCH ? AND k = ?
+        ORDER BY distance
+    )
     SELECT {id_col}, (1.0 - distance) AS similarity
-    FROM {table}
-    WHERE embedding MATCH ? AND k = ?
+    FROM knn
     ORDER BY distance ASC, {id_col} ASC
     ```
 - **Single-Owner Cache Cutover (`engine.py`, `optimizer.py`, `candidate_cache.py`)**:

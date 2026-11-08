@@ -7,14 +7,14 @@ only this connector applies reconciled row actions. No application-side writes.
 import re
 import sqlite3
 from collections.abc import Callable, Collection, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, NamedTuple, cast
 
 import cocoindex as coco
 from cocoindex.connectorkits.fingerprint import fingerprint_object
 from cocoindex.connectors import sqlite
 
-from .db import GRAPH_DB, ManagedConnection, resolve_db_identity
+from .db import GRAPH_DB, ManagedConnection, ensure_vec0_table, resolve_db_identity
 
 VALIDATE_SQLITE = coco.ContextKey[Callable[[sqlite3.Connection], None]]("yaw/managed_sqlite/validate")
 
@@ -31,12 +31,20 @@ class TableKey(NamedTuple):
 
 
 @dataclass(frozen=True)
+class VecSpec:
+    column: str = "embedding"
+    dim: int | None = None
+    distance_metric: str = "cosine"
+
+
+@dataclass(frozen=True)
 class TableSpec:
     name: str
     schema: sqlite.TableSchema[Any]
     fts_unindexed: tuple[str, ...] | None = None
     indexes: tuple[tuple[str, ...], ...] = ()
     db_identity: str = ""
+    vec: VecSpec | None = None
 
 
 @dataclass(frozen=True)
@@ -54,6 +62,16 @@ class RowAction:
 
 
 def create_table(conn: sqlite3.Connection, spec: TableSpec) -> None:
+    if spec.vec is not None:
+        ensure_vec0_table(
+            conn,
+            spec.name,
+            spec.schema.primary_key[0],
+            spec.vec.dim,
+            column=spec.vec.column,
+            metric=spec.vec.distance_metric,
+        )
+        return
     table = identifier(spec.name)
     if spec.fts_unindexed is not None:
         columns = ",".join(
@@ -101,14 +119,25 @@ class DatabaseSink:
                 table = identifier(action.spec.name)
                 pk = action.spec.schema.primary_key
                 where = " AND ".join(f"{identifier(name)}=?" for name in pk)
-                if action.values is None or action.spec.fts_unindexed is not None:
+                is_virtual = action.spec.fts_unindexed is not None or action.spec.vec is not None
+                if action.values is None or is_virtual:
+                    if action.values is not None and action.spec.vec is not None:
+                        blob = action.values[action.spec.vec.column]
+                        ensure_vec0_table(
+                            conn,
+                            action.spec.name,
+                            pk[0],
+                            len(blob) // 4,
+                            column=action.spec.vec.column,
+                            metric=action.spec.vec.distance_metric,
+                        )
                     conn.execute(f"DELETE FROM {table} WHERE {where}", action.key)
                 if action.values is not None:
                     columns = tuple(action.spec.schema.columns)
                     names = ",".join(identifier(name) for name in columns)
                     placeholders = ",".join("?" for _ in columns)
                     conflict = ""
-                    if action.spec.fts_unindexed is None:
+                    if not is_virtual:
                         updates = ",".join(
                             f"{identifier(name)}=excluded.{identifier(name)}" for name in columns if name not in pk
                         )
@@ -191,8 +220,24 @@ class TableHandler(coco.TargetHandler[TableSpec, TableSpec, RowHandler]):
             spec = desired
             record = desired
             create = prev_may_be_missing or not previous
-            if previous and any(fingerprint_object(old) != fingerprint_object(spec) for old in previous):
-                raise ValueError("Changed graph table schema requires a fresh index")
+            if previous:
+                if desired.vec is not None:
+                    desired_base = replace(desired, vec=replace(desired.vec, dim=None))
+                    if any(
+                        fingerprint_object(
+                            replace(old, vec=replace(old.vec, dim=None) if old.vec is not None else None)
+                        )
+                        != fingerprint_object(desired_base)
+                        for old in previous
+                    ):
+                        raise ValueError("Changed graph table schema requires a fresh index")
+                    if desired.vec.dim is None:
+                        spec = replace(desired, vec=next(iter(previous)).vec)
+                        record = spec
+                    elif any(old.vec is None or old.vec.dim != desired.vec.dim for old in previous):
+                        create = True
+                elif any(fingerprint_object(old) != fingerprint_object(spec) for old in previous):
+                    raise ValueError("Changed graph table schema requires a fresh index")
         return coco.TargetReconcileOutput[TableAction | RowAction, TableSpec, RowHandler](
             action=TableAction(spec, coco.is_non_existence(desired), create), sink=shared_sink(), tracking_record=record
         )
@@ -209,6 +254,7 @@ async def mount_table[RowT](
     fts_unindexed: tuple[str, ...] | None = None,
     indexes: tuple[tuple[str, ...], ...] = (),
     db_identity: str = "",
+    vec: VecSpec | None = None,
 ) -> sqlite.TableTarget[RowT]:
     schema = await sqlite.TableSchema[RowT].from_class(row_type, primary_key=list(primary_key))
     spec = TableSpec(
@@ -217,6 +263,7 @@ async def mount_table[RowT](
         fts_unindexed,
         indexes,
         db_identity=db_identity,
+        vec=vec,
     )
     # SDK inference includes the deletion sentinel in the row value type.
     provider = cast(

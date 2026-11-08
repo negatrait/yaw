@@ -688,9 +688,10 @@ def test_w3c_guardrail_3_case_insensitive_consolidation(tmp_path: Path) -> None:
 
         import numpy as np
 
+        from yaw.daemon.graph.storage.vectors import upsert_entity_vectors
+
         vec = np.ones(384, dtype=np.float32) / math.sqrt(384)
-        conn.execute("INSERT INTO entity_vec (entity_id, embedding) VALUES ('e1', ?)", (vec.tobytes(),))
-        conn.execute("INSERT INTO entity_vec (entity_id, embedding) VALUES ('e2', ?)", (vec.tobytes(),))
+        upsert_entity_vectors(conn, [("e1", vec), ("e2", vec)])
 
     with managed.transaction() as conn:
         entity_nodes = [

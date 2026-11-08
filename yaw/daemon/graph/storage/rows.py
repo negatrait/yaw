@@ -9,7 +9,7 @@ from typing import Any, NamedTuple
 from yaw.core import ChunkPointer
 
 from .evidence import EVIDENCE_INDEXES, EntityMention, FactAssertion
-from .managed_sqlite import mount_table
+from .managed_sqlite import VecSpec, mount_table
 from .shacl import lint_graph_shacl
 
 
@@ -116,7 +116,10 @@ class DesiredTable:
     primary_key: tuple[str, ...]
     rows: tuple[Any, ...]
     fts_unindexed: tuple[str, ...] | None = None
+    vec: VecSpec | None = None
 
+
+_VEC_TABLE_NAMES = frozenset({"chunk_vec", "entity_vec", "fact_vec"})
 
 GRAPH_TABLES = (
     ("chunks", ChunkRow, ("chunk_id",)),
@@ -145,7 +148,17 @@ def graph_tables(
     for name, row_type, key in GRAPH_TABLES:
         columns = ",".join(row_type.__annotations__)
         values = tuple(row_type(*row) for row in conn.execute(f"SELECT {columns} FROM {name} ORDER BY {','.join(key)}"))
-        tables.append(DesiredTable(name, row_type, key, values))
+        vec = (
+            VecSpec(
+                "embedding",
+                len(values[0].embedding) // 4
+                if values and isinstance(values[0], (ChunkVector, EntityVector, FactVector))
+                else None,
+            )
+            if name in _VEC_TABLE_NAMES
+            else None
+        )
+        tables.append(DesiredTable(name, row_type, key, values, vec=vec))
     tables.append(
         DesiredTable(
             "chunk_fts",
@@ -172,7 +185,16 @@ def empty_graph_tables(*, db_identity: str = "") -> tuple[DesiredTable, ...]:
     if db_identity:
         meta_rows.append(MetaRow("db_identity", db_identity))
     return (
-        *(DesiredTable(name, row_type, key, ()) for name, row_type, key in GRAPH_TABLES),
+        *(
+            DesiredTable(
+                name,
+                row_type,
+                key,
+                (),
+                vec=VecSpec("embedding", None) if name in _VEC_TABLE_NAMES else None,
+            )
+            for name, row_type, key in GRAPH_TABLES
+        ),
         DesiredTable("chunk_fts", ChunkText, ("chunk_id",), (), ("chunk_id",)),
         DesiredTable("fact_fts", FactText, ("fact_id",), (), ("fact_id",)),
         DesiredTable("meta", MetaRow, ("key",), tuple(meta_rows)),
@@ -180,6 +202,10 @@ def empty_graph_tables(*, db_identity: str = "") -> tuple[DesiredTable, ...]:
 
 
 async def declare_tables(tables: tuple[DesiredTable, ...], *, db_identity: str = "") -> None:
+    shared_vec_dim = next(
+        (len(t.rows[0].embedding) // 4 for t in tables if (t.vec is not None or t.name in _VEC_TABLE_NAMES) and t.rows),
+        None,
+    )
     targets = [
         await mount_table(
             table.name,
@@ -188,6 +214,15 @@ async def declare_tables(tables: tuple[DesiredTable, ...], *, db_identity: str =
             fts_unindexed=table.fts_unindexed,
             indexes=EVIDENCE_INDEXES.get(table.name, ()),
             db_identity=db_identity,
+            vec=VecSpec(
+                column=table.vec.column if table.vec is not None else "embedding",
+                dim=(len(table.rows[0].embedding) // 4)
+                if table.rows
+                else (table.vec.dim if table.vec is not None and table.vec.dim is not None else shared_vec_dim),
+                distance_metric=table.vec.distance_metric if table.vec is not None else "cosine",
+            )
+            if (table.vec is not None or table.name in _VEC_TABLE_NAMES)
+            else None,
         )
         for table in tables
     ]

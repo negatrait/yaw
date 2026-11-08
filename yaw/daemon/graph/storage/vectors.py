@@ -6,7 +6,7 @@ from collections.abc import Sequence
 
 import numpy as np
 
-from .db import batched, write_tx
+from .db import batched, ensure_vec0_table, write_tx
 
 _MAX_FTS_TERMS = 24
 FTS_STOPWORDS = frozenset(
@@ -95,10 +95,17 @@ def _upsert_vectors(
     if not vectors:
         return
     table, id_col = _VEC_TABLES[kind]
+    deduped = {str(item_id): serialize_f32_vector(vec) for item_id, vec in vectors}
+    dim = len(next(iter(deduped.values()))) // 4
     with write_tx(conn):
+        ensure_vec0_table(conn, table, id_col, dim)
         conn.executemany(
-            f"INSERT OR REPLACE INTO {table} ({id_col}, embedding) VALUES (?, ?)",
-            ((item_id, serialize_f32_vector(vec)) for item_id, vec in vectors),
+            f'DELETE FROM "{table}" WHERE "{id_col}" = ?',
+            ((item_id,) for item_id in deduped),
+        )
+        conn.executemany(
+            f'INSERT INTO "{table}" ("{id_col}", "embedding") VALUES (?, ?)',
+            deduped.items(),
         )
 
 
@@ -112,17 +119,22 @@ def _search_knn(
         return []
     table, id_col = _VEC_TABLES[kind]
     blob = serialize_f32_vector(query_vec)
+    if conn.execute(f'SELECT 1 FROM "{table}" LIMIT 1').fetchone() is None:
+        return []
+    k = min(int(top_k), 4096)
     cursor = conn.execute(
         f"""
-        SELECT {id_col}, (1.0 - dist) AS similarity
-        FROM (
-            SELECT {id_col}, vec_distance_cosine(embedding, ?) AS dist
+        WITH knn AS MATERIALIZED (
+            SELECT {id_col}, distance
             FROM {table}
-            ORDER BY dist ASC
-            LIMIT ?
+            WHERE embedding MATCH ? AND k = ?
+            ORDER BY distance
         )
+        SELECT {id_col}, (1.0 - distance) AS similarity
+        FROM knn
+        ORDER BY distance ASC, {id_col} ASC
         """,
-        (blob, top_k),
+        (blob, k),
     )
     return [(str(row[0]), float(row[1])) for row in cursor]
 

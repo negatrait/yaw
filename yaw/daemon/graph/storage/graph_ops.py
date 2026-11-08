@@ -98,22 +98,28 @@ def find_entity_synonym_candidates(
     }
 
     def _scan_entity_rows(rows_iter: Iterator[sqlite3.Row]) -> None:
-        for row in rows_iter:
+        rows = list(rows_iter)
+        if not rows:
+            return
+        k = min(int(top_k) + 1, 4096)
+        for row in rows:
             src_id = str(row[0])
             blob = row[1]
             knn_cursor = conn.execute(
                 """
-                SELECT entity_id, (1.0 - dist) AS similarity
-                FROM (
-                    SELECT entity_id, vec_distance_cosine(embedding, ?) AS dist
+                WITH knn AS MATERIALIZED (
+                    SELECT entity_id, distance
                     FROM entity_vec
-                    WHERE entity_id != ?
-                    ORDER BY dist ASC
-                    LIMIT ?
+                    WHERE embedding MATCH ? AND k = ?
+                    ORDER BY distance
                 )
-                WHERE dist <= ?
+                SELECT entity_id, (1.0 - distance) AS similarity
+                FROM knn
+                WHERE entity_id != ? AND distance <= ?
+                ORDER BY distance ASC, entity_id ASC
+                LIMIT ?
                 """,
-                (blob, src_id, top_k, max_dist),
+                (blob, k, src_id, max_dist, int(top_k)),
             )
             for hit in knn_cursor:
                 dst_id = str(hit[0])
@@ -1014,11 +1020,16 @@ def rekey_facts(conn: sqlite3.Connection, ids: list[str]) -> tuple[tuple[str, st
                 ),
                 (new_id, old_id),
             )
-            conn.execute(
-                "INSERT INTO fact_vec SELECT ?,embedding FROM fact_vec WHERE fact_id=? "
-                "ON CONFLICT(fact_id) DO UPDATE SET embedding=MIN(fact_vec.embedding,excluded.embedding)",
-                (new_id, old_id),
-            )
+            old_vec_row = conn.execute("SELECT embedding FROM fact_vec WHERE fact_id=?", (old_id,)).fetchone()
+            if old_vec_row is not None:
+                new_vec_row = conn.execute("SELECT embedding FROM fact_vec WHERE fact_id=?", (new_id,)).fetchone()
+                chosen_vec = (
+                    min(bytes(old_vec_row[0]), bytes(new_vec_row[0]))
+                    if new_vec_row is not None
+                    else bytes(old_vec_row[0])
+                )
+                conn.execute("DELETE FROM fact_vec WHERE fact_id=?", (new_id,))
+                conn.execute("INSERT INTO fact_vec (fact_id, embedding) VALUES (?, ?)", (new_id, chosen_vec))
         for table in ("fact_sources", "fact_vec", "fact_fts", "facts"):
             conn.execute(f"DELETE FROM {table} WHERE fact_id=?", (old_id,))
     return tuple(redirects)

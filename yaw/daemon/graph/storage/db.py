@@ -1,5 +1,6 @@
 """Unified yaw.db SQLite connection lifecycle, schema DDL, and metadata key-value store."""
 
+import re
 import sqlite3
 import time
 import uuid
@@ -13,6 +14,14 @@ from cocoindex.connectors.sqlite import ManagedConnection
 from cocoindex.connectors.sqlite import connect as coco_sqlite_connect
 
 SQL_BATCH_SIZE = 500
+DEFAULT_VEC_DIMENSION = 768
+_VEC0_PK_COLUMNS: dict[str, str] = {
+    "chunk_vec": "chunk_id",
+    "entity_vec": "entity_id",
+    "fact_vec": "fact_id",
+}
+_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z_0-9]*")
+_VEC0_DIM_RE = re.compile(r"USING\s+vec0\s*\(.*?\bfloat\[(\d+)\]", re.IGNORECASE | re.DOTALL)
 GRAPH_DB = coco.ContextKey[ManagedConnection]("yaw/graph_db")
 
 _CREATE_SCHEMA_STATEMENTS: tuple[str, ...] = (
@@ -142,24 +151,84 @@ _CREATE_SCHEMA_STATEMENTS: tuple[str, ...] = (
     """,
     "CREATE INDEX IF NOT EXISTS idx_edge_sources_chunk ON edge_sources(chunk_id)",
     """
-    CREATE TABLE IF NOT EXISTS chunk_vec (
+    CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vec USING vec0(
         chunk_id TEXT PRIMARY KEY,
-        embedding BLOB NOT NULL
+        embedding float[768] distance_metric=cosine
     )
     """,
     """
-    CREATE TABLE IF NOT EXISTS entity_vec (
+    CREATE VIRTUAL TABLE IF NOT EXISTS entity_vec USING vec0(
         entity_id TEXT PRIMARY KEY,
-        embedding BLOB NOT NULL
+        embedding float[768] distance_metric=cosine
     )
     """,
     """
-    CREATE TABLE IF NOT EXISTS fact_vec (
+    CREATE VIRTUAL TABLE IF NOT EXISTS fact_vec USING vec0(
         fact_id TEXT PRIMARY KEY,
-        embedding BLOB NOT NULL
+        embedding float[768] distance_metric=cosine
     )
     """,
 )
+
+
+def _validate_identifier(value: str) -> str:
+    if _IDENTIFIER_RE.fullmatch(value) is None:
+        raise ValueError(f"Invalid SQLite identifier: {value!r}")
+    return value
+
+
+def vec0_table_dimension(conn: sqlite3.Connection, table_name: str) -> int | None:
+    """Return the float[N] dimension of an existing vec0 virtual table, or None if not a vec0 table."""
+    _validate_identifier(table_name)
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+        (table_name,),
+    ).fetchone()
+    if row is None or not row[0]:
+        return None
+    match = _VEC0_DIM_RE.search(str(row[0]))
+    return int(match.group(1)) if match is not None else None
+
+
+def ensure_vec0_table(
+    conn: sqlite3.Connection,
+    table_name: str,
+    pk_col: str,
+    dim: int | None,
+    *,
+    column: str = "embedding",
+    metric: str = "cosine",
+) -> None:
+    """Ensure a sqlite-vec vec0 virtual table exists with the requested primary key and dimension."""
+    _validate_identifier(table_name)
+    _validate_identifier(pk_col)
+    _validate_identifier(column)
+    if metric != "cosine":
+        raise ValueError(f"Unsupported vec0 distance metric: {metric!r}")
+    if dim is not None and int(dim) <= 0:
+        raise ValueError(f"Invalid vec0 dimension: {dim}")
+
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+        (table_name,),
+    ).fetchone()
+    if row is not None and row[0]:
+        normalized = " ".join(str(row[0]).split())
+        if "USING VEC0(" in normalized.upper():
+            if dim is None:
+                return
+            if (
+                f"{pk_col} TEXT PRIMARY KEY" in normalized
+                and f"{column} float[{int(dim)}] distance_metric={metric}" in normalized
+            ):
+                return
+        conn.execute(f'DROP TABLE IF EXISTS "{table_name}"')
+
+    target_dim = int(dim) if dim is not None else DEFAULT_VEC_DIMENSION
+    conn.execute(
+        f'CREATE VIRTUAL TABLE IF NOT EXISTS "{table_name}" USING vec0('
+        f"{pk_col} TEXT PRIMARY KEY, {column} float[{target_dim}] distance_metric={metric})"
+    )
 
 
 def batched(items: Sequence[str], size: int = SQL_BATCH_SIZE) -> Iterator[Sequence[str]]:

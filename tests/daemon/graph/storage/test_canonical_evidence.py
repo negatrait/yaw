@@ -18,6 +18,7 @@ from yaw.daemon.graph.storage import (
     upsert_entities,
     upsert_entity_labels,
     upsert_fact_sources,
+    upsert_fact_vectors,
     upsert_facts,
 )
 from yaw.daemon.graph.storage.evidence import (
@@ -140,9 +141,9 @@ def test_incremental_alias_permutations_preserve_raw_evidence_and_canonical_fact
                     upsert_fact_sources(
                         conn, [(fid, pointer.chunk_id, 0.8, 0.9, 0.85) for fid, _ in batch.fact_sources_batch]
                     )
-                    conn.executemany(
-                        "INSERT OR REPLACE INTO fact_vec VALUES (?,?)",
-                        ((row[0], struct.pack("ff", 1.0, 0.0)) for row in batch.fact_nodes),
+                    upsert_fact_vectors(
+                        conn,
+                        [(row[0], [1.0, 0.0]) for row in batch.fact_nodes],
                     )
                     upsert_edges_with_sources(conn, batch.edges_with_sources)
                     mentions, assertions = build_evidence(pointer, text, "fixed-program", record, batch.bindings)
