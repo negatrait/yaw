@@ -763,3 +763,16 @@ NER owns resources, and the current healer reads frozen evidence through
   - Static quality gates: `ty check`, `ruff check`, `ruff format --check`, and `git diff --check` all passed with `0` errors `[measured: c6fa080]`.
 - **What This Measurement Establishes and Does Not Establish**:
   - Loopback/deterministic fixtures establish `64 + 64` vs. `128` canonical set equality, focus-isolated memo reuse, single-pass `reembed_facts` embedding, delta-scoped `fact_fts`/`entity_labels` updates, and `42/42` healed fact preservation on the captured `.yaw/yaw_optimize_20261106_221811.db` snapshot; they do not by themselves establish full-corpus GEPA QA/Recall benchmark completion or Tier 2 acceptance.
+
+## 2026-11-08: Reverse Top-$k$ Candidate Completeness (`U3`), CSR PPR Caching (`P3–P4`), and Paired `64 + 64` vs. `128` Acceptance (`G5–G6`)
+
+- **Governing Specs & Review Record**:
+  - [native-cocoindex-graph.md](native-cocoindex-graph.md) ([§8](native-cocoindex-graph.md#8-checkpoints), [§9](native-cocoindex-graph.md#9-verification)), [native-cocoindex-indexing.md](native-cocoindex-indexing.md) ([§8](native-cocoindex-indexing.md#8-checkpoints), [§9](native-cocoindex-indexing.md#9-verification)), and [reviews/incremental-publication-work.md](reviews/incremental-publication-work.md).
+- **Measured Results (`outputs/benchmarks/g5_g6_acceptance.json`)**:
+  - Paired `N = 20` fixed-evidence trials (`10` `cold_memo` + `10` `warm_stage1_memo` with alternated `incremental -> reference` and `reference -> incremental` arm ordering):
+    - $R_{\text{time}}$ (`cold_memo`): $\text{mean} = 1.1376$, $\text{median} = 1.1422$, $\min = 1.0793$, $\max = 1.1837 \in [0.80, 1.25]$.
+    - $R_{\text{graph}}$ (`warm_stage1_memo`): $\text{mean} = 1.1067$, $\text{median} = 1.0964$, $\min = 1.0872$, $\max = 1.1703 \in [0.80, 1.25]$.
+    - Canonical 15-table parity: `20/20` (`100%`) trials passed with `shacl_conforms == True`, `batch2_reembedded_batch1_chunks == 0`, `batch2_unindexed_readonly_selects == 0`, `batch2_unaffected_row_writes == 0`, and `peak_rss_bytes = 481,595,392 <= 1,073,741,824`.
+  - Reverse top-$k$ candidate completeness (`test_reverse_top_k_asymmetric_candidate_completeness_64_plus_64_equals_128`, `14` entities, `synonymy_top_k = 5`): `100%` canonical 15-table equality between `64 + 64` and `128` when `e_old` is rank 7 in `e_new`'s forward KNN (`> top_k`) and `e_new` is rank 1 in `e_old`'s reverse KNN.
+  - Sparse CSR topology caching (`test_csr_graph_cached_across_queries_and_invalidated_on_graph_commit`): `csr1 is csr2` across read-only queries (`load_graph_topology` called once) and immediate invalidation across `report_indexing_batch`, same-connection commits (`total_changes`), and external-connection commits (`PRAGMA data_version`).
+  - Pre-Epic 2 HippoRAG 2 Paper Parity Gate (`scripts/verify_paper_parity_gate.py --datasets popqa --mode retrieval`): `returncode = 0`, `Recall@5 Δ = +0.0400`, `Overall Gate Status: PASS`.

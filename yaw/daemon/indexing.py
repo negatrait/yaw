@@ -176,6 +176,10 @@ async def process_file(
     identity: InferenceIdentity,
     db_identity: str = "",
 ) -> tuple[ChunkProcessOutput, ...]:
+    source_root = coco.use_context(SOURCE_ROOT)
+    target_file = source_root / file.file_path.path
+    if not target_file.is_file():
+        return ()
     chunking_settings = normalize_chunking_settings(settings)
     metadata_rows = await coco.use_mount(
         coco.component_subpath("source"),
@@ -184,21 +188,28 @@ async def process_file(
         sources,
         chunking_settings,
     )
-    outputs = await asyncio.gather(
-        *(
-            coco.use_mount(
-                coco.component_subpath("chunk", metadata.chunk_id),
-                process_chunk,
-                metadata,
-                artifacts,
-                identity,
-                chunking_settings,
-                None,
-                db_identity,
+    if not target_file.is_file():
+        return ()
+    try:
+        outputs = await asyncio.gather(
+            *(
+                coco.use_mount(
+                    coco.component_subpath("chunk", metadata.chunk_id),
+                    process_chunk,
+                    metadata,
+                    artifacts,
+                    identity,
+                    chunking_settings,
+                    None,
+                    db_identity,
+                )
+                for metadata in metadata_rows
             )
-            for metadata in metadata_rows
         )
-    )
+    except ValueError:
+        if not target_file.is_file():
+            return ()
+        raise
     return tuple(outputs)
 
 

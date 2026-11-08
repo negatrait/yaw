@@ -150,7 +150,7 @@ def find_entity_synonym_candidates(
             target_rows.extend(batch_rows)
             _scan_entity_rows(iter(batch_rows))
         reverse_candidate_ids: set[str] = set()
-        k_wide = min(max(int(top_k) * 8, 64), 4096)
+        k_wide = 4096
         for row in target_rows:
             blob = row[1]
             for hit in conn.execute(
@@ -1655,10 +1655,10 @@ def load_affected_neighborhood(
     has_entity_vec = (
         ro_conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='entity_vec'").fetchone() is not None
     )
-    if has_entity_vec and delta_entity_vectors and synonymy_top_k > 0:
+    if has_entity_vec and synonymy_top_k > 0:
         eff_threshold = min(float(synonymy_threshold), 0.75)
         max_dist = max(0.0, 1.0 - eff_threshold + 1e-6)
-        k_wide = min(max(int(synonymy_top_k) * 8, 64), 4096)
+        k_wide = 4096
         knn_seed_ids: set[str] = set()
         for blob in delta_entity_vectors.values():
             for row in ro_conn.execute(
@@ -1671,24 +1671,28 @@ def load_affected_neighborhood(
             ):
                 knn_seed_ids.add(str(row[0]))
         core_entity_ids.update(knn_seed_ids)
-        # Seed each KNN candidate's own top-k neighbors in ro_conn so reverse top-k rank is exact
-        k_self = min(int(synonymy_top_k) + 1, 4096)
-        for batch in batched(sorted(knn_seed_ids)):
-            placeholders = ",".join("?" for _ in batch)
-            cand_blobs = ro_conn.execute(
-                f"SELECT entity_id, embedding FROM entity_vec WHERE entity_id IN ({placeholders})",
-                tuple(batch),
-            ).fetchall()
-            for _, cand_blob in cand_blobs:
-                for hit in ro_conn.execute(
-                    """
-                    SELECT entity_id
-                    FROM entity_vec
-                    WHERE embedding MATCH ? AND k = ? AND distance <= ?
-                    """,
-                    (cand_blob, k_self, max_dist),
-                ):
-                    core_entity_ids.add(str(hit[0]))
+        # Seed each core entity's own top-k neighbors in ro_conn so reverse top-k rank is exact
+        if core_entity_ids:
+            k_self = min(int(synonymy_top_k) + 1, 4096)
+            for batch in batched(sorted(core_entity_ids)):
+                placeholders = ",".join("?" for _ in batch)
+                seed_blobs = ro_conn.execute(
+                    f"SELECT entity_id, embedding FROM entity_vec WHERE entity_id IN ({placeholders})",
+                    tuple(batch),
+                ).fetchall()
+                for _seed_eid, seed_blob in seed_blobs:
+                    if seed_blob is None:
+                        continue
+                    rows = ro_conn.execute(
+                        """
+                        SELECT entity_id
+                        FROM entity_vec
+                        WHERE embedding MATCH ? AND k = ? AND distance <= ?
+                        """,
+                        (seed_blob, k_self, max_dist),
+                    ).fetchall()
+                    for (eid,) in rows:
+                        core_entity_ids.add(str(eid))
 
     if not core_entity_ids:
         return set()

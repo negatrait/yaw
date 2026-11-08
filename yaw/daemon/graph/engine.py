@@ -166,6 +166,7 @@ class YawGraphEngine:
         self.traversal_policy: RelationTraversalPolicy | None = traversal_policy
 
         self._csr_graph: CSRGraph | None = None
+        self._csr_cache_key: tuple[Any, ...] | None = None
         self._graph_rlm_stats: dict[str, Any] = self._empty_graph_rlm_stats()
         self._chunk_rlm_stats: dict[str, dict[str, float]] = {}
         self._active_query_rlm_stats: dict[str, int] | None = None
@@ -478,6 +479,13 @@ class YawGraphEngine:
                     if pred_inst is not None:
                         active_trace.append((pred_inst, dict(inp_dict), out_obj))
             if not bool(item_docs):
+                with self._lock:
+                    current_key = self._current_csr_cache_key()
+                    if self._csr_cache_key != current_key:
+                        self._csr_graph = None
+                        self._csr_cache_key = current_key
+                        self._query_retrieval_memo.clear()
+                        self._last_memo_question = None
                 if q_str != self._last_memo_question:
                     self._query_retrieval_memo.clear()
                     self._last_memo_question = q_str
@@ -672,9 +680,26 @@ class YawGraphEngine:
         with self._lock:
             set_meta(self.conn, key, value)
 
+    def _current_csr_cache_key(self) -> tuple[Any, ...]:
+        data_version_row = self.conn.execute("PRAGMA data_version").fetchone()
+        data_version = int(data_version_row[0]) if data_version_row is not None else 0
+        graph_fp = get_meta(self.conn, "graph_input_fingerprints") or ""
+        policy = self.traversal_policy or RelationTraversalPolicy()
+        return (
+            data_version,
+            int(self.conn.total_changes),
+            graph_fp,
+            float(self.beta),
+            policy,
+        )
+
     def _ensure_csr_graph(self) -> CSRGraph:
         with self._lock:
-            if self._csr_graph is None:
+            cache_key = self._current_csr_cache_key()
+            if self._csr_graph is None or self._csr_cache_key != cache_key:
+                if self._csr_cache_key != cache_key:
+                    self._query_retrieval_memo.clear()
+                    self._last_memo_question = None
                 chunk_ids, entity_ids, edges, entity_priors = load_graph_topology(self.conn)
                 self._csr_graph = build_transition_matrix(
                     chunk_ids,
@@ -684,6 +709,7 @@ class YawGraphEngine:
                     policy=self.traversal_policy or RelationTraversalPolicy(),
                     node_priors=entity_priors,
                 )
+                self._csr_cache_key = cache_key
             return self._csr_graph
 
     def _encode_texts(
@@ -922,6 +948,10 @@ class YawGraphEngine:
 
     def report_indexing_batch(self, summary: GraphPlanSummary, total_chunks: int) -> None:
         """Record an incrementally published batch summary and emit progress telemetry."""
+        self._csr_graph = None
+        self._csr_cache_key = None
+        self._query_retrieval_memo.clear()
+        self._last_memo_question = None
         self._opt_indexed_cids = set(summary.chunk_ids)
         self._graph_rlm_stats.update(summary.rlm_stats)
         self.emit_indexing_progress(f"indexing: {len(summary.chunk_ids)}/{total_chunks} chunks published")
@@ -950,6 +980,7 @@ class YawGraphEngine:
             finally:
                 self._active_progress_callback = prev_cb
             self._csr_graph = None
+            self._csr_cache_key = None
             self._query_retrieval_memo.clear()
             self._last_memo_question = None
             self._active_extraction_fingerprint = extraction_fingerprint(active_program)

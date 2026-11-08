@@ -1590,3 +1590,149 @@ def test_sync_now_executes_single_index_chunks_and_pre_start_stop(tmp_path: Path
         assert rt.stats().chunks == 1
     finally:
         rt.stop()
+
+
+def test_windows_live_lifecycle_create_modify_rename_delete_and_lock_release(tmp_path: Path, provider) -> None:
+    """Verify live file-watch create, rapid edit coalescing, rename, delete, and Windows lock release (I4)."""
+    import psutil
+
+    from yaw.daemon.graph.storage import lint_graph_shacl
+    from yaw.daemon.runtime import is_file_locked
+
+    class LiveLifecycleLM(DeterministicTestLM):
+        def __call__(
+            self,
+            prompt: str | None = None,
+            messages: list[dict[str, Any]] | None = None,
+            **kwargs: Any,
+        ) -> list[str]:
+            req_str = str(prompt or messages or kwargs)
+            unique_ent: str | None = None
+            for cand in ("UniqueA_v3", "UniqueA_v2", "UniqueA_v1", "UniqueA", "UniqueB"):
+                if cand in req_str:
+                    unique_ent = cand
+                    break
+            if unique_ent is not None:
+                if (
+                    "DefineMissingEntities" in req_str
+                    or "missing_entities" in req_str
+                    or "entity_definitions" in req_str
+                ):
+                    return [
+                        json.dumps(
+                            {
+                                "entity_definitions": [
+                                    [unique_ent, f"Unique lifecycle entity {unique_ent}"],
+                                    ["SharedEntity", "Shared corpus entity across documents"],
+                                ]
+                            }
+                        )
+                    ]
+                if "FilterTriples" in req_str or "fact_before_filter" in req_str:
+                    return [json.dumps({"fact": [[unique_ent, "connects to", "SharedEntity"]]})]
+                if "ExtractTriples" in req_str or '"triples"' in req_str or "`triples`" in req_str:
+                    return [
+                        json.dumps(
+                            {
+                                "triples": [
+                                    {
+                                        "sub": unique_ent,
+                                        "pred": "connects to",
+                                        "obj": "SharedEntity",
+                                        "def": f"{unique_ent} connects to SharedEntity.",
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                if "ExtractEntities" in req_str or "named_entities" in req_str:
+                    return [
+                        json.dumps(
+                            {
+                                "named_entities": [
+                                    [unique_ent, f"Unique lifecycle entity {unique_ent}"],
+                                    ["SharedEntity", "Shared corpus entity across documents"],
+                                ]
+                            }
+                        )
+                    ]
+            return super().__call__(prompt=prompt, messages=messages, **kwargs)
+
+    cfg, _ = _make_test_config(tmp_path)
+    assert cfg.corpus_root is not None
+    assert cfg.db_path is not None
+    assert cfg.lock_path is not None
+    assert cfg.state_dir is not None
+
+    lm = LiveLifecycleLM()
+    dspy.settings.configure(lm=lm)
+    prog = YawProgram(
+        enable_gbnf=False,
+        orchestrator_lm=lm,
+        rlm_sub_lm=lm,
+        synonym_token_counter=ServingTokenCounter(provider[0], lm.model),
+    )
+    emb = DeterministicTestEmbedder(dim=16)
+
+    rt = YawRuntime(cfg, program=prog, embedder=emb, auto_poll=True)
+    rt.start(sync_on_start=False)
+    try:
+        assert rt.engine is not None
+        assert is_file_locked(cfg.lock_path)
+
+        def entity_names() -> set[str]:
+            assert rt.engine is not None
+            with rt.engine._lock:
+                return {str(r[0]) for r in rt.engine.conn.execute("SELECT name FROM entities").fetchall()}
+
+        # 1. Create doc_a.md and doc_b.md sharing SharedEntity with unique entities UniqueA and UniqueB
+        doc_a = cfg.corpus_root / "doc_a.md"
+        doc_b = cfg.corpus_root / "doc_b.md"
+        doc_a.write_text("# Doc A\nUniqueA connects to SharedEntity in document alpha.\n", encoding="utf-8")
+        doc_b.write_text("# Doc B\nUniqueB connects to SharedEntity in document beta.\n", encoding="utf-8")
+        rt.sync_now()
+        assert entity_names() == {"UniqueA", "UniqueB", "SharedEntity"}
+        assert len(lint_graph_shacl(rt.engine.conn)) == 0
+
+        # 2. Rapid consecutive in-place edits on doc_a.md: UniqueA_v1 -> UniqueA_v2 -> UniqueA_v3
+        for ver in ("UniqueA_v1", "UniqueA_v2", "UniqueA_v3"):
+            doc_a.write_text(f"# Doc A\n{ver} connects to SharedEntity in document alpha.\n", encoding="utf-8")
+        rt.sync_now()
+        assert entity_names() == {"UniqueA_v3", "UniqueB", "SharedEntity"}
+        assert "UniqueA" not in entity_names()
+        assert "UniqueA_v1" not in entity_names()
+        assert "UniqueA_v2" not in entity_names()
+        assert len(lint_graph_shacl(rt.engine.conn)) == 0
+
+        # 3. Rename doc_a.md -> doc_a_renamed.md
+        doc_a_renamed = cfg.corpus_root / "doc_a_renamed.md"
+        doc_a.rename(doc_a_renamed)
+        rt.sync_now()
+        assert entity_names() == {"UniqueA_v3", "UniqueB", "SharedEntity"}
+        with rt.engine._lock:
+            rel_paths = {str(r[0]) for r in rt.engine.conn.execute("SELECT rel_posix_path FROM chunks").fetchall()}
+        assert rel_paths == {"doc_a_renamed.md", "doc_b.md"}
+        hits = rt.retrieve("UniqueA_v3 SharedEntity", top_k=2)
+        assert any(h.pointer.rel_posix_path == "doc_a_renamed.md" and "UniqueA_v3" in h.text for h in hits)
+        assert len(lint_graph_shacl(rt.engine.conn)) == 0
+
+        # 4. Delete doc_a_renamed.md -> retracts UniqueA_v3 while preserving SharedEntity and UniqueB
+        doc_a_renamed.unlink()
+        rt.sync_now()
+        assert entity_names() == {"UniqueB", "SharedEntity"}
+        assert len(lint_graph_shacl(rt.engine.conn)) == 0
+    finally:
+        rt.stop()
+
+    # 5. Verify clean Windows handle/lock release and memory bound after stop()
+    assert not is_file_locked(cfg.lock_path)
+    assert psutil.Process().memory_info().rss <= 1024**3
+
+    renamed_db = cfg.db_path.with_name("yaw_renamed.db")
+    cfg.db_path.rename(renamed_db)
+    renamed_db.rename(cfg.db_path)
+
+    if cfg.state_dir.exists():
+        renamed_state = cfg.state_dir.with_name("coco_state_renamed")
+        cfg.state_dir.rename(renamed_state)
+        renamed_state.rename(cfg.state_dir)

@@ -3037,3 +3037,98 @@ def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
         assert any(o == "1912-06-23" for _, _, o in kept_facts)
     finally:
         engine.close()
+
+
+def test_csr_graph_cached_across_queries_and_invalidated_on_graph_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reflection_token_counter: Any
+) -> None:
+    """Verify CSRGraph is cached across unchanged queries and invalidated on graph commits (P3-P4)."""
+    import sqlite3
+
+    import yaw.daemon.graph.engine as engine_mod
+    from yaw.daemon.graph.planner import GraphPlanSummary
+    from yaw.daemon.graph.storage import open_managed_yaw_db, set_meta
+
+    lm = DeterministicMockLM()
+    dspy.settings.configure(lm=lm)
+    prog = YawProgram(
+        synonym_token_counter=reflection_token_counter,
+        enable_gbnf=False,
+        orchestrator_lm=lm,
+        rlm_sub_lm=lm,
+    )
+    embedder: Any = DeterministicMockEmbedder(dim=64)
+    db_path = tmp_path / "yaw_csr_cache.db"
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=db_path,
+            workspace_root=tmp_path,
+            program=prog,
+            embedder=embedder,
+            retrieval_top_k=2,
+            synonymy_threshold=-1.0,
+        )
+    )
+    try:
+        doc_turing = "Alan Turing\nAlan Turing worked at Bletchley Park."
+        doc_lovelace = "Ada Lovelace\nAda Lovelace programmed the Analytical Engine."
+        engine.index([doc_turing, doc_lovelace])
+
+        topology_loads = 0
+        orig_load_topology = engine_mod.load_graph_topology
+
+        def counting_load_topology(conn: sqlite3.Connection):
+            nonlocal topology_loads
+            topology_loads += 1
+            return orig_load_topology(conn)
+
+        monkeypatch.setattr(engine_mod, "load_graph_topology", counting_load_topology)
+
+        # 1. Consecutive queries on unchanged DB reuse the exact same CSRGraph without reloading topology
+        csr1 = engine._ensure_csr_graph()
+        assert topology_loads == 1
+        csr2 = engine._ensure_csr_graph()
+        assert csr1 is csr2
+        assert topology_loads == 1
+
+        res1 = engine._canonical_retrieval_hook("Where did Alan Turing work?")
+        res2 = engine._canonical_retrieval_hook("Where did Alan Turing work?")
+        assert res1 == res2
+        assert engine._ensure_csr_graph() is csr1
+        assert topology_loads == 1
+
+        # 2. Mutating on engine.conn invalidates CSRGraph and retrieval memo on next query
+        with engine.managed_conn.transaction() as conn:
+            set_meta(conn, "graph_input_fingerprints", '{"mutated": 1}')
+        csr3 = engine._ensure_csr_graph()
+        assert csr3 is not csr1
+        assert topology_loads == 2
+        assert engine._query_retrieval_memo == {}
+
+        # 3. report_indexing_batch invalidates CSRGraph and retrieval memo
+        _ = engine._canonical_retrieval_hook("Where did Alan Turing work?")
+        assert len(engine._query_retrieval_memo) == 1
+        engine.report_indexing_batch(GraphPlanSummary(chunk_ids=tuple(engine._opt_indexed_cids)), 2)
+        assert engine._csr_graph is None
+        assert engine._csr_cache_key is None
+        assert engine._query_retrieval_memo == {}
+        csr4 = engine._ensure_csr_graph()
+        assert csr4 is not csr3
+        assert topology_loads == 3
+
+        # 4. External SQLite connection commit bumps PRAGMA data_version / graph_input_fingerprints and invalidates CSR
+        _ = engine._canonical_retrieval_hook("Where did Alan Turing work?")
+        assert len(engine._query_retrieval_memo) == 1
+        ext_managed = open_managed_yaw_db(db_path)
+        try:
+            with ext_managed.transaction() as ext_conn:
+                set_meta(ext_conn, "graph_input_fingerprints", '{"mutated": 2}')
+        finally:
+            ext_managed.close()
+
+        csr5 = engine._ensure_csr_graph()
+        assert csr5 is not csr4
+        assert topology_loads == 4
+        assert engine._query_retrieval_memo == {}
+    finally:
+        engine.close()

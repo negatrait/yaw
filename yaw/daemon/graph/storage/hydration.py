@@ -3,6 +3,7 @@
 import json
 import re
 import sqlite3
+import time
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -438,6 +439,12 @@ def resolve_chunk_text(
 ) -> str:
     """Resolve the exact chunk text for a ChunkPointer (including split JSON/JSONL sub-chunks)."""
     hydrated = hydrate_chunk_pointer(pointer, corpus_root)
+    if hydrated.stale_on_disk or not hydrated.text.strip():
+        for _ in range(3):
+            time.sleep(0.01)
+            hydrated = hydrate_chunk_pointer(pointer, corpus_root)
+            if not hydrated.stale_on_disk and hydrated.text.strip():
+                break
     if hydrated.stale_on_disk or not hydrated.text.strip():
         raise ValueError(f"Failed to hydrate source chunk {pointer.chunk_id} from {pointer.rel_posix_path}")
     if _is_json_corpus_path(pointer.rel_posix_path):

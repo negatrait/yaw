@@ -869,6 +869,7 @@ class YawRuntime:
             raise YawRuntimeError("NOT_READY", "Graph engine is not initialized.")
         with self.engine._lock:
             self.engine._csr_graph = None
+            self.engine._csr_cache_key = None
             self.engine._query_retrieval_memo.clear()
             self.engine._last_memo_question = None
             self.engine._hydrate_indexed_cids_from_db()
@@ -1316,7 +1317,12 @@ class YawRuntime:
                 new_syn_id,
                 new_shacl_id,
             ):
+                was_live = self._live_thread is not None and self._live_thread.is_alive()
+                if was_live:
+                    self._stop_live_update()
                 self._build_coco_app()
+                if was_live:
+                    self._start_live_update()
             self._update_state()
             return {
                 "reloaded": True,
