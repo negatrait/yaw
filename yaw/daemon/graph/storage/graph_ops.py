@@ -3,6 +3,7 @@
 import difflib
 import json
 import sqlite3
+from collections import defaultdict
 from collections.abc import Iterator, Mapping, Sequence
 from functools import lru_cache
 from pathlib import Path
@@ -1801,30 +1802,86 @@ def load_affected_neighborhood(
             sem_neighbors.add(str(row[0]))
     core_entity_ids.update(sem_neighbors)
 
-    affected_entity_ids = set(core_entity_ids)
-    affected_fact_ids: set[str] = set()
-
-    # 2d. Incident facts and their entity endpoints
+    # Include any entity in ro_conn.entity_labels sharing a label_norm with core_entity_ids
     for batch in batched(sorted(core_entity_ids)):
         placeholders = ",".join("?" for _ in batch)
-        b_tuple = tuple(batch)
-        for row in ro_conn.execute(
+        for (eid,) in ro_conn.execute(
             f"""
-            SELECT fact_id, subj_id, obj_id, obj_kind
-            FROM facts
-            WHERE subj_id IN ({placeholders}) OR obj_id IN ({placeholders})
+            SELECT DISTINCT entity_id
+            FROM entity_labels
+            WHERE label_norm IN (
+                SELECT label_norm FROM entity_labels WHERE entity_id IN ({placeholders})
+            )
             """,
-            (*b_tuple, *b_tuple),
+            tuple(batch),
         ):
-            affected_fact_ids.add(str(row[0]))
-            affected_entity_ids.add(str(row[1]))
-            if str(row[3] or "entity") == "entity" and row[2]:
-                affected_entity_ids.add(str(row[2]))
+            core_entity_ids.add(str(eid))
 
-    # 2e. Incident edges and their entity endpoints
+    affected_entity_ids = set(core_entity_ids)
+    affected_fact_ids: set[str] = set()
     incident_edges: list[tuple[Any, ...]] = []
     incident_edge_keys: set[tuple[str, str, str]] = set()
-    for batch in batched(sorted(core_entity_ids)):
+
+    # 2d & 2e. Fixed-point expansion over incident facts/edges and passive-endpoint homographs
+    expanded_core: set[str] = set()
+    while True:
+        pending_core = core_entity_ids - expanded_core
+        if not pending_core:
+            break
+        expanded_core.update(pending_core)
+
+        # 2d. Incident facts and their entity endpoints
+        for batch in batched(sorted(pending_core)):
+            placeholders = ",".join("?" for _ in batch)
+            b_tuple = tuple(batch)
+            for row in ro_conn.execute(
+                f"""
+                SELECT fact_id, subj_id, obj_id, obj_kind
+                FROM facts
+                WHERE subj_id IN ({placeholders}) OR obj_id IN ({placeholders})
+                """,
+                (*b_tuple, *b_tuple),
+            ):
+                affected_fact_ids.add(str(row[0]))
+                affected_entity_ids.add(str(row[1]))
+                if str(row[3] or "entity") == "entity" and row[2]:
+                    affected_entity_ids.add(str(row[2]))
+
+        # 2e. Incident edges and their entity endpoints
+        for batch in batched(sorted(pending_core)):
+            placeholders = ",".join("?" for _ in batch)
+            b_tuple = tuple(batch)
+            for row in ro_conn.execute(
+                f"""
+                SELECT src_id, dst_id, kind, weight, reasoning
+                FROM edges
+                WHERE src_id IN ({placeholders}) OR dst_id IN ({placeholders})
+                """,
+                (*b_tuple, *b_tuple),
+            ):
+                ekey = (str(row[0]), str(row[1]), str(row[2]))
+                if ekey not in incident_edge_keys:
+                    incident_edge_keys.add(ekey)
+                    incident_edges.append(tuple(row))
+                    if ekey[2] != "passage":
+                        affected_entity_ids.add(ekey[0])
+                        affected_entity_ids.add(ekey[1])
+
+        # Promote any passive entities in affected_entity_ids that share a label_norm within affected_entity_ids
+        eids_by_norm: dict[str, set[str]] = defaultdict(set)
+        for batch in batched(sorted(affected_entity_ids)):
+            placeholders = ",".join("?" for _ in batch)
+            for lnorm, eid in ro_conn.execute(
+                f"SELECT label_norm, entity_id FROM entity_labels WHERE entity_id IN ({placeholders})",
+                tuple(batch),
+            ):
+                eids_by_norm[str(lnorm)].add(str(eid))
+        for eids in eids_by_norm.values():
+            if len(eids) > 1:
+                core_entity_ids.update(eids)
+
+    # Copy passage edges and induced subgraph edges among passive affected_entity_ids
+    for batch in batched(sorted(affected_entity_ids - core_entity_ids)):
         placeholders = ",".join("?" for _ in batch)
         b_tuple = tuple(batch)
         for row in ro_conn.execute(
@@ -1836,11 +1893,11 @@ def load_affected_neighborhood(
             (*b_tuple, *b_tuple),
         ):
             ekey = (str(row[0]), str(row[1]), str(row[2]))
-            if ekey not in incident_edge_keys:
+            if ekey not in incident_edge_keys and (
+                ekey[2] == "passage" or (ekey[0] in affected_entity_ids and ekey[1] in affected_entity_ids)
+            ):
                 incident_edge_keys.add(ekey)
                 incident_edges.append(tuple(row))
-                affected_entity_ids.add(ekey[0])
-                affected_entity_ids.add(ekey[1])
 
     # Ensure vec0 dimensions match ro_conn before inserting vectors into stage_conn
     for vtable, pk_col in (("chunk_vec", "chunk_id"), ("entity_vec", "entity_id"), ("fact_vec", "fact_id")):

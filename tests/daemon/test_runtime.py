@@ -195,7 +195,7 @@ def _make_test_config(
 corpus_root = "corpus"
 db_path = ".yaw/yaw.db"
 lock_path = ".yaw/yaw.db.lock"
-state_dir = ".yaw/coco_state"
+state_dir = ".yaw/coco_lmdb"
 log_path = ".yaw/yaw.log"
 status_path = ".yaw/status.json"
 compiled_program_path = ".yaw/compiled_program.json"
@@ -285,29 +285,23 @@ def test_runtime_applies_configured_hydration_capacity(tmp_path: Path, provider)
         runtime.stop()
 
 
-def test_optimize_resume_parser_aliases() -> None:
+def test_optimize_fresh_and_db_path_parser_flags() -> None:
     parser = build_parser()
-    assert parser.parse_args(["dspy", "optimize", "--resume"]).resume
-    args = parser.parse_args(["dspy", "optimize", "--db-path", "latest"])
-    assert args.db_path == "latest"
+    assert parser.parse_args(["dspy", "optimize", "--fresh"]).fresh is True
+    assert parser.parse_args(["dspy", "optimize"]).fresh is False
+    args = parser.parse_args(["dspy", "optimize", "--db-path", ".yaw/optimize_yaw.db"])
+    assert args.db_path == ".yaw/optimize_yaw.db"
     with pytest.raises(SystemExit):
-        parser.parse_args(["optimize", "--resume"])
+        parser.parse_args(["dspy", "optimize", "--resume"])
     with pytest.raises(SystemExit):
-        parser.parse_args(["dspy", "optimize", "--db", "latest"])
+        parser.parse_args(["optimize", "--fresh"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["dspy", "optimize", "--db", ".yaw/optimize_yaw.db"])
 
 
-def test_cli_resume_without_a_run_fails_before_dataset_or_provider_access(tmp_path: Path) -> None:
-    cfg, toml_path = _make_test_config(tmp_path)
-    errors = io.StringIO()
-    with redirect_stderr(errors):
-        code = main(["dspy", "optimize", "--config", str(toml_path), "--resume"])
-    assert code == 1
-    assert "No optimization run exists" in errors.getvalue()
-    assert cfg.db_path is not None and not cfg.db_path.exists()
-
-
-def test_cli_resume_real_gepa_checkpoint_and_custom_output(tmp_path: Path, provider) -> None:
-    """Real GEPA/DSPy + SQLite + CocoIndex; deterministic LM tests orchestration only."""
+def test_canonical_optimize_resume_and_fresh_lifecycle(tmp_path: Path, provider) -> None:
+    """Verify canonical optimize_* sandbox, default-resume, and --fresh wipe lifecycle (CG-OPT-1)."""
+    from filelock import FileLock
     from gepa.core.state import GEPAState, ValsetEvaluation
 
     cfg, toml_path = _make_test_config(tmp_path, base_url=provider[0])
@@ -329,7 +323,6 @@ def test_cli_resume_real_gepa_checkpoint_and_custom_output(tmp_path: Path, provi
     ]
     dataset.write_text(json.dumps(records), encoding="utf-8")
     dataset_bundle = prepare_runtime_bundle(dataset)
-    custom_output = tmp_path / "my_compiled.json"
     common = [
         "dspy",
         "optimize",
@@ -355,16 +348,26 @@ def test_cli_resume_real_gepa_checkpoint_and_custom_output(tmp_path: Path, provi
             code = main([*invocation, *extra], program=prog, embedder=emb)
         return code, out.getvalue(), err.getvalue()
 
-    rc, output, errors = run_cli(["--output", str(custom_output)])
+    # 1. Default run initializes canonical .yaw/optimize_yaw.db and optimize_* sidecars
+    rc, output, errors = run_cli([])
     assert rc == 0, errors
     original = json.loads(output)
+    yaw_dir = tmp_path / ".yaw"
     db_path = Path(original["sandbox_db_path"])
-    telemetry = tmp_path / "my_compiled_telemetry"
+    assert db_path == (yaw_dir / "optimize_yaw.db").resolve()
+    canonical_output = yaw_dir / "optimize_program.json"
+    assert Path(original["compiled_program_path"]) == canonical_output.resolve()
+    assert Path(original["graph_rlm_audit_path"]) == (yaw_dir / "optimize_program_audit.json").resolve()
+    assert not list(yaw_dir.glob("coco_state*"))
+    assert (yaw_dir / "coco_lmdb").is_dir()
+    assert not (yaw_dir / "coco_lmdb" / "coco_lmdb").exists()
+    assert (yaw_dir / "optimize_coco").is_dir()
+    assert (yaw_dir / "optimize_status.json").is_file()
+
+    telemetry = yaw_dir / "optimize_program_telemetry"
     checkpoint = telemetry / "gepa_state.bin"
     assert checkpoint.is_file()
     state = GEPAState.load(str(telemetry))
-    # Persist a superior candidate using GEPA's real state API. A restart must
-    # return it, rather than deleting the checkpoint and returning the seed.
     candidate = dict(state.program_candidates[0])
     candidate["qa.predict"] += "\nRESUMED_WINNER: ground every answer in evidence."
     state.update_state_with_new_program(
@@ -379,31 +382,42 @@ def test_cli_resume_real_gepa_checkpoint_and_custom_output(tmp_path: Path, provi
         1,
     )
     state.save(str(telemetry), use_cloudpickle=True)
-    custom_output.unlink()  # unfinished run need not have a final program
+    canonical_output.unlink()
     with closing(sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True)) as conn:
         initial_openie = conn.execute("SELECT * FROM chunk_inference").fetchall()
-    for selection in (["--resume"], ["--db-path", "latest"]):
+        saved_meta_initial = json.loads(
+            conn.execute("SELECT value FROM meta WHERE key = 'optimization_run'").fetchone()[0]
+        )
+    assert saved_meta_initial.get("started_at")
+
+    # 2. Bare invocation (default without --fresh) automatically resumes optimize_yaw.db
+    for selection in ([], ["--db-path", str(db_path)]):
         rc, output, errors = run_cli(selection, bare=True)
         assert rc == 0, errors
         resumed = json.loads(output)
         assert resumed["sandbox_db_path"] == original["sandbox_db_path"]
-        assert custom_output.is_file()
-        assert "RESUMED_WINNER" in custom_output.read_text(encoding="utf-8")
+        assert canonical_output.is_file()
+        assert "RESUMED_WINNER" in canonical_output.read_text(encoding="utf-8")
         loaded = GEPAState.load(str(telemetry))
         assert loaded.program_candidates == state.program_candidates
         assert loaded.total_num_evals == state.total_num_evals
-        audit = json.loads((tmp_path / "my_compiled_graph_rlm_audit.json").read_text(encoding="utf-8"))
+        audit = json.loads((yaw_dir / "optimize_program_audit.json").read_text(encoding="utf-8"))
+        assert set(audit.keys()) == {"graph_rlm_stats", "candidate_records", "eval_records", "gepa_progress"}
         native = audit["gepa_progress"]
         expected_front = sorted({idx for group in loaded.get_pareto_front_mapping().values() for idx in group})
         assert native["frontier"] == expected_front
         assert native["validation"][1]["score"] == 1.0
         assert native["phase"] == "optimization complete"
-        pools = json.loads((tmp_path / "my_compiled_pools.json").read_text())
+        pools = json.loads((yaw_dir / "optimize_program_pools.json").read_text(encoding="utf-8"))
         assert pools["corpus_chunk_ids"]
         with closing(sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True)) as conn:
             assert conn.execute("SELECT * FROM chunk_inference").fetchall() == initial_openie
+            resumed_meta = json.loads(
+                conn.execute("SELECT value FROM meta WHERE key = 'optimization_run'").fetchone()[0]
+            )
+            assert resumed_meta["started_at"] == saved_meta_initial["started_at"]
 
-    # Metric/code upgrade with identical data, settings, mode, packages, and output path:
+    # 3. Metric/code upgrade with identical data, settings, mode, packages, and output path:
     # preserves chunk_inference while invalidating stale pre-upgrade gepa_state.bin and simba scores.
     with closing(sqlite3.connect(db_path)) as conn, conn:
         saved_meta = json.loads(conn.execute("SELECT value FROM meta WHERE key = 'optimization_run'").fetchone()[0])
@@ -415,9 +429,9 @@ def test_cli_resume_real_gepa_checkpoint_and_custom_output(tmp_path: Path, provi
         )
         conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('simba_worker:stale', '{}')")
         conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('simba_task_score:stale-key', '0.5')")
-    rc, output, errors = run_cli(["--resume"], bare=True)
+    rc, output, errors = run_cli([], bare=True)
     assert rc == 0, errors
-    assert "RESUMED_WINNER" not in custom_output.read_text(encoding="utf-8")
+    assert "RESUMED_WINNER" not in canonical_output.read_text(encoding="utf-8")
     with closing(sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True)) as conn:
         assert conn.execute("SELECT * FROM chunk_inference").fetchall() == initial_openie
         upgraded_meta = json.loads(conn.execute("SELECT value FROM meta WHERE key = 'optimization_run'").fetchone()[0])
@@ -425,8 +439,8 @@ def test_cli_resume_real_gepa_checkpoint_and_custom_output(tmp_path: Path, provi
         assert conn.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'simba_worker:%'").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'simba_task_score:%'").fetchone()[0] == 0
 
-    # Same length, different questions: reject before replacing the corpus or
-    # touching the checkpoint, preserving both for inspection or recovery.
+    # 4. Same length, different questions: default resume rejects incompatible data before touching checkpoint,
+    # while --fresh wipes optimize_* state intentionally (unless locked) and starts fresh reusing coco_lmdb.
     original_checkpoint = checkpoint.read_bytes()
     assert cfg.corpus_root is not None
     assert not list((cfg.corpus_root / "corpus").glob("*.md"))
@@ -442,7 +456,7 @@ def test_cli_resume_real_gepa_checkpoint_and_custom_output(tmp_path: Path, provi
     records[0]["question"] = "A changed training question"
     dataset.write_text(json.dumps(records), encoding="utf-8")
     dataset_bundle = prepare_runtime_bundle(dataset)
-    rc, _, errors = run_cli(["--resume"], bare=True)
+    rc, _, errors = run_cli([], bare=True)
     assert rc == 1
     assert "Cannot resume" in errors
     assert checkpoint.read_bytes() == original_checkpoint
@@ -453,6 +467,25 @@ def test_cli_resume_real_gepa_checkpoint_and_custom_output(tmp_path: Path, provi
             ).fetchall()
             == original_chunks
         )
+
+    # Lock guard: --fresh refuses to wipe when optimize_yaw.db.lock is held
+    assert opt_cfg.lock_path is not None
+    with FileLock(str(opt_cfg.lock_path)):
+        rc_locked, _, err_locked = run_cli(["--fresh"])
+    assert rc_locked == 1
+    assert "LOCK_CONFLICT" in err_locked
+    assert db_path.is_file()
+
+    # Unlocked --fresh wipes optimize_* artifacts and succeeds on the updated dataset while preserving coco_lmdb
+    (yaw_dir / "optimize_telemetry.json").write_text("{}", encoding="utf-8")
+    (yaw_dir / "optimize_kg_frames").mkdir(exist_ok=True)
+    rc_fresh, out_fresh, err_fresh = run_cli(["--fresh"])
+    assert rc_fresh == 0, err_fresh
+    assert not (yaw_dir / "optimize_telemetry.json").exists()
+    assert not (yaw_dir / "optimize_kg_frames").exists()
+    assert (yaw_dir / "coco_lmdb").is_dir()
+    assert (yaw_dir / "optimize_coco").is_dir()
+    assert canonical_output.is_file()
 
 
 def test_resume_preserves_unverifiable_legacy_checkpoint(tmp_path: Path, provider) -> None:
@@ -822,7 +855,7 @@ def test_optimize_and_reload_compiled_program_with_composite_fitness(tmp_path: P
         # Use GEPA itself with a one-evaluation budget, not an optimizer replacement.
         saved_path = rt1.optimize(trainset, mode="gepa", num_trials=1)
         assert saved_path.exists()
-        audit = json.loads(saved_path.with_name(f"{saved_path.stem}_graph_rlm_audit.json").read_text(encoding="utf-8"))
+        audit = json.loads(saved_path.with_name(f"{saved_path.stem}_audit.json").read_text(encoding="utf-8"))
         assert audit["eval_records"]
         for row in audit["eval_records"]:
             keys = ["r1", "r2", "r5", "r10", "r20"] if labels != "qa" else []
@@ -962,7 +995,7 @@ Tier 2 anti-overfitting guard."""
             captured_gepa["trainset_len"] = len(trainset)
             captured_gepa["valset_len"] = len(valset) if valset is not None else 0
             # Verify CocoIndex synced JSON passages in-place with zero markdown synthesis during GEPA evolution
-            opt_cfg = cfg.for_optimization(db_override="latest")
+            opt_cfg = cfg.for_optimization()
             assert opt_cfg.corpus_root is not None
             assert opt_cfg.db_path is not None
             assert not list((opt_cfg.corpus_root / "corpus").glob("*.md"))
@@ -974,16 +1007,6 @@ Tier 2 anti-overfitting guard."""
             assert all("/documents/" in row[0] for row in db_chunks)
             pred = student(question=trainset[0].question)
             assert pred.context.strip() != ""
-            proposer = captured_gepa.get("instruction_proposer")
-            if proposer is not None and hasattr(proposer, "telemetry"):
-                proposer.telemetry.append(
-                    {
-                        "component_name": "qa.predict",
-                        "previous_instruction": "old",
-                        "new_instruction": "new",
-                        "num_feedback_examples": len(trainset),
-                    }
-                )
             return student
 
     monkeypatch.setattr(dspy, "GEPA", CaptureGEPA, raising=False)
@@ -1015,7 +1038,7 @@ Tier 2 anti-overfitting guard."""
         )
     assert rc == 0
     assert not list((cfg.corpus_root / "corpus").glob("*.md"))
-    opt_cfg_after = cfg.for_optimization(db_override="latest")
+    opt_cfg_after = cfg.for_optimization()
     assert opt_cfg_after.corpus_root is not None
     assert opt_cfg_after.db_path is not None
     assert not list((opt_cfg_after.corpus_root / "corpus").glob("*.md"))
@@ -1030,7 +1053,7 @@ Tier 2 anti-overfitting guard."""
     assert opt_out["train_queries"] == 4
     assert opt_out["val_queries"] == 2
     assert Path(opt_out["compiled_program_path"]).exists()
-    assert Path(opt_out["proposer_telemetry_path"]).exists()
+    assert Path(opt_out["graph_rlm_audit_path"]).exists()
     assert opt_out["stats"]["chunks"] == 6
     assert captured_gepa["trainset_len"] == 4
     assert captured_gepa["valset_len"] == 2
@@ -1344,10 +1367,10 @@ def test_cli_dspy_optimize_sandbox_isolation_and_status(
                 embedder=emb,
             )
         assert rc == 0
-        assert "[yaw optimize] indexing: disambiguation candidate search" in err_buf.getvalue()
+        assert "indexing: disambiguation candidate search" in err_buf.getvalue()
         opt_out = json.loads(buf.getvalue())
         assert opt_out["optimized"] is True
-        assert "yaw_optimize_" in opt_out["sandbox_db_path"]
+        assert Path(opt_out["sandbox_db_path"]).name == "optimize_yaw.db"
         assert Path(opt_out["compiled_program_path"]).exists()
 
         # Production database was NOT touched or overwritten

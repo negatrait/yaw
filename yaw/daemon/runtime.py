@@ -16,6 +16,7 @@ import uuid
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar, Literal, TypeVar
 
@@ -30,6 +31,7 @@ from yaw.core import (
     YawConfig,
     YawRuntimeError,
     configure_logging,
+    parse_dataset_list,
     write_text_atomic,
 )
 from yaw.daemon.graph.engine import YawGraphEngine
@@ -41,11 +43,6 @@ from yaw.daemon.graph.inference import (
     compute_retrieval_recalls,
     create_dspy_rlm_pair,
     evaluate_benchmark_gate,
-    hierarchy_judge_fingerprint,
-    label_judge_fingerprint,
-    openie_fingerprint,
-    related_judge_fingerprint,
-    shacl_fingerprint,
 )
 from yaw.daemon.graph.inference.components import (
     EMBEDDING_ENDPOINT,
@@ -64,6 +61,7 @@ from yaw.daemon.indexing import (
     InferenceIdentity,
     SyncOutcome,
     bind_native_indexing,
+    graph_plan_fingerprints,
     indexing_app_main,
 )
 from yaw.daemon.ingestion import (
@@ -278,26 +276,36 @@ class YawRuntime:
             self._last_indexing_error = None
             return err
 
-    def _build_coco_app(self) -> None:
-        assert self.engine is not None
-        assert self.config.corpus_root is not None
-        assert self.config.state_dir is not None
-        assert self.config.workspace_root is not None
+    def _close_coco_app(self) -> None:
         if self._coco_env is not None:
             self._coco_env.close()
             self._coco_env = None
             self._coco_app = None
 
+    @classmethod
+    def _release_idle_coco_env(cls, state_dir: Path) -> None:
+        resolved = state_dir.resolve()
+        with cls._active_lock:
+            instances = list(cls._active_instances.values())
+        for rt in instances:
+            if (
+                rt._coco_env is not None
+                and rt._live_thread is None
+                and rt.config.state_dir is not None
+                and resolve_coco_state_root(rt.config.state_dir).resolve() == resolved
+            ):
+                rt._close_coco_app()
+
+    def _build_coco_app(self) -> None:
+        assert self.engine is not None
+        assert self.config.corpus_root is not None
+        assert self.config.state_dir is not None
+        assert self.config.workspace_root is not None
+        self._close_coco_app()
+
         program = self.engine.program
         embedder = self.engine.embedder
-        prog_id = openie_fingerprint(program)
-        emb_id = str(embedder.profile.index_identity)
-        syn_id = (
-            f"{label_judge_fingerprint(program)}:"
-            f"{hierarchy_judge_fingerprint(program)}:"
-            f"{related_judge_fingerprint(program)}"
-        )
-        shacl_id = shacl_fingerprint(program)
+        prog_id, emb_id, syn_id, shacl_id = graph_plan_fingerprints(program, embedder)
         lm = getattr(program, "orchestrator_lm", None) or getattr(program, "rlm_sub_lm", None)
 
         yaw_dir = (self.config.workspace_root / ".yaw").resolve()
@@ -318,6 +326,7 @@ class YawRuntime:
         context.provide(INDEXING_ERROR_SINK, self._record_indexing_error)
 
         state_dir = resolve_coco_state_root(self.config.state_dir)
+        self._release_idle_coco_env(state_dir)
         self._coco_env = coco.Environment(
             settings=coco.Settings.from_env(state_dir),
             context_provider=context,
@@ -355,42 +364,45 @@ class YawRuntime:
             self.auto_poll,
         )
 
-    def _open_components(self) -> None:
-        assert self.config.corpus_root is not None
-        assert self.config.state_dir is not None
-        assert self.config.db_path is not None
+    def _create_bound_engine(
+        self,
+        cfg: YawConfig,
+        *,
+        workspace_root: Path | None = None,
+        compiled_program_override: Path | str | None = None,
+    ) -> tuple[YawProgram, DSPyEmbeddingAdapter, YawGraphEngine]:
+        assert cfg.corpus_root is not None
+        assert cfg.db_path is not None
+        assert cfg.max_context_chars is not None
 
-        if self._custom_program is not None:
-            program = self._custom_program
-            if self.config.compiled_program_path and Path(self.config.compiled_program_path).exists():
-                program.load(str(self.config.compiled_program_path))
-        else:
-            program = YawProgram.from_config(self.config)
+        program = self._custom_program if self._custom_program is not None else YawProgram.from_config(cfg)
+        comp_path = compiled_program_override or cfg.compiled_program_path
+        if comp_path and Path(comp_path).exists() and hasattr(program, "load"):
+            program.load(str(comp_path))
 
-        embedder = (
-            self._custom_embedder
-            if self._custom_embedder is not None
-            else DSPyEmbeddingAdapter.from_config(self.config)
-        )
-
-        assert self.config.max_context_chars is not None
-        self.engine = bind_native_indexing(
+        embedder = self._custom_embedder if self._custom_embedder is not None else DSPyEmbeddingAdapter.from_config(cfg)
+        engine = bind_native_indexing(
             YawGraphEngine(
-                db_path=self.config.db_path,
-                workspace_root=self.config.corpus_root,
+                db_path=cfg.db_path,
+                workspace_root=workspace_root if workspace_root is not None else cfg.corpus_root,
                 program=program,
                 embedder=embedder,
-                linking_top_k=self.config.linking_top_k,
-                retrieval_top_k=self.config.retrieval_top_k,
-                damping=self.config.damping,
-                synonymy_threshold=self.config.synonymy_threshold,
-                synonymy_top_k=self.config.synonymy_top_k,
-                embed_batch_size=self.config.embed_batch_size,
-                max_context_chars=self.config.max_context_chars,
-                max_ast_expansion_hops=self.config.max_ast_expansion_hops,
-                ast_context_hops=self.config.ast_context_hops,
+                linking_top_k=cfg.linking_top_k,
+                retrieval_top_k=cfg.retrieval_top_k,
+                damping=cfg.damping,
+                synonymy_threshold=cfg.synonymy_threshold,
+                synonymy_top_k=cfg.synonymy_top_k,
+                embed_batch_size=cfg.embed_batch_size,
+                max_context_chars=cfg.max_context_chars,
+                max_ast_expansion_hops=cfg.max_ast_expansion_hops,
+                ast_context_hops=cfg.ast_context_hops,
             )
         )
+        return program, embedder, engine
+
+    def _open_components(self) -> None:
+        assert self.config.state_dir is not None
+        _, _, self.engine = self._create_bound_engine(self.config)
         self.engine.config = self.config
         self._build_coco_app()
         fp = self.config.config_fingerprint()
@@ -418,6 +430,8 @@ class YawRuntime:
         """Host the native live update; CocoIndex owns filesystem and inference work."""
         if not self.auto_poll or self._stop_event.is_set() or self._live_thread is not None:
             return
+        if self._coco_app is None:
+            self._build_coco_app()
         app = self._coco_app
         if app is None:
             raise YawRuntimeError("NOT_READY", "CocoIndex app is not initialized.")
@@ -490,13 +504,8 @@ class YawRuntime:
     def _persist_status_file(self, snapshot: dict[str, Any]) -> None:
         if self.config.status_path is None:
             return
-        status_path = Path(self.config.status_path)
-        for _ in range(5):
-            try:
-                write_text_atomic(status_path, json.dumps(snapshot, indent=2))
-                break
-            except OSError:
-                time.sleep(0.01)
+        with contextlib.suppress(OSError):
+            write_text_atomic(self.config.status_path, json.dumps(snapshot, indent=2))
 
     def _start_win32_stop_event(self) -> None:
         if os.name != "nt" or self.config.lock_path is None:
@@ -827,8 +836,11 @@ class YawRuntime:
             self._queue.task_done()
 
     def _execute_sync_worker(self) -> SyncOutcome:
-        if self._coco_app is None or self.engine is None:
+        if self.engine is None:
             raise YawRuntimeError("NOT_READY", "Engine or CocoIndex app is not initialized.")
+        if self._coco_app is None:
+            self._build_coco_app()
+        assert self._coco_app is not None
 
         self._update_state(active_op="syncing corpus via CocoIndex", sync_state="syncing")
         with self.engine._lock:
@@ -874,11 +886,7 @@ class YawRuntime:
         with self._state_lock:
             self._stats = new_stats
 
-    def request_sync(
-        self,
-        *,
-        progress_callback: Callable[[str], None] | None = None,
-    ) -> dict[str, Any]:
+    def request_sync(self) -> dict[str, Any]:
         """Request an asynchronous coalesced CocoIndex sync on the worker thread."""
         with self._state_lock:
             if self._pending_sync_future is not None and not self._pending_sync_future.done():
@@ -889,7 +897,7 @@ class YawRuntime:
             scan_id = f"scan-{uuid.uuid4().hex[:8]}"
             self._pending_scan_id = scan_id
 
-        fut = self.submit("sync", self._execute_sync_worker, progress_callback=progress_callback)
+        fut = self.submit("sync", self._execute_sync_worker)
         with self._state_lock:
             self._pending_sync_future = fut
         return {
@@ -897,11 +905,7 @@ class YawRuntime:
             "status": "accepted",
         }
 
-    def sync_now(
-        self,
-        *,
-        progress_callback: Callable[[str], None] | None = None,
-    ) -> SyncOutcome:
+    def sync_now(self) -> SyncOutcome:
         """Run or await a CocoIndex incremental sync and return the applied SyncOutcome."""
         with self._state_lock:
             existing_fut = (
@@ -912,7 +916,7 @@ class YawRuntime:
         if existing_fut is not None:
             return existing_fut.result()
 
-        fut = self.submit("sync", self._execute_sync_worker, progress_callback=progress_callback)
+        fut = self.submit("sync", self._execute_sync_worker)
         with self._state_lock:
             self._pending_sync_future = fut
         return fut.result()
@@ -921,8 +925,6 @@ class YawRuntime:
         self,
         query: str,
         top_k: int = 5,
-        *,
-        progress_callback: Callable[[str], None] | None = None,
     ) -> Future[list[HydratedPassage]]:
         """Validate query and enqueue hybrid PPR + 1-indexed disk line hydration."""
         cleaned = validate_query_input(query)
@@ -940,23 +942,19 @@ class YawRuntime:
                 HydratedPassage(pointer=ptr, text=text, score=score, stale_on_disk=False) for ptr, score, text in hits
             ]
 
-        return self.submit("retrieve", _run_retrieve, progress_callback=progress_callback)
+        return self.submit("retrieve", _run_retrieve)
 
     def retrieve(
         self,
         query: str,
         top_k: int = 5,
-        *,
-        progress_callback: Callable[[str], None] | None = None,
     ) -> list[HydratedPassage]:
         """Synchronously retrieve top-k hydrated passages via the bounded worker queue."""
-        return self.retrieve_async(query, top_k=top_k, progress_callback=progress_callback).result()
+        return self.retrieve_async(query, top_k=top_k).result()
 
     def rag_qa_async(
         self,
         question: str,
-        *,
-        progress_callback: Callable[[str], None] | None = None,
     ) -> Future[dict[str, Any]]:
         """Validate question and enqueue multi-hop HippoRAG 2 QA on the worker queue."""
         cleaned = validate_query_input(question)
@@ -1000,22 +998,16 @@ class YawRuntime:
                 "last_sync_at": self.status().last_sync_at,
             }
 
-        return self.submit("rag_qa", _run_qa, progress_callback=progress_callback)
+        return self.submit("rag_qa", _run_qa)
 
     def rag_qa(
         self,
         question: str,
-        *,
-        progress_callback: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
         """Synchronously execute multi-hop HippoRAG 2 QA via the bounded worker queue."""
-        return self.rag_qa_async(question, progress_callback=progress_callback).result()
+        return self.rag_qa_async(question).result()
 
-    def rebuild(
-        self,
-        *,
-        progress_callback: Callable[[str], None] | None = None,
-    ) -> IndexStats:
+    def rebuild(self) -> IndexStats:
         """Wipe yaw.db and CocoIndex state on the worker thread and perform a full re-sync."""
 
         def _run_rebuild() -> IndexStats:
@@ -1035,7 +1027,7 @@ class YawRuntime:
             self._execute_sync_worker()
             return self.stats()
 
-        return self.submit("rebuild", _run_rebuild, progress_callback=progress_callback).result()
+        return self.submit("rebuild", _run_rebuild).result()
 
     def optimize(
         self,
@@ -1084,7 +1076,7 @@ class YawRuntime:
             opt_chunks = []
             if dataset_bundles:
                 _progress("indexing: loading complete persistent corpus snapshot")
-                assert self.config.state_dir is not None
+                assert self.config.db_path is not None
                 opt_chunks = []
                 roots = {bundle.root.parent for bundle in dataset_bundles}
                 if len(roots) != 1:
@@ -1103,7 +1095,7 @@ class YawRuntime:
                     opt_chunks.extend(
                         snapshot_dataset_bundle(
                             bundle,
-                            Path(self.config.state_dir) / "optimize_coco" / bundle.dataset,
+                            Path(self.config.db_path).parent / "optimize_coco" / bundle.dataset,
                             document_ids=doc_ids,
                             chunk_size=self.config.chunk_size,
                             chunk_overlap=self.config.chunk_overlap,
@@ -1133,6 +1125,9 @@ class YawRuntime:
             eff_sleep = (
                 sleep_seconds if sleep_seconds is not None else getattr(self.config, "optimize_sleep_seconds", 0.0)
             )
+            assert self.config.state_dir is not None
+            self._close_coco_app()
+            self._release_idle_coco_env(resolve_coco_state_root(self.config.state_dir))
             try:
                 self.engine.evolve_prompts(
                     trainset=trainset,
@@ -1230,7 +1225,7 @@ class YawRuntime:
                 raise YawRuntimeError(
                     "INVALID_INPUT",
                     "Cannot resume: optimization data, settings, code, packages or output path "
-                    "changed. Start a fresh run without --resume/--db-path; "
+                    "changed. Start a fresh run with --fresh or --db-path; "
                     "old state is preserved.",
                 )
             metric_upgraded = saved_id.get("metric") != identity["metric"]
@@ -1238,8 +1233,9 @@ class YawRuntime:
             if metric_upgraded:
                 checkpoint = target_path.parent / f"{target_path.stem}_telemetry" / "gepa_state.bin"
                 checkpoint.unlink(missing_ok=True)
-            if metric_upgraded or code_upgraded or run_options is not None:
+            if metric_upgraded or code_upgraded or run_options is not None or not saved.get("started_at"):
                 saved["identity"] = identity
+                saved["started_at"] = saved.get("started_at") or datetime.now(UTC).isoformat()
                 if run_options is not None:
                     saved["cli_options"] = run_options
                 with self.engine.managed_conn.transaction() as tx:
@@ -1268,6 +1264,7 @@ class YawRuntime:
                             "output_path": str(target_path),
                             "identity": identity,
                             "cli_options": run_options or {},
+                            "started_at": datetime.now(UTC).isoformat(),
                         }
                     ),
                 ),
@@ -1285,34 +1282,15 @@ class YawRuntime:
         def _run_reload() -> dict[str, Any]:
             if self.engine is None:
                 raise YawRuntimeError("NOT_READY", "Graph engine is not initialized.")
-            old_prog_id = openie_fingerprint(self.engine.program)
-            old_emb_id = str(self.engine.embedder.profile.index_identity)
-            old_syn_id = (
-                f"{label_judge_fingerprint(self.engine.program)}:"
-                f"{hierarchy_judge_fingerprint(self.engine.program)}:"
-                f"{related_judge_fingerprint(self.engine.program)}"
-            )
-            old_shacl_id = shacl_fingerprint(self.engine.program)
+            old_fps = graph_plan_fingerprints(self.engine.program, self.engine.embedder)
             self.engine.program.load(str(p))
             self.engine.refresh_program_bindings()
-            new_prog_id = openie_fingerprint(self.engine.program)
-            new_emb_id = str(self.engine.embedder.profile.index_identity)
-            new_syn_id = (
-                f"{label_judge_fingerprint(self.engine.program)}:"
-                f"{hierarchy_judge_fingerprint(self.engine.program)}:"
-                f"{related_judge_fingerprint(self.engine.program)}"
-            )
-            new_shacl_id = shacl_fingerprint(self.engine.program)
+            new_fps = graph_plan_fingerprints(self.engine.program, self.engine.embedder)
             if self._openie_endpoint is not None:
-                self._openie_endpoint.program_identity = new_prog_id
+                self._openie_endpoint.program_identity = new_fps[0]
             if self._embedding_endpoint is not None:
                 self._embedding_endpoint.adapter = self.engine.embedder
-            if (old_prog_id, old_emb_id, old_syn_id, old_shacl_id) != (
-                new_prog_id,
-                new_emb_id,
-                new_syn_id,
-                new_shacl_id,
-            ):
+            if old_fps != new_fps:
                 was_live = self._live_thread is not None and self._live_thread.is_alive()
                 if was_live:
                     self._stop_live_update()
@@ -1364,13 +1342,7 @@ class YawRuntime:
             else "eval"
         )
 
-        raw_datasets: list[str] = []
-        if datasets is not None:
-            if isinstance(datasets, str):
-                raw_datasets = [p.strip() for p in datasets.split(",") if p.strip()]
-            else:
-                for item in datasets:
-                    raw_datasets.extend(p.strip() for p in str(item).split(",") if p.strip())
+        raw_datasets = parse_dataset_list(datasets)
         if not raw_datasets:
             if gate_spec and isinstance(gate_spec.get("baselines"), dict) and gate_spec["baselines"]:
                 raw_datasets = list(DEFAULT_PARITY_DATASETS)
@@ -1455,33 +1427,10 @@ class YawRuntime:
                 min_chunk_size=1,
             )
 
-            prog = self._custom_program if self._custom_program is not None else YawProgram.from_config(bench_cfg)
-            comp_p = compiled_program or compiled_program_path or bench_cfg.compiled_program_path
-            if comp_p and Path(comp_p).exists() and hasattr(prog, "load"):
-                prog.load(str(comp_p))
-
-            emb = (
-                self._custom_embedder
-                if self._custom_embedder is not None
-                else DSPyEmbeddingAdapter.from_config(bench_cfg)
-            )
-
-            bench_engine = bind_native_indexing(
-                YawGraphEngine(
-                    db_path=bench_cfg.db_path,
-                    workspace_root=effective_corpus_root,
-                    program=prog,
-                    embedder=emb,
-                    linking_top_k=bench_cfg.linking_top_k,
-                    retrieval_top_k=bench_cfg.retrieval_top_k,
-                    damping=bench_cfg.damping,
-                    synonymy_threshold=bench_cfg.synonymy_threshold,
-                    synonymy_top_k=bench_cfg.synonymy_top_k,
-                    embed_batch_size=bench_cfg.embed_batch_size,
-                    max_context_chars=bench_cfg.max_context_chars,
-                    max_ast_expansion_hops=bench_cfg.max_ast_expansion_hops,
-                    ast_context_hops=bench_cfg.ast_context_hops,
-                )
+            prog, _, bench_engine = self._create_bound_engine(
+                bench_cfg,
+                workspace_root=effective_corpus_root,
+                compiled_program_override=compiled_program or compiled_program_path,
             )
             try:
                 index_batches = bench_engine.index_chunks(chunks)

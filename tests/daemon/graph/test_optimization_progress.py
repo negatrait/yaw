@@ -220,9 +220,10 @@ def test_evaluate_program_uses_canonical_recall_and_gold_matching(tmp_path, monk
         reflection_worker_lm=dummy_lm,
         reflection_token_counter=lambda text: len(text.split()),
     )
-    audit_path = tmp_path / "compiled_graph_rlm_audit.json"
+    audit_path = tmp_path / "compiled_audit.json"
     assert audit_path.exists()
     audit_data = json.loads(audit_path.read_text(encoding="utf-8"))
+    assert set(audit_data.keys()) == {"graph_rlm_stats", "candidate_records", "eval_records", "gepa_progress"}
     assert len(audit_data["eval_records"]) == 1
     rec = audit_data["eval_records"][0]
     # chunk-short (<60 chars prefix) must not match at rank 1, while chunk-cropped matches at rank 2:

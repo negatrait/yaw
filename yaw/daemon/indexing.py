@@ -535,6 +535,25 @@ async def frozen_indexing_app_main(
     )
 
 
+def graph_plan_fingerprints(
+    program: YawProgram,
+    embedder: DSPyEmbeddingAdapter,
+) -> tuple[str, str, str, str]:
+    """Return (program_identity, embedding_identity, synonym_identity, shacl_identity)."""
+    return (
+        openie_fingerprint(program),
+        str(embedder.profile.index_identity),
+        ":".join(
+            (
+                label_judge_fingerprint(program),
+                hierarchy_judge_fingerprint(program),
+                related_judge_fingerprint(program),
+            )
+        ),
+        shacl_fingerprint(program),
+    )
+
+
 def bind_native_indexing(
     engine: YawGraphEngine,
     *,
@@ -544,8 +563,9 @@ def bind_native_indexing(
     """Compose frozen indexing at the daemon boundary; graph code owns no scheduler."""
 
     def execute(chunks: Sequence[tuple[ChunkPointer, str]], program: YawProgram) -> GraphPlanSummary:
-        program_identity = openie_fingerprint(program)
-        embedding_identity = str(engine.embedder.profile.index_identity)
+        program_identity, embedding_identity, synonym_identity, shacl_identity = graph_plan_fingerprints(
+            program, engine.embedder
+        )
         context = coco.ContextProvider()
         context.provide(SOURCE_DB, engine.managed_conn)
         context.provide(GRAPH_DB, engine.managed_conn)
@@ -566,14 +586,8 @@ def bind_native_indexing(
             corpus_root=engine.workspace_root,
             program_identity=program_identity,
             embedding_identity=embedding_identity,
-            synonym_identity=":".join(
-                (
-                    label_judge_fingerprint(program),
-                    hierarchy_judge_fingerprint(program),
-                    related_judge_fingerprint(program),
-                )
-            ),
-            shacl_identity=shacl_fingerprint(program),
+            synonym_identity=synonym_identity,
+            shacl_identity=shacl_identity,
             synonymy_threshold=engine.synonymy_threshold,
             synonymy_top_k=engine.synonymy_top_k,
             ast_context_hops=engine.ast_context_hops,

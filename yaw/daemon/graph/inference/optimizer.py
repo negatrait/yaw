@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import dspy
+from cocoindex.connectorkits.fingerprint import fingerprint_object
 from gepa.core.callbacks import CompositeCallback
 
 from yaw.core import ChunkPointer, YawRuntimeError, compute_mdhash_id, write_text_atomic
@@ -262,8 +263,7 @@ def embed_fingerprint(program: Any, instruction: str = "") -> str:
     else:
         prefix = query_prefix
     payload = {"prefix": prefix}
-    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return fingerprint_object(payload).hex()
 
 
 def shacl_fingerprint(program: YawProgram) -> str:
@@ -281,8 +281,7 @@ def shacl_fingerprint(program: YawProgram) -> str:
     }
     payload["context_budget"] = [program.context_window_tokens, program.max_output_tokens]
     payload["schema_version"] = SCHEMA_VERSION
-    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return fingerprint_object(payload).hex()
 
 
 def openie_fingerprint(program: YawProgram) -> str:
@@ -297,8 +296,7 @@ def openie_fingerprint(program: YawProgram) -> str:
         "context_budget": [program.context_window_tokens, program.max_output_tokens],
         "schema_version": SCHEMA_VERSION,
     }
-    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return fingerprint_object(payload).hex()
 
 
 def extraction_fingerprint(program: YawProgram) -> str:
@@ -323,8 +321,7 @@ def extraction_fingerprint(program: YawProgram) -> str:
         "context_budget": [program.context_window_tokens, program.max_output_tokens],
         "schema_version": SCHEMA_VERSION,
     }
-    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return fingerprint_object(payload).hex()
 
 
 def candidate_fingerprint(program: YawProgram) -> str:
@@ -338,8 +335,7 @@ def candidate_fingerprint(program: YawProgram) -> str:
         "context_budget": [program.context_window_tokens, program.max_output_tokens],
         "schema_version": SCHEMA_VERSION,
     }
-    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    return fingerprint_object(payload).hex()[:16]
 
 
 def query_retrieval_fingerprint(program: YawProgram) -> str:
@@ -351,8 +347,7 @@ def query_retrieval_fingerprint(program: YawProgram) -> str:
         "embedding_fact_prefix": getattr(program, "embedding_fact_prefix", None),
         "context_budget": [program.context_window_tokens, program.max_output_tokens],
     }
-    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    return fingerprint_object(payload).hex()[:16]
 
 
 def _query_qa_fingerprint(program: YawProgram) -> str:
@@ -365,8 +360,7 @@ def _query_qa_fingerprint(program: YawProgram) -> str:
         "embedding_fact_prefix": getattr(program, "embedding_fact_prefix", None),
         "context_budget": [program.context_window_tokens, program.max_output_tokens],
     }
-    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    return fingerprint_object(payload).hex()[:16]
 
 
 def select_pareto_frontier_programs(
@@ -1106,18 +1100,16 @@ def evolve_program_prompts(
             return
         p_inc = Path(save_path)
         p_inc.parent.mkdir(parents=True, exist_ok=True)
-        cand_prog = hooks.last_hook_program() or active_program_ref
         inc_payload = {
             "graph_rlm_stats": dict(hooks.graph_rlm_stats()),
             "candidate_records": _candidate_records(),
             "eval_records": eval_history[-500:],
             "gepa_progress": gepa_progress.snapshot(),
-            **cand_prog.dump_audit_trails(bounded=True, telemetry_key="program_telemetry"),
         }
         # Diagnostic write failures must not change optimization decisions.
         with contextlib.suppress(OSError):
             write_text_atomic(
-                p_inc.parent / f"{p_inc.stem}_graph_rlm_audit.json",
+                p_inc.parent / f"{p_inc.stem}_audit.json",
                 json.dumps(inc_payload, ensure_ascii=False, indent=2),
             )
 
@@ -1662,20 +1654,12 @@ def evolve_program_prompts(
 
     if save_path is not None:
         p = Path(save_path)
-        if proposer.telemetry:
-            telemetry_path = p.parent / f"{p.stem}_proposer_telemetry.json"
-            write_text_atomic(
-                telemetry_path,
-                json.dumps(proposer.telemetry, ensure_ascii=False, indent=2),
-            )
-        audit_path = p.parent / f"{p.stem}_graph_rlm_audit.json"
+        audit_path = p.parent / f"{p.stem}_audit.json"
         audit_payload = {
             "graph_rlm_stats": dict(hooks.graph_rlm_stats()),
             "candidate_records": _candidate_records(),
             "eval_records": eval_history[-500:],
             "gepa_progress": gepa_progress.snapshot(),
-            **compiled.dump_audit_trails(bounded=False, telemetry_key="program_telemetry"),
-            "proposer_simba_telemetry": list(getattr(proposer, "simba_telemetry", ())),
         }
         write_text_atomic(audit_path, json.dumps(audit_payload, ensure_ascii=False, indent=2))
         if valset:

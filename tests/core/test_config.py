@@ -6,7 +6,14 @@ from typing import Any, cast
 
 import pytest
 
-from yaw.core import YawConfig, YawRuntimeError, get_config_value, set_config_value
+from yaw.core import (
+    YawConfig,
+    YawRuntimeError,
+    get_config_value,
+    parse_dataset_list,
+    set_config_value,
+    write_via_temp_atomic,
+)
 
 
 def test_yaw_config_defaults() -> None:
@@ -15,6 +22,7 @@ def test_yaw_config_defaults() -> None:
     assert not hasattr(cfg, "optimize_max_metric_calls")
     assert cfg.optimize_mode == "hybrid"
     assert cfg.retrieval_top_k == 10
+    assert cfg.state_dir is not None and cfg.state_dir.name == "coco_lmdb"
 
 
 def test_yaw_config_validation() -> None:
@@ -25,7 +33,7 @@ def test_yaw_config_validation() -> None:
 
 def test_yaw_config_for_optimization(tmp_path: Path) -> None:
     cfg = YawConfig(workspace_root=tmp_path)
-    opt = cfg.for_optimization("20261016_120000")
+    opt = cfg.for_optimization()
 
     assert opt.corpus_root is not None
     assert opt.db_path is not None
@@ -36,11 +44,11 @@ def test_yaw_config_for_optimization(tmp_path: Path) -> None:
 
     assert opt.corpus_root == cfg.workspace_root
     assert "corpus_optimize_" not in str(opt.corpus_root)
-    assert opt.db_path.name == "yaw_optimize_20261016_120000.db"
-    assert opt.lock_path.name == "yaw_optimize_20261016_120000.db.lock"
-    assert opt.status_path.name == "status_optimize_20261016_120000.json"
-    assert opt.state_dir.name == "coco_state_optimize_20261016_120000"
-    assert opt.compiled_program_path.name == "compiled_program_optimize_20261016_120000.json"
+    assert opt.db_path.name == "optimize_yaw.db"
+    assert opt.lock_path.name == "optimize_yaw.db.lock"
+    assert opt.status_path.name == "optimize_status.json"
+    assert opt.state_dir.name == "coco_lmdb"
+    assert opt.compiled_program_path.name == "optimize_program.json"
     assert opt.poll_interval_seconds == 0.0
 
     # Model and retrieval parameters preserved
@@ -50,26 +58,10 @@ def test_yaw_config_for_optimization(tmp_path: Path) -> None:
     assert opt.optimize_auto == cfg.optimize_auto
 
 
-def test_optimization_latest_is_newest_run_not_largest_or_last_written(tmp_path: Path) -> None:
+def test_optimization_empty_db_override_raises(tmp_path: Path) -> None:
     cfg = YawConfig(workspace_root=tmp_path)
-    old = cfg.for_optimization("20261021_120000")
-    new = cfg.for_optimization("20261022_120000")
-    assert old.db_path is not None and new.db_path is not None
-    old.db_path.parent.mkdir(parents=True)
-    old.db_path.write_bytes(b"old" * 100)
-    new.db_path.write_bytes(b"new")
-    os.utime(old.db_path, (2_000_000_000, 2_000_000_000))
-    os.utime(new.db_path, (1_000_000_000, 1_000_000_000))
-    (old.db_path.parent / "yaw_optimize_z_backup.db").write_bytes(b"backup")
-    assert cfg.for_optimization(db_override="latest") == new
-    assert cfg.for_optimization(db_override=new.db_path) == new
-
-
-def test_optimization_resume_missing_database_never_creates_a_run(tmp_path: Path) -> None:
-    cfg = YawConfig(workspace_root=tmp_path)
-    for selected in ("latest", "missing.db"):
-        with pytest.raises(YawRuntimeError, match="No optimization run|does not exist"):
-            cfg.for_optimization(db_override=selected)
+    with pytest.raises(YawRuntimeError, match="cannot be empty"):
+        cfg.for_optimization(db_override="   ")
     assert not (tmp_path / ".yaw").exists()
 
 
@@ -79,10 +71,27 @@ def test_optimization_custom_database_has_stable_paths(tmp_path: Path) -> None:
     database.parent.mkdir()
     database.touch()
     first = cfg.for_optimization(db_override="custom/experiment.db")
-    second = cfg.for_optimization("20300101_000000", db_override=database)
+    second = cfg.for_optimization(db_override=database)
     assert first == second
     assert first.lock_path == database.with_suffix(".db.lock")
-    assert first.compiled_program_path == (database.parent / "compiled_program_optimize_experiment.json")
+    assert first.status_path == (database.parent / "optimize_status_experiment.json")
+    assert first.state_dir == (database.parent / "coco_lmdb")
+    assert first.compiled_program_path == (database.parent / "optimize_program_experiment.json")
+
+
+def test_parse_dataset_list() -> None:
+    assert parse_dataset_list(None) == []
+    assert parse_dataset_list("") == []
+    assert parse_dataset_list("popqa, 2wikimultihopqa , , hotpotqa") == [
+        "popqa",
+        "2wikimultihopqa",
+        "hotpotqa",
+    ]
+    assert parse_dataset_list(["popqa,musique", " hotpotqa "]) == [
+        "popqa",
+        "musique",
+        "hotpotqa",
+    ]
 
 
 def test_yaw_config_for_benchmark(tmp_path: Path) -> None:
@@ -179,7 +188,6 @@ def test_yaw_config_json_keys_and_patterns(tmp_path: Path) -> None:
 
 
 def test_default_patterns_and_write_text_atomic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    import os
 
     from yaw.core import (
         DEFAULT_EXCLUDED_PATTERNS,
@@ -198,7 +206,9 @@ def test_default_patterns_and_write_text_atomic(tmp_path: Path, monkeypatch: pyt
     assert target.read_text(encoding="utf-8") == '{"status": "ok"}\n'
     write_text_atomic(str(target), '{"status": "updated"}\n', retries=2)
     assert target.read_text(encoding="utf-8") == '{"status": "updated"}\n'
-    assert not list(target.parent.glob("*.tmp"))
+    write_via_temp_atomic(target, lambda tmp: tmp.write_bytes(b'{"status": "via_fn"}\n'))
+    assert target.read_text(encoding="utf-8") == '{"status": "via_fn"}\n'
+    assert not list(target.parent.glob(".*tmp*"))
 
     real_replace = os.replace
     attempts = 0
@@ -219,6 +229,7 @@ def test_default_patterns_and_write_text_atomic(tmp_path: Path, monkeypatch: pyt
         raise PermissionError("Simulated persistent Windows file lock")
 
     monkeypatch.setattr(os, "replace", always_locked_replace)
-    write_text_atomic(target, '{"status": "fallback"}\n', retries=2)
-    assert target.read_text(encoding="utf-8") == '{"status": "fallback"}\n'
-    assert not list(target.parent.glob("*.tmp"))
+    with pytest.raises(PermissionError, match="Simulated persistent Windows file lock"):
+        write_text_atomic(target, '{"status": "fallback"}\n', retries=2)
+    assert target.read_text(encoding="utf-8") == '{"status": "recovered"}\n'
+    assert not list(target.parent.glob(".*tmp*"))

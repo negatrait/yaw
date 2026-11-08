@@ -22,9 +22,8 @@ uv run yaw graph rebuild
 uv run yaw graph lint
 uv run yaw graph lint --turtle
 uv run yaw dspy optimize
-uv run --locked yaw dspy optimize --resume
-uv run --locked yaw dspy optimize --db-path latest
-uv run yaw dspy load-program .yaw/compiled_program_optimize_<datestamp>.json
+uv run --locked yaw dspy optimize --fresh
+uv run yaw dspy load-program .yaw/optimize_program.json
 uv run yaw dspy benchmark --gate benchmark_gate.json
 uv run yaw config get optimization.auto
 uv run yaw config set optimization.auto heavy
@@ -47,8 +46,9 @@ answers or categories. Enterprise's deterministic 150/100 split is selected by
 the loader.
 
 This development refactor requires fresh prepared bundles and indexes. After
-preparation, `uv run --locked yaw dspy optimize` starts a new sandbox; use
-`--resume` only for a run created with this document layout. Normal scans retain
+preparation, `uv run --locked yaw dspy optimize` resumes or initializes the
+canonical `.yaw/optimize_yaw.db` sandbox by default; pass `--fresh` to wipe prior
+`.yaw/optimize_*` state and start from scratch. Normal scans retain
 CocoIndex state, and complete snapshots include unchanged memoized documents.
 Production JSON key projection remains configurable. Unsafe source spans and
 malformed inputs fail explicitly rather than being repaired or silently skipped.
@@ -65,13 +65,18 @@ Ruff fixes and pytest `--testmon` are project defaults. ty's `--fix` has no
 persistent configuration setting; `uv run typecheck` supplies it automatically.
 See the [coverage plan](docs/coverage-plan.md) for remaining verification work.
 
-Optimization starts a fresh timestamped sandbox unless `--resume` or `--db-path`
-selects an existing run. `--resume` and `--db-path latest` select
-the newest run by its filename timestamp, regardless of database size or later
-writes to older runs. They restore the saved dataset slice, optimization options,
-custom output path, seed program, and GEPA checkpoint. A specific existing database
-can be selected with `--resume --db-path .yaw/yaw_optimize_<datestamp>.db`.
-Missing runs fail instead of silently starting over; an active run retains its
+Optimization uses the canonical `.yaw/optimize_yaw.db` sandbox and resumes by
+default so databases are never wiped accidentally (`--resume` and timestamped
+`*_optimize_<datestamp>*` sandboxes are retired). If `.yaw/optimize_yaw.db`
+exists, `uv run yaw dspy optimize` restores the saved dataset slice,
+optimization options, output path (`.yaw/optimize_program.json` plus
+`.yaw/optimize_program_audit.json`, `.yaw/optimize_program_eval.json`,
+`.yaw/optimize_program_pools.json`, and `.yaw/optimize_program_telemetry/`),
+seed program, and GEPA checkpoint; if `.yaw/optimize_yaw.db` does not exist yet,
+it initializes a new run. Pass `--fresh` to wipe `.yaw/optimize_yaw.db` and
+`.yaw/optimize_*` sidecars intentionally (while preserving shared
+`.yaw/coco_lmdb`, `.yaw/optimize_coco/`, and `.yaw/dspy_cache`). A custom
+database path can be selected with `--db-path <path>`. An active run retains its
 writer lock.
 
 Resume validates ordered training/validation data and corpus contents, inference

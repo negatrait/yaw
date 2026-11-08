@@ -40,12 +40,12 @@ def test_status_reads_only_held_optimizer_locks_and_merges_durable_progress(tmp_
     config = configured_workspace(tmp_path)
     assert config.lock_path is not None and config.status_path is not None
     folder = config.lock_path.parent
-    free = FileLock(str(folder / "yaw_optimize_unused.db.lock"))
+    free = FileLock(str(folder / "optimize_yaw_unused.db.lock"))
     with free:
         pass
     seed_openie(config.db_path, 2)
-    seed_openie(folder / "yaw_optimize_test.db", 3)
-    (folder / "status_optimize_test.json").write_text(
+    seed_openie(folder / "optimize_yaw_test.db", 3)
+    (folder / "optimize_status_test.json").write_text(
         json.dumps(
             {
                 "status": {"active_op": "reflecting"},
@@ -54,7 +54,7 @@ def test_status_reads_only_held_optimizer_locks_and_merges_durable_progress(tmp_
         ),
         encoding="utf-8",
     )
-    with FileLock(str(folder / "yaw_optimize_test.db.lock")):
+    with FileLock(str(folder / "optimize_yaw_test.db.lock")):
         stopped = inspect_status(config)
         assert stopped["status"]["lifecycle"] == "stopped"
         assert stopped["active_optimization"]["datestamp"] == "test"
@@ -92,8 +92,8 @@ def test_status_survives_corrupt_optional_status_and_database_files(tmp_path, co
     assert config.lock_path is not None and config.db_path is not None and config.status_path is not None
     config.db_path.write_bytes(b"not SQLite")
     config.status_path.write_text(content, encoding="utf-8")
-    with FileLock(str(config.lock_path)), FileLock(str(config.lock_path.parent / "yaw_optimize_broken.db.lock")):
-        (config.lock_path.parent / "status_optimize_broken.json").write_text(content, encoding="utf-8")
+    with FileLock(str(config.lock_path)), FileLock(str(config.lock_path.parent / "optimize_yaw_broken.db.lock")):
+        (config.lock_path.parent / "optimize_status_broken.json").write_text(content, encoding="utf-8")
         status = inspect_status(config)
     assert status["status"]["lifecycle"] == "ready"
     assert status["active_optimization"]["active_op"] == "optimizing"
@@ -251,9 +251,9 @@ def test_detached_empty_daemon_starts_and_stops_without_leaking_process_handles(
                 continue
 
 
-def test_graph_lint_db_path_latest_and_active_optimization_status_counts(tmp_path, capsys):
+def test_graph_lint_db_path_and_active_optimization_status_counts(tmp_path, capsys):
     config = configured_workspace(tmp_path)
-    opt_cfg = config.for_optimization(datestamp="20261107_120000")
+    opt_cfg = config.for_optimization()
     assert opt_cfg.db_path is not None and opt_cfg.lock_path is not None
     seed_openie(opt_cfg.db_path, 3)
     with closing(open_yaw_db(opt_cfg.db_path)) as conn:
@@ -264,7 +264,7 @@ def test_graph_lint_db_path_latest_and_active_optimization_status_counts(tmp_pat
         )
         conn.commit()
 
-    assert handle_graph_lint(config, db_path="latest") == 0
+    assert handle_graph_lint(config, db_path=opt_cfg.db_path) == 0
     lint_out = json.loads(capsys.readouterr().out)
     assert lint_out["conforms"] is True
     assert lint_out["db_path"] == str(opt_cfg.db_path.resolve())
@@ -275,6 +275,7 @@ def test_graph_lint_db_path_latest_and_active_optimization_status_counts(tmp_pat
     with FileLock(str(opt_cfg.lock_path)):
         status_out = inspect_status(config)
     assert status_out["active_optimization"]["active"] is True
+    assert status_out["active_optimization"]["datestamp"] == "canonical"
     assert status_out["active_optimization"]["entities"] == 1
     assert status_out["active_optimization"]["openie_checkpoints"] == 3
 

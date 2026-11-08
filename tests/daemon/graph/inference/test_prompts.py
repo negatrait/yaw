@@ -2335,8 +2335,8 @@ no frequency penalty."""
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_p = Path(tmpdir)
-            src_prog_file = tmp_p / "compiled_program_optimize_run.json"
-            src_telem_dir = tmp_p / "compiled_program_optimize_run_telemetry"
+            src_prog_file = tmp_p / "optimize_program_run.json"
+            src_telem_dir = tmp_p / "optimize_program_run_telemetry"
             src_telem_dir.mkdir(parents=True, exist_ok=True)
             cand0.save(str(src_prog_file), save_program=False)
             for idx, sib in enumerate(selected[1:], start=1):

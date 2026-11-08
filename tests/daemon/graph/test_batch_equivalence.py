@@ -373,6 +373,127 @@ def test_reverse_top_k_asymmetric_candidate_completeness_64_plus_64_equals_128(t
     assert_same_graph(results["incremental"], results["reference"])
 
 
+def test_passive_endpoint_homograph_preserves_edges_and_facts_across_batches(tmp_path, provider):
+    """Verify passive-endpoint homographs in load_affected_neighborhood preserve edges and facts (CG-OPT-2)."""
+
+    url, state = provider
+    state["delay"] = 0
+    state["relation"] = "skos:related"
+
+    def homograph_passive_vector(text: str) -> list[float]:
+        t = text.casefold()
+        if "horizontal row of seating" in t or "tier located in stadium" in t:
+            return [1.0, 0.0, 0.0, 0.0]
+        if "pricing level in a software" in t or "tier governs subscription" in t or "tier targets enterprise" in t:
+            return [0.0, 1.0, 0.0, 0.0]
+        if "corporate organization" in t:
+            return [0.0, -1.0, 0.0, 0.0]
+        if "sports arena" in t:
+            return [0.0, 0.0, 1.0, 0.0]
+        if "recurring software licensing" in t:
+            return [0.0, 0.0, 0.0, 1.0]
+        return [0.0, 0.0, 1.0, 0.0]
+
+    state["embedding_vector"] = homograph_passive_vector
+
+    c0_text = "Batch1 A: Tier is located in Stadium."
+    c1_text = "Batch1 B: Tier governs Subscription and Tier targets Enterprise."
+    c2_text = "Batch2 C: Stadium offers Subscription."
+
+    state["extractions"] = {
+        c0_text: {
+            "named_entities": [
+                ["Tier", "A horizontal row of seating in a stadium."],
+                ["Stadium", "A sports arena with tiered seating."],
+            ],
+            "triples": [
+                {
+                    "sub": "Tier",
+                    "pred": ["located in", "owl:ObjectProperty"],
+                    "obj": "Stadium",
+                    "def": "Tier is located in Stadium.",
+                }
+            ],
+        },
+        c1_text: {
+            "named_entities": [
+                ["Tier", "A pricing level in a software subscription model."],
+                ["Subscription", "A recurring software licensing model."],
+                ["Enterprise", "A large corporate organization."],
+            ],
+            "triples": [
+                {
+                    "sub": "Tier",
+                    "pred": ["governs", "owl:ObjectProperty"],
+                    "obj": "Subscription",
+                    "def": "Tier governs Subscription.",
+                },
+                {
+                    "sub": "Tier",
+                    "pred": ["targets", "owl:ObjectProperty"],
+                    "obj": "Enterprise",
+                    "def": "Tier targets Enterprise.",
+                },
+            ],
+        },
+        c2_text: {
+            "named_entities": [
+                ["Stadium", "A sports arena with tiered seating."],
+                ["Subscription", "A recurring software licensing model."],
+            ],
+            "triples": [
+                {
+                    "sub": "Stadium",
+                    "pred": ["offers", "owl:ObjectProperty"],
+                    "obj": "Subscription",
+                    "def": "Stadium offers Subscription.",
+                }
+            ],
+        },
+    }
+
+    chunks = [
+        (ChunkPointer("p000", "passive.md", 1, 1), c0_text),
+        (ChunkPointer("p001", "passive.md", 2, 2), c1_text),
+        (ChunkPointer("p002", "passive.md", 3, 3), c2_text),
+    ]
+    (tmp_path / "passive.md").write_text("\n".join(t for _, t in chunks) + "\n", encoding="utf-8")
+
+    results = {}
+
+    def make_engine(arm: str, batch_size: int) -> YawGraphEngine:
+        lm = create_dspy_lm("overlap", base_url=url + "/v1", cache=False, max_tokens=512)
+        program = YawProgram(orchestrator_lm=lm, rlm_sub_lm=lm, enable_gbnf=False, max_output_tokens=512)
+        return bind_native_indexing(
+            YawGraphEngine(
+                tmp_path / f"passive_{arm}" / "yaw.db",
+                tmp_path,
+                program,
+                adapter(url),
+                synonymy_threshold=0.80,
+                synonymy_top_k=5,
+            ),
+            batch_size=batch_size,
+        )
+
+    for arm, batch_size in (("incremental", 2), ("reference", 4)):
+        engine = make_engine(arm, batch_size)
+        try:
+            if arm == "incremental":
+                engine.index_chunks(chunks[:2])
+                assert engine.lint_graph()["conforms"]
+                assert engine.conn.execute("SELECT COUNT(*) FROM entities WHERE name = 'Tier'").fetchone()[0] == 2
+            engine.index_chunks(chunks)
+            assert engine.lint_graph()["conforms"]
+            assert engine.conn.execute("SELECT COUNT(*) FROM entities WHERE name = 'Tier'").fetchone()[0] == 2
+            assert engine.conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 4
+            results[arm] = canonical_graph(engine.conn)
+        finally:
+            engine.close()
+
+    assert_same_graph(results["incremental"], results["reference"])
+
+
 def test_g5_g6_paired_64_plus_64_vs_128_acceptance_report(tmp_path, provider):
     """Run N=20 paired fixed-evidence trials (10 cold + 10 warm Stage-1) and emit g5_g6_acceptance.json (G5-G6)."""
     import asyncio

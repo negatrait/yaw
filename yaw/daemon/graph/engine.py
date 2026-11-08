@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import logging
 import sqlite3
 import threading
 import time
@@ -78,6 +79,8 @@ from yaw.daemon.graph.storage import (
     serialize_graph_turtle,
     set_meta,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class YawGraphEngine:
@@ -936,6 +939,7 @@ class YawGraphEngine:
 
     def emit_indexing_progress(self, message: str) -> None:
         """Emit a sub-stage progress update during indexing or graph publication."""
+        logger.info("%s", message)
         if self._active_progress_callback is not None:
             self._active_progress_callback(message)
 

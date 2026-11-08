@@ -374,7 +374,11 @@ def resolve_coco_state_root(state_dir: Path | str) -> Path:
     resolved = Path(state_dir).resolve()
     if resolved.name == "coco_lmdb":
         return resolved
-    if resolved.suffix in {".db", ".sqlite", ".sqlite3"} or resolved.is_file():
+    if (
+        resolved.name.startswith("coco_state")
+        or resolved.suffix in {".db", ".sqlite", ".sqlite3"}
+        or resolved.is_file()
+    ):
         return resolved.parent / "coco_lmdb"
     return resolved / "coco_lmdb"
 

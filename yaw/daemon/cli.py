@@ -12,7 +12,9 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import logging
 import os
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -33,6 +35,7 @@ from yaw.core import (
     YawRuntimeError,
     get_config_value,
     load_config,
+    parse_dataset_list,
     set_config_value,
     write_text_atomic,
 )
@@ -46,6 +49,8 @@ from yaw.daemon.graph.storage import (
 )
 from yaw.daemon.ingestion import load_dataset_splits, resolve_dataset_bundle
 from yaw.daemon.runtime import YawRuntime, is_file_locked
+
+logger = logging.getLogger(__name__)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -239,12 +244,15 @@ def build_parser() -> argparse.ArgumentParser:
         dest="db_path",
         type=str,
         default=None,
-        help="Resume an existing sandbox database; 'latest' selects the newest run by timestamp",
+        help="Override sandbox database path (default: .yaw/optimize_yaw.db)",
     )
     p_opt.add_argument(
-        "--resume",
+        "--fresh",
         action="store_true",
-        help="Resume the newest optimization run (or the run selected by --db-path)",
+        help=(
+            "Wipe existing optimize_yaw.db and optimize_* sidecars before starting from scratch "
+            "(default: resume existing run)"
+        ),
     )
 
     p_load = dspy_subs.add_parser(
@@ -380,22 +388,33 @@ def _nonnegative_status_count(value: Any, fallback: int = 0) -> int:
     return value if type(value) is int and value >= 0 else fallback
 
 
+def _read_db_summary(conn: sqlite3.Connection) -> tuple[int, int, int, int, int, int, list[Any]]:
+    chunks, entities, facts, edges, openie = get_graph_counts(conn)
+    entity_labels = 0
+    violations: list[Any] = []
+    with contextlib.suppress(sqlite3.Error):
+        row = conn.execute("SELECT COUNT(*) FROM entity_labels").fetchone()
+        entity_labels = int(row[0]) if row else 0
+        violations = lint_graph_shacl(conn)
+    return chunks, entities, facts, edges, openie, entity_labels, violations
+
+
 def _inspect_active_optimization(config: YawConfig) -> dict[str, Any] | None:
-    """Detect if any sandbox yaw_optimize_*.db.lock is currently locked and read its live progress."""
+    """Detect if any sandbox optimize_yaw*.db.lock is currently locked and read its live progress."""
     if not config.lock_path:
         return None
     base_dir = config.lock_path.parent
     if not base_dir.exists():
         return None
 
-    for lock_file in base_dir.glob("yaw_optimize_*.db.lock"):
-        if is_file_locked(lock_file):
+    lock_candidates = [base_dir / "optimize_yaw.db.lock", *sorted(base_dir.glob("optimize_yaw_*.db.lock"))]
+    for lock_file in dict.fromkeys(lock_candidates):
+        if lock_file.exists() and is_file_locked(lock_file):
             raw_name = lock_file.name
-            # Format: yaw_optimize_<datestamp>.db.lock
             stem = raw_name.removesuffix(".lock").removesuffix(".db")
-            ds = stem.removeprefix("yaw_optimize_")
-            status_file = base_dir / f"status_optimize_{ds}.json"
-            opt_db = base_dir / f"yaw_optimize_{ds}.db"
+            suffix = stem.removeprefix("optimize_yaw").removeprefix("yaw_optimize").lstrip("_")
+            status_file = base_dir / (f"optimize_status_{suffix}.json" if suffix else "optimize_status.json")
+            opt_db = base_dir / f"{stem}.db"
 
             opt_chunks = opt_entities = opt_facts = opt_edges = openie = 0
             if opt_db.exists():
@@ -403,7 +422,7 @@ def _inspect_active_optimization(config: YawConfig) -> dict[str, Any] | None:
                     contextlib.suppress(sqlite3.Error),
                     contextlib.closing(open_readonly_yaw_db(opt_db, timeout=1.0)) as conn,
                 ):
-                    opt_chunks, opt_entities, opt_facts, opt_edges, openie = get_graph_counts(conn)
+                    opt_chunks, opt_entities, opt_facts, opt_edges, openie, _, _ = _read_db_summary(conn)
 
             snap: dict[str, Any] = {}
             if status_file.exists():
@@ -424,7 +443,7 @@ def _inspect_active_optimization(config: YawConfig) -> dict[str, Any] | None:
 
             return {
                 "active": True,
-                "datestamp": ds,
+                "datestamp": suffix or "canonical",
                 "sandbox_db": str(opt_db),
                 "chunks": max(opt_chunks, _nonnegative_status_count(stats.get("chunks"))),
                 "entities": max(opt_entities, _nonnegative_status_count(stats.get("entities"))),
@@ -447,11 +466,8 @@ def inspect_status(config: YawConfig) -> dict[str, Any]:
             contextlib.suppress(sqlite3.Error),
             contextlib.closing(open_readonly_yaw_db(config.db_path, timeout=1.0)) as conn,
         ):
-            chunks, entities, facts, edges, openie = get_graph_counts(conn)
-            with contextlib.suppress(sqlite3.Error):
-                row = conn.execute("SELECT COUNT(*) FROM entity_labels").fetchone()
-                entity_labels = int(row[0]) if row else 0
-                shacl_conforms = len(lint_graph_shacl(conn)) == 0
+            chunks, entities, facts, edges, openie, entity_labels, violations = _read_db_summary(conn)
+            shacl_conforms = len(violations) == 0
 
     opt_info = _inspect_active_optimization(config)
 
@@ -748,7 +764,7 @@ def handle_graph_lint(
         conn = open_yaw_db(":memory:")
 
     try:
-        violations = lint_graph_shacl(conn)
+        chunks, entities, facts, edges, openie, entity_labels, violations = _read_db_summary(conn)
 
         if as_turtle:
             ttl = serialize_graph_turtle(conn, violations=violations)
@@ -756,9 +772,6 @@ def handle_graph_lint(
                 ttl += "\n"
             sys.stdout.write(ttl)
         else:
-            chunks, entities, facts, edges, openie = get_graph_counts(conn)
-            label_row = conn.execute("SELECT COUNT(*) FROM entity_labels").fetchone()
-            entity_labels = int(label_row[0]) if label_row else 0
             edge_counts = {
                 str(r[0]): int(r[1])
                 for r in conn.execute("SELECT kind, COUNT(*) FROM edges GROUP BY kind ORDER BY kind").fetchall()
@@ -791,6 +804,43 @@ def handle_graph_lint(
         conn.close()
 
 
+def _clean_optimization_artifacts(opt_config: YawConfig, out_override: str | None = None) -> None:
+    """Wipe canonical optimization SQLite DB and sidecar artifacts (preserving coco_lmdb)."""
+    assert opt_config.db_path is not None
+    assert opt_config.lock_path is not None
+    assert opt_config.status_path is not None
+    assert opt_config.compiled_program_path is not None
+    if is_file_locked(Path(opt_config.lock_path)):
+        raise YawRuntimeError(
+            "LOCK_CONFLICT",
+            f"Optimization database is currently locked: {opt_config.db_path}",
+        )
+    db_p = Path(opt_config.db_path)
+    base_dir = db_p.parent
+    suffix = db_p.stem.removeprefix("optimize_yaw").removeprefix("yaw_optimize").lstrip("_")
+    for ext in ("", "-wal", "-shm", ".lock"):
+        Path(str(db_p) + ext).unlink(missing_ok=True)
+    Path(opt_config.status_path).unlink(missing_ok=True)
+    telemetry_file = base_dir / (f"optimize_telemetry_{suffix}.json" if suffix else "optimize_telemetry.json")
+    telemetry_file.unlink(missing_ok=True)
+    frame_dir = base_dir / (f"optimize_kg_frames_{suffix}" if suffix else "optimize_kg_frames")
+    shutil.rmtree(frame_dir, ignore_errors=True)
+    out_path = Path(out_override).resolve() if out_override else Path(opt_config.compiled_program_path)
+    stem = out_path.stem
+    parent = out_path.parent
+    for candidate in (
+        out_path,
+        parent / f"{stem}_audit.json",
+        parent / f"{stem}_eval.json",
+        parent / f"{stem}_pools.json",
+        parent / f"{stem}_pareto_manifest.json",
+    ):
+        candidate.unlink(missing_ok=True)
+    for member in parent.glob(f"{stem}_pareto_*.json"):
+        member.unlink(missing_ok=True)
+    shutil.rmtree(parent / f"{stem}_telemetry", ignore_errors=True)
+
+
 def handle_dspy_optimize(
     config: YawConfig,
     args: argparse.Namespace,
@@ -800,14 +850,15 @@ def handle_dspy_optimize(
 ) -> int:
     """Compile DSPy prompts in an isolated sandbox and save candidate JSON."""
     raw_db = getattr(args, "db_path", None)
-    if getattr(args, "resume", False) and raw_db is None:
-        raw_db = "latest"
+    fresh = bool(getattr(args, "fresh", False))
     opt_config = config.for_optimization(db_override=raw_db)
     out_override = getattr(args, "output", None)
-    if raw_db is not None:
-        # Read metadata before loading datasets, so bare --resume can recover
+    assert opt_config.db_path is not None
+    if fresh:
+        _clean_optimization_artifacts(opt_config, out_override)
+    elif opt_config.db_path.is_file() and opt_config.db_path.stat().st_size > 0:
+        # Read metadata before loading datasets, so default resume recovers
         # the original slice and budget even when they were CLI overrides.
-        assert opt_config.db_path is not None
         with contextlib.closing(open_readonly_yaw_db(opt_config.db_path, timeout=5.0)) as conn:
             row = conn.execute("SELECT value FROM meta WHERE key = 'optimization_run'").fetchone()
         if row is not None:
@@ -819,23 +870,13 @@ def handle_dspy_optimize(
             for key, value in saved_run.get("cli_options", {}).items():
                 if getattr(args, key, None) is None:
                     setattr(args, key, value)
-        print(
-            f"[yaw optimize] Resuming {opt_config.db_path}; output={out_override or opt_config.compiled_program_path}",
-            file=sys.stderr,
-            flush=True,
-        )
+        logger.info("Resuming optimization run from %s", opt_config.db_path)
+
     raw_dataset = getattr(args, "dataset", None)
     if raw_dataset is not None:
-        if isinstance(raw_dataset, str):
-            dataset_args = [p.strip() for p in raw_dataset.split(",") if p.strip()]
-        elif isinstance(raw_dataset, (list, tuple)):
-            dataset_args = []
-            for item in raw_dataset:
-                for sub in str(item).split(","):
-                    if sub.strip():
-                        dataset_args.append(sub.strip())
-        else:
-            dataset_args = [str(raw_dataset)]
+        dataset_args = parse_dataset_list(
+            raw_dataset if isinstance(raw_dataset, (str, Sequence)) else [str(raw_dataset)]
+        )
     elif config.optimize_datasets:
         dataset_args = list(config.optimize_datasets)
     else:
@@ -891,9 +932,6 @@ def handle_dspy_optimize(
     runtime = YawRuntime(opt_config, program=program, embedder=embedder, auto_poll=False)
     runtime.start(sync_on_start=False)
 
-    def _cli_progress(msg: str) -> None:
-        print(f"[yaw optimize] {msg}", file=sys.stderr, flush=True)
-
     try:
         saved_path = runtime.optimize(
             trainset=trainset,
@@ -908,7 +946,6 @@ def handle_dspy_optimize(
             max_labeled_demos=max_labeled_demos,
             corpus_docs=corpus_docs,
             dataset_bundles=dataset_bundles,
-            progress_callback=_cli_progress,
             run_options={
                 "dataset": dataset_args,
                 "max_queries": max_queries,
@@ -923,9 +960,7 @@ def handle_dspy_optimize(
                 "max_labeled_demos": max_labeled_demos,
             },
         )
-        print(file=sys.stderr)  # Move to next line before JSON output
-        proposer_telemetry = saved_path.parent / f"{saved_path.stem}_proposer_telemetry.json"
-        graph_rlm_audit = saved_path.parent / f"{saved_path.stem}_graph_rlm_audit.json"
+        graph_rlm_audit = saved_path.parent / f"{saved_path.stem}_audit.json"
         gepa_telemetry_dir = saved_path.parent / f"{saved_path.stem}_telemetry"
         val_eval_file = saved_path.parent / f"{saved_path.stem}_eval.json"
         eval_summary: dict[str, Any] | None = None
@@ -960,7 +995,6 @@ def handle_dspy_optimize(
             "val_eval_path": str(val_eval_file) if val_eval_file.exists() else None,
             "eval_summary": eval_summary,
             "sandbox_db_path": str(opt_config.db_path),
-            "proposer_telemetry_path": (str(proposer_telemetry) if proposer_telemetry.exists() else None),
             "graph_rlm_audit_path": (str(graph_rlm_audit) if graph_rlm_audit.exists() else None),
             "gepa_telemetry_dir": (str(gepa_telemetry_dir) if gepa_telemetry_dir.exists() else None),
             "stats": runtime.stats().to_dict(),

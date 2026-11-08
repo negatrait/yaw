@@ -37,12 +37,14 @@ _PUBLIC_API: dict[str, str] = {
     "configure_logging": ".logger",
     "detect_scalar_literal": ".types",
     "get_config_value": ".config",
+    "get_logger": ".logger",
     "inclusive_end_line": ".types",
     "is_irreflexive_statement": ".types",
     "is_resource_label": ".types",
     "is_scalar_label": ".types",
     "json_document_fields": ".types",
     "load_config": ".config",
+    "parse_dataset_list": ".config",
     "pool_confidences": ".types",
     "resolve_corpus_path": ".types",
     "render_document_text": ".types",
@@ -50,6 +52,7 @@ _PUBLIC_API: dict[str, str] = {
     "text_processing": ".types",
     "to_rel_posix_path": ".types",
     "write_text_atomic": ".config",
+    "write_via_temp_atomic": ".config",
 }
 
 __all__ = sorted(_PUBLIC_API.keys())

@@ -2376,11 +2376,11 @@ def test_evolve_prompts_real_unmocked_gepa_and_miprov2_with_context_limit_guard(
         for task_program in (compiled, restored):
             for name, predictor in task_program.named_predictors():
                 assert not predictor.demos, f"Zero-shot task predictor {name} retained demos"
-        telemetry_path = tmp_path / "real_compiled_proposer_telemetry.json"
-        assert telemetry_path.exists()
-        telemetry_data = json.loads(telemetry_path.read_text(encoding="utf-8"))
-        assert len(telemetry_data) >= 1
-        assert all(entry.get("mode") == "evidence_native" for entry in telemetry_data)
+        audit_path = tmp_path / "real_compiled_audit.json"
+        assert audit_path.exists()
+        audit_data = json.loads(audit_path.read_text(encoding="utf-8"))
+        assert set(audit_data.keys()) == {"graph_rlm_stats", "candidate_records", "eval_records", "gepa_progress"}
+        assert len(audit_data["eval_records"]) >= 1
     finally:
         engine.close()
 

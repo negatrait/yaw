@@ -1,12 +1,12 @@
 """Recent diagnostic records, separate from DSPy's optimization traces and usage."""
 
 import functools
-import hashlib
 import json
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 import dspy
+from cocoindex.connectorkits.fingerprint import fingerprint_object
 
 
 class DiagnosticHistory(list):
@@ -104,8 +104,7 @@ def judge_stage_fingerprint(
         getattr(program, "max_output_tokens", 1024),
     ]
     payload["schema_version"] = "skos-shacl-v3"
-    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return fingerprint_object(payload).hex()
 
 
 def label_judge_fingerprint(program: Any) -> str:

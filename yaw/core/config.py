@@ -6,7 +6,8 @@ import json
 import os
 import time
 import tomllib
-from dataclasses import dataclass, field, fields
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -73,26 +74,55 @@ DEFAULT_INCLUDED_PATTERNS: tuple[str, ...] = (
 DEFAULT_EXCLUDED_PATTERNS: tuple[str, ...] = (".*", "*/.*", "__pycache__/*")
 
 
-def write_text_atomic(path: Path | str, content: str, *, retries: int = 6, newline: str | None = None) -> None:
-    """Atomically write UTF-8 text via a sibling temporary file with Windows PermissionError backoff."""
+def write_via_temp_atomic(
+    path: Path | str,
+    write_fn: Callable[[Path], Any],
+    *,
+    retries: int = 6,
+) -> None:
+    """Write via a sibling temporary file and atomically replace target."""
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_name(f".{target.name}.{os.getpid()}_{time.time_ns()}.tmp")
+    suffix = target.suffix or ".tmp"
+    tmp = target.with_name(f".{target.stem}.{os.getpid()}.{time.time_ns()}{suffix}")
     max_attempts = max(1, int(retries))
     try:
-        tmp.write_text(content, encoding="utf-8", newline=newline)
+        write_fn(tmp)
         for attempt in range(max_attempts):
             try:
-                os.replace(tmp, target)
+                tmp.replace(target)
                 return
             except PermissionError:
                 if attempt == max_attempts - 1:
-                    target.write_text(content, encoding="utf-8")
-                    return
+                    raise
                 time.sleep(0.01 * (2**attempt))
     finally:
         with contextlib.suppress(OSError):
             tmp.unlink(missing_ok=True)
+
+
+def write_text_atomic(
+    path: Path | str,
+    content: str,
+    *,
+    encoding: str = "utf-8",
+    retries: int = 6,
+    newline: str | None = None,
+) -> None:
+    """Atomically write UTF-8 text via a sibling temporary file with Windows PermissionError backoff."""
+    write_via_temp_atomic(
+        path,
+        lambda tmp: tmp.write_text(content, encoding=encoding, newline=newline),
+        retries=retries,
+    )
+
+
+def parse_dataset_list(raw: str | Sequence[str] | None) -> list[str]:
+    """Normalize a string or sequence of comma-separated dataset names."""
+    if raw is None:
+        return []
+    items = [raw] if isinstance(raw, str) else list(raw)
+    return [part.strip() for item in items for part in str(item).split(",") if part.strip()]
 
 
 def scale_context_budget(base_budget: int, context_tokens: int) -> int:
@@ -117,7 +147,7 @@ _DEFAULT_RELATIVE_PATHS: dict[str, str] = {
     "corpus_root": "corpus",
     "db_path": ".yaw/yaw.db",
     "lock_path": ".yaw/yaw.db.lock",
-    "state_dir": ".yaw/coco_state",
+    "state_dir": ".yaw/coco_lmdb",
     "log_path": ".yaw/yaw.log",
     "status_path": ".yaw/status.json",
     "compiled_program_path": ".yaw/compiled_program.json",
@@ -291,69 +321,32 @@ class YawConfig:
 
     def for_optimization(
         self,
-        datestamp: str | None = None,
         db_override: Path | str | None = None,
     ) -> YawConfig:
-        """Derive an isolated configuration for prompt optimization using *_optimize_<datestamp>.* paths."""
-        import re
-        from datetime import UTC, datetime
-
+        """Derive an isolated configuration for prompt optimization."""
         base_db = Path(self.db_path) if self.db_path else Path(".yaw/yaw.db")
         base_dir = base_db.parent
 
         if db_override is not None:
             raw_path = str(db_override).strip()
-            if raw_path.lower() == "latest":
-                candidates = sorted(
-                    base_dir.glob("yaw_optimize_*.db"),
-                    # Run creation time is encoded in the name. Writes to an older
-                    # run must not make it newer than a subsequently created run.
-                    key=lambda p: p.name,
-                    reverse=True,
-                )
-                candidates = [
-                    p for p in candidates if p.is_file() and re.fullmatch(r"yaw_optimize_\d{8}_\d{6}\.db", p.name)
-                ]
-                if not candidates:
-                    raise YawRuntimeError("INVALID_INPUT", "No optimization run exists to resume.")
-                opt_db = candidates[0]
-            else:
-                opt_db = _resolve_path(self.workspace_root, raw_path, raw_path)
-                if not opt_db.is_file():
-                    raise YawRuntimeError("INVALID_INPUT", f"Optimization database does not exist: {opt_db}")
+            if not raw_path:
+                raise YawRuntimeError("INVALID_INPUT", "Optimization database path cannot be empty.")
+            opt_db = _resolve_path(self.workspace_root, raw_path, raw_path)
             base_dir = opt_db.parent
-            ds_match = re.search(r"yaw_optimize_(\d{8}_\d{6})", opt_db.name)
-            ds = ds_match.group(1) if ds_match else opt_db.stem
         else:
-            ds = datestamp or datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
-            opt_db = base_dir / f"yaw_optimize_{ds}.db"
+            opt_db = base_dir / "optimize_yaw.db"
 
-        opt_lock = Path(str(opt_db) + ".lock")
-        opt_status = base_dir / f"status_optimize_{ds}.json"
-        opt_state = base_dir / f"coco_state_optimize_{ds}"
-        opt_program = base_dir / f"compiled_program_optimize_{ds}.json"
-
-        cfg_dict: dict[str, Any] = {
-            f.name: getattr(self, f.name)
-            for f in fields(self)
-            if f.name
-            not in (
-                "corpus_root",
-                "db_path",
-                "lock_path",
-                "status_path",
-                "state_dir",
-                "compiled_program_path",
-            )
-        }
-        cfg_dict["corpus_root"] = self.workspace_root
-        cfg_dict["db_path"] = opt_db
-        cfg_dict["lock_path"] = opt_lock
-        cfg_dict["status_path"] = opt_status
-        cfg_dict["state_dir"] = opt_state
-        cfg_dict["compiled_program_path"] = opt_program
-        cfg_dict["poll_interval_seconds"] = 0.0
-        return YawConfig(**cfg_dict)
+        suffix = opt_db.stem.removeprefix("optimize_yaw").removeprefix("yaw_optimize").lstrip("_")
+        return replace(
+            self,
+            corpus_root=self.workspace_root,
+            db_path=opt_db,
+            lock_path=Path(str(opt_db) + ".lock"),
+            status_path=base_dir / (f"optimize_status_{suffix}.json" if suffix else "optimize_status.json"),
+            state_dir=base_dir / "coco_lmdb",
+            compiled_program_path=base_dir / (f"optimize_program_{suffix}.json" if suffix else "optimize_program.json"),
+            poll_interval_seconds=0.0,
+        )
 
     def for_benchmark(
         self,
@@ -377,35 +370,17 @@ class YawConfig:
             shutil.rmtree(sandbox_dir, ignore_errors=True)
         sandbox_dir.mkdir(parents=True, exist_ok=True)
 
-        bench_db = sandbox_dir / "yaw.db"
-        bench_lock = sandbox_dir / "yaw.db.lock"
-        bench_status = sandbox_dir / "status.json"
-        bench_state = sandbox_dir / "coco_state"
-        bench_log = sandbox_dir / "yaw.log"
-
-        cfg_dict: dict[str, Any] = {
-            f.name: getattr(self, f.name)
-            for f in fields(self)
-            if f.name
-            not in (
-                "workspace_root",
-                "corpus_root",
-                "db_path",
-                "lock_path",
-                "status_path",
-                "state_dir",
-                "log_path",
-            )
-        }
-        cfg_dict["workspace_root"] = sandbox_dir
-        cfg_dict["corpus_root"] = sandbox_dir
-        cfg_dict["db_path"] = bench_db
-        cfg_dict["lock_path"] = bench_lock
-        cfg_dict["status_path"] = bench_status
-        cfg_dict["state_dir"] = bench_state
-        cfg_dict["log_path"] = bench_log
-        cfg_dict["poll_interval_seconds"] = 0.0
-        return YawConfig(**cfg_dict)
+        return replace(
+            self,
+            workspace_root=sandbox_dir,
+            corpus_root=sandbox_dir,
+            db_path=sandbox_dir / "yaw.db",
+            lock_path=sandbox_dir / "yaw.db.lock",
+            status_path=sandbox_dir / "status.json",
+            state_dir=sandbox_dir / "coco_state",
+            log_path=sandbox_dir / "yaw.log",
+            poll_interval_seconds=0.0,
+        )
 
     def config_fingerprint(self) -> str:
         """Compute deterministic SHA-256 fingerprint of index-affecting settings."""
@@ -574,12 +549,9 @@ def load_config(
                 mapped_k = _OPTIMIZATION_KEY_ALIASES.get(k, k) if sec_name == "optimization" else k
                 if mapped_k in valid_fields:
                     if mapped_k == "optimize_datasets":
-                        if isinstance(v, str):
-                            kwargs[mapped_k] = tuple(p.strip() for p in v.split(",") if p.strip())
-                        elif isinstance(v, (list, tuple)):
-                            kwargs[mapped_k] = tuple(str(p).strip() for p in v if str(p).strip())
-                        else:
-                            kwargs[mapped_k] = (str(v),)
+                        kwargs[mapped_k] = tuple(
+                            parse_dataset_list(v if isinstance(v, (str, list, tuple)) else [str(v)])
+                        )
                     else:
                         kwargs[mapped_k] = tuple(v) if isinstance(v, list) else v
 
@@ -716,6 +688,8 @@ __all__ = [
     "YawConfig",
     "get_config_value",
     "load_config",
+    "parse_dataset_list",
     "set_config_value",
     "write_text_atomic",
+    "write_via_temp_atomic",
 ]

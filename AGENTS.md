@@ -56,5 +56,5 @@ uv run pytest
 git diff --check
 ```
 
-- `uv run yaw dspy optimize --resume`: launch GEPA optimization with resume and default settings.
+- `uv run yaw dspy optimize`: launch or resume GEPA optimization in `.yaw/optimize_yaw.db` (pass `--fresh` to wipe prior `optimize_*` state and start from scratch).
 - `$env:YAW_ARTIFACT_DIR = "<directory>"; uv run watchdog --watch 300`: launch the DSPy optimization watchdog outputting to the dashboard directory.
