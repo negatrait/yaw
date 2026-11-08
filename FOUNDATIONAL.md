@@ -116,5 +116,6 @@ At this stage a fallback hides defects and corrupts benchmark evidence. A visibl
 
 - [HippoRAG (`2405.14831v3`)](docs/arxiv-2405.14831v3-hipporag.md)
 - [HippoRAG 2 (`2502.14802v1`)](docs/arxiv-2502.14802v1-hipporag2.md)
-- [Epic 1: Native `yaw.db` Engine & CocoIndex Daemon](docs/epic-1-hipporag-daemon.md)
-- [Epic 2: FastMCP Streamable HTTP Adapter](docs/epic-2-fastmcp-http.md)
+- [Epic 1: Native `yaw.db` Engine & CocoIndex Daemon](docs/epic-1-hipporag-daemon.md) — Core engine & clean-slate 7-dataset slice-based paper parity decision gate
+- [Epic 2: FastMCP Streamable HTTP Adapter](docs/epic-2-fastmcp-http.md) — Feature completion (Streamable HTTP transport, daemon lifespan, 5 MCP tools, source freshness citations)
+- [Epic 3: Performance, Symbolic Pruning & Full-Corpus Scale](docs/epic-3-performance.md) — Post-Epic 2 W3C/OWL/SKOS/PROV-O symbolic distractor pruning, novel DSPy retrieval/QA experiments, demoscene execution speed, radical codebase reduction, and full-corpus multi-day holdout benchmarks

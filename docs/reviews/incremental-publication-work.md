@@ -860,3 +860,17 @@ Controlling contracts: [epic-1-hipporag-daemon.md §2 & §Decisions](../epic-1-h
   - Mandatory quality gates: `uv run --locked ty check` (`All checks passed!`), `uv run --locked ruff check --fix` (`All checks passed!`), `uv run --locked ruff format --check` (`172 files already formatted`), `uv run --locked pytest` (`836 passed, 3 subtests passed` across `tests/core/`, `tests/daemon/`, and `tests/scripts/`), and `git diff --check` (`0` errors).
 - **What it does not establish**:
   - Clean-Slate Epic 1 Completion Gate (`D1-A6` via `verify_paper_parity_gate.py --compiled-program .yaw/compiled_program.json --mode eval --fresh` and `Goal A` / `Goal B` live batch invariance) follows in Checkpoint C5 once the resumed `uv run yaw dspy optimize` run completes `.yaw/optimize_program.json`.
+
+## 2026-11-08: High-Throughput SQLite PRAGMAs, Vectorized BLAS Synonym Candidate Mining & Epic 3 Performance Spec
+
+Controlling contracts: [epic-3-performance.md §1.2](../epic-3-performance.md#12-baseline-already-in-place-from-epic-1-do-not-re-invent) and [native-cocoindex-graph.md §3](../native-cocoindex-graph.md#3-goals).
+
+- **Changed symbols & modules**:
+  - `yaw/daemon/graph/storage/db.py`: Added `PRAGMA cache_size = -65536;` (`64 MiB`) and `PRAGMA mmap_size = 268435456;` (`256 MiB`) to `_configure_connection_pragmas` and unified `open_readonly_yaw_db` onto `_configure_connection_pragmas(conn, busy_timeout_ms=busy_ms)` so `open_yaw_db`, `open_managed_yaw_db`, and `open_readonly_yaw_db` share a single pragma configuration.
+  - `yaw/daemon/graph/storage/graph_ops.py`: Replaced per-entity `vec0` `MATCH` SQLite loops in `find_entity_synonym_candidates` with a contiguous `float32` NumPy/BLAS implementation (`_collect_top_k`) preserving exact IEEE-754 `float32 -> float64` cosine distance semantics, deterministic `(distance ASC, entity_id ASC)` tie-breaking (`np.argsort(..., kind="stable")`), `adjudicated` pair exclusion, and both forward and reverse top-$k$ candidate discovery.
+  - `tests/daemon/graph/storage/test_db.py`: Added `test_connection_pragmas_configured_across_open_modes` and `test_find_entity_synonym_candidates_blas_vectorized_without_match_loops`.
+  - `docs/epic-3-performance.md`: Recorded the implemented SQLite connection PRAGMAs and vectorized BLAS `find_entity_synonym_candidates` in §1.2.
+- **Gate results & evidence paths**:
+  - Mandatory quality gates (`uv run --locked ty check`, `uv run --locked ruff check --fix`, `uv run --locked ruff format --check`, `uv run --locked pytest tests/daemon/graph/storage/test_db.py tests/daemon/graph/test_batch_equivalence.py tests/core/test_architecture.py -k "not test_g5_g6_paired_64_plus_64_vs_128_acceptance_report" --no-testmon -q`, `git diff --check`): all passed.
+- **What it does not establish**:
+  - Does not hot-reload the already-running background `uv run yaw dspy optimize` process in memory, nor complete Checkpoint C5 (`D1-A6` slice-based paper parity gate) until `.yaw/optimize_program.json` finishes.

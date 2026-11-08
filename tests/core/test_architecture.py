@@ -35,6 +35,7 @@ _CANONICAL_DOCS_INVENTORY = frozenset(
         "enterprise-rag-bench-training-plan.md",
         "epic-1-hipporag-daemon.md",
         "epic-2-fastmcp-http.md",
+        "epic-3-performance.md",
         "epistemic-confidence-spec.md",
         "evaluation-graph-storage.md",
         "evaluation-inference.md",
@@ -683,7 +684,7 @@ class ArchitectureTests(unittest.TestCase):
         self.assertEqual(broken_links, [], "Broken relative Markdown links found:\n" + "\n".join(broken_links))
 
     def test_every_doc_is_reachable_from_rules_and_canonical_inventory(self):
-        """Rule 11: docs/ matches the canonical 15-file inventory and every doc is reachable from .agents/rules/*.md."""
+        """Rule 11: docs/ matches the canonical 19-file inventory and every doc is reachable from .agents/rules/*.md."""
         actual_docs = {p.name for p in DOCS_DIR.glob("*.md")}
         self.assertEqual(
             actual_docs,

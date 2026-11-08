@@ -4,7 +4,7 @@ import difflib
 import json
 import sqlite3
 from collections import defaultdict
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -87,9 +87,16 @@ def find_entity_synonym_candidates(
     threshold: float = 0.8,
     top_k: int = 5,
 ) -> list[tuple[str, str, float]]:
-    """Mine entity synonymy pairs in SQLite where cosine similarity >= threshold without RAM matrices."""
-    if top_k <= 0:
+    """Mine entity synonymy pairs via vectorized float32 BLAS cosine similarity with reverse top-k completeness."""
+    if top_k <= 0 or (entity_ids is not None and not entity_ids):
         return []
+    rows = conn.execute("SELECT entity_id, embedding FROM entity_vec ORDER BY entity_id ASC").fetchall()
+    if len(rows) < 2:
+        return []
+
+    eids = [str(r[0]) for r in rows]
+    mat = np.frombuffer(b"".join(bytes(r[1]) for r in rows), dtype="<f4").reshape(len(rows), -1)
+    norms = np.sqrt(np.sum(mat * mat, axis=1, dtype=np.float32))
     max_dist = max(0.0, 1.0 - threshold + 1e-6)
     pair_scores: dict[tuple[str, str], float] = {}
 
@@ -100,80 +107,45 @@ def find_entity_synonym_candidates(
         )
     }
 
-    def _scan_entity_rows(
-        rows_iter: Iterator[sqlite3.Row],
-        *,
-        allowed_targets: set[str] | None = None,
-    ) -> None:
-        rows = list(rows_iter)
-        if not rows:
-            return
-        k = min(int(top_k) + 1, 4096)
-        for row in rows:
-            src_id = str(row[0])
-            blob = row[1]
-            knn_cursor = conn.execute(
-                """
-                WITH knn AS MATERIALIZED (
-                    SELECT entity_id, distance
-                    FROM entity_vec
-                    WHERE embedding MATCH ? AND k = ?
-                    ORDER BY distance
-                )
-                SELECT entity_id, (1.0 - distance) AS similarity
-                FROM knn
-                WHERE entity_id != ? AND distance <= ?
-                ORDER BY distance ASC, entity_id ASC
-                LIMIT ?
-                """,
-                (blob, k, src_id, max_dist, int(top_k)),
-            )
-            for hit in knn_cursor:
-                dst_id = str(hit[0])
-                if allowed_targets is not None and dst_id not in allowed_targets:
+    def _collect_top_k(
+        src_indices: Sequence[int],
+        allowed_target_mask: np.ndarray | None = None,
+    ) -> np.ndarray:
+        dot = mat[src_indices] @ mat.T
+        denom = norms[src_indices, None] * norms[None, :]
+        cos_sim = np.divide(dot, denom, out=np.zeros_like(dot, dtype=np.float32), where=denom > 0)
+        dists = np.float32(1.0) - cos_sim
+        dists[np.arange(len(src_indices)), src_indices] = np.inf
+        top_indices = np.argsort(dists, axis=1, kind="stable")[:, : int(top_k)]
+        for r_idx, src_idx in enumerate(src_indices):
+            src_id = eids[src_idx]
+            for dst_idx in top_indices[r_idx]:
+                if allowed_target_mask is not None and not allowed_target_mask[dst_idx]:
                     continue
-                sim = float(hit[1])
+                dist = float(dists[r_idx, dst_idx])
+                if dist > max_dist:
+                    break
+                sim = 1.0 - dist
                 if sim >= threshold:
+                    dst_id = eids[int(dst_idx)]
                     key = (src_id, dst_id) if src_id < dst_id else (dst_id, src_id)
                     if key not in adjudicated and sim > pair_scores.get(key, -1.0):
                         pair_scores[key] = sim
+        return dists
 
     if entity_ids is None:
-        _scan_entity_rows(conn.execute("SELECT entity_id, embedding FROM entity_vec"))
-    elif entity_ids:
+        _collect_top_k(range(len(eids)))
+    else:
         target_set = {str(eid) for eid in entity_ids}
-        target_rows: list[sqlite3.Row] = []
-        for batch in batched(sorted(target_set)):
-            placeholders = ",".join("?" for _ in batch)
-            cursor = conn.execute(
-                f"SELECT entity_id, embedding FROM entity_vec WHERE entity_id IN ({placeholders})",
-                tuple(batch),
-            )
-            batch_rows = list(cursor)
-            target_rows.extend(batch_rows)
-            _scan_entity_rows(iter(batch_rows))
-        reverse_candidate_ids: set[str] = set()
-        k_wide = 4096
-        for row in target_rows:
-            blob = row[1]
-            for hit in conn.execute(
-                """
-                SELECT entity_id
-                FROM entity_vec
-                WHERE embedding MATCH ? AND k = ? AND distance <= ?
-                """,
-                (blob, k_wide, max_dist),
-            ):
-                cand_id = str(hit[0])
-                if cand_id not in target_set:
-                    reverse_candidate_ids.add(cand_id)
-        for batch in batched(sorted(reverse_candidate_ids)):
-            placeholders = ",".join("?" for _ in batch)
-            cursor = conn.execute(
-                f"SELECT entity_id, embedding FROM entity_vec WHERE entity_id IN ({placeholders})",
-                tuple(batch),
-            )
-            _scan_entity_rows(cursor, allowed_targets=target_set)
+        target_indices = [i for i, eid in enumerate(eids) if eid in target_set]
+        if not target_indices:
+            return []
+        target_mask = np.zeros(len(eids), dtype=bool)
+        target_mask[target_indices] = True
+        target_dists = _collect_top_k(target_indices)
+        rev_indices = np.flatnonzero((~target_mask) & (np.min(target_dists, axis=0) <= max_dist)).tolist()
+        if rev_indices:
+            _collect_top_k(rev_indices, allowed_target_mask=target_mask)
 
     return [(a, b, sim) for (a, b), sim in sorted(pair_scores.items())]
 

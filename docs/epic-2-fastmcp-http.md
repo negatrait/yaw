@@ -1,6 +1,6 @@
 # Epic 2: FastMCP Streamable HTTP Adapter
 
-Owner: [FOUNDATIONAL](../FOUNDATIONAL.md) | Prerequisite: [Epic 1](epic-1-hipporag-daemon.md) | Results: [evaluation](evaluation.md)
+Owner: [FOUNDATIONAL](../FOUNDATIONAL.md) | Prerequisite: [Epic 1](epic-1-hipporag-daemon.md) | Next: [Epic 3](epic-3-performance.md) | Results: [evaluation](evaluation.md)
 
 ## Status and entry gate — reconciled 2026-10-27
 
@@ -15,7 +15,11 @@ reconciliation launches neither and does not waive the gate.
 After that gate passes, the first implementation packet is Sprint 1 dependency
 and containment verification. Its observable exit is a project-locked FastMCP
 import on Python 3.14.9 and passing adapter-boundary tests. Package resolution,
-installation, HTTP acceptance and model quality are separate evidence.
+installation, HTTP acceptance and model quality are separate evidence. Because
+`yaw/daemon/mcp_server.py` delegates exclusively to `runtime.retrieve` /
+`runtime.rag_qa` and `ChunkPointer.source_content_hash`, this external transport
+boundary remains completely decoupled from [Epic 3](epic-3-performance.md)'s
+internal retrieval, W3C symbolic pruning, and demoscene speed optimizations.
 
 ## Verified baseline and required work
 
@@ -261,7 +265,7 @@ commands only after the HTTP implementation passes.
 
 ## Deferred Epic 3 ideas — outside this epic
 
-Retain these proposals for a separate decision: reorganizing CLI domains around
+Retain these proposals for a separate decision in [Epic 3](epic-3-performance.md): reorganizing CLI domains around
 optimization/evaluation, numerical traversal tuning, grouping traversal/policy/
 seeding settings, and editable seed instructions/demonstrations. They are neither
 Epic 2 prerequisites nor accepted replacements for current interfaces.

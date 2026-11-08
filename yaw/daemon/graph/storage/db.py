@@ -268,6 +268,8 @@ def _configure_connection_pragmas(
     if enable_foreign_keys:
         conn.execute("PRAGMA foreign_keys = ON;")
     conn.execute("PRAGMA temp_store = MEMORY;")
+    conn.execute("PRAGMA cache_size = -65536;")
+    conn.execute("PRAGMA mmap_size = 268435456;")
     conn.execute(f"PRAGMA busy_timeout = {int(busy_timeout_ms)};")
 
 
@@ -334,8 +336,7 @@ def open_readonly_yaw_db(
                 timeout=timeout,
                 check_same_thread=False,
             )
-            conn.row_factory = sqlite3.Row
-            conn.execute(f"PRAGMA busy_timeout = {busy_ms};")
+            _configure_connection_pragmas(conn, busy_timeout_ms=busy_ms)
             conn.enable_load_extension(True)
             sqlite_vec.load(conn)
             conn.enable_load_extension(False)

@@ -161,7 +161,7 @@ The real leverage of `dspy.Flex` is **arbitrary code and tool execution**, not p
   - `dspy.Flex` defaults to an internal `dspy.RLM` over these tools.
   - `dspy.GEPA` rewrites the Python orchestrator class (`module_src`), allowing the model to write arbitrary multi-step retrieval loops, adaptive backtrack heuristics, and custom graph traversal logic.
   - All generated code executes isolated inside `BridgeRuntime` (fresh sandbox per query).
-- **Status**: Deferred for investigation **after Epic 2** (FastMCP HTTP transport).
+- **Status**: Deferred for investigation **after Epic 2** (FastMCP HTTP transport) under [Epic 3](epic-3-performance.md).
 - **Open Questions**:
   - Which parts of the current `YawProgram` could be replaced by `dspy.Flex` + Python tools?
   - What is the highest leverage MVP, the "ask question" part of the retrieval pipeline (F1, EM scores) or the recall pipeline (Recall@N scores)?

@@ -22,6 +22,7 @@ from yaw.daemon.graph.storage import (
     load_graph_topology,
     merge_entities,
     open_managed_yaw_db,
+    open_readonly_yaw_db,
     open_yaw_db,
     search_chunk_vectors_knn,
     search_chunks_fts,
@@ -941,5 +942,98 @@ def test_step11_skos_broader_cycle_safe_cte_and_s27_disjointness(tmp_path: Path)
         remaining = lint_graph_shacl(conn)
         assert remaining == []
         assert conn.execute("SELECT COUNT(*) FROM edges WHERE kind = 'skos:related'").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_connection_pragmas_configured_across_open_modes(tmp_path: Path) -> None:
+    db_file = tmp_path / "pragmas.db"
+
+    conn = open_yaw_db(db_file)
+    try:
+        assert conn.execute("PRAGMA synchronous;").fetchone()[0] == 1
+        assert conn.execute("PRAGMA temp_store;").fetchone()[0] == 2
+        assert conn.execute("PRAGMA cache_size;").fetchone()[0] == -65536
+        assert conn.execute("PRAGMA mmap_size;").fetchone()[0] > 0
+    finally:
+        conn.close()
+
+    managed = open_managed_yaw_db(db_file)
+    try:
+        with managed.transaction() as m_conn:
+            assert m_conn.execute("PRAGMA synchronous;").fetchone()[0] == 1
+            assert m_conn.execute("PRAGMA temp_store;").fetchone()[0] == 2
+            assert m_conn.execute("PRAGMA cache_size;").fetchone()[0] == -65536
+            assert m_conn.execute("PRAGMA mmap_size;").fetchone()[0] > 0
+    finally:
+        managed.close()
+
+    ro_conn = open_readonly_yaw_db(db_file)
+    try:
+        assert ro_conn.execute("PRAGMA synchronous;").fetchone()[0] == 1
+        assert ro_conn.execute("PRAGMA temp_store;").fetchone()[0] == 2
+        assert ro_conn.execute("PRAGMA cache_size;").fetchone()[0] == -65536
+        assert ro_conn.execute("PRAGMA mmap_size;").fetchone()[0] > 0
+    finally:
+        ro_conn.close()
+
+
+def test_find_entity_synonym_candidates_blas_vectorized_without_match_loops(tmp_path: Path) -> None:
+    conn = open_yaw_db(tmp_path / "syn_blas.db")
+    try:
+        upsert_entities(
+            conn,
+            [
+                ("e1", "Entity 1"),
+                ("e2", "Entity 2"),
+                ("e3", "Entity 3"),
+                ("e4", "Entity 4"),
+                ("e5", "Entity 5"),
+                ("e6", "Entity 6"),
+            ],
+        )
+        upsert_entity_vectors(
+            conn,
+            [
+                ("e1", [1.0, 0.0, 0.0]),
+                ("e2", [0.8, 0.6, 0.0]),
+                ("e3", [0.9, 0.43589, 0.0]),
+                ("e4", [0.9, 0.43589, 0.0]),
+                ("e5", [0.0, 1.0, 0.0]),
+                ("e6", [0.85, 0.52678, 0.0]),
+            ],
+        )
+        upsert_semantic_edges(conn, [("e1", "e6", "owl:differentFrom", 1.0)])
+
+        executed_sql: list[str] = []
+        conn.set_trace_callback(executed_sql.append)
+        try:
+            inc_e1_k2 = find_entity_synonym_candidates(conn, entity_ids=["e1"], threshold=0.8, top_k=2)
+            inc_e1_k4 = find_entity_synonym_candidates(conn, entity_ids=["e1"], threshold=0.8, top_k=4)
+            full_k1 = find_entity_synonym_candidates(conn, entity_ids=None, threshold=0.8, top_k=1)
+            rev_e3 = find_entity_synonym_candidates(conn, entity_ids=["e3"], threshold=0.8, top_k=1)
+            rev_e2 = find_entity_synonym_candidates(conn, entity_ids=["e2"], threshold=0.8, top_k=4)
+        finally:
+            conn.set_trace_callback(None)
+
+        assert not any("MATCH" in sql.upper() for sql in executed_sql)
+        assert {(a, b) for a, b, _ in inc_e1_k2} == {("e1", "e3"), ("e1", "e4")}
+
+        # Boundary vector e2 ([0.8, 0.6, 0.0]) against e1 ([1.0, 0.0, 0.0]) passes threshold=0.8,
+        # while adjudicated owl:differentFrom pair (e1, e6) is excluded.
+        inc_e1_pairs = {(a, b) for a, b, _ in inc_e1_k4}
+        assert ("e1", "e2") in inc_e1_pairs
+        assert ("e1", "e6") not in inc_e1_pairs
+        assert ("e1", "e2") in {(a, b) for a, b, _ in rev_e2}
+
+        # Deterministic (distance ASC, entity_id ASC) tie-breaking for e1 at top_k=1 picks e3 over e4 ("e3" < "e4").
+        full_k1_pairs = {(a, b) for a, b, _ in full_k1}
+        assert ("e1", "e3") in full_k1_pairs
+        assert ("e1", "e4") not in full_k1_pairs
+
+        # Reverse top-k: e3's own top-1 is e4 (sim=1.0), but e1's top-1 is e3 (sim=0.9),
+        # so querying entity_ids=["e3"] with top_k=1 discovers both ("e3", "e4") and ("e1", "e3").
+        rev_e3_pairs = {(a, b) for a, b, _ in rev_e3}
+        assert rev_e3_pairs == {("e1", "e3"), ("e3", "e4")}
     finally:
         conn.close()
