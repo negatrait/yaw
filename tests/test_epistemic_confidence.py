@@ -275,11 +275,25 @@ def test_empirical_bayes_s27_and_cagle_resolution(tmp_path: Path) -> None:
         ).fetchone()[0]
         assert broader_ac == 1  # Broader edge preserved
 
-        # --- Case 2: Step 2 Cagle Reification (above-average confidences with shared chunk reify to fact) ---
+        # --- Case 1b: 2-hop broader chain (A -> B -> C) with A skos:related C is valid ---
         conn.execute("DELETE FROM edges;")
+        conn.execute("DELETE FROM facts;")
         upsert_semantic_edges(conn, [("ent-a", "ent-b", "skos:broader", 0.9)])
-        upsert_semantic_edges(conn, [("ent-b", "ent-d", "skos:broader", 0.9)])
-        upsert_semantic_edges(conn, [("ent-a", "ent-d", "skos:related", 0.88)])
+        upsert_semantic_edges(conn, [("ent-b", "ent-c", "skos:broader", 0.9)])
+        upsert_semantic_edges(conn, [("ent-a", "ent-c", "skos:related", 0.88)])
+        s27_two_hop = [v for v in lint_graph_shacl(conn) if v.shape == "ConceptShape/S27-disjointBroaderRelated"]
+        assert s27_two_hop == []
+        assert auto_heal_deterministic_shacl(conn) == 0
+        rel_ac_two_hop = conn.execute(
+            "SELECT COUNT(*) FROM edges WHERE kind = 'skos:related' AND src_id = 'ent-a' AND dst_id = 'ent-c'"
+        ).fetchone()[0]
+        assert rel_ac_two_hop == 1
+
+        # --- Case 2: Step 2 Cagle Reification (1-hop above-average confidences with shared chunk reify to fact) ---
+        conn.execute("DELETE FROM edges;")
+        conn.execute("INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-a', 'ent-d', 'skos:broader', 0.9)")
+        conn.execute("INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-a', 'ent-d', 'skos:related', 0.88)")
+        conn.execute("INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-d', 'ent-a', 'skos:related', 0.88)")
         # Both ent-a and ent-d share chunk c1 from entity_labels
         healed_cagle = auto_heal_deterministic_shacl(conn)
         assert healed_cagle >= 1
@@ -296,35 +310,33 @@ def test_empirical_bayes_s27_and_cagle_resolution(tmp_path: Path) -> None:
         assert reified_fact[0] == "relatedTo"
         assert reified_fact[1] is not None and float(reified_fact[1]) > 0.8
 
-        # --- Case 3: Step 3 Case A (w_chain >= w_rel prunes skos:related when no shared chunk) ---
+        # --- Case 3: Step 3 Case A (w_broader >= w_rel prunes skos:related when no shared chunk) ---
         # Disjoint chunks: ent-a on c1, ent-d on c2
         conn.execute("DELETE FROM edges;")
         conn.execute("DELETE FROM facts;")
         conn.execute("UPDATE entity_labels SET chunk_id = 'c2' WHERE entity_id = 'ent-d'")
-        upsert_semantic_edges(conn, [("ent-a", "ent-b", "skos:broader", 0.9)])
-        upsert_semantic_edges(conn, [("ent-b", "ent-d", "skos:broader", 0.9)])
-        upsert_semantic_edges(conn, [("ent-a", "ent-d", "skos:related", 0.6)])
+        conn.execute("INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-a', 'ent-d', 'skos:broader', 0.9)")
+        conn.execute("INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-a', 'ent-d', 'skos:related', 0.6)")
+        conn.execute("INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-d', 'ent-a', 'skos:related', 0.6)")
 
         healed_case_a = auto_heal_deterministic_shacl(conn)
         assert healed_case_a >= 1
         rel_ad_after = conn.execute(
             "SELECT COUNT(*) FROM edges WHERE kind = 'skos:related' AND src_id = 'ent-a' AND dst_id = 'ent-d'"
         ).fetchone()[0]
-        assert rel_ad_after == 0  # Pruned because broader chain has higher epistemic confidence!
-        broader_ab = conn.execute(
-            "SELECT weight FROM edges WHERE kind = 'skos:broader' AND src_id = 'ent-a' AND dst_id = 'ent-b'"
+        assert rel_ad_after == 0  # Pruned because 1-hop broader has higher epistemic confidence!
+        broader_ad = conn.execute(
+            "SELECT weight FROM edges WHERE kind = 'skos:broader' AND src_id = 'ent-a' AND dst_id = 'ent-d'"
         ).fetchone()
-        assert broader_ab is not None
+        assert broader_ad is not None
 
-        # --- Case 4: Step 3 Case B (w_rel > w_chain keeps skos:related and demotes weakest broader link) ---
-        # Reset: broader A -> B (w=0.8), B -> C (w=0.3)
-        # Related: A -> C (w=0.85)
-        # w_chain = pool_confidences(0.8, 0.3) ~ 0.49 < w_rel (0.85) -> keep related, demote weakest broader (B -> C)
+        # --- Case 4: Step 3 Case B (w_rel > w_broader keeps skos:related and deletes 1-hop broader link) ---
+        # Reset: broader A -> C (w=0.3), Related: A -> C (w=0.85)
         conn.execute("DELETE FROM edges;")
         conn.execute("UPDATE entity_labels SET chunk_id = 'c3' WHERE entity_id = 'ent-c'")
-        upsert_semantic_edges(conn, [("ent-a", "ent-b", "skos:broader", 0.8)])
-        upsert_semantic_edges(conn, [("ent-b", "ent-c", "skos:broader", 0.3)])
-        upsert_semantic_edges(conn, [("ent-a", "ent-c", "skos:related", 0.85)])
+        conn.execute("INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-a', 'ent-c', 'skos:broader', 0.3)")
+        conn.execute("INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-a', 'ent-c', 'skos:related', 0.85)")
+        conn.execute("INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-c', 'ent-a', 'skos:related', 0.85)")
 
         healed_case_b = auto_heal_deterministic_shacl(conn)
         assert healed_case_b >= 1
@@ -335,17 +347,11 @@ def test_empirical_bayes_s27_and_cagle_resolution(tmp_path: Path) -> None:
         assert rel_row is not None
         assert abs(float(rel_row[0]) - 0.85) < 1e-6
 
-        # Weakest broader link B -> C (weight 0.3) was broken/demoted to skos:related
-        # while preserving its calibrated weight 0.3!
-        broader_bc = conn.execute(
-            "SELECT COUNT(*) FROM edges WHERE kind = 'skos:broader' AND src_id = 'ent-b' AND dst_id = 'ent-c'"
+        # Direct 1-hop broader link A -> C (weight 0.3) was deleted
+        broader_ac_after = conn.execute(
+            "SELECT COUNT(*) FROM edges WHERE kind = 'skos:broader' AND src_id = 'ent-a' AND dst_id = 'ent-c'"
         ).fetchone()[0]
-        assert broader_bc == 0  # Broken!
-        demoted_bc = conn.execute(
-            "SELECT weight FROM edges WHERE kind = 'skos:related' AND src_id = 'ent-b' AND dst_id = 'ent-c'"
-        ).fetchone()
-        assert demoted_bc is not None
-        assert abs(float(demoted_bc[0]) - 0.3) < 1e-6  # Preserves calibrated weight!
+        assert broader_ac_after == 0
 
 
 def test_markov_walk_divergence_and_turtle_payload(tmp_path: Path) -> None:
@@ -567,27 +573,10 @@ def test_w3c_guardrail_1_homograph_only_different_from(tmp_path: Path) -> None:
         assert rlm_stats["different_from_edges"] == 1
 
 
-def test_w3c_guardrail_2_head_noun_modifier_specialization(tmp_path: Path) -> None:
-    """Verify Guardrail 2: Head-Noun Modifier Specialization routes to skos:broader; disjoint tokens to skos:related."""
-    from yaw.daemon.graph.planner import (
-        _has_disjoint_non_acronym_tokens,
-        apply_synonym_adjudication,
-        is_modifier_head_specialization,
-    )
+def test_canonical_gemma4_ssot_no_python_token_overrides_in_planner(tmp_path: Path) -> None:
+    """Verify planner.py obeys Canonical Gemma 4 Ontology SSOT without Python token-prefix overrides."""
+    from yaw.daemon.graph.planner import apply_synonym_adjudication
 
-    # Invariant checks
-    assert is_modifier_head_specialization("Redwood", "Redwood Router") is True
-    assert is_modifier_head_specialization("Redwood Router", "Redwood") is True
-    assert is_modifier_head_specialization("Redwood", "Redwood secrets") is True
-    assert is_modifier_head_specialization("Redwood", "RedwoodTenant") is True
-    assert is_modifier_head_specialization("Redwood", "Redwood") is False
-
-    # Disjoint tokens check
-    assert _has_disjoint_non_acronym_tokens("Redwood", "CRDs") is True
-    assert _has_disjoint_non_acronym_tokens("CRD", "Custom Resource Definition") is False  # Acronym correspondence
-    assert _has_disjoint_non_acronym_tokens("Redwood", "Redwood Router") is False  # Shares "redwood"
-
-    # Behavior in apply_synonym_adjudication
     db_path = tmp_path / "yaw.db"
     managed = open_managed_yaw_db(db_path)
     with managed.transaction() as conn:
@@ -600,6 +589,9 @@ def test_w3c_guardrail_2_head_noun_modifier_specialization(tmp_path: Path) -> No
             "INSERT INTO entities (entity_id, name, definition) VALUES ('e2', 'Redwood Router', 'Routing component')"
         )
         conn.execute("INSERT INTO entities (entity_id, name, definition) VALUES ('e3', 'CRDs', 'Custom resources')")
+        conn.execute(
+            "INSERT INTO entities (entity_id, name, definition) VALUES ('e4', 'Custom Resource Definition', 'K8s CRD')"
+        )
 
     with managed.transaction() as conn:
         candidates = [
@@ -621,16 +613,44 @@ def test_w3c_guardrail_2_head_noun_modifier_specialization(tmp_path: Path) -> No
                 "lexical_sim": 0.1,
                 "similarity": 0.75,
             },
+            {
+                "pair_id": "e3|e4",
+                "entity_a": "e3",
+                "name_a": "CRDs",
+                "entity_b": "e4",
+                "name_b": "Custom Resource Definition",
+                "lexical_sim": 0.2,
+                "similarity": 0.9,
+            },
         ]
         cand_meta = {
             "e1": ("Redwood", "Core system"),
             "e2": ("Redwood Router", "Routing component"),
             "e3": ("CRDs", "Custom resources"),
+            "e4": ("Custom Resource Definition", "K8s CRD"),
         }
-        # Stage 1 LLM mistakenly proposes equivalence / altLabel on both
         decisions = [
-            {"pair_id": "e1|e2", "relation": "skos:altLabel", "reasoning": "Related to redwood"},
-            {"pair_id": "e1|e3", "relation": "skos:altLabel", "reasoning": "Related Kubernetes terms"},
+            {
+                "pair_id": "e1|e2",
+                "relation": "skos:broader",
+                "source_id": "e2",
+                "target_id": "e1",
+                "reasoning": "Stage 2 hierarchy: Redwood Router is a component of Redwood",
+            },
+            {
+                "pair_id": "e1|e3",
+                "relation": "skos:altLabel",
+                "equivalent": True,
+                "definition": "Fact-linked pair blocked by topological fact-pole guard",
+                "reasoning": "Active fact pole test",
+            },
+            {
+                "pair_id": "e3|e4",
+                "relation": "skos:altLabel",
+                "equivalent": True,
+                "definition": "Kubernetes Custom Resource Definition",
+                "reasoning": "Stage 1 equivalence: CRDs is the acronym for Custom Resource Definition",
+            },
         ]
         rlm_stats: dict[str, Any] = {"merged_entities": 0, "broader_edges": 0, "related_edges": 0}
         merges, sem_batch = apply_synonym_adjudication(
@@ -638,24 +658,21 @@ def test_w3c_guardrail_2_head_noun_modifier_specialization(tmp_path: Path) -> No
             candidates,
             cand_meta,
             decisions,
-            fact_linked_pairs=set(),
+            fact_linked_pairs={("e1", "e3")},
             synonymy_threshold=0.7,
             rlm_stats=rlm_stats,
         )
 
-        # Neither must be merged into a single entity!
-        assert merges == []
-        assert rlm_stats["merged_entities"] == 0
+        # e3|e4 merges via Stage 1 equivalence; e1|e3 is blocked only by topological _is_active_fact_pole
+        assert len(merges) == 1
+        assert {merges[0].removed_id, merges[0].canonical_id} == {"e3", "e4"}
+        assert rlm_stats["merged_entities"] == 1
 
-        # Redwood Router must be routed to skos:broader Redwood (child=e2, parent=e1)
         broader_edges = [(s, o) for s, o, k, _, _ in sem_batch if k == "skos:broader"]
         assert ("e2", "e1") in broader_edges
-        assert rlm_stats["broader_edges"] == 1
 
-        # Redwood vs CRDs must be routed to skos:related
         related_edges = [(s, o) for s, o, k, _, _ in sem_batch if k == "skos:related"]
-        assert ("e1", "e3") in related_edges or ("e3", "e1") in related_edges
-        assert rlm_stats["related_edges"] == 1
+        assert any({s, o} == {"e1", merges[0].canonical_id} or {s, o} == {"e1", "e3"} for s, o in related_edges)
 
 
 def test_w3c_guardrail_3_case_insensitive_consolidation(tmp_path: Path) -> None:

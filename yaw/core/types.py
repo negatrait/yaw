@@ -399,6 +399,36 @@ def is_scalar_label(label: str) -> bool:
     return detect_scalar_literal(text_processing(label))[0]
 
 
+def clean_surface_label(raw: str) -> str:
+    """Strip whitespace and stray leading/trailing clause delimiters (:;,)."""
+    return raw.strip().strip(":;,").strip()
+
+
+def is_irreflexive_statement(
+    subj: str,
+    pred: str,
+    obj: str,
+    subj_def: str = "",
+    obj_def: str = "",
+    obj_kind: str = "entity",
+) -> bool:
+    """Return True iff the statement does not relate a resource sense to itself or repeat subj as a literal."""
+    s_norm = str(text_processing(subj))
+    o_norm = str(text_processing(obj))
+    if not s_norm or not o_norm:
+        return False
+    if obj_kind == "literal":
+        if s_norm == o_norm:
+            return False
+        p_norm = str(text_processing(pred))
+        sd_norm = str(text_processing(subj_def))
+        return not (p_norm and sd_norm and p_norm == sd_norm)
+    return not (
+        s_norm == o_norm
+        and (not subj_def.strip() or not obj_def.strip() or subj_def.strip().casefold() == obj_def.strip().casefold())
+    )
+
+
 def compute_chunk_id(rel_posix_path: str, start_line: int, end_line: int, text: str) -> str:
     """Compute deterministic canonical chunk ID from relative path, line span, and slice text."""
     payload = f"{rel_posix_path}:{start_line}:{end_line}:{text}"

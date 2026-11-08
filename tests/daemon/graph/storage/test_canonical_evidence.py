@@ -77,7 +77,7 @@ def test_incremental_alias_permutations_preserve_raw_evidence_and_canonical_fact
                         StructuredTriple(
                             subj="Orion",
                             pred="display Name",
-                            obj="Orion",
+                            obj="Orion Service",
                             obj_kind="literal",
                             obj_datatype="rdf:langString",
                             obj_lang="en",

@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-import re
 import sqlite3
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -20,7 +19,9 @@ from yaw.core import (
     SHACLViolation,
     StructuredTriple,
     YawRuntimeError,
+    clean_surface_label,
     detect_scalar_literal,
+    is_irreflexive_statement,
     is_scalar_label,
     text_processing,
 )
@@ -102,8 +103,6 @@ class GraphPlanSettings:
     embedding_identity: str
     synonym_identity: str = ""
     shacl_identity: str = ""
-    auto_merge_cosine_gate: float = 0.95
-    auto_merge_difflib_gate: float = 0.96
     synonymy_threshold: float = 0.8
     synonymy_top_k: int = 5
     ast_context_hops: int = 1
@@ -215,7 +214,7 @@ def record_surface_form(
     cid_key: str = "",
 ) -> None:
     """Track preferred cased surface forms globally and per chunk."""
-    clean_raw = raw_val.strip()
+    clean_raw = clean_surface_label(raw_val) or raw_val.strip()
     if not norm_key or not clean_raw:
         return
     surface_by_norm[norm_key] = preferred_surface(
@@ -350,6 +349,8 @@ def materialize_entities_and_facts(
 
             is_literal_obj = st.obj_kind == "literal"
             if is_literal_obj:
+                if not is_irreflexive_statement(st.subj, st.pred, st.obj, st.subj_def, "", "literal"):
+                    continue
                 eff_obj_dt = (
                     st.obj_datatype
                     if (st.obj_datatype and st.obj_datatype != "rdfs:Literal")
@@ -434,75 +435,17 @@ def materialize_entities_and_facts(
     )
 
 
-def _is_acronym(short_str: str, long_str: str) -> bool:
-    s = "".join(c for c in short_str if c.isalnum()).lower()
-    if not s or len(s) < 2:
-        return False
-    variants = [s]
-    if s.endswith("s") and len(s) > 2:
-        variants.append(s[:-1])
-    tokens = [w for w in re.split(r"[^a-zA-Z0-9]+", long_str) if w]
-    if len(tokens) < 2:
-        return False
-    acronym_initials = "".join(w[0].lower() for w in tokens)
-    return any(v == acronym_initials or acronym_initials.startswith(v) for v in variants)
-
-
-def is_modifier_head_specialization(name_a: str, name_b: str) -> bool:
-    """Return True if one concept name is a modifier prefix specialization of the other with a distinct head noun."""
-    norm_a = str(text_processing(name_a)).strip().lower()
-    norm_b = str(text_processing(name_b)).strip().lower()
-    if not norm_a or not norm_b or norm_a == norm_b:
-        return False
-
-    tokens_a = norm_a.split()
-    tokens_b = norm_b.split()
-
-    if len(tokens_a) != len(tokens_b):
-        shorter_toks, longer_toks = (tokens_a, tokens_b) if len(tokens_a) < len(tokens_b) else (tokens_b, tokens_a)
-        if len(shorter_toks) > 0 and longer_toks[: len(shorter_toks)] == shorter_toks:
-            return True
-
-    clean_a = name_a.strip()
-    clean_b = name_b.strip()
-    if clean_a.casefold() != clean_b.casefold():
-        short_name, long_name = (clean_a, clean_b) if len(clean_a) < len(clean_b) else (clean_b, clean_a)
-        if long_name.casefold().startswith(short_name.casefold()):
-            suffix = long_name[len(short_name) :]
-            if suffix and (suffix[0].isupper() or suffix.startswith(("_", "-", " "))):
-                return True
-
-    return False
-
-
-def _has_disjoint_non_acronym_tokens(name_a: str, name_b: str, lexical_sim: float = 0.0) -> bool:
-    """Return True if token sets are completely disjoint and neither is an acronym/initialism of the other."""
-    norm_a = str(text_processing(name_a)).strip().lower()
-    norm_b = str(text_processing(name_b)).strip().lower()
-    if not norm_a or not norm_b or norm_a == norm_b:
-        return False
-    tokens_a = set(norm_a.split())
-    tokens_b = set(norm_b.split())
-    if tokens_a & tokens_b:
-        return False
-    if _is_acronym(name_a, name_b) or _is_acronym(name_b, name_a):
-        return False
-    return lexical_sim < 0.85
-
-
 def prepare_synonym_candidates(
     stage_conn: sqlite3.Connection,
     entity_nodes: Sequence[tuple[str, str, str]],
     *,
     synonymy_threshold: float,
     synonymy_top_k: int,
-    auto_merge_cosine_gate: float = 0.95,
-    auto_merge_difflib_gate: float = 0.96,
     fact_linked_pairs: set[tuple[str, str]] | None = None,
     rlm_stats: dict[str, Any] | None = None,
     progress_callback: Callable[[str], None] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, tuple[str, str]], int, list[EntityMerge]]:
-    """Filter valid SKOS concepts, apply the near-1 (cosine, difflib) auto-merge gate, and rank remaining pairs."""
+    """Filter valid SKOS concepts, consolidate same-norm senses above threshold, and rank remaining pairs."""
     valid_entity_ids = [eid for eid, name, _ in entity_nodes if bool(text_processing(name))]
     if not valid_entity_ids:
         return [], {}, 0, []
@@ -538,7 +481,7 @@ def prepare_synonym_candidates(
         return False
 
     with write_tx(stage_conn):
-        for raw_a, raw_b, d_sim, l_sim in raw_candidates:
+        for raw_a, raw_b, d_sim, _l_sim in raw_candidates:
             ea = _resolve_active_eid(raw_a)
             eb = _resolve_active_eid(raw_b)
             if ea == eb:
@@ -546,23 +489,9 @@ def prepare_synonym_candidates(
             name_a, def_a = cand_meta.get(ea, (ea, ""))
             name_b, def_b = cand_meta.get(eb, (eb, ""))
 
-            # Guardrail 2: Never auto-merge modifier-head specializations or disjoint non-acronym concepts
-            if is_modifier_head_specialization(name_a, name_b):
+            if text_processing(name_a) != text_processing(name_b):
                 continue
-            if _has_disjoint_non_acronym_tokens(name_a, name_b, float(l_sim)):
-                continue
-
-            # Guardrail 3: Case-insensitive identity consolidation before disambiguation
-            is_case_variant = (
-                text_processing(name_a) == text_processing(name_b) or name_a.casefold() == name_b.casefold()
-            )
-            meets_gate = (
-                is_case_variant and float(d_sim) >= synonymy_threshold and not _is_active_fact_pole(ea, eb)
-            ) or (float(d_sim) >= auto_merge_cosine_gate and float(l_sim) >= auto_merge_difflib_gate)
-            if not meets_gate:
-                continue
-
-            if text_processing(name_a) != text_processing(name_b) and _is_active_fact_pole(ea, eb):
+            if float(d_sim) < synonymy_threshold or _is_active_fact_pole(ea, eb):
                 continue
 
             casing_a = 1 if any(c.isupper() for c in name_a) else 0
@@ -709,17 +638,7 @@ def apply_synonym_adjudication(
             dec_llm_prob = float(dec_prob) if dec_prob is not None else None
             edge_weight = pool_confidences(dec_llm_prob, sim) or sim
             if rel in ("skos:altLabel", "skos:hiddenLabel", "exact_match"):
-                # Guardrail 2: Head-Noun & Proper-Noun Modifier Invariant
-                if is_modifier_head_specialization(name_src, name_tgt):
-                    child_id = src if len(name_src) >= len(name_tgt) else tgt
-                    parent_id = tgt if child_id == src else src
-                    raw_semantic_batch.append((child_id, parent_id, "skos:broader", edge_weight, reas))
-                    continue
-                if _has_disjoint_non_acronym_tokens(name_src, name_tgt, sim):
-                    raw_semantic_batch.append((src, tgt, "skos:related", edge_weight, reas))
-                    continue
-
-                if text_processing(name_src) != text_processing(name_tgt) and _is_active_fact_pole(src, tgt):
+                if _is_active_fact_pole(src, tgt):
                     raw_semantic_batch.append((src, tgt, "skos:related", edge_weight, reas))
                     continue
                 canon = str(dec.get("canonical", "") or "").strip()
@@ -1179,8 +1098,6 @@ async def plan_graph_publication(
             entity_nodes,
             synonymy_threshold=settings.synonymy_threshold,
             synonymy_top_k=settings.synonymy_top_k,
-            auto_merge_cosine_gate=settings.auto_merge_cosine_gate,
-            auto_merge_difflib_gate=settings.auto_merge_difflib_gate,
             fact_linked_pairs=materialized.fact_linked_pairs,
             rlm_stats=rlm_stats,
             progress_callback=extraction.progress_callback,
@@ -1341,6 +1258,7 @@ async def plan_graph_publication(
                         f_val = str(rep.get("value", "")).strip()
                         if f_node.startswith("fact-") and f_val:
                             prior_fact_definitions[f_node] = f_val
+                auto_heal_deterministic_shacl(staging_conn)
                 canonicalize_fact_definitions(staging_conn, prior_definitions=prior_fact_definitions)
                 canonicalize_fact_text(staging_conn)
                 rlm_stats["shacl_repairs_applied"] += applied

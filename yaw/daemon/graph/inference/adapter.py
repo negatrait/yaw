@@ -59,11 +59,11 @@ class YawGBNFAdapter(dspy.JSONAdapter):
         if sig_name == "DefineMissingEntities":
             return build_dspy_missing_entity_defs_grammar()
         if sig_name == "JudgeLabels":
-            return build_dspy_label_judge_grammar(self.max_entities)
+            return build_dspy_label_judge_grammar(self.max_entities, max_reasoning_chars=self.max_reasoning_chars)
         if sig_name == "JudgeHierarchy":
-            return build_dspy_hierarchy_judge_grammar(self.max_entities)
+            return build_dspy_hierarchy_judge_grammar(self.max_entities, max_reasoning_chars=self.max_reasoning_chars)
         if sig_name == "JudgeRelated":
-            return build_dspy_related_judge_grammar(self.max_entities)
+            return build_dspy_related_judge_grammar(self.max_entities, max_reasoning_chars=self.max_reasoning_chars)
         if sig_name == "ProposeSHACLRepairs":
             return build_dspy_shacl_repair_grammar(self.max_entities)
         if sig_name == "ExtractQueryIntent":
@@ -94,11 +94,17 @@ class YawGBNFAdapter(dspy.JSONAdapter):
                 sig_doc = str(getattr(signature, "__doc__", "") or getattr(signature, "instructions", ""))
                 combined = f"{dec_desc} {sig_doc}".lower()
                 if "alt_label" in combined or "hidden_label" in combined or "stage 1" in combined:
-                    return build_dspy_label_judge_grammar(self.max_entities)
+                    return build_dspy_label_judge_grammar(
+                        self.max_entities, max_reasoning_chars=self.max_reasoning_chars
+                    )
                 if "broader" in combined or "narrower" in combined or "stage 2" in combined:
-                    return build_dspy_hierarchy_judge_grammar(self.max_entities)
+                    return build_dspy_hierarchy_judge_grammar(
+                        self.max_entities, max_reasoning_chars=self.max_reasoning_chars
+                    )
                 if "related" in combined or "stage 3" in combined:
-                    return build_dspy_related_judge_grammar(self.max_entities)
+                    return build_dspy_related_judge_grammar(
+                        self.max_entities, max_reasoning_chars=self.max_reasoning_chars
+                    )
                 return None
             if out_keys == ("repairs",) and "focus_context" in in_keys:
                 return build_dspy_shacl_repair_grammar(self.max_entities)

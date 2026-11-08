@@ -894,12 +894,21 @@ def test_step11_skos_broader_cycle_safe_cte_and_s27_disjointness(tmp_path: Path)
         ]
         assert lint_graph_shacl(conn) == []
 
-        # 2. Inject a transitive S27 conflict (skos:related between dog and animal) and a 3-hop cycle (animal -> dog)
+        # 2. A 2-hop broader chain (dog -> mammal -> animal) with dog <-> animal skos:related is valid;
+        # injecting a direct 1-hop S27 conflict (dog <-> mammal skos:related) and a 3-hop cycle flags both
         conn.execute(
             "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-dog', 'ent-animal', 'skos:related', 0.7)"
         )
         conn.execute(
             "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-animal', 'ent-dog', 'skos:related', 0.7)"
+        )
+        assert [v for v in lint_graph_shacl(conn) if v.shape == "ConceptShape/S27-disjointBroaderRelated"] == []
+        conn.execute("DELETE FROM edges WHERE kind = 'skos:related'")
+        conn.execute(
+            "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-dog', 'ent-mammal', 'skos:related', 0.7)"
+        )
+        conn.execute(
+            "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-mammal', 'ent-dog', 'skos:related', 0.7)"
         )
         conn.execute(
             "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-animal', 'ent-dog', 'skos:broader', 0.8)"
@@ -922,7 +931,7 @@ def test_step11_skos_broader_cycle_safe_cte_and_s27_disjointness(tmp_path: Path)
                     "value": "",
                 },
                 {
-                    "focus_node": "ent-dog|ent-animal",
+                    "focus_node": "ent-dog|ent-mammal",
                     "action": "remove_conflicting_related",
                     "target_node": "",
                     "value": "",

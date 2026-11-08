@@ -15,33 +15,6 @@ from .hydration import hydrate_chunk_pointer
 from .shacl import inspect_entity_or_fact
 
 
-def query_broader_tc(
-    conn: sqlite3.Connection,
-    entity_ids: Sequence[str],
-) -> set[tuple[str, str]]:
-    """Compute transitive skos:broader pairs among entity_ids using a recursive CTE."""
-    if not entity_ids:
-        return set()
-    placeholders = ",".join("?" for _ in entity_ids)
-    sql = f"""
-    WITH RECURSIVE tc(narrower_id, broader_id) AS (
-        SELECT src_id, dst_id
-        FROM edges
-        WHERE kind = 'skos:broader' AND src_id IN ({placeholders})
-        UNION
-        SELECT tc.narrower_id, e.dst_id
-        FROM tc
-        JOIN edges e ON e.src_id = tc.broader_id AND e.kind = 'skos:broader'
-        LIMIT 1000
-    )
-    SELECT narrower_id, broader_id
-    FROM tc
-    WHERE broader_id IN ({placeholders})
-    """
-    rows = conn.execute(sql, (*entity_ids, *entity_ids)).fetchall()
-    return {(str(r[0]), str(r[1])) for r in rows}
-
-
 def query_shared_role_facts(
     conn: sqlite3.Connection,
     pairs: Sequence[tuple[str, str]],
@@ -104,7 +77,6 @@ class _Packet:
         root: Path,
         hops: int = 0,
         *,
-        broader_tc_pairs: set[tuple[str, str]] | None = None,
         shared_role_facts_map: dict[tuple[str, str], list[list[str]]] | None = None,
     ) -> None:
         self.conn, self.root, self.hops = conn, root, hops
@@ -114,7 +86,6 @@ class _Packet:
         self.infos: dict[str, dict[str, Any]] = {}
         self.pairs: list[dict[str, Any]] = []
         self.source_texts: dict[str, str] = {}
-        self.broader_tc_pairs = broader_tc_pairs
         self.shared_role_facts_map = shared_role_facts_map
 
     def fork(self) -> _Packet:
@@ -217,17 +188,8 @@ class _Packet:
                     if len(direct_facts) >= 2:
                         break
 
-        if self.broader_tc_pairs is None:
-            self.broader_tc_pairs = query_broader_tc(self.conn, [ea, eb])
         if self.shared_role_facts_map is None:
             self.shared_role_facts_map = query_shared_role_facts(self.conn, [(ea, eb)])
-
-        if (ea, eb) in self.broader_tc_pairs:
-            broader_tc = "a_under_b"
-        elif (eb, ea) in self.broader_tc_pairs:
-            broader_tc = "b_under_a"
-        else:
-            broader_tc = ""
 
         shared_role = self.shared_role_facts_map.get((ea, eb), [])
 
@@ -240,7 +202,6 @@ class _Packet:
                 "shared_islands": shared_islands,
                 "direct_facts": direct_facts,
                 "shared_role_facts": shared_role,
-                "broader_tc": broader_tc,
                 "entity_a": ent_a,
                 "entity_b": ent_b,
             }
@@ -274,16 +235,13 @@ def iter_synonym_evidence(
     """Yield complete evidence packets, splitting whole pairs without dropping evidence."""
     if batch_size < 1 or max_chars < 1:
         raise ValueError("Synonym packet limits must be positive")
-    entity_ids = sorted({str(c[k]) for c in candidates for k in ("entity_a", "entity_b")})
     pairs = [(str(c["entity_a"]), str(c["entity_b"])) for c in candidates]
-    broader_tc_pairs = query_broader_tc(conn, entity_ids)
     shared_role_facts_map = query_shared_role_facts(conn, pairs)
 
     packet = _Packet(
         conn,
         corpus_root,
         ast_context_hops,
-        broader_tc_pairs=broader_tc_pairs,
         shared_role_facts_map=shared_role_facts_map,
     )
     started = time.perf_counter()
@@ -302,7 +260,6 @@ def iter_synonym_evidence(
                     conn,
                     corpus_root,
                     ast_context_hops,
-                    broader_tc_pairs=broader_tc_pairs,
                     shared_role_facts_map=shared_role_facts_map,
                 )
                 child.infos = {
@@ -326,7 +283,6 @@ def iter_synonym_evidence(
                 conn,
                 corpus_root,
                 ast_context_hops,
-                broader_tc_pairs=broader_tc_pairs,
                 shared_role_facts_map=shared_role_facts_map,
             )
             packet.infos = {eid: trial.infos[eid] for eid in (candidate["entity_a"], candidate["entity_b"])}

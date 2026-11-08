@@ -669,12 +669,12 @@ def parse_label_decisions(raw_output: Any) -> list[dict[str, Any]]:
         definition = str(raw_def).strip() if isinstance(raw_def, str) else ""
         if equivalent and not definition:
             continue
-        alt_label = False if equivalent else _parse_bool(item.get("alt_label"))
-        hidden_label = False if (equivalent or alt_label) else _parse_bool(item.get("hidden_label"))
-        if equivalent or alt_label:
-            relation: str | None = "skos:altLabel"
-        elif hidden_label:
-            relation = "skos:hiddenLabel"
+        hidden_label = _parse_bool(item.get("hidden_label")) if equivalent else False
+        alt_label = (not hidden_label) if equivalent else False
+        if equivalent and hidden_label:
+            relation: str | None = "skos:hiddenLabel"
+        elif equivalent:
+            relation = "skos:altLabel"
         else:
             relation = None
         dec_entry: dict[str, Any] = {

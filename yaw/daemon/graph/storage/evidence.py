@@ -11,6 +11,7 @@ from yaw.core import (
     OpenIERecord,
     compute_mdhash_id,
     detect_scalar_literal,
+    is_irreflexive_statement,
     is_scalar_label,
     text_processing,
 )
@@ -141,7 +142,15 @@ def build_evidence(
                 obj.mention_id if obj else None,
                 raw,
                 None
-                if obj is not None and subject.entity_id == obj.entity_id
+                if (obj is not None and subject.entity_id == obj.entity_id)
+                or not is_irreflexive_statement(
+                    triple.subj,
+                    triple.pred,
+                    triple.obj,
+                    subject.resolved_definition,
+                    obj.resolved_definition if obj else "",
+                    triple.obj_kind,
+                )
                 else fact_id(
                     subject.entity_id,
                     triple.pred.strip(),
@@ -205,7 +214,12 @@ def canonicalize_fact_definitions(
             COALESCE(f.definition, ''),
             COALESCE(f.obj_kind, 'entity'),
             LOWER(TRIM(COALESCE(es.definition, ''))),
-            LOWER(TRIM(COALESCE(eo.definition, '')))
+            LOWER(TRIM(COALESCE(eo.definition, ''))),
+            COALESCE(es.name, f.subj_id),
+            f.pred,
+            COALESCE(eo.name, f.obj_id, ''),
+            COALESCE(f.obj_literal_lex, ''),
+            COALESCE(f.raw_triple_json, '')
         FROM facts f
         LEFT JOIN entities es ON es.entity_id = f.subj_id
         LEFT JOIN entities eo ON eo.entity_id = f.obj_id
@@ -238,6 +252,24 @@ def canonicalize_fact_definitions(
         obj_kind = str(row[2])
         subj_def_norm = str(row[3])
         obj_def_norm = str(row[4])
+        subj_name = str(row[5])
+        pred = str(row[6])
+        obj_name = str(row[7])
+        obj_literal_lex = str(row[8])
+        raw_triple_str = str(row[9])
+
+        obj_surface = obj_name if obj_kind == "entity" else obj_literal_lex
+        stale_synth_defs: set[str] = set()
+        if raw_triple_str.startswith("["):
+            try:
+                parsed_raw = json.loads(raw_triple_str)
+            except ValueError:
+                parsed_raw = None
+            if isinstance(parsed_raw, list) and len(parsed_raw) == 3:
+                raw_s, raw_p, raw_o = str(parsed_raw[0]), str(parsed_raw[1]), str(parsed_raw[2])
+                if (raw_s, raw_o) != (subj_name, obj_surface):
+                    stale_synth_defs.add(f"{raw_s} {raw_p} {raw_o}.".strip())
+                    stale_synth_defs.add(f"{raw_s} {raw_p} {raw_o} (statement).".strip())
 
         assertions = assertions_by_fact.get(fid, ())
         valid_assertions = [
@@ -247,14 +279,19 @@ def canonicalize_fact_definitions(
             resolved_def = valid_assertions[0]
         else:
             prior_cand = (prior_definitions.get(fid) or current_def) if prior_definitions is not None else current_def
-            if _is_valid_spo_def(prior_cand, subj_def_norm, obj_kind, obj_def_norm):
+            if prior_cand not in stale_synth_defs and _is_valid_spo_def(
+                prior_cand, subj_def_norm, obj_kind, obj_def_norm
+            ):
                 resolved_def = prior_cand
-            elif _is_valid_spo_def(current_def, subj_def_norm, obj_kind, obj_def_norm):
+            elif current_def not in stale_synth_defs and _is_valid_spo_def(
+                current_def, subj_def_norm, obj_kind, obj_def_norm
+            ):
                 resolved_def = current_def
-            elif assertions:
-                _, resolved_def = min(assertions, key=lambda item: (item[1].strip() == "", item[0]))
             else:
-                resolved_def = current_def
+                synth_def = f"{subj_name} {pred} {obj_surface}.".strip()
+                if not _is_valid_spo_def(synth_def, subj_def_norm, obj_kind, obj_def_norm):
+                    synth_def = f"{subj_name} {pred} {obj_surface} (statement).".strip()
+                resolved_def = synth_def
 
         if resolved_def != current_def:
             updates.append((resolved_def, fid))

@@ -15,6 +15,8 @@ from yaw.core import (
     SEMANTIC_EDGE_KINDS,
     OpenIERecord,
     StructuredTriple,
+    clean_surface_label,
+    is_irreflexive_statement,
     is_resource_label,
     is_scalar_label,
     resolve_corpus_path,
@@ -422,13 +424,14 @@ def upsert_entities(
                 else (raw_norm if raw_norm in existing_norms else "")
             )
             if pref_norm:
+                clean_ename = clean_surface_label(ename) or ename
                 conn.execute(
                     """
                     UPDATE entity_labels
-                    SET label_kind = 'skos:prefLabel'
-                    WHERE entity_id = ? AND label_norm = ? AND label_kind != 'skos:prefLabel'
+                    SET label_kind = 'skos:prefLabel', raw_label = ?
+                    WHERE entity_id = ? AND label_norm = ? AND (label_kind != 'skos:prefLabel' OR raw_label != ?)
                     """,
-                    (eid, pref_norm),
+                    (clean_ename, eid, pref_norm, clean_ename),
                 )
                 conn.execute(
                     """
@@ -544,6 +547,7 @@ def upsert_entity_labels(
                     if LABEL_KIND_PRIORITY.get(ek, 0) > LABEL_KIND_PRIORITY.get(best_kind, 0):
                         best_kind = ek
 
+            clean_raw = clean_surface_label(raw_label) or raw_label.strip() or norm
             conn.execute(
                 "\n"
                 "                INSERT INTO entity_labels (label_norm, entity_id, label_kind, raw_label, "
@@ -554,7 +558,7 @@ def upsert_entity_labels(
                 "                    raw_label = CASE WHEN excluded.raw_label != '' THEN "
                 "excluded.raw_label ELSE entity_labels.raw_label END\n"
                 "                ",
-                (norm, entity_id, best_kind, raw_label or label_norm, chunk_id),
+                (norm, entity_id, best_kind, clean_raw, chunk_id),
             )
             if existing_kinds and any(k != best_kind for k in existing_kinds):
                 conn.execute(
@@ -683,7 +687,7 @@ def canonicalize_entity_labels_edc(
                     return None
 
             name_updates: list[tuple[str, str]] = []
-            label_updates: list[tuple[str, str, str]] = []
+            label_updates: list[tuple[str, str, str, str]] = []
 
             for eid in batch:
                 norms_map = labels_by_eid.get(eid, {})
@@ -691,15 +695,16 @@ def canonicalize_entity_labels_edc(
 
                 # If entity has no labels but has a name, synthesize a prefLabel
                 if not norms_map and curr_name:
-                    synth_norm = str(text_processing(curr_name)) or curr_name.strip().lower()
+                    clean_curr = clean_surface_label(curr_name) or curr_name.strip()
+                    synth_norm = str(text_processing(clean_curr)) or clean_curr.lower()
                     conn.execute(
                         """
                         INSERT INTO entity_labels (label_norm, entity_id, label_kind, raw_label, chunk_id)
                         VALUES (?, ?, 'skos:prefLabel', ?, '__auto__')
                         """,
-                        (synth_norm, eid, curr_name),
+                        (synth_norm, eid, clean_curr),
                     )
-                    norms_map[synth_norm] = [("skos:prefLabel", curr_name, "__auto__")]
+                    norms_map[synth_norm] = [("skos:prefLabel", clean_curr, "__auto__")]
 
                 if not norms_map:
                     continue
@@ -727,13 +732,18 @@ def canonicalize_entity_labels_edc(
                 is_hidden_by_norm: dict[str, bool] = {}
 
                 for norm, occs in norms_map.items():
-                    raw_labels = list(dict.fromkeys(r[1].strip() for r in occs if r[1].strip()))
+                    raw_labels = list(
+                        dict.fromkeys((clean_surface_label(r[1]) or r[1].strip()) for r in occs if r[1].strip())
+                    )
                     if not raw_labels:
-                        raw_labels = [curr_name if curr_name.strip() else norm]
+                        fallback_name = clean_surface_label(curr_name) or curr_name.strip()
+                        raw_labels = [fallback_name if fallback_name else norm]
 
-                    def _surface_key(rl: str) -> tuple[int, int, str]:
-                        cased_or_multi = 1 if (any(c.isupper() for c in rl) or len(rl.split()) > 1) else 0
-                        return (cased_or_multi, -len(rl), rl)
+                    def _surface_key(rl: str, target_norm: str = norm) -> tuple[int, int, int, int, str]:
+                        matches_norm = 1 if str(text_processing(rl)) == target_norm else 0
+                        is_cased = 1 if any(c.isupper() for c in rl) else 0
+                        is_multiword = 1 if len(rl.split()) > 1 else 0
+                        return (matches_norm, is_cased, is_multiword, -len(rl), rl)
 
                     best_raw = max(raw_labels, key=_surface_key)
                     best_raw_by_norm[norm] = best_raw
@@ -749,7 +759,7 @@ def canonicalize_entity_labels_edc(
                         disk_grounded = 0
                         disk_failed = 0
                         for _, rlabel, cid in occs:
-                            lbl_to_check = (rlabel.strip() or best_raw).lower()
+                            lbl_to_check = (clean_surface_label(rlabel) or rlabel.strip() or best_raw).lower()
                             if cid.startswith("__") or cid not in chunks_meta:
                                 continue
                             c_text = _get_chunk_content(cid, chunks_meta)
@@ -796,7 +806,11 @@ def canonicalize_entity_labels_edc(
                 winning_norm = max(eligible_norms, key=lambda n: norm_scores[n])
                 winning_raw = best_raw_by_norm[winning_norm]
 
-                if winning_raw != curr_name or curr_pref_norms != {winning_norm}:
+                if (
+                    winning_raw != curr_name
+                    or curr_pref_norms != {winning_norm}
+                    or any(occ[1] != winning_raw for occ in norms_map.get(winning_norm, ()))
+                ):
                     updated_entities_count += 1
 
                 if winning_raw != curr_name:
@@ -810,14 +824,15 @@ def canonicalize_entity_labels_edc(
                     else:
                         target_kind = "skos:altLabel"
 
-                    if any(occ[0] != target_kind for occ in occs):
-                        label_updates.append((target_kind, eid, norm))
+                    target_raw = best_raw_by_norm[norm]
+                    if any(occ[0] != target_kind or occ[1] != target_raw for occ in occs):
+                        label_updates.append((target_kind, target_raw, eid, norm))
 
             if name_updates:
                 conn.executemany("UPDATE entities SET name = ? WHERE entity_id = ?", name_updates)
             if label_updates:
                 conn.executemany(
-                    "UPDATE entity_labels SET label_kind = ? WHERE entity_id = ? AND label_norm = ?",
+                    "UPDATE entity_labels SET label_kind = ?, raw_label = ? WHERE entity_id = ? AND label_norm = ?",
                     label_updates,
                 )
 
@@ -1015,17 +1030,35 @@ def rekey_facts(conn: sqlite3.Connection, ids: list[str]) -> tuple[tuple[str, st
     redirects = []
     for old_id in sorted(set(ids)):
         row = conn.execute(
-            "SELECT subj_id,pred,obj_kind,obj_id,obj_literal_lex,obj_datatype,obj_lang,"
-            "raw_triple_json,definition,confidence "
-            "FROM facts WHERE fact_id=?",
+            "SELECT facts.subj_id,facts.pred,facts.obj_kind,facts.obj_id,facts.obj_literal_lex,"
+            "facts.obj_datatype,facts.obj_lang,facts.raw_triple_json,facts.definition,facts.confidence,"
+            "COALESCE(es.name,''),COALESCE(es.definition,'') "
+            "FROM facts LEFT JOIN entities es ON es.entity_id=facts.subj_id WHERE facts.fact_id=?",
             (old_id,),
         ).fetchone()
         if row is None:
             raise ValueError(f"Cannot canonicalize missing fact {old_id!r}")
-        subject, predicate, kind, obj, lexical, datatype, language, raw_json, definition, confidence = row
+        (
+            subject,
+            predicate,
+            kind,
+            obj,
+            lexical,
+            datatype,
+            language,
+            raw_json,
+            definition,
+            confidence,
+            subj_name,
+            subj_def,
+        ) = row
         new_id = (
             None
-            if kind == "entity" and subject == obj
+            if (kind == "entity" and subject == obj)
+            or (
+                kind == "literal"
+                and not is_irreflexive_statement(subj_name, predicate, lexical or "", subj_def, "", "literal")
+            )
             else fact_id(subject, predicate, kind, obj if kind == "entity" else lexical, datatype, language)
         )
         if new_id == old_id:

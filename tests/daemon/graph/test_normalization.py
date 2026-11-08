@@ -153,8 +153,6 @@ def test_provisional_senses_auto_merge_on_high_cosine_and_difflib_while_homograp
             batch.entity_nodes,
             synonymy_threshold=0.8,
             synonymy_top_k=5,
-            auto_merge_cosine_gate=0.90,
-            auto_merge_difflib_gate=0.92,
             fact_linked_pairs=batch.fact_linked_pairs,
         )
         assert len(auto_merges) == 1
@@ -168,3 +166,50 @@ def test_provisional_senses_auto_merge_on_high_cosine_and_difflib_while_homograp
         ]
         assert len(homograph_cands) == 1
         assert {homograph_cands[0]["def_a"], homograph_cands[0]["def_b"]} == {def1, def3}
+
+
+def test_clean_surface_label_and_single_surface_pref_label_alignment(tmp_path: Path):
+    from yaw.core import clean_surface_label
+    from yaw.daemon.graph.normalization import preferred_surface
+    from yaw.daemon.graph.storage import canonicalize_entity_labels_edc
+
+    assert clean_surface_label(":feature flag") == "feature flag"
+    assert clean_surface_label("Control plane,") == "Control plane"
+    assert clean_surface_label(" ; Latency: ") == "Latency"
+    assert preferred_surface("Control plane,", "control plane", "Control plane", label_norm="control plane") == (
+        "Control plane"
+    )
+    assert preferred_surface(":feature flag", "feature flag", label_norm="feature flag") == "feature flag"
+
+    with closing(open_yaw_db(tmp_path / "single_pref.db")) as conn:
+        upsert_entities(conn, [("ent-cp", "control plane", "Central orchestration layer.")])
+        for cid, raw in [
+            ("c1", "control plane"),
+            ("c2", "Control-plane"),
+            ("c3", "Control plane,"),
+            ("c4", "Control plane"),
+            ("c5", ":feature flag"),
+        ]:
+            norm = "feature flag" if "feature" in raw else "control plane"
+            kind = "skos:altLabel" if "feature" in raw else "skos:prefLabel"
+            conn.execute(
+                "INSERT INTO entity_labels (label_norm, entity_id, label_kind, raw_label, chunk_id) VALUES (?,?,?,?,?)",
+                (norm, "ent-cp", kind, raw, cid),
+            )
+        canonicalize_entity_labels_edc(conn)
+        pref_raws = [
+            str(r[0])
+            for r in conn.execute(
+                "SELECT DISTINCT raw_label FROM entity_labels "
+                "WHERE entity_id = 'ent-cp' AND label_kind = 'skos:prefLabel'"
+            ).fetchall()
+        ]
+        assert pref_raws == ["Control plane"]
+        alt_raws = [
+            str(r[0])
+            for r in conn.execute(
+                "SELECT DISTINCT raw_label FROM entity_labels "
+                "WHERE entity_id = 'ent-cp' AND label_kind = 'skos:altLabel'"
+            ).fetchall()
+        ]
+        assert alt_raws == ["feature flag"]

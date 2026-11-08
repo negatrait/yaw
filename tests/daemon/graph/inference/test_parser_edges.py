@@ -247,19 +247,20 @@ def test_wrong_nested_response_envelopes_and_missing_filter_output_are_not_facts
 def test_invalid_label_items_cannot_displace_a_later_valid_decision():
     raw = [
         None,
-        {"pair_id": "", "reasoning": "valid", "equivalent": False, "alt_label": True},
-        {"pair_id": "0", "reasoning": "valid", "equivalent": False, "alt_label": True},
-        {"pair_id": "a|b", "reasoning": "", "equivalent": False, "alt_label": True},
-        {"pair_id": "a|b", "reasoning": "valid", "equivalent": False, "alt_label": True},
+        {"pair_id": "", "reasoning": "valid", "equivalent": True, "definition": "Valid def", "hidden_label": False},
+        {"pair_id": "0", "reasoning": "valid", "equivalent": True, "definition": "Valid def", "hidden_label": False},
+        {"pair_id": "a|b", "reasoning": "", "equivalent": True, "definition": "Valid def", "hidden_label": False},
+        {"pair_id": "a|b", "reasoning": "valid", "equivalent": True, "definition": "Valid def", "hidden_label": False},
     ]
     assert parse_label_decisions(raw) == [
         {
             "pair_id": "a|b",
             "reasoning": "valid",
-            "equivalent": False,
+            "equivalent": True,
             "alt_label": True,
             "hidden_label": False,
             "relation": "skos:altLabel",
+            "definition": "Valid def",
         }
     ]
 
@@ -267,8 +268,8 @@ def test_invalid_label_items_cannot_displace_a_later_valid_decision():
 @pytest.mark.parametrize("envelope", ["prediction", "dictionary", "json", "bare-json", "list"])
 def test_synonym_and_shacl_decisions_reject_unknown_actions(envelope):
     decisions = [
-        {"pair_id": "a|b", "reasoning": "valid", "equivalent": False, "alt_label": True},
-        {"pair_id": "c|d", "reasoning": "valid", "equivalent": False, "alt_label": False, "hidden_label": True},
+        {"pair_id": "a|b", "reasoning": "valid", "equivalent": True, "definition": "Valid def", "hidden_label": False},
+        {"pair_id": "c|d", "reasoning": "valid", "equivalent": True, "definition": "Valid def", "hidden_label": True},
         {"pair_id": "e", "reasoning": "invalid pair_id"},
         "invalid",
     ]
@@ -291,18 +292,20 @@ def test_synonym_and_shacl_decisions_reject_unknown_actions(envelope):
         {
             "pair_id": "a|b",
             "reasoning": "valid",
-            "equivalent": False,
+            "equivalent": True,
             "alt_label": True,
             "hidden_label": False,
             "relation": "skos:altLabel",
+            "definition": "Valid def",
         },
         {
             "pair_id": "c|d",
             "reasoning": "valid",
-            "equivalent": False,
+            "equivalent": True,
             "alt_label": False,
             "hidden_label": True,
             "relation": "skos:hiddenLabel",
+            "definition": "Valid def",
         },
     ]
     with pytest.raises(ValueError, match="Invalid SHACL repair"):

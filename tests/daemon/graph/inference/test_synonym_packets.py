@@ -81,15 +81,16 @@ def packet_provider():
                         {
                             "pair_id": p["pair_id"],
                             "reasoning": f"Reasoning {i}",
-                            "equivalent": False,
-                            "alt_label": True,
+                            "equivalent": True,
+                            "definition": f"Unified definition {i}",
+                            "hidden_label": False,
                         }
                         if i % 2 == 0
                         else {
                             "pair_id": p["pair_id"],
                             "reasoning": f"Reasoning {i}",
-                            "equivalent": False,
-                            "alt_label": False,
+                            "equivalent": True,
+                            "definition": f"Unified definition {i}",
                             "hidden_label": True,
                         }
                     )
@@ -104,7 +105,7 @@ def packet_provider():
                 elif state["mode"] == "canonical":
                     decisions[0]["reasoning"] = ""
                 elif state["mode"] == "relation":
-                    decisions[0]["alt_label"] = "not-a-bool"
+                    decisions[0]["hidden_label"] = "not-a-bool"
                 self.send(
                     {
                         "id": "packet",
@@ -205,11 +206,11 @@ def test_complete_native_request_and_original_id_decisions(tmp_path, packet_prov
     assert program.synonym_batch_fits(batch)
     decisions = program.judge_synonyms(batch)
     assert [x["relation"] for x in decisions] == [
-        "skos:broader",
         "skos:altLabel",
         "skos:hiddenLabel",
         "skos:altLabel",
         "skos:hiddenLabel",
+        "skos:altLabel",
     ]
     assert [x["pair_id"] for x in decisions] == [x["pair_id"] for x in batch.candidates]
     assert len(calls) == 1
@@ -227,12 +228,12 @@ def test_packet_specific_grammar_reaches_native_provider(tmp_path, packet_provid
     program.enable_gbnf = True
     program.label_judge.lm._yaw_supports_gbnf = True
     batch = make_batch(tmp_path)
-    pairs = [p["pair_id"] for p in json.loads(batch.payload)["pairs"] if not p.get("broader_tc")]
+    pairs = [p["pair_id"] for p in json.loads(batch.payload)["pairs"]]
     program.judge_synonyms(batch)
     grammar = calls[0]["grammar"]
     assert grammar == build_dspy_label_judge_grammar(pair_ids=pairs)
     root = grammar.splitlines()[0]
-    assert 'decision-0 ", " decision-1 ", " decision-2 ", " decision-3' in root
+    assert 'decision-0 ", " decision-1 ", " decision-2 ", " decision-3 ", " decision-4' in root
     assert "?" not in grammar
     assert len([line for line in grammar.splitlines() if line.startswith("decision-")]) == len(pairs)
     with pytest.raises(ValueError, match="unique"):

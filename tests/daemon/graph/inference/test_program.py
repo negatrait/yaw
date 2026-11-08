@@ -51,7 +51,11 @@ class CascadeMockLM(dspy.LM):
 
         is_related = "judgerelated" in req_lower or "differentfrom" in req_lower
         is_related = is_related or (
-            "related" in req_lower and "narrower" not in req_lower and "alt_label" not in req_lower
+            "related" in req_lower
+            and "narrower" not in req_lower
+            and "alt_label" not in req_lower
+            and "hidden_label" not in req_lower
+            and "equivalent" not in req_lower
         )
         if is_related:
             self.stage_calls["related_judge"] += 1
@@ -69,7 +73,9 @@ class CascadeMockLM(dspy.LM):
                 )
             return [json.dumps({"decisions": decisions})]
 
-        if "judgehierarchy" in req_lower or "narrower" in req_lower:
+        if ("judgehierarchy" in req_lower and "hidden_label" not in req_lower and "equivalent" not in req_lower) or (
+            "narrower" in req_lower and "hidden_label" not in req_lower and "equivalent" not in req_lower
+        ):
             self.stage_calls["hierarchy_judge"] += 1
             self.stage_payloads["hierarchy_judge"].append(pairs)
             decisions = []
@@ -86,7 +92,7 @@ class CascadeMockLM(dspy.LM):
                 )
             return [json.dumps({"decisions": decisions})]
 
-        if "judgelabels" in req_lower or "alt_label" in req_lower or "equivalent" in req_lower:
+        if "judgelabels" in req_lower or "hidden_label" in req_lower or "equivalent" in req_lower:
             self.stage_calls["label_judge"] += 1
             self.stage_payloads["label_judge"].append(pairs)
             decisions = []
@@ -100,15 +106,17 @@ class CascadeMockLM(dspy.LM):
                             "reasoning": f"Stage 1 label reasoning for {pid}",
                             "equivalent": True,
                             "definition": resp[1],
+                            "hidden_label": False,
                         }
                     )
-                elif resp[0]:
+                elif resp[0] or resp[1]:
                     decisions.append(
                         {
                             "pair_id": pid,
                             "reasoning": f"Stage 1 label reasoning for {pid}",
-                            "equivalent": False,
-                            "alt_label": True,
+                            "equivalent": True,
+                            "definition": f"Unified definition for {pid}",
+                            "hidden_label": bool(resp[1]),
                         }
                     )
                 else:
@@ -117,8 +125,6 @@ class CascadeMockLM(dspy.LM):
                             "pair_id": pid,
                             "reasoning": f"Stage 1 label reasoning for {pid}",
                             "equivalent": False,
-                            "alt_label": False,
-                            "hidden_label": bool(resp[1]),
                         }
                     )
             return [json.dumps({"decisions": decisions})]
@@ -208,35 +214,6 @@ def test_program_named_predictors_and_audit_trails() -> None:
     assert "synonym_audit_trail" not in trails
 
 
-def test_cascade_rule_w3_broader_tc_short_circuits() -> None:
-    """Verify Rule W3 broader_tc pairs resolve immediately with 0 LLM calls."""
-    lm = CascadeMockLM()
-    dspy.settings.configure(lm=lm)
-    program = _make_program(lm)
-
-    pairs = [
-        {"pair_id": "e0|e1", "broader_tc": "a_under_b", "direct_facts": [], "shared_role_facts": []},
-        {"pair_id": "e2|e3", "broader_tc": "b_under_a", "direct_facts": [], "shared_role_facts": []},
-    ]
-    batch = _make_batch(pairs)
-
-    decisions = program.judge_synonyms(batch)
-    assert len(decisions) == 2
-    assert lm.stage_calls["label_judge"] == 0
-    assert lm.stage_calls["hierarchy_judge"] == 0
-    assert lm.stage_calls["related_judge"] == 0
-
-    d0 = next(d for d in decisions if d["pair_id"] == "real_e0|real_e1")
-    assert d0["relation"] == "skos:broader"
-    assert d0["source_id"] == "real_e0"
-    assert d0["target_id"] == "real_e1"
-
-    d1 = next(d for d in decisions if d["pair_id"] == "real_e2|real_e3")
-    assert d1["relation"] == "skos:broader"
-    assert d1["source_id"] == "real_e3"
-    assert d1["target_id"] == "real_e2"
-
-
 def test_cascade_rule_w1_direct_facts_skips_stage1_to_stage2() -> None:
     """Verify Rule W1 pairs with direct facts bypass Stage 1 and go straight to Stage 2."""
     lm = CascadeMockLM()
@@ -246,7 +223,6 @@ def test_cascade_rule_w1_direct_facts_skips_stage1_to_stage2() -> None:
     pairs = [
         {
             "pair_id": "e0|e1",
-            "broader_tc": "",
             "direct_facts": [["pilot tenant", "participate in", "test"]],
             "shared_role_facts": [],
         },
@@ -266,24 +242,24 @@ def test_cascade_rule_w1_direct_facts_skips_stage1_to_stage2() -> None:
 
 
 def test_cascade_stage1_truth_table_short_circuiting() -> None:
-    """Verify Stage 1 branched truth table and advancing (False, False) to Stage 2."""
+    """Verify Stage 1 branched truth table and advancing equivalent=False to Stage 2."""
     lm = CascadeMockLM()
     dspy.settings.configure(lm=lm)
     program = _make_program(lm)
 
     pairs = [
-        {"pair_id": "e0|e1", "broader_tc": "", "direct_facts": [], "shared_role_facts": []},
-        {"pair_id": "e2|e3", "broader_tc": "", "direct_facts": [], "shared_role_facts": []},
-        {"pair_id": "e4|e5", "broader_tc": "", "direct_facts": [], "shared_role_facts": []},
-        {"pair_id": "e6|e7", "broader_tc": "", "direct_facts": [], "shared_role_facts": []},
+        {"pair_id": "e0|e1", "direct_facts": [], "shared_role_facts": []},
+        {"pair_id": "e2|e3", "direct_facts": [], "shared_role_facts": []},
+        {"pair_id": "e4|e5", "direct_facts": [], "shared_role_facts": []},
+        {"pair_id": "e6|e7", "direct_facts": [], "shared_role_facts": []},
     ]
-    # e0|e1: equivalent=True -> skos:altLabel with unified definition
+    # e0|e1: equivalent=True, hidden_label=False -> skos:altLabel with unified definition
     lm.label_responses["e0|e1"] = (True, "Unified Jira issue tracking platform.")
-    # e2|e3: equivalent=False, alt_label=False, hidden_label=True -> skos:hiddenLabel
+    # e2|e3: equivalent=True, hidden_label=True -> skos:hiddenLabel
     lm.label_responses["e2|e3"] = (False, True)
-    # e4|e5: equivalent=False, alt_label=True -> skos:altLabel
+    # e4|e5: equivalent=True, hidden_label=False -> skos:altLabel
     lm.label_responses["e4|e5"] = (True, False)
-    # e6|e7: equivalent=False, alt_label=False, hidden_label=False -> distinct concepts, advances to Stage 2
+    # e6|e7: equivalent=False -> distinct concepts, advances to Stage 2
     lm.label_responses["e6|e7"] = (False, False)
     lm.hierarchy_responses["e6|e7"] = (True, False)
 
@@ -301,10 +277,11 @@ def test_cascade_stage1_truth_table_short_circuiting() -> None:
 
     d_hid = next(d for d in decisions if d["pair_id"] == "real_e2|real_e3")
     assert d_hid["relation"] == "skos:hiddenLabel"
+    assert d_hid["equivalent"] is True
 
     d_alt2 = next(d for d in decisions if d["pair_id"] == "real_e4|real_e5")
     assert d_alt2["relation"] == "skos:altLabel"
-    assert d_alt2["equivalent"] is False
+    assert d_alt2["equivalent"] is True
 
     d_adv = next(d for d in decisions if d["pair_id"] == "real_e6|real_e7")
     assert d_adv["relation"] == "skos:broader"
@@ -317,9 +294,9 @@ def test_cascade_stage2_hierarchy_truth_table() -> None:
     program = _make_program(lm)
 
     pairs = [
-        {"pair_id": "e0|e1", "broader_tc": "", "direct_facts": [], "shared_role_facts": []},
-        {"pair_id": "e2|e3", "broader_tc": "", "direct_facts": [], "shared_role_facts": []},
-        {"pair_id": "e4|e5", "broader_tc": "", "direct_facts": [], "shared_role_facts": []},
+        {"pair_id": "e0|e1", "direct_facts": [], "shared_role_facts": []},
+        {"pair_id": "e2|e3", "direct_facts": [], "shared_role_facts": []},
+        {"pair_id": "e4|e5", "direct_facts": [], "shared_role_facts": []},
     ]
     # All pass Stage 1 as distinct concepts
     for p in pairs:
@@ -362,13 +339,11 @@ def test_cascade_rule_w1_w2_stage2_residuals_deterministic_related() -> None:
     pairs = [
         {
             "pair_id": "e0|e1",
-            "broader_tc": "",
             "direct_facts": [["pilot", "uses", "plane"]],
             "shared_role_facts": [],
         },
         {
             "pair_id": "e2|e3",
-            "broader_tc": "",
             "direct_facts": [],
             "shared_role_facts": [["cat", "eats", "fish"], ["dog", "eats", "meat"]],
         },
@@ -399,8 +374,8 @@ def test_cascade_stage3_related_and_different_from() -> None:
     program = _make_program(lm)
 
     pairs = [
-        {"pair_id": "e0|e1", "broader_tc": "", "direct_facts": [], "shared_role_facts": []},
-        {"pair_id": "e2|e3", "broader_tc": "", "direct_facts": [], "shared_role_facts": []},
+        {"pair_id": "e0|e1", "direct_facts": [], "shared_role_facts": []},
+        {"pair_id": "e2|e3", "direct_facts": [], "shared_role_facts": []},
     ]
     for p in pairs:
         lm.label_responses[str(p["pair_id"])] = (False, False)
@@ -435,7 +410,7 @@ def test_per_stage_fingerprint_isolation_on_signature_mutation() -> None:
         assert set(inspect.signature(fn).parameters).isdisjoint({"stage_" + "cache", "stage_" + "caches"})
 
     pairs = [
-        {"pair_id": "e0|e1", "broader_tc": "", "direct_facts": [], "shared_role_facts": []},
+        {"pair_id": "e0|e1", "direct_facts": [], "shared_role_facts": []},
     ]
     lm.label_responses["e0|e1"] = (False, False)
     lm.hierarchy_responses["e0|e1"] = (False, False)

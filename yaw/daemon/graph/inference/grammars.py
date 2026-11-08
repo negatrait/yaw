@@ -206,7 +206,7 @@ def _build_pair_boolean_grammar(
     *,
     pair_ids: Sequence[str] | None = None,
     max_decisions: int | None = None,
-    max_reasoning_chars: int | None = 240,
+    max_reasoning_chars: int | None = 360,
     custom_suffix: str | None = None,
     extra_rules: Sequence[str] = (),
 ) -> str:
@@ -268,23 +268,19 @@ def build_dspy_label_judge_grammar(
     max_decisions: int | None = None,
     *,
     pair_ids: Sequence[str] | None = None,
-    max_reasoning_chars: int | None = 240,
+    max_reasoning_chars: int | None = 360,
 ) -> str:
-    """Build pure-JSON GBNF grammar for JudgeLabels with conditional equivalent/alt_label/hidden_label branching."""
+    """Build pure-JSON GBNF grammar for JudgeLabels with conditional equivalent/hidden_label branching."""
     equiv_prefix = gbnf_escape_literal(', "equivalent": ')
-    def_key = gbnf_escape_literal('true, "definition": ')
-    alt_key = gbnf_escape_literal('false, "alt_label": ')
-    hid_key = gbnf_escape_literal('false, "hidden_label": ')
+    true_prefix = gbnf_escape_literal('true, "definition": ')
+    hid_key = gbnf_escape_literal(', "hidden_label": ')
     return _build_pair_boolean_grammar(
         (),
         pair_ids=pair_ids,
         max_decisions=max_decisions,
         max_reasoning_chars=max_reasoning_chars,
         custom_suffix=f"{equiv_prefix} equiv-branch",
-        extra_rules=(
-            f"equiv-branch ::= {def_key} reasoning-str | {alt_key} alt-branch",
-            f'alt-branch ::= "true" | {hid_key} boolean',
-        ),
+        extra_rules=(f'equiv-branch ::= {true_prefix} reasoning-str {hid_key} boolean | "false"',),
     )
 
 
@@ -292,7 +288,7 @@ def build_dspy_hierarchy_judge_grammar(
     max_decisions: int | None = None,
     *,
     pair_ids: Sequence[str] | None = None,
-    max_reasoning_chars: int | None = 240,
+    max_reasoning_chars: int | None = 360,
 ) -> str:
     """Build pure-JSON GBNF grammar for JudgeHierarchy."""
     return _build_pair_boolean_grammar(
@@ -307,7 +303,7 @@ def build_dspy_related_judge_grammar(
     max_decisions: int | None = None,
     *,
     pair_ids: Sequence[str] | None = None,
-    max_reasoning_chars: int | None = 240,
+    max_reasoning_chars: int | None = 360,
 ) -> str:
     """Build pure-JSON GBNF grammar for JudgeRelated."""
     return _build_pair_boolean_grammar(

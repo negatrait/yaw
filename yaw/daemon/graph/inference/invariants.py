@@ -7,6 +7,7 @@ from typing import Any
 from yaw.core import (
     VALID_SHACL_ACTIONS,
     VALUE_BEARING_SHACL_ACTIONS,
+    is_irreflexive_statement,
     text_processing,
 )
 
@@ -61,7 +62,7 @@ STAGE_SCHEMA_CONTRACTS: dict[str, tuple[str, tuple[str, ...], str]] = {
         ("decisions",),
         (
             'Populate `decisions` with branched `{"pair_id", "reasoning", "equivalent"}` objects '
-            '(`"definition"` when `equivalent=true`; `"alt_label"` and `"hidden_label"` when `equivalent=false`).'
+            '(`"definition"` and `"hidden_label"` when `equivalent=true`; close immediately when `equivalent=false`).'
         ),
     ),
     "hierarchy_judge": (
@@ -198,11 +199,7 @@ def validate_stage_invariants(
             ):
                 incomplete += 1
                 continue
-            if (
-                st.obj_kind != "literal"
-                and s_norm == o_norm
-                and (not s_def_clean or not o_def_clean or s_def_clean == o_def_clean)
-            ):
+            if not is_irreflexive_statement(st.subj, st.pred, st.obj, s_def_clean, o_def_clean, st.obj_kind):
                 self_loops.append(st.subj)
             if s_norm not in closed_world_norms:
                 unregistered.append(st.subj)
@@ -299,23 +296,19 @@ def validate_stage_invariants(
                     raw_def = d.get("definition")
                     if not isinstance(raw_def, str) or not raw_def.strip():
                         issues.append(f"Missing or empty 'definition' for equivalent=True in {pair_id!r}")
-                    if d.get("alt_label") is True or d.get("hidden_label") is True:
-                        issues.append(f"Conflicting alt_label/hidden_label with equivalent=True in {pair_id!r}")
-                else:
-                    if "alt_label" not in d:
-                        issues.append(f"Missing boolean field 'alt_label' for {pair_id!r}")
-                    elif not isinstance(d["alt_label"], bool):
+                    if "hidden_label" in d and not isinstance(d["hidden_label"], bool):
+                        issues.append(f"Non-boolean value {d['hidden_label']!r} for 'hidden_label' in {pair_id!r}")
+                    if "alt_label" in d and not isinstance(d["alt_label"], bool):
                         issues.append(f"Non-boolean value {d['alt_label']!r} for 'alt_label' in {pair_id!r}")
-                    elif d["alt_label"] is True:
-                        if "hidden_label" in d and not isinstance(d["hidden_label"], bool):
-                            issues.append(f"Non-boolean value {d['hidden_label']!r} for 'hidden_label' in {pair_id!r}")
-                        elif d.get("hidden_label") is True:
-                            issues.append(f"Conflicting alt_label=True and hidden_label=True in {pair_id!r}")
-                    else:
-                        if "hidden_label" not in d:
-                            issues.append(f"Missing boolean field 'hidden_label' for {pair_id!r}")
-                        elif not isinstance(d["hidden_label"], bool):
-                            issues.append(f"Non-boolean value {d['hidden_label']!r} for 'hidden_label' in {pair_id!r}")
+                    if d.get("alt_label") is True and d.get("hidden_label") is True:
+                        issues.append(f"Conflicting alt_label=True and hidden_label=True in {pair_id!r}")
+                else:
+                    if "alt_label" in d and not isinstance(d["alt_label"], bool):
+                        issues.append(f"Non-boolean value {d['alt_label']!r} for 'alt_label' in {pair_id!r}")
+                    elif "hidden_label" in d and not isinstance(d["hidden_label"], bool):
+                        issues.append(f"Non-boolean value {d['hidden_label']!r} for 'hidden_label' in {pair_id!r}")
+                    elif d.get("alt_label") is True or d.get("hidden_label") is True:
+                        issues.append(f"Conflicting alt_label/hidden_label with equivalent=False in {pair_id!r}")
             else:
                 for bk in bool_keys:
                     if bk not in d:

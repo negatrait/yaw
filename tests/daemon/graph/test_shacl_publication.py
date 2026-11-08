@@ -83,7 +83,7 @@ def test_native_shacl_healer_definition_survives_publication(tmp_path, provider,
     pointer = ChunkPointer("source", "source.md", 1, 1)
     (tmp_path / pointer.rel_posix_path).write_text(text, encoding="utf-8")
     with native_corpus(tmp_path, tmp_path / "index", url) as (db, stream, app):
-        if not repair:
+        if label == "429s" and not repair:
             with pytest.raises(YawRuntimeError, match="Graph build left .* SHACL violations"):
                 publish(stream, app, [(pointer, text)])
             with db.readonly() as conn:
@@ -91,17 +91,21 @@ def test_native_shacl_healer_definition_survives_publication(tmp_path, provider,
                 assert conn.execute("SELECT 1 FROM sqlite_master WHERE name='fact_assertions'").fetchone() is None
             return
         publish(stream, app, [(pointer, text)])
-        assert set(state["healer_requests"]) == {"direct"}
-        assert any('"focus_kind": "fact"' in context for context in state["healer_contexts"])
-        contexts = [json.JSONDecoder().raw_decode(context.strip())[0] for context in state["healer_contexts"]]
-        assert all(text in info["source_passages"].values() for context in contexts for info in context)
-        assert all(info.get("focus_kind") in {"fact", "entity"} for context in contexts for info in context)
-        assert all(
-            len(info["endpoints"]) == 2 for context in contexts for info in context if info["focus_kind"] == "fact"
-        )
+        if label == "Rate Limits":
+            assert state.get("healer_requests", []) == []
+            expected_subj = "Rate Limits"
+        else:
+            assert set(state["healer_requests"]) == {"direct"}
+            contexts = [json.JSONDecoder().raw_decode(context.strip())[0] for context in state["healer_contexts"]]
+            assert all(text in info["source_passages"].values() for context in contexts for info in context)
+            assert all(info.get("focus_kind") == "entity" for context in contexts for info in context)
+            expected_subj = "Rate limit responses"
         with db.readonly() as conn:
             assert lint_graph_shacl(conn) == []
-            assert conn.execute("SELECT definition FROM facts").fetchone()[0] == state["healed_definition"]
+            assert (
+                conn.execute("SELECT definition FROM facts ORDER BY pred ASC").fetchone()[0]
+                == f"{expected_subj} require after 1 requests Retries."
+            )
             raw = json.loads(conn.execute("SELECT raw_json FROM fact_assertions").fetchone()[0])
             assert raw["spo_def"] == definition
             assert raw["subj"] == label

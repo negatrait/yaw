@@ -109,7 +109,7 @@ Deno/Pyodide WASM) with
         gbnf_max_entities: int | None = None,
         gbnf_max_triples: int | None = None,
         gbnf_max_facts: int = 4,
-        gbnf_max_reasoning_chars: int | None = None,
+        gbnf_max_reasoning_chars: int | None = 360,
         embedding_query_prefix: str | None = None,
         embedding_fact_prefix: str | None = None,
         embedding_document_prefix: str | None = None,
@@ -1007,6 +1007,7 @@ chunk."""
                 use_gbnf=use_gbnf,
                 grammar_fn=lambda: grammar_fn(
                     pair_ids=[pair["pair_id"] for pair in json.loads(batch.payload)["pairs"]],
+                    max_reasoning_chars=self.gbnf_max_reasoning_chars,
                 ),
                 request_adapter=budget,
                 candidate_pairs=batch.payload,
@@ -1079,51 +1080,18 @@ chunk."""
 
         pairs_by_id = {p["pair_id"]: p for p in pairs_list}
         resolved_decisions: list[dict[str, Any]] = []
-        unresolved_pids: list[str] = []
 
-        # 1. Rule W3: Transitive broader pre-gate (0 LLM calls)
-        for p in pairs_list:
-            pid = p["pair_id"]
-            tc = str(p.get("broader_tc", "") or "").strip()
-            if tc == "a_under_b":
-                ea, eb = pid.split("|", 1)
-                resolved_decisions.append(
-                    {
-                        "pair_id": pid,
-                        "reasoning": "Deterministic skos:broader via Rule W3 transitive closure (a_under_b)",
-                        "relation": "skos:broader",
-                        "source_id": ea,
-                        "target_id": eb,
-                    }
-                )
-            elif tc == "b_under_a":
-                ea, eb = pid.split("|", 1)
-                resolved_decisions.append(
-                    {
-                        "pair_id": pid,
-                        "reasoning": "Deterministic skos:broader via Rule W3 transitive closure (b_under_a)",
-                        "relation": "skos:broader",
-                        "source_id": eb,
-                        "target_id": ea,
-                    }
-                )
-            else:
-                unresolved_pids.append(pid)
-
-        if not unresolved_pids:
-            return batch.resolve_decisions(resolved_decisions)
-
-        # 2. Rule W1: Direct facts skip Stage 1 directly to Stage 2
+        # 1. Rule W1: Direct facts skip Stage 1 directly to Stage 2
         stage1_pids: list[str] = []
         stage2_pids: list[str] = []
-        for pid in unresolved_pids:
-            p = pairs_by_id[pid]
+        for p in pairs_list:
+            pid = p["pair_id"]
             if p.get("direct_facts"):
                 stage2_pids.append(pid)
             else:
                 stage1_pids.append(pid)
 
-        # 3. Stage 1: JudgeLabels (skos:altLabel / skos:hiddenLabel)
+        # 2. Stage 1: JudgeLabels (skos:altLabel / skos:hiddenLabel)
         if stage1_pids:
             stage1_batch = batch.subset(stage1_pids)
             s1_decs = self._run_judge_stage(
@@ -1137,15 +1105,14 @@ chunk."""
             for dec in s1_decs:
                 pid = dec["pair_id"]
                 equiv = bool(dec.get("equivalent"))
-                alt = bool(dec.get("alt_label"))
                 hidden = bool(dec.get("hidden_label"))
-                if equiv or alt:
-                    dec_copy = dict(dec)
-                    dec_copy["relation"] = "skos:altLabel"
-                    resolved_decisions.append(dec_copy)
-                elif hidden:
+                if equiv and hidden:
                     dec_copy = dict(dec)
                     dec_copy["relation"] = "skos:hiddenLabel"
+                    resolved_decisions.append(dec_copy)
+                elif equiv:
+                    dec_copy = dict(dec)
+                    dec_copy["relation"] = "skos:altLabel"
                     resolved_decisions.append(dec_copy)
                 else:
                     stage2_pids.append(pid)

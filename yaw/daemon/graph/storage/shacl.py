@@ -10,6 +10,7 @@ from typing import Any
 from yaw.core import (
     SHACLViolation,
     detect_scalar_literal,
+    is_irreflexive_statement,
     is_resource_label,
     is_scalar_label,
     text_processing,
@@ -804,6 +805,20 @@ def _scan_shacl_violations(conn: sqlite3.Connection) -> list[SHACLViolation]:
                 message=f"Fact {fid} relates a resource sense to itself.",
             )
         )
+    for fid, s_name, pred, lit_lex, s_def in conn.execute(
+        "SELECT f.fact_id, COALESCE(es.name, ''), f.pred, COALESCE(f.obj_literal_lex, ''), COALESCE(es.definition, '') "
+        "FROM facts f JOIN entities es ON es.entity_id = f.subj_id "
+        "WHERE f.obj_kind = 'literal' ORDER BY f.fact_id ASC"
+    ):
+        if not is_irreflexive_statement(str(s_name), str(pred), str(lit_lex), str(s_def), "", "literal"):
+            violations.append(
+                SHACLViolation(
+                    shape="StatementShape/irreflexive",
+                    focus_node=str(fid),
+                    result_path="rdf:subject|rdf:object",
+                    message=f"Fact {fid} relates a resource sense to itself.",
+                )
+            )
 
     # 6. EdgeShape/closedWorld: Endpoints exist, no skos:related + owl:differentFrom collision, symmetric semantic edges
     for row in conn.execute(
@@ -888,45 +903,19 @@ def _scan_shacl_violations(conn: sqlite3.Connection) -> list[SHACLViolation]:
             )
         )
 
-    # 7. ConceptShape/broaderCycle & ConceptShape/S27-disjointBroaderRelated via cycle-safe recursive CTE
-    tc_count_row = conn.execute(
-        """
-        WITH RECURSIVE broader_tc(narrower_id, broader_id) AS (
-            SELECT src_id, dst_id FROM edges WHERE kind = 'skos:broader'
-            UNION
-            SELECT tc.narrower_id, e.dst_id
-            FROM broader_tc tc
-            JOIN edges e ON e.src_id = tc.broader_id AND e.kind = 'skos:broader'
-            LIMIT 10000
-        )
-        SELECT COUNT(*) FROM broader_tc
-        """
-    ).fetchone()
-    if tc_count_row is not None and int(tc_count_row[0]) >= 10000:
-        violations.append(
-            SHACLViolation(
-                shape="ConceptShape/broaderTransitiveCapExceeded",
-                focus_node="skos:broader",
-                result_path="skos:broader",
-                message=(
-                    "Transitive skos:broader closure reached the 10000-pair safety cap; "
-                    "hierarchy cycle and S27 disjointness checks may be incomplete."
-                ),
-            )
-        )
-
+    # 7. ConceptShape/broaderCycle & direct 1-hop ConceptShape/S27-disjointBroaderRelated
     for row in conn.execute(
         """
-        WITH RECURSIVE broader_tc(narrower_id, broader_id) AS (
+        WITH RECURSIVE broader_reach(narrower_id, broader_id) AS (
             SELECT src_id, dst_id FROM edges WHERE kind = 'skos:broader'
             UNION
-            SELECT tc.narrower_id, e.dst_id
-            FROM broader_tc tc
-            JOIN edges e ON e.src_id = tc.broader_id AND e.kind = 'skos:broader'
+            SELECT br.narrower_id, e.dst_id
+            FROM broader_reach br
+            JOIN edges e ON e.src_id = br.broader_id AND e.kind = 'skos:broader'
             LIMIT 10000
         )
         SELECT DISTINCT narrower_id
-        FROM broader_tc
+        FROM broader_reach
         WHERE narrower_id = broader_id
         ORDER BY narrower_id ASC
         """
@@ -943,24 +932,16 @@ def _scan_shacl_violations(conn: sqlite3.Connection) -> list[SHACLViolation]:
 
     for row in conn.execute(
         """
-        WITH RECURSIVE broader_tc(narrower_id, broader_id) AS (
-            SELECT src_id, dst_id FROM edges WHERE kind = 'skos:broader'
-            UNION
-            SELECT tc.narrower_id, e.dst_id
-            FROM broader_tc tc
-            JOIN edges e ON e.src_id = tc.broader_id AND e.kind = 'skos:broader'
-            LIMIT 10000
-        )
-        SELECT DISTINCT tc.narrower_id, tc.broader_id
-        FROM broader_tc tc
+        SELECT DISTINCT b.src_id, b.dst_id
+        FROM edges b
         INNER JOIN edges rel
           ON rel.kind = 'skos:related'
          AND (
-             (rel.src_id = tc.narrower_id AND rel.dst_id = tc.broader_id)
-             OR (rel.src_id = tc.broader_id AND rel.dst_id = tc.narrower_id)
+             (rel.src_id = b.src_id AND rel.dst_id = b.dst_id)
+             OR (rel.src_id = b.dst_id AND rel.dst_id = b.src_id)
          )
-        WHERE tc.narrower_id != tc.broader_id
-        ORDER BY tc.narrower_id ASC, tc.broader_id ASC
+        WHERE b.kind = 'skos:broader' AND b.src_id != b.dst_id
+        ORDER BY b.src_id ASC, b.dst_id ASC
         """
     ):
         s, d = str(row[0]), str(row[1])
@@ -970,8 +951,7 @@ def _scan_shacl_violations(conn: sqlite3.Connection) -> list[SHACLViolation]:
                 focus_node=f"{s}|{d}",
                 result_path="skos:broader|skos:related",
                 message=(
-                    f"Concept pair ({s}, {d}) violates SKOS S27 disjointness between "
-                    "skos:broaderTransitive and skos:related."
+                    f"Concept pair ({s}, {d}) violates SKOS S27 disjointness between skos:broader and skos:related."
                 ),
             )
         )
@@ -1964,60 +1944,83 @@ def auto_heal_deterministic_shacl(conn: sqlite3.Connection) -> int:
         for eid in scalar_eids:
             repaired += apply_shacl_repairs(conn, [{"focus_node": eid, "action": "remove_scalar_entity", "value": ""}])
 
-        # 2. Break skos:broader cycles at minimum-weight edge
-        cycle_nodes = [
+        irreflexive_fids = [
             str(r[0])
             for r in conn.execute(
-                """
-                WITH RECURSIVE broader_tc(narrower_id, broader_id, path_str) AS (
-                    SELECT src_id, dst_id, src_id || '->' || dst_id
-                    FROM edges WHERE kind = 'skos:broader'
-                    UNION
-                    SELECT tc.narrower_id, e.dst_id, tc.path_str || '->' || e.dst_id
-                    FROM broader_tc tc
-                    JOIN edges e ON e.src_id = tc.broader_id AND e.kind = 'skos:broader'
-                    WHERE INSTR(tc.path_str, e.dst_id) = 0 OR e.dst_id = tc.narrower_id
-                    LIMIT 10000
-                )
-                SELECT DISTINCT narrower_id
-                FROM broader_tc
-                WHERE narrower_id = broader_id
-                """
+                "SELECT fact_id FROM facts WHERE COALESCE(obj_kind, 'entity') = 'entity' AND subj_id = obj_id "
+                "ORDER BY fact_id ASC"
             ).fetchall()
         ]
-        for cn in cycle_nodes:
-            cycle_edge = conn.execute(
-                """
-                WITH RECURSIVE cycle_path(src_id, dst_id, weight, depth) AS (
-                    SELECT src_id, dst_id, weight, 1
-                    FROM edges WHERE kind = 'skos:broader' AND src_id = ?
-                    UNION ALL
-                    SELECT e.src_id, e.dst_id, e.weight, cp.depth + 1
-                    FROM cycle_path cp
-                    JOIN edges e ON e.src_id = cp.dst_id AND e.kind = 'skos:broader'
-                    WHERE cp.depth < 10
-                )
-                SELECT src_id, dst_id, weight
-                FROM cycle_path
-                WHERE dst_id = ?
-                ORDER BY weight ASC
-                LIMIT 1
-                """,
-                (cn, cn),
-            ).fetchone()
-            if cycle_edge is not None:
-                c_src, c_dst = str(cycle_edge[0]), str(cycle_edge[1])
-                conn.execute(
-                    "DELETE FROM edges WHERE kind = 'skos:broader' AND src_id = ? AND dst_id = ?",
-                    (c_src, c_dst),
-                )
-                conn.execute(
-                    "DELETE FROM edge_sources WHERE kind = 'skos:broader' AND src_id = ? AND dst_id = ?",
-                    (c_src, c_dst),
-                )
-                repaired += 1
+        for fid, s_name, pred, lit_lex, s_def in conn.execute(
+            "SELECT f.fact_id, COALESCE(es.name, ''), f.pred, "
+            "COALESCE(f.obj_literal_lex, ''), COALESCE(es.definition, '') "
+            "FROM facts f JOIN entities es ON es.entity_id = f.subj_id "
+            "WHERE f.obj_kind = 'literal' ORDER BY f.fact_id ASC"
+        ).fetchall():
+            if not is_irreflexive_statement(str(s_name), str(pred), str(lit_lex), str(s_def), "", "literal"):
+                irreflexive_fids.append(str(fid))
+        for fid in irreflexive_fids:
+            repaired += apply_shacl_repairs(conn, [{"focus_node": fid, "action": "delete_invalid_fact", "value": ""}])
 
-        # 3. Empirical Bayes S27 & Cagle resolution
+        # 2. Break skos:broader cycles at minimum-weight edge (fixed-point loop)
+        for _ in range(16):
+            cycle_nodes = [
+                str(r[0])
+                for r in conn.execute(
+                    """
+                    WITH RECURSIVE broader_reach(narrower_id, broader_id, path_str) AS (
+                        SELECT src_id, dst_id, src_id || '->' || dst_id
+                        FROM edges WHERE kind = 'skos:broader'
+                        UNION
+                        SELECT br.narrower_id, e.dst_id, br.path_str || '->' || e.dst_id
+                        FROM broader_reach br
+                        JOIN edges e ON e.src_id = br.broader_id AND e.kind = 'skos:broader'
+                        WHERE INSTR(br.path_str, e.dst_id) = 0 OR e.dst_id = br.narrower_id
+                        LIMIT 10000
+                    )
+                    SELECT DISTINCT narrower_id
+                    FROM broader_reach
+                    WHERE narrower_id = broader_id
+                    """
+                ).fetchall()
+            ]
+            deleted_in_pass = 0
+            for cn in cycle_nodes:
+                cycle_edge = conn.execute(
+                    """
+                    WITH RECURSIVE cycle_path(src_id, dst_id, weight, depth) AS (
+                        SELECT src_id, dst_id, weight, 1
+                        FROM edges WHERE kind = 'skos:broader' AND src_id = ?
+                        UNION ALL
+                        SELECT e.src_id, e.dst_id, e.weight, cp.depth + 1
+                        FROM cycle_path cp
+                        JOIN edges e ON e.src_id = cp.dst_id AND e.kind = 'skos:broader'
+                        WHERE cp.depth < 10
+                    )
+                    SELECT src_id, dst_id, weight
+                    FROM cycle_path
+                    WHERE dst_id = ?
+                    ORDER BY weight ASC
+                    LIMIT 1
+                    """,
+                    (cn, cn),
+                ).fetchone()
+                if cycle_edge is not None:
+                    c_src, c_dst = str(cycle_edge[0]), str(cycle_edge[1])
+                    conn.execute(
+                        "DELETE FROM edges WHERE kind = 'skos:broader' AND src_id = ? AND dst_id = ?",
+                        (c_src, c_dst),
+                    )
+                    conn.execute(
+                        "DELETE FROM edge_sources WHERE kind = 'skos:broader' AND src_id = ? AND dst_id = ?",
+                        (c_src, c_dst),
+                    )
+                    repaired += 1
+                    deleted_in_pass += 1
+            if deleted_in_pass == 0:
+                break
+
+        # 3. Empirical Bayes 1-hop S27 & Cagle resolution
         avg_b_row = conn.execute("SELECT AVG(weight) FROM edges WHERE kind = 'skos:broader'").fetchone()
         avg_broader = float(avg_b_row[0]) if avg_b_row and avg_b_row[0] is not None else 0.5
 
@@ -2029,29 +2032,22 @@ def auto_heal_deterministic_shacl(conn: sqlite3.Connection) -> int:
 
         s27_pairs = conn.execute(
             """
-            WITH RECURSIVE broader_tc(narrower_id, broader_id) AS (
-                SELECT src_id, dst_id FROM edges WHERE kind = 'skos:broader'
-                UNION
-                SELECT tc.narrower_id, e.dst_id
-                FROM broader_tc tc
-                JOIN edges e ON e.src_id = tc.broader_id AND e.kind = 'skos:broader'
-                LIMIT 10000
-            )
-            SELECT DISTINCT tc.narrower_id, tc.broader_id
-            FROM broader_tc tc
+            SELECT DISTINCT b.src_id, b.dst_id, b.weight
+            FROM edges b
             INNER JOIN edges rel
               ON rel.kind = 'skos:related'
              AND (
-                 (rel.src_id = tc.narrower_id AND rel.dst_id = tc.broader_id)
-                 OR (rel.src_id = tc.broader_id AND rel.dst_id = tc.narrower_id)
+                 (rel.src_id = b.src_id AND rel.dst_id = b.dst_id)
+                 OR (rel.src_id = b.dst_id AND rel.dst_id = b.src_id)
              )
-            WHERE tc.narrower_id != tc.broader_id
-            ORDER BY tc.narrower_id ASC, tc.broader_id ASC
+            WHERE b.kind = 'skos:broader' AND b.src_id != b.dst_id
+            ORDER BY b.src_id ASC, b.dst_id ASC
             """
         ).fetchall()
 
         for row in s27_pairs:
             a_id, c_id = str(row[0]), str(row[1])
+            w_broader = float(row[2]) if row[2] is not None else 0.8
 
             rel_row = conn.execute(
                 """
@@ -2062,7 +2058,9 @@ def auto_heal_deterministic_shacl(conn: sqlite3.Connection) -> int:
                 """,
                 (a_id, c_id, c_id, a_id),
             ).fetchone()
-            w_rel = float(rel_row[0]) if rel_row and rel_row[0] is not None else 0.8
+            if rel_row is None:
+                continue
+            w_rel = float(rel_row[0]) if rel_row[0] is not None else 0.8
 
             # Step 1: Existing fact check (Deterministic Cagle Short-Circuit)
             fact_exists = (
@@ -2097,47 +2095,8 @@ def auto_heal_deterministic_shacl(conn: sqlite3.Connection) -> int:
                 repaired += 1
                 continue
 
-            # Find path in skos:broader from A to C
-            path_row = conn.execute(
-                """
-                WITH RECURSIVE path_finder(curr_id, path_str, min_w, hop_count) AS (
-                    SELECT dst_id, src_id || '->' || dst_id, weight, 1
-                    FROM edges
-                    WHERE kind = 'skos:broader' AND src_id = ?
-                    UNION ALL
-                    SELECT e.dst_id, pf.path_str || '->' || e.dst_id, MIN(pf.min_w, e.weight), pf.hop_count + 1
-                    FROM path_finder pf
-                    JOIN edges e ON e.src_id = pf.curr_id AND e.kind = 'skos:broader'
-                    WHERE pf.hop_count < 10
-                )
-                SELECT path_str, hop_count
-                FROM path_finder
-                WHERE curr_id = ?
-                ORDER BY hop_count ASC
-                LIMIT 1
-                """,
-                (a_id, c_id),
-            ).fetchone()
-
-            if path_row is None:
-                continue
-
-            path_str = str(path_row[0])
-            nodes_in_path = path_str.split("->")
-            path_edges: list[tuple[str, str, float]] = []
-            for i in range(len(nodes_in_path) - 1):
-                u, v = nodes_in_path[i], nodes_in_path[i + 1]
-                ew_row = conn.execute(
-                    "SELECT weight FROM edges WHERE kind = 'skos:broader' AND src_id = ? AND dst_id = ?",
-                    (u, v),
-                ).fetchone()
-                ew = float(ew_row[0]) if ew_row and ew_row[0] is not None else 0.8
-                path_edges.append((u, v, ew))
-
-            w_chain = pool_confidences(*[ew for _, _, ew in path_edges]) or 0.8
-
             # Step 2: Empirical Database Means Gate for Cagle Reification
-            above_avg = (w_chain >= avg_broader) and (w_rel >= avg_rel)
+            above_avg = (w_broader >= avg_broader) and (w_rel >= avg_rel)
             shared_chunk: str | None = None
             if above_avg:
                 chunk_row = conn.execute(
@@ -2164,7 +2123,7 @@ def auto_heal_deterministic_shacl(conn: sqlite3.Connection) -> int:
                 if chunk_row is not None:
                     shared_chunk = str(chunk_row[0])
 
-            atomic_conf = pool_confidences(w_chain, w_rel) or 0.8
+            atomic_conf = pool_confidences(w_broader, w_rel) or 0.8
             if above_avg and shared_chunk is not None and atomic_conf >= avg_fact:
                 new_fid = fact_id(a_id, "relatedTo", "entity", c_id)
                 raw_json = json.dumps([a_id, "relatedTo", c_id])
@@ -2203,8 +2162,8 @@ def auto_heal_deterministic_shacl(conn: sqlite3.Connection) -> int:
                 repaired += 1
                 continue
 
-            # Step 3: Direct Bayes Factor Comparison (w_chain vs w_rel)
-            if w_chain >= w_rel:
+            # Step 3: Direct Bayes Factor Comparison (w_broader vs w_rel)
+            if w_broader >= w_rel:
                 conn.execute(
                     """
                     DELETE FROM edges
@@ -2223,17 +2182,14 @@ def auto_heal_deterministic_shacl(conn: sqlite3.Connection) -> int:
                 )
                 repaired += 1
             else:
-                weakest_u, weakest_v, min_w = min(path_edges, key=lambda e: e[2])
                 conn.execute(
                     "DELETE FROM edges WHERE kind = 'skos:broader' AND src_id = ? AND dst_id = ?",
-                    (weakest_u, weakest_v),
+                    (a_id, c_id),
                 )
                 conn.execute(
                     "DELETE FROM edge_sources WHERE kind = 'skos:broader' AND src_id = ? AND dst_id = ?",
-                    (weakest_u, weakest_v),
+                    (a_id, c_id),
                 )
-                if len(path_edges) >= 2:
-                    upsert_semantic_edges(conn, [(weakest_u, weakest_v, "skos:related", min_w)])
                 repaired += 1
 
     return repaired

@@ -20,10 +20,10 @@ def test_label_judge_grammar_structure() -> None:
     assert 'decision ::= "{\\"pair_id\\": " string ", \\"reasoning\\": " reasoning-str' in grammar
     assert ', \\"equivalent\\": " equiv-branch' in grammar
     assert (
-        'equiv-branch ::= "true, \\"definition\\": " reasoning-str | "false, \\"alt_label\\": " alt-branch' in grammar
+        'equiv-branch ::= "true, \\"definition\\": " reasoning-str ", \\"hidden_label\\": " boolean | "false"'
+        in grammar
     )
-    assert 'alt-branch ::= "true" | "false, \\"hidden_label\\": " boolean' in grammar
-    assert 'reasoning-str ::= "\\"" char{1,240} "\\""' in grammar
+    assert 'reasoning-str ::= "\\"" char{1,360} "\\""' in grammar
     assert 'boolean ::= "true" | "false"' in grammar
 
 
@@ -60,7 +60,7 @@ def test_hierarchy_judge_grammar_structure() -> None:
     assert 'decision ::= "{\\"pair_id\\": " string ", \\"reasoning\\": " reasoning-str' in grammar
     assert ', \\"broader\\": " boolean' in grammar
     assert ', \\"narrower\\": " boolean' in grammar
-    assert 'reasoning-str ::= "\\"" char{1,240} "\\""' in grammar
+    assert 'reasoning-str ::= "\\"" char{1,360} "\\""' in grammar
     assert 'boolean ::= "true" | "false"' in grammar
 
 
@@ -85,7 +85,7 @@ def test_related_judge_grammar_structure() -> None:
     assert 'root ::= "{\\"decisions\\": [" decision-list "]}"' in grammar
     assert 'decision ::= "{\\"pair_id\\": " string ", \\"reasoning\\": " reasoning-str' in grammar
     assert ', \\"related\\": " boolean' in grammar
-    assert 'reasoning-str ::= "\\"" char{1,240} "\\""' in grammar
+    assert 'reasoning-str ::= "\\"" char{1,360} "\\""' in grammar
     assert 'boolean ::= "true" | "false"' in grammar
 
 
@@ -115,7 +115,7 @@ def test_adapter_resolves_3_stage_grammars() -> None:
     adapter = YawGBNFAdapter(enable_gbnf=True)
     g_label = adapter.resolve_grammar(JudgeLabels)
     assert g_label is not None
-    assert "alt_label" in g_label
+    assert "hidden_label" in g_label
 
     g_hier = adapter.resolve_grammar(JudgeHierarchy)
     assert g_hier is not None

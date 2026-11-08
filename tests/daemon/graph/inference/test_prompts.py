@@ -494,6 +494,7 @@ tools, and mode=None routes pre-hydrated focus_context directly to shacl_repair.
             DSPY_NER_GBNF_GRAMMAR,
             DSPY_QA_GBNF_GRAMMAR,
             DSPY_TRIPLES_GBNF_GRAMMAR,
+            build_dspy_qa_grammar,
             build_dspy_rerank_grammar,
             build_dspy_triples_grammar,
         )
@@ -553,7 +554,7 @@ tools, and mode=None routes pre-hydrated focus_context directly to shacl_repair.
         program.answer_question("Alan Turing was born in London.", "Where?", lm=lm, use_gbnf=True)
         self.assertEqual(
             lm.history[3]["kwargs"].get("extra_body"),
-            {"grammar": DSPY_QA_GBNF_GRAMMAR},
+            {"grammar": build_dspy_qa_grammar(program.gbnf_max_reasoning_chars)},
         )
 
     def test_sizecoding_gbnf_caps_and_gepa_pareto_metric(self):
@@ -1028,8 +1029,8 @@ no frequency penalty."""
                         {
                             "pair_id": "e0|e1",
                             "reasoning": "Standard synonym",
-                            "equivalent": False,
-                            "alt_label": True,
+                            "equivalent": True,
+                            "definition": "Unified canonical concept definition.",
                             "hidden_label": False,
                         }
                     ]
@@ -1163,7 +1164,7 @@ no frequency penalty."""
 
         # Verify GBNF grammars and parser edge cases
         self.assertIn("entity_definitions", DSPY_MISSING_ENTITY_DEFS_GBNF_GRAMMAR)
-        self.assertIn("alt_label", build_dspy_label_judge_grammar())
+        self.assertIn("hidden_label", build_dspy_label_judge_grammar())
         self.assertIn("set_definition", DSPY_SHACL_REPAIR_GBNF_GRAMMAR)
         with self.assertRaises(json.JSONDecodeError):
             parse_label_decisions("invalid json")
@@ -1641,8 +1642,8 @@ no frequency penalty."""
                     {
                         "pair_id": "ent-1|ent-2",
                         "reasoning": "Identical synonyms",
-                        "equivalent": False,
-                        "alt_label": True,
+                        "equivalent": True,
+                        "definition": "Unified canonical concept.",
                         "hidden_label": False,
                     }
                 ]
@@ -1658,8 +1659,6 @@ no frequency penalty."""
                         "pair_id": "ent-1|ent-1",
                         "reasoning": "Self loop",
                         "equivalent": False,
-                        "alt_label": True,
-                        "hidden_label": False,
                     }
                 ]
             ),
@@ -1942,7 +1941,7 @@ no frequency penalty."""
             build_dspy_shacl_repair_grammar,
         )
 
-        self.assertIn("alt_label", build_dspy_label_judge_grammar(max_decisions=2))
+        self.assertIn("hidden_label", build_dspy_label_judge_grammar(max_decisions=2))
         self.assertIn("broader", build_dspy_hierarchy_judge_grammar(max_decisions=2))
         self.assertIn("related", build_dspy_related_judge_grammar(max_decisions=2))
         self.assertIn("skos:altLabel", JudgeLabels.instructions)

@@ -266,34 +266,36 @@ SYNONYM_JUDGE_STAGE_NAMES: tuple[str, str, str] = (
 
 
 class JudgeLabels(dspy.Signature):
-    """Evaluate Stage 1 W3C SKOS concept equivalence and lexical identity (`skos:altLabel` and `skos:hiddenLabel`) \
-for candidate pairs in `candidate_pairs` using a 2-step conditional branching heuristic:
-    1. Concept Equivalence (`equivalent=true`): If `entity_a` and `entity_b` denote the same underlying concept or \
-duplicate entity (e.g., identical surface names across passages like 'Jira' and 'Jira' or 'Change Management Policy' \
-and 'Change Management Policy', or coreferent mentions of the exact same referent), emit `"equivalent": true` and \
-synthesize a unified, non-tautological `"definition"` string combining their context to collapse them into a single \
-concept.
-    2. Distinct or Lexical Variant (`equivalent=false`): Branch on `"alt_label"`:
-       - If one surface name is a valid alternative label, synonym, acronym, or abbreviation of the other \
-(`skos:altLabel`), emit `"equivalent": false, "alt_label": true` (do not emit `"hidden_label"`).
-       - Otherwise emit `"equivalent": false, "alt_label": false, "hidden_label": true` for a misspelling/typo \
-(`skos:hiddenLabel`), or `"equivalent": false, "alt_label": false, "hidden_label": false` when `entity_a` and \
-`entity_b` are distinct concepts advancing to Stage 2 hierarchy evaluation.
-    Head-Noun Preservation Rule: Never merge a system/proper noun `X` with a distinct component, role, or artifact \
-modified by `X` (such as `X Router`, `X secrets`, `XTenant`, or `CRDs`). A phrase with an additional head noun or \
-modifier is NOT an alternative label (`alt_label: false, equivalent: false`)."""
+    """Evaluate candidate entity pairs in `candidate_pairs` for strict W3C SKOS identity equivalence \
+(`skos:altLabel` / `skos:hiddenLabel`).
+
+    CORE PRINCIPLE:
+    - Merging two nodes (`equivalent: true`) asserts they are the EXACT SAME underlying `skos:Concept` or \
+`owl:NamedIndividual` in this domain.
+    - If two nodes are distinct concepts or distinct individuals (`equivalent: false`), emit `"equivalent": false` \
+so the pair advances to Stage 2 (`JudgeHierarchy`).
+
+    MANDATORY FALSIFICATION RULES (state in 1 concise sentence in `reasoning` before `equivalent`):
+    1. Named Individuals & Identifiers: NEVER merge (`equivalent: false`) two people, teams, regions, tiers, stages, \
+versions, or percentiles that have different given names, surnames, numbers, or codes (e.g., 'Noah Patel' vs \
+'Ravi Patel', 'Priya Rao' vs 'Priya Shah', 'Tier 1' vs 'Tier 4', 'Fast tier' vs 'Standard tier', 'p95' vs 'p99').
+    2. Modifier-Head & Category Distinctions: NEVER merge (`equivalent: false`) a general system/tier/resource with \
+a specific component, metric, regression, or policy that modifies it (e.g., 'Fast tier' vs 'fast tier p99 regression', \
+'Tenant' vs 'Tenant-id', 'Latency' vs 'p99 TTFT regression', 'Redwood' vs 'Redwood Router').
+    3. True Equivalence (`equivalent: true`): Emit `equivalent: true` ONLY when both `a` and `b` denote the exact \
+same concept or individual, provide a unified `"definition"`, and set `"hidden_label": false` for a valid \
+synonym/acronym (`skos:altLabel`) or `"hidden_label": true` for a misspelling/typo (`skos:hiddenLabel`)."""
 
     candidate_pairs: str = dspy.InputField(
-        desc="JSON object (`synonym-evidence-v2`) with inline definitions, facts, and source excerpts."
+        desc=(
+            "JSON object containing `pairs`: list of candidate entity pairs with definitions, direct_facts, "
+            "shared_role_facts, and chunk context"
+        )
     )
     decisions: list[dict[str, Any]] = dspy.OutputField(
         desc=(
-            'List of branched decision objects: if equivalent=true, emit {"pair_id": "e0|e1", "reasoning": "...", '
-            '"equivalent": true, "definition": "<unified skos:definition>"}; '
-            'if equivalent=false and alt_label=true, emit {"pair_id": "e0|e1", "reasoning": "...", '
-            '"equivalent": false, "alt_label": true}; '
-            'if equivalent=false and alt_label=false, emit {"pair_id": "e0|e1", "reasoning": "...", '
-            '"equivalent": false, "alt_label": false, "hidden_label": bool}.'
+            'List of decision objects: `{"pair_id", "reasoning", "equivalent": true, "definition", '
+            '"hidden_label": bool}` when equivalent, or `{"pair_id", "reasoning", "equivalent": false}` when distinct'
         )
     )
 

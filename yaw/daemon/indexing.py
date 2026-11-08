@@ -213,7 +213,7 @@ async def process_file(
     return tuple(outputs)
 
 
-@coco.fn
+@coco.fn(memo=True, version=2)
 async def publish_graph(
     settings: GraphPlanSettings,
     chunk_outputs: tuple[ChunkProcessOutput, ...],
@@ -574,8 +574,6 @@ def bind_native_indexing(
                 )
             ),
             shacl_identity=shacl_fingerprint(program),
-            auto_merge_cosine_gate=engine.auto_merge_cosine_gate,
-            auto_merge_difflib_gate=engine.auto_merge_difflib_gate,
             synonymy_threshold=engine.synonymy_threshold,
             synonymy_top_k=engine.synonymy_top_k,
             ast_context_hops=engine.ast_context_hops,

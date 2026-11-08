@@ -175,8 +175,8 @@ class PipelineGateMockLM(dspy.LM):
                             }
                         )
                     elif pair_names == {"cryptanalysis", "number theory"}:
-                        # Both closes a 3-cycle in skos:broader (if broader) or triggers S27 (if related);
-                        # emit skos:related to trigger SKOS S27 against the 2-hop broaderTransitive path!
+                        # 2-hop broader chain (cryptanalysis -> discrete mathematics -> number theory) with
+                        # skos:related between cryptanalysis and number theory is valid under non-transitive broader
                         decisions.append(
                             {
                                 "pair_id": pid,

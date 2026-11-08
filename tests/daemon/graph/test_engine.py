@@ -108,7 +108,7 @@ class DeterministicMockLM(dspy.LM):
         ):
             return [json.dumps({"query_intent": "Ada Lovelace" if "Lovelace" in req_str else "Alan Turing"})]
         pids = _extract_mock_pair_ids(prompt, messages, req_str)
-        if "alt_label" in req_str or "JudgeLabels" in req_str:
+        if "alt_label" in req_str or "hidden_label" in req_str or "JudgeLabels" in req_str:
             return [
                 json.dumps(
                     {
@@ -117,8 +117,6 @@ class DeterministicMockLM(dspy.LM):
                                 "pair_id": pid,
                                 "reasoning": f"Deterministic label decision for {pid}",
                                 "equivalent": False,
-                                "alt_label": False,
-                                "hidden_label": False,
                             }
                             for pid in pids
                         ]
@@ -959,14 +957,15 @@ Option A (standalone Stage 1 NER entities preserved with definitions)."""
                     {"prompt_tokens": 32, "completion_tokens": 16, "total_tokens": 48},
                 )
             req_str = str(prompt or messages or kwargs)
-            if "alt_label" in req_str or "JudgeLabels" in req_str:
+            if "alt_label" in req_str or "hidden_label" in req_str or "JudgeLabels" in req_str:
                 pair_ids = _extract_mock_pair_ids(prompt, messages, req_str)
                 decisions = [
                     {
                         "pair_id": pid,
                         "reasoning": f"Merge same-label sense back for {pid}",
-                        "equivalent": False,
-                        "alt_label": True,
+                        "equivalent": True,
+                        "definition": f"Unified concept definition for {pid}",
+                        "hidden_label": False,
                     }
                     for pid in pair_ids
                 ]
@@ -1175,14 +1174,12 @@ using all 5 bound REPL tools."""
                     )
                 ]
             pids = _extract_mock_pair_ids(prompt, messages, req_str)
-            if "alt_label" in req_str or "JudgeLabels" in req_str:
+            if "alt_label" in req_str or "hidden_label" in req_str or "JudgeLabels" in req_str:
                 decisions = [
                     {
                         "pair_id": pid,
                         "reasoning": "Not lexical label match",
                         "equivalent": False,
-                        "alt_label": False,
-                        "hidden_label": False,
                     }
                     for pid in pids
                 ]
@@ -2094,7 +2091,7 @@ minibatch q_stats lookup."""
             req_str = str(prompt or messages or kwargs)
             if "ExtractEntities" in req_str or ("named_entities" in req_str and "triples" not in req_str):
                 stage_call_counts["ner"] += 1
-            elif "alt_label" in req_str or "JudgeLabels" in req_str:
+            elif "alt_label" in req_str or "hidden_label" in req_str or "JudgeLabels" in req_str:
                 stage_call_counts["label_judge"] += 1
                 pair_ids = _extract_mock_pair_ids(prompt, messages, req_str)
                 return [
@@ -2104,8 +2101,9 @@ minibatch q_stats lookup."""
                                 {
                                     "pair_id": p,
                                     "reasoning": "Lexical identity match",
-                                    "equivalent": False,
-                                    "alt_label": True,
+                                    "equivalent": True,
+                                    "definition": f"Unified concept for {p}",
+                                    "hidden_label": False,
                                 }
                                 for p in pair_ids
                             ]
@@ -2405,7 +2403,7 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
             **kwargs: Any,
         ) -> list[str]:
             req_str = str(prompt or messages or kwargs)
-            if "alt_label" in req_str or "JudgeLabels" in req_str:
+            if "alt_label" in req_str or "hidden_label" in req_str or "JudgeLabels" in req_str:
                 decisions = []
                 packet_text = "\n".join(str(m.get("content", "")) for m in messages or [])
                 candidates = candidate_rows(packet_text)
@@ -2419,8 +2417,8 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
                             {
                                 "pair_id": pid,
                                 "reasoning": "Hidden label typo variant",
-                                "equivalent": False,
-                                "alt_label": False,
+                                "equivalent": True,
+                                "definition": "Unified Cinderella concept.",
                                 "hidden_label": True,
                                 "canonical": "A" if na == "cinderella" else "B",
                             }
@@ -2431,8 +2429,6 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
                                 "pair_id": pid,
                                 "reasoning": "Not lexical label match",
                                 "equivalent": False,
-                                "alt_label": False,
-                                "hidden_label": False,
                             }
                         )
                 return [json.dumps({"decisions": complete_decisions(candidates, decisions, stage_text=req_str)})]
@@ -2803,7 +2799,7 @@ def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
             **kwargs: Any,
         ) -> list[str]:
             req_str = str(prompt or messages or kwargs)
-            if "alt_label" in req_str or "JudgeLabels" in req_str:
+            if "alt_label" in req_str or "hidden_label" in req_str or "JudgeLabels" in req_str:
                 decisions = []
                 packet_text = "\n".join(str(m.get("content", "")) for m in messages or [])
                 candidates = candidate_rows(packet_text)
@@ -2814,8 +2810,6 @@ def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
                             "pair_id": pid,
                             "reasoning": "Not lexical label match",
                             "equivalent": False,
-                            "alt_label": False,
-                            "hidden_label": False,
                         }
                     )
                 return [json.dumps({"decisions": decisions})]

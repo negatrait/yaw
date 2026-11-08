@@ -23,40 +23,138 @@ def test_parse_label_decisions_truth_table() -> None:
                 "reasoning": "Identical concept across passages",
                 "equivalent": True,
                 "definition": "Unified canonical concept definition.",
+                "hidden_label": False,
             },
-            {"pair_id": "a|b", "reasoning": "Standard synonym", "equivalent": False, "alt_label": True},
             {
                 "pair_id": "c|d",
                 "reasoning": "Typo in source",
-                "equivalent": False,
-                "alt_label": False,
+                "equivalent": True,
+                "definition": "Unified concept with hidden typo label.",
                 "hidden_label": True,
             },
             {
                 "pair_id": "g|h",
                 "reasoning": "Distinct concepts",
                 "equivalent": False,
-                "alt_label": False,
-                "hidden_label": False,
             },
         ]
     }
     decisions = parse_label_decisions(raw)
-    assert len(decisions) == 4
+    assert len(decisions) == 3
     assert decisions[0]["equivalent"] is True
+    assert decisions[0]["alt_label"] is True
+    assert decisions[0]["hidden_label"] is False
     assert decisions[0]["definition"] == "Unified canonical concept definition."
     assert decisions[0]["relation"] == "skos:altLabel"
-    assert decisions[1]["equivalent"] is False
-    assert decisions[1]["alt_label"] is True
-    assert decisions[1]["hidden_label"] is False
-    assert decisions[1]["relation"] == "skos:altLabel"
-    assert decisions[2]["relation"] == "skos:hiddenLabel"
-    assert decisions[3]["relation"] is None
+    assert decisions[1]["equivalent"] is True
+    assert decisions[1]["alt_label"] is False
+    assert decisions[1]["hidden_label"] is True
+    assert decisions[1]["relation"] == "skos:hiddenLabel"
+    assert decisions[2]["equivalent"] is False
+    assert decisions[2]["alt_label"] is False
+    assert decisions[2]["hidden_label"] is False
+    assert decisions[2]["relation"] is None
+
+
+def test_label_judge_grammar_and_parser_forbid_non_equivalent_merges() -> None:
+    import dspy
+
+    from yaw.core.config import YawConfig
+    from yaw.daemon.graph.inference.adapter import YawGBNFAdapter
+    from yaw.daemon.graph.inference.grammars import (
+        build_dspy_hierarchy_judge_grammar,
+        build_dspy_label_judge_grammar,
+        build_dspy_related_judge_grammar,
+    )
+    from yaw.daemon.graph.inference.invariants import validate_stage_invariants
+    from yaw.daemon.graph.inference.program import YawProgram
+    from yaw.daemon.graph.inference.prompts import JudgeHierarchy, JudgeLabels, JudgeRelated
+
+    # 1. Grammar defaults to 360 reasoning chars and enforces 2-branch equiv-branch without alt_label
+    grammar = build_dspy_label_judge_grammar(pair_ids=["e0|e1"])
+    assert 'reasoning-str ::= "\\"" char{1,360} "\\""' in grammar
+    assert (
+        'equiv-branch ::= "true, \\"definition\\": " reasoning-str ", \\"hidden_label\\": " boolean | "false"'
+        in grammar
+    )
+    assert "alt_label" not in grammar
+    assert "alt-branch" not in grammar
+    assert 'reasoning-str ::= "\\"" char{1,360} "\\""' in build_dspy_hierarchy_judge_grammar()
+    assert 'reasoning-str ::= "\\"" char{1,360} "\\""' in build_dspy_related_judge_grammar()
+
+    # 2. Config, Program, and Adapter default/forward max_reasoning_chars=360
+    cfg = YawConfig()
+    assert cfg.gbnf_max_reasoning_chars == 360
+    prog = YawProgram()
+    assert prog.gbnf_max_reasoning_chars == 360
+    adapter = YawGBNFAdapter(enable_gbnf=True, max_reasoning_chars=300)
+    for sig in (JudgeLabels, JudgeHierarchy, JudgeRelated):
+        resolved = adapter.resolve_grammar(sig)
+        assert resolved is not None
+        assert "char{1,300}" in resolved
+
+    # 3. Parser forbids non-equivalent merges even if legacy alt_label/hidden_label keys are present
+    parsed = parse_label_decisions(
+        {
+            "decisions": [
+                {"pair_id": "a|b", "reasoning": "Distinct concepts", "equivalent": False, "alt_label": True},
+                {"pair_id": "c|d", "reasoning": "Distinct concepts", "equivalent": False, "hidden_label": True},
+                {
+                    "pair_id": "e|f",
+                    "reasoning": "Same concept synonym",
+                    "equivalent": True,
+                    "definition": "Unified concept.",
+                    "hidden_label": False,
+                },
+                {
+                    "pair_id": "g|h",
+                    "reasoning": "Same concept typo",
+                    "equivalent": True,
+                    "definition": "Unified concept.",
+                    "hidden_label": True,
+                },
+            ]
+        }
+    )
+    assert [d["relation"] for d in parsed] == [None, None, "skos:altLabel", "skos:hiddenLabel"]
+    assert parsed[0]["alt_label"] is False and parsed[0]["hidden_label"] is False
+    assert parsed[1]["alt_label"] is False and parsed[1]["hidden_label"] is False
+    assert parsed[2]["alt_label"] is True and parsed[2]["hidden_label"] is False
+    assert parsed[3]["alt_label"] is False and parsed[3]["hidden_label"] is True
+
+    # 4. Stage invariants reject alt_label/hidden_label when equivalent=False
+    inputs = {"candidate_pairs": json.dumps({"format": "synonym-evidence-v2", "pairs": [{"pair_id": "a|b"}]})}
+    score_conflict, fb_conflict = validate_stage_invariants(
+        "label_judge",
+        inputs,
+        dspy.Prediction(
+            decisions=[{"pair_id": "a|b", "reasoning": "Distinct", "equivalent": False, "alt_label": True}]
+        ),
+    )
+    assert score_conflict < 1.0
+    assert "Conflicting alt_label/hidden_label with equivalent=False" in fb_conflict
+
+    score_ok, _ = validate_stage_invariants(
+        "label_judge",
+        inputs,
+        dspy.Prediction(decisions=[{"pair_id": "a|b", "reasoning": "Distinct", "equivalent": False}]),
+    )
+    assert score_ok == 1.0
 
 
 def test_parse_label_decisions_json_string() -> None:
     payload = json.dumps(
-        {"decisions": [{"pair_id": "x|y", "reasoning": "Acronym variant", "equivalent": False, "alt_label": True}]}
+        {
+            "decisions": [
+                {
+                    "pair_id": "x|y",
+                    "reasoning": "Acronym variant",
+                    "equivalent": True,
+                    "definition": "Unified acronym concept.",
+                    "hidden_label": False,
+                }
+            ]
+        }
     )
     decisions = parse_label_decisions(payload)
     assert len(decisions) == 1
@@ -66,16 +164,16 @@ def test_parse_label_decisions_json_string() -> None:
 
 def test_parse_label_decisions_skips_invalid() -> None:
     raw = [
-        {"pair_id": "invalid", "reasoning": "bad id", "equivalent": False, "alt_label": True},
-        {"pair_id": "a|a", "reasoning": "self loop", "equivalent": False, "alt_label": True},
-        {"pair_id": "a|b", "reasoning": "", "equivalent": False, "alt_label": True},
+        {"pair_id": "invalid", "reasoning": "bad id", "equivalent": True, "definition": "Valid def"},
+        {"pair_id": "a|a", "reasoning": "self loop", "equivalent": True, "definition": "Valid def"},
+        {"pair_id": "a|b", "reasoning": "", "equivalent": True, "definition": "Valid def"},
         {"pair_id": "a|b", "reasoning": "missing def for equiv", "equivalent": True, "definition": ""},
         "not a dict",
         {
             "pair_id": "valid|ok",
             "reasoning": "valid reasoning",
-            "equivalent": False,
-            "alt_label": False,
+            "equivalent": True,
+            "definition": "Unified concept with typo.",
             "hidden_label": True,
         },
     ]
@@ -153,9 +251,7 @@ def test_stage_invariants_label_judge() -> None:
             }
         )
     }
-    pred_pass = dspy.Prediction(
-        decisions=[{"pair_id": "a|b", "reasoning": "Valid reasoning", "equivalent": False, "alt_label": True}]
-    )
+    pred_pass = dspy.Prediction(decisions=[{"pair_id": "a|b", "reasoning": "Valid reasoning", "equivalent": False}])
     score, feedback = validate_stage_invariants("label_judge", inputs, pred_pass)
     assert score == 1.0
     assert "PASS [label_judge]" in feedback
@@ -167,6 +263,7 @@ def test_stage_invariants_label_judge() -> None:
                 "reasoning": "Same concept",
                 "equivalent": True,
                 "definition": "Unified concept definition.",
+                "hidden_label": False,
             }
         ]
     )
@@ -175,28 +272,27 @@ def test_stage_invariants_label_judge() -> None:
     assert "PASS [label_judge]" in feedback_eq
 
     # Empty reasoning fails
-    pred_empty_reason = dspy.Prediction(
-        decisions=[{"pair_id": "a|b", "reasoning": "", "equivalent": False, "alt_label": True}]
-    )
+    pred_empty_reason = dspy.Prediction(decisions=[{"pair_id": "a|b", "reasoning": "", "equivalent": False}])
     score_bad, feedback_bad = validate_stage_invariants("label_judge", inputs, pred_empty_reason)
     assert score_bad < 1.0
     assert "Empty reasoning string" in feedback_bad
 
-    # Missing boolean field fails when alt_label=False and hidden_label is omitted
-    pred_missing_bool = dspy.Prediction(
-        decisions=[{"pair_id": "a|b", "reasoning": "Valid reasoning", "equivalent": False, "alt_label": False}]
+    # Conflicting alt_label/hidden_label with equivalent=False fails
+    pred_conflict_false = dspy.Prediction(
+        decisions=[{"pair_id": "a|b", "reasoning": "Valid reasoning", "equivalent": False, "alt_label": True}]
     )
-    score_bad2, feedback_bad2 = validate_stage_invariants("label_judge", inputs, pred_missing_bool)
+    score_bad2, feedback_bad2 = validate_stage_invariants("label_judge", inputs, pred_conflict_false)
     assert score_bad2 < 1.0
-    assert "Missing boolean field 'hidden_label'" in feedback_bad2
+    assert "Conflicting alt_label/hidden_label with equivalent=False" in feedback_bad2
 
-    # Conflicting alt_label=True and hidden_label=True fails
+    # Conflicting alt_label=True and hidden_label=True with equivalent=True fails
     pred_conflict = dspy.Prediction(
         decisions=[
             {
                 "pair_id": "a|b",
                 "reasoning": "Conflict",
-                "equivalent": False,
+                "equivalent": True,
+                "definition": "Unified definition.",
                 "alt_label": True,
                 "hidden_label": True,
             }

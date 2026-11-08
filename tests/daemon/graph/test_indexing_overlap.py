@@ -417,7 +417,9 @@ def provider():
                                         "action": "set_pref_label"
                                         if v["source_shape"] == "ConceptShape/noScalarLiterals"
                                         else "set_definition",
-                                        "value": "Rate limit responses"
+                                        "value": state.get("healed_pref_labels", {}).get(
+                                            v["focus_node"], "Rate limit responses"
+                                        )
                                         if v["source_shape"] == "ConceptShape/noScalarLiterals"
                                         else state["healed_definition"],
                                     }
@@ -810,16 +812,23 @@ def test_partition_frozen_chunks_requires_published_graph_and_emits_substage_pro
     state["extractions"] = {
         text: {
             "named_entities": [
+                ["429s", "HTTP rate limit status"],
                 ["Ada Lovelace", "English mathematician"],
                 ["Ada M. Lovelace", "British mathematician and analyst"],
             ],
             "triples": [
                 {
+                    "sub": "429s",
+                    "pred": "observed by",
+                    "obj": "Ada Lovelace",
+                    "def": "Rate limit status observed by Ada Lovelace.",
+                },
+                {
                     "sub": "Ada Lovelace",
                     "pred": "collaborated with",
                     "obj": "Ada M. Lovelace",
                     "def": "English mathematician",
-                }
+                },
             ],
         }
         for _, text in chunks
@@ -860,8 +869,6 @@ def test_partition_frozen_chunks_requires_published_graph_and_emits_substage_pro
                 )
             ),
             shacl_identity=shacl_fingerprint(program),
-            auto_merge_cosine_gate=engine.auto_merge_cosine_gate,
-            auto_merge_difflib_gate=engine.auto_merge_difflib_gate,
             synonymy_threshold=engine.synonymy_threshold,
             synonymy_top_k=engine.synonymy_top_k,
             ast_context_hops=engine.ast_context_hops,
@@ -926,11 +933,18 @@ def test_shared_lmdb_cross_db_memo_reuse_and_target_isolation(tmp_path, provider
         text: (
             {
                 "named_entities": [
+                    ["429s", "HTTP rate limit status"],
                     ["Ada Lovelace", "English mathematician"],
                     ["Ada M. Lovelace", "British mathematician and analyst"],
                     ["London", ""],
                 ],
                 "triples": [
+                    {
+                        "sub": "429s",
+                        "pred": "observed by",
+                        "obj": "Ada Lovelace",
+                        "def": "Rate limit status observed by Ada Lovelace.",
+                    },
                     {
                         "sub": "Ada Lovelace",
                         "pred": "collaborated with",

@@ -329,7 +329,7 @@ async def define_missing_entities(request: MissingEntityInput) -> DefinedEntitie
         return await endpoint.define_entities(request)
 
 
-@coco.fn(memo=True)
+@coco.fn(memo=True, version=2)
 async def judge_synonyms(request: SynonymJudgeInput) -> JudgedSynonyms:
     endpoint = coco.use_context(OPENIE_ENDPOINT)
     async with endpoint.admission:

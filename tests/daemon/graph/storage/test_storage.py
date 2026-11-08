@@ -35,7 +35,6 @@ from yaw.daemon.graph.storage.graph_ops import upsert_facts
 from yaw.daemon.graph.storage.managed_sqlite import create_table
 from yaw.daemon.graph.storage.synonyms import (
     _Packet,
-    query_broader_tc,
     query_shared_role_facts,
 )
 from yaw.daemon.graph.storage.synonyms import (
@@ -189,7 +188,7 @@ def test_synonym_evidence_v2_denormalized_structure(tmp_path: Path) -> None:
 
 
 def test_synonym_evidence_w3c_structural_queries(tmp_path: Path) -> None:
-    """Verify Rule W1 (direct_facts), Rule W2 (shared_role_facts), and Rule W3 (broader_tc)."""
+    """Verify Rule W1 (direct_facts) and Rule W2 (shared_role_facts)."""
     with closing(open_yaw_db(tmp_path / "w3c_rules.db")) as conn:
         _seed_w3c_test_graph(conn, tmp_path)
 
@@ -241,19 +240,25 @@ def test_synonym_evidence_w3c_structural_queries(tmp_path: Path) -> None:
             "tenants",
         ] in triples
         assert has_subj_role or has_obj_role
+        expected_pair_keys = {
+            "pair_id",
+            "dense_sim",
+            "lexical_sim",
+            "shared_documents",
+            "shared_islands",
+            "direct_facts",
+            "shared_role_facts",
+            "entity_a",
+            "entity_b",
+        }
+        assert set(p0.keys()) == expected_pair_keys
 
-        # Rule W3: broader_tc check
-        # ent-pilot-tenants is narrower than ent-tenants. Since ent-tenants is entity_a, ent-pilot-tenants is entity_b:
-        # entity_b is under entity_a -> "b_under_a"
-        assert p0["broader_tc"] == "b_under_a"
-
-        # Pair 1: ent-pilot-tenants (entity_a) is transitively narrower than ent-root-concept (entity_b) -> "a_under_b"
         p1 = pairs[1]
-        assert p1["broader_tc"] == "a_under_b"
+        assert set(p1.keys()) == expected_pair_keys
 
-        # Pair 2: ent-tenants and ent-unrelated have no broader relation
+        # Pair 2: ent-tenants and ent-unrelated have no direct or shared-role facts
         p2 = pairs[2]
-        assert p2["broader_tc"] == ""
+        assert set(p2.keys()) == expected_pair_keys
         assert p2["direct_facts"] == []
         assert p2["shared_role_facts"] == []
 
@@ -366,22 +371,15 @@ def test_packet_has_no_obsolete_indirection_methods() -> None:
 
 
 def test_structural_queries_batched_efficiency(tmp_path: Path) -> None:
-    """Verify query_broader_tc and query_shared_role_facts execute efficiently in a single batch."""
+    """Verify query_shared_role_facts executes efficiently in a single batch."""
     with closing(open_yaw_db(tmp_path / "efficiency.db")) as conn:
         _seed_w3c_test_graph(conn, tmp_path)
 
-        entity_ids = ["ent-tenants", "ent-pilot-tenants", "ent-root-concept"]
         pairs = [
             ("ent-tenants", "ent-pilot-tenants"),
             ("ent-pilot-tenants", "ent-root-concept"),
             ("ent-tenants", "ent-root-concept"),
         ]
-
-        # Both queries execute in single queries without per-pair looping
-        broader_set = query_broader_tc(conn, entity_ids)
-        assert ("ent-pilot-tenants", "ent-tenants") in broader_set
-        assert ("ent-tenants", "ent-root-concept") in broader_set
-        assert ("ent-pilot-tenants", "ent-root-concept") in broader_set
 
         roles = query_shared_role_facts(conn, pairs)
         assert ("ent-pilot-tenants", "ent-tenants") in roles or ("ent-tenants", "ent-pilot-tenants") in roles
@@ -725,10 +723,13 @@ def test_canonicalize_fact_definitions_validity_precedence_and_repair_preservati
         upsert_evidence(conn, mentions, assertions)
 
         updated = canonicalize_fact_definitions(conn)
-        assert updated == 1
+        assert updated == 2
         row_multi = conn.execute("SELECT definition FROM facts WHERE fact_id = 'fact-multi'").fetchone()
         assert row_multi is not None
         assert row_multi[0] == "Gateway forwards validated requests to Backend."
+        row_synth = conn.execute("SELECT definition FROM facts WHERE fact_id = 'fact-healed'").fetchone()
+        assert row_synth is not None
+        assert row_synth[0] == "Gateway monitors Backend."
 
         # 2. Cross-batch repair preservation:
         # Heal fact-healed via apply_shacl_repairs, then simulate next batch re-asserting fact-healed with invalid def
@@ -787,20 +788,15 @@ def test_canonicalize_fact_definitions_validity_precedence_and_repair_preservati
         assert row_rekeyed[0] == healed_def
 
         # 3. Endpoint definition collision invalidation:
-        # Update ent-obj definition to collide with healed_def -> valid_spo_def becomes False -> falls back to assertion
+        # Update ent-obj definition to collide with healed_def -> valid_spo_def becomes False -> Tier 3 synthesis
         conn.execute("UPDATE entities SET definition = ? WHERE entity_id = 'ent-obj'", (healed_def,))
         conn.commit()
         changed_on_collision = canonicalize_fact_definitions(conn, prior_definitions=prior_defs)
         assert changed_on_collision == 1
         row_collided = conn.execute("SELECT definition FROM facts WHERE fact_id = 'fact-healed'").fetchone()
         assert row_collided is not None
-        assert row_collided[0] == "An API gateway component."
-        flagged = [
-            v
-            for v in lint_graph_shacl(conn)
-            if v.focus_node == "fact-healed" and v.shape == "StatementShape/closedWorld"
-        ]
-        assert len(flagged) == 1
+        assert row_collided[0] == "Gateway monitors Backend."
+        assert lint_graph_shacl(conn) == []
 
 
 def test_canonicalize_fact_text_delta_only(tmp_path: Path) -> None:

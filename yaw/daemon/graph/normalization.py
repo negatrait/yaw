@@ -6,6 +6,7 @@ from yaw.core import (
     OpenIERecord,
     StructuredTriple,
     clean_schema_definition,
+    clean_surface_label,
     detect_scalar_literal,
     is_scalar_label,
     text_processing,
@@ -22,8 +23,18 @@ class NormalizedRecord:
 
 
 def preferred_surface(*values: str, label_norm: str) -> str:
-    """Choose a display spelling by a total order, independently of arrival."""
-    return max(values, key=lambda value: (text_processing(value) == label_norm, value != value.lower(), value))
+    """Choose a clean display spelling by a total order, independently of arrival."""
+    cleaned = [clean_surface_label(v) or v.strip() for v in values if v.strip()]
+    pool = cleaned or list(values)
+    return max(
+        pool,
+        key=lambda value: (
+            text_processing(value) == label_norm,
+            value != value.lower(),
+            -len(value),
+            value,
+        ),
+    )
 
 
 def normalize_openie_record(rec: OpenIERecord) -> NormalizedRecord:
@@ -32,7 +43,7 @@ def normalize_openie_record(rec: OpenIERecord) -> NormalizedRecord:
     surfaces: dict[str, str] = {}
 
     def _record_surface(norm_key: str, raw_val: str) -> None:
-        clean_raw = raw_val.strip()
+        clean_raw = clean_surface_label(raw_val) or raw_val.strip()
         if not norm_key or not clean_raw:
             return
         surfaces[norm_key] = preferred_surface(surfaces.get(norm_key, clean_raw), clean_raw, label_norm=norm_key)

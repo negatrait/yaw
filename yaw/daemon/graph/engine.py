@@ -79,9 +79,6 @@ from yaw.daemon.graph.storage import (
     set_meta,
 )
 
-_AUTO_MERGE_COSINE_GATE = 0.95
-_AUTO_MERGE_DIFFLIB_GATE = 0.96
-
 
 class YawGraphEngine:
     """HippoRAG 2 engine backed by yaw.db, CSR Personalized PageRank, and lazy disk line hydration."""
@@ -112,8 +109,6 @@ class YawGraphEngine:
         activation_renormalize: bool = False,
         beta: float = 0.5,
         dual_weight: float | None = 0.5,
-        auto_merge_cosine_gate: float = _AUTO_MERGE_COSINE_GATE,
-        auto_merge_difflib_gate: float = _AUTO_MERGE_DIFFLIB_GATE,
         max_context_chars: int | None = None,
         max_ast_expansion_hops: int = 1,
         ast_context_hops: int = 0,
@@ -161,8 +156,6 @@ class YawGraphEngine:
         self.activation_renormalize = activation_renormalize
         self.beta = beta
         self.dual_weight = dual_weight
-        self.auto_merge_cosine_gate = float(auto_merge_cosine_gate)
-        self.auto_merge_difflib_gate = float(auto_merge_difflib_gate)
         self.traversal_policy: RelationTraversalPolicy | None = traversal_policy
 
         self._csr_graph: CSRGraph | None = None
@@ -1530,8 +1523,6 @@ class YawGraphEngine:
                     "activation_renormalize",
                     "beta",
                     "dual_weight",
-                    "auto_merge_cosine_gate",
-                    "auto_merge_difflib_gate",
                 )
             },
             bind_program_hooks=self._bind_program_hooks,

@@ -147,7 +147,7 @@ def test_shacl_new_shapes_detection(tmp_path: Path) -> None:
             "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-sys', 'ent-eng', 'skos:related', 0.7)"
         )
 
-        # 7. ConceptShape/broaderCycle (2-cycle and 3-cycle) & ConceptShape/S27-disjointBroaderRelated:
+        # 7. ConceptShape/broaderCycle (2-cycle and 3-cycle) & 1-hop ConceptShape/S27-disjointBroaderRelated:
         conn.execute(
             "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-2cyc-a', 'ent-2cyc-b', 'skos:broader', 0.8)"
         )
@@ -163,6 +163,8 @@ def test_shacl_new_shapes_detection(tmp_path: Path) -> None:
         conn.execute(
             "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-cyc-c', 'ent-cyc-a', 'skos:broader', 0.8)"
         )
+        # 2-hop broader chain (leaf -> mid -> root) with leaf <-> root skos:related is valid under non-transitive
+        # skos:broader; direct 1-hop leaf -> mid with leaf <-> mid skos:related violates S27:
         conn.execute(
             "INSERT INTO edges (src_id, dst_id, kind, weight) "
             "VALUES ('ent-s27-leaf', 'ent-s27-mid', 'skos:broader', 0.8)"
@@ -178,6 +180,14 @@ def test_shacl_new_shapes_detection(tmp_path: Path) -> None:
         conn.execute(
             "INSERT INTO edges (src_id, dst_id, kind, weight) "
             "VALUES ('ent-s27-root', 'ent-s27-leaf', 'skos:related', 0.5)"
+        )
+        conn.execute(
+            "INSERT INTO edges (src_id, dst_id, kind, weight) "
+            "VALUES ('ent-s27-leaf', 'ent-s27-mid', 'skos:related', 0.5)"
+        )
+        conn.execute(
+            "INSERT INTO edges (src_id, dst_id, kind, weight) "
+            "VALUES ('ent-s27-mid', 'ent-s27-leaf', 'skos:related', 0.5)"
         )
 
         # 8. ConceptShape/noScalarLiterals:
@@ -294,7 +304,8 @@ def test_shacl_new_shapes_detection(tmp_path: Path) -> None:
             "ent-cyc-b",
             "ent-cyc-c",
         }.issubset(focus_by_shape["ConceptShape/broaderCycle"])
-        assert "ent-s27-leaf|ent-s27-root" in focus_by_shape["ConceptShape/S27-disjointBroaderRelated"]
+        assert "ent-s27-leaf|ent-s27-mid" in focus_by_shape["ConceptShape/S27-disjointBroaderRelated"]
+        assert "ent-s27-leaf|ent-s27-root" not in focus_by_shape["ConceptShape/S27-disjointBroaderRelated"]
         assert {"ent-date", "ent-lit-port"}.issubset(focus_by_shape["ConceptShape/noScalarLiterals"])
         assert "fact-orphan-1" in focus_by_shape["ProvenanceShape/factSources"]
 
@@ -405,7 +416,7 @@ def test_shacl_auto_healing_complete(tmp_path: Path) -> None:
             "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-sys', 'ent-multi-pref', 'skos:related', 0.7)"
         )
 
-        # Seed Shape 7 (broaderCycle 2-cycle & 3-cycle + S27 transitive broader/related conflict)
+        # Seed Shape 7 (broaderCycle 2-cycle & 3-cycle + 1-hop S27 broader/related conflict)
         conn.execute(
             "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-2cyc-a', 'ent-2cyc-b', 'skos:broader', 0.8)"
         )
@@ -422,10 +433,10 @@ def test_shacl_auto_healing_complete(tmp_path: Path) -> None:
             "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-cyc-c', 'ent-cyc-a', 'skos:broader', 0.8)"
         )
         conn.execute(
-            "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-cyc-a', 'ent-cyc-c', 'skos:related', 0.5)"
+            "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-cyc-a', 'ent-cyc-b', 'skos:related', 0.5)"
         )
         conn.execute(
-            "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-cyc-c', 'ent-cyc-a', 'skos:related', 0.5)"
+            "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-cyc-b', 'ent-cyc-a', 'skos:related', 0.5)"
         )
 
         # Seed Shape 9 (lexicalSubsumption) & Shape 10 (siblingNotBroader) via raw SQL
@@ -595,7 +606,7 @@ def test_shacl_auto_healing_complete(tmp_path: Path) -> None:
             },
             {"focus_node": "ent-cyc-c->ent-cyc-a", "action": "remove_hierarchy_cycle", "target_node": "", "value": ""},
             {
-                "focus_node": "ent-cyc-a|ent-cyc-c",
+                "focus_node": "ent-cyc-a|ent-cyc-b",
                 "action": "remove_conflicting_related",
                 "target_node": "",
                 "value": "",
@@ -695,7 +706,7 @@ def test_shacl_auto_healing_complete(tmp_path: Path) -> None:
         assert (
             conn.execute(
                 "SELECT 1 FROM edges WHERE kind = 'skos:related' "
-                "AND src_id IN ('ent-cyc-a', 'ent-cyc-c') AND dst_id IN ('ent-cyc-a', 'ent-cyc-c')"
+                "AND src_id IN ('ent-cyc-a', 'ent-cyc-b') AND dst_id IN ('ent-cyc-a', 'ent-cyc-b')"
             ).fetchone()
             is None
         )

@@ -762,3 +762,24 @@ Each unit is executed by delegating to `research` (read-only call-graph/SDK disc
   - When `_ensure_csr_graph()` builds `self._csr_graph` for the first time during an ensemble query (`_csr_graph is None` while `_csr_cache_key == cache_key`), clearing `_query_retrieval_memo` or resetting `_last_memo_question = None` would evict the active question's ensemble memo; guarding memo invalidation on `self._csr_cache_key != cache_key` preserves intra-query Pareto ensemble memoization while invalidating immediately on any graph commit.
 - **What it does not establish**:
   - Loopback paired trials (`N = 20`) and the single-dataset (`popqa`) retrieval parity gate establish `64 + 64` vs. `128` canonical 15-table equivalence, `0.80 <= R_time, R_graph <= 1.25` bounded incremental overhead, and Windows live file-watch lifecycle conformance; full 7-dataset Tier 2 holdout evaluation remains gated on a dedicated full-corpus live benchmark run.
+
+## 2026-11-08: W3C Assertion Cleanup, Strict `JudgeLabels` Equivalence, Non-Transitive `1`-Hop `skos:broader` S27 Disjointness & Deterministic SHACL Healing (from `c98aebe`)
+
+Controlling contracts: [w3c-improvements.md §12, §13, §Decisions](../w3c-improvements.md#12-strict-judgelabels-identity-equivalence--canonical-gemma-4-3-stage-cascade-without-python-token-overrides-or-auto-merge-gates), [native-cocoindex-graph.md §4, §Decisions](../native-cocoindex-graph.md#decisions), and [epistemic-confidence-spec.md §2.4, §Decisions](../epistemic-confidence-spec.md#24-s27-disjointness-resolution-cagle-reification-pattern--direct-1-hop-bayes-factor).
+
+### Checkpoints (2026-11-08 — `c98aebe`)
+
+- [x] **C1 (Documentation & Rule Promotion)**: Promote Invariants `W1–W5`, `CG-W3C-1`, `CG-W3C-2`, and the Removal Inventory into [w3c-improvements.md](../w3c-improvements.md), [native-cocoindex-graph.md](../native-cocoindex-graph.md), [epistemic-confidence-spec.md](../epistemic-confidence-spec.md), [graph-storage.md](../../.agents/rules/graph-storage.md), and [inference.md](../../.agents/rules/inference.md).
+- [x] **C2 (Strict `JudgeLabels` Equivalence, Retirement of `broader_tc` Rule W3, and Retirement of Python Token Overrides / Auto-Merge Gates)**: TDD implementation of `CG-W3C-1`, `2`-branch `equiv-branch` GBNF grammar (`max_reasoning_chars = 360`), `judge_synonyms` `@coco.fn(memo=True, version=2)`, removal of `query_broader_tc` / `broader_tc` / `Rule W3`, and removal of `_is_acronym`, `is_modifier_head_specialization`, `_has_disjoint_non_acronym_tokens`, `auto_merge_cosine_gate`, and `auto_merge_difflib_gate`.
+- [x] **C3 (Tier 3 Deterministic Statement Definition Synthesis, Irreflexive Literal Filtering, `1`-Hop S27 & Single-Surface `skos:prefLabel`)**: TDD implementation of `CG-W3C-2`, `clean_surface_label` and `is_irreflexive_statement` in `yaw.core`, Tier 3 deterministic synthesis in `canonicalize_fact_definitions`, universal literal/entity irreflexivity across `evidence.py` / `planner.py` / `graph_ops.py` / `shacl.py` / `invariants.py`, single-surface `skos:prefLabel` alignment in `normalization.py` / `planner.py` / `graph_ops.py`, direct `1`-hop `ConceptShape/S27-disjointBroaderRelated` + fixed-point `ConceptShape/broaderCycle` healing in `shacl.py`, and post-repair `auto_heal_deterministic_shacl` in `plan_graph_publication`.
+- [x] **C4 (Critic Audit, Review Ledger Update, Full Quality Gates & Live Optimization Restart)**: Critic audit (`0` blocking findings), review ledger updates in [shacl-healer-publication.md](shacl-healer-publication.md) and [incremental-publication-work.md](incremental-publication-work.md), full quality gates, atomic commit, and restart of `uv run yaw dspy optimize --resume`.
+
+### Completed Implementation Unit (2026-11-08)
+
+- **Changed symbols & modules**:
+  - See full entry in [shacl-healer-publication.md](shacl-healer-publication.md#2026-11-08-w3c-assertion-cleanup-strict-judgelabels-equivalence-non-transitive-1-hop-skosbroader-s27-disjointness--deterministic-shacl-healing-from-c98aebe).
+- **Gate results & evidence paths**:
+  - `git grep -n -e "_is_acronym" -e "is_modifier_head_specialization" -e "_has_disjoint_non_acronym_tokens" -e "auto_merge_cosine_gate" -e "auto_merge_difflib_gate" -e "_AUTO_MERGE_COSINE_GATE" -e "_AUTO_MERGE_DIFFLIB_GATE" -e "query_broader_tc" -e "broader_tc" -e "broaderTransitiveCapExceeded" yaw/ tests/` -> `0` matches.
+  - `uv run --locked ty check`, `uv run --locked ruff check --fix`, `uv run --locked ruff format --check`, `uv run --locked pytest` (`741 passed` across `tests/daemon/graph/`, `tests/test_epistemic_confidence.py`, and `tests/core/`), and `git diff --check`: all passed.
+- **What it does not establish**:
+  - Does not claim completion of the live full-corpus GEPA optimization run until all batches finish publishing and GEPA iterations converge.

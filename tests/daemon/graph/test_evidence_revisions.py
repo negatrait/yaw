@@ -482,7 +482,7 @@ def test_cross_batch_fact_definition_repair_persists_and_invalidates_on_endpoint
 
     c1_text = "Orion routes via Anchor in batch one."
     c2_text = "Orion routes via Anchor again and Beacon monitors Pulse in batch two."
-    anchor_def = "A telemetry anchor service."
+    anchor_def = "Anchor node."
     state["extractions"] = {
         c1_text: {
             "named_entities": [
@@ -529,30 +529,27 @@ def test_cross_batch_fact_definition_repair_persists_and_invalidates_on_endpoint
     with native_corpus(tmp_path, tmp_path / "inc", url) as (db, stream, app):
         publish(stream, app, [c1])
         healer_calls_batch1 = len(state.get("healer_requests", []))
-        assert state.get("healer_requests", []) == ["direct"]
-        assert healer_calls_batch1 == 1
+        assert healer_calls_batch1 == 0
         with db.readonly() as conn:
             assert lint_graph_shacl(conn) == []
             fid_b1 = conn.execute("SELECT fact_id FROM facts WHERE pred = 'routes Via'").fetchone()[0]
             defs_b1 = dict(conn.execute("SELECT pred, definition FROM facts").fetchall())
-            assert defs_b1 == {"routes Via": healed_v1}
+            assert defs_b1 == {"routes Via": "Orion routes Via Anchor."}
 
         publish(stream, app, [c1, c2])
-        assert len(state.get("healer_requests", [])) == healer_calls_batch1
+        assert len(state.get("healer_requests", [])) == 0
         with db.readonly() as conn:
             assert lint_graph_shacl(conn) == []
             fid_b2 = conn.execute("SELECT fact_id FROM facts WHERE pred = 'routes Via'").fetchone()[0]
             assert fid_b2 != fid_b1
             defs_b2 = dict(conn.execute("SELECT pred, definition FROM facts").fetchall())
-            assert defs_b2["routes Via"] == healed_v1
+            assert defs_b2["routes Via"] == "Orion routes Via Anchor."
             assert defs_b2["monitors"] == "Beacon monitors the Pulse health signal."
 
-        healed_v2 = "Orion forwards telemetry packets to the Anchor endpoint."
-        state["healed_definition"] = healed_v2
         c3_text = "Anchor endpoint description update."
         state["extractions"][c3_text] = {
             "named_entities": [
-                ["Anchor", healed_v1],
+                ["Anchor", "Orion routes Via Anchor."],
                 ["Pulse", "A health signal."],
             ],
             "triples": [
@@ -567,36 +564,31 @@ def test_cross_batch_fact_definition_repair_persists_and_invalidates_on_endpoint
         c3 = (ChunkPointer("c3", "c3.md", 1, 1), c3_text)
         (tmp_path / c3[0].rel_posix_path).write_text(c3_text + "\n", encoding="utf-8")
         publish(stream, app, [c1, c2, c3])
-        assert len(state.get("healer_requests", [])) > healer_calls_batch1
+        assert len(state.get("healer_requests", [])) == 0
         with db.readonly() as conn:
             assert lint_graph_shacl(conn) == []
             defs_b3 = dict(conn.execute("SELECT pred, definition FROM facts").fetchall())
-            assert defs_b3["routes Via"] == healed_v2
+            assert defs_b3["routes Via"] == "Orion routes Via Anchor (statement)."
 
 
 def test_focus_isolated_shacl_memo_reuses_healed_focus_when_earlier_violation_added(tmp_path, provider):
     from yaw.daemon.graph.storage import lint_graph_shacl
-    from yaw.daemon.graph.storage.evidence import fact_id as canonical_fact_id
 
     url, state = provider
     state["delay"] = 0
-    state["embedding_vector"] = fixed_vector
     state["healed_definition"] = "A distinct non-colliding statement definition."
 
     specs = [
-        ("Alpha", "Alpha node.", "Beta", "Beta node."),
-        ("Gamma", "Gamma node.", "Delta", "Delta node."),
-        ("Epsilon", "Epsilon node.", "Zeta", "Zeta node."),
+        ("429s", "Alpha node.", "Beta", "Beta node."),
+        ("503s", "Gamma node.", "Delta", "Delta node."),
+        ("504s", "Epsilon node.", "Zeta", "Zeta node."),
     ]
-    ranked = sorted(
-        specs,
-        key=lambda item: canonical_fact_id(
-            sense_id(item[0].lower(), item[1]),
-            "links to",
-            "entity",
-            sense_id(item[2].lower(), item[3]),
-        ),
-    )
+    ranked = sorted(specs, key=lambda item: sense_id(item[0], item[1]))
+    state["relation"] = "owl:differentFrom"
+    state["embedding_vector"] = fixed_vector
+    state["healed_pref_labels"] = {
+        sense_id(s_lbl, s_def): f"Status concept {idx}" for idx, (s_lbl, s_def, _, _) in enumerate(ranked)
+    }
     chunks = []
     state["extractions"] = {}
     for idx, (s_lbl, s_def, o_lbl, o_def) in enumerate(ranked):
@@ -718,3 +710,285 @@ def test_single_pass_fact_embedding_and_delta_scoped_batch_publication(tmp_path,
         publish(ref_stream, ref_app, [c1, c2])
         with ref_db.readonly() as conn:
             assert_same_graph(actual, canonical_graph(conn))
+
+
+def test_deterministic_fact_definition_synthesis_and_irreflexive_literal_pruning(tmp_path, provider):
+    import asyncio
+    import json
+    from contextlib import closing
+
+    from yaw.core import clean_surface_label, is_irreflexive_statement
+    from yaw.daemon.graph.storage import (
+        auto_heal_deterministic_shacl,
+        canonicalize_entity_labels_edc,
+        lint_graph_shacl,
+        open_yaw_db,
+        serialize_graph_turtle,
+        upsert_chunk_pointers,
+        upsert_entities,
+        upsert_entity_labels,
+        upsert_fact_sources,
+        upsert_facts,
+        upsert_semantic_edges,
+    )
+    from yaw.daemon.graph.storage.evidence import (
+        FactAssertion,
+        canonicalize_fact_definitions,
+        evidence_schemas,
+        upsert_evidence,
+    )
+    from yaw.daemon.graph.storage.graph_ops import rekey_facts
+    from yaw.daemon.graph.storage.managed_sqlite import create_table
+
+    assert clean_surface_label(" :feature flag, ") == "feature flag"
+    assert clean_surface_label("Control plane,") == "Control plane"
+    assert not is_irreflexive_statement(
+        "burst logic",
+        "logic controlling request bursts",
+        "burst logic",
+        "Logic controlling request bursts.",
+        "",
+        "literal",
+    )
+    assert not is_irreflexive_statement(
+        "burst logic",
+        "logic controlling request bursts",
+        "100",
+        "Logic controlling request bursts.",
+        "",
+        "literal",
+    )
+    assert is_irreflexive_statement(
+        "burst logic",
+        "has threshold",
+        "100",
+        "Logic controlling request bursts.",
+        "",
+        "literal",
+    )
+
+    url, state = provider
+    state["delay"] = 0
+    state["embedding_vector"] = fixed_vector
+
+    burst_def = "Logic controlling request bursts."
+    cp_def = "Central orchestration layer for cluster routing."
+    ff_def = "Runtime configuration toggle for gradual rollouts."
+    pseudo_reflexive_triples = [
+        {
+            "sub": "burst logic",
+            "pred": [f"burst metric {i}", "owl:DatatypeProperty"],
+            "obj": {"value": "burst logic", "datatype": "xsd:string", "lang": ""},
+            "def": f"Pseudo-reflexive literal statement {i}.",
+        }
+        for i in range(10)
+    ] + [
+        {
+            "sub": "burst logic",
+            "pred": ["logic controlling request bursts", "owl:DatatypeProperty"],
+            "obj": {"value": f"threshold-{i}", "datatype": "xsd:string", "lang": ""},
+            "def": f"Predicate-duplicating literal statement {i}.",
+        }
+        for i in range(5)
+    ]
+    c1_text = "Control plane, uses :feature flag and burst logic."
+    state["extractions"] = {
+        c1_text: {
+            "named_entities": [
+                ["Control plane,", cp_def],
+                ["Control plane", cp_def],
+                [":feature flag", ff_def],
+                ["burst logic", burst_def],
+            ],
+            "triples": [
+                {
+                    "sub": "Control plane,",
+                    "pred": ["evaluates", "owl:ObjectProperty"],
+                    "obj": ":feature flag",
+                    "def": cp_def,
+                },
+                {
+                    "sub": ":feature flag",
+                    "pred": ["governs", "owl:ObjectProperty"],
+                    "obj": "burst logic",
+                    "def": burst_def,
+                },
+                *pseudo_reflexive_triples,
+            ],
+        }
+    }
+    c1 = (ChunkPointer("c1", "c1.md", 1, 1), c1_text)
+    (tmp_path / c1[0].rel_posix_path).write_text(c1_text + "\n", encoding="utf-8")
+
+    with native_corpus(tmp_path, tmp_path / "cg_w3c_2", url) as (db, stream, app):
+        publish(stream, app, [c1])
+        assert state.get("healer_requests", []) == []
+        with db.readonly() as conn:
+            assert lint_graph_shacl(conn) == []
+            validate_graph_state(conn)
+            facts = [
+                tuple(r)
+                for r in conn.execute("SELECT pred, definition, obj_kind FROM facts ORDER BY pred ASC").fetchall()
+            ]
+            assert facts == [
+                ("evaluates", "Control plane evaluates feature flag.", "entity"),
+                ("governs", "feature flag governs burst logic.", "entity"),
+            ]
+            null_assertions = conn.execute("SELECT COUNT(*) FROM fact_assertions WHERE fact_id IS NULL").fetchone()[0]
+            assert null_assertions == 15
+            bound_assertions = conn.execute(
+                "SELECT COUNT(*) FROM fact_assertions WHERE fact_id IS NOT NULL"
+            ).fetchone()[0]
+            assert bound_assertions == 2
+
+            for eid, ename in conn.execute("SELECT entity_id, name FROM entities").fetchall():
+                assert ename == clean_surface_label(ename)
+                pref_raws = [
+                    str(r[0])
+                    for r in conn.execute(
+                        "SELECT DISTINCT raw_label FROM entity_labels "
+                        "WHERE entity_id = ? AND label_kind = 'skos:prefLabel'",
+                        (eid,),
+                    ).fetchall()
+                ]
+                assert pref_raws == [ename]
+
+    # Verify pre-existing DB auto-healing of 15 pseudo-reflexive literal facts, 1-hop vs 2-hop S27, and rekey_facts
+    with closing(open_yaw_db(tmp_path / "legacy_repair.db")) as mem_conn:
+        for schema in asyncio.run(evidence_schemas()):
+            create_table(mem_conn, schema)
+        upsert_chunk_pointers(mem_conn, [(c1[0], c1_text)])
+        upsert_entities(
+            mem_conn,
+            [
+                ("ent-a", "Release Engineering", "Engineering discipline for release pipelines."),
+                ("ent-b", "Security engineering", "Engineering discipline for system security."),
+                ("ent-c", "Engineering peer", "Peer engineering organization."),
+                ("ent-d", "Burst logic", burst_def),
+                ("ent-e", "Control plane", cp_def),
+            ],
+        )
+        upsert_entity_labels(
+            mem_conn,
+            [
+                ("release engineering", "ent-a", "skos:prefLabel", "Release Engineering", "c1"),
+                ("security engineering", "ent-b", "skos:prefLabel", "Security engineering", "c1"),
+                ("engineering peer", "ent-c", "skos:prefLabel", "Engineering peer", "c1"),
+                ("burst logic", "ent-d", "skos:prefLabel", "Burst logic", "c1"),
+                ("control plane", "ent-e", "skos:prefLabel", "Control plane,", "c1"),
+            ],
+        )
+        # Insert a duplicate skos:prefLabel surface with trailing comma on ent-e
+        mem_conn.execute(
+            "INSERT INTO entity_labels (label_norm, entity_id, label_kind, raw_label, chunk_id) "
+            "VALUES ('control plane', 'ent-e', 'skos:prefLabel', 'Control plane', '__auto__')"
+        )
+        # 2-hop broader chain A -> B -> C with A skos:related C (valid under non-transitive skos:broader)
+        upsert_semantic_edges(
+            mem_conn,
+            [
+                ("ent-a", "ent-b", "skos:broader", 0.9),
+                ("ent-b", "ent-c", "skos:broader", 0.9),
+                ("ent-a", "ent-c", "skos:related", 0.8),
+            ],
+        )
+        # Direct 1-hop S27 conflict on D -> E
+        mem_conn.execute(
+            "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-d', 'ent-e', 'skos:broader', 0.9)"
+        )
+        mem_conn.execute(
+            "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-d', 'ent-e', 'skos:related', 0.6)"
+        )
+        mem_conn.execute(
+            "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-e', 'ent-d', 'skos:related', 0.6)"
+        )
+        # 15 pseudo-reflexive literal facts in facts + fact_assertions
+        lit_facts = [
+            (
+                f"fact-lit-{i}",
+                "ent-d",
+                "logic controlling request bursts" if i < 5 else "has label",
+                None,
+                json.dumps(["Burst logic", "has label", "Burst logic"]),
+                f"Literal loop {i}.",
+                "literal",
+                "100" if i < 5 else "Burst logic",
+                "xsd:string",
+                "",
+            )
+            for i in range(15)
+        ]
+        upsert_facts(
+            mem_conn,
+            [
+                *lit_facts,
+                (
+                    "fact-valid",
+                    "ent-e",
+                    "governs",
+                    "ent-d",
+                    json.dumps(["Control plane", "governs", "Burst logic"]),
+                    cp_def,
+                    "entity",
+                    None,
+                    "",
+                    "",
+                ),
+            ],
+        )
+        upsert_fact_sources(
+            mem_conn,
+            [(f"fact-lit-{i}", "c1") for i in range(15)] + [("fact-valid", "c1")],
+        )
+        upsert_evidence(
+            mem_conn,
+            (),
+            tuple(
+                FactAssertion(
+                    f"assert-lit-{i}",
+                    "c1",
+                    "rev-1",
+                    "m-d",
+                    None,
+                    json.dumps({"spo_def": f"Literal loop {i}."}),
+                    f"fact-lit-{i}",
+                )
+                for i in range(15)
+            ),
+        )
+
+        pre_v = lint_graph_shacl(mem_conn)
+        irreflexive_nodes = {v.focus_node for v in pre_v if v.shape == "StatementShape/irreflexive"}
+        assert irreflexive_nodes == {f"fact-lit-{i}" for i in range(15)}
+        s27_nodes = {v.focus_node for v in pre_v if v.shape == "ConceptShape/S27-disjointBroaderRelated"}
+        assert s27_nodes == {"ent-d|ent-e"}
+
+        # rekey_facts on one of the literal self-loops returns (fid, None)
+        redirects = rekey_facts(mem_conn, ["fact-lit-0"])
+        assert redirects == (("fact-lit-0", None),)
+        mem_conn.execute("UPDATE fact_assertions SET fact_id = NULL WHERE fact_id = 'fact-lit-0'")
+
+        auto_heal_deterministic_shacl(mem_conn)
+        canonicalize_entity_labels_edc(mem_conn)
+        canonicalize_fact_definitions(mem_conn)
+
+        assert lint_graph_shacl(mem_conn) == []
+        remaining_facts = [tuple(r) for r in mem_conn.execute("SELECT fact_id, definition FROM facts").fetchall()]
+        assert remaining_facts == [("fact-valid", "Control plane governs Burst logic.")]
+        assert mem_conn.execute("SELECT COUNT(*) FROM fact_assertions WHERE fact_id IS NULL").fetchone()[0] == 15
+        # 2-hop A -> B -> C and A <-> C preserved
+        assert (
+            mem_conn.execute(
+                "SELECT COUNT(*) FROM edges WHERE kind = 'skos:related' AND src_id = 'ent-a' AND dst_id = 'ent-c'"
+            ).fetchone()[0]
+            == 1
+        )
+        # 1-hop D <-> E related pruned
+        assert (
+            mem_conn.execute(
+                "SELECT COUNT(*) FROM edges WHERE kind = 'skos:related' AND src_id = 'ent-d' AND dst_id = 'ent-e'"
+            ).fetchone()[0]
+            == 0
+        )
+        turtle = serialize_graph_turtle(mem_conn)
+        assert '"Control plane,"' not in turtle

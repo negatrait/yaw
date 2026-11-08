@@ -52,26 +52,23 @@ def complete_decisions(
 
     # Determine stage from stage_text or decision contents
     text_lower = stage_text.lower()
-    is_related_stage = (
+    is_label_stage = (
+        "judgelabels" in text_lower
+        or "label_judge" in text_lower
+        or "alt_label" in text_lower
+        or "hidden_label" in text_lower
+        or "equivalent" in text_lower
+    )
+    is_related_stage = not is_label_stage and (
         "judgerelated" in text_lower
         or "related_judge" in text_lower
         or "differentfrom" in text_lower
         or "different_from" in text_lower
     )
-    is_hierarchy_stage = not is_related_stage and (
-        "judgehierarchy" in text_lower
-        or "hierarchy_judge" in text_lower
-        or ("narrower" in text_lower and "judgelabels" not in text_lower and "alt_label" not in text_lower)
-    )
-    is_label_stage = (
-        not is_related_stage
-        and not is_hierarchy_stage
-        and (
-            "judgelabels" in text_lower
-            or "label_judge" in text_lower
-            or "alt_label" in text_lower
-            or "equivalent" in text_lower
-        )
+    is_hierarchy_stage = (
+        not is_label_stage
+        and not is_related_stage
+        and ("judgehierarchy" in text_lower or "hierarchy_judge" in text_lower or "narrower" in text_lower)
     )
 
     if not (is_label_stage or is_hierarchy_stage or is_related_stage):
@@ -103,21 +100,21 @@ def complete_decisions(
         for pair in candidates:
             pid = pair["pair_id"]
             d = chosen.get(pid, {})
-            equiv = bool(d.get("equivalent", False))
             if "equivalent" in d or "alt_label" in d or "hidden_label" in d:
-                alt = False if equiv else bool(d.get("alt_label", False))
-                hidden = False if (equiv or alt) else bool(d.get("hidden_label", False))
+                hidden = bool(d.get("hidden_label", False))
+                alt = bool(d.get("alt_label", False))
+                equiv = bool(d.get("equivalent", False)) or alt or hidden
                 reason = str(d.get("reasoning", f"Label reasoning for {pid}"))
             else:
                 rel = str(d.get("relation", "")).strip()
                 if rel == "skos:altLabel":
-                    alt, hidden = True, False
+                    equiv, hidden = True, False
                     reason = f"Alias label for {pid}"
                 elif rel == "skos:hiddenLabel":
-                    alt, hidden = False, True
+                    equiv, hidden = True, True
                     reason = f"Hidden label for {pid}"
                 else:
-                    alt, hidden = False, False
+                    equiv, hidden = False, False
                     reason = f"Not a label alias for {pid}"
             if equiv:
                 item: dict[str, Any] = {
@@ -125,21 +122,13 @@ def complete_decisions(
                     "reasoning": reason,
                     "equivalent": True,
                     "definition": str(d.get("definition") or f"Unified definition for {pid}"),
-                }
-            elif alt:
-                item = {
-                    "pair_id": pid,
-                    "reasoning": reason,
-                    "equivalent": False,
-                    "alt_label": True,
+                    "hidden_label": hidden,
                 }
             else:
                 item = {
                     "pair_id": pid,
                     "reasoning": reason,
                     "equivalent": False,
-                    "alt_label": False,
-                    "hidden_label": hidden,
                 }
             if "canonical" in d and d["canonical"]:
                 canon = str(d["canonical"])
