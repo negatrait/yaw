@@ -4,6 +4,13 @@ Owner: [FOUNDATIONAL](../FOUNDATIONAL.md) | Results: [evaluation](evaluation.md)
 
 ## Hard Gates
 
+Early performance pilot (`E1-P6`, planned 2026-11-09): the bounded exception in
+[Epic 3](epic-3-performance.md#early-epic-1-exception-audit-json-pilot-e1-p6)
+permits evaluating msgspec for optimizer audit publication and watchdog audit
+reading during Epic 1. The [review plan](reviews/msgspec-audit-pilot.md) fixes its
+scope and acceptance gates before implementation. This pilot does not replace
+or establish the outstanding `D1-A6` parity and ingestion gates.
+
 Graph target revision (2026-11-05): [native graph publication](native-cocoindex-graph.md)
 requires total scheme removal, comparable cumulative time for 64+64 versus 128
 chunks, and exact fixed-evidence canonical graph/count equality. It owns the
@@ -230,6 +237,8 @@ Execute strictly in order `E1-S1` $\to$ `E1-S6`. Never start Sprint $k+1$ until 
 
 ## 3. Checklist Summary
 
+- [ ] **E1-P6 (early audit JSON pilot):** implement and evaluate optimizer audit encoding and watchdog audit decoding under the [review plan](reviews/msgspec-audit-pilot.md); retain only after compatibility, performance, memory and project gates pass. Parent ownership: [Epic 3](epic-3-performance.md#early-epic-1-exception-audit-json-pilot-e1-p6).
+
 - [x] **D1-A0 (`D1-01`):** Embedding repeatability (`cosine >= 0.999`), $T=0.2$ floors, GBNF, 500-line FIFO logger, paper datasets downloaded.
 - [x] **D1-A1 (`E1-S1`):** `yaw/core/` + containment tree locked; `test_architecture.py` enforces `0` horizontal/cross-domain imports.
 - [x] **D1-A2 (`E1-S2`):** `inference/` refactored onto native `dspy` (`dspy.LM`, `dspy.Embedder`, `dspy.Signature`s, `dspy.Predict`/`ChainOfThought`/`RLM`, GBNF grammar forwarding, `.save()`/`.load()`) with `0` `hipporag` imports in `yaw/`.
@@ -241,6 +250,8 @@ Execute strictly in order `E1-S1` $\to$ `E1-S6`. Never start Sprint $k+1$ until 
 ---
 
 ## Decisions
+
+- 2026-11-09: "In that case, your first experiment proposal sounds better. Plan that." (User). Track the bounded `E1-P6` audit JSON pilot during Epic 1 under the [Epic 3 exception](epic-3-performance.md#early-epic-1-exception-audit-json-pilot-e1-p6). This turn authorizes the plan; implementation is a subsequent step.
 
 - 2026-11-08: "I want the slice test first to know if the full corpus benchmarking is worth it or if we need to make adjustments to have a realistic chance at stabbing those targets. That is a decision better left as an Open question after the slice based gate - most probably answered as epic 3, after the mcp epic 2 is done. We could actually formulate it like that. Epic 3, the performance epic. Epic 2, the feature completion epic." (User). Establishes the 3-Epic separation of concerns: **Epic 1** completes upon passing the clean-slate 7-dataset slice-based paper parity gate (`scripts/verify_paper_parity_gate.py --compiled-program .yaw/compiled_program.json --mode eval --fresh`), **[Epic 2](epic-2-fastmcp-http.md)** owns feature completion (`FastMCP` Streamable HTTP transport, 5 MCP tools, and `source_content_hash` freshness citations), and **[Epic 3](epic-3-performance.md)** owns post-Epic 2 W3C symbolic pruning, novel DSPy optimization, demoscene execution speed, codebase reduction, and full-corpus multi-day holdout benchmarks.
 - 2026-11-08: "I think everything should default to resume, so we do not wipe databases by accident, and `--fresh` flag wipes intentionally. Adjust all flags to behave like this across the codebase" / "Think if we should switch from postfix to prefix across the board so these related files get sorted together in file browser: `optimize_program_telemetry`, `optimize_program.json`, `optimize_program_eval.json`, `optimize_program_audit.json`, `optimize_program_pools.json`, `optimize_status.json`, `optimize_telemetry.json`, `optimize_yaw.db`, `optimize_yaw.db.lock` -> this looks much nicer and well organized when sorted by alphabet" / "Think if we can use cocoindex fingerprinting capabilities instead of handrolling our own." (User). Retires `--resume` and timestamped `*_optimize_<datestamp>*` sandboxes in favor of the single `optimize_`-prefixed canonical sandbox (`.yaw/optimize_yaw.db`, `.yaw/optimize_status.json`, `.yaw/optimize_program.json`, `.yaw/optimize_program_audit.json`, `.yaw/optimize_program_eval.json`, `.yaw/optimize_program_pools.json`, `.yaw/optimize_program_telemetry/`, `.yaw/optimize_telemetry.json`, `.yaw/optimize_kg_frames/`, `.yaw/optimize_coco/<dataset>/`) with default-resume behavior on `yaw dspy optimize` and explicit `--fresh` to wipe `.yaw/optimize_*` intentionally; unifies CocoIndex LMDB state roots at `.yaw/coco_lmdb`; replaces hand-rolled `json.dumps` + `hashlib.sha256` predictor/stage fingerprint helpers with CocoIndex's Rust-backed `fingerprint_object(payload).hex()` via `graph_plan_fingerprints`; and consolidates audit/telemetry sidecars onto `<stem>_audit.json` (`.yaw/optimize_program_audit.json`) and SQLite `meta['dspy_trails_state']`.

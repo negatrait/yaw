@@ -497,6 +497,78 @@ class ArchitectureTests(unittest.TestCase):
             "Protected/private cross-module imports detected:\n" + "\n".join(violations),
         )
 
+    def test_zero_cross_module_private_attributes(self):
+        """Rule 5b: Zero cross-object private/protected attribute access across storage, ingestion, and graph.
+
+        Forbids accessing _-prefixed attributes on objects other than self, cls, or super(),
+        with the sole documented exemption of managed._conn in db.py for low-level PRAGMA configuration.
+        Also forbids any access to ._provider across all of yaw/ outside managed_sqlite.py.
+        """
+
+        def is_self_cls_super(val_node: ast.AST) -> bool:
+            if isinstance(val_node, ast.Name) and val_node.id in {"self", "cls"}:
+                return True
+            return bool(
+                isinstance(val_node, ast.Call) and isinstance(val_node.func, ast.Name) and val_node.func.id == "super"
+            )
+
+        target_files = (
+            sorted((YAW_DIR / "daemon" / "graph" / "storage").glob("*.py"))
+            + [YAW_DIR / "daemon" / "indexing.py"]
+            + sorted((YAW_DIR / "daemon" / "ingestion").glob("*.py"))
+            + [
+                YAW_DIR / "daemon" / "graph" / "planner.py",
+                YAW_DIR / "daemon" / "graph" / "normalization.py",
+                YAW_DIR / "daemon" / "graph" / "ppr.py",
+            ]
+        )
+        self.assertGreater(len(target_files), 0, "No target files found for private attribute scan")
+
+        violations: list[str] = []
+        for py_file in target_files:
+            source = py_file.read_text(encoding="utf-8")
+            tree = ast.parse(source, filename=str(py_file))
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Attribute)
+                    and node.attr.startswith("_")
+                    and not node.attr.startswith("__")
+                    and not is_self_cls_super(node.value)
+                ):
+                    if py_file.name == "db.py" and node.attr == "_conn":
+                        continue
+                    violations.append(
+                        f"{py_file.relative_to(PROJECT_ROOT)}:{node.lineno}: "
+                        f"cross-object access of private attribute '{node.attr}'"
+                    )
+
+        self.assertEqual(
+            violations,
+            [],
+            "Cross-object private attribute accesses detected:\n" + "\n".join(violations),
+        )
+
+        all_yaw_files = sorted(YAW_DIR.rglob("*.py"))
+        provider_violations: list[str] = []
+        for py_file in all_yaw_files:
+            if py_file.name == "managed_sqlite.py":
+                continue
+            source = py_file.read_text(encoding="utf-8")
+            tree = ast.parse(source, filename=str(py_file))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Attribute) and node.attr == "_provider":
+                    provider_violations.append(
+                        f"{py_file.relative_to(PROJECT_ROOT)}:{node.lineno}: "
+                        f"cross-module access of TableTarget._provider is forbidden"
+                    )
+
+        self.assertEqual(
+            provider_violations,
+            [],
+            "Forbidden ._provider attribute accesses detected outside managed_sqlite.py:\n"
+            + "\n".join(provider_violations),
+        )
+
     def test_zero_circular_dependencies_across_all_yaw_modules(self):
         """Rule 6: The global module import graph must form a strict DAG with zero circular dependencies."""
         graph = build_internal_import_graph()

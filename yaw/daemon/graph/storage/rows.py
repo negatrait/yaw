@@ -6,12 +6,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, NamedTuple
 
-import cocoindex as coco
-
 from yaw.core import ChunkPointer
 
 from .evidence import EVIDENCE_INDEXES, EntityMention, FactAssertion
-from .managed_sqlite import DELETE_ROW, VecSpec, mount_table
+from .managed_sqlite import ManagedTableTarget, VecSpec, mount_table
 from .shacl import lint_graph_shacl
 
 
@@ -305,7 +303,7 @@ async def declare_tables(tables: tuple[DesiredTable, ...], *, db_identity: str =
         ),
         None,
     )
-    targets = [
+    targets: list[ManagedTableTarget[Any]] = [
         await mount_table(
             table.name,
             table.row_type,
@@ -330,7 +328,7 @@ async def declare_tables(tables: tuple[DesiredTable, ...], *, db_identity: str =
         for row in table.rows:
             target.declare_row(row=row)
         for key in table.deleted_keys:
-            coco.declare_target_state(target._provider.target_state(key, DELETE_ROW))
+            target.delete_row(key)
         if table.name == "meta" and db_identity and not any(row.key == "db_identity" for row in table.rows):
             target.declare_row(row=MetaRow("db_identity", db_identity))
 

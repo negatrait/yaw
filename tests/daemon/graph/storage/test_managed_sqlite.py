@@ -7,7 +7,7 @@ import pytest
 
 from yaw.daemon.graph.storage import open_managed_yaw_db
 from yaw.daemon.graph.storage.db import GRAPH_DB
-from yaw.daemon.graph.storage.managed_sqlite import VALIDATE_SQLITE, mount_table
+from yaw.daemon.graph.storage.managed_sqlite import VALIDATE_SQLITE, ManagedTableTarget, mount_table
 
 
 @dataclass(frozen=True)
@@ -67,6 +67,42 @@ def test_shared_sink_rolls_back_and_recovers_without_partial_publication(tmp_pat
         app.update_blocking()
         with db.readonly() as conn:
             assert conn.total_changes == changes
+    finally:
+        env.close()
+        db.close()
+
+
+def test_managed_table_target_delete_row(tmp_path):
+    db = open_managed_yaw_db(tmp_path / "yaw.db")
+
+    @dataclass
+    class SourceState:
+        deleted: bool = False
+
+    state = SourceState(deleted=False)
+
+    @coco.fn
+    async def publish_deletable(source: SourceState) -> None:
+        nodes = await mount_table("deletable_nodes", RevisionRow, ["key"])
+        assert isinstance(nodes, ManagedTableTarget)
+        if not source.deleted:
+            nodes.declare_row(row=RevisionRow("node_1", 42))
+        else:
+            nodes.delete_row(("node_1",))
+
+    context = coco.ContextProvider()
+    context.provide(GRAPH_DB, db)
+    context.provide(VALIDATE_SQLITE, lambda conn: None)
+    env = coco.Environment(settings=coco.Settings(db_path=tmp_path / "native-state"), context_provider=context)
+    app = coco.App(coco.AppConfig(name="delete_probe", environment=env), publish_deletable, state)
+    try:
+        app.update_blocking()
+        with db.readonly() as conn:
+            assert conn.execute("SELECT revision FROM deletable_nodes WHERE key='node_1'").fetchone()[0] == 42
+        state.deleted = True
+        app.update_blocking()
+        with db.readonly() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM deletable_nodes WHERE key='node_1'").fetchone()[0] == 0
     finally:
         env.close()
         db.close()

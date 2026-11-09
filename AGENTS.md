@@ -45,6 +45,7 @@ Read [FOUNDATIONAL.md](FOUNDATIONAL.md) first. Verify checkout `C:\Users\Harri.A
 - Editing code on disk does **not** reload a long-running process (`optimize`, `watchdog`, daemon) in memory, and the Windows command sandbox hides host processes—check host PIDs (`BypassSandbox: true`) and verify actual artifact timestamps and non-zero data before claiming live state.
 - Keep current README commands separate from epic targets; update scope docs when decisions change; report only checks actually executed; commit with conventional commits after passing all gates.
 - **Review records**: Before planning, read `docs/reviews/` for the subject and resume from its latest verified checkpoint. Every implementation unit appends its result (changes, evidence paths, gate results, discoveries, what it does not establish) to its `docs/reviews/<topic>.md` record in the same commit. Promote contract decisions into the governing spec; tick checkpoints only with evidence.
+- **Mandatory Critic Audit**: Before committing any completed unit of work or ticking a checkpoint, dispatch `critic (Model="flash")` using the unguided dispatch pattern: `"Review the implementation checkpoint <ID>, defined in <spec>. Analyse the implementation in files <files> and audit the git diff. Report any findings."` Never spoon-feed checklists, confirmation questions, or leading scenarios.
 
 ## Mandatory Quality Gates & Commands
 

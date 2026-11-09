@@ -272,6 +272,12 @@ class TableHandler(coco.TargetHandler[TableSpec, TableSpec, RowHandler]):
 TABLES = coco.register_root_target_states_provider("yaw/managed_sqlite/tables", TableHandler())
 
 
+class ManagedTableTarget[RowT](sqlite.TableTarget[RowT]):
+    def delete_row(self, key: tuple[Any, ...]) -> None:
+        """Declare a DELETE_ROW target state for key without exposing _provider across modules."""
+        coco.declare_target_state(self._provider.target_state(key, DELETE_ROW))
+
+
 async def mount_table[RowT](
     name: str,
     row_type: type[RowT],
@@ -282,7 +288,7 @@ async def mount_table[RowT](
     db_identity: str = "",
     vec: VecSpec | None = None,
     is_delta: bool = False,
-) -> sqlite.TableTarget[RowT]:
+) -> ManagedTableTarget[RowT]:
     schema = await sqlite.TableSchema[RowT].from_class(row_type, primary_key=list(primary_key))
     spec = TableSpec(
         name,
@@ -298,4 +304,4 @@ async def mount_table[RowT](
         coco.TargetStateProvider[dict[str, Any], None],
         await coco.mount_target(TABLES.target_state(TableKey(db_identity, name), spec)),
     )
-    return sqlite.TableTarget(provider, schema)
+    return ManagedTableTarget(provider, schema)

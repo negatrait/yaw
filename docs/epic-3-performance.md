@@ -22,6 +22,16 @@ Epic 3 is the post-feature-completion **performance, symbolic pruning, and full-
 1. **[Epic 1 (`D1-A6`)](epic-1-hipporag-daemon.md):** Passes the clean-slate `7`-dataset `[target]` slice-based paper parity gate (`scripts/verify_paper_parity_gate.py --compiled-program .yaw/compiled_program.json --mode eval --fresh`) against Target 1 (`monkeypatched_hipporag`) and Target 2 (`paper_70b`).
 2. **[Epic 2 (`E2-A1`..`E2-A3`)](epic-2-fastmcp-http.md):** Completes the `FastMCP` Streamable HTTP transport (`yaw/daemon/mcp_server.py`), the `5` `[target]` MCP tool contracts (`retrieve`, `rag_qa`, `index_stats`, `daemon_status`, `sync_sources`), and `ChunkPointer.source_content_hash` source-freshness provenance.
 
+### Early Epic 1 exception: audit JSON pilot (`E1-P6`)
+
+The user authorized planning a bounded early experiment on 2026-11-09. Only the
+optimizer's incremental/final `optimize_program_audit.json` encoding and the
+watchdog's audit decoding are candidates. [Epic 1](epic-1-hipporag-daemon.md)
+tracks this pilot; its scope, restart checklist and predefined gates are in the
+[audit JSON review plan](reviews/msgspec-audit-pilot.md). Implementation remains
+pending. This exception does not start the rest of Epic 3 or satisfy `E3-P6`,
+`E3-C3`, Epic 1 parity, or Epic 2 transport acceptance.
+
 ### 1.1 How Epic 2 Ties Into Epic 3 (Architectural Decoupling)
 - **Locked External Boundary, Mutable Internal Engine:** In [Epic 2](epic-2-fastmcp-http.md), `yaw/daemon/mcp_server.py` imports only `yaw.daemon.runtime` and `yaw.core.*`, delegating retrieval and QA to `runtime.retrieve(query, top_k)` and `runtime.rag_qa(question)` while validating physical source freshness via `ChunkPointer.source_content_hash`.
 - Because MCP tool schemas, progress stages (`1/3` `[target]` `queued`, `2/3` `[target]` `started`, `3/3` `[target]` `ready`), and `Passage` citation envelopes are frozen at the `runtime.py` boundary in Epic 2, Epic 3 can freely swap internal W3C/OWL/SKOS/PROV-O pruning rules, CSR transition operators, `dspy.Flex` / query-cluster routing policies, and `msgspec` binary/JSON sidecar serializers without breaking a single MCP client or transport test.
@@ -242,6 +252,8 @@ git diff --check
 ---
 
 ## Decisions
+
+- 2026-11-09: "Since 3 is on a real hot path, it sounds tempting. What is the complexity of that as a msgspec candidate, how would you evaluate it?" / "In that case, your first experiment proposal sounds better. Plan that." (User). Plan `E1-P6`, an early Epic 1 audit JSON experiment scoped to optimizer audit publication and watchdog consumption. Chunk inference serialization remains deferred; implementation follows the recorded plan in a subsequent step.
 
 - 2026-11-08: "I want the slice test first to know if the full corpus benchmarking is worth it or if we need to make adjustments to have a realistic chance at stabbing those targets. That is a decision better left as an Open question after the slice based gate - most probably answered as epic 3, after the mcp epic 2 is done. We could actually formulate it like that. Epic 3, the performance epic. Epic 2, the feature completion epic." (User). Establishes the 3-Epic separation of concerns: Epic 1 completes on the clean-slate `7`-dataset `[target]` slice-based paper parity gate (`D1-A6`), Epic 2 completes the FastMCP feature/transport contract, and Epic 3 owns performance scaling and full-corpus multi-day holdout benchmarks.
 - 2026-11-08: "You could also outline the spec goals in a brief manner for epic 3:
