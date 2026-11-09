@@ -230,8 +230,8 @@ class YawConfig:
     optimize_query_offset: int = 0
     optimize_auto: Literal["light", "medium", "heavy"] = "light"
     optimize_sleep_seconds: float = 0.0
-    optimize_max_bootstrapped_demos: int = 0
-    optimize_max_labeled_demos: int = 0
+    optimize_max_bootstrapped_demos: int = 1
+    optimize_max_labeled_demos: int = 1
 
     def __post_init__(self) -> None:
         ws = Path(self.workspace_root).resolve()
@@ -286,12 +286,12 @@ class YawConfig:
         object.__setattr__(
             self,
             "optimize_max_bootstrapped_demos",
-            max(0, int(self.optimize_max_bootstrapped_demos or 0)),
+            max(0, int(1 if self.optimize_max_bootstrapped_demos is None else self.optimize_max_bootstrapped_demos)),
         )
         object.__setattr__(
             self,
             "optimize_max_labeled_demos",
-            max(0, int(self.optimize_max_labeled_demos or 0)),
+            max(0, int(1 if self.optimize_max_labeled_demos is None else self.optimize_max_labeled_demos)),
         )
         raw_ds = self.optimize_datasets
         if isinstance(raw_ds, str):

@@ -245,7 +245,7 @@ def test_bad_decisions_fail_before_graph_application(tmp_path, packet_provider, 
     url, calls, _, state = packet_provider
     state["mode"] = mode
     program = make_program(url)
-    with pytest.raises(ValueError):
+    with pytest.raises((ValueError, dspy.utils.exceptions.AdapterParseError)):
         program.judge_synonyms(make_batch(tmp_path))
     assert len(calls) == 1
     assert not program.label_judge_audit_trail

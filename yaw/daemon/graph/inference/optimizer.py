@@ -1376,7 +1376,7 @@ def evolve_program_prompts(
                 else getattr(
                     hooks.config,
                     "optimize_max_bootstrapped_demos",
-                    0,
+                    1,
                 )
             )
             eff_labeled_demos = (
@@ -1385,7 +1385,7 @@ def evolve_program_prompts(
                 else getattr(
                     hooks.config,
                     "optimize_max_labeled_demos",
-                    0,
+                    1,
                 )
             )
             optimizer_kwargs: dict[str, Any] = {

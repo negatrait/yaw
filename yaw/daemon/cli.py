@@ -922,10 +922,10 @@ def handle_dspy_optimize(
 
     raw_bootstrapped = getattr(args, "max_bootstrapped_demos", None)
     max_bootstrapped_demos = (
-        int(raw_bootstrapped) if raw_bootstrapped is not None else int(config.optimize_max_bootstrapped_demos or 0)
+        int(raw_bootstrapped) if raw_bootstrapped is not None else int(config.optimize_max_bootstrapped_demos)
     )
     raw_labeled = getattr(args, "max_labeled_demos", None)
-    max_labeled_demos = int(raw_labeled) if raw_labeled is not None else int(config.optimize_max_labeled_demos or 0)
+    max_labeled_demos = int(raw_labeled) if raw_labeled is not None else int(config.optimize_max_labeled_demos)
     object.__setattr__(opt_config, "optimize_max_bootstrapped_demos", max_bootstrapped_demos)
     object.__setattr__(opt_config, "optimize_max_labeled_demos", max_labeled_demos)
 

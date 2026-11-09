@@ -37,8 +37,9 @@ char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
 """
 
 _OPEN_TRIPLE_GBNF_RULES = (
-    'triple ::= "{\\"sub\\": " string ", \\"pred\\": " pred-obj ", \\"def\\": " string "}"\n'
-    'pred-obj ::= resource-pred ", \\"obj\\": " string | literal-statement\n' + _STATEMENT_GBNF_RULES
+    'triple ::= "{\\"sub\\": " resource-slot ", \\"pred\\": " pred-obj ", \\"def\\": " string "}"\n'
+    'pred-obj ::= resource-pred ", \\"obj\\": " resource-slot | literal-statement\n'
+    'resource-slot ::= string | "[" string ", " string "]"\n' + _STATEMENT_GBNF_RULES
 )
 
 DSPY_TRIPLES_GBNF_GRAMMAR = (
@@ -376,7 +377,7 @@ def build_dspy_qa_grammar(max_reasoning_chars: int | None = None) -> str:
 
 
 def build_dspy_instruction_proposal_grammar(max_chars: int | None = 1500) -> str:
-    """Build pure-JSON GBNF grammar for GEPA/MIPROv2 instruction synthesis on Qwen (`llama.cpp` GPU)."""
+    """Build pure-JSON GBNF grammar for GEPA/MIPROv2 instruction synthesis on local LLM (`llama.cpp` GPU)."""
     if max_chars is None or max_chars <= 0:
         return DSPY_INSTRUCTION_PROPOSAL_GBNF_GRAMMAR
     return (

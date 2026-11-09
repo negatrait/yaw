@@ -156,7 +156,7 @@ def indexing_provider():
 
 def make_engine(tmp_path, url) -> YawGraphEngine:
     lm = dspy.LM("openai/indexing-contract", api_base=url, api_key="test", cache=False, num_retries=0)
-    program = YawProgram(include_demos=False, enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
+    program = YawProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
 
     def embed(texts):
         return np.array(

@@ -451,7 +451,7 @@ def match_facts_to_candidate_indices(
 
 
 def coerce_generated_facts(raw_output: Any) -> list[list[str]]:
-    """Extract 3-element string lists from a FactList, dict, JSON string, or list."""
+    """Extract 3-element string lists from a prediction, dict, JSON string, or list."""
     candidates: Any = None
     if hasattr(raw_output, "fact"):
         candidates = raw_output.fact

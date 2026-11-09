@@ -44,51 +44,61 @@ def is_abstaining_answer(answer: str) -> bool:
 STAGE_SCHEMA_CONTRACTS: dict[str, tuple[str, tuple[str, ...], str]] = {
     "ner": (
         "named_entities",
-        ("named_entities", "named entities"),
-        "Populate `named_entities` with `[skos:prefLabel, skos:definition]` pairs.",
+        ("named_entities", "named entities", "entities"),
+        "Populate `named_entities` with deduplicated resource label and contextual definition pairs.",
     ),
     "triples": (
         "triples",
-        ("triples",),
-        'Populate `triples` with reified `rdf:Statement` objects `{"sub", "pred", "obj", "def"}`.',
+        ("triples", "statements"),
+        "Populate `triples` with passage-supported reified `rdf:Statement` facts.",
     ),
     "entity_definer": (
         "entity_definitions",
         ("entity_definitions", "entity definitions"),
-        "Populate `entity_definitions` with `[entity_name, contextual_definition]` pairs.",
+        "Populate `entity_definitions` with contextual definitions paired with each requested entity name.",
     ),
     "label_judge": (
         "decisions",
         ("decisions",),
         (
-            'Populate `decisions` with branched `{"pair_id", "reasoning", "equivalent"}` objects '
-            '(`"definition"` and `"hidden_label"` when `equivalent=true`; close immediately when `equivalent=false`).'
+            "Populate `decisions` with identity equivalence decisions, supplying a unified definition "
+            "and `hidden_label` flag only when equivalent."
         ),
     ),
     "hierarchy_judge": (
         "decisions",
         ("decisions",),
-        'Populate `decisions` with `{"pair_id", "reasoning", "broader", "narrower"}` objects.',
+        "Populate `decisions` with hierarchical subsumption decisions (`broader` and `narrower`).",
     ),
     "related_judge": (
         "decisions",
         ("decisions",),
-        'Populate `decisions` with `{"pair_id", "reasoning", "related"}` objects.',
+        "Populate `decisions` with associative relation decisions (`related`).",
     ),
     "shacl_repair": (
         "repairs",
         ("repairs",),
-        'Populate `repairs` with `{"focus_node", "action", "value"}` SHACL repair objects.',
+        "Populate `repairs` with closed-world SHACL repair actions for the reported focus nodes.",
+    ),
+    "shacl_healer_rlm": (
+        "repairs",
+        ("repairs",),
+        "Populate `repairs` with closed-world SHACL repair actions for the reported focus nodes.",
     ),
     "triple_filter": (
         "fact",
         ("fact", "facts"),
-        "Populate `fact` with up to 4 verbatim `[subject, predicate, object]` triples.",
+        "Populate `fact` with up to 4 verbatim subject-predicate-object triples from `fact_before_filter`.",
     ),
-    "fact_filter": (
-        "fact",
-        ("fact", "facts"),
-        "Populate `fact` with up to 4 verbatim `[subject, predicate, object]` triples.",
+    "query_intent": (
+        "query_intent",
+        ("query_intent", "query intent"),
+        "Populate `query_intent` with a concise declarative statement of the sought fact.",
+    ),
+    "qa": (
+        "answer",
+        ("answer",),
+        "Populate `answer` with a definitive closed-world answer grounded in `context`.",
     ),
 }
 
@@ -432,20 +442,22 @@ def validate_stage_invariants(
         return max(0.2, round(1.0 - 0.45 * len(issues), 4)), f"[qa] {'; '.join(issues)}"
 
     if stage in ("llm_proposer", "llm_compressor"):
-        new_inst = str(getattr(prediction, "new_instruction", "") or "").strip()
+        inst_field = "shortened_instruction" if stage == "llm_compressor" else "new_instruction"
+        new_inst = str(getattr(prediction, inst_field, "") or "").strip()
         max_chars = int(inputs.get("max_instruction_chars", 1500) or 1500)
         comp_name = str(inputs.get("component_name", "") or "").strip()
+        comp_stage = comp_name.removesuffix(".predict")
         cur_inst = str(inputs.get("current_instruction", "") or "").strip()
         if not new_inst:
-            return 0.0, f"[{stage}] Empty new_instruction."
+            return 0.0, f"[{stage}] Empty {inst_field}."
         issues = []
         if len(new_inst) > max_chars:
             issues.append(f"Instruction length {len(new_inst)} > {max_chars}")
         for marker in ("<TargetAnswer>", "<TargetPassage>", "<TargetEntity>"):
             if marker in new_inst:
                 issues.append(f"Leaked placeholder marker {marker}")
-        if comp_name in STAGE_SCHEMA_CONTRACTS:
-            strict_key, alt_markers, _ = STAGE_SCHEMA_CONTRACTS[comp_name]
+        if comp_stage in STAGE_SCHEMA_CONTRACTS:
+            strict_key, alt_markers, _ = STAGE_SCHEMA_CONTRACTS[comp_stage]
             had_strict = strict_key in cur_inst if cur_inst else True
             has_strict = strict_key in new_inst
             has_any = any(m.lower() in new_inst.lower() for m in alt_markers)

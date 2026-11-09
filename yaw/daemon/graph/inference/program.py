@@ -41,10 +41,6 @@ from .parsers import (
     text_processing,
 )
 from .prompts import (
-    NER_DEMOS,
-    QA_DEMOS,
-    TRIPLE_DEMOS,
-    TRIPLE_FILTER_DEMOS,
     AnswerQuestion,
     DefineMissingEntities,
     ExtractEntities,
@@ -59,7 +55,7 @@ from .prompts import (
 )
 from .reflection import ServingTokenCounter
 from .retriever import YawRetriever, YawRM
-from .rlm import STAGE_RLM_DELEGATION_RULES, PositionalSafeRLM, build_rlm_action_demos
+from .rlm import STAGE_RLM_DELEGATION_RULES, PositionalSafeRLM
 from .synonyms import SynonymRequestBudget
 
 
@@ -104,7 +100,6 @@ Deno/Pyodide WASM) with
     def __init__(
         self,
         *,
-        include_demos: bool = False,
         enable_gbnf: bool = False,
         gbnf_max_entities: int | None = None,
         gbnf_max_triples: int | None = None,
@@ -222,14 +217,6 @@ Deno/Pyodide WASM) with
         )
 
         self._bind_predictor_lms()
-
-        if include_demos:
-            self.ner.demos = list(NER_DEMOS)
-            self.triples.demos = list(TRIPLE_DEMOS)
-            self.triple_filter.demos = list(TRIPLE_FILTER_DEMOS)
-            self.qa.predict.demos = list(QA_DEMOS)
-            rlm_demos = build_rlm_action_demos()
-            self.shacl_healer_rlm.generate_action.demos = list(rlm_demos["shacl_repair"])
 
         self.loaded_from_path: Path | None = None
         if compiled_path is not None:
@@ -591,7 +578,7 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
         ]
 
     def _dspy_ctx(self, lm: dspy.BaseLM | None, *, use_json_adapter: bool = True, adapter: dspy.Adapter | None = None):
-        ctx_kwargs: dict[str, Any] = {}
+        ctx_kwargs: dict[str, Any] = {"warn_on_type_mismatch": False}
         if lm is not None:
             ctx_kwargs["lm"] = lm
         if use_json_adapter:
@@ -757,7 +744,7 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
         lm: Any = None,
         use_gbnf: bool | None = None,
     ) -> tuple[str, ...]:
-        """Run DSPy NER extraction on Qwen w/ GBNF."""
+        """Run DSPy NER extraction on llama w/ GBNF."""
         entities, _ = self._run_ner_stage(passage, lm=lm, use_gbnf=use_gbnf)
         return entities
 
@@ -783,7 +770,9 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
         triples_payload: list[Any] = []
         for t in triples:
             if isinstance(t, StructuredTriple):
-                triples_payload.append(list(t.as_tuple()))
+                triples_payload.append(t.as_tuple())
+            elif isinstance(t, (list, tuple)) and len(t) == 3:
+                triples_payload.append((str(t[0]), str(t[1]), str(t[2])))
             elif isinstance(t, (list, tuple, dict)):
                 triples_payload.append(t)
 
@@ -855,6 +844,12 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
         definitions.extend(
             (name, definition) for name, definition in extract_entity_definitions(named_entities) if definition
         )
+        normalized_entities: list[Any] = [
+            (str(item[0]), str(item[1]))
+            if isinstance(item, (list, tuple)) and len(item) >= 2
+            else str(item[0] if isinstance(item, (list, tuple)) and item else item)
+            for item in named_entities
+        ]
         pred = self._invoke_stage(
             self.triples,
             stage_name="triples",
@@ -863,7 +858,7 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
             use_gbnf=use_gbnf,
             grammar_fn=lambda: build_dspy_triples_grammar(self.gbnf_max_triples, known_entities=named_entities),
             passage=passage,
-            named_entities=list(named_entities),
+            named_entities=normalized_entities,
         )
         return extract_structured_triples(
             getattr(pred, "triples", []),
@@ -879,7 +874,7 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
         lm: Any = None,
         use_gbnf: bool | None = None,
     ) -> tuple[tuple[str, str, str], ...]:
-        """Run DSPy triple extraction on Qwen w/ GBNF."""
+        """Run DSPy triple extraction on llama w/ GBNF."""
         structured = self.extract_structured_triples(
             passage,
             named_entities,
@@ -900,9 +895,7 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
 chunk."""
         entities, entity_definitions = self._run_ner_stage(passage, lm=lm, use_gbnf=use_gbnf)
         has_nonempty_defs = any(defn for _, defn in entity_definitions)
-        stage2_entities_input: list[Any] = (
-            [[name, defn] for name, defn in entity_definitions] if has_nonempty_defs else list(entities)
-        )
+        stage2_entities_input: list[Any] = list(entity_definitions) if has_nonempty_defs else list(entities)
         structured_triples = self.extract_structured_triples(
             passage,
             stage2_entities_input,
@@ -1288,7 +1281,7 @@ chunk."""
         lm: Any = None,
         use_gbnf: bool | None = None,
     ) -> list[int]:
-        """Filter candidate triples on Qwen w/ dynamic candidate-literal GBNF."""
+        """Filter candidate triples on llama w/ dynamic candidate-literal GBNF."""
         if not candidate_facts:
             return []
         effective_max_facts = self.gbnf_max_facts if max_facts is None else max_facts
@@ -1314,12 +1307,12 @@ chunk."""
         lm: Any = None,
         use_gbnf: bool | None = None,
     ) -> str:
-        """Rewrite question into a declarative query_intent string (GBNF on Qwen GPU, temp=0.4)."""
+        """Rewrite question into a declarative query_intent string (GBNF on llama, GPU, temp=1.0)."""
         from dspy.utils.usage_tracker import track_usage
 
         effective_lm = lm or self.query_intent.lm or dspy.settings.lm
         call_cfg: dict[str, Any] = {
-            "temperature": 0.4,
+            "temperature": 1.0,
         }
         if self._should_use_gbnf(use_gbnf, effective_lm):
             call_cfg["extra_body"] = {"grammar": build_dspy_query_intent_grammar()}

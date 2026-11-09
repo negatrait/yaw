@@ -72,8 +72,12 @@ class YawGBNFAdapter(dspy.JSONAdapter):
             return DSPY_RERANK_GBNF_GRAMMAR
         if sig_name == "AnswerQuestion":
             return build_dspy_qa_grammar(self.max_reasoning_chars)
-        if sig_name in ("ProposeInstructionSignature", "CompressInstructionSignature"):
+        if sig_name in ("ProposeInstructionSignature", "ProposeInstruction"):
             return build_dspy_instruction_proposal_grammar(self.max_instruction_chars)
+        if sig_name in ("CompressInstructionSignature", "CompressInstruction"):
+            return build_dspy_instruction_proposal_grammar(self.max_instruction_chars).replace(
+                "new_instruction", "shortened_instruction"
+            )
 
         out_fields = getattr(signature, "output_fields", None)
         in_fields = getattr(signature, "input_fields", None)
@@ -88,6 +92,19 @@ class YawGBNFAdapter(dspy.JSONAdapter):
                 return build_dspy_missing_entity_defs_grammar()
             if out_keys == ("decisions",):
                 dec_field = out_fields["decisions"]
+                ann_str = str(getattr(dec_field, "annotation", ""))
+                if "LabelDecision" in ann_str or "EquivalentLabelDecision" in ann_str:
+                    return build_dspy_label_judge_grammar(
+                        self.max_entities, max_reasoning_chars=self.max_reasoning_chars
+                    )
+                if "HierarchyDecision" in ann_str:
+                    return build_dspy_hierarchy_judge_grammar(
+                        self.max_entities, max_reasoning_chars=self.max_reasoning_chars
+                    )
+                if "RelatedDecision" in ann_str:
+                    return build_dspy_related_judge_grammar(
+                        self.max_entities, max_reasoning_chars=self.max_reasoning_chars
+                    )
                 extra = getattr(dec_field, "json_schema_extra", None)
                 extra_desc = extra.get("desc") if isinstance(extra, Mapping) else None
                 dec_desc = str(getattr(dec_field, "description", None) or extra_desc or "")

@@ -641,28 +641,13 @@ def apply_synonym_adjudication(
                 if _is_active_fact_pole(src, tgt):
                     raw_semantic_batch.append((src, tgt, "skos:related", edge_weight, reas))
                     continue
-                canon = str(dec.get("canonical", "") or "").strip()
-                canon_id = _resolve_active_eid(canon) if canon else ""
-                if canon and (
-                    canon.upper() == "A"
-                    or canon in (src, raw_src)
-                    or canon_id == src
-                    or (
-                        text_processing(canon) == text_processing(name_src)
-                        and text_processing(canon) != text_processing(name_tgt)
-                    )
+                merged_def = str(dec.get("definition", "") or "").strip() or None
+                if (
+                    merged_def
+                    and name_src.strip().casefold() in merged_def.casefold()
+                    and name_tgt.strip().casefold() not in merged_def.casefold()
                 ):
                     merge_src, merge_dst = tgt, src
-                elif canon and (
-                    canon.upper() == "B"
-                    or canon in (tgt, raw_tgt)
-                    or canon_id == tgt
-                    or (
-                        text_processing(canon) == text_processing(name_tgt)
-                        and text_processing(canon) != text_processing(name_src)
-                    )
-                ):
-                    merge_src, merge_dst = src, tgt
                 else:
                     merge_src, merge_dst = src, tgt
                 lkind = (
@@ -677,8 +662,6 @@ def apply_synonym_adjudication(
                         hidden_label_norms[merge_dst].add(src_norm)
                 if merge_src in hidden_label_norms:
                     hidden_label_norms[merge_dst].update(hidden_label_norms.pop(merge_src))
-
-                merged_def = str(dec.get("definition", "") or "").strip() or None
                 merged = merge_entities(
                     stage_conn,
                     merge_src,

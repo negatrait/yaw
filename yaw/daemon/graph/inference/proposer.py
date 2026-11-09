@@ -29,7 +29,7 @@ from .reflection import (
     validate_request_checkpoint,
     validate_simba_state,
 )
-from .rlm import STAGE_RLM_DELEGATION_RULES, PositionalSafeRLM, build_rlm_action_demos
+from .rlm import STAGE_RLM_DELEGATION_RULES, PositionalSafeRLM
 
 
 class InstructionSynthesizerWorker(dspy.Module):
@@ -166,7 +166,6 @@ class RLMInstructionProposer:
         rlm_max_iters: int = 10,
         rlm_max_llm_calls: int = 20,
         rlm_max_output_chars: int | None = None,
-        include_demos: bool = False,
         adapter: dspy.Adapter | None = None,
         rlm_interpreter_factory: Callable[[], Any] = dspy.PythonInterpreter,
         task_scorer: Callable[[Mapping[str, str]], float] | None = None,
@@ -261,10 +260,6 @@ class RLMInstructionProposer:
         self.rlm = self.inner_rlm
 
         self._bind_predictor_lms()
-
-        if include_demos:
-            rlm_demos = build_rlm_action_demos()
-            self.inner_rlm.generate_action.demos = list(rlm_demos["instruction_proposer_inner"])
 
     def _bind_predictor_lms(self) -> None:
         """Use native contextual writer LMs and a role-bound evidence selector."""

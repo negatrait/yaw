@@ -130,15 +130,6 @@ def complete_decisions(
                     "reasoning": reason,
                     "equivalent": False,
                 }
-            if "canonical" in d and d["canonical"]:
-                canon = str(d["canonical"])
-                if canon in ("A", "B"):
-                    canon = pair["entity_a" if canon == "A" else "entity_b"]
-                for side in ("a", "b"):
-                    if canon.casefold() == str(pair.get(f"name_{side}", "")).casefold():
-                        canon = pair[f"entity_{side}"]
-                        break
-                item["canonical"] = canon
             res_list.append(item)
         return res_list
 

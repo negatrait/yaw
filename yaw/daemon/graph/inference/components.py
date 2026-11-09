@@ -102,11 +102,23 @@ class OpenIEInput:
     program_identity: str
 
 
+def _normalize_trace_value(value: Any) -> Any:
+    if isinstance(value, (list, tuple)):
+        return [_normalize_trace_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(k): _normalize_trace_value(v) for k, v in value.items()}
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class PredictorTrace:
     predictor: str
     inputs: dict[str, Any]
     outputs: dict[str, Any]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "inputs", _normalize_trace_value(self.inputs))
+        object.__setattr__(self, "outputs", _normalize_trace_value(self.outputs))
 
 
 @dataclass(frozen=True, slots=True)

@@ -172,18 +172,13 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             extract_entity_definitions(truncated_ner)
 
     def test_dspy_signatures_and_default_demos(self):
-        """Verify all 4 dspy.Signatures and seeded dspy.Example demos."""
+        """Verify all 4 core dspy.Signatures."""
         import dspy
 
         from yaw.daemon.graph.inference.prompts import (
-            NER_DEMOS,
-            QA_DEMOS,
-            TRIPLE_DEMOS,
-            TRIPLE_FILTER_DEMOS,
             AnswerQuestion,
             ExtractEntities,
             ExtractTriples,
-            FactList,
             FilterTriples,
         )
 
@@ -200,14 +195,6 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         self.assertEqual(list(FilterTriples.output_fields.keys()), ["fact"])
         self.assertEqual(list(AnswerQuestion.input_fields.keys()), ["context", "question"])
         self.assertEqual(list(AnswerQuestion.output_fields.keys()), ["answer"])
-
-        self.assertEqual(len(NER_DEMOS), 1)
-        self.assertEqual(len(TRIPLE_DEMOS), 1)
-        self.assertEqual(len(TRIPLE_FILTER_DEMOS), 10)
-        self.assertIsInstance(TRIPLE_FILTER_DEMOS[0].fact_before_filter, str)
-        self.assertIsInstance(TRIPLE_FILTER_DEMOS[0].fact, list)
-        self.assertIsInstance(FactList(fact=TRIPLE_FILTER_DEMOS[0].fact), FactList)
-        self.assertEqual(len(QA_DEMOS), 2)
 
     def test_hipporag_program_openie_triple_filter_and_qa(self):
         """Verify YawProgram executes OpenIE, triple filtering, and QA via dspy.JSONAdapter (pure JSON output)."""
@@ -327,14 +314,10 @@ tools, and mode=None routes pre-hydrated focus_context directly to shacl_repair.
         from yaw.daemon.graph.inference.parsers import shacl_repair_actions
         from yaw.daemon.graph.inference.program import YawProgram
         from yaw.daemon.graph.inference.prompts import HealSHACLViolations
-        from yaw.daemon.graph.inference.rlm import STAGE_RLM_DELEGATION_RULES, build_rlm_action_demos
+        from yaw.daemon.graph.inference.rlm import STAGE_RLM_DELEGATION_RULES
 
         self.assertIn("SINGLE-STEP DELEGATION", STAGE_RLM_DELEGATION_RULES["shacl_repair"])
         self.assertNotIn("inspect_focus_node(focus_node)", STAGE_RLM_DELEGATION_RULES["shacl_repair"])
-        self.assertIn(
-            "Delegate once to propose_repairs()",
-            build_rlm_action_demos()["shacl_repair"][0].reasoning,
-        )
         self.assertIn("propose_repairs()", HealSHACLViolations.__doc__ or "")
 
         orch_lm = CapabilityDummyLM(
@@ -949,7 +932,7 @@ tools, and mode=None routes pre-hydrated focus_context directly to shacl_repair.
         self.assertEqual(worker_lm.history, [])
 
     def test_extract_query_intent_gbnf_and_sampling_contract(self):
-        """TDD Contract: extract_query_intent enforces DSPY_QUERY_INTENT_GBNF_GRAMMAR on llamacpp with temp=0.4 and \
+        """TDD Contract: extract_query_intent enforces DSPY_QUERY_INTENT_GBNF_GRAMMAR on llamacpp with temp=1.0 and \
 no frequency penalty."""
 
         from yaw.daemon.graph.inference import (
@@ -973,7 +956,7 @@ no frequency penalty."""
         self.assertEqual(intent, "Erik Hort birthplace village town county")
         self.assertEqual(len(llm_lm.history), 1)
         call_kwargs = llm_lm.history[0]["kwargs"]
-        self.assertAlmostEqual(call_kwargs.get("temperature"), 0.4)
+        self.assertAlmostEqual(call_kwargs.get("temperature"), 1.0)
         self.assertNotIn("frequency_penalty", call_kwargs)
         self.assertEqual(
             (call_kwargs.get("extra_body") or {}).get("grammar"),

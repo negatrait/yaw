@@ -181,7 +181,7 @@ def test_datatype_property_literal_objects_stored_with_weighted_edges_and_exclud
                 {
                     "sub": "YAW Service",
                     "pred": ["listens on port", "owl:DatatypeProperty"],
-                    "obj": "8080",
+                    "obj": {"value": "8080", "datatype": "xsd:integer", "lang": ""},
                     "def": "YAW Service listens on port 8080.",
                 }
             ]

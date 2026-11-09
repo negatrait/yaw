@@ -106,7 +106,6 @@ def test_serving_context_changes_real_extraction_truncation(provider):
         lm = create_dspy_lm("budget-test", base_url=url, cache=False, context_window_tokens=context_tokens)
         task = YawProgram(
             enable_gbnf=False,
-            include_demos=False,
             orchestrator_lm=lm,
             rlm_sub_lm=lm,
             context_window_tokens=context_tokens,

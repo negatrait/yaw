@@ -107,9 +107,11 @@ def test_custom_reasoning_chars() -> None:
 def test_adapter_resolves_3_stage_grammars() -> None:
     from yaw.daemon.graph.inference.adapter import YawGBNFAdapter
     from yaw.daemon.graph.inference.prompts import (
+        CompressInstructionSignature,
         JudgeHierarchy,
         JudgeLabels,
         JudgeRelated,
+        ProposeInstructionSignature,
     )
 
     adapter = YawGBNFAdapter(enable_gbnf=True)
@@ -124,6 +126,15 @@ def test_adapter_resolves_3_stage_grammars() -> None:
     g_rel = adapter.resolve_grammar(JudgeRelated)
     assert g_rel is not None
     assert "related" in g_rel
+
+    g_prop = adapter.resolve_grammar(ProposeInstructionSignature)
+    assert g_prop is not None
+    assert "new_instruction" in g_prop
+
+    g_comp = adapter.resolve_grammar(CompressInstructionSignature)
+    assert g_comp is not None
+    assert "shortened_instruction" in g_comp
+    assert "new_instruction" not in g_comp
 
 
 def _parse_gbnf_rules(grammar: str) -> dict[str, str]:
@@ -164,6 +175,9 @@ def test_ner_and_triples_grammars_bound_repetition_and_string_length() -> None:
 
     open_triples = _parse_gbnf_rules(DSPY_TRIPLES_GBNF_GRAMMAR)
     assert open_triples["triple-list"] == '"[]" | "[" triple (", " triple){0,39} "]"'
+    assert open_triples["triple"] == '"{\\"sub\\": " resource-slot ", \\"pred\\": " pred-obj ", \\"def\\": " string "}"'
+    assert open_triples["pred-obj"] == 'resource-pred ", \\"obj\\": " resource-slot | literal-statement'
+    assert open_triples["resource-slot"] == 'string | "[" string ", " string "]"'
     assert open_triples["string"] == '"\\"" char{1,512} "\\""'
 
     pinned_triples = _parse_gbnf_rules(build_dspy_triples_grammar(None, [["HubSpot", "CRM platform."]]))

@@ -141,7 +141,6 @@ def proposer(url, **kwargs):
         worker_lm=lm,
         orchestrator_lm=lm,
         token_counter=counter,
-        include_demos=False,
         enable_gbnf=False,
         **kwargs,
     )

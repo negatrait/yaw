@@ -12,9 +12,23 @@ import dspy
 import pytest
 from dspy.utils.exceptions import AdapterParseError
 
+from yaw.core import VALID_SHACL_ACTIONS
 from yaw.daemon.graph.inference import RLMInstructionProposer, YawProgram, create_dspy_lm
 from yaw.daemon.graph.inference.adapter import YawGBNFAdapter
-from yaw.daemon.graph.inference.prompts import ExtractEntities
+from yaw.daemon.graph.inference.prompts import (
+    AnswerQuestion,
+    DefineMissingEntities,
+    ExtractEntities,
+    ExtractQueryIntent,
+    ExtractTriples,
+    FilterTriples,
+    HealSHACLViolations,
+    JudgeHierarchy,
+    JudgeLabels,
+    JudgeRelated,
+    ProposeSHACLRepairs,
+    ReflectiveInnerDistillerSignature,
+)
 
 
 @pytest.fixture
@@ -171,18 +185,12 @@ def test_native_state_roundtrip_keeps_demos_and_explicit_deployment_lms(tmp_path
     assert requests[-1]["model"] == "replacement"
 
 
-def test_fresh_programs_are_zero_shot_and_examples_require_explicit_opt_in():
+def test_fresh_programs_are_zero_shot():
     program = YawProgram()
     proposer = RLMInstructionProposer()
     assert all(not predictor.demos for _, predictor in program.named_predictors())
     assert not proposer.llm_proposer.demos and not proposer.llm_compressor.demos
     assert all(not predictor.demos for _, predictor in proposer.inner_rlm.named_predictors())
-    examples = YawProgram(include_demos=True)
-    assert len(examples.ner.demos) == 1
-    assert len(examples.triples.demos) == 1
-    assert len(examples.triple_filter.demos) == 10
-    assert len(examples.qa.predict.demos) == 2
-    assert not program.ner.demos
 
 
 def test_legacy_state_missing_a_predictor_uses_native_configured_defaults(provider):
@@ -234,3 +242,297 @@ def test_history_remains_explicit_conversation_input_not_diagnostic_storage():
     assert [message["role"] for message in messages] == ["system", "user", "assistant", "user"]
     assert "Widget" in messages[-2]["content"]
     assert len(history.messages) == 1
+
+
+def test_typed_schema_contracts_exported_on_prompts_and_inference_facade():
+    import yaw.daemon.graph.inference as inf_pkg
+    import yaw.daemon.graph.inference.prompts as prompts_mod
+
+    expected_types = (
+        "EntitySensePair",
+        "FactTriple",
+        "ObjectPropertyPredicate",
+        "DatatypePropertyPredicate",
+        "LiteralObject",
+        "ObjectPropertyStatement",
+        "DatatypePropertyStatement",
+        "ReifiedStatement",
+        "EquivalentLabelDecision",
+        "DistinctLabelDecision",
+        "LabelDecision",
+        "HierarchyDecision",
+        "RelatedDecision",
+        "SHACLRepairAction",
+        "SHACLRepair",
+        "DistillerReference",
+        "DistillerSelection",
+    )
+    for sym in expected_types:
+        assert sym in prompts_mod.__all__, f"{sym} missing from prompts.__all__"
+        assert sym in inf_pkg.__all__, f"{sym} missing from inference.__all__"
+        assert getattr(prompts_mod, sym) is getattr(inf_pkg, sym)
+
+
+def test_predictor_signatures_emit_strict_json_schema_hints():
+    adapter = YawGBNFAdapter()
+    all_signatures = (
+        ExtractEntities,
+        ExtractTriples,
+        DefineMissingEntities,
+        JudgeLabels,
+        JudgeHierarchy,
+        JudgeRelated,
+        ProposeSHACLRepairs,
+        HealSHACLViolations,
+        FilterTriples,
+        ExtractQueryIntent,
+        AnswerQuestion,
+        ReflectiveInnerDistillerSignature,
+    )
+    for sig in all_signatures:
+        rendered = adapter.format_field_structure(sig).replace('\\"', '"')
+        assert '"items": {}' not in rendered, f"{sig.__name__} has untyped items: {rendered}"
+        assert '"additionalProperties": true' not in rendered, (
+            f"{sig.__name__} has open dict additionalProperties: {rendered}"
+        )
+
+    object_schema_signatures = (
+        ExtractTriples,
+        JudgeLabels,
+        JudgeHierarchy,
+        JudgeRelated,
+        ProposeSHACLRepairs,
+        HealSHACLViolations,
+        ReflectiveInnerDistillerSignature,
+    )
+    for sig in object_schema_signatures:
+        rendered = adapter.format_field_structure(sig).replace('\\"', '"')
+        assert '"additionalProperties": false' in rendered, (
+            f"{sig.__name__} missing closed-world additionalProperties=false: {rendered}"
+        )
+
+    ner_schema = adapter.format_field_structure(ExtractEntities).replace('\\"', '"')
+    assert '"prefixItems"' in ner_schema
+    assert '"minItems": 2' in ner_schema and '"maxItems": 2' in ner_schema
+
+    definer_schema = adapter.format_field_structure(DefineMissingEntities).replace('\\"', '"')
+    assert '"prefixItems"' in definer_schema
+    assert '"minItems": 2' in definer_schema and '"maxItems": 2' in definer_schema
+
+    filter_schema = adapter.format_field_structure(FilterTriples).replace('\\"', '"')
+    assert '"prefixItems"' in filter_schema
+    assert '"minItems": 3' in filter_schema and '"maxItems": 3' in filter_schema
+
+    triples_schema = adapter.format_field_structure(ExtractTriples).replace('\\"', '"')
+    for token in (
+        "ObjectPropertyStatement",
+        "DatatypePropertyStatement",
+        "LiteralObject",
+        "owl:ObjectProperty",
+        "owl:DatatypeProperty",
+        '"sub"',
+        '"pred"',
+        '"obj"',
+        '"def"',
+    ):
+        assert token in triples_schema, f"{token} missing from ExtractTriples schema: {triples_schema}"
+
+    label_schema = adapter.format_field_structure(JudgeLabels).replace('\\"', '"')
+    for token in (
+        "EquivalentLabelDecision",
+        "DistinctLabelDecision",
+        '"pair_id"',
+        '"reasoning"',
+        '"equivalent"',
+        '"definition"',
+        '"hidden_label"',
+    ):
+        assert token in label_schema, f"{token} missing from JudgeLabels schema: {label_schema}"
+
+    hierarchy_schema = adapter.format_field_structure(JudgeHierarchy).replace('\\"', '"')
+    for token in ("HierarchyDecision", '"pair_id"', '"reasoning"', '"broader"', '"narrower"'):
+        assert token in hierarchy_schema
+
+    related_schema = adapter.format_field_structure(JudgeRelated).replace('\\"', '"')
+    for token in ("RelatedDecision", '"pair_id"', '"reasoning"', '"related"'):
+        assert token in related_schema
+
+    for shacl_sig in (ProposeSHACLRepairs, HealSHACLViolations):
+        shacl_schema = adapter.format_field_structure(shacl_sig).replace('\\"', '"')
+        for token in ("SHACLRepair", '"focus_node"', '"action"', '"value"', *VALID_SHACL_ACTIONS):
+            assert token in shacl_schema, f"{token} missing from {shacl_sig.__name__} schema"
+
+    distiller_schema = adapter.format_field_structure(ReflectiveInnerDistillerSignature).replace('\\"', '"')
+    for token in ("DistillerSelection", "DistillerReference", '"diagnosis"', '"references"', '"example_id"', '"path"'):
+        assert token in distiller_schema
+
+
+def test_predictor_signatures_parse_valid_and_reject_invalid_payloads():
+    adapter = YawGBNFAdapter()
+
+    assert adapter.parse(ExtractEntities, '{"named_entities": [["Radio City", "Private FM station"]]}') == {
+        "named_entities": [("Radio City", "Private FM station")]
+    }
+    assert adapter.parse(DefineMissingEntities, '{"entity_definitions": [["Radio City", "Private FM station"]]}') == {
+        "entity_definitions": [("Radio City", "Private FM station")]
+    }
+    assert adapter.parse(FilterTriples, '{"fact": [["Radio City", "located in", "India"]]}') == {
+        "fact": [("Radio City", "located in", "India")]
+    }
+    triples_parsed = adapter.parse(
+        ExtractTriples,
+        json.dumps(
+            {
+                "triples": [
+                    {
+                        "sub": "Radio City",
+                        "pred": ["started on", "owl:DatatypeProperty"],
+                        "obj": {"value": "2001-07-03", "datatype": "xsd:date", "lang": ""},
+                        "def": "Radio City started on 3 July 2001.",
+                    }
+                ]
+            }
+        ),
+    )
+    assert triples_parsed["triples"][0]["pred"] == ("started on", "owl:DatatypeProperty")
+
+    assert (
+        adapter.parse(
+            JudgeLabels,
+            json.dumps(
+                {
+                    "decisions": [
+                        {
+                            "pair_id": "e0|e1",
+                            "reasoning": "Same entity",
+                            "equivalent": True,
+                            "definition": "Unified def",
+                            "hidden_label": False,
+                        },
+                        {"pair_id": "e1|e2", "reasoning": "Distinct", "equivalent": False},
+                    ]
+                }
+            ),
+        )["decisions"][0]["equivalent"]
+        is True
+    )
+
+    assert (
+        adapter.parse(
+            JudgeHierarchy,
+            '{"decisions": [{"pair_id": "e0|e1", "reasoning": "Subtype", "broader": true, "narrower": false}]}',
+        )["decisions"][0]["broader"]
+        is True
+    )
+
+    assert (
+        adapter.parse(
+            JudgeRelated,
+            '{"decisions": [{"pair_id": "e0|e1", "reasoning": "Related", "related": true}]}',
+        )["decisions"][0]["related"]
+        is True
+    )
+
+    for shacl_sig in (ProposeSHACLRepairs, HealSHACLViolations):
+        assert adapter.parse(
+            shacl_sig,
+            '{"repairs": [{"focus_node": "ent-1", "action": "set_definition", "value": "Updated definition."}]}',
+        ) == {"repairs": [{"focus_node": "ent-1", "action": "set_definition", "value": "Updated definition."}]}
+
+    assert (
+        adapter.parse(
+            ReflectiveInnerDistillerSignature,
+            json.dumps(
+                {
+                    "selection": {
+                        "diagnosis": "Missing bridge",
+                        "references": [{"example_id": "ex-1", "path": ["Feedback"], "start": 0, "end": 10}],
+                    }
+                }
+            ),
+        )["selection"]["diagnosis"]
+        == "Missing bridge"
+    )
+
+    invalid_cases = [
+        (ExtractEntities, '{"named_entities": [["OnlyLabel"]]}'),
+        (ExtractEntities, '{"named_entities": [["A", "B", "C"]]}'),
+        (DefineMissingEntities, '{"entity_definitions": [["OnlyName"]]}'),
+        (ExtractTriples, '{"triples": [{"sub": "A", "pred": "p", "obj": "B"}]}'),
+        (
+            ExtractTriples,
+            '{"triples": [{"sub": "A", "pred": ["p", "owl:InvalidProperty"], "obj": "B", "def": "A p B."}]}',
+        ),
+        (
+            ExtractTriples,
+            (
+                '{"triples": [{"sub": "A", "pred": ["p", "owl:DatatypeProperty"], '
+                '"obj": {"value": "1"}, "def": "A p 1."}]}'
+            ),
+        ),
+        (
+            ExtractTriples,
+            (
+                '{"triples": [{"sub": "A", "pred": ["started on", "owl:DatatypeProperty"], '
+                '"obj": "2001-07-03", "def": "A started on 2001-07-03."}]}'
+            ),
+        ),
+        (
+            ExtractTriples,
+            (
+                '{"triples": [{"sub": "A", "pred": ["located in", "owl:ObjectProperty"], '
+                '"obj": {"value": "India", "datatype": "xsd:string", "lang": ""}, "def": "A located in India."}]}'
+            ),
+        ),
+        (JudgeLabels, '{"decisions": [{"pair_id": "e0|e1", "reasoning": "Missing equivalent"}]}'),
+        (JudgeLabels, '{"decisions": [{"pair_id": "a|b", "reasoning": "r", "equivalent": true}]}'),
+        (
+            JudgeLabels,
+            '{"decisions": [{"pair_id": "a|b", "reasoning": "r", "equivalent": false, "hidden_label": false}]}',
+        ),
+        (JudgeHierarchy, '{"decisions": [{"pair_id": "e0|e1", "reasoning": "Missing narrower", "broader": true}]}'),
+        (JudgeRelated, '{"decisions": [{"pair_id": "e0|e1", "reasoning": "Missing related"}]}'),
+        (
+            JudgeRelated,
+            '{"decisions": [{"pair_id": "e0|e1", "reasoning": "Extra field", "related": true, "extra": 1}]}',
+        ),
+        (ProposeSHACLRepairs, '{"repairs": [{"focus_node": "ent-1", "action": "invent_action", "value": "x"}]}'),
+        (HealSHACLViolations, '{"repairs": [{"focus_node": "ent-1", "action": "invent_action", "value": "x"}]}'),
+        (FilterTriples, '{"fact": [["Subj", "Pred"]]}'),
+        (FilterTriples, '{"fact": [["S", "P", "O", "Extra"]]}'),
+        (ReflectiveInnerDistillerSignature, '{"selection": {"diagnosis": "Missing references"}}'),
+    ]
+    for sig, bad_payload in invalid_cases:
+        with pytest.raises(AdapterParseError):
+            adapter.parse(sig, bad_payload)
+
+
+def test_signature_instructions_and_stage_contracts_avoid_schema_repetition_and_validate_compressor():
+    from yaw.daemon.graph.inference.invariants import STAGE_SCHEMA_CONTRACTS, validate_stage_invariants
+
+    assert "[skos:prefLabel, skos:definition]" not in ExtractEntities.instructions
+    extra = ExtractEntities.output_fields["named_entities"].json_schema_extra
+    assert isinstance(extra, dict)
+    desc = extra.get("desc")
+    assert isinstance(desc, str) and "[skos:prefLabel, skos:definition]" not in desc
+    assert "[skos:prefLabel, skos:definition]" not in STAGE_SCHEMA_CONTRACTS["ner"][2]
+    assert "fact_filter" not in STAGE_SCHEMA_CONTRACTS
+    for stage_key in ("qa", "query_intent", "shacl_healer_rlm"):
+        assert stage_key in STAGE_SCHEMA_CONTRACTS
+
+    assert validate_stage_invariants(
+        "llm_compressor", {}, dspy.Prediction(shortened_instruction="Concise instruction.")
+    ) == (1.0, "PASS [llm_compressor]")
+    comp_empty_score, comp_empty_fb = validate_stage_invariants(
+        "llm_compressor", {}, dspy.Prediction(shortened_instruction="")
+    )
+    assert comp_empty_score == 0.0
+    assert "shortened_instruction" in comp_empty_fb
+
+    prop_score, prop_fb = validate_stage_invariants(
+        "llm_proposer",
+        {"component_name": "qa.predict", "current_instruction": "Return answer"},
+        dspy.Prediction(new_instruction="Unrelated text"),
+    )
+    assert prop_score < 1.0
+    assert "answer" in prop_fb

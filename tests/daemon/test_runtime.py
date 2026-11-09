@@ -114,7 +114,8 @@ class DeterministicTestLM(dspy.LM):
                 ]
             return [
                 '{"triples": [{"sub": "University of Southampton", '
-                '"pred": ["founded in", "owl:DatatypeProperty"], "obj": "1862", '
+                '"pred": ["founded in", "owl:DatatypeProperty"], '
+                '"obj": {"value": "1862", "datatype": "xsd:gYear", "lang": ""}, '
                 '"def": "University of Southampton was founded in 1862."}]}'
             ]
         if "ExtractEntities" in req_str or "named_entities" in req_str:

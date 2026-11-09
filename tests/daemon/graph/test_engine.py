@@ -844,12 +844,10 @@ def test_engine_homograph_gate_edc_and_shacl_conformance(synonym_token_counter, 
                             {
                                 "triples": [
                                     {
-                                        "subj": "Apple",
-                                        "subj_def": "Technology company headquartered in Cupertino",
+                                        "sub": ["Apple", "Technology company headquartered in Cupertino"],
                                         "pred": "headquartered in",
-                                        "obj": "Cupertino",
-                                        "obj_def": "City in Silicon Valley, California",
-                                        "spo_def": "Apple is a technology company headquartered in Cupertino.",
+                                        "obj": ["Cupertino", "City in Silicon Valley, California"],
+                                        "def": "Apple is a technology company headquartered in Cupertino.",
                                     }
                                 ]
                             }
@@ -861,12 +859,10 @@ def test_engine_homograph_gate_edc_and_shacl_conformance(synonym_token_counter, 
                             {
                                 "triples": [
                                     {
-                                        "subj": "Apple",
-                                        "subj_def": "Edible pome fruit harvested from orchard trees",
+                                        "sub": ["Apple", "Edible pome fruit harvested from orchard trees"],
                                         "pred": "harvested in",
-                                        "obj": "Autumn",
-                                        "obj_def": "Temperate harvest season",
-                                        "spo_def": "Apple fruit is harvested in autumn from orchard trees.",
+                                        "obj": ["Autumn", "Temperate harvest season"],
+                                        "def": "Apple fruit is harvested in autumn from orchard trees.",
                                     }
                                 ]
                             }
@@ -985,7 +981,12 @@ Option A (standalone Stage 1 NER entities preserved with definitions)."""
                         json.dumps(
                             {
                                 "triples": [
-                                    ["Apple", "designed", "iPhone"],
+                                    {
+                                        "sub": "Apple",
+                                        "pred": "designed",
+                                        "obj": "iPhone",
+                                        "def": "Apple designed the iPhone in 2007.",
+                                    },
                                 ]
                             }
                         )
@@ -995,7 +996,12 @@ Option A (standalone Stage 1 NER entities preserved with definitions)."""
                         json.dumps(
                             {
                                 "triples": [
-                                    ["Apple", "manufactures", "MacBook"],
+                                    {
+                                        "sub": "Apple",
+                                        "pred": "manufactures",
+                                        "obj": "MacBook",
+                                        "def": "Apple manufactures the MacBook.",
+                                    },
                                 ]
                             }
                         )
@@ -1230,12 +1236,10 @@ using all 5 bound REPL tools."""
                             {
                                 "triples": [
                                     {
-                                        "subj": "Alan M. Turing",
-                                        "subj_def": "British cryptanalyst at Bletchley Park",
+                                        "sub": ["Alan M. Turing", "British cryptanalyst at Bletchley Park"],
                                         "pred": "worked at",
-                                        "obj": "Bletchley Park",
-                                        "obj_def": "British wartime codebreaking center",
-                                        "spo_def": "Alan M. Turing worked on cryptanalysis at Bletchley Park.",
+                                        "obj": ["Bletchley Park", "British wartime codebreaking center"],
+                                        "def": "Alan M. Turing worked on cryptanalysis at Bletchley Park.",
                                     }
                                 ]
                             }
@@ -1246,12 +1250,10 @@ using all 5 bound REPL tools."""
                         {
                             "triples": [
                                 {
-                                    "subj": "Alan Turing",
-                                    "subj_def": "English mathematician and logician",
+                                    "sub": ["Alan Turing", "English mathematician and logician"],
                                     "pred": "formulated",
-                                    "obj": "Turing machine",
-                                    "obj_def": "Mathematical model of computation",
-                                    "spo_def": "Alan Turing formulated the Turing machine in 1936.",
+                                    "obj": ["Turing machine", "Mathematical model of computation"],
+                                    "def": "Alan Turing formulated the Turing machine in 1936.",
                                 }
                             ]
                         }
@@ -2427,7 +2429,6 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
                                 "equivalent": True,
                                 "definition": "Unified Cinderella concept.",
                                 "hidden_label": True,
-                                "canonical": "A" if na == "cinderella" else "B",
                             }
                         )
                     else:
@@ -2489,30 +2490,27 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
                         json.dumps(
                             {
                                 "triples": [
-                                    [
-                                        "Cinderella",
-                                        "folk tale heroine who lost a glass slipper",
-                                        "attended",
-                                        "a ball",
-                                        "formal royal dance party",
-                                        "Cinderella attended a formal royal dance ball.",
-                                    ],
-                                    [
-                                        "Cindarella",
-                                        "misspelled folk tale heroine who lost a glass slipper",
-                                        "danced at",
-                                        "a ball",
-                                        "formal royal dance party",
-                                        "Cindarella danced at a formal royal dance ball.",
-                                    ],
-                                    [
-                                        "Cindy Real",
-                                        "modern investigative journalist in Chicago",
-                                        "wrote about",
-                                        "a ball",
-                                        "spherical leather sports toy",
-                                        "Cindy Real wrote about a spherical sports ball.",
-                                    ],
+                                    {
+                                        "sub": ["Cinderella", "folk tale heroine who lost a glass slipper"],
+                                        "pred": "attended",
+                                        "obj": ["a ball", "formal royal dance party"],
+                                        "def": "Cinderella attended a formal royal dance ball.",
+                                    },
+                                    {
+                                        "sub": [
+                                            "Cindarella",
+                                            "misspelled folk tale heroine who lost a glass slipper",
+                                        ],
+                                        "pred": "danced at",
+                                        "obj": ["a ball", "formal royal dance party"],
+                                        "def": "Cindarella danced at a formal royal dance ball.",
+                                    },
+                                    {
+                                        "sub": ["Cindy Real", "modern investigative journalist in Chicago"],
+                                        "pred": "wrote about",
+                                        "obj": ["a ball", "spherical leather sports toy"],
+                                        "def": "Cindy Real wrote about a spherical sports ball.",
+                                    },
                                 ]
                             }
                         )
@@ -2521,22 +2519,18 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
                     json.dumps(
                         {
                             "triples": [
-                                [
-                                    "a ball",
-                                    "spherical golden toy object",
-                                    "was handled in",
-                                    "a ball",
-                                    "formal royal dance party",
-                                    "A spherical golden toy ball was handled in a formal royal dance ball.",
-                                ],
-                                [
-                                    "a ball",
-                                    "formal royal dance party",
-                                    "featured",
-                                    "a ball",
-                                    "spherical golden toy object",
-                                    "The formal royal dance ball featured a spherical golden toy ball.",
-                                ],
+                                {
+                                    "sub": ["a ball", "spherical golden toy object"],
+                                    "pred": "was handled in",
+                                    "obj": ["a ball", "formal royal dance party"],
+                                    "def": "A spherical golden toy ball was handled in a formal royal dance ball.",
+                                },
+                                {
+                                    "sub": ["a ball", "formal royal dance party"],
+                                    "pred": "featured",
+                                    "obj": ["a ball", "spherical golden toy object"],
+                                    "def": "The formal royal dance ball featured a spherical golden toy ball.",
+                                },
                             ]
                         }
                     )
@@ -2874,31 +2868,27 @@ def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
                             {
                                 "triples": [
                                     {
-                                        "sub": "Alan Turing",
-                                        "sub_def": "English mathematician and logician",
-                                        "pred": "was born on",
-                                        "obj": "1912-06-23",
-                                        "obj_def": "",
-                                        "obj_kind": "literal",
-                                        "obj_datatype": "xsd:date",
+                                        "sub": ["Alan Turing", "English mathematician and logician"],
+                                        "pred": ["was born on", "owl:DatatypeProperty"],
+                                        "obj": {"value": "1912-06-23", "datatype": "xsd:date", "lang": ""},
                                         "def": "Alan Turing was born on 1912-06-23.",
                                     },
                                     {
-                                        "sub": "Alan Turing",
-                                        "sub_def": "English mathematician and logician",
-                                        "pred": "worked on",
-                                        "obj": "Cryptanalysis",
-                                        "obj_def": "Study of analyzing information systems to decipher ciphertexts",
-                                        "obj_kind": "entity",
+                                        "sub": ["Alan Turing", "English mathematician and logician"],
+                                        "pred": ["worked on", "owl:ObjectProperty"],
+                                        "obj": [
+                                            "Cryptanalysis",
+                                            "Study of analyzing information systems to decipher ciphertexts",
+                                        ],
                                         "def": "Alan Turing worked on cryptanalysis during World War II.",
                                     },
                                     {
-                                        "sub": "Alan Turing",
-                                        "sub_def": "English mathematician and logician",
-                                        "pred": "pioneered",
-                                        "obj": "Cryptanalysis",
-                                        "obj_def": "Study of analyzing information systems to decipher ciphertexts",
-                                        "obj_kind": "entity",
+                                        "sub": ["Alan Turing", "English mathematician and logician"],
+                                        "pred": ["pioneered", "owl:ObjectProperty"],
+                                        "obj": [
+                                            "Cryptanalysis",
+                                            "Study of analyzing information systems to decipher ciphertexts",
+                                        ],
                                         "def": "Alan Turing pioneered modern cryptanalysis.",
                                     },
                                 ]
@@ -2910,12 +2900,12 @@ def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
                         {
                             "triples": [
                                 {
-                                    "sub": "Cryptanalysis",
-                                    "sub_def": "Study of analyzing information systems to decipher ciphertexts",
-                                    "pred": "is a subfield of",
-                                    "obj": "Mathematics",
-                                    "obj_def": "Formal science of numbers, structure, and logic",
-                                    "obj_kind": "entity",
+                                    "sub": [
+                                        "Cryptanalysis",
+                                        "Study of analyzing information systems to decipher ciphertexts",
+                                    ],
+                                    "pred": ["is a subfield of", "owl:ObjectProperty"],
+                                    "obj": ["Mathematics", "Formal science of numbers, structure, and logic"],
                                     "def": "Cryptanalysis is a subfield of mathematics.",
                                 }
                             ]

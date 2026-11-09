@@ -140,7 +140,6 @@ def make_learning(root, url, *, resume=False, answer="Alan Turing"):
         worker_lm=worker_lm,
         orchestrator_lm=worker_lm,
         enable_gbnf=False,
-        include_demos=False,
         token_counter=ServingTokenCounter(url, worker_lm.model),
     )
     train = [

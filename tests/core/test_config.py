@@ -21,8 +21,14 @@ def test_yaw_config_defaults() -> None:
     assert cfg.optimize_auto == "light"
     assert not hasattr(cfg, "optimize_max_metric_calls")
     assert cfg.optimize_mode == "hybrid"
+    assert cfg.optimize_max_bootstrapped_demos == 1
+    assert cfg.optimize_max_labeled_demos == 1
     assert cfg.retrieval_top_k == 10
     assert cfg.state_dir is not None and cfg.state_dir.name == "coco_lmdb"
+
+    zero_demos = YawConfig(optimize_max_bootstrapped_demos=0, optimize_max_labeled_demos=0)
+    assert zero_demos.optimize_max_bootstrapped_demos == 0
+    assert zero_demos.optimize_max_labeled_demos == 0
 
 
 def test_yaw_config_validation() -> None:

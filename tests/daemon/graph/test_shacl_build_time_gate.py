@@ -216,13 +216,13 @@ class PipelineGateMockLM(dspy.LM):
                             {
                                 "sub": "Yet Another Wiki",
                                 "pred": ["launched on", "owl:DatatypeProperty"],
-                                "obj": "2026-10-25",
+                                "obj": {"value": "2026-10-25", "datatype": "xsd:date", "lang": ""},
                                 "def": "Yet Another Wiki was launched on 2026-10-25.",
                             },
                             {
                                 "sub": "Yet Another Wiki",
                                 "pred": ["listens on port", "owl:DatatypeProperty"],
-                                "obj": "8080",
+                                "obj": {"value": "8080", "datatype": "xsd:integer", "lang": ""},
                                 "def": "Yet Another Wiki listens on port 8080.",
                             },
                             {

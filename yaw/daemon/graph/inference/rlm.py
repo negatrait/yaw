@@ -34,28 +34,6 @@ STAGE_RLM_DELEGATION_RULES: dict[str, str] = {
 }
 
 
-def build_rlm_action_demos() -> dict[str, list[dspy.Example]]:
-    """Build few-shot action demonstrations for single-level RLM sandboxes."""
-    from dspy.primitives.repl_types import REPLHistory
-
-    empty_history = REPLHistory()
-    return {
-        "shacl_repair": [
-            dspy.Example(
-                variables_info="Variable: `violations` (type: str): JSON list of SHACLViolation report items",
-                repl_history=empty_history,
-                iteration="1/10",
-                reasoning=(
-                    "Delegate once to propose_repairs(), which supplies the complete structured focus dossiers "
-                    "and source passages automatically, and immediately submit its repair proposals."
-                ),
-                code="```python\nrepairs = propose_repairs()\nSUBMIT(repairs=repairs)\n```",
-            ).with_inputs("variables_info", "repl_history", "iteration")
-        ],
-        "instruction_proposer_inner": [],
-    }
-
-
 def _normalize_rlm_field(name: str, val: Any, annotation: Any) -> Any:
     if isinstance(val, dict):
         if name in val:
@@ -100,7 +78,7 @@ _RLM_Base: Any = getattr(dspy, "RLM", dspy.Module)
 
 
 class PositionalSafeRLM(_RLM_Base):
-    """RLM subclass that binds positional tool arguments, enforces 1-step Qwen delegation, and normalizes SUBMIT \
+    """RLM subclass that binds positional tool arguments, enforces 1-step LM delegation, and normalizes SUBMIT \
 payloads."""
 
     def __init__(self, *args: Any, stage_rule: str = "", **kwargs: Any) -> None:
@@ -189,6 +167,5 @@ payloads."""
 __all__ = [
     "PositionalSafeRLM",
     "STAGE_RLM_DELEGATION_RULES",
-    "build_rlm_action_demos",
     "sanitize_repl_code",
 ]

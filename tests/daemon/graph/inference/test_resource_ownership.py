@@ -112,19 +112,6 @@ def test_homograph_senses_must_already_exist_in_ner():
         )
 
 
-def test_default_demonstrations_obey_resource_ownership():
-    from yaw.daemon.graph.inference.prompts import TRIPLE_DEMOS
-
-    for demo in TRIPLE_DEMOS:
-        triples = extract_structured_triples(
-            demo.triples,
-            entity_definitions=demo.named_entities,
-            known_entities=[name for name, _ in demo.named_entities],
-        )
-        assert len(triples) == len(demo.triples)
-        assert any(triple.obj_kind == "literal" for triple in triples)
-
-
 def test_grammar_has_no_new_resource_slot_and_empty_ner_has_no_statements():
     grammar = build_dspy_triples_grammar(known_entities=RESOURCES)
     assert "new-entity" not in grammar
