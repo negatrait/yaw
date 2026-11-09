@@ -1,32 +1,17 @@
 """Faithful document-file preparation and explicit dataset bundle manifests."""
 
-import asyncio
 import hashlib
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import cocoindex as coco
-from cocoindex.connectors import localfs
 from filelock import FileLock
 
 from yaw.core import (
-    ChunkPointer,
     render_document_text,
     write_text_atomic,
-)
-
-from .source_targets import (
-    SOURCE_ROOT,
-    SourceMetadata,
-    SourceSettings,
-    acquire_coco_environment,
-    build_source_path_matcher,
-    chunk_file_memo,
-    close_coco_environment,
-    normalize_chunking_settings,
 )
 
 
@@ -228,109 +213,3 @@ def validate_dataset_bundle(bundle: DatasetBundle) -> None:
     actual = {p.resolve() for p in bundle.documents_root.glob("*.json")}
     if actual != {(bundle.root / d.path).resolve() for d in bundle.documents}:
         raise ValueError("Dataset document inventory does not match its manifest")
-
-
-BUNDLE_SOURCE_SETTINGS = coco.ContextKey[SourceSettings | None]("yaw/bundle_source_settings")
-
-
-@coco.fn
-async def _bundle_snapshot_app_main(
-    settings: SourceSettings | None = None,
-) -> dict[str, tuple[tuple[SourceMetadata, str], ...]]:
-    effective = settings if settings is not None else coco.use_context(BUNDLE_SOURCE_SETTINGS)
-    assert effective is not None
-    files = localfs.walk_dir(
-        SOURCE_ROOT,
-        recursive=False,
-        live=False,
-        path_matcher=build_source_path_matcher(effective),
-        rescan_interval=None,
-    )
-    chunking_settings = normalize_chunking_settings(effective)
-    items = [(rel, file) async for rel, file in files.items()]
-    rels = [rel for rel, _ in items]
-    per_file_chunks = await asyncio.gather(*(chunk_file_memo(file, chunking_settings) for _, file in items))
-    return dict(zip(rels, per_file_chunks, strict=True))
-
-
-async def _run_bundle_snapshot_app(
-    app: coco.App[Any, dict[str, tuple[tuple[SourceMetadata, str], ...]]],
-) -> dict[str, tuple[tuple[SourceMetadata, str], ...]]:
-    handle = app.update()
-    result = await handle.result()
-    stats = handle.stats()
-    if stats is not None and stats.total.num_errors > 0:
-        raise ValueError(f"Dataset bundle snapshot failed with {stats.total.num_errors} component error(s)")
-    return result
-
-
-def snapshot_dataset_bundle(
-    bundle: DatasetBundle,
-    state_dir: Path,
-    *,
-    document_ids: Sequence[str] | None = None,
-    chunk_size: int = 1200,
-    chunk_overlap: int = 100,
-    min_chunk_size: int = 50,
-    json_keys_whitelist: Sequence[str] = ("*",),
-    json_keys_blacklist: Sequence[str] = (),
-) -> list[tuple[ChunkPointer, str]]:
-    """Return a complete native-memo snapshot under a stable source namespace."""
-    selected = set(document_ids) if document_ids is not None else None
-    by_name = {Path(d.path).name: d.document_id for d in bundle.documents}
-    if selected is not None and (unknown := selected - set(by_name.values())):
-        raise ValueError(f"Document IDs missing from {bundle.dataset} manifest: {sorted(unknown)}")
-    included_files = (
-        tuple(sorted(name for name, doc_id in by_name.items() if doc_id in selected)) if selected is not None else None
-    )
-    settings = SourceSettings(
-        included_patterns=("*.json",),
-        excluded_patterns=(),
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        min_chunk_size=min_chunk_size,
-        json_keys_whitelist=tuple(json_keys_whitelist),
-        json_keys_blacklist=tuple(json_keys_blacklist),
-        included_files=included_files,
-    )
-    resolved_state = Path(state_dir if state_dir is not None else bundle.root).resolve()
-    resolved_state.mkdir(parents=True, exist_ok=True)
-    with FileLock(str(bundle.root / "bundle.lock")):
-        validate_dataset_bundle(bundle)
-        shared = acquire_coco_environment(resolved_state)
-        shared.context.provide(SOURCE_ROOT, bundle.documents_root.resolve())
-        shared.context.provide(BUNDLE_SOURCE_SETTINGS, settings)
-        app = shared.apps.get("yaw_bundle_source")
-        if app is None:
-            app = coco.App(
-                coco.AppConfig(name="yaw_bundle_source", environment=shared.environment, max_inflight_components=4),
-                _bundle_snapshot_app_main,
-            )
-            shared.apps["yaw_bundle_source"] = app
-        try:
-            bundle_chunks = asyncio.run(_run_bundle_snapshot_app(app))
-        finally:
-            close_coco_environment(resolved_state)
-
-        snapshot: list[tuple[ChunkPointer, str]] = []
-        for doc in bundle.documents:
-            rel_name = Path(doc.path).name
-            if selected is not None and doc.document_id not in selected:
-                continue
-            file_chunks = bundle_chunks.get(rel_name, ())
-            for meta, text in file_chunks:
-                snapshot.append(
-                    (
-                        ChunkPointer(
-                            meta.chunk_id,
-                            f"{bundle.dataset}/documents/{meta.rel_posix_path}",
-                            meta.start_line,
-                            meta.end_line,
-                            meta.title,
-                            meta.ast_island_start,
-                            meta.ast_island_end,
-                        ),
-                        text,
-                    )
-                )
-        return snapshot

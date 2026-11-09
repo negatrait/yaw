@@ -20,6 +20,8 @@ from yaw.core import (
     FatalGraphPublicationError,
     IndexStats,
     RelationTraversalPolicy,
+    compute_chunk_id,
+    render_document_text,
     write_text_atomic,
 )
 from yaw.core.config import context_char_limit
@@ -72,6 +74,7 @@ from yaw.daemon.graph.storage import (
     make_chunk_hydrator,
     open_managed_yaw_db,
     pool_confidences,
+    resolve_chunk_text,
     search_chunk_vectors_knn,
     search_chunks_fts,
     search_fact_vectors_knn,
@@ -131,7 +134,7 @@ class YawGraphEngine:
         self.program = program
         self.embedder = embedder
         self.config: Any = None
-        self.indexing_runner: Callable[[Sequence[tuple[ChunkPointer, str]], YawProgram], GraphPlanSummary] | None = None
+        self.indexing_runner: Callable[..., GraphPlanSummary] | None = None
         self._close_callbacks: list[Callable[[], None]] = []
 
         self.max_context_chars = (
@@ -933,12 +936,17 @@ class YawGraphEngine:
             chunks = []
             line = 2
             for record in records:
-                item = "\n".join("  " + row for row in json.dumps(record, ensure_ascii=False, indent=2).splitlines())
+                full_text = render_document_text(record["title"], record["text"]) if record["title"] else record["text"]
+                rec_copy = dict(record)
+                item = "\n".join("  " + row for row in json.dumps(rec_copy, ensure_ascii=False, indent=2).splitlines())
                 end_line = line + item.count("\n")
+                cid = compute_chunk_id("passages.json", line, end_line, full_text)
+                rec_copy["id"] = cid
+                item = "\n".join("  " + row for row in json.dumps(rec_copy, ensure_ascii=False, indent=2).splitlines())
                 chunks.append(
                     (
-                        ChunkPointer(record["id"], "passages.json", line, end_line, record["title"], line, end_line),
-                        record["text"],
+                        ChunkPointer(cid, "passages.json", line, end_line, record["title"], line, end_line),
+                        full_text,
                     )
                 )
                 rendered.append(item)
@@ -965,10 +973,11 @@ class YawGraphEngine:
 
     def index_chunks(
         self,
-        chunks: Sequence[tuple[ChunkPointer, str]],
+        chunks: Sequence[tuple[ChunkPointer, str]] = (),
         *,
         progress_callback: Callable[[str], None] | None = None,
         program: YawProgram | None = None,
+        included_files: Sequence[str] | None = None,
     ) -> int:
         """Publish the complete desired snapshot, including empty input for withdrawal."""
         if self.indexing_runner is None:
@@ -980,10 +989,11 @@ class YawGraphEngine:
             prev_cb = self._active_progress_callback
             if progress_callback is not None:
                 self._active_progress_callback = progress_callback
-                progress_callback("indexing: native frozen candidate preparation and graph publication")
-            self._opt_chunks_pool = list(chunks)
+                progress_callback("indexing: native candidate preparation and graph publication")
+            if chunks:
+                self._opt_chunks_pool = list(chunks)
             try:
-                summary = self.indexing_runner(chunks, active_program)
+                summary = self.indexing_runner(chunks, active_program, included_files=included_files)
             finally:
                 self._active_progress_callback = prev_cb
             self._csr_graph = None
@@ -1000,6 +1010,8 @@ class YawGraphEngine:
                 if trace.predictor not in {"ner", "triples"}
             ]
             self._captured_chunk_traces.clear()
+            if not self._opt_chunks_pool and self._opt_indexed_cids:
+                self._hydrate_opt_chunks_pool_from_db()
             self._hydrate_chunk_traces_and_stats_from_db(self._opt_chunks_pool)
             for name in (
                 "entity_def_audit_trail",
@@ -1010,7 +1022,21 @@ class YawGraphEngine:
             ):
                 getattr(active_program, name).extend(getattr(summary, name))
             trim_diagnostics(active_program)
-            return len(chunks)
+            return len(summary.chunk_ids) if summary.chunk_ids else len(chunks)
+
+    def _hydrate_opt_chunks_pool_from_db(self) -> None:
+        """Hydrate _opt_chunks_pool from persisted chunks table when indexed directly from disk."""
+        pool: list[tuple[ChunkPointer, str]] = []
+        with self.managed_conn.readonly() as conn:
+            rows = conn.execute(
+                "SELECT chunk_id, rel_posix_path, start_line, end_line, title, ast_island_start, ast_island_end "
+                "FROM chunks ORDER BY chunk_id"
+            ).fetchall()
+            for r in rows:
+                ptr = ChunkPointer(r[0], r[1], r[2], r[3], r[4], r[5], r[6])
+                c_text = resolve_chunk_text(ptr, self.workspace_root)
+                pool.append((ptr, c_text))
+        self._opt_chunks_pool = pool
 
     def retrieve_with_seeds(
         self,

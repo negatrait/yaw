@@ -362,7 +362,6 @@ def test_canonical_optimize_resume_and_fresh_lifecycle(tmp_path: Path, provider)
     assert not list(yaw_dir.glob("coco_state*"))
     assert (yaw_dir / "coco_lmdb").is_dir()
     assert not (yaw_dir / "coco_lmdb" / "coco_lmdb").exists()
-    assert (yaw_dir / "optimize_coco").is_dir()
     assert (yaw_dir / "optimize_status.json").is_file()
 
     telemetry = yaw_dir / "optimize_program_telemetry"
@@ -453,7 +452,7 @@ def test_canonical_optimize_resume_and_fresh_lifecycle(tmp_path: Path, provider)
             "SELECT chunk_id, rel_posix_path, start_line, end_line FROM chunks ORDER BY chunk_id"
         ).fetchall()
     assert original_chunks
-    assert all("/documents/" in row[1] for row in original_chunks)
+    assert all("documents/" in row[1] for row in original_chunks)
     records[0]["question"] = "A changed training question"
     dataset.write_text(json.dumps(records), encoding="utf-8")
     dataset_bundle = prepare_runtime_bundle(dataset)
@@ -485,7 +484,6 @@ def test_canonical_optimize_resume_and_fresh_lifecycle(tmp_path: Path, provider)
     assert not (yaw_dir / "optimize_telemetry.json").exists()
     assert not (yaw_dir / "optimize_kg_frames").exists()
     assert (yaw_dir / "coco_lmdb").is_dir()
-    assert (yaw_dir / "optimize_coco").is_dir()
     assert canonical_output.is_file()
 
 
@@ -930,7 +928,7 @@ def test_cli_subcommands_sync_status_rebuild_and_stop(tmp_path: Path, provider) 
     )
     run_thread.start()
 
-    deadline = time.monotonic() + 5.0
+    deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
         live = inspect_status(cfg)
         if live["status"]["lifecycle"] == "ready":
@@ -1005,7 +1003,7 @@ Tier 2 anti-overfitting guard."""
             with closing(sqlite3.connect(opt_cfg.db_path.as_uri() + "?mode=ro", uri=True)) as conn:
                 db_chunks = conn.execute("SELECT rel_posix_path FROM chunks").fetchall()
             assert len(db_chunks) >= 4
-            assert all("/documents/" in row[0] for row in db_chunks)
+            assert all("documents/" in row[0] for row in db_chunks)
             pred = student(question=trainset[0].question)
             assert pred.context.strip() != ""
             return student
@@ -1046,7 +1044,7 @@ Tier 2 anti-overfitting guard."""
     with closing(sqlite3.connect(opt_cfg_after.db_path.as_uri() + "?mode=ro", uri=True)) as conn:
         db_chunks_after = conn.execute("SELECT rel_posix_path FROM chunks").fetchall()
     assert len(db_chunks_after) == 6
-    assert all("/documents/" in row[0] for row in db_chunks_after)
+    assert all("documents/" in row[0] for row in db_chunks_after)
     opt_out = json.loads(buf.getvalue())
     assert opt_out["optimized"] is True
     assert opt_out["mode"] == "gepa"

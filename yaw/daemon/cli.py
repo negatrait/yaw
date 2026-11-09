@@ -946,6 +946,7 @@ def handle_dspy_optimize(
             max_labeled_demos=max_labeled_demos,
             corpus_docs=corpus_docs,
             dataset_bundles=dataset_bundles,
+            progress_callback=lambda msg: print(msg, flush=True),
             run_options={
                 "dataset": dataset_args,
                 "max_queries": max_queries,

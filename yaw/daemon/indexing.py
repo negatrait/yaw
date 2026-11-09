@@ -2,10 +2,9 @@
 
 import asyncio
 import contextlib
-import hashlib
 import json
 from collections.abc import Callable, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -67,23 +66,6 @@ RELOAD_SIGNAL_HANDLER = coco.ContextKey[Callable[[str], None]]("yaw/reload_signa
 INDEXING_ERROR_SINK = coco.ContextKey[Callable[[BaseException], None] | None]("yaw/indexing_error_sink")
 
 
-class FrozenChunkStream:
-    """Dynamic chunk stream for batching frozen candidate indexing through a single CocoIndex app."""
-
-    __slots__ = ("chunks", "settings")
-
-    def __init__(
-        self,
-        chunks: tuple[tuple[ChunkPointer, str], ...] = (),
-        settings: GraphPlanSettings | None = None,
-    ) -> None:
-        self.chunks = chunks
-        self.settings = settings
-
-
-_FROZEN_STREAMS: dict[Path, FrozenChunkStream] = {}
-
-
 @dataclass(frozen=True, slots=True)
 class SyncOutcome:
     added_chunks: tuple[str, ...] = ()
@@ -96,9 +78,12 @@ class InferenceIdentity:
     embedding: str
 
 
-ACTIVE_SOURCE_SETTINGS = coco.ContextKey[SourceSettings | None]("yaw/active_source_settings")
-ACTIVE_INFERENCE_IDENTITY = coco.ContextKey[InferenceIdentity | None]("yaw/active_inference_identity")
-ACTIVE_GRAPH_SETTINGS = coco.ContextKey[GraphPlanSettings | None]("yaw/active_graph_settings")
+ACTIVE_SOURCE_SETTINGS = coco.ContextKey[SourceSettings | None]("yaw/active_source_settings", detect_change=True)
+ACTIVE_INFERENCE_IDENTITY = coco.ContextKey[InferenceIdentity | None](
+    "yaw/active_inference_identity", detect_change=True
+)
+ACTIVE_GRAPH_SETTINGS = coco.ContextKey[GraphPlanSettings | None]("yaw/active_graph_settings", detect_change=True)
+ACTIVE_BATCH_STEP = coco.ContextKey[tuple[int, int]]("yaw/active_batch_step", detect_change=True)
 
 
 def _managed_db_identity(db: sqlite.ManagedConnection) -> str:
@@ -274,6 +259,7 @@ class CorpusIndexingLiveComponent:
         db_identity: str = "",
         live: bool = True,
         batch_size: int = 64,
+        batch_step: int = 0,
     ) -> None:
         CorpusIndexingLiveComponent.last_instance = self
         self._files = files
@@ -285,9 +271,14 @@ class CorpusIndexingLiveComponent:
         self._db_identity = db_identity
         self._live = live
         self._batch_size = batch_size
+        self._batch_step = batch_step
         self._active_files: dict[str, FileLike] | None = None
         self.remaining_chunks: int = 0
         self.last_summary: GraphPlanSummary | None = None
+        self.last_retained: tuple[tuple[SourceMetadata, str], ...] = ()
+        self.last_changed: tuple[tuple[SourceMetadata, str], ...] = ()
+        self.initial_retained: tuple[tuple[SourceMetadata, str], ...] = ()
+        self.initial_changed: tuple[tuple[SourceMetadata, str], ...] = ()
 
     @property
     def active_files(self) -> dict[str, FileLike] | None:
@@ -309,7 +300,7 @@ class CorpusIndexingLiveComponent:
 
     async def process(self) -> GraphPlanSummary | None:
         try:
-            if self._active_files is None:
+            if self._active_files is None or not self._live:
                 self._active_files = {str(rel): f async for rel, f in self._files.items()}
 
             try:
@@ -418,7 +409,14 @@ class CorpusIndexingLiveComponent:
                             continue
                     changed.append((metadata, text))
 
-                batch_size = self._batch_size
+                self.last_retained = tuple(retained)
+                self.last_changed = tuple(changed)
+                try:
+                    active_batch_step = coco.use_context(ACTIVE_BATCH_STEP)
+                    effective_batch_size = active_batch_step[0]
+                except KeyError:
+                    effective_batch_size = self._batch_size
+                batch_size = effective_batch_size
                 active_chunks = (*retained, *changed[:batch_size])
                 self.remaining_chunks = max(0, len(changed) - batch_size)
 
@@ -486,6 +484,20 @@ async def indexing_app_main(
     live: bool = True,
     batch_size: int = 64,
 ) -> None:
+    try:
+        active_step = coco.use_context(ACTIVE_BATCH_STEP)
+        effective_batch_size = active_step[0]
+        batch_step = active_step[1]
+    except KeyError:
+        effective_batch_size = batch_size
+        batch_step = 0
+
+    try:
+        active_src = coco.use_context(ACTIVE_SOURCE_SETTINGS)
+        effective_settings = active_src if active_src is not None else settings
+    except KeyError:
+        effective_settings = settings
+
     source_db = coco.use_context(SOURCE_DB)
     db_identity = _managed_db_identity(source_db)
     sources = await mount_table("source_chunks", SourceMetadata, ["chunk_id"], db_identity=db_identity)
@@ -494,7 +506,10 @@ async def indexing_app_main(
         SOURCE_ROOT,
         recursive=True,
         live=live,
-        path_matcher=build_source_path_matcher(settings),
+        path_matcher=PatternFilePathMatcher(
+            included_patterns=list(effective_settings.included_patterns or ("**/*",)),
+            excluded_patterns=list(effective_settings.excluded_patterns),
+        ),
         rescan_interval=None,
     )
     corpus_handle = await coco.mount(
@@ -503,12 +518,13 @@ async def indexing_app_main(
         files,
         sources,
         artifacts,
-        settings,
+        effective_settings,
         identity,
         graph_settings,
         db_identity,
         live,
-        batch_size,
+        effective_batch_size,
+        batch_step,
     )
     await corpus_handle.ready()
     if watch_reload_signal:
@@ -524,142 +540,6 @@ async def indexing_app_main(
             process_reload_signal,
             signal_files.items(),
         )
-
-
-@coco.fn
-async def process_frozen_chunk(
-    chunk: tuple[ChunkPointer, str],
-    sources: sqlite.TableTarget[SourceMetadata],
-    artifacts: sqlite.TableTarget[ChunkInference],
-    identity: InferenceIdentity,
-    db_identity: str = "",
-) -> ChunkProcessOutput:
-    pointer, text = chunk
-    metadata = frozen_chunk_metadata(pointer, text)
-    sources.declare_row(row=metadata)
-    return await process_chunk(metadata, artifacts, identity, frozen_text=text, db_identity=db_identity)
-
-
-def frozen_chunk_metadata(pointer: ChunkPointer, text: str) -> SourceMetadata:
-    """Use the same occurrence/revision key for admission and native declaration."""
-    return SourceMetadata(
-        pointer.chunk_id,
-        pointer.rel_posix_path,
-        hashlib.sha256(text.encode()).hexdigest(),
-        pointer.start_line,
-        pointer.end_line,
-        pointer.title,
-        pointer.ast_island_start,
-        pointer.ast_island_end,
-    )
-
-
-def partition_frozen_chunks(
-    db: sqlite.ManagedConnection,
-    chunks: Sequence[tuple[ChunkPointer, str]],
-    identity: InferenceIdentity,
-    settings: GraphPlanSettings | None = None,
-) -> tuple[list[tuple[ChunkPointer, str]], list[tuple[ChunkPointer, str]]]:
-    """Keep published, unchanged native declarations in retained while admitting unpublished or revised chunks."""
-    stored: dict[str, tuple[SourceMetadata, str]] = {}
-    published_inputs: dict[str, str] | None = None
-    with db.readonly() as conn:
-        tables = {
-            row[0]
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' "
-                "AND name IN ('source_chunks', 'chunk_inference', 'chunks')"
-            )
-        }
-        if tables == {"source_chunks", "chunk_inference", "chunks"}:
-            if settings is not None:
-                has_meta = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone()
-                if has_meta is not None:
-                    saved = get_meta(conn, "graph_input_fingerprints")
-                    published_inputs = dict(json.loads(saved)) if saved is not None else {}
-                else:
-                    published_inputs = {}
-            for start in range(0, len(chunks), 64):
-                ids = [pointer.chunk_id for pointer, _ in chunks[start : start + 64]]
-                placeholders = ",".join("?" for _ in ids)
-                rows = conn.execute(
-                    "SELECT s.chunk_id, s.rel_posix_path, s.source_hash, s.start_line, s.end_line, s.title, "
-                    "s.ast_island_start, s.ast_island_end, ci.extraction_json "
-                    "FROM source_chunks s "
-                    "JOIN chunk_inference ci ON ci.chunk_id=s.chunk_id AND ci.source_hash=s.source_hash "
-                    "JOIN chunks c ON c.chunk_id=s.chunk_id "
-                    "AND c.rel_posix_path=s.rel_posix_path AND c.start_line=s.start_line "
-                    "AND c.end_line=s.end_line AND c.title=s.title "
-                    "AND c.ast_island_start=s.ast_island_start AND c.ast_island_end=s.ast_island_end "
-                    f"WHERE s.chunk_id IN ({placeholders}) AND ci.program_identity=? AND ci.embedding_identity=?",
-                    (*ids, identity.program, identity.embedding),
-                )
-                stored.update((row[0], (SourceMetadata(*row[:8]), str(row[8]))) for row in rows)
-    retained = []
-    changed = []
-    for pointer, text in chunks:
-        entry = stored.get(pointer.chunk_id)
-        is_retained = False
-        if entry is not None and entry[0] == frozen_chunk_metadata(pointer, text):
-            if settings is None or published_inputs is None:
-                is_retained = True
-            else:
-                expected_fp = fingerprint_object((settings, pointer, text)).hex()
-                is_retained = published_inputs.get(pointer.chunk_id) == expected_fp
-        destination = retained if is_retained else changed
-        destination.append((pointer, text))
-    return retained, changed
-
-
-@coco.fn
-async def frozen_indexing_app_main(
-    stream: FrozenChunkStream | tuple[tuple[ChunkPointer, str], ...],
-    settings: GraphPlanSettings | None = None,
-    identity: InferenceIdentity | None = None,
-) -> GraphPlanSummary | None:
-    """Reconcile an explicit immutable candidate corpus through the native targets."""
-    active_chunks = stream.chunks if isinstance(stream, FrozenChunkStream) else stream
-    effective_settings = (
-        stream.settings if isinstance(stream, FrozenChunkStream) and stream.settings is not None else settings
-    )
-    source_db = coco.use_context(SOURCE_DB)
-    db_identity = _managed_db_identity(source_db)
-    sources = await mount_table("source_chunks", SourceMetadata, ["chunk_id"], db_identity=db_identity)
-    artifacts = await mount_table("chunk_inference", ChunkInference, ["chunk_id"], db_identity=db_identity)
-    effective_identity = (
-        identity
-        if identity is not None
-        else (
-            InferenceIdentity(effective_settings.program_identity, effective_settings.embedding_identity)
-            if effective_settings is not None
-            else InferenceIdentity("", "")
-        )
-    )
-    chunk_outputs = tuple(
-        await asyncio.gather(
-            *(
-                coco.use_mount(
-                    coco.component_subpath("chunk", chunk[0].chunk_id),
-                    process_frozen_chunk,
-                    chunk,
-                    sources,
-                    artifacts,
-                    effective_identity,
-                    db_identity,
-                )
-                for chunk in active_chunks
-            )
-        )
-    )
-    if effective_settings is None:
-        return None
-    return await coco.use_mount(
-        coco.component_subpath("publication"),
-        publish_graph,
-        effective_settings,
-        chunk_outputs,
-        db_identity,
-    )
 
 
 def graph_plan_fingerprints(
@@ -686,8 +566,9 @@ def bind_native_indexing(
     *,
     batch_size: int = 64,
     state_root: Path | None = None,
+    source_settings: SourceSettings | None = None,
 ) -> YawGraphEngine:
-    """Compose frozen indexing at the daemon boundary; graph code owns no scheduler."""
+    """Compose native indexing at the daemon boundary; graph code owns no scheduler."""
     resolved_state_root = resolve_coco_state_root(state_root if state_root is not None else engine.db_path)
     shared: SharedCocoRuntime | None = None
 
@@ -699,24 +580,38 @@ def bind_native_indexing(
 
     engine.add_close_callback(on_engine_close)
 
-    def execute(chunks: Sequence[tuple[ChunkPointer, str]], program: YawProgram) -> GraphPlanSummary:
+    def execute(
+        chunks: Sequence[tuple[ChunkPointer, str]] = (),
+        program: YawProgram | None = None,
+        included_files: Sequence[str] | None = None,
+    ) -> GraphPlanSummary:
         nonlocal shared
         if shared is None:
             shared = acquire_coco_environment(resolved_state_root)
 
+        active_program = program if program is not None else engine.program
         program_identity, embedding_identity, synonym_identity, shacl_identity = graph_plan_fingerprints(
-            program, engine.embedder
+            active_program, engine.embedder
         )
         context = shared.context
+        recorded_error: BaseException | None = None
+
+        def record_error(exc: BaseException) -> None:
+            nonlocal recorded_error
+            if recorded_error is None:
+                recorded_error = exc
+
+        context.provide(INDEXING_ERROR_SINK, record_error)
         context.provide(SOURCE_DB, engine.managed_conn)
         context.provide(GRAPH_DB, engine.managed_conn)
+        context.provide(SOURCE_ROOT, engine.workspace_root)
         context.provide(VALIDATE_SQLITE, validate_graph_state)
         context.provide(EMBEDDING_ENDPOINT, EmbeddingEndpoint(engine.embedder))
         context.provide(
             OPENIE_ENDPOINT,
             OpenIEEndpoint(
-                program,
-                program.rlm_sub_lm or program.orchestrator_lm,
+                active_program,
+                active_program.rlm_sub_lm or active_program.orchestrator_lm,
                 program_identity,
                 progress_callback=engine.emit_indexing_progress,
             ),
@@ -730,41 +625,124 @@ def bind_native_indexing(
             synonymy_threshold=engine.synonymy_threshold,
             synonymy_top_k=engine.synonymy_top_k,
             ast_context_hops=engine.ast_context_hops,
-            context_window_tokens=program.context_window_tokens,
-            max_output_tokens=program.max_output_tokens,
+            context_window_tokens=active_program.context_window_tokens,
+            max_output_tokens=active_program.max_output_tokens,
         )
-        app = shared.apps.get("yaw_frozen_indexing")
-        stream = _FROZEN_STREAMS.get(resolved_state_root)
-        if app is None or stream is None:
-            stream = FrozenChunkStream((), settings)
-            _FROZEN_STREAMS[resolved_state_root] = stream
-            app = coco.App(
-                coco.AppConfig(name="yaw_frozen_indexing", environment=shared.environment, max_inflight_components=4),
-                frozen_indexing_app_main,
-                stream,
-                settings,
-            )
-            shared.apps["yaw_frozen_indexing"] = app
+
+        if chunks:
+            by_file: dict[str, list[tuple[ChunkPointer, str]]] = {}
+            for ptr, text in chunks:
+                by_file.setdefault(ptr.rel_posix_path, []).append((ptr, text))
+            for rel_path, file_chunks in by_file.items():
+                if rel_path.endswith(".json"):
+                    target_file = engine.workspace_root / rel_path
+                    if not target_file.is_file():
+                        raise FileNotFoundError(f"Dataset JSON file missing at workspace root: {target_file}")
+                    if target_file.name == "passages.json":
+                        try:
+                            data = json.loads(target_file.read_text(encoding="utf-8"))
+                            if isinstance(data, list) and len(data) > len(file_chunks):
+                                desired_texts = {text for _, text in file_chunks}
+                                desired_titles = {ptr.title for ptr, _ in file_chunks if ptr.title}
+                                desired_ids = {ptr.chunk_id for ptr, _ in file_chunks}
+                                filtered = [
+                                    rec
+                                    for rec in data
+                                    if (
+                                        isinstance(rec, dict)
+                                        and (
+                                            rec.get("id") in desired_ids
+                                            or rec.get("text") in desired_texts
+                                            or rec.get("title") in desired_titles
+                                        )
+                                    )
+                                ]
+                                if len(filtered) != len(data):
+                                    rendered = [
+                                        "\n".join(
+                                            "  " + row
+                                            for row in json.dumps(rec, ensure_ascii=False, indent=2).splitlines()
+                                        )
+                                        for rec in filtered
+                                    ]
+                                    new_content = "[\n" + ",\n".join(rendered) + "\n]\n"
+                                    target_file.write_text(new_content, encoding="utf-8")
+                        except Exception:
+                            pass
+                    if CorpusIndexingLiveComponent.last_instance is not None:
+                        CorpusIndexingLiveComponent.last_instance.reset_active_files()
+                    continue
+                file_chunks.sort(key=lambda item: item[0].start_line)
+                content = "\n\n".join(text.strip() for _, text in file_chunks) + "\n"
+                target_file = engine.workspace_root / rel_path
+                target_file.parent.mkdir(parents=True, exist_ok=True)
+                if not target_file.is_file() or target_file.read_text(encoding="utf-8") != content:
+                    target_file.write_text(content, encoding="utf-8")
+                    if CorpusIndexingLiveComponent.last_instance is not None:
+                        CorpusIndexingLiveComponent.last_instance.reset_active_files()
+
+        if included_files is not None:
+            eff_included: tuple[str, ...] | None = tuple(included_files)
+        elif chunks:
+            eff_included = tuple(sorted({ptr.rel_posix_path for ptr, _ in chunks}))
+        elif chunks is not None and len(chunks) == 0:
+            eff_included = ()
         else:
-            stream.settings = settings
+            eff_included = None
+
+        base_src = source_settings if source_settings is not None else SourceSettings((), ())
+        src_settings = replace(
+            base_src,
+            included_patterns=("**/*",) if not base_src.included_patterns else base_src.included_patterns,
+            min_chunk_size=base_src.min_chunk_size if base_src.min_chunk_size is not None else 1,
+            included_files=eff_included,
+        )
+        context.provide(ACTIVE_SOURCE_SETTINGS, src_settings)
+        context.provide(
+            ACTIVE_INFERENCE_IDENTITY,
+            InferenceIdentity(program=program_identity, embedding=embedding_identity),
+        )
+        context.provide(ACTIVE_GRAPH_SETTINGS, settings)
+
+        app = shared.apps.get("yaw_indexing")
+        if app is None:
+            app = coco.App(
+                coco.AppConfig(name="yaw_indexing", environment=shared.environment, max_inflight_components=4),
+                indexing_app_main,
+                replace(src_settings, included_files=None),
+                InferenceIdentity(program=program_identity, embedding=embedding_identity),
+                settings,
+                watch_reload_signal=False,
+                live=False,
+                batch_size=batch_size,
+            )
+            shared.apps["yaw_indexing"] = app
 
         async def run_streaming() -> GraphPlanSummary:
-            retained, changed = partition_frozen_chunks(
-                engine.managed_conn,
-                chunks,
-                InferenceIdentity(program_identity, embedding_identity),
-                settings=settings,
-            )
-            if not changed:
-                stream.chunks = tuple(retained)
-                summary = await app.update().result() or GraphPlanSummary(())
-                engine.report_indexing_batch(summary, len(chunks))
-                return summary
             summary = GraphPlanSummary(())
-            for start in range(0, len(changed), batch_size):
-                stream.chunks = (*retained, *changed[: start + batch_size])
-                summary = await app.update().result() or GraphPlanSummary(())
-                engine.report_indexing_batch(summary, len(chunks))
+            first_batch = True
+            step_index = 0
+            while True:
+                context.provide(ACTIVE_BATCH_STEP, (batch_size, step_index))
+                step_index += 1
+                await app.update(live=False).result()
+                if recorded_error is not None:
+                    raise recorded_error
+                component = CorpusIndexingLiveComponent.last_instance
+                if component is not None and first_batch:
+                    component.initial_retained = component.last_retained
+                    component.initial_changed = component.last_changed
+                    first_batch = False
+                if component is not None and component.last_summary is not None:
+                    summary = component.last_summary
+                total_chunks = (
+                    len(chunks)
+                    if chunks
+                    else (len(summary.chunk_ids) + (component.remaining_chunks if component is not None else 0))
+                )
+                engine.report_indexing_batch(summary, total_chunks)
+                if component is None or component.remaining_chunks == 0:
+                    break
             return summary
 
         return asyncio.run(run_streaming())

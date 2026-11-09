@@ -72,7 +72,6 @@ from yaw.daemon.ingestion import (
     DatasetBundle,
     build_benchmark_slice,
     resolve_dataset_bundle,
-    snapshot_dataset_bundle,
 )
 from yaw.daemon.ingestion.source_targets import SOURCE_DB, SOURCE_ROOT, SourceSettings
 
@@ -1066,35 +1065,24 @@ class YawRuntime:
                 if progress_callback is not None:
                     progress_callback(msg)
 
-            opt_chunks = []
+            opt_chunks = None
             if dataset_bundles:
                 _progress("indexing: loading complete persistent corpus snapshot")
                 assert self.config.db_path is not None
-                opt_chunks = []
                 roots = {bundle.root.parent for bundle in dataset_bundles}
                 if len(roots) != 1:
                     raise ValueError("Dataset bundles must share one dataset directory")
-                self.engine.workspace_root = next(iter(roots))
+                bundle_root = next(iter(roots))
+                self.engine.workspace_root = bundle_root
                 selected_corpus = set(corpus_docs) if corpus_docs else None
+                matched_files: list[str] = []
                 for bundle in dataset_bundles:
-                    doc_ids: list[str] | None = None
-                    if selected_corpus:
-                        by_id = bundle.corpus_by_id()
-                        matched_ids = [
-                            doc.document_id for doc in bundle.documents if by_id.get(doc.document_id) in selected_corpus
-                        ]
-                        if matched_ids:
-                            doc_ids = matched_ids
-                    opt_chunks.extend(
-                        snapshot_dataset_bundle(
-                            bundle,
-                            Path(self.config.db_path).parent / "optimize_coco" / bundle.dataset,
-                            document_ids=doc_ids,
-                            chunk_size=self.config.chunk_size,
-                            chunk_overlap=self.config.chunk_overlap,
-                            min_chunk_size=self.config.min_chunk_size,
-                        )
-                    )
+                    by_id = bundle.corpus_by_id()
+                    for doc in bundle.documents:
+                        if selected_corpus is None or by_id.get(doc.document_id) in selected_corpus:
+                            rel_path = (bundle.root / doc.path).relative_to(bundle_root).as_posix()
+                            matched_files.append(rel_path)
+                self.engine.index_chunks(included_files=tuple(matched_files))
                 new_stats = self.engine.get_stats(self.config.config_fingerprint())
                 with self._state_lock:
                     self._stats = new_stats
@@ -1407,23 +1395,19 @@ class YawRuntime:
             if progress_callback is not None:
                 progress_callback(f"benchmarking {canonical_ds}: indexing {len(docs)} docs")
 
-            effective_corpus_root = bundle.root.parent
-            chunks = snapshot_dataset_bundle(
-                bundle,
-                bench_cfg.state_dir,
-                document_ids=docs,
-                chunk_size=bench_cfg.chunk_size,
-                chunk_overlap=bench_cfg.chunk_overlap,
-                min_chunk_size=1,
-            )
-
+            effective_corpus_root = bundle.root
             prog, _, bench_engine = self._create_bound_engine(
                 bench_cfg,
                 workspace_root=effective_corpus_root,
                 compiled_program_override=compiled_program or compiled_program_path,
             )
+            matched_files = (
+                tuple(doc.path for doc in bundle.documents if doc.document_id in docs)
+                if docs
+                else tuple(doc.path for doc in bundle.documents)
+            )
             try:
-                index_batches = bench_engine.index_chunks(chunks)
+                index_batches = bench_engine.index_chunks(included_files=matched_files)
 
                 if progress_callback is not None:
                     progress_callback(f"benchmarking {canonical_ds}: evaluating {len(queries)} queries")

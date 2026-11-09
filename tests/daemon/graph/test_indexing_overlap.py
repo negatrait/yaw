@@ -54,24 +54,25 @@ from yaw.daemon.ingestion.source_targets import SOURCE_DB, SOURCE_ROOT, SourceSe
 
 
 def test_frozen_candidate_replay_uses_native_targets_and_original_text(tmp_path, provider):
-    from yaw.core import ChunkPointer
+    from yaw.core import ChunkPointer, compute_chunk_id
     from yaw.daemon.graph.engine import YawGraphEngine
     from yaw.daemon.indexing import bind_native_indexing
 
     url, state = provider
     source = tmp_path / "source.md"
     original = "Ada studies Algebra."
+    expected_id = compute_chunk_id(source.name, 1, 1, original)
     source.write_text("Changed after the evaluation snapshot was frozen.", encoding="utf-8")
-    pointer = ChunkPointer("frozen", source.name, 1, 1, "source", 1, 1)
+    pointer = ChunkPointer(expected_id, source.name, 1, 1, "source", 1, 1)
     lm = create_dspy_lm("overlap", base_url=url + "/v1", cache=False, num_retries=0, max_tokens=512)
     program = YawProgram(orchestrator_lm=lm, rlm_sub_lm=lm, enable_gbnf=False, max_output_tokens=512)
     engine = bind_native_indexing(YawGraphEngine(tmp_path / "yaw.db", tmp_path, program, adapter(url)))
     try:
         assert engine.index_chunks([(pointer, original)]) == 1
-        assert [row[0] for row in engine.conn.execute("SELECT chunk_id FROM chunks")] == ["frozen"]
+        assert [row[0] for row in engine.conn.execute("SELECT chunk_id FROM chunks")] == [expected_id]
         assert engine.conn.execute("SELECT COUNT(*) FROM chunk_inference").fetchone()[0] == 1
         assert engine.conn.execute("SELECT 1 FROM sqlite_master WHERE name='openie_chunks'").fetchone() is None
-        traces = engine._captured_chunk_traces["frozen"]
+        traces = engine._captured_chunk_traces[expected_id]
         assert {name for name, _, _ in traces} == {"ner", "triples"}
         assert all(inputs["passage"] == original for _, inputs, _ in traces)
         calls = len(state["intervals"])
@@ -735,7 +736,7 @@ def test_frozen_candidate_streaming_batches(tmp_path, provider):
 
 
 def test_addition_preserves_adjudicated_graph_and_edit_invalidates_reuse(tmp_path, provider):
-    from yaw.core import ChunkPointer
+    from yaw.core import ChunkPointer, compute_chunk_id
     from yaw.daemon.graph.engine import YawGraphEngine
     from yaw.daemon.graph.storage import upsert_edges_with_sources, upsert_semantic_edges
     from yaw.daemon.indexing import bind_native_indexing
@@ -745,8 +746,12 @@ def test_addition_preserves_adjudicated_graph_and_edit_invalidates_reuse(tmp_pat
     lm = create_dspy_lm("overlap", base_url=url + "/v1", cache=False, num_retries=0, max_tokens=512)
     program = YawProgram(orchestrator_lm=lm, rlm_sub_lm=lm, enable_gbnf=False, max_output_tokens=512)
     engine = bind_native_indexing(YawGraphEngine(tmp_path / "yaw.db", tmp_path, program, adapter(url)))
-    first = (ChunkPointer("first", "first.md", 1, 1, "first", 1, 1), "Ada studies Algebra.")
-    second = (ChunkPointer("second", "second.md", 1, 1, "second", 1, 1), "Ada studies Algebra again.")
+    first_text = "Ada studies Algebra."
+    first_id = compute_chunk_id("first.md", 1, 1, first_text)
+    second_text = "Ada studies Algebra again."
+    second_id = compute_chunk_id("second.md", 1, 1, second_text)
+    first = (ChunkPointer(first_id, "first.md", 1, 1, "first", 1, 1), first_text)
+    second = (ChunkPointer(second_id, "second.md", 1, 1, "second", 1, 1), second_text)
     try:
         engine.index_chunks([first])
         entities = [row[0] for row in engine.conn.execute("SELECT entity_id FROM entities ORDER BY entity_id")]
@@ -758,7 +763,7 @@ def test_addition_preserves_adjudicated_graph_and_edit_invalidates_reuse(tmp_pat
                 [
                     (a, b, "owl:differentFrom", weight, cid)
                     for a, b in (entities, entities[::-1])
-                    for weight, cid in ((0.9, "first"), (0.8, ""))
+                    for weight, cid in ((0.9, first_id), (0.8, ""))
                 ],
             )
         assert engine.lint_graph()["conforms"]
@@ -766,7 +771,7 @@ def test_addition_preserves_adjudicated_graph_and_edit_invalidates_reuse(tmp_pat
             "SELECT src_id, dst_id, kind, weight FROM edges WHERE kind='owl:differentFrom'"
         ).fetchall()
         assert previous
-        vectors = engine.conn.execute("SELECT embedding FROM chunk_vec WHERE chunk_id='first'").fetchone()
+        vectors = engine.conn.execute("SELECT embedding FROM chunk_vec WHERE chunk_id=?", (first_id,)).fetchone()
         engine.index_chunks([first, second])
         assert engine._graph_rlm_stats["reused_chunks"] == 1
         assert engine._graph_rlm_stats["processed_chunks"] == 1
@@ -776,10 +781,15 @@ def test_addition_preserves_adjudicated_graph_and_edit_invalidates_reuse(tmp_pat
             ).fetchall()
             == previous
         )
-        assert engine.conn.execute("SELECT embedding FROM chunk_vec WHERE chunk_id='first'").fetchone() == vectors
+        assert (
+            engine.conn.execute("SELECT embedding FROM chunk_vec WHERE chunk_id=?", (first_id,)).fetchone() == vectors
+        )
         assert engine.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 2
         assert engine.lint_graph()["conforms"]
-        engine.index_chunks([(first[0], "Ada studies Algebra with a revised source."), second])
+        revised_text = "Ada studies Algebra with a revised source."
+        revised_id = compute_chunk_id("first.md", 1, 1, revised_text)
+        revised_chunk = (ChunkPointer(revised_id, "first.md", 1, 1, "first", 1, 1), revised_text)
+        engine.index_chunks([revised_chunk, second])
         assert engine._graph_rlm_stats["reused_chunks"] == 0
         assert engine._graph_rlm_stats["processed_chunks"] == 2
         assert engine.lint_graph()["conforms"]
@@ -787,28 +797,30 @@ def test_addition_preserves_adjudicated_graph_and_edit_invalidates_reuse(tmp_pat
         engine.close()
 
 
-def test_partition_frozen_chunks_requires_published_graph_and_emits_substage_progress(tmp_path, provider):
-    from yaw.core import ChunkPointer
+def test_incremental_indexing_recovers_from_interrupted_publication_and_emits_substage_progress(tmp_path, provider):
+    from yaw.core import ChunkPointer, compute_chunk_id
     from yaw.daemon.graph.engine import YawGraphEngine
-    from yaw.daemon.graph.inference.optimizer import (
-        hierarchy_judge_fingerprint,
-        label_judge_fingerprint,
-        openie_fingerprint,
-        related_judge_fingerprint,
-        shacl_fingerprint,
-    )
-    from yaw.daemon.indexing import InferenceIdentity, bind_native_indexing, partition_frozen_chunks
+    from yaw.daemon.indexing import CorpusIndexingLiveComponent, bind_native_indexing
 
     url, state = provider
     state["delay"] = 0
     state["healed_definition"] = "Ada Lovelace collaborated with Ada M. Lovelace on algebra."
     chunks = [
         (
-            ChunkPointer(f"c{i}", f"doc{i}.md", 1, 1, f"doc{i}", 1, 1),
+            ChunkPointer(
+                compute_chunk_id(f"doc{i}.md", 1, 1, f"Passage {i}: Ada Lovelace collaborated with Ada M. Lovelace."),
+                f"doc{i}.md",
+                1,
+                1,
+                f"doc{i}",
+                1,
+                1,
+            ),
             f"Passage {i}: Ada Lovelace collaborated with Ada M. Lovelace.",
         )
         for i in range(4)
     ]
+    c_ids = [ptr.chunk_id for ptr, _ in chunks]
     state["extractions"] = {
         text: {
             "named_entities": [
@@ -849,72 +861,40 @@ def test_partition_frozen_chunks_requires_published_graph_and_emits_substage_pro
     )
     try:
         events: list[str] = []
-        assert engine.index_chunks(chunks, progress_callback=events.append) == 4
+        assert engine.index_chunks(chunks[:2], progress_callback=events.append) == 2
         assert any("indexing: disambiguation candidate search" in ev for ev in events)
         assert any("indexing: synonym adjudication (" in ev for ev in events)
         assert any("indexing: SHACL healing (" in ev for ev in events)
 
-        program_identity = openie_fingerprint(program)
-        embedding_identity = str(embedder.profile.index_identity)
-        identity = InferenceIdentity(program_identity, embedding_identity)
-        settings = GraphPlanSettings(
-            corpus_root=engine.workspace_root,
-            program_identity=program_identity,
-            embedding_identity=embedding_identity,
-            synonym_identity=":".join(
-                (
-                    label_judge_fingerprint(program),
-                    hierarchy_judge_fingerprint(program),
-                    related_judge_fingerprint(program),
-                )
-            ),
-            shacl_identity=shacl_fingerprint(program),
-            synonymy_threshold=engine.synonymy_threshold,
-            synonymy_top_k=engine.synonymy_top_k,
-            ast_context_hops=engine.ast_context_hops,
-            context_window_tokens=program.context_window_tokens,
-            max_output_tokens=program.max_output_tokens,
-        )
+        # Indexing all 4 chunks must dynamically partition discovered chunks:
+        # c_ids[0..1] are retained, c_ids[2..3] are changed.
+        assert engine.index_chunks(chunks) == 4
+        component = CorpusIndexingLiveComponent.last_instance
+        assert component is not None
+        assert [m.chunk_id for m, _ in component.initial_retained] == [c_ids[0], c_ids[1]]
+        assert [m.chunk_id for m, _ in component.initial_changed] == [c_ids[2], c_ids[3]]
 
-        # Simulate a mid-batch crash after c2 and c3 were extracted into source_chunks/chunk_inference
-        # but before publish_graph committed c2 and c3 into chunks and meta['graph_input_fingerprints'].
-        with engine.managed_conn.transaction() as conn:
-            conn.execute("DELETE FROM chunks WHERE chunk_id IN ('c2', 'c3')")
-            fps = dict(
-                json.loads(conn.execute("SELECT value FROM meta WHERE key='graph_input_fingerprints'").fetchone()[0])
-            )
-            fps.pop("c2", None)
-            fps.pop("c3", None)
-            conn.execute(
-                "UPDATE meta SET value=? WHERE key='graph_input_fingerprints'",
-                (json.dumps(sorted(fps.items())),),
-            )
-
-        retained, changed = partition_frozen_chunks(engine.managed_conn, chunks, identity, settings=settings)
-        assert [ptr.chunk_id for ptr, _ in retained] == ["c0", "c1"]
-        assert [ptr.chunk_id for ptr, _ in changed] == ["c2", "c3"]
-
-        # Tampering with c0's published input fingerprint forces c0 into changed even though c0 is in chunks.
+        # Tampering with c_ids[0]'s published input fingerprint forces c_ids[0] into changed.
         with engine.managed_conn.transaction() as conn:
             fps = dict(
                 json.loads(conn.execute("SELECT value FROM meta WHERE key='graph_input_fingerprints'").fetchone()[0])
             )
-            fps["c0"] = "0" * 64
+            fps[c_ids[0]] = "0" * 64
             conn.execute(
                 "UPDATE meta SET value=? WHERE key='graph_input_fingerprints'",
                 (json.dumps(sorted(fps.items())),),
             )
-        retained_after_tamper, changed_after_tamper = partition_frozen_chunks(
-            engine.managed_conn, chunks, identity, settings=settings
-        )
-        assert [ptr.chunk_id for ptr, _ in retained_after_tamper] == ["c1"]
-        assert [ptr.chunk_id for ptr, _ in changed_after_tamper] == ["c0", "c2", "c3"]
+        assert engine.index_chunks(chunks) == 4
+        component = CorpusIndexingLiveComponent.last_instance
+        assert component is not None
+        assert [m.chunk_id for m, _ in component.initial_retained] == [c_ids[1], c_ids[2], c_ids[3]]
+        assert [m.chunk_id for m, _ in component.initial_changed] == [c_ids[0]]
     finally:
         engine.close()
 
 
 def test_shared_lmdb_cross_db_memo_reuse_and_target_isolation(tmp_path, provider):
-    from yaw.core import ChunkPointer
+    from yaw.core import ChunkPointer, compute_chunk_id
     from yaw.daemon.graph.engine import YawGraphEngine
     from yaw.daemon.graph.storage import resolve_coco_state_root, resolve_db_identity
     from yaw.daemon.indexing import bind_native_indexing
@@ -924,7 +904,20 @@ def test_shared_lmdb_cross_db_memo_reuse_and_target_isolation(tmp_path, provider
     state["healed_definition"] = "Ada Lovelace collaborated with Ada M. Lovelace on analytical algebra."
     chunks = [
         (
-            ChunkPointer(f"c{i:02d}", f"doc{i:02d}.md", 1, 1, f"doc{i:02d}", 1, 1),
+            ChunkPointer(
+                compute_chunk_id(
+                    f"doc{i:02d}.md",
+                    1,
+                    1,
+                    f"Passage {i:02d}: Ada Lovelace collaborated with Ada M. Lovelace in London.",
+                ),
+                f"doc{i:02d}.md",
+                1,
+                1,
+                f"doc{i:02d}",
+                1,
+                1,
+            ),
             f"Passage {i:02d}: Ada Lovelace collaborated with Ada M. Lovelace in London.",
         )
         for i in range(64)
@@ -1080,7 +1073,7 @@ def test_shared_lmdb_cross_db_memo_reuse_and_target_isolation(tmp_path, provider
 def test_direct_use_mount_chunk_output_handoff_without_chunk_state_target(tmp_path, provider):
     import yaw.daemon.graph.planner as planner_mod
     import yaw.daemon.indexing as indexing_mod
-    from yaw.core import ChunkPointer
+    from yaw.core import ChunkPointer, compute_chunk_id
     from yaw.daemon.graph.engine import YawGraphEngine
     from yaw.daemon.indexing import bind_native_indexing
 
@@ -1114,9 +1107,13 @@ def test_direct_use_mount_chunk_output_handoff_without_chunk_state_target(tmp_pa
         YawGraphEngine(tmp_path / "yaw.db", tmp_path, program, embedder, synonymy_top_k=0),
         batch_size=2,
     )
+    t0 = "Ada studies Algebra."
+    t1 = "Euler studies Graphs."
+    h0 = compute_chunk_id("doc0.md", 1, 1, t0)
+    h1 = compute_chunk_id("doc1.md", 1, 1, t1)
     chunks = [
-        (ChunkPointer("h0", "doc0.md", 1, 1, "doc0", 1, 1), "Ada studies Algebra."),
-        (ChunkPointer("h1", "doc1.md", 1, 1, "doc1", 1, 1), "Euler studies Graphs."),
+        (ChunkPointer(h0, "doc0.md", 1, 1, "doc0", 1, 1), t0),
+        (ChunkPointer(h1, "doc1.md", 1, 1, "doc1", 1, 1), t1),
     ]
     captured_outputs: list[tuple[ChunkProcessOutput, ...]] = []
     orig_plan = planner_mod.plan_graph_publication
@@ -1138,11 +1135,11 @@ def test_direct_use_mount_chunk_output_handoff_without_chunk_state_target(tmp_pa
         ]
         # Each chunk is embedded once in process_chunk and never re-embedded in planner.py
         assert len(chunk_embed_calls) == 2
-        row = engine.conn.execute("SELECT * FROM chunk_inference WHERE chunk_id = 'h0'").fetchone()
+        row = engine.conn.execute("SELECT * FROM chunk_inference WHERE chunk_id = ?", (h0,)).fetchone()
         inf = ChunkInference(*row)
-        vec_bytes = engine.conn.execute("SELECT embedding FROM chunk_vec WHERE chunk_id = 'h0'").fetchone()[0]
+        vec_bytes = engine.conn.execute("SELECT embedding FROM chunk_vec WHERE chunk_id = ?", (h0,)).fetchone()[0]
         out = ChunkProcessOutput(pointer=chunks[0][0], text=chunks[0][1], inference=inf, embedding=vec_bytes)
-        assert out.chunk_id == "h0"
+        assert out.chunk_id == h0
         assert out.vector_f32 == vec_bytes
         captured_outputs.append((out,))
         assert len(captured_outputs[0]) == 1

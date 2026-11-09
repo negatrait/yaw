@@ -1,7 +1,6 @@
 """Source evidence revisions and canonical bindings through the native CocoIndex app."""
 
 from contextlib import contextmanager
-from dataclasses import replace
 from itertools import permutations
 
 import cocoindex as coco
@@ -10,7 +9,7 @@ import pytest
 from daemon.graph.test_batch_equivalence import assert_same_graph, canonical_graph
 from daemon.graph.test_indexing_overlap import adapter
 from daemon.graph.test_indexing_overlap import provider as provider
-from yaw.core import ChunkPointer
+from yaw.core import ChunkPointer, compute_chunk_id
 from yaw.daemon.graph.engine import YawGraphEngine
 from yaw.daemon.graph.inference import YawProgram, create_dspy_lm, openie_fingerprint
 from yaw.daemon.graph.inference.components import EMBEDDING_ENDPOINT, OPENIE_ENDPOINT, EmbeddingEndpoint, OpenIEEndpoint
@@ -21,10 +20,10 @@ from yaw.daemon.graph.storage.evidence import sense_id
 from yaw.daemon.graph.storage.managed_sqlite import VALIDATE_SQLITE
 from yaw.daemon.graph.storage.rows import validate_graph_state
 from yaw.daemon.indexing import (
-    FrozenChunkStream,
+    ACTIVE_SOURCE_SETTINGS,
+    CorpusIndexingLiveComponent,
     InferenceIdentity,
     bind_native_indexing,
-    frozen_indexing_app_main,
     indexing_app_main,
 )
 from yaw.daemon.ingestion.source_targets import SOURCE_DB, SOURCE_ROOT, SourceSettings
@@ -61,11 +60,16 @@ def native_environment(root, state_dir, url):
 @contextmanager
 def native_corpus(root, state_dir, url):
     with native_environment(root, state_dir, url) as (db, env, settings):
-        stream = FrozenChunkStream()
         app = coco.App(
-            coco.AppConfig(name="evidence_revisions", environment=env), frozen_indexing_app_main, stream, settings
+            coco.AppConfig(name="evidence_revisions", environment=env, max_inflight_components=4),
+            indexing_app_main,
+            SourceSettings(("**/*.md",), (), min_chunk_size=1),
+            InferenceIdentity(settings.program_identity, settings.embedding_identity),
+            settings,
+            watch_reload_signal=False,
+            live=False,
         )
-        yield db, stream, app
+        yield db, env, app
 
 
 def filesystem_app(env, settings):
@@ -112,9 +116,17 @@ def fixed_vector(text):
     return [0.0, 1.0, 0.0, 0.0]
 
 
-def publish(stream, app, chunks):
-    stream.chunks = tuple(chunks)
-    app.update_blocking()
+def publish(env, app, chunks):
+    included = tuple(ptr.rel_posix_path for ptr, _ in chunks)
+    env.context_provider.provide(
+        ACTIVE_SOURCE_SETTINGS,
+        SourceSettings(("**/*.md",), (), min_chunk_size=1, included_files=included),
+    )
+    while True:
+        app.update_blocking(live=False)
+        component = CorpusIndexingLiveComponent.last_instance
+        if component is None or component.remaining_chunks == 0:
+            break
 
 
 def native_engine(root, state_dir, url, **settings):
@@ -133,7 +145,10 @@ def test_engine_snapshots_withdraw_shared_support_and_reintroduce(tmp_path, prov
     state["embedding_vector"] = fixed_vector
     texts = ("Orion first evidence.", "Orion second evidence.")
     state["extractions"] = {text: extraction("Orion", "A telemetry service.") for text in texts}
-    chunks = [(ChunkPointer(str(index), f"{index}.md", 1, 1), text) for index, text in enumerate(texts)]
+    chunks = [
+        (ChunkPointer(compute_chunk_id(f"{index}.md", 1, 1, text), f"{index}.md", 1, 1), text)
+        for index, text in enumerate(texts)
+    ]
     for ptr, text in chunks:
         (tmp_path / ptr.rel_posix_path).write_text(text, encoding="utf-8")
     engine = native_engine(tmp_path, tmp_path / "incremental", url)
@@ -226,10 +241,24 @@ def test_native_evidence_replacement_withdrawal_and_late_representative(tmp_path
         text: extraction("Orion", definition) for text, definition in zip(texts, definitions, strict=True)
     }
     state["extractions"][revised_text] = extraction("Orion", definitions[1], "008")
-    chunks = [(ChunkPointer(f"c{index}", f"source-{index}.md", 1, 1), text) for index, text in enumerate(texts)]
-    duplicate = (ChunkPointer("duplicate", "duplicate.md", 1, 1), texts[0])
-    revised = (chunks[1][0], revised_text)
-    renamed = (replace(duplicate[0], rel_posix_path="renamed.md"), duplicate[1])
+    chunks = [
+        (ChunkPointer(compute_chunk_id(f"source-{index}.md", 1, 1, text), f"source-{index}.md", 1, 1), text)
+        for index, text in enumerate(texts)
+    ]
+    duplicate = (ChunkPointer(compute_chunk_id("duplicate.md", 1, 1, texts[0]), "duplicate.md", 1, 1), texts[0])
+    revised = (
+        ChunkPointer(
+            compute_chunk_id(chunks[1][0].rel_posix_path, 1, 1, revised_text),
+            chunks[1][0].rel_posix_path,
+            1,
+            1,
+        ),
+        revised_text,
+    )
+    renamed = (
+        ChunkPointer(compute_chunk_id("renamed.md", 1, 1, duplicate[1]), "renamed.md", 1, 1),
+        duplicate[1],
+    )
     snapshots = (
         [chunks[0], duplicate],
         [*chunks, duplicate],
@@ -249,8 +278,8 @@ def test_native_evidence_replacement_withdrawal_and_late_representative(tmp_path
                 (tmp_path / pointer.rel_posix_path).write_text(text + "\n", encoding="utf-8")
             if holder is None:
                 holder = native_corpus(tmp_path, tmp_path / "incremental", url)
-                db, stream, app = holder.__enter__()
-            publish(stream, app, desired)
+                db, env, app = holder.__enter__()
+            publish(env, app, desired)
             with db.readonly() as conn:
                 actual = canonical_graph(conn)
                 assert conn.execute("SELECT COUNT(*) FROM fact_assertions").fetchone()[0] == 5 * len(desired)
@@ -302,27 +331,27 @@ def test_native_evidence_replacement_withdrawal_and_late_representative(tmp_path
                     assert len({row[1] for row in revisions}) == 2
             with native_corpus(tmp_path, tmp_path / f"reference-{step}", url) as (
                 reference_db,
-                reference_stream,
+                reference_env,
                 reference_app,
             ):
-                publish(reference_stream, reference_app, desired)
+                publish(reference_env, reference_app, desired)
                 with reference_db.readonly() as conn:
                     assert_same_graph(actual, canonical_graph(conn))
             calls = len(state["intervals"])
             with db.readonly() as conn:
                 changes = conn.total_changes
-            publish(stream, app, desired)
+            publish(env, app, desired)
             assert len(state["intervals"]) == calls
             with db.readonly() as conn:
                 assert conn.total_changes == changes
             if restart:
                 holder.__exit__(None, None, None)
                 holder = native_corpus(tmp_path, tmp_path / "incremental", url)
-                db, stream, app = holder.__enter__()
+                db, env, app = holder.__enter__()
                 calls = len(state["intervals"])
                 with db.readonly() as conn:
                     changes = conn.total_changes
-                publish(stream, app, desired)
+                publish(env, app, desired)
                 assert len(state["intervals"]) == calls
                 with db.readonly() as conn:
                     assert conn.total_changes == changes
@@ -382,19 +411,21 @@ def test_native_same_sense_metadata_is_independent_of_arrival(tmp_path, provider
         "Uppercase Orion source.": extraction("ORION", "A TELEMETRY SERVICE."),
         "Titlecase Orion source.": extraction("Orion", "A telemetry service."),
     }
+    t_upper = "Uppercase Orion source."
+    t_title = "Titlecase Orion source."
     chunks = [
-        (ChunkPointer("z", "upper.md", 1, 1), "Uppercase Orion source."),
-        (ChunkPointer("a", "title.md", 1, 1), "Titlecase Orion source."),
+        (ChunkPointer(compute_chunk_id("upper.md", 1, 1, t_upper), "upper.md", 1, 1), t_upper),
+        (ChunkPointer(compute_chunk_id("title.md", 1, 1, t_title), "title.md", 1, 1), t_title),
     ]
     for pointer, text in chunks:
         (tmp_path / pointer.rel_posix_path).write_text(text + "\n", encoding="utf-8")
-    with native_corpus(tmp_path, tmp_path / "incremental", url) as (db, stream, app):
-        publish(stream, app, chunks[:1])
-        publish(stream, app, chunks)
+    with native_corpus(tmp_path, tmp_path / "incremental", url) as (db, env, app):
+        publish(env, app, chunks[:1])
+        publish(env, app, chunks)
         with db.readonly() as conn:
             actual = canonical_graph(conn)
-    with native_corpus(tmp_path, tmp_path / "reference", url) as (db, stream, app):
-        publish(stream, app, chunks)
+    with native_corpus(tmp_path, tmp_path / "reference", url) as (db, env, app):
+        publish(env, app, chunks)
         with db.readonly() as conn:
             assert_same_graph(actual, canonical_graph(conn))
 
@@ -414,18 +445,18 @@ def test_native_alias_classes_converge_for_every_arrival_order(tmp_path, provide
     state["extractions"] = {}
     for index, (name, definition) in enumerate(rows):
         text = f"Alias evidence {index}: {name} routes through Anchor."
-        pointer = ChunkPointer(f"alias-{index}", f"alias-{index}.md", 1, 1)
+        pointer = ChunkPointer(compute_chunk_id(f"alias-{index}.md", 1, 1, text), f"alias-{index}.md", 1, 1)
         (tmp_path / pointer.rel_posix_path).write_text(text + "\n", encoding="utf-8")
         chunks.append((pointer, text))
         state["extractions"][text] = extraction(name, definition)
-    with native_corpus(tmp_path, tmp_path / "reference", url) as (db, stream, app):
-        publish(stream, app, chunks)
+    with native_corpus(tmp_path, tmp_path / "reference", url) as (db, env, app):
+        publish(env, app, chunks)
         with db.readonly() as conn:
             expected = canonical_graph(conn)
     for order in permutations(range(3)):
-        with native_corpus(tmp_path, tmp_path / ("order-" + "".join(map(str, order))), url) as (db, stream, app):
+        with native_corpus(tmp_path, tmp_path / ("order-" + "".join(map(str, order))), url) as (db, env, app):
             for count in range(1, 4):
-                publish(stream, app, [chunks[index] for index in order[:count]])
+                publish(env, app, [chunks[index] for index in order[:count]])
             with db.readonly() as conn:
                 assert_same_graph(canonical_graph(conn), expected)
 
@@ -446,16 +477,22 @@ def test_source_evidence_bindings_are_validated_before_commit(tmp_path, provider
     state["embedding_vector"] = fixed_vector
     texts = ("Orion source one.", "Orion source two.")
     state["extractions"] = {text: extraction("Orion", "A telemetry service.") for text in texts}
-    chunks = [(ChunkPointer(cid, f"{cid}.md", 1, 1), text) for cid, text in zip(("owner", "other"), texts, strict=True)]
+    chunks = [
+        (ChunkPointer(compute_chunk_id(f"{cid}.md", 1, 1, text), f"{cid}.md", 1, 1), text)
+        for cid, text in zip(("owner", "other"), texts, strict=True)
+    ]
     for pointer, text in chunks:
         (tmp_path / pointer.rel_posix_path).write_text(text + "\n", encoding="utf-8")
-    with native_corpus(tmp_path, tmp_path / "index", url) as (db, stream, app):
-        publish(stream, app, chunks)
+    with native_corpus(tmp_path, tmp_path / "index", url) as (db, env, app):
+        publish(env, app, chunks)
         with db.readonly() as conn:
             before = canonical_graph(conn)
         # Deliberately corrupt a proposed row in a real transaction, not the committed graph.
+        formatted_mutation = mutation.replace("'owner'", f"'{chunks[0][0].chunk_id}'").replace(
+            "'other'", f"'{chunks[1][0].chunk_id}'"
+        )
         with pytest.raises(ValueError, match="source (mention|assertion) binding"), db.transaction() as conn:
-            conn.execute(mutation)
+            conn.execute(formatted_mutation)
             validate_graph_state(conn)
         with db.readonly() as conn:
             assert_same_graph(canonical_graph(conn), before)
@@ -521,13 +558,13 @@ def test_cross_batch_fact_definition_repair_persists_and_invalidates_on_endpoint
             ],
         },
     }
-    c1 = (ChunkPointer("c1", "c1.md", 1, 1), c1_text)
-    c2 = (ChunkPointer("c2", "c2.md", 1, 1), c2_text)
+    c1 = (ChunkPointer(compute_chunk_id("c1.md", 1, 1, c1_text), "c1.md", 1, 1), c1_text)
+    c2 = (ChunkPointer(compute_chunk_id("c2.md", 1, 1, c2_text), "c2.md", 1, 1), c2_text)
     for ptr, text in (c1, c2):
         (tmp_path / ptr.rel_posix_path).write_text(text + "\n", encoding="utf-8")
 
-    with native_corpus(tmp_path, tmp_path / "inc", url) as (db, stream, app):
-        publish(stream, app, [c1])
+    with native_corpus(tmp_path, tmp_path / "inc", url) as (db, env, app):
+        publish(env, app, [c1])
         healer_calls_batch1 = len(state.get("healer_requests", []))
         assert healer_calls_batch1 == 0
         with db.readonly() as conn:
@@ -536,7 +573,7 @@ def test_cross_batch_fact_definition_repair_persists_and_invalidates_on_endpoint
             defs_b1 = dict(conn.execute("SELECT pred, definition FROM facts").fetchall())
             assert defs_b1 == {"routes Via": "Orion routes Via Anchor."}
 
-        publish(stream, app, [c1, c2])
+        publish(env, app, [c1, c2])
         assert len(state.get("healer_requests", [])) == 0
         with db.readonly() as conn:
             assert lint_graph_shacl(conn) == []
@@ -561,9 +598,9 @@ def test_cross_batch_fact_definition_repair_persists_and_invalidates_on_endpoint
                 }
             ],
         }
-        c3 = (ChunkPointer("c3", "c3.md", 1, 1), c3_text)
+        c3 = (ChunkPointer(compute_chunk_id("c3.md", 1, 1, c3_text), "c3.md", 1, 1), c3_text)
         (tmp_path / c3[0].rel_posix_path).write_text(c3_text + "\n", encoding="utf-8")
-        publish(stream, app, [c1, c2, c3])
+        publish(env, app, [c1, c2, c3])
         assert len(state.get("healer_requests", [])) == 0
         with db.readonly() as conn:
             assert lint_graph_shacl(conn) == []
@@ -593,7 +630,7 @@ def test_focus_isolated_shacl_memo_reuses_healed_focus_when_earlier_violation_ad
     state["extractions"] = {}
     for idx, (s_lbl, s_def, o_lbl, o_def) in enumerate(ranked):
         text = f"Passage {idx}: {s_lbl} links to {o_lbl}."
-        ptr = ChunkPointer(f"m{idx}", f"m{idx}.md", 1, 1)
+        ptr = ChunkPointer(compute_chunk_id(f"m{idx}.md", 1, 1, text), f"m{idx}.md", 1, 1)
         (tmp_path / ptr.rel_posix_path).write_text(text + "\n", encoding="utf-8")
         chunks.append((ptr, text))
         state["extractions"][text] = {
@@ -609,7 +646,7 @@ def test_focus_isolated_shacl_memo_reuses_healed_focus_when_earlier_violation_ad
         }
 
     ephemeral_text = "Passage ephemeral: Beacon monitors Pulse."
-    ephemeral_ptr = ChunkPointer("m_ephemeral", "m_ephemeral.md", 1, 1)
+    ephemeral_ptr = ChunkPointer(compute_chunk_id("m_ephemeral.md", 1, 1, ephemeral_text), "m_ephemeral.md", 1, 1)
     (tmp_path / ephemeral_ptr.rel_posix_path).write_text(ephemeral_text + "\n", encoding="utf-8")
     state["extractions"][ephemeral_text] = {
         "named_entities": [["Beacon", "A monitoring agent."], ["Pulse", "A health signal."]],
@@ -624,14 +661,14 @@ def test_focus_isolated_shacl_memo_reuses_healed_focus_when_earlier_violation_ad
     }
     chunk_ephemeral = (ephemeral_ptr, ephemeral_text)
     chunk_lo, chunk_hi_1, chunk_hi_2 = chunks
-    with native_corpus(tmp_path, tmp_path / "memo", url) as (db, stream, app):
-        publish(stream, app, [chunk_ephemeral, chunk_hi_1, chunk_hi_2])
+    with native_corpus(tmp_path, tmp_path / "memo", url) as (db, env, app):
+        publish(env, app, [chunk_ephemeral, chunk_hi_1, chunk_hi_2])
         healer_calls_after_first = len(state.get("healer_requests", []))
         direct_calls_after_first = state.get("healer_requests", []).count("direct")
         assert healer_calls_after_first == 2
         assert direct_calls_after_first == 2
 
-        publish(stream, app, [chunk_lo, chunk_hi_1, chunk_hi_2])
+        publish(env, app, [chunk_lo, chunk_hi_1, chunk_hi_2])
         assert len(state.get("healer_requests", [])) - healer_calls_after_first == 1
         assert state.get("healer_requests", []).count("direct") - direct_calls_after_first == 1
         with db.readonly() as conn:
@@ -676,13 +713,13 @@ def test_single_pass_fact_embedding_and_delta_scoped_batch_publication(tmp_path,
             ],
         },
     }
-    c1 = (ChunkPointer("c1", "c1.md", 1, 1), c1_text)
-    c2 = (ChunkPointer("c2", "c2.md", 1, 1), c2_text)
+    c1 = (ChunkPointer(compute_chunk_id("c1.md", 1, 1, c1_text), "c1.md", 1, 1), c1_text)
+    c2 = (ChunkPointer(compute_chunk_id("c2.md", 1, 1, c2_text), "c2.md", 1, 1), c2_text)
     for ptr, text in (c1, c2):
         (tmp_path / ptr.rel_posix_path).write_text(text + "\n", encoding="utf-8")
 
-    with native_corpus(tmp_path, tmp_path / "inc_embed", url) as (db, stream, app):
-        publish(stream, app, [c1])
+    with native_corpus(tmp_path, tmp_path / "inc_embed", url) as (db, env, app):
+        publish(env, app, [c1])
         batch1_embeds = list(state.get("embedding_inputs", []))
         orion_fact_embeds_b1 = [
             s
@@ -692,7 +729,7 @@ def test_single_pass_fact_embedding_and_delta_scoped_batch_publication(tmp_path,
         assert len(orion_fact_embeds_b1) == 1
         assert "Orion routes Via Anchor." in orion_fact_embeds_b1[0]
 
-        publish(stream, app, [c1, c2])
+        publish(env, app, [c1, c2])
         batch2_new_embeds = state.get("embedding_inputs", [])[len(batch1_embeds) :]
         orion_fact_embeds_b2 = [s for s in batch2_new_embeds if "routes via" in s.casefold()]
         vega_fact_embeds_b2 = [
@@ -706,8 +743,8 @@ def test_single_pass_fact_embedding_and_delta_scoped_batch_publication(tmp_path,
         with db.readonly() as conn:
             actual = canonical_graph(conn)
 
-    with native_corpus(tmp_path, tmp_path / "ref_embed", url) as (ref_db, ref_stream, ref_app):
-        publish(ref_stream, ref_app, [c1, c2])
+    with native_corpus(tmp_path, tmp_path / "ref_embed", url) as (ref_db, ref_env, ref_app):
+        publish(ref_env, ref_app, [c1, c2])
         with ref_db.readonly() as conn:
             assert_same_graph(actual, canonical_graph(conn))
 
@@ -817,11 +854,11 @@ def test_deterministic_fact_definition_synthesis_and_irreflexive_literal_pruning
             ],
         }
     }
-    c1 = (ChunkPointer("c1", "c1.md", 1, 1), c1_text)
+    c1 = (ChunkPointer(compute_chunk_id("c1.md", 1, 1, c1_text), "c1.md", 1, 1), c1_text)
     (tmp_path / c1[0].rel_posix_path).write_text(c1_text + "\n", encoding="utf-8")
 
-    with native_corpus(tmp_path, tmp_path / "cg_w3c_2", url) as (db, stream, app):
-        publish(stream, app, [c1])
+    with native_corpus(tmp_path, tmp_path / "cg_w3c_2", url) as (db, env, app):
+        publish(env, app, [c1])
         assert state.get("healer_requests", []) == []
         with db.readonly() as conn:
             assert lint_graph_shacl(conn) == []
@@ -871,11 +908,11 @@ def test_deterministic_fact_definition_synthesis_and_irreflexive_literal_pruning
         upsert_entity_labels(
             mem_conn,
             [
-                ("release engineering", "ent-a", "skos:prefLabel", "Release Engineering", "c1"),
-                ("security engineering", "ent-b", "skos:prefLabel", "Security engineering", "c1"),
-                ("engineering peer", "ent-c", "skos:prefLabel", "Engineering peer", "c1"),
-                ("burst logic", "ent-d", "skos:prefLabel", "Burst logic", "c1"),
-                ("control plane", "ent-e", "skos:prefLabel", "Control plane,", "c1"),
+                ("release engineering", "ent-a", "skos:prefLabel", "Release Engineering", c1[0].chunk_id),
+                ("security engineering", "ent-b", "skos:prefLabel", "Security engineering", c1[0].chunk_id),
+                ("engineering peer", "ent-c", "skos:prefLabel", "Engineering peer", c1[0].chunk_id),
+                ("burst logic", "ent-d", "skos:prefLabel", "Burst logic", c1[0].chunk_id),
+                ("control plane", "ent-e", "skos:prefLabel", "Control plane,", c1[0].chunk_id),
             ],
         )
         # Insert a duplicate skos:prefLabel surface with trailing comma on ent-e
@@ -938,7 +975,7 @@ def test_deterministic_fact_definition_synthesis_and_irreflexive_literal_pruning
         )
         upsert_fact_sources(
             mem_conn,
-            [(f"fact-lit-{i}", "c1") for i in range(15)] + [("fact-valid", "c1")],
+            [(f"fact-lit-{i}", c1[0].chunk_id) for i in range(15)] + [("fact-valid", c1[0].chunk_id)],
         )
         upsert_evidence(
             mem_conn,
@@ -946,7 +983,7 @@ def test_deterministic_fact_definition_synthesis_and_irreflexive_literal_pruning
             tuple(
                 FactAssertion(
                     f"assert-lit-{i}",
-                    "c1",
+                    c1[0].chunk_id,
                     "rev-1",
                     "m-d",
                     None,

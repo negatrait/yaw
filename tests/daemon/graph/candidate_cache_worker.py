@@ -11,7 +11,7 @@ import numpy as np
 from yaw.daemon.graph.engine import YawGraphEngine
 from yaw.daemon.graph.inference import PASSAGE_INSTRUCTION, DSPyEmbeddingAdapter, YawProgram
 from yaw.daemon.indexing import bind_native_indexing
-from yaw.daemon.ingestion import prepare_dataset_bundle, snapshot_dataset_bundle
+from yaw.daemon.ingestion import prepare_dataset_bundle
 
 
 def main() -> None:
@@ -85,7 +85,9 @@ def main() -> None:
         )
         questions.write_text("[]", encoding="utf-8")
         bundle = prepare_dataset_bundle("cache_documents", source, questions, args.root / "datasets")
-        engine.index_chunks(snapshot_dataset_bundle(bundle, args.root / "coco_state", document_ids=["first", "second"]))
+        engine.workspace_root = bundle.root
+        matched_files = tuple(doc.path for doc in bundle.documents if doc.document_id in ["first", "second"])
+        engine.index_chunks(included_files=matched_files)
         assert engine.lint_graph()["conforms"]
         print(
             json.dumps(

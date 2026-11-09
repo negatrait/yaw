@@ -250,6 +250,7 @@ class ProjectedRecord:
     body: str
     start_line: int
     end_line: int
+    record_id: str | None = None
 
 
 def should_keep_json_key_path(
@@ -332,13 +333,15 @@ def project_json_records(
             fnmatchcase(title, p) for p in blacklist
         ):
             title = ""
+        raw_id = obj.get("id") or obj.get("chunk_id")
+        record_id = raw_id if isinstance(raw_id, str) and raw_id else None
         s_line, e_line = safe_lines(start, end, "document")
         if not pair_matches:
             if blacklist or whitelist not in ((), ("*",)):
                 continue
             _, body = json_document_fields(obj)
             if body or title:
-                records.append(ProjectedRecord(title, body, s_line, e_line))
+                records.append(ProjectedRecord(title, body, s_line, e_line, record_id=record_id))
             continue
         kept = []
         containers = []
@@ -385,7 +388,7 @@ def project_json_records(
         if not excluded:
             _, body = json_document_fields(obj)
             if title or body:
-                records.append(ProjectedRecord(title, body, s_line, e_line))
+                records.append(ProjectedRecord(title, body, s_line, e_line, record_id=record_id))
             continue
         safe_containers = [
             (key, value, chunk)
@@ -421,7 +424,7 @@ def project_json_records(
                 if key in ("text", "content") and isinstance(value, str)
                 else json.dumps({key: value}, ensure_ascii=False)
             )
-            records.append(ProjectedRecord(title, body, sl, el))
+            records.append(ProjectedRecord(title, body, sl, el, record_id=record_id))
     return records
 
 
@@ -488,8 +491,11 @@ def chunk_source_text(
                 if records is not None
                 else resolve_ast_island_bounds(headings, sl, len(text.splitlines()))
             )
-            ptr = ChunkPointer(
-                compute_chunk_id(rel_posix_path, sl, el, body), rel_posix_path, sl, el, title, ast_s, ast_e
+            cid = (
+                record.record_id
+                if records is not None and record.record_id
+                else compute_chunk_id(rel_posix_path, sl, el, body)
             )
+            ptr = ChunkPointer(cid, rel_posix_path, sl, el, title, ast_s, ast_e)
             result.append((ptr, body))
     return tuple(dict((p.chunk_id, (p, t)) for p, t in result).values())

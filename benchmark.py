@@ -60,7 +60,6 @@ from yaw.daemon.ingestion import (
     get_gold_answers,
     get_gold_docs,
     resolve_dataset_bundle,
-    snapshot_dataset_bundle,
 )
 from yaw.daemon.ingestion import (
     PINNED_COMMIT as PINNED_COMMIT,
@@ -282,10 +281,14 @@ def run_yaw_benchmark(
         index_start = perf_counter()
         num_docs = len(document_ids)
         bundle = resolve_dataset_bundle(dataset, workspace_root=PROJECT_ROOT)
-        yaw_engine.workspace_root = bundle.root.parent
-        chunks_to_index = snapshot_dataset_bundle(bundle, index_dir / "coco_state", document_ids=document_ids)
+        yaw_engine.workspace_root = bundle.root
+        matched_files = (
+            tuple(doc.path for doc in bundle.documents if doc.document_id in document_ids)
+            if document_ids
+            else tuple(doc.path for doc in bundle.documents)
+        )
         report["index_batches"] = yaw_engine.index_chunks(
-            chunks_to_index,
+            included_files=matched_files,
             progress_callback=lambda msg: print(f"[Native YAW] [{dataset}] {msg}", flush=True),
         )
         del document_ids

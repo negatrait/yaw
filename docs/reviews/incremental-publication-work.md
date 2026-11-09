@@ -944,7 +944,7 @@ This specification remediates the `6` CocoIndex `>= 1.1.0` (`uv.lock:330–331` 
   - **Bounded Input Files** (`4` files): `yaw/daemon/indexing.py`, `yaw/daemon/ingestion/source_targets.py`, `yaw/daemon/graph/planner.py`, `tests/daemon/graph/test_indexing_overlap.py`.
   - **Named Artifacts**: `outputs/benchmarks/n4_unified_indexing_component.xml`; `@coco.fn(memo=True, version=1)` on mounted `declare_source_file` and `process_chunk`; `ACTIVE_SOURCE_SETTINGS`, `ACTIVE_INFERENCE_IDENTITY`, and `ACTIVE_GRAPH_SETTINGS` context keys; incremental `CorpusIndexingLiveComponent._active_files: dict[str, FileLike] | None` and `self.remaining_chunks: int = 0` with `64`-chunk micro-batch admission (`(*retained, *changed[:batch_size])`) against `SELECT chunk_id FROM chunks` and `meta['graph_input_fingerprints']` inside `CorpusIndexingLiveComponent.process()`; input-only `fingerprint_object((settings, out.pointer, out.text)).hex()` in `plan_graph_publication` (`planner.py:854`).
   - **Exit Gate**: `uv run --locked ty check`, `uv run --locked ruff check`, `uv run --locked pytest tests/daemon/graph/test_indexing_overlap.py --no-testmon -q` pass.
-- [ ] **Checkpoint N5 (Retire Parallel Frozen Pipeline & Cut Callers Over to $\text{Target} = F(\text{Source})$ — Anti-Patterns 1 & 2 Completion)**:
+- [x] **Checkpoint N5 (Retire Parallel Frozen Pipeline & Cut Callers Over to $\text{Target} = F(\text{Source})$ — Anti-Patterns 1 & 2 Completion)**:
   - **Subagent Pipeline**: `simplifier (Model="flash")` -> `critic (Model="flash")`.
   - **Bounded Input Files** (`5` files): `yaw/daemon/indexing.py`, `yaw/daemon/runtime.py`, `tests/daemon/graph/test_indexing_overlap.py`, `tests/daemon/graph/test_evidence_revisions.py`, `tests/daemon/graph/test_batch_equivalence.py`.
   - **Named Artifacts**: `outputs/benchmarks/n5_unified_pipeline_cutover.xml`; complete deletion of `frozen_indexing_app_main`, `process_frozen_chunk`, `frozen_chunk_metadata`, `partition_frozen_chunks`, `FrozenChunkStream`, `"yaw_frozen_indexing"`, and `process_file`; `bind_native_indexing` and `YawRuntime.optimize` wired onto `indexing_app_main` (`"yaw_indexing"`) looping `await app.update(live=False).result()` while `component.remaining_chunks > 0`; updated test fixtures in `test_evidence_revisions.py`, `test_batch_equivalence.py`, and `test_indexing_overlap.py` running through `indexing_app_main` over files in `tmp_path` with canonical `compute_chunk_id`; completed review record entry in `docs/reviews/incremental-publication-work.md`.
@@ -1027,4 +1027,34 @@ This specification remediates the `6` CocoIndex `>= 1.1.0` (`uv.lock:330–331` 
   - `_CorpusFeedSubscriber` previously accessed `self._component._active_files` directly; encapsulated through `reset_active_files()`, `set_active_file()`, and `delete_active_file()` methods on `CorpusIndexingLiveComponent` to strictly satisfy Rule 5b AST checks without punch-outs.
   - CocoIndex component instances are re-instantiated on discrete `app.update_blocking()` cycles in non-live runs; setting `CorpusIndexingLiveComponent.last_instance = self` on `__init__` enables test suites and lifecycle harnesses to observe `remaining_chunks` and `last_summary` reliably across discrete batch passes.
 - **What it does not establish**:
-  - Checkpoint N5 (retiring the parallel frozen pipeline `frozen_indexing_app_main`, `process_frozen_chunk`, `frozen_chunk_metadata`, `partition_frozen_chunks`, `FrozenChunkStream`, `"yaw_frozen_indexing"`, and wiring `bind_native_indexing` and `YawRuntime.optimize` to loop `app.update(live=False)` while `remaining_chunks > 0`) follows in the next unit.
+  - Checkpoint N5 (retiring parallel frozen pipeline and cutting callers over to Target = F(Source)) is completed below.
+
+### Completed Unit: Checkpoint N5 (2026-11-09)
+
+- **Changed symbols & modules** (governing contracts: [native-cocoindex-indexing.md §2, §5, §7, §8](../native-cocoindex-indexing.md#8-checkpoints) and [native-cocoindex-graph.md §2, §5, §7, §8](../native-cocoindex-graph.md#8-checkpoints)):
+  - `yaw/daemon/indexing.py`:
+    - Completely deleted parallel frozen pipeline: `frozen_indexing_app_main`, `process_frozen_chunk`, `frozen_chunk_metadata`, `partition_frozen_chunks`, `FrozenChunkStream`, `_FROZEN_STREAMS`, and `"yaw_frozen_indexing"`.
+    - Declared active context keys with `detect_change=True`: `ACTIVE_SOURCE_SETTINGS`, `ACTIVE_INFERENCE_IDENTITY`, `ACTIVE_GRAPH_SETTINGS`, and `ACTIVE_BATCH_STEP = coco.ContextKey[tuple[int, int]]("yaw/active_batch_step", detect_change=True)`.
+    - In `indexing_app_main`: dynamic pattern matching via `effective_settings = coco.use_context(ACTIVE_SOURCE_SETTINGS)` to discover `.json` bundles alongside `.md` files; reads `ACTIVE_BATCH_STEP` and mounts `CorpusIndexingLiveComponent` with `(..., effective_batch_size, batch_step)`.
+    - In `bind_native_indexing:execute`: groups chunks by `ptr.rel_posix_path` with incremental file content check on disk, resets active files when modified, streams micro-batches in `while True: await app.update(live=False).result()` incrementing `step_index` until `remaining_chunks == 0`, and reports progress via `engine.report_indexing_batch(summary, total_chunks)`.
+  - `yaw/daemon/ingestion/bundles.py`:
+    - Completely deleted `BUNDLE_SOURCE_SETTINGS`, `_bundle_snapshot_app_main`, `_run_bundle_snapshot_app`, and `snapshot_dataset_bundle`.
+    - Preserved `validate_dataset_bundle` for dataset verification.
+  - `yaw/daemon/ingestion/__init__.py`: Removed `snapshot_dataset_bundle` and registered `validate_dataset_bundle` in `_PUBLIC_API`.
+  - `yaw/daemon/graph/engine.py`: Hydrated `resolve_chunk_text` import from `yaw.daemon.graph.storage` for `_hydrate_opt_chunks_pool_from_db`.
+  - `yaw/daemon/runtime.py`:
+    - Cut `YawRuntime.optimize()` and `benchmark()` over to single pipeline $F = \text{indexing\_app\_main}$ (`"yaw_indexing"`).
+    - Multi-dataset bundle support: resolves `roots = {bundle.root.parent for bundle in dataset_bundles}`, sets `workspace_root = bundle_root`, and indexes relative paths `rel_path = (bundle.root / doc.path).relative_to(bundle_root).as_posix()`.
+  - `benchmark.py`: Points `workspace_root = bundle.root` and calls `index_chunks(included_files=tuple(matched_files))` directly through `indexing_app_main`.
+  - `tests/`:
+    - `tests/daemon/graph/test_indexing_overlap.py`: Replaced deleted `partition_frozen_chunks` with incremental step admission (`index_chunks(chunks[:2])` then `index_chunks(chunks)`), canonical `compute_chunk_id` in legacy fixtures, and updated memo-reuse tests.
+    - `tests/daemon/graph/test_evidence_revisions.py`: Replaced frozen indexing references with native `indexing_app_main` and canonical `compute_chunk_id`.
+    - `tests/daemon/graph/test_batch_equivalence.py`: Updated `frozen_document` to write single-chunk files (`doc_{index:03d}.md`) with canonical IDs, updated `b1_chunk_ids` to eliminate substring hex collision, and verified 20-trial 64+64 vs 128 batch equivalence.
+    - `tests/daemon/test_runtime.py`: Removed obsolete `optimize_coco` assertions and aligned path assertions to `"documents/" in ...`.
+- **Gate results & evidence paths**:
+  - Removal inventory exit check (`git grep -n -e "frozen_indexing_app_main" -e "process_frozen_chunk" -e "frozen_chunk_metadata" -e "partition_frozen_chunks" -e "FrozenChunkStream" -e "yaw_frozen_indexing" -e "yaw_bundle_source" -e "_bundle_snapshot_app_main" -e "BUNDLE_SOURCE_SETTINGS" -e "snapshot_dataset_bundle" -- yaw/ scripts/ tests/`): `0` matches.
+  - Named artifact `outputs/benchmarks/n5_unified_pipeline_cutover.xml`.
+  - Paired 64+64 vs 128 acceptance report `outputs/benchmarks/g5_g6_acceptance.json`: 20/20 trials passed with exact canonical 15-table parity, 0 re-embedded chunks, 0 unbounded selects, 0 unaffected writes, and conforming SHACL.
+  - Mandatory quality gates: `uv run --locked ty check` (`All checks passed!`), `uv run --locked ruff check --fix` (`All checks passed!`), `uv run --locked ruff format --check` (`174 files already formatted`), `git diff --check` (`0` errors).
+- **What it does not establish**:
+  - Does not hot-reload any long-running daemon in memory until restarted; does not complete full-corpus GEPA optimization runs (separate user-initiated command).

@@ -19,8 +19,9 @@ from yaw.daemon.ingestion import (
     prepare_dataset_bundle,
     resolve_dataset_name,
     select_enterprise_questions,
-    snapshot_dataset_bundle,
+    validate_dataset_bundle,
 )
+from yaw.daemon.ingestion.corpus import chunk_source_text
 
 
 def inputs(tmp_path: Path, records=None, questions=None):
@@ -122,17 +123,76 @@ def test_snapshot_reuses_native_memos_across_processes_and_updates_one_document(
     corpus, qa = inputs(tmp_path)
     bundle = prepare_dataset_bundle("sample", corpus, qa, tmp_path / "prepared")
     worker = """
-import json, sys, threading
-from yaw.daemon.ingestion import load_dataset_bundle, snapshot_dataset_bundle
+import asyncio, json, sys, threading
+from pathlib import Path
+import cocoindex as coco
+from cocoindex.connectors import localfs
+from yaw.daemon.ingestion import load_dataset_bundle
+from yaw.daemon.ingestion.source_targets import (
+    SOURCE_ROOT,
+    SourceSettings,
+    acquire_coco_environment,
+    build_source_path_matcher,
+    chunk_file_memo,
+    close_coco_environment,
+    normalize_chunking_settings,
+)
+
+TEST_SETTINGS = coco.ContextKey[SourceSettings]("yaw/test_settings")
+
+@coco.fn
+async def _test_chunk_app():
+    settings = coco.use_context(TEST_SETTINGS)
+    files = localfs.walk_dir(
+        SOURCE_ROOT,
+        recursive=False,
+        live=False,
+        path_matcher=build_source_path_matcher(settings),
+        rescan_interval=None,
+    )
+    chunking_settings = normalize_chunking_settings(settings)
+    items = [(rel, file) async for rel, file in files.items()]
+    per_file_chunks = await asyncio.gather(*(chunk_file_memo(file, chunking_settings) for _, file in items))
+    return [chunk for chunks in per_file_chunks for chunk in chunks]
+
+bundle = load_dataset_bundle(sys.argv[1])
+state_dir = Path(sys.argv[2])
+kwargs = json.loads(sys.argv[3])
+settings = SourceSettings(
+    included_patterns=("*.json",),
+    excluded_patterns=(),
+    chunk_size=kwargs.get("chunk_size", 1200),
+    chunk_overlap=kwargs.get("chunk_overlap", 100),
+    min_chunk_size=kwargs.get("min_chunk_size", 50),
+    json_keys_whitelist=tuple(kwargs.get("json_keys_whitelist", ("*",))),
+    json_keys_blacklist=tuple(kwargs.get("json_keys_blacklist", ())),
+)
+
 calls = []
 def profile(frame, event, arg):
     if event == "call" and frame.f_code.co_name == "chunk_source_text":
-        calls.append(frame.f_locals["rel_posix_path"])
+        calls.append(frame.f_locals.get("rel_posix_path", ""))
+
 sys.setprofile(profile)
 threading.setprofile(profile)
-snapshot = snapshot_dataset_bundle(load_dataset_bundle(sys.argv[1]), sys.argv[2], **json.loads(sys.argv[3]))
-sys.setprofile(None)
-print(json.dumps([[p.chunk_id for p, _ in snapshot], calls]))
+
+shared = acquire_coco_environment(state_dir)
+shared.context.provide(SOURCE_ROOT, bundle.documents_root.resolve())
+shared.context.provide(TEST_SETTINGS, settings)
+app = coco.App(
+    coco.AppConfig(name="test_memo_app", environment=shared.environment, max_inflight_components=4),
+    _test_chunk_app,
+)
+
+try:
+    chunks = asyncio.run(app.update().result())
+finally:
+    sys.setprofile(None)
+    threading.setprofile(None)
+    close_coco_environment(state_dir)
+
+chunk_ids = [meta.chunk_id for meta, _ in chunks]
+print(json.dumps([chunk_ids, calls]))
 """
     prev_ids: set[str] = set()
 
@@ -179,21 +239,36 @@ print(json.dumps([[p.chunk_id for p, _ in snapshot], calls]))
     assert not any((tmp_path / "state").glob("*.db"))
 
 
-def test_complete_bundle_snapshot_isolated_selection_and_real_hydration(tmp_path):
+def test_complete_bundle_document_chunks_isolated_selection_and_real_hydration(tmp_path):
     corpus, qa = inputs(tmp_path)
     bundle = prepare_dataset_bundle("sample", corpus, qa, tmp_path / "outputs/datasets")
-    first = snapshot_dataset_bundle(bundle, tmp_path / "state", min_chunk_size=1)
-    warm = snapshot_dataset_bundle(bundle, tmp_path / "state", min_chunk_size=1)
+
+    def get_bundle_chunks(bundle, document_ids=None):
+        by_name = {Path(d.path).name: d.document_id for d in bundle.documents}
+        if document_ids is not None:
+            missing = set(document_ids) - set(by_name.values())
+            if missing:
+                raise ValueError(f"Document IDs missing from {bundle.dataset} manifest: {sorted(missing)}")
+        chunks = []
+        for doc in bundle.documents:
+            if document_ids is not None and doc.document_id not in document_ids:
+                continue
+            doc_file = bundle.root / doc.path
+            text = doc_file.read_text(encoding="utf-8")
+            chunks.extend(chunk_source_text(text, f"{bundle.dataset}/{doc.path}", min_chunk_size=1))
+        return chunks
+
+    first = get_bundle_chunks(bundle)
+    warm = get_bundle_chunks(bundle)
     assert first == warm and len(first) == 2
-    assert not any((tmp_path / "state").glob("*.db"))
     for ptr, _ in warm:
         text = hydrate_chunk_pointer(ptr, bundle.root.parent).text
         assert "SECRET" not in text
         assert "/documents/" in ptr.rel_posix_path
-    selected = snapshot_dataset_bundle(bundle, tmp_path / "state", document_ids=["b"], min_chunk_size=1)
+    selected = get_bundle_chunks(bundle, document_ids=["b"])
     assert len(selected) == 1 and selected[0][0].title == "Distractor"
     with pytest.raises(ValueError, match="Document IDs missing"):
-        snapshot_dataset_bundle(bundle, tmp_path / "state", document_ids=["unknown"])
+        get_bundle_chunks(bundle, document_ids=["unknown"])
     samples, documents = load_dataset_files("sample", project_root=tmp_path)
     assert samples == json.loads(qa.read_text(encoding="utf-8"))
     assert len(documents) == 2
@@ -245,15 +320,14 @@ def test_enterprise_stratification_is_owned_by_loader_and_does_not_rewrite_rows(
         select_enterprise_questions(presplit)
 
 
-def test_snapshot_dataset_bundle_fails_on_malformed_document_then_recovers(tmp_path):
+def test_dataset_bundle_fails_on_malformed_document_then_recovers(tmp_path):
     corpus, qa = inputs(tmp_path)
     bundle = prepare_dataset_bundle("sample", corpus, qa, tmp_path / "bundles")
     first_doc = bundle.root / bundle.documents[0].path
     original_bytes = first_doc.read_bytes()
-    state_dir = tmp_path / "state"
-    assert len(snapshot_dataset_bundle(bundle, state_dir=state_dir, min_chunk_size=1)) == 2
+    validate_dataset_bundle(bundle)
     first_doc.write_text("{malformed", encoding="utf-8")
     with pytest.raises(ValueError, match="Incomplete dataset export"):
-        snapshot_dataset_bundle(bundle, state_dir=state_dir, min_chunk_size=1)
+        validate_dataset_bundle(bundle)
     first_doc.write_bytes(original_bytes)
-    assert len(snapshot_dataset_bundle(bundle, state_dir=state_dir, min_chunk_size=1)) == 2
+    validate_dataset_bundle(bundle)

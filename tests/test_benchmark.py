@@ -18,8 +18,9 @@ from benchmark import (
 )
 from yaw.daemon.graph.inference import YawProgram
 from yaw.daemon.indexing import bind_native_indexing
-from yaw.daemon.ingestion import prepare_dataset_bundle, resolve_dataset_name, snapshot_dataset_bundle
+from yaw.daemon.ingestion import prepare_dataset_bundle, resolve_dataset_name
 from yaw.daemon.ingestion.bundles import document_identity
+from yaw.daemon.ingestion.corpus import chunk_source_text
 
 
 def selected_texts(ids, corpus):
@@ -737,6 +738,7 @@ class PaperParityGateTests(unittest.TestCase):
         from yaw.core import OpenIERecord
         from yaw.daemon.graph.engine import YawGraphEngine
         from yaw.daemon.graph.inference.embedding import resolve_embedding_profile
+        from yaw.daemon.ingestion.source_targets import SourceSettings
 
         with tempfile.TemporaryDirectory() as tmp_str:
             tmp_path = Path(tmp_str)
@@ -799,7 +801,15 @@ class PaperParityGateTests(unittest.TestCase):
             )
             corpus_dir = bundle.root.parent
             added_chunks = tuple(
-                snapshot_dataset_bundle(bundle, state_dir, chunk_size=180, chunk_overlap=20, min_chunk_size=30)
+                chunk
+                for doc in bundle.documents
+                for chunk in chunk_source_text(
+                    (bundle.root / doc.path).read_text(encoding="utf-8"),
+                    f"{bundle.dataset}/{doc.path}",
+                    chunk_size=180,
+                    chunk_overlap=20,
+                    min_chunk_size=30,
+                )
             )
             # Long passage is split into multiple sub-chunks, plus 1 distractor chunk
             self.assertGreaterEqual(len(added_chunks), 3)
@@ -901,7 +911,8 @@ class PaperParityGateTests(unittest.TestCase):
                     program=MinimalProgram(),
                     embedder=TitleCheckingEmbedder(profile),
                     retrieval_top_k=5,
-                )
+                ),
+                source_settings=SourceSettings(("**/*",), (), chunk_size=180, chunk_overlap=20, min_chunk_size=30),
             )
             try:
                 engine.index_chunks(added_chunks)
@@ -942,11 +953,17 @@ class PaperParityGateTests(unittest.TestCase):
             cp.write_text(json.dumps([{"idx": "a", "title": "A", "text": "Grounded text"}]), encoding="utf-8")
             qp.write_text(json.dumps([{"question": "Evaluation only", "answer": "Secret"}]), encoding="utf-8")
             bundle = prepare_dataset_bundle("sample", cp, qp, root / "prepared")
-            cold = snapshot_dataset_bundle(bundle, root / "state", min_chunk_size=1)
-            warm = snapshot_dataset_bundle(bundle, root / "state", min_chunk_size=1)
-            self.assertEqual(cold, warm)
-            self.assertEqual(len(warm), 1)
-            pointer, text = warm[0]
+            chunks = tuple(
+                chunk
+                for doc in bundle.documents
+                for chunk in chunk_source_text(
+                    (bundle.root / doc.path).read_text(encoding="utf-8"),
+                    f"{bundle.dataset}/{doc.path}",
+                    min_chunk_size=1,
+                )
+            )
+            self.assertEqual(len(chunks), 1)
+            pointer, text = chunks[0]
             self.assertIn("/documents/", pointer.rel_posix_path)
             self.assertEqual(hydrate_chunk_pointer(pointer, bundle.root.parent).text, text)
 

@@ -8,7 +8,7 @@ import pytest
 
 from daemon.graph.test_indexing_overlap import adapter
 from daemon.graph.test_indexing_overlap import provider as provider
-from yaw.core import ChunkPointer
+from yaw.core import ChunkPointer, compute_chunk_id
 from yaw.daemon.graph.engine import YawGraphEngine
 from yaw.daemon.graph.inference import YawProgram, create_dspy_lm
 from yaw.daemon.indexing import bind_native_indexing
@@ -55,8 +55,11 @@ def frozen_document(root):
                 },
             ],
         }
-        chunks.append((ChunkPointer(f"c{index:03}", "document.md", index + 1, index + 1), text))
-    (root / "document.md").write_text("\n".join(text for _, text in chunks) + "\n", encoding="utf-8")
+        rel_path = f"doc_{index:03d}.md"
+        cid = compute_chunk_id(rel_path, 1, 1, text)
+        ptr = ChunkPointer(cid, rel_path, 1, 1, f"doc_{index:03d}", 1, 1)
+        chunks.append((ptr, text))
+        (root / rel_path).write_text(text + "\n", encoding="utf-8")
     return chunks, extractions
 
 
@@ -321,8 +324,11 @@ def test_reverse_top_k_asymmetric_candidate_completeness_64_plus_64_equals_128(t
                 {"sub": subject, "pred": [predicate, "owl:ObjectProperty"], "obj": obj, "def": statement},
             ],
         }
-        chunks.append((ChunkPointer(f"a{index:03}", "asymmetric.md", index + 1, index + 1), text))
-    (tmp_path / "asymmetric.md").write_text("\n".join(text for _, text in chunks) + "\n", encoding="utf-8")
+        rel_path = f"asym_{index:03d}.md"
+        cid = compute_chunk_id(rel_path, 1, 1, text)
+        ptr = ChunkPointer(cid, rel_path, 1, 1, f"asym_{index:03d}", 1, 1)
+        chunks.append((ptr, text))
+        (tmp_path / rel_path).write_text(text + "\n", encoding="utf-8")
     state["extractions"] = extractions
 
     results = {}
@@ -452,12 +458,13 @@ def test_passive_endpoint_homograph_preserves_edges_and_facts_across_batches(tmp
         },
     }
 
+    c_texts = [c0_text, c1_text, c2_text]
     chunks = [
-        (ChunkPointer("p000", "passive.md", 1, 1), c0_text),
-        (ChunkPointer("p001", "passive.md", 2, 2), c1_text),
-        (ChunkPointer("p002", "passive.md", 3, 3), c2_text),
+        (ChunkPointer(compute_chunk_id(f"passive_{i}.md", 1, 1, t), f"passive_{i}.md", 1, 1), t)
+        for i, t in enumerate(c_texts)
     ]
-    (tmp_path / "passive.md").write_text("\n".join(t for _, t in chunks) + "\n", encoding="utf-8")
+    for ptr, t in chunks:
+        (tmp_path / ptr.rel_posix_path).write_text(t + "\n", encoding="utf-8")
 
     results = {}
 
@@ -563,12 +570,13 @@ def test_suffix_lexical_match_on_passive_endpoint_preserves_closed_world_across_
         },
     }
 
+    c_texts = [c0_text, c1_text, c2_text]
     chunks = [
-        (ChunkPointer("s000", "suffix.md", 1, 1), c0_text),
-        (ChunkPointer("s001", "suffix.md", 2, 2), c1_text),
-        (ChunkPointer("s002", "suffix.md", 3, 3), c2_text),
+        (ChunkPointer(compute_chunk_id(f"suffix_{i}.md", 1, 1, t), f"suffix_{i}.md", 1, 1), t)
+        for i, t in enumerate(c_texts)
     ]
-    (tmp_path / "suffix.md").write_text("\n".join(t for _, t in chunks) + "\n", encoding="utf-8")
+    for ptr, t in chunks:
+        (tmp_path / ptr.rel_posix_path).write_text(t + "\n", encoding="utf-8")
 
     results = {}
 
@@ -604,7 +612,6 @@ def test_suffix_lexical_match_on_passive_endpoint_preserves_closed_world_across_
 
 def test_g5_g6_paired_64_plus_64_vs_128_acceptance_report(tmp_path, provider):
     """Run N=20 paired fixed-evidence trials (10 cold + 10 warm Stage-1) and emit g5_g6_acceptance.json (G5-G6)."""
-    import asyncio
     import re
     import statistics
     import subprocess
@@ -612,25 +619,9 @@ def test_g5_g6_paired_64_plus_64_vs_128_acceptance_report(tmp_path, provider):
     import urllib.request
     from pathlib import Path
 
-    import cocoindex as coco
     import psutil
 
-    from yaw.daemon.graph.storage.rows import validate_graph_state
-    from yaw.daemon.indexing import (
-        EMBEDDING_ENDPOINT,
-        GRAPH_DB,
-        OPENIE_ENDPOINT,
-        SOURCE_DB,
-        SOURCE_ROOT,
-        VALIDATE_SQLITE,
-        EmbeddingEndpoint,
-        FrozenChunkStream,
-        InferenceIdentity,
-        OpenIEEndpoint,
-        frozen_indexing_app_main,
-        openie_fingerprint,
-    )
-    from yaw.daemon.runtime import resolve_coco_state_root
+    from yaw.daemon.indexing import bind_native_indexing
 
     url, state = provider
     state["delay"] = 0
@@ -642,7 +633,7 @@ def test_g5_g6_paired_64_plus_64_vs_128_acceptance_report(tmp_path, provider):
         r"^SELECT\b(?!.*\bWHERE\b).*\bFROM\s+\"?(entities|facts|edges|chunk_vec|entity_vec|fact_vec|entity_mentions|fact_assertions)\"?\b",
         re.IGNORECASE,
     )
-    b1_chunk_ids = {f"c{i:03}" for i in range(64)}
+    b1_chunk_ids = {ptr.chunk_id for ptr, _ in chunks[:64]}
     b1_mutation_pattern = re.compile(
         r"^(UPDATE|DELETE)\b.*\b(chunks|chunk_vec|chunk_fts|source_chunks|chunk_inference)\b",
         re.IGNORECASE,
@@ -651,33 +642,13 @@ def test_g5_g6_paired_64_plus_64_vs_128_acceptance_report(tmp_path, provider):
     # Pre-warm Stage-1 cache (extract_text) for the 10 warm_stage1_memo trials
     lm_seed = create_dspy_lm("overlap", base_url=url + "/v1", cache=True, max_tokens=512)
     prog_seed = YawProgram(orchestrator_lm=lm_seed, rlm_sub_lm=lm_seed, enable_gbnf=False, max_output_tokens=512)
-    eng_seed = YawGraphEngine(tmp_path / "warm_seed" / "yaw.db", tmp_path, prog_seed, adapter(url))
+    eng_seed = bind_native_indexing(
+        YawGraphEngine(tmp_path / "warm_seed" / "yaw.db", tmp_path, prog_seed, adapter(url)),
+        batch_size=128,
+        state_root=tmp_path / "warm_template_state",
+    )
     try:
-        prog_id = openie_fingerprint(prog_seed)
-        emb_id = str(eng_seed.embedder.profile.index_identity)
-        ctx = coco.ContextProvider()
-        ctx.provide(SOURCE_DB, eng_seed.managed_conn)
-        ctx.provide(GRAPH_DB, eng_seed.managed_conn)
-        ctx.provide(VALIDATE_SQLITE, validate_graph_state)
-        ctx.provide(SOURCE_ROOT, eng_seed.workspace_root)
-        ctx.provide(EMBEDDING_ENDPOINT, EmbeddingEndpoint(eng_seed.embedder))
-        ctx.provide(OPENIE_ENDPOINT, OpenIEEndpoint(prog_seed, lm_seed, prog_id))
-        env = coco.Environment(
-            settings=coco.Settings.from_env(resolve_coco_state_root(tmp_path / "warm_template_state")),
-            context_provider=ctx,
-        )
-        warm_stream = FrozenChunkStream(tuple(chunks))
-        try:
-            app = coco.App(
-                coco.AppConfig(name="yaw_frozen_indexing", environment=env, max_inflight_components=4),
-                frozen_indexing_app_main,
-                warm_stream,
-                None,
-                InferenceIdentity(prog_id, emb_id),
-            )
-            asyncio.run(app.update().result())
-        finally:
-            env.close()
+        eng_seed.index_chunks(chunks)
     finally:
         eng_seed.close()
 
