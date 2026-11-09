@@ -38,7 +38,7 @@ async def source_target_fixture(settings: SourceSettings) -> None:
 
 
 @coco.fn
-async def declare_files_fixture(settings: SourceSettings) -> tuple[tuple[SourceMetadata, ...], ...]:
+async def declare_files_fixture(settings: SourceSettings) -> tuple[tuple[tuple[SourceMetadata, str], ...], ...]:
     table = await sqlite.mount_table_target(
         SOURCE_DB,
         table_name="source_chunks",
@@ -190,9 +190,11 @@ def test_source_targets_replace_delete_and_restart(tmp_path: Path) -> None:
                 batches = app.update_blocking()
                 assert isinstance(batches, tuple) and len(batches) == 1
                 assert isinstance(batches[0], tuple) and len(batches[0]) == 1
-                assert isinstance(batches[0][0], SourceMetadata)
-                assert not hasattr(batches[0][0], "text")
-                assert "Original grounded source evidence." not in repr(batches)
+                assert isinstance(batches[0][0], tuple) and len(batches[0][0]) == 2
+                meta, text = batches[0][0]
+                assert isinstance(meta, SourceMetadata)
+                assert not hasattr(meta, "text")
+                assert text == "# First\n\nOriginal grounded source evidence."
                 with db.readonly() as conn:
                     rows = conn.execute("SELECT chunk_id, title, source_hash FROM source_chunks").fetchall()
                     assert "text" not in {row[1] for row in conn.execute("PRAGMA table_info(source_chunks)")}
@@ -204,8 +206,10 @@ def test_source_targets_replace_delete_and_restart(tmp_path: Path) -> None:
                 if phase == 1:
                     source.write_text("# Second\n\nReplacement source evidence.\n", encoding="utf-8")
                     updated_batches = app.update_blocking()
-                    assert len(updated_batches) == 1 and isinstance(updated_batches[0][0], SourceMetadata)
-                    assert "Replacement source evidence." not in repr(updated_batches)
+                    assert len(updated_batches) == 1 and isinstance(updated_batches[0][0], tuple)
+                    meta, text = updated_batches[0][0]
+                    assert isinstance(meta, SourceMetadata)
+                    assert text == "# Second\n\nReplacement source evidence."
                     with db.readonly() as conn:
                         changed = conn.execute("SELECT title, source_hash FROM source_chunks").fetchall()
                     assert len(changed) == 1
@@ -257,7 +261,7 @@ def test_source_settings_included_files_selects_only_requested_paths(tmp_path: P
     )
     try:
         batches = app.update_blocking()
-        returned_paths = sorted(row.rel_posix_path for batch in batches for row in batch)
+        returned_paths = sorted(meta.rel_posix_path for batch in batches for meta, _ in batch)
         assert returned_paths == ["keep.md", "nested/keep_nested.md"]
         with db.readonly() as conn:
             db_paths = [

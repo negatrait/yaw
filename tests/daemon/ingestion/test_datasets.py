@@ -176,6 +176,7 @@ print(json.dumps([[p.chunk_id for p, _ in snapshot], calls]))
     projected = scan(chunk_size=200, json_keys_whitelist=["text"])
     assert projected[2] == 2 and len(projected[3]) == 2
     assert scan(chunk_size=200, json_keys_whitelist=["text"]) == [0, 0, 2, []]
+    assert not any((tmp_path / "state").glob("*.db"))
 
 
 def test_complete_bundle_snapshot_isolated_selection_and_real_hydration(tmp_path):
@@ -184,6 +185,7 @@ def test_complete_bundle_snapshot_isolated_selection_and_real_hydration(tmp_path
     first = snapshot_dataset_bundle(bundle, tmp_path / "state", min_chunk_size=1)
     warm = snapshot_dataset_bundle(bundle, tmp_path / "state", min_chunk_size=1)
     assert first == warm and len(first) == 2
+    assert not any((tmp_path / "state").glob("*.db"))
     for ptr, _ in warm:
         text = hydrate_chunk_pointer(ptr, bundle.root.parent).text
         assert "SECRET" not in text

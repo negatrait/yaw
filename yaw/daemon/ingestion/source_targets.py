@@ -77,14 +77,14 @@ def normalize_chunking_settings(settings: SourceSettings) -> SourceSettings:
 
 @coco.fn(
     memo=True,
-    version=1,
+    version=2,
     deps={
         "parser_source": hashlib.sha256(Path(inspect.getfile(chunk_source_text)).read_bytes()).hexdigest(),
         "contract_source": hashlib.sha256(Path(inspect.getfile(json_document_fields)).read_bytes()).hexdigest(),
         "cocoindex_version": version("cocoindex"),
     },
 )
-async def _chunk_file_memo(file: FileLike, settings: SourceSettings) -> tuple[SourceMetadata, ...]:
+async def chunk_file_memo(file: FileLike, settings: SourceSettings) -> tuple[tuple[SourceMetadata, str], ...]:
     path = file.file_path.path
     if path.is_absolute():
         raise ValueError("Source contribution paths must be relative")
@@ -100,26 +100,29 @@ async def _chunk_file_memo(file: FileLike, settings: SourceSettings) -> tuple[So
         json_keys_blacklist=settings.json_keys_blacklist,
     )
     return tuple(
-        SourceMetadata(
-            pointer.chunk_id,
-            pointer.rel_posix_path,
-            digest,
-            pointer.start_line,
-            pointer.end_line,
-            pointer.title,
-            pointer.ast_island_start,
-            pointer.ast_island_end,
+        (
+            SourceMetadata(
+                pointer.chunk_id,
+                pointer.rel_posix_path,
+                digest,
+                pointer.start_line,
+                pointer.end_line,
+                pointer.title,
+                pointer.ast_island_start,
+                pointer.ast_island_end,
+            ),
+            text,
         )
-        for pointer, _ in chunks
+        for pointer, text in chunks
     )
 
 
 @coco.fn
 async def declare_source_file(
     file: FileLike, table: sqlite.TableTarget[SourceMetadata], settings: SourceSettings
-) -> tuple[SourceMetadata, ...]:
+) -> tuple[tuple[SourceMetadata, str], ...]:
     """Failed parsing declares nothing; CocoIndex retains the previous targets."""
-    contributions = await _chunk_file_memo(file, normalize_chunking_settings(settings))
-    for contribution in contributions:
-        table.declare_row(row=contribution)
+    contributions = await chunk_file_memo(file, normalize_chunking_settings(settings))
+    for meta, _ in contributions:
+        table.declare_row(row=meta)
     return contributions

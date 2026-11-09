@@ -140,7 +140,7 @@ async def process_chunk(
             stage="chunk_embed",
         )
     openie_passage = chunk_text
-    if frozen_text is None and pointer.start_line > 1:
+    if settings is not None and pointer.start_line > 1:
         ast_parent_ctx = hydrate_ast_parent_context(pointer, source_root, hops=1)
         if ast_parent_ctx:
             openie_passage = (
@@ -181,7 +181,7 @@ async def process_file(
     if not target_file.is_file():
         return ()
     chunking_settings = normalize_chunking_settings(settings)
-    metadata_rows = await coco.use_mount(
+    chunk_items = await coco.use_mount(
         coco.component_subpath("source"),
         declare_source_file,
         file,
@@ -200,10 +200,10 @@ async def process_file(
                     artifacts,
                     identity,
                     chunking_settings,
-                    None,
+                    text,
                     db_identity,
                 )
-                for metadata in metadata_rows
+                for metadata, text in chunk_items
             )
         )
     except ValueError:

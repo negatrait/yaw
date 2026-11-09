@@ -9,26 +9,21 @@ from pathlib import Path
 from typing import Any
 
 import cocoindex as coco
-from cocoindex.connectors import localfs, sqlite
-from cocoindex.resources.file import FileLike
+from cocoindex.connectors import localfs
 from filelock import FileLock
 
 from yaw.core import (
     ChunkPointer,
-    compute_chunk_id,
-    json_document_fields,
     render_document_text,
     write_text_atomic,
 )
 
-from .corpus import chunk_source_text
 from .source_targets import (
-    SOURCE_DB,
     SOURCE_ROOT,
     SourceMetadata,
     SourceSettings,
     build_source_path_matcher,
-    declare_source_file,
+    chunk_file_memo,
     normalize_chunking_settings,
 )
 
@@ -234,21 +229,9 @@ def validate_dataset_bundle(bundle: DatasetBundle) -> None:
 
 
 @coco.fn
-async def _process_bundle_file(
-    file: FileLike,
-    sources: sqlite.TableTarget[SourceMetadata],
+async def _bundle_snapshot_app_main(
     settings: SourceSettings,
-) -> None:
-    await declare_source_file(file, sources, normalize_chunking_settings(settings))
-
-
-@coco.fn
-async def _bundle_snapshot_app_main(settings: SourceSettings) -> None:
-    sources = await sqlite.mount_table_target(
-        SOURCE_DB,
-        table_name="source_chunks",
-        table_schema=await sqlite.TableSchema[SourceMetadata].from_class(SourceMetadata, primary_key=["chunk_id"]),
-    )
+) -> dict[str, tuple[tuple[SourceMetadata, str], ...]]:
     files = localfs.walk_dir(
         SOURCE_ROOT,
         recursive=False,
@@ -256,15 +239,22 @@ async def _bundle_snapshot_app_main(settings: SourceSettings) -> None:
         path_matcher=build_source_path_matcher(settings),
         rescan_interval=None,
     )
-    await coco.mount_each(_process_bundle_file, files.items(), sources, settings)
+    chunking_settings = normalize_chunking_settings(settings)
+    items = [(rel, file) async for rel, file in files.items()]
+    rels = [rel for rel, _ in items]
+    per_file_chunks = await asyncio.gather(*(chunk_file_memo(file, chunking_settings) for _, file in items))
+    return dict(zip(rels, per_file_chunks, strict=True))
 
 
-async def _run_bundle_snapshot_app(app: coco.App[Any, None]) -> None:
+async def _run_bundle_snapshot_app(
+    app: coco.App[Any, dict[str, tuple[tuple[SourceMetadata, str], ...]]],
+) -> dict[str, tuple[tuple[SourceMetadata, str], ...]]:
     handle = app.update()
-    await handle.result()
+    result = await handle.result()
     stats = handle.stats()
     if stats is not None and stats.total.num_errors > 0:
         raise ValueError(f"Dataset bundle snapshot failed with {stats.total.num_errors} component error(s)")
+    return result
 
 
 def snapshot_dataset_bundle(
@@ -300,9 +290,7 @@ def snapshot_dataset_bundle(
     resolved_state.mkdir(parents=True, exist_ok=True)
     with FileLock(str(bundle.root / "bundle.lock")):
         validate_dataset_bundle(bundle)
-        db = sqlite.connect(resolved_state / "source_snapshot.db", load_vec=False)
         context = coco.ContextProvider()
-        context.provide(SOURCE_DB, db)
         context.provide(SOURCE_ROOT, bundle.documents_root.resolve())
         env = coco.Environment(settings=coco.Settings.from_env(resolved_state / "coco_lmdb"), context_provider=context)
         app = coco.App(
@@ -311,84 +299,29 @@ def snapshot_dataset_bundle(
             settings,
         )
         try:
-            asyncio.run(_run_bundle_snapshot_app(app))
-            with db.readonly() as conn:
-                rows = conn.execute(
-                    """
-                    SELECT chunk_id, rel_posix_path, source_hash, start_line, end_line, title,
-                           ast_island_start, ast_island_end
-                    FROM source_chunks
-                    ORDER BY rel_posix_path, start_line, end_line, chunk_id
-                    """
-                ).fetchall()
+            bundle_chunks = asyncio.run(_run_bundle_snapshot_app(app))
         finally:
             env.close()
-            db.close()
-
-        by_rel_path: dict[str, list[SourceMetadata]] = {}
-        for row in rows:
-            meta = SourceMetadata(*row)
-            by_rel_path.setdefault(meta.rel_posix_path, []).append(meta)
 
         snapshot: list[tuple[ChunkPointer, str]] = []
         for doc in bundle.documents:
             rel_name = Path(doc.path).name
             if selected is not None and doc.document_id not in selected:
                 continue
-            file_rows = by_rel_path.get(rel_name, [])
-            if not file_rows:
-                continue
-            raw_text = (bundle.documents_root / rel_name).read_text(encoding="utf-8")
-            if len(file_rows) == 1:
-                meta = file_rows[0]
-                raw_lines = raw_text.splitlines()
-                if meta.start_line == 1 and meta.end_line == len(raw_lines):
-                    rendered = document_text(json.loads(raw_text), bundle.title_key, bundle.body_key)
-                else:
-                    raw_slice = "\n".join(raw_lines[meta.start_line - 1 : meta.end_line]).strip().rstrip(",")
-                    obj = json.loads(raw_slice if raw_slice.startswith("{") else "{" + raw_slice + "}")
-                    p_title, p_body = json_document_fields(obj, meta.title)
-                    rendered = render_document_text(p_title, p_body)
-                if compute_chunk_id(rel_name, meta.start_line, meta.end_line, rendered) == meta.chunk_id:
-                    snapshot.append(
-                        (
-                            ChunkPointer(
-                                meta.chunk_id,
-                                f"{bundle.dataset}/documents/{meta.rel_posix_path}",
-                                meta.start_line,
-                                meta.end_line,
-                                meta.title,
-                                meta.ast_island_start,
-                                meta.ast_island_end,
-                            ),
-                            rendered,
-                        )
+            file_chunks = bundle_chunks.get(rel_name, ())
+            for meta, text in file_chunks:
+                snapshot.append(
+                    (
+                        ChunkPointer(
+                            meta.chunk_id,
+                            f"{bundle.dataset}/documents/{meta.rel_posix_path}",
+                            meta.start_line,
+                            meta.end_line,
+                            meta.title,
+                            meta.ast_island_start,
+                            meta.ast_island_end,
+                        ),
+                        text,
                     )
-                    continue
-            chunked = chunk_source_text(
-                raw_text,
-                rel_name,
-                chunk_size=chunk_size,
-                chunk_overlap=chunk_overlap,
-                min_chunk_size=min_chunk_size,
-                json_keys_whitelist=tuple(json_keys_whitelist),
-                json_keys_blacklist=tuple(json_keys_blacklist),
-            )
-            active_ids = {meta.chunk_id for meta in file_rows}
-            for ptr, text in chunked:
-                if ptr.chunk_id in active_ids:
-                    snapshot.append(
-                        (
-                            ChunkPointer(
-                                ptr.chunk_id,
-                                f"{bundle.dataset}/documents/{ptr.rel_posix_path}",
-                                ptr.start_line,
-                                ptr.end_line,
-                                ptr.title,
-                                ptr.ast_island_start,
-                                ptr.ast_island_end,
-                            ),
-                            text,
-                        )
-                    )
+                )
         return snapshot

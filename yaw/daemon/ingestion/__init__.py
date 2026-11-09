@@ -44,6 +44,7 @@ _PUBLIC_API: dict[str, str] = {
     "resolve_heading_for_line": ".corpus",
     "should_keep_json_key_path": ".corpus",
     "build_source_path_matcher": ".source_targets",
+    "chunk_file_memo": ".source_targets",
     "declare_source_file": ".source_targets",
     "normalize_chunking_settings": ".source_targets",
 }
