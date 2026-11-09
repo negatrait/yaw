@@ -76,7 +76,7 @@ def _lexical_similarity_cascade(
 
     if matcher is None:
         matcher = difflib.SequenceMatcher(autojunk=False)
-        matcher.set_seq2(norm_a)
+    matcher.set_seq2(norm_a)
     matcher.set_seq1(norm_b)
     if matcher.real_quick_ratio() >= threshold and matcher.quick_ratio() >= threshold:
         ratio = matcher.ratio()
@@ -1653,27 +1653,40 @@ def load_affected_neighborhood(
         ):
             core_entity_ids.add(str(row[0]))
 
-    # 1c. Bounded prefix scan on entity_labels primary key for lexical similarity candidates (>= 0.70)
-    prefixes: set[str] = set()
-    for name in delta_entity_names.values():
-        norm_a, tok_a = _lexical_name_parts(name)
-        for item in (norm_a, tok_a, *norm_a.split(), *tok_a.split()):
-            if len(item) >= 3 and not item.isdigit():
-                prefixes.add(item[:3])
-    prefix_hit_eids: set[str] = set()
-    for pfx in sorted(prefixes):
-        upper = pfx[:-1] + chr(ord(pfx[-1]) + 1)
-        for row in ro_conn.execute(
-            "SELECT DISTINCT entity_id, raw_label FROM entity_labels WHERE label_norm >= ? AND label_norm < ?",
-            (pfx, upper),
-        ):
+    # 1c. Lexical similarity candidates (>= 0.70) with upper-bound length pruning
+    delta_lex = [
+        (name, norm_a, tok_a, len(norm_a))
+        for name in dict.fromkeys(delta_entity_names.values())
+        for norm_a, tok_a in (_lexical_name_parts(name),)
+        if norm_a and not norm_a.isdigit()
+    ]
+    if delta_lex:
+        matcher = difflib.SequenceMatcher(autojunk=False)
+        cand_rows = ro_conn.execute(
+            """
+            SELECT entity_id, name FROM entities WHERE entity_id != ''
+            UNION
+            SELECT entity_id, raw_label FROM entity_labels WHERE label_norm != ''
+            """
+        ).fetchall()
+        for row in cand_rows:
             cand_eid = str(row[0])
-            raw_lbl = str(row[1])
             if cand_eid in core_entity_ids:
                 continue
-            if any(_lexical_similarity_cascade(name, raw_lbl, 0.70) >= 0.70 for name in delta_entity_names.values()):
-                prefix_hit_eids.add(cand_eid)
-    core_entity_ids.update(prefix_hit_eids)
+            raw_lbl = str(row[1])
+            norm_b, tok_b = _lexical_name_parts(raw_lbl)
+            if not norm_b or norm_b.isdigit():
+                continue
+            len_b = len(norm_b)
+            for name, norm_a, tok_a, len_a in delta_lex:
+                if norm_a == norm_b or (tok_a and tok_a == tok_b):
+                    core_entity_ids.add(cand_eid)
+                    break
+                if 2.0 * (len_a if len_a < len_b else len_b) / (len_a + len_b) < 0.70:
+                    continue
+                if _lexical_similarity_cascade(name, raw_lbl, 0.70, matcher=matcher) >= 0.70:
+                    core_entity_ids.add(cand_eid)
+                    break
 
     # 1d. Dense KNN candidate partners in ro_conn.entity_vec + reverse top-k neighbors
     has_entity_vec = (
@@ -1856,16 +1869,28 @@ def load_affected_neighborhood(
                         affected_entity_ids.add(ekey[0])
                         affected_entity_ids.add(ekey[1])
 
-        # Promote any passive entities in affected_entity_ids that share a label_norm within affected_entity_ids
+        # Promote any passive entities in affected_entity_ids that share a label_norm or definition
         eids_by_norm: dict[str, set[str]] = defaultdict(set)
+        eids_by_def: dict[str, set[str]] = defaultdict(set)
         for batch in batched(sorted(affected_entity_ids)):
             placeholders = ",".join("?" for _ in batch)
+            b_tuple = tuple(batch)
             for lnorm, eid in ro_conn.execute(
                 f"SELECT label_norm, entity_id FROM entity_labels WHERE entity_id IN ({placeholders})",
-                tuple(batch),
+                b_tuple,
             ):
                 eids_by_norm[str(lnorm)].add(str(eid))
+            for defn, eid in ro_conn.execute(
+                f"SELECT definition, entity_id FROM entities WHERE entity_id IN ({placeholders})",
+                b_tuple,
+            ):
+                def_norm = str(defn or "").strip().casefold()
+                if def_norm:
+                    eids_by_def[def_norm].add(str(eid))
         for eids in eids_by_norm.values():
+            if len(eids) > 1:
+                core_entity_ids.update(eids)
+        for eids in eids_by_def.values():
             if len(eids) > 1:
                 core_entity_ids.update(eids)
 

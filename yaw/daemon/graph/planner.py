@@ -1052,7 +1052,7 @@ async def plan_graph_publication(
         if incremental:
             seed_entity_ids = tuple(
                 {
-                    *existing_bindings.values(),
+                    *(eid for eid, _, _ in existing_bindings.values()),
                     *(eid for eid, _, _ in entity_nodes),
                 }
             )

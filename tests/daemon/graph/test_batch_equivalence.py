@@ -494,6 +494,114 @@ def test_passive_endpoint_homograph_preserves_edges_and_facts_across_batches(tmp
     assert_same_graph(results["incremental"], results["reference"])
 
 
+def test_suffix_lexical_match_on_passive_endpoint_preserves_closed_world_across_batches(tmp_path, provider):
+    """Verify suffix lexical matches (>= 0.70) with disjoint 3-char prefixes preserve closed-world across batches."""
+    url, state = provider
+    state["delay"] = 0
+    state["relation"] = "skos:exactMatch"
+
+    def suffix_lexical_vector(text: str) -> list[float]:
+        t = text.casefold()
+        if "nimbus client sdk" in t:
+            return [1.0, 0.0, 0.0, 0.0]
+        if "sse disconnect" in t:
+            return [0.0, 1.0, 0.0, 0.0]
+        if "streaming disconnect" in t:
+            return [0.0, 0.0, 1.0, 0.0]
+        if "sse-gateway" in t:
+            return [0.0, 0.0, 0.0, 1.0]
+        return [0.5, 0.5, 0.5, 0.5]
+
+    state["embedding_vector"] = suffix_lexical_vector
+
+    c0_text = "Batch1 A: Nimbus client SDK is retried on streaming disconnect."
+    c1_text = "Batch1 B: sse-gateway monitors streaming disconnect."
+    c2_text = "Batch2 C: sse-gateway mitigates SSE disconnect."
+
+    state["extractions"] = {
+        c0_text: {
+            "named_entities": [
+                ["Nimbus client SDK", "Client software development kit."],
+                ["streaming disconnect", "Short-lived connection disruption during telemetry streams."],
+            ],
+            "triples": [
+                {
+                    "sub": "Nimbus client SDK",
+                    "pred": ["retried on", "owl:ObjectProperty"],
+                    "obj": "streaming disconnect",
+                    "def": "Nimbus client SDK is retried on streaming disconnect.",
+                }
+            ],
+        },
+        c1_text: {
+            "named_entities": [
+                ["sse-gateway", "Gateway component handling SSE streams."],
+                ["streaming disconnect", "Short-lived connection disruption during telemetry streams."],
+            ],
+            "triples": [
+                {
+                    "sub": "sse-gateway",
+                    "pred": ["monitors", "owl:ObjectProperty"],
+                    "obj": "streaming disconnect",
+                    "def": "sse-gateway monitors streaming disconnect.",
+                }
+            ],
+        },
+        c2_text: {
+            "named_entities": [
+                ["sse-gateway", "Gateway component handling SSE streams."],
+                ["SSE disconnect", "Short-lived connection disruption during telemetry streams."],
+            ],
+            "triples": [
+                {
+                    "sub": "sse-gateway",
+                    "pred": ["mitigates", "owl:ObjectProperty"],
+                    "obj": "SSE disconnect",
+                    "def": "sse-gateway mitigates SSE disconnect.",
+                }
+            ],
+        },
+    }
+
+    chunks = [
+        (ChunkPointer("s000", "suffix.md", 1, 1), c0_text),
+        (ChunkPointer("s001", "suffix.md", 2, 2), c1_text),
+        (ChunkPointer("s002", "suffix.md", 3, 3), c2_text),
+    ]
+    (tmp_path / "suffix.md").write_text("\n".join(t for _, t in chunks) + "\n", encoding="utf-8")
+
+    results = {}
+
+    def make_engine(arm: str, batch_size: int) -> YawGraphEngine:
+        lm = create_dspy_lm("overlap", base_url=url + "/v1", cache=False, max_tokens=512)
+        program = YawProgram(orchestrator_lm=lm, rlm_sub_lm=lm, enable_gbnf=False, max_output_tokens=512)
+        return bind_native_indexing(
+            YawGraphEngine(
+                tmp_path / f"suffix_{arm}" / "yaw.db",
+                tmp_path,
+                program,
+                adapter(url),
+                synonymy_threshold=0.80,
+                synonymy_top_k=5,
+            ),
+            batch_size=batch_size,
+        )
+
+    for arm, batch_size in (("incremental", 2), ("reference", 4)):
+        engine = make_engine(arm, batch_size)
+        try:
+            if arm == "incremental":
+                engine.index_chunks(chunks[:2])
+                assert engine.lint_graph()["conforms"]
+            engine.index_chunks(chunks)
+            assert engine.lint_graph()["conforms"]
+            results[arm] = canonical_graph(engine.conn)
+        finally:
+            engine.close()
+
+    assert_same_graph(results["incremental"], results["reference"])
+
+
 def test_g5_g6_paired_64_plus_64_vs_128_acceptance_report(tmp_path, provider):
     """Run N=20 paired fixed-evidence trials (10 cold + 10 warm Stage-1) and emit g5_g6_acceptance.json (G5-G6)."""
     import asyncio

@@ -107,7 +107,7 @@ def complete_decisions(
                 reason = str(d.get("reasoning", f"Label reasoning for {pid}"))
             else:
                 rel = str(d.get("relation", "")).strip()
-                if rel == "skos:altLabel":
+                if rel in ("skos:altLabel", "skos:exactMatch", "exact_match"):
                     equiv, hidden = True, False
                     reason = f"Alias label for {pid}"
                 elif rel == "skos:hiddenLabel":
