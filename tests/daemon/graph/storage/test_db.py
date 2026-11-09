@@ -747,8 +747,6 @@ def test_step11_literal_facts_check_constraints_fact_sources_and_merge_collision
     """Verify H2: facts CHECK constraint, fact_sources provenance, orphan pruning, and merge collision dedup."""
     import sqlite3
 
-    from yaw.daemon.graph.storage import get_facts_with_meta_by_ids
-
     conn = open_yaw_db(tmp_path / "test_step11_h2.db")
     try:
         upsert_chunk_pointers(
@@ -831,12 +829,6 @@ def test_step11_literal_facts_check_constraints_fact_sources_and_merge_collision
                 ("c2", "ent-turing-alias", "passage", 1.0, "c2"),
             ],
         )
-
-        meta = get_facts_with_meta_by_ids(conn, ["fact-lit-1"])
-        assert meta["fact-lit-1"]["obj_kind"] == "literal"
-        assert meta["fact-lit-1"]["obj_id"] is None
-        assert meta["fact-lit-1"]["obj_literal_lex"] == "1912-06-23"
-        assert meta["fact-lit-1"]["obj_datatype"] == "xsd:date"
 
         # SHACL closed-world validation conforms for literal-object facts (obj_id IS NULL)
         assert lint_graph_shacl(conn) == []

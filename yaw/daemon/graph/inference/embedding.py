@@ -7,9 +7,7 @@ import os
 import re
 import time
 from collections.abc import Awaitable, Callable, Sequence
-from concurrent.futures import CancelledError
 from dataclasses import asdict, dataclass, replace
-from threading import Event
 from typing import Any, cast
 
 os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
@@ -392,54 +390,11 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
         """Bind a callback invoked with each structured embedding telemetry entry."""
         self._telemetry_hook = hook
 
-    def reset_telemetry(self) -> None:
-        """Clear accumulated embedding telemetry entries."""
-        self.telemetry.clear()
-
     def prepare_request(self, texts: Sequence[str], *, batch_size: int, stage: str) -> EmbeddingRequest:
         """Capture an immutable embedding contract on the engine owner thread."""
         return EmbeddingRequest(
             tuple(texts), self.profile.index_contract, self.task_mode, batch_size, self.max_batch_chars, stage=stage
         )
-
-    def execute_request(self, request: EmbeddingRequest, stop: Event | None = None) -> EmbeddingResult:
-        """Execute without publishing history, invoking hooks or accessing storage."""
-        if (self.profile.index_identity, self.task_mode, self.max_batch_chars) != (
-            request.profile.index_identity,
-            request.task_mode,
-            request.max_batch_chars,
-        ):
-            raise RuntimeError("Embedding settings changed during an indexing batch")
-        started = time.perf_counter()
-        texts, query, mapping, pieces, weights, batches = self._prepare_pieces_and_batches(
-            list(request.texts), instruction=request.instruction, batch_size=request.batch_size
-        )
-        flat: list[np.ndarray | None] = [None] * len(pieces)
-        for batch in batches:
-            if stop is not None and stop.is_set():
-                raise CancelledError("Indexing stopped before the next embedding request")
-            vectors = self._encode_prepared([pieces[i] for i in batch], {"batch_size": len(batch)})
-            if vectors.shape != (len(batch), request.profile.dimensions) or not np.isfinite(vectors).all():
-                raise ValueError("Embedding provider returned an invalid vector count, dimensions or values")
-            for i, vector in zip(batch, vectors, strict=True):
-                flat[i] = vector
-        result = self._build_embedding_result(
-            texts,
-            mapping,
-            pieces,
-            weights,
-            batches,
-            flat,
-            is_query=query,
-            instruction=request.instruction,
-            norm=True,
-            stage=request.stage,
-        )
-        result.telemetry["duration_seconds"] = time.perf_counter() - started
-        result.telemetry["started_at"] = started
-        result.telemetry["completed_at"] = time.perf_counter()
-        result.telemetry["batch_sizes"] = [len(batch) for batch in batches]
-        return result
 
     def publish_result(self, result: EmbeddingResult) -> np.ndarray:
         """Publish validated inference telemetry on the engine owner thread."""

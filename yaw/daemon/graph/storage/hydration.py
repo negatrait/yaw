@@ -1046,22 +1046,31 @@ def format_subgraph_for_qa(
             elif alias_clause:
                 concept_lines.append(f"- **{pref_name}**{alias_clause}")
 
-    sections: list[str] = []
-    if statement_lines:
-        sections.append("### Knowledge Graph Statements (rdf:Statement)\n" + "\n".join(statement_lines))
-    if trace_lines:
-        sections.append("### Taxonomy & Disambiguation Trace (SKOS / OWL)\n" + "\n".join(trace_lines))
-    if concept_lines:
-        sections.append("### Concept Definitions & Aliases (skos:Concept)\n" + "\n".join(concept_lines))
+    active_sections: list[str] = []
+    current_chars = 0
+    for title, lines in (
+        ("### Knowledge Graph Statements (rdf:Statement)", statement_lines),
+        ("### Taxonomy & Disambiguation Trace (SKOS / OWL)", trace_lines),
+        ("### Concept Definitions & Aliases (skos:Concept)", concept_lines),
+    ):
+        if not lines:
+            continue
+        kept_lines: list[str] = []
+        for line in lines:
+            needed = (
+                len(line)
+                + 1
+                + (len(title) + 2 if not kept_lines else 0)
+                + (2 if active_sections and not kept_lines else 0)
+            )
+            if current_chars + needed > max_subgraph_chars:
+                break
+            kept_lines.append(line)
+            current_chars += needed
+        if kept_lines:
+            active_sections.append(f"{title}\n" + "\n".join(kept_lines))
 
-    if not sections:
+    if not active_sections:
         return ""
 
-    subgraph_text = "\n\n".join(sections)
-    if len(subgraph_text) > max_subgraph_chars:
-        truncated = subgraph_text[:max_subgraph_chars]
-        last_nl = truncated.rfind("\n")
-        if last_nl > 0:
-            truncated = truncated[:last_nl]
-        return truncated.rstrip()
-    return subgraph_text
+    return "\n\n".join(active_sections).rstrip()

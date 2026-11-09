@@ -287,9 +287,6 @@ class CorpusIndexingLiveComponent:
     def reset_active_files(self) -> None:
         self._active_files = None
 
-    def init_active_files(self, files: dict[str, FileLike]) -> None:
-        self._active_files = dict(files)
-
     def set_active_file(self, key: str, value: FileLike) -> None:
         if self._active_files is not None:
             self._active_files[key] = value
@@ -624,6 +621,7 @@ def bind_native_indexing(
             shacl_identity=shacl_identity,
             synonymy_threshold=engine.synonymy_threshold,
             synonymy_top_k=engine.synonymy_top_k,
+            synonym_batch_size=engine.synonym_batch_size,
             ast_context_hops=engine.ast_context_hops,
             context_window_tokens=active_program.context_window_tokens,
             max_output_tokens=active_program.max_output_tokens,

@@ -16,6 +16,7 @@ from yaw.core import ChunkPointer, YawRuntimeError
 from yaw.daemon.graph.engine import YawGraphEngine
 from yaw.daemon.graph.inference import RLMInstructionProposer, YawProgram
 from yaw.daemon.graph.inference.chat import YawDSPyLM, create_dspy_lm
+from yaw.daemon.graph.inference.optimizer import configure_simba_task_learning
 from yaw.daemon.indexing import bind_native_indexing
 
 
@@ -23,7 +24,6 @@ def test_native_qa_predictor_state_survives_json_restore_and_deepcopy(tmp_path):
     program = YawProgram(enable_gbnf=False)
     assert type(program.qa) is dspy.ChainOfThought
     predictor = dict(program.named_predictors())["qa.predict"]
-    assert dict(program.all_stage_predictors())["qa"] is predictor
     lm = create_dspy_lm("gemma-4-E4B-it-qat-q4_0-gguf-Q4_0", cache=False)
     program.qa.set_lm(lm)
     assert predictor.lm is lm
@@ -127,8 +127,14 @@ def learning(tmp_path, url, *, resume=False):
     engine = bind_native_indexing(YawGraphEngine(tmp_path / "yaw.db", tmp_path, task, dspy.Embedder(lambda texts: [])))
     train = [dspy.Example(question="Who?", context="Source.").with_inputs("question", "context")]
     try:
-        engine._configure_simba_task_learning(
-            prop, task, train, lambda gold, pred: 0.0, save_path=tmp_path / "compiled.json", resume=resume
+        configure_simba_task_learning(
+            prop,
+            task,
+            train,
+            lambda gold, pred: 0.0,
+            hooks=engine._build_optimization_hooks(),
+            save_path=tmp_path / "compiled.json",
+            resume=resume,
         )
     except ValueError:
         engine.close()

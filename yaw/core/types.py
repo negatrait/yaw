@@ -252,22 +252,6 @@ class RelationTraversalPolicy:
     skos_broader_down: float = 0.5
     owl_different_from: float = 0.0
 
-    @property
-    def fact_fwd(self) -> float:
-        return self.fact_forward
-
-    @property
-    def fact_rev(self) -> float:
-        return self.fact_reverse
-
-    @property
-    def skos_broader(self) -> float:
-        return self.skos_broader_up
-
-    @property
-    def skos_narrower(self) -> float:
-        return self.skos_broader_down
-
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
@@ -449,15 +433,6 @@ def resolve_corpus_path(corpus_root: Path, rel_posix_path: str) -> Path:
     if not target_path.is_relative_to(root_resolved):
         raise ValueError(f"Path traversal detected: {rel_posix_path!r} resolves outside corpus root {corpus_root}")
     return target_path
-
-
-def to_rel_posix_path(corpus_root: Path, file_path: Path | str) -> str:
-    """Convert an absolute or relative file path to a relative POSIX path under corpus_root."""
-    root_resolved = corpus_root.resolve()
-    target_path = Path(file_path).resolve()
-    if not target_path.is_relative_to(root_resolved):
-        raise ValueError(f"File path {file_path!r} resolves outside corpus root {corpus_root}")
-    return target_path.relative_to(root_resolved).as_posix()
 
 
 _XSD_BOOLEAN_RE = re.compile(r"^(?:true|false)$", re.IGNORECASE)

@@ -20,6 +20,7 @@ from yaw.daemon.graph.inference import (
     compute_task_quality_score,
     create_dspy_lm,
 )
+from yaw.daemon.graph.inference.optimizer import configure_simba_task_learning
 from yaw.daemon.indexing import bind_native_indexing
 
 GOOD = "FULL_NAME: Answer with the full name supported by the context."
@@ -152,8 +153,14 @@ def make_learning(root, url, *, resume=False, answer="Alan Turing"):
     ]
     try:
         with dspy.context(lm=None):
-            engine._configure_simba_task_learning(
-                proposer, task, train, task_metric, save_path=root / "compiled.json", resume=resume
+            configure_simba_task_learning(
+                proposer,
+                task,
+                train,
+                task_metric,
+                hooks=engine._build_optimization_hooks(),
+                save_path=root / "compiled.json",
+                resume=resume,
             )
     except Exception:
         engine.close()

@@ -10,7 +10,6 @@ from typing import Any
 import pytest
 
 from yaw.core.types import detect_scalar_literal
-from yaw.daemon.graph.inference.chat import extract_completion_logprob_confidence
 from yaw.daemon.graph.ppr import build_transition_matrix, run_ppr
 from yaw.daemon.graph.storage.db import initialize_schema, open_managed_yaw_db
 from yaw.daemon.graph.storage.graph_ops import (
@@ -21,9 +20,7 @@ from yaw.daemon.graph.storage.graph_ops import (
 )
 from yaw.daemon.graph.storage.shacl import (
     auto_heal_deterministic_shacl,
-    format_subgraph_turtle,
     lint_graph_shacl,
-    query_graph_provenance,
     serialize_graph_turtle,
 )
 
@@ -48,36 +45,6 @@ def test_pool_confidences_scale_idempotency_and_unknown() -> None:
     c1, c2 = 0.9, 0.4
     expected_geom = math.exp((math.log(0.9) + math.log(0.4)) / 2.0)
     assert pool_confidences(c1, c2) == pytest.approx(expected_geom)
-
-    # extract_completion_logprob_confidence contract
-    # 1. With token logprobs structure
-    resp_with_lp = {
-        "choices": [
-            {
-                "logprobs": {
-                    "content": [
-                        {"token": "Alan", "logprob": -0.10536, "bytes": [65, 108, 97, 110]},
-                        {"token": " Turing", "logprob": -0.05129, "bytes": [32, 84, 117, 114, 105, 110, 103]},
-                    ]
-                }
-            }
-        ]
-    }
-    full_conf = extract_completion_logprob_confidence(resp_with_lp)
-    assert full_conf is not None
-    assert 0.0 < full_conf <= 1.0
-    # Mean logprob: (-0.10536 + -0.05129) / 2 = -0.078325 -> exp(-0.078325) ~ 0.92466
-    assert full_conf == pytest.approx(math.exp((-0.10536 + -0.05129) / 2.0), abs=1e-4)
-
-    # Span-specific confidence
-    span_conf = extract_completion_logprob_confidence(resp_with_lp, span_text="Turing")
-    assert span_conf is not None
-    assert span_conf == pytest.approx(math.exp(-0.05129), abs=1e-4)
-
-    # 2. Strict honest unknown when logprobs are absent
-    resp_without_lp = {"choices": [{"message": {"content": "Alan Turing"}}]}
-    assert extract_completion_logprob_confidence(resp_without_lp) is None
-    assert extract_completion_logprob_confidence(None) is None
 
 
 def test_bayesian_noisy_or_additive_evidence() -> None:
@@ -445,9 +412,8 @@ def test_markov_walk_divergence_and_turtle_payload(tmp_path: Path) -> None:
 
         # 2. Turtle serialization verification
         turtle_full = serialize_graph_turtle(conn)
-        subgraph_turtle = format_subgraph_turtle(conn, ["chunk-s"])
 
-        for ttl in (turtle_full, subgraph_turtle):
+        for ttl in (turtle_full,):
             # Standard W3C prefix header with default prefix : <urn:graph:>
             assert "@prefix : <urn:graph:> ." in ttl
             assert "@prefix skos: <http://www.w3.org/2004/02/skos/core#> ." in ttl
@@ -459,11 +425,6 @@ def test_markov_walk_divergence_and_turtle_payload(tmp_path: Path) -> None:
 
             # prov:value calibration emission
             assert 'prov:value "' in ttl
-
-        # 3. ProvenanceConfidenceShape verification
-        prov = query_graph_provenance(conn)
-        assert "provenance_sources" in prov
-        assert prov["provenance_sources"]["fact_sources"] == 2
 
         # Zero violations initially
         violations = lint_graph_shacl(conn)

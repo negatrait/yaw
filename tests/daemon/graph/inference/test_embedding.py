@@ -163,8 +163,6 @@ class EmbeddingTests(unittest.TestCase):
         )
         self.assertEqual(adapter.telemetry[0]["predictor"], "embedder")
         self.assertEqual(adapter.telemetry[0]["num_inputs"], 2)
-        adapter.reset_telemetry()
-        self.assertEqual(adapter.telemetry, [])
 
     def test_legacy_embedding_shim_is_retired(self):
         """Verify RetrievalEmbedding is completely removed from embedding and inference facade."""

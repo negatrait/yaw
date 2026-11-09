@@ -111,7 +111,7 @@ def test_serving_context_changes_real_extraction_truncation(provider):
             context_window_tokens=context_tokens,
         )
         with dspy.context(lm=lm, disable_history=True):
-            assert task.extract_entities(passage) == ("Aster",)
+            assert task.extract_entity_definitions(passage) == (("Aster", "A project."),)
         prompt = str(requests[-1]["messages"])
         assert ("TAIL_RETAINED_AT_64K" in prompt) == (context_tokens == 65536)
         assert "context_window_tokens" not in requests[-1]  # local budget, not an API parameter
@@ -237,7 +237,7 @@ def test_context_aware_extraction_preserves_complete_shacl_context(provider):
     for context in (65536, 131072):
         lm = create_dspy_lm("budget-test", base_url=url, cache=False, context_window_tokens=context)
         program = YawProgram(orchestrator_lm=lm, rlm_sub_lm=lm, context_window_tokens=context)
-        program.extract_entities(passage)
+        program.extract_entity_definitions(passage)
         assert ("TAIL_FOR_128K" in str(requests[-1]["messages"])) == (context == 131072)
         assert requests[-1].get("max_completion_tokens", requests[-1].get("max_tokens")) == context // 16
         program.propose_shacl_repairs(

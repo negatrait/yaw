@@ -327,7 +327,7 @@ class ArchitectureTests(unittest.TestCase):
         self.assertTrue(hasattr(ingestion, "declare_source_file"))
         self.assertTrue(hasattr(ingestion, "chunk_source_text"))
         self.assertTrue(hasattr(ingestion, "SourceMetadata"))
-        self.assertTrue(hasattr(ingestion, "extract_chunk_title"))
+        self.assertTrue(hasattr(ingestion, "chunk_source_text"))
         self.assertFalse(hasattr(ingestion, "chunk_markdown_text"))
         self.assertFalse(hasattr(ingestion, "chunk_json_text"))
         self.assertFalse(hasattr(ingestion, "CorpusIngestor"))

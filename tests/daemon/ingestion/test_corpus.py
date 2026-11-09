@@ -5,8 +5,7 @@ from pathlib import Path
 from yaw.daemon.graph.storage import hydrate_chunk_pointer
 from yaw.daemon.ingestion import (
     chunk_source_text,
-    extract_chunk_title,
-    extract_markdown_headings,
+    extract_ast_headings,
     resolve_heading_for_line,
 )
 
@@ -68,7 +67,7 @@ def test_extract_markdown_headings_and_skips_code_fences() -> None:
         "================\n"
         "Setext body.\n"
     )
-    headings = extract_markdown_headings(doc)
+    headings = extract_ast_headings(doc, language="markdown")
     # Must only contain Chapter 1, Section 1.1, and Setext Chapter 2
     titles = [h[1] for h in headings]
     assert "Chapter 1" in titles
@@ -95,11 +94,6 @@ def test_resolve_heading_for_line_and_extract_chunk_title() -> None:
     assert resolve_heading_for_line(headings, 8, "default") == "Section 1.1"
     # Line 20: after Chapter 2
     assert resolve_heading_for_line(headings, 20, "default") == "Chapter 2"
-
-    doc = "# Top Title\n\nIntro\n\n## Subheading\n\nLine 6\nLine 7"
-    assert extract_chunk_title(doc, start_line=1, rel_posix_path="a.md") == "Top Title"
-    assert extract_chunk_title(doc, start_line=5, rel_posix_path="a.md") == "Subheading"
-    assert extract_chunk_title(doc, start_line=7, rel_posix_path="a.md") == "Subheading"
 
 
 def test_parser_helper_edit_invalidates_persistent_memo_across_processes(tmp_path: Path) -> None:
@@ -321,7 +315,7 @@ def test_native_scopes_preserve_unindented_brace_style():
 
 def test_markdown_fences_require_matching_marker_and_closing_length():
     source = "````md\n# Hidden\n~~~\n# Also hidden\n```\n# Still hidden\n````\n# Visible\n"
-    assert extract_markdown_headings(source) == [(8, "Visible")]
+    assert extract_ast_headings(source, language="markdown") == [(8, "Visible")]
 
 
 def test_json_projection_rejects_unsafe_compact_spans_and_malformed_input(tmp_path):

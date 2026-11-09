@@ -25,7 +25,6 @@ from yaw.core import (
     is_scalar_label,
     text_processing,
 )
-from yaw.core.config import context_char_limit, scale_context_budget
 from yaw.daemon.graph.inference import DSPyEmbeddingAdapter, EmbeddingRequest
 from yaw.daemon.graph.inference.components import (
     EMBEDDING_ENDPOINT,
@@ -105,6 +104,7 @@ class GraphPlanSettings:
     shacl_identity: str = ""
     synonymy_threshold: float = 0.8
     synonymy_top_k: int = 5
+    synonym_batch_size: int = 4
     ast_context_hops: int = 1
     context_window_tokens: int = 32768
     max_output_tokens: int = 4096
@@ -1089,11 +1089,15 @@ async def plan_graph_publication(
         if candidates or raw_cand_count:
             decisions: list[dict[str, str]] = []
             if candidates:
-                batch_limit = max(1, scale_context_budget(8, settings.context_window_tokens))
-                max_dossier_chars = min(
-                    40000,
-                    context_char_limit(12000, settings.context_window_tokens, settings.max_output_tokens),
-                )
+                # Cognitive Load Safeguard: clamp batch_limit to max 4 pairs. Smaller models (4B-8B)
+                # suffer attention dispersion and conservative rejection when evaluating too many pairs at once.
+                # Actual prompt context fit is strictly governed by fits=extraction.program.synonym_batch_fits
+                # via DSPy adapter token counting. max_dossier_chars serves purely as a generous in-memory backstop
+                # (context_window_tokens * 3) to prevent unbounded memory growth before tokenization, ensuring
+                # individual pairs with rich context/excerpts are never prematurely split or rejected by
+                # character heuristics.
+                batch_limit = max(1, min(settings.synonym_batch_size, 4))
+                max_dossier_chars = max(40000, settings.context_window_tokens * 3)
                 evidence_batches = list(
                     iter_synonym_evidence(
                         staging_conn,

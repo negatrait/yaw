@@ -84,15 +84,6 @@ class YawRM:
         pids = tuple(str(p) if str(p).startswith("chunk-") else f"chunk-{i}" for i, p in enumerate(passages))
         return str(ctx), tuple(passages), tuple(scores), pids
 
-    def _invoke_hook(
-        self,
-        query: str,
-        *,
-        item_docs: Sequence[str] | None = None,
-    ) -> tuple[str, tuple[str, ...], tuple[float, ...]]:
-        ctx, passages, scores, _ = self._invoke_hook_with_pids(query, item_docs=item_docs)
-        return ctx, passages, scores
-
     def __call__(
         self,
         query_or_queries: str | list[str],

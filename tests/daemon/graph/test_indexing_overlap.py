@@ -12,7 +12,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 import cocoindex as coco
-import numpy as np
 import pytest
 from cocoindex.connectors import sqlite
 
@@ -493,20 +492,6 @@ def provider():
 def adapter(url):
     profile = EmbeddingProfile("overlap", "fixture", 4, 2048, "mean", "query: ", "text: ")
     return DSPyEmbeddingAdapter(profile, base_url=url + "/v1", batch_size=64)
-
-
-def test_async_embedding_request_matches_sync_without_publishing(provider):
-    url, state = provider
-    embedder = adapter(url)
-    request = embedder.prepare_request(
-        ["Ada studies algebra.", "Euler studies graphs."], batch_size=64, stage="chunk_embed"
-    )
-    expected = embedder.execute_request(request)
-    actual = asyncio.run(embedder.aexecute_request(request))
-    np.testing.assert_array_equal(actual.vectors, expected.vectors)
-    assert actual.telemetry["batch_sizes"] == expected.telemetry["batch_sizes"]
-    assert len(state["intervals"]) == 2
-    assert not embedder.telemetry
 
 
 @pytest.mark.parametrize("mode", ["count", "dimensions", "nan"])
@@ -1247,8 +1232,8 @@ def test_corpus_feed_subscriber_incremental_active_files_event_handling():
     assert asyncio.run(handle.ready()) is None
     assert op.update_full_calls == 2
 
-    # Now populate active_files via init_active_files
-    comp.init_active_files({"doc1.md": "file_obj_1", "doc2.md": "file_obj_2"})
+    # Seed subscriber state
+    vars(comp)["_active_files"] = {"doc1.md": "file_obj_1", "doc2.md": "file_obj_2"}
 
     # update(key, value) updates in O(1)
     asyncio.run(subscriber.update("doc3.md", "file_obj_3"))

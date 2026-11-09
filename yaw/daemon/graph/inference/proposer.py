@@ -319,14 +319,6 @@ class RLMInstructionProposer:
         self.inner_rlm.sub_lm = self.worker_lm or self.orchestrator_lm
         self._bind_predictor_lms()
 
-    def all_reflection_predictors(self) -> list[tuple[str, Any]]:
-        """Return all 3 active reflection predictors (`inner_rlm`, `llm_proposer`, `llm_compressor`)."""
-        return [
-            ("inner_rlm", self.inner_rlm),
-            ("llm_proposer", self.llm_proposer),
-            ("llm_compressor", self.llm_compressor),
-        ]
-
     def dump_simba_state(self) -> dict[str, Any]:
         """JSON-safe DSPy predictor state; exclude clients, traces and optimizer archives."""
         predictors = {}

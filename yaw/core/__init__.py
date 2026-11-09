@@ -51,7 +51,6 @@ _PUBLIC_API: dict[str, str] = {
     "resolve_corpus_path": ".types",
     "set_config_value": ".config",
     "text_processing": ".types",
-    "to_rel_posix_path": ".types",
     "write_text_atomic": ".config",
     "write_via_temp_atomic": ".config",
 }

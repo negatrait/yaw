@@ -30,13 +30,11 @@ from yaw.daemon.graph.inference import (
     PASSAGE_INSTRUCTION,
     DSPyEmbeddingAdapter,
     GraphOptimizationHooks,
-    RLMInstructionProposer,
     YawProgram,
     YawRetriever,
     YawRM,
     compile_pareto_ensemble,
     compute_mdhash_id,
-    configure_simba_task_learning,
     configure_yaw_dspy_cache,
     embed_fingerprint,
     evaluate_program,
@@ -108,6 +106,7 @@ class YawGraphEngine:
         damping: float = 0.5,
         synonymy_threshold: float = 0.8,
         synonymy_top_k: int = 100,
+        synonym_batch_size: int = 4,
         retrieval_top_k: int = 10,
         embed_batch_size: int = 64,
         activation: str = "scaled_tanh",
@@ -156,6 +155,7 @@ class YawGraphEngine:
         self.damping = damping
         self.synonymy_threshold = synonymy_threshold
         self.synonymy_top_k = synonymy_top_k
+        self.synonym_batch_size = synonym_batch_size
         self.retrieval_top_k = retrieval_top_k
         self.embed_batch_size = embed_batch_size
         self.activation = activation
@@ -1578,27 +1578,6 @@ class YawGraphEngine:
             rehydrate_sandbox_after_optimization=self._rehydrate_sandbox_after_optimization,
             dspy_cache_dir=self._dspy_cache_dir,
             config=self.config,
-        )
-
-    def _configure_simba_task_learning(
-        self,
-        proposer: RLMInstructionProposer,
-        template: YawProgram,
-        trainset: Sequence[Any],
-        metric: Callable[[Any, Any], float],
-        *,
-        save_path: Path | str | None,
-        resume: bool,
-    ) -> None:
-        """Wire counterfactual training rewards and atomic worker snapshots in yaw.db."""
-        configure_simba_task_learning(
-            proposer,
-            template,
-            trainset,
-            metric,
-            self._build_optimization_hooks(),
-            save_path=save_path,
-            resume=resume,
         )
 
     def evolve_prompts(

@@ -48,7 +48,6 @@ _PUBLIC_API: dict[str, str] = {
     "create_dspy_lm": ".chat",
     "create_dspy_rlm_pair": ".chat",
     "configure_yaw_dspy_cache": ".chat",
-    "extract_completion_logprob_confidence": ".chat",
     "set_yaw_sleep_seconds": ".chat",
     "trim_diagnostics": ".diagnostics",
     "lm_supports_gbnf": ".grammars",

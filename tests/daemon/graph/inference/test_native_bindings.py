@@ -127,7 +127,7 @@ def test_native_precedence_per_call_then_bound_then_context(provider):
     with dspy.context(lm=ambient, adapter=program.json_adapter):
         program.ner(passage="first")
         program.ner(passage="second", lm=override)
-        program.extract_entities("third", lm=override)
+        program.extract_entity_definitions("third", lm=override)
         program.answer_question(context="Widget is an object.", question="What is it?", lm=override)
     assert [request["model"] for request in requests] == ["bound", "override", "override", "override"]
     assert program.ner.lm is bound
@@ -138,7 +138,9 @@ def test_unbound_program_uses_context_set_after_construction(provider):
     program = YawProgram()
     assert all(predictor.lm is None for _, predictor in program.named_predictors())
     with dspy.context(lm=lm_for(url, "contextual"), adapter=program.json_adapter):
-        assert program.extract_entities("Widget is an object.") == ("Widget",)
+        assert program.extract_entity_definitions("Widget is an object.") == (
+            ("Widget", "An object described in the source."),
+        )
     assert requests[-1]["model"] == "contextual"
 
 
@@ -149,7 +151,7 @@ def test_task_roles_and_query_intent_override_keep_models_independent(provider):
     override = lm_for(url, "override")
     program = YawProgram(orchestrator_lm=qa, rlm_sub_lm=extraction)
     with dspy.context(lm=override):
-        program.extract_entities("Widget is an object.")
+        program.extract_entity_definitions("Widget is an object.")
         program.answer_question(context="Widget is an object.", question="What is it?")
         assert program.extract_query_intent("What is Widget?", lm=override) == "Widget is an object"
     assert [request["model"] for request in requests] == ["extraction", "qa", "override"]
@@ -161,7 +163,7 @@ def test_candidate_deepcopy_preserves_native_lm_copy_settings(provider):
     program = YawProgram(orchestrator_lm=lm, rlm_sub_lm=lm)
     program.ner.set_lm(lm.copy(temperature=0.8, max_tokens=119))
     candidate = copy.deepcopy(program)
-    candidate.extract_entities("Widget is an object.")
+    candidate.extract_entity_definitions("Widget is an object.")
     assert requests[-1]["temperature"] == 0.8
     assert requests[-1].get("max_completion_tokens", requests[-1].get("max_tokens")) == 119
     assert program.qa.predict.lm.kwargs["temperature"] == 0.1
@@ -181,7 +183,7 @@ def test_native_state_roundtrip_keeps_demos_and_explicit_deployment_lms(tmp_path
     assert restored.ner.demos[0]["named_entities"] == [["A", "An example concept."]]
     assert restored.qa.predict.signature.instructions == "Use only supplied evidence."
     assert restored.get_lm() is replacement
-    restored.extract_entities("Widget is an object.")
+    restored.extract_entity_definitions("Widget is an object.")
     assert requests[-1]["model"] == "replacement"
 
 

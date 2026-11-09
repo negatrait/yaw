@@ -59,17 +59,6 @@ from .rlm import STAGE_RLM_DELEGATION_RULES, PositionalSafeRLM
 from .synonyms import SynonymRequestBudget
 
 
-def _bounded_prompt_json(items: Sequence[Any], max_items: int, max_chars: int) -> str:
-    """Fit whole structured input items; never split a JSON item to fit a prompt."""
-    selected = list(items[:max_items])
-    while selected:
-        rendered = json.dumps(selected, ensure_ascii=False)
-        if len(rendered) <= max_chars:
-            return rendered
-        selected.pop()
-    return "[]"
-
-
 class YawProgram(dspy.Module):
     """Unified DSPy Module for HippoRAG 2 OpenIE, EDC/SKOS Schema Canon, SHACL Repair, Recognition Memory, and \
 Multi-Hop QA.
@@ -274,22 +263,6 @@ Deno/Pyodide WASM) with
         if orchestrator is not None:
             self.qa.set_lm(orchestrator)
             self.shacl_healer_rlm.set_lm(orchestrator)
-
-    def all_stage_predictors(self) -> list[tuple[str, Any]]:
-        """Return all canonical stage predictors (10 direct GBNF + 1 SHACL RLM healer)."""
-        return [
-            ("ner", self.ner),
-            ("triples", self.triples),
-            ("entity_definer", self.entity_definer),
-            ("label_judge", self.label_judge),
-            ("hierarchy_judge", self.hierarchy_judge),
-            ("related_judge", self.related_judge),
-            ("shacl_repair", self.shacl_repair),
-            ("shacl_healer_rlm", self.shacl_healer_rlm),
-            ("triple_filter", self.triple_filter),
-            ("query_intent", self.query_intent),
-            ("qa", self.qa.predict),
-        ]
 
     def set_graph_tools(
         self,
@@ -737,17 +710,6 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
         _, entity_defs = self._run_ner_stage(passage, lm=lm, use_gbnf=use_gbnf)
         return entity_defs
 
-    def extract_entities(
-        self,
-        passage: str,
-        *,
-        lm: Any = None,
-        use_gbnf: bool | None = None,
-    ) -> tuple[str, ...]:
-        """Run DSPy NER extraction on llama w/ GBNF."""
-        entities, _ = self._run_ner_stage(passage, lm=lm, use_gbnf=use_gbnf)
-        return entities
-
     def define_missing_entities(
         self,
         passage: str,
@@ -865,23 +827,6 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
             entity_definitions=definitions,
             known_entities=names,
         )
-
-    def extract_triples(
-        self,
-        passage: str,
-        named_entities: Sequence[Any],
-        *,
-        lm: Any = None,
-        use_gbnf: bool | None = None,
-    ) -> tuple[tuple[str, str, str], ...]:
-        """Run DSPy triple extraction on llama w/ GBNF."""
-        structured = self.extract_structured_triples(
-            passage,
-            named_entities,
-            lm=lm,
-            use_gbnf=use_gbnf,
-        )
-        return tuple(st.as_tuple() for st in structured)
 
     def extract_openie(
         self,

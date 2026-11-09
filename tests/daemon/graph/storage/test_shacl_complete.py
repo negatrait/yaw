@@ -5,7 +5,6 @@ from pathlib import Path
 from yaw.core import ChunkPointer
 from yaw.daemon.graph.storage import (
     apply_shacl_repairs,
-    get_facts_with_meta_by_ids,
     inspect_focus_node,
     lint_graph_shacl,
     open_yaw_db,
@@ -732,10 +731,9 @@ def test_shacl_auto_healing_complete(tmp_path: Path) -> None:
         ).fetchone()
         assert date_fid_row is not None
         date_fid = str(date_fid_row[0])
-        fact_meta = get_facts_with_meta_by_ids(conn, [date_fid])
-        assert fact_meta[date_fid]["obj_kind"] == "literal"
-        assert fact_meta[date_fid]["obj_id"] is None
-        assert fact_meta[date_fid]["obj_literal_lex"] == "2026-10-25"
+        assert tuple(
+            conn.execute("SELECT obj_kind,obj_id,obj_literal_lex FROM facts WHERE fact_id=?", (date_fid,)).fetchone()
+        ) == ("literal", None, "2026-10-25")
 
         # 9. Inverted broader edge was inverted: security engineering -> engineering
         eng_broader = conn.execute(
@@ -924,10 +922,9 @@ def test_heal_8_scalar_entity_converts_to_literal_and_prunes_edges(tmp_path: Pat
         ).fetchone()
         assert date_fid_row is not None
         date_fid = str(date_fid_row[0])
-        f_meta = get_facts_with_meta_by_ids(conn, [date_fid])[date_fid]
-        assert f_meta["obj_kind"] == "literal"
-        assert f_meta["obj_id"] is None
-        assert f_meta["obj_literal_lex"] == "2026-10-25"
+        assert tuple(
+            conn.execute("SELECT obj_kind,obj_id,obj_literal_lex FROM facts WHERE fact_id=?", (date_fid,)).fetchone()
+        ) == ("literal", None, "2026-10-25")
 
         edge_row = conn.execute(
             "SELECT weight FROM edges WHERE src_id = 'ent-sys' AND dst_id = 'ent-date' AND kind = 'fact'"

@@ -1045,37 +1045,6 @@ no frequency penalty."""
             enable_gbnf=True,
         )
 
-        stage_preds = prog.all_stage_predictors()
-        refl_preds = proposer.all_reflection_predictors()
-        self.assertEqual(len(stage_preds), 11)
-        self.assertEqual(len(refl_preds), 3)
-
-        all_14 = dict(stage_preds + refl_preds)
-        self.assertEqual(len(all_14), 14)
-        self.assertEqual(
-            list(all_14.keys()),
-            [
-                "ner",
-                "triples",
-                "entity_definer",
-                "label_judge",
-                "hierarchy_judge",
-                "related_judge",
-                "shacl_repair",
-                "shacl_healer_rlm",
-                "triple_filter",
-                "query_intent",
-                "qa",
-                "inner_rlm",
-                "llm_proposer",
-                "llm_compressor",
-            ],
-        )
-
-        # Pairwise-distinct Signature classes across all 14 canonical predictors
-        sig_classes = [p.signature for p in all_14.values()]
-        self.assertEqual(len(set(sig_classes)), 14)
-
         # Native role bindings share the actual LM, not artificial per-predictor
         # proxies. The native writer reads the worker's scoped rollout context.
         self.assertIs(prog.ner.lm, sub_lm)

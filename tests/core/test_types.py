@@ -17,7 +17,6 @@ from yaw.core.types import (
     inclusive_end_line,
     resolve_corpus_path,
     text_processing,
-    to_rel_posix_path,
 )
 
 
@@ -130,15 +129,9 @@ class TypesTests(unittest.TestCase):
             resolved = resolve_corpus_path(root, "nested/doc.md")
             self.assertEqual(resolved, sub)
 
-            # Valid relative posix path conversion
-            rel = to_rel_posix_path(root, sub)
-            self.assertEqual(rel, "nested/doc.md")
-
             # Traversal attempt rejection
             with self.assertRaises(ValueError):
                 resolve_corpus_path(root, "../outside.txt")
-            with self.assertRaises(ValueError):
-                to_rel_posix_path(root, root.parent / "outside.txt")
 
     def test_text_processing(self):
         self.assertEqual(text_processing("Apple Inc."), "apple inc")

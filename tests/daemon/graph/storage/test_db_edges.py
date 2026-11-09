@@ -12,7 +12,6 @@ from yaw.daemon.graph.storage import (
     deserialize_f32_vector,
     find_entity_disambiguation_candidates,
     get_entity_metadata_batch,
-    get_facts_with_meta_by_ids,
     initialize_schema,
     open_readonly_yaw_db,
     open_yaw_db,
@@ -69,26 +68,6 @@ def test_failed_owned_transaction_rolls_back_partial_writes_and_outer_owner_reta
         assert conn.execute("SELECT count(*) FROM entities").fetchone()[0] == 1
         conn.rollback()
         assert conn.execute("SELECT count(*) FROM entities").fetchone()[0] == 0
-
-
-def test_fact_metadata_preserves_original_triples_and_optional_entity_definitions(tmp_path):
-    with closing(open_yaw_db(tmp_path / "meta.db")) as conn:
-        upsert_entities(conn, [("ada", "Ada", "Mathematician"), ("notes", "Notes", "Publication")])
-        upsert_facts(conn, [("fact", "ada", "wrote", "notes", '["Ada","wrote","Notes"]', "Ada wrote Notes.")])
-        assert get_facts_with_meta_by_ids(conn, []) == {}
-        assert get_facts_with_meta_by_ids(conn, ["missing"]) == {}
-        assert get_facts_with_meta_by_ids(conn, ["fact", "missing"])["fact"] == {
-            "fact_id": "fact",
-            "subj_id": "ada",
-            "pred": "wrote",
-            "obj_id": "notes",
-            "triple": ("Ada", "wrote", "Notes"),
-            "definition": "Ada wrote Notes.",
-            "subj_def": "Mathematician",
-            "obj_def": "Publication",
-        }
-        conn.execute("DELETE FROM entities WHERE entity_id='notes'")
-        assert get_facts_with_meta_by_ids(conn, ["fact"])["fact"]["obj_def"] == ""
 
 
 @pytest.mark.parametrize("blob", [b"", b"x", b"12345"])

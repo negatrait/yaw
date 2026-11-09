@@ -215,11 +215,6 @@ def extract_ast_headings(
     return sorted(headings_by_line.items(), key=lambda h: h[0])
 
 
-def extract_markdown_headings(content: str | CodeSource) -> list[tuple[int, str]]:
-    """Extract sorted [(1_indexed_start_line, title)] Markdown headings using CocoIndex Rust AST."""
-    return extract_ast_headings(content, language="markdown")
-
-
 def resolve_heading_for_line(
     headings: Sequence[tuple[int, str]],
     start_line: int,
@@ -234,14 +229,6 @@ def resolve_heading_for_line(
         return fallback_title
     heading_title = headings[idx - 1][1]
     return heading_title if heading_title else fallback_title
-
-
-def extract_chunk_title(content: str, start_line: int, rel_posix_path: str) -> str:
-    """Extract closest preceding AST heading/scope or fallback to file stem."""
-    lang = detect_corpus_language(rel_posix_path) or "markdown"
-    headings = extract_ast_headings(content, language=lang)
-    fallback_title = Path(rel_posix_path).stem
-    return resolve_heading_for_line(headings, start_line, fallback_title)
 
 
 @dataclass(frozen=True, slots=True)

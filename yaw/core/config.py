@@ -227,6 +227,7 @@ class YawConfig:
 
     synonymy_threshold: float = 0.8
     synonymy_top_k: int = 100
+    synonym_batch_size: int = 4
     embed_batch_size: int = 64
     embed_batch_chars: int = 3500
     max_context_chars: int | None = None
@@ -423,6 +424,7 @@ class YawConfig:
             "reflection_tokenizer_url": self.reflection_tokenizer_url,
             "max_context_chars": self.max_context_chars,
             "synonymy_threshold": self.synonymy_threshold,
+            "synonym_batch_size": self.synonym_batch_size,
             "damping": self.damping,
         }
         raw = json.dumps(payload, sort_keys=True).encode("utf-8")
@@ -482,6 +484,7 @@ _FIELD_TO_SECTION: dict[str, str] = {
     "damping": "graph",
     "synonymy_threshold": "graph",
     "synonymy_top_k": "graph",
+    "synonym_batch_size": "graph",
     "embed_batch_size": "graph",
     "embed_batch_chars": "graph",
     "max_context_chars": "graph",

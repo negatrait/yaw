@@ -1312,61 +1312,6 @@ def get_facts_by_ids(
     return results
 
 
-def get_facts_with_meta_by_ids(
-    conn: sqlite3.Connection,
-    fact_ids: Sequence[str],
-) -> dict[str, dict[str, Any]]:
-    """Retrieve enriched fact records with statement, subject, object definitions, and literal metadata."""
-    if not fact_ids:
-        return {}
-    results: dict[str, dict[str, Any]] = {}
-    for batch in batched(fact_ids):
-        placeholders = ",".join("?" for _ in batch)
-        cursor = conn.execute(
-            f"""
-            SELECT
-                f.fact_id,
-                f.subj_id,
-                f.pred,
-                f.obj_id,
-                f.raw_triple_json,
-                f.definition,
-                COALESCE(es.definition, '') AS subj_def,
-                COALESCE(eo.definition, '') AS obj_def,
-                f.obj_kind,
-                f.obj_literal_lex,
-                f.obj_datatype,
-                f.obj_lang
-            FROM facts f
-            LEFT JOIN entities es ON es.entity_id = f.subj_id
-            LEFT JOIN entities eo ON eo.entity_id = f.obj_id
-            WHERE f.fact_id IN ({placeholders})
-            """,
-            tuple(batch),
-        )
-        for row in cursor:
-            fid = str(row[0])
-            raw_list = json.loads(row[4])
-            item: dict[str, Any] = {
-                "fact_id": fid,
-                "subj_id": str(row[1]),
-                "pred": str(row[2]),
-                "obj_id": str(row[3]) if row[3] is not None else None,
-                "triple": (str(raw_list[0]), str(raw_list[1]), str(raw_list[2])),
-                "definition": str(row[5]),
-                "subj_def": str(row[6]),
-                "obj_def": str(row[7]),
-            }
-            obj_kind = str(row[8] or "entity")
-            if obj_kind != "entity" or row[9] is not None or row[10] or row[11]:
-                item["obj_kind"] = obj_kind
-                item["obj_literal_lex"] = str(row[9]) if row[9] is not None else None
-                item["obj_datatype"] = str(row[10] or "")
-                item["obj_lang"] = str(row[11] or "")
-            results[fid] = item
-    return results
-
-
 def get_entity_doc_frequencies(
     conn: sqlite3.Connection,
     entity_ids: Sequence[str],

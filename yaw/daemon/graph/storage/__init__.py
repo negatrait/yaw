@@ -49,7 +49,6 @@ _PUBLIC_API: dict[str, str] = {
     "upsert_semantic_edges": ".graph_ops",
     "get_existing_ids": ".graph_ops",
     "get_facts_by_ids": ".graph_ops",
-    "get_facts_with_meta_by_ids": ".graph_ops",
     "get_entity_doc_frequencies": ".graph_ops",
     "get_entity_metadata_batch": ".graph_ops",
     "get_graph_counts": ".graph_ops",
@@ -58,10 +57,7 @@ _PUBLIC_API: dict[str, str] = {
     "pool_confidences": ".graph_ops",
     "bayesian_noisy_or": ".graph_ops",
     # Closed-world SQL SHACL linter, repair execution & W3C Turtle serializer
-    "W3C_PREFIX_HEADER": ".shacl",
     "auto_heal_deterministic_shacl": ".shacl",
-    "format_subgraph_turtle": ".shacl",
-    "query_graph_provenance": ".shacl",
     "inspect_focus_node": ".shacl",
     "format_entity_skos_markdown": ".shacl",
     "format_pair_disambiguation_dossier": ".shacl",
