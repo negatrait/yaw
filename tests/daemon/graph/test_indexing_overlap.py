@@ -1212,3 +1212,227 @@ def test_shared_coco_environment_lifecycle_and_app_caching(tmp_path):
 
     assert resolve_coco_state_root(root_a).resolve() not in _SHARED_COCO_RUNTIMES
     assert resolve_coco_state_root(root_b).resolve() not in _SHARED_COCO_RUNTIMES
+
+
+def test_corpus_feed_subscriber_incremental_active_files_event_handling():
+    from typing import cast
+
+    from yaw.daemon.indexing import CorpusIndexingLiveComponent, _CorpusFeedSubscriber
+
+    class MockOperator:
+        def __init__(self) -> None:
+            self.update_full_calls = 0
+
+        async def update_full(self) -> None:
+            self.update_full_calls += 1
+
+        async def mark_ready(self) -> None:
+            pass
+
+    op = MockOperator()
+    comp = CorpusIndexingLiveComponent(
+        files=None,
+        sources=cast(Any, None),
+        artifacts=cast(Any, None),
+        settings=SourceSettings(("*.md",), ()),
+        identity=InferenceIdentity("prog", "embed"),
+    )
+    subscriber = _CorpusFeedSubscriber(cast(coco.LiveComponentOperator, op), comp)
+
+    # When active_files is None, update and delete do not crash and still call update_full
+    assert comp.active_files is None
+    handle = asyncio.run(subscriber.update("doc1.md", "file_obj_1"))
+    assert asyncio.run(handle.ready()) is None
+    assert op.update_full_calls == 1
+    assert comp.active_files is None
+
+    handle = asyncio.run(subscriber.delete("doc1.md"))
+    assert asyncio.run(handle.ready()) is None
+    assert op.update_full_calls == 2
+
+    # Now populate active_files via init_active_files
+    comp.init_active_files({"doc1.md": "file_obj_1", "doc2.md": "file_obj_2"})
+
+    # update(key, value) updates in O(1)
+    asyncio.run(subscriber.update("doc3.md", "file_obj_3"))
+    assert op.update_full_calls == 3
+    assert comp.active_files == {
+        "doc1.md": "file_obj_1",
+        "doc2.md": "file_obj_2",
+        "doc3.md": "file_obj_3",
+    }
+
+    # delete(key) pops in O(1)
+    asyncio.run(subscriber.delete("doc2.md"))
+    assert op.update_full_calls == 4
+    assert comp.active_files == {
+        "doc1.md": "file_obj_1",
+        "doc3.md": "file_obj_3",
+    }
+
+    # delete of non-existent key is safe
+    asyncio.run(subscriber.delete("non_existent.md"))
+    assert op.update_full_calls == 5
+    assert comp.active_files == {
+        "doc1.md": "file_obj_1",
+        "doc3.md": "file_obj_3",
+    }
+
+    # update_all() sets active_files to None
+    asyncio.run(subscriber.update_all())
+    assert op.update_full_calls == 6
+    assert comp.active_files is None
+
+
+def test_corpus_indexing_live_component_micro_batching_and_memo_hits(tmp_path, provider):
+    url, state = provider
+    state["delay"] = 0
+    root = tmp_path / "documents"
+    root.mkdir()
+    for i in range(5):
+        (root / f"doc_{i:02d}.md").write_text(f"Ada Lovelace studied science topic {i:02d}.", encoding="utf-8")
+
+    db = open_managed_yaw_db(tmp_path / "yaw.db")
+    lm = create_dspy_lm("overlap", base_url=url + "/v1", cache=False, num_retries=0, max_tokens=512)
+    program = YawProgram(rlm_sub_lm=lm, max_output_tokens=512)
+    embedder = adapter(url)
+
+    context = coco.ContextProvider()
+    context.provide(SOURCE_DB, db)
+    context.provide(GRAPH_DB, db)
+    context.provide(VALIDATE_SQLITE, validate_graph_state)
+    context.provide(SOURCE_ROOT, root)
+    context.provide(EMBEDDING_ENDPOINT, EmbeddingEndpoint(embedder, asyncio.Semaphore(2)))
+    context.provide(OPENIE_ENDPOINT, OpenIEEndpoint(program, lm, "fixture-v1", asyncio.Semaphore(2)))
+
+    graph_settings = GraphPlanSettings(
+        corpus_root=root,
+        program_identity="fixture-v1",
+        embedding_identity=embedder.profile.index_identity,
+        synonymy_top_k=0,
+    )
+    env = coco.Environment(settings=coco.Settings.from_env(tmp_path / "state"), context_provider=context)
+    app = coco.App(
+        coco.AppConfig(name="batching_pipeline", environment=env, max_inflight_components=4),
+        indexing_app_main,
+        SourceSettings(("**/*.md",), (), min_chunk_size=1),
+        InferenceIdentity("fixture-v1", embedder.profile.index_identity),
+        graph_settings,
+        False,  # watch_reload_signal
+        False,  # live
+        2,  # batch_size = 2
+    )
+    try:
+        # Pass 1: 5 chunks discovered, batch_size=2 -> 2 chunks published, remaining=3
+        app.update_blocking()
+        comp = CorpusIndexingLiveComponent.last_instance
+        assert comp is not None
+        assert comp.remaining_chunks == 3
+        with db.readonly() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 2
+
+        calls_after_pass1 = len(state["intervals"])
+        assert calls_after_pass1 > 0
+
+        # Pass 2: next 2 chunks -> 4 published, remaining=1
+        app.update_blocking()
+        comp = CorpusIndexingLiveComponent.last_instance
+        assert comp is not None
+        assert comp.remaining_chunks == 1
+        with db.readonly() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 4
+
+        calls_after_pass2 = len(state["intervals"])
+        # Retained chunks from Pass 1 hit memo! Only the 2 new chunks incur calls.
+        assert calls_after_pass2 > calls_after_pass1
+
+        # Pass 3: final 1 chunk -> 5 published, remaining=0
+        app.update_blocking()
+        comp = CorpusIndexingLiveComponent.last_instance
+        assert comp is not None
+        assert comp.remaining_chunks == 0
+        with db.readonly() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 5
+
+        calls_after_pass3 = len(state["intervals"])
+        assert calls_after_pass3 > calls_after_pass2
+
+        # Pass 4: unchanged -> remaining=0, 0 additional provider calls (full memo hit!)
+        app.update_blocking()
+        comp = CorpusIndexingLiveComponent.last_instance
+        assert comp is not None
+        assert comp.remaining_chunks == 0
+        with db.readonly() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 5
+        assert len(state["intervals"]) == calls_after_pass3
+    finally:
+        env.close()
+        db.close()
+
+
+def test_active_context_keys_override_constructor_defaults(tmp_path, provider):
+    from yaw.daemon.indexing import (
+        ACTIVE_GRAPH_SETTINGS,
+        ACTIVE_INFERENCE_IDENTITY,
+        ACTIVE_SOURCE_SETTINGS,
+    )
+
+    url, state = provider
+    state["delay"] = 0
+    root = tmp_path / "documents"
+    root.mkdir()
+    (root / "doc.md").write_text("Ada studies Algebra.", encoding="utf-8")
+    (root / "doc2.md").write_text("Unrelated text", encoding="utf-8")
+
+    db = open_managed_yaw_db(tmp_path / "yaw.db")
+    lm = create_dspy_lm("overlap", base_url=url + "/v1", cache=False, num_retries=0, max_tokens=512)
+    program = YawProgram(rlm_sub_lm=lm, max_output_tokens=512)
+    embedder = adapter(url)
+
+    active_src = SourceSettings(("**/*.md",), (), included_files=("doc.md",), min_chunk_size=1)
+    active_ident = InferenceIdentity("active-v1", embedder.profile.index_identity)
+    active_graph = GraphPlanSettings(
+        corpus_root=root,
+        program_identity="active-v1",
+        embedding_identity=embedder.profile.index_identity,
+        synonymy_top_k=0,
+    )
+
+    context = coco.ContextProvider()
+    context.provide(SOURCE_DB, db)
+    context.provide(GRAPH_DB, db)
+    context.provide(VALIDATE_SQLITE, validate_graph_state)
+    context.provide(SOURCE_ROOT, root)
+    context.provide(EMBEDDING_ENDPOINT, EmbeddingEndpoint(embedder, asyncio.Semaphore(2)))
+    context.provide(OPENIE_ENDPOINT, OpenIEEndpoint(program, lm, "active-v1", asyncio.Semaphore(2)))
+    context.provide(ACTIVE_SOURCE_SETTINGS, active_src)
+    context.provide(ACTIVE_INFERENCE_IDENTITY, active_ident)
+    context.provide(ACTIVE_GRAPH_SETTINGS, active_graph)
+
+    env = coco.Environment(settings=coco.Settings.from_env(tmp_path / "state"), context_provider=context)
+    # Pass dummy/fallback settings to indexing_app_main; context keys will override them
+    app = coco.App(
+        coco.AppConfig(name="active_ctx_pipeline", environment=env),
+        indexing_app_main,
+        SourceSettings(("**/*.md",), ()),
+        InferenceIdentity("fallback", "fallback"),
+        None,  # graph_settings fallback is None
+        False,
+        False,
+    )
+    try:
+        app.update_blocking()
+        with db.readonly() as conn:
+            # Overridden active_graph caused publish_graph to run and publish chunks
+            assert conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 1
+            chunk_row = conn.execute("SELECT rel_posix_path FROM chunks").fetchone()
+            assert chunk_row[0] == "doc.md"
+            # Overridden active_src included_files filtered out doc2.md from source_chunks
+            src_rows = conn.execute("SELECT rel_posix_path FROM source_chunks").fetchall()
+            assert [r[0] for r in src_rows] == ["doc.md"]
+            # Overridden active_ident was stored in chunk_inference
+            row = conn.execute("SELECT program_identity FROM chunk_inference").fetchone()
+            assert row[0] == "active-v1"
+    finally:
+        env.close()
+        db.close()

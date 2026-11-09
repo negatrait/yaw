@@ -1,6 +1,7 @@
 """Native source, inference, and declarative graph target composition at the daemon boundary."""
 
 import asyncio
+import contextlib
 import hashlib
 import json
 from collections.abc import Callable, Sequence
@@ -95,6 +96,11 @@ class InferenceIdentity:
     embedding: str
 
 
+ACTIVE_SOURCE_SETTINGS = coco.ContextKey[SourceSettings | None]("yaw/active_source_settings")
+ACTIVE_INFERENCE_IDENTITY = coco.ContextKey[InferenceIdentity | None]("yaw/active_inference_identity")
+ACTIVE_GRAPH_SETTINGS = coco.ContextKey[GraphPlanSettings | None]("yaw/active_graph_settings")
+
+
 def _managed_db_identity(db: sqlite.ManagedConnection) -> str:
     with db.readonly() as conn:
         has_meta = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone()
@@ -106,7 +112,7 @@ def _managed_db_identity(db: sqlite.ManagedConnection) -> str:
         return resolve_db_identity(conn)
 
 
-@coco.fn
+@coco.fn(memo=True, version=1)
 async def process_chunk(
     metadata: SourceMetadata,
     target: sqlite.TableTarget[ChunkInference],
@@ -191,52 +197,6 @@ async def process_chunk(
     )
 
 
-@coco.fn
-async def process_file(
-    file: FileLike,
-    sources: sqlite.TableTarget[SourceMetadata],
-    artifacts: sqlite.TableTarget[ChunkInference],
-    settings: SourceSettings,
-    identity: InferenceIdentity,
-    db_identity: str = "",
-) -> tuple[ChunkProcessOutput, ...]:
-    source_root = coco.use_context(SOURCE_ROOT)
-    target_file = source_root / file.file_path.path
-    if not target_file.is_file():
-        return ()
-    chunking_settings = normalize_chunking_settings(settings)
-    chunk_items = await coco.use_mount(
-        coco.component_subpath("source"),
-        declare_source_file,
-        file,
-        sources,
-        chunking_settings,
-    )
-    if not target_file.is_file():
-        return ()
-    try:
-        outputs = await asyncio.gather(
-            *(
-                coco.use_mount(
-                    coco.component_subpath("chunk", metadata.chunk_id),
-                    process_chunk,
-                    metadata,
-                    artifacts,
-                    identity,
-                    chunking_settings,
-                    text,
-                    db_identity,
-                )
-                for metadata, text in chunk_items
-            )
-        )
-    except ValueError:
-        if not target_file.is_file():
-            return ()
-        raise
-    return tuple(outputs)
-
-
 @coco.fn(memo=True, version=2)
 async def publish_graph(
     settings: GraphPlanSettings,
@@ -257,8 +217,13 @@ class _CompletedHandle:
 class _CorpusFeedSubscriber:
     """Forwards live localfs file events into serialized CorpusIndexingLiveComponent updates."""
 
-    def __init__(self, operator: coco.LiveComponentOperator) -> None:
+    def __init__(
+        self,
+        operator: coco.LiveComponentOperator,
+        component: CorpusIndexingLiveComponent,
+    ) -> None:
         self._operator = operator
+        self._component = component
         self._lock = asyncio.Lock()
 
     async def _refresh(self) -> None:
@@ -266,19 +231,23 @@ class _CorpusFeedSubscriber:
             await self._operator.update_full()
 
     async def update_all(self) -> None:
-        await self._refresh()
+        async with self._lock:
+            self._component.reset_active_files()
+            await self._operator.update_full()
 
     async def mark_ready(self) -> None:
         await self._operator.mark_ready()
 
     async def update(self, key: Any, value: Any) -> Any:
-        _ = key, value
-        await self._refresh()
+        async with self._lock:
+            self._component.set_active_file(str(key), value)
+            await self._operator.update_full()
         return _CompletedHandle()
 
     async def delete(self, key: Any) -> Any:
-        _ = key
-        await self._refresh()
+        async with self._lock:
+            self._component.delete_active_file(str(key))
+            await self._operator.update_full()
         return _CompletedHandle()
 
     async def read_committed_state(self, key: Any) -> Any:
@@ -292,6 +261,8 @@ class _CorpusFeedSubscriber:
 class CorpusIndexingLiveComponent:
     """Native LiveComponent that coordinates file indexing and direct ChunkProcessOutput publication."""
 
+    last_instance: CorpusIndexingLiveComponent | None = None
+
     def __init__(
         self,
         files: Any,
@@ -302,7 +273,9 @@ class CorpusIndexingLiveComponent:
         graph_settings: GraphPlanSettings | None = None,
         db_identity: str = "",
         live: bool = True,
+        batch_size: int = 64,
     ) -> None:
+        CorpusIndexingLiveComponent.last_instance = self
         self._files = files
         self._sources = sources
         self._artifacts = artifacts
@@ -311,35 +284,169 @@ class CorpusIndexingLiveComponent:
         self._graph_settings = graph_settings
         self._db_identity = db_identity
         self._live = live
+        self._batch_size = batch_size
+        self._active_files: dict[str, FileLike] | None = None
+        self.remaining_chunks: int = 0
         self.last_summary: GraphPlanSummary | None = None
+
+    @property
+    def active_files(self) -> dict[str, FileLike] | None:
+        return self._active_files
+
+    def reset_active_files(self) -> None:
+        self._active_files = None
+
+    def init_active_files(self, files: dict[str, FileLike]) -> None:
+        self._active_files = dict(files)
+
+    def set_active_file(self, key: str, value: FileLike) -> None:
+        if self._active_files is not None:
+            self._active_files[key] = value
+
+    def delete_active_file(self, key: str) -> None:
+        if self._active_files is not None:
+            self._active_files.pop(key, None)
 
     async def process(self) -> GraphPlanSummary | None:
         try:
-            entries = [item async for item in self._files.items()]
-            file_batches = await asyncio.gather(
+            if self._active_files is None:
+                self._active_files = {str(rel): f async for rel, f in self._files.items()}
+
+            try:
+                active_src = coco.use_context(ACTIVE_SOURCE_SETTINGS)
+                effective_settings = active_src if active_src is not None else self._settings
+            except KeyError:
+                effective_settings = self._settings
+
+            try:
+                active_ident = coco.use_context(ACTIVE_INFERENCE_IDENTITY)
+                effective_identity = active_ident if active_ident is not None else self._identity
+            except KeyError:
+                effective_identity = self._identity
+
+            try:
+                active_graph = coco.use_context(ACTIVE_GRAPH_SETTINGS)
+                effective_graph_settings = active_graph if active_graph is not None else self._graph_settings
+            except KeyError:
+                effective_graph_settings = self._graph_settings
+
+            chunking_settings = normalize_chunking_settings(effective_settings)
+
+            source_root = None
+            with contextlib.suppress(KeyError):
+                source_root = coco.use_context(SOURCE_ROOT)
+
+            source_matcher = build_source_path_matcher(effective_settings)
+
+            file_items: list[tuple[str, FileLike]] = []
+            for rel_path, file in sorted(self._active_files.items(), key=lambda item: item[0]):
+                if not source_matcher.is_file_included(Path(file.file_path.path)):
+                    continue
+                if source_root is not None:
+                    target_file = source_root / file.file_path.path
+                    if not target_file.is_file():
+                        continue
+                file_items.append((rel_path, file))
+
+            file_contributions = await asyncio.gather(
                 *(
                     coco.use_mount(
-                        coco.component_subpath("process_file", rel_path),
-                        process_file,
+                        coco.component_subpath("source_file", rel_path),
+                        declare_source_file,
                         file,
                         self._sources,
-                        self._artifacts,
-                        self._settings,
-                        self._identity,
-                        self._db_identity,
+                        chunking_settings,
                     )
-                    for rel_path, file in entries
+                    for rel_path, file in file_items
                 )
             )
-            chunk_outputs = tuple(out for batch in file_batches for out in batch)
-            if self._graph_settings is None:
+
+            discovered_chunks: list[tuple[SourceMetadata, str]] = [
+                item for contributions in file_contributions for item in contributions
+            ]
+
+            if effective_graph_settings is None:
+                self.remaining_chunks = 0
+                active_chunks = tuple(discovered_chunks)
+            else:
+                target_db = None
+                try:
+                    target_db = coco.use_context(GRAPH_DB)
+                except KeyError:
+                    with contextlib.suppress(KeyError):
+                        target_db = coco.use_context(SOURCE_DB)
+
+                published_fingerprints: dict[str, str] = {}
+                published_chunks: set[str] = set()
+
+                if target_db is not None:
+                    with target_db.readonly() as conn:
+                        has_chunks = (
+                            conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks'").fetchone()
+                            is not None
+                        )
+                        if has_chunks:
+                            published_chunks = {row[0] for row in conn.execute("SELECT chunk_id FROM chunks")}
+                            has_meta = (
+                                conn.execute(
+                                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'"
+                                ).fetchone()
+                                is not None
+                            )
+                            if has_meta:
+                                saved = get_meta(conn, "graph_input_fingerprints")
+                                if saved:
+                                    published_fingerprints = dict(json.loads(saved))
+
+                retained: list[tuple[SourceMetadata, str]] = []
+                changed: list[tuple[SourceMetadata, str]] = []
+
+                for metadata, text in discovered_chunks:
+                    pointer = ChunkPointer(
+                        metadata.chunk_id,
+                        metadata.rel_posix_path,
+                        metadata.start_line,
+                        metadata.end_line,
+                        metadata.title,
+                        metadata.ast_island_start,
+                        metadata.ast_island_end,
+                    )
+                    if metadata.chunk_id in published_chunks:
+                        fp = fingerprint_object((effective_graph_settings, pointer, text)).hex()
+                        if published_fingerprints.get(metadata.chunk_id) == fp:
+                            retained.append((metadata, text))
+                            continue
+                    changed.append((metadata, text))
+
+                batch_size = self._batch_size
+                active_chunks = (*retained, *changed[:batch_size])
+                self.remaining_chunks = max(0, len(changed) - batch_size)
+
+            chunk_outputs = await asyncio.gather(
+                *(
+                    coco.use_mount(
+                        coco.component_subpath("chunk", metadata.chunk_id),
+                        process_chunk,
+                        metadata,
+                        self._artifacts,
+                        effective_identity,
+                        chunking_settings,
+                        text,
+                        self._db_identity,
+                    )
+                    for metadata, text in active_chunks
+                )
+            )
+
+            if effective_graph_settings is None:
                 self.last_summary = None
                 return None
+
             self.last_summary = await coco.use_mount(
                 coco.component_subpath("publication"),
                 publish_graph,
-                self._graph_settings,
-                chunk_outputs,
+                effective_graph_settings,
+                tuple(chunk_outputs),
                 self._db_identity,
             )
             return self.last_summary
@@ -358,7 +465,7 @@ class CorpusIndexingLiveComponent:
             await operator.update_full()
             await operator.mark_ready()
             return
-        await items.watch(_CorpusFeedSubscriber(operator))
+        await items.watch(_CorpusFeedSubscriber(operator, self))
 
 
 @coco.fn
@@ -377,6 +484,7 @@ async def indexing_app_main(
     graph_settings: GraphPlanSettings | None = None,
     watch_reload_signal: bool = False,
     live: bool = True,
+    batch_size: int = 64,
 ) -> None:
     source_db = coco.use_context(SOURCE_DB)
     db_identity = _managed_db_identity(source_db)
@@ -400,6 +508,7 @@ async def indexing_app_main(
         graph_settings,
         db_identity,
         live,
+        batch_size,
     )
     await corpus_handle.ready()
     if watch_reload_signal:
@@ -495,7 +604,7 @@ def partition_frozen_chunks(
             if settings is None or published_inputs is None:
                 is_retained = True
             else:
-                expected_fp = fingerprint_object((settings, pointer, text, entry[1])).hex()
+                expected_fp = fingerprint_object((settings, pointer, text)).hex()
                 is_retained = published_inputs.get(pointer.chunk_id) == expected_fp
         destination = retained if is_retained else changed
         destination.append((pointer, text))

@@ -180,7 +180,7 @@ async def chunk_file_memo(file: FileLike, settings: SourceSettings) -> tuple[tup
     )
 
 
-@coco.fn
+@coco.fn(memo=True, version=1)
 async def declare_source_file(
     file: FileLike, table: sqlite.TableTarget[SourceMetadata], settings: SourceSettings
 ) -> tuple[tuple[SourceMetadata, str], ...]:

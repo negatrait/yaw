@@ -851,8 +851,7 @@ async def plan_graph_publication(
     # Reuse only verified unchanged contributions. Edits, removals and semantic
     # profile changes require recomputing their graph interpretation.
     input_fingerprints = {
-        out.chunk_id: fingerprint_object((settings, out.pointer, out.text, out.inference.extraction_json)).hex()
-        for out in ordered_outputs
+        out.chunk_id: fingerprint_object((settings, out.pointer, out.text)).hex() for out in ordered_outputs
     }
     incremental = (
         bool(published_inputs)
@@ -883,8 +882,8 @@ async def plan_graph_publication(
     chunk_vec_pairs: list[tuple[str, np.ndarray]] = []
     for out in outputs_to_process:
         chunks.append((out.pointer, out.text))
-        all_records.append(deserialize_openie_record(out.inference.extraction_json, chunk_id=out.chunk_id))
-        raw_traces = json.loads(out.inference.traces_json or "[]")
+        all_records.append(deserialize_openie_record(out.extraction_json, chunk_id=out.chunk_id))
+        raw_traces = json.loads(out.traces_json or "[]")
         for t in raw_traces:
             if isinstance(t, Mapping):
                 all_traces.append(

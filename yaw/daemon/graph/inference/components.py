@@ -47,6 +47,14 @@ class ChunkProcessOutput:
     def vector_f32(self) -> bytes:
         return self.embedding
 
+    @property
+    def extraction_json(self) -> str:
+        return self.inference.extraction_json
+
+    @property
+    def traces_json(self) -> str:
+        return self.inference.traces_json
+
 
 @dataclass
 class EmbeddingEndpoint:
