@@ -2,19 +2,82 @@
 
 import hashlib
 import inspect
+import threading
 from dataclasses import dataclass, replace
 from importlib.metadata import version
 from pathlib import Path, PurePath, PurePosixPath
+from typing import Any
 
 import cocoindex as coco
 from cocoindex.connectors import sqlite
 from cocoindex.resources.file import FileLike, FilePathMatcher, PatternFilePathMatcher
 
-from yaw.core import json_document_fields
+from yaw.core import json_document_fields, resolve_coco_state_root
 from yaw.daemon.ingestion.corpus import chunk_source_text
 
 SOURCE_DB = coco.ContextKey[sqlite.ManagedConnection]("yaw/source_db")
 SOURCE_ROOT = coco.ContextKey[Path]("yaw/source_root", detect_change=True)
+
+
+@dataclass
+class SharedCocoRuntime:
+    environment: coco.Environment
+    context: coco.ContextProvider
+    apps: dict[str, coco.App[Any, Any]]
+    ref_count: int = 0
+
+
+_SharedCocoRuntime = SharedCocoRuntime
+SHARED_COCO_RUNTIMES: dict[Path, SharedCocoRuntime] = {}
+_SHARED_COCO_RUNTIMES = SHARED_COCO_RUNTIMES
+_COCO_RUNTIME_LOCK = threading.Lock()
+
+
+def acquire_coco_environment(state_root: Path | str) -> SharedCocoRuntime:
+    """Return the shared process-level SharedCocoRuntime(environment, context, apps, ref_count) for
+    resolved_state_root, creating it on first access so multiple CocoIndex apps share one
+    open LMDB handle and reuse registered app instances by name.
+    """
+    resolved = resolve_coco_state_root(state_root).resolve()
+    with _COCO_RUNTIME_LOCK:
+        runtime = SHARED_COCO_RUNTIMES.get(resolved)
+        if runtime is None:
+            context = coco.ContextProvider()
+            environment = coco.Environment(
+                settings=coco.Settings.from_env(resolved),
+                context_provider=context,
+            )
+            runtime = SharedCocoRuntime(
+                environment=environment,
+                context=context,
+                apps={},
+                ref_count=1,
+            )
+            SHARED_COCO_RUNTIMES[resolved] = runtime
+        else:
+            runtime.ref_count += 1
+        return runtime
+
+
+def close_coco_environment(state_root: Path | str | None = None, *, force: bool = False) -> None:
+    """Close and evict the shared SharedCocoRuntime for state_root (or all open environments when None)."""
+    with _COCO_RUNTIME_LOCK:
+        if state_root is None:
+            for runtime in list(SHARED_COCO_RUNTIMES.values()):
+                runtime.apps.clear()
+                runtime.environment.close()
+            SHARED_COCO_RUNTIMES.clear()
+            return
+
+        resolved = resolve_coco_state_root(state_root).resolve()
+        runtime = SHARED_COCO_RUNTIMES.get(resolved)
+        if runtime is None:
+            return
+        runtime.ref_count = max(0, runtime.ref_count - 1)
+        if runtime.ref_count == 0 or force:
+            SHARED_COCO_RUNTIMES.pop(resolved, None)
+            runtime.apps.clear()
+            runtime.environment.close()
 
 
 @dataclass(frozen=True, slots=True)

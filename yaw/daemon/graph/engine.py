@@ -132,6 +132,7 @@ class YawGraphEngine:
         self.embedder = embedder
         self.config: Any = None
         self.indexing_runner: Callable[[Sequence[tuple[ChunkPointer, str]], YawProgram], GraphPlanSummary] | None = None
+        self._close_callbacks: list[Callable[[], None]] = []
 
         self.max_context_chars = (
             max_context_chars
@@ -619,9 +620,18 @@ class YawGraphEngine:
             if getattr(target, "embedding_document_prefix", None) is None:
                 target.embedding_document_prefix = getattr(profile, "document_prefix", None)
 
+    def add_close_callback(self, callback: Callable[[], None]) -> None:
+        """Register a callback to run when engine.close() is invoked."""
+        with self._lock:
+            self._close_callbacks.append(callback)
+
     def close(self) -> None:
         """Close SQLite database connection and release any open DSPy disk cache handles."""
         with self._lock:
+            callbacks = list(self._close_callbacks)
+            self._close_callbacks.clear()
+            for callback in callbacks:
+                callback()
             active_cache = getattr(dspy, "cache", None)
             disk_cache = getattr(active_cache, "disk_cache", None) if active_cache is not None else None
             close_fn = getattr(disk_cache, "close", None)

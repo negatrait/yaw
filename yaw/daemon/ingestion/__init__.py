@@ -47,6 +47,10 @@ _PUBLIC_API: dict[str, str] = {
     "chunk_file_memo": ".source_targets",
     "declare_source_file": ".source_targets",
     "normalize_chunking_settings": ".source_targets",
+    "acquire_coco_environment": ".source_targets",
+    "close_coco_environment": ".source_targets",
+    "SharedCocoRuntime": ".source_targets",
+    "SHARED_COCO_RUNTIMES": ".source_targets",
 }
 
 __all__ = sorted(_PUBLIC_API.keys())

@@ -1149,3 +1149,66 @@ def test_direct_use_mount_chunk_output_handoff_without_chunk_state_target(tmp_pa
         assert orig_plan is not None
     finally:
         engine.close()
+
+
+def test_shared_coco_environment_lifecycle_and_app_caching(tmp_path):
+    import yaw.daemon.indexing as indexing_mod
+    import yaw.daemon.runtime as runtime_mod
+    from yaw.daemon.indexing import (
+        _SHARED_COCO_RUNTIMES,
+        _SharedCocoRuntime,
+        acquire_coco_environment,
+        close_coco_environment,
+    )
+
+    for symbol in (
+        "_".join(("", "release", "idle", "coco", "env")),
+        "_".join(("", "Active", "Coco", "App", "Registry")),
+        "_".join(("register", "active", "coco", "env", "closer")),
+        "_".join(("release", "idle", "coco", "env")),
+    ):
+        assert not hasattr(indexing_mod, symbol), f"{symbol} must not exist in yaw.daemon.indexing"
+        assert not hasattr(runtime_mod, symbol), f"{symbol} must not exist in yaw.daemon.runtime"
+
+    root_a = tmp_path / "env_a"
+    root_b = tmp_path / "env_b"
+
+    shared_a1 = acquire_coco_environment(root_a)
+    assert isinstance(shared_a1, _SharedCocoRuntime)
+    assert shared_a1.ref_count == 1
+    assert shared_a1.apps == {}
+
+    shared_a2 = acquire_coco_environment(root_a)
+    assert shared_a2 is shared_a1
+    assert shared_a1.ref_count == 2
+
+    shared_b = acquire_coco_environment(root_b)
+    assert shared_b is not shared_a1
+    assert shared_b.ref_count == 1
+
+    dummy_app = coco.App(coco.AppConfig(name="dummy", environment=shared_a1.environment), lambda: None)
+    shared_a1.apps["dummy"] = dummy_app
+
+    close_coco_environment(root_a)
+    assert shared_a1.ref_count == 1
+    assert "dummy" in shared_a1.apps
+
+    shared_a3 = acquire_coco_environment(root_a)
+    assert shared_a3 is shared_a1
+    assert shared_a1.ref_count == 2
+    assert "dummy" in shared_a1.apps
+
+    close_coco_environment(root_a)
+    assert shared_a1.ref_count == 1
+
+    close_coco_environment(root_a)
+    assert shared_a1.ref_count == 0
+    assert len(shared_a1.apps) == 0
+
+    close_coco_environment(root_b)
+    assert shared_b.ref_count == 0
+
+    from yaw.core import resolve_coco_state_root
+
+    assert resolve_coco_state_root(root_a).resolve() not in _SHARED_COCO_RUNTIMES
+    assert resolve_coco_state_root(root_b).resolve() not in _SHARED_COCO_RUNTIMES

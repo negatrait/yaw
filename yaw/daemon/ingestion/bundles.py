@@ -22,8 +22,10 @@ from .source_targets import (
     SOURCE_ROOT,
     SourceMetadata,
     SourceSettings,
+    acquire_coco_environment,
     build_source_path_matcher,
     chunk_file_memo,
+    close_coco_environment,
     normalize_chunking_settings,
 )
 
@@ -228,18 +230,23 @@ def validate_dataset_bundle(bundle: DatasetBundle) -> None:
         raise ValueError("Dataset document inventory does not match its manifest")
 
 
+BUNDLE_SOURCE_SETTINGS = coco.ContextKey[SourceSettings | None]("yaw/bundle_source_settings")
+
+
 @coco.fn
 async def _bundle_snapshot_app_main(
-    settings: SourceSettings,
+    settings: SourceSettings | None = None,
 ) -> dict[str, tuple[tuple[SourceMetadata, str], ...]]:
+    effective = settings if settings is not None else coco.use_context(BUNDLE_SOURCE_SETTINGS)
+    assert effective is not None
     files = localfs.walk_dir(
         SOURCE_ROOT,
         recursive=False,
         live=False,
-        path_matcher=build_source_path_matcher(settings),
+        path_matcher=build_source_path_matcher(effective),
         rescan_interval=None,
     )
-    chunking_settings = normalize_chunking_settings(settings)
+    chunking_settings = normalize_chunking_settings(effective)
     items = [(rel, file) async for rel, file in files.items()]
     rels = [rel for rel, _ in items]
     per_file_chunks = await asyncio.gather(*(chunk_file_memo(file, chunking_settings) for _, file in items))
@@ -286,22 +293,24 @@ def snapshot_dataset_bundle(
         json_keys_blacklist=tuple(json_keys_blacklist),
         included_files=included_files,
     )
-    resolved_state = Path(state_dir).resolve()
+    resolved_state = Path(state_dir if state_dir is not None else bundle.root).resolve()
     resolved_state.mkdir(parents=True, exist_ok=True)
     with FileLock(str(bundle.root / "bundle.lock")):
         validate_dataset_bundle(bundle)
-        context = coco.ContextProvider()
-        context.provide(SOURCE_ROOT, bundle.documents_root.resolve())
-        env = coco.Environment(settings=coco.Settings.from_env(resolved_state / "coco_lmdb"), context_provider=context)
-        app = coco.App(
-            coco.AppConfig(name="yaw_bundle_source", environment=env, max_inflight_components=4),
-            _bundle_snapshot_app_main,
-            settings,
-        )
+        shared = acquire_coco_environment(resolved_state)
+        shared.context.provide(SOURCE_ROOT, bundle.documents_root.resolve())
+        shared.context.provide(BUNDLE_SOURCE_SETTINGS, settings)
+        app = shared.apps.get("yaw_bundle_source")
+        if app is None:
+            app = coco.App(
+                coco.AppConfig(name="yaw_bundle_source", environment=shared.environment, max_inflight_components=4),
+                _bundle_snapshot_app_main,
+            )
+            shared.apps["yaw_bundle_source"] = app
         try:
             bundle_chunks = asyncio.run(_run_bundle_snapshot_app(app))
         finally:
-            env.close()
+            close_coco_environment(resolved_state)
 
         snapshot: list[tuple[ChunkPointer, str]] = []
         for doc in bundle.documents:

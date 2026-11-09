@@ -13,6 +13,8 @@ import sqlite_vec
 from cocoindex.connectors.sqlite import ManagedConnection
 from cocoindex.connectors.sqlite import connect as coco_sqlite_connect
 
+from yaw.core import resolve_coco_state_root as resolve_coco_state_root
+
 SQL_BATCH_SIZE = 500
 DEFAULT_VEC_DIMENSION = 768
 _VEC0_PK_COLUMNS: dict[str, str] = {
@@ -365,23 +367,6 @@ def validate_graph_schema(conn: sqlite3.Connection) -> None:
     ).fetchone()
     if retired is not None:
         raise ValueError("Obsolete graph schema: preserve this database and build a fresh scheme-free index")
-
-
-def resolve_coco_state_root(state_dir: Path | str) -> Path:
-    """Return the single persistent CocoIndex LMDB directory (<state_dir>/coco_lmdb).
-
-    Never append transient per-candidate SQLite filenames.
-    """
-    resolved = Path(state_dir).resolve()
-    if resolved.name == "coco_lmdb":
-        return resolved
-    if (
-        resolved.name.startswith("coco_state")
-        or resolved.suffix in {".db", ".sqlite", ".sqlite3"}
-        or resolved.is_file()
-    ):
-        return resolved.parent / "coco_lmdb"
-    return resolved / "coco_lmdb"
 
 
 def resolve_db_identity(conn: sqlite3.Connection, db_path: Path | str | None = None) -> str:

@@ -32,6 +32,7 @@ from yaw.core import (
     YawRuntimeError,
     configure_logging,
     parse_dataset_list,
+    resolve_coco_state_root,
     write_text_atomic,
 )
 from yaw.daemon.graph.engine import YawGraphEngine
@@ -51,7 +52,7 @@ from yaw.daemon.graph.inference.components import (
     OpenIEEndpoint,
 )
 from yaw.daemon.graph.planner import GraphPlanSettings
-from yaw.daemon.graph.storage.db import GRAPH_DB, resolve_coco_state_root
+from yaw.daemon.graph.storage.db import GRAPH_DB
 from yaw.daemon.graph.storage.managed_sqlite import VALIDATE_SQLITE
 from yaw.daemon.graph.storage.rows import validate_graph_state
 from yaw.daemon.indexing import (
@@ -60,7 +61,9 @@ from yaw.daemon.indexing import (
     RELOAD_SIGNAL_ROOT,
     InferenceIdentity,
     SyncOutcome,
+    acquire_coco_environment,
     bind_native_indexing,
+    close_coco_environment,
     graph_plan_fingerprints,
     indexing_app_main,
 )
@@ -278,23 +281,10 @@ class YawRuntime:
 
     def _close_coco_app(self) -> None:
         if self._coco_env is not None:
-            self._coco_env.close()
+            if self.config.state_dir is not None:
+                close_coco_environment(self.config.state_dir)
             self._coco_env = None
             self._coco_app = None
-
-    @classmethod
-    def _release_idle_coco_env(cls, state_dir: Path) -> None:
-        resolved = state_dir.resolve()
-        with cls._active_lock:
-            instances = list(cls._active_instances.values())
-        for rt in instances:
-            if (
-                rt._coco_env is not None
-                and rt._live_thread is None
-                and rt.config.state_dir is not None
-                and resolve_coco_state_root(rt.config.state_dir).resolve() == resolved
-            ):
-                rt._close_coco_app()
 
     def _build_coco_app(self) -> None:
         assert self.engine is not None
@@ -314,7 +304,11 @@ class YawRuntime:
         self._embedding_endpoint = EmbeddingEndpoint(embedder, asyncio.Semaphore(4))
         self._openie_endpoint = OpenIEEndpoint(program, lm, prog_id, asyncio.Semaphore(1))
 
-        context = coco.ContextProvider()
+        state_dir = resolve_coco_state_root(self.config.state_dir)
+        shared = acquire_coco_environment(state_dir)
+        self._coco_env = shared.environment
+
+        context = shared.context
         context.provide(SOURCE_DB, self.engine.managed_conn)
         context.provide(GRAPH_DB, self.engine.managed_conn)
         context.provide(VALIDATE_SQLITE, validate_graph_state)
@@ -325,12 +319,6 @@ class YawRuntime:
         context.provide(RELOAD_SIGNAL_HANDLER, self._on_reload_signal)
         context.provide(INDEXING_ERROR_SINK, self._record_indexing_error)
 
-        state_dir = resolve_coco_state_root(self.config.state_dir)
-        self._release_idle_coco_env(state_dir)
-        self._coco_env = coco.Environment(
-            settings=coco.Settings.from_env(state_dir),
-            context_provider=context,
-        )
         src_settings = SourceSettings(
             included_patterns=tuple(self.config.included_patterns),
             excluded_patterns=tuple(self.config.excluded_patterns),
@@ -355,14 +343,18 @@ class YawRuntime:
             chunk_overlap=self.config.chunk_overlap,
             min_chunk_size=self.config.min_chunk_size,
         )
-        self._coco_app = coco.App(
-            coco.AppConfig(name="yaw_indexing", environment=self._coco_env, max_inflight_components=4),
-            indexing_app_main,
-            src_settings,
-            InferenceIdentity(program=prog_id, embedding=emb_id),
-            graph_settings,
-            self.auto_poll,
-        )
+        app = shared.apps.get("yaw_indexing")
+        if app is None:
+            app = coco.App(
+                coco.AppConfig(name="yaw_indexing", environment=self._coco_env, max_inflight_components=4),
+                indexing_app_main,
+                src_settings,
+                InferenceIdentity(program=prog_id, embedding=emb_id),
+                graph_settings,
+                self.auto_poll,
+            )
+            shared.apps["yaw_indexing"] = app
+        self._coco_app = app
 
     def _create_bound_engine(
         self,
@@ -396,7 +388,8 @@ class YawRuntime:
                 max_context_chars=cfg.max_context_chars,
                 max_ast_expansion_hops=cfg.max_ast_expansion_hops,
                 ast_context_hops=cfg.ast_context_hops,
-            )
+            ),
+            state_root=cfg.state_dir,
         )
         return program, embedder, engine
 
@@ -417,7 +410,7 @@ class YawRuntime:
                 if self.engine is not None:
                     cleanup.callback(self.engine.close)
                 if self._coco_env is not None:
-                    cleanup.callback(self._coco_env.close)
+                    cleanup.callback(self._close_coco_app)
                 cleanup.callback(self._stop_live_update)
         finally:
             self._coco_env = None
@@ -1125,9 +1118,6 @@ class YawRuntime:
             eff_sleep = (
                 sleep_seconds if sleep_seconds is not None else getattr(self.config, "optimize_sleep_seconds", 0.0)
             )
-            assert self.config.state_dir is not None
-            self._close_coco_app()
-            self._release_idle_coco_env(resolve_coco_state_root(self.config.state_dir))
             try:
                 self.engine.evolve_prompts(
                     trainset=trainset,
