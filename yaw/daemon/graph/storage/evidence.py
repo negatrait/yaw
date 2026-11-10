@@ -144,16 +144,20 @@ def build_evidence(
         return mentions[key]
 
     for name, definition in record.entity_definitions:
-        if not is_scalar_label(name):
+        if not is_scalar_label(name) and not detect_scalar_literal(name)[0]:
             mention(name, definition)
     defined = {name for name, _ in record.entity_definitions}
     for name in record.entities:
-        if name not in defined and not is_scalar_label(name):
+        if name not in defined and not is_scalar_label(name) and not detect_scalar_literal(name)[0]:
             mention(name, "")
     assertions = []
     for triple in record.structured_triples:
         subject = mention(triple.subj, triple.subj_def)
-        obj = mention(triple.obj, triple.obj_def) if triple.obj_kind == "entity" else None
+        is_literal_obj = (
+            triple.obj_kind == "literal" or is_scalar_label(triple.obj) or detect_scalar_literal(triple.obj)[0]
+        )
+        obj = None if is_literal_obj else mention(triple.obj, triple.obj_def)
+        effective_kind = "literal" if is_literal_obj else "entity"
         raw_data = asdict(triple)
         raw = json.dumps(raw_data, sort_keys=True, ensure_ascii=False)
         raw_data.pop("llm_prob")
@@ -174,12 +178,12 @@ def build_evidence(
                     triple.obj,
                     subject.resolved_definition,
                     obj.resolved_definition if obj else "",
-                    triple.obj_kind,
+                    effective_kind,
                 )
                 else fact_id(
                     subject.entity_id,
                     triple.pred.strip(),
-                    triple.obj_kind,
+                    effective_kind,
                     obj.entity_id if obj else triple.obj.strip(),
                     (
                         triple.obj_datatype

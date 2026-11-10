@@ -418,7 +418,7 @@ def materialize_entities_and_facts(
                     edges_with_sources.append((s_id, o_id, "fact", 0.8, cid))
 
         for e_raw_lbl, e_def in ner_entities:
-            if is_scalar_label(e_raw_lbl):
+            if is_scalar_label(e_raw_lbl) or detect_scalar_literal(e_raw_lbl)[0]:
                 continue
             e_norm = str(text_processing(e_raw_lbl)) or e_raw_lbl.strip().lower()
             e_key = (e_norm, e_def.strip().lower())

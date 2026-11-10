@@ -219,3 +219,68 @@ def test_clean_surface_label_and_single_surface_pref_label_alignment(tmp_path: P
             ).fetchall()
         ]
         assert alt_raws == ["feature flag"]
+
+
+def test_scalar_literal_object_evidence_materialization_and_binding():
+    from yaw.core import ChunkPointer
+    from yaw.daemon.graph.storage.evidence import build_evidence
+
+    raw_record = OpenIERecord(
+        chunk_id="chunk-lat-1",
+        entities=("API Gateway", "<= 200ms"),
+        triples=(("API Gateway", "has latency target", "<= 200ms"),),
+        structured_triples=(
+            StructuredTriple(
+                subj="API Gateway",
+                subj_def="Edge entry point for incoming client traffic.",
+                pred="has latency target",
+                obj="<= 200ms",
+                obj_kind="entity",  # Raw OpenIE extracted as entity
+                spo_def="API Gateway latency target is <= 200ms.",
+            ),
+        ),
+        entity_definitions=(
+            ("API Gateway", "Edge entry point for incoming client traffic."),
+            ("<= 200ms", "Maximum acceptable response time."),
+        ),
+    )
+    normalized = normalize_openie_record(raw_record)
+    assert len(normalized.triples) == 1
+    st = normalized.triples[0]
+    assert st.obj == "<= 200ms"
+    assert st.obj_kind == "literal"
+    assert st.obj_datatype == "xsd:string"
+
+    surface_by_norm = {str(text_processing("API Gateway")): "API Gateway"}
+    chunk_surface_by_norm = {("chunk-lat-1", str(text_processing("API Gateway"))): "API Gateway"}
+    record_structured = [("chunk-lat-1", normalized.triples, normalized.entities)]
+
+    batch = materialize_entities_and_facts(
+        record_structured=record_structured,
+        surface_by_norm=surface_by_norm,
+        chunk_surface_by_norm=chunk_surface_by_norm,
+        existing_bindings={},
+    )
+    # Scalar literal object should NOT create an entity node
+    assert len(batch.entity_nodes) == 1
+    assert batch.entity_nodes[0][1] == "API Gateway"
+    assert len(batch.fact_nodes) == 1
+    fact_node = batch.fact_nodes[0]
+    assert fact_node[8] == "literal"  # obj_kind
+    assert fact_node[9] == "<= 200ms"  # obj_val
+    assert fact_node[10] == "xsd:string"  # obj_datatype
+
+    # build_evidence must succeed without ValueError on raw_record containing '<= 200ms'
+    pointer = ChunkPointer("chunk-lat-1", "doc.md", 1, 10)
+    mentions, assertions = build_evidence(
+        pointer=pointer,
+        text="API Gateway latency target is <= 200ms.",
+        program_identity="test-program",
+        record=raw_record,
+        bindings=batch.bindings,
+    )
+    assert len(mentions) == 1
+    assert mentions[0].name == "API Gateway"
+    assert len(assertions) == 1
+    assert assertions[0].object_mention_id is None
+    assert assertions[0].fact_id == fact_node[0]
