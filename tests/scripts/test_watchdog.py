@@ -2,6 +2,7 @@
 
 import sqlite3
 from contextlib import closing
+from datetime import UTC
 
 from daemon.native_inference import publish_inference
 
@@ -312,3 +313,110 @@ def test_kg_dashboard_throughput_entities_per_chunk_and_apng_projection(tmp_path
     with Image.open(apng_dest) as img:
         assert getattr(img, "is_animated", False) is True
         assert getattr(img, "n_frames", 1) == 2
+
+
+def test_schedule_guard_window_and_seconds_until_end():
+    from datetime import datetime as dt
+    from datetime import time as dt_time
+
+    # Day window: 07:00 to 21:00
+    assert watchdog.is_within_schedule_window(dt_time(12, 0), "07:00", "21:00") is True
+    assert watchdog.is_within_schedule_window(dt_time(7, 0), "07:00", "21:00") is True
+    assert watchdog.is_within_schedule_window(dt_time(6, 59, 59), "07:00", "21:00") is False
+    assert watchdog.is_within_schedule_window(dt_time(21, 0), "07:00", "21:00") is False
+    assert watchdog.is_within_schedule_window(dt_time(23, 0), "07:00", "21:00") is False
+
+    # Overnight window: 21:00 to 07:00
+    assert watchdog.is_within_schedule_window(dt_time(22, 0), "21:00", "07:00") is True
+    assert watchdog.is_within_schedule_window(dt_time(2, 0), "21:00", "07:00") is True
+    assert watchdog.is_within_schedule_window(dt_time(7, 0), "21:00", "07:00") is False
+    assert watchdog.is_within_schedule_window(dt_time(12, 0), "21:00", "07:00") is False
+
+    # Seconds until end
+    t_day = dt(2026, 11, 10, 10, 0, tzinfo=UTC)
+    assert watchdog.seconds_until_schedule_end(t_day, "21:00") == 11 * 3600.0
+
+    t_night = dt(2026, 11, 10, 23, 0, tzinfo=UTC)
+    assert watchdog.seconds_until_schedule_end(t_night, "07:00") == 8 * 3600.0
+
+
+def test_suspended_workload_context_manager(monkeypatch):
+    calls = []
+
+    class DummyProc:
+        def __init__(self, pid: int, depth: int):
+            self.pid = pid
+            self._depth = depth
+
+        def parents(self):
+            return [0] * self._depth
+
+        def suspend(self):
+            calls.append(("suspend", self.pid))
+
+        def resume(self):
+            calls.append(("resume", self.pid))
+
+    p_parent = DummyProc(100, 1)
+    p_child = DummyProc(101, 2)
+
+    monkeypatch.setattr(watchdog, "_find_workload_processes", lambda **kwargs: [p_child, p_parent])
+
+    with watchdog._suspended_workload("unit test", include_optimizer=True) as active:
+        assert active is True
+        assert calls == [("suspend", 101), ("suspend", 100)]
+
+    # Resume must be in reverse order (parent before child)
+    assert calls == [
+        ("suspend", 101),
+        ("suspend", 100),
+        ("resume", 100),
+        ("resume", 101),
+    ]
+
+
+def test_check_schedule_guard_active_and_inactive(monkeypatch):
+    resumed = []
+
+    class DummyProc:
+        def suspend(self):
+            pass
+
+        def resume(self):
+            resumed.append(True)
+
+    monkeypatch.setattr(watchdog, "_find_workload_processes", lambda **kwargs: [DummyProc()])
+
+    # When outside the window: returns False immediately without sleeping or suspending
+    from datetime import datetime as dt
+
+    # 22:00 is outside 07:00..21:00
+    outside_dt = dt(2026, 11, 10, 22, 0, tzinfo=UTC)
+
+    class MockDatetimeOutside(dt):
+        @classmethod
+        def now(cls, tz=None):
+            return outside_dt
+
+    monkeypatch.setattr(watchdog, "datetime", MockDatetimeOutside)
+    assert watchdog.check_schedule_guard("07:00", "21:00") is False
+    assert not resumed
+
+    # When inside window: suspends, loops, and exits when window passes
+    inside_times = [
+        dt(2026, 11, 10, 12, 0, tzinfo=UTC),  # initial
+        dt(2026, 11, 10, 21, 1, tzinfo=UTC),  # check after sleep
+    ]
+
+    class MockDatetimeInside(dt):
+        @classmethod
+        def now(cls, tz=None):
+            if inside_times:
+                return inside_times.pop(0)
+            return dt(2026, 11, 10, 22, 0, tzinfo=UTC)
+
+    monkeypatch.setattr(watchdog, "datetime", MockDatetimeInside)
+    monkeypatch.setattr(watchdog.time, "sleep", lambda sec: None)
+
+    assert watchdog.check_schedule_guard("07:00", "21:00", poll_interval_sec=0.01) is True
+    assert resumed == [True]

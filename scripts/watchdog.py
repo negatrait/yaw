@@ -15,7 +15,8 @@ import time
 import urllib.request
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from datetime import time as dt_time
 from pathlib import Path
 from typing import Any
 
@@ -1828,20 +1829,123 @@ def generate_report_markdown(
     write_text_atomic(dest, md)
 
 
+def _find_workload_processes(*, include_optimizer: bool = False) -> list[psutil.Process]:
+    """Discover llama-server and optionally yaw optimizer processes to suspend/resume in top-down order."""
+    my_pids = {os.getpid()}
+    with contextlib.suppress(psutil.Error, OSError):
+        my_pids.add(psutil.Process().parent().pid)
+
+    targets: list[psutil.Process] = []
+    seen_pids: set[int] = set()
+
+    for p in psutil.process_iter(["pid", "name", "cmdline"]):
+        if p.pid in my_pids or p.pid in seen_pids:
+            continue
+        try:
+            name = (p.info.get("name") or "").lower()
+            cmd = " ".join(p.info.get("cmdline") or []).lower()
+        except psutil.Error, OSError:
+            continue
+
+        if "llama-server" in name:
+            targets.append(p)
+            seen_pids.add(p.pid)
+        elif include_optimizer and any(k in name for k in ("yaw", "python")):
+            if ("yaw" in cmd and "optimize" in cmd) and "watchdog" not in cmd:
+                targets.append(p)
+                seen_pids.add(p.pid)
+                with contextlib.suppress(psutil.Error, OSError):
+                    for child in p.children(recursive=True):
+                        if child.pid not in seen_pids and child.pid not in my_pids:
+                            targets.append(child)
+                            seen_pids.add(child.pid)
+
+    def _proc_depth(proc: psutil.Process) -> int:
+        try:
+            return len(proc.parents())
+        except psutil.Error, OSError:
+            return 0
+
+    # Suspend deeper child processes first, resume in reverse
+    targets.sort(key=_proc_depth, reverse=True)
+    return targets
+
+
 @contextlib.contextmanager
-def _suspended_llama(reason: str):
-    targets = [p for p in psutil.process_iter(["pid", "name"]) if "llama-server" in (p.info.get("name") or "").lower()]
+def _suspended_workload(reason: str, *, include_optimizer: bool = False):
+    targets = _find_workload_processes(include_optimizer=include_optimizer)
     if targets:
-        logger.info("Suspending %d llama-server process(es) (%s)...", len(targets), reason)
+        logger.info(
+            "Suspending %d process(es) [include_optimizer=%s] (%s)...",
+            len(targets),
+            include_optimizer,
+            reason,
+        )
         for p in targets:
             with contextlib.suppress(psutil.Error, OSError):
                 p.suspend()
     try:
         yield bool(targets)
     finally:
-        for p in targets:
+        # Resume in reverse order (parents before children)
+        for p in reversed(targets):
             with contextlib.suppress(psutil.Error, OSError):
                 p.resume()
+
+
+def _suspended_llama(reason: str):
+    """Backwards-compatible wrapper suspending llama-server inference instances."""
+    return _suspended_workload(reason, include_optimizer=False)
+
+
+def is_within_schedule_window(now_time: dt_time, start_str: str, end_str: str) -> bool:
+    """Check if current time falls within [start, end) supporting overnight wrap-around."""
+    t_start = dt_time.fromisoformat(start_str)
+    t_end = dt_time.fromisoformat(end_str)
+    if t_start <= t_end:
+        return t_start <= now_time < t_end
+    return now_time >= t_start or now_time < t_end
+
+
+def seconds_until_schedule_end(now_dt: datetime, end_str: str) -> float:
+    """Calculate remaining seconds until the schedule window ends."""
+    t_end = dt_time.fromisoformat(end_str)
+    end_dt = datetime.combine(now_dt.date(), t_end, tzinfo=now_dt.tzinfo)
+    if end_dt <= now_dt:
+        end_dt += timedelta(days=1)
+    return max(0.0, (end_dt - now_dt).total_seconds())
+
+
+def check_schedule_guard(
+    day_suspend_start: str = "07:00",
+    day_suspend_end: str = "21:00",
+    *,
+    poll_interval_sec: float = 30.0,
+) -> bool:
+    """If current local time is inside the suspend window, pause optimizer and llama-server until window ends."""
+    now_local = datetime.now().astimezone()
+    if not is_within_schedule_window(now_local.time(), day_suspend_start, day_suspend_end):
+        return False
+
+    rem = seconds_until_schedule_end(now_local, day_suspend_end)
+    rem_h = rem / 3600.0
+    reason = (
+        f"Daytime schedule window {day_suspend_start}..{day_suspend_end} "
+        f"(resuming in {rem_h:.2f}h at {day_suspend_end})"
+    )
+    with _suspended_workload(reason, include_optimizer=True) as active:
+        while active:
+            time.sleep(poll_interval_sec)
+            now_check = datetime.now().astimezone()
+            if not is_within_schedule_window(now_check.time(), day_suspend_start, day_suspend_end):
+                logger.info(
+                    "Exiting daytime schedule suspend window at %s (window %s..%s). Resuming workload.",
+                    now_check.strftime("%H:%M:%S"),
+                    day_suspend_start,
+                    day_suspend_end,
+                )
+                break
+    return True
 
 
 def check_thermal_guard(crisis_temp: float = 82.0, target_temp: float = 72.0, max_pause_sec: int = 300) -> bool:
@@ -1938,6 +2042,24 @@ def main() -> int:
     ap.add_argument("--thermal-guard", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--crisis-temp", type=float, default=82.0)
     ap.add_argument("--target-temp", type=float, default=72.0)
+    ap.add_argument(
+        "--schedule-guard",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable daytime workload suspension (default: False)",
+    )
+    ap.add_argument(
+        "--day-suspend-start",
+        type=str,
+        default="07:00",
+        help="Local time (HH:MM) to begin suspending optimizer and llama-server (default: 07:00)",
+    )
+    ap.add_argument(
+        "--day-suspend-end",
+        type=str,
+        default="21:00",
+        help="Local time (HH:MM) to resume optimizer and llama-server (default: 21:00)",
+    )
     args = ap.parse_args()
     if args.layout_iterations < 1:
         ap.error("--layout-iterations must be positive")
@@ -1973,6 +2095,9 @@ def main() -> int:
         if args.thermal_guard:
             with contextlib.suppress(Exception):
                 check_thermal_guard(args.crisis_temp, args.target_temp)
+        if args.schedule_guard:
+            with contextlib.suppress(Exception):
+                check_schedule_guard(args.day_suspend_start, args.day_suspend_end)
         if args.watch is None:
             return 0
         cool_inference_servers(args.cool_seconds)
