@@ -441,8 +441,8 @@ def test_markov_walk_divergence_and_turtle_payload(tmp_path: Path) -> None:
         assert "out of valid bounds" in conf_violations[0].message
 
 
-def test_w3c_guardrail_1_homograph_only_different_from(tmp_path: Path) -> None:
-    """Verify Guardrail 1: owl:differentFrom is strictly emitted for homographs/high lexical overlap, not noise."""
+def test_explicit_distinctness_for_admitted_pairs_is_independent_of_other_votes(tmp_path: Path) -> None:
+    """Retain explicit distinctness without a batch-global lexical-score veto."""
     from yaw.daemon.graph.planner import apply_synonym_adjudication
 
     db_path = tmp_path / "yaw.db"
@@ -528,10 +528,9 @@ def test_w3c_guardrail_1_homograph_only_different_from(tmp_path: Path) -> None:
         kinds = {(s, o, k) for s, o, k, _, _ in sem_batch}
         # Homograph pair e1|e2 MUST receive owl:differentFrom
         assert ("e1", "e2", "owl:differentFrom") in kinds or ("e2", "e1", "owl:differentFrom") in kinds
-        # Non-homograph pair e1|e3 MUST NOT receive owl:differentFrom (emits NO edge)
-        assert ("e1", "e3", "owl:differentFrom") not in kinds
-        assert ("e3", "e1", "owl:differentFrom") not in kinds
-        assert rlm_stats["different_from_edges"] == 1
+        # An admitted non-homograph pair retains its explicit Stage-3 verdict too.
+        assert ("e1", "e3", "owl:differentFrom") in kinds or ("e3", "e1", "owl:differentFrom") in kinds
+        assert rlm_stats["different_from_edges"] == 2
 
 
 def test_canonical_gemma4_ssot_no_python_token_overrides_in_planner(tmp_path: Path) -> None:

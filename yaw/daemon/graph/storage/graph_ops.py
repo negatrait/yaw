@@ -236,11 +236,16 @@ def deserialize_openie_record(
                 obj_kind="literal" if str(st.get("obj_kind", "entity")) == "literal" else "entity",
                 obj_datatype=str(st.get("obj_datatype", "")),
                 obj_lang=str(st.get("obj_lang", "")),
+                llm_prob=st.get("llm_prob"),
             )
             for st in (data.get("structured_triples") or ())
             if isinstance(st, Mapping) and "subj" in st and "pred" in st and "obj" in st
         ),
         entity_definitions=explicit_defs if explicit_defs else (tuple(inferred_defs) if has_inferred_def else ()),
+        entity_probabilities=tuple(
+            (str(name), str(definition), probability)
+            for name, definition, probability in data.get("entity_probabilities", ())
+        ),
     )
 
 
@@ -862,15 +867,12 @@ def merge_entities(
                 conn.execute(
                     """
                     UPDATE edges
-                    SET weight = COALESCE(
-                        (
+                    SET weight = (
                             SELECT 1.0 - EXP(SUM(LN(MAX(
-                                1e-6, 1.0 - MIN(1.0 - 1e-6, COALESCE(es.atomic_confidence, 0.5))
+                                1e-6, 1.0 - MIN(1.0 - 1e-6, es.atomic_confidence)
                             ))))
                             FROM edge_sources es
                             WHERE es.src_id = edges.src_id AND es.dst_id = edges.dst_id AND es.kind = edges.kind
-                        ),
-                        edges.weight
                     )
                     WHERE src_id = ? AND dst_id = ? AND kind = 'fact'
                     """,
@@ -1137,13 +1139,10 @@ def upsert_edges_with_sources(
         conn.executemany(
             """
             UPDATE edges
-            SET weight = COALESCE(
-                (
-                    SELECT 1.0 - EXP(SUM(LN(MAX(1e-6, 1.0 - MIN(1.0 - 1e-6, COALESCE(es.atomic_confidence, 0.5))))))
+            SET weight = (
+                    SELECT 1.0 - EXP(SUM(LN(MAX(1e-6, 1.0 - MIN(1.0 - 1e-6, es.atomic_confidence)))))
                     FROM edge_sources es
                     WHERE es.src_id = edges.src_id AND es.dst_id = edges.dst_id AND es.kind = edges.kind
-                ),
-                edges.weight
             )
             WHERE src_id = ? AND dst_id = ? AND kind = ?
             """,
@@ -1286,15 +1285,15 @@ def load_graph_topology(
             'fact' AS kind,
             COALESCE(
                 f.confidence,
-                (SELECT 1.0 - EXP(SUM(LN(MAX(1e-6, 1.0 - MIN(1.0 - 1e-6, COALESCE(fs.atomic_confidence, 0.5))))))
-                 FROM fact_sources fs WHERE fs.fact_id = f.fact_id),
-                0.5
+                (SELECT 1.0 - EXP(SUM(LN(MAX(1e-6, 1.0 - MIN(1.0 - 1e-6, fs.atomic_confidence)))))
+                 FROM fact_sources fs WHERE fs.fact_id = f.fact_id)
             ) AS weight
         FROM facts f
         WHERE f.obj_id IS NOT NULL
           AND f.obj_id != ''
           AND f.subj_id != f.obj_id
           AND COALESCE(f.obj_kind, 'entity') = 'entity'
+          AND weight > 0.0
           AND NOT EXISTS (
               SELECT 1 FROM edges e
               WHERE e.src_id = f.subj_id AND e.dst_id = f.obj_id AND e.kind = 'fact'
@@ -1361,15 +1360,15 @@ def upsert_semantic_edges(
                     conn.execute(
                         """
                         INSERT INTO edges (src_id, dst_id, kind, weight, reasoning)
-                        VALUES (?, ?, 'owl:differentFrom', 0.0, ?)
+                        VALUES (?, ?, 'owl:differentFrom', ?, ?)
                         ON CONFLICT(src_id, dst_id, kind) DO UPDATE SET
-                            weight = 0.0,
+                            weight = MAX(edges.weight, excluded.weight),
                             reasoning = CASE
                                 WHEN excluded.reasoning != '' THEN excluded.reasoning
                                 ELSE edges.reasoning
                             END
                         """,
-                        (s, d, reasoning),
+                        (s, d, weight, reasoning),
                     )
             elif kind == "skos:broader":
                 has_diff = conn.execute(
@@ -1738,7 +1737,7 @@ def load_affected_neighborhood(
                         seed_chunk_ids.add(cid)
             mention_rows = ro_conn.execute(
                 f"SELECT mention_id, chunk_id, source_revision, sense_id, name, definition, "
-                f"resolved_definition, entity_id "
+                f"resolved_definition, entity_id, llm_prob "
                 f"FROM entity_mentions WHERE entity_id IN ({placeholders})",
                 b_tuple,
             ).fetchall()
@@ -1746,7 +1745,7 @@ def load_affected_neighborhood(
                 stage_conn.executemany(
                     "INSERT OR REPLACE INTO entity_mentions "
                     "(mention_id, chunk_id, source_revision, sense_id, name, definition, "
-                    "resolved_definition, entity_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "resolved_definition, entity_id, llm_prob) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     mention_rows,
                 )
                 for row in mention_rows:
@@ -1853,7 +1852,7 @@ def load_affected_neighborhood(
                         if cid and not cid.startswith("__"):
                             seed_chunk_ids.add(cid)
 
-        # 3d. Copy referenced chunks metadata for provenance & Active EDC checks
+        # 3d. Copy referenced chunks and their source-coherence vectors.
         for batch in batched(sorted(seed_chunk_ids)):
             placeholders = ",".join("?" for _ in batch)
             chunk_rows = ro_conn.execute(
@@ -1868,5 +1867,10 @@ def load_affected_neighborhood(
                     "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     chunk_rows,
                 )
+            for cid, embedding in ro_conn.execute(
+                f"SELECT chunk_id,embedding FROM chunk_vec WHERE chunk_id IN ({placeholders})", tuple(batch)
+            ):
+                stage_conn.execute("DELETE FROM chunk_vec WHERE chunk_id=?", (cid,))
+                stage_conn.execute("INSERT INTO chunk_vec (chunk_id,embedding) VALUES (?,?)", (cid, embedding))
 
     return affected_entity_ids

@@ -163,8 +163,8 @@ Execute strictly in order `E1-S1` $\to$ `E1-S6`. Never start Sprint $k+1$ until 
     - Run $p^{(t+1)} = (1 - \alpha) (P^T p^{(t)} + m_{\text{dangling}} p_0) + \alpha p_0$ with HippoRAG damping $\alpha = 0.5$ (`damping=0.5`), converging in `<3 ms` on CSR matrices.
   - **HippoRAG 2 + EDC + SKOS/SHACL Graph Construction (`engine.py`):**
     - Stage 1 OpenIE via `YawProgram.extract_openie(passage)` cached in `openie_chunks` with Stage 1 `entity_definitions` (`[name, definition]`) and Stage 2 `StructuredTriple` contextual definitions (`subj_def`, `obj_def`, `spo_def`). Materialize all Stage 1 NER entities (including standalone entities that do not appear in Stage 2 triples) into `entities`, `entity_labels`, and bidirectional `(chunk <-> entity)` `passage` edges.
-    - **Provisional Same-Label Sense-Split Gate:** Before assigning `compute_mdhash_id(label_norm, prefix="entity-")`, compare contextual embeddings (`# {name}\n{definition}`); if $\cos \ge 0.85$ (`same_sense_cosine_gate`), reuse the existing `entity_id`; if $\cos < 0.85$, mint a provisional `sense_id` (`compute_mdhash_id(f"{label_norm}::{defn.lower()}", prefix="entity-")`) **without** writing any `owl:differentFrom` edge in Step 4 so that `find_entity_disambiguation_candidates` surfaces the pair to `judge_synonyms`.
-    - **Atomic Closed-World Transaction (Zero Deterministic Fallbacks):** Inside `with self.managed_conn.transaction() as conn:`, commit nodes/vectors/edges, run 2-channel + same-`label_norm` candidate generation + `self.program.judge_synonyms(candidates)` (`merge_entities` / `upsert_semantic_edges`), and run `lint_graph_shacl(conn, auto_heal=False)` + `self.program.heal_shacl_violations(violations, focus_context=...)`.
+    - **Provisional Same-Label Sense-Split Gate:** Before assigning `compute_mdhash_id(label_norm, prefix="entity-")`, compare contextual embeddings (`# {name}\n{definition}`); if $\cos \ge 0.85$ (`same_sense_cosine_gate`), reuse the existing `entity_id`; if $\cos < 0.85$, mint a provisional `sense_id` (`compute_mdhash_id(f"{label_norm}::{defn.lower()}", prefix="entity-")`) **without** writing any `owl:differentFrom` edge in Step 4 so that `find_entity_disambiguation_candidates` surfaces the pair to `judge_semantics`.
+    - **Atomic Closed-World Transaction (Zero Deterministic Fallbacks):** Inside `with self.managed_conn.transaction() as conn:`, commit nodes/vectors/edges, run 2-channel + same-`label_norm` candidate generation + `self.program.judge_semantics(candidates)` (`merge_entities` / `upsert_semantic_edges`), and run `lint_graph_shacl(conn, auto_heal=False)` + `self.program.heal_shacl_violations(violations, focus_context=...)`.
   - **HippoRAG 2 Retrieval & DSPy Multi-Step QA (`engine.py`):**
     - Fact linking & Recognition Memory (`HippoRAG.py:2125-2175`): query `fact_vec` + `fact_fts` RRF $\to$ filter via `YawProgram.filter_triples`.
     - PPR Seeding (`HippoRAG.py:2008-2120`): resolve surface mentions via `resolve_entity_labels(conn, surface_mentions, query_vec=query_fact_vec)`; entity weight $w(e) = \text{mean\_fact\_score}(e) / \max(1, \text{doc\_freq}(e))$; passage weight $w(c) = 0.05 \cdot (\widehat{s}_{\text{vec}}(c) + \widehat{s}_{\text{fts}}(c))$ $\to$ `ppr.run_ppr` $\to$ rank chunk nodes $\to$ hydrate **only** top-$k$ chunks via `storage/hydration.py`.
@@ -250,6 +250,19 @@ Execute strictly in order `E1-S1` $\to$ `E1-S6`. Never start Sprint $k+1$ until 
 ---
 
 ## Decisions
+
+- 2026-11-10: User authorized [CP1 constraint propagation](reviews/constraint-propagation.md)
+  and [EX1 extraction confidence](reviews/extraction-confidence.md): collect token
+  votes on existing calls only, preserve Bayesian operators, retain semantic
+  votes when model metadata is absent, and verify fixed-evidence 64+64/128
+  canonical equivalence. User selected GPT Terra for the critic role. No new
+  dependency or inference call is authorized by confidence collection.
+
+- 2026-11-10: User authorized minimal evidence-backed SHACL provenance repair,
+  preserving Bayesian scoring and avoiding LLM healing for recoverable missing
+  source links. [EP1](reviews/shacl-healer-publication.md#2026-11-10-ep1-evidence-backed-provenance-repair)
+  records scope and verification; [native graph publication](native-cocoindex-graph.md#evidence-backed-provenance-restoration)
+  owns the contract. This does not complete the Epic 1 acceptance gate.
 
 - 2026-11-10: "Maybe you could calibrate the algorighm for -/+10% candidate volume, so that the intended functionality stays the same. A hyperparameter for candidate count volume is needed, just like the threshold with the current implementation." / "Extreme speed with miniscule malloc is called for." (User). Refines the [candidate-search proposal](reviews/synonym-candidate-search.md): expose `candidate_volume_ratio=1.0` for offline cutoff calibration, require ±10% unique eligible candidate volume per fitting input, freeze cutoffs across batch layouts and avoid runtime quotas. Use small reusable buffers and emit objects only for surviving pairs. Initial fitting counts are recorded; production implementation, held-out volume and batch-publication validation remain pending.
 

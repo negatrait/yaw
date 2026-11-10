@@ -12,6 +12,7 @@ from yaw.daemon.graph.inference.grammars import build_dspy_shacl_repair_grammar
 from yaw.daemon.graph.inference.parsers import parse_shacl_repairs, shacl_repair_actions
 from yaw.daemon.graph.inference.program import YawProgram
 from yaw.daemon.graph.storage import apply_shacl_repairs, lint_graph_shacl, open_yaw_db
+from yaw.daemon.indexing import CorpusIndexingLiveComponent
 
 
 @pytest.mark.parametrize("contract", [None, "bound-report-v1", "bound-report-v2", "bound-report-v3"])
@@ -121,3 +122,68 @@ def test_native_shacl_healer_definition_survives_publication(tmp_path, provider,
         publish(stream, app, [(pointer, text)])
         assert len(state["intervals"]) == calls
         assert conn.total_changes == changes
+
+
+def test_native_assertion_backed_provenance_repair_bypasses_healer(tmp_path, provider):
+    url, state = provider
+    state["delay"] = 0
+    definition = "A telemetry service."
+    chunks = []
+    for index, destination in enumerate(("Anchor", "Beacon")):
+        text = f"Orion reports to {destination}."
+        pointer = ChunkPointer(f"chunk-{index}", f"source-{index}.md", 1, 1)
+        chunks.append((pointer, text))
+        (tmp_path / pointer.rel_posix_path).write_text(text, encoding="utf-8")
+        state.setdefault("extractions", {})[text] = {
+            "named_entities": [["Orion", definition], [destination, f"The {destination} destination."]],
+            "triples": [
+                {
+                    "sub": "Orion",
+                    "pred": "reports to",
+                    "obj": destination,
+                    "def": f"Orion sends telemetry to {destination}.",
+                }
+            ],
+        }
+    state["embedding_vector"] = lambda value: (
+        [1.0, 0.0, 0.0, 0.0]
+        if "telemetry service" in value
+        else [0.0, 1.0, 0.0, 0.0]
+        if "Anchor" in value
+        else [0.0, 0.0, 1.0, 0.0]
+    )
+    with native_corpus(tmp_path, tmp_path / "index", url) as (db, env, app):
+        publish(env, app, chunks[:1])
+        # Seed an incomplete snapshot without stale CocoIndex target fingerprints.
+        # Out-of-band damage to an already-owned target is a separate recovery problem.
+        repair_dir = tmp_path / "repair"
+        repair_dir.mkdir()
+        with db.readonly() as source, closing(open_yaw_db(repair_dir / "yaw.db")) as snapshot:
+            source.backup(snapshot)
+    with closing(open_yaw_db(repair_dir / "yaw.db")) as conn:
+        original_fact = conn.execute("SELECT fact_id FROM facts").fetchone()[0]
+        raw = conn.execute("SELECT raw_json FROM fact_assertions").fetchone()[0]
+        original_chunk = conn.execute("SELECT chunk_id FROM fact_assertions").fetchone()[0]
+        conn.execute("DELETE FROM fact_sources")
+        conn.commit()
+        assert any(v.shape == "ProvenanceShape/factSources" for v in lint_graph_shacl(conn))
+    with native_corpus(tmp_path, repair_dir, url) as (db, env, app):
+        publish(env, app, chunks)
+        component = CorpusIndexingLiveComponent.last_instance
+        assert component is not None and component.last_summary is not None
+        stats = component.last_summary.rlm_stats
+        assert stats["reused_chunks"] == 1
+        assert stats["shacl_deterministic_healed"] == 1
+        assert state.get("healer_requests", []) == []
+        with db.readonly() as conn:
+            assert lint_graph_shacl(conn) == []
+            assert tuple(
+                conn.execute(
+                    "SELECT chunk_id,llm_prob,vec_coherence,atomic_confidence FROM fact_sources WHERE fact_id=?",
+                    (original_fact,),
+                ).fetchone()
+            ) == (original_chunk, 0.81, pytest.approx(1e-6), pytest.approx((0.81 * 1e-6) ** 0.5))
+            assert (
+                conn.execute("SELECT raw_json FROM fact_assertions WHERE fact_id=?", (original_fact,)).fetchone()[0]
+                == raw
+            )

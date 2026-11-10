@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import dspy
+import pytest
 
 from daemon.graph.synonym_protocol import candidate_rows, complete_decisions
 from yaw.core import ChunkPointer
@@ -294,8 +295,7 @@ def _make_engine(
 
 
 def test_build_time_shacl_gate_success(synonym_token_counter, tmp_path: Path) -> None:
-    """Verify that index_chunks executes Stage 1 -> Stage 2 -> Stage 3 -> SHACL build gate end-to-end without
-    checkpoint pre-seeding, materializing 0.5-weighted owl:DatatypeProperty literal nodes and healing SKOS edges."""
+    """Run extraction, adjudication and strict SHACL publication without pre-seeded artifacts."""
     engine, mock_lm = _make_engine(synonym_token_counter, tmp_path, mode="gate")
     try:
         text = (
@@ -375,8 +375,17 @@ def test_build_time_shacl_gate_success(synonym_token_counter, tmp_path: Path) ->
                 (str(r[0]), str(r[1])): float(r[2])
                 for r in conn.execute("SELECT src_id, dst_id, weight FROM edges WHERE kind = 'fact'").fetchall()
             }
-            assert abs(fact_edges[(sec_eng_id, eng_id)] - 0.8) < 1e-6
-            assert abs(fact_edges[(h2_id, h3_id)] - 0.8) < 1e-6
+            source_weights = {
+                (src, dst): confidence
+                for src, dst, confidence in conn.execute(
+                    "SELECT f.subj_id,f.obj_id,fs.atomic_confidence FROM facts f "
+                    "JOIN fact_sources fs USING(fact_id) WHERE f.obj_kind='entity'"
+                )
+            }
+            assert fact_edges == pytest.approx(source_weights)
+            assert (sec_eng_id, eng_id) in fact_edges
+            assert (h2_id, h3_id) in fact_edges
+            assert all(0 < weight < 1 for weight in fact_edges.values())
             assert len(fact_edges) == 2
 
             # Facts table records obj_kind == 'literal' and obj_id IS NULL for both literal facts

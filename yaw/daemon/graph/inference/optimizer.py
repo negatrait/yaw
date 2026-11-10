@@ -52,7 +52,7 @@ from .reflection import (
 
 # Extraction/validation contract version (native graph spec §5.3). Bump whenever a grammar, parser
 # or SHACL rule changes so memoized artifacts produced under the old contract are not reused.
-SCHEMA_VERSION = "skos-shacl-v6-evidence-identity"
+SCHEMA_VERSION = "skos-shacl-v7-source-logprobs"
 
 
 def _optimization_history_scope(fn: Callable[..., Any]) -> Callable[..., Any]:

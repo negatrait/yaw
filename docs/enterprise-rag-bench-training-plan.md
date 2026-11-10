@@ -182,7 +182,7 @@ when adopting this breaking layout; no migration or legacy-layout discovery exis
 
 ### 3.4 Two-Stratum Separation of the Canonical 12 DSPy Signatures
 
-- **Stratum A (Signatures 1–9 in `YawProgram.named_predictors()`)**: `ExtractEntities` (`ner`), `ExtractTriples` (`triples`), `DefineMissingEntities` (`entity_definer`), `JudgeSynonyms` (`synonym_judge`), `ExtractQueryIntent` (`query_intent`), `FilterTriples` (`triple_filter`), `AnswerQuestion` (`qa`), `HealSHACLViolations` (`shacl_healer_rlm`), and `ProposeSHACLRepairs` (`shacl_repair`). Mutated by `dspy.GEPA` and saved in `compiled_program.json`.
+- **Stratum A (Signatures 1–9 in `YawProgram.named_predictors()`)**: `ExtractEntities` (`ner`), `ExtractTriples` (`triples`), `DefineMissingEntities` (`entity_definer`), `JudgeSynonyms` (`semantic_judge`), `ExtractQueryIntent` (`query_intent`), `FilterTriples` (`triple_filter`), `AnswerQuestion` (`qa`), `HealSHACLViolations` (`shacl_healer_rlm`), and `ProposeSHACLRepairs` (`shacl_repair`). Mutated by `dspy.GEPA` and saved in `compiled_program.json`.
 - **Stratum B (Signatures 10–12 in `RLMInstructionProposer`)**: `ReflectiveInnerDistillerSignature` (`inner_rlm`), `ProposeInstructionSignature` (`llm_proposer`), and `CompressInstructionSignature` (`llm_compressor`). Fixed meta-optimizer (`ProposalFn`) that reflects on Stratum A. Nothing reflects on Stratum B.
 
 ---

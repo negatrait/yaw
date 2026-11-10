@@ -433,8 +433,7 @@ def test_dual_role_literal_promoted_to_concept_and_weight_preserved_across_merge
 
 
 def test_forward_fact_edges_strictly_directed(synonym_token_counter, tmp_path: Path) -> None:
-    """Verify that entity-to-entity facts store ONLY forward (subj -> obj) edges with weight 1.0,
-    and topology + transition matrix distinguish ObjectProperty (1.0) vs DatatypeProperty (0.5)."""
+    """Resource facts retain measured forward weights; literal objects create no graph edge."""
     engine, conn = _make_engine(synonym_token_counter, tmp_path, "test_directed_edges.db")
 
     chunk = ChunkPointer(
@@ -487,10 +486,14 @@ def test_forward_fact_edges_strictly_directed(synonym_token_counter, tmp_path: P
         (r[0], r[1]): float(r[2])
         for r in conn.execute("SELECT src_id, dst_id, weight FROM edges WHERE kind = 'fact'").fetchall()
     }
-    # Must contain ONLY forward edges for ObjectProperty (0.8) and ZERO edges for literal objects
+    expected_weight = conn.execute(
+        "SELECT fs.atomic_confidence FROM fact_sources fs JOIN facts f USING(fact_id) WHERE f.obj_kind='entity'"
+    ).fetchone()[0]
+    assert 0 < expected_weight < 1
+    # One source observation supports only the forward resource edge.
     assert (s_id, o_id) in fact_edges
     assert (o_id, s_id) not in fact_edges
-    assert abs(fact_edges[(s_id, o_id)] - 0.8) < 1e-6
+    assert fact_edges[(s_id, o_id)] == pytest.approx(expected_weight)
     assert len(fact_edges) == 1
 
     # Verify literal fact exists strictly in facts table
@@ -506,7 +509,7 @@ def test_forward_fact_edges_strictly_directed(synonym_token_counter, tmp_path: P
     # Verify load_graph_topology and build_transition_matrix preserve the fact edge
     chunk_ids, entity_ids, topo_edges, _ = load_graph_topology(conn)
     topo_fact_weights = {(src, dst): float(w) for src, dst, k, w in topo_edges if k == "fact"}
-    assert abs(topo_fact_weights[(s_id, o_id)] - 0.8) < 1e-6
+    assert topo_fact_weights[(s_id, o_id)] == pytest.approx(expected_weight)
     assert len(topo_fact_weights) == 1
 
     policy = RelationTraversalPolicy()
@@ -951,8 +954,7 @@ def test_apply_synonym_adjudication_remaps_semantic_edges_after_later_merge() ->
 
 
 def test_apply_synonym_adjudication_prevents_transitive_collapse_across_separated_clusters() -> None:
-    """Verify fact_linked_pairs blocks transitive self-loop collapse while non-fact semantic edges do not
-    override Gemma 4 skos:altLabel merges and have any resulting self-loops dropped in Phase 2."""
+    """Accepted semantic separations and fact poles both survive later transitive merge proposals."""
     stage_conn = open_yaw_db(":memory:")
     try:
         upsert_entities(
@@ -1010,12 +1012,14 @@ def test_apply_synonym_adjudication_prevents_transitive_collapse_across_separate
         )
         assert [(merge.removed_id, merge.canonical_id) for merge in staged_merges] == [
             ("ent-b", "ent-a"),
-            ("ent-c", "ent-a"),
             ("ent-p1", "ent-alias"),
         ]
-        assert [row[:4] for row in resolved_batch] == [("ent-alias", "ent-p2", "skos:related", 0.82)]
+        assert [row[:4] for row in resolved_batch] == [
+            ("ent-a", "ent-c", "skos:related", 0.84),
+            ("ent-alias", "ent-p2", "skos:related", 0.82),
+        ]
         surviving = {str(r[0]) for r in stage_conn.execute("SELECT entity_id FROM entities").fetchall()}
-        assert surviving == {"ent-a", "ent-alias", "ent-p2"}
+        assert surviving == {"ent-a", "ent-c", "ent-alias", "ent-p2"}
         assert lint_graph_shacl(stage_conn) == []
     finally:
         stage_conn.close()

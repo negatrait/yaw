@@ -1,8 +1,24 @@
 """Translate synthetic test decisions into the compact request's wire identifiers."""
 
 import json
+import math
 import re
 from typing import Any
+
+
+def response_logprobs(text: str, probability: float = 0.81) -> dict[str, Any]:
+    """OpenAI-shaped response metadata with measurable Boolean decision tokens."""
+    return {
+        "content": [
+            {
+                "token": token,
+                "bytes": list(token.encode()),
+                "logprob": math.log(probability) if token in ("true", "false") or token.startswith('"') else -0.001,
+                "top_logprobs": [],
+            }
+            for token in re.findall(r'"(?:[^"\\]|\\.)*"|true|false|.', text, re.DOTALL)
+        ]
+    }
 
 
 def candidate_rows(text: str) -> list[dict[str, Any]]:
@@ -50,7 +66,8 @@ def complete_decisions(
         if not stage_text and candidates and "_source_text" in candidates[0]:
             stage_text = str(candidates[0]["_source_text"])
 
-    # Determine stage from stage_text or decision contents
+    # Evidence can mention other stages' predicates; route from the instructions.
+    stage_text = stage_text.split("[[ ## candidate_pairs ## ]]", 1)[0]
     text_lower = stage_text.lower()
     is_label_stage = (
         "judgelabels" in text_lower
@@ -84,6 +101,7 @@ def complete_decisions(
         result: list[dict[str, Any]] = []
         for pair in candidates:
             pid = pair["pair_id"]
+            names = " / ".join(sorted((str(pair.get("name_a", "")), str(pair.get("name_b", "")))))
             decision = chosen.get(pid, {"pair_id": pid, "relation": "skos:related", "canonical": pair["entity_a"]})
             if decision.get("canonical") in ("A", "B"):
                 decision["canonical"] = pair["entity_a" if decision["canonical"] == "A" else "entity_b"]
@@ -99,29 +117,30 @@ def complete_decisions(
         res_list: list[dict[str, Any]] = []
         for pair in candidates:
             pid = pair["pair_id"]
+            names = " / ".join(sorted((str(pair.get("name_a", "")), str(pair.get("name_b", "")))))
             d = chosen.get(pid, {})
             if "equivalent" in d or "alt_label" in d or "hidden_label" in d:
                 hidden = bool(d.get("hidden_label", False))
                 alt = bool(d.get("alt_label", False))
                 equiv = bool(d.get("equivalent", False)) or alt or hidden
-                reason = str(d.get("reasoning", f"Label reasoning for {pid}"))
+                reason = str(d.get("reasoning", f"Label reasoning for {names}"))
             else:
                 rel = str(d.get("relation", "")).strip()
                 if rel in ("skos:altLabel", "skos:exactMatch", "exact_match"):
                     equiv, hidden = True, False
-                    reason = f"Alias label for {pid}"
+                    reason = f"Alias label for {names}"
                 elif rel == "skos:hiddenLabel":
                     equiv, hidden = True, True
-                    reason = f"Hidden label for {pid}"
+                    reason = f"Hidden label for {names}"
                 else:
                     equiv, hidden = False, False
-                    reason = f"Not a label alias for {pid}"
+                    reason = f"Not a label alias for {names}"
             if equiv:
                 item: dict[str, Any] = {
                     "pair_id": pid,
                     "reasoning": reason,
                     "equivalent": True,
-                    "definition": str(d.get("definition") or f"Unified definition for {pid}"),
+                    "definition": str(d.get("definition") or f"Unified definition for {names}"),
                     "hidden_label": hidden,
                 }
             else:
@@ -137,11 +156,12 @@ def complete_decisions(
         res_list = []
         for pair in candidates:
             pid = pair["pair_id"]
+            names = " / ".join(sorted((str(pair.get("name_a", "")), str(pair.get("name_b", "")))))
             d = chosen.get(pid, {})
             if "broader" in d or "narrower" in d:
                 broader = bool(d.get("broader", False))
                 narrower = bool(d.get("narrower", False))
-                reason = str(d.get("reasoning", f"Hierarchy reasoning for {pid}"))
+                reason = str(d.get("reasoning", f"Hierarchy reasoning for {names}"))
             else:
                 rel = str(d.get("relation", "")).strip()
                 if rel == "skos:broader":
@@ -158,13 +178,13 @@ def complete_decisions(
                         broader, narrower = False, True
                     else:
                         broader, narrower = True, False
-                    reason = f"Broader hierarchy for {pid}"
+                    reason = f"Broader hierarchy for {names}"
                 elif rel == "skos:narrower":
                     broader, narrower = False, True
-                    reason = f"Narrower hierarchy for {pid}"
+                    reason = f"Narrower hierarchy for {names}"
                 else:
                     broader, narrower = False, False
-                    reason = f"Not hierarchical for {pid}"
+                    reason = f"Not hierarchical for {names}"
             res_list.append(
                 {
                     "pair_id": pid,
@@ -179,18 +199,19 @@ def complete_decisions(
         res_list = []
         for pair in candidates:
             pid = pair["pair_id"]
+            names = " / ".join(sorted((str(pair.get("name_a", "")), str(pair.get("name_b", "")))))
             d = chosen.get(pid, {})
             if "related" in d and isinstance(d["related"], bool):
                 related = d["related"]
-                reason = str(d.get("reasoning", f"Related reasoning for {pid}"))
+                reason = str(d.get("reasoning", f"Related reasoning for {names}"))
             else:
                 rel = str(d.get("relation", "")).strip()
                 if rel in ("owl:differentFrom", "different", "different_from"):
                     related = False
-                    reason = f"Different concepts for {pid}"
+                    reason = f"Different concepts for {names}"
                 else:
                     related = True
-                    reason = f"Related concepts for {pid}"
+                    reason = f"Related concepts for {names}"
             res_list.append(
                 {
                     "pair_id": pid,

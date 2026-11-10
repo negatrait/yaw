@@ -322,6 +322,7 @@ def extract_structured_triples(
     *,
     entity_definitions: Sequence[tuple[str, str]] | dict[str, str] | None = None,
     known_entities: Sequence[str] | None = None,
+    llm_probabilities: Sequence[float | None] | None = None,
 ) -> tuple[StructuredTriple, ...]:
     """Extract, validate, and deduplicate StructuredTriple records from raw list, dict, or JSON string."""
     def_lookup: dict[str, str] = {}
@@ -375,7 +376,9 @@ def extract_structured_triples(
             raise ValueError("Ambiguous NER label requires an existing NER definition")
         return def_lookup.get(name, "")
 
-    for item in raw_list:
+    if llm_probabilities is not None and len(llm_probabilities) != len(raw_list):
+        raise ValueError("Triple probabilities do not cover the source records")
+    for index, item in enumerate(raw_list):
         st = _coerce_structured_triple_item(item, def_lookup=def_lookup)
         if st is None:
             if resources is not None:
@@ -419,6 +422,8 @@ def extract_structured_triples(
         )
         if key not in seen:
             seen.add(key)
+            if llm_probabilities is not None:
+                st = replace(st, llm_prob=llm_probabilities[index])
             results.append(st)
     return tuple(results)
 

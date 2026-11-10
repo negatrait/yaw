@@ -200,7 +200,7 @@ def test_program_named_predictors_and_audit_trails() -> None:
     assert "label_judge" in named_predictors
     assert "hierarchy_judge" in named_predictors
     assert "related_judge" in named_predictors
-    assert "synonym_judge" not in named_predictors
+    assert "semantic_judge" not in named_predictors
 
     assert isinstance(program.label_judge_audit_trail, DiagnosticHistory)
     assert isinstance(program.hierarchy_judge_audit_trail, DiagnosticHistory)
@@ -230,7 +230,7 @@ def test_cascade_rule_w1_direct_facts_skips_stage1_to_stage2() -> None:
     lm.hierarchy_responses["e0|e1"] = (True, False)
     batch = _make_batch(pairs)
 
-    decisions = program.judge_synonyms(batch)
+    decisions = program.judge_semantics(batch)
     assert len(decisions) == 1
     assert lm.stage_calls["label_judge"] == 0
     assert lm.stage_calls["hierarchy_judge"] == 1
@@ -264,7 +264,7 @@ def test_cascade_stage1_truth_table_short_circuiting() -> None:
     lm.hierarchy_responses["e6|e7"] = (True, False)
 
     batch = _make_batch(pairs)
-    decisions = program.judge_synonyms(batch)
+    decisions = program.judge_semantics(batch)
 
     assert lm.stage_calls["label_judge"] == 1
     assert lm.stage_calls["hierarchy_judge"] == 1
@@ -310,7 +310,7 @@ def test_cascade_stage2_hierarchy_truth_table() -> None:
     lm.hierarchy_responses["e4|e5"] = (True, True)
 
     batch = _make_batch(pairs)
-    decisions = program.judge_synonyms(batch)
+    decisions = program.judge_semantics(batch)
 
     assert lm.stage_calls["label_judge"] == 1
     assert lm.stage_calls["hierarchy_judge"] == 1
@@ -355,7 +355,7 @@ def test_cascade_rule_w1_w2_stage2_residuals_deterministic_related() -> None:
     lm.hierarchy_responses["e2|e3"] = (False, False)
 
     batch = _make_batch(pairs)
-    decisions = program.judge_synonyms(batch)
+    decisions = program.judge_semantics(batch)
 
     assert lm.stage_calls["hierarchy_judge"] == 1
     assert lm.stage_calls["related_judge"] == 0
@@ -385,7 +385,7 @@ def test_cascade_stage3_related_and_different_from() -> None:
     lm.related_responses["e2|e3"] = False
 
     batch = _make_batch(pairs)
-    decisions = program.judge_synonyms(batch)
+    decisions = program.judge_semantics(batch)
 
     assert lm.stage_calls["label_judge"] == 1
     assert lm.stage_calls["hierarchy_judge"] == 1
@@ -406,7 +406,7 @@ def test_per_stage_fingerprint_isolation_on_signature_mutation() -> None:
     dspy.settings.configure(lm=lm)
     program = _make_program(lm)
 
-    for fn in (program.judge_synonyms, program._run_judge_stage):
+    for fn in (program.judge_semantics, program._run_judge_stage):
         assert set(inspect.signature(fn).parameters).isdisjoint({"stage_" + "cache", "stage_" + "caches"})
 
     pairs = [
@@ -418,7 +418,7 @@ def test_per_stage_fingerprint_isolation_on_signature_mutation() -> None:
 
     batch = _make_batch(pairs)
 
-    decisions1 = program.judge_synonyms(batch)
+    decisions1 = program.judge_semantics(batch)
     assert len(decisions1) == 1
     assert lm.stage_calls["label_judge"] == 1
     assert lm.stage_calls["hierarchy_judge"] == 1
@@ -437,7 +437,7 @@ def test_per_stage_fingerprint_isolation_on_signature_mutation() -> None:
     assert batch.subset(["e0|e1"]).cache_identity == _make_batch(pairs).subset(["e0|e1"]).cache_identity
 
     cand_prog.set_lm(lm)
-    decisions2 = cand_prog.judge_synonyms(batch, lm=lm)
+    decisions2 = cand_prog.judge_semantics(batch, lm=lm)
     assert decisions2 == decisions1
 
 

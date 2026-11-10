@@ -9,10 +9,11 @@ from typing import Any, Literal
 import dspy
 
 from yaw.core.config import DEFAULT_CONTEXT_WINDOW_TOKENS, YawConfig, context_char_limit, scale_context_budget
-from yaw.core.types import OpenIERecord, StructuredTriple, SynonymEvidenceBatch, is_resource_label
+from yaw.core.types import OpenIERecord, StructuredTriple, SynonymEvidenceBatch, is_resource_label, pool_confidences
 
 from .adapter import YawGBNFAdapter, sum_usage_tokens
 from .chat import create_dspy_lm
+from .confidence import extraction_logprob_votes, judge_logprob_votes
 from .diagnostics import DiagnosticHistory, diagnostic_boundary
 from .grammars import (
     build_dspy_hierarchy_judge_grammar,
@@ -551,7 +552,7 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
         ]
 
     def _dspy_ctx(self, lm: dspy.BaseLM | None, *, use_json_adapter: bool = True, adapter: dspy.Adapter | None = None):
-        ctx_kwargs: dict[str, Any] = {"warn_on_type_mismatch": False}
+        ctx_kwargs: dict[str, Any] = {"warn_on_type_mismatch": False, "disable_history": True, "max_history_size": 0}
         if lm is not None:
             ctx_kwargs["lm"] = lm
         if use_json_adapter:
@@ -605,6 +606,7 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
         use_gbnf: bool | None,
         grammar_fn: Callable[[], str],
         request_adapter: dspy.Adapter | None = None,
+        collect_logprobs: bool = False,
         **inputs: Any,
     ) -> Any:
         from dspy.utils.usage_tracker import track_usage
@@ -644,8 +646,11 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
                 call_kwargs: dict[str, Any] = {}
                 if lm is not None:
                     call_kwargs["lm"] = lm
+                config: dict[str, Any] = {"logprobs": True} if collect_logprobs else {}
                 if self._should_use_gbnf(use_gbnf, effective_lm):
-                    call_kwargs["config"] = {"extra_body": {"grammar": grammar_fn()}}
+                    config["extra_body"] = {"grammar": grammar_fn()}
+                if config:
+                    call_kwargs["config"] = config
                 with self._dspy_ctx(effective_lm, use_json_adapter=True, adapter=request_adapter):
                     pred = direct_mod(**direct_inputs, **call_kwargs)
                     inv_score, inv_feedback = validate_stage_invariants(
@@ -669,7 +674,7 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
                 is_rlm=bool(is_rlm and rlm_mod is not None),
                 usage=tokens,
                 inputs_summary=str(list(inputs.keys())),
-                outputs_summary=str(pred)[:240],
+                outputs_summary=str({key: value for key, value in pred.items() if key != "logprobs"})[:240],
                 invariant_score=inv_score,
                 invariant_feedback=inv_feedback,
             )
@@ -681,10 +686,11 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
         *,
         lm: Any = None,
         use_gbnf: bool | None = None,
-    ) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
+    ) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...], tuple[tuple[str, str, float | None], ...]]:
         pred = self._invoke_stage(
             self.ner,
             stage_name="ner",
+            collect_logprobs=True,
             is_rlm=False,
             lm=lm,
             use_gbnf=use_gbnf,
@@ -693,11 +699,22 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
         )
         raw_entities = getattr(pred, "named_entities", [])
         parsed_defs = extract_entity_definitions(raw_entities)
+        measurements = extraction_logprob_votes(pred.get("logprobs"), "named_entities", raw_entities)
+        if "logprobs" in pred:
+            del pred["logprobs"]
+        votes: dict[tuple[str, str], list[float | None]] = {}
+        for item, probability in zip(raw_entities, measurements, strict=True):
+            for name, definition in extract_entity_definitions([item]):
+                votes.setdefault((name, definition.casefold()), []).append(probability)
+        probabilities = tuple(
+            (name, definition, pool_confidences(*votes[(name, definition.casefold())]))
+            for name, definition in parsed_defs
+        )
         literals = [name for name, _ in parsed_defs if not is_resource_label(name)]
         if literals:
             raise ValueError(f"NER resource label lacks lexical content (literals are not resources): {literals!r}")
         entities = tuple(ename for ename, _ in parsed_defs)
-        return entities, tuple(parsed_defs)
+        return entities, tuple(parsed_defs), probabilities
 
     def extract_entity_definitions(
         self,
@@ -707,7 +724,7 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
         use_gbnf: bool | None = None,
     ) -> tuple[tuple[str, str], ...]:
         """Run DSPy NER extraction and return deduplicated (entity_name, contextual_definition) pairs."""
-        _, entity_defs = self._run_ner_stage(passage, lm=lm, use_gbnf=use_gbnf)
+        _, entity_defs, _ = self._run_ner_stage(passage, lm=lm, use_gbnf=use_gbnf)
         return entity_defs
 
     def define_missing_entities(
@@ -815,6 +832,7 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
         pred = self._invoke_stage(
             self.triples,
             stage_name="triples",
+            collect_logprobs=True,
             is_rlm=False,
             lm=lm,
             use_gbnf=use_gbnf,
@@ -822,10 +840,15 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
             passage=passage,
             named_entities=normalized_entities,
         )
+        raw_triples = getattr(pred, "triples", [])
+        probabilities = extraction_logprob_votes(pred.get("logprobs"), "triples", raw_triples)
+        if "logprobs" in pred:
+            del pred["logprobs"]
         return extract_structured_triples(
-            getattr(pred, "triples", []),
+            raw_triples,
             entity_definitions=definitions,
             known_entities=names,
+            llm_probabilities=probabilities,
         )
 
     def extract_openie(
@@ -838,7 +861,7 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
     ) -> OpenIERecord:
         """Execute OpenIE (NER-owned resources/definitions -> resource-closed statements) for a passage \
 chunk."""
-        entities, entity_definitions = self._run_ner_stage(passage, lm=lm, use_gbnf=use_gbnf)
+        entities, entity_definitions, entity_probabilities = self._run_ner_stage(passage, lm=lm, use_gbnf=use_gbnf)
         has_nonempty_defs = any(defn for _, defn in entity_definitions)
         stage2_entities_input: list[Any] = list(entity_definitions) if has_nonempty_defs else list(entities)
         structured_triples = self.extract_structured_triples(
@@ -855,6 +878,7 @@ chunk."""
             triples=triples,
             structured_triples=structured_triples,
             entity_definitions=entity_definitions,
+            entity_probabilities=entity_probabilities,
         )
 
     def synonym_request_budget(self, lm: Any = None) -> SynonymRequestBudget:
@@ -948,6 +972,7 @@ chunk."""
                     max_reasoning_chars=self.gbnf_max_reasoning_chars,
                 ),
                 request_adapter=budget,
+                collect_logprobs=True,
                 candidate_pairs=batch.payload,
             )
             elapsed = time.perf_counter() - started
@@ -961,6 +986,9 @@ chunk."""
             raise ValueError(feedback)
 
         parsed_decs = parser_fn(pred.decisions)
+        judge_logprob_votes(pred.get("logprobs"), parsed_decs)
+        if "logprobs" in pred:
+            del pred["logprobs"]
         stage_tokens = int(self.telemetry[-1].get("tokens_used", 0)) if len(self.telemetry) > prev_telem_len else 0
         summary = {
             "packet_id": batch.cache_identity,
@@ -998,7 +1026,7 @@ chunk."""
 
         return parsed_decs
 
-    def judge_synonyms(
+    def judge_semantics(
         self,
         batch: SynonymEvidenceBatch,
         *,
@@ -1018,13 +1046,14 @@ chunk."""
 
         pairs_by_id = {p["pair_id"]: p for p in pairs_list}
         resolved_decisions: list[dict[str, Any]] = []
+        votes: dict[str, list[float | None]] = {pid: [] for pid in pairs_by_id}
 
         # 1. Rule W1: Direct facts skip Stage 1 directly to Stage 2
         stage1_pids: list[str] = []
         stage2_pids: list[str] = []
         for p in pairs_list:
             pid = p["pair_id"]
-            if p.get("direct_facts"):
+            if p.get("direct_facts") or p.get("merge_forbidden"):
                 stage2_pids.append(pid)
             else:
                 stage1_pids.append(pid)
@@ -1042,6 +1071,7 @@ chunk."""
             )
             for dec in s1_decs:
                 pid = dec["pair_id"]
+                votes[pid].append(dec["llm_prob"])
                 equiv = bool(dec.get("equivalent"))
                 hidden = bool(dec.get("hidden_label"))
                 if equiv and hidden:
@@ -1069,6 +1099,7 @@ chunk."""
             )
             for dec in s2_decs:
                 pid = dec["pair_id"]
+                votes[pid].append(dec["llm_prob"])
                 ea, eb = pid.split("|", 1)
                 broader = bool(dec.get("broader"))
                 narrower = bool(dec.get("narrower"))
@@ -1118,12 +1149,15 @@ chunk."""
                 rlm_stats=rlm_stats,
             )
             for dec in s3_decs:
+                votes[dec["pair_id"]].append(dec["llm_prob"])
                 dec_copy = dict(dec)
                 related = bool(dec.get("related"))
                 dec_copy["relation"] = "skos:related" if related else "owl:differentFrom"
                 resolved_decisions.append(dec_copy)
 
         # 7. Aggregate all resolved decisions and return
+        for decision in resolved_decisions:
+            decision["llm_prob"] = pool_confidences(*votes[decision["pair_id"]])
         return batch.resolve_decisions(resolved_decisions)
 
     def propose_shacl_repairs(

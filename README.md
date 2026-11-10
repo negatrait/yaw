@@ -65,9 +65,15 @@ Ruff fixes and pytest `--testmon` are project defaults. ty's `--fix` has no
 persistent configuration setting; `uv run typecheck` supplies it automatically.
 See the [coverage plan](docs/coverage-plan.md) for remaining verification work.
 
-Indexes created before source-vector retention require a rebuild from source
+Indexes created before source-vector retention or `entity_mentions.llm_prob`
+require a rebuild from source
 before indexing with this version. The pipeline reports the missing schema
 explicitly. Restart long-running processes to load the implementation.
+
+NER, triples and semantic judges collect token logprobs on their existing calls.
+Source confidence pools those optional measurements with retained semantic
+similarity votes; missing logprobs do not remove scored traversal edges. Raw
+source measurements survive canonical merges and are withdrawn with their source.
 
 Candidate discovery uses fixed `[graph]` `candidate_dense_threshold` and
 `candidate_lexical_threshold` cutoffs. `auto_merge_threshold` separately requires
@@ -219,7 +225,7 @@ YAW replaces upstream HippoRAG 2's flat, unvalidated 7-file Parquet/Pickle/JSON 
 - **Multi-Label Synonymy & SKOS S13 Constraint (`entity_labels`):**
   Synonyms are mapped via `entity_labels(label_norm, entity_id, label_kind, raw_label, chunk_id)` supporting `skos:prefLabel`, `skos:altLabel`, and `skos:hiddenLabel`. YAW enforces W3C SKOS integrity constraint **S13** (pairwise disjointness among `prefLabel`, `altLabel`, and `hiddenLabel` for any given concept).
 - **Reversible Merges & Lineage Tracking (`entity_alt_labels`, `entity_redirects`, `entity_merge_lineage`):**
-  When synonym candidates are verified by LLM adjudication (`judge_synonyms`), `merge_entities` aliases duplicate concepts into `entity_alt_labels` while preserving complete merge lineage and redirects. This ensures that incremental document removals (`delete_chunks`) via CocoIndex `SyncDelta` remain fully reversible without corrupting the graph.
+  When synonym candidates are verified by LLM adjudication (`judge_semantics`), `merge_entities` aliases duplicate concepts into `entity_alt_labels` while preserving complete merge lineage and redirects. This ensures that incremental document removals (`delete_chunks`) via CocoIndex `SyncDelta` remain fully reversible without corrupting the graph.
 - **Typed Semantic Edges & Contrastive Semantics (`edges`, `edge_sources`):**
   Edges model semantic relations explicitly:
   - `passage`: Bipartite passage-to-entity links.

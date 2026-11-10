@@ -361,6 +361,12 @@ def provider():
                     output = {"fact": state["selected_facts"]}
                 elif "candidate_pairs" in text:
                     packet = json.JSONDecoder().raw_decode(text[text.index('{"format":') :])[0]
+                    state.setdefault("synonym_requests", []).append(
+                        {
+                            "pairs": [(p["entity_a"]["name"], p["entity_b"]["name"]) for p in packet["pairs"]],
+                            "logprobs": data.get("logprobs"),
+                        }
+                    )
                     output = {
                         "decisions": complete_decisions(
                             candidate_rows(text),
@@ -393,6 +399,8 @@ def provider():
                             stage_text=json.dumps(data["messages"]),
                         )
                     }
+                    if state.get("reverse_synonym_decisions"):
+                        output["decisions"].reverse()
                 elif "missing_entities" in text:
                     output = (
                         {"entity_definitions": []}
@@ -405,6 +413,7 @@ def provider():
                     output = {field: state["extractions"][passage][field]}
                     with lock:
                         state.setdefault("extraction_requests", []).append((field, passage))
+                        state.setdefault("extraction_logprobs", []).append(data.get("logprobs"))
                 elif "violations" in text:
                     all_msg_text = json.dumps(data["messages"])
                     if "healed_definition" in state:
@@ -487,6 +496,15 @@ def provider():
                     ],
                     "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
                 }
+                if data.get("logprobs") and not state.get("omit_logprobs"):
+                    from daemon.graph.synonym_protocol import response_logprobs
+
+                    probability = state.get("logprob_probability", 0.81)
+                    if callable(probability):
+                        probability = probability(output)
+                    body["choices"][0]["logprobs"] = response_logprobs(
+                        body["choices"][0]["message"]["content"], probability
+                    )
             with lock:
                 state["intervals"].append((kind, started, time.perf_counter()))
             self.send(body)

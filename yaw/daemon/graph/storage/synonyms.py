@@ -5,6 +5,8 @@ import json
 import sqlite3
 import time
 from collections.abc import Callable, Iterator, Sequence
+from dataclasses import replace
+from itertools import chain
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +15,74 @@ from yaw.core import SynonymEvidenceBatch
 from .chunks import get_chunk_pointers
 from .hydration import hydrate_chunk_pointer
 from .shacl import inspect_entity_or_fact
+
+
+class SynonymConstraints:
+    """Plan-local identity proofs and separation adjacency; never scored observations."""
+
+    def __init__(self, conn: sqlite3.Connection, fact_pairs: Sequence[tuple[str, str]] = ()) -> None:
+        self.parents: dict[str, str] = {}
+        self.apart: dict[str, set[str]] = {}
+        self.fact_pairs = set(fact_pairs)
+        self.fact_pairs.update(conn.execute("SELECT subj_id,obj_id FROM facts WHERE obj_kind='entity'"))
+        for a, b in chain(
+            self.fact_pairs,
+            conn.execute(
+                "SELECT src_id,dst_id FROM edges WHERE kind IN ('skos:broader','skos:related','owl:differentFrom')"
+            ),
+        ):
+            if a != b:
+                self.apart.setdefault(a, set()).add(b)
+                self.apart.setdefault(b, set()).add(a)
+
+    def resolve(self, entity: str) -> str:
+        while entity in self.parents:
+            parent = self.parents[entity]
+            self.parents[entity] = self.parents.get(parent, parent)
+            entity = parent
+        return entity
+
+    def separated(self, a: str, b: str) -> bool:
+        return self.resolve(b) in self.apart.get(self.resolve(a), ())
+
+    def separate(self, a: str, b: str) -> None:
+        a, b = self.resolve(a), self.resolve(b)
+        if a != b:
+            self.apart.setdefault(a, set()).add(b)
+            self.apart.setdefault(b, set()).add(a)
+
+    def merge(self, a: str, b: str) -> bool:
+        a, b = sorted((self.resolve(a), self.resolve(b)))
+        if a == b or b in self.apart.get(a, ()):
+            return False
+        self.parents[b] = a
+        for neighbor in self.apart.pop(b, ()):
+            self.apart[neighbor].discard(b)
+            self.apart[neighbor].add(a)
+            self.apart.setdefault(a, set()).add(neighbor)
+        return True
+
+    def prune(self, batch: SynonymEvidenceBatch) -> SynonymEvidenceBatch:
+        """Omit collapsed pairs and route established separation past label judging."""
+        retained = []
+        separated = set()
+        for candidate in batch.candidates:
+            a, b = candidate["entity_a"], candidate["entity_b"]
+            if self.resolve(a) == self.resolve(b):
+                continue
+            retained.append(candidate["pair_id"])
+            if self.separated(a, b):
+                separated.add(candidate["pair_id"])
+        if len(retained) != len(batch.candidates):
+            batch = batch.subset(retained)
+        if not separated:
+            return batch
+        payload = json.loads(batch.payload)
+        for pair in payload["pairs"]:
+            a, b = pair["pair_id"].split("|", 1)
+            if f"{batch.identifiers.get(a, a)}|{batch.identifiers.get(b, b)}" in separated:
+                pair["merge_forbidden"] = True
+        return replace(batch, payload=json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
 
 
 def query_shared_role_facts(

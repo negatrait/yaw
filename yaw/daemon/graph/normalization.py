@@ -175,6 +175,7 @@ def normalize_openie_record(rec: OpenIERecord) -> NormalizedRecord:
                 obj_kind="literal" if is_literal_obj else "entity",
                 obj_datatype=resolved_dt,
                 obj_lang=str(getattr(st, "obj_lang", "") or ""),
+                llm_prob=st.llm_prob,
             )
         )
 

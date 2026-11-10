@@ -204,7 +204,7 @@ def test_complete_native_request_and_original_id_decisions(tmp_path, packet_prov
     program = make_program(url)
     batch = make_batch(tmp_path)
     assert program.synonym_batch_fits(batch)
-    decisions = program.judge_synonyms(batch)
+    decisions = program.judge_semantics(batch)
     assert [x["relation"] for x in decisions] == [
         "skos:altLabel",
         "skos:hiddenLabel",
@@ -229,7 +229,7 @@ def test_packet_specific_grammar_reaches_native_provider(tmp_path, packet_provid
     program.label_judge.lm._yaw_supports_gbnf = True
     batch = make_batch(tmp_path)
     pairs = [p["pair_id"] for p in json.loads(batch.payload)["pairs"]]
-    program.judge_synonyms(batch)
+    program.judge_semantics(batch)
     grammar = calls[0]["grammar"]
     assert grammar == build_dspy_label_judge_grammar(pair_ids=pairs)
     root = grammar.splitlines()[0]
@@ -246,7 +246,7 @@ def test_bad_decisions_fail_before_graph_application(tmp_path, packet_provider, 
     state["mode"] = mode
     program = make_program(url)
     with pytest.raises((ValueError, dspy.utils.exceptions.AdapterParseError)):
-        program.judge_synonyms(make_batch(tmp_path))
+        program.judge_semantics(make_batch(tmp_path))
     assert len(calls) == 1
     assert not program.label_judge_audit_trail
 
@@ -258,7 +258,7 @@ def test_complete_request_budget_counts_demos_and_never_generates_over_budget(tm
     program.label_judge.demos = [dspy.Example(candidate_pairs="unabridged demo " * 2000, decisions=[])]
     assert not program.synonym_batch_fits(batch)
     with pytest.raises(ValueError, match="exceeds context"):
-        program.judge_synonyms(batch)
+        program.judge_semantics(batch)
     assert not calls
 
 
@@ -323,7 +323,7 @@ try:
   row=conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
   decisions=json.loads(row[0]) if row is not None else None
   if decisions is None:
-   decisions=program.judge_synonyms(batch)
+   decisions=program.judge_semantics(batch)
    conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (key, json.dumps(decisions)))
   if crash:raise RuntimeError('interrupted before graph commit')
  print(json.dumps(decisions))

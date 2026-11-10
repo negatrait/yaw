@@ -48,6 +48,22 @@ flowchart LR
 ```
 
 ### 1.1 Operator 1: `pool_confidences` — Logarithmic Opinion Pool (Geometric Mean)
+
+Semantic judges request token logprobs on their existing calls. Confidence is
+measured from Boolean decision values, excluding standalone syntax, pair IDs,
+definitions and reasoning. A split value uses the sum of its token logprobs;
+multiple fields and measured stages on the selected cascade path use the
+existing geometric opinion pool. Tokens crossing a value boundary contribute
+their token probability; this is model confidence, not demonstrated empirical
+calibration. Unavailable measurements remain None and malformed metadata fails.
+Deterministic constraint deductions add no vote. See [CP1](reviews/constraint-propagation.md).
+NER and OpenIE use the same collector on their existing calls, measuring semantic
+string values with per-value token-length normalization. Retained source-sense
+and chunk vectors supply NER coherence; statements pool their resource-role
+cosines against that chunk. Preserve one complete source observation per
+owner/chunk and aggregate surviving chunks with Noisy-OR. The semantic vote is
+required, so absent logprobs do not produce NULL edge weights. See
+[EX1](reviews/extraction-confidence.md).
 Whenever we combine $K$ confidence measurements $x_1, \dots, x_K \in (0, 1]$ of a **single assertion, state transition, query seed, or adjudicated edge**, we use the **Logarithmic Opinion Pool** (geometric mean over the non-`None` known values $\mathcal{S} = \{x_k \mid x_k \neq \text{None}\}$):
 $$\text{pool\_confidences}(x_1, \dots, x_K) = \begin{cases} \exp\left(\frac{1}{|\mathcal{S}|} \sum_{x \in \mathcal{S}} \log x\right) = \left(\prod_{x \in \mathcal{S}} x\right)^{1 / |\mathcal{S}|} & \text{if } |\mathcal{S}| \ge 1 \\ \text{None} & \text{if } |\mathcal{S}| = 0 \end{cases}$$
 
@@ -68,6 +84,14 @@ $$\text{pool\_confidences}(x_1, \dots, x_K) = \begin{cases} \exp\left(\frac{1}{|
 ---
 
 ### 1.2 Operator 2: `bayesian_noisy_or` — Additive Shannon Evidence Across Independent Observations
+
+Provenance restoration is not a new independent observation. The
+[assertion-backed repair](native-cocoindex-graph.md#evidence-backed-provenance-restoration)
+preserves existing source rows and reconstructs missing observations from raw
+assertion model votes and retained source-role/context vectors. Duplicate
+assertions from one chunk never create multiple source observations. Missing
+logprobs leave the model vote None; semantic votes still contribute. No aggregate
+posterior is copied into a restored atomic observation.
 Whenever $m$ **independent parallel observations** $\{c_1, \dots, c_m\}$ corroborate the same entity, fact statement, or directed node pair $(u, v)$, each observation contributes additive Shannon evidence $E_i = -\log(1 - c_i) > 0$:
 $$E_{\text{total}} = \sum_{i=1}^{m} -\log(1 - c_i), \quad P(\text{true} \mid c_1, \dots, c_m) = 1 - \exp(-E_{\text{total}}) = 1 - \prod_{i=1}^{m} (1 - c_i) \in (0, 1)$$
 This single operator computes:
@@ -161,8 +185,8 @@ class RelationTraversalPolicy:
 
 ### 2.4 W3C Semantic Guardrails & Canonical Gemma 4 Ontology SSOT (`planner.py` & `prompts.py`)
 
-1. **Guardrail 1: Homograph-Only `owl:differentFrom` (`apply_synonym_adjudication`)**:
-   - Emit `owl:differentFrom` when Stage 3 (`related_judge`) returns `related: false` **only** if the pair shares a normalized surface label (`text_processing(name_a) == text_processing(name_b)`) or has confusable lexical overlap at or above the empirical mean lexical similarity of accepted `skos:altLabel` pairs on `stage_conn` (`lexical_sim >= avg_alt_label_sim`). Otherwise emit no edge.
+1. **Guardrail 1: Explicit distinctness for admitted pairs (`apply_synonym_adjudication`)**:
+   - Retain Stage 3 `related: false` as `owl:differentFrom`. Candidate admission already bounds the pool. The former homograph/mean-altLabel lexical gate was retired by [CP1](reviews/constraint-propagation.md): it depended on unrelated votes sharing a micro-batch and was incompatible with constraint pruning and fixed-evidence batch parity.
 2. **Guardrail 2 (Superseded `2026-11-08` by Invariants `W1` & `W2` in [w3c-improvements.md §12](w3c-improvements.md#12-strict-judgelabels-identity-equivalence--canonical-gemma-4-3-stage-cascade-without-python-token-overrides-or-auto-merge-gates)): Strict `JudgeLabels` Equivalence & Same-Norm Pre-Consolidation Only**:
    - *Superseded*: Post-hoc Python prefix-token rewriting (`_is_acronym`, `is_modifier_head_specialization`, `_has_disjoint_non_acronym_tokens`) and cross-label auto-merge gates (`auto_merge_cosine_gate`, `auto_merge_difflib_gate`) in `planner.py` are retired because they violated [graph-storage.md](../.agents/rules/graph-storage.md) (**Canonical Gemma 4 Ontology SSOT**) and inverted English `[Modifier, Head]` compounds (`"Tenant-id"`, `"Retention policy"`, `"Telemetry-team"`, `"CustomerName"`) into false `skos:broader` assertions (`Tenant-id skos:broader Tenant`).
    - *Active Contract (`W1` & `W2`)*: Pre-LLM consolidation in `prepare_synonym_candidates` merges $(A, B)$ if and only if $\text{text\_processing}(\text{name}_A) = \text{text\_processing}(\text{name}_B) \land d_{\text{sim}}(A, B) \ge \tau_{\text{syn}} \land \neg\text{is\_active\_fact\_pole}(A, B)$. Cross-label candidates advance to `JudgeLabels`, where a `2`-branch `equiv-branch` GBNF grammar (`max_reasoning_chars = 360` `[target]`) enforces $\text{merge}(A, B) \iff \text{equivalent}(A, B) = \text{true}$ and routes all `equivalent: false` pairs (including distinct `owl:NamedIndividual`s and modifier-head specializations falsified in `JudgeLabels` `reasoning`) to Stage 2 (`JudgeHierarchy`).

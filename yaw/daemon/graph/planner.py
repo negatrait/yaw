@@ -34,11 +34,11 @@ from yaw.daemon.graph.inference.components import (
     MissingEntityInput,
     PredictorTrace,
     SHACLHealInput,
-    SynonymJudgeInput,
+    SemanticAdjudicationInput,
     define_missing_entities,
     embed_text,
     heal_shacl_violations,
-    judge_synonyms,
+    judge_semantics,
 )
 from yaw.daemon.graph.normalization import normalize_openie_record, preferred_surface
 from yaw.daemon.graph.storage import (
@@ -81,6 +81,8 @@ from yaw.daemon.graph.storage.evidence import (
     canonicalize_fact_text,
     evidence_schemas,
     load_sense_bindings,
+    refresh_source_confidences,
+    restore_asserted_fact_sources,
     sense_id,
     upsert_evidence,
 )
@@ -95,6 +97,7 @@ from yaw.daemon.graph.storage.rows import (
     graph_tables,
     snapshot_table_rows,
 )
+from yaw.daemon.graph.storage.synonyms import SynonymConstraints
 
 
 @dataclass(frozen=True, slots=True)
@@ -288,6 +291,7 @@ def apply_stage1_definitions(
                 obj_kind=st.obj_kind,
                 obj_datatype=st.obj_datatype,
                 obj_lang=st.obj_lang,
+                llm_prob=st.llm_prob,
             )
             for st in normalized_sts
         ]
@@ -563,16 +567,8 @@ def apply_synonym_adjudication(
 ) -> tuple[list[EntityMerge], list[tuple[str, str, str, float, str]]]:
     """Apply Stage 3 Gemma 4 synonym decisions on stage_conn with two-phase topological resolution."""
     cand_meta = dict(cand_meta)
-    merged_into: dict[str, str] = {}
+    constraints = SynonymConstraints(stage_conn, tuple(fact_linked_pairs))
     hidden_label_norms: dict[str, set[str]] = defaultdict(set)
-
-    def _resolve_active_eid(eid: str) -> str:
-        curr = eid
-        visited: set[str] = set()
-        while curr in merged_into and curr not in visited:
-            visited.add(curr)
-            curr = merged_into[curr]
-        return curr
 
     staged_merges: list[EntityMerge] = []
     raw_semantic_batch: list[tuple[str, str, str, float, str]] = []
@@ -581,30 +577,20 @@ def apply_synonym_adjudication(
         ea, eb = str(c["entity_a"]), str(c["entity_b"])
         cand_by_pair[(min(ea, eb), max(ea, eb))] = c
 
-    # Empirical mean lexical similarity of accepted skos:altLabel pairs
-    alt_label_sims: list[float] = []
-    for dec in decisions:
-        rel_check = str(dec.get("relation") or dec.get("decision") or "").strip()
-        if rel_check in ("skos:altLabel", "exact_match"):
-            pid_check = str(dec.get("pair_id", "")).strip()
-            if pid_check and "|" in pid_check:
-                r_src, r_tgt = pid_check.split("|", 1)
-                pk = (min(r_src.strip(), r_tgt.strip()), max(r_src.strip(), r_tgt.strip()))
-                c_item = cand_by_pair.get(pk)
-                if c_item:
-                    alt_label_sims.append(float(c_item.get("lexical_sim", 0.0)))
-    avg_alt_label_sim: float | None = sum(alt_label_sims) / len(alt_label_sims) if alt_label_sims else None
-
     def _is_active_fact_pole(u: str, v: str) -> bool:
         target_pair = (min(u, v), max(u, v))
-        for fa, fb in fact_linked_pairs:
-            ra, rb = _resolve_active_eid(fa), _resolve_active_eid(fb)
+        for fa, fb in constraints.fact_pairs:
+            ra, rb = constraints.resolve(fa), constraints.resolve(fb)
             if (min(ra, rb), max(ra, rb)) == target_pair:
                 return True
         return False
 
     with write_tx(stage_conn):
-        for dec in decisions:
+        candidate_order = {pair: index for index, pair in enumerate(cand_by_pair)}
+        for dec in sorted(
+            decisions,
+            key=lambda d: candidate_order.get(tuple(sorted(str(d.get("pair_id", "")).split("|"))), len(candidates)),
+        ):
             pid = str(dec.get("pair_id", "")).strip()
             if dec.get("source_id") and dec.get("target_id"):
                 raw_src = str(dec["source_id"]).strip()
@@ -621,22 +607,25 @@ def apply_synonym_adjudication(
             pkey = (min(raw_src, raw_tgt), max(raw_src, raw_tgt))
             if pkey not in cand_by_pair:
                 continue
-            src = _resolve_active_eid(raw_src)
-            tgt = _resolve_active_eid(raw_tgt)
+            src = constraints.resolve(raw_src)
+            tgt = constraints.resolve(raw_tgt)
             if src == tgt:
                 continue
             cand_info = cand_by_pair[pkey]
-            sim = float(cand_info.get("similarity", 0.5) or 0.5)
+            sim = float(cand_info["similarity"])
             name_src, _ = cand_meta.get(src, cand_meta.get(raw_src, (src, "")))
             name_tgt, _ = cand_meta.get(tgt, cand_meta.get(raw_tgt, (tgt, "")))
 
             reas = str(dec.get("reasoning", "") or "").strip()
             dec_prob = dec.get("llm_prob")
             dec_llm_prob = float(dec_prob) if dec_prob is not None else None
-            edge_weight = pool_confidences(dec_llm_prob, sim) or sim
+            edge_weight = pool_confidences(dec_llm_prob, sim)
+            assert edge_weight is not None
             if rel in ("skos:altLabel", "skos:hiddenLabel", "exact_match"):
                 if _is_active_fact_pole(src, tgt):
                     raw_semantic_batch.append((src, tgt, "skos:related", edge_weight, reas))
+                    continue
+                if not constraints.merge(src, tgt):
                     continue
                 merged_def = str(dec.get("definition", "") or "").strip() or None
                 if (
@@ -674,27 +663,24 @@ def apply_synonym_adjudication(
                         hidden_label_norms[merge_dst].update(hidden_label_norms.pop(owner))
                 cand_meta.update(get_entity_metadata_batch(stage_conn, [merge_dst]))
                 staged_merges.append(merged)
-                merged_into[merge_src] = merge_dst
                 rlm_stats["merged_entities"] = int(rlm_stats.get("merged_entities", 0)) + 1
             else:
                 if rel in ("owl:differentFrom", "different", "different_from"):
-                    # Guardrail 1: Homograph-Only owl:differentFrom
-                    is_homograph = text_processing(name_src) == text_processing(name_tgt)
-                    lex_sim = float(cand_info.get("lexical_sim", 0.0))
-                    meets_homograph_boundary = avg_alt_label_sim is not None and lex_sim >= avg_alt_label_sim
-                    if is_homograph or meets_homograph_boundary:
-                        raw_semantic_batch.append((src, tgt, "owl:differentFrom", 0.0, reas))
+                    constraints.separate(src, tgt)
+                    raw_semantic_batch.append((src, tgt, "owl:differentFrom", edge_weight, reas))
                 elif rel == "skos:broader":
+                    constraints.separate(src, tgt)
                     child_id, parent_id = src, tgt
                     raw_semantic_batch.append((child_id, parent_id, "skos:broader", edge_weight, reas))
                 elif rel in ("skos:related", "related"):
+                    constraints.separate(src, tgt)
                     raw_semantic_batch.append((src, tgt, "skos:related", edge_weight, reas))
 
         edge_priority = {"skos:related": 1, "skos:broader": 2, "owl:differentFrom": 3}
         pair_edges: dict[tuple[str, str], tuple[str, str, str, float, str]] = {}
         for s_raw, o_raw, r_kind, w, r_reas in raw_semantic_batch:
-            s_act = _resolve_active_eid(s_raw)
-            o_act = _resolve_active_eid(o_raw)
+            s_act = constraints.resolve(s_raw)
+            o_act = constraints.resolve(o_raw)
             if s_act == o_act:
                 continue
             upair = (min(s_act, o_act), max(s_act, o_act))
@@ -723,16 +709,16 @@ def apply_synonym_adjudication(
 
         if touched_entity_ids is not None:
             active_touched: list[str] | None = sorted(
-                {_resolve_active_eid(eid) for eid in touched_entity_ids}
-                | {_resolve_active_eid(m.canonical_id) for m in staged_merges}
-                | {_resolve_active_eid(eid) for eid in hidden_label_norms}
+                {constraints.resolve(eid) for eid in touched_entity_ids}
+                | {constraints.resolve(m.canonical_id) for m in staged_merges}
+                | {constraints.resolve(eid) for eid in hidden_label_norms}
             )
         else:
             active_touched = (
                 sorted(
-                    {_resolve_active_eid(eid) for c in candidates for eid in (str(c["entity_a"]), str(c["entity_b"]))}
-                    | {_resolve_active_eid(m.canonical_id) for m in staged_merges}
-                    | {_resolve_active_eid(eid) for eid in hidden_label_norms}
+                    {constraints.resolve(eid) for c in candidates for eid in (str(c["entity_a"]), str(c["entity_b"]))}
+                    | {constraints.resolve(m.canonical_id) for m in staged_merges}
+                    | {constraints.resolve(eid) for eid in hidden_label_norms}
                 )
                 or None
             )
@@ -1105,8 +1091,10 @@ async def plan_graph_publication(
         rlm_stats["candidate_pairs"] += raw_cand_count
         touched_eids = [*(eid for eid, _, _ in entity_nodes), *(m.canonical_id for m in merges)]
         if candidates or raw_cand_count:
-            decisions: list[dict[str, str]] = []
+            decisions: list[dict[str, Any]] = []
             if candidates:
+                constraints = SynonymConstraints(staging_conn, tuple(materialized.fact_linked_pairs))
+                candidate_order = {str(c["pair_id"]): index for index, c in enumerate(candidates)}
                 # Cognitive Load Safeguard: clamp batch_limit to max 4 pairs. Smaller models (4B-8B)
                 # suffer attention dispersion and conservative rejection when evaluating too many pairs at once.
                 # Actual prompt context fit is strictly governed by fits=extraction.program.synonym_batch_fits
@@ -1116,31 +1104,42 @@ async def plan_graph_publication(
                 # character heuristics.
                 batch_limit = max(1, min(settings.synonym_batch_size, 4))
                 max_dossier_chars = max(40000, settings.context_window_tokens * 3)
-                evidence_batches = list(
-                    iter_synonym_evidence(
-                        staging_conn,
-                        candidates,
-                        settings.corpus_root,
-                        ast_context_hops=settings.ast_context_hops,
-                        batch_size=batch_limit,
-                        max_chars=max_dossier_chars,
-                        fits=extraction.program.synonym_batch_fits,
-                    )
+                evidence_batches = iter_synonym_evidence(
+                    staging_conn,
+                    candidates,
+                    settings.corpus_root,
+                    ast_context_hops=settings.ast_context_hops,
+                    batch_size=batch_limit,
+                    max_chars=max_dossier_chars,
+                    fits=extraction.program.synonym_batch_fits,
                 )
                 for batch_idx, ev in enumerate(evidence_batches, start=1):
+                    original_count = len(ev.candidates)
+                    ev = constraints.prune(ev)
+                    rlm_stats["constraint_resolved_pairs"] = int(rlm_stats.get("constraint_resolved_pairs", 0)) + (
+                        original_count - len(ev.candidates)
+                    )
+                    if not ev.candidates:
+                        continue
                     if extraction.progress_callback is not None:
                         extraction.progress_callback(
-                            f"indexing: synonym adjudication ({batch_idx}/{len(evidence_batches)} batches, "
-                            f"{len(candidates)} candidate pairs)"
+                            f"indexing: synonym adjudication (batch {batch_idx}, {len(ev.candidates)} candidate pairs)"
                         )
-                    judged = await judge_synonyms(
-                        SynonymJudgeInput(
+                    judged = await judge_semantics(
+                        SemanticAdjudicationInput(
                             batch=ev,
                             program_identity=settings.program_identity,
                             synonym_identity=settings.synonym_identity,
                         )
                     )
                     decisions.extend(judged.decisions)
+                    for decision in sorted(judged.decisions, key=lambda d: candidate_order[d["pair_id"]]):
+                        endpoints = decision["pair_id"].split("|", 1)
+                        relation = decision.get("relation")
+                        if relation in ("skos:altLabel", "skos:hiddenLabel", "exact_match"):
+                            constraints.merge(*endpoints)
+                        elif relation in ("skos:related", "skos:broader", "owl:differentFrom"):
+                            constraints.separate(*endpoints)
                     all_traces.extend(judged.traces)
                     all_telemetry.extend(judged.telemetry)
                     for entry in judged.audit_trail:
@@ -1196,7 +1195,12 @@ async def plan_graph_publication(
         canonicalize_fact_text(staging_conn)
 
         # 3. Closed-World SHACL Deterministic Auto-Healing & RLM Healing on staging_conn
-        auto_healed = auto_heal_deterministic_shacl(staging_conn)
+        auto_healed = restore_asserted_fact_sources(staging_conn)
+        refresh_source_confidences(staging_conn)
+        deterministic_healed = auto_heal_deterministic_shacl(staging_conn)
+        auto_healed += deterministic_healed
+        if deterministic_healed:
+            refresh_source_confidences(staging_conn)
         if auto_healed > 0:
             canonicalize_fact_text(staging_conn)
         rlm_stats["shacl_deterministic_healed"] = auto_healed
@@ -1261,7 +1265,9 @@ async def plan_graph_publication(
                         f_val = str(rep.get("value", "")).strip()
                         if f_node.startswith("fact-") and f_val:
                             prior_fact_definitions[f_node] = f_val
-                auto_heal_deterministic_shacl(staging_conn)
+                refresh_source_confidences(staging_conn)
+                if auto_heal_deterministic_shacl(staging_conn):
+                    refresh_source_confidences(staging_conn)
                 canonicalize_fact_definitions(staging_conn, prior_definitions=prior_fact_definitions)
                 canonicalize_fact_text(staging_conn)
                 rlm_stats["shacl_repairs_applied"] += applied

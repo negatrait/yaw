@@ -155,7 +155,7 @@ class DefinedEntities:
 
 
 @dataclass(frozen=True, slots=True)
-class SynonymJudgeInput:
+class SemanticAdjudicationInput:
     batch: SynonymEvidenceBatch
     program_identity: str
     synonym_identity: str = ""
@@ -167,7 +167,7 @@ class SynonymJudgeInput:
 
 @dataclass(frozen=True, slots=True)
 class JudgedSynonyms:
-    decisions: tuple[dict[str, str], ...]
+    decisions: tuple[dict[str, Any], ...]
     traces: tuple[PredictorTrace, ...]
     telemetry: tuple[dict[str, Any], ...]
     audit_trail: tuple[dict[str, Any], ...] = ()
@@ -263,7 +263,7 @@ class OpenIEEndpoint:
         )
 
     @coco.fn.as_async
-    def judge_synonyms(self, /, request: SynonymJudgeInput) -> JudgedSynonyms:
+    def judge_semantics(self, /, request: SemanticAdjudicationInput) -> JudgedSynonyms:
         if request.program_identity != self.program_identity:
             raise ValueError("OpenIE program identity does not match the bound program")
         program = self.program.deepcopy()
@@ -274,7 +274,7 @@ class OpenIEEndpoint:
         lm = self._resolve_lm()
         traces: list[Any] = []
         with dspy.context(lm=lm, trace=traces):
-            decisions = program.judge_synonyms(request.batch, lm=lm)
+            decisions = program.judge_semantics(request.batch, lm=lm)
         names = {id(predictor): name for src in (self.program, program) for name, predictor in src.named_predictors()}
         audit_trail = [
             *program.label_judge_audit_trail,
@@ -282,7 +282,7 @@ class OpenIEEndpoint:
             *program.related_judge_audit_trail,
         ]
         return JudgedSynonyms(
-            tuple({str(k): str(v) for k, v in d.items()} for d in decisions),
+            tuple(dict(d) for d in decisions),
             tuple(
                 PredictorTrace(names[id(predictor)], dict(inputs), dict(outputs))
                 for predictor, inputs, outputs in traces
@@ -335,7 +335,7 @@ class OpenIEEndpoint:
 OPENIE_ENDPOINT = coco.ContextKey[OpenIEEndpoint]("yaw/openie_endpoint")
 
 
-@coco.fn(memo=True)
+@coco.fn(memo=True, version=2)
 async def extract_text(request: OpenIEInput) -> ExtractedText:
     endpoint = coco.use_context(OPENIE_ENDPOINT)
     async with endpoint.admission:
@@ -349,11 +349,11 @@ async def define_missing_entities(request: MissingEntityInput) -> DefinedEntitie
         return await endpoint.define_entities(request)
 
 
-@coco.fn(memo=True, version=2)
-async def judge_synonyms(request: SynonymJudgeInput) -> JudgedSynonyms:
+@coco.fn(memo=True, version=4)
+async def judge_semantics(request: SemanticAdjudicationInput) -> JudgedSynonyms:
     endpoint = coco.use_context(OPENIE_ENDPOINT)
     async with endpoint.admission:
-        return await endpoint.judge_synonyms(request)
+        return await endpoint.judge_semantics(request)
 
 
 @coco.fn(memo=True, version=5)

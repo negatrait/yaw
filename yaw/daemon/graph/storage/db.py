@@ -361,6 +361,9 @@ def open_readonly_yaw_db(
 
 def validate_graph_schema(conn: sqlite3.Connection) -> None:
     """Reject retired graph stores before any persistent database change."""
+    mention_columns = {row[1] for row in conn.execute("PRAGMA table_info(entity_mentions)")}
+    if mention_columns and "llm_prob" not in mention_columns:
+        raise ValueError("Source confidence schema changed; preserve this database and rebuild the index from source")
     retired = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name IN (?, ?)",
         ("concept_schemes", "concept_scheme_members"),

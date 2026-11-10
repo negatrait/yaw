@@ -592,7 +592,7 @@ Domain evaluation ledger for DSPy signatures, GBNF worker vs unconstrained RLM o
   all stage diagnostics were truncated. Longer traces remain bounded by the
   configured character policy.
 - Saved native `candidates.json` contained two accepted programs; the second
-  changed `synonym_judge` relative to the seed. The six engine candidate records
+  changed `semantic_judge` relative to the seed. The six engine candidate records
   include scored/rejected proposals, not six accepted native candidates.
   Full-validation scores remain the previously recorded 0.4759 versus 0.4525.
   Exact rejected reflection inputs/tool trajectories are not recoverable from

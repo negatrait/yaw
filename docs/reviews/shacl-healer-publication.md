@@ -376,14 +376,14 @@ Audit of `.yaw/yaw_optimize_20261107_110501.db` (`703` published chunks, `767` e
 2. `prepare_synonym_candidates` and `apply_synonym_adjudication` (`planner.py`) layered Python token/acronym heuristics (`_is_acronym`, `is_modifier_head_specialization`, `_has_disjoint_non_acronym_tokens`) and cross-label auto-merge gates (`auto_merge_cosine_gate`, `auto_merge_difflib_gate`) over the canonical Gemma 4 3-stage cascade.
 3. `canonicalize_fact_definitions` (`evidence.py`) fell back to `min(assertions, ...)` (duplicating an endpoint entity's definition) when `valid_assertions` was empty, accounting for `125/128` (`97.7%`) of LLM SHACL healer calls (`StatementShape/closedWorld`).
 4. `build_evidence`, `materialize_entities_and_facts`, `rekey_facts`, and `StatementShape/irreflexive` only checked `obj_kind == 'entity' AND subj_id == obj_id`, allowing `15` pseudo-reflexive literal statements (`"def": ""`, `subj == obj` or `pred == subj_def`) into `facts`.
-5. `query_broader_tc`, `YawProgram.judge_synonyms` (`Rule W3`), and `ConceptShape/S27-disjointBroaderRelated` computed a transitive `broader_tc` closure over non-transitive `1`-hop `skos:broader` edges (including partitive/instantial hierarchy edges) and lacked a post-repair `auto_heal_deterministic_shacl` pass after `apply_shacl_repairs` in `plan_graph_publication`.
+5. `query_broader_tc`, `YawProgram.judge_semantics` (`Rule W3`), and `ConceptShape/S27-disjointBroaderRelated` computed a transitive `broader_tc` closure over non-transitive `1`-hop `skos:broader` edges (including partitive/instantial hierarchy edges) and lacked a post-repair `auto_heal_deterministic_shacl` pass after `apply_shacl_repairs` in `plan_graph_publication`.
 
 Controlling contracts: [w3c-improvements.md §12, §13, §Decisions](../w3c-improvements.md#12-strict-judgelabels-identity-equivalence--canonical-gemma-4-3-stage-cascade-without-python-token-overrides-or-auto-merge-gates), [native-cocoindex-graph.md §4, §Decisions](../native-cocoindex-graph.md#decisions), and [epistemic-confidence-spec.md §2.4, §Decisions](../epistemic-confidence-spec.md#24-s27-disjointness-resolution-cagle-reification-pattern--direct-1-hop-bayes-factor).
 
 ### Checkpoints (2026-11-08 — `c98aebe`)
 
 - [x] **C1 (Documentation & Rule Promotion)**: Promote Invariants `W1–W5`, `CG-W3C-1`, `CG-W3C-2`, and the Removal Inventory into [w3c-improvements.md](../w3c-improvements.md), [native-cocoindex-graph.md](../native-cocoindex-graph.md), [epistemic-confidence-spec.md](../epistemic-confidence-spec.md), [graph-storage.md](../../.agents/rules/graph-storage.md), and [inference.md](../../.agents/rules/inference.md).
-- [x] **C2 (Strict `JudgeLabels` Equivalence, Retirement of `broader_tc` Rule W3, and Retirement of Python Token Overrides / Auto-Merge Gates)**: TDD implementation of `CG-W3C-1`, `2`-branch `equiv-branch` GBNF grammar (`max_reasoning_chars = 360`), `judge_synonyms` `@coco.fn(memo=True, version=2)`, removal of `query_broader_tc` / `broader_tc` / `Rule W3`, and removal of `_is_acronym`, `is_modifier_head_specialization`, `_has_disjoint_non_acronym_tokens`, `auto_merge_cosine_gate`, and `auto_merge_difflib_gate`.
+- [x] **C2 (Strict `JudgeLabels` Equivalence, Retirement of `broader_tc` Rule W3, and Retirement of Python Token Overrides / Auto-Merge Gates)**: TDD implementation of `CG-W3C-1`, `2`-branch `equiv-branch` GBNF grammar (`max_reasoning_chars = 360`), `judge_semantics` `@coco.fn(memo=True, version=2)`, removal of `query_broader_tc` / `broader_tc` / `Rule W3`, and removal of `_is_acronym`, `is_modifier_head_specialization`, `_has_disjoint_non_acronym_tokens`, `auto_merge_cosine_gate`, and `auto_merge_difflib_gate`.
 - [x] **C3 (Tier 3 Deterministic Statement Definition Synthesis, Irreflexive Literal Filtering, `1`-Hop S27 & Single-Surface `skos:prefLabel`)**: TDD implementation of `CG-W3C-2`, `clean_surface_label` and `is_irreflexive_statement` in `yaw.core`, Tier 3 deterministic synthesis in `canonicalize_fact_definitions`, universal literal/entity irreflexivity across `evidence.py` / `planner.py` / `graph_ops.py` / `shacl.py` / `invariants.py`, single-surface `skos:prefLabel` alignment in `normalization.py` / `planner.py` / `graph_ops.py`, direct `1`-hop `ConceptShape/S27-disjointBroaderRelated` + fixed-point `ConceptShape/broaderCycle` healing in `shacl.py`, and post-repair `auto_heal_deterministic_shacl` in `plan_graph_publication`.
 - [x] **C4 (Critic Audit, Review Ledger Update, Full Quality Gates & Live Optimization Restart)**: Critic audit (`0` blocking findings), review ledger updates in [shacl-healer-publication.md](shacl-healer-publication.md) and [incremental-publication-work.md](incremental-publication-work.md), full quality gates, atomic commit, and restart of `uv run yaw dspy optimize --resume`.
 
@@ -391,7 +391,7 @@ Controlling contracts: [w3c-improvements.md §12, §13, §Decisions](../w3c-impr
 
 - **Changed symbols & modules**:
   - `yaw/core/types.py`, `yaw/core/__init__.py`, `yaw/core/config.py`: Added and exported `clean_surface_label` and `is_irreflexive_statement`; set `gbnf_max_reasoning_chars = 360`; deleted `auto_merge_cosine_gate` and `auto_merge_difflib_gate`.
-  - `yaw/daemon/graph/inference/{prompts,grammars,adapter,parsers,invariants,program,components}.py`: Enforced the `2`-branch `equiv-branch` schema on `JudgeLabels` (`merge(A, B) <=> equivalent=true`), wired `max_reasoning_chars = 360` into `YawGBNFAdapter` and `YawProgram._run_judge_stage`, deleted the `Rule W3` (`broader_tc`) pre-gate in `YawProgram.judge_synonyms`, wired `is_irreflexive_statement` into `validate_stage_invariants("triples")`, and bumped `judge_synonyms` to `version=2`.
+  - `yaw/daemon/graph/inference/{prompts,grammars,adapter,parsers,invariants,program,components}.py`: Enforced the `2`-branch `equiv-branch` schema on `JudgeLabels` (`merge(A, B) <=> equivalent=true`), wired `max_reasoning_chars = 360` into `YawGBNFAdapter` and `YawProgram._run_judge_stage`, deleted the `Rule W3` (`broader_tc`) pre-gate in `YawProgram.judge_semantics`, wired `is_irreflexive_statement` into `validate_stage_invariants("triples")`, and bumped `judge_semantics` to `version=2`.
   - `yaw/daemon/graph/storage/{synonyms,__init__,evidence,graph_ops,shacl}.py`: Deleted `query_broader_tc` and `"broader_tc"` from `synonyms.py` and `storage/__init__.py`; added Tier 3 deterministic `f"{subj_name} {pred} {obj_surface}."` synthesis (and endpoint-collision `(statement).` fallback + stale synthesized definition refresh on `set_pref_label`) in `canonicalize_fact_definitions`; enforced `is_irreflexive_statement` in `build_evidence`, `rekey_facts`, `_scan_shacl_violations`, and `auto_heal_deterministic_shacl`; enforced `clean_surface_label` and single-surface `skos:prefLabel` in `upsert_entities`, `upsert_entity_labels`, and `canonicalize_entity_labels_edc`; removed `ConceptShape/broaderTransitiveCapExceeded`, scoped `ConceptShape/S27-disjointBroaderRelated` to direct `1`-hop `skos:broader` $\cap$ `skos:related` collisions, and wrapped `ConceptShape/broaderCycle` healing in a `16`-pass fixed-point loop.
   - `yaw/daemon/graph/{normalization,planner,engine}.py`, `yaw/daemon/{indexing,runtime}.py`: Deleted `_is_acronym`, `is_modifier_head_specialization`, `_has_disjoint_non_acronym_tokens`, `auto_merge_cosine_gate`, `auto_merge_difflib_gate`, `_AUTO_MERGE_COSINE_GATE`, and `_AUTO_MERGE_DIFFLIB_GATE`; restricted `prepare_synonym_candidates` auto-merge to same-norm sense consolidation (`text_processing(name_a) == text_processing(name_b)`); re-ran `auto_heal_deterministic_shacl(staging_conn)` after `apply_shacl_repairs` in `plan_graph_publication`.
 - **Gate results & evidence paths**:
@@ -399,5 +399,58 @@ Controlling contracts: [w3c-improvements.md §12, §13, §Decisions](../w3c-impr
   - `uv run --locked ty check`, `uv run --locked ruff check --fix`, `uv run --locked ruff format --check`, `uv run --locked pytest` (`741 passed` across `tests/daemon/graph/`, `tests/test_epistemic_confidence.py`, and `tests/core/`), and `git diff --check`: all passed.
 - **Discoveries during implementation**:
   - When an entity's `skos:prefLabel` is repaired by `apply_shacl_repairs` (`set_pref_label`), any fact whose prior definition matched the pre-repair Tier-3 synthesized string `f"{old_subj_name} {pred} {old_obj_surface}."` must invalidate that stale synthesized candidate in Tier 2 so Tier 3 re-synthesizes `facts.definition` using the repaired entity label.
+
+## 2026-11-10: EP1 evidence-backed provenance repair
+
+Baseline: clean `dev`, `7bd5ea9`. Scope: restore assertion-determined missing
+fact-source links during graph planning, before semantic healing. No new
+dependency, schema, public repair action, confidence heuristic or live cutover.
+Controlling contract: [native graph publication](../native-cocoindex-graph.md#evidence-backed-provenance-restoration).
+
+Plan and definition of done:
+
+- Implement one set-based SQL restoration over existing bound assertions, valid
+  chunks and matching mention ownership/revisions/endpoints. Deduplicate by the
+  existing `(fact_id, chunk_id)` key; leave unsupported violations unresolved.
+- Preserve scored source rows, fact confidence and immutable evidence. Missing
+  scoring inputs remain NULL; never re-pool an aggregate as new evidence.
+- Exercise real SQLite for complete/partial loss, duplicates, literals, merges,
+  invalid bindings and idempotence. Use native publication with a loopback
+  provider to verify recovered provenance does not request LLM healing.
+- Run mandatory type/lint/format/test/diff gates and an unguided critic audit
+  before committing EP1. Record actual evidence and limitations here.
+
+Implementation: `storage/evidence.py:restore_asserted_fact_sources` uses one
+`INSERT ... SELECT DISTINCT` with indexed bindings and provenance keys. The
+planner includes restored rows in existing `shacl_deterministic_healed` /
+`shacl_repairs_applied` counters before collecting healer dossiers. No alternate
+writer or public repair action was added.
+
+Evidence so far:
+
+- Ten real-SQLite regressions cover complete and partial provenance loss,
+  duplicate assertions, entity/literal objects, current IDs after merge,
+  idempotence, unchanged raw assertions and confidence, and unsupported bindings.
+- Native CocoIndex publication regression uses an incomplete snapshot, reuses
+  one prior chunk, records exactly one deterministic repair, publishes a clean
+  graph and makes zero healer requests to the loopback provider. Together with
+  the SQL regressions: `11 passed`.
+- An initial out-of-band-deletion probe reached the strict publication gate and
+  failed: an existing CocoIndex target fingerprint can still describe a row
+  deleted behind its back. That separate target-state recovery problem is not
+  solved here. This repair operates on the affected staged neighborhood; it is
+  not a global corruption scan or recovery command.
+- `outputs/provenance-repair/probe.py` / `probe.json`: 10,004 synthetic bound
+  assertion/source pairs, seven repetitions, 32.26 ms median complete repair,
+  5.15 ms median unchanged pass. Confidence stayed unchanged. These diagnostic
+  timings ran alongside the test suite and do not establish indexing speedup or
+  the frequency of recoverable violations in a real corpus.
+- Type, Ruff, format and diff checks passed. Unguided critic audit: no actionable
+  findings; critic independently verified the eleven new regressions. Full suite
+  pending. Results are also recorded in [evaluation-graph-storage.md](../evaluation-graph-storage.md#2026-11-10-assertion-backed-provenance-repair-ep1).
+
+`flash` is not an available model in this session; the required unguided critic
+dispatch uses the available existing critic agent instead. No checkpoint is
+marked complete pending its findings and the full suite.
 - **What it does not establish**:
   - Does not claim completion of the live full-corpus GEPA optimization run until all batches finish publishing and GEPA iterations converge.

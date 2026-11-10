@@ -895,7 +895,7 @@ class PaperParityGateTests(unittest.TestCase):
                 def filter_triples(self, query, candidates):
                     return [0] if candidates else []
 
-                def judge_synonyms(self, candidates, *args, **kwargs):
+                def judge_semantics(self, candidates, *args, **kwargs):
                     return []
 
                 def synonym_batch_fits(self, batch):

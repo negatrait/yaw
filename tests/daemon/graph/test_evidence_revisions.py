@@ -630,7 +630,13 @@ def test_focus_isolated_shacl_memo_reuses_healed_focus_when_earlier_violation_ad
     ]
     ranked = sorted(specs, key=lambda item: sense_id(item[0], item[1]))
     state["relation"] = "owl:differentFrom"
-    state["embedding_vector"] = fixed_vector
+
+    def isolated_vector(text):
+        # Adding a focus must not change the other focuses' semantic neighborhoods.
+        axis = next((i for i, terms in enumerate(ranked) if any(term.lower() in text.lower() for term in terms)), 3)
+        return [float(i == axis) for i in range(4)]
+
+    state["embedding_vector"] = isolated_vector
     state["healed_pref_labels"] = {
         sense_id(s_lbl, s_def): f"Status concept {idx}" for idx, (s_lbl, s_def, _, _) in enumerate(ranked)
     }

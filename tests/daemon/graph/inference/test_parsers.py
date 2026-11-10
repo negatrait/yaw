@@ -235,7 +235,7 @@ def test_compute_task_quality_score_stage_tokens() -> None:
     assert pred.label_judge_tokens == 42
     assert pred.hierarchy_judge_tokens == 30
     assert pred.related_judge_tokens == 15
-    assert not hasattr(pred, "synonym_judge_tokens")
+    assert not hasattr(pred, "semantic_judge_tokens")
 
 
 def test_stage_invariants_label_judge() -> None:

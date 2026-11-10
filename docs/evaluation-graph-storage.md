@@ -586,9 +586,9 @@ NER owns resources, and the current healer reads frozen evidence through
     - Updated `yaw.toml` `[optimization]` defaults to `max_queries = 250` and `train_queries = 150`.
   - **Causal End-to-End Extraction & Graph Re-Indexing + Trace Injection (`yaw/daemon/cli.py`, `yaw/daemon/graph/inference/program.py`, `yaw/daemon/graph/engine.py`, `yaw/daemon/runtime.py`):**
     - Attached `item_docs` (`gold` + `2.0x` distractors) to each `dspy.Example` with `.with_inputs("question", "item_docs")` and threaded `item_docs` through `YawProgram.forward` $\to$ `YawGraphEngine._program_retrieval_hook`.
-    - Implemented two-level extraction/graph fingerprinting (`_openie_fingerprint` for `ner`, `triples`, `entity_definer` + `_extraction_fingerprint` adding `synonym_judge`, `shacl_repair`, `shacl_healer_rlm.*`, and `embedding_*_prefix`).
+    - Implemented two-level extraction/graph fingerprinting (`_openie_fingerprint` for `ner`, `triples`, `entity_definer` + `_extraction_fingerprint` adding `semantic_judge`, `shacl_repair`, `shacl_healer_rlm.*`, and `embedding_*_prefix`).
     - When a candidate mutates any extraction/graph predictor or embedding prefix, `_ensure_candidate_chunks_indexed` invalidates stale SQLite graph tables (and `openie_chunks` when `_openie_fingerprint` changes) via `_reset_sandbox_graph` and re-indexes the active candidate chunks under the candidate `program`.
-    - Captured per-chunk OpenIE & `define_missing_entities` traces (`_captured_chunk_traces`) and graph-level `synonym_judge` & `shacl_healer_rlm` traces (`_captured_graph_traces`), injecting them bound to the candidate `program`'s predictor instances into `dspy.settings.trace` during `forward()` so `DspyAdapter.make_reflective_dataset` receives real execution traces for all 9 predictors.
+    - Captured per-chunk OpenIE & `define_missing_entities` traces (`_captured_chunk_traces`) and graph-level `semantic_judge` & `shacl_healer_rlm` traces (`_captured_graph_traces`), injecting them bound to the candidate `program`'s predictor instances into `dspy.settings.trace` during `forward()` so `DspyAdapter.make_reflective_dataset` receives real execution traces for all 9 predictors.
     - Wired `pred_name` and `pred_trace` into `_evaluate_prediction` / `_gepa_metric` to emit stage-specific diagnostics (`Stage[{pred_name}]: ...`) alongside the Sizecoding Pareto feedback.
   - **`RLMInstructionProposer` Anti-Leakage & Top-5 Failing Example Hardening (`yaw/daemon/graph/inference/prompts.py`, `yaw/daemon/graph/inference/program.py`, `tests/daemon/graph/inference/test_prompts.py`):**
     - Replaced stock DSPy's leaky meta-instruction (`"Identify all niche and domain specific factual information..."`) in `ProposeInstructionSignature` and `ReflectiveInnerDistillerSignature` with strict anti-leakage generalization rules (`NEVER include specific entity names, proper nouns, locations, dates, numbers, or question-specific facts from the examples in new_instruction`).
@@ -635,7 +635,7 @@ NER owns resources, and the current healer reads frozen evidence through
     - Implemented `YawRetriever(dspy.Retrieve)` with backward-compatible `dump_state` / `load_state` (`state_copy.setdefault("retriever", {"k": ...})`) and wired `self.rm` and `self.retriever` onto `YawProgram` while preserving the 9-predictor `named_predictors()` invariant.
   - **Exhaustive Stage & Closed-World SHACL/SKOS/Connected-Node Invariants (`yaw/daemon/graph/inference/invariants.py`):**
     - Implemented `validate_stage_invariants(...)` and `is_abstaining_answer(...)`.
-    - Enforces all 9 stage contracts (`ner`, `triples`, `entity_definer`, `synonym_judge`, `shacl_repair` / `shacl_healer_rlm`, `query_intent`, `triple_filter`, `qa`, `llm_proposer` / `llm_compressor`) and all 6 closed-world SHACL shapes (`ConceptShape/prefLabel`, `ConceptShape/definition`, `ConceptShape/S13-disjointLabels`, `ConceptShape/homographDifferentFrom`, `StatementShape/closedWorld`, `EdgeShape/closedWorld`), plus connected-node subgraph topology (`_count_connected_components`), closed-world candidate fact subset closure, and anti-leakage instruction validation.
+    - Enforces all 9 stage contracts (`ner`, `triples`, `entity_definer`, `semantic_judge`, `shacl_repair` / `shacl_healer_rlm`, `query_intent`, `triple_filter`, `qa`, `llm_proposer` / `llm_compressor`) and all 6 closed-world SHACL shapes (`ConceptShape/prefLabel`, `ConceptShape/definition`, `ConceptShape/S13-disjointLabels`, `ConceptShape/homographDifferentFrom`, `StatementShape/closedWorld`, `EdgeShape/closedWorld`), plus connected-node subgraph topology (`_count_connected_components`), closed-world candidate fact subset closure, and anti-leakage instruction validation.
     - Wired feedback-guided self-correction retry (`max_invariant_retries = 1`) into `YawProgram._invoke_stage`, recording `invariant_score`, `invariant_feedback`, and `invariant_retries` in `self.telemetry`.
   - **GEPA Pareto Frontier Ensembling (`yaw/daemon/graph/inference/program.py`):**
     - Implemented `ParetoProgramEnsemble(dspy.Module)` wrapping `dspy.Ensemble(reduce_fn=...)` with `self._compiled = True`, `from_frontier_states`, `reduce_ner_predictions`, `reduce_triple_predictions`, `reduce_qa_predictions`, `extract_openie`, `answer_question`, and `aanswer_question` (concurrent async dispatch via `prog.as_async()` + `anyio.create_task_group()`).
@@ -776,3 +776,20 @@ NER owns resources, and the current healer reads frozen evidence through
   - Reverse top-$k$ candidate completeness (`test_reverse_top_k_asymmetric_candidate_completeness_64_plus_64_equals_128`, `14` entities, `synonymy_top_k = 5`): `100%` canonical 15-table equality between `64 + 64` and `128` when `e_old` is rank 7 in `e_new`'s forward KNN (`> top_k`) and `e_new` is rank 1 in `e_old`'s reverse KNN.
   - Sparse CSR topology caching (`test_csr_graph_cached_across_queries_and_invalidated_on_graph_commit`): `csr1 is csr2` across read-only queries (`load_graph_topology` called once) and immediate invalidation across `report_indexing_batch`, same-connection commits (`total_changes`), and external-connection commits (`PRAGMA data_version`).
   - Pre-Epic 2 HippoRAG 2 Paper Parity Gate (`scripts/verify_paper_parity_gate.py --datasets popqa --mode retrieval`): `returncode = 0`, `Recall@5 Δ = +0.0400`, `Overall Gate Status: PASS`.
+
+## 2026-11-10: Assertion-backed provenance repair (EP1)
+
+Contract and implementation record: [native graph publication](native-cocoindex-graph.md#evidence-backed-provenance-restoration),
+[EP1 review](reviews/shacl-healer-publication.md#2026-11-10-ep1-evidence-backed-provenance-repair).
+
+- Real SQLite and native CocoIndex/loopback regression checks: `11 passed`.
+  The native test reused an existing chunk, restored one missing source link,
+  published a SHACL-clean graph and recorded zero healer requests.
+- Bayesian confidence and raw assertions remain unchanged; repeated same-chunk
+  assertions do not become independent source observations.
+- Diagnostic `outputs/provenance-repair/probe.json`: 10,004 synthetic missing
+  links, seven repetitions, median repair 32.26 ms, unchanged pass 5.15 ms.
+  Concurrent full-suite execution; not a real-corpus throughput measurement.
+- Full-suite evidence: pending `outputs/provenance-repair/full-suite.xml`.
+  Out-of-band target corruption recovery and live inference performance were
+  not established by this evaluation.

@@ -100,7 +100,7 @@ _PUBLIC_API: dict[str, str] = {
     "JudgeHierarchy": ".prompts",
     "JudgeLabels": ".prompts",
     "JudgeRelated": ".prompts",
-    "SYNONYM_JUDGE_STAGE_NAMES": ".prompts",
+    "SEMANTIC_JUDGE_STAGE_NAMES": ".prompts",
     "ProposeSHACLRepairs": ".prompts",
     "HealSHACLViolations": ".prompts",
     "FilterTriples": ".prompts",

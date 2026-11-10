@@ -31,6 +31,8 @@ class CapabilityDummyLM(NativeDummyLM):
     def __init__(self, answers: Any, **kwargs: Any) -> None:
         kwargs.setdefault("adapter", dspy.JSONAdapter())
         super().__init__(answers, **kwargs)
+        self.request_audit = LMRequestAudit()
+        self.callbacks.append(self.request_audit)
 
 
 class LMRequestAudit(BaseCallback):
@@ -401,11 +403,11 @@ tools, and mode=None routes pre-hydrated focus_context directly to shacl_repair.
             ],
         )
         self.assertEqual(inspector_calls, ["ent-1"])
-        self.assertEqual(len(orch_lm.history), 1)
-        self.assertIsNone(orch_lm.history[0]["kwargs"].get("extra_body"))
-        self.assertEqual(len(sub_lm.history), 1)
+        self.assertEqual(len(orch_lm.request_audit.calls), 1)
+        self.assertIsNone(orch_lm.request_audit.calls[0][1].get("extra_body"))
+        self.assertEqual(len(sub_lm.request_audit.calls), 1)
         self.assertEqual(
-            sub_lm.history[0]["kwargs"].get("extra_body"),
+            sub_lm.request_audit.calls[0][1].get("extra_body"),
             {"grammar": build_dspy_shacl_repair_grammar(allowed_actions=shacl_repair_actions(report))},
         )
 
@@ -421,8 +423,8 @@ tools, and mode=None routes pre-hydrated focus_context directly to shacl_repair.
             repairs_bound[0]["value"],
             "Repaired entity definition reusing bound focus_context.",
         )
-        self.assertEqual(len(orch_lm.history), 2)
-        self.assertEqual(len(sub_lm.history), 2)
+        self.assertEqual(len(orch_lm.request_audit.calls), 2)
+        self.assertEqual(len(sub_lm.request_audit.calls), 2)
 
         # Default mode=None with non-empty focus_context dispatches directly to shacl_repair (0 orchestrator calls)
         repairs_direct = program.propose_shacl_repairs(
@@ -433,8 +435,8 @@ tools, and mode=None routes pre-hydrated focus_context directly to shacl_repair.
             repairs_direct[0]["value"],
             "Repaired entity definition from direct default dispatch.",
         )
-        self.assertEqual(len(orch_lm.history), 2)
-        self.assertEqual(len(sub_lm.history), 3)
+        self.assertEqual(len(orch_lm.request_audit.calls), 2)
+        self.assertEqual(len(sub_lm.request_audit.calls), 3)
         self.assertEqual(program.shacl_audit_trail[-1]["mode"], "direct")
 
     def test_hipporag_program_save_and_load_gepa_state(self):
@@ -512,11 +514,11 @@ tools, and mode=None routes pre-hydrated focus_context directly to shacl_repair.
         self.assertNotIn("[[ ##", DSPY_TRIPLES_GBNF_GRAMMAR)
         self.assertNotIn("[[ ##", DSPY_QA_GBNF_GRAMMAR)
         self.assertEqual(
-            lm.history[0]["kwargs"].get("extra_body"),
+            lm.request_audit.calls[0][1].get("extra_body"),
             {"grammar": DSPY_NER_GBNF_GRAMMAR},
         )
         self.assertEqual(
-            lm.history[1]["kwargs"].get("extra_body"),
+            lm.request_audit.calls[1][1].get("extra_body"),
             {"grammar": build_dspy_triples_grammar(None, stage1_pairs)},
         )
 
@@ -530,13 +532,13 @@ tools, and mode=None routes pre-hydrated focus_context directly to shacl_repair.
         self.assertNotIn("[[ ##", expected_rerank_grammar)
         self.assertIn('"[\\"alan turing\\", \\"born in\\", \\"london\\"]"', expected_rerank_grammar)
         self.assertEqual(
-            lm.history[2]["kwargs"].get("extra_body"),
+            lm.request_audit.calls[2][1].get("extra_body"),
             {"grammar": expected_rerank_grammar},
         )
 
         program.answer_question("Alan Turing was born in London.", "Where?", lm=lm, use_gbnf=True)
         self.assertEqual(
-            lm.history[3]["kwargs"].get("extra_body"),
+            lm.request_audit.calls[3][1].get("extra_body"),
             {"grammar": build_dspy_qa_grammar(program.gbnf_max_reasoning_chars)},
         )
 
@@ -583,11 +585,11 @@ tools, and mode=None routes pre-hydrated focus_context directly to shacl_repair.
         )
         program.extract_openie("c-1", "Alan Turing was born in London.", lm=lm)
         self.assertEqual(
-            lm.history[0]["kwargs"].get("extra_body"),
+            lm.request_audit.calls[0][1].get("extra_body"),
             {"grammar": build_dspy_ner_grammar(3)},
         )
         self.assertEqual(
-            lm.history[1]["kwargs"].get("extra_body"),
+            lm.request_audit.calls[1][1].get("extra_body"),
             {"grammar": build_dspy_triples_grammar(2, stage1_pairs)},
         )
 
@@ -597,7 +599,7 @@ tools, and mode=None routes pre-hydrated focus_context directly to shacl_repair.
         self.assertEqual(pred.answer, "London")
         self.assertIn("char{1,180}", build_dspy_qa_grammar(180))
         self.assertEqual(
-            lm.history[2]["kwargs"].get("extra_body"),
+            lm.request_audit.calls[2][1].get("extra_body"),
             {"grammar": build_dspy_qa_grammar(180)},
         )
 
@@ -954,9 +956,9 @@ no frequency penalty."""
         )
         intent = prog.extract_query_intent("What county is Erik Hort's birthplace a part of?")
         self.assertEqual(intent, "Erik Hort birthplace village town county")
-        self.assertEqual(len(llm_lm.history), 1)
-        call_kwargs = llm_lm.history[0]["kwargs"]
-        self.assertAlmostEqual(call_kwargs.get("temperature"), 1.0)
+        self.assertEqual(len(llm_lm.request_audit.calls), 1)
+        call_kwargs = llm_lm.request_audit.calls[0][1]
+        self.assertAlmostEqual(call_kwargs["temperature"], 1.0)
         self.assertNotIn("frequency_penalty", call_kwargs)
         self.assertEqual(
             (call_kwargs.get("extra_body") or {}).get("grammar"),
@@ -969,7 +971,7 @@ no frequency penalty."""
         non_gbnf_lm._yaw_supports_gbnf = False
         intent_non_gbnf = prog.extract_query_intent("What county is Erik Hort's birthplace a part of?", lm=non_gbnf_lm)
         self.assertEqual(intent_non_gbnf, "Erik Hort birthplace county")
-        self.assertIsNone(non_gbnf_lm.history[0]["kwargs"].get("extra_body"))
+        self.assertIsNone(non_gbnf_lm.request_audit.calls[0][1].get("extra_body"))
 
     def test_canonical_12_predictor_separation_of_concerns_and_distinct_signatures(self):
         """Canonical predictors retain distinct signatures and native role/context LM bindings."""
@@ -1069,7 +1071,7 @@ no frequency penalty."""
         self.assertEqual(prog.embedding_audit_trail[0]["stage"], "fact_embed")
         self.assertEqual(prog.telemetry[-1]["predictor"], "embedder")
 
-        # Test extract_structured_triples, judge_synonyms, propose_shacl_repairs
+        # Test extract_structured_triples, judge_semantics, propose_shacl_repairs
         structured = prog.extract_structured_triples(
             "Ada Lovelace wrote Note G.",
             [["Ada Lovelace", "English mathematician"], ["Note G", "First computer algorithm"]],
@@ -1094,7 +1096,7 @@ no frequency penalty."""
             candidates=({"pair_id": "ent-1|ent-2", "entity_a": "ent-1", "entity_b": "ent-2"},),
             identifiers={"e0": "ent-1", "e1": "ent-2"},
         )
-        decisions = prog.judge_synonyms(syn_batch)
+        decisions = prog.judge_semantics(syn_batch)
         self.assertEqual(decisions[0]["pair_id"], "ent-1|ent-2")
         self.assertEqual(decisions[0]["relation"], "skos:altLabel")
 

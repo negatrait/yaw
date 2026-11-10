@@ -362,6 +362,18 @@ def test_openie_resume_reuses_matching_prompts_and_invalidates_mutations(tmp_pat
 
 
 def test_engine_retrieve_and_rag_qa(test_engine: YawGraphEngine) -> None:
+    class TopicEmbedder(DeterministicMockEmbedder):
+        def encode(self, texts, instruction="", *, stage=None):
+            vectors = super().encode(texts, instruction, stage=stage)
+            for text, vector in zip(texts, vectors, strict=True):
+                vector.fill(0)
+                vector[0 if "turing" in text.lower() or "computer science" in text.lower() else 1] = 1
+            return vectors
+
+    # Ranking needs meaningful geometry; hash-random vectors cannot assert relevance.
+    embedder = TopicEmbedder()
+    embedder.profile = EmbeddingProfile("deterministic", "topic-fixture-v1", 64, 2048, "mean", "", "")
+    test_engine.embedder = embedder
     docs = [
         "Alan Turing was an English mathematician and computer scientist.\nHe formulated the Turing machine.",
         "Ada Lovelace was a mathematician recognized for work on the Analytical Engine.",
@@ -939,7 +951,7 @@ def test_engine_homograph_gate_edc_and_shacl_conformance(synonym_token_counter, 
         engine.close()
 
 
-def test_engine_same_label_provisional_split_merged_by_judge_synonyms_and_stage1_standalone_ner(
+def test_engine_same_label_provisional_split_merged_by_judge_semantics_and_stage1_standalone_ner(
     synonym_token_counter,
     tmp_path: Path,
 ) -> None:

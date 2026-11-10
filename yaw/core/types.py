@@ -208,6 +208,11 @@ class StructuredTriple:
     obj_kind: Literal["entity", "literal"] = "entity"
     obj_datatype: str = ""
     obj_lang: str = ""
+    llm_prob: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.llm_prob is not None and (not math.isfinite(self.llm_prob) or not 0 <= self.llm_prob <= 1):
+            raise ValueError("Invalid triple model probability")
 
     @property
     def subject(self) -> str:
@@ -237,6 +242,8 @@ class StructuredTriple:
             d["obj_kind"] = self.obj_kind
             d["obj_datatype"] = self.obj_datatype
             d["obj_lang"] = self.obj_lang
+        if self.llm_prob is not None:
+            d["llm_prob"] = self.llm_prob
         return d
 
 
@@ -265,6 +272,11 @@ class OpenIERecord:
     triples: tuple[tuple[str, str, str], ...]
     structured_triples: tuple[StructuredTriple, ...] = ()
     entity_definitions: tuple[tuple[str, str], ...] = ()
+    entity_probabilities: tuple[tuple[str, str, float | None], ...] = ()
+
+    def __post_init__(self) -> None:
+        if any(p is not None and (not math.isfinite(p) or not 0 <= p <= 1) for _, _, p in self.entity_probabilities):
+            raise ValueError("Invalid NER model probability")
 
 
 @dataclass(slots=True, frozen=True)

@@ -195,7 +195,7 @@ never emit an empty definition or repeat the entity name tautologically."""
     )
 
 
-SYNONYM_JUDGE_STAGE_NAMES: tuple[str, str, str] = (
+SEMANTIC_JUDGE_STAGE_NAMES: tuple[str, str, str] = (
     "label_judge",
     "hierarchy_judge",
     "related_judge",
@@ -439,5 +439,5 @@ __all__ = [
     "RelatedDecision",
     "SHACLRepair",
     "SHACLRepairAction",
-    "SYNONYM_JUDGE_STAGE_NAMES",
+    "SEMANTIC_JUDGE_STAGE_NAMES",
 ]

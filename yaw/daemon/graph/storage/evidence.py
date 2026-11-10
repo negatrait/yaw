@@ -2,17 +2,21 @@
 
 import hashlib
 import json
+import math
 import sqlite3
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict, astuple, dataclass
+from itertools import groupby
 
 from yaw.core import (
     ChunkPointer,
     OpenIERecord,
+    bayesian_noisy_or,
     compute_mdhash_id,
     detect_scalar_literal,
     is_irreflexive_statement,
     is_scalar_label,
+    pool_confidences,
     text_processing,
 )
 
@@ -44,6 +48,7 @@ class EntityMention:
     definition: str
     resolved_definition: str
     entity_id: str
+    llm_prob: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +114,7 @@ def build_evidence(
         prefix="revision-",
     )
     mentions: dict[tuple[str, str], EntityMention] = {}
+    probabilities = {(name, definition): probability for name, definition, probability in record.entity_probabilities}
 
     def mention(name: str, definition: str) -> EntityMention:
         key = (name, definition)
@@ -133,6 +139,7 @@ def build_evidence(
                 definition,
                 resolved_definition,
                 entity,
+                probabilities.get(key),
             )
         return mentions[key]
 
@@ -147,10 +154,13 @@ def build_evidence(
     for triple in record.structured_triples:
         subject = mention(triple.subj, triple.subj_def)
         obj = mention(triple.obj, triple.obj_def) if triple.obj_kind == "entity" else None
-        raw = json.dumps(asdict(triple), sort_keys=True, ensure_ascii=False)
+        raw_data = asdict(triple)
+        raw = json.dumps(raw_data, sort_keys=True, ensure_ascii=False)
+        raw_data.pop("llm_prob")
+        identity = json.dumps(raw_data, sort_keys=True, ensure_ascii=False)
         assertions.append(
             FactAssertion(
-                compute_mdhash_id(json.dumps([occurrence, revision, raw]), prefix="assertion-"),
+                compute_mdhash_id(json.dumps([occurrence, revision, identity]), prefix="assertion-"),
                 pointer.chunk_id,
                 revision,
                 subject.mention_id,
@@ -189,15 +199,144 @@ def upsert_evidence(
     conn: sqlite3.Connection, mentions: tuple[EntityMention, ...], assertions: tuple[FactAssertion, ...]
 ) -> None:
     conn.executemany(
-        "INSERT INTO entity_mentions VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(mention_id) "
-        "DO UPDATE SET entity_id=excluded.entity_id",
+        "INSERT INTO entity_mentions VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(mention_id) "
+        "DO UPDATE SET entity_id=excluded.entity_id,llm_prob=excluded.llm_prob",
         (astuple(row) for row in mentions),
     )
     conn.executemany(
         "INSERT INTO fact_assertions VALUES (?,?,?,?,?,?,?) ON CONFLICT(assertion_id) "
-        "DO UPDATE SET fact_id=excluded.fact_id",
+        "DO UPDATE SET fact_id=excluded.fact_id,raw_json=excluded.raw_json",
         (astuple(row) for row in assertions),
     )
+
+
+def restore_asserted_fact_sources(conn: sqlite3.Connection) -> int:
+    """Restore missing provenance from bound source assertions without inventing scores."""
+    with write_tx(conn):
+        rows = conn.execute(
+            """
+            SELECT a.fact_id, a.chunk_id, MAX(json_extract(a.raw_json, '$.llm_prob'))
+            FROM fact_assertions a
+            JOIN facts f ON f.fact_id = a.fact_id
+            JOIN chunks c ON c.chunk_id = a.chunk_id
+            JOIN entity_mentions s ON s.mention_id = a.subject_mention_id
+                AND s.chunk_id = a.chunk_id AND s.source_revision = a.source_revision
+                AND s.entity_id = f.subj_id
+            LEFT JOIN entity_mentions o ON o.mention_id = a.object_mention_id
+                AND o.chunk_id = a.chunk_id AND o.source_revision = a.source_revision
+                AND o.entity_id = f.obj_id
+            WHERE ((f.obj_kind = 'entity' AND o.mention_id IS NOT NULL)
+                OR (f.obj_kind = 'literal' AND a.object_mention_id IS NULL))
+                AND NOT EXISTS (
+                    SELECT 1 FROM fact_sources fs
+                    WHERE fs.fact_id = a.fact_id AND fs.chunk_id = a.chunk_id
+                )
+            GROUP BY a.fact_id, a.chunk_id
+            """
+        )
+        return conn.executemany(
+            "INSERT INTO fact_sources (fact_id,chunk_id,llm_prob,atomic_confidence) VALUES (?,?,?,?)",
+            ((fid, cid, probability, pool_confidences(probability)) for fid, cid, probability in rows),
+        ).rowcount
+
+
+def refresh_source_confidences(conn: sqlite3.Connection) -> None:
+    """Pool token votes with immutable source-role/context cosine measurements."""
+
+    def vote(probability: float | None, coherences: tuple[float, ...]) -> tuple[float | None, float, float]:
+        if any(c is None or not math.isfinite(c) for c in coherences):
+            raise ValueError("Source semantic coherence must be measured and finite")
+        if probability is not None and (not math.isfinite(probability) or not 0 <= probability <= 1):
+            raise ValueError("Invalid source model probability")
+        coherence = pool_confidences(*coherences)
+        assert coherence is not None
+        atomic = pool_confidences(probability, coherence)
+        assert atomic is not None
+        return probability, coherence, atomic
+
+    rows = conn.execute(
+        "SELECT m.entity_id,m.chunk_id,m.llm_prob,1-vec_distance_cosine(v.embedding,c.embedding) "
+        "FROM entity_mentions m LEFT JOIN entity_candidate_vectors v ON v.sense_id=m.sense_id "
+        "LEFT JOIN chunk_vec c ON c.chunk_id=m.chunk_id ORDER BY m.entity_id,m.chunk_id,m.mention_id"
+    )
+    for (entity, chunk), observations in groupby(rows, key=lambda row: tuple(row[:2])):
+        probability, coherence, atomic = max((vote(row[2], (row[3],)) for row in observations), key=lambda v: v[2])
+        for src, dst in ((entity, chunk), (chunk, entity)):
+            conn.execute(
+                "INSERT INTO edge_sources (src_id,dst_id,kind,chunk_id,llm_prob,vec_coherence,atomic_confidence) "
+                "VALUES (?,?,'passage',?,?,?,?) ON CONFLICT(src_id,dst_id,kind,chunk_id) DO UPDATE SET "
+                "llm_prob=excluded.llm_prob,vec_coherence=excluded.vec_coherence,atomic_confidence=excluded.atomic_confidence",
+                (src, dst, chunk, probability, coherence, atomic),
+            )
+            conn.execute(
+                "INSERT INTO edges (src_id,dst_id,kind,weight) VALUES (?,?,'passage',?) "
+                "ON CONFLICT(src_id,dst_id,kind) DO UPDATE SET weight=excluded.weight",
+                (src, dst, atomic),
+            )
+    rows = conn.execute(
+        "SELECT a.fact_id,a.chunk_id,json_extract(a.raw_json,'$.llm_prob'),a.object_mention_id,"
+        "1-vec_distance_cosine(sv.embedding,c.embedding),"
+        "CASE WHEN a.object_mention_id IS NOT NULL THEN 1-vec_distance_cosine(ov.embedding,c.embedding) END "
+        "FROM fact_assertions a JOIN facts f ON f.fact_id=a.fact_id "
+        "JOIN entity_mentions s ON s.mention_id=a.subject_mention_id "
+        "AND s.chunk_id=a.chunk_id AND s.source_revision=a.source_revision AND s.entity_id=f.subj_id "
+        "LEFT JOIN entity_mentions o ON o.mention_id=a.object_mention_id "
+        "AND o.chunk_id=a.chunk_id AND o.source_revision=a.source_revision AND o.entity_id=f.obj_id "
+        "LEFT JOIN entity_candidate_vectors sv ON sv.sense_id=s.sense_id "
+        "LEFT JOIN entity_candidate_vectors ov ON ov.sense_id=o.sense_id "
+        "JOIN chunks source ON source.chunk_id=a.chunk_id LEFT JOIN chunk_vec c ON c.chunk_id=a.chunk_id "
+        "WHERE (f.obj_kind='entity' AND o.mention_id IS NOT NULL) "
+        "OR (f.obj_kind='literal' AND a.object_mention_id IS NULL) "
+        "ORDER BY a.fact_id,a.chunk_id,a.assertion_id"
+    )
+    for (fid, cid), observations in groupby(rows, key=lambda row: tuple(row[:2])):
+        probability, coherence, atomic = max(
+            (vote(row[2], (row[4], row[5]) if row[3] is not None else (row[4],)) for row in observations),
+            key=lambda v: v[2],
+        )
+        conn.execute(
+            "UPDATE fact_sources SET llm_prob=?,vec_coherence=?,atomic_confidence=? WHERE fact_id=? AND chunk_id=?",
+            (probability, coherence, atomic, fid, cid),
+        )
+    rows = conn.execute(
+        "SELECT f.subj_id,f.obj_id,fs.chunk_id,fs.llm_prob,fs.vec_coherence,fs.atomic_confidence "
+        "FROM facts f JOIN fact_sources fs ON fs.fact_id=f.fact_id WHERE f.obj_kind='entity' "
+        "ORDER BY f.subj_id,f.obj_id,fs.chunk_id,f.fact_id"
+    )
+    for (src, dst, cid), observations in groupby(rows, key=lambda row: tuple(row[:3])):
+        probability, coherence, atomic = max((tuple(row[3:]) for row in observations), key=lambda v: v[2])
+        conn.execute(
+            "UPDATE edge_sources SET llm_prob=?,vec_coherence=?,atomic_confidence=? "
+            "WHERE kind='fact' AND src_id=? AND dst_id=? AND chunk_id=?",
+            (probability, coherence, atomic, src, dst, cid),
+        )
+    for table, key, query in (
+        ("facts", "fact_id", "SELECT fact_id,atomic_confidence FROM fact_sources ORDER BY fact_id,chunk_id"),
+        (
+            "entities",
+            "entity_id",
+            "SELECT dst_id,MAX(atomic_confidence) FROM edge_sources "
+            "WHERE kind='passage' AND src_id=chunk_id GROUP BY dst_id,chunk_id ORDER BY dst_id,chunk_id",
+        ),
+    ):
+        for owner, observations in groupby(conn.execute(query), key=lambda row: row[0]):
+            probability = bayesian_noisy_or([row[1] for row in observations])
+            conn.execute(
+                f"UPDATE {table} SET confidence=? WHERE {key}=? AND confidence IS NOT ?",
+                (probability, owner, probability),
+            )
+    rows = conn.execute(
+        "SELECT src_id,dst_id,kind,atomic_confidence FROM edge_sources "
+        "WHERE kind IN ('passage','fact') ORDER BY src_id,dst_id,kind,chunk_id"
+    )
+    for edge, observations in groupby(rows, key=lambda row: tuple(row[:3])):
+        probability = bayesian_noisy_or([row[3] for row in observations])
+        if probability is None:
+            raise ValueError("Structural edge has no measured confidence")
+        conn.execute(
+            "UPDATE edges SET weight=? WHERE src_id=? AND dst_id=? AND kind=? AND weight IS NOT ?",
+            (probability, *edge, probability),
+        )
 
 
 def load_sense_bindings(conn: sqlite3.Connection, labels: Iterable[str]) -> dict[str, tuple[str, str, str]]:
